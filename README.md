@@ -17,9 +17,38 @@ orca
 orca "fix this test"
 orca --print "summarize this repository"
 orca exec --output-format jsonl "run the full verification"
+orca exec --approval-mode read-only "read README.md"
+orca exec --verifier "cargo test" "run the full verification"
 ```
+
+## Harness Contract
+
+`orca exec` is the first stable runtime boundary. It emits one JSON object per line when `--output-format jsonl` is selected.
+
+The current mock runtime supports:
+
+- `session.started`
+- `turn.started`
+- `assistant.reasoning.delta`
+- `assistant.message.delta`
+- `approval.requested`
+- `approval.resolved`
+- `tool.call.requested`
+- `tool.call.completed`
+- `verification.started`
+- `verification.completed`
+- `session.completed`
+
+Exit codes:
+
+- `0`: success
+- `1`: failed
+- `2`: verification failed
+- `3`: approval required or denied
+- `4`: budget exhausted
+- `130`: cancelled
 
 ## Status
 
-Early initialization. The current code is only a placeholder CLI while the runtime architecture is being built.
+Early runtime contract implementation. `orca exec` currently uses a mock agent loop while the DeepSeek provider and full tool runtime are being built.
 
