@@ -1,4 +1,5 @@
 pub mod deepseek_fixture;
+pub mod deepseek_http;
 
 use serde::{Deserialize, Serialize};
 
@@ -18,12 +19,14 @@ pub enum ProviderStep {
     MessageDelta(String),
     ToolCall(ToolRequest),
     ReplayState(ProviderReplayState),
+    Error(String),
 }
 
 pub fn plan(kind: ProviderKind, prompt: &str) -> Vec<ProviderStep> {
     match kind {
         ProviderKind::Mock => mock_plan(prompt),
         ProviderKind::DeepSeekFixture => deepseek_fixture::plan(prompt),
+        ProviderKind::DeepSeek => deepseek_http::plan(prompt),
     }
 }
 

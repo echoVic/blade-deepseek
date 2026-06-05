@@ -46,6 +46,7 @@ Every JSONL line is one event:
 - `tool.call.completed`
 - `verification.started`
 - `verification.completed`
+- `error`
 - `session.completed`
 
 ## Run Status
@@ -96,5 +97,12 @@ Current providers:
 
 - `mock`: default provider used for local harness contract tests.
 - `deepseek-fixture`: recorded provider fixture that emits DeepSeek-style reasoning, replay state, a tool call, and a final assistant message.
+- `deepseek`: minimal non-streaming HTTP provider. It reads `DEEPSEEK_API_KEY`, `DEEPSEEK_BASE_URL` (optional, default `https://api.deepseek.com`), and `DEEPSEEK_MODEL` (optional, default `deepseek-chat`).
 
 `provider.replay.updated` exists to preserve provider-specific context that must be replayed in later model turns. For DeepSeek thinking/tool-use flows, this includes `reasoning_content` and tool call IDs. The event is part of the harness trace so future real HTTP transport code can keep DeepSeek replay semantics without changing the external JSONL contract.
+
+The current `deepseek` provider maps non-streaming response fields into harness events:
+
+- `reasoning_content` -> `assistant.reasoning.delta` and `provider.replay.updated`
+- `content` -> `assistant.message.delta`
+- provider/config/request errors -> `error` and final status `failed`

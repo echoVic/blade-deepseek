@@ -54,6 +54,34 @@ fn deepseek_fixture_preserves_reasoning_and_replay_state() {
     assert_eq!(events.last().unwrap()["payload"]["status"], "success");
 }
 
+#[test]
+fn deepseek_provider_without_api_key_emits_error_and_fails() {
+    let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .env_remove("DEEPSEEK_API_KEY")
+        .args([
+            "exec",
+            "--output-format",
+            "jsonl",
+            "--provider",
+            "deepseek",
+            "inspect repo",
+        ])
+        .output()
+        .expect("run orca");
+
+    assert_eq!(output.status.code(), Some(1));
+
+    let events = parse_jsonl(&output.stdout);
+    let error = find_event(&events, "error");
+    assert!(
+        error["payload"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("DEEPSEEK_API_KEY")
+    );
+    assert_eq!(events.last().unwrap()["payload"]["status"], "failed");
+}
+
 fn find_event<'a>(events: &'a [Value], event_type: &str) -> &'a Value {
     events
         .iter()

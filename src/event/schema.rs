@@ -45,6 +45,8 @@ pub enum EventType {
     VerificationStarted,
     #[serde(rename = "verification.completed")]
     VerificationCompleted,
+    #[serde(rename = "error")]
+    Error,
     #[serde(rename = "session.completed")]
     SessionCompleted,
 }
@@ -209,6 +211,15 @@ impl EventFactory {
                 "exit_code": result.exit_code,
                 "stdout": result.stdout,
                 "stderr": result.stderr
+            }),
+        )
+    }
+
+    pub fn error(&mut self, message: &str) -> EventEnvelope {
+        self.make(
+            EventType::Error,
+            json!({
+                "message": message
             }),
         )
     }

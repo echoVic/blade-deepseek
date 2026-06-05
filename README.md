@@ -20,6 +20,7 @@ orca exec --output-format jsonl "run the full verification"
 orca exec --approval-mode read-only "read README.md"
 orca exec --verifier "cargo test" "run the full verification"
 orca exec --provider deepseek-fixture "inspect repo"
+DEEPSEEK_API_KEY=... orca exec --provider deepseek "inspect repo"
 ```
 
 ## Harness Contract
@@ -39,6 +40,7 @@ The current mock runtime supports:
 - `tool.call.completed`
 - `verification.started`
 - `verification.completed`
+- `error`
 - `session.completed`
 
 Exit codes:
@@ -52,4 +54,4 @@ Exit codes:
 
 ## Status
 
-Early runtime contract implementation. `orca exec` currently supports a mock provider and a recorded `deepseek-fixture` provider while the real DeepSeek HTTP transport is being built.
+Early runtime contract implementation. `orca exec` currently supports a mock provider, a recorded `deepseek-fixture` provider, and a minimal non-streaming `deepseek` HTTP provider.

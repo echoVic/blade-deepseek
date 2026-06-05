@@ -17,6 +17,8 @@ pub enum ProviderKind {
     Mock,
     #[value(name = "deepseek-fixture")]
     DeepSeekFixture,
+    #[value(name = "deepseek")]
+    DeepSeek,
 }
 
 impl ProviderKind {
@@ -24,6 +26,7 @@ impl ProviderKind {
         match self {
             Self::Mock => "mock",
             Self::DeepSeekFixture => "deepseek-fixture",
+            Self::DeepSeek => "deepseek",
         }
     }
 }

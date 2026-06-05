@@ -57,6 +57,11 @@ impl<W: Write> EventSink<W> {
             }
             EventType::VerificationStarted => writeln!(self.writer, "verification started"),
             EventType::VerificationCompleted => writeln!(self.writer, "verification completed"),
+            EventType::Error => writeln!(
+                self.writer,
+                "error: {}",
+                event.payload["message"].as_str().unwrap_or("unknown")
+            ),
             EventType::SessionCompleted => {
                 writeln!(
                     self.writer,

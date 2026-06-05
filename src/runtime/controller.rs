@@ -92,6 +92,11 @@ fn run_provider_plan(
             ProviderStep::ReplayState(replay) => {
                 sink.emit(&events.provider_replay_updated(&replay))?;
             }
+            ProviderStep::Error(message) => {
+                sink.emit(&events.error(&message))?;
+                status = RunStatus::Failed;
+                break;
+            }
             ProviderStep::ToolCall(tool_request) => {
                 status = run_tool_request(config, cwd, events, sink, tool_request, false)?;
                 if status != RunStatus::Success {
