@@ -5,6 +5,7 @@ use crate::approval::policy::{ActionKind, ApprovalDecision, ApprovalPolicy, Appr
 use crate::config::RunConfig;
 use crate::event::schema::{EventFactory, RunStatus};
 use crate::event::sink::EventSink;
+use crate::provider::{self, ProviderStep};
 use crate::runtime::session::new_run_id;
 use crate::tools;
 use crate::verification;
@@ -35,26 +36,33 @@ fn run_inner(config: RunConfig) -> io::Result<RunStatus> {
     sink.emit(&events.session_started(
         &cwd,
         config.approval_mode.as_str(),
+        config.provider.as_str(),
         config.max_turns,
         config.verifier.as_deref(),
     ))?;
     sink.emit(&events.turn_started(1, prompt))?;
-    sink.emit(
-        &events.assistant_reasoning_delta(
-            "Mock runtime is preserving the DeepSeek reasoning channel.",
-        ),
-    )?;
 
-    let status = if let Some(tool_request) = tools::request_from_prompt(prompt) {
-        run_tool_request(&config, &cwd_path, &mut events, &mut sink, tool_request)?
+    let status = if config.provider != crate::config::ProviderKind::Mock {
+        run_provider_plan(&config, &cwd_path, &mut events, &mut sink, prompt)?
+    } else if let Some(tool_request) = tools::request_from_prompt(prompt) {
+        sink.emit(&events.assistant_reasoning_delta(
+            "Mock runtime is preserving the DeepSeek reasoning channel.",
+        ))?;
+        run_tool_request(
+            &config,
+            &cwd_path,
+            &mut events,
+            &mut sink,
+            tool_request,
+            true,
+        )?
     } else if prompt_requests_write(prompt) {
+        sink.emit(&events.assistant_reasoning_delta(
+            "Mock runtime is preserving the DeepSeek reasoning channel.",
+        ))?;
         run_mock_write_request(&config, &mut events, &mut sink)?
     } else {
-        sink.emit(
-            &events
-                .assistant_message_delta("Mock runtime completed the headless harness contract."),
-        )?;
-        RunStatus::Success
+        run_provider_plan(&config, &cwd_path, &mut events, &mut sink, prompt)?
     };
 
     let status =
@@ -64,12 +72,45 @@ fn run_inner(config: RunConfig) -> io::Result<RunStatus> {
     Ok(status)
 }
 
+fn run_provider_plan(
+    config: &RunConfig,
+    cwd: &PathBuf,
+    events: &mut EventFactory,
+    sink: &mut EventSink<impl io::Write>,
+    prompt: &str,
+) -> io::Result<RunStatus> {
+    let mut status = RunStatus::Success;
+
+    for step in provider::plan(config.provider, prompt) {
+        match step {
+            ProviderStep::ReasoningDelta(text) => {
+                sink.emit(&events.assistant_reasoning_delta(&text))?;
+            }
+            ProviderStep::MessageDelta(text) => {
+                sink.emit(&events.assistant_message_delta(&text))?;
+            }
+            ProviderStep::ReplayState(replay) => {
+                sink.emit(&events.provider_replay_updated(&replay))?;
+            }
+            ProviderStep::ToolCall(tool_request) => {
+                status = run_tool_request(config, cwd, events, sink, tool_request, false)?;
+                if status != RunStatus::Success {
+                    break;
+                }
+            }
+        }
+    }
+
+    Ok(status)
+}
+
 fn run_tool_request(
     config: &RunConfig,
     cwd: &PathBuf,
     events: &mut EventFactory,
     sink: &mut EventSink<impl io::Write>,
     tool_request: tools::ToolRequest,
+    emit_summary: bool,
 ) -> io::Result<RunStatus> {
     let policy = ApprovalPolicy::new(config.approval_mode);
 
@@ -106,7 +147,9 @@ fn run_tool_request(
     if is_failure {
         Ok(RunStatus::Failed)
     } else {
-        sink.emit(&events.assistant_message_delta("Mock runtime completed one tool request."))?;
+        if emit_summary {
+            sink.emit(&events.assistant_message_delta("Mock runtime completed one tool request."))?;
+        }
         Ok(RunStatus::Success)
     }
 }

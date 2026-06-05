@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::approval::policy::{ApprovalRequest, ApprovalResolution};
+use crate::provider::ProviderReplayState;
 use crate::tools::{ToolRequest, ToolResult};
 use crate::verification::VerificationResult;
 
@@ -30,6 +31,8 @@ pub enum EventType {
     AssistantReasoningDelta,
     #[serde(rename = "assistant.message.delta")]
     AssistantMessageDelta,
+    #[serde(rename = "provider.replay.updated")]
+    ProviderReplayUpdated,
     #[serde(rename = "approval.requested")]
     ApprovalRequested,
     #[serde(rename = "approval.resolved")]
@@ -84,6 +87,7 @@ impl EventFactory {
         &mut self,
         cwd: &str,
         approval_mode: &str,
+        provider: &str,
         max_turns: Option<u32>,
         verifier: Option<&str>,
     ) -> EventEnvelope {
@@ -92,6 +96,7 @@ impl EventFactory {
             json!({
                 "cwd": cwd,
                 "approval_mode": approval_mode,
+                "provider": provider,
                 "max_turns": max_turns,
                 "verifier": verifier
             }),
@@ -122,6 +127,17 @@ impl EventFactory {
             EventType::AssistantMessageDelta,
             json!({
                 "text": text
+            }),
+        )
+    }
+
+    pub fn provider_replay_updated(&mut self, replay: &ProviderReplayState) -> EventEnvelope {
+        self.make(
+            EventType::ProviderReplayUpdated,
+            json!({
+                "provider": replay.provider,
+                "reasoning_content": replay.reasoning_content,
+                "tool_call_ids": replay.tool_call_ids
             }),
         )
     }

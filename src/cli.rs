@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::approval::policy::ApprovalMode;
-use crate::config::{OutputFormat, RunConfig};
+use crate::config::{OutputFormat, ProviderKind, RunConfig};
 use crate::runtime::controller;
 
 #[derive(Debug, Parser)]
@@ -37,6 +37,10 @@ struct ExecArgs {
     /// Approval policy for tool actions.
     #[arg(long, value_enum, default_value_t = ApprovalMode::WorkspaceWrite)]
     approval_mode: ApprovalMode,
+
+    /// Provider implementation to use for this run.
+    #[arg(long, value_enum, default_value_t = ProviderKind::Mock)]
+    provider: ProviderKind,
 
     /// Maximum turns for this run.
     #[arg(long)]
@@ -81,6 +85,7 @@ fn run_exec(args: ExecArgs) -> i32 {
         cwd: args.cwd,
         output_format: args.output_format.into(),
         approval_mode: args.approval_mode,
+        provider: args.provider,
         max_turns: args.max_turns,
         verifier: args.verifier,
     };

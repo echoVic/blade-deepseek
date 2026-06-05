@@ -43,6 +43,7 @@ impl<W: Write> EventSink<W> {
                     event.payload["text"].as_str().unwrap_or("")
                 )
             }
+            EventType::ProviderReplayUpdated => writeln!(self.writer, "provider replay updated"),
             EventType::ApprovalRequested => writeln!(self.writer, "approval requested"),
             EventType::ApprovalResolved => writeln!(self.writer, "approval resolved"),
             EventType::ToolCallRequested => {

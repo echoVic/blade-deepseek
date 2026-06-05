@@ -2,6 +2,7 @@ mod approval;
 mod cli;
 mod config;
 mod event;
+mod provider;
 mod runtime;
 mod tools;
 mod verification;

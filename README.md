@@ -19,6 +19,7 @@ orca --print "summarize this repository"
 orca exec --output-format jsonl "run the full verification"
 orca exec --approval-mode read-only "read README.md"
 orca exec --verifier "cargo test" "run the full verification"
+orca exec --provider deepseek-fixture "inspect repo"
 ```
 
 ## Harness Contract
@@ -31,6 +32,7 @@ The current mock runtime supports:
 - `turn.started`
 - `assistant.reasoning.delta`
 - `assistant.message.delta`
+- `provider.replay.updated`
 - `approval.requested`
 - `approval.resolved`
 - `tool.call.requested`
@@ -50,5 +52,4 @@ Exit codes:
 
 ## Status
 
-Early runtime contract implementation. `orca exec` currently uses a mock agent loop while the DeepSeek provider and full tool runtime are being built.
-
+Early runtime contract implementation. `orca exec` currently supports a mock provider and a recorded `deepseek-fixture` provider while the real DeepSeek HTTP transport is being built.

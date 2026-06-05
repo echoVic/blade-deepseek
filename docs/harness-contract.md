@@ -39,6 +39,7 @@ Every JSONL line is one event:
 - `turn.started`
 - `assistant.reasoning.delta`
 - `assistant.message.delta`
+- `provider.replay.updated`
 - `approval.requested`
 - `approval.resolved`
 - `tool.call.requested`
@@ -88,3 +89,12 @@ Current behavior:
 - `git_status` runs `git status --short`.
 - `bash` runs through `sh -c` only when the approval policy permits shell actions. With the default `workspace-write` policy, shell actions are denied and the run exits with code `3`.
 - `edit` supports exact replacement with `edit <path> :: <old> => <new>`. It fails without changing the file if the old text is missing, empty, or matches multiple locations.
+
+## Provider Contract
+
+Current providers:
+
+- `mock`: default provider used for local harness contract tests.
+- `deepseek-fixture`: recorded provider fixture that emits DeepSeek-style reasoning, replay state, a tool call, and a final assistant message.
+
+`provider.replay.updated` exists to preserve provider-specific context that must be replayed in later model turns. For DeepSeek thinking/tool-use flows, this includes `reasoning_content` and tool call IDs. The event is part of the harness trace so future real HTTP transport code can keep DeepSeek replay semantics without changing the external JSONL contract.
