@@ -1,0 +1,12 @@
+[package]
+name = "blade-deepseek"
+version = "0.1.0"
+edition = "2024"
+description = "Orca: a DeepSeek-native coding agent runtime by Blade"
+license = "MIT"
+repository = "https://github.com/echoVic/blade-deepseek"
+
+[[bin]]
+name = "orca"
+path = "src/main.rs"
+
