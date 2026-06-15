@@ -41,6 +41,12 @@ pub enum EventType {
     ToolCallRequested,
     #[serde(rename = "tool.call.completed")]
     ToolCallCompleted,
+    #[serde(rename = "subagent.started")]
+    SubagentStarted,
+    #[serde(rename = "subagent.launched")]
+    SubagentLaunched,
+    #[serde(rename = "subagent.completed")]
+    SubagentCompleted,
     #[serde(rename = "verification.started")]
     VerificationStarted,
     #[serde(rename = "verification.completed")]
@@ -185,6 +191,53 @@ impl EventFactory {
                 "error": result.error,
                 "exit_code": result.exit_code,
                 "truncated": result.truncated
+            }),
+        )
+    }
+
+    pub fn subagent_started(&mut self, id: &str, description: &str) -> EventEnvelope {
+        self.make(
+            EventType::SubagentStarted,
+            json!({
+                "id": id,
+                "description": description
+            }),
+        )
+    }
+
+    pub fn subagent_launched(
+        &mut self,
+        id: &str,
+        description: &str,
+        output_file: &str,
+    ) -> EventEnvelope {
+        self.make(
+            EventType::SubagentLaunched,
+            json!({
+                "id": id,
+                "description": description,
+                "output_file": output_file,
+                "can_read_output_file": true
+            }),
+        )
+    }
+
+    pub fn subagent_completed(
+        &mut self,
+        id: &str,
+        description: &str,
+        status: RunStatus,
+        output: Option<&str>,
+        error: Option<&str>,
+    ) -> EventEnvelope {
+        self.make(
+            EventType::SubagentCompleted,
+            json!({
+                "id": id,
+                "description": description,
+                "status": status,
+                "output": output,
+                "error": error
             }),
         )
     }

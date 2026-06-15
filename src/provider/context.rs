@@ -57,15 +57,15 @@ pub fn conversation_tokens(conversation: &Conversation) -> usize {
 
 pub fn needs_compaction(conversation: &Conversation, config: &ContextConfig) -> bool {
     let total = conversation_tokens(conversation);
-    let effective_limit =
-        (config.max_tokens as f64 * config.compaction_threshold) as usize - config.reserved_for_response;
+    let effective_limit = (config.max_tokens as f64 * config.compaction_threshold) as usize
+        - config.reserved_for_response;
     total > effective_limit
 }
 
 pub fn compact(conversation: &Conversation, config: &ContextConfig) -> Conversation {
     let messages = &conversation.messages;
-    let target_tokens =
-        (config.max_tokens as f64 * config.compaction_threshold) as usize - config.reserved_for_response;
+    let target_tokens = (config.max_tokens as f64 * config.compaction_threshold) as usize
+        - config.reserved_for_response;
 
     let system_msg = messages.first().cloned();
     let system_tokens = system_msg.as_ref().map(message_tokens).unwrap_or(0);
@@ -73,7 +73,9 @@ pub fn compact(conversation: &Conversation, config: &ContextConfig) -> Conversat
     let non_system: Vec<&Message> = messages.iter().skip(1).collect();
 
     let mut kept: Vec<Message> = Vec::new();
-    let mut budget = system_tokens + estimate_tokens("[Earlier conversation history was truncated to fit context window]") + 4;
+    let mut budget = system_tokens
+        + estimate_tokens("[Earlier conversation history was truncated to fit context window]")
+        + 4;
 
     for msg in non_system.iter().rev() {
         let msg_tokens = message_tokens(msg);

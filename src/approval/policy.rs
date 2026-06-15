@@ -74,9 +74,7 @@ impl ApprovalPolicy {
     pub fn resolve(self, request: &ApprovalRequest) -> ApprovalResolution {
         let decision = match (self.mode, request.action) {
             (_, ActionKind::Read) => ApprovalDecision::Allow,
-            (ApprovalMode::Suggest, ActionKind::Write | ActionKind::Shell) => {
-                ApprovalDecision::Ask
-            }
+            (ApprovalMode::Suggest, ActionKind::Write | ActionKind::Shell) => ApprovalDecision::Ask,
             (ApprovalMode::AutoEdit, ActionKind::Write) => ApprovalDecision::Allow,
             (ApprovalMode::AutoEdit, ActionKind::Shell) => ApprovalDecision::Ask,
             (ApprovalMode::FullAuto, _) => ApprovalDecision::Allow,

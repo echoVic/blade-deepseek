@@ -115,8 +115,9 @@ fn request_chat_streaming(
     config: &ProviderConfig,
     on_step: &mut dyn FnMut(&ProviderStep),
 ) -> Result<ProviderResponse, String> {
-    let api_key = config.api_key.as_deref()
-        .ok_or_else(|| "DEEPSEEK_API_KEY is required (set via env var or ~/.orca/auth.json)".to_string())?;
+    let api_key = config.api_key.as_deref().ok_or_else(|| {
+        "DEEPSEEK_API_KEY is required (set via env var or ~/.orca/auth.json)".to_string()
+    })?;
     let base_url = config.base_url.as_deref().unwrap_or(DEFAULT_BASE_URL);
     let model = config.model.as_deref().unwrap_or(DEFAULT_MODEL);
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
@@ -195,8 +196,10 @@ fn request_chat_streaming(
         }
     } else {
         if !raw_calls_for_history.is_empty() {
-            let tool_call_ids: Vec<String> =
-                raw_calls_for_history.iter().map(|tc| tc.id.clone()).collect();
+            let tool_call_ids: Vec<String> = raw_calls_for_history
+                .iter()
+                .map(|tc| tc.id.clone())
+                .collect();
             steps.push(ProviderStep::ReplayState(ProviderReplayState {
                 provider: "deepseek",
                 reasoning_content: stream_result.reasoning.clone(),
@@ -224,9 +227,13 @@ fn request_chat_streaming(
     })
 }
 
-fn request_chat(conversation: &Conversation, config: &ProviderConfig) -> Result<ProviderResponse, String> {
-    let api_key = config.api_key.as_deref()
-        .ok_or_else(|| "DEEPSEEK_API_KEY is required (set via env var or ~/.orca/auth.json)".to_string())?;
+fn request_chat(
+    conversation: &Conversation,
+    config: &ProviderConfig,
+) -> Result<ProviderResponse, String> {
+    let api_key = config.api_key.as_deref().ok_or_else(|| {
+        "DEEPSEEK_API_KEY is required (set via env var or ~/.orca/auth.json)".to_string()
+    })?;
     let base_url = config.base_url.as_deref().unwrap_or(DEFAULT_BASE_URL);
     let model = config.model.as_deref().unwrap_or(DEFAULT_MODEL);
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
@@ -260,20 +267,22 @@ fn request_chat(conversation: &Conversation, config: &ProviderConfig) -> Result<
 
     match finish_reason.as_str() {
         "length" => {
-            return Err("Response truncated: model hit max_tokens limit (finish_reason=length)".to_string());
+            return Err(
+                "Response truncated: model hit max_tokens limit (finish_reason=length)".to_string(),
+            );
         }
         "content_filter" => {
             return Err("Response blocked by content filter".to_string());
         }
         "stop" | "tool_calls" | "" => {}
         other => {
-            steps.push(ProviderStep::Error(format!("Unexpected finish_reason: {other}")));
+            steps.push(ProviderStep::Error(format!(
+                "Unexpected finish_reason: {other}"
+            )));
         }
     }
 
-    let assistant_reasoning = message
-        .reasoning_content
-        .filter(|text| !text.is_empty());
+    let assistant_reasoning = message.reasoning_content.filter(|text| !text.is_empty());
     let assistant_content = message.content.filter(|text| !text.is_empty());
 
     if let Some(ref reasoning) = assistant_reasoning {
@@ -344,7 +353,10 @@ fn parse_tool_call(tc: &ApiToolCallResponse) -> Result<ToolRequest, String> {
         "list_files" => (
             ToolName::ListFiles,
             ActionKind::Read,
-            args["path"].as_str().map(String::from).or(Some(".".to_string())),
+            args["path"]
+                .as_str()
+                .map(String::from)
+                .or(Some(".".to_string())),
         ),
         "grep" => (
             ToolName::Grep,
@@ -361,10 +373,14 @@ fn parse_tool_call(tc: &ApiToolCallResponse) -> Result<ToolRequest, String> {
             ActionKind::Write,
             args["path"].as_str().map(String::from),
         ),
-        "git_status" => (
-            ToolName::GitStatus,
+        "git_status" => (ToolName::GitStatus, ActionKind::Read, Some(".".to_string())),
+        "subagent" => (
+            ToolName::Subagent,
             ActionKind::Read,
-            Some(".".to_string()),
+            args["description"]
+                .as_str()
+                .map(String::from)
+                .or_else(|| args["prompt"].as_str().map(String::from)),
         ),
         other => return Err(format!("unknown tool: {other}")),
     };
@@ -521,6 +537,19 @@ mod tests {
         assert_eq!(req.name, ToolName::GitStatus);
         assert_eq!(req.action, ActionKind::Read);
         assert_eq!(req.target.as_deref(), Some("."));
+    }
+
+    #[test]
+    fn parse_subagent() {
+        let tc = make_tc(
+            "subagent",
+            r#"{"description":"inspect repo","prompt":"inspect the repo and report"}"#,
+        );
+        let req = parse_tool_call(&tc).unwrap();
+        assert_eq!(req.name, ToolName::Subagent);
+        assert_eq!(req.action, ActionKind::Read);
+        assert_eq!(req.target.as_deref(), Some("inspect repo"));
+        assert!(req.raw_arguments.is_some());
     }
 
     #[test]

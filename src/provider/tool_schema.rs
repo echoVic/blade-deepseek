@@ -111,5 +111,26 @@ pub fn deepseek_tools_schema() -> Vec<Value> {
                 }
             }
         }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "subagent",
+                "description": "Launch a synchronous child agent for a complex, multi-step subtask. The child runs independently and returns a concise result summary.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "description": {
+                            "type": "string",
+                            "description": "Short 3-8 word label for the delegated task"
+                        },
+                        "prompt": {
+                            "type": "string",
+                            "description": "Full standalone instructions for the child agent"
+                        }
+                    },
+                    "required": ["description", "prompt"]
+                }
+            }
+        }),
     ]
 }

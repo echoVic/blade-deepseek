@@ -75,10 +75,7 @@ fn parse_edit_args(request: &ToolRequest) -> Result<(String, String, String), St
         return Ok((path, old_text, new_text));
     }
 
-    let spec = request
-        .target
-        .as_deref()
-        .ok_or("edit spec is required")?;
+    let spec = request.target.as_deref().ok_or("edit spec is required")?;
     let (path_part, replacement_part) = spec
         .split_once("::")
         .ok_or("edit spec must be: <path> :: <old> => <new>")?;

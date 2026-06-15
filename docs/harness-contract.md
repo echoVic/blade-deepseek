@@ -45,6 +45,8 @@ Every JSONL line is one event:
 - `approval.resolved`
 - `tool.call.requested`
 - `tool.call.completed`
+- `subagent.started`
+- `subagent.completed`
 - `verification.started`
 - `verification.completed`
 - `error`
@@ -72,7 +74,7 @@ The final `session.completed` event contains one of:
 
 ## Tool Contract
 
-All 6 tools are fully implemented:
+All 7 tools are fully implemented:
 
 | Tool | Action | Description |
 |------|--------|-------------|
@@ -82,10 +84,15 @@ All 6 tools are fully implemented:
 | `git_status` | read | Runs `git status --short` |
 | `bash` | shell | Executes via `sh -c`, requires approval unless `full-auto` |
 | `edit` | write | Exact text replacement, requires approval unless `full-auto` |
+| `subagent` | read | Runs a synchronous child agent with `description` and `prompt`, returning the child summary |
 
 Tool events:
 - `tool.call.requested` — emitted before execution, contains `name`, `action`, `target`
 - `tool.call.completed` — emitted after execution, contains `name`, `status` (completed/failed/denied), `output`, `truncated`
+
+Subagent events:
+- `subagent.started` — emitted when the child agent starts, contains `id`, `description`
+- `subagent.completed` — emitted when the child agent finishes, contains `id`, `description`, `status`, `output`, `error`
 
 ## Approval Policy
 
@@ -135,6 +142,8 @@ The runtime executes a multi-turn agent loop (max 128 turns):
 2. If response contains tool calls → execute each tool → add results to conversation → next turn
 3. If response is a final message → return success
 4. If budget exhausted → return `budget_exhausted` (exit code 4)
+
+Subagents run the same loop as a child conversation in the same workspace. They inherit provider/model config and approval mode. Nested subagents are rejected in this MVP.
 
 Context window management:
 - Window size: 128K tokens (estimated as chars/4)

@@ -208,7 +208,10 @@ mod tests {
         assert_eq!(result.tool_calls.len(), 1);
         assert_eq!(result.tool_calls[0].id, "call_1");
         assert_eq!(result.tool_calls[0].function_name, "read_file");
-        assert_eq!(result.tool_calls[0].arguments, "{\"path\": \"src/main.rs\"}");
+        assert_eq!(
+            result.tool_calls[0].arguments,
+            "{\"path\": \"src/main.rs\"}"
+        );
         assert_eq!(result.finish_reason.as_deref(), Some("tool_calls"));
     }
 }

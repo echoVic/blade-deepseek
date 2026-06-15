@@ -90,9 +90,7 @@ fn run_exec(args: ExecArgs) -> i32 {
 
     let prompt = args.prompt.join(" ");
 
-    let api_key = env::var("DEEPSEEK_API_KEY")
-        .ok()
-        .or(file_config.api_key);
+    let api_key = env::var("DEEPSEEK_API_KEY").ok().or(file_config.api_key);
 
     let base_url = args
         .base_url
@@ -122,13 +120,9 @@ fn run_exec(args: ExecArgs) -> i32 {
 fn run_placeholder(prompt: Vec<String>) -> i32 {
     let file_config = file::load_user_config();
 
-    let api_key = env::var("DEEPSEEK_API_KEY")
-        .ok()
-        .or(file_config.api_key);
+    let api_key = env::var("DEEPSEEK_API_KEY").ok().or(file_config.api_key);
 
-    let base_url = env::var("DEEPSEEK_BASE_URL")
-        .ok()
-        .or(file_config.base_url);
+    let base_url = env::var("DEEPSEEK_BASE_URL").ok().or(file_config.base_url);
 
     let model = env::var("DEEPSEEK_MODEL").ok().or(file_config.model);
 

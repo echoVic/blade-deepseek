@@ -64,7 +64,7 @@ Options:
 
 ## Tools
 
-All 6 tools are fully implemented:
+All 7 tools are fully implemented:
 
 | Tool | Description |
 |------|-------------|
@@ -74,10 +74,12 @@ All 6 tools are fully implemented:
 | `bash` | Execute shell commands via `sh -c` |
 | `edit` | Exact text replacement in files |
 | `git_status` | Show git working tree status |
+| `subagent` | Run a synchronous child agent for a delegated task |
 
 ## Architecture
 
 - **Agent Loop**: prompt → model → tool_call → execute → feed result → next turn (up to 128 turns)
+- **Subagents**: Synchronous child agent loops share the parent workspace, provider/model config, and approval policy, then return a concise result to the parent
 - **SSE Streaming**: Real-time reasoning and content deltas via Server-Sent Events
 - **Context Window**: 128K tokens, 80% threshold compaction (preserves system + recent messages)
 - **HTTP Client**: Singleton with 30s connect / 120s request / 300s streaming timeouts, exponential backoff retry (3 attempts, handles 429/5xx)
@@ -92,7 +94,7 @@ When `--output-format jsonl` is used, each line is a versioned event:
 {"version":"1","run_id":"run-...","seq":0,"timestamp_ms":1780647978857,"type":"session.started","payload":{}}
 ```
 
-Event types: `session.started`, `turn.started`, `assistant.reasoning.delta`, `assistant.message.delta`, `provider.replay.updated`, `approval.requested`, `approval.resolved`, `tool.call.requested`, `tool.call.completed`, `verification.started`, `verification.completed`, `error`, `session.completed`.
+Event types: `session.started`, `turn.started`, `assistant.reasoning.delta`, `assistant.message.delta`, `provider.replay.updated`, `approval.requested`, `approval.resolved`, `tool.call.requested`, `tool.call.completed`, `subagent.started`, `subagent.completed`, `verification.started`, `verification.completed`, `error`, `session.completed`.
 
 ## Exit Codes
 
@@ -111,4 +113,4 @@ Event types: `session.started`, `turn.started`, `assistant.reasoning.delta`, `as
 
 ## Status
 
-Production-ready agent loop with DeepSeek streaming provider. All 6 tools implemented, multi-turn conversation with context management, approval policies, and verification support.
+Production-ready agent loop with DeepSeek streaming provider. All 7 tools implemented, multi-turn conversation with context management, subagents, approval policies, and verification support.

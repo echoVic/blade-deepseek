@@ -58,12 +58,9 @@ pub fn execute_with_retry(
                         .map_err(|e| format!("request error: {e}"));
                 }
                 if attempt >= MAX_RETRIES {
-                    return Err(format!(
-                        "max retries exceeded (last status: {status})"
-                    ));
+                    return Err(format!("max retries exceeded (last status: {status})"));
                 }
-                let delay = retry_after_header(&resp)
-                    .unwrap_or_else(|| compute_backoff(attempt));
+                let delay = retry_after_header(&resp).unwrap_or_else(|| compute_backoff(attempt));
                 thread::sleep(delay);
             }
             Err(err) => {
@@ -102,12 +99,9 @@ pub fn execute_streaming_with_retry(
                     return Ok(resp);
                 }
                 if attempt >= MAX_RETRIES {
-                    return Err(format!(
-                        "max retries exceeded (last status: {status})"
-                    ));
+                    return Err(format!("max retries exceeded (last status: {status})"));
                 }
-                let delay = retry_after_header(&resp)
-                    .unwrap_or_else(|| compute_backoff(attempt));
+                let delay = retry_after_header(&resp).unwrap_or_else(|| compute_backoff(attempt));
                 thread::sleep(delay);
             }
             Err(err) => {

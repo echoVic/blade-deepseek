@@ -1,5 +1,5 @@
-pub mod conversation;
 pub mod context;
+pub mod conversation;
 pub mod deepseek_fixture;
 pub mod deepseek_http;
 pub mod http_client;
@@ -42,7 +42,11 @@ pub struct ProviderResponse {
     pub tool_calls: Vec<RawToolCall>,
 }
 
-pub fn call(kind: ProviderKind, conversation: &Conversation, config: &ProviderConfig) -> ProviderResponse {
+pub fn call(
+    kind: ProviderKind,
+    conversation: &Conversation,
+    config: &ProviderConfig,
+) -> ProviderResponse {
     match kind {
         ProviderKind::Mock => mock_call(conversation),
         ProviderKind::DeepSeekFixture => {
@@ -130,6 +134,17 @@ fn mock_call(conversation: &Conversation) -> ProviderResponse {
 
     let prompt = conversation.last_user_message().unwrap_or("");
 
+    if prompt.trim() == "mock_fail" {
+        return ProviderResponse {
+            steps: vec![ProviderStep::Error(
+                "mock child failure requested".to_string(),
+            )],
+            assistant_content: None,
+            assistant_reasoning: None,
+            tool_calls: Vec::new(),
+        };
+    }
+
     if let Some(tool_request) = parse_mock_prompt(prompt) {
         let raw_call = RawToolCall {
             id: tool_request.id.clone(),
@@ -184,6 +199,28 @@ fn parse_mock_prompt(prompt: &str) -> Option<ToolRequest> {
             action: ActionKind::Read,
             target: Some(".".to_string()),
             raw_arguments: None,
+        });
+    }
+
+    if let Some(rest) = prompt.strip_prefix("subagent ") {
+        let description = rest.trim();
+        let prompt = if description == "mock_fail" {
+            "mock_fail".to_string()
+        } else {
+            description.to_string()
+        };
+        return Some(ToolRequest {
+            id: "mock-tool-1".to_string(),
+            name: ToolName::Subagent,
+            action: ActionKind::Read,
+            target: Some(description.to_string()),
+            raw_arguments: Some(
+                serde_json::json!({
+                    "description": description,
+                    "prompt": prompt
+                })
+                .to_string(),
+            ),
         });
     }
 

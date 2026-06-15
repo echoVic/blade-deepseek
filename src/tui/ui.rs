@@ -1,9 +1,9 @@
 use pulldown_cmark::{Event, Parser, Tag, TagEnd};
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
-use ratatui::Frame;
 use tui_textarea::TextArea;
 
 use super::types::{AppState, AppStatus, ChatMessage};
@@ -123,10 +123,7 @@ fn build_message_lines(state: &AppState) -> Vec<Line<'static>> {
                         format!("  {icon} {name}{target_str}"),
                         Style::default().fg(color),
                     ),
-                    Span::styled(
-                        format!(" ({status})"),
-                        Style::default().fg(Color::DarkGray),
-                    ),
+                    Span::styled(format!(" ({status})"), Style::default().fg(Color::DarkGray)),
                 ]));
                 if let Some(out) = output {
                     let preview = truncate_lines(out, 2);
@@ -135,6 +132,15 @@ fn build_message_lines(state: &AppState) -> Vec<Line<'static>> {
                         Style::default().fg(Color::DarkGray),
                     )));
                 }
+            }
+            ChatMessage::Subagent {
+                description,
+                status,
+                output,
+                error,
+                ..
+            } => {
+                append_subagent_lines(&mut lines, description, status, output, error);
             }
             ChatMessage::Error(text) => {
                 lines.push(Line::from(Span::styled(
@@ -147,6 +153,61 @@ fn build_message_lines(state: &AppState) -> Vec<Line<'static>> {
     }
 
     lines
+}
+
+fn append_subagent_lines(
+    lines: &mut Vec<Line<'static>>,
+    description: &str,
+    status: &str,
+    output: &Option<String>,
+    error: &Option<String>,
+) {
+    let (label, color) = match status {
+        "success" | "completed" => ("done", Color::Green),
+        "running" => ("running", Color::Cyan),
+        "failed" => ("failed", Color::Red),
+        other => (other, Color::Gray),
+    };
+
+    lines.push(Line::from(vec![
+        Span::styled("  ┌─ delegated task", Style::default().fg(Color::Cyan)),
+        Span::styled(" · ", Style::default().fg(Color::DarkGray)),
+        Span::styled(label.to_string(), Style::default().fg(color)),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("  │ ", Style::default().fg(Color::Cyan)),
+        Span::styled(description.to_string(), Style::default().fg(Color::White)),
+    ]));
+
+    match (status, output, error) {
+        ("running", _, _) => {
+            lines.push(Line::from(vec![
+                Span::styled("  │ ", Style::default().fg(Color::Cyan)),
+                Span::styled(
+                    "working in a child context",
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
+        }
+        (_, _, Some(err)) => {
+            lines.push(Line::from(vec![
+                Span::styled("  │ error: ", Style::default().fg(Color::Red)),
+                Span::styled(truncate_lines(err, 3), Style::default().fg(Color::Red)),
+            ]));
+        }
+        (_, Some(out), _) => {
+            lines.push(Line::from(vec![
+                Span::styled("  │ result: ", Style::default().fg(Color::Green)),
+                Span::styled(truncate_lines(out, 3), Style::default().fg(Color::DarkGray)),
+            ]));
+        }
+        _ => {}
+    }
+
+    lines.push(Line::from(Span::styled(
+        "  └─ returned to main agent",
+        Style::default().fg(Color::DarkGray),
+    )));
 }
 
 fn render_input(frame: &mut Frame, area: Rect, textarea: &TextArea) {
@@ -198,10 +259,7 @@ fn render_approval_dialog(frame: &mut Frame, state: &AppState) {
 
     frame.render_widget(Clear, popup_area);
 
-    let target_str = dialog
-        .target
-        .as_deref()
-        .unwrap_or("(none)");
+    let target_str = dialog.target.as_deref().unwrap_or("(none)");
 
     let allow_style = if dialog.selected == 0 {
         Style::default()
@@ -211,9 +269,7 @@ fn render_approval_dialog(frame: &mut Frame, state: &AppState) {
         Style::default().fg(Color::White)
     };
     let deny_style = if dialog.selected == 1 {
-        Style::default()
-            .fg(Color::Red)
-            .add_modifier(Modifier::BOLD)
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(Color::White)
     };
@@ -232,14 +288,8 @@ fn render_approval_dialog(frame: &mut Frame, state: &AppState) {
             Span::styled(target_str.to_string(), Style::default().fg(Color::White)),
         ]),
         Line::from(""),
-        Line::from(Span::styled(
-            format!("{allow_prefix}Allow"),
-            allow_style,
-        )),
-        Line::from(Span::styled(
-            format!("{deny_prefix}Deny"),
-            deny_style,
-        )),
+        Line::from(Span::styled(format!("{allow_prefix}Allow"), allow_style)),
+        Line::from(Span::styled(format!("{deny_prefix}Deny"), deny_style)),
         Line::from(""),
         Line::from(Span::styled(
             "  ↑↓ select, Enter confirm",
@@ -321,16 +371,13 @@ fn render_setup(frame: &mut Frame, state: &AppState, textarea: &TextArea) {
             let y = (area.height.saturating_sub(height)) / 2;
             let popup_area = Rect::new(x, y, width, height);
 
-            let inner = Layout::vertical([
-                Constraint::Min(3),
-                Constraint::Length(3),
-            ])
-            .split(Rect::new(
-                popup_area.x + 1,
-                popup_area.y + 1,
-                popup_area.width.saturating_sub(2),
-                popup_area.height.saturating_sub(2),
-            ));
+            let inner =
+                Layout::vertical([Constraint::Min(3), Constraint::Length(3)]).split(Rect::new(
+                    popup_area.x + 1,
+                    popup_area.y + 1,
+                    popup_area.width.saturating_sub(2),
+                    popup_area.height.saturating_sub(2),
+                ));
 
             let content = vec![
                 Line::from(""),
@@ -376,7 +423,9 @@ fn render_setup(frame: &mut Frame, state: &AppState, textarea: &TextArea) {
                 Line::from(""),
                 Line::from(Span::styled(
                     "  ✓ API key saved successfully!",
-                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
                 )),
                 Line::from(""),
                 Line::from(Span::styled(
@@ -424,11 +473,7 @@ fn render_markdown(input: &str) -> Vec<Line<'static>> {
                         pulldown_cmark::HeadingLevel::H2 => Color::Green,
                         _ => Color::Yellow,
                     };
-                    style_stack.push(
-                        Style::default()
-                            .fg(color)
-                            .add_modifier(Modifier::BOLD),
-                    );
+                    style_stack.push(Style::default().fg(color).add_modifier(Modifier::BOLD));
                 }
                 Tag::Strong => {
                     let base = *style_stack.last().unwrap_or(&Style::default());
@@ -453,10 +498,7 @@ fn render_markdown(input: &str) -> Vec<Line<'static>> {
                     ));
                 }
                 Tag::BlockQuote(_) => {
-                    current_spans.push(Span::styled(
-                        "│ ",
-                        Style::default().fg(Color::DarkGray),
-                    ));
+                    current_spans.push(Span::styled("│ ", Style::default().fg(Color::DarkGray)));
                     let base = *style_stack.last().unwrap_or(&Style::default());
                     style_stack.push(base.fg(Color::Gray));
                 }
@@ -496,10 +538,7 @@ fn render_markdown(input: &str) -> Vec<Line<'static>> {
                 };
                 if in_code_block {
                     for code_line in text.lines() {
-                        current_spans.push(Span::styled(
-                            format!("  {code_line}"),
-                            style,
-                        ));
+                        current_spans.push(Span::styled(format!("  {code_line}"), style));
                         flush_line(&mut current_spans, &mut lines);
                     }
                 } else {

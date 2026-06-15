@@ -12,10 +12,37 @@ use crate::provider::conversation::Conversation;
 use crate::provider::system_prompt::build_system_prompt;
 use crate::provider::{self, ProviderConfig, ProviderStep};
 use crate::runtime::session::new_run_id;
+use crate::runtime::subagent::{self, SubagentMode};
 use crate::tools;
 use crate::verification;
 
 const DEFAULT_MAX_TURNS: u32 = 128;
+const MAX_SUBAGENT_DEPTH: u32 = 1;
+
+#[derive(Clone, Debug)]
+struct AgentLoopResult {
+    status: RunStatus,
+    final_message: Option<String>,
+    error: Option<String>,
+}
+
+impl AgentLoopResult {
+    fn success(final_message: Option<String>) -> Self {
+        Self {
+            status: RunStatus::Success,
+            final_message,
+            error: None,
+        }
+    }
+
+    fn failure(status: RunStatus, error: impl Into<String>) -> Self {
+        Self {
+            status,
+            final_message: None,
+            error: Some(error.into()),
+        }
+    }
+}
 
 pub fn run(config: RunConfig) -> i32 {
     match run_inner(config) {
@@ -47,7 +74,8 @@ fn run_inner(config: RunConfig) -> io::Result<RunStatus> {
         config.verifier.as_deref(),
     ))?;
 
-    let status = run_agent_loop(&config, &cwd_path, &mut events, &mut sink, prompt)?;
+    let result = run_agent_loop(&config, &cwd_path, &mut events, &mut sink, prompt, 0, true)?;
+    let status = result.status;
 
     let status =
         run_verifier_if_needed(status, config.verifier.as_deref(), &mut events, &mut sink)?;
@@ -62,7 +90,9 @@ fn run_agent_loop(
     events: &mut EventFactory,
     sink: &mut EventSink<impl io::Write>,
     prompt: &str,
-) -> io::Result<RunStatus> {
+    subagent_depth: u32,
+    emit_deltas: bool,
+) -> io::Result<AgentLoopResult> {
     let max_turns = DEFAULT_MAX_TURNS;
     let ctx_config = provider::context::ContextConfig::default();
     let provider_config = ProviderConfig {
@@ -72,7 +102,7 @@ fn run_agent_loop(
     };
 
     let mut conversation = Conversation::new();
-    conversation.add_system(build_system_prompt(cwd));
+    conversation.add_system(build_agent_system_prompt(cwd, subagent_depth));
     conversation.add_user(prompt.to_string());
 
     let mut turn: u32 = 0;
@@ -81,8 +111,11 @@ fn run_agent_loop(
         turn += 1;
 
         if turn > max_turns {
-            sink.emit(&events.error("max turns exhausted"))?;
-            return Ok(RunStatus::BudgetExhausted);
+            let error = "max turns exhausted";
+            if emit_deltas {
+                sink.emit(&events.error(error))?;
+            }
+            return Ok(AgentLoopResult::failure(RunStatus::BudgetExhausted, error));
         }
 
         if provider::context::needs_compaction(&conversation, &ctx_config) {
@@ -90,13 +123,18 @@ fn run_agent_loop(
         }
 
         let turn_prompt = if turn == 1 { Some(prompt) } else { None };
-        sink.emit(&events.turn_started(turn, turn_prompt))?;
+        if emit_deltas {
+            sink.emit(&events.turn_started(turn, turn_prompt))?;
+        }
 
         let response = provider::call_streaming(
             config.provider,
             &conversation,
             &provider_config,
             &mut |step| {
+                if !emit_deltas {
+                    return;
+                }
                 match step {
                     ProviderStep::ReasoningDelta(text) => {
                         let _ = sink.emit(&events.assistant_reasoning_delta(text));
@@ -113,10 +151,14 @@ fn run_agent_loop(
         for step in &response.steps {
             match step {
                 ProviderStep::ReplayState(replay) => {
-                    sink.emit(&events.provider_replay_updated(replay))?;
+                    if emit_deltas {
+                        sink.emit(&events.provider_replay_updated(replay))?;
+                    }
                 }
                 ProviderStep::Error(message) => {
-                    sink.emit(&events.error(message))?;
+                    if emit_deltas {
+                        sink.emit(&events.error(message))?;
+                    }
                     had_error = true;
                     break;
                 }
@@ -125,16 +167,24 @@ fn run_agent_loop(
         }
 
         if had_error {
-            return Ok(RunStatus::Failed);
+            let error = response.steps.iter().find_map(|step| match step {
+                ProviderStep::Error(message) => Some(message.clone()),
+                _ => None,
+            });
+            return Ok(AgentLoopResult::failure(
+                RunStatus::Failed,
+                error.unwrap_or_else(|| "provider error".to_string()),
+            ));
         }
 
         if response.tool_calls.is_empty() {
+            let final_message = response.assistant_content.clone();
             conversation.add_assistant(
                 response.assistant_content,
                 response.assistant_reasoning,
                 vec![],
             );
-            return Ok(RunStatus::Success);
+            return Ok(AgentLoopResult::success(final_message));
         }
 
         conversation.add_assistant(
@@ -145,14 +195,25 @@ fn run_agent_loop(
 
         for step in &response.steps {
             if let ProviderStep::ToolCall(tool_request) = step {
-                let (status, result) =
-                    execute_tool_with_approval(config, cwd, events, sink, tool_request)?;
+                let (status, result) = execute_tool_with_approval(
+                    config,
+                    cwd,
+                    events,
+                    sink,
+                    tool_request,
+                    subagent_depth,
+                    emit_deltas,
+                )?;
 
                 let result_content = format_tool_result_for_model(&result);
                 conversation.add_tool_result(tool_request.id.clone(), result_content);
 
                 if status != RunStatus::Success {
-                    return Ok(status);
+                    return Ok(AgentLoopResult {
+                        status,
+                        final_message: None,
+                        error: result.error.clone(),
+                    });
                 }
             }
         }
@@ -165,6 +226,8 @@ fn execute_tool_with_approval(
     events: &mut EventFactory,
     sink: &mut EventSink<impl io::Write>,
     tool_request: &tools::ToolRequest,
+    subagent_depth: u32,
+    emit_deltas: bool,
 ) -> io::Result<(RunStatus, tools::ToolResult)> {
     let policy = ApprovalPolicy::new(config.approval_mode);
 
@@ -179,39 +242,61 @@ fn execute_tool_with_approval(
             ),
         };
         let resolution = policy.resolve(&approval);
-        sink.emit(&events.approval_requested(&approval))?;
+        if emit_deltas {
+            sink.emit(&events.approval_requested(&approval))?;
+        }
 
         match resolution.decision {
             ApprovalDecision::Allow => {
-                sink.emit(&events.approval_resolved(&resolution))?;
+                if emit_deltas {
+                    sink.emit(&events.approval_resolved(&resolution))?;
+                }
             }
             ApprovalDecision::Ask => {
                 let final_resolution = resolve_interactive(config, &approval, tool_request)?;
-                sink.emit(&events.approval_resolved(&final_resolution))?;
+                if emit_deltas {
+                    sink.emit(&events.approval_resolved(&final_resolution))?;
+                }
                 if final_resolution.decision == ApprovalDecision::Deny {
-                    sink.emit(&events.tool_call_requested(tool_request))?;
+                    if emit_deltas {
+                        sink.emit(&events.tool_call_requested(tool_request))?;
+                    }
                     let result = tools::ToolResult::denied(tool_request, final_resolution.reason);
-                    sink.emit(&events.tool_call_completed(&result))?;
+                    if emit_deltas {
+                        sink.emit(&events.tool_call_completed(&result))?;
+                    }
                     return Ok((RunStatus::ApprovalRequired, result));
                 }
             }
             ApprovalDecision::Deny => {
-                sink.emit(&events.approval_resolved(&resolution))?;
-                sink.emit(&events.tool_call_requested(tool_request))?;
+                if emit_deltas {
+                    sink.emit(&events.approval_resolved(&resolution))?;
+                    sink.emit(&events.tool_call_requested(tool_request))?;
+                }
                 let result = tools::ToolResult::denied(tool_request, resolution.reason);
-                sink.emit(&events.tool_call_completed(&result))?;
+                if emit_deltas {
+                    sink.emit(&events.tool_call_completed(&result))?;
+                }
                 return Ok((RunStatus::ApprovalRequired, result));
             }
         }
     }
 
-    sink.emit(&events.tool_call_requested(tool_request))?;
-    let result = tools::execute(tool_request, cwd);
+    if emit_deltas {
+        sink.emit(&events.tool_call_requested(tool_request))?;
+    }
+    let result = if tool_request.name == tools::ToolName::Subagent {
+        execute_subagent_tool(config, cwd, events, sink, tool_request, subagent_depth)?
+    } else {
+        tools::execute(tool_request, cwd)
+    };
     let is_failure = matches!(
         result.status,
         tools::ToolStatus::Failed | tools::ToolStatus::Denied
     );
-    sink.emit(&events.tool_call_completed(&result))?;
+    if emit_deltas {
+        sink.emit(&events.tool_call_completed(&result))?;
+    }
 
     let status = if is_failure {
         RunStatus::Failed
@@ -220,6 +305,121 @@ fn execute_tool_with_approval(
     };
 
     Ok((status, result))
+}
+
+fn execute_subagent_tool(
+    config: &RunConfig,
+    cwd: &Path,
+    events: &mut EventFactory,
+    sink: &mut EventSink<impl io::Write>,
+    tool_request: &tools::ToolRequest,
+    subagent_depth: u32,
+) -> io::Result<tools::ToolResult> {
+    // 创建 subagent 请求
+    let request = subagent::create_subagent_request(tool_request);
+    let description = request.description.clone();
+    let mode = request.mode.clone();
+
+    sink.emit(&events.subagent_started(&tool_request.id, &description))?;
+
+    // 检查是否为异步模式
+    if let SubagentMode::Async {
+        ref output_file, ..
+    } = mode
+    {
+        // 异步模式：立即返回
+        sink.emit(&events.subagent_launched(
+            &tool_request.id,
+            &description,
+            &output_file.display().to_string(),
+        ))?;
+
+        // 返回异步启动的结果
+        let output = format!(
+            "Subagent launched (async)\n\nAgent ID: {}\nOutput file: {}\n\nUse read_file to check progress.",
+            tool_request.id,
+            output_file.display()
+        );
+        return Ok(tools::ToolResult::completed(tool_request, output, false));
+    }
+
+    // 同步模式：保持原有逻辑
+    let prompt = request.prompt;
+
+    if subagent_depth >= MAX_SUBAGENT_DEPTH {
+        let error = "nested subagents are disabled in this MVP";
+        sink.emit(&events.subagent_completed(
+            &tool_request.id,
+            &description,
+            RunStatus::Failed,
+            None,
+            Some(error),
+        ))?;
+        return Ok(tools::ToolResult::failed(tool_request, error, None));
+    }
+
+    let child = run_agent_loop(
+        config,
+        cwd,
+        events,
+        sink,
+        &prompt,
+        subagent_depth + 1,
+        false,
+    )?;
+
+    match child.status {
+        RunStatus::Success => {
+            let output = child
+                .final_message
+                .unwrap_or_else(|| "(subagent completed without a final message)".to_string());
+            sink.emit(&events.subagent_completed(
+                &tool_request.id,
+                &description,
+                child.status,
+                Some(&output),
+                None,
+            ))?;
+            Ok(tools::ToolResult::completed(
+                tool_request,
+                format!("Subagent status: success\n\n{output}"),
+                false,
+            ))
+        }
+        status => {
+            let error = child
+                .error
+                .unwrap_or_else(|| format!("subagent ended with status {status:?}"));
+            sink.emit(&events.subagent_completed(
+                &tool_request.id,
+                &description,
+                status,
+                child.final_message.as_deref(),
+                Some(&error),
+            ))?;
+            Ok(tools::ToolResult::failed(
+                tool_request,
+                format!("Subagent status: {status:?}\n\n{error}"),
+                None,
+            ))
+        }
+    }
+}
+
+fn subagent_field(tool_request: &tools::ToolRequest, field: &str) -> Option<String> {
+    let raw = tool_request.raw_arguments.as_ref()?;
+    let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+    value[field].as_str().map(String::from)
+}
+
+fn build_agent_system_prompt(cwd: &Path, subagent_depth: u32) -> String {
+    let mut prompt = build_system_prompt(cwd);
+    if subagent_depth > 0 {
+        prompt.push_str(
+            "\n\n## Subagent Role\nYou are running as a synchronous subagent. Complete only the delegated task and return a concise report for the parent agent. Do not assume the user can see your intermediate tool output.",
+        );
+    }
+    prompt
 }
 
 fn resolve_interactive(
@@ -235,10 +435,7 @@ fn resolve_interactive(
         });
     }
 
-    let allowed = confirm::prompt_user(
-        tool_request.name.as_str(),
-        tool_request.target.as_deref(),
-    )?;
+    let allowed = confirm::prompt_user(tool_request.name.as_str(), tool_request.target.as_deref())?;
 
     Ok(ApprovalResolution {
         id: approval.id.clone(),

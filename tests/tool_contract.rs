@@ -7,7 +7,14 @@ use serde_json::Value;
 #[test]
 fn read_file_emits_tool_request_and_completed_events() {
     let output = Command::new(env!("CARGO_BIN_EXE_orca"))
-        .args(["exec", "--output-format", "jsonl", "--provider", "mock", "read README.md"])
+        .args([
+            "exec",
+            "--output-format",
+            "jsonl",
+            "--provider",
+            "mock",
+            "read README.md",
+        ])
         .output()
         .expect("run orca");
 
@@ -34,7 +41,14 @@ fn read_file_emits_tool_request_and_completed_events() {
 #[test]
 fn git_status_emits_completed_tool_event() {
     let output = Command::new(env!("CARGO_BIN_EXE_orca"))
-        .args(["exec", "--output-format", "jsonl", "--provider", "mock", "git status"])
+        .args([
+            "exec",
+            "--output-format",
+            "jsonl",
+            "--provider",
+            "mock",
+            "git status",
+        ])
         .output()
         .expect("run orca");
 
@@ -54,7 +68,14 @@ fn git_status_emits_completed_tool_event() {
 #[test]
 fn grep_emits_completed_tool_event_with_matches() {
     let output = Command::new(env!("CARGO_BIN_EXE_orca"))
-        .args(["exec", "--output-format", "jsonl", "--provider", "mock", "grep Orca"])
+        .args([
+            "exec",
+            "--output-format",
+            "jsonl",
+            "--provider",
+            "mock",
+            "grep Orca",
+        ])
         .output()
         .expect("run orca");
 
@@ -80,7 +101,14 @@ fn grep_emits_completed_tool_event_with_matches() {
 #[test]
 fn suggest_denies_bash_in_jsonl_mode() {
     let output = Command::new(env!("CARGO_BIN_EXE_orca"))
-        .args(["exec", "--output-format", "jsonl", "--provider", "mock", "bash printf hi"])
+        .args([
+            "exec",
+            "--output-format",
+            "jsonl",
+            "--provider",
+            "mock",
+            "bash printf hi",
+        ])
         .output()
         .expect("run orca");
 

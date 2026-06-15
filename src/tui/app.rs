@@ -4,15 +4,15 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+use crossterm::ExecutableCommand;
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
-use crossterm::ExecutableCommand;
-use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
 use tui_textarea::{Input, TextArea};
 
-use crate::config::file::save_api_key;
 use crate::config::RunConfig;
+use crate::config::file::save_api_key;
 use crate::tui::bridge;
 use crate::tui::types::{AppState, AppStatus, ChatMessage, TuiEvent, UserAction};
 use crate::tui::ui;
@@ -85,8 +85,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
             let ev = event::read()?;
 
             if let Event::Key(key) = &ev {
-                if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c')
-                {
+                if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
                     let _ = action_tx.send(UserAction::Cancel);
                     exit_code = 130;
                     break;
