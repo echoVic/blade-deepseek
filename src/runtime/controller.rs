@@ -77,7 +77,8 @@ fn run_agent_loop(
             return Ok(RunStatus::BudgetExhausted);
         }
 
-        sink.emit(&events.turn_started(turn, prompt))?;
+        let turn_prompt = if turn == 1 { Some(prompt) } else { None };
+        sink.emit(&events.turn_started(turn, turn_prompt))?;
 
         let response = provider::call(config.provider, &conversation);
 

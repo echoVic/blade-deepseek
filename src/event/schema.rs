@@ -105,14 +105,12 @@ impl EventFactory {
         )
     }
 
-    pub fn turn_started(&mut self, turn: u32, prompt: &str) -> EventEnvelope {
-        self.make(
-            EventType::TurnStarted,
-            json!({
-                "turn": turn,
-                "prompt": prompt
-            }),
-        )
+    pub fn turn_started(&mut self, turn: u32, prompt: Option<&str>) -> EventEnvelope {
+        let mut payload = json!({ "turn": turn });
+        if let Some(p) = prompt {
+            payload["prompt"] = json!(p);
+        }
+        self.make(EventType::TurnStarted, payload)
     }
 
     pub fn assistant_reasoning_delta(&mut self, text: &str) -> EventEnvelope {
