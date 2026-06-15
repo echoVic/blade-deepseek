@@ -5,6 +5,7 @@ mod event;
 mod provider;
 mod runtime;
 mod tools;
+mod tui;
 mod verification;
 
 fn main() {

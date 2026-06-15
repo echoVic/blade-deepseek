@@ -7,6 +7,7 @@ use crate::approval::policy::ApprovalMode;
 use crate::config::file;
 use crate::config::{OutputFormat, ProviderKind, RunConfig};
 use crate::runtime::controller;
+use crate::tui::app;
 
 #[derive(Debug, Parser)]
 #[command(name = "orca")]
@@ -119,15 +120,29 @@ fn run_exec(args: ExecArgs) -> i32 {
 }
 
 fn run_placeholder(prompt: Vec<String>) -> i32 {
-    if prompt.is_empty() {
-        println!("Orca");
-        println!("A DeepSeek-native coding agent runtime by Blade.");
-        println!();
-        println!("Run `orca --help` for usage.");
-    } else {
-        println!("Orca runtime is not implemented yet.");
-        println!("Received: {}", prompt.join(" "));
-    }
+    let file_config = file::load_user_config();
 
-    0
+    let api_key = env::var("DEEPSEEK_API_KEY")
+        .ok()
+        .or(file_config.api_key);
+
+    let base_url = env::var("DEEPSEEK_BASE_URL")
+        .ok()
+        .or(file_config.base_url);
+
+    let model = env::var("DEEPSEEK_MODEL").ok().or(file_config.model);
+
+    let config = RunConfig {
+        prompt: prompt.join(" "),
+        cwd: None,
+        output_format: OutputFormat::Text,
+        approval_mode: ApprovalMode::Suggest,
+        provider: ProviderKind::DeepSeek,
+        verifier: None,
+        model,
+        api_key,
+        base_url,
+    };
+
+    app::run_tui(config)
 }
