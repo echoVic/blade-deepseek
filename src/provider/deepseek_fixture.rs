@@ -2,12 +2,13 @@ use crate::approval::policy::ActionKind;
 use crate::provider::{ProviderReplayState, ProviderStep};
 use crate::tools::{ToolName, ToolRequest};
 
-pub fn plan(_prompt: &str) -> Vec<ProviderStep> {
+pub fn plan() -> Vec<ProviderStep> {
     let tool_request = ToolRequest {
         id: "fixture-tool-1".to_string(),
         name: ToolName::ReadFile,
         action: ActionKind::Read,
         target: Some("README.md".to_string()),
+        raw_arguments: None,
     };
 
     vec![
@@ -23,8 +24,5 @@ pub fn plan(_prompt: &str) -> Vec<ProviderStep> {
             tool_call_ids: vec![tool_request.id.clone()],
         }),
         ProviderStep::ToolCall(tool_request),
-        ProviderStep::MessageDelta(
-            "DeepSeek fixture completed after reading repository context.".to_string(),
-        ),
     ]
 }

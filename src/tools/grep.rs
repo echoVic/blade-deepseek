@@ -12,8 +12,15 @@ pub fn execute(request: &ToolRequest, cwd: &Path, max_bytes: usize) -> ToolResul
         return ToolResult::failed(request, "grep pattern is required", None);
     };
 
+    let search_path = request
+        .raw_arguments
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .and_then(|args| args["path"].as_str().map(String::from))
+        .unwrap_or_else(|| ".".to_string());
+
     let output = Command::new("rg")
-        .args(["--line-number", "--no-heading", pattern, "."])
+        .args(["--line-number", "--no-heading", pattern, &search_path])
         .current_dir(cwd)
         .output();
 

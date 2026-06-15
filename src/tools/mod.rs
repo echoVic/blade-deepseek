@@ -43,6 +43,8 @@ pub struct ToolRequest {
     pub name: ToolName,
     pub action: ActionKind,
     pub target: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_arguments: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -111,81 +113,6 @@ pub fn execute(request: &ToolRequest, cwd: &Path) -> ToolResult {
         ToolName::Grep => grep::execute(request, cwd, MAX_TOOL_OUTPUT_BYTES),
         ToolName::Bash => bash::execute(request, cwd, MAX_TOOL_OUTPUT_BYTES),
         ToolName::Edit => edit::execute(request, cwd),
-    }
-}
-
-pub fn request_from_prompt(prompt: &str) -> Option<ToolRequest> {
-    let prompt = prompt.trim();
-    let lower = prompt.to_ascii_lowercase();
-
-    if lower.contains("git status") {
-        return Some(ToolRequest {
-            id: "tool-1".to_string(),
-            name: ToolName::GitStatus,
-            action: ActionKind::Read,
-            target: Some(".".to_string()),
-        });
-    }
-
-    if lower.contains("list files") || lower == "ls" {
-        return Some(ToolRequest {
-            id: "tool-1".to_string(),
-            name: ToolName::ListFiles,
-            action: ActionKind::Read,
-            target: Some(".".to_string()),
-        });
-    }
-
-    if let Some(target) = target_after(prompt, "read") {
-        return Some(ToolRequest {
-            id: "tool-1".to_string(),
-            name: ToolName::ReadFile,
-            action: ActionKind::Read,
-            target: Some(target),
-        });
-    }
-
-    if let Some(target) = target_after(prompt, "grep") {
-        return Some(ToolRequest {
-            id: "tool-1".to_string(),
-            name: ToolName::Grep,
-            action: ActionKind::Read,
-            target: Some(target),
-        });
-    }
-
-    if lower.starts_with("bash ") {
-        return Some(ToolRequest {
-            id: "tool-1".to_string(),
-            name: ToolName::Bash,
-            action: ActionKind::Shell,
-            target: Some(prompt[5..].trim().to_string()),
-        });
-    }
-
-    if lower.starts_with("edit ") {
-        return Some(ToolRequest {
-            id: "tool-1".to_string(),
-            name: ToolName::Edit,
-            action: ActionKind::Write,
-            target: Some(prompt[5..].trim().to_string()),
-        });
-    }
-
-    None
-}
-
-fn target_after(prompt: &str, command: &str) -> Option<String> {
-    let mut parts = prompt.split_whitespace();
-    if parts.next()?.eq_ignore_ascii_case(command) {
-        let target = parts.collect::<Vec<_>>().join(" ");
-        if target.is_empty() {
-            None
-        } else {
-            Some(target)
-        }
-    } else {
-        None
     }
 }
 
