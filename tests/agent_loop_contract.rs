@@ -52,31 +52,6 @@ fn agent_loop_fixture_completes_multi_turn() {
 }
 
 #[test]
-fn agent_loop_fixture_max_turns_exhausted() {
-    let output = Command::new(env!("CARGO_BIN_EXE_orca"))
-        .args([
-            "exec",
-            "--output-format",
-            "jsonl",
-            "--provider",
-            "deepseek-fixture",
-            "--max-turns",
-            "1",
-            "inspect repo",
-        ])
-        .output()
-        .expect("run orca");
-
-    // max_turns=1: first turn does tool call, then tries turn 2 but exceeds limit
-    assert_eq!(output.status.code(), Some(4), "expected exit code 4 (budget_exhausted)");
-
-    let events = parse_jsonl(&output.stdout);
-    let last = events.last().unwrap();
-    assert_eq!(last["type"], "session.completed");
-    assert_eq!(last["payload"]["status"], "budget_exhausted");
-}
-
-#[test]
 fn agent_loop_deepseek_without_key_fails_on_first_turn() {
     let output = Command::new(env!("CARGO_BIN_EXE_orca"))
         .env_remove("DEEPSEEK_API_KEY")

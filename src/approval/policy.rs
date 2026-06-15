@@ -1,10 +1,11 @@
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ValueEnum)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 pub enum ApprovalMode {
     ReadOnly,
+    #[default]
     WorkspaceWrite,
     FullAuto,
 }
@@ -16,12 +17,6 @@ impl ApprovalMode {
             Self::WorkspaceWrite => "workspace-write",
             Self::FullAuto => "full-auto",
         }
-    }
-}
-
-impl Default for ApprovalMode {
-    fn default() -> Self {
-        Self::WorkspaceWrite
     }
 }
 

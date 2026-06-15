@@ -15,8 +15,9 @@ Options:
 - `--output-format jsonl|text`
 - `--cwd <path>`
 - `--approval-mode read-only|workspace-write|full-auto`
-- `--max-turns <n>`
 - `--verifier <command>`
+- `--model <name>`
+- `--base-url <url>`
 
 ## Event Envelope
 

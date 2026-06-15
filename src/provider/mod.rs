@@ -13,6 +13,12 @@ use crate::config::ProviderKind;
 use crate::provider::conversation::{Conversation, RawToolCall};
 use crate::tools::ToolRequest;
 
+pub struct ProviderConfig {
+    pub api_key: Option<String>,
+    pub base_url: Option<String>,
+    pub model: Option<String>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ProviderReplayState {
     pub provider: &'static str,
@@ -36,7 +42,7 @@ pub struct ProviderResponse {
     pub tool_calls: Vec<RawToolCall>,
 }
 
-pub fn call(kind: ProviderKind, conversation: &Conversation) -> ProviderResponse {
+pub fn call(kind: ProviderKind, conversation: &Conversation, config: &ProviderConfig) -> ProviderResponse {
     match kind {
         ProviderKind::Mock => mock_call(conversation),
         ProviderKind::DeepSeekFixture => {
@@ -81,24 +87,25 @@ pub fn call(kind: ProviderKind, conversation: &Conversation) -> ProviderResponse
                 }
             }
         }
-        ProviderKind::DeepSeek => deepseek_http::call(conversation),
+        ProviderKind::DeepSeek => deepseek_http::call(conversation, config),
     }
 }
 
 pub fn call_streaming(
     kind: ProviderKind,
     conversation: &Conversation,
+    config: &ProviderConfig,
     on_step: &mut dyn FnMut(&ProviderStep),
 ) -> ProviderResponse {
     match kind {
         ProviderKind::Mock | ProviderKind::DeepSeekFixture => {
-            let response = call(kind, conversation);
+            let response = call(kind, conversation, config);
             for step in &response.steps {
                 on_step(step);
             }
             response
         }
-        ProviderKind::DeepSeek => deepseek_http::call_streaming(conversation, on_step),
+        ProviderKind::DeepSeek => deepseek_http::call_streaming(conversation, config, on_step),
     }
 }
 
@@ -200,24 +207,24 @@ fn parse_mock_prompt(prompt: &str) -> Option<ToolRequest> {
         });
     }
 
-    if let Some(rest) = prompt.strip_prefix("edit ") {
-        if let Some((file, replacement)) = rest.split_once(" :: ") {
-            let (old, new) = replacement.split_once(" => ").unwrap_or((replacement, ""));
-            return Some(ToolRequest {
-                id: "mock-tool-1".to_string(),
-                name: ToolName::Edit,
-                action: ActionKind::Write,
-                target: Some(file.to_string()),
-                raw_arguments: Some(
-                    serde_json::json!({
-                        "path": file,
-                        "old_text": old,
-                        "new_text": new
-                    })
-                    .to_string(),
-                ),
-            });
-        }
+    if let Some(rest) = prompt.strip_prefix("edit ")
+        && let Some((file, replacement)) = rest.split_once(" :: ")
+    {
+        let (old, new) = replacement.split_once(" => ").unwrap_or((replacement, ""));
+        return Some(ToolRequest {
+            id: "mock-tool-1".to_string(),
+            name: ToolName::Edit,
+            action: ActionKind::Write,
+            target: Some(file.to_string()),
+            raw_arguments: Some(
+                serde_json::json!({
+                    "path": file,
+                    "old_text": old,
+                    "new_text": new
+                })
+                .to_string(),
+            ),
+        });
     }
 
     if prompt.contains("write") {

@@ -100,18 +100,18 @@ pub fn parse_sse_stream<R: Read>(
 
             let delta = &choice.delta;
 
-            if let Some(text) = delta.reasoning() {
-                if !text.is_empty() {
-                    reasoning_buf.push_str(text);
-                    on_delta(StreamEvent::Reasoning(text));
-                }
+            if let Some(text) = delta.reasoning()
+                && !text.is_empty()
+            {
+                reasoning_buf.push_str(text);
+                on_delta(StreamEvent::Reasoning(text));
             }
 
-            if let Some(ref text) = delta.content {
-                if !text.is_empty() {
-                    content_buf.push_str(text);
-                    on_delta(StreamEvent::Content(text));
-                }
+            if let Some(ref text) = delta.content
+                && !text.is_empty()
+            {
+                content_buf.push_str(text);
+                on_delta(StreamEvent::Content(text));
             }
 
             if let Some(ref tcs) = delta.tool_calls {

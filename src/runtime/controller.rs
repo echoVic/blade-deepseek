@@ -1,5 +1,5 @@
 use std::io;
-use std::path::PathBuf;
+use std::path::Path;
 
 use crate::approval::policy::{ActionKind, ApprovalDecision, ApprovalPolicy, ApprovalRequest};
 use crate::config::RunConfig;
@@ -7,12 +7,12 @@ use crate::event::schema::{EventFactory, RunStatus};
 use crate::event::sink::EventSink;
 use crate::provider::conversation::Conversation;
 use crate::provider::system_prompt::build_system_prompt;
-use crate::provider::{self, ProviderStep};
+use crate::provider::{self, ProviderConfig, ProviderStep};
 use crate::runtime::session::new_run_id;
 use crate::tools;
 use crate::verification;
 
-const DEFAULT_MAX_TURNS: u32 = 10;
+const DEFAULT_MAX_TURNS: u32 = 128;
 
 pub fn run(config: RunConfig) -> i32 {
     match run_inner(config) {
@@ -41,7 +41,6 @@ fn run_inner(config: RunConfig) -> io::Result<RunStatus> {
         &cwd,
         config.approval_mode.as_str(),
         config.provider.as_str(),
-        config.max_turns,
         config.verifier.as_deref(),
     ))?;
 
@@ -56,13 +55,18 @@ fn run_inner(config: RunConfig) -> io::Result<RunStatus> {
 
 fn run_agent_loop(
     config: &RunConfig,
-    cwd: &PathBuf,
+    cwd: &Path,
     events: &mut EventFactory,
     sink: &mut EventSink<impl io::Write>,
     prompt: &str,
 ) -> io::Result<RunStatus> {
-    let max_turns = config.max_turns.unwrap_or(DEFAULT_MAX_TURNS);
+    let max_turns = DEFAULT_MAX_TURNS;
     let ctx_config = provider::context::ContextConfig::default();
+    let provider_config = ProviderConfig {
+        api_key: config.api_key.clone(),
+        base_url: config.base_url.clone(),
+        model: config.model.clone(),
+    };
 
     let mut conversation = Conversation::new();
     conversation.add_system(build_system_prompt(cwd));
@@ -88,6 +92,7 @@ fn run_agent_loop(
         let response = provider::call_streaming(
             config.provider,
             &conversation,
+            &provider_config,
             &mut |step| {
                 match step {
                     ProviderStep::ReasoningDelta(text) => {
@@ -153,7 +158,7 @@ fn run_agent_loop(
 
 fn execute_tool_with_approval(
     config: &RunConfig,
-    cwd: &PathBuf,
+    cwd: &Path,
     events: &mut EventFactory,
     sink: &mut EventSink<impl io::Write>,
     tool_request: &tools::ToolRequest,

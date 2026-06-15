@@ -5,7 +5,7 @@ use serde_json::Value;
 #[test]
 fn exec_outputs_jsonl_contract_and_success_status() {
     let output = Command::new(env!("CARGO_BIN_EXE_orca"))
-        .args(["exec", "--output-format", "jsonl", "hello"])
+        .args(["exec", "--output-format", "jsonl", "--provider", "mock", "hello"])
         .output()
         .expect("run orca");
 

@@ -1,16 +1,14 @@
-use std::env;
-
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::approval::policy::ActionKind;
 use crate::provider::conversation::Conversation;
 use crate::provider::tool_schema::deepseek_tools_schema;
-use crate::provider::{ProviderReplayState, ProviderResponse, ProviderStep};
+use crate::provider::{ProviderConfig, ProviderReplayState, ProviderResponse, ProviderStep};
 use crate::tools::{ToolName, ToolRequest};
 
 const DEFAULT_BASE_URL: &str = "https://api.deepseek.com";
-const DEFAULT_MODEL: &str = "deepseek-chat";
+const DEFAULT_MODEL: &str = "deepseek-v4-flash";
 
 #[derive(Debug, Serialize)]
 struct ChatRequest {
@@ -78,8 +76,8 @@ struct ApiFunctionResponse {
     arguments: String,
 }
 
-pub fn call(conversation: &Conversation) -> ProviderResponse {
-    match request_chat(conversation) {
+pub fn call(conversation: &Conversation, config: &ProviderConfig) -> ProviderResponse {
+    match request_chat(conversation, config) {
         Ok(response) => response,
         Err(error) => ProviderResponse {
             steps: vec![ProviderStep::Error(format!(
@@ -94,9 +92,10 @@ pub fn call(conversation: &Conversation) -> ProviderResponse {
 
 pub fn call_streaming(
     conversation: &Conversation,
+    config: &ProviderConfig,
     on_step: &mut dyn FnMut(&ProviderStep),
 ) -> ProviderResponse {
-    match request_chat_streaming(conversation, on_step) {
+    match request_chat_streaming(conversation, config, on_step) {
         Ok(response) => response,
         Err(error) => {
             let step = ProviderStep::Error(format!("DeepSeek provider error: {error}"));
@@ -113,26 +112,27 @@ pub fn call_streaming(
 
 fn request_chat_streaming(
     conversation: &Conversation,
+    config: &ProviderConfig,
     on_step: &mut dyn FnMut(&ProviderStep),
 ) -> Result<ProviderResponse, String> {
-    let api_key = env::var("DEEPSEEK_API_KEY")
-        .map_err(|_| "DEEPSEEK_API_KEY is required for --provider deepseek".to_string())?;
-    let base_url = env::var("DEEPSEEK_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_string());
-    let model = env::var("DEEPSEEK_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
+    let api_key = config.api_key.as_deref()
+        .ok_or_else(|| "DEEPSEEK_API_KEY is required for --provider deepseek (set via config file, env var, or ~/.config/orca/config.toml)".to_string())?;
+    let base_url = config.base_url.as_deref().unwrap_or(DEFAULT_BASE_URL);
+    let model = config.model.as_deref().unwrap_or(DEFAULT_MODEL);
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
 
     let messages = conversation_to_api_messages(conversation);
     let tools = deepseek_tools_schema();
 
     let request = ChatRequest {
-        model,
+        model: model.to_string(),
         messages,
         stream: true,
         tools: Some(tools),
     };
 
     let response = super::http_client::execute_streaming_with_retry(|client| {
-        client.post(&url).bearer_auth(&api_key).json(&request)
+        client.post(&url).bearer_auth(api_key).json(&request)
     })?;
 
     let mut steps = Vec::new();
@@ -224,25 +224,25 @@ fn request_chat_streaming(
     })
 }
 
-fn request_chat(conversation: &Conversation) -> Result<ProviderResponse, String> {
-    let api_key = env::var("DEEPSEEK_API_KEY")
-        .map_err(|_| "DEEPSEEK_API_KEY is required for --provider deepseek".to_string())?;
-    let base_url = env::var("DEEPSEEK_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_string());
-    let model = env::var("DEEPSEEK_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
+fn request_chat(conversation: &Conversation, config: &ProviderConfig) -> Result<ProviderResponse, String> {
+    let api_key = config.api_key.as_deref()
+        .ok_or_else(|| "DEEPSEEK_API_KEY is required for --provider deepseek (set via config file, env var, or ~/.config/orca/config.toml)".to_string())?;
+    let base_url = config.base_url.as_deref().unwrap_or(DEFAULT_BASE_URL);
+    let model = config.model.as_deref().unwrap_or(DEFAULT_MODEL);
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
 
     let messages = conversation_to_api_messages(conversation);
     let tools = deepseek_tools_schema();
 
     let request = ChatRequest {
-        model,
+        model: model.to_string(),
         messages,
         stream: false,
         tools: Some(tools),
     };
 
     let response = super::http_client::execute_with_retry(|client| {
-        client.post(&url).bearer_auth(&api_key).json(&request)
+        client.post(&url).bearer_auth(api_key).json(&request)
     })?
     .json::<ChatResponse>()
     .map_err(|error| format!("invalid response: {error}"))?;

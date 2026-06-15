@@ -1,8 +1,10 @@
+use std::env;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::approval::policy::ApprovalMode;
+use crate::config::file;
 use crate::config::{OutputFormat, ProviderKind, RunConfig};
 use crate::runtime::controller;
 
@@ -20,14 +22,14 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Run a task without the TUI and emit machine-readable events.
+    /// Run a task and emit events.
     Exec(ExecArgs),
 }
 
 #[derive(Debug, Parser)]
 struct ExecArgs {
-    /// Output format for the run.
-    #[arg(long, value_enum, default_value_t = OutputFormatArg::Jsonl)]
+    /// Output format: text (human-readable) or jsonl (machine-readable).
+    #[arg(long, value_enum, default_value_t = OutputFormatArg::Text)]
     output_format: OutputFormatArg,
 
     /// Workspace directory.
@@ -38,19 +40,23 @@ struct ExecArgs {
     #[arg(long, value_enum, default_value_t = ApprovalMode::WorkspaceWrite)]
     approval_mode: ApprovalMode,
 
-    /// Provider implementation to use for this run.
-    #[arg(long, value_enum, default_value_t = ProviderKind::Mock)]
-    provider: ProviderKind,
-
-    /// Maximum turns for this run.
+    /// Model to use (overrides config file and DEEPSEEK_MODEL env).
     #[arg(long)]
-    max_turns: Option<u32>,
+    model: Option<String>,
 
-    /// Optional verifier command.
+    /// API base URL (overrides config file and DEEPSEEK_BASE_URL env).
+    #[arg(long)]
+    base_url: Option<String>,
+
+    /// Optional verifier command to run after completion.
     #[arg(long)]
     verifier: Option<String>,
 
-    /// Prompt to execute. If omitted, stdin support will be added later.
+    /// Provider implementation (internal, for testing).
+    #[arg(long, value_enum, default_value_t = ProviderKind::DeepSeek, hide = true)]
+    provider: ProviderKind,
+
+    /// Prompt to execute.
     prompt: Vec<String>,
 }
 
@@ -79,15 +85,34 @@ pub fn run() -> i32 {
 }
 
 fn run_exec(args: ExecArgs) -> i32 {
+    let file_config = file::load_user_config();
+
     let prompt = args.prompt.join(" ");
+
+    let api_key = env::var("DEEPSEEK_API_KEY")
+        .ok()
+        .or(file_config.api_key);
+
+    let base_url = args
+        .base_url
+        .or_else(|| env::var("DEEPSEEK_BASE_URL").ok())
+        .or(file_config.base_url);
+
+    let model = args
+        .model
+        .or_else(|| env::var("DEEPSEEK_MODEL").ok())
+        .or(file_config.model);
+
     let config = RunConfig {
         prompt,
         cwd: args.cwd,
         output_format: args.output_format.into(),
         approval_mode: args.approval_mode,
         provider: args.provider,
-        max_turns: args.max_turns,
         verifier: args.verifier,
+        model,
+        api_key,
+        base_url,
     };
 
     controller::run(config)

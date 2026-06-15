@@ -9,6 +9,8 @@ fn read_only_denies_write_requests() {
             "exec",
             "--output-format",
             "jsonl",
+            "--provider",
+            "mock",
             "--approval-mode",
             "read-only",
             "write a file",

@@ -5,15 +5,18 @@ use serde::{Deserialize, Serialize};
 
 use crate::approval::policy::ApprovalMode;
 
+pub mod file;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OutputFormat {
     Jsonl,
     Text,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ValueEnum)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 pub enum ProviderKind {
+    #[default]
     Mock,
     #[value(name = "deepseek-fixture")]
     DeepSeekFixture,
@@ -31,12 +34,6 @@ impl ProviderKind {
     }
 }
 
-impl Default for ProviderKind {
-    fn default() -> Self {
-        Self::Mock
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct RunConfig {
     pub prompt: String,
@@ -44,6 +41,8 @@ pub struct RunConfig {
     pub output_format: OutputFormat,
     pub approval_mode: ApprovalMode,
     pub provider: ProviderKind,
-    pub max_turns: Option<u32>,
     pub verifier: Option<String>,
+    pub model: Option<String>,
+    pub api_key: Option<String>,
+    pub base_url: Option<String>,
 }

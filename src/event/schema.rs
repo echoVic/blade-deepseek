@@ -90,7 +90,6 @@ impl EventFactory {
         cwd: &str,
         approval_mode: &str,
         provider: &str,
-        max_turns: Option<u32>,
         verifier: Option<&str>,
     ) -> EventEnvelope {
         self.make(
@@ -99,7 +98,6 @@ impl EventFactory {
                 "cwd": cwd,
                 "approval_mode": approval_mode,
                 "provider": provider,
-                "max_turns": max_turns,
                 "verifier": verifier
             }),
         )
@@ -296,12 +294,11 @@ mod tests {
     #[test]
     fn session_started_payload_structure() {
         let mut f = EventFactory::new("run-1".to_string());
-        let e = f.session_started("/tmp", "read-only", "mock", Some(5), None);
+        let e = f.session_started("/tmp", "read-only", "mock", None);
         assert_eq!(e.event_type, EventType::SessionStarted);
         assert_eq!(e.payload["cwd"], "/tmp");
         assert_eq!(e.payload["approval_mode"], "read-only");
         assert_eq!(e.payload["provider"], "mock");
-        assert_eq!(e.payload["max_turns"], 5);
         assert!(e.payload["verifier"].is_null());
     }
 
