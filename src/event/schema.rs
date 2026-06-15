@@ -251,3 +251,82 @@ fn timestamp_ms() -> u128 {
         .map(|duration| duration.as_millis())
         .unwrap_or_default()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn factory_increments_seq() {
+        let mut f = EventFactory::new("run-1".to_string());
+        let e0 = f.error("a");
+        let e1 = f.error("b");
+        let e2 = f.error("c");
+        assert_eq!(e0.seq, 0);
+        assert_eq!(e1.seq, 1);
+        assert_eq!(e2.seq, 2);
+    }
+
+    #[test]
+    fn factory_preserves_run_id() {
+        let mut f = EventFactory::new("run-abc".to_string());
+        let e = f.error("x");
+        assert_eq!(e.run_id, "run-abc");
+    }
+
+    #[test]
+    fn event_type_serializes_correctly() {
+        let s = serde_json::to_string(&EventType::SessionStarted).unwrap();
+        assert_eq!(s, "\"session.started\"");
+
+        let s = serde_json::to_string(&EventType::ToolCallCompleted).unwrap();
+        assert_eq!(s, "\"tool.call.completed\"");
+    }
+
+    #[test]
+    fn run_status_exit_codes() {
+        assert_eq!(RunStatus::Success.exit_code(), 0);
+        assert_eq!(RunStatus::Failed.exit_code(), 1);
+        assert_eq!(RunStatus::VerificationFailed.exit_code(), 2);
+        assert_eq!(RunStatus::ApprovalRequired.exit_code(), 3);
+        assert_eq!(RunStatus::BudgetExhausted.exit_code(), 4);
+        assert_eq!(RunStatus::Cancelled.exit_code(), 130);
+    }
+
+    #[test]
+    fn session_started_payload_structure() {
+        let mut f = EventFactory::new("run-1".to_string());
+        let e = f.session_started("/tmp", "read-only", "mock", Some(5), None);
+        assert_eq!(e.event_type, EventType::SessionStarted);
+        assert_eq!(e.payload["cwd"], "/tmp");
+        assert_eq!(e.payload["approval_mode"], "read-only");
+        assert_eq!(e.payload["provider"], "mock");
+        assert_eq!(e.payload["max_turns"], 5);
+        assert!(e.payload["verifier"].is_null());
+    }
+
+    #[test]
+    fn turn_started_with_and_without_prompt() {
+        let mut f = EventFactory::new("run-1".to_string());
+
+        let e = f.turn_started(1, Some("hello"));
+        assert_eq!(e.payload["turn"], 1);
+        assert_eq!(e.payload["prompt"], "hello");
+
+        let e = f.turn_started(2, None);
+        assert_eq!(e.payload["turn"], 2);
+        assert!(e.payload.get("prompt").is_none());
+    }
+
+    #[test]
+    fn event_envelope_serializes_to_valid_json() {
+        let mut f = EventFactory::new("run-1".to_string());
+        let e = f.assistant_message_delta("test text");
+        let json = serde_json::to_string(&e).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["type"], "assistant.message.delta");
+        assert_eq!(parsed["payload"]["text"], "test text");
+        assert_eq!(parsed["seq"], 0);
+        assert_eq!(parsed["version"], "1");
+    }
+}

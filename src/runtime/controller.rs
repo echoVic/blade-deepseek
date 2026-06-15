@@ -62,6 +62,7 @@ fn run_agent_loop(
     prompt: &str,
 ) -> io::Result<RunStatus> {
     let max_turns = config.max_turns.unwrap_or(DEFAULT_MAX_TURNS);
+    let ctx_config = provider::context::ContextConfig::default();
 
     let mut conversation = Conversation::new();
     conversation.add_system(build_system_prompt(cwd));
@@ -77,20 +78,32 @@ fn run_agent_loop(
             return Ok(RunStatus::BudgetExhausted);
         }
 
+        if provider::context::needs_compaction(&conversation, &ctx_config) {
+            conversation = provider::context::compact(&conversation, &ctx_config);
+        }
+
         let turn_prompt = if turn == 1 { Some(prompt) } else { None };
         sink.emit(&events.turn_started(turn, turn_prompt))?;
 
-        let response = provider::call(config.provider, &conversation);
+        let response = provider::call_streaming(
+            config.provider,
+            &conversation,
+            &mut |step| {
+                match step {
+                    ProviderStep::ReasoningDelta(text) => {
+                        let _ = sink.emit(&events.assistant_reasoning_delta(text));
+                    }
+                    ProviderStep::MessageDelta(text) => {
+                        let _ = sink.emit(&events.assistant_message_delta(text));
+                    }
+                    _ => {}
+                }
+            },
+        );
 
         let mut had_error = false;
         for step in &response.steps {
             match step {
-                ProviderStep::ReasoningDelta(text) => {
-                    sink.emit(&events.assistant_reasoning_delta(text))?;
-                }
-                ProviderStep::MessageDelta(text) => {
-                    sink.emit(&events.assistant_message_delta(text))?;
-                }
                 ProviderStep::ReplayState(replay) => {
                     sink.emit(&events.provider_replay_updated(replay))?;
                 }
@@ -99,7 +112,7 @@ fn run_agent_loop(
                     had_error = true;
                     break;
                 }
-                ProviderStep::ToolCall(_) => {}
+                _ => {}
             }
         }
 

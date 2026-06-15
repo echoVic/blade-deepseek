@@ -1,6 +1,9 @@
 pub mod conversation;
+pub mod context;
 pub mod deepseek_fixture;
 pub mod deepseek_http;
+pub mod http_client;
+pub mod streaming;
 pub mod system_prompt;
 pub mod tool_schema;
 
@@ -79,6 +82,23 @@ pub fn call(kind: ProviderKind, conversation: &Conversation) -> ProviderResponse
             }
         }
         ProviderKind::DeepSeek => deepseek_http::call(conversation),
+    }
+}
+
+pub fn call_streaming(
+    kind: ProviderKind,
+    conversation: &Conversation,
+    on_step: &mut dyn FnMut(&ProviderStep),
+) -> ProviderResponse {
+    match kind {
+        ProviderKind::Mock | ProviderKind::DeepSeekFixture => {
+            let response = call(kind, conversation);
+            for step in &response.steps {
+                on_step(step);
+            }
+            response
+        }
+        ProviderKind::DeepSeek => deepseek_http::call_streaming(conversation, on_step),
     }
 }
 

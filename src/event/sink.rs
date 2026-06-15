@@ -72,3 +72,45 @@ impl<W: Write> EventSink<W> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::event::schema::EventFactory;
+
+    #[test]
+    fn jsonl_format_writes_one_line_per_event() {
+        let mut buf = Vec::new();
+        let mut sink = EventSink::new(&mut buf, OutputFormat::Jsonl);
+        let mut f = EventFactory::new("run-1".to_string());
+
+        sink.emit(&f.error("test error")).unwrap();
+        sink.emit(&f.assistant_message_delta("hello")).unwrap();
+
+        let output = String::from_utf8(buf).unwrap();
+        let lines: Vec<&str> = output.lines().collect();
+        assert_eq!(lines.len(), 2);
+
+        let parsed: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(parsed["type"], "error");
+        assert_eq!(parsed["payload"]["message"], "test error");
+
+        let parsed: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(parsed["type"], "assistant.message.delta");
+        assert_eq!(parsed["payload"]["text"], "hello");
+    }
+
+    #[test]
+    fn text_format_writes_human_readable() {
+        let mut buf = Vec::new();
+        let mut sink = EventSink::new(&mut buf, OutputFormat::Text);
+        let mut f = EventFactory::new("run-1".to_string());
+
+        sink.emit(&f.error("something broke")).unwrap();
+        sink.emit(&f.assistant_message_delta("hi")).unwrap();
+
+        let output = String::from_utf8(buf).unwrap();
+        assert!(output.contains("error: something broke"));
+        assert!(output.contains("assistant: hi"));
+    }
+}

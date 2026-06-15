@@ -92,6 +92,138 @@ pub fn call(conversation: &Conversation) -> ProviderResponse {
     }
 }
 
+pub fn call_streaming(
+    conversation: &Conversation,
+    on_step: &mut dyn FnMut(&ProviderStep),
+) -> ProviderResponse {
+    match request_chat_streaming(conversation, on_step) {
+        Ok(response) => response,
+        Err(error) => {
+            let step = ProviderStep::Error(format!("DeepSeek provider error: {error}"));
+            on_step(&step);
+            ProviderResponse {
+                steps: vec![step],
+                assistant_content: None,
+                assistant_reasoning: None,
+                tool_calls: Vec::new(),
+            }
+        }
+    }
+}
+
+fn request_chat_streaming(
+    conversation: &Conversation,
+    on_step: &mut dyn FnMut(&ProviderStep),
+) -> Result<ProviderResponse, String> {
+    let api_key = env::var("DEEPSEEK_API_KEY")
+        .map_err(|_| "DEEPSEEK_API_KEY is required for --provider deepseek".to_string())?;
+    let base_url = env::var("DEEPSEEK_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_string());
+    let model = env::var("DEEPSEEK_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
+    let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+
+    let messages = conversation_to_api_messages(conversation);
+    let tools = deepseek_tools_schema();
+
+    let request = ChatRequest {
+        model,
+        messages,
+        stream: true,
+        tools: Some(tools),
+    };
+
+    let response = super::http_client::execute_streaming_with_retry(|client| {
+        client.post(&url).bearer_auth(&api_key).json(&request)
+    })?;
+
+    let mut steps = Vec::new();
+
+    let stream_result = super::streaming::parse_sse_stream(response, |delta| {
+        use super::streaming::StreamEvent;
+        let step = match delta {
+            StreamEvent::Reasoning(text) => ProviderStep::ReasoningDelta(text.to_string()),
+            StreamEvent::Content(text) => ProviderStep::MessageDelta(text.to_string()),
+        };
+        on_step(&step);
+        steps.push(step);
+    })?;
+
+    match stream_result.finish_reason.as_deref() {
+        Some("length") => {
+            return Err(
+                "Response truncated: model hit max_tokens limit (finish_reason=length)".to_string(),
+            );
+        }
+        Some("content_filter") => {
+            return Err("Response blocked by content filter".to_string());
+        }
+        _ => {}
+    }
+
+    let mut raw_calls_for_history = Vec::new();
+    for tc in &stream_result.tool_calls {
+        raw_calls_for_history.push(crate::provider::conversation::RawToolCall {
+            id: tc.id.clone(),
+            function_name: tc.function_name.clone(),
+            arguments: tc.arguments.clone(),
+        });
+
+        let tc_response = ApiToolCallResponse {
+            id: tc.id.clone(),
+            function: ApiFunctionResponse {
+                name: tc.function_name.clone(),
+                arguments: tc.arguments.clone(),
+            },
+        };
+        match parse_tool_call(&tc_response) {
+            Ok(tool_request) => {
+                steps.push(ProviderStep::ToolCall(tool_request));
+            }
+            Err(error) => {
+                steps.push(ProviderStep::Error(format!(
+                    "failed to parse tool call '{}': {error}",
+                    tc.function_name
+                )));
+            }
+        }
+    }
+
+    let assistant_reasoning = if stream_result.reasoning.is_empty() {
+        if !raw_calls_for_history.is_empty() {
+            Some("(reasoning omitted)".to_string())
+        } else {
+            None
+        }
+    } else {
+        if !raw_calls_for_history.is_empty() {
+            let tool_call_ids: Vec<String> =
+                raw_calls_for_history.iter().map(|tc| tc.id.clone()).collect();
+            steps.push(ProviderStep::ReplayState(ProviderReplayState {
+                provider: "deepseek",
+                reasoning_content: stream_result.reasoning.clone(),
+                tool_call_ids,
+            }));
+        }
+        Some(stream_result.reasoning)
+    };
+
+    let assistant_content = if stream_result.content.is_empty() {
+        None
+    } else {
+        Some(stream_result.content)
+    };
+
+    if steps.is_empty() {
+        return Err("response did not contain content or tool calls".to_string());
+    }
+
+    Ok(ProviderResponse {
+        steps,
+        assistant_content,
+        assistant_reasoning,
+        tool_calls: raw_calls_for_history,
+    })
+}
+
 fn request_chat(conversation: &Conversation) -> Result<ProviderResponse, String> {
     let api_key = env::var("DEEPSEEK_API_KEY")
         .map_err(|_| "DEEPSEEK_API_KEY is required for --provider deepseek".to_string())?;
@@ -109,16 +241,11 @@ fn request_chat(conversation: &Conversation) -> Result<ProviderResponse, String>
         tools: Some(tools),
     };
 
-    let response = reqwest::blocking::Client::new()
-        .post(url)
-        .bearer_auth(api_key)
-        .json(&request)
-        .send()
-        .map_err(|error| format!("request failed: {error}"))?
-        .error_for_status()
-        .map_err(|error| format!("request returned error: {error}"))?
-        .json::<ChatResponse>()
-        .map_err(|error| format!("invalid response: {error}"))?;
+    let response = super::http_client::execute_with_retry(|client| {
+        client.post(&url).bearer_auth(&api_key).json(&request)
+    })?
+    .json::<ChatResponse>()
+    .map_err(|error| format!("invalid response: {error}"))?;
 
     let choice = response
         .choices
@@ -127,9 +254,23 @@ fn request_chat(conversation: &Conversation) -> Result<ProviderResponse, String>
         .ok_or_else(|| "response did not contain choices".to_string())?;
 
     let message = choice.message;
-    let _finish_reason = choice.finish_reason.unwrap_or_default();
+    let finish_reason = choice.finish_reason.unwrap_or_default();
 
     let mut steps = Vec::new();
+
+    match finish_reason.as_str() {
+        "length" => {
+            return Err("Response truncated: model hit max_tokens limit (finish_reason=length)".to_string());
+        }
+        "content_filter" => {
+            return Err("Response blocked by content filter".to_string());
+        }
+        "stop" | "tool_calls" | "" => {}
+        other => {
+            steps.push(ProviderStep::Error(format!("Unexpected finish_reason: {other}")));
+        }
+    }
+
     let assistant_reasoning = message
         .reasoning_content
         .filter(|text| !text.is_empty());
@@ -300,4 +441,99 @@ fn conversation_to_api_messages(conversation: &Conversation) -> Vec<ApiMessage> 
             },
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::approval::policy::ActionKind;
+    use crate::tools::ToolName;
+
+    fn make_tc(name: &str, arguments: &str) -> ApiToolCallResponse {
+        ApiToolCallResponse {
+            id: "call_123".to_string(),
+            function: ApiFunctionResponse {
+                name: name.to_string(),
+                arguments: arguments.to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn parse_read_file() {
+        let tc = make_tc("read_file", r#"{"path":"src/main.rs"}"#);
+        let req = parse_tool_call(&tc).unwrap();
+        assert_eq!(req.name, ToolName::ReadFile);
+        assert_eq!(req.action, ActionKind::Read);
+        assert_eq!(req.target.as_deref(), Some("src/main.rs"));
+        assert_eq!(req.id, "call_123");
+    }
+
+    #[test]
+    fn parse_list_files_with_path() {
+        let tc = make_tc("list_files", r#"{"path":"src/provider"}"#);
+        let req = parse_tool_call(&tc).unwrap();
+        assert_eq!(req.name, ToolName::ListFiles);
+        assert_eq!(req.action, ActionKind::Read);
+        assert_eq!(req.target.as_deref(), Some("src/provider"));
+    }
+
+    #[test]
+    fn parse_list_files_without_path_defaults_to_dot() {
+        let tc = make_tc("list_files", r#"{}"#);
+        let req = parse_tool_call(&tc).unwrap();
+        assert_eq!(req.name, ToolName::ListFiles);
+        assert_eq!(req.target.as_deref(), Some("."));
+    }
+
+    #[test]
+    fn parse_grep() {
+        let tc = make_tc("grep", r#"{"pattern":"fn main","path":"src"}"#);
+        let req = parse_tool_call(&tc).unwrap();
+        assert_eq!(req.name, ToolName::Grep);
+        assert_eq!(req.action, ActionKind::Read);
+        assert_eq!(req.target.as_deref(), Some("fn main"));
+    }
+
+    #[test]
+    fn parse_bash() {
+        let tc = make_tc("bash", r#"{"command":"cargo test"}"#);
+        let req = parse_tool_call(&tc).unwrap();
+        assert_eq!(req.name, ToolName::Bash);
+        assert_eq!(req.action, ActionKind::Shell);
+        assert_eq!(req.target.as_deref(), Some("cargo test"));
+    }
+
+    #[test]
+    fn parse_edit() {
+        let tc = make_tc("edit", r#"{"path":"foo.rs","old_text":"a","new_text":"b"}"#);
+        let req = parse_tool_call(&tc).unwrap();
+        assert_eq!(req.name, ToolName::Edit);
+        assert_eq!(req.action, ActionKind::Write);
+        assert_eq!(req.target.as_deref(), Some("foo.rs"));
+        assert!(req.raw_arguments.is_some());
+    }
+
+    #[test]
+    fn parse_git_status() {
+        let tc = make_tc("git_status", r#"{}"#);
+        let req = parse_tool_call(&tc).unwrap();
+        assert_eq!(req.name, ToolName::GitStatus);
+        assert_eq!(req.action, ActionKind::Read);
+        assert_eq!(req.target.as_deref(), Some("."));
+    }
+
+    #[test]
+    fn parse_unknown_tool_returns_error() {
+        let tc = make_tc("unknown_tool", r#"{}"#);
+        let err = parse_tool_call(&tc).unwrap_err();
+        assert!(err.contains("unknown tool"));
+    }
+
+    #[test]
+    fn parse_invalid_json_returns_error() {
+        let tc = make_tc("read_file", "not json");
+        let err = parse_tool_call(&tc).unwrap_err();
+        assert!(err.contains("invalid arguments JSON"));
+    }
 }
