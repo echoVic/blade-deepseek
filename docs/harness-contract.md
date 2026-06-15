@@ -1,8 +1,8 @@
 # Orca Harness Contract
 
-This document defines the first external contract for `orca exec`.
+This document defines the external contract for `orca exec`.
 
-The contract is intentionally small: a headless command, a versioned JSONL event stream, approval events, tool events, verification events, and deterministic exit codes.
+The contract covers: a headless command, a versioned JSONL event stream, approval events, tool events, verification events, and deterministic exit codes.
 
 ## Command
 
@@ -12,12 +12,12 @@ orca exec [options] <prompt>
 
 Options:
 
-- `--output-format jsonl|text`
-- `--cwd <path>`
-- `--approval-mode read-only|workspace-write|full-auto`
-- `--verifier <command>`
-- `--model <name>`
-- `--base-url <url>`
+- `--output-format text|jsonl` — Output format (default: text)
+- `--cwd <path>` — Workspace directory
+- `--approval-mode read-only|workspace-write|full-auto` — Approval policy (default: workspace-write)
+- `--verifier <command>` — Post-completion verification command
+- `--model <name>` — Model override
+- `--base-url <url>` — API base URL override
 
 ## Event Envelope
 
@@ -70,40 +70,79 @@ The final `session.completed` event contains one of:
 - `4`: budget exhausted
 - `130`: cancelled
 
-## Current Tool Contract
+## Tool Contract
 
-The mock runtime can currently trigger tools from simple prompts:
+All 6 tools are fully implemented:
 
-- `read README.md` -> `read_file`
-- `list files` -> `list_files`
-- `git status` -> `git_status`
-- `grep ...` -> `grep` placeholder
-- `bash ...` -> `bash` placeholder
-- `edit ...` -> `edit` placeholder
+| Tool | Action | Description |
+|------|--------|-------------|
+| `read_file` | read | Reads UTF-8 file content, truncated at 8KB |
+| `list_files` | read | Lists one directory, sorted names |
+| `grep` | read | Regex search via `rg` with line numbers, `(no matches)` for empty results |
+| `git_status` | read | Runs `git status --short` |
+| `bash` | shell | Executes via `sh -c`, requires approval unless `full-auto` |
+| `edit` | write | Exact text replacement, requires approval unless `full-auto` |
 
-Implemented tools emit `tool.call.requested` and `tool.call.completed`. Placeholder tools return `not_implemented`, still through the same event contract.
+Tool events:
+- `tool.call.requested` — emitted before execution, contains `name`, `action`, `target`
+- `tool.call.completed` — emitted after execution, contains `name`, `status` (completed/failed/denied), `output`, `truncated`
 
-Current behavior:
+## Approval Policy
 
-- `read_file` reads UTF-8 text and truncates large output.
-- `list_files` lists one directory and sorts names.
-- `grep` uses `rg` with line numbers and returns `(no matches)` for empty results.
-- `git_status` runs `git status --short`.
-- `bash` runs through `sh -c` only when the approval policy permits shell actions. With the default `workspace-write` policy, shell actions are denied and the run exits with code `3`.
-- `edit` supports exact replacement with `edit <path> :: <old> => <new>`. It fails without changing the file if the old text is missing, empty, or matches multiple locations.
+Three modes control which tool actions require approval:
+
+| Mode | read | write | shell |
+|------|------|-------|-------|
+| `read-only` | allow | deny | deny |
+| `workspace-write` | allow | allow | deny |
+| `full-auto` | allow | allow | allow |
+
+When an action is denied:
+- `approval.requested` and `approval.resolved` (decision=deny) events are emitted
+- The tool result status is `denied`
+- The run terminates with status `approval_required` and exit code `3`
 
 ## Provider Contract
 
-Current providers:
+The default (and only production) provider is DeepSeek. Internal test providers (`mock`, `deepseek-fixture`) exist for harness testing but are not user-facing.
 
-- `mock`: default provider used for local harness contract tests.
-- `deepseek-fixture`: recorded provider fixture that emits DeepSeek-style reasoning, replay state, a tool call, and a final assistant message.
-- `deepseek`: minimal non-streaming HTTP provider. It reads `DEEPSEEK_API_KEY`, `DEEPSEEK_BASE_URL` (optional, default `https://api.deepseek.com`), and `DEEPSEEK_MODEL` (optional, default `deepseek-chat`).
+### DeepSeek Provider
 
-`provider.replay.updated` exists to preserve provider-specific context that must be replayed in later model turns. For DeepSeek thinking/tool-use flows, this includes `reasoning_content` and tool call IDs. The event is part of the harness trace so future real HTTP transport code can keep DeepSeek replay semantics without changing the external JSONL contract.
+- Default model: `deepseek-v4-flash`
+- Default base URL: `https://api.deepseek.com`
+- Streaming: SSE with real-time reasoning/content deltas
+- Authentication: `DEEPSEEK_API_KEY` (required)
+- HTTP retry: 3 attempts with exponential backoff for 429/5xx status codes
+- Timeout: 30s connect, 120s request, 300s streaming
+- `finish_reason=length` → error (response truncated)
+- `finish_reason=content_filter` → error (content blocked)
 
-The current `deepseek` provider maps non-streaming response fields into harness events:
+Response mapping:
+- `reasoning_content` → `assistant.reasoning.delta` + `provider.replay.updated`
+- `content` → `assistant.message.delta`
+- `tool_calls` → parsed into `tool.call.requested` events
+- errors → `error` event + status `failed`
 
-- `reasoning_content` -> `assistant.reasoning.delta` and `provider.replay.updated`
-- `content` -> `assistant.message.delta`
-- provider/config/request errors -> `error` and final status `failed`
+### Agent Loop
+
+The runtime executes a multi-turn agent loop (max 128 turns):
+
+1. Send conversation to DeepSeek (with system prompt + tool schemas)
+2. If response contains tool calls → execute each tool → add results to conversation → next turn
+3. If response is a final message → return success
+4. If budget exhausted → return `budget_exhausted` (exit code 4)
+
+Context window management:
+- Window size: 128K tokens (estimated as chars/4)
+- Compaction threshold: 80% utilization
+- Strategy: preserve system message + most recent messages, truncate older history with a marker
+
+### Replay State
+
+`provider.replay.updated` preserves provider-specific context for multi-turn DeepSeek thinking/tool-use flows (reasoning_content + tool call IDs). This is part of the trace for maintaining DeepSeek replay semantics.
+
+## Configuration
+
+Priority: Environment variables > CLI arguments > Config file (`~/.config/orca/config.toml`) > Defaults.
+
+Config file fields: `model`, `api_key`, `base_url`.

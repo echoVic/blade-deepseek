@@ -2,48 +2,99 @@
 
 Orca is a DeepSeek-native coding agent runtime by Blade.
 
-This repository is the Rust-first foundation for `blade-deepseek`: a local terminal coding agent focused on DeepSeek thinking and tool-use semantics.
+A local terminal coding agent built in Rust, focused on DeepSeek reasoning and tool-use semantics. It runs a multi-turn agent loop with SSE streaming, automatic context window management, and HTTP retry with exponential backoff.
 
-## Goals
+## Quick Start
 
-- Build a fast local CLI/TUI runtime in Rust.
-- Treat DeepSeek reasoning and tool-call state as first-class runtime data.
-- Keep the first milestone small: interactive CLI, headless exec, core tools, approval, event log, and JSONL output.
+```sh
+# Set your API key
+export DEEPSEEK_API_KEY=sk-...
+
+# Run a task
+orca exec "fix this test"
+
+# With options
+orca exec --approval-mode full-auto "refactor the auth module"
+orca exec --model deepseek-reasoner "explain this codebase"
+orca exec --verifier "cargo test" "fix the failing test"
+```
+
+## Configuration
+
+Priority chain (highest wins): Environment variables > CLI arguments > Config file > Defaults.
+
+### Environment Variables
+
+- `DEEPSEEK_API_KEY` — API key (required)
+- `DEEPSEEK_MODEL` — Model override
+- `DEEPSEEK_BASE_URL` — API base URL override
+
+### Config File
+
+`~/.config/orca/config.toml`:
+
+```toml
+model = "deepseek-v4-flash"
+api_key = "sk-..."
+base_url = "https://api.deepseek.com"
+```
+
+### Defaults
+
+- Model: `deepseek-v4-flash`
+- Base URL: `https://api.deepseek.com`
+- Approval mode: `workspace-write`
+- Output format: `text`
+- Max turns: 128
 
 ## Command
 
 ```sh
-orca
-orca "fix this test"
-orca --print "summarize this repository"
-orca exec --output-format jsonl "run the full verification"
-orca exec --approval-mode read-only "read README.md"
-orca exec --verifier "cargo test" "run the full verification"
-orca exec --provider deepseek-fixture "inspect repo"
-DEEPSEEK_API_KEY=... orca exec --provider deepseek "inspect repo"
+orca exec [options] <prompt>
 ```
 
-## Harness Contract
+Options:
 
-`orca exec` is the first stable runtime boundary. It emits one JSON object per line when `--output-format jsonl` is selected.
+- `--output-format text|jsonl` — Output format (default: text)
+- `--cwd <path>` — Workspace directory
+- `--approval-mode read-only|workspace-write|full-auto` — Approval policy
+- `--model <name>` — Model to use
+- `--base-url <url>` — API base URL
+- `--verifier <command>` — Post-run verification command
 
-The current mock runtime supports:
+## Tools
 
-- `session.started`
-- `turn.started`
-- `assistant.reasoning.delta`
-- `assistant.message.delta`
-- `provider.replay.updated`
-- `approval.requested`
-- `approval.resolved`
-- `tool.call.requested`
-- `tool.call.completed`
-- `verification.started`
-- `verification.completed`
-- `error`
-- `session.completed`
+All 6 tools are fully implemented:
 
-Exit codes:
+| Tool | Description |
+|------|-------------|
+| `read_file` | Read file contents (UTF-8, truncated at 8KB) |
+| `list_files` | List directory entries |
+| `grep` | Search with ripgrep (regex, line numbers) |
+| `bash` | Execute shell commands via `sh -c` |
+| `edit` | Exact text replacement in files |
+| `git_status` | Show git working tree status |
+
+## Architecture
+
+- **Agent Loop**: prompt → model → tool_call → execute → feed result → next turn (up to 128 turns)
+- **SSE Streaming**: Real-time reasoning and content deltas via Server-Sent Events
+- **Context Window**: 128K tokens, 80% threshold compaction (preserves system + recent messages)
+- **HTTP Client**: Singleton with 30s connect / 120s request / 300s streaming timeouts, exponential backoff retry (3 attempts, handles 429/5xx)
+- **Approval Policy**: Read operations always allowed; write/shell actions require approval based on mode
+- **Verification**: Optional post-completion verifier command with pass/fail status
+
+## Event Stream (JSONL)
+
+When `--output-format jsonl` is used, each line is a versioned event:
+
+```json
+{"version":"1","run_id":"run-...","seq":0,"timestamp_ms":1780647978857,"type":"session.started","payload":{}}
+```
+
+Event types: `session.started`, `turn.started`, `assistant.reasoning.delta`, `assistant.message.delta`, `provider.replay.updated`, `approval.requested`, `approval.resolved`, `tool.call.requested`, `tool.call.completed`, `verification.started`, `verification.completed`, `error`, `session.completed`.
+
+## Exit Codes
 
 - `0`: success
 - `1`: failed
@@ -52,6 +103,12 @@ Exit codes:
 - `4`: budget exhausted
 - `130`: cancelled
 
+## Tech Stack
+
+- Rust 2024 edition
+- clap (CLI), reqwest (blocking HTTP), serde (JSON), toml (config), dirs (XDG paths)
+- Synchronous blocking I/O, suitable for CLI interaction
+
 ## Status
 
-Early runtime contract implementation. `orca exec` currently supports a mock provider, a recorded `deepseek-fixture` provider, and a minimal non-streaming `deepseek` HTTP provider.
+Production-ready agent loop with DeepSeek streaming provider. All 6 tools implemented, multi-turn conversation with context management, approval policies, and verification support.
