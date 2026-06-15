@@ -43,7 +43,7 @@ base_url = "https://api.deepseek.com"
 
 - Model: `deepseek-v4-flash`
 - Base URL: `https://api.deepseek.com`
-- Approval mode: `workspace-write`
+- Approval mode: `suggest`
 - Output format: `text`
 - Max turns: 128
 
@@ -57,7 +57,7 @@ Options:
 
 - `--output-format text|jsonl` — Output format (default: text)
 - `--cwd <path>` — Workspace directory
-- `--approval-mode read-only|workspace-write|full-auto` — Approval policy
+- `--approval-mode suggest|auto-edit|full-auto` — Approval policy
 - `--model <name>` — Model to use
 - `--base-url <url>` — API base URL
 - `--verifier <command>` — Post-run verification command
@@ -81,7 +81,7 @@ All 6 tools are fully implemented:
 - **SSE Streaming**: Real-time reasoning and content deltas via Server-Sent Events
 - **Context Window**: 128K tokens, 80% threshold compaction (preserves system + recent messages)
 - **HTTP Client**: Singleton with 30s connect / 120s request / 300s streaming timeouts, exponential backoff retry (3 attempts, handles 429/5xx)
-- **Approval Policy**: Read operations always allowed; write/shell actions require approval based on mode
+- **Approval Policy**: Read operations always allowed; write/shell actions require interactive confirmation (suggest mode) or auto-allowed based on mode
 - **Verification**: Optional post-completion verifier command with pass/fail status
 
 ## Event Stream (JSONL)

@@ -78,7 +78,7 @@ fn grep_emits_completed_tool_event_with_matches() {
 }
 
 #[test]
-fn workspace_write_denies_bash_tool() {
+fn suggest_denies_bash_in_jsonl_mode() {
     let output = Command::new(env!("CARGO_BIN_EXE_orca"))
         .args(["exec", "--output-format", "jsonl", "--provider", "mock", "bash printf hi"])
         .output()
@@ -121,7 +121,7 @@ fn full_auto_allows_bash_tool() {
 }
 
 #[test]
-fn workspace_write_allows_exact_edit_tool() {
+fn auto_edit_allows_edit_tool() {
     let temp_dir = make_temp_workspace("edit-success");
     let file_path = temp_dir.join("note.txt");
     fs::write(&file_path, "hello orca\n").expect("write fixture");
@@ -133,6 +133,8 @@ fn workspace_write_allows_exact_edit_tool() {
             "jsonl",
             "--provider",
             "mock",
+            "--approval-mode",
+            "auto-edit",
             "--cwd",
             temp_dir.to_str().unwrap(),
             "edit note.txt :: hello => hi",
@@ -153,7 +155,7 @@ fn workspace_write_allows_exact_edit_tool() {
 }
 
 #[test]
-fn read_only_denies_edit_without_changing_file() {
+fn suggest_denies_edit_in_jsonl_mode() {
     let temp_dir = make_temp_workspace("edit-denied");
     let file_path = temp_dir.join("note.txt");
     fs::write(&file_path, "hello orca\n").expect("write fixture");
@@ -165,8 +167,6 @@ fn read_only_denies_edit_without_changing_file() {
             "jsonl",
             "--provider",
             "mock",
-            "--approval-mode",
-            "read-only",
             "--cwd",
             temp_dir.to_str().unwrap(),
             "edit note.txt :: hello => hi",

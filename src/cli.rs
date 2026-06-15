@@ -37,7 +37,7 @@ struct ExecArgs {
     cwd: Option<PathBuf>,
 
     /// Approval policy for tool actions.
-    #[arg(long, value_enum, default_value_t = ApprovalMode::WorkspaceWrite)]
+    #[arg(long, value_enum, default_value_t = ApprovalMode::Suggest)]
     approval_mode: ApprovalMode,
 
     /// Model to use (overrides config file and DEEPSEEK_MODEL env).

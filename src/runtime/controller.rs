@@ -1,8 +1,11 @@
 use std::io;
 use std::path::Path;
 
-use crate::approval::policy::{ActionKind, ApprovalDecision, ApprovalPolicy, ApprovalRequest};
-use crate::config::RunConfig;
+use crate::approval::confirm;
+use crate::approval::policy::{
+    ActionKind, ApprovalDecision, ApprovalPolicy, ApprovalRequest, ApprovalResolution,
+};
+use crate::config::{OutputFormat, RunConfig};
 use crate::event::schema::{EventFactory, RunStatus};
 use crate::event::sink::EventSink;
 use crate::provider::conversation::Conversation;
@@ -177,13 +180,28 @@ fn execute_tool_with_approval(
         };
         let resolution = policy.resolve(&approval);
         sink.emit(&events.approval_requested(&approval))?;
-        sink.emit(&events.approval_resolved(&resolution))?;
 
-        if resolution.decision == ApprovalDecision::Deny {
-            sink.emit(&events.tool_call_requested(tool_request))?;
-            let result = tools::ToolResult::denied(tool_request, resolution.reason);
-            sink.emit(&events.tool_call_completed(&result))?;
-            return Ok((RunStatus::ApprovalRequired, result));
+        match resolution.decision {
+            ApprovalDecision::Allow => {
+                sink.emit(&events.approval_resolved(&resolution))?;
+            }
+            ApprovalDecision::Ask => {
+                let final_resolution = resolve_interactive(config, &approval, tool_request)?;
+                sink.emit(&events.approval_resolved(&final_resolution))?;
+                if final_resolution.decision == ApprovalDecision::Deny {
+                    sink.emit(&events.tool_call_requested(tool_request))?;
+                    let result = tools::ToolResult::denied(tool_request, final_resolution.reason);
+                    sink.emit(&events.tool_call_completed(&result))?;
+                    return Ok((RunStatus::ApprovalRequired, result));
+                }
+            }
+            ApprovalDecision::Deny => {
+                sink.emit(&events.approval_resolved(&resolution))?;
+                sink.emit(&events.tool_call_requested(tool_request))?;
+                let result = tools::ToolResult::denied(tool_request, resolution.reason);
+                sink.emit(&events.tool_call_completed(&result))?;
+                return Ok((RunStatus::ApprovalRequired, result));
+            }
         }
     }
 
@@ -202,6 +220,39 @@ fn execute_tool_with_approval(
     };
 
     Ok((status, result))
+}
+
+fn resolve_interactive(
+    config: &RunConfig,
+    approval: &ApprovalRequest,
+    tool_request: &tools::ToolRequest,
+) -> io::Result<ApprovalResolution> {
+    if config.output_format == OutputFormat::Jsonl {
+        return Ok(ApprovalResolution {
+            id: approval.id.clone(),
+            decision: ApprovalDecision::Deny,
+            reason: "interactive confirmation unavailable in jsonl mode".to_string(),
+        });
+    }
+
+    let allowed = confirm::prompt_user(
+        tool_request.name.as_str(),
+        tool_request.target.as_deref(),
+    )?;
+
+    Ok(ApprovalResolution {
+        id: approval.id.clone(),
+        decision: if allowed {
+            ApprovalDecision::Allow
+        } else {
+            ApprovalDecision::Deny
+        },
+        reason: if allowed {
+            "user approved".to_string()
+        } else {
+            "user denied".to_string()
+        },
+    })
 }
 
 fn format_tool_result_for_model(result: &tools::ToolResult) -> String {

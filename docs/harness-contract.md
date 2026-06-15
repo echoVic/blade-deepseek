@@ -14,7 +14,7 @@ Options:
 
 - `--output-format text|jsonl` — Output format (default: text)
 - `--cwd <path>` — Workspace directory
-- `--approval-mode read-only|workspace-write|full-auto` — Approval policy (default: workspace-write)
+- `--approval-mode suggest|auto-edit|full-auto` — Approval policy (default: suggest)
 - `--verifier <command>` — Post-completion verification command
 - `--model <name>` — Model override
 - `--base-url <url>` — API base URL override
@@ -89,13 +89,17 @@ Tool events:
 
 ## Approval Policy
 
-Three modes control which tool actions require approval:
+Three modes control which tool actions require user confirmation:
 
 | Mode | read | write | shell |
 |------|------|-------|-------|
-| `read-only` | allow | deny | deny |
-| `workspace-write` | allow | allow | deny |
+| `suggest` (default) | allow | ask | ask |
+| `auto-edit` | allow | allow | ask |
 | `full-auto` | allow | allow | allow |
+
+Behavior of `ask`:
+- In **text mode**: prompts the user interactively on stderr for y/n confirmation
+- In **jsonl mode**: automatically denies (no interactive input available)
 
 When an action is denied:
 - `approval.requested` and `approval.resolved` (decision=deny) events are emitted

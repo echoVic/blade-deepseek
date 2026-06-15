@@ -3,7 +3,7 @@ use std::process::Command;
 use serde_json::Value;
 
 #[test]
-fn read_only_denies_write_requests() {
+fn suggest_denies_write_in_jsonl_mode() {
     let output = Command::new(env!("CARGO_BIN_EXE_orca"))
         .args([
             "exec",
@@ -11,8 +11,6 @@ fn read_only_denies_write_requests() {
             "jsonl",
             "--provider",
             "mock",
-            "--approval-mode",
-            "read-only",
             "write a file",
         ])
         .output()
@@ -26,6 +24,34 @@ fn read_only_denies_write_requests() {
             .iter()
             .any(|event| event["type"] == "approval.requested")
     );
+    assert!(events.iter().any(|event| {
+        event["type"] == "approval.resolved" && event["payload"]["decision"] == "deny"
+    }));
+    assert_eq!(
+        events.last().unwrap()["payload"]["status"],
+        "approval_required"
+    );
+}
+
+#[test]
+fn auto_edit_denies_shell_in_jsonl_mode() {
+    let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .args([
+            "exec",
+            "--output-format",
+            "jsonl",
+            "--provider",
+            "mock",
+            "--approval-mode",
+            "auto-edit",
+            "bash echo hi",
+        ])
+        .output()
+        .expect("run orca");
+
+    assert_eq!(output.status.code(), Some(3));
+
+    let events = parse_jsonl(&output.stdout);
     assert!(events.iter().any(|event| {
         event["type"] == "approval.resolved" && event["payload"]["decision"] == "deny"
     }));
