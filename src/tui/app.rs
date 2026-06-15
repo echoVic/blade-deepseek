@@ -48,12 +48,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
     let needs_setup = config.api_key.is_none();
     if needs_setup {
         state.status = AppStatus::Setup;
-        state.messages.push(ChatMessage::Assistant(
-            "Welcome to Orca! To get started, please enter your DeepSeek API key.\n\
-             You can get one at https://platform.deepseek.com/api_keys\n\
-             The key will be saved to ~/.config/orca/config.toml"
-                .to_string(),
-        ));
+        state.setup_step = 0;
     }
 
     let initial_prompt = if config.prompt.trim().is_empty() {
@@ -84,7 +79,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
     let exit_code;
 
     loop {
-        terminal.draw(|f| ui::render(f, &state, &textarea))?;
+        terminal.draw(|f| ui::render(f, &mut state, &textarea))?;
 
         if event::poll(Duration::from_millis(50))? {
             let ev = event::read()?;
@@ -97,59 +92,146 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                     break;
                 }
 
+                // Setup mode: step-by-step
                 if state.status == AppStatus::Setup {
-                    match key.code {
-                        KeyCode::Enter => {
-                            let lines: Vec<String> = textarea.lines().to_vec();
-                            let key_input = lines.join("").trim().to_string();
-                            if !key_input.is_empty() {
-                                save_api_key(&key_input);
-                                config.api_key = Some(key_input.clone());
-                                if let Ok(mut cfg) = shared_config.lock() {
-                                    cfg.api_key = Some(key_input);
+                    match state.setup_step {
+                        0 => {
+                            // Welcome screen — Enter to continue, Esc to quit
+                            match key.code {
+                                KeyCode::Enter => {
+                                    state.setup_step = 1;
+                                    textarea = make_setup_textarea();
                                 }
-                                state.status = AppStatus::Idle;
-                                state.messages.push(ChatMessage::Assistant(
-                                    "API key saved! You're all set. Type a message to get started."
-                                        .to_string(),
-                                ));
-                                textarea = make_textarea();
-
-                                if let Some(prompt) = initial_prompt.clone() {
-                                    state.messages.push(ChatMessage::User(prompt.clone()));
-                                    state.status = AppStatus::Running;
-                                    let _ = action_tx.send(UserAction::Submit(prompt));
+                                KeyCode::Esc => {
+                                    exit_code = 0;
+                                    break;
+                                }
+                                _ => {}
+                            }
+                        }
+                        1 => {
+                            // API key input
+                            match key.code {
+                                KeyCode::Enter => {
+                                    let lines: Vec<String> = textarea.lines().to_vec();
+                                    let key_input = lines.join("").trim().to_string();
+                                    if !key_input.is_empty() {
+                                        save_api_key(&key_input);
+                                        config.api_key = Some(key_input.clone());
+                                        if let Ok(mut cfg) = shared_config.lock() {
+                                            cfg.api_key = Some(key_input);
+                                        }
+                                        state.setup_step = 2;
+                                    }
+                                }
+                                KeyCode::Esc => {
+                                    exit_code = 0;
+                                    break;
+                                }
+                                _ => {
+                                    textarea.input(Input::from(ev));
                                 }
                             }
                         }
-                        KeyCode::Esc => {
-                            exit_code = 0;
-                            break;
-                        }
-                        _ => {
-                            textarea.input(Input::from(ev));
-                        }
-                    }
-                    continue;
-                }
+                        2 => {
+                            // Completion screen — Enter to start
+                            match key.code {
+                                KeyCode::Enter => {
+                                    state.status = AppStatus::Idle;
+                                    state.setup_step = 0;
+                                    textarea = make_textarea();
 
-                if state.status == AppStatus::WaitingApproval {
-                    match key.code {
-                        KeyCode::Char('y') | KeyCode::Char('Y') => {
-                            let _ = action_tx.send(UserAction::Approve(true));
-                            state.status = AppStatus::Running;
-                            state.approval_info = None;
-                        }
-                        KeyCode::Char('n') | KeyCode::Char('N') => {
-                            let _ = action_tx.send(UserAction::Approve(false));
-                            state.status = AppStatus::Idle;
-                            state.approval_info = None;
+                                    if let Some(prompt) = initial_prompt.clone() {
+                                        state.messages.push(ChatMessage::User(prompt.clone()));
+                                        state.status = AppStatus::Running;
+                                        let _ = action_tx.send(UserAction::Submit(prompt));
+                                    }
+                                }
+                                KeyCode::Esc => {
+                                    exit_code = 0;
+                                    break;
+                                }
+                                _ => {}
+                            }
                         }
                         _ => {}
                     }
                     continue;
                 }
 
+                // Approval dialog: Up/Down/Enter
+                if state.status == AppStatus::WaitingApproval {
+                    match key.code {
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            if let Some(dialog) = &mut state.approval_dialog {
+                                dialog.selected = 0;
+                            }
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            if let Some(dialog) = &mut state.approval_dialog {
+                                dialog.selected = 1;
+                            }
+                        }
+                        KeyCode::Enter => {
+                            let approved = state
+                                .approval_dialog
+                                .as_ref()
+                                .map(|d| d.selected == 0)
+                                .unwrap_or(false);
+                            let _ = action_tx.send(UserAction::Approve(approved));
+                            if approved {
+                                state.status = AppStatus::Running;
+                            } else {
+                                state.status = AppStatus::Idle;
+                            }
+                            state.approval_dialog = None;
+                        }
+                        KeyCode::Char('y') | KeyCode::Char('Y') => {
+                            let _ = action_tx.send(UserAction::Approve(true));
+                            state.status = AppStatus::Running;
+                            state.approval_dialog = None;
+                        }
+                        KeyCode::Char('n') | KeyCode::Char('N') => {
+                            let _ = action_tx.send(UserAction::Approve(false));
+                            state.status = AppStatus::Idle;
+                            state.approval_dialog = None;
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
+                // Scrolling — works in Idle and Running
+                match key.code {
+                    KeyCode::PageUp => {
+                        let page = state.visible_height.saturating_sub(2);
+                        state.scroll_up(page);
+                        continue;
+                    }
+                    KeyCode::PageDown => {
+                        let page = state.visible_height.saturating_sub(2);
+                        state.scroll_down(page);
+                        continue;
+                    }
+                    _ => {}
+                }
+                if key.modifiers.contains(KeyModifiers::CONTROL) {
+                    match key.code {
+                        KeyCode::Char('u') => {
+                            let page = state.visible_height / 2;
+                            state.scroll_up(page);
+                            continue;
+                        }
+                        KeyCode::Char('d') => {
+                            let page = state.visible_height / 2;
+                            state.scroll_down(page);
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
+
+                // Normal Idle mode input
                 if state.status == AppStatus::Idle {
                     match key.code {
                         KeyCode::Enter if !key.modifiers.contains(KeyModifiers::SHIFT) => {
@@ -158,9 +240,16 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                             if !text.is_empty() {
                                 state.messages.push(ChatMessage::User(text.clone()));
                                 state.status = AppStatus::Running;
+                                state.scroll_to_bottom();
                                 let _ = action_tx.send(UserAction::Submit(text));
                                 textarea = make_textarea();
                             }
+                        }
+                        KeyCode::Up => {
+                            state.scroll_up(1);
+                        }
+                        KeyCode::Down => {
+                            state.scroll_down(1);
                         }
                         KeyCode::Esc => {
                             exit_code = 0;
@@ -170,12 +259,26 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                             textarea.input(Input::from(ev));
                         }
                     }
+                } else if state.status == AppStatus::Running {
+                    // In running mode, Up/Down scroll but don't feed to textarea
+                    match key.code {
+                        KeyCode::Up => {
+                            state.scroll_up(1);
+                        }
+                        KeyCode::Down => {
+                            state.scroll_down(1);
+                        }
+                        _ => {}
+                    }
                 }
             }
         }
 
         while let Ok(tui_event) = event_rx.try_recv() {
             state.update(tui_event);
+            if state.auto_scroll {
+                state.scroll_to_bottom();
+            }
         }
     }
 
@@ -199,12 +302,14 @@ fn make_textarea<'a>() -> TextArea<'a> {
 
 fn make_setup_textarea<'a>() -> TextArea<'a> {
     let mut textarea = TextArea::default();
-    textarea.set_placeholder_text("Paste your API key here (sk-...)");
+    textarea.set_placeholder_text("sk-...");
     textarea.set_cursor_line_style(ratatui::style::Style::default());
+    textarea.set_mask_char('*');
     textarea.set_block(
         ratatui::widgets::Block::default()
             .borders(ratatui::widgets::Borders::ALL)
-            .title(" API Key "),
+            .title(" API Key ")
+            .border_style(ratatui::style::Style::default().fg(ratatui::style::Color::Cyan)),
     );
     textarea
 }

@@ -116,7 +116,7 @@ fn request_chat_streaming(
     on_step: &mut dyn FnMut(&ProviderStep),
 ) -> Result<ProviderResponse, String> {
     let api_key = config.api_key.as_deref()
-        .ok_or_else(|| "DEEPSEEK_API_KEY is required for --provider deepseek (set via config file, env var, or ~/.config/orca/config.toml)".to_string())?;
+        .ok_or_else(|| "DEEPSEEK_API_KEY is required (set via env var or ~/.orca/auth.json)".to_string())?;
     let base_url = config.base_url.as_deref().unwrap_or(DEFAULT_BASE_URL);
     let model = config.model.as_deref().unwrap_or(DEFAULT_MODEL);
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
@@ -226,7 +226,7 @@ fn request_chat_streaming(
 
 fn request_chat(conversation: &Conversation, config: &ProviderConfig) -> Result<ProviderResponse, String> {
     let api_key = config.api_key.as_deref()
-        .ok_or_else(|| "DEEPSEEK_API_KEY is required for --provider deepseek (set via config file, env var, or ~/.config/orca/config.toml)".to_string())?;
+        .ok_or_else(|| "DEEPSEEK_API_KEY is required (set via env var or ~/.orca/auth.json)".to_string())?;
     let base_url = config.base_url.as_deref().unwrap_or(DEFAULT_BASE_URL);
     let model = config.model.as_deref().unwrap_or(DEFAULT_MODEL);
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));

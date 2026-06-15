@@ -20,3 +20,4 @@ dirs = "6"
 ratatui = "0.29"
 crossterm = "0.28"
 tui-textarea = "0.7"
+pulldown-cmark = { version = "0.12", default-features = false }

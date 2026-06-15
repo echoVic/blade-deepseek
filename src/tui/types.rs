@@ -42,15 +42,25 @@ pub enum ChatMessage {
     Error(String),
 }
 
+#[derive(Debug, Clone)]
+pub struct ApprovalDialog {
+    pub tool: String,
+    pub target: Option<String>,
+    pub selected: usize,
+}
+
 pub struct AppState {
     pub messages: Vec<ChatMessage>,
     pub status: AppStatus,
-    #[allow(dead_code)]
     pub scroll_offset: u16,
+    pub auto_scroll: bool,
+    pub total_lines: u16,
+    pub visible_height: u16,
     pub model_name: String,
     #[allow(dead_code)]
     pub event_tx: mpsc::Sender<UserAction>,
-    pub approval_info: Option<String>,
+    pub approval_dialog: Option<ApprovalDialog>,
+    pub setup_step: u8,
 }
 
 impl AppState {
@@ -59,10 +69,33 @@ impl AppState {
             messages: Vec::new(),
             status: AppStatus::Idle,
             scroll_offset: 0,
+            auto_scroll: true,
+            total_lines: 0,
+            visible_height: 0,
             model_name,
             event_tx,
-            approval_info: None,
+            approval_dialog: None,
+            setup_step: 0,
         }
+    }
+
+    pub fn scroll_up(&mut self, lines: u16) {
+        self.scroll_offset = self.scroll_offset.saturating_sub(lines);
+        self.auto_scroll = false;
+    }
+
+    pub fn scroll_down(&mut self, lines: u16) {
+        let max_scroll = self.total_lines.saturating_sub(self.visible_height);
+        self.scroll_offset = (self.scroll_offset + lines).min(max_scroll);
+        if self.scroll_offset >= max_scroll {
+            self.auto_scroll = true;
+        }
+    }
+
+    pub fn scroll_to_bottom(&mut self) {
+        let max_scroll = self.total_lines.saturating_sub(self.visible_height);
+        self.scroll_offset = max_scroll;
+        self.auto_scroll = true;
     }
 
     pub fn update(&mut self, event: TuiEvent) {
@@ -129,11 +162,11 @@ impl AppState {
             }
             TuiEvent::ApprovalNeeded { tool, target, .. } => {
                 self.status = AppStatus::WaitingApproval;
-                let info = match target {
-                    Some(t) => format!("{tool}: {t}"),
-                    None => tool,
-                };
-                self.approval_info = Some(info);
+                self.approval_dialog = Some(ApprovalDialog {
+                    tool,
+                    target,
+                    selected: 0,
+                });
             }
             TuiEvent::Error(msg) => {
                 self.messages.push(ChatMessage::Error(msg));

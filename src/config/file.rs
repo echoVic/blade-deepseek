@@ -1,5 +1,6 @@
+use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
@@ -10,37 +11,50 @@ pub struct FileConfig {
     pub base_url: Option<String>,
 }
 
-pub fn load_user_config() -> FileConfig {
-    let Some(config_dir) = dirs::config_dir() else {
-        return FileConfig::default();
-    };
-    let path = config_dir.join("orca").join("config.toml");
-    load_from_path(&path)
+fn config_dir() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(".orca"))
 }
 
-fn load_from_path(path: &Path) -> FileConfig {
+pub fn load_user_config() -> FileConfig {
+    let Some(dir) = config_dir() else {
+        return FileConfig::default();
+    };
+
+    let mut config = load_toml(&dir.join("config.toml"));
+    if config.api_key.is_none() {
+        config.api_key = load_auth_key(&dir.join("auth.json"));
+    }
+    config
+}
+
+fn load_toml(path: &Path) -> FileConfig {
     let Ok(content) = fs::read_to_string(path) else {
         return FileConfig::default();
     };
     toml::from_str(&content).unwrap_or_default()
 }
 
+fn load_auth_key(path: &Path) -> Option<String> {
+    let content = fs::read_to_string(path).ok()?;
+    let map: HashMap<String, String> = serde_json::from_str(&content).ok()?;
+    map.get("DEEPSEEK_API_KEY").cloned()
+}
+
 pub fn save_api_key(api_key: &str) {
-    let Some(config_dir) = dirs::config_dir() else {
+    let Some(dir) = config_dir() else {
         return;
     };
-    let dir = config_dir.join("orca");
     let _ = fs::create_dir_all(&dir);
-    let path = dir.join("config.toml");
+    let path = dir.join("auth.json");
 
-    let existing = fs::read_to_string(&path).unwrap_or_default();
-    let mut doc: toml::Table = toml::from_str(&existing).unwrap_or_default();
-    doc.insert(
-        "api_key".to_string(),
-        toml::Value::String(api_key.to_string()),
-    );
+    let mut map: HashMap<String, String> = fs::read_to_string(&path)
+        .ok()
+        .and_then(|c| serde_json::from_str(&c).ok())
+        .unwrap_or_default();
 
-    if let Ok(content) = toml::to_string_pretty(&doc) {
+    map.insert("DEEPSEEK_API_KEY".to_string(), api_key.to_string());
+
+    if let Ok(content) = serde_json::to_string_pretty(&map) {
         let _ = fs::write(&path, content);
     }
 }
@@ -52,21 +66,19 @@ mod tests {
     #[test]
     fn parse_full_config() {
         let toml = r#"
-model = "deepseek-reasoner"
-api_key = "sk-test-123"
+model = "deepseek-v4-flash"
 base_url = "https://custom.api.com"
 "#;
         let config: FileConfig = toml::from_str(toml).unwrap();
-        assert_eq!(config.model.as_deref(), Some("deepseek-reasoner"));
-        assert_eq!(config.api_key.as_deref(), Some("sk-test-123"));
+        assert_eq!(config.model.as_deref(), Some("deepseek-v4-flash"));
         assert_eq!(config.base_url.as_deref(), Some("https://custom.api.com"));
     }
 
     #[test]
     fn parse_partial_config() {
-        let toml = r#"model = "deepseek-chat""#;
+        let toml = r#"model = "deepseek-v4-flash""#;
         let config: FileConfig = toml::from_str(toml).unwrap();
-        assert_eq!(config.model.as_deref(), Some("deepseek-chat"));
+        assert_eq!(config.model.as_deref(), Some("deepseek-v4-flash"));
         assert!(config.api_key.is_none());
         assert!(config.base_url.is_none());
     }
@@ -80,7 +92,7 @@ base_url = "https://custom.api.com"
 
     #[test]
     fn load_nonexistent_returns_default() {
-        let config = load_from_path(Path::new("/nonexistent/path/config.toml"));
+        let config = load_toml(Path::new("/nonexistent/path/config.toml"));
         assert!(config.model.is_none());
     }
 
@@ -91,9 +103,28 @@ base_url = "https://custom.api.com"
         let path = dir.join("config.toml");
         std::fs::write(&path, "this is not [valid toml {{{").unwrap();
 
-        let config = load_from_path(&path);
+        let config = load_toml(&path);
         assert!(config.model.is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_auth_key_from_json() {
+        let dir = std::env::temp_dir().join("orca-test-auth-json");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("auth.json");
+        std::fs::write(&path, r#"{"DEEPSEEK_API_KEY": "sk-abc123"}"#).unwrap();
+
+        let key = load_auth_key(&path);
+        assert_eq!(key.as_deref(), Some("sk-abc123"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_auth_key_missing_file() {
+        let key = load_auth_key(Path::new("/nonexistent/auth.json"));
+        assert!(key.is_none());
     }
 }
