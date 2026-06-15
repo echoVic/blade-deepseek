@@ -1,5 +1,6 @@
 use std::io;
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -10,6 +11,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use tui_textarea::{Input, TextArea};
 
+use crate::config::file::save_api_key;
 use crate::config::RunConfig;
 use crate::tui::bridge;
 use crate::tui::types::{AppState, AppStatus, ChatMessage, TuiEvent, UserAction};
@@ -25,7 +27,7 @@ pub fn run_tui(config: RunConfig) -> i32 {
     }
 }
 
-fn run_tui_inner(config: RunConfig) -> io::Result<i32> {
+fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
     terminal::enable_raw_mode()?;
     let mut stdout = io::stdout();
     stdout.execute(EnterAlternateScreen)?;
@@ -43,25 +45,42 @@ fn run_tui_inner(config: RunConfig) -> io::Result<i32> {
 
     let mut state = AppState::new(action_tx.clone(), model_name);
 
+    let needs_setup = config.api_key.is_none();
+    if needs_setup {
+        state.status = AppStatus::Setup;
+        state.messages.push(ChatMessage::Assistant(
+            "Welcome to Orca! To get started, please enter your DeepSeek API key.\n\
+             You can get one at https://platform.deepseek.com/api_keys\n\
+             The key will be saved to ~/.config/orca/config.toml"
+                .to_string(),
+        ));
+    }
+
     let initial_prompt = if config.prompt.trim().is_empty() {
         None
     } else {
         Some(config.prompt.clone())
     };
 
-    let agent_config = config.clone();
+    let shared_config = Arc::new(Mutex::new(config.clone()));
+    let agent_config = Arc::clone(&shared_config);
     let agent_event_tx = event_tx.clone();
-    thread::spawn(move || {
+
+    let _agent_handle = thread::spawn(move || {
         agent_loop_thread(agent_config, agent_event_tx, action_rx);
     });
 
-    if let Some(prompt) = initial_prompt {
-        state.messages.push(ChatMessage::User(prompt.clone()));
-        state.status = AppStatus::Running;
-        let _ = action_tx.send(UserAction::Submit(prompt));
-    }
+    let mut textarea = if needs_setup {
+        make_setup_textarea()
+    } else {
+        if let Some(prompt) = initial_prompt.clone() {
+            state.messages.push(ChatMessage::User(prompt.clone()));
+            state.status = AppStatus::Running;
+            let _ = action_tx.send(UserAction::Submit(prompt));
+        }
+        make_textarea()
+    };
 
-    let mut textarea = make_textarea();
     let exit_code;
 
     loop {
@@ -76,6 +95,42 @@ fn run_tui_inner(config: RunConfig) -> io::Result<i32> {
                     let _ = action_tx.send(UserAction::Cancel);
                     exit_code = 130;
                     break;
+                }
+
+                if state.status == AppStatus::Setup {
+                    match key.code {
+                        KeyCode::Enter => {
+                            let lines: Vec<String> = textarea.lines().to_vec();
+                            let key_input = lines.join("").trim().to_string();
+                            if !key_input.is_empty() {
+                                save_api_key(&key_input);
+                                config.api_key = Some(key_input.clone());
+                                if let Ok(mut cfg) = shared_config.lock() {
+                                    cfg.api_key = Some(key_input);
+                                }
+                                state.status = AppStatus::Idle;
+                                state.messages.push(ChatMessage::Assistant(
+                                    "API key saved! You're all set. Type a message to get started."
+                                        .to_string(),
+                                ));
+                                textarea = make_textarea();
+
+                                if let Some(prompt) = initial_prompt.clone() {
+                                    state.messages.push(ChatMessage::User(prompt.clone()));
+                                    state.status = AppStatus::Running;
+                                    let _ = action_tx.send(UserAction::Submit(prompt));
+                                }
+                            }
+                        }
+                        KeyCode::Esc => {
+                            exit_code = 0;
+                            break;
+                        }
+                        _ => {
+                            textarea.input(Input::from(ev));
+                        }
+                    }
+                    continue;
                 }
 
                 if state.status == AppStatus::WaitingApproval {
@@ -142,15 +197,28 @@ fn make_textarea<'a>() -> TextArea<'a> {
     textarea
 }
 
+fn make_setup_textarea<'a>() -> TextArea<'a> {
+    let mut textarea = TextArea::default();
+    textarea.set_placeholder_text("Paste your API key here (sk-...)");
+    textarea.set_cursor_line_style(ratatui::style::Style::default());
+    textarea.set_block(
+        ratatui::widgets::Block::default()
+            .borders(ratatui::widgets::Borders::ALL)
+            .title(" API Key "),
+    );
+    textarea
+}
+
 fn agent_loop_thread(
-    config: RunConfig,
+    config: Arc<Mutex<RunConfig>>,
     event_tx: mpsc::Sender<TuiEvent>,
     action_rx: mpsc::Receiver<UserAction>,
 ) {
     loop {
         match action_rx.recv() {
             Ok(UserAction::Submit(prompt)) => {
-                bridge::run_agent_for_tui(&config, &prompt, &event_tx, &action_rx);
+                let cfg = config.lock().unwrap().clone();
+                bridge::run_agent_for_tui(&cfg, &prompt, &event_tx, &action_rx);
             }
             Ok(UserAction::Cancel) | Err(_) => break,
             Ok(UserAction::Approve(_)) => {}

@@ -25,6 +25,26 @@ fn load_from_path(path: &Path) -> FileConfig {
     toml::from_str(&content).unwrap_or_default()
 }
 
+pub fn save_api_key(api_key: &str) {
+    let Some(config_dir) = dirs::config_dir() else {
+        return;
+    };
+    let dir = config_dir.join("orca");
+    let _ = fs::create_dir_all(&dir);
+    let path = dir.join("config.toml");
+
+    let existing = fs::read_to_string(&path).unwrap_or_default();
+    let mut doc: toml::Table = toml::from_str(&existing).unwrap_or_default();
+    doc.insert(
+        "api_key".to_string(),
+        toml::Value::String(api_key.to_string()),
+    );
+
+    if let Ok(content) = toml::to_string_pretty(&doc) {
+        let _ = fs::write(&path, content);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

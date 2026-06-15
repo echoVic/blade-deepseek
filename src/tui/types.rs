@@ -22,6 +22,7 @@ pub enum UserAction {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppStatus {
+    Setup,
     Idle,
     Running,
     WaitingApproval,

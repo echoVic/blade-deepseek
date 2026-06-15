@@ -126,6 +126,7 @@ fn render_input(frame: &mut Frame, area: Rect, textarea: &TextArea) {
 
 fn render_status(frame: &mut Frame, area: Rect, state: &AppState) {
     let (status_text, color) = match &state.status {
+        AppStatus::Setup => ("● setup", Color::Cyan),
         AppStatus::Idle => ("● idle", Color::Green),
         AppStatus::Running => ("● running", Color::Yellow),
         AppStatus::WaitingApproval => ("● waiting approval [y/n]", Color::Magenta),
