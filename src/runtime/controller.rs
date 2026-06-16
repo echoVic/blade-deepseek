@@ -12,6 +12,7 @@ use crate::provider::conversation::Conversation;
 use crate::provider::tool_schema::deepseek_tools_schema_for_type;
 use crate::provider::{self, ProviderConfig, ProviderStep};
 use crate::runtime::agent_common;
+use crate::runtime::cancel::CancelToken;
 use crate::runtime::session::new_run_id;
 use crate::runtime::subagent;
 use crate::runtime::subagent_types::SubagentType;
@@ -76,6 +77,7 @@ fn run_inner(config: RunConfig) -> io::Result<RunStatus> {
         config.verifier.as_deref(),
     ))?;
 
+    let cancel = CancelToken::new();
     let result = run_agent_loop(
         &config,
         &cwd_path,
@@ -85,6 +87,7 @@ fn run_inner(config: RunConfig) -> io::Result<RunStatus> {
         0,
         true,
         &SubagentType::General,
+        &cancel,
     )?;
     let status = result.status;
 
@@ -105,6 +108,7 @@ fn run_agent_loop(
     subagent_depth: u32,
     emit_deltas: bool,
     subagent_type: &SubagentType,
+    cancel: &CancelToken,
 ) -> io::Result<AgentLoopResult> {
     let max_turns = DEFAULT_MAX_TURNS;
     let ctx_config = provider::context::ContextConfig::default();
@@ -154,6 +158,7 @@ fn run_agent_loop(
             config.provider,
             &conversation,
             &provider_config,
+            cancel,
             &mut |step| {
                 if !emit_deltas {
                     return;
@@ -356,6 +361,7 @@ fn execute_subagent_tool(
         return Ok(tools::ToolResult::failed(tool_request, error, None));
     }
 
+    let child_cancel = CancelToken::new();
     let child = run_agent_loop(
         config,
         cwd,
@@ -365,6 +371,7 @@ fn execute_subagent_tool(
         subagent_depth + 1,
         false,
         &subagent_type,
+        &child_cancel,
     )?;
 
     match child.status {

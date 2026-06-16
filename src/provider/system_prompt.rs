@@ -39,6 +39,12 @@ Parameters:
 - `old_text` (required): Exact text to find. Must appear exactly once in the file.
 - `new_text` (required): Replacement text.
 
+### write_file
+Create or overwrite a file with the given content.
+Parameters:
+- `path` (required): File path relative to workspace root.
+- `content` (required): The full content to write to the file.
+
 ### git_status
 Show the git working tree status in short format. Takes no parameters.
 

@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::ProviderKind;
 use crate::provider::conversation::{Conversation, RawToolCall};
+use crate::runtime::cancel::CancelToken;
 use crate::tools::ToolRequest;
 
 pub struct ProviderConfig {
@@ -100,6 +101,7 @@ pub fn call_streaming(
     kind: ProviderKind,
     conversation: &Conversation,
     config: &ProviderConfig,
+    cancel: &CancelToken,
     on_step: &mut dyn FnMut(&ProviderStep),
 ) -> ProviderResponse {
     match kind {
@@ -110,7 +112,9 @@ pub fn call_streaming(
             }
             response
         }
-        ProviderKind::DeepSeek => deepseek_http::call_streaming(conversation, config, on_step),
+        ProviderKind::DeepSeek => {
+            deepseek_http::call_streaming(conversation, config, cancel, on_step)
+        }
     }
 }
 

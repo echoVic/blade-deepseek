@@ -2,6 +2,8 @@ use std::io::{BufRead, BufReader, Read};
 
 use serde::Deserialize;
 
+use crate::runtime::cancel::CancelToken;
+
 #[derive(Debug, Deserialize)]
 pub struct StreamChunk {
     pub choices: Vec<StreamChoice>,
@@ -50,6 +52,7 @@ pub struct ToolCallAccumulator {
     pub arguments: String,
 }
 
+#[derive(Debug)]
 pub struct StreamResult {
     pub finish_reason: Option<String>,
     pub reasoning: String,
@@ -64,6 +67,7 @@ pub enum StreamEvent<'a> {
 
 pub fn parse_sse_stream<R: Read>(
     reader: R,
+    cancel: &CancelToken,
     mut on_delta: impl FnMut(StreamEvent),
 ) -> Result<StreamResult, String> {
     let buf_reader = BufReader::new(reader);
@@ -73,6 +77,9 @@ pub fn parse_sse_stream<R: Read>(
     let mut tool_calls: Vec<ToolCallAccumulator> = Vec::new();
 
     for line in buf_reader.lines() {
+        if cancel.is_cancelled() {
+            return Err("cancelled".to_string());
+        }
         let line = line.map_err(|e| format!("stream read error: {e}"))?;
         let line = line.trim_end();
 
@@ -163,8 +170,9 @@ mod tests {
                         data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
                         data: [DONE]\n\n";
 
+        let cancel = CancelToken::new();
         let mut content_parts = Vec::new();
-        let result = parse_sse_stream(sse_data.as_bytes(), |delta| {
+        let result = parse_sse_stream(sse_data.as_bytes(), &cancel, |delta| {
             if let StreamEvent::Content(text) = delta {
                 content_parts.push(text.to_string());
             }
@@ -182,8 +190,9 @@ mod tests {
                         data: {\"choices\":[{\"delta\":{\"content\":\"answer\"},\"finish_reason\":\"stop\"}]}\n\n\
                         data: [DONE]\n\n";
 
+        let cancel = CancelToken::new();
         let mut reasoning_parts = Vec::new();
-        let result = parse_sse_stream(sse_data.as_bytes(), |delta| {
+        let result = parse_sse_stream(sse_data.as_bytes(), &cancel, |delta| {
             if let StreamEvent::Reasoning(text) = delta {
                 reasoning_parts.push(text.to_string());
             }
@@ -203,7 +212,8 @@ mod tests {
                         data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n\
                         data: [DONE]\n\n";
 
-        let result = parse_sse_stream(sse_data.as_bytes(), |_| {}).unwrap();
+        let cancel = CancelToken::new();
+        let result = parse_sse_stream(sse_data.as_bytes(), &cancel, |_| {}).unwrap();
 
         assert_eq!(result.tool_calls.len(), 1);
         assert_eq!(result.tool_calls[0].id, "call_1");
@@ -213,5 +223,17 @@ mod tests {
             "{\"path\": \"src/main.rs\"}"
         );
         assert_eq!(result.finish_reason.as_deref(), Some("tool_calls"));
+    }
+
+    #[test]
+    fn cancel_interrupts_stream() {
+        let sse_data = "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}\n\n\
+                        data: {\"choices\":[{\"delta\":{\"content\":\" world\"},\"finish_reason\":null}]}\n\n\
+                        data: [DONE]\n\n";
+
+        let cancel = CancelToken::new();
+        cancel.cancel();
+        let result = parse_sse_stream(sse_data.as_bytes(), &cancel, |_| {});
+        assert_eq!(result.unwrap_err(), "cancelled");
     }
 }

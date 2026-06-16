@@ -13,6 +13,7 @@ use tui_textarea::{Input, TextArea};
 
 use crate::config::RunConfig;
 use crate::config::file::save_api_key;
+use crate::runtime::cancel::CancelToken;
 use crate::tui::bridge;
 use crate::tui::types::{AppState, AppStatus, ChatMessage, TuiEvent, UserAction};
 use crate::tui::ui;
@@ -60,9 +61,11 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
     let shared_config = Arc::new(Mutex::new(config.clone()));
     let agent_config = Arc::clone(&shared_config);
     let agent_event_tx = event_tx.clone();
+    let cancel_token = CancelToken::new();
+    let agent_cancel = cancel_token.clone();
 
     let _agent_handle = thread::spawn(move || {
-        agent_loop_thread(agent_config, agent_event_tx, action_rx);
+        agent_loop_thread(agent_config, agent_event_tx, action_rx, agent_cancel);
     });
 
     let mut textarea = if needs_setup {
@@ -259,8 +262,12 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                         }
                     }
                 } else if state.status == AppStatus::Running {
-                    // In running mode, Up/Down scroll but don't feed to textarea
+                    // In running mode, Esc interrupts streaming, Up/Down scroll
                     match key.code {
+                        KeyCode::Esc => {
+                            cancel_token.cancel();
+                            let _ = action_tx.send(UserAction::Interrupt);
+                        }
                         KeyCode::Up => {
                             state.scroll_up(1);
                         }
@@ -317,12 +324,17 @@ fn agent_loop_thread(
     config: Arc<Mutex<RunConfig>>,
     event_tx: mpsc::Sender<TuiEvent>,
     action_rx: mpsc::Receiver<UserAction>,
+    cancel: CancelToken,
 ) {
     loop {
         match action_rx.recv() {
             Ok(UserAction::Submit(prompt)) => {
+                cancel.reset();
                 let cfg = config.lock().unwrap().clone();
-                bridge::run_agent_for_tui(&cfg, &prompt, &event_tx, &action_rx);
+                bridge::run_agent_for_tui(&cfg, &prompt, &event_tx, &action_rx, &cancel);
+            }
+            Ok(UserAction::Interrupt) => {
+                // Cancel already set by TUI thread; just continue waiting for next Submit
             }
             Ok(UserAction::Cancel) | Err(_) => break,
             Ok(UserAction::Approve(_)) => {}

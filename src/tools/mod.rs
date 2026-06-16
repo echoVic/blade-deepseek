@@ -10,6 +10,7 @@ pub mod git;
 pub mod grep;
 pub mod list_files;
 pub mod read_file;
+pub mod write_file;
 
 const MAX_TOOL_OUTPUT_BYTES: usize = 8 * 1024;
 
@@ -21,6 +22,7 @@ pub enum ToolName {
     Grep,
     Bash,
     Edit,
+    WriteFile,
     GitStatus,
     Subagent,
 }
@@ -33,6 +35,7 @@ impl ToolName {
             Self::Grep => "grep",
             Self::Bash => "bash",
             Self::Edit => "edit",
+            Self::WriteFile => "write_file",
             Self::GitStatus => "git_status",
             Self::Subagent => "subagent",
         }
@@ -115,6 +118,7 @@ pub fn execute(request: &ToolRequest, cwd: &Path) -> ToolResult {
         ToolName::Grep => grep::execute(request, cwd, MAX_TOOL_OUTPUT_BYTES),
         ToolName::Bash => bash::execute(request, cwd, MAX_TOOL_OUTPUT_BYTES),
         ToolName::Edit => edit::execute(request, cwd),
+        ToolName::WriteFile => write_file::execute(request, cwd),
         ToolName::Subagent => ToolResult::failed(
             request,
             "subagent tool must be executed by the runtime",

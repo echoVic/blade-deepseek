@@ -1,4 +1,5 @@
-use pulldown_cmark::{Event, Parser, Tag, TagEnd};
+use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
+use unicode_width::UnicodeWidthStr;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -33,18 +34,25 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea) {
 fn render_messages(frame: &mut Frame, area: Rect, state: &mut AppState) {
     let lines = build_message_lines(state);
 
+    // Account for block borders: 1 left + 1 right
+    let content_width = area.width.saturating_sub(2) as usize;
     let visible_height = area.height.saturating_sub(2);
-    let total_lines = lines.len() as u16;
 
-    state.total_lines = total_lines;
+    // Calculate total visual lines after wrapping
+    let total_visual: u16 = lines
+        .iter()
+        .map(|line| wrapped_line_count(line, content_width) as u16)
+        .sum();
+
+    state.total_lines = total_visual;
     state.visible_height = visible_height;
 
     let scroll = if state.auto_scroll {
-        let max_scroll = total_lines.saturating_sub(visible_height);
+        let max_scroll = total_visual.saturating_sub(visible_height);
         state.scroll_offset = max_scroll;
         max_scroll
     } else {
-        let max_scroll = total_lines.saturating_sub(visible_height);
+        let max_scroll = total_visual.saturating_sub(visible_height);
         state.scroll_offset = state.scroll_offset.min(max_scroll);
         state.scroll_offset
     };
@@ -56,6 +64,17 @@ fn render_messages(frame: &mut Frame, area: Rect, state: &mut AppState) {
         .scroll((scroll, 0));
 
     frame.render_widget(paragraph, area);
+}
+
+fn wrapped_line_count(line: &Line, width: usize) -> usize {
+    if width == 0 {
+        return 1;
+    }
+    let line_width: usize = line.spans.iter().map(|s| UnicodeWidthStr::width(s.content.as_ref())).sum();
+    if line_width == 0 {
+        return 1;
+    }
+    (line_width + width - 1) / width
 }
 
 fn build_message_lines(state: &AppState) -> Vec<Line<'static>> {
@@ -457,15 +476,60 @@ fn render_setup(frame: &mut Frame, state: &AppState, textarea: &TextArea) {
 }
 
 fn render_markdown(input: &str) -> Vec<Line<'static>> {
-    let parser = Parser::new(input);
+    let mut opts = Options::empty();
+    opts.insert(Options::ENABLE_TABLES);
+    let parser = Parser::new_ext(input, opts);
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut current_spans: Vec<Span<'static>> = Vec::new();
     let mut style_stack: Vec<Style> = vec![Style::default().fg(Color::White)];
     let mut in_code_block = false;
     let mut list_depth: u16 = 0;
 
+    // Table buffering state
+    let mut in_table = false;
+    let mut table_rows: Vec<Vec<String>> = Vec::new();
+    let mut current_row: Vec<String> = Vec::new();
+    let mut current_cell = String::new();
+
     for event in parser {
+        // When inside a table, buffer content instead of rendering immediately
+        if in_table {
+            match event {
+                Event::Start(Tag::TableHead) => {}
+                Event::Start(Tag::TableRow) => {}
+                Event::Start(Tag::TableCell) => {
+                    current_cell.clear();
+                }
+                Event::End(TagEnd::TableCell) => {
+                    current_row.push(std::mem::take(&mut current_cell));
+                }
+                Event::End(TagEnd::TableRow) | Event::End(TagEnd::TableHead) => {
+                    table_rows.push(std::mem::take(&mut current_row));
+                }
+                Event::End(TagEnd::Table) => {
+                    render_table(&table_rows, &mut lines);
+                    table_rows.clear();
+                    in_table = false;
+                }
+                Event::Text(text) => {
+                    current_cell.push_str(&text);
+                }
+                Event::Code(code) => {
+                    current_cell.push('`');
+                    current_cell.push_str(&code);
+                    current_cell.push('`');
+                }
+                _ => {}
+            }
+            continue;
+        }
+
         match event {
+            Event::Start(Tag::Table(_alignments)) => {
+                flush_line(&mut current_spans, &mut lines);
+                in_table = true;
+                table_rows.clear();
+            }
             Event::Start(tag) => match tag {
                 Tag::Heading { level, .. } => {
                     let color = match level {
@@ -560,6 +624,84 @@ fn render_markdown(input: &str) -> Vec<Line<'static>> {
 
     flush_line(&mut current_spans, &mut lines);
     lines
+}
+
+fn render_table(rows: &[Vec<String>], lines: &mut Vec<Line<'static>>) {
+    if rows.is_empty() {
+        return;
+    }
+
+    let num_cols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+    if num_cols == 0 {
+        return;
+    }
+
+    // Calculate column widths (minimum 3 chars per column)
+    let mut col_widths: Vec<usize> = vec![3; num_cols];
+    for row in rows {
+        for (i, cell) in row.iter().enumerate() {
+            if i < num_cols {
+                col_widths[i] = col_widths[i].max(UnicodeWidthStr::width(cell.as_str()));
+            }
+        }
+    }
+
+    let border_style = Style::default().fg(Color::DarkGray);
+    let header_style = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let cell_style = Style::default().fg(Color::White);
+
+    // Top border: ┌───┬───┐
+    let top = format_table_border(&col_widths, '┌', '┬', '┐', '─');
+    lines.push(Line::from(Span::styled(top, border_style)));
+
+    for (row_idx, row) in rows.iter().enumerate() {
+        // Data row: │ x │ y │
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        spans.push(Span::styled("│", border_style));
+        for (i, width) in col_widths.iter().enumerate() {
+            let content = row.get(i).map(|s| s.as_str()).unwrap_or("");
+            let display_width = UnicodeWidthStr::width(content);
+            let padding = width.saturating_sub(display_width);
+            let style = if row_idx == 0 { header_style } else { cell_style };
+            spans.push(Span::styled(format!(" {content}"), style));
+            spans.push(Span::styled(format!("{} ", " ".repeat(padding)), style));
+            spans.push(Span::styled("│", border_style));
+        }
+        lines.push(Line::from(spans));
+
+        // After header row: ├───┼───┤
+        if row_idx == 0 {
+            let sep = format_table_border(&col_widths, '├', '┼', '┤', '─');
+            lines.push(Line::from(Span::styled(sep, border_style)));
+        }
+    }
+
+    // Bottom border: └───┴───┘
+    let bottom = format_table_border(&col_widths, '└', '┴', '┘', '─');
+    lines.push(Line::from(Span::styled(bottom, border_style)));
+    lines.push(Line::from(""));
+}
+
+fn format_table_border(
+    col_widths: &[usize],
+    left: char,
+    mid: char,
+    right: char,
+    fill: char,
+) -> String {
+    let mut s = String::new();
+    s.push(left);
+    for (i, &w) in col_widths.iter().enumerate() {
+        // +2 for the padding spaces around content
+        for _ in 0..w + 2 {
+            s.push(fill);
+        }
+        if i < col_widths.len() - 1 {
+            s.push(mid);
+        }
+    }
+    s.push(right);
+    s
 }
 
 fn flush_line(spans: &mut Vec<Span<'static>>, lines: &mut Vec<Line<'static>>) {

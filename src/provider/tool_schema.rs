@@ -104,6 +104,27 @@ pub fn deepseek_tools_schema() -> Vec<Value> {
         json!({
             "type": "function",
             "function": {
+                "name": "write_file",
+                "description": "Create or overwrite a file with the given content. Use for creating new files or completely replacing file contents.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "File path relative to workspace root"
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "The full content to write to the file"
+                        }
+                    },
+                    "required": ["path", "content"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
                 "name": "git_status",
                 "description": "Show the git working tree status in short format.",
                 "parameters": {

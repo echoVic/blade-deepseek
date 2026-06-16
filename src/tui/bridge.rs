@@ -7,6 +7,7 @@ use crate::provider::conversation::Conversation;
 use crate::provider::tool_schema::deepseek_tools_schema_for_type;
 use crate::provider::{self, ProviderConfig, ProviderStep};
 use crate::runtime::agent_common;
+use crate::runtime::cancel::CancelToken;
 use crate::runtime::subagent;
 use crate::runtime::subagent_types::SubagentType;
 use crate::tools;
@@ -27,6 +28,7 @@ pub fn run_agent_for_tui(
     prompt: &str,
     event_tx: &Sender<TuiEvent>,
     action_rx: &Receiver<UserAction>,
+    cancel: &CancelToken,
 ) {
     let cwd = config
         .cwd
@@ -73,6 +75,7 @@ pub fn run_agent_for_tui(
             config.provider,
             &conversation,
             &provider_config,
+            cancel,
             &mut |step| match step {
                 ProviderStep::ReasoningDelta(text) => {
                     let _ = tx.send(TuiEvent::ReasoningDelta(text.to_string()));
@@ -83,6 +86,13 @@ pub fn run_agent_for_tui(
                 _ => {}
             },
         );
+
+        if cancel.is_cancelled() {
+            let _ = event_tx.send(TuiEvent::SessionCompleted {
+                status: "interrupted".to_string(),
+            });
+            return;
+        }
 
         let mut had_error = false;
         for step in &response.steps {
@@ -346,10 +356,12 @@ fn run_child_agent_for_tui(
             conversation = provider::context::compact(&conversation, &ctx_config);
         }
 
+        let child_cancel = CancelToken::new();
         let response = provider::call_streaming(
             config.provider,
             &conversation,
             &provider_config,
+            &child_cancel,
             &mut |_| {},
         );
 

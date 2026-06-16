@@ -5,6 +5,7 @@ use crate::approval::policy::ActionKind;
 use crate::provider::conversation::Conversation;
 use crate::provider::tool_schema::deepseek_tools_schema;
 use crate::provider::{ProviderConfig, ProviderReplayState, ProviderResponse, ProviderStep};
+use crate::runtime::cancel::CancelToken;
 use crate::tools::{ToolName, ToolRequest};
 
 const DEFAULT_BASE_URL: &str = "https://api.deepseek.com";
@@ -93,9 +94,10 @@ pub fn call(conversation: &Conversation, config: &ProviderConfig) -> ProviderRes
 pub fn call_streaming(
     conversation: &Conversation,
     config: &ProviderConfig,
+    cancel: &CancelToken,
     on_step: &mut dyn FnMut(&ProviderStep),
 ) -> ProviderResponse {
-    match request_chat_streaming(conversation, config, on_step) {
+    match request_chat_streaming(conversation, config, cancel, on_step) {
         Ok(response) => response,
         Err(error) => {
             let step = ProviderStep::Error(format!("DeepSeek provider error: {error}"));
@@ -113,6 +115,7 @@ pub fn call_streaming(
 fn request_chat_streaming(
     conversation: &Conversation,
     config: &ProviderConfig,
+    cancel: &CancelToken,
     on_step: &mut dyn FnMut(&ProviderStep),
 ) -> Result<ProviderResponse, String> {
     let api_key = config.api_key.as_deref().ok_or_else(|| {
@@ -138,7 +141,7 @@ fn request_chat_streaming(
 
     let mut steps = Vec::new();
 
-    let stream_result = super::streaming::parse_sse_stream(response, |delta| {
+    let stream_result = super::streaming::parse_sse_stream(response, cancel, |delta| {
         use super::streaming::StreamEvent;
         let step = match delta {
             StreamEvent::Reasoning(text) => ProviderStep::ReasoningDelta(text.to_string()),
@@ -370,6 +373,11 @@ fn parse_tool_call(tc: &ApiToolCallResponse) -> Result<ToolRequest, String> {
         ),
         "edit" => (
             ToolName::Edit,
+            ActionKind::Write,
+            args["path"].as_str().map(String::from),
+        ),
+        "write_file" => (
+            ToolName::WriteFile,
             ActionKind::Write,
             args["path"].as_str().map(String::from),
         ),

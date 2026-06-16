@@ -43,6 +43,7 @@ pub enum TuiEvent {
 pub enum UserAction {
     Submit(String),
     Approve(bool),
+    Interrupt,
     Cancel,
 }
 
