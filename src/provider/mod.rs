@@ -150,6 +150,25 @@ fn mock_call(conversation: &Conversation) -> ProviderResponse {
         };
     }
 
+    if prompt.trim() == "mock_history_echo" {
+        let users = conversation
+            .messages
+            .iter()
+            .filter_map(|message| match message {
+                conversation::Message::User(content) => Some(content.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" | ");
+        let message = format!("Mock history users: {users}");
+        return ProviderResponse {
+            steps: vec![ProviderStep::MessageDelta(message.clone())],
+            assistant_content: Some(message),
+            assistant_reasoning: None,
+            tool_calls: Vec::new(),
+        };
+    }
+
     if let Some(tool_request) = parse_mock_prompt(prompt) {
         let raw_call = RawToolCall {
             id: tool_request.id.clone(),

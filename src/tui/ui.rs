@@ -15,6 +15,10 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea) {
         render_setup(frame, state, textarea);
         return;
     }
+    if state.status == AppStatus::SessionPicker {
+        render_session_picker(frame, state);
+        return;
+    }
 
     let chunks = Layout::vertical([
         Constraint::Min(5),
@@ -34,6 +38,49 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea) {
     if state.show_shortcuts {
         render_shortcuts(frame, state);
     }
+}
+
+fn render_session_picker(frame: &mut Frame, state: &mut AppState) {
+    let area = frame.area();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Resume Conversation ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let mut lines = Vec::new();
+    lines.push(Line::from(Span::styled(
+        "Enter resume · n new session · Esc quit",
+        Style::default().fg(Color::DarkGray),
+    )));
+    lines.push(Line::from(""));
+
+    for (index, session) in state.session_picker_sessions.iter().enumerate() {
+        let selected = index == state.session_picker_selected;
+        let marker = if selected { "> " } else { "  " };
+        let style = if selected {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(marker, style),
+            Span::styled(session.title.clone(), style),
+            Span::styled(
+                format!(
+                    "  {}  {}",
+                    session.updated_at.format("%Y-%m-%d %H:%M"),
+                    session.provider
+                ),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+    }
+
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, inner);
 }
 
 fn render_messages(frame: &mut Frame, area: Rect, state: &mut AppState) {
@@ -252,6 +299,7 @@ fn render_input(frame: &mut Frame, area: Rect, textarea: &TextArea) {
 fn render_status(frame: &mut Frame, area: Rect, state: &AppState) {
     let (status_text, color) = match &state.status {
         AppStatus::Setup => ("● setup", Color::Cyan),
+        AppStatus::SessionPicker => ("● sessions", Color::Cyan),
         AppStatus::Idle => ("● idle", Color::Green),
         AppStatus::Running => ("● running", Color::Yellow),
         AppStatus::WaitingApproval => ("● approval", Color::Magenta),
@@ -313,7 +361,7 @@ fn active_shortcut_scopes(state: &AppState) -> Vec<ShortcutScope> {
         AppStatus::Idle => vec![ShortcutScope::Global, ShortcutScope::Idle],
         AppStatus::Running => vec![ShortcutScope::Global, ShortcutScope::Running],
         AppStatus::WaitingApproval => vec![ShortcutScope::Global, ShortcutScope::Approval],
-        AppStatus::Setup => vec![ShortcutScope::Global],
+        AppStatus::Setup | AppStatus::SessionPicker => vec![ShortcutScope::Global],
     }
 }
 

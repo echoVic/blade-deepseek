@@ -19,8 +19,8 @@ pub fn create_subagent_request(tool_request: &ToolRequest) -> SubagentRequest {
         .or_else(|| tool_request.target.clone())
         .unwrap_or_else(|| "subagent".to_string());
 
-    let prompt = extract_subagent_field(tool_request, "prompt")
-        .unwrap_or_else(|| description.clone());
+    let prompt =
+        extract_subagent_field(tool_request, "prompt").unwrap_or_else(|| description.clone());
 
     let subagent_type = extract_subagent_field(tool_request, "subagent_type")
         .map(|s| SubagentType::from_str(&s))

@@ -35,6 +35,14 @@ impl ProviderKind {
 }
 
 #[derive(Clone, Debug)]
+pub enum HistoryMode {
+    Record,
+    Disabled,
+    Resume(String),
+    Fork(String),
+}
+
+#[derive(Clone, Debug)]
 pub struct RunConfig {
     pub prompt: String,
     pub cwd: Option<PathBuf>,
@@ -45,4 +53,6 @@ pub struct RunConfig {
     pub model: Option<String>,
     pub api_key: Option<String>,
     pub base_url: Option<String>,
+    pub history_mode: HistoryMode,
+    pub show_session_picker: bool,
 }

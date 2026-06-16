@@ -126,7 +126,10 @@ fn request_chat_streaming(
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
 
     let messages = conversation_to_api_messages(conversation);
-    let tools = config.tools_override.clone().unwrap_or_else(deepseek_tools_schema);
+    let tools = config
+        .tools_override
+        .clone()
+        .unwrap_or_else(deepseek_tools_schema);
 
     let request = ChatRequest {
         model: model.to_string(),
@@ -242,7 +245,10 @@ fn request_chat(
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
 
     let messages = conversation_to_api_messages(conversation);
-    let tools = config.tools_override.clone().unwrap_or_else(deepseek_tools_schema);
+    let tools = config
+        .tools_override
+        .clone()
+        .unwrap_or_else(deepseek_tools_schema);
 
     let request = ChatRequest {
         model: model.to_string(),

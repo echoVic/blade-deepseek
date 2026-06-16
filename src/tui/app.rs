@@ -11,9 +11,10 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use tui_textarea::{CursorMove, Input, TextArea};
 
-use crate::config::RunConfig;
 use crate::config::file::save_api_key;
+use crate::config::{HistoryMode, RunConfig};
 use crate::runtime::cancel::CancelToken;
+use crate::runtime::history;
 use crate::tui::bridge;
 use crate::tui::shortcuts::{
     ApprovalShortcut, GlobalShortcut, IdleShortcut, RunningShortcut, approval_shortcut,
@@ -48,9 +49,26 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
         .clone()
         .unwrap_or_else(|| "deepseek-v4-flash".to_string());
 
-    let mut state = AppState::new(action_tx.clone(), model_name);
-
     let needs_setup = config.api_key.is_none();
+    let should_show_picker = config.show_session_picker
+        && !needs_setup
+        && config.prompt.trim().is_empty()
+        && !matches!(
+            config.history_mode,
+            HistoryMode::Resume(_) | HistoryMode::Fork(_)
+        );
+    let picker_sessions = if should_show_picker {
+        crate::runtime::history::list_sessions(20).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    let mut state = AppState::new(action_tx.clone(), model_name);
+    if should_show_picker && !picker_sessions.is_empty() {
+        state.status = AppStatus::SessionPicker;
+        state.session_picker_sessions = picker_sessions;
+    }
+
     if needs_setup {
         state.status = AppStatus::Setup;
         state.setup_step = 0;
@@ -62,14 +80,47 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
         Some(config.prompt.clone())
     };
 
+    if matches!(
+        config.history_mode,
+        HistoryMode::Resume(_) | HistoryMode::Fork(_)
+    ) {
+        if let Ok(transcript) = crate::runtime::history::load_session(match &config.history_mode {
+            HistoryMode::Resume(selector) | HistoryMode::Fork(selector) => selector,
+            HistoryMode::Record | HistoryMode::Disabled => "",
+        }) {
+            for message in transcript.messages {
+                if let Some(chat_message) = chat_message_from_history(message) {
+                    state.messages.push(chat_message);
+                }
+            }
+            if !state.messages.is_empty() {
+                let label = if matches!(config.history_mode, HistoryMode::Fork(_)) {
+                    "Forked saved conversation."
+                } else {
+                    "Resumed saved conversation."
+                };
+                state.messages.push(ChatMessage::System(label.to_string()));
+            }
+        }
+    }
+
     let shared_config = Arc::new(Mutex::new(config.clone()));
     let agent_config = Arc::clone(&shared_config);
+    let preloaded_transcript: Arc<Mutex<Option<history::SessionTranscript>>> =
+        Arc::new(Mutex::new(None));
+    let agent_preloaded = Arc::clone(&preloaded_transcript);
     let agent_event_tx = event_tx.clone();
     let cancel_token = CancelToken::new();
     let agent_cancel = cancel_token.clone();
 
     let _agent_handle = thread::spawn(move || {
-        agent_loop_thread(agent_config, agent_event_tx, action_rx, agent_cancel);
+        agent_loop_thread(
+            agent_config,
+            agent_preloaded,
+            agent_event_tx,
+            action_rx,
+            agent_cancel,
+        );
     });
 
     let mut textarea = if needs_setup {
@@ -213,6 +264,54 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                     continue;
                 }
 
+                if state.status == AppStatus::SessionPicker {
+                    match key.code {
+                        KeyCode::Up => state.select_previous_session(),
+                        KeyCode::Down => state.select_next_session(),
+                        KeyCode::Char('n') | KeyCode::Char('N') => {
+                            state.status = AppStatus::Idle;
+                            state.session_picker_sessions.clear();
+                            config.history_mode = HistoryMode::Record;
+                            if let Ok(mut cfg) = shared_config.lock() {
+                                cfg.history_mode = HistoryMode::Record;
+                            }
+                        }
+                        KeyCode::Enter => {
+                            if let Some(session_id) = state.selected_session_id() {
+                                config.history_mode = HistoryMode::Resume(session_id.clone());
+                                if let Ok(mut cfg) = shared_config.lock() {
+                                    cfg.history_mode = HistoryMode::Resume(session_id.clone());
+                                }
+                                if let Ok(transcript) =
+                                    history::load_session(&session_id)
+                                {
+                                    state.messages.clear();
+                                    for message in &transcript.messages {
+                                        if let Some(chat_message) =
+                                            chat_message_from_history(message.clone())
+                                        {
+                                            state.messages.push(chat_message);
+                                        }
+                                    }
+                                    state.messages.push(ChatMessage::System(
+                                        "Resumed saved conversation.".to_string(),
+                                    ));
+                                    if let Ok(mut preloaded) = preloaded_transcript.lock() {
+                                        *preloaded = Some(transcript);
+                                    }
+                                }
+                                state.status = AppStatus::Idle;
+                            }
+                        }
+                        KeyCode::Esc => {
+                            exit_code = 0;
+                            break;
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
                 // Approval dialog: selection and direct approve/deny shortcuts
                 if state.status == AppStatus::WaitingApproval {
                     match approval_shortcut(*key) {
@@ -310,9 +409,8 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                             let page = state.visible_height / 2;
                             state.scroll_down(page);
                         }
-                        Some(IdleShortcut::Quit) => {
-                            exit_code = 0;
-                            break;
+                        Some(IdleShortcut::Backtrack) => {
+                            let _ = action_tx.send(UserAction::Backtrack);
                         }
                         None => {
                             if textarea.input(Input::from(ev)) {
@@ -355,7 +453,14 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
         }
 
         while let Ok(tui_event) = event_rx.try_recv() {
+            let backtracked_prompt = match &tui_event {
+                TuiEvent::Backtracked { prompt } => Some(prompt.clone()),
+                _ => None,
+            };
             state.update(tui_event);
+            if let Some(prompt) = backtracked_prompt {
+                textarea = make_textarea_with_text(&prompt);
+            }
             if state.auto_scroll {
                 state.scroll_to_bottom();
             }
@@ -427,22 +532,107 @@ fn resolve_approval(state: &mut AppState, action_tx: &mpsc::Sender<UserAction>, 
 
 fn agent_loop_thread(
     config: Arc<Mutex<RunConfig>>,
+    preloaded: Arc<Mutex<Option<history::SessionTranscript>>>,
     event_tx: mpsc::Sender<TuiEvent>,
     action_rx: mpsc::Receiver<UserAction>,
     cancel: CancelToken,
 ) {
+    let mut session: Option<bridge::TuiConversationSession> = None;
+
     loop {
         match action_rx.recv() {
             Ok(UserAction::Submit(prompt)) => {
                 cancel.reset();
                 let cfg = config.lock().unwrap().clone();
-                bridge::run_agent_for_tui(&cfg, &prompt, &event_tx, &action_rx, &cancel);
+                if session.is_none() {
+                    let transcript = preloaded.lock().unwrap().take();
+                    session =
+                        match bridge::TuiConversationSession::new_with_preloaded(
+                            &cfg,
+                            &prompt,
+                            transcript,
+                        ) {
+                            Ok(session) => Some(session),
+                            Err(error) => {
+                                let _ = event_tx.send(TuiEvent::Error(format!(
+                                    "failed to initialize conversation history: {error}"
+                                )));
+                                continue;
+                            }
+                        };
+                }
+                bridge::run_agent_for_tui(
+                    &cfg,
+                    session.as_mut().expect("session initialized"),
+                    &prompt,
+                    &event_tx,
+                    &action_rx,
+                    &cancel,
+                );
             }
             Ok(UserAction::Interrupt) => {
                 // Cancel already set by TUI thread; just continue waiting for next Submit
             }
+            Ok(UserAction::Backtrack) => {
+                if let Some(session) = session.as_mut() {
+                    match session.backtrack_last_user() {
+                        Some(prompt) => {
+                            let _ = event_tx.send(TuiEvent::Backtracked { prompt });
+                        }
+                        None => {
+                            let _ =
+                                event_tx.send(TuiEvent::Error("nothing to backtrack".to_string()));
+                        }
+                    }
+                } else {
+                    let _ = event_tx.send(TuiEvent::Error("nothing to backtrack".to_string()));
+                }
+            }
             Ok(UserAction::Cancel) | Err(_) => break,
             Ok(UserAction::Approve(_)) => {}
         }
+    }
+}
+
+fn chat_message_from_history(
+    message: crate::provider::conversation::Message,
+) -> Option<ChatMessage> {
+    use crate::provider::conversation::Message;
+
+    match message {
+        Message::System(_) => None,
+        Message::User(content) => Some(ChatMessage::User(content)),
+        Message::Assistant {
+            content,
+            reasoning_content,
+            tool_calls,
+        } => {
+            if let Some(content) = content.filter(|text| !text.trim().is_empty()) {
+                Some(ChatMessage::Assistant(content))
+            } else if let Some(reasoning) = reasoning_content.filter(|text| !text.trim().is_empty())
+            {
+                Some(ChatMessage::Reasoning(reasoning))
+            } else if !tool_calls.is_empty() {
+                let names = tool_calls
+                    .iter()
+                    .map(|tool| tool.function_name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                Some(ChatMessage::System(format!(
+                    "Previous assistant requested tools: {names}"
+                )))
+            } else {
+                None
+            }
+        }
+        Message::Tool {
+            tool_call_id,
+            content,
+        } => Some(ChatMessage::ToolCall {
+            name: format!("tool:{tool_call_id}"),
+            target: None,
+            status: "completed".to_string(),
+            output: Some(content),
+        }),
     }
 }

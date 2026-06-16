@@ -67,6 +67,17 @@ pub enum RunStatus {
 }
 
 impl RunStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::ApprovalRequired => "approval_required",
+            Self::VerificationFailed => "verification_failed",
+            Self::BudgetExhausted => "budget_exhausted",
+        }
+    }
+
     pub fn exit_code(self) -> i32 {
         match self {
             Self::Success => 0,

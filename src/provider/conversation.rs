@@ -1,4 +1,6 @@
-#[derive(Clone, Debug)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RawToolCall {
     pub id: String,
     pub function_name: String,
@@ -65,6 +67,19 @@ impl Conversation {
             Message::User(content) => Some(content.as_str()),
             _ => None,
         })
+    }
+
+    pub fn backtrack_last_user(&mut self) -> Option<String> {
+        let index = self
+            .messages
+            .iter()
+            .rposition(|message| matches!(message, Message::User(_)))?;
+        let prompt = match &self.messages[index] {
+            Message::User(content) => content.clone(),
+            _ => unreachable!("rposition only matches user messages"),
+        };
+        self.messages.truncate(index);
+        Some(prompt)
     }
 }
 
@@ -169,5 +184,19 @@ mod tests {
         conv.add_system("sys".to_string());
         conv.add_assistant(Some("hi".to_string()), None, vec![]);
         assert_eq!(conv.last_user_message(), None);
+    }
+
+    #[test]
+    fn backtrack_last_user_removes_user_and_later_messages() {
+        let mut conv = Conversation::new();
+        conv.add_system("sys".to_string());
+        conv.add_user("first".to_string());
+        conv.add_assistant(Some("reply".to_string()), None, vec![]);
+        conv.add_user("second".to_string());
+        conv.add_assistant(Some("later".to_string()), None, vec![]);
+
+        assert_eq!(conv.backtrack_last_user(), Some("second".to_string()));
+        assert_eq!(conv.messages.len(), 3);
+        assert_eq!(conv.last_user_message(), Some("first"));
     }
 }

@@ -53,11 +53,7 @@ pub fn execute(request: &ToolRequest, cwd: &Path) -> ToolResult {
 
     if let Some(parent) = normalized.parent() {
         if let Err(e) = fs::create_dir_all(parent) {
-            return ToolResult::failed(
-                request,
-                format!("failed to create directories: {e}"),
-                None,
-            );
+            return ToolResult::failed(request, format!("failed to create directories: {e}"), None);
         }
     }
 
@@ -99,7 +95,10 @@ mod tests {
         let req = make_request("hello.txt", "world");
         let result = execute(&req, dir.path());
         assert_eq!(result.status, crate::tools::ToolStatus::Completed);
-        assert_eq!(fs::read_to_string(dir.path().join("hello.txt")).unwrap(), "world");
+        assert_eq!(
+            fs::read_to_string(dir.path().join("hello.txt")).unwrap(),
+            "world"
+        );
     }
 
     #[test]

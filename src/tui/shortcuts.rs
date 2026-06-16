@@ -59,7 +59,7 @@ pub enum IdleShortcut {
     PageDown,
     HalfPageUp,
     HalfPageDown,
-    Quit,
+    Backtrack,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -160,7 +160,7 @@ pub fn idle_shortcut(event: KeyEvent) -> Option<IdleShortcut> {
             KeyBinding::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
         ),
         (
-            IdleShortcut::Quit,
+            IdleShortcut::Backtrack,
             KeyBinding::new(KeyCode::Esc, KeyModifiers::NONE),
         ),
     ];
@@ -351,7 +351,7 @@ pub const SHORTCUT_HINTS: &[ShortcutHint] = &[
     ShortcutHint {
         scope: ShortcutScope::Idle,
         keys: "esc",
-        action: "quit",
+        action: "backtrack previous prompt",
     },
     ShortcutHint {
         scope: ShortcutScope::Running,

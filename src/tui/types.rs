@@ -1,6 +1,8 @@
 use std::sync::mpsc;
 use std::time::Instant;
 
+use crate::runtime::history::SessionSummary;
+
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub enum TuiEvent {
@@ -38,12 +40,16 @@ pub enum TuiEvent {
     SessionCompleted {
         status: String,
     },
+    Backtracked {
+        prompt: String,
+    },
 }
 
 #[derive(Debug, Clone)]
 pub enum UserAction {
     Submit(String),
     Approve(bool),
+    Backtrack,
     Interrupt,
     Cancel,
 }
@@ -51,6 +57,7 @@ pub enum UserAction {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppStatus {
     Setup,
+    SessionPicker,
     Idle,
     Running,
     WaitingApproval,
@@ -102,6 +109,8 @@ pub struct AppState {
     pub history_cursor: Option<usize>,
     pub draft_before_history: Option<String>,
     pub last_ctrl_c: Option<Instant>,
+    pub session_picker_sessions: Vec<SessionSummary>,
+    pub session_picker_selected: usize,
 }
 
 impl AppState {
@@ -122,6 +131,8 @@ impl AppState {
             history_cursor: None,
             draft_before_history: None,
             last_ctrl_c: None,
+            session_picker_sessions: Vec::new(),
+            session_picker_selected: 0,
         }
     }
 
@@ -199,6 +210,22 @@ impl AppState {
     pub fn reset_history_navigation(&mut self) {
         self.history_cursor = None;
         self.draft_before_history = None;
+    }
+
+    pub fn select_previous_session(&mut self) {
+        self.session_picker_selected = self.session_picker_selected.saturating_sub(1);
+    }
+
+    pub fn select_next_session(&mut self) {
+        if self.session_picker_selected + 1 < self.session_picker_sessions.len() {
+            self.session_picker_selected += 1;
+        }
+    }
+
+    pub fn selected_session_id(&self) -> Option<String> {
+        self.session_picker_sessions
+            .get(self.session_picker_selected)
+            .map(|session| session.session_id.clone())
     }
 
     pub fn update(&mut self, event: TuiEvent) {
@@ -332,6 +359,24 @@ impl AppState {
             TuiEvent::SessionCompleted { .. } => {
                 self.status = AppStatus::Idle;
             }
+            TuiEvent::Backtracked { prompt } => {
+                self.remove_after_last_user();
+                self.messages.push(ChatMessage::System(format!(
+                    "Backtracked to previous prompt: {}",
+                    prompt.trim()
+                )));
+                self.status = AppStatus::Idle;
+            }
+        }
+    }
+
+    pub fn remove_after_last_user(&mut self) {
+        if let Some(index) = self
+            .messages
+            .iter()
+            .rposition(|message| matches!(message, ChatMessage::User(_)))
+        {
+            self.messages.truncate(index);
         }
     }
 }

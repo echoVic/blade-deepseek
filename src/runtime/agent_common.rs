@@ -5,7 +5,11 @@ use crate::provider::system_prompt::build_system_prompt;
 use crate::runtime::subagent_types::SubagentType;
 use crate::tools;
 
-pub fn build_agent_system_prompt(cwd: &Path, subagent_depth: u32, subagent_type: &SubagentType) -> String {
+pub fn build_agent_system_prompt(
+    cwd: &Path,
+    subagent_depth: u32,
+    subagent_type: &SubagentType,
+) -> String {
     let mut prompt = build_system_prompt(cwd);
     if subagent_depth > 0 {
         prompt.push_str(

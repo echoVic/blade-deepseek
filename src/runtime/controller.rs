@@ -5,7 +5,7 @@ use crate::approval::confirm;
 use crate::approval::policy::{
     ApprovalDecision, ApprovalPolicy, ApprovalRequest, ApprovalResolution,
 };
-use crate::config::{OutputFormat, RunConfig};
+use crate::config::{HistoryMode, OutputFormat, RunConfig};
 use crate::event::schema::{EventFactory, RunStatus};
 use crate::event::sink::EventSink;
 use crate::provider::conversation::Conversation;
@@ -13,6 +13,7 @@ use crate::provider::tool_schema::deepseek_tools_schema_for_type;
 use crate::provider::{self, ProviderConfig, ProviderStep};
 use crate::runtime::agent_common;
 use crate::runtime::cancel::CancelToken;
+use crate::runtime::history::{self, SessionWriter};
 use crate::runtime::session::new_run_id;
 use crate::runtime::subagent;
 use crate::runtime::subagent_types::SubagentType;
@@ -61,14 +62,57 @@ fn run_inner(config: RunConfig) -> io::Result<RunStatus> {
     let cwd_path = config.cwd.clone().unwrap_or(std::env::current_dir()?);
     let cwd = cwd_path.display().to_string();
     let prompt = if config.prompt.trim().is_empty() {
-        "(empty prompt)"
+        "(empty prompt)".to_string()
     } else {
-        config.prompt.trim()
+        config.prompt.trim().to_string()
     };
 
     let mut events = EventFactory::new(new_run_id());
     let stdout = io::stdout();
     let mut sink = EventSink::new(stdout.lock(), config.output_format);
+
+    let resumed = match &config.history_mode {
+        HistoryMode::Resume(selector) | HistoryMode::Fork(selector) => {
+            Some(history::load_session(selector)?)
+        }
+        HistoryMode::Record | HistoryMode::Disabled => None,
+    };
+
+    let mut history_writer = match &config.history_mode {
+        HistoryMode::Disabled => None,
+        HistoryMode::Record | HistoryMode::Resume(_) => match SessionWriter::start(
+            &cwd_path,
+            config.provider.as_str(),
+            config.model.clone(),
+            &prompt,
+        ) {
+            Ok(writer) => Some(writer),
+            Err(error) => {
+                eprintln!("orca: warning: failed to initialize history: {error}");
+                None
+            }
+        },
+        HistoryMode::Fork(_) => {
+            let parent_id = resumed
+                .as_ref()
+                .map(|transcript| transcript.meta.session_id.clone())
+                .unwrap_or_default();
+            let meta = history::create_fork_meta(
+                &cwd_path,
+                config.provider.as_str(),
+                config.model.clone(),
+                &prompt,
+                parent_id,
+            );
+            match SessionWriter::start_from_meta(meta) {
+                Ok(writer) => Some(writer),
+                Err(error) => {
+                    eprintln!("orca: warning: failed to initialize history: {error}");
+                    None
+                }
+            }
+        }
+    };
 
     sink.emit(&events.session_started(
         &cwd,
@@ -83,7 +127,9 @@ fn run_inner(config: RunConfig) -> io::Result<RunStatus> {
         &cwd_path,
         &mut events,
         &mut sink,
-        prompt,
+        &prompt,
+        resumed.as_ref(),
+        history_writer.as_mut(),
         0,
         true,
         &SubagentType::General,
@@ -93,6 +139,10 @@ fn run_inner(config: RunConfig) -> io::Result<RunStatus> {
 
     let status =
         run_verifier_if_needed(status, config.verifier.as_deref(), &mut events, &mut sink)?;
+
+    if let Some(writer) = history_writer.as_mut() {
+        writer.complete(status.as_str())?;
+    }
 
     sink.emit(&events.session_completed(status))?;
     Ok(status)
@@ -105,6 +155,8 @@ fn run_agent_loop(
     events: &mut EventFactory,
     sink: &mut EventSink<impl io::Write>,
     prompt: &str,
+    resumed: Option<&history::SessionTranscript>,
+    history_writer: Option<&mut SessionWriter>,
     subagent_depth: u32,
     emit_deltas: bool,
     subagent_type: &SubagentType,
@@ -124,13 +176,31 @@ fn run_agent_loop(
         tools_override,
     };
 
-    let mut conversation = Conversation::new();
-    conversation.add_system(agent_common::build_agent_system_prompt(
-        cwd,
-        subagent_depth,
-        subagent_type,
-    ));
+    let system_prompt = agent_common::build_agent_system_prompt(cwd, subagent_depth, subagent_type);
+    let mut conversation = if let Some(resumed) = resumed {
+        history::resume_conversation(resumed, system_prompt)
+    } else {
+        let mut conversation = Conversation::new();
+        conversation.add_system(system_prompt);
+        conversation
+    };
     conversation.add_user(prompt.to_string());
+
+    let mut history_writer = history_writer;
+    if emit_deltas && let Some(writer) = history_writer.as_deref_mut() {
+        if resumed.is_some() {
+            for message in &conversation.messages {
+                writer.append_message(message)?;
+            }
+        } else {
+            if let Some(system) = conversation.messages.first() {
+                writer.append_message(system)?;
+            }
+            if let Some(user) = conversation.messages.last() {
+                writer.append_message(user)?;
+            }
+        }
+    }
 
     let mut turn: u32 = 0;
 
@@ -146,7 +216,11 @@ fn run_agent_loop(
         }
 
         if provider::context::needs_compaction(&conversation, &ctx_config) {
+            let before_messages = conversation.messages.len();
             conversation = provider::context::compact(&conversation, &ctx_config);
+            if emit_deltas && let Some(writer) = history_writer.as_deref_mut() {
+                writer.append_compaction(before_messages, conversation.messages.len())?;
+            }
         }
 
         let turn_prompt = if turn == 1 { Some(prompt) } else { None };
@@ -212,6 +286,12 @@ fn run_agent_loop(
                 response.assistant_reasoning,
                 vec![],
             );
+            if emit_deltas
+                && let Some(writer) = history_writer.as_deref_mut()
+                && let Some(message) = conversation.messages.last()
+            {
+                writer.append_message(message)?;
+            }
             return Ok(AgentLoopResult::success(final_message));
         }
 
@@ -220,6 +300,12 @@ fn run_agent_loop(
             response.assistant_reasoning,
             response.tool_calls.clone(),
         );
+        if emit_deltas
+            && let Some(writer) = history_writer.as_deref_mut()
+            && let Some(message) = conversation.messages.last()
+        {
+            writer.append_message(message)?;
+        }
 
         for step in &response.steps {
             if let ProviderStep::ToolCall(tool_request) = step {
@@ -235,6 +321,12 @@ fn run_agent_loop(
 
                 let result_content = agent_common::format_tool_result_for_model(&result);
                 conversation.add_tool_result(tool_request.id.clone(), result_content);
+                if emit_deltas
+                    && let Some(writer) = history_writer.as_deref_mut()
+                    && let Some(message) = conversation.messages.last()
+                {
+                    writer.append_message(message)?;
+                }
 
                 if status != RunStatus::Success {
                     return Ok(AgentLoopResult {
@@ -368,6 +460,8 @@ fn execute_subagent_tool(
         events,
         sink,
         &request.prompt,
+        None,
+        None,
         subagent_depth + 1,
         false,
         &subagent_type,
