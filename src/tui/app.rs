@@ -2,19 +2,23 @@ use std::io;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::ExecutableCommand;
-use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use tui_textarea::{Input, TextArea};
+use tui_textarea::{CursorMove, Input, TextArea};
 
 use crate::config::RunConfig;
 use crate::config::file::save_api_key;
 use crate::runtime::cancel::CancelToken;
 use crate::tui::bridge;
+use crate::tui::shortcuts::{
+    ApprovalShortcut, GlobalShortcut, IdleShortcut, RunningShortcut, approval_shortcut,
+    global_shortcut, idle_shortcut, running_shortcut,
+};
 use crate::tui::types::{AppState, AppStatus, ChatMessage, TuiEvent, UserAction};
 use crate::tui::ui;
 
@@ -88,10 +92,58 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
             let ev = event::read()?;
 
             if let Event::Key(key) = &ev {
-                if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-                    let _ = action_tx.send(UserAction::Cancel);
-                    exit_code = 130;
-                    break;
+                if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+                    continue;
+                }
+
+                if let Some(shortcut) = global_shortcut(*key) {
+                    match shortcut {
+                        GlobalShortcut::Cancel => {
+                            if state.status == AppStatus::Running {
+                                cancel_token.cancel();
+                                let _ = action_tx.send(UserAction::Interrupt);
+                                continue;
+                            }
+                            let now = Instant::now();
+                            if state
+                                .last_ctrl_c
+                                .is_some_and(|t| now.duration_since(t) < Duration::from_secs(2))
+                            {
+                                let _ = action_tx.send(UserAction::Cancel);
+                                exit_code = 130;
+                                break;
+                            }
+                            state.last_ctrl_c = Some(now);
+                            state
+                                .messages
+                                .push(ChatMessage::System("Press Ctrl+C again to quit.".into()));
+                            state.scroll_to_bottom();
+                            continue;
+                        }
+                        GlobalShortcut::ToggleShortcuts => {
+                            state.toggle_shortcuts();
+                            continue;
+                        }
+                        GlobalShortcut::ScrollBottom => {
+                            state.scroll_to_bottom();
+                            continue;
+                        }
+                        GlobalShortcut::ScrollTop => {
+                            state.scroll_to_top();
+                            continue;
+                        }
+                        GlobalShortcut::ClearScreen => {
+                            state.messages.clear();
+                            state.scroll_offset = 0;
+                            state.auto_scroll = true;
+                            continue;
+                        }
+                    }
+                }
+
+                if state.show_shortcuts && key.code == KeyCode::Esc {
+                    state.show_shortcuts = false;
+                    continue;
                 }
 
                 // Setup mode: step-by-step
@@ -161,85 +213,51 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                     continue;
                 }
 
-                // Approval dialog: Up/Down/Enter
+                // Approval dialog: selection and direct approve/deny shortcuts
                 if state.status == AppStatus::WaitingApproval {
-                    match key.code {
-                        KeyCode::Up | KeyCode::Char('k') => {
+                    match approval_shortcut(*key) {
+                        Some(ApprovalShortcut::SelectAllow) => {
                             if let Some(dialog) = &mut state.approval_dialog {
                                 dialog.selected = 0;
                             }
                         }
-                        KeyCode::Down | KeyCode::Char('j') => {
+                        Some(ApprovalShortcut::SelectDeny) => {
                             if let Some(dialog) = &mut state.approval_dialog {
                                 dialog.selected = 1;
                             }
                         }
-                        KeyCode::Enter => {
+                        Some(ApprovalShortcut::ToggleSelection) => {
+                            if let Some(dialog) = &mut state.approval_dialog {
+                                dialog.selected = 1usize.saturating_sub(dialog.selected);
+                            }
+                        }
+                        Some(ApprovalShortcut::Confirm) => {
                             let approved = state
                                 .approval_dialog
                                 .as_ref()
                                 .map(|d| d.selected == 0)
                                 .unwrap_or(false);
-                            let _ = action_tx.send(UserAction::Approve(approved));
-                            if approved {
-                                state.status = AppStatus::Running;
-                            } else {
-                                state.status = AppStatus::Idle;
-                            }
-                            state.approval_dialog = None;
+                            resolve_approval(&mut state, &action_tx, approved);
                         }
-                        KeyCode::Char('y') | KeyCode::Char('Y') => {
-                            let _ = action_tx.send(UserAction::Approve(true));
-                            state.status = AppStatus::Running;
-                            state.approval_dialog = None;
+                        Some(ApprovalShortcut::Approve) => {
+                            resolve_approval(&mut state, &action_tx, true);
                         }
-                        KeyCode::Char('n') | KeyCode::Char('N') => {
-                            let _ = action_tx.send(UserAction::Approve(false));
-                            state.status = AppStatus::Idle;
-                            state.approval_dialog = None;
+                        Some(ApprovalShortcut::Deny) => {
+                            resolve_approval(&mut state, &action_tx, false);
                         }
-                        _ => {}
+                        None => {}
                     }
                     continue;
                 }
 
-                // Scrolling — works in Idle and Running
-                match key.code {
-                    KeyCode::PageUp => {
-                        let page = state.visible_height.saturating_sub(2);
-                        state.scroll_up(page);
-                        continue;
-                    }
-                    KeyCode::PageDown => {
-                        let page = state.visible_height.saturating_sub(2);
-                        state.scroll_down(page);
-                        continue;
-                    }
-                    _ => {}
-                }
-                if key.modifiers.contains(KeyModifiers::CONTROL) {
-                    match key.code {
-                        KeyCode::Char('u') => {
-                            let page = state.visible_height / 2;
-                            state.scroll_up(page);
-                            continue;
-                        }
-                        KeyCode::Char('d') => {
-                            let page = state.visible_height / 2;
-                            state.scroll_down(page);
-                            continue;
-                        }
-                        _ => {}
-                    }
-                }
-
                 // Normal Idle mode input
                 if state.status == AppStatus::Idle {
-                    match key.code {
-                        KeyCode::Enter if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    match idle_shortcut(*key) {
+                        Some(IdleShortcut::Submit) => {
                             let lines: Vec<String> = textarea.lines().to_vec();
                             let text = lines.join("\n").trim().to_string();
                             if !text.is_empty() {
+                                state.record_prompt(text.clone());
                                 state.messages.push(ChatMessage::User(text.clone()));
                                 state.status = AppStatus::Running;
                                 state.scroll_to_bottom();
@@ -247,34 +265,90 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                                 textarea = make_textarea();
                             }
                         }
-                        KeyCode::Up => {
-                            state.scroll_up(1);
+                        Some(IdleShortcut::Newline) => {
+                            textarea.insert_newline();
+                            state.reset_history_navigation();
                         }
-                        KeyCode::Down => {
-                            state.scroll_down(1);
+                        Some(IdleShortcut::HistoryPrevious) => {
+                            let draft = textarea_text(&textarea);
+                            if let Some(history) = state.history_previous(draft) {
+                                textarea = make_textarea_with_text(&history);
+                            }
                         }
-                        KeyCode::Esc => {
+                        Some(IdleShortcut::HistoryNext) => {
+                            if let Some(history) = state.history_next() {
+                                textarea = make_textarea_with_text(&history);
+                            }
+                        }
+                        Some(IdleShortcut::ScrollUp) => {
+                            if textarea.lines().len() > 1 {
+                                textarea.input(Input::from(ev));
+                            } else {
+                                state.scroll_up(1);
+                            }
+                        }
+                        Some(IdleShortcut::ScrollDown) => {
+                            if textarea.lines().len() > 1 {
+                                textarea.input(Input::from(ev));
+                            } else {
+                                state.scroll_down(1);
+                            }
+                        }
+                        Some(IdleShortcut::PageUp) => {
+                            let page = state.visible_height.saturating_sub(2);
+                            state.scroll_up(page);
+                        }
+                        Some(IdleShortcut::PageDown) => {
+                            let page = state.visible_height.saturating_sub(2);
+                            state.scroll_down(page);
+                        }
+                        Some(IdleShortcut::HalfPageUp) => {
+                            let page = state.visible_height / 2;
+                            state.scroll_up(page);
+                        }
+                        Some(IdleShortcut::HalfPageDown) => {
+                            let page = state.visible_height / 2;
+                            state.scroll_down(page);
+                        }
+                        Some(IdleShortcut::Quit) => {
                             exit_code = 0;
                             break;
                         }
-                        _ => {
-                            textarea.input(Input::from(ev));
+                        None => {
+                            if textarea.input(Input::from(ev)) {
+                                state.reset_history_navigation();
+                            }
                         }
                     }
                 } else if state.status == AppStatus::Running {
-                    // In running mode, Esc interrupts streaming, Up/Down scroll
-                    match key.code {
-                        KeyCode::Esc => {
+                    match running_shortcut(*key) {
+                        Some(RunningShortcut::Interrupt) => {
                             cancel_token.cancel();
                             let _ = action_tx.send(UserAction::Interrupt);
                         }
-                        KeyCode::Up => {
+                        Some(RunningShortcut::ScrollUp) => {
                             state.scroll_up(1);
                         }
-                        KeyCode::Down => {
+                        Some(RunningShortcut::ScrollDown) => {
                             state.scroll_down(1);
                         }
-                        _ => {}
+                        Some(RunningShortcut::PageUp) => {
+                            let page = state.visible_height.saturating_sub(2);
+                            state.scroll_up(page);
+                        }
+                        Some(RunningShortcut::PageDown) => {
+                            let page = state.visible_height.saturating_sub(2);
+                            state.scroll_down(page);
+                        }
+                        Some(RunningShortcut::HalfPageUp) => {
+                            let page = state.visible_height / 2;
+                            state.scroll_up(page);
+                        }
+                        Some(RunningShortcut::HalfPageDown) => {
+                            let page = state.visible_height / 2;
+                            state.scroll_down(page);
+                        }
+                        None => {}
                     }
                 }
             }
@@ -296,14 +370,35 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
 
 fn make_textarea<'a>() -> TextArea<'a> {
     let mut textarea = TextArea::default();
-    textarea.set_placeholder_text("Type a message... (Enter to send, Esc to quit)");
+    configure_textarea(&mut textarea);
+    textarea
+}
+
+fn make_textarea_with_text<'a>(text: &str) -> TextArea<'a> {
+    let lines: Vec<String> = if text.is_empty() {
+        vec![String::new()]
+    } else {
+        text.lines().map(str::to_string).collect()
+    };
+    let mut textarea = TextArea::from(lines);
+    configure_textarea(&mut textarea);
+    textarea.move_cursor(CursorMove::Bottom);
+    textarea.move_cursor(CursorMove::End);
+    textarea
+}
+
+fn configure_textarea(textarea: &mut TextArea) {
+    textarea.set_placeholder_text("Type a message... (Enter send, shift+Enter newline)");
     textarea.set_cursor_line_style(ratatui::style::Style::default());
     textarea.set_block(
         ratatui::widgets::Block::default()
             .borders(ratatui::widgets::Borders::ALL)
             .title(" Input "),
     );
-    textarea
+}
+
+fn textarea_text(textarea: &TextArea) -> String {
+    textarea.lines().join("\n")
 }
 
 fn make_setup_textarea<'a>() -> TextArea<'a> {
@@ -318,6 +413,16 @@ fn make_setup_textarea<'a>() -> TextArea<'a> {
             .border_style(ratatui::style::Style::default().fg(ratatui::style::Color::Cyan)),
     );
     textarea
+}
+
+fn resolve_approval(state: &mut AppState, action_tx: &mpsc::Sender<UserAction>, approved: bool) {
+    let _ = action_tx.send(UserAction::Approve(approved));
+    if approved {
+        state.status = AppStatus::Running;
+    } else {
+        state.status = AppStatus::Idle;
+    }
+    state.approval_dialog = None;
 }
 
 fn agent_loop_thread(

@@ -1,12 +1,13 @@
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
-use unicode_width::UnicodeWidthStr;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use tui_textarea::TextArea;
+use unicode_width::UnicodeWidthStr;
 
+use super::shortcuts::{self, ShortcutScope};
 use super::types::{AppState, AppStatus, ChatMessage};
 
 pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea) {
@@ -28,6 +29,10 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea) {
 
     if state.status == AppStatus::WaitingApproval {
         render_approval_dialog(frame, state);
+    }
+
+    if state.show_shortcuts {
+        render_shortcuts(frame, state);
     }
 }
 
@@ -70,7 +75,11 @@ fn wrapped_line_count(line: &Line, width: usize) -> usize {
     if width == 0 {
         return 1;
     }
-    let line_width: usize = line.spans.iter().map(|s| UnicodeWidthStr::width(s.content.as_ref())).sum();
+    let line_width: usize = line
+        .spans
+        .iter()
+        .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+        .sum();
     if line_width == 0 {
         return 1;
     }
@@ -168,6 +177,13 @@ fn build_message_lines(state: &AppState) -> Vec<Line<'static>> {
                 )));
                 lines.push(Line::from(""));
             }
+            ChatMessage::System(text) => {
+                lines.push(Line::from(Span::styled(
+                    text.clone(),
+                    Style::default().fg(Color::DarkGray),
+                )));
+                lines.push(Line::from(""));
+            }
         }
     }
 
@@ -258,10 +274,47 @@ fn render_status(frame: &mut Frame, area: Rect, state: &AppState) {
             format!(" | model: {}", state.model_name),
             Style::default().fg(Color::DarkGray),
         ),
+        Span::styled(
+            " | F1/ctrl+k shortcuts",
+            Style::default().fg(Color::DarkGray),
+        ),
     ]);
 
     let paragraph = Paragraph::new(line);
     frame.render_widget(paragraph, area);
+}
+
+fn render_shortcuts(frame: &mut Frame, state: &AppState) {
+    let area = frame.area();
+    let width = 58u16.min(area.width.saturating_sub(4));
+    let max_height = area.height.saturating_sub(4);
+    let scopes = active_shortcut_scopes(state);
+    let lines = shortcuts::shortcut_lines(&scopes);
+    let height = ((lines.len() as u16) + 2).min(max_height).max(3);
+    let x = (area.width.saturating_sub(width)) / 2;
+    let y = (area.height.saturating_sub(height)) / 2;
+    let popup_area = Rect::new(x, y, width, height);
+
+    frame.render_widget(Clear, popup_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Shortcuts ")
+        .border_style(Style::default().fg(Color::Cyan));
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(paragraph, popup_area);
+}
+
+fn active_shortcut_scopes(state: &AppState) -> Vec<ShortcutScope> {
+    match state.status {
+        AppStatus::Idle => vec![ShortcutScope::Global, ShortcutScope::Idle],
+        AppStatus::Running => vec![ShortcutScope::Global, ShortcutScope::Running],
+        AppStatus::WaitingApproval => vec![ShortcutScope::Global, ShortcutScope::Approval],
+        AppStatus::Setup => vec![ShortcutScope::Global],
+    }
 }
 
 fn render_approval_dialog(frame: &mut Frame, state: &AppState) {
@@ -647,7 +700,9 @@ fn render_table(rows: &[Vec<String>], lines: &mut Vec<Line<'static>>) {
     }
 
     let border_style = Style::default().fg(Color::DarkGray);
-    let header_style = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let header_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
     let cell_style = Style::default().fg(Color::White);
 
     // Top border: ┌───┬───┐
@@ -662,7 +717,11 @@ fn render_table(rows: &[Vec<String>], lines: &mut Vec<Line<'static>>) {
             let content = row.get(i).map(|s| s.as_str()).unwrap_or("");
             let display_width = UnicodeWidthStr::width(content);
             let padding = width.saturating_sub(display_width);
-            let style = if row_idx == 0 { header_style } else { cell_style };
+            let style = if row_idx == 0 {
+                header_style
+            } else {
+                cell_style
+            };
             spans.push(Span::styled(format!(" {content}"), style));
             spans.push(Span::styled(format!("{} ", " ".repeat(padding)), style));
             spans.push(Span::styled("│", border_style));

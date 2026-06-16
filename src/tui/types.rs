@@ -1,4 +1,5 @@
 use std::sync::mpsc;
+use std::time::Instant;
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -74,6 +75,7 @@ pub enum ChatMessage {
         error: Option<String>,
     },
     Error(String),
+    System(String),
 }
 
 #[derive(Debug, Clone)]
@@ -95,6 +97,11 @@ pub struct AppState {
     pub event_tx: mpsc::Sender<UserAction>,
     pub approval_dialog: Option<ApprovalDialog>,
     pub setup_step: u8,
+    pub show_shortcuts: bool,
+    pub input_history: Vec<String>,
+    pub history_cursor: Option<usize>,
+    pub draft_before_history: Option<String>,
+    pub last_ctrl_c: Option<Instant>,
 }
 
 impl AppState {
@@ -110,6 +117,11 @@ impl AppState {
             event_tx,
             approval_dialog: None,
             setup_step: 0,
+            show_shortcuts: false,
+            input_history: Vec::new(),
+            history_cursor: None,
+            draft_before_history: None,
+            last_ctrl_c: None,
         }
     }
 
@@ -130,6 +142,63 @@ impl AppState {
         let max_scroll = self.total_lines.saturating_sub(self.visible_height);
         self.scroll_offset = max_scroll;
         self.auto_scroll = true;
+    }
+
+    pub fn scroll_to_top(&mut self) {
+        self.scroll_offset = 0;
+        self.auto_scroll = false;
+    }
+
+    pub fn toggle_shortcuts(&mut self) {
+        self.show_shortcuts = !self.show_shortcuts;
+    }
+
+    pub fn record_prompt(&mut self, prompt: String) {
+        if self
+            .input_history
+            .last()
+            .map(|last| last != &prompt)
+            .unwrap_or(true)
+        {
+            self.input_history.push(prompt);
+        }
+        self.history_cursor = None;
+        self.draft_before_history = None;
+    }
+
+    pub fn history_previous(&mut self, current_draft: String) -> Option<String> {
+        if self.input_history.is_empty() {
+            return None;
+        }
+
+        let next = match self.history_cursor {
+            Some(0) => return None,
+            Some(index) => index - 1,
+            None => {
+                self.draft_before_history = Some(current_draft);
+                self.input_history.len() - 1
+            }
+        };
+        self.history_cursor = Some(next);
+        self.input_history.get(next).cloned()
+    }
+
+    pub fn history_next(&mut self) -> Option<String> {
+        let cursor = self.history_cursor?;
+        let next = cursor + 1;
+
+        if next >= self.input_history.len() {
+            self.history_cursor = None;
+            return Some(self.draft_before_history.take().unwrap_or_default());
+        }
+
+        self.history_cursor = Some(next);
+        self.input_history.get(next).cloned()
+    }
+
+    pub fn reset_history_navigation(&mut self) {
+        self.history_cursor = None;
+        self.draft_before_history = None;
     }
 
     pub fn update(&mut self, event: TuiEvent) {
