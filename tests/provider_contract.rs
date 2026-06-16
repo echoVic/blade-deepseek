@@ -58,6 +58,7 @@ fn deepseek_fixture_preserves_reasoning_and_replay_state() {
 fn deepseek_provider_without_api_key_emits_error_and_fails() {
     let output = Command::new(env!("CARGO_BIN_EXE_orca"))
         .env_remove("DEEPSEEK_API_KEY")
+        .env("HOME", "/tmp/orca_test_no_home")
         .args([
             "exec",
             "--output-format",

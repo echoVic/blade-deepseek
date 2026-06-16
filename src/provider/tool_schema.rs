@@ -1,5 +1,7 @@
 use serde_json::{Value, json};
 
+use crate::runtime::subagent_types::SubagentType;
+
 pub fn deepseek_tools_schema() -> Vec<Value> {
     vec![
         json!({
@@ -126,6 +128,11 @@ pub fn deepseek_tools_schema() -> Vec<Value> {
                         "prompt": {
                             "type": "string",
                             "description": "Full standalone instructions for the child agent"
+                        },
+                        "subagent_type": {
+                            "type": "string",
+                            "enum": ["general", "code_reviewer", "test_writer", "debugger", "documenter"],
+                            "description": "Optional specialized agent type that restricts tools and provides focused expertise"
                         }
                     },
                     "required": ["description", "prompt"]
@@ -133,4 +140,17 @@ pub fn deepseek_tools_schema() -> Vec<Value> {
             }
         }),
     ]
+}
+
+pub fn deepseek_tools_schema_for_type(subagent_type: &SubagentType) -> Vec<Value> {
+    let allowed = subagent_type.allowed_tools();
+    deepseek_tools_schema()
+        .into_iter()
+        .filter(|tool| {
+            tool["function"]["name"]
+                .as_str()
+                .map(|name| name != "subagent" && allowed.contains(&name))
+                .unwrap_or(false)
+        })
+        .collect()
 }

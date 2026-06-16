@@ -17,6 +17,7 @@ pub struct ProviderConfig {
     pub api_key: Option<String>,
     pub base_url: Option<String>,
     pub model: Option<String>,
+    pub tools_override: Option<Vec<serde_json::Value>>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

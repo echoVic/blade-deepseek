@@ -59,12 +59,6 @@ impl<W: Write> EventSink<W> {
                 let description = event.payload["description"].as_str().unwrap_or("subagent");
                 writeln!(self.writer, "subagent started: {description}")
             }
-            EventType::SubagentLaunched => {
-                let description = event.payload["description"].as_str().unwrap_or("subagent");
-                let output_file = event.payload["output_file"].as_str().unwrap_or("");
-                writeln!(self.writer, "subagent launched (async): {description}")?;
-                writeln!(self.writer, "  output file: {output_file}")
-            }
             EventType::SubagentCompleted => {
                 let description = event.payload["description"].as_str().unwrap_or("subagent");
                 let status = event.payload["status"].as_str().unwrap_or("unknown");

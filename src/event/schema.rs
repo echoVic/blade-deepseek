@@ -43,8 +43,6 @@ pub enum EventType {
     ToolCallCompleted,
     #[serde(rename = "subagent.started")]
     SubagentStarted,
-    #[serde(rename = "subagent.launched")]
-    SubagentLaunched,
     #[serde(rename = "subagent.completed")]
     SubagentCompleted,
     #[serde(rename = "verification.started")]
@@ -201,23 +199,6 @@ impl EventFactory {
             json!({
                 "id": id,
                 "description": description
-            }),
-        )
-    }
-
-    pub fn subagent_launched(
-        &mut self,
-        id: &str,
-        description: &str,
-        output_file: &str,
-    ) -> EventEnvelope {
-        self.make(
-            EventType::SubagentLaunched,
-            json!({
-                "id": id,
-                "description": description,
-                "output_file": output_file,
-                "can_read_output_file": true
             }),
         )
     }

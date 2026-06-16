@@ -3,16 +3,18 @@ use std::path::Path;
 
 use crate::approval::confirm;
 use crate::approval::policy::{
-    ActionKind, ApprovalDecision, ApprovalPolicy, ApprovalRequest, ApprovalResolution,
+    ApprovalDecision, ApprovalPolicy, ApprovalRequest, ApprovalResolution,
 };
 use crate::config::{OutputFormat, RunConfig};
 use crate::event::schema::{EventFactory, RunStatus};
 use crate::event::sink::EventSink;
 use crate::provider::conversation::Conversation;
-use crate::provider::system_prompt::build_system_prompt;
+use crate::provider::tool_schema::deepseek_tools_schema_for_type;
 use crate::provider::{self, ProviderConfig, ProviderStep};
+use crate::runtime::agent_common;
 use crate::runtime::session::new_run_id;
-use crate::runtime::subagent::{self, SubagentMode};
+use crate::runtime::subagent;
+use crate::runtime::subagent_types::SubagentType;
 use crate::tools;
 use crate::verification;
 
@@ -74,7 +76,16 @@ fn run_inner(config: RunConfig) -> io::Result<RunStatus> {
         config.verifier.as_deref(),
     ))?;
 
-    let result = run_agent_loop(&config, &cwd_path, &mut events, &mut sink, prompt, 0, true)?;
+    let result = run_agent_loop(
+        &config,
+        &cwd_path,
+        &mut events,
+        &mut sink,
+        prompt,
+        0,
+        true,
+        &SubagentType::General,
+    )?;
     let status = result.status;
 
     let status =
@@ -84,6 +95,7 @@ fn run_inner(config: RunConfig) -> io::Result<RunStatus> {
     Ok(status)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_agent_loop(
     config: &RunConfig,
     cwd: &Path,
@@ -92,17 +104,28 @@ fn run_agent_loop(
     prompt: &str,
     subagent_depth: u32,
     emit_deltas: bool,
+    subagent_type: &SubagentType,
 ) -> io::Result<AgentLoopResult> {
     let max_turns = DEFAULT_MAX_TURNS;
     let ctx_config = provider::context::ContextConfig::default();
+    let tools_override = if subagent_depth > 0 {
+        Some(deepseek_tools_schema_for_type(subagent_type))
+    } else {
+        None
+    };
     let provider_config = ProviderConfig {
         api_key: config.api_key.clone(),
         base_url: config.base_url.clone(),
         model: config.model.clone(),
+        tools_override,
     };
 
     let mut conversation = Conversation::new();
-    conversation.add_system(build_agent_system_prompt(cwd, subagent_depth));
+    conversation.add_system(agent_common::build_agent_system_prompt(
+        cwd,
+        subagent_depth,
+        subagent_type,
+    ));
     conversation.add_user(prompt.to_string());
 
     let mut turn: u32 = 0;
@@ -205,7 +228,7 @@ fn run_agent_loop(
                     emit_deltas,
                 )?;
 
-                let result_content = format_tool_result_for_model(&result);
+                let result_content = agent_common::format_tool_result_for_model(&result);
                 conversation.add_tool_result(tool_request.id.clone(), result_content);
 
                 if status != RunStatus::Success {
@@ -231,7 +254,7 @@ fn execute_tool_with_approval(
 ) -> io::Result<(RunStatus, tools::ToolResult)> {
     let policy = ApprovalPolicy::new(config.approval_mode);
 
-    if requires_approval(tool_request.action) {
+    if agent_common::requires_approval(tool_request.action) {
         let approval = ApprovalRequest {
             id: format!("approval-{}", tool_request.id),
             action: tool_request.action,
@@ -315,36 +338,11 @@ fn execute_subagent_tool(
     tool_request: &tools::ToolRequest,
     subagent_depth: u32,
 ) -> io::Result<tools::ToolResult> {
-    // 创建 subagent 请求
     let request = subagent::create_subagent_request(tool_request);
     let description = request.description.clone();
-    let mode = request.mode.clone();
+    let subagent_type = request.subagent_type;
 
     sink.emit(&events.subagent_started(&tool_request.id, &description))?;
-
-    // 检查是否为异步模式
-    if let SubagentMode::Async {
-        ref output_file, ..
-    } = mode
-    {
-        // 异步模式：立即返回
-        sink.emit(&events.subagent_launched(
-            &tool_request.id,
-            &description,
-            &output_file.display().to_string(),
-        ))?;
-
-        // 返回异步启动的结果
-        let output = format!(
-            "Subagent launched (async)\n\nAgent ID: {}\nOutput file: {}\n\nUse read_file to check progress.",
-            tool_request.id,
-            output_file.display()
-        );
-        return Ok(tools::ToolResult::completed(tool_request, output, false));
-    }
-
-    // 同步模式：保持原有逻辑
-    let prompt = request.prompt;
 
     if subagent_depth >= MAX_SUBAGENT_DEPTH {
         let error = "nested subagents are disabled in this MVP";
@@ -363,9 +361,10 @@ fn execute_subagent_tool(
         cwd,
         events,
         sink,
-        &prompt,
+        &request.prompt,
         subagent_depth + 1,
         false,
+        &subagent_type,
     )?;
 
     match child.status {
@@ -406,22 +405,6 @@ fn execute_subagent_tool(
     }
 }
 
-fn subagent_field(tool_request: &tools::ToolRequest, field: &str) -> Option<String> {
-    let raw = tool_request.raw_arguments.as_ref()?;
-    let value: serde_json::Value = serde_json::from_str(raw).ok()?;
-    value[field].as_str().map(String::from)
-}
-
-fn build_agent_system_prompt(cwd: &Path, subagent_depth: u32) -> String {
-    let mut prompt = build_system_prompt(cwd);
-    if subagent_depth > 0 {
-        prompt.push_str(
-            "\n\n## Subagent Role\nYou are running as a synchronous subagent. Complete only the delegated task and return a concise report for the parent agent. Do not assume the user can see your intermediate tool output.",
-        );
-    }
-    prompt
-}
-
 fn resolve_interactive(
     config: &RunConfig,
     approval: &ApprovalRequest,
@@ -450,24 +433,6 @@ fn resolve_interactive(
             "user denied".to_string()
         },
     })
-}
-
-fn format_tool_result_for_model(result: &tools::ToolResult) -> String {
-    match (&result.output, &result.error) {
-        (Some(output), _) => {
-            if result.truncated {
-                format!("{output}\n[output truncated]")
-            } else {
-                output.clone()
-            }
-        }
-        (_, Some(error)) => format!("ERROR: {error}"),
-        _ => "(no output)".to_string(),
-    }
-}
-
-fn requires_approval(action: ActionKind) -> bool {
-    matches!(action, ActionKind::Write | ActionKind::Shell)
 }
 
 fn run_verifier_if_needed(

@@ -55,6 +55,7 @@ fn agent_loop_fixture_completes_multi_turn() {
 fn agent_loop_deepseek_without_key_fails_on_first_turn() {
     let output = Command::new(env!("CARGO_BIN_EXE_orca"))
         .env_remove("DEEPSEEK_API_KEY")
+        .env("HOME", "/tmp/orca_test_no_home")
         .args([
             "exec",
             "--output-format",

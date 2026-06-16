@@ -1,11 +1,14 @@
 use std::path::Path;
 use std::sync::mpsc::{Receiver, Sender};
 
-use crate::approval::policy::{ActionKind, ApprovalDecision, ApprovalPolicy, ApprovalRequest};
+use crate::approval::policy::{ApprovalDecision, ApprovalPolicy, ApprovalRequest};
 use crate::config::RunConfig;
 use crate::provider::conversation::Conversation;
-use crate::provider::system_prompt::build_system_prompt;
+use crate::provider::tool_schema::deepseek_tools_schema_for_type;
 use crate::provider::{self, ProviderConfig, ProviderStep};
+use crate::runtime::agent_common;
+use crate::runtime::subagent;
+use crate::runtime::subagent_types::SubagentType;
 use crate::tools;
 use crate::tui::types::{TuiEvent, UserAction};
 
@@ -34,11 +37,16 @@ pub fn run_agent_for_tui(
         api_key: config.api_key.clone(),
         base_url: config.base_url.clone(),
         model: config.model.clone(),
+        tools_override: None,
     };
 
     let ctx_config = provider::context::ContextConfig::default();
     let mut conversation = Conversation::new();
-    conversation.add_system(build_agent_system_prompt(&cwd, 0));
+    conversation.add_system(agent_common::build_agent_system_prompt(
+        &cwd,
+        0,
+        &SubagentType::General,
+    ));
     conversation.add_user(prompt.to_string());
 
     let mut turn: u32 = 0;
@@ -115,7 +123,7 @@ pub fn run_agent_for_tui(
                 let (should_stop, result) =
                     execute_tool_for_tui(config, &cwd, tool_request, event_tx, action_rx, 0);
 
-                let result_content = format_tool_result_for_model(&result);
+                let result_content = agent_common::format_tool_result_for_model(&result);
                 conversation.add_tool_result(tool_request.id.clone(), result_content);
 
                 if should_stop {
@@ -139,7 +147,7 @@ fn execute_tool_for_tui(
 ) -> (bool, tools::ToolResult) {
     let policy = ApprovalPolicy::new(config.approval_mode);
 
-    if requires_approval(tool_request.action) {
+    if agent_common::requires_approval(tool_request.action) {
         let approval = ApprovalRequest {
             id: format!("approval-{}", tool_request.id),
             action: tool_request.action,
@@ -235,9 +243,9 @@ fn execute_subagent_for_tui(
     action_rx: &Receiver<UserAction>,
     subagent_depth: u32,
 ) -> tools::ToolResult {
-    let description = subagent_field(tool_request, "description")
-        .or_else(|| tool_request.target.clone())
-        .unwrap_or_else(|| "subagent".to_string());
+    let request = subagent::create_subagent_request(tool_request);
+    let description = request.description.clone();
+    let subagent_type = request.subagent_type;
 
     let _ = event_tx.send(TuiEvent::SubagentStarted {
         id: tool_request.id.clone(),
@@ -256,15 +264,14 @@ fn execute_subagent_for_tui(
         return tools::ToolResult::failed(tool_request, error, None);
     }
 
-    let prompt = subagent_field(tool_request, "prompt").unwrap_or_else(|| description.clone());
-
     let child = run_child_agent_for_tui(
         config,
         cwd,
-        &prompt,
+        &request.prompt,
         event_tx,
         action_rx,
         subagent_depth + 1,
+        &subagent_type,
     );
 
     if child.status == "success" {
@@ -298,6 +305,7 @@ fn execute_subagent_for_tui(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_child_agent_for_tui(
     config: &RunConfig,
     cwd: &Path,
@@ -305,16 +313,22 @@ fn run_child_agent_for_tui(
     event_tx: &Sender<TuiEvent>,
     action_rx: &Receiver<UserAction>,
     subagent_depth: u32,
+    subagent_type: &SubagentType,
 ) -> TuiAgentResult {
     let provider_config = ProviderConfig {
         api_key: config.api_key.clone(),
         base_url: config.base_url.clone(),
         model: config.model.clone(),
+        tools_override: Some(deepseek_tools_schema_for_type(subagent_type)),
     };
 
     let ctx_config = provider::context::ContextConfig::default();
     let mut conversation = Conversation::new();
-    conversation.add_system(build_agent_system_prompt(cwd, subagent_depth));
+    conversation.add_system(agent_common::build_agent_system_prompt(
+        cwd,
+        subagent_depth,
+        subagent_type,
+    ));
     conversation.add_user(prompt.to_string());
 
     let mut turn: u32 = 0;
@@ -380,7 +394,7 @@ fn run_child_agent_for_tui(
                     subagent_depth,
                 );
 
-                let result_content = format_tool_result_for_model(&result);
+                let result_content = agent_common::format_tool_result_for_model(&result);
                 conversation.add_tool_result(tool_request.id.clone(), result_content);
 
                 if should_stop {
@@ -393,38 +407,4 @@ fn run_child_agent_for_tui(
             }
         }
     }
-}
-
-fn subagent_field(tool_request: &tools::ToolRequest, field: &str) -> Option<String> {
-    let raw = tool_request.raw_arguments.as_ref()?;
-    let value: serde_json::Value = serde_json::from_str(raw).ok()?;
-    value[field].as_str().map(String::from)
-}
-
-fn build_agent_system_prompt(cwd: &Path, subagent_depth: u32) -> String {
-    let mut prompt = build_system_prompt(cwd);
-    if subagent_depth > 0 {
-        prompt.push_str(
-            "\n\n## Subagent Role\nYou are running as a synchronous subagent. Complete only the delegated task and return a concise report for the parent agent. Do not assume the user can see your intermediate tool output.",
-        );
-    }
-    prompt
-}
-
-fn format_tool_result_for_model(result: &tools::ToolResult) -> String {
-    match (&result.output, &result.error) {
-        (Some(output), _) => {
-            if result.truncated {
-                format!("{output}\n[output truncated]")
-            } else {
-                output.clone()
-            }
-        }
-        (_, Some(error)) => format!("ERROR: {error}"),
-        _ => "(no output)".to_string(),
-    }
-}
-
-fn requires_approval(action: ActionKind) -> bool {
-    matches!(action, ActionKind::Write | ActionKind::Shell)
 }
