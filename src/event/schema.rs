@@ -5,6 +5,7 @@ use serde_json::{Value, json};
 
 use crate::approval::policy::{ApprovalRequest, ApprovalResolution};
 use crate::provider::ProviderReplayState;
+use crate::runtime::cost::UsageTotals;
 use crate::tools::{ToolRequest, ToolResult};
 use crate::verification::VerificationResult;
 
@@ -33,6 +34,8 @@ pub enum EventType {
     AssistantMessageDelta,
     #[serde(rename = "provider.replay.updated")]
     ProviderReplayUpdated,
+    #[serde(rename = "usage.updated")]
+    UsageUpdated,
     #[serde(rename = "approval.requested")]
     ApprovalRequested,
     #[serde(rename = "approval.resolved")]
@@ -151,6 +154,19 @@ impl EventFactory {
                 "provider": replay.provider,
                 "reasoning_content": replay.reasoning_content,
                 "tool_call_ids": replay.tool_call_ids
+            }),
+        )
+    }
+
+    pub fn usage_updated(&mut self, usage: UsageTotals) -> EventEnvelope {
+        self.make(
+            EventType::UsageUpdated,
+            json!({
+                "input_tokens": usage.input_tokens,
+                "output_tokens": usage.output_tokens,
+                "cache_tokens": usage.cache_tokens,
+                "total_tokens": usage.total_tokens(),
+                "estimated_cost_usd": usage.estimated_cost_usd
             }),
         )
     }

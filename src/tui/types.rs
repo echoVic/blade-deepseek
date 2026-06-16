@@ -1,6 +1,7 @@
 use std::sync::mpsc;
 use std::time::Instant;
 
+use crate::runtime::cost::UsageTotals;
 use crate::runtime::history::SessionSummary;
 
 #[derive(Debug, Clone)]
@@ -37,6 +38,7 @@ pub enum TuiEvent {
         target: Option<String>,
     },
     Error(String),
+    UsageUpdated(UsageTotals),
     SessionCompleted {
         status: String,
     },
@@ -111,6 +113,7 @@ pub struct AppState {
     pub last_ctrl_c: Option<Instant>,
     pub session_picker_sessions: Vec<SessionSummary>,
     pub session_picker_selected: usize,
+    pub usage: UsageTotals,
 }
 
 impl AppState {
@@ -133,6 +136,7 @@ impl AppState {
             last_ctrl_c: None,
             session_picker_sessions: Vec::new(),
             session_picker_selected: 0,
+            usage: UsageTotals::default(),
         }
     }
 
@@ -355,6 +359,9 @@ impl AppState {
             }
             TuiEvent::Error(msg) => {
                 self.messages.push(ChatMessage::Error(msg));
+            }
+            TuiEvent::UsageUpdated(usage) => {
+                self.usage = usage;
             }
             TuiEvent::SessionCompleted { .. } => {
                 self.status = AppStatus::Idle;

@@ -2,11 +2,14 @@ use std::io::{BufRead, BufReader, Read};
 
 use serde::Deserialize;
 
+use crate::provider::Usage;
 use crate::runtime::cancel::CancelToken;
 
 #[derive(Debug, Deserialize)]
 pub struct StreamChunk {
+    #[serde(default)]
     pub choices: Vec<StreamChoice>,
+    pub usage: Option<StreamUsage>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -58,6 +61,35 @@ pub struct StreamResult {
     pub reasoning: String,
     pub content: String,
     pub tool_calls: Vec<ToolCallAccumulator>,
+    pub usage: Option<Usage>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct StreamUsage {
+    prompt_tokens: Option<u64>,
+    completion_tokens: Option<u64>,
+    total_tokens: Option<u64>,
+    prompt_cache_hit_tokens: Option<u64>,
+    prompt_cache_miss_tokens: Option<u64>,
+}
+
+impl From<StreamUsage> for Usage {
+    fn from(usage: StreamUsage) -> Self {
+        let input_tokens = usage.prompt_tokens.unwrap_or_else(|| {
+            usage.prompt_cache_hit_tokens.unwrap_or(0) + usage.prompt_cache_miss_tokens.unwrap_or(0)
+        });
+        let output_tokens = usage.completion_tokens.unwrap_or_else(|| {
+            usage
+                .total_tokens
+                .unwrap_or(input_tokens)
+                .saturating_sub(input_tokens)
+        });
+        Self {
+            input_tokens,
+            output_tokens,
+            cache_tokens: usage.prompt_cache_hit_tokens.unwrap_or(0),
+        }
+    }
 }
 
 pub enum StreamEvent<'a> {
@@ -75,6 +107,7 @@ pub fn parse_sse_stream<R: Read>(
     let mut reasoning_buf = String::new();
     let mut content_buf = String::new();
     let mut tool_calls: Vec<ToolCallAccumulator> = Vec::new();
+    let mut usage = None;
 
     for line in buf_reader.lines() {
         if cancel.is_cancelled() {
@@ -99,6 +132,10 @@ pub fn parse_sse_stream<R: Read>(
             Ok(c) => c,
             Err(_) => continue,
         };
+
+        if let Some(chunk_usage) = chunk.usage {
+            usage = Some(chunk_usage.into());
+        }
 
         for choice in &chunk.choices {
             if let Some(ref reason) = choice.finish_reason {
@@ -134,6 +171,7 @@ pub fn parse_sse_stream<R: Read>(
         reasoning: reasoning_buf,
         content: content_buf,
         tool_calls,
+        usage,
     })
 }
 
@@ -235,5 +273,20 @@ mod tests {
         cancel.cancel();
         let result = parse_sse_stream(sse_data.as_bytes(), &cancel, |_| {});
         assert_eq!(result.unwrap_err(), "cancelled");
+    }
+
+    #[test]
+    fn parse_usage_chunk() {
+        let sse_data = "data: {\"choices\":[{\"delta\":{\"content\":\"answer\"},\"finish_reason\":\"stop\"}]}\n\n\
+                        data: {\"choices\":[],\"usage\":{\"prompt_tokens\":120,\"completion_tokens\":30,\"total_tokens\":150,\"prompt_cache_hit_tokens\":10}}\n\n\
+                        data: [DONE]\n\n";
+
+        let cancel = CancelToken::new();
+        let result = parse_sse_stream(sse_data.as_bytes(), &cancel, |_| {}).unwrap();
+
+        let usage = result.usage.expect("usage");
+        assert_eq!(usage.input_tokens, 120);
+        assert_eq!(usage.output_tokens, 30);
+        assert_eq!(usage.cache_tokens, 10);
     }
 }

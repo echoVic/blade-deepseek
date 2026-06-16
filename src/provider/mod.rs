@@ -21,6 +21,23 @@ pub struct ProviderConfig {
     pub tools_override: Option<Vec<serde_json::Value>>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct Usage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_tokens: u64,
+}
+
+impl Usage {
+    pub fn total_tokens(self) -> u64 {
+        self.input_tokens + self.output_tokens + self.cache_tokens
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.total_tokens() == 0
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ProviderReplayState {
     pub provider: &'static str,
@@ -42,6 +59,7 @@ pub struct ProviderResponse {
     pub assistant_content: Option<String>,
     pub assistant_reasoning: Option<String>,
     pub tool_calls: Vec<RawToolCall>,
+    pub usage: Option<Usage>,
 }
 
 pub fn call(
@@ -65,6 +83,7 @@ pub fn call(
                     assistant_content: Some(msg),
                     assistant_reasoning: None,
                     tool_calls: Vec::new(),
+                    usage: None,
                 }
             } else {
                 let steps = deepseek_fixture::plan();
@@ -90,6 +109,7 @@ pub fn call(
                             .to_string(),
                     ),
                     tool_calls,
+                    usage: None,
                 }
             }
         }
@@ -134,6 +154,7 @@ fn mock_call(conversation: &Conversation) -> ProviderResponse {
             assistant_content: Some(msg),
             assistant_reasoning: Some("Mock reasoning.".to_string()),
             tool_calls: Vec::new(),
+            usage: None,
         };
     }
 
@@ -147,6 +168,26 @@ fn mock_call(conversation: &Conversation) -> ProviderResponse {
             assistant_content: None,
             assistant_reasoning: None,
             tool_calls: Vec::new(),
+            usage: None,
+        };
+    }
+
+    if prompt.trim() == "mock_usage" {
+        let reasoning = "Mock runtime is preserving the DeepSeek reasoning channel.";
+        let message = "Mock runtime completed with usage accounting.";
+        return ProviderResponse {
+            steps: vec![
+                ProviderStep::ReasoningDelta(reasoning.to_string()),
+                ProviderStep::MessageDelta(message.to_string()),
+            ],
+            assistant_content: Some(message.to_string()),
+            assistant_reasoning: Some(reasoning.to_string()),
+            tool_calls: Vec::new(),
+            usage: Some(Usage {
+                input_tokens: 120,
+                output_tokens: 30,
+                cache_tokens: 10,
+            }),
         };
     }
 
@@ -166,6 +207,7 @@ fn mock_call(conversation: &Conversation) -> ProviderResponse {
             assistant_content: Some(message),
             assistant_reasoning: None,
             tool_calls: Vec::new(),
+            usage: None,
         };
     }
 
@@ -184,6 +226,7 @@ fn mock_call(conversation: &Conversation) -> ProviderResponse {
             assistant_content: None,
             assistant_reasoning: Some(reasoning),
             tool_calls: vec![raw_call],
+            usage: None,
         }
     } else {
         let reasoning = "Mock runtime is preserving the DeepSeek reasoning channel.";
@@ -196,6 +239,7 @@ fn mock_call(conversation: &Conversation) -> ProviderResponse {
             assistant_content: Some(message.to_string()),
             assistant_reasoning: Some(reasoning.to_string()),
             tool_calls: Vec::new(),
+            usage: None,
         }
     }
 }

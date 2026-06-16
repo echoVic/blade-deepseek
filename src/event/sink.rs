@@ -44,6 +44,11 @@ impl<W: Write> EventSink<W> {
                 )
             }
             EventType::ProviderReplayUpdated => writeln!(self.writer, "provider replay updated"),
+            EventType::UsageUpdated => {
+                let total = event.payload["total_tokens"].as_u64().unwrap_or(0);
+                let cost = event.payload["estimated_cost_usd"].as_f64().unwrap_or(0.0);
+                writeln!(self.writer, "usage: {total} tokens (${cost:.6})")
+            }
             EventType::ApprovalRequested => writeln!(self.writer, "approval requested"),
             EventType::ApprovalResolved => writeln!(self.writer, "approval resolved"),
             EventType::ToolCallRequested => {

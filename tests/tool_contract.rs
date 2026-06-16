@@ -149,6 +149,56 @@ fn full_auto_allows_bash_tool() {
 }
 
 #[test]
+fn full_auto_bash_cannot_write_outside_workspace() {
+    if !sandbox_seatbelt_available() {
+        return;
+    }
+
+    let temp_dir = make_temp_workspace("bash-sandbox");
+    let outside = std::env::temp_dir().join(format!(
+        "orca-outside-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .args([
+            "exec",
+            "--output-format",
+            "jsonl",
+            "--provider",
+            "mock",
+            "--approval-mode",
+            "full-auto",
+            "--cwd",
+            temp_dir.to_str().unwrap(),
+            &format!("bash printf blocked > {}", outside.display()),
+        ])
+        .output()
+        .expect("run orca");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(!outside.exists());
+
+    let events = parse_jsonl(&output.stdout);
+    let completed = find_event(&events, "tool.call.completed");
+    assert_eq!(completed["payload"]["name"], "bash");
+    assert_eq!(completed["payload"]["status"], "failed");
+}
+
+fn sandbox_seatbelt_available() -> bool {
+    Command::new("sandbox-exec")
+        .arg("-p")
+        .arg("(version 1) (allow default)")
+        .arg("true")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+#[test]
 fn auto_edit_allows_edit_tool() {
     let temp_dir = make_temp_workspace("edit-success");
     let file_path = temp_dir.join("note.txt");

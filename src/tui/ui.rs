@@ -323,6 +323,14 @@ fn render_status(frame: &mut Frame, area: Rect, state: &AppState) {
             Style::default().fg(Color::DarkGray),
         ),
         Span::styled(
+            format!(
+                " | tokens: {} | cost: ${:.6}",
+                state.usage.total_tokens(),
+                state.usage.estimated_cost_usd
+            ),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(
             " | F1/ctrl+k shortcuts",
             Style::default().fg(Color::DarkGray),
         ),

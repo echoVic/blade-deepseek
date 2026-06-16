@@ -4,7 +4,7 @@ use serde_json::Value;
 use crate::approval::policy::ActionKind;
 use crate::provider::conversation::Conversation;
 use crate::provider::tool_schema::deepseek_tools_schema;
-use crate::provider::{ProviderConfig, ProviderReplayState, ProviderResponse, ProviderStep};
+use crate::provider::{ProviderConfig, ProviderReplayState, ProviderResponse, ProviderStep, Usage};
 use crate::runtime::cancel::CancelToken;
 use crate::tools::{ToolName, ToolRequest};
 
@@ -50,6 +50,7 @@ struct ApiFunctionRequest {
 #[derive(Debug, Deserialize)]
 struct ChatResponse {
     choices: Vec<Choice>,
+    usage: Option<ApiUsage>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -77,6 +78,34 @@ struct ApiFunctionResponse {
     arguments: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ApiUsage {
+    prompt_tokens: Option<u64>,
+    completion_tokens: Option<u64>,
+    total_tokens: Option<u64>,
+    prompt_cache_hit_tokens: Option<u64>,
+    prompt_cache_miss_tokens: Option<u64>,
+}
+
+impl From<ApiUsage> for Usage {
+    fn from(usage: ApiUsage) -> Self {
+        let input_tokens = usage.prompt_tokens.unwrap_or_else(|| {
+            usage.prompt_cache_hit_tokens.unwrap_or(0) + usage.prompt_cache_miss_tokens.unwrap_or(0)
+        });
+        let output_tokens = usage.completion_tokens.unwrap_or_else(|| {
+            usage
+                .total_tokens
+                .unwrap_or(input_tokens)
+                .saturating_sub(input_tokens)
+        });
+        Self {
+            input_tokens,
+            output_tokens,
+            cache_tokens: usage.prompt_cache_hit_tokens.unwrap_or(0),
+        }
+    }
+}
+
 pub fn call(conversation: &Conversation, config: &ProviderConfig) -> ProviderResponse {
     match request_chat(conversation, config) {
         Ok(response) => response,
@@ -87,6 +116,7 @@ pub fn call(conversation: &Conversation, config: &ProviderConfig) -> ProviderRes
             assistant_content: None,
             assistant_reasoning: None,
             tool_calls: Vec::new(),
+            usage: None,
         },
     }
 }
@@ -107,6 +137,7 @@ pub fn call_streaming(
                 assistant_content: None,
                 assistant_reasoning: None,
                 tool_calls: Vec::new(),
+                usage: None,
             }
         }
     }
@@ -230,6 +261,7 @@ fn request_chat_streaming(
         assistant_content,
         assistant_reasoning,
         tool_calls: raw_calls_for_history,
+        usage: stream_result.usage,
     })
 }
 
@@ -263,6 +295,7 @@ fn request_chat(
     .json::<ChatResponse>()
     .map_err(|error| format!("invalid response: {error}"))?;
 
+    let usage = response.usage.map(Usage::from);
     let choice = response
         .choices
         .into_iter()
@@ -346,6 +379,7 @@ fn request_chat(
         assistant_content,
         assistant_reasoning,
         tool_calls: raw_calls_for_history,
+        usage,
     })
 }
 

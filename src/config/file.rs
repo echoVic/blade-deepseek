@@ -4,15 +4,23 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use crate::approval::policy::PermissionRules;
+
+const ORCA_HOME_ENV: &str = "ORCA_HOME";
+
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct FileConfig {
     pub model: Option<String>,
     pub api_key: Option<String>,
     pub base_url: Option<String>,
+    #[serde(default)]
+    pub permissions: PermissionRules,
 }
 
 fn config_dir() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".orca"))
+    std::env::var_os(ORCA_HOME_ENV)
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|h| h.join(".orca")))
 }
 
 pub fn load_user_config() -> FileConfig {
@@ -72,6 +80,26 @@ base_url = "https://custom.api.com"
         let config: FileConfig = toml::from_str(toml).unwrap();
         assert_eq!(config.model.as_deref(), Some("deepseek-v4-flash"));
         assert_eq!(config.base_url.as_deref(), Some("https://custom.api.com"));
+    }
+
+    #[test]
+    fn parse_permission_rules() {
+        let toml = r#"
+[[permissions.allow]]
+tool = "bash"
+pattern = "cargo *"
+
+[[permissions.deny]]
+tool = "write_file"
+pattern = "/etc/**"
+"#;
+        let config: FileConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.permissions.allow.len(), 1);
+        assert_eq!(config.permissions.allow[0].tool, "bash");
+        assert_eq!(config.permissions.allow[0].pattern, "cargo *");
+        assert_eq!(config.permissions.deny.len(), 1);
+        assert_eq!(config.permissions.deny[0].tool, "write_file");
+        assert_eq!(config.permissions.deny[0].pattern, "/etc/**");
     }
 
     #[test]

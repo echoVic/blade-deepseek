@@ -282,9 +282,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                                 if let Ok(mut cfg) = shared_config.lock() {
                                     cfg.history_mode = HistoryMode::Resume(session_id.clone());
                                 }
-                                if let Ok(transcript) =
-                                    history::load_session(&session_id)
-                                {
+                                if let Ok(transcript) = history::load_session(&session_id) {
                                     state.messages.clear();
                                     for message in &transcript.messages {
                                         if let Some(chat_message) =
@@ -546,20 +544,17 @@ fn agent_loop_thread(
                 let cfg = config.lock().unwrap().clone();
                 if session.is_none() {
                     let transcript = preloaded.lock().unwrap().take();
-                    session =
-                        match bridge::TuiConversationSession::new_with_preloaded(
-                            &cfg,
-                            &prompt,
-                            transcript,
-                        ) {
-                            Ok(session) => Some(session),
-                            Err(error) => {
-                                let _ = event_tx.send(TuiEvent::Error(format!(
-                                    "failed to initialize conversation history: {error}"
-                                )));
-                                continue;
-                            }
-                        };
+                    session = match bridge::TuiConversationSession::new_with_preloaded(
+                        &cfg, &prompt, transcript,
+                    ) {
+                        Ok(session) => Some(session),
+                        Err(error) => {
+                            let _ = event_tx.send(TuiEvent::Error(format!(
+                                "failed to initialize conversation history: {error}"
+                            )));
+                            continue;
+                        }
+                    };
                 }
                 bridge::run_agent_for_tui(
                     &cfg,

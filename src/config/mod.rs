@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 
-use crate::approval::policy::ApprovalMode;
+use crate::approval::policy::{ApprovalMode, PermissionRules};
 
 pub mod file;
 
@@ -55,4 +55,6 @@ pub struct RunConfig {
     pub base_url: Option<String>,
     pub history_mode: HistoryMode,
     pub show_session_picker: bool,
+    pub permission_rules: PermissionRules,
+    pub max_budget_usd: Option<f64>,
 }

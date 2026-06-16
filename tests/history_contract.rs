@@ -40,6 +40,30 @@ fn exec_saves_history_and_history_commands_can_read_it() {
 }
 
 #[test]
+fn exec_persists_usage_in_history() {
+    let home = TempDir::new().expect("temp home");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .env("ORCA_HOME", home.path())
+        .args(["exec", "--provider", "mock", "mock_usage"])
+        .output()
+        .expect("run orca");
+
+    assert_eq!(output.status.code(), Some(0));
+
+    let show = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .env("ORCA_HOME", home.path())
+        .args(["history", "show", "latest"])
+        .output()
+        .expect("show history");
+
+    assert_eq!(show.status.code(), Some(0));
+    let show_stdout = String::from_utf8_lossy(&show.stdout);
+    assert!(show_stdout.contains("Usage: input=120 output=30 cache=10 total=150"));
+    assert!(show_stdout.contains("Estimated cost: $"));
+}
+
+#[test]
 fn exec_resume_injects_prior_conversation() {
     let home = TempDir::new().expect("temp home");
 
@@ -73,6 +97,85 @@ fn exec_resume_injects_prior_conversation() {
         .expect("assistant message");
     let text = message["payload"]["text"].as_str().unwrap_or_default();
     assert!(text.contains("first prompt | mock_history_echo"));
+}
+
+#[test]
+fn exec_injects_project_instructions_into_system_prompt() {
+    let home = TempDir::new().expect("temp home");
+    let project = TempDir::new().expect("temp project");
+    std::fs::write(
+        project.path().join("Cargo.toml"),
+        "[package]\nname = \"probe\"\n",
+    )
+    .expect("write Cargo.toml");
+    std::fs::write(
+        project.path().join("AGENTS.md"),
+        "Always prefer contract tests.\n",
+    )
+    .expect("write AGENTS.md");
+    std::fs::create_dir_all(project.path().join(".orca/rules")).expect("create rules dir");
+    std::fs::write(
+        project.path().join(".orca/rules/010-style.md"),
+        "Keep user-facing output concise.\n",
+    )
+    .expect("write rule");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .current_dir(project.path())
+        .env("ORCA_HOME", home.path())
+        .args(["exec", "--provider", "mock", "instruction probe"])
+        .output()
+        .expect("run orca");
+
+    assert_eq!(output.status.code(), Some(0));
+
+    let show = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .env("ORCA_HOME", home.path())
+        .args(["history", "show", "latest"])
+        .output()
+        .expect("show history");
+
+    assert_eq!(show.status.code(), Some(0));
+    let show_stdout = String::from_utf8_lossy(&show.stdout);
+    assert!(show_stdout.contains("<project-instructions>"));
+    assert!(show_stdout.contains("Always prefer contract tests."));
+    assert!(show_stdout.contains("Keep user-facing output concise."));
+}
+
+#[test]
+fn exec_injects_user_instructions_before_project_instructions() {
+    let home = TempDir::new().expect("temp home");
+    let project = TempDir::new().expect("temp project");
+    std::fs::write(
+        project.path().join("Cargo.toml"),
+        "[package]\nname = \"probe\"\n",
+    )
+    .expect("write Cargo.toml");
+    std::fs::write(home.path().join("AGENTS.md"), "Global instruction\n")
+        .expect("write global AGENTS.md");
+    std::fs::write(project.path().join("AGENTS.md"), "Project instruction\n")
+        .expect("write project AGENTS.md");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .current_dir(project.path())
+        .env("ORCA_HOME", home.path())
+        .args(["exec", "--provider", "mock", "global instruction probe"])
+        .output()
+        .expect("run orca");
+
+    assert_eq!(output.status.code(), Some(0));
+
+    let show = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .env("ORCA_HOME", home.path())
+        .args(["history", "show", "latest"])
+        .output()
+        .expect("show history");
+
+    assert_eq!(show.status.code(), Some(0));
+    let show_stdout = String::from_utf8_lossy(&show.stdout);
+    let global = show_stdout.find("Global instruction").expect("global");
+    let project = show_stdout.find("Project instruction").expect("project");
+    assert!(global < project);
 }
 
 #[test]

@@ -1,6 +1,6 @@
 use std::path::Path;
-use std::process::Command;
 
+use crate::sandbox;
 use crate::tools::{ToolRequest, ToolResult, truncate_output};
 
 pub fn execute(request: &ToolRequest, cwd: &Path, max_bytes: usize) -> ToolResult {
@@ -12,11 +12,7 @@ pub fn execute(request: &ToolRequest, cwd: &Path, max_bytes: usize) -> ToolResul
         return ToolResult::failed(request, "bash command is required", None);
     };
 
-    let output = Command::new("sh")
-        .arg("-c")
-        .arg(command)
-        .current_dir(cwd)
-        .output();
+    let output = sandbox::bash_command(command, cwd).output();
 
     match output {
         Ok(output) if output.status.success() => {

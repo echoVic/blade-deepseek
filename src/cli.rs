@@ -72,6 +72,10 @@ struct ExecArgs {
     #[arg(long)]
     verifier: Option<String>,
 
+    /// Maximum estimated USD budget for this run.
+    #[arg(long)]
+    max_budget: Option<f64>,
+
     /// Resume a saved history session by ID, prefix, or 'latest'.
     #[arg(long)]
     resume: Option<String>,
@@ -213,15 +217,13 @@ fn run_exec(args: ExecArgs) -> i32 {
         .or(file_config.model);
 
     let output_format = args.output_format;
-    let fallback = if args.no_history
-        || (output_format == OutputFormatArg::Jsonl && !args.save_history)
-    {
-        HistoryMode::Disabled
-    } else {
-        HistoryMode::Record
-    };
-    let history_mode =
-        resolve_history_mode(args.resume, args.fork, args.continue_latest, fallback);
+    let fallback =
+        if args.no_history || (output_format == OutputFormatArg::Jsonl && !args.save_history) {
+            HistoryMode::Disabled
+        } else {
+            HistoryMode::Record
+        };
+    let history_mode = resolve_history_mode(args.resume, args.fork, args.continue_latest, fallback);
 
     let config = RunConfig {
         prompt,
@@ -235,6 +237,8 @@ fn run_exec(args: ExecArgs) -> i32 {
         base_url,
         history_mode,
         show_session_picker: false,
+        permission_rules: file_config.permissions,
+        max_budget_usd: args.max_budget,
     };
 
     controller::run(config)
@@ -291,6 +295,16 @@ fn run_history(args: HistoryArgs) -> i32 {
                             compaction.after_messages
                         );
                     }
+                }
+                if let Some(usage) = transcript.usage {
+                    println!(
+                        "Usage: input={} output={} cache={} total={}",
+                        usage.input_tokens,
+                        usage.output_tokens,
+                        usage.cache_tokens,
+                        usage.total_tokens()
+                    );
+                    println!("Estimated cost: ${:.6}", usage.estimated_cost_usd);
                 }
                 println!("CWD: {}", transcript.meta.cwd);
                 println!("Path: {}", transcript.path.display());
@@ -441,8 +455,12 @@ fn run_placeholder(cli: Cli) -> i32 {
 
     let model = env::var("DEEPSEEK_MODEL").ok().or(file_config.model);
 
-    let history_mode =
-        resolve_history_mode(cli.resume, cli.fork, cli.continue_latest, HistoryMode::Record);
+    let history_mode = resolve_history_mode(
+        cli.resume,
+        cli.fork,
+        cli.continue_latest,
+        HistoryMode::Record,
+    );
 
     let config = RunConfig {
         prompt: cli.prompt.join(" "),
@@ -456,6 +474,8 @@ fn run_placeholder(cli: Cli) -> i32 {
         base_url,
         history_mode,
         show_session_picker: cli.session_picker,
+        permission_rules: file_config.permissions,
+        max_budget_usd: None,
     };
 
     app::run_tui(config)

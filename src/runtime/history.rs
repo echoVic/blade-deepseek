@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::provider::conversation::{Conversation, Message, RawToolCall};
+use crate::runtime::cost::UsageTotals;
 
 const ORCA_HOME_ENV: &str = "ORCA_HOME";
 const SESSION_SCHEMA_VERSION: u32 = 1;
@@ -48,6 +49,7 @@ pub struct SessionTranscript {
     pub meta: SessionMeta,
     pub messages: Vec<Message>,
     pub compactions: Vec<CompactionRecord>,
+    pub usage: Option<UsageTotals>,
     pub path: PathBuf,
 }
 
@@ -77,6 +79,8 @@ enum SessionRecord {
     },
     #[serde(rename = "context.collapsed")]
     ContextCollapsed(CompactionRecord),
+    #[serde(rename = "session.usage")]
+    Usage(UsageTotals),
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -201,6 +205,10 @@ impl SessionWriter {
                 after_messages,
             }),
         )
+    }
+
+    pub fn append_usage(&mut self, usage: UsageTotals) -> io::Result<()> {
+        write_record(&self.path, &SessionRecord::Usage(usage))
     }
 }
 
@@ -402,6 +410,7 @@ fn read_transcript(path: &Path) -> io::Result<SessionTranscript> {
     let mut meta = None;
     let mut messages = Vec::new();
     let mut compactions = Vec::new();
+    let mut usage = None;
 
     for record in records {
         match record {
@@ -409,6 +418,7 @@ fn read_transcript(path: &Path) -> io::Result<SessionTranscript> {
             SessionRecord::Message { message } => messages.push(message.into()),
             SessionRecord::Completed { .. } => {}
             SessionRecord::ContextCollapsed(record) => compactions.push(record),
+            SessionRecord::Usage(record) => usage = Some(record),
         }
     }
 
@@ -423,6 +433,7 @@ fn read_transcript(path: &Path) -> io::Result<SessionTranscript> {
         meta,
         messages,
         compactions,
+        usage,
         path: path.to_path_buf(),
     })
 }

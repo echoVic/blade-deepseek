@@ -8,7 +8,9 @@ use crate::provider::tool_schema::deepseek_tools_schema_for_type;
 use crate::provider::{self, ProviderConfig, ProviderStep};
 use crate::runtime::agent_common;
 use crate::runtime::cancel::CancelToken;
+use crate::runtime::cost::CostTracker;
 use crate::runtime::history::{self, SessionWriter};
+use crate::runtime::instructions::{self, ProjectInstructions};
 use crate::runtime::subagent;
 use crate::runtime::subagent_types::SubagentType;
 use crate::tools;
@@ -27,6 +29,8 @@ struct TuiAgentResult {
 pub struct TuiConversationSession {
     conversation: Conversation,
     writer: Option<SessionWriter>,
+    instructions: ProjectInstructions,
+    cost_tracker: CostTracker,
 }
 
 impl TuiConversationSession {
@@ -39,8 +43,13 @@ impl TuiConversationSession {
             .cwd
             .clone()
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-        let system_prompt =
-            agent_common::build_agent_system_prompt(&cwd, 0, &SubagentType::General);
+        let instructions = load_project_instructions(&cwd);
+        let system_prompt = agent_common::build_agent_system_prompt(
+            &cwd,
+            0,
+            &SubagentType::General,
+            Some(&instructions),
+        );
         let (conversation, loaded_transcript) = match &config.history_mode {
             crate::config::HistoryMode::Resume(selector)
             | crate::config::HistoryMode::Fork(selector) => {
@@ -87,6 +96,8 @@ impl TuiConversationSession {
         Ok(Self {
             conversation,
             writer,
+            instructions,
+            cost_tracker: CostTracker::new(config.model.as_deref()),
         })
     }
 
@@ -129,6 +140,16 @@ fn start_writer_with_messages(
         Err(error) => {
             eprintln!("orca: warning: failed to initialize history: {error}");
             None
+        }
+    }
+}
+
+fn load_project_instructions(cwd: &Path) -> ProjectInstructions {
+    match instructions::load_for_cwd(cwd) {
+        Ok(instructions) => instructions,
+        Err(error) => {
+            eprintln!("orca: warning: failed to load project instructions: {error}");
+            ProjectInstructions::default()
         }
     }
 }
@@ -201,6 +222,29 @@ pub fn run_agent_for_tui(
             },
         );
 
+        if let Some(usage) = response.usage
+            && !usage.is_empty()
+        {
+            let totals = session.cost_tracker.add_usage(usage);
+            let _ = event_tx.send(TuiEvent::UsageUpdated(totals));
+            if let Some(writer) = &mut session.writer {
+                let _ = writer.append_usage(totals);
+            }
+            if let Some(max_budget) = config.max_budget_usd
+                && totals.estimated_cost_usd > max_budget
+            {
+                let _ = event_tx.send(TuiEvent::Error(format!(
+                    "budget exhausted: estimated cost ${:.6} exceeded limit ${:.6}",
+                    totals.estimated_cost_usd, max_budget
+                )));
+                let _ = event_tx.send(TuiEvent::SessionCompleted {
+                    status: "budget_exhausted".to_string(),
+                });
+                session.complete("budget_exhausted");
+                return;
+            }
+        }
+
         if cancel.is_cancelled() {
             let _ = event_tx.send(TuiEvent::SessionCompleted {
                 status: "interrupted".to_string(),
@@ -253,8 +297,15 @@ pub fn run_agent_for_tui(
 
         for step in &response.steps {
             if let ProviderStep::ToolCall(tool_request) = step {
-                let (should_stop, result) =
-                    execute_tool_for_tui(config, &cwd, tool_request, event_tx, action_rx, 0);
+                let (should_stop, result) = execute_tool_for_tui(
+                    config,
+                    &cwd,
+                    tool_request,
+                    event_tx,
+                    action_rx,
+                    0,
+                    &session.instructions,
+                );
 
                 let result_content = agent_common::format_tool_result_for_model(&result);
                 session
@@ -283,8 +334,10 @@ fn execute_tool_for_tui(
     event_tx: &Sender<TuiEvent>,
     action_rx: &Receiver<UserAction>,
     subagent_depth: u32,
+    instructions: &ProjectInstructions,
 ) -> (bool, tools::ToolResult) {
-    let policy = ApprovalPolicy::new(config.approval_mode);
+    let policy = ApprovalPolicy::new(config.approval_mode)
+        .with_permission_rules(config.permission_rules.clone());
 
     if agent_common::requires_approval(tool_request.action) {
         let approval = ApprovalRequest {
@@ -296,7 +349,11 @@ fn execute_tool_for_tui(
                 tool_request.action.as_str()
             ),
         };
-        let resolution = policy.resolve(&approval);
+        let resolution = policy.resolve_for_tool(
+            &approval,
+            tool_request.name.as_str(),
+            tool_request.target.as_deref(),
+        );
 
         match resolution.decision {
             ApprovalDecision::Allow => {}
@@ -350,6 +407,7 @@ fn execute_tool_for_tui(
             event_tx,
             action_rx,
             subagent_depth,
+            instructions,
         )
     } else {
         let _ = event_tx.send(TuiEvent::ToolRequested {
@@ -381,6 +439,7 @@ fn execute_subagent_for_tui(
     event_tx: &Sender<TuiEvent>,
     action_rx: &Receiver<UserAction>,
     subagent_depth: u32,
+    instructions: &ProjectInstructions,
 ) -> tools::ToolResult {
     let request = subagent::create_subagent_request(tool_request);
     let description = request.description.clone();
@@ -411,6 +470,7 @@ fn execute_subagent_for_tui(
         action_rx,
         subagent_depth + 1,
         &subagent_type,
+        instructions,
     );
 
     if child.status == "success" {
@@ -453,6 +513,7 @@ fn run_child_agent_for_tui(
     action_rx: &Receiver<UserAction>,
     subagent_depth: u32,
     subagent_type: &SubagentType,
+    instructions: &ProjectInstructions,
 ) -> TuiAgentResult {
     let provider_config = ProviderConfig {
         api_key: config.api_key.clone(),
@@ -467,6 +528,7 @@ fn run_child_agent_for_tui(
         cwd,
         subagent_depth,
         subagent_type,
+        Some(instructions),
     ));
     conversation.add_user(prompt.to_string());
 
@@ -533,6 +595,7 @@ fn run_child_agent_for_tui(
                     event_tx,
                     action_rx,
                     subagent_depth,
+                    instructions,
                 );
 
                 let result_content = agent_common::format_tool_result_for_model(&result);
@@ -571,6 +634,8 @@ mod tests {
             base_url: None,
             history_mode: HistoryMode::Disabled,
             show_session_picker: false,
+            permission_rules: Default::default(),
+            max_budget_usd: None,
         }
     }
 
@@ -580,7 +645,8 @@ mod tests {
         let (event_tx, event_rx) = mpsc::channel();
         let (_action_tx, action_rx) = mpsc::channel();
         let cancel = CancelToken::new();
-        let mut session = TuiConversationSession::new_with_preloaded(&config, "first", None).expect("session");
+        let mut session =
+            TuiConversationSession::new_with_preloaded(&config, "first", None).expect("session");
 
         run_agent_for_tui(
             &config,
@@ -619,7 +685,8 @@ mod tests {
         let (event_tx, event_rx) = mpsc::channel();
         let (_action_tx, action_rx) = mpsc::channel();
         let cancel = CancelToken::new();
-        let mut session = TuiConversationSession::new_with_preloaded(&config, "first", None).expect("session");
+        let mut session =
+            TuiConversationSession::new_with_preloaded(&config, "first", None).expect("session");
 
         run_agent_for_tui(
             &config,

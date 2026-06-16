@@ -13,7 +13,9 @@ use crate::provider::tool_schema::deepseek_tools_schema_for_type;
 use crate::provider::{self, ProviderConfig, ProviderStep};
 use crate::runtime::agent_common;
 use crate::runtime::cancel::CancelToken;
+use crate::runtime::cost::CostTracker;
 use crate::runtime::history::{self, SessionWriter};
+use crate::runtime::instructions::{self, ProjectInstructions};
 use crate::runtime::session::new_run_id;
 use crate::runtime::subagent;
 use crate::runtime::subagent_types::SubagentType;
@@ -70,6 +72,7 @@ fn run_inner(config: RunConfig) -> io::Result<RunStatus> {
     let mut events = EventFactory::new(new_run_id());
     let stdout = io::stdout();
     let mut sink = EventSink::new(stdout.lock(), config.output_format);
+    let instructions = load_project_instructions(&cwd_path);
 
     let resumed = match &config.history_mode {
         HistoryMode::Resume(selector) | HistoryMode::Fork(selector) => {
@@ -122,6 +125,7 @@ fn run_inner(config: RunConfig) -> io::Result<RunStatus> {
     ))?;
 
     let cancel = CancelToken::new();
+    let mut cost_tracker = CostTracker::new(config.model.as_deref());
     let result = run_agent_loop(
         &config,
         &cwd_path,
@@ -133,6 +137,8 @@ fn run_inner(config: RunConfig) -> io::Result<RunStatus> {
         0,
         true,
         &SubagentType::General,
+        &instructions,
+        &mut cost_tracker,
         &cancel,
     )?;
     let status = result.status;
@@ -160,6 +166,8 @@ fn run_agent_loop(
     subagent_depth: u32,
     emit_deltas: bool,
     subagent_type: &SubagentType,
+    instructions: &ProjectInstructions,
+    cost_tracker: &mut CostTracker,
     cancel: &CancelToken,
 ) -> io::Result<AgentLoopResult> {
     let max_turns = DEFAULT_MAX_TURNS;
@@ -176,7 +184,12 @@ fn run_agent_loop(
         tools_override,
     };
 
-    let system_prompt = agent_common::build_agent_system_prompt(cwd, subagent_depth, subagent_type);
+    let system_prompt = agent_common::build_agent_system_prompt(
+        cwd,
+        subagent_depth,
+        subagent_type,
+        Some(instructions),
+    );
     let mut conversation = if let Some(resumed) = resumed {
         history::resume_conversation(resumed, system_prompt)
     } else {
@@ -249,6 +262,27 @@ fn run_agent_loop(
             },
         );
 
+        if emit_deltas
+            && let Some(usage) = response.usage
+            && !usage.is_empty()
+        {
+            let totals = cost_tracker.add_usage(usage);
+            sink.emit(&events.usage_updated(totals))?;
+            if let Some(writer) = history_writer.as_deref_mut() {
+                writer.append_usage(totals)?;
+            }
+            if let Some(max_budget) = config.max_budget_usd
+                && totals.estimated_cost_usd > max_budget
+            {
+                let error = format!(
+                    "budget exhausted: estimated cost ${:.6} exceeded limit ${:.6}",
+                    totals.estimated_cost_usd, max_budget
+                );
+                sink.emit(&events.error(&error))?;
+                return Ok(AgentLoopResult::failure(RunStatus::BudgetExhausted, error));
+            }
+        }
+
         let mut had_error = false;
         for step in &response.steps {
             match step {
@@ -317,6 +351,7 @@ fn run_agent_loop(
                     tool_request,
                     subagent_depth,
                     emit_deltas,
+                    instructions,
                 )?;
 
                 let result_content = agent_common::format_tool_result_for_model(&result);
@@ -348,8 +383,10 @@ fn execute_tool_with_approval(
     tool_request: &tools::ToolRequest,
     subagent_depth: u32,
     emit_deltas: bool,
+    instructions: &ProjectInstructions,
 ) -> io::Result<(RunStatus, tools::ToolResult)> {
-    let policy = ApprovalPolicy::new(config.approval_mode);
+    let policy = ApprovalPolicy::new(config.approval_mode)
+        .with_permission_rules(config.permission_rules.clone());
 
     if agent_common::requires_approval(tool_request.action) {
         let approval = ApprovalRequest {
@@ -361,7 +398,11 @@ fn execute_tool_with_approval(
                 tool_request.action.as_str()
             ),
         };
-        let resolution = policy.resolve(&approval);
+        let resolution = policy.resolve_for_tool(
+            &approval,
+            tool_request.name.as_str(),
+            tool_request.target.as_deref(),
+        );
         if emit_deltas {
             sink.emit(&events.approval_requested(&approval))?;
         }
@@ -406,7 +447,15 @@ fn execute_tool_with_approval(
         sink.emit(&events.tool_call_requested(tool_request))?;
     }
     let result = if tool_request.name == tools::ToolName::Subagent {
-        execute_subagent_tool(config, cwd, events, sink, tool_request, subagent_depth)?
+        execute_subagent_tool(
+            config,
+            cwd,
+            events,
+            sink,
+            tool_request,
+            subagent_depth,
+            instructions,
+        )?
     } else {
         tools::execute(tool_request, cwd)
     };
@@ -434,6 +483,7 @@ fn execute_subagent_tool(
     sink: &mut EventSink<impl io::Write>,
     tool_request: &tools::ToolRequest,
     subagent_depth: u32,
+    instructions: &ProjectInstructions,
 ) -> io::Result<tools::ToolResult> {
     let request = subagent::create_subagent_request(tool_request);
     let description = request.description.clone();
@@ -454,6 +504,7 @@ fn execute_subagent_tool(
     }
 
     let child_cancel = CancelToken::new();
+    let mut child_cost_tracker = CostTracker::new(config.model.as_deref());
     let child = run_agent_loop(
         config,
         cwd,
@@ -465,6 +516,8 @@ fn execute_subagent_tool(
         subagent_depth + 1,
         false,
         &subagent_type,
+        instructions,
+        &mut child_cost_tracker,
         &child_cancel,
     )?;
 
@@ -559,5 +612,15 @@ fn run_verifier_if_needed(
         Ok(RunStatus::Success)
     } else {
         Ok(RunStatus::VerificationFailed)
+    }
+}
+
+fn load_project_instructions(cwd: &Path) -> ProjectInstructions {
+    match instructions::load_for_cwd(cwd) {
+        Ok(instructions) => instructions,
+        Err(error) => {
+            eprintln!("orca: warning: failed to load project instructions: {error}");
+            ProjectInstructions::default()
+        }
     }
 }
