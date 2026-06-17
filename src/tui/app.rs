@@ -648,20 +648,32 @@ fn handle_slash_menu_key(
                 }
                 return true;
             }
+            KeyCode::Tab => {
+                let chosen = sub.items[sub.selected].clone();
+                let value = chosen.split_whitespace().next().unwrap_or(&chosen);
+                *textarea = make_textarea_with_text(
+                    &format!("{} {value}", sub.title),
+                    vim_state,
+                    theme,
+                );
+                state.slash_menu = None;
+                return true;
+            }
             KeyCode::Enter => {
                 let chosen = sub.items[sub.selected].clone();
                 // Execute the sub-command
                 if sub.title == "/model" {
-                    if let Ok(()) = commands::validate_model(&chosen) {
-                        config.model = ModelSelection::from_unchecked(Some(chosen.clone()));
+                    let chosen_model = chosen.split_whitespace().next().unwrap_or(&chosen).to_string();
+                    if let Ok(()) = commands::validate_model(&chosen_model) {
+                        config.model = ModelSelection::from_unchecked(Some(chosen_model.clone()));
                         if let Ok(mut cfg) = shared_config.lock() {
-                            cfg.model = ModelSelection::from_unchecked(Some(chosen.clone()));
+                            cfg.model = ModelSelection::from_unchecked(Some(chosen_model.clone()));
                         }
-                        state.model_name = chosen.clone();
+                        state.model_name = chosen_model.clone();
                         state
                             .messages
-                            .push(ChatMessage::System(format!("Model switched to {chosen}.")));
-                        let _ = action_tx.send(UserAction::SetModel(chosen));
+                            .push(ChatMessage::System(format!("Model switched to {chosen_model}.")));
+                        let _ = action_tx.send(UserAction::SetModel(chosen_model));
                     }
                 } else if sub.title == "/mode" {
                     if let Some(mode) = parse_approval_mode(&chosen) {
@@ -699,13 +711,76 @@ fn handle_slash_menu_key(
             }
             true
         }
+        KeyCode::Tab => {
+            let selected_cmd = menu.items[menu.selected].command;
+            // Tab acts like Enter — directly execute the selected command
+            match selected_cmd {
+                "/model" => {
+                    let models: Vec<String> = commands::available_models()
+                        .iter()
+                        .map(|s| match *s {
+                            "auto" => "auto (pro + flash for aux)".to_string(),
+                            other => other.to_string(),
+                        })
+                        .collect();
+                    state.slash_menu = Some(SlashMenu {
+                        items: menu.items.clone(),
+                        selected: menu.selected,
+                        sub_menu: Some(SubMenu {
+                            title: "/model".to_string(),
+                            items: models,
+                            selected: 0,
+                        }),
+                    });
+                }
+                "/mode" => {
+                    let modes = vec![
+                        "suggest".to_string(),
+                        "auto-edit".to_string(),
+                        "full-auto".to_string(),
+                    ];
+                    state.slash_menu = Some(SlashMenu {
+                        items: menu.items.clone(),
+                        selected: menu.selected,
+                        sub_menu: Some(SubMenu {
+                            title: "/mode".to_string(),
+                            items: modes,
+                            selected: 0,
+                        }),
+                    });
+                }
+                "/remember" => {
+                    *textarea = make_textarea_with_text("/remember ", vim_state, theme);
+                    state.slash_menu = None;
+                }
+                _ => {
+                    *textarea = make_textarea_with_text(selected_cmd, vim_state, theme);
+                    state.slash_menu = None;
+                    if let Some(outcome) =
+                        handle_slash_command(selected_cmd, config, shared_config, state, action_tx)
+                    {
+                        match outcome {
+                            SlashOutcome::Continue => {
+                                *textarea = make_textarea(vim_state, theme);
+                            }
+                            SlashOutcome::Exit(_) => {}
+                        }
+                    }
+                    *textarea = make_textarea(vim_state, theme);
+                }
+            }
+            true
+        }
         KeyCode::Enter => {
             let selected_cmd = menu.items[menu.selected].command;
             match selected_cmd {
                 "/model" => {
                     let models: Vec<String> = commands::available_models()
                         .iter()
-                        .map(|s| s.to_string())
+                        .map(|s| match *s {
+                            "auto" => "auto (pro + flash for aux)".to_string(),
+                            other => other.to_string(),
+                        })
                         .collect();
                     state.slash_menu = Some(SlashMenu {
                         items: menu.items.clone(),
