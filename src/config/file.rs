@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use crate::approval::policy::PermissionRules;
+use crate::runtime::subagent_config::SubagentConfig;
 
 const ORCA_HOME_ENV: &str = "ORCA_HOME";
 
@@ -14,7 +15,13 @@ pub struct FileConfig {
     pub api_key: Option<String>,
     pub base_url: Option<String>,
     #[serde(default)]
+    pub mcp_servers: Vec<crate::mcp::types::McpServerConfig>,
+    #[serde(default)]
+    pub hooks: Vec<crate::runtime::hooks::HookConfig>,
+    #[serde(default)]
     pub permissions: PermissionRules,
+    #[serde(default)]
+    pub subagents: SubagentConfig,
 }
 
 fn config_dir() -> Option<PathBuf> {
@@ -116,6 +123,45 @@ pattern = "/etc/**"
         let config: FileConfig = toml::from_str("").unwrap();
         assert!(config.model.is_none());
         assert!(config.api_key.is_none());
+    }
+
+    #[test]
+    fn parse_mcp_servers() {
+        let toml = r#"
+[[mcp_servers]]
+name = "demo"
+transport = "stdio"
+command = "node"
+args = ["server.js"]
+"#;
+        let config: FileConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.mcp_servers.len(), 1);
+        assert_eq!(config.mcp_servers[0].name, "demo");
+    }
+
+    #[test]
+    fn parse_hooks() {
+        let toml = r#"
+[[hooks]]
+event = "post_tool_use"
+tool = "bash"
+command = "echo done"
+"#;
+        let config: FileConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.hooks.len(), 1);
+        assert_eq!(config.hooks[0].tool.as_deref(), Some("bash"));
+    }
+
+    #[test]
+    fn parse_subagent_config() {
+        let toml = r#"
+[subagents]
+max_depth = 3
+max_parallel = 6
+"#;
+        let config: FileConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.subagents.max_depth, 3);
+        assert_eq!(config.subagents.max_parallel, 6);
     }
 
     #[test]

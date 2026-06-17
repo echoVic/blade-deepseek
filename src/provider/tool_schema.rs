@@ -1,8 +1,26 @@
 use serde_json::{Value, json};
 
+use crate::mcp::McpRegistry;
 use crate::runtime::subagent_types::SubagentType;
 
 pub fn deepseek_tools_schema() -> Vec<Value> {
+    builtin_tools_schema()
+}
+
+pub fn deepseek_tools_schema_with_mcp(mcp_registry: Option<&McpRegistry>) -> Vec<Value> {
+    let mut schema = builtin_tools_schema();
+    if let Some(registry) = mcp_registry {
+        schema.extend(
+            registry
+                .tools()
+                .iter()
+                .map(|tool| tool.to_deepseek_schema()),
+        );
+    }
+    schema
+}
+
+fn builtin_tools_schema() -> Vec<Value> {
     vec![
         json!({
             "type": "function",
@@ -137,6 +155,27 @@ pub fn deepseek_tools_schema() -> Vec<Value> {
         json!({
             "type": "function",
             "function": {
+                "name": "web_search",
+                "description": "Search the web for current information using Brave Search. Returns top results with title, summary, and URL.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Search query"
+                        },
+                        "count": {
+                            "type": "integer",
+                            "description": "Number of results to return, 1-10 (default: 5)"
+                        }
+                    },
+                    "required": ["query"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
                 "name": "subagent",
                 "description": "Launch a synchronous child agent for a complex, multi-step subtask. The child runs independently and returns a concise result summary.",
                 "parameters": {
@@ -163,9 +202,12 @@ pub fn deepseek_tools_schema() -> Vec<Value> {
     ]
 }
 
-pub fn deepseek_tools_schema_for_type(subagent_type: &SubagentType) -> Vec<Value> {
+pub fn deepseek_tools_schema_for_type_with_mcp(
+    subagent_type: &SubagentType,
+    mcp_registry: Option<&McpRegistry>,
+) -> Vec<Value> {
     let allowed = subagent_type.allowed_tools();
-    deepseek_tools_schema()
+    let mut tools: Vec<Value> = deepseek_tools_schema()
         .into_iter()
         .filter(|tool| {
             tool["function"]["name"]
@@ -173,5 +215,47 @@ pub fn deepseek_tools_schema_for_type(subagent_type: &SubagentType) -> Vec<Value
                 .map(|name| name != "subagent" && allowed.contains(&name))
                 .unwrap_or(false)
         })
-        .collect()
+        .collect();
+
+    if let Some(registry) = mcp_registry {
+        tools.extend(
+            registry
+                .tools()
+                .iter()
+                .map(|tool| tool.to_deepseek_schema()),
+        );
+    }
+
+    tools
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mcp::client::McpRegistry;
+    use crate::mcp::types::McpTool;
+
+    #[test]
+    fn merges_mcp_tools_into_schema() {
+        let registry = McpRegistry::from_tools_for_test(vec![McpTool {
+            server: "demo".to_string(),
+            name: "search".to_string(),
+            schema_name: "mcp__demo__search".to_string(),
+            description: Some("search docs".to_string()),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string" }
+                },
+                "required": ["query"]
+            }),
+        }]);
+
+        let schema = deepseek_tools_schema_with_mcp(Some(&registry));
+        assert!(
+            schema
+                .iter()
+                .any(|tool| { tool["function"]["name"] == "mcp__demo__search" })
+        );
+    }
 }

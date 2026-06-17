@@ -14,6 +14,7 @@ pub enum ApprovalMode {
     #[value(name = "auto-edit")]
     AutoEdit,
     FullAuto,
+    Plan,
 }
 
 impl ApprovalMode {
@@ -22,6 +23,7 @@ impl ApprovalMode {
             Self::Suggest => "suggest",
             Self::AutoEdit => "auto-edit",
             Self::FullAuto => "full-auto",
+            Self::Plan => "plan",
         }
     }
 }
@@ -126,6 +128,7 @@ impl ApprovalPolicy {
 
         let decision = match (self.mode, request.action) {
             (_, ActionKind::Read) => ApprovalDecision::Allow,
+            (ApprovalMode::Plan, ActionKind::Write | ActionKind::Shell) => ApprovalDecision::Deny,
             (ApprovalMode::Suggest, ActionKind::Write | ActionKind::Shell) => ApprovalDecision::Ask,
             (ApprovalMode::AutoEdit, ActionKind::Write) => ApprovalDecision::Allow,
             (ApprovalMode::AutoEdit, ActionKind::Shell) => ApprovalDecision::Ask,
@@ -224,6 +227,23 @@ mod tests {
         assert_eq!(
             policy.resolve(&make_request(ActionKind::Shell)).decision,
             ApprovalDecision::Allow
+        );
+    }
+
+    #[test]
+    fn plan_mode_allows_read_and_denies_mutation() {
+        let policy = ApprovalPolicy::new(ApprovalMode::Plan);
+        assert_eq!(
+            policy.resolve(&make_request(ActionKind::Read)).decision,
+            ApprovalDecision::Allow
+        );
+        assert_eq!(
+            policy.resolve(&make_request(ActionKind::Write)).decision,
+            ApprovalDecision::Deny
+        );
+        assert_eq!(
+            policy.resolve(&make_request(ActionKind::Shell)).decision,
+            ApprovalDecision::Deny
         );
     }
 

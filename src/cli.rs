@@ -215,6 +215,13 @@ fn run_exec(args: ExecArgs) -> i32 {
         .model
         .or_else(|| env::var("DEEPSEEK_MODEL").ok())
         .or(file_config.model);
+    let model = match validate_model_config(model) {
+        Ok(model) => model,
+        Err(error) => {
+            eprintln!("orca: {error}");
+            return 1;
+        }
+    };
 
     let output_format = args.output_format;
     let fallback =
@@ -239,6 +246,9 @@ fn run_exec(args: ExecArgs) -> i32 {
         show_session_picker: false,
         permission_rules: file_config.permissions,
         max_budget_usd: args.max_budget,
+        mcp_servers: file_config.mcp_servers,
+        hooks: file_config.hooks,
+        subagents: file_config.subagents.normalized(),
     };
 
     controller::run(config)
@@ -454,6 +464,13 @@ fn run_placeholder(cli: Cli) -> i32 {
     let base_url = env::var("DEEPSEEK_BASE_URL").ok().or(file_config.base_url);
 
     let model = env::var("DEEPSEEK_MODEL").ok().or(file_config.model);
+    let model = match validate_model_config(model) {
+        Ok(model) => model,
+        Err(error) => {
+            eprintln!("orca: {error}");
+            return 1;
+        }
+    };
 
     let history_mode = resolve_history_mode(
         cli.resume,
@@ -476,7 +493,17 @@ fn run_placeholder(cli: Cli) -> i32 {
         show_session_picker: cli.session_picker,
         permission_rules: file_config.permissions,
         max_budget_usd: None,
+        mcp_servers: file_config.mcp_servers,
+        hooks: file_config.hooks,
+        subagents: file_config.subagents.normalized(),
     };
 
     app::run_tui(config)
+}
+
+fn validate_model_config(model: Option<String>) -> Result<Option<String>, String> {
+    if let Some(model) = model.as_deref() {
+        crate::tui::commands::validate_model(model)?;
+    }
+    Ok(model)
 }

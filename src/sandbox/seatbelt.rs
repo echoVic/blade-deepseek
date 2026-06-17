@@ -57,7 +57,8 @@ fn write_profile(cwd: &Path) -> std::io::Result<std::path::PathBuf> {
     let id = PROFILE_COUNTER.fetch_add(1, Ordering::Relaxed);
     let profile_path =
         std::env::temp_dir().join(format!("orca-seatbelt-{}-{id}.sb", std::process::id()));
-    std::fs::write(&profile_path, profile(cwd))?;
+    let canonical_cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    std::fs::write(&profile_path, profile(&canonical_cwd))?;
     Ok(profile_path)
 }
 
@@ -134,7 +135,10 @@ mod tests {
         // deny rules must come AFTER allow rules (last-match-wins in Seatbelt)
         let allow_write_pos = profile.find("(allow file-write*").unwrap();
         let deny_pos = profile.find("(deny file-read* file-write*").unwrap();
-        assert!(deny_pos > allow_write_pos, "deny must come after allow for last-match-wins");
+        assert!(
+            deny_pos > allow_write_pos,
+            "deny must come after allow for last-match-wins"
+        );
     }
 
     #[test]

@@ -3,27 +3,33 @@ use std::sync::mpsc::{Receiver, Sender};
 
 use crate::approval::policy::{ApprovalDecision, ApprovalPolicy, ApprovalRequest};
 use crate::config::RunConfig;
+use crate::mcp::McpRegistry;
 use crate::provider::conversation::Conversation;
-use crate::provider::tool_schema::deepseek_tools_schema_for_type;
+use crate::provider::tool_schema::{
+    deepseek_tools_schema_for_type_with_mcp, deepseek_tools_schema_with_mcp,
+};
 use crate::provider::{self, ProviderConfig, ProviderStep};
 use crate::runtime::agent_common;
 use crate::runtime::cancel::CancelToken;
 use crate::runtime::cost::CostTracker;
 use crate::runtime::history::{self, SessionWriter};
+use crate::runtime::hooks::{HookContext, HookEvent, HookRunner};
 use crate::runtime::instructions::{self, ProjectInstructions};
+use crate::runtime::memory::{self, MemoryBlock};
 use crate::runtime::subagent;
 use crate::runtime::subagent_types::SubagentType;
 use crate::tools;
+use crate::tui::diff;
 use crate::tui::types::{TuiEvent, UserAction};
 
 const DEFAULT_MAX_TURNS: u32 = 128;
-const MAX_SUBAGENT_DEPTH: u32 = 1;
 
 #[derive(Clone, Debug)]
 struct TuiAgentResult {
     status: String,
     final_message: Option<String>,
     error: Option<String>,
+    cost_tracker: CostTracker,
 }
 
 pub struct TuiConversationSession {
@@ -31,6 +37,9 @@ pub struct TuiConversationSession {
     writer: Option<SessionWriter>,
     instructions: ProjectInstructions,
     cost_tracker: CostTracker,
+    mcp_registry: McpRegistry,
+    hooks: HookRunner,
+    memory: MemoryBlock,
 }
 
 impl TuiConversationSession {
@@ -44,11 +53,16 @@ impl TuiConversationSession {
             .clone()
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
         let instructions = load_project_instructions(&cwd);
+        let memory = memory::load_for_cwd(&cwd);
+        let mcp_registry = crate::mcp::initialize_registry(&config.mcp_servers);
+        let hooks = HookRunner::new(config.hooks.clone());
         let system_prompt = agent_common::build_agent_system_prompt(
             &cwd,
             0,
             &SubagentType::General,
             Some(&instructions),
+            config.approval_mode,
+            Some(&memory),
         );
         let (conversation, loaded_transcript) = match &config.history_mode {
             crate::config::HistoryMode::Resume(selector)
@@ -98,6 +112,9 @@ impl TuiConversationSession {
             writer,
             instructions,
             cost_tracker: CostTracker::new(config.model.as_deref()),
+            mcp_registry,
+            hooks,
+            memory,
         })
     }
 
@@ -120,6 +137,45 @@ impl TuiConversationSession {
 
     pub fn backtrack_last_user(&mut self) -> Option<String> {
         self.conversation.backtrack_last_user()
+    }
+
+    pub fn set_model(&mut self, model: Option<&str>) {
+        self.cost_tracker.set_model(model);
+    }
+
+    pub fn compact(&mut self, cwd: &Path) -> (usize, usize) {
+        let before_messages = self.conversation.messages.len();
+        let _ = self.hooks.run(
+            HookEvent::PreCompact,
+            HookContext {
+                cwd: &cwd.display().to_string(),
+                session_status: None,
+                tool_request: None,
+                tool_result: None,
+                before_messages: Some(before_messages),
+                after_messages: None,
+            },
+        );
+        self.conversation = provider::context::compact(
+            &self.conversation,
+            &provider::context::ContextConfig::default(),
+        );
+        let after_messages = self.conversation.messages.len();
+        if let Some(writer) = &mut self.writer {
+            let _ = writer.append_compaction(before_messages, after_messages);
+        }
+        let _ = self.hooks.run(
+            HookEvent::PostCompact,
+            HookContext {
+                cwd: &cwd.display().to_string(),
+                session_status: None,
+                tool_request: None,
+                tool_result: None,
+                before_messages: Some(before_messages),
+                after_messages: Some(after_messages),
+            },
+        );
+        (before_messages, after_messages)
     }
 }
 
@@ -145,13 +201,7 @@ fn start_writer_with_messages(
 }
 
 fn load_project_instructions(cwd: &Path) -> ProjectInstructions {
-    match instructions::load_for_cwd(cwd) {
-        Ok(instructions) => instructions,
-        Err(error) => {
-            eprintln!("orca: warning: failed to load project instructions: {error}");
-            ProjectInstructions::default()
-        }
-    }
+    instructions::load_for_cwd_or_default(cwd)
 }
 
 pub fn run_agent_for_tui(
@@ -171,10 +221,13 @@ pub fn run_agent_for_tui(
         api_key: config.api_key.clone(),
         base_url: config.base_url.clone(),
         model: config.model.clone(),
-        tools_override: None,
+        tools_override: Some(deepseek_tools_schema_with_mcp(Some(&session.mcp_registry))),
+        mcp_registry: Some(session.mcp_registry.clone()),
     };
 
     let ctx_config = provider::context::ContextConfig::default();
+    let policy = ApprovalPolicy::new(config.approval_mode)
+        .with_permission_rules(config.permission_rules.clone());
     session.conversation.add_user(prompt.to_string());
     if let Some(message) = session.conversation.messages.last().cloned() {
         session.append_message(&message);
@@ -196,10 +249,38 @@ pub fn run_agent_for_tui(
 
         if provider::context::needs_compaction(&session.conversation, &ctx_config) {
             let before_messages = session.conversation.messages.len();
+            if let Err(error) = session.hooks.run(
+                HookEvent::PreCompact,
+                HookContext {
+                    cwd: &cwd.display().to_string(),
+                    session_status: None,
+                    tool_request: None,
+                    tool_result: None,
+                    before_messages: Some(before_messages),
+                    after_messages: None,
+                },
+            ) {
+                let _ = event_tx.send(TuiEvent::Error(format!("pre_compact hook failed: {error}")));
+            }
             session.conversation = provider::context::compact(&session.conversation, &ctx_config);
+            let after_messages = session.conversation.messages.len();
             if let Some(writer) = &mut session.writer {
-                let _ =
-                    writer.append_compaction(before_messages, session.conversation.messages.len());
+                let _ = writer.append_compaction(before_messages, after_messages);
+            }
+            if let Err(error) = session.hooks.run(
+                HookEvent::PostCompact,
+                HookContext {
+                    cwd: &cwd.display().to_string(),
+                    session_status: None,
+                    tool_request: None,
+                    tool_result: None,
+                    before_messages: Some(before_messages),
+                    after_messages: Some(after_messages),
+                },
+            ) {
+                let _ = event_tx.send(TuiEvent::Error(format!(
+                    "post_compact hook failed: {error}"
+                )));
             }
         }
 
@@ -297,15 +378,23 @@ pub fn run_agent_for_tui(
 
         for step in &response.steps {
             if let ProviderStep::ToolCall(tool_request) = step {
-                let (should_stop, result) = execute_tool_for_tui(
+                let (should_stop, result, child_cost) = execute_tool_for_tui(
                     config,
                     &cwd,
                     tool_request,
                     event_tx,
                     action_rx,
                     0,
+                    &policy,
                     &session.instructions,
+                    &session.memory,
+                    &session.mcp_registry,
+                    &session.hooks,
                 );
+
+                if let Some(c) = child_cost {
+                    session.cost_tracker.merge(&c);
+                }
 
                 let result_content = agent_common::format_tool_result_for_model(&result);
                 session
@@ -334,11 +423,12 @@ fn execute_tool_for_tui(
     event_tx: &Sender<TuiEvent>,
     action_rx: &Receiver<UserAction>,
     subagent_depth: u32,
+    policy: &ApprovalPolicy,
     instructions: &ProjectInstructions,
-) -> (bool, tools::ToolResult) {
-    let policy = ApprovalPolicy::new(config.approval_mode)
-        .with_permission_rules(config.permission_rules.clone());
-
+    memory: &MemoryBlock,
+    mcp_registry: &McpRegistry,
+    hooks: &HookRunner,
+) -> (bool, tools::ToolResult, Option<CostTracker>) {
     if agent_common::requires_approval(tool_request.action) {
         let approval = ApprovalRequest {
             id: format!("approval-{}", tool_request.id),
@@ -379,8 +469,9 @@ fn execute_tool_for_tui(
                         name: tool_request.name.as_str().to_string(),
                         status: "denied".to_string(),
                         output: String::new(),
+                        diff: None,
                     });
-                    return (true, result);
+                    return (true, result, None);
                 }
             }
             ApprovalDecision::Deny => {
@@ -393,14 +484,16 @@ fn execute_tool_for_tui(
                     name: tool_request.name.as_str().to_string(),
                     status: "denied".to_string(),
                     output: String::new(),
+                    diff: None,
                 });
-                return (true, result);
+                return (true, result, None);
             }
         }
     }
 
-    let result = if tool_request.name == tools::ToolName::Subagent {
-        execute_subagent_for_tui(
+    let mut rendered_diff = None;
+    let (result, child_cost) = if tool_request.name == tools::ToolName::Subagent {
+        let (r, c) = execute_subagent_for_tui(
             config,
             cwd,
             tool_request,
@@ -408,13 +501,45 @@ fn execute_tool_for_tui(
             action_rx,
             subagent_depth,
             instructions,
-        )
+            memory,
+            hooks,
+        );
+        (r, Some(c))
     } else {
         let _ = event_tx.send(TuiEvent::ToolRequested {
             name: tool_request.name.as_str().to_string(),
             target: tool_request.target.clone(),
         });
-        tools::execute(tool_request, cwd)
+        if let Err(error) = hooks.run(
+            HookEvent::PreToolUse,
+            HookContext {
+                cwd: &cwd.display().to_string(),
+                session_status: None,
+                tool_request: Some(tool_request),
+                tool_result: None,
+                before_messages: None,
+                after_messages: None,
+            },
+        ) {
+            let result = tools::ToolResult::failed(
+                tool_request,
+                format!("pre_tool_use hook blocked tool: {error}"),
+                None,
+            );
+            let _ = event_tx.send(TuiEvent::ToolCompleted {
+                name: tool_request.name.as_str().to_string(),
+                status: "failed".to_string(),
+                output: result.error.clone().unwrap_or_default(),
+                diff: None,
+            });
+            return (true, result, None);
+        }
+        let before = diff::capture_before(tool_request, cwd);
+        let result = tools::execute_with_mcp(tool_request, cwd, mcp_registry);
+        if matches!(result.status, tools::ToolStatus::Completed) {
+            rendered_diff = before.and_then(diff::render_after);
+        }
+        (result, None)
     };
 
     if tool_request.name != tools::ToolName::Subagent {
@@ -422,14 +547,30 @@ fn execute_tool_for_tui(
             name: tool_request.name.as_str().to_string(),
             status: format!("{:?}", result.status).to_lowercase(),
             output: result.output.clone().unwrap_or_default(),
+            diff: rendered_diff,
         });
+        if let Err(error) = hooks.run(
+            HookEvent::PostToolUse,
+            HookContext {
+                cwd: &cwd.display().to_string(),
+                session_status: None,
+                tool_request: Some(tool_request),
+                tool_result: Some(&result),
+                before_messages: None,
+                after_messages: None,
+            },
+        ) {
+            let _ = event_tx.send(TuiEvent::Error(format!(
+                "post_tool_use hook failed: {error}"
+            )));
+        }
     }
 
     let failed = matches!(
         result.status,
         tools::ToolStatus::Failed | tools::ToolStatus::Denied
     );
-    (failed, result)
+    (failed, result, child_cost)
 }
 
 fn execute_subagent_for_tui(
@@ -440,7 +581,9 @@ fn execute_subagent_for_tui(
     action_rx: &Receiver<UserAction>,
     subagent_depth: u32,
     instructions: &ProjectInstructions,
-) -> tools::ToolResult {
+    memory: &MemoryBlock,
+    hooks: &HookRunner,
+) -> (tools::ToolResult, CostTracker) {
     let request = subagent::create_subagent_request(tool_request);
     let description = request.description.clone();
     let subagent_type = request.subagent_type;
@@ -450,16 +593,19 @@ fn execute_subagent_for_tui(
         description: description.clone(),
     });
 
-    if subagent_depth >= MAX_SUBAGENT_DEPTH {
-        let error = "nested subagents are disabled in this MVP";
+    if subagent_depth >= config.subagents.max_depth {
+        let error = format!("subagent max depth {} reached", config.subagents.max_depth);
         let _ = event_tx.send(TuiEvent::SubagentCompleted {
             id: tool_request.id.clone(),
             description,
             status: "failed".to_string(),
             output: None,
-            error: Some(error.to_string()),
+            error: Some(error.clone()),
         });
-        return tools::ToolResult::failed(tool_request, error, None);
+        return (
+            tools::ToolResult::failed(tool_request, error, None),
+            CostTracker::new(config.model.as_deref()),
+        );
     }
 
     let child = run_child_agent_for_tui(
@@ -471,6 +617,8 @@ fn execute_subagent_for_tui(
         subagent_depth + 1,
         &subagent_type,
         instructions,
+        memory,
+        hooks,
     );
 
     if child.status == "success" {
@@ -484,10 +632,13 @@ fn execute_subagent_for_tui(
             output: Some(output.clone()),
             error: None,
         });
-        tools::ToolResult::completed(
-            tool_request,
-            format!("Subagent status: success\n\n{output}"),
-            false,
+        (
+            tools::ToolResult::completed(
+                tool_request,
+                format!("Subagent status: success\n\n{output}"),
+                false,
+            ),
+            child.cost_tracker,
         )
     } else {
         let error = child
@@ -500,7 +651,10 @@ fn execute_subagent_for_tui(
             output: child.final_message,
             error: Some(error.clone()),
         });
-        tools::ToolResult::failed(tool_request, error, None)
+        (
+            tools::ToolResult::failed(tool_request, error, None),
+            child.cost_tracker,
+        )
     }
 }
 
@@ -514,12 +668,19 @@ fn run_child_agent_for_tui(
     subagent_depth: u32,
     subagent_type: &SubagentType,
     instructions: &ProjectInstructions,
+    memory: &MemoryBlock,
+    hooks: &HookRunner,
 ) -> TuiAgentResult {
+    let mcp_registry = crate::mcp::initialize_registry(&config.mcp_servers);
     let provider_config = ProviderConfig {
         api_key: config.api_key.clone(),
         base_url: config.base_url.clone(),
         model: config.model.clone(),
-        tools_override: Some(deepseek_tools_schema_for_type(subagent_type)),
+        tools_override: Some(deepseek_tools_schema_for_type_with_mcp(
+            subagent_type,
+            Some(&mcp_registry),
+        )),
+        mcp_registry: Some(mcp_registry.clone()),
     };
 
     let ctx_config = provider::context::ContextConfig::default();
@@ -529,9 +690,14 @@ fn run_child_agent_for_tui(
         subagent_depth,
         subagent_type,
         Some(instructions),
+        config.approval_mode,
+        Some(memory),
     ));
     conversation.add_user(prompt.to_string());
 
+    let policy = ApprovalPolicy::new(config.approval_mode)
+        .with_permission_rules(config.permission_rules.clone());
+    let mut child_cost_tracker = CostTracker::new(config.model.as_deref());
     let mut turn: u32 = 0;
     loop {
         turn += 1;
@@ -540,6 +706,7 @@ fn run_child_agent_for_tui(
                 status: "budget_exhausted".to_string(),
                 final_message: None,
                 error: Some("max turns exhausted".to_string()),
+                cost_tracker: child_cost_tracker,
             };
         }
 
@@ -564,7 +731,14 @@ fn run_child_agent_for_tui(
                 status: "failed".to_string(),
                 final_message: None,
                 error: Some(error),
+                cost_tracker: child_cost_tracker,
             };
+        }
+
+        if let Some(usage) = response.usage
+            && !usage.is_empty()
+        {
+            child_cost_tracker.add_usage(usage);
         }
 
         if response.tool_calls.is_empty() {
@@ -577,6 +751,7 @@ fn run_child_agent_for_tui(
                 status: "success".to_string(),
                 final_message: response.assistant_content,
                 error: None,
+                cost_tracker: child_cost_tracker,
             };
         }
 
@@ -588,15 +763,23 @@ fn run_child_agent_for_tui(
 
         for step in &response.steps {
             if let ProviderStep::ToolCall(tool_request) = step {
-                let (should_stop, result) = execute_tool_for_tui(
+                let (should_stop, result, child_cost) = execute_tool_for_tui(
                     config,
                     cwd,
                     tool_request,
                     event_tx,
                     action_rx,
                     subagent_depth,
+                    &policy,
                     instructions,
+                    memory,
+                    &mcp_registry,
+                    hooks,
                 );
+
+                if let Some(c) = child_cost {
+                    child_cost_tracker.merge(&c);
+                }
 
                 let result_content = agent_common::format_tool_result_for_model(&result);
                 conversation.add_tool_result(tool_request.id.clone(), result_content);
@@ -606,6 +789,7 @@ fn run_child_agent_for_tui(
                         status: "failed".to_string(),
                         final_message: None,
                         error: result.error,
+                        cost_tracker: child_cost_tracker,
                     };
                 }
             }
@@ -636,6 +820,9 @@ mod tests {
             show_session_picker: false,
             permission_rules: Default::default(),
             max_budget_usd: None,
+            mcp_servers: Vec::new(),
+            hooks: Vec::new(),
+            subagents: Default::default(),
         }
     }
 

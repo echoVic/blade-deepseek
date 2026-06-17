@@ -15,7 +15,7 @@ orca exec "fix this test"
 
 # With options
 orca exec --approval-mode full-auto "refactor the auth module"
-orca exec --model deepseek-reasoner "explain this codebase"
+orca exec --model deepseek-v4-pro "explain this codebase"
 orca exec --verifier "cargo test" "fix the failing test"
 ```
 
@@ -58,7 +58,7 @@ Options:
 - `--output-format text|jsonl` — Output format (default: text)
 - `--cwd <path>` — Workspace directory
 - `--approval-mode suggest|auto-edit|full-auto` — Approval policy
-- `--model <name>` — Model to use
+- `--model deepseek-v4-flash|deepseek-v4-pro` — Model to use
 - `--base-url <url>` — API base URL
 - `--verifier <command>` — Post-run verification command
 - `--resume <session|latest>` — Continue from a saved conversation transcript

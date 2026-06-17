@@ -175,6 +175,7 @@ fn build_message_lines(state: &AppState) -> Vec<Line<'static>> {
                 target,
                 status,
                 output,
+                diff,
             } => {
                 let icon = match status.as_str() {
                     "completed" => "✓",
@@ -206,6 +207,9 @@ fn build_message_lines(state: &AppState) -> Vec<Line<'static>> {
                         format!("    {preview}"),
                         Style::default().fg(Color::DarkGray),
                     )));
+                }
+                if let Some(diff) = diff {
+                    append_diff_lines(&mut lines, diff);
                 }
             }
             ChatMessage::Subagent {
@@ -290,6 +294,32 @@ fn append_subagent_lines(
         "  └─ returned to main agent",
         Style::default().fg(Color::DarkGray),
     )));
+}
+
+fn append_diff_lines(lines: &mut Vec<Line<'static>>, diff: &str) {
+    let mut count = 0;
+    for line in diff.lines().take(80) {
+        count += 1;
+        let color = if line.starts_with('+') && !line.starts_with("+++") {
+            Color::Green
+        } else if line.starts_with('-') && !line.starts_with("---") {
+            Color::Red
+        } else if line.starts_with("@@") {
+            Color::Cyan
+        } else {
+            Color::DarkGray
+        };
+        lines.push(Line::from(Span::styled(
+            format!("    {line}"),
+            Style::default().fg(color),
+        )));
+    }
+    if diff.lines().count() > count {
+        lines.push(Line::from(Span::styled(
+            "    [... diff truncated ...]",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
 }
 
 fn render_input(frame: &mut Frame, area: Rect, textarea: &TextArea) {

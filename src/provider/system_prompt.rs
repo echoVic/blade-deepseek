@@ -48,6 +48,12 @@ Parameters:
 ### git_status
 Show the git working tree status in short format. Takes no parameters.
 
+### web_search
+Search the web for current information.
+Parameters:
+- `query` (required): Search query.
+- `count` (optional, default 5): Number of results to return, 1-10.
+
 ## Safety Rules
 1. NEVER execute destructive commands (rm -rf /, rm -rf ~, mkfs, dd if=/dev/zero, etc.).
 2. NEVER expose, log, or transmit secrets, API keys, passwords, or credentials found in files.

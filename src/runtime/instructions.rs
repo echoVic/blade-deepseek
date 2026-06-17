@@ -44,16 +44,27 @@ impl ProjectInstructions {
     }
 }
 
+pub fn load_for_cwd_or_default(cwd: &Path) -> ProjectInstructions {
+    match load_for_cwd(cwd) {
+        Ok(instructions) => instructions,
+        Err(error) => {
+            eprintln!("orca: warning: failed to load project instructions: {error}");
+            ProjectInstructions::default()
+        }
+    }
+}
+
 pub fn load_for_cwd(cwd: &Path) -> io::Result<ProjectInstructions> {
     let mut sections = Vec::new();
     let mut visited = HashSet::new();
 
-    if let Some(user_agents) = orca_home().map(|home| home.join(INSTRUCTIONS_FILE))
+    let orca_home_path = orca_home();
+    if let Some(user_agents) = orca_home_path.as_ref().map(|home| home.join(INSTRUCTIONS_FILE))
         && user_agents.is_file()
     {
         sections.push(InstructionSection {
             source: user_agents.clone(),
-            content: read_with_includes(&user_agents, &mut visited)?,
+            content: read_with_includes(&user_agents, &mut visited, orca_home_path.as_deref())?,
         });
     }
 
@@ -62,7 +73,7 @@ pub fn load_for_cwd(cwd: &Path) -> io::Result<ProjectInstructions> {
         if root_agents.is_file() {
             sections.push(InstructionSection {
                 source: root_agents.clone(),
-                content: read_with_includes(&root_agents, &mut visited)?,
+                content: read_with_includes(&root_agents, &mut visited, Some(&project_root))?,
             });
         }
 
@@ -70,7 +81,7 @@ pub fn load_for_cwd(cwd: &Path) -> io::Result<ProjectInstructions> {
         for rule in sorted_markdown_files(&rules_dir)? {
             sections.push(InstructionSection {
                 source: rule.clone(),
-                content: read_with_includes(&rule, &mut visited)?,
+                content: read_with_includes(&rule, &mut visited, Some(&project_root))?,
             });
         }
     }
@@ -86,12 +97,9 @@ fn orca_home() -> Option<PathBuf> {
 
 fn find_project_root(cwd: &Path) -> Option<PathBuf> {
     // Search both the original path and canonical path to handle symlinks
-    for start in [
-        Some(cwd.to_path_buf()),
-        cwd.canonicalize().ok(),
-    ]
-    .into_iter()
-    .flatten()
+    for start in [Some(cwd.to_path_buf()), cwd.canonicalize().ok()]
+        .into_iter()
+        .flatten()
     {
         for candidate in start.ancestors() {
             if candidate.join(".git").exists()
@@ -122,7 +130,11 @@ fn sorted_markdown_files(dir: &Path) -> io::Result<Vec<PathBuf>> {
     Ok(files)
 }
 
-fn read_with_includes(path: &Path, visited: &mut HashSet<PathBuf>) -> io::Result<String> {
+fn read_with_includes(
+    path: &Path,
+    visited: &mut HashSet<PathBuf>,
+    allowed_root: Option<&Path>,
+) -> io::Result<String> {
     let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     if !visited.insert(canonical) {
         return Err(io::Error::new(
@@ -144,8 +156,24 @@ fn read_with_includes(path: &Path, visited: &mut HashSet<PathBuf>) -> io::Result
                 continue;
             }
             let resolved = base_dir.join(include_path);
+            // Path traversal guard: included file must reside within allowed_root
+            if let Some(root) = allowed_root {
+                let resolved_canonical = resolved
+                    .canonicalize()
+                    .unwrap_or_else(|_| resolved.clone());
+                let root_canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+                if !resolved_canonical.starts_with(&root_canonical) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!(
+                            "@include path escapes project root: {}",
+                            include_path
+                        ),
+                    ));
+                }
+            }
             if seen_includes.insert(resolved.clone()) {
-                let included = read_with_includes(&resolved, visited)?;
+                let included = read_with_includes(&resolved, visited, allowed_root)?;
                 output.push_str(included.trim());
                 output.push('\n');
             }
@@ -202,5 +230,22 @@ mod tests {
         let block = instructions.to_system_prompt_block().unwrap();
 
         assert!(block.contains("Before\nShared instruction\nAfter"));
+    }
+
+    #[test]
+    fn include_rejects_path_traversal_outside_project_root() {
+        let dir = TempDir::new().expect("temp dir");
+        fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        fs::write(
+            dir.path().join(INSTRUCTIONS_FILE),
+            "@include ../../etc/passwd\n",
+        )
+        .unwrap();
+
+        let result = load_for_cwd(dir.path());
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(err.to_string().contains("escapes project root"));
     }
 }

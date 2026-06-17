@@ -1,8 +1,9 @@
 use std::path::Path;
 
-use crate::approval::policy::ActionKind;
+use crate::approval::policy::{ActionKind, ApprovalMode};
 use crate::provider::system_prompt::build_system_prompt;
 use crate::runtime::instructions::ProjectInstructions;
+use crate::runtime::memory::MemoryBlock;
 use crate::runtime::subagent_types::SubagentType;
 use crate::tools;
 
@@ -11,8 +12,14 @@ pub fn build_agent_system_prompt(
     subagent_depth: u32,
     subagent_type: &SubagentType,
     instructions: Option<&ProjectInstructions>,
+    approval_mode: ApprovalMode,
+    memory: Option<&MemoryBlock>,
 ) -> String {
     let mut prompt = build_system_prompt(cwd);
+    if let Some(block) = memory.and_then(MemoryBlock::to_system_prompt_block) {
+        prompt.push_str("\n\n");
+        prompt.push_str(&block);
+    }
     if let Some(block) = instructions.and_then(ProjectInstructions::to_system_prompt_block) {
         prompt.push_str("\n\n");
         prompt.push_str(&block);
@@ -25,6 +32,11 @@ pub fn build_agent_system_prompt(
         if !suffix.is_empty() {
             prompt.push_str(suffix);
         }
+    }
+    if approval_mode == ApprovalMode::Plan {
+        prompt.push_str(
+            "\n\n## Plan Mode\nYou are in read-only planning mode. You may analyze and inspect context, but you must not modify files, run shell commands, or perform write actions.",
+        );
     }
     prompt
 }

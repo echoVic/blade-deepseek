@@ -20,6 +20,7 @@ pub enum TuiEvent {
         name: String,
         status: String,
         output: String,
+        diff: Option<String>,
     },
     SubagentStarted {
         id: String,
@@ -42,6 +43,10 @@ pub enum TuiEvent {
     SessionCompleted {
         status: String,
     },
+    Compacted {
+        before_messages: usize,
+        after_messages: usize,
+    },
     Backtracked {
         prompt: String,
     },
@@ -50,6 +55,8 @@ pub enum TuiEvent {
 #[derive(Debug, Clone)]
 pub enum UserAction {
     Submit(String),
+    SetModel(String),
+    Compact,
     Approve(bool),
     Backtrack,
     Interrupt,
@@ -75,6 +82,7 @@ pub enum ChatMessage {
         target: Option<String>,
         status: String,
         output: Option<String>,
+        diff: Option<String>,
     },
     Subagent {
         id: String,
@@ -260,12 +268,14 @@ impl AppState {
                     target,
                     status: "running".to_string(),
                     output: None,
+                    diff: None,
                 });
             }
             TuiEvent::ToolCompleted {
                 name,
                 status,
                 output,
+                diff,
             } => {
                 if name == "subagent" {
                     return;
@@ -274,6 +284,7 @@ impl AppState {
                     name: existing_name,
                     status: s,
                     output: o,
+                    diff: d,
                     ..
                 }) = self.messages.last_mut()
                 {
@@ -284,6 +295,7 @@ impl AppState {
                         } else {
                             Some(output.clone())
                         };
+                        *d = diff.clone();
                         true
                     } else {
                         false
@@ -301,6 +313,7 @@ impl AppState {
                         } else {
                             Some(output)
                         },
+                        diff,
                     });
                 }
             }
@@ -364,6 +377,15 @@ impl AppState {
                 self.usage = usage;
             }
             TuiEvent::SessionCompleted { .. } => {
+                self.status = AppStatus::Idle;
+            }
+            TuiEvent::Compacted {
+                before_messages,
+                after_messages,
+            } => {
+                self.messages.push(ChatMessage::System(format!(
+                    "Compacted conversation context: {before_messages} -> {after_messages} messages."
+                )));
                 self.status = AppStatus::Idle;
             }
             TuiEvent::Backtracked { prompt } => {
@@ -475,6 +497,7 @@ mod tests {
             name: "subagent".to_string(),
             status: "completed".to_string(),
             output: "Subagent status: success".to_string(),
+            diff: None,
         });
 
         assert!(state.messages.is_empty());

@@ -27,6 +27,14 @@ pub struct ContextConfig {
     pub reserved_for_response: usize,
 }
 
+impl ContextConfig {
+    fn effective_limit(&self) -> usize {
+        let threshold = self.compaction_threshold.clamp(0.1, 1.0);
+        ((self.max_tokens as f64 * threshold) as usize)
+            .saturating_sub(self.reserved_for_response)
+    }
+}
+
 impl Default for ContextConfig {
     fn default() -> Self {
         Self {
@@ -86,9 +94,7 @@ fn conversation_tokens_with_counter(
 
 pub fn needs_compaction(conversation: &Conversation, config: &ContextConfig) -> bool {
     let total = conversation_tokens(conversation);
-    let effective_limit = (config.max_tokens as f64 * config.compaction_threshold) as usize
-        - config.reserved_for_response;
-    total > effective_limit
+    total > config.effective_limit()
 }
 
 pub fn compact(conversation: &Conversation, config: &ContextConfig) -> Conversation {
@@ -101,8 +107,7 @@ pub fn compact_with_counter(
     counter: &impl TokenCounter,
 ) -> Conversation {
     let messages = &conversation.messages;
-    let target_tokens = (config.max_tokens as f64 * config.compaction_threshold) as usize
-        - config.reserved_for_response;
+    let target_tokens = config.effective_limit();
 
     let system_msg = messages.first().cloned();
     let system_tokens = system_msg
@@ -126,6 +131,18 @@ pub fn compact_with_counter(
         kept.push((*msg).clone());
     }
     kept.reverse();
+
+    // Ensure tool_call/tool_result pairing: if the first kept message is a Tool result
+    // without its corresponding Assistant tool_call, drop orphaned Tool messages from the front.
+    while let Some(Message::Tool { .. }) = kept.first() {
+        kept.remove(0);
+    }
+    // If the last kept message is an Assistant with tool_calls but missing Tool results, drop it.
+    if let Some(Message::Assistant { tool_calls, .. }) = kept.last() {
+        if !tool_calls.is_empty() {
+            kept.pop();
+        }
+    }
 
     let mut result = Conversation::new();
     if let Some(sys) = system_msg {
@@ -212,5 +229,110 @@ mod tests {
         // last message should be "end"
         let last = compacted.messages.last().unwrap();
         assert!(matches!(last, Message::User(s) if s == "end"));
+    }
+
+    #[test]
+    fn effective_limit_does_not_underflow_when_reserved_exceeds_threshold() {
+        let config = ContextConfig {
+            max_tokens: 100,
+            compaction_threshold: 0.5,
+            reserved_for_response: 9999,
+        };
+        // 100 * 0.5 = 50, saturating_sub(9999) = 0 (not panic)
+        assert_eq!(config.effective_limit(), 0);
+    }
+
+    #[test]
+    fn effective_limit_clamps_invalid_threshold() {
+        let below = ContextConfig {
+            max_tokens: 1000,
+            compaction_threshold: 0.0,
+            reserved_for_response: 0,
+        };
+        // 0.0 clamped to 0.1 → 1000 * 0.1 = 100
+        assert_eq!(below.effective_limit(), 100);
+
+        let above = ContextConfig {
+            max_tokens: 1000,
+            compaction_threshold: 2.0,
+            reserved_for_response: 0,
+        };
+        // 2.0 clamped to 1.0 → 1000 * 1.0 = 1000
+        assert_eq!(above.effective_limit(), 1000);
+    }
+
+    #[test]
+    fn compact_trims_orphaned_tool_messages_at_front() {
+        use crate::provider::conversation::RawToolCall;
+
+        let config = ContextConfig {
+            max_tokens: 200,
+            compaction_threshold: 1.0,
+            reserved_for_response: 0,
+        };
+
+        let mut conv = Conversation::new();
+        conv.add_system("s".to_string());
+        // Old assistant with tool_call (will be dropped due to budget)
+        conv.add_user("filler".repeat(50));
+        conv.add_assistant(
+            Some("calling tool".to_string()),
+            None,
+            vec![RawToolCall {
+                id: "tc1".to_string(),
+                function_name: "read_file".to_string(),
+                arguments: "{}".to_string(),
+            }],
+        );
+        conv.add_tool_result("tc1".to_string(), "file content".to_string());
+        // Recent messages that fit in budget
+        conv.add_user("recent question".to_string());
+        conv.add_assistant(Some("recent answer".to_string()), None, vec![]);
+
+        let compacted = compact_with_counter(&conv, &config, &FixedCounter);
+
+        // Should not start with an orphaned Tool message
+        for msg in &compacted.messages {
+            if matches!(msg, Message::Tool { .. }) {
+                panic!("orphaned Tool message should have been trimmed");
+            }
+            if matches!(msg, Message::User(_) | Message::Assistant { .. }) {
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn compact_trims_trailing_assistant_with_pending_tool_calls() {
+        use crate::provider::conversation::RawToolCall;
+
+        let config = ContextConfig {
+            max_tokens: 50,
+            compaction_threshold: 1.0,
+            reserved_for_response: 0,
+        };
+
+        let mut conv = Conversation::new();
+        conv.add_system("s".to_string());
+        conv.add_user("question".to_string());
+        conv.add_assistant(
+            Some("let me call a tool".to_string()),
+            None,
+            vec![RawToolCall {
+                id: "tc1".to_string(),
+                function_name: "bash".to_string(),
+                arguments: "{}".to_string(),
+            }],
+        );
+
+        let compacted = compact_with_counter(&conv, &config, &FixedCounter);
+
+        // Last message should NOT be an Assistant with pending tool_calls
+        if let Some(Message::Assistant { tool_calls, .. }) = compacted.messages.last() {
+            assert!(
+                tool_calls.is_empty(),
+                "trailing Assistant with pending tool_calls should be trimmed"
+            );
+        }
     }
 }

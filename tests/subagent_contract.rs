@@ -1,6 +1,7 @@
 use std::process::Command;
 
 use serde_json::Value;
+use tempfile::tempdir;
 
 #[test]
 fn subagent_tool_runs_child_agent_and_emits_events() {
@@ -54,7 +55,15 @@ fn subagent_tool_runs_child_agent_and_emits_events() {
 
 #[test]
 fn nested_subagent_calls_are_rejected() {
+    let orca_home = tempdir().expect("temp orca home");
+    std::fs::write(
+        orca_home.path().join("config.toml"),
+        "[subagents]\nmax_depth = 1\n",
+    )
+    .expect("write config");
+
     let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .env("ORCA_HOME", orca_home.path())
         .args([
             "exec",
             "--output-format",
@@ -75,7 +84,7 @@ fn nested_subagent_calls_are_rejected() {
         completed["payload"]["error"]
             .as_str()
             .unwrap()
-            .contains("nested subagents are disabled")
+            .contains("subagent max depth 1 reached")
     );
 
     let tool_completed = find_event(&events, "tool.call.completed");

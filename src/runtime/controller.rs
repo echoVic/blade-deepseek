@@ -1,5 +1,6 @@
 use std::io;
 use std::path::Path;
+use std::thread;
 
 use crate::approval::confirm;
 use crate::approval::policy::{
@@ -8,14 +9,19 @@ use crate::approval::policy::{
 use crate::config::{HistoryMode, OutputFormat, RunConfig};
 use crate::event::schema::{EventFactory, RunStatus};
 use crate::event::sink::EventSink;
+use crate::mcp::McpRegistry;
 use crate::provider::conversation::Conversation;
-use crate::provider::tool_schema::deepseek_tools_schema_for_type;
+use crate::provider::tool_schema::{
+    deepseek_tools_schema_for_type_with_mcp, deepseek_tools_schema_with_mcp,
+};
 use crate::provider::{self, ProviderConfig, ProviderStep};
 use crate::runtime::agent_common;
 use crate::runtime::cancel::CancelToken;
 use crate::runtime::cost::CostTracker;
 use crate::runtime::history::{self, SessionWriter};
+use crate::runtime::hooks::{HookContext, HookEvent, HookRunner};
 use crate::runtime::instructions::{self, ProjectInstructions};
+use crate::runtime::memory::{self, MemoryBlock};
 use crate::runtime::session::new_run_id;
 use crate::runtime::subagent;
 use crate::runtime::subagent_types::SubagentType;
@@ -23,13 +29,20 @@ use crate::tools;
 use crate::verification;
 
 const DEFAULT_MAX_TURNS: u32 = 128;
-const MAX_SUBAGENT_DEPTH: u32 = 1;
 
 #[derive(Clone, Debug)]
 struct AgentLoopResult {
     status: RunStatus,
     final_message: Option<String>,
     error: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct SubagentExecutionResult {
+    tool_request: tools::ToolRequest,
+    description: String,
+    child: AgentLoopResult,
+    cost_tracker: CostTracker,
 }
 
 impl AgentLoopResult {
@@ -73,6 +86,12 @@ fn run_inner(config: RunConfig) -> io::Result<RunStatus> {
     let stdout = io::stdout();
     let mut sink = EventSink::new(stdout.lock(), config.output_format);
     let instructions = load_project_instructions(&cwd_path);
+    let memory = memory::load_for_cwd(&cwd_path);
+    let hooks = HookRunner::new(config.hooks.clone());
+    let mcp_registry = crate::mcp::initialize_registry(&config.mcp_servers);
+    for error in mcp_registry.errors() {
+        eprintln!("orca: warning: {error}");
+    }
 
     let resumed = match &config.history_mode {
         HistoryMode::Resume(selector) | HistoryMode::Fork(selector) => {
@@ -123,6 +142,19 @@ fn run_inner(config: RunConfig) -> io::Result<RunStatus> {
         config.provider.as_str(),
         config.verifier.as_deref(),
     ))?;
+    if let Err(error) = hooks.run(
+        HookEvent::SessionStart,
+        HookContext {
+            cwd: &cwd,
+            session_status: None,
+            tool_request: None,
+            tool_result: None,
+            before_messages: None,
+            after_messages: None,
+        },
+    ) {
+        sink.emit(&events.error(&format!("session_start hook failed: {error}")))?;
+    }
 
     let cancel = CancelToken::new();
     let mut cost_tracker = CostTracker::new(config.model.as_deref());
@@ -138,6 +170,9 @@ fn run_inner(config: RunConfig) -> io::Result<RunStatus> {
         true,
         &SubagentType::General,
         &instructions,
+        &memory,
+        &mcp_registry,
+        &hooks,
         &mut cost_tracker,
         &cancel,
     )?;
@@ -148,6 +183,19 @@ fn run_inner(config: RunConfig) -> io::Result<RunStatus> {
 
     if let Some(writer) = history_writer.as_mut() {
         writer.complete(status.as_str())?;
+    }
+    if let Err(error) = hooks.run(
+        HookEvent::SessionEnd,
+        HookContext {
+            cwd: &cwd,
+            session_status: Some(status.as_str()),
+            tool_request: None,
+            tool_result: None,
+            before_messages: None,
+            after_messages: None,
+        },
+    ) {
+        sink.emit(&events.error(&format!("session_end hook failed: {error}")))?;
     }
 
     sink.emit(&events.session_completed(status))?;
@@ -167,21 +215,30 @@ fn run_agent_loop(
     emit_deltas: bool,
     subagent_type: &SubagentType,
     instructions: &ProjectInstructions,
+    memory: &MemoryBlock,
+    mcp_registry: &McpRegistry,
+    hooks: &HookRunner,
     cost_tracker: &mut CostTracker,
     cancel: &CancelToken,
 ) -> io::Result<AgentLoopResult> {
     let max_turns = DEFAULT_MAX_TURNS;
     let ctx_config = provider::context::ContextConfig::default();
+    let policy = ApprovalPolicy::new(config.approval_mode)
+        .with_permission_rules(config.permission_rules.clone());
     let tools_override = if subagent_depth > 0 {
-        Some(deepseek_tools_schema_for_type(subagent_type))
+        Some(deepseek_tools_schema_for_type_with_mcp(
+            subagent_type,
+            Some(mcp_registry),
+        ))
     } else {
-        None
+        Some(deepseek_tools_schema_with_mcp(Some(mcp_registry)))
     };
     let provider_config = ProviderConfig {
         api_key: config.api_key.clone(),
         base_url: config.base_url.clone(),
         model: config.model.clone(),
         tools_override,
+        mcp_registry: Some(mcp_registry.clone()),
     };
 
     let system_prompt = agent_common::build_agent_system_prompt(
@@ -189,6 +246,8 @@ fn run_agent_loop(
         subagent_depth,
         subagent_type,
         Some(instructions),
+        config.approval_mode,
+        Some(memory),
     );
     let mut conversation = if let Some(resumed) = resumed {
         history::resume_conversation(resumed, system_prompt)
@@ -230,9 +289,40 @@ fn run_agent_loop(
 
         if provider::context::needs_compaction(&conversation, &ctx_config) {
             let before_messages = conversation.messages.len();
+            if emit_deltas
+                && let Err(error) = hooks.run(
+                    HookEvent::PreCompact,
+                    HookContext {
+                        cwd: &cwd.display().to_string(),
+                        session_status: None,
+                        tool_request: None,
+                        tool_result: None,
+                        before_messages: Some(before_messages),
+                        after_messages: None,
+                    },
+                )
+            {
+                sink.emit(&events.error(&format!("pre_compact hook failed: {error}")))?;
+            }
             conversation = provider::context::compact(&conversation, &ctx_config);
+            let after_messages = conversation.messages.len();
             if emit_deltas && let Some(writer) = history_writer.as_deref_mut() {
-                writer.append_compaction(before_messages, conversation.messages.len())?;
+                writer.append_compaction(before_messages, after_messages)?;
+            }
+            if emit_deltas
+                && let Err(error) = hooks.run(
+                    HookEvent::PostCompact,
+                    HookContext {
+                        cwd: &cwd.display().to_string(),
+                        session_status: None,
+                        tool_request: None,
+                        tool_result: None,
+                        before_messages: Some(before_messages),
+                        after_messages: Some(after_messages),
+                    },
+                )
+            {
+                sink.emit(&events.error(&format!("post_compact hook failed: {error}")))?;
             }
         }
 
@@ -341,36 +431,89 @@ fn run_agent_loop(
             writer.append_message(message)?;
         }
 
-        for step in &response.steps {
-            if let ProviderStep::ToolCall(tool_request) = step {
-                let (status, result) = execute_tool_with_approval(
+        let tool_requests: Vec<tools::ToolRequest> = response
+            .steps
+            .iter()
+            .filter_map(|step| match step {
+                ProviderStep::ToolCall(tool_request) => Some(tool_request.clone()),
+                _ => None,
+            })
+            .collect();
+        let mut index = 0;
+        while index < tool_requests.len() {
+            if should_run_subagent_batch(config, &tool_requests[index], subagent_depth) {
+                let batch_end = collect_subagent_batch(config, &tool_requests, index);
+                let results = execute_subagent_batch(
                     config,
                     cwd,
                     events,
                     sink,
-                    tool_request,
+                    &tool_requests[index..batch_end],
                     subagent_depth,
                     emit_deltas,
                     instructions,
+                    memory,
+                    mcp_registry,
+                    hooks,
+                    cost_tracker,
                 )?;
 
-                let result_content = agent_common::format_tool_result_for_model(&result);
-                conversation.add_tool_result(tool_request.id.clone(), result_content);
-                if emit_deltas
-                    && let Some(writer) = history_writer.as_deref_mut()
-                    && let Some(message) = conversation.messages.last()
-                {
-                    writer.append_message(message)?;
-                }
+                for (status, result) in results {
+                    let result_content = agent_common::format_tool_result_for_model(&result);
+                    conversation.add_tool_result(result.id.clone(), result_content);
+                    if emit_deltas
+                        && let Some(writer) = history_writer.as_deref_mut()
+                        && let Some(message) = conversation.messages.last()
+                    {
+                        writer.append_message(message)?;
+                    }
 
-                if status != RunStatus::Success {
-                    return Ok(AgentLoopResult {
-                        status,
-                        final_message: None,
-                        error: result.error.clone(),
-                    });
+                    if status != RunStatus::Success {
+                        return Ok(AgentLoopResult {
+                            status,
+                            final_message: None,
+                            error: result.error.clone(),
+                        });
+                    }
                 }
+                index = batch_end;
+                continue;
             }
+
+            let tool_request = &tool_requests[index];
+            let (status, result) = execute_tool_with_approval(
+                config,
+                cwd,
+                events,
+                sink,
+                tool_request,
+                subagent_depth,
+                emit_deltas,
+                &policy,
+                instructions,
+                memory,
+                mcp_registry,
+                hooks,
+                cost_tracker,
+            )?;
+
+            let result_content = agent_common::format_tool_result_for_model(&result);
+            conversation.add_tool_result(tool_request.id.clone(), result_content);
+            if emit_deltas
+                && let Some(writer) = history_writer.as_deref_mut()
+                && let Some(message) = conversation.messages.last()
+            {
+                writer.append_message(message)?;
+            }
+
+            if status != RunStatus::Success {
+                return Ok(AgentLoopResult {
+                    status,
+                    final_message: None,
+                    error: result.error.clone(),
+                });
+            }
+            index += 1;
         }
     }
 }
@@ -383,11 +526,13 @@ fn execute_tool_with_approval(
     tool_request: &tools::ToolRequest,
     subagent_depth: u32,
     emit_deltas: bool,
+    policy: &ApprovalPolicy,
     instructions: &ProjectInstructions,
+    memory: &MemoryBlock,
+    mcp_registry: &McpRegistry,
+    hooks: &HookRunner,
+    cost_tracker: &mut CostTracker,
 ) -> io::Result<(RunStatus, tools::ToolResult)> {
-    let policy = ApprovalPolicy::new(config.approval_mode)
-        .with_permission_rules(config.permission_rules.clone());
-
     if agent_common::requires_approval(tool_request.action) {
         let approval = ApprovalRequest {
             id: format!("approval-{}", tool_request.id),
@@ -446,6 +591,27 @@ fn execute_tool_with_approval(
     if emit_deltas {
         sink.emit(&events.tool_call_requested(tool_request))?;
     }
+    if let Err(error) = hooks.run(
+        HookEvent::PreToolUse,
+        HookContext {
+            cwd: &cwd.display().to_string(),
+            session_status: None,
+            tool_request: Some(tool_request),
+            tool_result: None,
+            before_messages: None,
+            after_messages: None,
+        },
+    ) {
+        let result = tools::ToolResult::failed(
+            tool_request,
+            format!("pre_tool_use hook blocked tool: {error}"),
+            None,
+        );
+        if emit_deltas {
+            sink.emit(&events.tool_call_completed(&result))?;
+        }
+        return Ok((RunStatus::Failed, result));
+    }
     let result = if tool_request.name == tools::ToolName::Subagent {
         execute_subagent_tool(
             config,
@@ -455,9 +621,14 @@ fn execute_tool_with_approval(
             tool_request,
             subagent_depth,
             instructions,
+            memory,
+            mcp_registry,
+            hooks,
+            emit_deltas,
+            cost_tracker,
         )?
     } else {
-        tools::execute(tool_request, cwd)
+        tools::execute_with_mcp(tool_request, cwd, mcp_registry)
     };
     let is_failure = matches!(
         result.status,
@@ -465,6 +636,19 @@ fn execute_tool_with_approval(
     );
     if emit_deltas {
         sink.emit(&events.tool_call_completed(&result))?;
+        if let Err(error) = hooks.run(
+            HookEvent::PostToolUse,
+            HookContext {
+                cwd: &cwd.display().to_string(),
+                session_status: None,
+                tool_request: Some(tool_request),
+                tool_result: Some(&result),
+                before_messages: None,
+                after_messages: None,
+            },
+        ) {
+            sink.emit(&events.error(&format!("post_tool_use hook failed: {error}")))?;
+        }
     }
 
     let status = if is_failure {
@@ -476,6 +660,228 @@ fn execute_tool_with_approval(
     Ok((status, result))
 }
 
+fn should_run_subagent_batch(
+    config: &RunConfig,
+    tool_request: &tools::ToolRequest,
+    subagent_depth: u32,
+) -> bool {
+    tool_request.name == tools::ToolName::Subagent
+        && subagent_depth < config.subagents.max_depth
+        && config.subagents.max_parallel > 1
+}
+
+fn collect_subagent_batch(
+    config: &RunConfig,
+    tool_requests: &[tools::ToolRequest],
+    start: usize,
+) -> usize {
+    let max_end = (start + config.subagents.max_parallel).min(tool_requests.len());
+    let mut end = start;
+    while end < max_end && tool_requests[end].name == tools::ToolName::Subagent {
+        end += 1;
+    }
+    end
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_subagent_batch(
+    config: &RunConfig,
+    cwd: &Path,
+    events: &mut EventFactory,
+    sink: &mut EventSink<impl io::Write>,
+    tool_requests: &[tools::ToolRequest],
+    subagent_depth: u32,
+    emit_deltas: bool,
+    instructions: &ProjectInstructions,
+    memory: &MemoryBlock,
+    mcp_registry: &McpRegistry,
+    hooks: &HookRunner,
+    cost_tracker: &mut CostTracker,
+) -> io::Result<Vec<(RunStatus, tools::ToolResult)>> {
+    let mut handles = Vec::new();
+    let mut results: Vec<Option<(RunStatus, tools::ToolResult)>> = vec![None; tool_requests.len()];
+
+    for (idx, tool_request) in tool_requests.iter().enumerate() {
+        if emit_deltas {
+            sink.emit(&events.tool_call_requested(tool_request))?;
+        }
+        if let Err(error) = hooks.run(
+            HookEvent::PreToolUse,
+            HookContext {
+                cwd: &cwd.display().to_string(),
+                session_status: None,
+                tool_request: Some(tool_request),
+                tool_result: None,
+                before_messages: None,
+                after_messages: None,
+            },
+        ) {
+            let result = tools::ToolResult::failed(
+                tool_request,
+                format!("pre_tool_use hook blocked tool: {error}"),
+                None,
+            );
+            if emit_deltas {
+                sink.emit(&events.tool_call_completed(&result))?;
+            }
+            results[idx] = Some((RunStatus::Failed, result));
+            continue;
+        }
+
+        let request = subagent::create_subagent_request(tool_request);
+        if emit_deltas {
+            sink.emit(&events.subagent_started(&tool_request.id, &request.description))?;
+        }
+
+        let child_tool_request = tool_request.clone();
+        let child_config = config.clone();
+        let child_cwd = cwd.to_path_buf();
+        let child_instructions = instructions.clone();
+        let child_memory = memory.clone();
+        let child_mcp_registry = mcp_registry.clone();
+        let child_hooks = hooks.clone();
+        handles.push((
+            idx,
+            thread::spawn(move || {
+                let mut child_events =
+                    EventFactory::new(format!("subagent-{}", child_tool_request.id));
+                let mut child_sink = EventSink::new(io::sink(), child_config.output_format);
+                let child_cancel = CancelToken::new();
+                let mut child_cost_tracker = CostTracker::new(child_config.model.as_deref());
+                let child = run_agent_loop(
+                    &child_config,
+                    &child_cwd,
+                    &mut child_events,
+                    &mut child_sink,
+                    &request.prompt,
+                    None,
+                    None,
+                    subagent_depth + 1,
+                    false,
+                    &request.subagent_type,
+                    &child_instructions,
+                    &child_memory,
+                    &child_mcp_registry,
+                    &child_hooks,
+                    &mut child_cost_tracker,
+                    &child_cancel,
+                )
+                .unwrap_or_else(|error| {
+                    AgentLoopResult::failure(RunStatus::Failed, error.to_string())
+                });
+
+                SubagentExecutionResult {
+                    tool_request: child_tool_request,
+                    description: request.description,
+                    child,
+                    cost_tracker: child_cost_tracker,
+                }
+            }),
+        ));
+    }
+
+    for (idx, handle) in handles {
+        let execution = match handle.join() {
+            Ok(execution) => execution,
+            Err(_) => {
+                let tool_request = &tool_requests[idx];
+                let result =
+                    tools::ToolResult::failed(tool_request, "subagent thread panicked", None);
+                if emit_deltas {
+                    sink.emit(&events.tool_call_completed(&result))?;
+                }
+                results[idx] = Some((RunStatus::Failed, result));
+                continue;
+            }
+        };
+
+        cost_tracker.merge(&execution.cost_tracker);
+
+        let (status, result) =
+            subagent_execution_to_tool_result(events, sink, &execution, emit_deltas)?;
+        if emit_deltas {
+            sink.emit(&events.tool_call_completed(&result))?;
+            if let Err(error) = hooks.run(
+                HookEvent::PostToolUse,
+                HookContext {
+                    cwd: &cwd.display().to_string(),
+                    session_status: None,
+                    tool_request: Some(&execution.tool_request),
+                    tool_result: Some(&result),
+                    before_messages: None,
+                    after_messages: None,
+                },
+            ) {
+                sink.emit(&events.error(&format!("post_tool_use hook failed: {error}")))?;
+            }
+        }
+        results[idx] = Some((status, result));
+    }
+
+    Ok(results
+        .into_iter()
+        .map(|result| result.expect("each subagent batch item has a result"))
+        .collect())
+}
+
+fn subagent_execution_to_tool_result(
+    events: &mut EventFactory,
+    sink: &mut EventSink<impl io::Write>,
+    execution: &SubagentExecutionResult,
+    emit_deltas: bool,
+) -> io::Result<(RunStatus, tools::ToolResult)> {
+    match execution.child.status {
+        RunStatus::Success => {
+            let output = execution
+                .child
+                .final_message
+                .clone()
+                .unwrap_or_else(|| "(subagent completed without a final message)".to_string());
+            if emit_deltas {
+                sink.emit(&events.subagent_completed(
+                    &execution.tool_request.id,
+                    &execution.description,
+                    execution.child.status,
+                    Some(&output),
+                    None,
+                ))?;
+            }
+            Ok((
+                RunStatus::Success,
+                tools::ToolResult::completed(
+                    &execution.tool_request,
+                    format!("Subagent status: success\n\n{output}"),
+                    false,
+                ),
+            ))
+        }
+        status => {
+            let error = execution
+                .child
+                .error
+                .clone()
+                .unwrap_or_else(|| format!("subagent ended with status {status:?}"));
+            if emit_deltas {
+                sink.emit(&events.subagent_completed(
+                    &execution.tool_request.id,
+                    &execution.description,
+                    status,
+                    execution.child.final_message.as_deref(),
+                    Some(&error),
+                ))?;
+            }
+            Ok((
+                RunStatus::Failed,
+                tools::ToolResult::failed(
+                    &execution.tool_request,
+                    format!("Subagent status: {status:?}\n\n{error}"),
+                    None,
+                ),
+            ))
+        }
+    }
+}
+
 fn execute_subagent_tool(
     config: &RunConfig,
     cwd: &Path,
@@ -484,22 +890,31 @@ fn execute_subagent_tool(
     tool_request: &tools::ToolRequest,
     subagent_depth: u32,
     instructions: &ProjectInstructions,
+    memory: &MemoryBlock,
+    mcp_registry: &McpRegistry,
+    hooks: &HookRunner,
+    emit_deltas: bool,
+    cost_tracker: &mut CostTracker,
 ) -> io::Result<tools::ToolResult> {
     let request = subagent::create_subagent_request(tool_request);
     let description = request.description.clone();
     let subagent_type = request.subagent_type;
 
-    sink.emit(&events.subagent_started(&tool_request.id, &description))?;
+    if emit_deltas {
+        sink.emit(&events.subagent_started(&tool_request.id, &description))?;
+    }
 
-    if subagent_depth >= MAX_SUBAGENT_DEPTH {
-        let error = "nested subagents are disabled in this MVP";
-        sink.emit(&events.subagent_completed(
-            &tool_request.id,
-            &description,
-            RunStatus::Failed,
-            None,
-            Some(error),
-        ))?;
+    if subagent_depth >= config.subagents.max_depth {
+        let error = format!("subagent max depth {} reached", config.subagents.max_depth);
+        if emit_deltas {
+            sink.emit(&events.subagent_completed(
+                &tool_request.id,
+                &description,
+                RunStatus::Failed,
+                None,
+                Some(&error),
+            ))?;
+        }
         return Ok(tools::ToolResult::failed(tool_request, error, None));
     }
 
@@ -517,22 +932,29 @@ fn execute_subagent_tool(
         false,
         &subagent_type,
         instructions,
+        memory,
+        mcp_registry,
+        hooks,
         &mut child_cost_tracker,
         &child_cancel,
     )?;
+
+    cost_tracker.merge(&child_cost_tracker);
 
     match child.status {
         RunStatus::Success => {
             let output = child
                 .final_message
                 .unwrap_or_else(|| "(subagent completed without a final message)".to_string());
-            sink.emit(&events.subagent_completed(
-                &tool_request.id,
-                &description,
-                child.status,
-                Some(&output),
-                None,
-            ))?;
+            if emit_deltas {
+                sink.emit(&events.subagent_completed(
+                    &tool_request.id,
+                    &description,
+                    child.status,
+                    Some(&output),
+                    None,
+                ))?;
+            }
             Ok(tools::ToolResult::completed(
                 tool_request,
                 format!("Subagent status: success\n\n{output}"),
@@ -543,13 +965,15 @@ fn execute_subagent_tool(
             let error = child
                 .error
                 .unwrap_or_else(|| format!("subagent ended with status {status:?}"));
-            sink.emit(&events.subagent_completed(
-                &tool_request.id,
-                &description,
-                status,
-                child.final_message.as_deref(),
-                Some(&error),
-            ))?;
+            if emit_deltas {
+                sink.emit(&events.subagent_completed(
+                    &tool_request.id,
+                    &description,
+                    status,
+                    child.final_message.as_deref(),
+                    Some(&error),
+                ))?;
+            }
             Ok(tools::ToolResult::failed(
                 tool_request,
                 format!("Subagent status: {status:?}\n\n{error}"),
@@ -616,11 +1040,89 @@ fn run_verifier_if_needed(
 }
 
 fn load_project_instructions(cwd: &Path) -> ProjectInstructions {
-    match instructions::load_for_cwd(cwd) {
-        Ok(instructions) => instructions,
-        Err(error) => {
-            eprintln!("orca: warning: failed to load project instructions: {error}");
-            ProjectInstructions::default()
+    instructions::load_for_cwd_or_default(cwd)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::approval::policy::{ActionKind, ApprovalMode};
+    use crate::config::{HistoryMode, OutputFormat, ProviderKind};
+    use crate::runtime::subagent_config::SubagentConfig;
+
+    fn config(subagents: SubagentConfig) -> RunConfig {
+        RunConfig {
+            prompt: String::new(),
+            cwd: None,
+            output_format: OutputFormat::Text,
+            approval_mode: ApprovalMode::Suggest,
+            provider: ProviderKind::Mock,
+            verifier: None,
+            model: None,
+            api_key: None,
+            base_url: None,
+            history_mode: HistoryMode::Disabled,
+            show_session_picker: false,
+            permission_rules: Default::default(),
+            max_budget_usd: None,
+            mcp_servers: Vec::new(),
+            hooks: Vec::new(),
+            subagents,
         }
+    }
+
+    fn subagent_request(id: &str) -> tools::ToolRequest {
+        tools::ToolRequest {
+            id: id.to_string(),
+            name: tools::ToolName::Subagent,
+            action: ActionKind::Read,
+            target: Some("task".to_string()),
+            raw_arguments: None,
+        }
+    }
+
+    #[test]
+    fn subagent_batch_respects_parallel_limit() {
+        let config = config(SubagentConfig::default());
+        let requests = vec![
+            subagent_request("a"),
+            subagent_request("b"),
+            subagent_request("c"),
+            subagent_request("d"),
+            subagent_request("e"),
+        ];
+
+        assert!(should_run_subagent_batch(&config, &requests[0], 0));
+        assert_eq!(collect_subagent_batch(&config, &requests, 0), 4);
+    }
+
+    #[test]
+    fn max_parallel_one_uses_sequential_subagent_path() {
+        let config = config(
+            SubagentConfig {
+                max_depth: 2,
+                max_parallel: 1,
+            }
+            .normalized(),
+        );
+        let request = subagent_request("a");
+
+        assert!(!should_run_subagent_batch(&config, &request, 0));
+    }
+
+    #[test]
+    fn subagent_batch_stops_at_first_non_subagent_tool() {
+        let config = config(SubagentConfig::default());
+        let mut requests = vec![subagent_request("a"), subagent_request("b")];
+        requests.push(tools::ToolRequest {
+            id: "read".to_string(),
+            name: tools::ToolName::ReadFile,
+            action: ActionKind::Read,
+            target: Some("src/main.rs".to_string()),
+            raw_arguments: None,
+        });
+        requests.push(subagent_request("c"));
+
+        assert_eq!(collect_subagent_batch(&config, &requests, 0), 2);
     }
 }

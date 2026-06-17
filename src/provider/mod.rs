@@ -10,6 +10,7 @@ pub mod tool_schema;
 use serde::{Deserialize, Serialize};
 
 use crate::config::ProviderKind;
+use crate::mcp::McpRegistry;
 use crate::provider::conversation::{Conversation, RawToolCall};
 use crate::runtime::cancel::CancelToken;
 use crate::tools::ToolRequest;
@@ -19,6 +20,7 @@ pub struct ProviderConfig {
     pub base_url: Option<String>,
     pub model: Option<String>,
     pub tools_override: Option<Vec<serde_json::Value>>,
+    pub mcp_registry: Option<McpRegistry>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -30,11 +32,11 @@ pub struct Usage {
 
 impl Usage {
     pub fn total_tokens(self) -> u64 {
-        self.input_tokens + self.output_tokens + self.cache_tokens
+        self.input_tokens + self.output_tokens
     }
 
     pub fn is_empty(self) -> bool {
-        self.total_tokens() == 0
+        self.input_tokens == 0 && self.output_tokens == 0 && self.cache_tokens == 0
     }
 }
 

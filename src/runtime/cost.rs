@@ -44,6 +44,17 @@ impl CostTracker {
         self.totals.estimated_cost_usd += self.pricing.estimate(usage);
         self.totals
     }
+
+    pub fn set_model(&mut self, model: Option<&str>) {
+        self.pricing = ModelPricing::for_model(model);
+    }
+
+    pub fn merge(&mut self, other: &CostTracker) {
+        self.totals.input_tokens += other.totals.input_tokens;
+        self.totals.output_tokens += other.totals.output_tokens;
+        self.totals.cache_tokens += other.totals.cache_tokens;
+        self.totals.estimated_cost_usd += other.totals.estimated_cost_usd;
+    }
 }
 
 impl ModelPricing {
@@ -54,8 +65,7 @@ impl ModelPricing {
                 output_per_million: 0.87,
                 cache_per_million: 0.044,
             },
-            // V4-Flash is the default. Legacy aliases (deepseek-chat, deepseek-reasoner) also
-            // map to V4-Flash since 2026-07-24 deprecation.
+            // V4-Flash is the default and the low-cost option when the model is omitted.
             _ => Self {
                 input_per_million: 0.14,
                 output_per_million: 0.28,
@@ -98,5 +108,32 @@ mod tests {
         // V4-Flash: (120-10)*0.14 + 10*0.014 + 30*0.28 = 110*0.14 + 0.14 + 8.4 = 15.4+0.14+8.4 = 23.94 per million
         let expected = (110.0 * 0.14 + 10.0 * 0.014 + 30.0 * 0.28) / 1_000_000.0;
         assert!((totals.estimated_cost_usd - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn merge_accumulates_from_child_tracker() {
+        let mut parent = CostTracker::new(Some("deepseek-v4-flash"));
+        parent.add_usage(Usage {
+            input_tokens: 100,
+            output_tokens: 50,
+            cache_tokens: 20,
+        });
+
+        let mut child = CostTracker::new(Some("deepseek-v4-flash"));
+        child.add_usage(Usage {
+            input_tokens: 200,
+            output_tokens: 80,
+            cache_tokens: 30,
+        });
+
+        let parent_cost_before = parent.totals.estimated_cost_usd;
+        let child_cost = child.totals.estimated_cost_usd;
+
+        parent.merge(&child);
+
+        assert_eq!(parent.totals.input_tokens, 300);
+        assert_eq!(parent.totals.output_tokens, 130);
+        assert_eq!(parent.totals.cache_tokens, 50);
+        assert!((parent.totals.estimated_cost_usd - (parent_cost_before + child_cost)).abs() < 1e-12);
     }
 }

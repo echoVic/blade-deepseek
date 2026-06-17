@@ -4,6 +4,9 @@ use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 
 use crate::approval::policy::{ApprovalMode, PermissionRules};
+use crate::mcp::types::McpServerConfig;
+use crate::runtime::hooks::HookConfig;
+use crate::runtime::subagent_config::SubagentConfig;
 
 pub mod file;
 
@@ -53,8 +56,11 @@ pub struct RunConfig {
     pub model: Option<String>,
     pub api_key: Option<String>,
     pub base_url: Option<String>,
+    pub mcp_servers: Vec<McpServerConfig>,
+    pub hooks: Vec<HookConfig>,
     pub history_mode: HistoryMode,
     pub show_session_picker: bool,
     pub permission_rules: PermissionRules,
     pub max_budget_usd: Option<f64>,
+    pub subagents: SubagentConfig,
 }

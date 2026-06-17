@@ -51,6 +51,7 @@ impl SubagentType {
                 "edit",
                 "write_file",
                 "git_status",
+                "web_search",
             ],
             Self::CodeReviewer => vec!["read_file", "list_files", "grep", "git_status"],
             Self::TestWriter => vec![
@@ -71,6 +72,7 @@ impl SubagentType {
                 "edit",
                 "write_file",
                 "git_status",
+                "web_search",
             ],
         }
     }

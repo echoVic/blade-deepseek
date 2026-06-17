@@ -15,6 +15,7 @@ clap = { version = "4.5.50", features = ["derive"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 reqwest = { version = "0.12.24", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+tokio = { version = "1.48", features = ["rt-multi-thread", "macros", "process", "io-util", "sync", "time"] }
 toml = "0.8"
 tiktoken-rs = "0.12.0"
 dirs = "6"
@@ -26,6 +27,7 @@ uuid = { version = "1.0", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 unicode-width = "0.2.0"
 zstd = "0.13"
+similar = "3.1.1"
 
 [dev-dependencies]
 tempfile = "3.27.0"

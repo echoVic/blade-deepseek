@@ -16,6 +16,8 @@ use crate::config::{HistoryMode, RunConfig};
 use crate::runtime::cancel::CancelToken;
 use crate::runtime::history;
 use crate::tui::bridge;
+use crate::tui::commands::{self, SlashCommand};
+use crate::tui::mentions;
 use crate::tui::shortcuts::{
     ApprovalShortcut, GlobalShortcut, IdleShortcut, RunningShortcut, approval_shortcut,
     global_shortcut, idle_shortcut, running_shortcut,
@@ -354,6 +356,24 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                             let lines: Vec<String> = textarea.lines().to_vec();
                             let text = lines.join("\n").trim().to_string();
                             if !text.is_empty() {
+                                if let Some(outcome) = handle_slash_command(
+                                    &text,
+                                    &mut config,
+                                    &shared_config,
+                                    &mut state,
+                                    &action_tx,
+                                ) {
+                                    match outcome {
+                                        SlashOutcome::Continue => {
+                                            textarea = make_textarea();
+                                            continue;
+                                        }
+                                        SlashOutcome::Exit(code) => {
+                                            exit_code = code;
+                                            break;
+                                        }
+                                    }
+                                }
                                 state.record_prompt(text.clone());
                                 state.messages.push(ChatMessage::User(text.clone()));
                                 state.status = AppStatus::Running;
@@ -542,6 +562,17 @@ fn agent_loop_thread(
             Ok(UserAction::Submit(prompt)) => {
                 cancel.reset();
                 let cfg = config.lock().unwrap().clone();
+                let cwd = cfg
+                    .cwd
+                    .clone()
+                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+                let prompt = match mentions::expand_file_mentions(&prompt, &cwd) {
+                    Ok(prompt) => prompt,
+                    Err(error) => {
+                        let _ = event_tx.send(TuiEvent::Error(error));
+                        continue;
+                    }
+                };
                 if session.is_none() {
                     let transcript = preloaded.lock().unwrap().take();
                     session = match bridge::TuiConversationSession::new_with_preloaded(
@@ -568,6 +599,27 @@ fn agent_loop_thread(
             Ok(UserAction::Interrupt) => {
                 // Cancel already set by TUI thread; just continue waiting for next Submit
             }
+            Ok(UserAction::SetModel(model)) => {
+                if let Some(session) = session.as_mut() {
+                    session.set_model(Some(&model));
+                }
+            }
+            Ok(UserAction::Compact) => {
+                if let Some(session) = session.as_mut() {
+                    let cfg = config.lock().unwrap().clone();
+                    let cwd = cfg
+                        .cwd
+                        .clone()
+                        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+                    let (before_messages, after_messages) = session.compact(&cwd);
+                    let _ = event_tx.send(TuiEvent::Compacted {
+                        before_messages,
+                        after_messages,
+                    });
+                } else {
+                    let _ = event_tx.send(TuiEvent::Error("nothing to compact".to_string()));
+                }
+            }
             Ok(UserAction::Backtrack) => {
                 if let Some(session) = session.as_mut() {
                     match session.backtrack_last_user() {
@@ -586,6 +638,156 @@ fn agent_loop_thread(
             Ok(UserAction::Cancel) | Err(_) => break,
             Ok(UserAction::Approve(_)) => {}
         }
+    }
+}
+
+enum SlashOutcome {
+    Continue,
+    Exit(i32),
+}
+
+fn handle_slash_command(
+    text: &str,
+    config: &mut RunConfig,
+    shared_config: &Arc<Mutex<RunConfig>>,
+    state: &mut AppState,
+    action_tx: &mpsc::Sender<UserAction>,
+) -> Option<SlashOutcome> {
+    let command = commands::parse(text)?;
+    match command {
+        SlashCommand::Help => {
+            state.messages.push(ChatMessage::System(
+                "/help /model <name> /compact /clear /cost /history /mode <suggest|auto-edit|full-auto> /plan [off] /remember <note> /exit"
+                    .to_string(),
+            ));
+        }
+        SlashCommand::Model(model) => match commands::validate_model(&model) {
+            Ok(()) => {
+                config.model = Some(model.clone());
+                if let Ok(mut cfg) = shared_config.lock() {
+                    cfg.model = Some(model.clone());
+                }
+                state.model_name = model.clone();
+                state
+                    .messages
+                    .push(ChatMessage::System(format!("Model switched to {model}.")));
+                let _ = action_tx.send(UserAction::SetModel(model));
+            }
+            Err(error) => state.messages.push(ChatMessage::Error(error)),
+        },
+        SlashCommand::Clear => {
+            state.messages.clear();
+            state.scroll_offset = 0;
+            state.auto_scroll = true;
+        }
+        SlashCommand::Cost => {
+            state.messages.push(ChatMessage::System(format!(
+                "Session usage: {} input, {} output, {} cache tokens, estimated ${:.6}.",
+                state.usage.input_tokens,
+                state.usage.output_tokens,
+                state.usage.cache_tokens,
+                state.usage.estimated_cost_usd
+            )));
+        }
+        SlashCommand::Mode(mode) => match parse_approval_mode(&mode) {
+            Some(approval_mode) => {
+                config.approval_mode = approval_mode;
+                if let Ok(mut cfg) = shared_config.lock() {
+                    cfg.approval_mode = approval_mode;
+                }
+                state.messages.push(ChatMessage::System(format!(
+                    "Approval mode switched to {mode}."
+                )));
+            }
+            None => state.messages.push(ChatMessage::Error(
+                "unsupported mode. Use suggest, auto-edit, or full-auto.".to_string(),
+            )),
+        },
+        SlashCommand::Plan(arg) => match arg.as_deref() {
+            Some("off") => {
+                config.approval_mode = crate::approval::policy::ApprovalMode::Suggest;
+                if let Ok(mut cfg) = shared_config.lock() {
+                    cfg.approval_mode = crate::approval::policy::ApprovalMode::Suggest;
+                }
+                state
+                    .messages
+                    .push(ChatMessage::System("Plan mode disabled.".to_string()));
+            }
+            None => {
+                config.approval_mode = crate::approval::policy::ApprovalMode::Plan;
+                if let Ok(mut cfg) = shared_config.lock() {
+                    cfg.approval_mode = crate::approval::policy::ApprovalMode::Plan;
+                }
+                state
+                    .messages
+                    .push(ChatMessage::System("Plan mode enabled.".to_string()));
+            }
+            Some(_) => state.messages.push(ChatMessage::Error(
+                "unsupported plan command. Use /plan or /plan off.".to_string(),
+            )),
+        },
+        SlashCommand::Remember(note) => {
+            let result = if let Some(project_note) = note.strip_prefix("project:") {
+                let cwd = config
+                    .cwd
+                    .clone()
+                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+                crate::runtime::memory::remember_project(&cwd, project_note)
+            } else {
+                crate::runtime::memory::remember_user(&note)
+            };
+            match result {
+                Ok(path) => state.messages.push(ChatMessage::System(format!(
+                    "Remembered in {}.",
+                    path.display()
+                ))),
+                Err(error) => state
+                    .messages
+                    .push(ChatMessage::Error(format!("failed to remember: {error}"))),
+            }
+        }
+        SlashCommand::Compact => {
+            state.status = AppStatus::Running;
+            let _ = action_tx.send(UserAction::Compact);
+        }
+        SlashCommand::History => match history::list_sessions(10) {
+            Ok(sessions) if sessions.is_empty() => state
+                .messages
+                .push(ChatMessage::System("No saved sessions.".to_string())),
+            Ok(sessions) => {
+                let summary = sessions
+                    .into_iter()
+                    .map(|session| {
+                        format!(
+                            "{}  {}  {}",
+                            session.session_id,
+                            session.updated_at.format("%Y-%m-%d %H:%M"),
+                            session.title
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                state
+                    .messages
+                    .push(ChatMessage::System(format!("Recent sessions:\n{summary}")));
+            }
+            Err(error) => state.messages.push(ChatMessage::Error(format!(
+                "failed to list history: {error}"
+            ))),
+        },
+        SlashCommand::Exit => return Some(SlashOutcome::Exit(0)),
+    }
+    state.scroll_to_bottom();
+    Some(SlashOutcome::Continue)
+}
+
+fn parse_approval_mode(mode: &str) -> Option<crate::approval::policy::ApprovalMode> {
+    match mode {
+        "suggest" => Some(crate::approval::policy::ApprovalMode::Suggest),
+        "auto-edit" => Some(crate::approval::policy::ApprovalMode::AutoEdit),
+        "full-auto" => Some(crate::approval::policy::ApprovalMode::FullAuto),
+        "plan" => Some(crate::approval::policy::ApprovalMode::Plan),
+        _ => None,
     }
 }
 
@@ -628,6 +830,7 @@ fn chat_message_from_history(
             target: None,
             status: "completed".to_string(),
             output: Some(content),
+            diff: None,
         }),
     }
 }

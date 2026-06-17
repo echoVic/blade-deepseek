@@ -3,7 +3,7 @@ use serde_json::Value;
 
 use crate::approval::policy::ActionKind;
 use crate::provider::conversation::Conversation;
-use crate::provider::tool_schema::deepseek_tools_schema;
+use crate::provider::tool_schema::deepseek_tools_schema_with_mcp;
 use crate::provider::{ProviderConfig, ProviderReplayState, ProviderResponse, ProviderStep, Usage};
 use crate::runtime::cancel::CancelToken;
 use crate::tools::{ToolName, ToolRequest};
@@ -160,7 +160,7 @@ fn request_chat_streaming(
     let tools = config
         .tools_override
         .clone()
-        .unwrap_or_else(deepseek_tools_schema);
+        .unwrap_or_else(|| deepseek_tools_schema_with_mcp(config.mcp_registry.as_ref()));
 
     let request = ChatRequest {
         model: model.to_string(),
@@ -280,7 +280,7 @@ fn request_chat(
     let tools = config
         .tools_override
         .clone()
-        .unwrap_or_else(deepseek_tools_schema);
+        .unwrap_or_else(|| deepseek_tools_schema_with_mcp(config.mcp_registry.as_ref()));
 
     let request = ChatRequest {
         model: model.to_string(),
@@ -429,6 +429,16 @@ fn parse_tool_call(tc: &ApiToolCallResponse) -> Result<ToolRequest, String> {
                 .as_str()
                 .map(String::from)
                 .or_else(|| args["prompt"].as_str().map(String::from)),
+        ),
+        "web_search" => (
+            ToolName::WebSearch,
+            ActionKind::Read,
+            args["query"].as_str().map(String::from),
+        ),
+        other if other.starts_with("mcp__") => (
+            ToolName::Mcp(other.to_string()),
+            ActionKind::Read,
+            Some(other.to_string()),
         ),
         other => return Err(format!("unknown tool: {other}")),
     };
@@ -597,6 +607,26 @@ mod tests {
         assert_eq!(req.name, ToolName::Subagent);
         assert_eq!(req.action, ActionKind::Read);
         assert_eq!(req.target.as_deref(), Some("inspect repo"));
+        assert!(req.raw_arguments.is_some());
+    }
+
+    #[test]
+    fn parse_mcp_tool() {
+        let tc = make_tc("mcp__demo__search", r#"{"query":"orca"}"#);
+        let req = parse_tool_call(&tc).unwrap();
+        assert_eq!(req.name, ToolName::Mcp("mcp__demo__search".to_string()));
+        assert_eq!(req.action, ActionKind::Read);
+        assert_eq!(req.target.as_deref(), Some("mcp__demo__search"));
+        assert_eq!(req.raw_arguments.as_deref(), Some(r#"{"query":"orca"}"#));
+    }
+
+    #[test]
+    fn parse_web_search() {
+        let tc = make_tc("web_search", r#"{"query":"deepseek latest","count":3}"#);
+        let req = parse_tool_call(&tc).unwrap();
+        assert_eq!(req.name, ToolName::WebSearch);
+        assert_eq!(req.action, ActionKind::Read);
+        assert_eq!(req.target.as_deref(), Some("deepseek latest"));
         assert!(req.raw_arguments.is_some());
     }
 
