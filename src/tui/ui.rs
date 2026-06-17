@@ -8,15 +8,16 @@ use tui_textarea::TextArea;
 use unicode_width::UnicodeWidthStr;
 
 use super::shortcuts::{self, ShortcutScope};
+use super::theme::Theme;
 use super::types::{AppState, AppStatus, ChatMessage};
 
-pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea) {
+pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, theme: &Theme) {
     if state.status == AppStatus::Setup {
-        render_setup(frame, state, textarea);
+        render_setup(frame, state, textarea, theme);
         return;
     }
     if state.status == AppStatus::SessionPicker {
-        render_session_picker(frame, state);
+        render_session_picker(frame, state, theme);
         return;
     }
 
@@ -27,20 +28,20 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea) {
     ])
     .split(frame.area());
 
-    render_messages(frame, chunks[0], state);
+    render_messages(frame, chunks[0], state, theme);
     render_input(frame, chunks[1], textarea);
-    render_status(frame, chunks[2], state);
+    render_status(frame, chunks[2], state, theme);
 
     if state.status == AppStatus::WaitingApproval {
-        render_approval_dialog(frame, state);
+        render_approval_dialog(frame, state, theme);
     }
 
     if state.show_shortcuts {
-        render_shortcuts(frame, state);
+        render_shortcuts(frame, state, theme);
     }
 }
 
-fn render_session_picker(frame: &mut Frame, state: &mut AppState) {
+fn render_session_picker(frame: &mut Frame, state: &mut AppState, theme: &Theme) {
     let area = frame.area();
     let block = Block::default()
         .borders(Borders::ALL)
@@ -51,7 +52,7 @@ fn render_session_picker(frame: &mut Frame, state: &mut AppState) {
     let mut lines = Vec::new();
     lines.push(Line::from(Span::styled(
         "Enter resume · n new session · Esc quit",
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(theme.muted),
     )));
     lines.push(Line::from(""));
 
@@ -60,10 +61,10 @@ fn render_session_picker(frame: &mut Frame, state: &mut AppState) {
         let marker = if selected { "> " } else { "  " };
         let style = if selected {
             Style::default()
-                .fg(Color::Cyan)
+                .fg(theme.border)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(theme.text)
         };
         lines.push(Line::from(vec![
             Span::styled(marker, style),
@@ -74,7 +75,7 @@ fn render_session_picker(frame: &mut Frame, state: &mut AppState) {
                     session.updated_at.format("%Y-%m-%d %H:%M"),
                     session.provider
                 ),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme.muted),
             ),
         ]));
     }
@@ -83,8 +84,8 @@ fn render_session_picker(frame: &mut Frame, state: &mut AppState) {
     frame.render_widget(paragraph, inner);
 }
 
-fn render_messages(frame: &mut Frame, area: Rect, state: &mut AppState) {
-    let lines = build_message_lines(state);
+fn render_messages(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) {
+    let lines = build_message_lines(state, theme);
 
     // Account for block borders: 1 left + 1 right
     let content_width = area.width.saturating_sub(2) as usize;
@@ -133,15 +134,15 @@ fn wrapped_line_count(line: &Line, width: usize) -> usize {
     (line_width + width - 1) / width
 }
 
-fn build_message_lines(state: &AppState) -> Vec<Line<'static>> {
+fn build_message_lines(state: &AppState, theme: &Theme) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
 
     for msg in &state.messages {
         match msg {
             ChatMessage::User(text) => {
                 lines.push(Line::from(vec![
-                    Span::styled("> ", Style::default().fg(Color::Blue)),
-                    Span::styled(text.clone(), Style::default().fg(Color::Blue)),
+                    Span::styled("> ", Style::default().fg(theme.user)),
+                    Span::styled(text.clone(), Style::default().fg(theme.user)),
                 ]));
                 lines.push(Line::from(""));
             }
@@ -149,7 +150,7 @@ fn build_message_lines(state: &AppState) -> Vec<Line<'static>> {
                 let prefix = Span::styled(
                     "[thinking] ",
                     Style::default()
-                        .fg(Color::DarkGray)
+                        .fg(theme.muted)
                         .add_modifier(Modifier::ITALIC),
                 );
                 let truncated = truncate_lines(text, 3);
@@ -158,7 +159,7 @@ fn build_message_lines(state: &AppState) -> Vec<Line<'static>> {
                     Span::styled(
                         truncated,
                         Style::default()
-                            .fg(Color::DarkGray)
+                            .fg(theme.muted)
                             .add_modifier(Modifier::ITALIC),
                     ),
                 ]));
@@ -185,10 +186,10 @@ fn build_message_lines(state: &AppState) -> Vec<Line<'static>> {
                     _ => "·",
                 };
                 let color = match status.as_str() {
-                    "completed" => Color::Green,
-                    "running" => Color::Yellow,
-                    "denied" | "failed" => Color::Red,
-                    _ => Color::Gray,
+                    "completed" => theme.success,
+                    "running" => theme.warning,
+                    "denied" | "failed" => theme.error,
+                    _ => theme.muted,
                 };
                 let target_str = target
                     .as_deref()
@@ -199,17 +200,17 @@ fn build_message_lines(state: &AppState) -> Vec<Line<'static>> {
                         format!("  {icon} {name}{target_str}"),
                         Style::default().fg(color),
                     ),
-                    Span::styled(format!(" ({status})"), Style::default().fg(Color::DarkGray)),
+                    Span::styled(format!(" ({status})"), Style::default().fg(theme.muted)),
                 ]));
                 if let Some(out) = output {
                     let preview = truncate_lines(out, 2);
                     lines.push(Line::from(Span::styled(
                         format!("    {preview}"),
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(theme.muted),
                     )));
                 }
                 if let Some(diff) = diff {
-                    append_diff_lines(&mut lines, diff);
+                    append_diff_lines(&mut lines, diff, theme);
                 }
             }
             ChatMessage::Subagent {
@@ -219,19 +220,19 @@ fn build_message_lines(state: &AppState) -> Vec<Line<'static>> {
                 error,
                 ..
             } => {
-                append_subagent_lines(&mut lines, description, status, output, error);
+                append_subagent_lines(&mut lines, description, status, output, error, theme);
             }
             ChatMessage::Error(text) => {
                 lines.push(Line::from(Span::styled(
                     format!("ERROR: {text}"),
-                    Style::default().fg(Color::Red),
+                    Style::default().fg(theme.error),
                 )));
                 lines.push(Line::from(""));
             }
             ChatMessage::System(text) => {
                 lines.push(Line::from(Span::styled(
                     text.clone(),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(theme.muted),
                 )));
                 lines.push(Line::from(""));
             }
@@ -247,44 +248,45 @@ fn append_subagent_lines(
     status: &str,
     output: &Option<String>,
     error: &Option<String>,
+    theme: &Theme,
 ) {
     let (label, color) = match status {
-        "success" | "completed" => ("done", Color::Green),
-        "running" => ("running", Color::Cyan),
-        "failed" => ("failed", Color::Red),
-        other => (other, Color::Gray),
+        "success" | "completed" => ("done", theme.success),
+        "running" => ("running", theme.border),
+        "failed" => ("failed", theme.error),
+        other => (other, theme.muted),
     };
 
     lines.push(Line::from(vec![
-        Span::styled("  ┌─ delegated task", Style::default().fg(Color::Cyan)),
-        Span::styled(" · ", Style::default().fg(Color::DarkGray)),
+        Span::styled("  ┌─ delegated task", Style::default().fg(theme.border)),
+        Span::styled(" · ", Style::default().fg(theme.muted)),
         Span::styled(label.to_string(), Style::default().fg(color)),
     ]));
     lines.push(Line::from(vec![
-        Span::styled("  │ ", Style::default().fg(Color::Cyan)),
-        Span::styled(description.to_string(), Style::default().fg(Color::White)),
+        Span::styled("  │ ", Style::default().fg(theme.border)),
+        Span::styled(description.to_string(), Style::default().fg(theme.text)),
     ]));
 
     match (status, output, error) {
         ("running", _, _) => {
             lines.push(Line::from(vec![
-                Span::styled("  │ ", Style::default().fg(Color::Cyan)),
+                Span::styled("  │ ", Style::default().fg(theme.border)),
                 Span::styled(
                     "working in a child context",
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(theme.muted),
                 ),
             ]));
         }
         (_, _, Some(err)) => {
             lines.push(Line::from(vec![
-                Span::styled("  │ error: ", Style::default().fg(Color::Red)),
-                Span::styled(truncate_lines(err, 3), Style::default().fg(Color::Red)),
+                Span::styled("  │ error: ", Style::default().fg(theme.error)),
+                Span::styled(truncate_lines(err, 3), Style::default().fg(theme.error)),
             ]));
         }
         (_, Some(out), _) => {
             lines.push(Line::from(vec![
-                Span::styled("  │ result: ", Style::default().fg(Color::Green)),
-                Span::styled(truncate_lines(out, 3), Style::default().fg(Color::DarkGray)),
+                Span::styled("  │ result: ", Style::default().fg(theme.success)),
+                Span::styled(truncate_lines(out, 3), Style::default().fg(theme.muted)),
             ]));
         }
         _ => {}
@@ -292,22 +294,22 @@ fn append_subagent_lines(
 
     lines.push(Line::from(Span::styled(
         "  └─ returned to main agent",
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(theme.muted),
     )));
 }
 
-fn append_diff_lines(lines: &mut Vec<Line<'static>>, diff: &str) {
+fn append_diff_lines(lines: &mut Vec<Line<'static>>, diff: &str, theme: &Theme) {
     let mut count = 0;
     for line in diff.lines().take(80) {
         count += 1;
         let color = if line.starts_with('+') && !line.starts_with("+++") {
-            Color::Green
+            theme.diff_add
         } else if line.starts_with('-') && !line.starts_with("---") {
-            Color::Red
+            theme.diff_remove
         } else if line.starts_with("@@") {
-            Color::Cyan
+            theme.border
         } else {
-            Color::DarkGray
+            theme.muted
         };
         lines.push(Line::from(Span::styled(
             format!("    {line}"),
@@ -317,7 +319,7 @@ fn append_diff_lines(lines: &mut Vec<Line<'static>>, diff: &str) {
     if diff.lines().count() > count {
         lines.push(Line::from(Span::styled(
             "    [... diff truncated ...]",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme.muted),
         )));
     }
 }
@@ -326,13 +328,13 @@ fn render_input(frame: &mut Frame, area: Rect, textarea: &TextArea) {
     frame.render_widget(textarea, area);
 }
 
-fn render_status(frame: &mut Frame, area: Rect, state: &AppState) {
+fn render_status(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let (status_text, color) = match &state.status {
-        AppStatus::Setup => ("● setup", Color::Cyan),
-        AppStatus::SessionPicker => ("● sessions", Color::Cyan),
-        AppStatus::Idle => ("● idle", Color::Green),
-        AppStatus::Running => ("● running", Color::Yellow),
-        AppStatus::WaitingApproval => ("● approval", Color::Magenta),
+        AppStatus::Setup => ("● setup", theme.border),
+        AppStatus::SessionPicker => ("● sessions", theme.border),
+        AppStatus::Idle => ("● idle", theme.success),
+        AppStatus::Running => ("● running", theme.warning),
+        AppStatus::WaitingApproval => ("● approval", theme.approval),
     };
 
     let scroll_hint = if !state.auto_scroll {
@@ -347,10 +349,10 @@ fn render_status(frame: &mut Frame, area: Rect, state: &AppState) {
 
     let line = Line::from(vec![
         Span::styled(format!(" {status_text}"), Style::default().fg(color)),
-        Span::styled(scroll_hint, Style::default().fg(Color::DarkGray)),
+        Span::styled(scroll_hint, Style::default().fg(theme.muted)),
         Span::styled(
             format!(" | model: {}", state.model_name),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme.muted),
         ),
         Span::styled(
             format!(
@@ -358,19 +360,16 @@ fn render_status(frame: &mut Frame, area: Rect, state: &AppState) {
                 state.usage.total_tokens(),
                 state.usage.estimated_cost_usd
             ),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme.muted),
         ),
-        Span::styled(
-            " | F1/ctrl+k shortcuts",
-            Style::default().fg(Color::DarkGray),
-        ),
+        Span::styled(" | F1/ctrl+k shortcuts", Style::default().fg(theme.muted)),
     ]);
 
     let paragraph = Paragraph::new(line);
     frame.render_widget(paragraph, area);
 }
 
-fn render_shortcuts(frame: &mut Frame, state: &AppState) {
+fn render_shortcuts(frame: &mut Frame, state: &AppState, theme: &Theme) {
     let area = frame.area();
     let width = 58u16.min(area.width.saturating_sub(4));
     let max_height = area.height.saturating_sub(4);
@@ -386,7 +385,7 @@ fn render_shortcuts(frame: &mut Frame, state: &AppState) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Shortcuts ")
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_style(Style::default().fg(theme.border));
     let paragraph = Paragraph::new(lines)
         .block(block)
         .wrap(Wrap { trim: false });
@@ -403,7 +402,7 @@ fn active_shortcut_scopes(state: &AppState) -> Vec<ShortcutScope> {
     }
 }
 
-fn render_approval_dialog(frame: &mut Frame, state: &AppState) {
+fn render_approval_dialog(frame: &mut Frame, state: &AppState, theme: &Theme) {
     let Some(dialog) = &state.approval_dialog else {
         return;
     };
@@ -424,12 +423,12 @@ fn render_approval_dialog(frame: &mut Frame, state: &AppState) {
             .fg(Color::Green)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::White)
+        Style::default().fg(theme.text)
     };
     let deny_style = if dialog.selected == 1 {
         Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::White)
+        Style::default().fg(theme.text)
     };
 
     let allow_prefix = if dialog.selected == 0 { "▸ " } else { "  " };
@@ -438,12 +437,12 @@ fn render_approval_dialog(frame: &mut Frame, state: &AppState) {
     let content = vec![
         Line::from(""),
         Line::from(vec![
-            Span::styled("  Tool: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(dialog.tool.clone(), Style::default().fg(Color::Yellow)),
+            Span::styled("  Tool: ", Style::default().fg(theme.muted)),
+            Span::styled(dialog.tool.clone(), Style::default().fg(theme.warning)),
         ]),
         Line::from(vec![
-            Span::styled("  Target: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(target_str.to_string(), Style::default().fg(Color::White)),
+            Span::styled("  Target: ", Style::default().fg(theme.muted)),
+            Span::styled(target_str.to_string(), Style::default().fg(theme.text)),
         ]),
         Line::from(""),
         Line::from(Span::styled(format!("{allow_prefix}Allow"), allow_style)),
@@ -451,20 +450,20 @@ fn render_approval_dialog(frame: &mut Frame, state: &AppState) {
         Line::from(""),
         Line::from(Span::styled(
             "  ↑↓ select, Enter confirm",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme.muted),
         )),
     ];
 
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Approval Required ")
-        .border_style(Style::default().fg(Color::Magenta));
+        .border_style(Style::default().fg(theme.approval));
 
     let paragraph = Paragraph::new(content).block(block);
     frame.render_widget(paragraph, popup_area);
 }
 
-fn render_setup(frame: &mut Frame, state: &AppState, textarea: &TextArea) {
+fn render_setup(frame: &mut Frame, state: &AppState, textarea: &TextArea, _theme: &Theme) {
     let area = frame.area();
 
     match state.setup_step {

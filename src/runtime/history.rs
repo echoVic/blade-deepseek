@@ -49,6 +49,7 @@ pub struct SessionTranscript {
     pub meta: SessionMeta,
     pub messages: Vec<Message>,
     pub compactions: Vec<CompactionRecord>,
+    pub summaries: Vec<ContextSummaryRecord>,
     pub usage: Option<UsageTotals>,
     pub path: PathBuf,
 }
@@ -66,6 +67,14 @@ pub struct CompactionRecord {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ContextSummaryRecord {
+    pub summarized_at: DateTime<Utc>,
+    pub before_messages: usize,
+    pub after_messages: usize,
+    pub summary: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "type")]
 enum SessionRecord {
     #[serde(rename = "session.meta")]
@@ -79,6 +88,8 @@ enum SessionRecord {
     },
     #[serde(rename = "context.collapsed")]
     ContextCollapsed(CompactionRecord),
+    #[serde(rename = "context.summary")]
+    ContextSummary(ContextSummaryRecord),
     #[serde(rename = "session.usage")]
     Usage(UsageTotals),
 }
@@ -203,6 +214,23 @@ impl SessionWriter {
                 collapsed_at: Utc::now(),
                 before_messages,
                 after_messages,
+            }),
+        )
+    }
+
+    pub fn append_summary(
+        &mut self,
+        before_messages: usize,
+        after_messages: usize,
+        summary: impl Into<String>,
+    ) -> io::Result<()> {
+        write_record(
+            &self.path,
+            &SessionRecord::ContextSummary(ContextSummaryRecord {
+                summarized_at: Utc::now(),
+                before_messages,
+                after_messages,
+                summary: summary.into(),
             }),
         )
     }
@@ -410,6 +438,7 @@ fn read_transcript(path: &Path) -> io::Result<SessionTranscript> {
     let mut meta = None;
     let mut messages = Vec::new();
     let mut compactions = Vec::new();
+    let mut summaries = Vec::new();
     let mut usage = None;
 
     for record in records {
@@ -418,6 +447,7 @@ fn read_transcript(path: &Path) -> io::Result<SessionTranscript> {
             SessionRecord::Message { message } => messages.push(message.into()),
             SessionRecord::Completed { .. } => {}
             SessionRecord::ContextCollapsed(record) => compactions.push(record),
+            SessionRecord::ContextSummary(record) => summaries.push(record),
             SessionRecord::Usage(record) => usage = Some(record),
         }
     }
@@ -433,6 +463,7 @@ fn read_transcript(path: &Path) -> io::Result<SessionTranscript> {
         meta,
         messages,
         compactions,
+        summaries,
         usage,
         path: path.to_path_buf(),
     })
@@ -939,10 +970,13 @@ mod tests {
             let cwd = std::env::current_dir()?;
             let mut writer = SessionWriter::start(&cwd, "mock", None, "compact me")?;
             writer.append_compaction(42, 7)?;
+            writer.append_summary(42, 7, "important facts")?;
             let transcript = load_session("latest")?;
             assert_eq!(transcript.compactions.len(), 1);
             assert_eq!(transcript.compactions[0].before_messages, 42);
             assert_eq!(transcript.compactions[0].after_messages, 7);
+            assert_eq!(transcript.summaries.len(), 1);
+            assert_eq!(transcript.summaries[0].summary, "important facts");
             Ok::<(), io::Error>(())
         })();
 

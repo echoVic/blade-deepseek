@@ -1,8 +1,10 @@
-use std::collections::hash_map::DefaultHasher;
 use std::fs::{self, OpenOptions};
-use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+
+use crate::config::ProviderKind;
+use crate::provider::conversation::{Conversation, Message};
+use crate::provider::{self, ProviderConfig};
 
 #[derive(Clone, Debug, Default)]
 pub struct MemoryBlock {
@@ -77,6 +79,50 @@ pub fn remember_project(cwd: &Path, note: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+pub fn extract_project_memory(
+    provider_kind: ProviderKind,
+    provider_config: &ProviderConfig,
+    cwd: &Path,
+    messages: &[Message],
+) -> Result<Option<PathBuf>, String> {
+    let source = format_messages_for_memory(messages);
+    if source.trim().is_empty() {
+        return Ok(None);
+    }
+
+    let mut conversation = Conversation::new();
+    conversation.add_system(
+        "Extract durable project memory from this coding session. Return only concise bullet points worth remembering for future sessions. If nothing is worth remembering, return NOTHING.".to_string(),
+    );
+    conversation.add_user(source);
+    let summary_config = ProviderConfig {
+        api_key: provider_config.api_key.clone(),
+        base_url: provider_config.base_url.clone(),
+        model: provider_config
+            .model
+            .clone()
+            .or_else(|| Some("deepseek-v4-flash".to_string())),
+        tools_override: Some(Vec::new()),
+        mcp_registry: None,
+    };
+    let response = provider::call(provider_kind, &conversation, &summary_config);
+    if response
+        .steps
+        .iter()
+        .any(|step| matches!(step, provider::ProviderStep::Error(_)))
+    {
+        return Ok(None);
+    }
+    let Some(note) = response
+        .assistant_content
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty() && text != "NOTHING")
+    else {
+        return Ok(None);
+    };
+    remember_project(cwd, &note).map(Some)
+}
+
 fn memory_root() -> Option<PathBuf> {
     std::env::var_os("ORCA_HOME")
         .map(PathBuf::from)
@@ -92,9 +138,19 @@ fn project_memory_path(root: &Path, cwd: &Path) -> PathBuf {
 
 fn project_hash(cwd: &Path) -> u64 {
     let canonical = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
-    let mut hasher = DefaultHasher::new();
-    canonical.display().to_string().hash(&mut hasher);
-    hasher.finish()
+    let bytes = canonical.display().to_string();
+    fnv1a_hash(bytes.as_bytes())
+}
+
+fn fnv1a_hash(data: &[u8]) -> u64 {
+    const BASIS: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x100000001b3;
+    let mut hash = BASIS;
+    for &byte in data {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
 }
 
 fn read_trimmed(path: PathBuf) -> Option<String> {
@@ -104,6 +160,7 @@ fn read_trimmed(path: PathBuf) -> Option<String> {
         .filter(|text| !text.is_empty())
 }
 
+// Append-only file write; no lock needed in current single-session usage.
 fn append_note(path: &Path, note: &str) -> Result<(), String> {
     let note = note.trim();
     if note.is_empty() {
@@ -119,6 +176,37 @@ fn append_note(path: &Path, note: &str) -> Result<(), String> {
         .open(path)
         .map_err(|error| format!("failed to open memory file: {error}"))?;
     writeln!(file, "- {note}").map_err(|error| format!("failed to write memory: {error}"))
+}
+
+fn format_messages_for_memory(messages: &[Message]) -> String {
+    const MAX_BYTES: usize = 32 * 1024;
+    let mut output = String::new();
+    for message in messages.iter().rev().take(40).rev() {
+        match message {
+            Message::System(_) => {}
+            Message::User(content) => {
+                output.push_str("[user]\n");
+                output.push_str(content.trim());
+                output.push_str("\n\n");
+            }
+            Message::Assistant { content, .. } => {
+                if let Some(content) = content.as_deref().filter(|text| !text.trim().is_empty()) {
+                    output.push_str("[assistant]\n");
+                    output.push_str(content.trim());
+                    output.push_str("\n\n");
+                }
+            }
+            Message::Tool { content, .. } => {
+                output.push_str("[tool]\n");
+                output.push_str(content.trim());
+                output.push_str("\n\n");
+            }
+        }
+        if output.len() >= MAX_BYTES {
+            break;
+        }
+    }
+    output
 }
 
 #[cfg(test)]
@@ -144,5 +232,16 @@ mod tests {
         let path = dir.path().join("memory.md");
         append_note(&path, "remember this").unwrap();
         assert_eq!(fs::read_to_string(path).unwrap(), "- remember this\n");
+    }
+
+    #[test]
+    fn format_messages_for_memory_skips_system_messages() {
+        let messages = vec![
+            Message::System("system".to_string()),
+            Message::User("remember cargo test".to_string()),
+        ];
+        let formatted = format_messages_for_memory(&messages);
+        assert!(!formatted.contains("system"));
+        assert!(formatted.contains("remember cargo test"));
     }
 }

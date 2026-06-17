@@ -1,12 +1,12 @@
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SlashCommand {
     Help,
-    Model(String),
+    Model(Option<String>),
     Compact,
     Clear,
     Cost,
     History,
-    Mode(String),
+    Mode(Option<String>),
     Plan(Option<String>),
     Remember(String),
     Exit,
@@ -19,16 +19,16 @@ pub fn parse(input: &str) -> Option<SlashCommand> {
     let command = parts.next()?;
     match command {
         "help" => Some(SlashCommand::Help),
-        "model" => parts
-            .next()
-            .map(|name| SlashCommand::Model(name.to_string())),
+        "model" => Some(SlashCommand::Model(
+            parts.next().map(|name| name.to_string()),
+        )),
         "compact" => Some(SlashCommand::Compact),
         "clear" => Some(SlashCommand::Clear),
         "cost" => Some(SlashCommand::Cost),
         "history" => Some(SlashCommand::History),
-        "mode" => parts
-            .next()
-            .map(|mode| SlashCommand::Mode(mode.to_string())),
+        "mode" => Some(SlashCommand::Mode(
+            parts.next().map(|mode| mode.to_string()),
+        )),
         "plan" => Some(SlashCommand::Plan(parts.next().map(str::to_string))),
         "remember" => {
             let note = parts.collect::<Vec<_>>().join(" ");
@@ -60,8 +60,9 @@ mod tests {
     fn parses_model_command() {
         assert_eq!(
             parse("/model deepseek-v4-pro"),
-            Some(SlashCommand::Model("deepseek-v4-pro".to_string()))
+            Some(SlashCommand::Model(Some("deepseek-v4-pro".to_string())))
         );
+        assert_eq!(parse("/model"), Some(SlashCommand::Model(None)));
     }
 
     #[test]

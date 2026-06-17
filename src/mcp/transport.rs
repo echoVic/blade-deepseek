@@ -31,6 +31,13 @@ struct StdioState {
     next_id: u64,
 }
 
+impl Drop for StdioState {
+    fn drop(&mut self) {
+        let _ = self._child.kill();
+        let _ = self._child.wait();
+    }
+}
+
 impl StdioTransport {
     fn start(config: &McpServerConfig) -> Result<Self, String> {
         let command = config
@@ -115,7 +122,17 @@ impl StdioTransport {
         });
         write_json_line(&mut state.stdin, &message)?;
 
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut iterations = 0u32;
         loop {
+            if iterations >= 1000 {
+                return Err(format!("MCP request '{method}' exceeded max notification count"));
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(format!("MCP request '{method}' timed out after 30s"));
+            }
+            iterations += 1;
+
             let response = read_json_line(&mut state.stdout)?;
             if response.get("id").and_then(Value::as_u64) != Some(id) {
                 continue;
@@ -170,6 +187,7 @@ struct SseTransport {
     endpoint: String,
     headers: HashMap<String, String>,
     next_id: Mutex<u64>,
+    client: reqwest::blocking::Client,
 }
 
 impl SseTransport {
@@ -178,10 +196,12 @@ impl SseTransport {
             .url
             .clone()
             .ok_or_else(|| format!("MCP SSE server '{}' is missing url", config.name))?;
+        let client = reqwest::blocking::Client::new();
         Ok(Self {
             endpoint,
             headers: config.headers.clone(),
             next_id: Mutex::new(1),
+            client,
         })
     }
 }
@@ -199,7 +219,7 @@ impl McpTransport for SseTransport {
                 }
             }),
         )?;
-        Ok(())
+        self.notify("notifications/initialized", json!({}))
     }
 
     fn list_tools(&self) -> Result<Value, String> {
@@ -218,6 +238,18 @@ impl McpTransport for SseTransport {
 }
 
 impl SseTransport {
+    fn notify(&self, method: &str, params: Value) -> Result<(), String> {
+        let mut builder = self.client.post(&self.endpoint);
+        for (key, value) in &self.headers {
+            builder = builder.header(key, value);
+        }
+        builder
+            .json(&json!({ "jsonrpc": "2.0", "method": method, "params": params }))
+            .send()
+            .map_err(|e| format!("MCP SSE notify '{method}' failed: {e}"))?;
+        Ok(())
+    }
+
     fn request(&self, method: &str, params: Value) -> Result<Value, String> {
         let id = {
             let mut next_id = self
@@ -229,8 +261,7 @@ impl SseTransport {
             id
         };
 
-        let client = reqwest::blocking::Client::new();
-        let mut builder = client.post(&self.endpoint);
+        let mut builder = self.client.post(&self.endpoint);
         for (key, value) in &self.headers {
             builder = builder.header(key, value);
         }

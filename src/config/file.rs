@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use crate::approval::policy::PermissionRules;
+use crate::config::ThemeName;
 use crate::runtime::subagent_config::SubagentConfig;
 
 const ORCA_HOME_ENV: &str = "ORCA_HOME";
@@ -22,6 +23,21 @@ pub struct FileConfig {
     pub permissions: PermissionRules,
     #[serde(default)]
     pub subagents: SubagentConfig,
+    pub summary_model: Option<String>,
+    #[serde(default)]
+    pub theme: ThemeName,
+    #[serde(default)]
+    pub vim_mode: bool,
+    #[serde(default = "default_true")]
+    pub update_check: bool,
+    #[serde(default)]
+    pub desktop_notifications: bool,
+    #[serde(default)]
+    pub auto_memory: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn config_dir() -> Option<PathBuf> {
@@ -162,6 +178,25 @@ max_parallel = 6
         let config: FileConfig = toml::from_str(toml).unwrap();
         assert_eq!(config.subagents.max_depth, 3);
         assert_eq!(config.subagents.max_parallel, 6);
+    }
+
+    #[test]
+    fn parse_experience_config() {
+        let toml = r#"
+summary_model = "deepseek-v4-flash"
+theme = "solarized"
+vim_mode = true
+update_check = false
+desktop_notifications = true
+auto_memory = true
+"#;
+        let config: FileConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.summary_model.as_deref(), Some("deepseek-v4-flash"));
+        assert_eq!(config.theme, ThemeName::Solarized);
+        assert!(config.vim_mode);
+        assert!(!config.update_check);
+        assert!(config.desktop_notifications);
+        assert!(config.auto_memory);
     }
 
     #[test]

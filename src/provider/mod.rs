@@ -31,10 +31,6 @@ pub struct Usage {
 }
 
 impl Usage {
-    pub fn total_tokens(self) -> u64 {
-        self.input_tokens + self.output_tokens
-    }
-
     pub fn is_empty(self) -> bool {
         self.input_tokens == 0 && self.output_tokens == 0 && self.cache_tokens == 0
     }

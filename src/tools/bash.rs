@@ -12,7 +12,9 @@ pub fn execute(request: &ToolRequest, cwd: &Path, max_bytes: usize) -> ToolResul
         return ToolResult::failed(request, "bash command is required", None);
     };
 
-    let output = sandbox::bash_command(command, cwd).output();
+    let output = sandbox::bash_command(command, cwd)
+        .env_remove("ORCA_API_KEY")
+        .output();
 
     match output {
         Ok(output) if output.status.success() => {

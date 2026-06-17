@@ -1,6 +1,6 @@
 use serde::Deserialize;
 
-pub const DEFAULT_MAX_SUBAGENT_DEPTH: u32 = 2;
+pub const DEFAULT_MAX_SUBAGENT_DEPTH: u32 = 1;
 pub const DEFAULT_MAX_PARALLEL_SUBAGENTS: usize = 4;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -44,7 +44,7 @@ mod tests {
     #[test]
     fn default_allows_nested_parallel_subagents() {
         let config = SubagentConfig::default();
-        assert_eq!(config.max_depth, 2);
+        assert_eq!(config.max_depth, 1);
         assert_eq!(config.max_parallel, 4);
     }
 

@@ -75,10 +75,12 @@ impl HookRunner {
                 )
                 .env(
                     "ORCA_TOOL_TARGET",
-                    context
-                        .tool_request
-                        .and_then(|request| request.target.as_deref())
-                        .unwrap_or_default(),
+                    sanitize_env_value(
+                        context
+                            .tool_request
+                            .and_then(|request| request.target.as_deref())
+                            .unwrap_or_default(),
+                    ),
                 )
                 .env(
                     "ORCA_TOOL_STATUS",
@@ -105,8 +107,12 @@ impl HookRunner {
                 .map_err(|error| format!("hook '{}' failed to start: {error}", hook.command))?;
 
             if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                let stderr = String::from_utf8_lossy(&output.stderr[..output.stderr.len().min(65536)])
+                    .trim()
+                    .to_string();
+                let stdout = String::from_utf8_lossy(&output.stdout[..output.stdout.len().min(65536)])
+                    .trim()
+                    .to_string();
                 let detail = if stderr.is_empty() { stdout } else { stderr };
                 return Err(if detail.is_empty() {
                     format!("hook '{}' exited with {}", hook.command, output.status)
@@ -140,6 +146,16 @@ impl HookRunner {
                     .unwrap_or(true)
         })
     }
+}
+
+fn sanitize_env_value(value: &str) -> String {
+    const MAX_ENV_VALUE_LEN: usize = 4096;
+    let sanitized: String = value
+        .chars()
+        .take(MAX_ENV_VALUE_LEN)
+        .map(|c| if c == '\n' || c == '\r' || c == '\0' { ' ' } else { c })
+        .collect();
+    sanitized
 }
 
 impl crate::tools::ToolStatus {

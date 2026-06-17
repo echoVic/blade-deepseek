@@ -199,6 +199,9 @@ fn run_inner(config: RunConfig) -> io::Result<RunStatus> {
     }
 
     sink.emit(&events.session_completed(status))?;
+    if config.desktop_notifications {
+        let _ = crate::runtime::notify::notify("Orca", &format!("Session {}", status.as_str()));
+    }
     Ok(status)
 }
 
@@ -304,10 +307,20 @@ fn run_agent_loop(
             {
                 sink.emit(&events.error(&format!("pre_compact hook failed: {error}")))?;
             }
-            conversation = provider::context::compact(&conversation, &ctx_config);
+            let compaction = provider::context::compact_with_summary(
+                config.provider,
+                &conversation,
+                &ctx_config,
+                &provider_config,
+                config.summary_model.as_deref(),
+            );
+            conversation = compaction.conversation;
             let after_messages = conversation.messages.len();
             if emit_deltas && let Some(writer) = history_writer.as_deref_mut() {
                 writer.append_compaction(before_messages, after_messages)?;
+                if let provider::context::CompactionKind::RemoteSummary(summary) = compaction.kind {
+                    writer.append_summary(before_messages, after_messages, summary)?;
+                }
             }
             if emit_deltas
                 && let Err(error) = hooks.run(
@@ -416,6 +429,26 @@ fn run_agent_loop(
             {
                 writer.append_message(message)?;
             }
+            if emit_deltas && config.auto_memory {
+                let provider_config = ProviderConfig {
+                    api_key: config.api_key.clone(),
+                    base_url: config.base_url.clone(),
+                    model: config
+                        .summary_model
+                        .clone()
+                        .or_else(|| config.model.clone()),
+                    tools_override: Some(Vec::new()),
+                    mcp_registry: None,
+                };
+                if let Err(error) = memory::extract_project_memory(
+                    config.provider,
+                    &provider_config,
+                    cwd,
+                    &conversation.messages,
+                ) {
+                    sink.emit(&events.error(&format!("memory extraction failed: {error}")))?;
+                }
+            }
             return Ok(AgentLoopResult::success(final_message));
         }
 
@@ -456,6 +489,7 @@ fn run_agent_loop(
                     mcp_registry,
                     hooks,
                     cost_tracker,
+                    cancel,
                 )?;
 
                 for (status, result) in results {
@@ -468,12 +502,18 @@ fn run_agent_loop(
                         writer.append_message(message)?;
                     }
 
-                    if status != RunStatus::Success {
+                    if status == RunStatus::ApprovalRequired {
                         return Ok(AgentLoopResult {
                             status,
                             final_message: None,
                             error: result.error.clone(),
                         });
+                    }
+                    if status == RunStatus::Failed {
+                        return Ok(AgentLoopResult::failure(
+                            RunStatus::Failed,
+                            result.error.clone().unwrap_or_default(),
+                        ));
                     }
                 }
                 index = batch_end;
@@ -495,6 +535,7 @@ fn run_agent_loop(
                 mcp_registry,
                 hooks,
                 cost_tracker,
+                cancel,
             )?;
 
             let result_content = agent_common::format_tool_result_for_model(&result);
@@ -506,12 +547,18 @@ fn run_agent_loop(
                 writer.append_message(message)?;
             }
 
-            if status != RunStatus::Success {
+            if status == RunStatus::ApprovalRequired {
                 return Ok(AgentLoopResult {
                     status,
                     final_message: None,
                     error: result.error.clone(),
                 });
+            }
+            if status == RunStatus::Failed && tool_request.name == tools::ToolName::Subagent {
+                return Ok(AgentLoopResult::failure(
+                    RunStatus::Failed,
+                    result.error.clone().unwrap_or_default(),
+                ));
             }
             index += 1;
         }
@@ -532,6 +579,7 @@ fn execute_tool_with_approval(
     mcp_registry: &McpRegistry,
     hooks: &HookRunner,
     cost_tracker: &mut CostTracker,
+    cancel: &CancelToken,
 ) -> io::Result<(RunStatus, tools::ToolResult)> {
     if agent_common::requires_approval(tool_request.action) {
         let approval = ApprovalRequest {
@@ -626,6 +674,7 @@ fn execute_tool_with_approval(
             hooks,
             emit_deltas,
             cost_tracker,
+            cancel,
         )?
     } else {
         tools::execute_with_mcp(tool_request, cwd, mcp_registry)
@@ -697,6 +746,7 @@ fn execute_subagent_batch(
     mcp_registry: &McpRegistry,
     hooks: &HookRunner,
     cost_tracker: &mut CostTracker,
+    cancel: &CancelToken,
 ) -> io::Result<Vec<(RunStatus, tools::ToolResult)>> {
     let mut handles = Vec::new();
     let mut results: Vec<Option<(RunStatus, tools::ToolResult)>> = vec![None; tool_requests.len()];
@@ -740,13 +790,13 @@ fn execute_subagent_batch(
         let child_memory = memory.clone();
         let child_mcp_registry = mcp_registry.clone();
         let child_hooks = hooks.clone();
+        let child_cancel = cancel.clone();
         handles.push((
             idx,
             thread::spawn(move || {
                 let mut child_events =
                     EventFactory::new(format!("subagent-{}", child_tool_request.id));
                 let mut child_sink = EventSink::new(io::sink(), child_config.output_format);
-                let child_cancel = CancelToken::new();
                 let mut child_cost_tracker = CostTracker::new(child_config.model.as_deref());
                 let child = run_agent_loop(
                     &child_config,
@@ -895,6 +945,7 @@ fn execute_subagent_tool(
     hooks: &HookRunner,
     emit_deltas: bool,
     cost_tracker: &mut CostTracker,
+    cancel: &CancelToken,
 ) -> io::Result<tools::ToolResult> {
     let request = subagent::create_subagent_request(tool_request);
     let description = request.description.clone();
@@ -918,7 +969,6 @@ fn execute_subagent_tool(
         return Ok(tools::ToolResult::failed(tool_request, error, None));
     }
 
-    let child_cancel = CancelToken::new();
     let mut child_cost_tracker = CostTracker::new(config.model.as_deref());
     let child = run_agent_loop(
         config,
@@ -936,7 +986,7 @@ fn execute_subagent_tool(
         mcp_registry,
         hooks,
         &mut child_cost_tracker,
-        &child_cancel,
+        cancel,
     )?;
 
     cost_tracker.merge(&child_cost_tracker);
@@ -1068,6 +1118,12 @@ mod tests {
             mcp_servers: Vec::new(),
             hooks: Vec::new(),
             subagents,
+            summary_model: None,
+            theme: crate::config::ThemeName::Dark,
+            vim_mode: false,
+            update_check: false,
+            desktop_notifications: false,
+            auto_memory: false,
         }
     }
 

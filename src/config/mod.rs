@@ -10,6 +10,16 @@ use crate::runtime::subagent_config::SubagentConfig;
 
 pub mod file;
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ThemeName {
+    #[default]
+    Dark,
+    Light,
+    Solarized,
+    Catppuccin,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OutputFormat {
     Jsonl,
@@ -63,4 +73,10 @@ pub struct RunConfig {
     pub permission_rules: PermissionRules,
     pub max_budget_usd: Option<f64>,
     pub subagents: SubagentConfig,
+    pub summary_model: Option<String>,
+    pub theme: ThemeName,
+    pub vim_mode: bool,
+    pub update_check: bool,
+    pub desktop_notifications: bool,
+    pub auto_memory: bool,
 }

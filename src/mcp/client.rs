@@ -39,6 +39,13 @@ pub fn initialize_registry(configs: &[McpServerConfig]) -> McpRegistry {
         match connect_server(config, &server_name) {
             Ok((client, server_tools)) => {
                 for tool in server_tools {
+                    if lookup.contains_key(&tool.schema_name) {
+                        errors.push(format!(
+                            "MCP tool name conflict: '{}' already registered, skipping from '{}'",
+                            tool.schema_name, server_name
+                        ));
+                        continue;
+                    }
                     lookup.insert(
                         tool.schema_name.clone(),
                         McpToolRef {

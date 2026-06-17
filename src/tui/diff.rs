@@ -80,6 +80,16 @@ fn resolve_inside_workspace(cwd: &Path, path: &str) -> Result<PathBuf, String> {
     if !normalized.starts_with(&canonical_cwd) {
         return Err(format!("path escapes workspace: {path}"));
     }
+
+    if normalized.exists() {
+        let real = normalized
+            .canonicalize()
+            .map_err(|e| format!("cannot resolve path: {e}"))?;
+        if !real.starts_with(&canonical_cwd) {
+            return Err(format!("path escapes workspace via symlink: {path}"));
+        }
+    }
+
     Ok(normalized)
 }
 

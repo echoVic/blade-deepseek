@@ -249,6 +249,12 @@ fn run_exec(args: ExecArgs) -> i32 {
         mcp_servers: file_config.mcp_servers,
         hooks: file_config.hooks,
         subagents: file_config.subagents.normalized(),
+        summary_model: file_config.summary_model,
+        theme: file_config.theme,
+        vim_mode: file_config.vim_mode,
+        update_check: file_config.update_check,
+        desktop_notifications: file_config.desktop_notifications,
+        auto_memory: file_config.auto_memory,
     };
 
     controller::run(config)
@@ -303,6 +309,18 @@ fn run_history(args: HistoryArgs) -> i32 {
                             compaction.collapsed_at.to_rfc3339(),
                             compaction.before_messages,
                             compaction.after_messages
+                        );
+                    }
+                }
+                if !transcript.summaries.is_empty() {
+                    println!("Summaries: {}", transcript.summaries.len());
+                    for summary in &transcript.summaries {
+                        println!(
+                            "  {} {} -> {} messages: {}",
+                            summary.summarized_at.to_rfc3339(),
+                            summary.before_messages,
+                            summary.after_messages,
+                            summary.summary.lines().next().unwrap_or_default()
                         );
                     }
                 }
@@ -496,6 +514,12 @@ fn run_placeholder(cli: Cli) -> i32 {
         mcp_servers: file_config.mcp_servers,
         hooks: file_config.hooks,
         subagents: file_config.subagents.normalized(),
+        summary_model: file_config.summary_model,
+        theme: file_config.theme,
+        vim_mode: file_config.vim_mode,
+        update_check: file_config.update_check,
+        desktop_notifications: file_config.desktop_notifications,
+        auto_memory: file_config.auto_memory,
     };
 
     app::run_tui(config)

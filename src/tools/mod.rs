@@ -208,14 +208,43 @@ fn execute_mcp(request: &ToolRequest, schema_name: &str, mcp_registry: &McpRegis
     }
 }
 
-fn resolve_workspace_path(cwd: &Path, target: Option<&str>) -> PathBuf {
+fn resolve_workspace_path(cwd: &Path, target: Option<&str>) -> Result<PathBuf, String> {
     let target = target.unwrap_or(".");
     let candidate = PathBuf::from(target);
-    if candidate.is_absolute() {
+    let joined = if candidate.is_absolute() {
         candidate
     } else {
         cwd.join(candidate)
+    };
+
+    let mut normalized = PathBuf::new();
+    for component in joined.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            std::path::Component::CurDir => {}
+            _ => normalized.push(component),
+        }
     }
+
+    if !normalized.starts_with(cwd) {
+        return Err(format!("path escapes workspace: {target}"));
+    }
+
+    if normalized.exists() {
+        let canonical = normalized
+            .canonicalize()
+            .map_err(|e| format!("cannot resolve path: {e}"))?;
+        let canonical_cwd = cwd
+            .canonicalize()
+            .map_err(|e| format!("cannot resolve cwd: {e}"))?;
+        if !canonical.starts_with(&canonical_cwd) {
+            return Err(format!("path escapes workspace via symlink: {target}"));
+        }
+    }
+
+    Ok(normalized)
 }
 
 fn truncate_output(output: String, max_bytes: usize) -> (String, bool) {
@@ -226,10 +255,10 @@ fn truncate_output(output: String, max_bytes: usize) -> (String, bool) {
     let marker = "\n[... tool output micro-compacted ...]\n";
     if max_bytes <= marker.len() + 2 {
         let mut end = max_bytes;
-        while !output.is_char_boundary(end) {
+        while end > 0 && !output.is_char_boundary(end) {
             end -= 1;
         }
-        return (format!("{}\n[truncated]", &output[..end]), true);
+        return (output[..end].to_string(), true);
     }
 
     let side_budget = (max_bytes - marker.len()) / 2;

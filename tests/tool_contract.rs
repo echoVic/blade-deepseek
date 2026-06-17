@@ -179,7 +179,7 @@ fn full_auto_bash_cannot_write_outside_workspace() {
         .output()
         .expect("run orca");
 
-    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.status.code(), Some(0));
     assert!(!outside.exists());
 
     let events = parse_jsonl(&output.stdout);

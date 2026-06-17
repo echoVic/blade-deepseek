@@ -9,7 +9,10 @@ pub fn execute(request: &ToolRequest, cwd: &Path) -> ToolResult {
         Err(error) => return ToolResult::failed(request, error, None),
     };
 
-    let path = resolve_workspace_path(cwd, Some(&path_str));
+    let path = match resolve_workspace_path(cwd, Some(&path_str)) {
+        Ok(p) => p,
+        Err(error) => return ToolResult::failed(request, error, None),
+    };
     if !is_inside_workspace(cwd, &path) {
         return ToolResult::failed(request, "edit target is outside the workspace", None);
     }

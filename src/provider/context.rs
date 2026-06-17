@@ -1,4 +1,6 @@
+use crate::config::ProviderKind;
 use crate::provider::conversation::{Conversation, Message};
+use crate::provider::{self, ProviderConfig};
 use tiktoken_rs::cl100k_base_singleton;
 
 const DEFAULT_MAX_TOKENS: usize = 128_000;
@@ -30,8 +32,7 @@ pub struct ContextConfig {
 impl ContextConfig {
     fn effective_limit(&self) -> usize {
         let threshold = self.compaction_threshold.clamp(0.1, 1.0);
-        ((self.max_tokens as f64 * threshold) as usize)
-            .saturating_sub(self.reserved_for_response)
+        ((self.max_tokens as f64 * threshold) as usize).saturating_sub(self.reserved_for_response)
     }
 }
 
@@ -101,6 +102,212 @@ pub fn compact(conversation: &Conversation, config: &ContextConfig) -> Conversat
     compact_with_counter(conversation, config, &DefaultTokenCounter)
 }
 
+#[derive(Clone, Debug)]
+pub enum CompactionKind {
+    LocalTruncation,
+    RemoteSummary(String),
+}
+
+#[derive(Clone, Debug)]
+pub struct CompactionResult {
+    pub conversation: Conversation,
+    pub kind: CompactionKind,
+}
+
+pub fn compact_with_summary(
+    provider_kind: ProviderKind,
+    conversation: &Conversation,
+    context_config: &ContextConfig,
+    provider_config: &ProviderConfig,
+    summary_model: Option<&str>,
+) -> CompactionResult {
+    match summarize_collapsed_messages(
+        provider_kind,
+        conversation,
+        context_config,
+        provider_config,
+        summary_model,
+    ) {
+        Some((conversation, summary)) => CompactionResult {
+            conversation,
+            kind: CompactionKind::RemoteSummary(summary),
+        },
+        None => CompactionResult {
+            conversation: compact(conversation, context_config),
+            kind: CompactionKind::LocalTruncation,
+        },
+    }
+}
+
+fn summarize_collapsed_messages(
+    provider_kind: ProviderKind,
+    conversation: &Conversation,
+    context_config: &ContextConfig,
+    provider_config: &ProviderConfig,
+    summary_model: Option<&str>,
+) -> Option<(Conversation, String)> {
+    let (system_msg, collapsed, kept) =
+        partition_for_compaction(conversation, context_config, &DefaultTokenCounter)?;
+    if collapsed.is_empty() || kept.is_empty() {
+        return None;
+    }
+
+    let summary = request_summary(
+        provider_kind,
+        provider_config,
+        summary_model,
+        &format_messages(&collapsed),
+    )?;
+
+    let mut result = Conversation::new();
+    if let Some(system) = system_msg {
+        result.messages.push(system);
+    }
+    result.messages.push(Message::System(format!(
+        "[Summary of earlier conversation]\n{}",
+        summary.trim()
+    )));
+    result.messages.extend(kept);
+    Some((result, summary))
+}
+
+fn partition_for_compaction(
+    conversation: &Conversation,
+    config: &ContextConfig,
+    counter: &impl TokenCounter,
+) -> Option<(Option<Message>, Vec<Message>, Vec<Message>)> {
+    let messages = &conversation.messages;
+    let target_tokens = config.effective_limit();
+    let system_msg = messages.first().cloned();
+    let system_tokens = system_msg
+        .as_ref()
+        .map(|message| message_tokens_with_counter(message, counter))
+        .unwrap_or(0);
+    let summary_tokens = counter.count_text("[Summary of earlier conversation]") + 256;
+    let non_system: Vec<&Message> = messages.iter().skip(1).collect();
+
+    let mut kept: Vec<Message> = Vec::new();
+    let mut budget = system_tokens + summary_tokens + 4;
+    for msg in non_system.iter().rev() {
+        let msg_tokens = message_tokens_with_counter(msg, counter);
+        if budget + msg_tokens > target_tokens {
+            break;
+        }
+        budget += msg_tokens;
+        kept.push((*msg).clone());
+    }
+    kept.reverse();
+    normalize_tool_boundaries(&mut kept);
+
+    let collapsed_len = non_system.len().saturating_sub(kept.len());
+    if collapsed_len == 0 {
+        return None;
+    }
+    let collapsed = non_system
+        .iter()
+        .take(collapsed_len)
+        .map(|message| (*message).clone())
+        .collect();
+    Some((system_msg, collapsed, kept))
+}
+
+fn request_summary(
+    provider_kind: ProviderKind,
+    provider_config: &ProviderConfig,
+    summary_model: Option<&str>,
+    collapsed_text: &str,
+) -> Option<String> {
+    let mut summary_config = ProviderConfig {
+        api_key: provider_config.api_key.clone(),
+        base_url: provider_config.base_url.clone(),
+        model: summary_model
+            .map(str::to_string)
+            .or_else(|| provider_config.model.clone()),
+        tools_override: Some(Vec::new()),
+        mcp_registry: None,
+    };
+    if summary_config.model.is_none() {
+        summary_config.model = Some("deepseek-v4-flash".to_string());
+    }
+
+    let mut summary_conversation = Conversation::new();
+    summary_conversation.add_system(
+        "Summarize old agent conversation context for future continuation. Preserve user goals, decisions, file paths, tool results, blockers, and exact constraints. Be concise and factual.".to_string(),
+    );
+    summary_conversation.add_user(format!(
+        "Summarize this collapsed conversation segment:\n\n{collapsed_text}"
+    ));
+
+    let response = provider::call(provider_kind, &summary_conversation, &summary_config);
+    if response
+        .steps
+        .iter()
+        .any(|step| matches!(step, provider::ProviderStep::Error(_)))
+    {
+        return None;
+    }
+    response
+        .assistant_content
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+}
+
+fn format_messages(messages: &[Message]) -> String {
+    let mut output = String::new();
+    for message in messages {
+        match message {
+            Message::System(content) => {
+                output.push_str("[system]\n");
+                output.push_str(content.trim());
+                output.push_str("\n\n");
+            }
+            Message::User(content) => {
+                output.push_str("[user]\n");
+                output.push_str(content.trim());
+                output.push_str("\n\n");
+            }
+            Message::Assistant {
+                content,
+                reasoning_content,
+                tool_calls,
+            } => {
+                output.push_str("[assistant]\n");
+                if let Some(reasoning) = reasoning_content
+                    .as_deref()
+                    .filter(|text| !text.trim().is_empty())
+                {
+                    output.push_str("reasoning: ");
+                    output.push_str(reasoning.trim());
+                    output.push('\n');
+                }
+                if let Some(content) = content.as_deref().filter(|text| !text.trim().is_empty()) {
+                    output.push_str(content.trim());
+                    output.push('\n');
+                }
+                for tool_call in tool_calls {
+                    output.push_str("tool_call ");
+                    output.push_str(&tool_call.function_name);
+                    output.push(' ');
+                    output.push_str(&tool_call.arguments);
+                    output.push('\n');
+                }
+                output.push('\n');
+            }
+            Message::Tool {
+                tool_call_id,
+                content,
+            } => {
+                output.push_str("[tool ");
+                output.push_str(tool_call_id);
+                output.push_str("]\n");
+                output.push_str(content.trim());
+                output.push_str("\n\n");
+            }
+        }
+    }
+    output
+}
+
 pub fn compact_with_counter(
     conversation: &Conversation,
     config: &ContextConfig,
@@ -132,17 +339,7 @@ pub fn compact_with_counter(
     }
     kept.reverse();
 
-    // Ensure tool_call/tool_result pairing: if the first kept message is a Tool result
-    // without its corresponding Assistant tool_call, drop orphaned Tool messages from the front.
-    while let Some(Message::Tool { .. }) = kept.first() {
-        kept.remove(0);
-    }
-    // If the last kept message is an Assistant with tool_calls but missing Tool results, drop it.
-    if let Some(Message::Assistant { tool_calls, .. }) = kept.last() {
-        if !tool_calls.is_empty() {
-            kept.pop();
-        }
-    }
+    normalize_tool_boundaries(&mut kept);
 
     let mut result = Conversation::new();
     if let Some(sys) = system_msg {
@@ -155,6 +352,17 @@ pub fn compact_with_counter(
     }
     result.messages.extend(kept);
     result
+}
+
+fn normalize_tool_boundaries(messages: &mut Vec<Message>) {
+    while let Some(Message::Tool { .. }) = messages.first() {
+        messages.remove(0);
+    }
+    if let Some(Message::Assistant { tool_calls, .. }) = messages.last()
+        && !tool_calls.is_empty()
+    {
+        messages.pop();
+    }
 }
 
 #[cfg(test)]
@@ -334,5 +542,40 @@ mod tests {
                 "trailing Assistant with pending tool_calls should be trimmed"
             );
         }
+    }
+
+    #[test]
+    fn compact_with_summary_falls_back_to_local_when_provider_errors() {
+        let mut conv = Conversation::new();
+        conv.add_system("system".to_string());
+        conv.add_user("old ".repeat(100));
+        conv.add_assistant(Some("older answer".to_string()), None, vec![]);
+        conv.add_user("newest request".to_string());
+
+        let config = ContextConfig {
+            max_tokens: 40,
+            compaction_threshold: 1.0,
+            reserved_for_response: 0,
+        };
+        let provider_config = ProviderConfig {
+            api_key: None,
+            base_url: None,
+            model: None,
+            tools_override: Some(Vec::new()),
+            mcp_registry: None,
+        };
+
+        let result = compact_with_summary(
+            ProviderKind::DeepSeek,
+            &conv,
+            &config,
+            &provider_config,
+            Some("deepseek-v4-flash"),
+        );
+
+        assert!(matches!(result.kind, CompactionKind::LocalTruncation));
+        assert!(result.conversation.messages.iter().any(|message| {
+            matches!(message, Message::System(text) if text.contains("truncated to fit context window"))
+        }));
     }
 }

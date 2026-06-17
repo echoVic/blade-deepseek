@@ -4,7 +4,10 @@ use std::path::Path;
 use crate::tools::{ToolRequest, ToolResult, resolve_workspace_path, truncate_output};
 
 pub fn execute(request: &ToolRequest, cwd: &Path, max_bytes: usize) -> ToolResult {
-    let path = resolve_workspace_path(cwd, request.target.as_deref());
+    let path = match resolve_workspace_path(cwd, request.target.as_deref()) {
+        Ok(p) => p,
+        Err(error) => return ToolResult::failed(request, error, None),
+    };
     let entries = match fs::read_dir(&path) {
         Ok(entries) => entries,
         Err(error) => {

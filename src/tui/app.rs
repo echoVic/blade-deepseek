@@ -22,8 +22,10 @@ use crate::tui::shortcuts::{
     ApprovalShortcut, GlobalShortcut, IdleShortcut, RunningShortcut, approval_shortcut,
     global_shortcut, idle_shortcut, running_shortcut,
 };
+use crate::tui::theme::Theme;
 use crate::tui::types::{AppState, AppStatus, ChatMessage, TuiEvent, UserAction};
 use crate::tui::ui;
+use crate::tui::vim::VimState;
 
 pub fn run_tui(config: RunConfig) -> i32 {
     match run_tui_inner(config) {
@@ -66,6 +68,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
     };
 
     let mut state = AppState::new(action_tx.clone(), model_name);
+    let theme = Theme::named(config.theme);
     if should_show_picker && !picker_sessions.is_empty() {
         state.status = AppStatus::SessionPicker;
         state.session_picker_sessions = picker_sessions;
@@ -115,6 +118,20 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
     let cancel_token = CancelToken::new();
     let agent_cancel = cancel_token.clone();
 
+    if config.update_check {
+        let tx = event_tx.clone();
+        thread::spawn(move || match crate::runtime::update_check::check_latest() {
+            Ok(Some(info)) => {
+                let _ = tx.send(TuiEvent::Notice(format!(
+                    "Update available: {} -> {} ({})",
+                    info.current, info.latest, info.url
+                )));
+            }
+            Ok(None) => {}
+            Err(_) => {}
+        });
+    }
+
     let _agent_handle = thread::spawn(move || {
         agent_loop_thread(
             agent_config,
@@ -125,21 +142,22 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
         );
     });
 
+    let mut vim_state = VimState::new(config.vim_mode);
     let mut textarea = if needs_setup {
-        make_setup_textarea()
+        make_setup_textarea(&theme)
     } else {
         if let Some(prompt) = initial_prompt.clone() {
             state.messages.push(ChatMessage::User(prompt.clone()));
             state.status = AppStatus::Running;
             let _ = action_tx.send(UserAction::Submit(prompt));
         }
-        make_textarea()
+        make_textarea(&vim_state, &theme)
     };
 
     let exit_code;
 
     loop {
-        terminal.draw(|f| ui::render(f, &mut state, &textarea))?;
+        terminal.draw(|f| ui::render(f, &mut state, &textarea, &theme))?;
 
         if event::poll(Duration::from_millis(50))? {
             let ev = event::read()?;
@@ -207,7 +225,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                             match key.code {
                                 KeyCode::Enter => {
                                     state.setup_step = 1;
-                                    textarea = make_setup_textarea();
+                                    textarea = make_setup_textarea(&theme);
                                 }
                                 KeyCode::Esc => {
                                     exit_code = 0;
@@ -246,7 +264,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                                 KeyCode::Enter => {
                                     state.status = AppStatus::Idle;
                                     state.setup_step = 0;
-                                    textarea = make_textarea();
+                                    textarea = make_textarea(&vim_state, &theme);
 
                                     if let Some(prompt) = initial_prompt.clone() {
                                         state.messages.push(ChatMessage::User(prompt.clone()));
@@ -365,7 +383,8 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                                 ) {
                                     match outcome {
                                         SlashOutcome::Continue => {
-                                            textarea = make_textarea();
+                                            vim_state.reset_insert(&mut textarea, &theme);
+                                            textarea = make_textarea(&vim_state, &theme);
                                             continue;
                                         }
                                         SlashOutcome::Exit(code) => {
@@ -379,7 +398,8 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                                 state.status = AppStatus::Running;
                                 state.scroll_to_bottom();
                                 let _ = action_tx.send(UserAction::Submit(text));
-                                textarea = make_textarea();
+                                vim_state.reset_insert(&mut textarea, &theme);
+                                textarea = make_textarea(&vim_state, &theme);
                             }
                         }
                         Some(IdleShortcut::Newline) => {
@@ -389,12 +409,12 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                         Some(IdleShortcut::HistoryPrevious) => {
                             let draft = textarea_text(&textarea);
                             if let Some(history) = state.history_previous(draft) {
-                                textarea = make_textarea_with_text(&history);
+                                textarea = make_textarea_with_text(&history, &vim_state, &theme);
                             }
                         }
                         Some(IdleShortcut::HistoryNext) => {
                             if let Some(history) = state.history_next() {
-                                textarea = make_textarea_with_text(&history);
+                                textarea = make_textarea_with_text(&history, &vim_state, &theme);
                             }
                         }
                         Some(IdleShortcut::ScrollUp) => {
@@ -431,7 +451,26 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                             let _ = action_tx.send(UserAction::Backtrack);
                         }
                         None => {
-                            if textarea.input(Input::from(ev)) {
+                            let changed = if key.code == KeyCode::Tab {
+                                let cwd = config
+                                    .cwd
+                                    .clone()
+                                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+                                if let Some(completed) =
+                                    mentions::complete_file_mention(&textarea_text(&textarea), &cwd)
+                                {
+                                    textarea =
+                                        make_textarea_with_text(&completed, &vim_state, &theme);
+                                    true
+                                } else {
+                                    textarea.input(Input::from(ev))
+                                }
+                            } else if vim_state.enabled {
+                                vim_state.handle(Input::from(ev), &mut textarea, &theme)
+                            } else {
+                                textarea.input(Input::from(ev))
+                            };
+                            if changed {
                                 state.reset_history_navigation();
                             }
                         }
@@ -477,7 +516,8 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
             };
             state.update(tui_event);
             if let Some(prompt) = backtracked_prompt {
-                textarea = make_textarea_with_text(&prompt);
+                vim_state.reset_insert(&mut textarea, &theme);
+                textarea = make_textarea_with_text(&prompt, &vim_state, &theme);
             }
             if state.auto_scroll {
                 state.scroll_to_bottom();
@@ -491,40 +531,36 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
     Ok(exit_code)
 }
 
-fn make_textarea<'a>() -> TextArea<'a> {
+fn make_textarea<'a>(vim_state: &VimState, theme: &Theme) -> TextArea<'a> {
     let mut textarea = TextArea::default();
-    configure_textarea(&mut textarea);
+    configure_textarea(&mut textarea, vim_state, theme);
     textarea
 }
 
-fn make_textarea_with_text<'a>(text: &str) -> TextArea<'a> {
+fn make_textarea_with_text<'a>(text: &str, vim_state: &VimState, theme: &Theme) -> TextArea<'a> {
     let lines: Vec<String> = if text.is_empty() {
         vec![String::new()]
     } else {
         text.lines().map(str::to_string).collect()
     };
     let mut textarea = TextArea::from(lines);
-    configure_textarea(&mut textarea);
+    configure_textarea(&mut textarea, vim_state, theme);
     textarea.move_cursor(CursorMove::Bottom);
     textarea.move_cursor(CursorMove::End);
     textarea
 }
 
-fn configure_textarea(textarea: &mut TextArea) {
+fn configure_textarea(textarea: &mut TextArea, vim_state: &VimState, theme: &Theme) {
     textarea.set_placeholder_text("Type a message... (Enter send, shift+Enter newline)");
     textarea.set_cursor_line_style(ratatui::style::Style::default());
-    textarea.set_block(
-        ratatui::widgets::Block::default()
-            .borders(ratatui::widgets::Borders::ALL)
-            .title(" Input "),
-    );
+    vim_state.configure_block(textarea, theme);
 }
 
 fn textarea_text(textarea: &TextArea) -> String {
     textarea.lines().join("\n")
 }
 
-fn make_setup_textarea<'a>() -> TextArea<'a> {
+fn make_setup_textarea<'a>(theme: &Theme) -> TextArea<'a> {
     let mut textarea = TextArea::default();
     textarea.set_placeholder_text("sk-...");
     textarea.set_cursor_line_style(ratatui::style::Style::default());
@@ -533,7 +569,7 @@ fn make_setup_textarea<'a>() -> TextArea<'a> {
         ratatui::widgets::Block::default()
             .borders(ratatui::widgets::Borders::ALL)
             .title(" API Key ")
-            .border_style(ratatui::style::Style::default().fg(ratatui::style::Color::Cyan)),
+            .border_style(ratatui::style::Style::default().fg(theme.border)),
     );
     textarea
 }
@@ -595,6 +631,9 @@ fn agent_loop_thread(
                     &action_rx,
                     &cancel,
                 );
+                if cfg.desktop_notifications {
+                    let _ = crate::runtime::notify::notify("Orca", "Task completed");
+                }
             }
             Ok(UserAction::Interrupt) => {
                 // Cancel already set by TUI thread; just continue waiting for next Submit
@@ -611,7 +650,7 @@ fn agent_loop_thread(
                         .cwd
                         .clone()
                         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-                    let (before_messages, after_messages) = session.compact(&cwd);
+                    let (before_messages, after_messages) = session.compact(&cfg, &cwd);
                     let _ = event_tx.send(TuiEvent::Compacted {
                         before_messages,
                         after_messages,
@@ -661,7 +700,7 @@ fn handle_slash_command(
                     .to_string(),
             ));
         }
-        SlashCommand::Model(model) => match commands::validate_model(&model) {
+        SlashCommand::Model(Some(model)) => match commands::validate_model(&model) {
             Ok(()) => {
                 config.model = Some(model.clone());
                 if let Ok(mut cfg) = shared_config.lock() {
@@ -675,6 +714,12 @@ fn handle_slash_command(
             }
             Err(error) => state.messages.push(ChatMessage::Error(error)),
         },
+        SlashCommand::Model(None) => {
+            state.messages.push(ChatMessage::System(format!(
+                "Current model: {}",
+                state.model_name
+            )));
+        }
         SlashCommand::Clear => {
             state.messages.clear();
             state.scroll_offset = 0;
@@ -689,7 +734,7 @@ fn handle_slash_command(
                 state.usage.estimated_cost_usd
             )));
         }
-        SlashCommand::Mode(mode) => match parse_approval_mode(&mode) {
+        SlashCommand::Mode(Some(mode)) => match parse_approval_mode(&mode) {
             Some(approval_mode) => {
                 config.approval_mode = approval_mode;
                 if let Ok(mut cfg) = shared_config.lock() {
@@ -703,6 +748,12 @@ fn handle_slash_command(
                 "unsupported mode. Use suggest, auto-edit, or full-auto.".to_string(),
             )),
         },
+        SlashCommand::Mode(None) => {
+            state.messages.push(ChatMessage::System(format!(
+                "Current mode: {}",
+                config.approval_mode.as_str()
+            )));
+        }
         SlashCommand::Plan(arg) => match arg.as_deref() {
             Some("off") => {
                 config.approval_mode = crate::approval::policy::ApprovalMode::Suggest;

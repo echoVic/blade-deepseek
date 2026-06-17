@@ -38,6 +38,7 @@ pub enum TuiEvent {
         tool: String,
         target: Option<String>,
     },
+    Notice(String),
     Error(String),
     UsageUpdated(UsageTotals),
     SessionCompleted {
@@ -372,6 +373,9 @@ impl AppState {
             }
             TuiEvent::Error(msg) => {
                 self.messages.push(ChatMessage::Error(msg));
+            }
+            TuiEvent::Notice(msg) => {
+                self.messages.push(ChatMessage::System(msg));
             }
             TuiEvent::UsageUpdated(usage) => {
                 self.usage = usage;

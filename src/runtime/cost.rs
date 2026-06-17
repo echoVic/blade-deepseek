@@ -134,6 +134,8 @@ mod tests {
         assert_eq!(parent.totals.input_tokens, 300);
         assert_eq!(parent.totals.output_tokens, 130);
         assert_eq!(parent.totals.cache_tokens, 50);
-        assert!((parent.totals.estimated_cost_usd - (parent_cost_before + child_cost)).abs() < 1e-12);
+        assert!(
+            (parent.totals.estimated_cost_usd - (parent_cost_before + child_cost)).abs() < 1e-12
+        );
     }
 }

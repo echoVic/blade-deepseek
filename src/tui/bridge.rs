@@ -1,5 +1,6 @@
 use std::path::Path;
 use std::sync::mpsc::{Receiver, Sender};
+use std::thread;
 
 use crate::approval::policy::{ApprovalDecision, ApprovalPolicy, ApprovalRequest};
 use crate::config::RunConfig;
@@ -143,7 +144,7 @@ impl TuiConversationSession {
         self.cost_tracker.set_model(model);
     }
 
-    pub fn compact(&mut self, cwd: &Path) -> (usize, usize) {
+    pub fn compact(&mut self, config: &RunConfig, cwd: &Path) -> (usize, usize) {
         let before_messages = self.conversation.messages.len();
         let _ = self.hooks.run(
             HookEvent::PreCompact,
@@ -156,13 +157,27 @@ impl TuiConversationSession {
                 after_messages: None,
             },
         );
-        self.conversation = provider::context::compact(
+        let provider_config = ProviderConfig {
+            api_key: config.api_key.clone(),
+            base_url: config.base_url.clone(),
+            model: config.model.clone(),
+            tools_override: Some(Vec::new()),
+            mcp_registry: None,
+        };
+        let compaction = provider::context::compact_with_summary(
+            config.provider,
             &self.conversation,
             &provider::context::ContextConfig::default(),
+            &provider_config,
+            config.summary_model.as_deref(),
         );
+        self.conversation = compaction.conversation;
         let after_messages = self.conversation.messages.len();
         if let Some(writer) = &mut self.writer {
             let _ = writer.append_compaction(before_messages, after_messages);
+            if let provider::context::CompactionKind::RemoteSummary(summary) = compaction.kind {
+                let _ = writer.append_summary(before_messages, after_messages, summary);
+            }
         }
         let _ = self.hooks.run(
             HookEvent::PostCompact,
@@ -262,10 +277,20 @@ pub fn run_agent_for_tui(
             ) {
                 let _ = event_tx.send(TuiEvent::Error(format!("pre_compact hook failed: {error}")));
             }
-            session.conversation = provider::context::compact(&session.conversation, &ctx_config);
+            let compaction = provider::context::compact_with_summary(
+                config.provider,
+                &session.conversation,
+                &ctx_config,
+                &provider_config,
+                config.summary_model.as_deref(),
+            );
+            session.conversation = compaction.conversation;
             let after_messages = session.conversation.messages.len();
             if let Some(writer) = &mut session.writer {
                 let _ = writer.append_compaction(before_messages, after_messages);
+                if let provider::context::CompactionKind::RemoteSummary(summary) = compaction.kind {
+                    let _ = writer.append_summary(before_messages, after_messages, summary);
+                }
             }
             if let Err(error) = session.hooks.run(
                 HookEvent::PostCompact,
@@ -360,6 +385,28 @@ pub fn run_agent_for_tui(
             if let Some(message) = session.conversation.messages.last().cloned() {
                 session.append_message(&message);
             }
+            if config.auto_memory {
+                let provider_config = ProviderConfig {
+                    api_key: config.api_key.clone(),
+                    base_url: config.base_url.clone(),
+                    model: config
+                        .summary_model
+                        .clone()
+                        .or_else(|| config.model.clone()),
+                    tools_override: Some(Vec::new()),
+                    mcp_registry: None,
+                };
+                if let Err(error) = memory::extract_project_memory(
+                    config.provider,
+                    &provider_config,
+                    &cwd,
+                    &session.conversation.messages,
+                ) {
+                    let _ = event_tx.send(TuiEvent::Error(format!(
+                        "memory extraction failed: {error}"
+                    )));
+                }
+            }
             let _ = event_tx.send(TuiEvent::SessionCompleted {
                 status: "success".to_string(),
             });
@@ -376,44 +423,206 @@ pub fn run_agent_for_tui(
             session.append_message(&message);
         }
 
-        for step in &response.steps {
-            if let ProviderStep::ToolCall(tool_request) = step {
-                let (should_stop, result, child_cost) = execute_tool_for_tui(
+        let tool_requests: Vec<tools::ToolRequest> = response
+            .steps
+            .iter()
+            .filter_map(|step| match step {
+                ProviderStep::ToolCall(tool_request) => Some(tool_request.clone()),
+                _ => None,
+            })
+            .collect();
+        let mut index = 0;
+        while index < tool_requests.len() {
+            if should_run_subagent_batch(config, &tool_requests[index], 0) {
+                let batch_end = collect_subagent_batch(config, &tool_requests, index);
+                let results = execute_subagent_batch_for_tui(
                     config,
                     &cwd,
-                    tool_request,
+                    &tool_requests[index..batch_end],
                     event_tx,
-                    action_rx,
                     0,
-                    &policy,
                     &session.instructions,
                     &session.memory,
-                    &session.mcp_registry,
                     &session.hooks,
                 );
-
-                if let Some(c) = child_cost {
-                    session.cost_tracker.merge(&c);
+                for (should_stop, result, child_cost) in results {
+                    session.cost_tracker.merge(&child_cost);
+                    let result_content = agent_common::format_tool_result_for_model(&result);
+                    session
+                        .conversation
+                        .add_tool_result(result.id.clone(), result_content);
+                    if let Some(message) = session.conversation.messages.last().cloned() {
+                        session.append_message(&message);
+                    }
+                    if should_stop {
+                        let _ = event_tx.send(TuiEvent::SessionCompleted {
+                            status: "approval_required".to_string(),
+                        });
+                        session.complete("approval_required");
+                        return;
+                    }
                 }
-
-                let result_content = agent_common::format_tool_result_for_model(&result);
-                session
-                    .conversation
-                    .add_tool_result(tool_request.id.clone(), result_content);
-                if let Some(message) = session.conversation.messages.last().cloned() {
-                    session.append_message(&message);
-                }
-
-                if should_stop {
-                    let _ = event_tx.send(TuiEvent::SessionCompleted {
-                        status: "approval_required".to_string(),
-                    });
-                    session.complete("approval_required");
-                    return;
-                }
+                index = batch_end;
+                continue;
             }
+
+            let tool_request = &tool_requests[index];
+            let (should_stop, result, child_cost) = execute_tool_for_tui(
+                config,
+                &cwd,
+                tool_request,
+                event_tx,
+                action_rx,
+                0,
+                &policy,
+                &session.instructions,
+                &session.memory,
+                &session.mcp_registry,
+                &session.hooks,
+            );
+
+            if let Some(c) = child_cost {
+                session.cost_tracker.merge(&c);
+            }
+
+            let result_content = agent_common::format_tool_result_for_model(&result);
+            session
+                .conversation
+                .add_tool_result(tool_request.id.clone(), result_content);
+            if let Some(message) = session.conversation.messages.last().cloned() {
+                session.append_message(&message);
+            }
+
+            if should_stop {
+                let _ = event_tx.send(TuiEvent::SessionCompleted {
+                    status: "approval_required".to_string(),
+                });
+                session.complete("approval_required");
+                return;
+            }
+            index += 1;
         }
     }
+}
+
+fn should_run_subagent_batch(
+    config: &RunConfig,
+    tool_request: &tools::ToolRequest,
+    subagent_depth: u32,
+) -> bool {
+    tool_request.name == tools::ToolName::Subagent
+        && subagent_depth < config.subagents.max_depth
+        && config.subagents.max_parallel > 1
+}
+
+fn collect_subagent_batch(
+    config: &RunConfig,
+    tool_requests: &[tools::ToolRequest],
+    start: usize,
+) -> usize {
+    let max_end = (start + config.subagents.max_parallel).min(tool_requests.len());
+    let mut end = start;
+    while end < max_end && tool_requests[end].name == tools::ToolName::Subagent {
+        end += 1;
+    }
+    end
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_subagent_batch_for_tui(
+    config: &RunConfig,
+    cwd: &Path,
+    tool_requests: &[tools::ToolRequest],
+    event_tx: &Sender<TuiEvent>,
+    subagent_depth: u32,
+    instructions: &ProjectInstructions,
+    memory: &MemoryBlock,
+    hooks: &HookRunner,
+) -> Vec<(bool, tools::ToolResult, CostTracker)> {
+    let mut handles = Vec::new();
+    let mut results: Vec<Option<(bool, tools::ToolResult, CostTracker)>> =
+        vec![None; tool_requests.len()];
+
+    for (idx, tool_request) in tool_requests.iter().enumerate() {
+        let request = subagent::create_subagent_request(tool_request);
+        let description = request.description.clone();
+        let subagent_type = request.subagent_type;
+        let _ = event_tx.send(TuiEvent::SubagentStarted {
+            id: tool_request.id.clone(),
+            description: description.clone(),
+        });
+
+        if subagent_depth >= config.subagents.max_depth {
+            let error = format!("subagent max depth {} reached", config.subagents.max_depth);
+            let _ = event_tx.send(TuiEvent::SubagentCompleted {
+                id: tool_request.id.clone(),
+                description,
+                status: "failed".to_string(),
+                output: None,
+                error: Some(error.clone()),
+            });
+            results[idx] = Some((
+                true,
+                tools::ToolResult::failed(tool_request, error, None),
+                CostTracker::new(config.model.as_deref()),
+            ));
+            continue;
+        }
+
+        let child_config = config.clone();
+        let child_cwd = cwd.to_path_buf();
+        let child_prompt = request.prompt;
+        let child_instructions = instructions.clone();
+        let child_memory = memory.clone();
+        let child_hooks = hooks.clone();
+        let child_tool_request = tool_request.clone();
+        handles.push((
+            idx,
+            description,
+            thread::spawn(move || {
+                let child = run_child_agent_for_tui_silent(
+                    &child_config,
+                    &child_cwd,
+                    &child_prompt,
+                    subagent_depth + 1,
+                    &subagent_type,
+                    &child_instructions,
+                    &child_memory,
+                    &child_hooks,
+                );
+                (child_tool_request, child)
+            }),
+        ));
+    }
+
+    for (idx, description, handle) in handles {
+        let (tool_request, child) = match handle.join() {
+            Ok(result) => result,
+            Err(_) => {
+                let tool_request = &tool_requests[idx];
+                let result =
+                    tools::ToolResult::failed(tool_request, "subagent thread panicked", None);
+                let _ = event_tx.send(TuiEvent::SubagentCompleted {
+                    id: tool_request.id.clone(),
+                    description,
+                    status: "failed".to_string(),
+                    output: None,
+                    error: result.error.clone(),
+                });
+                results[idx] = Some((true, result, CostTracker::new(config.model.as_deref())));
+                continue;
+            }
+        };
+
+        let (should_stop, result, cost_tracker) =
+            child_result_to_tui_tool_result(&tool_request, &description, child, event_tx);
+        results[idx] = Some((should_stop, result, cost_tracker));
+    }
+
+    results
+        .into_iter()
+        .map(|result| result.expect("each subagent batch item has a result"))
+        .collect()
 }
 
 fn execute_tool_for_tui(
@@ -658,6 +867,52 @@ fn execute_subagent_for_tui(
     }
 }
 
+fn child_result_to_tui_tool_result(
+    tool_request: &tools::ToolRequest,
+    description: &str,
+    child: TuiAgentResult,
+    event_tx: &Sender<TuiEvent>,
+) -> (bool, tools::ToolResult, CostTracker) {
+    let cost_tracker = child.cost_tracker.clone();
+    if child.status == "success" {
+        let output = child
+            .final_message
+            .unwrap_or_else(|| "(subagent completed without a final message)".to_string());
+        let _ = event_tx.send(TuiEvent::SubagentCompleted {
+            id: tool_request.id.clone(),
+            description: description.to_string(),
+            status: "completed".to_string(),
+            output: Some(output.clone()),
+            error: None,
+        });
+        (
+            false,
+            tools::ToolResult::completed(
+                tool_request,
+                format!("Subagent status: success\n\n{output}"),
+                false,
+            ),
+            cost_tracker,
+        )
+    } else {
+        let error = child
+            .error
+            .unwrap_or_else(|| format!("subagent ended with status {}", child.status));
+        let _ = event_tx.send(TuiEvent::SubagentCompleted {
+            id: tool_request.id.clone(),
+            description: description.to_string(),
+            status: "failed".to_string(),
+            output: child.final_message,
+            error: Some(error.clone()),
+        });
+        (
+            true,
+            tools::ToolResult::failed(tool_request, error, None),
+            cost_tracker,
+        )
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_child_agent_for_tui(
     config: &RunConfig,
@@ -797,6 +1052,34 @@ fn run_child_agent_for_tui(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn run_child_agent_for_tui_silent(
+    config: &RunConfig,
+    cwd: &Path,
+    prompt: &str,
+    subagent_depth: u32,
+    subagent_type: &SubagentType,
+    instructions: &ProjectInstructions,
+    memory: &MemoryBlock,
+    hooks: &HookRunner,
+) -> TuiAgentResult {
+    let (event_tx, _event_rx) = std::sync::mpsc::channel();
+    let (action_tx, action_rx) = std::sync::mpsc::channel();
+    drop(action_tx);
+    run_child_agent_for_tui(
+        config,
+        cwd,
+        prompt,
+        &event_tx,
+        &action_rx,
+        subagent_depth,
+        subagent_type,
+        instructions,
+        memory,
+        hooks,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -823,6 +1106,12 @@ mod tests {
             mcp_servers: Vec::new(),
             hooks: Vec::new(),
             subagents: Default::default(),
+            summary_model: None,
+            theme: crate::config::ThemeName::Dark,
+            vim_mode: false,
+            update_check: false,
+            desktop_notifications: false,
+            auto_memory: false,
         }
     }
 

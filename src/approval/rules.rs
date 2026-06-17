@@ -130,8 +130,14 @@ fn glob_match(pattern: &[u8], mut p: usize, value: &[u8], mut v: usize) -> bool 
                 if value[v] == b'/' {
                     return false;
                 }
+                let char_len = match value[v] {
+                    b if b < 0x80 => 1,
+                    b if b < 0xE0 => 2,
+                    b if b < 0xF0 => 3,
+                    _ => 4,
+                };
                 p += 1;
-                v += 1;
+                v += char_len.min(value.len() - v);
             }
             c => {
                 if c != value[v] {

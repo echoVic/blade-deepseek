@@ -59,7 +59,9 @@ pub fn load_for_cwd(cwd: &Path) -> io::Result<ProjectInstructions> {
     let mut visited = HashSet::new();
 
     let orca_home_path = orca_home();
-    if let Some(user_agents) = orca_home_path.as_ref().map(|home| home.join(INSTRUCTIONS_FILE))
+    if let Some(user_agents) = orca_home_path
+        .as_ref()
+        .map(|home| home.join(INSTRUCTIONS_FILE))
         && user_agents.is_file()
     {
         sections.push(InstructionSection {
@@ -158,17 +160,13 @@ fn read_with_includes(
             let resolved = base_dir.join(include_path);
             // Path traversal guard: included file must reside within allowed_root
             if let Some(root) = allowed_root {
-                let resolved_canonical = resolved
-                    .canonicalize()
-                    .unwrap_or_else(|_| resolved.clone());
+                let resolved_canonical =
+                    resolved.canonicalize().unwrap_or_else(|_| resolved.clone());
                 let root_canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
                 if !resolved_canonical.starts_with(&root_canonical) {
                     return Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
-                        format!(
-                            "@include path escapes project root: {}",
-                            include_path
-                        ),
+                        format!("@include path escapes project root: {}", include_path),
                     ));
                 }
             }
