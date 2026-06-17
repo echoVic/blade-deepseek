@@ -26,7 +26,7 @@ use crate::tui::shortcuts::{
     global_shortcut, idle_shortcut, running_shortcut,
 };
 use crate::tui::theme::Theme;
-use crate::tui::types::{AppState, AppStatus, ChatMessage, TuiEvent, UserAction};
+use crate::tui::types::{AppState, AppStatus, ChatMessage, SlashMenu, SlashMenuItem, SubMenu, TuiEvent, UserAction};
 use crate::tui::ui;
 use crate::tui::vim::VimState;
 
@@ -79,7 +79,16 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
         Vec::new()
     };
 
-    let mut state = AppState::new(action_tx.clone(), model_name);
+    let cwd_display = config
+        .cwd
+        .as_deref()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
+        .display()
+        .to_string();
+    let cwd_display = shorten_home(&cwd_display);
+
+    let mut state = AppState::new(action_tx.clone(), model_name, cwd_display);
     let theme = Theme::named(config.theme);
     if should_show_picker && !picker_sessions.is_empty() {
         state.status = AppStatus::SessionPicker;
@@ -334,8 +343,8 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                             }
                         }
                         KeyCode::Esc => {
-                            exit_code = 0;
-                            break;
+                            state.status = AppStatus::Idle;
+                            state.session_picker_sessions.clear();
                         }
                         _ => {}
                     }
@@ -381,8 +390,16 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
 
                 // Normal Idle mode input
                 if state.status == AppStatus::Idle {
+                    // Handle slash menu if open
+                    if state.slash_menu.is_some() {
+                        if handle_slash_menu_key(&ev, key, &mut state, &mut config, &shared_config, &action_tx, &mut textarea, &vim_state, &theme) {
+                            continue;
+                        }
+                    }
+
                     match idle_shortcut(*key) {
                         Some(IdleShortcut::Submit) => {
+                            state.slash_menu = None;
                             let lines: Vec<String> = textarea.lines().to_vec();
                             let text = lines.join("\n").trim().to_string();
                             if !text.is_empty() {
@@ -484,6 +501,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                             };
                             if changed {
                                 state.reset_history_navigation();
+                                update_slash_menu(&textarea, &mut state);
                             }
                         }
                     }
@@ -545,6 +563,228 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
     terminal::disable_raw_mode()?;
 
     Ok(exit_code)
+}
+
+fn shorten_home(path: &str) -> String {
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = home.to_string_lossy();
+        if let Some(rest) = path.strip_prefix(home.as_ref()) {
+            return format!("~{rest}");
+        }
+    }
+    path.to_string()
+}
+
+// --- Slash menu helpers ---
+
+fn update_slash_menu(textarea: &TextArea, state: &mut AppState) {
+    let text = textarea_text(textarea);
+    if textarea.lines().len() == 1 && text.starts_with('/') {
+        let filter = &text;
+        let items: Vec<SlashMenuItem> = commands::all_commands()
+            .iter()
+            .filter(|(cmd, _)| cmd.starts_with(filter))
+            .map(|(cmd, desc)| SlashMenuItem {
+                command: cmd,
+                description: desc,
+            })
+            .collect();
+        if items.is_empty() {
+            state.slash_menu = None;
+        } else {
+            let selected = state
+                .slash_menu
+                .as_ref()
+                .map(|m| m.selected.min(items.len().saturating_sub(1)))
+                .unwrap_or(0);
+            state.slash_menu = Some(SlashMenu {
+                items,
+                selected,
+                sub_menu: None,
+            });
+        }
+    } else {
+        state.slash_menu = None;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_slash_menu_key(
+    ev: &Event,
+    key: &crossterm::event::KeyEvent,
+    state: &mut AppState,
+    config: &mut RunConfig,
+    shared_config: &Arc<Mutex<RunConfig>>,
+    action_tx: &mpsc::Sender<UserAction>,
+    textarea: &mut TextArea,
+    vim_state: &VimState,
+    theme: &Theme,
+) -> bool {
+    let menu = match &mut state.slash_menu {
+        Some(m) => m,
+        None => return false,
+    };
+
+    // Sub-menu mode
+    if let Some(sub) = &mut menu.sub_menu {
+        match key.code {
+            KeyCode::Up => {
+                sub.selected = sub.selected.saturating_sub(1);
+                return true;
+            }
+            KeyCode::Down => {
+                if sub.selected + 1 < sub.items.len() {
+                    sub.selected += 1;
+                }
+                return true;
+            }
+            KeyCode::Enter => {
+                let chosen = sub.items[sub.selected].clone();
+                // Execute the sub-command
+                if sub.title == "/model" {
+                    if let Ok(()) = commands::validate_model(&chosen) {
+                        config.model = Some(chosen.clone());
+                        if let Ok(mut cfg) = shared_config.lock() {
+                            cfg.model = Some(chosen.clone());
+                        }
+                        state.model_name = chosen.clone();
+                        state
+                            .messages
+                            .push(ChatMessage::System(format!("Model switched to {chosen}.")));
+                        let _ = action_tx.send(UserAction::SetModel(chosen));
+                    }
+                } else if sub.title == "/mode" {
+                    if let Some(mode) = parse_approval_mode(&chosen) {
+                        config.approval_mode = mode;
+                        if let Ok(mut cfg) = shared_config.lock() {
+                            cfg.approval_mode = mode;
+                        }
+                        state.messages.push(ChatMessage::System(format!(
+                            "Approval mode switched to {chosen}."
+                        )));
+                    }
+                }
+                state.slash_menu = None;
+                *textarea = make_textarea(vim_state, theme);
+                return true;
+            }
+            KeyCode::Esc => {
+                state.slash_menu = None;
+                *textarea = make_textarea(vim_state, theme);
+                return true;
+            }
+            _ => return true,
+        }
+    }
+
+    // Main menu mode
+    match key.code {
+        KeyCode::Up => {
+            menu.selected = menu.selected.saturating_sub(1);
+            true
+        }
+        KeyCode::Down => {
+            if menu.selected + 1 < menu.items.len() {
+                menu.selected += 1;
+            }
+            true
+        }
+        KeyCode::Enter => {
+            let selected_cmd = menu.items[menu.selected].command;
+            match selected_cmd {
+                "/model" => {
+                    let models: Vec<String> = commands::available_models()
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect();
+                    state.slash_menu = Some(SlashMenu {
+                        items: menu.items.clone(),
+                        selected: menu.selected,
+                        sub_menu: Some(SubMenu {
+                            title: "/model".to_string(),
+                            items: models,
+                            selected: 0,
+                        }),
+                    });
+                }
+                "/mode" => {
+                    let modes = vec![
+                        "suggest".to_string(),
+                        "auto-edit".to_string(),
+                        "full-auto".to_string(),
+                    ];
+                    state.slash_menu = Some(SlashMenu {
+                        items: menu.items.clone(),
+                        selected: menu.selected,
+                        sub_menu: Some(SubMenu {
+                            title: "/mode".to_string(),
+                            items: modes,
+                            selected: 0,
+                        }),
+                    });
+                }
+                "/remember" => {
+                    // Leave "/remember " in textarea for user to type the note
+                    *textarea = make_textarea_with_text("/remember ", vim_state, theme);
+                    state.slash_menu = None;
+                }
+                "/history" => {
+                    // Open session picker directly
+                    state.slash_menu = None;
+                    *textarea = make_textarea(vim_state, theme);
+                    match crate::runtime::history::list_sessions(20) {
+                        Ok(sessions) if !sessions.is_empty() => {
+                            state.session_picker_sessions = sessions;
+                            state.session_picker_selected = 0;
+                            state.status = AppStatus::SessionPicker;
+                        }
+                        Ok(_) => {
+                            state.messages.push(ChatMessage::System(
+                                "No saved sessions.".to_string(),
+                            ));
+                        }
+                        Err(e) => {
+                            state.messages.push(ChatMessage::Error(format!(
+                                "failed to list history: {e}"
+                            )));
+                        }
+                    }
+                }
+                _ => {
+                    // Fill command into textarea and submit
+                    *textarea = make_textarea_with_text(selected_cmd, vim_state, theme);
+                    state.slash_menu = None;
+                    // Auto-execute the command
+                    if let Some(outcome) = handle_slash_command(
+                        selected_cmd,
+                        config,
+                        shared_config,
+                        state,
+                        action_tx,
+                    ) {
+                        match outcome {
+                            SlashOutcome::Continue => {
+                                *textarea = make_textarea(vim_state, theme);
+                            }
+                            SlashOutcome::Exit(_) => {}
+                        }
+                    }
+                    *textarea = make_textarea(vim_state, theme);
+                }
+            }
+            true
+        }
+        KeyCode::Esc => {
+            state.slash_menu = None;
+            true
+        }
+        _ => {
+            // Pass key to textarea for filtering
+            textarea.input(Input::from(ev.clone()));
+            update_slash_menu(textarea, state);
+            true
+        }
+    }
 }
 
 fn make_textarea<'a>(vim_state: &VimState, theme: &Theme) -> TextArea<'a> {

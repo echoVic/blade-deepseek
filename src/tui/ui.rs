@@ -35,6 +35,10 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
     render_input(frame, chunks[1], textarea);
     render_status(frame, chunks[2], state, theme);
 
+    if state.slash_menu.is_some() {
+        render_slash_menu(frame, chunks[1], state, theme);
+    }
+
     if state.status == AppStatus::WaitingApproval {
         render_approval_dialog(frame, state, theme);
     }
@@ -88,13 +92,15 @@ fn render_session_picker(frame: &mut Frame, state: &mut AppState, theme: &Theme)
 }
 
 fn render_messages(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) {
-    let lines = build_message_lines(state, theme);
+    let lines = if state.messages.is_empty() {
+        build_welcome_lines(state, theme)
+    } else {
+        build_message_lines(state, theme)
+    };
 
-    // Account for block borders: 1 left + 1 right
     let content_width = area.width.saturating_sub(2) as usize;
     let visible_height = area.height.saturating_sub(2);
 
-    // Calculate total visual lines after wrapping
     let total_visual: u16 = lines
         .iter()
         .map(|line| wrapped_line_count(line, content_width) as u16)
@@ -120,6 +126,49 @@ fn render_messages(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &
         .scroll((scroll, 0));
 
     frame.render_widget(paragraph, area);
+}
+
+fn build_welcome_lines<'a>(state: &AppState, theme: &Theme) -> Vec<Line<'a>> {
+    let version = env!("CARGO_PKG_VERSION");
+    let cyan = Style::default().fg(theme.border);
+    let text = Style::default().fg(theme.text);
+    let muted = Style::default().fg(theme.muted);
+
+    vec![
+        Line::from(""),
+        Line::from(Span::styled("   ___                ", cyan)),
+        Line::from(Span::styled("  / _ \\ _ __ ___ __ _ ", cyan)),
+        Line::from(Span::styled(" | | | | '__/ __/ _` |", cyan)),
+        Line::from(Span::styled(" | |_| | | | (_| (_| |", cyan)),
+        Line::from(vec![
+            Span::styled("  \\___/|_|  \\___\\__,_|", cyan),
+            Span::styled(format!("  v{version}"), muted),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  model:      ", muted),
+            Span::styled(state.model_name.clone(), text),
+        ]),
+        Line::from(vec![
+            Span::styled("  directory:  ", muted),
+            Span::styled(state.cwd.clone(), text),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled("  Tips", Style::default().fg(theme.success))),
+        Line::from(Span::styled(
+            "  • Shift+Enter to insert newline, Enter to send",
+            muted,
+        )),
+        Line::from(Span::styled(
+            "  • /model to switch model, /compact to compress context",
+            muted,
+        )),
+        Line::from(Span::styled(
+            "  • Ctrl+K or F1 for keyboard shortcuts",
+            muted,
+        )),
+        Line::from(""),
+    ]
 }
 
 fn wrapped_line_count(line: &Line, width: usize) -> usize {
@@ -403,6 +452,64 @@ fn active_shortcut_scopes(state: &AppState) -> Vec<ShortcutScope> {
         AppStatus::WaitingApproval => vec![ShortcutScope::Global, ShortcutScope::Approval],
         AppStatus::Setup | AppStatus::SessionPicker => vec![ShortcutScope::Global],
     }
+}
+
+fn render_slash_menu(frame: &mut Frame, input_area: Rect, state: &AppState, theme: &Theme) {
+    let menu = match &state.slash_menu {
+        Some(m) => m,
+        None => return,
+    };
+
+    // Determine items and title based on sub-menu state
+    let (items, selected, title): (Vec<(&str, &str)>, usize, &str) =
+        if let Some(sub) = &menu.sub_menu {
+            let items: Vec<(&str, &str)> = sub.items.iter().map(|s| (s.as_str(), "")).collect();
+            (items, sub.selected, &sub.title)
+        } else {
+            let items: Vec<(&str, &str)> = menu
+                .items
+                .iter()
+                .map(|i| (i.command, i.description))
+                .collect();
+            (items, menu.selected, " Commands ")
+        };
+
+    let item_count = items.len() as u16;
+    let height = (item_count + 2).min(14); // +2 for border
+    let width = input_area.width;
+    let y = input_area.y.saturating_sub(height);
+    let popup_area = Rect::new(input_area.x, y, width, height);
+
+    frame.render_widget(Clear, popup_area);
+
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, (cmd, desc)) in items.iter().enumerate() {
+        let prefix = if i == selected as usize { "▸ " } else { "  " };
+        let style = if i == selected as usize {
+            Style::default()
+                .fg(theme.border)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.text)
+        };
+
+        if desc.is_empty() {
+            lines.push(Line::from(Span::styled(format!("{prefix}{cmd}"), style)));
+        } else {
+            lines.push(Line::from(vec![
+                Span::styled(format!("{prefix}{cmd}"), style),
+                Span::styled(format!("  {desc}"), Style::default().fg(theme.muted)),
+            ]));
+        }
+    }
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(Style::default().fg(theme.border));
+
+    let paragraph = Paragraph::new(lines).block(block);
+    frame.render_widget(paragraph, popup_area);
 }
 
 fn render_approval_dialog(frame: &mut Frame, state: &AppState, theme: &Theme) {

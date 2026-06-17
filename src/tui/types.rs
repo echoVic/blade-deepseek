@@ -103,6 +103,26 @@ pub struct ApprovalDialog {
     pub selected: usize,
 }
 
+#[derive(Debug, Clone)]
+pub struct SlashMenuItem {
+    pub command: &'static str,
+    pub description: &'static str,
+}
+
+#[derive(Debug, Clone)]
+pub struct SlashMenu {
+    pub items: Vec<SlashMenuItem>,
+    pub selected: usize,
+    pub sub_menu: Option<SubMenu>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SubMenu {
+    pub title: String,
+    pub items: Vec<String>,
+    pub selected: usize,
+}
+
 pub struct AppState {
     pub messages: Vec<ChatMessage>,
     pub status: AppStatus,
@@ -111,6 +131,7 @@ pub struct AppState {
     pub total_lines: u16,
     pub visible_height: u16,
     pub model_name: String,
+    pub cwd: String,
     #[allow(dead_code)]
     pub event_tx: mpsc::Sender<UserAction>,
     pub approval_dialog: Option<ApprovalDialog>,
@@ -123,10 +144,11 @@ pub struct AppState {
     pub session_picker_sessions: Vec<SessionSummary>,
     pub session_picker_selected: usize,
     pub usage: UsageTotals,
+    pub slash_menu: Option<SlashMenu>,
 }
 
 impl AppState {
-    pub fn new(event_tx: mpsc::Sender<UserAction>, model_name: String) -> Self {
+    pub fn new(event_tx: mpsc::Sender<UserAction>, model_name: String, cwd: String) -> Self {
         Self {
             messages: Vec::new(),
             status: AppStatus::Idle,
@@ -135,6 +157,7 @@ impl AppState {
             total_lines: 0,
             visible_height: 0,
             model_name,
+            cwd,
             event_tx,
             approval_dialog: None,
             setup_step: 0,
@@ -146,6 +169,7 @@ impl AppState {
             session_picker_sessions: Vec::new(),
             session_picker_selected: 0,
             usage: UsageTotals::default(),
+            slash_menu: None,
         }
     }
 
@@ -429,7 +453,7 @@ mod tests {
 
     fn state() -> AppState {
         let (tx, _rx) = mpsc::channel();
-        AppState::new(tx, "mock".to_string())
+        AppState::new(tx, "mock".to_string(), "/tmp".to_string())
     }
 
     #[test]

@@ -43,6 +43,25 @@ pub fn parse(input: &str) -> Option<SlashCommand> {
     }
 }
 
+pub fn all_commands() -> &'static [(&'static str, &'static str)] {
+    &[
+        ("/help", "Show available commands"),
+        ("/model", "Switch or show current model"),
+        ("/compact", "Compress conversation context"),
+        ("/clear", "Clear message history"),
+        ("/cost", "Show session cost"),
+        ("/mode", "Switch approval mode"),
+        ("/plan", "Toggle plan mode"),
+        ("/remember", "Save a note to memory"),
+        ("/history", "Browse session history"),
+        ("/exit", "Exit Orca"),
+    ]
+}
+
+pub fn available_models() -> &'static [&'static str] {
+    &["deepseek-v4-flash", "deepseek-v4-pro"]
+}
+
 pub fn validate_model(model: &str) -> Result<(), String> {
     match model {
         "deepseek-v4-flash" | "deepseek-v4-pro" => Ok(()),
