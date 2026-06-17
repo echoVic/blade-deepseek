@@ -17,7 +17,14 @@ struct ChatRequest {
     messages: Vec<ApiMessage>,
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<StreamOptions>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<Value>>,
+}
+
+#[derive(Debug, Serialize)]
+struct StreamOptions {
+    include_usage: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -166,6 +173,7 @@ fn request_chat_streaming(
         model: model.to_string(),
         messages,
         stream: true,
+        stream_options: Some(StreamOptions { include_usage: true }),
         tools: Some(tools),
     };
 
@@ -286,6 +294,7 @@ fn request_chat(
         model: model.to_string(),
         messages,
         stream: false,
+        stream_options: None,
         tools: Some(tools),
     };
 

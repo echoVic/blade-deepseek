@@ -5,7 +5,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crossterm::ExecutableCommand;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEventKind, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
+};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -41,6 +44,15 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
     terminal::enable_raw_mode()?;
     let mut stdout = io::stdout();
     stdout.execute(EnterAlternateScreen)?;
+    // Kitty keyboard protocol: push enhancement AFTER entering alternate screen,
+    // otherwise the terminal may reset the keyboard state stack on screen switch.
+    let kbd_enhanced = stdout
+        .execute(PushKeyboardEnhancementFlags(
+            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS,
+        ))
+        .is_ok();
 
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
@@ -525,8 +537,12 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
         }
     }
 
-    terminal::disable_raw_mode()?;
+    // Restore order: pop keyboard enhancement first, then leave alternate screen
+    if kbd_enhanced {
+        let _ = io::stdout().execute(PopKeyboardEnhancementFlags);
+    }
     io::stdout().execute(LeaveAlternateScreen)?;
+    terminal::disable_raw_mode()?;
 
     Ok(exit_code)
 }
@@ -551,7 +567,7 @@ fn make_textarea_with_text<'a>(text: &str, vim_state: &VimState, theme: &Theme) 
 }
 
 fn configure_textarea(textarea: &mut TextArea, vim_state: &VimState, theme: &Theme) {
-    textarea.set_placeholder_text("Type a message... (Enter send, shift+Enter newline)");
+    textarea.set_placeholder_text("Type a message... (Enter send, Alt+Enter newline)");
     textarea.set_cursor_line_style(ratatui::style::Style::default());
     vim_state.configure_block(textarea, theme);
 }

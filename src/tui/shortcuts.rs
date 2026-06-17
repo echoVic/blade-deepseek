@@ -125,6 +125,10 @@ pub fn idle_shortcut(event: KeyEvent) -> Option<IdleShortcut> {
         ),
         (
             IdleShortcut::Newline,
+            KeyBinding::new(KeyCode::Enter, KeyModifiers::ALT),
+        ),
+        (
+            IdleShortcut::Newline,
             KeyBinding::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
         ),
         (
@@ -325,7 +329,7 @@ pub const SHORTCUT_HINTS: &[ShortcutHint] = &[
     },
     ShortcutHint {
         scope: ShortcutScope::Idle,
-        keys: "shift+enter / ctrl+j",
+        keys: "alt+enter / shift+enter",
         action: "insert newline",
     },
     ShortcutHint {
@@ -479,6 +483,18 @@ mod tests {
         assert_eq!(
             idle_shortcut(key(KeyCode::Char('n'), KeyModifiers::CONTROL)),
             Some(IdleShortcut::HistoryNext)
+        );
+    }
+
+    #[test]
+    fn idle_shortcuts_distinguish_enter_from_shift_enter() {
+        assert_eq!(
+            idle_shortcut(key(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(IdleShortcut::Submit)
+        );
+        assert_eq!(
+            idle_shortcut(key(KeyCode::Enter, KeyModifiers::SHIFT)),
+            Some(IdleShortcut::Newline)
         );
     }
 }

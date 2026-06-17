@@ -21,9 +21,12 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
         return;
     }
 
+    let input_lines = textarea.lines().len().max(1) as u16;
+    let input_height = input_lines + 2;
+
     let chunks = Layout::vertical([
         Constraint::Min(5),
-        Constraint::Length(3),
+        Constraint::Length(input_height),
         Constraint::Length(1),
     ])
     .split(frame.area());

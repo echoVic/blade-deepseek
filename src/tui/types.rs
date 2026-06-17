@@ -381,6 +381,7 @@ impl AppState {
                 self.usage = usage;
             }
             TuiEvent::SessionCompleted { .. } => {
+                self.promote_trailing_reasoning();
                 self.status = AppStatus::Idle;
             }
             TuiEvent::Compacted {
@@ -400,6 +401,14 @@ impl AppState {
                 )));
                 self.status = AppStatus::Idle;
             }
+        }
+    }
+
+    fn promote_trailing_reasoning(&mut self) {
+        if let Some(ChatMessage::Reasoning(text)) = self.messages.last() {
+            let text = text.clone();
+            self.messages.pop();
+            self.messages.push(ChatMessage::Assistant(text));
         }
     }
 
