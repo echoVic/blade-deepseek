@@ -15,6 +15,7 @@ use crate::provider::conversation::{Conversation, RawToolCall};
 use crate::runtime::cancel::CancelToken;
 use crate::tools::ToolRequest;
 
+#[derive(Clone)]
 pub struct ProviderConfig {
     pub api_key: Option<String>,
     pub base_url: Option<String>,

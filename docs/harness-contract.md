@@ -119,7 +119,7 @@ The default (and only production) provider is DeepSeek. Internal test providers 
 
 ### DeepSeek Provider
 
-- Default model: `deepseek-v4-flash`
+- Default model: `auto` (main loop uses `deepseek-v4-pro`, auxiliary tasks use `deepseek-v4-flash`)
 - Default base URL: `https://api.deepseek.com`
 - Streaming: SSE with real-time reasoning/content deltas
 - Authentication: `DEEPSEEK_API_KEY` (required)

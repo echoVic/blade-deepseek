@@ -44,6 +44,11 @@ impl<W: Write> EventSink<W> {
                 )
             }
             EventType::ProviderReplayUpdated => writeln!(self.writer, "provider replay updated"),
+            EventType::ModelRouted => {
+                let actual = event.payload["actual_model"].as_str().unwrap_or("unknown");
+                let reason = event.payload["reason"].as_str().unwrap_or("unknown");
+                writeln!(self.writer, "model routed: {actual} ({reason})")
+            }
             EventType::UsageUpdated => {
                 let total = event.payload["total_tokens"].as_u64().unwrap_or(0);
                 let cost = event.payload["estimated_cost_usd"].as_f64().unwrap_or(0.0);

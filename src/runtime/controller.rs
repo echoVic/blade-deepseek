@@ -10,6 +10,7 @@ use crate::config::{HistoryMode, OutputFormat, RunConfig};
 use crate::event::schema::{EventFactory, RunStatus};
 use crate::event::sink::EventSink;
 use crate::mcp::McpRegistry;
+use crate::model::ModelRouteContext;
 use crate::provider::conversation::Conversation;
 use crate::provider::tool_schema::{
     deepseek_tools_schema_for_type_with_mcp, deepseek_tools_schema_with_mcp,
@@ -105,7 +106,7 @@ fn run_inner(config: RunConfig) -> io::Result<RunStatus> {
         HistoryMode::Record | HistoryMode::Resume(_) => match SessionWriter::start(
             &cwd_path,
             config.provider.as_str(),
-            config.model.clone(),
+            config.model.as_history_value(),
             &prompt,
         ) {
             Ok(writer) => Some(writer),
@@ -122,7 +123,7 @@ fn run_inner(config: RunConfig) -> io::Result<RunStatus> {
             let meta = history::create_fork_meta(
                 &cwd_path,
                 config.provider.as_str(),
-                config.model.clone(),
+                config.model.as_history_value(),
                 &prompt,
                 parent_id,
             );
@@ -239,7 +240,7 @@ fn run_agent_loop(
     let provider_config = ProviderConfig {
         api_key: config.api_key.clone(),
         base_url: config.base_url.clone(),
-        model: config.model.clone(),
+        model: config.model.as_option(),
         tools_override,
         mcp_registry: Some(mcp_registry.clone()),
     };
@@ -312,7 +313,6 @@ fn run_agent_loop(
                 &conversation,
                 &ctx_config,
                 &provider_config,
-                config.summary_model.as_deref(),
             );
             conversation = compaction.conversation;
             let after_messages = conversation.messages.len();
@@ -344,10 +344,21 @@ fn run_agent_loop(
             sink.emit(&events.turn_started(turn, turn_prompt))?;
         }
 
+        let route_decision = config.model.route(ModelRouteContext {
+            subagent_type,
+            subagent_model: None,
+        });
+        cost_tracker.set_model(Some(&route_decision.actual_model));
+        if emit_deltas {
+            sink.emit(&events.model_routed(&route_decision))?;
+        }
+        let mut turn_provider_config = provider_config.clone();
+        turn_provider_config.model = Some(route_decision.actual_model.clone());
+
         let response = provider::call_streaming(
             config.provider,
             &conversation,
-            &provider_config,
+            &turn_provider_config,
             cancel,
             &mut |step| {
                 if !emit_deltas {
@@ -433,10 +444,7 @@ fn run_agent_loop(
                 let provider_config = ProviderConfig {
                     api_key: config.api_key.clone(),
                     base_url: config.base_url.clone(),
-                    model: config
-                        .summary_model
-                        .clone()
-                        .or_else(|| config.model.clone()),
+                    model: Some(crate::model::auxiliary_model().to_string()),
                     tools_override: Some(Vec::new()),
                     mcp_registry: None,
                 };
@@ -797,6 +805,10 @@ fn execute_subagent_batch(
                 let mut child_events =
                     EventFactory::new(format!("subagent-{}", child_tool_request.id));
                 let mut child_sink = EventSink::new(io::sink(), child_config.output_format);
+                let mut child_config = child_config;
+                child_config.model = child_config
+                    .model
+                    .with_subagent_override(request.model.clone());
                 let mut child_cost_tracker = CostTracker::new(child_config.model.as_deref());
                 let child = run_agent_loop(
                     &child_config,
@@ -969,9 +981,13 @@ fn execute_subagent_tool(
         return Ok(tools::ToolResult::failed(tool_request, error, None));
     }
 
-    let mut child_cost_tracker = CostTracker::new(config.model.as_deref());
+    let mut child_config = config.clone();
+    child_config.model = child_config
+        .model
+        .with_subagent_override(request.model.clone());
+    let mut child_cost_tracker = CostTracker::new(child_config.model.as_deref());
     let child = run_agent_loop(
-        config,
+        &child_config,
         cwd,
         events,
         sink,
@@ -1098,6 +1114,7 @@ mod tests {
     use super::*;
     use crate::approval::policy::{ActionKind, ApprovalMode};
     use crate::config::{HistoryMode, OutputFormat, ProviderKind};
+    use crate::model::ModelSelection;
     use crate::runtime::subagent_config::SubagentConfig;
 
     fn config(subagents: SubagentConfig) -> RunConfig {
@@ -1108,7 +1125,7 @@ mod tests {
             approval_mode: ApprovalMode::Suggest,
             provider: ProviderKind::Mock,
             verifier: None,
-            model: None,
+            model: ModelSelection::parse(None).unwrap(),
             api_key: None,
             base_url: None,
             history_mode: HistoryMode::Disabled,
@@ -1118,7 +1135,6 @@ mod tests {
             mcp_servers: Vec::new(),
             hooks: Vec::new(),
             subagents,
-            summary_model: None,
             theme: crate::config::ThemeName::Dark,
             vim_mode: false,
             update_check: false,

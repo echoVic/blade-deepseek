@@ -193,6 +193,11 @@ fn builtin_tools_schema() -> Vec<Value> {
                             "type": "string",
                             "enum": ["general", "code_reviewer", "test_writer", "debugger", "documenter"],
                             "description": "Optional specialized agent type that restricts tools and provides focused expertise"
+                        },
+                        "model": {
+                            "type": "string",
+                            "enum": ["auto", "deepseek-v4-flash", "deepseek-v4-pro"],
+                            "description": "Optional model override for this child agent. auto uses Orca's router, flash is faster, pro is stronger for deep reasoning."
                         }
                     },
                     "required": ["description", "prompt"]

@@ -72,6 +72,88 @@ fn exec_emits_usage_event_when_provider_reports_usage() {
 }
 
 #[test]
+fn exec_auto_model_defaults_to_pro() {
+    let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .args([
+            "exec",
+            "--output-format",
+            "jsonl",
+            "--provider",
+            "mock",
+            "hello",
+        ])
+        .output()
+        .expect("run orca");
+
+    assert_eq!(output.status.code(), Some(0));
+
+    let events = parse_jsonl(&output.stdout);
+    let routed = events
+        .iter()
+        .find(|event| event["type"] == "model.routed")
+        .expect("model routed event");
+    assert_eq!(routed["payload"]["requested_model"], Value::Null);
+    assert_eq!(routed["payload"]["actual_model"], "deepseek-v4-pro");
+    assert_eq!(routed["payload"]["reason"], "default_pro");
+}
+
+#[test]
+fn exec_auto_model_routes_any_prompt_to_pro() {
+    let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .args([
+            "exec",
+            "--output-format",
+            "jsonl",
+            "--provider",
+            "mock",
+            "--model",
+            "auto",
+            "review this migration plan",
+        ])
+        .output()
+        .expect("run orca");
+
+    assert_eq!(output.status.code(), Some(0));
+
+    let events = parse_jsonl(&output.stdout);
+    let routed = events
+        .iter()
+        .find(|event| event["type"] == "model.routed")
+        .expect("model routed event");
+    assert_eq!(routed["payload"]["requested_model"], "auto");
+    assert_eq!(routed["payload"]["actual_model"], "deepseek-v4-pro");
+    assert_eq!(routed["payload"]["reason"], "default_pro");
+}
+
+#[test]
+fn exec_explicit_model_disables_auto_route() {
+    let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .args([
+            "exec",
+            "--output-format",
+            "jsonl",
+            "--provider",
+            "mock",
+            "--model",
+            "deepseek-v4-flash",
+            "review this migration plan",
+        ])
+        .output()
+        .expect("run orca");
+
+    assert_eq!(output.status.code(), Some(0));
+
+    let events = parse_jsonl(&output.stdout);
+    let routed = events
+        .iter()
+        .find(|event| event["type"] == "model.routed")
+        .expect("model routed event");
+    assert_eq!(routed["payload"]["requested_model"], "deepseek-v4-flash");
+    assert_eq!(routed["payload"]["actual_model"], "deepseek-v4-flash");
+    assert_eq!(routed["payload"]["reason"], "explicit");
+}
+
+#[test]
 fn exec_stops_when_usage_exceeds_max_budget() {
     let output = Command::new(env!("CARGO_BIN_EXE_orca"))
         .args([

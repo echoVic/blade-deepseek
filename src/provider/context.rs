@@ -119,14 +119,12 @@ pub fn compact_with_summary(
     conversation: &Conversation,
     context_config: &ContextConfig,
     provider_config: &ProviderConfig,
-    summary_model: Option<&str>,
 ) -> CompactionResult {
     match summarize_collapsed_messages(
         provider_kind,
         conversation,
         context_config,
         provider_config,
-        summary_model,
     ) {
         Some((conversation, summary)) => CompactionResult {
             conversation,
@@ -144,7 +142,6 @@ fn summarize_collapsed_messages(
     conversation: &Conversation,
     context_config: &ContextConfig,
     provider_config: &ProviderConfig,
-    summary_model: Option<&str>,
 ) -> Option<(Conversation, String)> {
     let (system_msg, collapsed, kept) =
         partition_for_compaction(conversation, context_config, &DefaultTokenCounter)?;
@@ -155,7 +152,6 @@ fn summarize_collapsed_messages(
     let summary = request_summary(
         provider_kind,
         provider_config,
-        summary_model,
         &format_messages(&collapsed),
     )?;
 
@@ -214,21 +210,18 @@ fn partition_for_compaction(
 fn request_summary(
     provider_kind: ProviderKind,
     provider_config: &ProviderConfig,
-    summary_model: Option<&str>,
     collapsed_text: &str,
 ) -> Option<String> {
-    let mut summary_config = ProviderConfig {
+    let summary_config = ProviderConfig {
         api_key: provider_config.api_key.clone(),
         base_url: provider_config.base_url.clone(),
-        model: summary_model
-            .map(str::to_string)
-            .or_else(|| provider_config.model.clone()),
+        model: provider_config
+            .model
+            .clone()
+            .or_else(|| Some(crate::model::auxiliary_model().to_string())),
         tools_override: Some(Vec::new()),
         mcp_registry: None,
     };
-    if summary_config.model.is_none() {
-        summary_config.model = Some("deepseek-v4-flash".to_string());
-    }
 
     let mut summary_conversation = Conversation::new();
     summary_conversation.add_system(
@@ -570,7 +563,6 @@ mod tests {
             &conv,
             &config,
             &provider_config,
-            Some("deepseek-v4-flash"),
         );
 
         assert!(matches!(result.kind, CompactionKind::LocalTruncation));

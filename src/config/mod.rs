@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::approval::policy::{ApprovalMode, PermissionRules};
 use crate::mcp::types::McpServerConfig;
+use crate::model::ModelSelection;
 use crate::runtime::hooks::HookConfig;
 use crate::runtime::subagent_config::SubagentConfig;
 
@@ -63,7 +64,7 @@ pub struct RunConfig {
     pub approval_mode: ApprovalMode,
     pub provider: ProviderKind,
     pub verifier: Option<String>,
-    pub model: Option<String>,
+    pub model: ModelSelection,
     pub api_key: Option<String>,
     pub base_url: Option<String>,
     pub mcp_servers: Vec<McpServerConfig>,
@@ -73,7 +74,6 @@ pub struct RunConfig {
     pub permission_rules: PermissionRules,
     pub max_budget_usd: Option<f64>,
     pub subagents: SubagentConfig,
-    pub summary_model: Option<String>,
     pub theme: ThemeName,
     pub vim_mode: bool,
     pub update_check: bool,

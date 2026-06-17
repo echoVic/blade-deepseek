@@ -16,6 +16,7 @@ use tui_textarea::{CursorMove, Input, TextArea};
 
 use crate::config::file::save_api_key;
 use crate::config::{HistoryMode, RunConfig};
+use crate::model::ModelSelection;
 use crate::runtime::cancel::CancelToken;
 use crate::runtime::history;
 use crate::tui::bridge;
@@ -26,7 +27,9 @@ use crate::tui::shortcuts::{
     global_shortcut, idle_shortcut, running_shortcut,
 };
 use crate::tui::theme::Theme;
-use crate::tui::types::{AppState, AppStatus, ChatMessage, SlashMenu, SlashMenuItem, SubMenu, TuiEvent, UserAction};
+use crate::tui::types::{
+    AppState, AppStatus, ChatMessage, SlashMenu, SlashMenuItem, SubMenu, TuiEvent, UserAction,
+};
 use crate::tui::ui;
 use crate::tui::vim::VimState;
 
@@ -60,10 +63,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
     let (event_tx, event_rx) = mpsc::channel::<TuiEvent>();
     let (action_tx, action_rx) = mpsc::channel::<UserAction>();
 
-    let model_name = config
-        .model
-        .clone()
-        .unwrap_or_else(|| "deepseek-v4-flash".to_string());
+    let model_name = config.model.display_name().to_string();
 
     let needs_setup = config.api_key.is_none();
     let should_show_picker = config.show_session_picker
@@ -392,7 +392,17 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                 if state.status == AppStatus::Idle {
                     // Handle slash menu if open
                     if state.slash_menu.is_some() {
-                        if handle_slash_menu_key(&ev, key, &mut state, &mut config, &shared_config, &action_tx, &mut textarea, &vim_state, &theme) {
+                        if handle_slash_menu_key(
+                            &ev,
+                            key,
+                            &mut state,
+                            &mut config,
+                            &shared_config,
+                            &action_tx,
+                            &mut textarea,
+                            &vim_state,
+                            &theme,
+                        ) {
                             continue;
                         }
                     }
@@ -643,9 +653,9 @@ fn handle_slash_menu_key(
                 // Execute the sub-command
                 if sub.title == "/model" {
                     if let Ok(()) = commands::validate_model(&chosen) {
-                        config.model = Some(chosen.clone());
+                        config.model = ModelSelection::from_unchecked(Some(chosen.clone()));
                         if let Ok(mut cfg) = shared_config.lock() {
-                            cfg.model = Some(chosen.clone());
+                            cfg.model = ModelSelection::from_unchecked(Some(chosen.clone()));
                         }
                         state.model_name = chosen.clone();
                         state
@@ -739,14 +749,14 @@ fn handle_slash_menu_key(
                             state.status = AppStatus::SessionPicker;
                         }
                         Ok(_) => {
-                            state.messages.push(ChatMessage::System(
-                                "No saved sessions.".to_string(),
-                            ));
+                            state
+                                .messages
+                                .push(ChatMessage::System("No saved sessions.".to_string()));
                         }
                         Err(e) => {
-                            state.messages.push(ChatMessage::Error(format!(
-                                "failed to list history: {e}"
-                            )));
+                            state
+                                .messages
+                                .push(ChatMessage::Error(format!("failed to list history: {e}")));
                         }
                     }
                 }
@@ -755,13 +765,9 @@ fn handle_slash_menu_key(
                     *textarea = make_textarea_with_text(selected_cmd, vim_state, theme);
                     state.slash_menu = None;
                     // Auto-execute the command
-                    if let Some(outcome) = handle_slash_command(
-                        selected_cmd,
-                        config,
-                        shared_config,
-                        state,
-                        action_tx,
-                    ) {
+                    if let Some(outcome) =
+                        handle_slash_command(selected_cmd, config, shared_config, state, action_tx)
+                    {
                         match outcome {
                             SlashOutcome::Continue => {
                                 *textarea = make_textarea(vim_state, theme);
@@ -958,9 +964,9 @@ fn handle_slash_command(
         }
         SlashCommand::Model(Some(model)) => match commands::validate_model(&model) {
             Ok(()) => {
-                config.model = Some(model.clone());
+                config.model = ModelSelection::from_unchecked(Some(model.clone()));
                 if let Ok(mut cfg) = shared_config.lock() {
-                    cfg.model = Some(model.clone());
+                    cfg.model = ModelSelection::from_unchecked(Some(model.clone()));
                 }
                 state.model_name = model.clone();
                 state

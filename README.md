@@ -34,14 +34,14 @@ Priority chain (highest wins): Environment variables > CLI arguments > Config fi
 `~/.orca/config.toml`:
 
 ```toml
-model = "deepseek-v4-flash"
+model = "auto"
 api_key = "sk-..."
 base_url = "https://api.deepseek.com"
 ```
 
 ### Defaults
 
-- Model: `deepseek-v4-flash`
+- Model: `auto` (main loop uses `deepseek-v4-pro`, auxiliary tasks use `deepseek-v4-flash`)
 - Base URL: `https://api.deepseek.com`
 - Approval mode: `suggest`
 - Output format: `text`
@@ -58,7 +58,7 @@ Options:
 - `--output-format text|jsonl` — Output format (default: text)
 - `--cwd <path>` — Workspace directory
 - `--approval-mode suggest|auto-edit|full-auto` — Approval policy
-- `--model deepseek-v4-flash|deepseek-v4-pro` — Model to use
+- `--model auto|deepseek-v4-flash|deepseek-v4-pro` — Model to use; `auto` defaults to Pro for the main loop and Flash for auxiliary tasks
 - `--base-url <url>` — API base URL
 - `--verifier <command>` — Post-run verification command
 - `--resume <session|latest>` — Continue from a saved conversation transcript

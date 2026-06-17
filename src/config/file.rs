@@ -23,7 +23,6 @@ pub struct FileConfig {
     pub permissions: PermissionRules,
     #[serde(default)]
     pub subagents: SubagentConfig,
-    pub summary_model: Option<String>,
     #[serde(default)]
     pub theme: ThemeName,
     #[serde(default)]
@@ -183,7 +182,6 @@ max_parallel = 6
     #[test]
     fn parse_experience_config() {
         let toml = r#"
-summary_model = "deepseek-v4-flash"
 theme = "solarized"
 vim_mode = true
 update_check = false
@@ -191,7 +189,6 @@ desktop_notifications = true
 auto_memory = true
 "#;
         let config: FileConfig = toml::from_str(toml).unwrap();
-        assert_eq!(config.summary_model.as_deref(), Some("deepseek-v4-flash"));
         assert_eq!(config.theme, ThemeName::Solarized);
         assert!(config.vim_mode);
         assert!(!config.update_check);

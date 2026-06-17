@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::approval::policy::{ApprovalRequest, ApprovalResolution};
+use crate::model::ModelRouteDecision;
 use crate::provider::ProviderReplayState;
 use crate::runtime::cost::UsageTotals;
 use crate::tools::{ToolRequest, ToolResult};
@@ -36,6 +37,8 @@ pub enum EventType {
     ProviderReplayUpdated,
     #[serde(rename = "usage.updated")]
     UsageUpdated,
+    #[serde(rename = "model.routed")]
+    ModelRouted,
     #[serde(rename = "approval.requested")]
     ApprovalRequested,
     #[serde(rename = "approval.resolved")]
@@ -167,6 +170,17 @@ impl EventFactory {
                 "cache_tokens": usage.cache_tokens,
                 "total_tokens": usage.total_tokens(),
                 "estimated_cost_usd": usage.estimated_cost_usd
+            }),
+        )
+    }
+
+    pub fn model_routed(&mut self, decision: &ModelRouteDecision) -> EventEnvelope {
+        self.make(
+            EventType::ModelRouted,
+            json!({
+                "requested_model": decision.requested_model,
+                "actual_model": decision.actual_model,
+                "reason": decision.reason
             }),
         )
     }

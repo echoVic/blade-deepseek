@@ -5,6 +5,7 @@ use std::thread;
 use crate::approval::policy::{ApprovalDecision, ApprovalPolicy, ApprovalRequest};
 use crate::config::RunConfig;
 use crate::mcp::McpRegistry;
+use crate::model::ModelRouteContext;
 use crate::provider::conversation::Conversation;
 use crate::provider::tool_schema::{
     deepseek_tools_schema_for_type_with_mcp, deepseek_tools_schema_with_mcp,
@@ -88,7 +89,7 @@ impl TuiConversationSession {
                 let meta = history::create_meta(
                     &cwd,
                     config.provider.as_str(),
-                    config.model.clone(),
+                    config.model.as_history_value(),
                     prompt_for_title,
                 );
                 start_writer_with_messages(meta, &conversation)
@@ -100,7 +101,7 @@ impl TuiConversationSession {
                 let meta = history::create_fork_meta(
                     &cwd,
                     config.provider.as_str(),
-                    config.model.clone(),
+                    config.model.as_history_value(),
                     prompt_for_title,
                     parent_id,
                 );
@@ -112,7 +113,7 @@ impl TuiConversationSession {
             conversation,
             writer,
             instructions,
-            cost_tracker: CostTracker::new(config.model.as_deref()),
+            cost_tracker: CostTracker::new(None),
             mcp_registry,
             hooks,
             memory,
@@ -160,7 +161,7 @@ impl TuiConversationSession {
         let provider_config = ProviderConfig {
             api_key: config.api_key.clone(),
             base_url: config.base_url.clone(),
-            model: config.model.clone(),
+            model: Some(crate::model::auxiliary_model().to_string()),
             tools_override: Some(Vec::new()),
             mcp_registry: None,
         };
@@ -169,7 +170,6 @@ impl TuiConversationSession {
             &self.conversation,
             &provider::context::ContextConfig::default(),
             &provider_config,
-            config.summary_model.as_deref(),
         );
         self.conversation = compaction.conversation;
         let after_messages = self.conversation.messages.len();
@@ -235,7 +235,7 @@ pub fn run_agent_for_tui(
     let provider_config = ProviderConfig {
         api_key: config.api_key.clone(),
         base_url: config.base_url.clone(),
-        model: config.model.clone(),
+        model: Some(crate::model::FLASH_MODEL.to_string()),
         tools_override: Some(deepseek_tools_schema_with_mcp(Some(&session.mcp_registry))),
         mcp_registry: Some(session.mcp_registry.clone()),
     };
@@ -282,7 +282,6 @@ pub fn run_agent_for_tui(
                 &session.conversation,
                 &ctx_config,
                 &provider_config,
-                config.summary_model.as_deref(),
             );
             session.conversation = compaction.conversation;
             let after_messages = session.conversation.messages.len();
@@ -311,11 +310,21 @@ pub fn run_agent_for_tui(
 
         let _ = event_tx.send(TuiEvent::TurnStarted { turn });
 
+        let route_decision = config.model.route(ModelRouteContext {
+            subagent_type: &SubagentType::General,
+            subagent_model: None,
+        });
+        session
+            .cost_tracker
+            .set_model(Some(&route_decision.actual_model));
+        let mut turn_provider_config = provider_config.clone();
+        turn_provider_config.model = Some(route_decision.actual_model);
+
         let tx = event_tx.clone();
         let response = provider::call_streaming(
             config.provider,
             &session.conversation,
-            &provider_config,
+            &turn_provider_config,
             cancel,
             &mut |step| match step {
                 ProviderStep::ReasoningDelta(text) => {
@@ -389,10 +398,7 @@ pub fn run_agent_for_tui(
                 let provider_config = ProviderConfig {
                     api_key: config.api_key.clone(),
                     base_url: config.base_url.clone(),
-                    model: config
-                        .summary_model
-                        .clone()
-                        .or_else(|| config.model.clone()),
+                    model: Some(crate::model::auxiliary_model().to_string()),
                     tools_override: Some(Vec::new()),
                     mcp_registry: None,
                 };
@@ -564,12 +570,15 @@ fn execute_subagent_batch_for_tui(
             results[idx] = Some((
                 true,
                 tools::ToolResult::failed(tool_request, error, None),
-                CostTracker::new(config.model.as_deref()),
+                CostTracker::new(None),
             ));
             continue;
         }
 
-        let child_config = config.clone();
+        let mut child_config = config.clone();
+        child_config.model = child_config
+            .model
+            .with_subagent_override(request.model.clone());
         let child_cwd = cwd.to_path_buf();
         let child_prompt = request.prompt;
         let child_instructions = instructions.clone();
@@ -609,7 +618,7 @@ fn execute_subagent_batch_for_tui(
                     output: None,
                     error: result.error.clone(),
                 });
-                results[idx] = Some((true, result, CostTracker::new(config.model.as_deref())));
+                results[idx] = Some((true, result, CostTracker::new(None)));
                 continue;
             }
         };
@@ -813,12 +822,16 @@ fn execute_subagent_for_tui(
         });
         return (
             tools::ToolResult::failed(tool_request, error, None),
-            CostTracker::new(config.model.as_deref()),
+            CostTracker::new(None),
         );
     }
 
+    let mut child_config = config.clone();
+    child_config.model = child_config
+        .model
+        .with_subagent_override(request.model.clone());
     let child = run_child_agent_for_tui(
-        config,
+        &child_config,
         cwd,
         &request.prompt,
         event_tx,
@@ -930,7 +943,7 @@ fn run_child_agent_for_tui(
     let provider_config = ProviderConfig {
         api_key: config.api_key.clone(),
         base_url: config.base_url.clone(),
-        model: config.model.clone(),
+        model: Some(crate::model::FLASH_MODEL.to_string()),
         tools_override: Some(deepseek_tools_schema_for_type_with_mcp(
             subagent_type,
             Some(&mcp_registry),
@@ -952,7 +965,7 @@ fn run_child_agent_for_tui(
 
     let policy = ApprovalPolicy::new(config.approval_mode)
         .with_permission_rules(config.permission_rules.clone());
-    let mut child_cost_tracker = CostTracker::new(config.model.as_deref());
+    let mut child_cost_tracker = CostTracker::new(None);
     let mut turn: u32 = 0;
     loop {
         turn += 1;
@@ -970,10 +983,18 @@ fn run_child_agent_for_tui(
         }
 
         let child_cancel = CancelToken::new();
+        let route_decision = config.model.route(ModelRouteContext {
+            subagent_type,
+            subagent_model: None,
+        });
+        child_cost_tracker.set_model(Some(&route_decision.actual_model));
+        let mut turn_provider_config = provider_config.clone();
+        turn_provider_config.model = Some(route_decision.actual_model);
+
         let response = provider::call_streaming(
             config.provider,
             &conversation,
-            &provider_config,
+            &turn_provider_config,
             &child_cancel,
             &mut |_| {},
         );
@@ -1087,6 +1108,7 @@ mod tests {
 
     use crate::approval::policy::ApprovalMode;
     use crate::config::{HistoryMode, OutputFormat, ProviderKind, RunConfig};
+    use crate::model::ModelSelection;
 
     fn config() -> RunConfig {
         RunConfig {
@@ -1096,7 +1118,7 @@ mod tests {
             approval_mode: ApprovalMode::Suggest,
             provider: ProviderKind::Mock,
             verifier: None,
-            model: None,
+            model: ModelSelection::parse(None).unwrap(),
             api_key: None,
             base_url: None,
             history_mode: HistoryMode::Disabled,
@@ -1106,7 +1128,6 @@ mod tests {
             mcp_servers: Vec::new(),
             hooks: Vec::new(),
             subagents: Default::default(),
-            summary_model: None,
             theme: crate::config::ThemeName::Dark,
             vim_mode: false,
             update_check: false,

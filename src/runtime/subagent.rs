@@ -6,6 +6,7 @@ pub struct SubagentRequest {
     pub description: String,
     pub prompt: String,
     pub subagent_type: SubagentType,
+    pub model: Option<String>,
 }
 
 pub fn extract_subagent_field(tool_request: &ToolRequest, field: &str) -> Option<String> {
@@ -25,11 +26,14 @@ pub fn create_subagent_request(tool_request: &ToolRequest) -> SubagentRequest {
     let subagent_type = extract_subagent_field(tool_request, "subagent_type")
         .map(|s| SubagentType::from_str(&s))
         .unwrap_or_default();
+    let model = extract_subagent_field(tool_request, "model")
+        .filter(|model| crate::model::validate_model(model).is_ok());
 
     SubagentRequest {
         description,
         prompt,
         subagent_type,
+        model,
     }
 }
 
@@ -50,7 +54,8 @@ mod tests {
                 serde_json::json!({
                     "description": "review code",
                     "prompt": "review src/main.rs for bugs",
-                    "subagent_type": "code_reviewer"
+                    "subagent_type": "code_reviewer",
+                    "model": "deepseek-v4-pro"
                 })
                 .to_string(),
             ),
@@ -59,6 +64,7 @@ mod tests {
         assert_eq!(result.description, "review code");
         assert_eq!(result.prompt, "review src/main.rs for bugs");
         assert_eq!(result.subagent_type, SubagentType::CodeReviewer);
+        assert_eq!(result.model.as_deref(), Some("deepseek-v4-pro"));
     }
 
     #[test]

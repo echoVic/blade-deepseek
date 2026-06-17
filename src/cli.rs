@@ -6,6 +6,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use crate::approval::policy::ApprovalMode;
 use crate::config::file;
 use crate::config::{HistoryMode, OutputFormat, ProviderKind, RunConfig};
+use crate::model::ModelSelection;
 use crate::runtime::controller;
 use crate::runtime::history;
 use crate::tui::app;
@@ -215,7 +216,7 @@ fn run_exec(args: ExecArgs) -> i32 {
         .model
         .or_else(|| env::var("DEEPSEEK_MODEL").ok())
         .or(file_config.model);
-    let model = match validate_model_config(model) {
+    let model = match ModelSelection::parse(model) {
         Ok(model) => model,
         Err(error) => {
             eprintln!("orca: {error}");
@@ -249,7 +250,6 @@ fn run_exec(args: ExecArgs) -> i32 {
         mcp_servers: file_config.mcp_servers,
         hooks: file_config.hooks,
         subagents: file_config.subagents.normalized(),
-        summary_model: file_config.summary_model,
         theme: file_config.theme,
         vim_mode: file_config.vim_mode,
         update_check: file_config.update_check,
@@ -482,7 +482,7 @@ fn run_placeholder(cli: Cli) -> i32 {
     let base_url = env::var("DEEPSEEK_BASE_URL").ok().or(file_config.base_url);
 
     let model = env::var("DEEPSEEK_MODEL").ok().or(file_config.model);
-    let model = match validate_model_config(model) {
+    let model = match ModelSelection::parse(model) {
         Ok(model) => model,
         Err(error) => {
             eprintln!("orca: {error}");
@@ -514,7 +514,6 @@ fn run_placeholder(cli: Cli) -> i32 {
         mcp_servers: file_config.mcp_servers,
         hooks: file_config.hooks,
         subagents: file_config.subagents.normalized(),
-        summary_model: file_config.summary_model,
         theme: file_config.theme,
         vim_mode: file_config.vim_mode,
         update_check: file_config.update_check,
@@ -523,11 +522,4 @@ fn run_placeholder(cli: Cli) -> i32 {
     };
 
     app::run_tui(config)
-}
-
-fn validate_model_config(model: Option<String>) -> Result<Option<String>, String> {
-    if let Some(model) = model.as_deref() {
-        crate::tui::commands::validate_model(model)?;
-    }
-    Ok(model)
 }

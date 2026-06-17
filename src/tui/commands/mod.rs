@@ -46,7 +46,7 @@ pub fn parse(input: &str) -> Option<SlashCommand> {
 pub fn all_commands() -> &'static [(&'static str, &'static str)] {
     &[
         ("/help", "Show available commands"),
-        ("/model", "Switch or show current model"),
+        ("/model", "Switch model: auto, flash, or pro"),
         ("/compact", "Compress conversation context"),
         ("/clear", "Clear message history"),
         ("/cost", "Show session cost"),
@@ -59,16 +59,11 @@ pub fn all_commands() -> &'static [(&'static str, &'static str)] {
 }
 
 pub fn available_models() -> &'static [&'static str] {
-    &["deepseek-v4-flash", "deepseek-v4-pro"]
+    crate::model::allowed_models()
 }
 
 pub fn validate_model(model: &str) -> Result<(), String> {
-    match model {
-        "deepseek-v4-flash" | "deepseek-v4-pro" => Ok(()),
-        other => Err(format!(
-            "unsupported model '{other}'. Allowed models: deepseek-v4-flash, deepseek-v4-pro"
-        )),
-    }
+    crate::model::validate_model(model)
 }
 
 #[cfg(test)]
@@ -103,6 +98,7 @@ mod tests {
 
     #[test]
     fn validates_only_v4_models() {
+        assert!(validate_model("auto").is_ok());
         assert!(validate_model("deepseek-v4-flash").is_ok());
         assert!(validate_model("deepseek-v4-pro").is_ok());
         assert!(validate_model("deepseek-reasoner").is_err());
