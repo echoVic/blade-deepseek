@@ -145,6 +145,8 @@ pub struct AppState {
     pub session_picker_selected: usize,
     pub usage: UsageTotals,
     pub slash_menu: Option<SlashMenu>,
+    pub mention_candidates: Vec<String>,
+    pub mention_selected: usize,
 }
 
 impl AppState {
@@ -170,6 +172,8 @@ impl AppState {
             session_picker_selected: 0,
             usage: UsageTotals::default(),
             slash_menu: None,
+            mention_candidates: Vec::new(),
+            mention_selected: 0,
         }
     }
 

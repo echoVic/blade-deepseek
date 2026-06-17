@@ -16,12 +16,12 @@ use tui_textarea::{CursorMove, Input, TextArea};
 
 use crate::config::file::save_api_key;
 use crate::config::{HistoryMode, RunConfig};
+use crate::mentions;
 use crate::model::ModelSelection;
 use crate::runtime::cancel::CancelToken;
 use crate::runtime::history;
 use crate::tui::bridge;
 use crate::tui::commands::{self, SlashCommand};
-use crate::tui::mentions;
 use crate::tui::shortcuts::{
     ApprovalShortcut, GlobalShortcut, IdleShortcut, RunningShortcut, approval_shortcut,
     global_shortcut, idle_shortcut, running_shortcut,
@@ -407,6 +407,20 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                         }
                     }
 
+                    if !state.mention_candidates.is_empty() {
+                        if handle_mention_menu_key(
+                            &ev,
+                            key,
+                            &mut state,
+                            &config,
+                            &mut textarea,
+                            &vim_state,
+                            &theme,
+                        ) {
+                            continue;
+                        }
+                    }
+
                     match idle_shortcut(*key) {
                         Some(IdleShortcut::Submit) => {
                             state.slash_menu = None;
@@ -495,8 +509,9 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                                     .cwd
                                     .clone()
                                     .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+                                let text = textarea_text(&textarea);
                                 if let Some(completed) =
-                                    mentions::complete_file_mention(&textarea_text(&textarea), &cwd)
+                                    mentions::complete_file_mention(&text, &cwd)
                                 {
                                     textarea =
                                         make_textarea_with_text(&completed, &vim_state, &theme);
@@ -512,6 +527,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                             if changed {
                                 state.reset_history_navigation();
                                 update_slash_menu(&textarea, &mut state);
+                                update_mention_candidates(&textarea, &mut state, &config);
                             }
                         }
                     }
@@ -615,6 +631,83 @@ fn update_slash_menu(textarea: &TextArea, state: &mut AppState) {
         }
     } else {
         state.slash_menu = None;
+    }
+}
+
+fn update_mention_candidates(textarea: &TextArea, state: &mut AppState, config: &RunConfig) {
+    if state.slash_menu.is_some() {
+        state.mention_candidates.clear();
+        state.mention_selected = 0;
+        return;
+    }
+    let text = textarea_text(textarea);
+    let has_at_token = text.rfind('@').map_or(false, |pos| {
+        pos == 0 || text.as_bytes()[pos - 1].is_ascii_whitespace()
+    });
+    if !has_at_token {
+        state.mention_candidates.clear();
+        state.mention_selected = 0;
+        return;
+    }
+    let cwd = config
+        .cwd
+        .clone()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let candidates = mentions::list_mention_candidates(&text, &cwd);
+    if candidates != state.mention_candidates {
+        state.mention_selected = 0;
+    }
+    state.mention_candidates = candidates;
+}
+
+fn handle_mention_menu_key(
+    ev: &Event,
+    key: &crossterm::event::KeyEvent,
+    state: &mut AppState,
+    config: &RunConfig,
+    textarea: &mut TextArea,
+    vim_state: &VimState,
+    theme: &Theme,
+) -> bool {
+    match key.code {
+        KeyCode::Up => {
+            state.mention_selected = state.mention_selected.saturating_sub(1);
+            true
+        }
+        KeyCode::Down => {
+            let max = state.mention_candidates.len().saturating_sub(1);
+            if state.mention_selected < max {
+                state.mention_selected += 1;
+            }
+            true
+        }
+        KeyCode::Tab | KeyCode::Enter => {
+            if let Some(candidate) = state.mention_candidates.get(state.mention_selected).cloned() {
+                let text = textarea_text(textarea);
+                let applied = mentions::apply_mention_selection(&text, &candidate);
+                *textarea = make_textarea_with_text(&applied, vim_state, theme);
+                state.mention_candidates.clear();
+                state.mention_selected = 0;
+                let cwd = config
+                    .cwd
+                    .clone()
+                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+                if candidate.ends_with('/') {
+                    state.mention_candidates = mentions::list_mention_candidates(&applied, &cwd);
+                }
+            }
+            true
+        }
+        KeyCode::Esc => {
+            state.mention_candidates.clear();
+            state.mention_selected = 0;
+            true
+        }
+        _ => {
+            textarea.input(Input::from(ev.clone()));
+            update_mention_candidates(textarea, state, config);
+            true
+        }
     }
 }
 

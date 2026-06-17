@@ -204,6 +204,17 @@ fn run_exec(args: ExecArgs) -> i32 {
     let file_config = file::load_user_config();
 
     let prompt = args.prompt.join(" ");
+    let cwd_for_mentions = args
+        .cwd
+        .clone()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let prompt = match crate::mentions::expand_file_mentions(&prompt, &cwd_for_mentions) {
+        Ok(prompt) => prompt,
+        Err(error) => {
+            eprintln!("orca: {error}");
+            return 1;
+        }
+    };
 
     let api_key = env::var("DEEPSEEK_API_KEY").ok().or(file_config.api_key);
 

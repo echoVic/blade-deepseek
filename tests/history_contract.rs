@@ -40,6 +40,41 @@ fn exec_saves_history_and_history_commands_can_read_it() {
 }
 
 #[test]
+fn exec_expands_file_mentions_before_saving_history() {
+    let home = TempDir::new().expect("temp home");
+    let project = TempDir::new().expect("temp project");
+    std::fs::write(project.path().join("notes.txt"), "alpha\nbeta\ngamma\n")
+        .expect("write mentioned file");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .env("ORCA_HOME", home.path())
+        .arg("exec")
+        .arg("--provider")
+        .arg("mock")
+        .arg("--cwd")
+        .arg(project.path())
+        .arg("summarize")
+        .arg("@notes.txt#L2")
+        .output()
+        .expect("run orca");
+
+    assert_eq!(output.status.code(), Some(0));
+
+    let show = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .env("ORCA_HOME", home.path())
+        .args(["history", "show", "latest"])
+        .output()
+        .expect("show history");
+
+    assert_eq!(show.status.code(), Some(0));
+    let show_stdout = String::from_utf8_lossy(&show.stdout);
+    assert!(show_stdout.contains("summarize @notes.txt#L2"));
+    assert!(show_stdout.contains(r#"<file path="notes.txt" range="L2">"#));
+    assert!(show_stdout.contains("beta</file>"));
+    assert!(!show_stdout.contains("alpha\nbeta"));
+}
+
+#[test]
 fn exec_persists_usage_in_history() {
     let home = TempDir::new().expect("temp home");
 

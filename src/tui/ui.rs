@@ -39,6 +39,10 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
         render_slash_menu(frame, chunks[1], state, theme);
     }
 
+    if !state.mention_candidates.is_empty() && state.slash_menu.is_none() {
+        render_mention_candidates(frame, chunks[1], state, theme);
+    }
+
     if state.status == AppStatus::WaitingApproval {
         render_approval_dialog(frame, state, theme);
     }
@@ -506,6 +510,46 @@ fn render_slash_menu(frame: &mut Frame, input_area: Rect, state: &AppState, them
     let block = Block::default()
         .borders(Borders::ALL)
         .title(title)
+        .border_style(Style::default().fg(theme.border));
+
+    let paragraph = Paragraph::new(lines).block(block);
+    frame.render_widget(paragraph, popup_area);
+}
+
+fn render_mention_candidates(frame: &mut Frame, input_area: Rect, state: &AppState, theme: &Theme) {
+    let candidates = &state.mention_candidates;
+    if candidates.is_empty() {
+        return;
+    }
+
+    let item_count = candidates.len().min(12) as u16;
+    let height = item_count + 2;
+    let width = input_area.width;
+    let y = input_area.y.saturating_sub(height);
+    let popup_area = Rect::new(input_area.x, y, width, height);
+
+    frame.render_widget(Clear, popup_area);
+
+    let lines: Vec<Line> = candidates
+        .iter()
+        .take(12)
+        .enumerate()
+        .map(|(i, c)| {
+            let prefix = if i == state.mention_selected { "▸ " } else { "  " };
+            let style = if i == state.mention_selected {
+                Style::default()
+                    .fg(theme.border)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.text)
+            };
+            Line::from(Span::styled(format!("{prefix}@{c}"), style))
+        })
+        .collect();
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Files ")
         .border_style(Style::default().fg(theme.border));
 
     let paragraph = Paragraph::new(lines).block(block);

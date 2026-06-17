@@ -3,6 +3,7 @@ mod cli;
 mod config;
 mod event;
 mod mcp;
+mod mentions;
 mod model;
 mod provider;
 mod runtime;
