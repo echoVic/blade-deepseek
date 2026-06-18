@@ -145,6 +145,13 @@ impl TuiConversationSession {
         self.cost_tracker.set_model(model);
     }
 
+    pub fn add_pinned_context(&mut self, content: String) {
+        self.conversation.add_user_pinned(content);
+        if let Some(message) = self.conversation.messages.last().cloned() {
+            self.append_message(&message);
+        }
+    }
+
     pub fn compact(&mut self, config: &RunConfig, cwd: &Path) -> (usize, usize) {
         let before_messages = self.conversation.messages.len();
         let _ = self.hooks.run(
@@ -168,7 +175,7 @@ impl TuiConversationSession {
         let compaction = provider::context::compact_with_summary(
             config.provider,
             &self.conversation,
-            &provider::context::ContextConfig::default(),
+            &provider::context::ContextConfig::for_model(config.model.as_option().as_deref()),
             &provider_config,
         );
         self.conversation = compaction.conversation;
@@ -240,7 +247,8 @@ pub fn run_agent_for_tui(
         mcp_registry: Some(session.mcp_registry.clone()),
     };
 
-    let ctx_config = provider::context::ContextConfig::default();
+    let budget_model = config.model.as_option();
+    let ctx_config = provider::context::ContextConfig::for_model(budget_model.as_deref());
     let policy = ApprovalPolicy::new(config.approval_mode)
         .with_permission_rules(config.permission_rules.clone());
     session.conversation.add_user(prompt.to_string());
@@ -249,6 +257,7 @@ pub fn run_agent_for_tui(
     }
 
     let mut turn: u32 = 0;
+    let mut reactive_compacted = false;
 
     loop {
         turn += 1;
@@ -318,7 +327,11 @@ pub fn run_agent_for_tui(
             .cost_tracker
             .set_model(Some(&route_decision.actual_model));
         let mut turn_provider_config = provider_config.clone();
-        turn_provider_config.model = Some(route_decision.actual_model);
+        turn_provider_config.model = Some(route_decision.actual_model.clone());
+        provider::context::apply_context_budget_hint(
+            &mut session.conversation,
+            Some(&route_decision.actual_model),
+        );
 
         let tx = event_tx.clone();
         let response = provider::call_streaming(
@@ -368,22 +381,40 @@ pub fn run_agent_for_tui(
             return;
         }
 
-        let mut had_error = false;
-        for step in &response.steps {
-            if let ProviderStep::Error(message) = step {
-                let _ = event_tx.send(TuiEvent::Error(message.clone()));
-                had_error = true;
-                break;
+        if let Some(error) = response.steps.iter().find_map(|step| match step {
+            ProviderStep::Error(message) => Some(message.clone()),
+            _ => None,
+        }) {
+            if provider::context::is_prompt_too_long_error(&error) && !reactive_compacted {
+                let before_messages = session.conversation.messages.len();
+                let compaction = provider::context::compact_with_summary(
+                    config.provider,
+                    &session.conversation,
+                    &ctx_config,
+                    &provider_config,
+                );
+                session.conversation = compaction.conversation;
+                let after_messages = session.conversation.messages.len();
+                if let Some(writer) = &mut session.writer {
+                    let _ = writer.append_compaction(before_messages, after_messages);
+                    if let provider::context::CompactionKind::RemoteSummary(summary) =
+                        compaction.kind
+                    {
+                        let _ = writer.append_summary(before_messages, after_messages, summary);
+                    }
+                }
+                reactive_compacted = true;
+                continue;
             }
-        }
-
-        if had_error {
+            let _ = event_tx.send(TuiEvent::Error(error));
             let _ = event_tx.send(TuiEvent::SessionCompleted {
                 status: "failed".to_string(),
             });
             session.complete("failed");
             return;
         }
+
+        reactive_compacted = false;
 
         if response.tool_calls.is_empty() {
             session.conversation.add_assistant(
@@ -472,8 +503,15 @@ pub fn run_agent_for_tui(
                 continue;
             }
 
-            if tools::should_run_readonly_batch(config.tools.max_read_parallel, &tool_requests[index]) {
-                let batch_end = tools::collect_readonly_batch(config.tools.max_read_parallel, &tool_requests, index);
+            if tools::should_run_readonly_batch(
+                config.tools.max_read_parallel,
+                &tool_requests[index],
+            ) {
+                let batch_end = tools::collect_readonly_batch(
+                    config.tools.max_read_parallel,
+                    &tool_requests,
+                    index,
+                );
                 let results = execute_readonly_batch_for_tui(
                     &cwd,
                     &tool_requests[index..batch_end],
@@ -517,6 +555,12 @@ pub fn run_agent_for_tui(
                 && result.status == tools::ToolStatus::Completed
             {
                 if let Ok(update) = tools::update_plan::parse_args(tool_request) {
+                    session
+                        .conversation
+                        .replace_plan_state(tools::update_plan::format_context_message(&update));
+                    if let Some(message) = session.conversation.messages.last().cloned() {
+                        session.append_message(&message);
+                    }
                     if let Some(writer) = &mut session.writer {
                         let _ = writer.append_plan_state(update.explanation, update.plan);
                     }
@@ -603,7 +647,8 @@ fn execute_readonly_batch_for_tui(
         }
     }
 
-    let mut results = tools::run_readonly_batch_parallel(tool_requests, runnable, cwd, mcp_registry);
+    let mut results =
+        tools::run_readonly_batch_parallel(tool_requests, runnable, cwd, mcp_registry);
 
     for (idx, failed) in hook_failed.into_iter().enumerate() {
         if let Some(result) = failed {
@@ -1108,7 +1153,8 @@ fn run_child_agent_for_tui(
         mcp_registry: Some(mcp_registry.clone()),
     };
 
-    let ctx_config = provider::context::ContextConfig::default();
+    let budget_model = config.model.as_option();
+    let ctx_config = provider::context::ContextConfig::for_model(budget_model.as_deref());
     let mut conversation = Conversation::new();
     conversation.add_system(agent_common::build_agent_system_prompt(
         cwd,
@@ -1124,6 +1170,7 @@ fn run_child_agent_for_tui(
         .with_permission_rules(config.permission_rules.clone());
     let mut child_cost_tracker = CostTracker::new(None);
     let mut turn: u32 = 0;
+    let mut reactive_compacted = false;
     loop {
         turn += 1;
         if turn > DEFAULT_MAX_TURNS {
@@ -1146,7 +1193,11 @@ fn run_child_agent_for_tui(
         });
         child_cost_tracker.set_model(Some(&route_decision.actual_model));
         let mut turn_provider_config = provider_config.clone();
-        turn_provider_config.model = Some(route_decision.actual_model);
+        turn_provider_config.model = Some(route_decision.actual_model.clone());
+        provider::context::apply_context_budget_hint(
+            &mut conversation,
+            Some(&route_decision.actual_model),
+        );
 
         let response = provider::call_streaming(
             config.provider,
@@ -1160,6 +1211,11 @@ fn run_child_agent_for_tui(
             ProviderStep::Error(message) => Some(message.clone()),
             _ => None,
         }) {
+            if provider::context::is_prompt_too_long_error(&error) && !reactive_compacted {
+                conversation = provider::context::compact(&conversation, &ctx_config);
+                reactive_compacted = true;
+                continue;
+            }
             return TuiAgentResult {
                 status: "failed".to_string(),
                 final_message: None,
@@ -1167,6 +1223,8 @@ fn run_child_agent_for_tui(
                 cost_tracker: child_cost_tracker,
             };
         }
+
+        reactive_compacted = false;
 
         if let Some(usage) = response.usage
             && !usage.is_empty()

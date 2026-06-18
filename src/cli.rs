@@ -490,12 +490,13 @@ fn print_message(message: crate::provider::conversation::Message) {
     use crate::provider::conversation::Message;
 
     match message {
-        Message::System(content) => println!("[system]\n{}\n", content.trim()),
-        Message::User(content) => println!("[user]\n{}\n", content.trim()),
+        Message::System { content, .. } => println!("[system]\n{}\n", content.trim()),
+        Message::User { content, .. } => println!("[user]\n{}\n", content.trim()),
         Message::Assistant {
             content,
             reasoning_content,
             tool_calls,
+            ..
         } => {
             println!("[assistant]");
             if let Some(reasoning) = reasoning_content.filter(|text| !text.trim().is_empty()) {
@@ -515,6 +516,7 @@ fn print_message(message: crate::provider::conversation::Message) {
         Message::Tool {
             tool_call_id,
             content,
+            ..
         } => println!("[tool {tool_call_id}]\n{}\n", content.trim()),
     }
 }

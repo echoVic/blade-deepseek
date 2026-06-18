@@ -183,8 +183,8 @@ fn format_messages_for_memory(messages: &[Message]) -> String {
     let mut output = String::new();
     for message in messages.iter().rev().take(40).rev() {
         match message {
-            Message::System(_) => {}
-            Message::User(content) => {
+            Message::System { .. } => {}
+            Message::User { content, .. } => {
                 output.push_str("[user]\n");
                 output.push_str(content.trim());
                 output.push_str("\n\n");
@@ -237,8 +237,8 @@ mod tests {
     #[test]
     fn format_messages_for_memory_skips_system_messages() {
         let messages = vec![
-            Message::System("system".to_string()),
-            Message::User("remember cargo test".to_string()),
+            Message::system("system".to_string()),
+            Message::user("remember cargo test".to_string()),
         ];
         let formatted = format_messages_for_memory(&messages);
         assert!(!formatted.contains("system"));

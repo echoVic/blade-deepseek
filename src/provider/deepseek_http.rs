@@ -447,14 +447,14 @@ fn conversation_to_api_messages(conversation: &Conversation) -> Vec<ApiMessage> 
         .messages
         .iter()
         .map(|msg| match msg {
-            Message::System(content) => ApiMessage {
+            Message::System { content, .. } => ApiMessage {
                 role: "system".to_string(),
                 content: Some(content.clone()),
                 reasoning_content: None,
                 tool_calls: None,
                 tool_call_id: None,
             },
-            Message::User(content) => ApiMessage {
+            Message::User { content, .. } => ApiMessage {
                 role: "user".to_string(),
                 content: Some(content.clone()),
                 reasoning_content: None,
@@ -465,6 +465,7 @@ fn conversation_to_api_messages(conversation: &Conversation) -> Vec<ApiMessage> 
                 content,
                 reasoning_content,
                 tool_calls,
+                ..
             } => {
                 let api_tool_calls = if tool_calls.is_empty() {
                     None
@@ -494,6 +495,7 @@ fn conversation_to_api_messages(conversation: &Conversation) -> Vec<ApiMessage> 
             Message::Tool {
                 tool_call_id,
                 content,
+                ..
             } => ApiMessage {
                 role: "tool".to_string(),
                 content: Some(content.clone()),

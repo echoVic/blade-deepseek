@@ -62,6 +62,27 @@ fn format_success(args: &UpdatePlanArgs) -> String {
     lines.join("\n")
 }
 
+pub fn format_context_message(args: &UpdatePlanArgs) -> String {
+    let mut lines = Vec::with_capacity(args.plan.len() + 3);
+    lines.push("[Pinned plan state]".to_string());
+    if let Some(explanation) = args
+        .explanation
+        .as_deref()
+        .filter(|text| !text.trim().is_empty())
+    {
+        lines.push(format!("explanation: {}", explanation.trim()));
+    }
+    for item in &args.plan {
+        let status = match item.status {
+            PlanStatus::Completed => "completed",
+            PlanStatus::InProgress => "in_progress",
+            PlanStatus::Pending => "pending",
+        };
+        lines.push(format!("[{status}] {}", item.step));
+    }
+    lines.join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -92,10 +113,8 @@ mod tests {
 
     #[test]
     fn rejects_empty_step() {
-        let error = parse_args(&request(
-            r#"{"plan":[{"step":"  ","status":"pending"}]}"#,
-        ))
-        .unwrap_err();
+        let error =
+            parse_args(&request(r#"{"plan":[{"step":"  ","status":"pending"}]}"#)).unwrap_err();
         assert!(error.contains("cannot be empty"));
     }
 
@@ -107,7 +126,8 @@ mod tests {
 
     #[test]
     fn handles_special_characters_in_step() {
-        let json = r#"{"plan":[{"step":"Fix \"quotes\" & <tags> 🚀\nnewline","status":"pending"}]}"#;
+        let json =
+            r#"{"plan":[{"step":"Fix \"quotes\" & <tags> 🚀\nnewline","status":"pending"}]}"#;
         let args = parse_args(&request(json)).unwrap();
         assert!(args.plan[0].step.contains("quotes"));
         assert!(args.plan[0].step.contains("🚀"));
@@ -118,15 +138,41 @@ mod tests {
         let args = UpdatePlanArgs {
             explanation: None,
             plan: vec![
-                PlanItem { step: "Done".to_string(), status: PlanStatus::Completed },
-                PlanItem { step: "Doing".to_string(), status: PlanStatus::InProgress },
-                PlanItem { step: "Todo".to_string(), status: PlanStatus::Pending },
+                PlanItem {
+                    step: "Done".to_string(),
+                    status: PlanStatus::Completed,
+                },
+                PlanItem {
+                    step: "Doing".to_string(),
+                    status: PlanStatus::InProgress,
+                },
+                PlanItem {
+                    step: "Todo".to_string(),
+                    status: PlanStatus::Pending,
+                },
             ],
         };
         let output = format_success(&args);
         assert!(output.contains("[x] Done"));
         assert!(output.contains("[>] Doing"));
         assert!(output.contains("[ ] Todo"));
+    }
+
+    #[test]
+    fn format_context_message_marks_current_plan_state() {
+        let args = UpdatePlanArgs {
+            explanation: Some("working".to_string()),
+            plan: vec![PlanItem {
+                step: "Patch context".to_string(),
+                status: PlanStatus::InProgress,
+            }],
+        };
+
+        let output = format_context_message(&args);
+
+        assert!(output.starts_with("[Pinned plan state]"));
+        assert!(output.contains("working"));
+        assert!(output.contains("[in_progress] Patch context"));
     }
 
     #[test]

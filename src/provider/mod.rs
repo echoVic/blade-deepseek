@@ -195,7 +195,7 @@ fn mock_call(conversation: &Conversation) -> ProviderResponse {
             .messages
             .iter()
             .filter_map(|message| match message {
-                conversation::Message::User(content) => Some(content.as_str()),
+                conversation::Message::User { content, .. } => Some(content.as_str()),
                 _ => None,
             })
             .collect::<Vec<_>>()

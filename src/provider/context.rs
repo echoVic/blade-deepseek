@@ -6,6 +6,8 @@ use tiktoken_rs::cl100k_base_singleton;
 const DEFAULT_MAX_TOKENS: usize = 128_000;
 const COMPACTION_THRESHOLD: f64 = 0.80;
 const RESERVED_FOR_RESPONSE: usize = 4096;
+const STALE_TOOL_OUTPUT_BYTES: usize = 2048;
+const BUDGET_HINT_PREFIX: &str = "[context: ~";
 
 pub trait TokenCounter {
     fn count_text(&self, text: &str) -> usize;
@@ -30,6 +32,14 @@ pub struct ContextConfig {
 }
 
 impl ContextConfig {
+    pub fn for_model(model: Option<&str>) -> Self {
+        Self {
+            max_tokens: crate::model::max_context_tokens(model),
+            compaction_threshold: COMPACTION_THRESHOLD,
+            reserved_for_response: RESERVED_FOR_RESPONSE,
+        }
+    }
+
     fn effective_limit(&self) -> usize {
         let threshold = self.compaction_threshold.clamp(0.1, 1.0);
         ((self.max_tokens as f64 * threshold) as usize).saturating_sub(self.reserved_for_response)
@@ -48,12 +58,13 @@ impl Default for ContextConfig {
 
 pub fn message_tokens_with_counter(msg: &Message, counter: &impl TokenCounter) -> usize {
     match msg {
-        Message::System(content) => counter.count_text(content) + 4,
-        Message::User(content) => counter.count_text(content) + 4,
+        Message::System { content, .. } => counter.count_text(content) + 4,
+        Message::User { content, .. } => counter.count_text(content) + 4,
         Message::Assistant {
             content,
             reasoning_content,
             tool_calls,
+            ..
         } => {
             let mut tokens = 4;
             if let Some(c) = content {
@@ -81,7 +92,6 @@ pub fn conversation_tokens(conversation: &Conversation) -> usize {
     conversation.messages.iter().map(message_tokens).sum()
 }
 
-#[cfg(test)]
 fn conversation_tokens_with_counter(
     conversation: &Conversation,
     counter: &impl TokenCounter,
@@ -96,6 +106,54 @@ fn conversation_tokens_with_counter(
 pub fn needs_compaction(conversation: &Conversation, config: &ContextConfig) -> bool {
     let total = conversation_tokens(conversation);
     total > config.effective_limit()
+}
+
+pub fn apply_context_budget_hint(conversation: &mut Conversation, model: Option<&str>) {
+    apply_context_budget_hint_with_counter(conversation, model, &DefaultTokenCounter);
+}
+
+pub fn apply_context_budget_hint_with_counter(
+    conversation: &mut Conversation,
+    model: Option<&str>,
+    counter: &impl TokenCounter,
+) {
+    let config = ContextConfig::for_model(model);
+    let used = conversation_tokens_with_counter(conversation, counter);
+    let remaining = config.effective_limit().saturating_sub(used);
+    let hint = format!("[context: ~{}K tokens remaining]", (remaining + 999) / 1000);
+
+    if let Some(Message::System { content, .. }) = conversation.messages.first_mut() {
+        let stripped = strip_budget_hint(content);
+        *content = if stripped.is_empty() {
+            hint
+        } else {
+            format!("{stripped}\n\n{hint}")
+        };
+    }
+}
+
+fn strip_budget_hint(content: &str) -> String {
+    let trimmed = content.trim_end();
+    let Some(line_start) = trimmed.rfind(BUDGET_HINT_PREFIX) else {
+        return trimmed.to_string();
+    };
+    if line_start > 0 && trimmed.as_bytes()[line_start - 1] != b'\n' {
+        return trimmed.to_string();
+    }
+    let candidate = &trimmed[line_start..];
+    if candidate.ends_with(" tokens remaining]") {
+        trimmed[..line_start].trim_end().to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+pub fn is_prompt_too_long_error(message: &str) -> bool {
+    let normalized = message.to_ascii_lowercase();
+    normalized.contains("prompt_too_long")
+        || normalized.contains("maximum context length")
+        || normalized.contains("context length exceeded")
+        || normalized.contains("context_length_exceeded")
 }
 
 pub fn compact(conversation: &Conversation, config: &ContextConfig) -> Conversation {
@@ -120,9 +178,16 @@ pub fn compact_with_summary(
     context_config: &ContextConfig,
     provider_config: &ProviderConfig,
 ) -> CompactionResult {
+    let conversation = micro_compact_stale_tool_outputs(conversation);
+    if !needs_compaction(&conversation, context_config) {
+        return CompactionResult {
+            conversation,
+            kind: CompactionKind::LocalTruncation,
+        };
+    }
     match summarize_collapsed_messages(
         provider_kind,
-        conversation,
+        &conversation,
         context_config,
         provider_config,
     ) {
@@ -131,7 +196,7 @@ pub fn compact_with_summary(
             kind: CompactionKind::RemoteSummary(summary),
         },
         None => CompactionResult {
-            conversation: compact(conversation, context_config),
+            conversation: compact(&conversation, context_config),
             kind: CompactionKind::LocalTruncation,
         },
     }
@@ -143,26 +208,23 @@ fn summarize_collapsed_messages(
     context_config: &ContextConfig,
     provider_config: &ProviderConfig,
 ) -> Option<(Conversation, String)> {
-    let (system_msg, collapsed, kept) =
+    let (system_msg, pinned, collapsed, kept) =
         partition_for_compaction(conversation, context_config, &DefaultTokenCounter)?;
     if collapsed.is_empty() || kept.is_empty() {
         return None;
     }
 
-    let summary = request_summary(
-        provider_kind,
-        provider_config,
-        &format_messages(&collapsed),
-    )?;
+    let summary = request_summary(provider_kind, provider_config, &format_messages(&collapsed))?;
 
     let mut result = Conversation::new();
     if let Some(system) = system_msg {
         result.messages.push(system);
     }
-    result.messages.push(Message::System(format!(
+    result.messages.push(Message::system(format!(
         "[Summary of earlier conversation]\n{}",
         summary.trim()
     )));
+    result.messages.extend(pinned);
     result.messages.extend(kept);
     Some((result, summary))
 }
@@ -171,7 +233,7 @@ fn partition_for_compaction(
     conversation: &Conversation,
     config: &ContextConfig,
     counter: &impl TokenCounter,
-) -> Option<(Option<Message>, Vec<Message>, Vec<Message>)> {
+) -> Option<(Option<Message>, Vec<Message>, Vec<Message>, Vec<Message>)> {
     let messages = &conversation.messages;
     let target_tokens = config.effective_limit();
     let system_msg = messages.first().cloned();
@@ -181,10 +243,24 @@ fn partition_for_compaction(
         .unwrap_or(0);
     let summary_tokens = counter.count_text("[Summary of earlier conversation]") + 256;
     let non_system: Vec<&Message> = messages.iter().skip(1).collect();
+    let pinned: Vec<Message> = non_system
+        .iter()
+        .filter(|message| message.is_pinned())
+        .map(|message| (*message).clone())
+        .collect();
+    let droppable: Vec<&Message> = non_system
+        .iter()
+        .copied()
+        .filter(|message| !message.is_pinned())
+        .collect();
 
     let mut kept: Vec<Message> = Vec::new();
-    let mut budget = system_tokens + summary_tokens + 4;
-    for msg in non_system.iter().rev() {
+    let pinned_tokens: usize = pinned
+        .iter()
+        .map(|message| message_tokens_with_counter(message, counter))
+        .sum();
+    let mut budget = system_tokens + pinned_tokens + summary_tokens + 4;
+    for msg in droppable.iter().rev() {
         let msg_tokens = message_tokens_with_counter(msg, counter);
         if budget + msg_tokens > target_tokens {
             break;
@@ -195,16 +271,16 @@ fn partition_for_compaction(
     kept.reverse();
     normalize_tool_boundaries(&mut kept);
 
-    let collapsed_len = non_system.len().saturating_sub(kept.len());
+    let collapsed_len = droppable.len().saturating_sub(kept.len());
     if collapsed_len == 0 {
         return None;
     }
-    let collapsed = non_system
+    let collapsed = droppable
         .iter()
         .take(collapsed_len)
         .map(|message| (*message).clone())
         .collect();
-    Some((system_msg, collapsed, kept))
+    Some((system_msg, pinned, collapsed, kept))
 }
 
 fn request_summary(
@@ -215,10 +291,7 @@ fn request_summary(
     let summary_config = ProviderConfig {
         api_key: provider_config.api_key.clone(),
         base_url: provider_config.base_url.clone(),
-        model: provider_config
-            .model
-            .clone()
-            .or_else(|| Some(crate::model::auxiliary_model().to_string())),
+        model: Some(crate::model::auxiliary_model().to_string()),
         tools_override: Some(Vec::new()),
         mcp_registry: None,
     };
@@ -249,12 +322,12 @@ fn format_messages(messages: &[Message]) -> String {
     let mut output = String::new();
     for message in messages {
         match message {
-            Message::System(content) => {
+            Message::System { content, .. } => {
                 output.push_str("[system]\n");
                 output.push_str(content.trim());
                 output.push_str("\n\n");
             }
-            Message::User(content) => {
+            Message::User { content, .. } => {
                 output.push_str("[user]\n");
                 output.push_str(content.trim());
                 output.push_str("\n\n");
@@ -263,6 +336,7 @@ fn format_messages(messages: &[Message]) -> String {
                 content,
                 reasoning_content,
                 tool_calls,
+                ..
             } => {
                 output.push_str("[assistant]\n");
                 if let Some(reasoning) = reasoning_content
@@ -289,6 +363,7 @@ fn format_messages(messages: &[Message]) -> String {
             Message::Tool {
                 tool_call_id,
                 content,
+                ..
             } => {
                 output.push_str("[tool ");
                 output.push_str(tool_call_id);
@@ -306,7 +381,14 @@ pub fn compact_with_counter(
     config: &ContextConfig,
     counter: &impl TokenCounter,
 ) -> Conversation {
-    let messages = &conversation.messages;
+    let micro_compacted = micro_compact_stale_tool_outputs(conversation);
+    if conversation_tokens_with_counter(&micro_compacted, counter)
+        <= config.effective_limit()
+    {
+        return normalize_compacted_conversation(micro_compacted);
+    }
+
+    let messages = &micro_compacted.messages;
     let target_tokens = config.effective_limit();
 
     let system_msg = messages.first().cloned();
@@ -316,13 +398,46 @@ pub fn compact_with_counter(
         .unwrap_or(0);
 
     let non_system: Vec<&Message> = messages.iter().skip(1).collect();
+    let mut pinned: Vec<Message> = non_system
+        .iter()
+        .filter(|message| message.is_pinned())
+        .map(|message| (*message).clone())
+        .collect();
+    let droppable: Vec<&Message> = non_system
+        .iter()
+        .copied()
+        .filter(|message| !message.is_pinned())
+        .collect();
 
     let mut kept: Vec<Message> = Vec::new();
+    let pinned_budget_limit = target_tokens / 2;
+    let mut pinned_tokens: usize = pinned
+        .iter()
+        .map(|message| message_tokens_with_counter(message, counter))
+        .sum();
+
+    if pinned_tokens > pinned_budget_limit {
+        eprintln!(
+            "orca: warning: pinned messages use {pinned_tokens} tokens (>{pinned_budget_limit} limit), demoting oldest"
+        );
+        while pinned_tokens > pinned_budget_limit && pinned.len() > 1 {
+            let is_plan = pinned[0]
+                .content_str()
+                .map_or(false, |c| c.starts_with("[Pinned plan state]"));
+            if is_plan {
+                break;
+            }
+            pinned_tokens -= message_tokens_with_counter(&pinned[0], counter);
+            pinned.remove(0);
+        }
+    }
+
     let mut budget = system_tokens
+        + pinned_tokens
         + counter.count_text("[Earlier conversation history was truncated to fit context window]")
         + 4;
 
-    for msg in non_system.iter().rev() {
+    for msg in droppable.iter().rev() {
         let msg_tokens = message_tokens_with_counter(msg, counter);
         if budget + msg_tokens > target_tokens {
             break;
@@ -338,18 +453,75 @@ pub fn compact_with_counter(
     if let Some(sys) = system_msg {
         result.messages.push(sys);
     }
-    if kept.len() < non_system.len() {
-        result.messages.push(Message::System(
+    if kept.len() < droppable.len() {
+        result.messages.push(Message::system(
             "[Earlier conversation history was truncated to fit context window]".to_string(),
         ));
     }
+    result.messages.extend(pinned);
     result.messages.extend(kept);
     result
 }
 
+fn normalize_compacted_conversation(mut conversation: Conversation) -> Conversation {
+    if conversation.messages.len() <= 1 {
+        return conversation;
+    }
+    let system = conversation.messages.remove(0);
+    normalize_tool_boundaries(&mut conversation.messages);
+    let mut result = Conversation::new();
+    result.messages.push(system);
+    result.messages.extend(conversation.messages);
+    result
+}
+
+fn micro_compact_stale_tool_outputs(conversation: &Conversation) -> Conversation {
+    let mut result = Conversation::new();
+    let last_user_index = conversation
+        .messages
+        .iter()
+        .rposition(|message| matches!(message, Message::User { .. }))
+        .unwrap_or(conversation.messages.len());
+
+    for (index, message) in conversation.messages.iter().enumerate() {
+        let compacted = match message {
+            Message::Tool {
+                tool_call_id,
+                content,
+                pinned,
+            } if index < last_user_index && !*pinned && content.len() > STALE_TOOL_OUTPUT_BYTES => {
+                Message::Tool {
+                    tool_call_id: tool_call_id.clone(),
+                    content: micro_compact_tool_output(content),
+                    pinned: false,
+                }
+            }
+            _ => message.clone(),
+        };
+        result.messages.push(compacted);
+    }
+    result
+}
+
+fn micro_compact_tool_output(content: &str) -> String {
+    let head: String = content.chars().take(320).collect();
+    let tail_vec: Vec<char> = content.chars().rev().take(320).collect();
+    let tail: String = tail_vec.into_iter().rev().collect();
+    format!(
+        "[tool output micro-compact]\noriginal_bytes: {}\nhead:\n{}\n\ntail:\n{}",
+        content.len(),
+        head.trim_end(),
+        tail.trim_start()
+    )
+}
+
 fn normalize_tool_boundaries(messages: &mut Vec<Message>) {
-    while let Some(Message::Tool { .. }) = messages.first() {
-        messages.remove(0);
+    let leading_tools = messages
+        .iter()
+        .take_while(|msg| matches!(msg, Message::Tool { .. }))
+        .count();
+    if leading_tools > 0 {
+        messages.drain(..leading_tools);
     }
     if let Some(Message::Assistant { tool_calls, .. }) = messages.last()
         && !tool_calls.is_empty()
@@ -396,6 +568,36 @@ mod tests {
     }
 
     #[test]
+    fn context_config_uses_model_specific_token_limit() {
+        assert_eq!(
+            ContextConfig::for_model(Some("deepseek-chat")).max_tokens,
+            64_000
+        );
+        assert_eq!(
+            ContextConfig::for_model(Some("deepseek-reasoner")).max_tokens,
+            128_000
+        );
+        assert_eq!(
+            ContextConfig::for_model(Some(crate::model::PRO_MODEL)).max_tokens,
+            128_000
+        );
+    }
+
+    #[test]
+    fn system_prompt_budget_hint_uses_remaining_model_budget() {
+        let mut conv = Conversation::new();
+        conv.add_system("system prompt".to_string());
+        conv.add_user("active request".to_string());
+
+        apply_context_budget_hint_with_counter(&mut conv, Some("deepseek-chat"), &FixedCounter);
+
+        assert!(matches!(
+            &conv.messages[0],
+            Message::System { content, .. } if content.ends_with("[context: ~48K tokens remaining]")
+        ));
+    }
+
+    #[test]
     fn conversation_tokens_can_use_custom_counter() {
         let mut conv = Conversation::new();
         conv.add_system("system".to_string());
@@ -424,12 +626,77 @@ mod tests {
         let compacted = compact(&conv, &config);
 
         // system should be first
-        assert!(matches!(&compacted.messages[0], Message::System(s) if s == "s"));
+        assert!(
+            matches!(&compacted.messages[0], Message::System { content, .. } if content == "s")
+        );
         // should have dropped some messages
         assert!(compacted.messages.len() < conv.messages.len());
         // last message should be "end"
         let last = compacted.messages.last().unwrap();
-        assert!(matches!(last, Message::User(s) if s == "end"));
+        assert!(matches!(last, Message::User { content, .. } if content == "end"));
+    }
+
+    #[test]
+    fn compact_preserves_pinned_messages_outside_recent_window() {
+        let config = ContextConfig {
+            max_tokens: 42,
+            compaction_threshold: 1.0,
+            reserved_for_response: 0,
+        };
+
+        let mut conv = Conversation::new();
+        conv.add_system("s".to_string());
+        conv.add_user_pinned("core constraint".to_string());
+        conv.add_user("old filler".repeat(40));
+        conv.add_assistant(Some("old answer".repeat(40)), None, vec![]);
+        conv.add_user("newest request".to_string());
+
+        let compacted = compact_with_counter(&conv, &config, &FixedCounter);
+
+        assert!(compacted.messages.iter().any(|message| {
+            matches!(message, Message::User { content, .. } if content == "core constraint")
+                && message.is_pinned()
+        }));
+        assert!(
+            matches!(compacted.messages.last(), Some(Message::User { content, .. }) if content == "newest request")
+        );
+    }
+
+    #[test]
+    fn compact_micro_compacts_stale_tool_output_before_dropping_messages() {
+        let config = ContextConfig {
+            max_tokens: 80,
+            compaction_threshold: 1.0,
+            reserved_for_response: 0,
+        };
+
+        let mut conv = Conversation::new();
+        conv.add_system("s".to_string());
+        conv.add_user("inspect".to_string());
+        conv.add_assistant(
+            Some("calling read_file".to_string()),
+            None,
+            vec![crate::provider::conversation::RawToolCall {
+                id: "tc1".to_string(),
+                function_name: "read_file".to_string(),
+                arguments: r#"{"path":"large.log"}"#.to_string(),
+            }],
+        );
+        conv.add_tool_result("tc1".to_string(), "line\n".repeat(500));
+        conv.add_user("newest request".to_string());
+
+        let compacted = compact_with_counter(&conv, &config, &FixedCounter);
+
+        let tool_output = compacted.messages.iter().find_map(|message| match message {
+            Message::Tool { content, .. } => Some(content.as_str()),
+            _ => None,
+        });
+        assert!(matches!(
+            tool_output,
+            Some(content)
+                if content.contains("[tool output micro-compact]")
+                    && !content.contains(&"line\n".repeat(100))
+        ));
     }
 
     #[test]
@@ -497,7 +764,7 @@ mod tests {
             if matches!(msg, Message::Tool { .. }) {
                 panic!("orphaned Tool message should have been trimmed");
             }
-            if matches!(msg, Message::User(_) | Message::Assistant { .. }) {
+            if matches!(msg, Message::User { .. } | Message::Assistant { .. }) {
                 break;
             }
         }
@@ -558,16 +825,24 @@ mod tests {
             mcp_registry: None,
         };
 
-        let result = compact_with_summary(
-            ProviderKind::DeepSeek,
-            &conv,
-            &config,
-            &provider_config,
-        );
+        let result = compact_with_summary(ProviderKind::DeepSeek, &conv, &config, &provider_config);
 
         assert!(matches!(result.kind, CompactionKind::LocalTruncation));
         assert!(result.conversation.messages.iter().any(|message| {
-            matches!(message, Message::System(text) if text.contains("truncated to fit context window"))
+            matches!(message, Message::System { content, .. } if content.contains("truncated to fit context window"))
         }));
+    }
+
+    #[test]
+    fn detects_prompt_too_long_provider_errors() {
+        assert!(is_prompt_too_long_error(
+            "DeepSeek provider error: prompt_too_long: context length exceeded"
+        ));
+        assert!(is_prompt_too_long_error(
+            "This model's maximum context length is 64000 tokens."
+        ));
+        assert!(!is_prompt_too_long_error(
+            "Response blocked by content filter"
+        ));
     }
 }

@@ -4,14 +4,14 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crossterm::ExecutableCommand;
 use crossterm::event::{
     self, Event, KeyCode, KeyEventKind, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
     PushKeyboardEnhancementFlags,
 };
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
-use crossterm::ExecutableCommand;
-use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
 use tui_textarea::{CursorMove, Input, TextArea};
 
 use crate::config::file::save_api_key;
@@ -23,8 +23,8 @@ use crate::runtime::history;
 use crate::tui::bridge;
 use crate::tui::commands::{self, SlashCommand};
 use crate::tui::shortcuts::{
-    approval_shortcut, global_shortcut, idle_shortcut, running_shortcut, ApprovalShortcut,
-    GlobalShortcut, IdleShortcut, RunningShortcut,
+    ApprovalShortcut, GlobalShortcut, IdleShortcut, RunningShortcut, approval_shortcut,
+    global_shortcut, idle_shortcut, running_shortcut,
 };
 use crate::tui::theme::Theme;
 use crate::tui::types::{
@@ -1055,6 +1055,7 @@ fn agent_loop_thread(
     cancel: CancelToken,
 ) {
     let mut session: Option<bridge::TuiConversationSession> = None;
+    let mut pending_pinned_context: Vec<String> = Vec::new();
 
     loop {
         match action_rx.recv() {
@@ -1086,6 +1087,11 @@ fn agent_loop_thread(
                         }
                     };
                 }
+                if let Some(session) = session.as_mut() {
+                    for context in pending_pinned_context.drain(..) {
+                        session.add_pinned_context(context);
+                    }
+                }
                 bridge::run_agent_for_tui(
                     &cfg,
                     session.as_mut().expect("session initialized"),
@@ -1104,6 +1110,14 @@ fn agent_loop_thread(
             Ok(UserAction::SetModel(model)) => {
                 if let Some(session) = session.as_mut() {
                     session.set_model(Some(&model));
+                }
+            }
+            Ok(UserAction::Remember(note)) => {
+                let context = format!("[Pinned remembered note]\n{}", note.trim());
+                if let Some(session) = session.as_mut() {
+                    session.add_pinned_context(context);
+                } else {
+                    pending_pinned_context.push(context);
                 }
             }
             Ok(UserAction::Compact) => {
@@ -1248,6 +1262,11 @@ fn handle_slash_command(
             )),
         },
         SlashCommand::Remember(note) => {
+            let remembered_note = note
+                .strip_prefix("project:")
+                .map(str::trim)
+                .unwrap_or(note.as_str())
+                .to_string();
             let result = if let Some(project_note) = note.strip_prefix("project:") {
                 let cwd = config
                     .cwd
@@ -1257,7 +1276,7 @@ fn handle_slash_command(
             } else {
                 crate::runtime::memory::remember_user(&note)
             };
-            match result {
+            match &result {
                 Ok(path) => state.messages.push(ChatMessage::System(format!(
                     "Remembered in {}.",
                     path.display()
@@ -1265,6 +1284,9 @@ fn handle_slash_command(
                 Err(error) => state
                     .messages
                     .push(ChatMessage::Error(format!("failed to remember: {error}"))),
+            }
+            if result.is_ok() {
+                let _ = action_tx.send(UserAction::Remember(remembered_note));
             }
         }
         SlashCommand::Compact => {
@@ -1318,12 +1340,13 @@ fn chat_message_from_history(
     use crate::provider::conversation::Message;
 
     match message {
-        Message::System(_) => None,
-        Message::User(content) => Some(ChatMessage::User(content)),
+        Message::System { .. } => None,
+        Message::User { content, .. } => Some(ChatMessage::User(content)),
         Message::Assistant {
             content,
             reasoning_content,
             tool_calls,
+            ..
         } => {
             if let Some(content) = content.filter(|text| !text.trim().is_empty()) {
                 Some(ChatMessage::Assistant(content))
@@ -1346,6 +1369,7 @@ fn chat_message_from_history(
         Message::Tool {
             tool_call_id,
             content,
+            ..
         } => Some(ChatMessage::ToolCall {
             id: tool_call_id.clone(),
             name: format!("tool:{tool_call_id}"),

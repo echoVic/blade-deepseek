@@ -106,45 +106,59 @@ enum SessionRecord {
 enum StoredMessage {
     System {
         content: String,
+        #[serde(default)]
+        pinned: bool,
     },
     User {
         content: String,
+        #[serde(default)]
+        pinned: bool,
     },
     Assistant {
         content: Option<String>,
         reasoning_content: Option<String>,
         tool_calls: Vec<RawToolCall>,
+        #[serde(default)]
+        pinned: bool,
     },
     Tool {
         tool_call_id: String,
         content: String,
+        #[serde(default)]
+        pinned: bool,
     },
 }
 
 impl From<&Message> for StoredMessage {
     fn from(message: &Message) -> Self {
         match message {
-            Message::System(content) => Self::System {
+            Message::System { content, pinned } => Self::System {
                 content: content.clone(),
+                pinned: *pinned,
             },
-            Message::User(content) => Self::User {
+            Message::User { content, pinned } => Self::User {
                 content: content.clone(),
+                pinned: *pinned,
             },
             Message::Assistant {
                 content,
                 reasoning_content,
                 tool_calls,
+                pinned,
             } => Self::Assistant {
                 content: content.clone(),
                 reasoning_content: reasoning_content.clone(),
                 tool_calls: tool_calls.clone(),
+                pinned: *pinned,
             },
             Message::Tool {
                 tool_call_id,
                 content,
+                pinned,
             } => Self::Tool {
                 tool_call_id: tool_call_id.clone(),
                 content: content.clone(),
+                pinned: *pinned,
             },
         }
     }
@@ -153,23 +167,27 @@ impl From<&Message> for StoredMessage {
 impl From<StoredMessage> for Message {
     fn from(message: StoredMessage) -> Self {
         match message {
-            StoredMessage::System { content } => Self::System(content),
-            StoredMessage::User { content } => Self::User(content),
+            StoredMessage::System { content, pinned } => Self::System { content, pinned },
+            StoredMessage::User { content, pinned } => Self::User { content, pinned },
             StoredMessage::Assistant {
                 content,
                 reasoning_content,
                 tool_calls,
+                pinned,
             } => Self::Assistant {
                 content,
                 reasoning_content,
                 tool_calls,
+                pinned,
             },
             StoredMessage::Tool {
                 tool_call_id,
                 content,
+                pinned,
             } => Self::Tool {
                 tool_call_id,
                 content,
+                pinned,
             },
         }
     }
@@ -372,7 +390,7 @@ pub fn resume_conversation(transcript: &SessionTranscript, system_prompt: String
     for message in transcript
         .messages
         .iter()
-        .filter(|message| !matches!(message, Message::System(_)))
+        .filter(|message| !matches!(message, Message::System { .. }))
     {
         conversation.messages.push(message.clone());
     }
@@ -1012,6 +1030,39 @@ mod tests {
     }
 
     #[test]
+    fn writer_round_trips_pinned_messages() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let home = tempfile::tempdir().expect("temp home");
+        let previous = std::env::var_os(ORCA_HOME_ENV);
+        unsafe {
+            std::env::set_var(ORCA_HOME_ENV, home.path());
+        }
+
+        let result = (|| {
+            let cwd = std::env::current_dir()?;
+            let mut writer = SessionWriter::start(&cwd, "mock", None, "remember")?;
+            writer.append_message(&Message::pinned_user("pinned constraint".to_string()))?;
+            let transcript = load_session("latest")?;
+            assert_eq!(transcript.messages.len(), 1);
+            assert!(transcript.messages[0].is_pinned());
+            assert!(matches!(
+                &transcript.messages[0],
+                Message::User { content, .. } if content == "pinned constraint"
+            ));
+            Ok::<(), io::Error>(())
+        })();
+
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var(ORCA_HOME_ENV, previous);
+            } else {
+                std::env::remove_var(ORCA_HOME_ENV);
+            }
+        }
+        result.expect("pinned message round-tripped");
+    }
+
+    #[test]
     fn plan_state_round_trips_through_session() {
         let _guard = ENV_LOCK.lock().expect("env lock");
         let home = tempfile::tempdir().expect("temp home");
@@ -1026,9 +1077,18 @@ mod tests {
             writer.append_plan_state(
                 Some("initial plan".to_string()),
                 vec![
-                    PlanItem { step: "Step 1".to_string(), status: PlanStatus::Completed },
-                    PlanItem { step: "Step 2".to_string(), status: PlanStatus::InProgress },
-                    PlanItem { step: "Step 3".to_string(), status: PlanStatus::Pending },
+                    PlanItem {
+                        step: "Step 1".to_string(),
+                        status: PlanStatus::Completed,
+                    },
+                    PlanItem {
+                        step: "Step 2".to_string(),
+                        status: PlanStatus::InProgress,
+                    },
+                    PlanItem {
+                        step: "Step 3".to_string(),
+                        status: PlanStatus::Pending,
+                    },
                 ],
             )?;
             let transcript = load_session("latest")?;
@@ -1065,12 +1125,21 @@ mod tests {
             writer.append_plan_state(
                 None,
                 vec![
-                    PlanItem { step: "Done 1".to_string(), status: PlanStatus::Completed },
-                    PlanItem { step: "Done 2".to_string(), status: PlanStatus::Completed },
+                    PlanItem {
+                        step: "Done 1".to_string(),
+                        status: PlanStatus::Completed,
+                    },
+                    PlanItem {
+                        step: "Done 2".to_string(),
+                        status: PlanStatus::Completed,
+                    },
                 ],
             )?;
             let transcript = load_session("latest")?;
-            assert!(transcript.plan.is_none(), "all-completed plan should restore as None");
+            assert!(
+                transcript.plan.is_none(),
+                "all-completed plan should restore as None"
+            );
             Ok::<(), io::Error>(())
         })();
 
@@ -1098,7 +1167,10 @@ mod tests {
             let mut writer = SessionWriter::start(&cwd, "mock", None, "empty plan")?;
             writer.append_plan_state(None, vec![])?;
             let transcript = load_session("latest")?;
-            assert!(transcript.plan.is_none(), "empty plan should restore as None");
+            assert!(
+                transcript.plan.is_none(),
+                "empty plan should restore as None"
+            );
             Ok::<(), io::Error>(())
         })();
 
@@ -1125,7 +1197,10 @@ mod tests {
             let cwd = std::env::current_dir()?;
             let _writer = SessionWriter::start(&cwd, "mock", None, "no plan")?;
             let transcript = load_session("latest")?;
-            assert!(transcript.plan.is_none(), "no plan records means plan is None");
+            assert!(
+                transcript.plan.is_none(),
+                "no plan records means plan is None"
+            );
             assert_eq!(transcript.meta.title, "no plan");
             Ok::<(), io::Error>(())
         })();

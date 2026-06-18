@@ -68,6 +68,7 @@ pub enum TuiEvent {
 pub enum UserAction {
     Submit(String),
     SetModel(String),
+    Remember(String),
     Compact,
     Approve(bool),
     Backtrack,

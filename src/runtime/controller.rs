@@ -226,7 +226,8 @@ fn run_agent_loop(
     cancel: &CancelToken,
 ) -> io::Result<AgentLoopResult> {
     let max_turns = DEFAULT_MAX_TURNS;
-    let ctx_config = provider::context::ContextConfig::default();
+    let budget_model = config.model.as_option();
+    let ctx_config = provider::context::ContextConfig::for_model(budget_model.as_deref());
     let policy = ApprovalPolicy::new(config.approval_mode)
         .with_permission_rules(config.permission_rules.clone());
     let tools_override = if subagent_depth > 0 {
@@ -279,6 +280,7 @@ fn run_agent_loop(
     }
 
     let mut turn: u32 = 0;
+    let mut reactive_compacted = false;
 
     loop {
         turn += 1;
@@ -354,6 +356,10 @@ fn run_agent_loop(
         }
         let mut turn_provider_config = provider_config.clone();
         turn_provider_config.model = Some(route_decision.actual_model.clone());
+        provider::context::apply_context_budget_hint(
+            &mut conversation,
+            Some(&route_decision.actual_model),
+        );
 
         let response = provider::call_streaming(
             config.provider,
@@ -397,7 +403,41 @@ fn run_agent_loop(
             }
         }
 
-        let mut had_error = false;
+        let provider_error = response.steps.iter().find_map(|step| match step {
+            ProviderStep::Error(message) => Some(message.clone()),
+            _ => None,
+        });
+
+        if let Some(error) = provider_error {
+            if provider::context::is_prompt_too_long_error(&error) && !reactive_compacted {
+                let before_messages = conversation.messages.len();
+                let compaction = provider::context::compact_with_summary(
+                    config.provider,
+                    &conversation,
+                    &ctx_config,
+                    &provider_config,
+                );
+                conversation = compaction.conversation;
+                let after_messages = conversation.messages.len();
+                if emit_deltas && let Some(writer) = history_writer.as_deref_mut() {
+                    writer.append_compaction(before_messages, after_messages)?;
+                    if let provider::context::CompactionKind::RemoteSummary(summary) =
+                        compaction.kind
+                    {
+                        writer.append_summary(before_messages, after_messages, summary)?;
+                    }
+                }
+                reactive_compacted = true;
+                continue;
+            }
+            if emit_deltas {
+                sink.emit(&events.error(&error))?;
+            }
+            return Ok(AgentLoopResult::failure(RunStatus::Failed, error));
+        }
+
+        reactive_compacted = false;
+
         for step in &response.steps {
             match step {
                 ProviderStep::ReplayState(replay) => {
@@ -405,26 +445,8 @@ fn run_agent_loop(
                         sink.emit(&events.provider_replay_updated(replay))?;
                     }
                 }
-                ProviderStep::Error(message) => {
-                    if emit_deltas {
-                        sink.emit(&events.error(message))?;
-                    }
-                    had_error = true;
-                    break;
-                }
                 _ => {}
             }
-        }
-
-        if had_error {
-            let error = response.steps.iter().find_map(|step| match step {
-                ProviderStep::Error(message) => Some(message.clone()),
-                _ => None,
-            });
-            return Ok(AgentLoopResult::failure(
-                RunStatus::Failed,
-                error.unwrap_or_else(|| "provider error".to_string()),
-            ));
         }
 
         if response.tool_calls.is_empty() {
@@ -583,6 +605,14 @@ fn run_agent_loop(
                 && result.status == tools::ToolStatus::Completed
             {
                 if let Ok(update) = tools::update_plan::parse_args(tool_request) {
+                    conversation
+                        .replace_plan_state(tools::update_plan::format_context_message(&update));
+                    if emit_deltas
+                        && let Some(writer) = history_writer.as_deref_mut()
+                        && let Some(message) = conversation.messages.last()
+                    {
+                        writer.append_message(message)?;
+                    }
                     if let Some(writer) = history_writer.as_deref_mut() {
                         let _ = writer.append_plan_state(update.explanation, update.plan);
                     }

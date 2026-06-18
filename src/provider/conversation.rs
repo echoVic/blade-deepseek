@@ -9,17 +9,73 @@ pub struct RawToolCall {
 
 #[derive(Clone, Debug)]
 pub enum Message {
-    System(String),
-    User(String),
+    System {
+        content: String,
+        pinned: bool,
+    },
+    User {
+        content: String,
+        pinned: bool,
+    },
     Assistant {
         content: Option<String>,
         reasoning_content: Option<String>,
         tool_calls: Vec<RawToolCall>,
+        pinned: bool,
     },
     Tool {
         tool_call_id: String,
         content: String,
+        pinned: bool,
     },
+}
+
+impl Message {
+    pub fn system(content: String) -> Self {
+        Self::System {
+            content,
+            pinned: false,
+        }
+    }
+
+    pub fn pinned_system(content: String) -> Self {
+        Self::System {
+            content,
+            pinned: true,
+        }
+    }
+
+    pub fn user(content: String) -> Self {
+        Self::User {
+            content,
+            pinned: false,
+        }
+    }
+
+    pub fn pinned_user(content: String) -> Self {
+        Self::User {
+            content,
+            pinned: true,
+        }
+    }
+
+    pub fn is_pinned(&self) -> bool {
+        match self {
+            Self::System { pinned, .. }
+            | Self::User { pinned, .. }
+            | Self::Assistant { pinned, .. }
+            | Self::Tool { pinned, .. } => *pinned,
+        }
+    }
+
+    pub fn content_str(&self) -> Option<&str> {
+        match self {
+            Self::System { content, .. }
+            | Self::User { content, .. }
+            | Self::Tool { content, .. } => Some(content),
+            Self::Assistant { content, .. } => content.as_deref(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -35,11 +91,26 @@ impl Conversation {
     }
 
     pub fn add_system(&mut self, content: String) {
-        self.messages.push(Message::System(content));
+        self.messages.push(Message::system(content));
+    }
+
+    pub fn add_system_pinned(&mut self, content: String) {
+        self.messages.push(Message::pinned_system(content));
+    }
+
+    pub fn replace_plan_state(&mut self, content: String) {
+        self.messages.retain(|msg| {
+            !matches!(msg, Message::System { content: c, pinned: true, .. } if c.starts_with("[Pinned plan state]"))
+        });
+        self.messages.push(Message::pinned_system(content));
     }
 
     pub fn add_user(&mut self, content: String) {
-        self.messages.push(Message::User(content));
+        self.messages.push(Message::user(content));
+    }
+
+    pub fn add_user_pinned(&mut self, content: String) {
+        self.messages.push(Message::pinned_user(content));
     }
 
     pub fn add_assistant(
@@ -52,6 +123,7 @@ impl Conversation {
             content,
             reasoning_content,
             tool_calls,
+            pinned: false,
         });
     }
 
@@ -59,12 +131,13 @@ impl Conversation {
         self.messages.push(Message::Tool {
             tool_call_id,
             content,
+            pinned: false,
         });
     }
 
     pub fn last_user_message(&self) -> Option<&str> {
         self.messages.iter().rev().find_map(|msg| match msg {
-            Message::User(content) => Some(content.as_str()),
+            Message::User { content, .. } => Some(content.as_str()),
             _ => None,
         })
     }
@@ -73,9 +146,9 @@ impl Conversation {
         let index = self
             .messages
             .iter()
-            .rposition(|message| matches!(message, Message::User(_)))?;
+            .rposition(|message| matches!(message, Message::User { .. }))?;
         let prompt = match &self.messages[index] {
-            Message::User(content) => content.clone(),
+            Message::User { content, .. } => content.clone(),
             _ => unreachable!("rposition only matches user messages"),
         };
         self.messages.truncate(index);
@@ -97,14 +170,24 @@ mod tests {
     fn add_system_pushes_system_message() {
         let mut conv = Conversation::new();
         conv.add_system("you are helpful".to_string());
-        assert!(matches!(&conv.messages[0], Message::System(s) if s == "you are helpful"));
+        assert!(
+            matches!(&conv.messages[0], Message::System { content, .. } if content == "you are helpful")
+        );
     }
 
     #[test]
     fn add_user_pushes_user_message() {
         let mut conv = Conversation::new();
         conv.add_user("hello".to_string());
-        assert!(matches!(&conv.messages[0], Message::User(s) if s == "hello"));
+        assert!(matches!(&conv.messages[0], Message::User { content, .. } if content == "hello"));
+    }
+
+    #[test]
+    fn add_pinned_user_marks_message_pinned() {
+        let mut conv = Conversation::new();
+        conv.add_user_pinned("keep this constraint".to_string());
+
+        assert!(conv.messages[0].is_pinned());
     }
 
     #[test]
@@ -120,6 +203,7 @@ mod tests {
                 content,
                 reasoning_content,
                 tool_calls,
+                ..
             } => {
                 assert_eq!(content.as_deref(), Some("answer"));
                 assert_eq!(reasoning_content.as_deref(), Some("thinking"));
@@ -155,6 +239,7 @@ mod tests {
             Message::Tool {
                 tool_call_id,
                 content,
+                ..
             } => {
                 assert_eq!(tool_call_id, "call_1");
                 assert_eq!(content, "file contents");

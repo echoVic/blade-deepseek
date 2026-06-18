@@ -5,6 +5,8 @@ use crate::runtime::subagent_types::SubagentType;
 pub const FLASH_MODEL: &str = "deepseek-v4-flash";
 pub const PRO_MODEL: &str = "deepseek-v4-pro";
 pub const AUTO_MODEL: &str = "auto";
+pub const DEEPSEEK_CHAT_MODEL: &str = "deepseek-chat";
+pub const DEEPSEEK_REASONER_MODEL: &str = "deepseek-reasoner";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ModelSelection {
@@ -92,6 +94,16 @@ impl ModelSelection {
                 actual_model: PRO_MODEL.to_string(),
                 reason: ModelRouteReason::Explicit,
             },
+            Some(DEEPSEEK_CHAT_MODEL) => ModelRouteDecision {
+                requested_model: self.value.clone(),
+                actual_model: DEEPSEEK_CHAT_MODEL.to_string(),
+                reason: ModelRouteReason::Explicit,
+            },
+            Some(DEEPSEEK_REASONER_MODEL) => ModelRouteDecision {
+                requested_model: self.value.clone(),
+                actual_model: DEEPSEEK_REASONER_MODEL.to_string(),
+                reason: ModelRouteReason::Explicit,
+            },
             _ => ModelRouteDecision {
                 requested_model: self.value.clone(),
                 actual_model: PRO_MODEL.to_string(),
@@ -109,15 +121,32 @@ pub fn auxiliary_model() -> &'static str {
 
 pub fn validate_model(model: &str) -> Result<(), String> {
     match model {
-        AUTO_MODEL | FLASH_MODEL | PRO_MODEL => Ok(()),
+        AUTO_MODEL | FLASH_MODEL | PRO_MODEL | DEEPSEEK_CHAT_MODEL | DEEPSEEK_REASONER_MODEL => {
+            Ok(())
+        }
         other => Err(format!(
-            "unsupported model '{other}'. Allowed models: auto, {FLASH_MODEL}, {PRO_MODEL}"
+            "unsupported model '{other}'. Allowed models: auto, {FLASH_MODEL}, {PRO_MODEL}, {DEEPSEEK_CHAT_MODEL}, {DEEPSEEK_REASONER_MODEL}"
         )),
     }
 }
 
 pub fn allowed_models() -> &'static [&'static str] {
-    &[AUTO_MODEL, FLASH_MODEL, PRO_MODEL]
+    &[
+        AUTO_MODEL,
+        FLASH_MODEL,
+        PRO_MODEL,
+        DEEPSEEK_CHAT_MODEL,
+        DEEPSEEK_REASONER_MODEL,
+    ]
+}
+
+pub fn max_context_tokens(model: Option<&str>) -> usize {
+    match model {
+        Some(DEEPSEEK_CHAT_MODEL) | Some(FLASH_MODEL) => 64_000,
+        Some(DEEPSEEK_REASONER_MODEL) | Some(PRO_MODEL) => 128_000,
+        Some(AUTO_MODEL) | None => 128_000,
+        Some(_) => 128_000,
+    }
 }
 
 #[cfg(test)]
@@ -181,5 +210,13 @@ mod tests {
     #[test]
     fn auxiliary_model_returns_flash() {
         assert_eq!(auxiliary_model(), FLASH_MODEL);
+    }
+
+    #[test]
+    fn supports_legacy_deepseek_model_budget_names() {
+        assert!(validate_model("deepseek-chat").is_ok());
+        assert!(validate_model("deepseek-reasoner").is_ok());
+        assert_eq!(max_context_tokens(Some("deepseek-chat")), 64_000);
+        assert_eq!(max_context_tokens(Some("deepseek-reasoner")), 128_000);
     }
 }
