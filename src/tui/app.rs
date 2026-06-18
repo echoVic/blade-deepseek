@@ -181,6 +181,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
     let exit_code;
 
     loop {
+        state.advance_tick();
         terminal.draw(|f| ui::render(f, &mut state, &textarea, &theme))?;
 
         if event::poll(Duration::from_millis(50))? {
@@ -512,6 +513,24 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                         Some(IdleShortcut::Backtrack) => {
                             let _ = action_tx.send(UserAction::Backtrack);
                         }
+                        Some(IdleShortcut::ExpandToolOutput) => {
+                            if textarea_text(&textarea).trim().is_empty()
+                                && state.toggle_latest_tool_output()
+                            {
+                                state.scroll_to_bottom();
+                            } else {
+                                let changed = if vim_state.enabled {
+                                    vim_state.handle(Input::from(ev), &mut textarea, &theme)
+                                } else {
+                                    textarea.input(Input::from(ev))
+                                };
+                                if changed {
+                                    state.reset_history_navigation();
+                                    update_slash_menu(&textarea, &mut state);
+                                    update_mention_candidates(&textarea, &mut state, &config);
+                                }
+                            }
+                        }
                         None => {
                             let changed = if key.code == KeyCode::Tab {
                                 let cwd = config
@@ -691,7 +710,11 @@ fn handle_mention_menu_key(
             true
         }
         KeyCode::Tab | KeyCode::Enter => {
-            if let Some(candidate) = state.mention_candidates.get(state.mention_selected).cloned() {
+            if let Some(candidate) = state
+                .mention_candidates
+                .get(state.mention_selected)
+                .cloned()
+            {
                 let text = textarea_text(textarea);
                 let applied = mentions::apply_mention_selection(&text, &candidate);
                 *textarea = make_textarea_with_text(&applied, vim_state, theme);
@@ -753,11 +776,8 @@ fn handle_slash_menu_key(
             KeyCode::Tab => {
                 let chosen = sub.items[sub.selected].clone();
                 let value = chosen.split_whitespace().next().unwrap_or(&chosen);
-                *textarea = make_textarea_with_text(
-                    &format!("{} {value}", sub.title),
-                    vim_state,
-                    theme,
-                );
+                *textarea =
+                    make_textarea_with_text(&format!("{} {value}", sub.title), vim_state, theme);
                 state.slash_menu = None;
                 return true;
             }
@@ -765,16 +785,20 @@ fn handle_slash_menu_key(
                 let chosen = sub.items[sub.selected].clone();
                 // Execute the sub-command
                 if sub.title == "/model" {
-                    let chosen_model = chosen.split_whitespace().next().unwrap_or(&chosen).to_string();
+                    let chosen_model = chosen
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or(&chosen)
+                        .to_string();
                     if let Ok(()) = commands::validate_model(&chosen_model) {
                         config.model = ModelSelection::from_unchecked(Some(chosen_model.clone()));
                         if let Ok(mut cfg) = shared_config.lock() {
                             cfg.model = ModelSelection::from_unchecked(Some(chosen_model.clone()));
                         }
                         state.model_name = chosen_model.clone();
-                        state
-                            .messages
-                            .push(ChatMessage::System(format!("Model switched to {chosen_model}.")));
+                        state.messages.push(ChatMessage::System(format!(
+                            "Model switched to {chosen_model}."
+                        )));
                         let _ = action_tx.send(UserAction::SetModel(chosen_model));
                     }
                 } else if sub.title == "/mode" {
@@ -1316,11 +1340,13 @@ fn chat_message_from_history(
             tool_call_id,
             content,
         } => Some(ChatMessage::ToolCall {
+            id: tool_call_id.clone(),
             name: format!("tool:{tool_call_id}"),
             target: None,
             status: "completed".to_string(),
             output: Some(content),
             diff: None,
+            expanded: false,
         }),
     }
 }

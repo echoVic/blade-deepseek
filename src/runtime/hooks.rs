@@ -158,17 +158,6 @@ fn sanitize_env_value(value: &str) -> String {
     sanitized
 }
 
-impl crate::tools::ToolStatus {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Completed => "completed",
-            Self::Failed => "failed",
-            Self::Denied => "denied",
-            Self::NotImplemented => "not_implemented",
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -239,10 +239,12 @@ fn build_message_lines(state: &AppState, theme: &Theme) -> Vec<Line<'static>> {
                 status,
                 output,
                 diff,
+                expanded,
+                ..
             } => {
                 let icon = match status.as_str() {
                     "completed" => "✓",
-                    "running" => "⟳",
+                    "running" => spinner_frame(state.tick),
                     "denied" => "✗",
                     "failed" => "✗",
                     _ => "·",
@@ -265,17 +267,14 @@ fn build_message_lines(state: &AppState, theme: &Theme) -> Vec<Line<'static>> {
                     Span::styled(format!(" ({status})"), Style::default().fg(theme.muted)),
                 ]));
                 if let Some(out) = output {
-                    let preview = truncate_lines(out, 2);
-                    lines.push(Line::from(Span::styled(
-                        format!("    {preview}"),
-                        Style::default().fg(theme.muted),
-                    )));
+                    append_tool_output_lines(&mut lines, out, *expanded, theme);
                 }
                 if let Some(diff) = diff {
                     append_diff_lines(&mut lines, diff, theme);
                 }
             }
-            ChatMessage::PlanUpdate { .. } => {
+            ChatMessage::PlanUpdate { explanation, plan } => {
+                let _ = (explanation, plan);
                 // Plan is rendered in the fixed bottom panel; skip inline rendering.
             }
             ChatMessage::Subagent {
@@ -305,44 +304,6 @@ fn build_message_lines(state: &AppState, theme: &Theme) -> Vec<Line<'static>> {
     }
 
     lines
-}
-
-fn append_plan_lines(
-    lines: &mut Vec<Line<'static>>,
-    explanation: Option<&str>,
-    plan: &[crate::tools::update_plan::PlanItem],
-    theme: &Theme,
-) {
-    lines.push(Line::from(Span::styled(
-        "  task plan",
-        Style::default().fg(theme.border),
-    )));
-    if let Some(explanation) = explanation.filter(|text| !text.trim().is_empty()) {
-        lines.push(Line::from(Span::styled(
-            format!("    {explanation}"),
-            Style::default()
-                .fg(theme.muted)
-                .add_modifier(Modifier::ITALIC),
-        )));
-    }
-    if plan.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "    (empty)",
-            Style::default().fg(theme.muted),
-        )));
-        return;
-    }
-    for item in plan {
-        let (icon, color) = match item.status {
-            crate::tools::update_plan::PlanStatus::Completed => ("✓", theme.success),
-            crate::tools::update_plan::PlanStatus::InProgress => ("→", theme.warning),
-            crate::tools::update_plan::PlanStatus::Pending => ("•", theme.muted),
-        };
-        lines.push(Line::from(vec![
-            Span::styled(format!("    {icon} "), Style::default().fg(color)),
-            Span::styled(item.step.clone(), Style::default().fg(color)),
-        ]));
-    }
 }
 
 fn plan_panel_height(state: &AppState) -> u16 {
@@ -466,6 +427,37 @@ fn append_diff_lines(lines: &mut Vec<Line<'static>>, diff: &str, theme: &Theme) 
             Style::default().fg(theme.muted),
         )));
     }
+}
+
+fn append_tool_output_lines(
+    lines: &mut Vec<Line<'static>>,
+    output: &str,
+    expanded: bool,
+    theme: &Theme,
+) {
+    let max_lines = if expanded { 40 } else { 2 };
+    let output_lines: Vec<&str> = output.lines().collect();
+    let shown = output_lines.len().min(max_lines);
+
+    for line in output_lines.iter().take(shown) {
+        lines.push(Line::from(Span::styled(
+            format!("    {line}"),
+            Style::default().fg(theme.muted),
+        )));
+    }
+
+    if output_lines.len() > shown {
+        let hidden = output_lines.len() - shown;
+        lines.push(Line::from(Span::styled(
+            format!("    [+{hidden} lines]"),
+            Style::default().fg(theme.muted),
+        )));
+    }
+}
+
+fn spinner_frame(tick: u64) -> &'static str {
+    const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    SPINNER_FRAMES[((tick / 2) as usize) % SPINNER_FRAMES.len()]
 }
 
 fn render_input(frame: &mut Frame, area: Rect, textarea: &TextArea) {
@@ -623,7 +615,11 @@ fn render_mention_candidates(frame: &mut Frame, input_area: Rect, state: &AppSta
         .take(12)
         .enumerate()
         .map(|(i, c)| {
-            let prefix = if i == state.mention_selected { "▸ " } else { "  " };
+            let prefix = if i == state.mention_selected {
+                "▸ "
+            } else {
+                "  "
+            };
             let style = if i == state.mention_selected {
                 Style::default()
                     .fg(theme.border)

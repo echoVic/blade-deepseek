@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use crate::approval::policy::PermissionRules;
-use crate::config::ThemeName;
+use crate::config::{ThemeName, ToolConfig};
 use crate::runtime::subagent_config::SubagentConfig;
 
 const ORCA_HOME_ENV: &str = "ORCA_HOME";
@@ -23,6 +23,8 @@ pub struct FileConfig {
     pub permissions: PermissionRules,
     #[serde(default)]
     pub subagents: SubagentConfig,
+    #[serde(default)]
+    pub tools: ToolConfig,
     #[serde(default)]
     pub theme: ThemeName,
     #[serde(default)]
@@ -177,6 +179,16 @@ max_parallel = 6
         let config: FileConfig = toml::from_str(toml).unwrap();
         assert_eq!(config.subagents.max_depth, 3);
         assert_eq!(config.subagents.max_parallel, 6);
+    }
+
+    #[test]
+    fn parse_tool_config() {
+        let toml = r#"
+[tools]
+max_read_parallel = 5
+"#;
+        let config: FileConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.tools.max_read_parallel, 5);
     }
 
     #[test]

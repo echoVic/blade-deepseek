@@ -14,10 +14,16 @@ pub enum TuiEvent {
     ReasoningDelta(String),
     MessageDelta(String),
     ToolRequested {
+        id: String,
         name: String,
         target: Option<String>,
     },
+    ToolOutputDelta {
+        id: String,
+        chunk: String,
+    },
     ToolCompleted {
+        id: String,
         name: String,
         status: String,
         output: String,
@@ -84,11 +90,13 @@ pub enum ChatMessage {
     Reasoning(String),
     Assistant(String),
     ToolCall {
+        id: String,
         name: String,
         target: Option<String>,
         status: String,
         output: Option<String>,
         diff: Option<String>,
+        expanded: bool,
     },
     PlanUpdate {
         explanation: Option<String>,
@@ -157,6 +165,7 @@ pub struct AppState {
     pub mention_candidates: Vec<String>,
     pub mention_selected: usize,
     pub current_plan: Option<(Option<String>, Vec<PlanItem>)>,
+    pub tick: u64,
 }
 
 impl AppState {
@@ -185,6 +194,7 @@ impl AppState {
             mention_candidates: Vec::new(),
             mention_selected: 0,
             current_plan: None,
+            tick: 0,
         }
     }
 
@@ -214,6 +224,22 @@ impl AppState {
 
     pub fn toggle_shortcuts(&mut self) {
         self.show_shortcuts = !self.show_shortcuts;
+    }
+
+    pub fn advance_tick(&mut self) {
+        if self.status == AppStatus::Running {
+            self.tick = self.tick.wrapping_add(1);
+        }
+    }
+
+    pub fn toggle_latest_tool_output(&mut self) -> bool {
+        for message in self.messages.iter_mut().rev() {
+            if let ChatMessage::ToolCall { expanded, .. } = message {
+                *expanded = !*expanded;
+                return true;
+            }
+        }
+        false
     }
 
     pub fn record_prompt(&mut self, prompt: String) {
@@ -299,19 +325,31 @@ impl AppState {
                     self.messages.push(ChatMessage::Assistant(text));
                 }
             }
-            TuiEvent::ToolRequested { name, target } => {
+            TuiEvent::ToolRequested { id, name, target } => {
                 if name == "subagent" || name == "update_plan" {
                     return;
                 }
                 self.messages.push(ChatMessage::ToolCall {
+                    id,
                     name,
                     target,
                     status: "running".to_string(),
                     output: None,
                     diff: None,
+                    expanded: false,
                 });
             }
+            TuiEvent::ToolOutputDelta { id, chunk } => {
+                if let Some(ChatMessage::ToolCall { output, .. }) =
+                    self.messages.iter_mut().rev().find(|message| {
+                        matches!(message, ChatMessage::ToolCall { id: existing_id, .. } if existing_id == &id)
+                    })
+                {
+                    output.get_or_insert_with(String::new).push_str(&chunk);
+                }
+            }
             TuiEvent::ToolCompleted {
+                id,
                 name,
                 status,
                 output,
@@ -321,30 +359,34 @@ impl AppState {
                     return;
                 }
                 let updated = if let Some(ChatMessage::ToolCall {
+                    id: existing_id,
                     name: existing_name,
                     status: s,
                     output: o,
                     diff: d,
                     ..
-                }) = self.messages.last_mut()
+                }) = self.messages.iter_mut().rev().find(|message| {
+                    matches!(message, ChatMessage::ToolCall { id: existing_id, .. } if existing_id == &id)
+                })
                 {
-                    if existing_name == &name {
-                        *s = status.clone();
+                    *existing_id = id.clone();
+                    *existing_name = name.clone();
+                    *s = status.clone();
+                    if o.is_none() || output.is_empty() {
                         *o = if output.is_empty() {
                             None
                         } else {
                             Some(output.clone())
                         };
-                        *d = diff.clone();
-                        true
-                    } else {
-                        false
                     }
+                    *d = diff.clone();
+                    true
                 } else {
                     false
                 };
                 if !updated {
                     self.messages.push(ChatMessage::ToolCall {
+                        id,
                         name,
                         target: None,
                         status,
@@ -354,6 +396,7 @@ impl AppState {
                             Some(output)
                         },
                         diff,
+                        expanded: false,
                     });
                 }
             }
@@ -551,10 +594,12 @@ mod tests {
         let mut state = state();
 
         state.update(TuiEvent::ToolRequested {
+            id: "tool-subagent".to_string(),
             name: "subagent".to_string(),
             target: Some("inspect repo".to_string()),
         });
         state.update(TuiEvent::ToolCompleted {
+            id: "tool-subagent".to_string(),
             name: "subagent".to_string(),
             status: "completed".to_string(),
             output: "Subagent status: success".to_string(),
@@ -569,10 +614,12 @@ mod tests {
         let mut state = state();
 
         state.update(TuiEvent::ToolRequested {
+            id: "tool-plan".to_string(),
             name: "update_plan".to_string(),
             target: Some("2 items".to_string()),
         });
         state.update(TuiEvent::ToolCompleted {
+            id: "tool-plan".to_string(),
             name: "update_plan".to_string(),
             status: "completed".to_string(),
             output: "Plan updated".to_string(),
@@ -600,6 +647,54 @@ mod tests {
                 assert_eq!(plan[1].step, "Patch");
             }
             other => panic!("expected plan update message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_output_delta_updates_matching_tool_id() {
+        let mut state = state();
+
+        state.update(TuiEvent::ToolRequested {
+            id: "a".to_string(),
+            name: "bash".to_string(),
+            target: Some("first".to_string()),
+        });
+        state.update(TuiEvent::ToolRequested {
+            id: "b".to_string(),
+            name: "bash".to_string(),
+            target: Some("second".to_string()),
+        });
+        state.update(TuiEvent::ToolOutputDelta {
+            id: "a".to_string(),
+            chunk: "one\n".to_string(),
+        });
+
+        match &state.messages[0] {
+            ChatMessage::ToolCall { output, .. } => {
+                assert_eq!(output.as_deref(), Some("one\n"));
+            }
+            other => panic!("expected tool call, got {other:?}"),
+        }
+        match &state.messages[1] {
+            ChatMessage::ToolCall { output, .. } => assert!(output.is_none()),
+            other => panic!("expected tool call, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn toggle_latest_tool_output_flips_expanded_state() {
+        let mut state = state();
+
+        state.update(TuiEvent::ToolRequested {
+            id: "tool-1".to_string(),
+            name: "grep".to_string(),
+            target: None,
+        });
+
+        assert!(state.toggle_latest_tool_output());
+        match &state.messages[0] {
+            ChatMessage::ToolCall { expanded, .. } => assert!(*expanded),
+            other => panic!("expected tool call, got {other:?}"),
         }
     }
 }

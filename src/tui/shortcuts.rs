@@ -60,6 +60,7 @@ pub enum IdleShortcut {
     HalfPageUp,
     HalfPageDown,
     Backtrack,
+    ExpandToolOutput,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -166,6 +167,10 @@ pub fn idle_shortcut(event: KeyEvent) -> Option<IdleShortcut> {
         (
             IdleShortcut::Backtrack,
             KeyBinding::new(KeyCode::Esc, KeyModifiers::NONE),
+        ),
+        (
+            IdleShortcut::ExpandToolOutput,
+            KeyBinding::new(KeyCode::Char('e'), KeyModifiers::NONE),
         ),
     ];
     match_binding(event, &bindings)
@@ -358,6 +363,11 @@ pub const SHORTCUT_HINTS: &[ShortcutHint] = &[
         action: "backtrack previous prompt",
     },
     ShortcutHint {
+        scope: ShortcutScope::Idle,
+        keys: "e",
+        action: "expand latest tool output",
+    },
+    ShortcutHint {
         scope: ShortcutScope::Running,
         keys: "esc / ctrl+g",
         action: "interrupt current turn",
@@ -495,6 +505,14 @@ mod tests {
         assert_eq!(
             idle_shortcut(key(KeyCode::Enter, KeyModifiers::SHIFT)),
             Some(IdleShortcut::Newline)
+        );
+    }
+
+    #[test]
+    fn idle_shortcuts_resolve_tool_output_expand() {
+        assert_eq!(
+            idle_shortcut(key(KeyCode::Char('e'), KeyModifiers::NONE)),
+            Some(IdleShortcut::ExpandToolOutput)
         );
     }
 }

@@ -472,6 +472,28 @@ pub fn run_agent_for_tui(
                 continue;
             }
 
+            if tools::should_run_readonly_batch(config.tools.max_read_parallel, &tool_requests[index]) {
+                let batch_end = tools::collect_readonly_batch(config.tools.max_read_parallel, &tool_requests, index);
+                let results = execute_readonly_batch_for_tui(
+                    &cwd,
+                    &tool_requests[index..batch_end],
+                    event_tx,
+                    &session.mcp_registry,
+                    &session.hooks,
+                );
+                for result in results {
+                    let result_content = agent_common::format_tool_result_for_model(&result);
+                    session
+                        .conversation
+                        .add_tool_result(result.id.clone(), result_content);
+                    if let Some(message) = session.conversation.messages.last().cloned() {
+                        session.append_message(&message);
+                    }
+                }
+                index = batch_end;
+                continue;
+            }
+
             let tool_request = &tool_requests[index];
             let (should_stop, result, child_cost) = execute_tool_for_tui(
                 config,
@@ -542,6 +564,83 @@ fn collect_subagent_batch(
         end += 1;
     }
     end
+}
+
+fn execute_readonly_batch_for_tui(
+    cwd: &Path,
+    tool_requests: &[tools::ToolRequest],
+    event_tx: &Sender<TuiEvent>,
+    mcp_registry: &McpRegistry,
+    hooks: &HookRunner,
+) -> Vec<tools::ToolResult> {
+    let mut hook_failed: Vec<Option<tools::ToolResult>> = vec![None; tool_requests.len()];
+    let mut runnable = Vec::new();
+
+    for (idx, tool_request) in tool_requests.iter().enumerate() {
+        let _ = event_tx.send(TuiEvent::ToolRequested {
+            id: tool_request.id.clone(),
+            name: tool_request.name.as_str().to_string(),
+            target: tool_request.target.clone(),
+        });
+        if let Err(error) = hooks.run(
+            HookEvent::PreToolUse,
+            HookContext {
+                cwd: &cwd.display().to_string(),
+                session_status: None,
+                tool_request: Some(tool_request),
+                tool_result: None,
+                before_messages: None,
+                after_messages: None,
+            },
+        ) {
+            hook_failed[idx] = Some(tools::ToolResult::failed(
+                tool_request,
+                format!("pre_tool_use hook blocked tool: {error}"),
+                None,
+            ));
+        } else {
+            runnable.push((idx, tool_request.clone()));
+        }
+    }
+
+    let mut results = tools::run_readonly_batch_parallel(tool_requests, runnable, cwd, mcp_registry);
+
+    for (idx, failed) in hook_failed.into_iter().enumerate() {
+        if let Some(result) = failed {
+            results[idx] = result;
+        }
+    }
+
+    for (tool_request, result) in tool_requests.iter().zip(results.iter()) {
+        let _ = event_tx.send(TuiEvent::ToolCompleted {
+            id: result.id.clone(),
+            name: result.name.as_str().to_string(),
+            status: result.status.as_str().to_string(),
+            output: result
+                .output
+                .clone()
+                .or_else(|| result.error.clone())
+                .unwrap_or_default(),
+            diff: None,
+        });
+        if let Err(error) = hooks.run(
+            HookEvent::PostToolUse,
+            HookContext {
+                cwd: &cwd.display().to_string(),
+                session_status: None,
+                tool_request: Some(tool_request),
+                tool_result: Some(result),
+                before_messages: None,
+                after_messages: None,
+            },
+        ) {
+            let _ = event_tx.send(TuiEvent::Error(format!(
+                "post_tool_use hook failed: {error}"
+            )));
+        }
+    }
+
+    results
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -695,10 +794,12 @@ fn execute_tool_for_tui(
                 if !allowed {
                     let result = tools::ToolResult::denied(tool_request, "user denied");
                     let _ = event_tx.send(TuiEvent::ToolRequested {
+                        id: tool_request.id.clone(),
                         name: tool_request.name.as_str().to_string(),
                         target: tool_request.target.clone(),
                     });
                     let _ = event_tx.send(TuiEvent::ToolCompleted {
+                        id: tool_request.id.clone(),
                         name: tool_request.name.as_str().to_string(),
                         status: "denied".to_string(),
                         output: String::new(),
@@ -710,10 +811,12 @@ fn execute_tool_for_tui(
             ApprovalDecision::Deny => {
                 let result = tools::ToolResult::denied(tool_request, resolution.reason.clone());
                 let _ = event_tx.send(TuiEvent::ToolRequested {
+                    id: tool_request.id.clone(),
                     name: tool_request.name.as_str().to_string(),
                     target: tool_request.target.clone(),
                 });
                 let _ = event_tx.send(TuiEvent::ToolCompleted {
+                    id: tool_request.id.clone(),
                     name: tool_request.name.as_str().to_string(),
                     status: "denied".to_string(),
                     output: String::new(),
@@ -740,6 +843,7 @@ fn execute_tool_for_tui(
         (r, Some(c))
     } else {
         let _ = event_tx.send(TuiEvent::ToolRequested {
+            id: tool_request.id.clone(),
             name: tool_request.name.as_str().to_string(),
             target: tool_request.target.clone(),
         });
@@ -760,6 +864,7 @@ fn execute_tool_for_tui(
                 None,
             );
             let _ = event_tx.send(TuiEvent::ToolCompleted {
+                id: tool_request.id.clone(),
                 name: tool_request.name.as_str().to_string(),
                 status: "failed".to_string(),
                 output: result.error.clone().unwrap_or_default(),
@@ -768,7 +873,22 @@ fn execute_tool_for_tui(
             return (true, result, None);
         }
         let before = diff::capture_before(tool_request, cwd);
-        let result = tools::execute_with_mcp(tool_request, cwd, mcp_registry);
+        let result = if tool_request.name == tools::ToolName::Bash {
+            let mut on_output = |chunk: &str| {
+                let _ = event_tx.send(TuiEvent::ToolOutputDelta {
+                    id: tool_request.id.clone(),
+                    chunk: chunk.to_string(),
+                });
+            };
+            tools::bash::execute_streaming(
+                tool_request,
+                cwd,
+                tools::MAX_TOOL_OUTPUT_BYTES,
+                &mut on_output,
+            )
+        } else {
+            tools::execute_with_mcp(tool_request, cwd, mcp_registry)
+        };
         if matches!(result.status, tools::ToolStatus::Completed) {
             rendered_diff = before.and_then(diff::render_after);
         }
@@ -777,9 +897,14 @@ fn execute_tool_for_tui(
 
     if tool_request.name != tools::ToolName::Subagent {
         let _ = event_tx.send(TuiEvent::ToolCompleted {
+            id: tool_request.id.clone(),
             name: tool_request.name.as_str().to_string(),
-            status: format!("{:?}", result.status).to_lowercase(),
-            output: result.output.clone().unwrap_or_default(),
+            status: result.status.as_str().to_string(),
+            output: result
+                .output
+                .clone()
+                .or_else(|| result.error.clone())
+                .unwrap_or_default(),
             diff: rendered_diff,
         });
         if tool_request.name == tools::ToolName::UpdatePlan
@@ -1160,6 +1285,7 @@ mod tests {
             mcp_servers: Vec::new(),
             hooks: Vec::new(),
             subagents: Default::default(),
+            tools: Default::default(),
             theme: crate::config::ThemeName::Dark,
             vim_mode: false,
             update_check: false,

@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::thread;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -15,7 +16,7 @@ pub mod update_plan;
 pub mod web_search;
 pub mod write_file;
 
-const MAX_TOOL_OUTPUT_BYTES: usize = 8 * 1024;
+pub const MAX_TOOL_OUTPUT_BYTES: usize = 8 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ToolName {
@@ -47,6 +48,13 @@ impl ToolName {
             Self::UpdatePlan => "update_plan",
             Self::Mcp(name) => name,
         }
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        matches!(
+            self,
+            Self::ReadFile | Self::ListFiles | Self::Grep | Self::GitStatus | Self::WebSearch
+        )
     }
 }
 
@@ -103,6 +111,17 @@ pub enum ToolStatus {
     Failed,
     Denied,
     NotImplemented,
+}
+
+impl ToolStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Denied => "denied",
+            Self::NotImplemented => "not_implemented",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -211,6 +230,70 @@ fn execute_mcp(request: &ToolRequest, schema_name: &str, mcp_registry: &McpRegis
         Ok(result) => ToolResult::completed(request, result.output, false),
         Err(error) => ToolResult::failed(request, error, None),
     }
+}
+
+pub fn should_run_readonly_batch(
+    max_read_parallel: usize,
+    tool_request: &ToolRequest,
+) -> bool {
+    tool_request.name.is_read_only()
+        && !matches!(tool_request.action, ActionKind::Write | ActionKind::Shell)
+        && max_read_parallel > 1
+}
+
+pub fn collect_readonly_batch(
+    max_read_parallel: usize,
+    tool_requests: &[ToolRequest],
+    start: usize,
+) -> usize {
+    let max_end = (start + max_read_parallel).min(tool_requests.len());
+    let mut end = start;
+    while end < max_end
+        && tool_requests[end].name.is_read_only()
+        && !matches!(tool_requests[end].action, ActionKind::Write | ActionKind::Shell)
+    {
+        end += 1;
+    }
+    end
+}
+
+pub fn run_readonly_batch_parallel(
+    tool_requests: &[ToolRequest],
+    runnable: Vec<(usize, ToolRequest)>,
+    cwd: &Path,
+    mcp_registry: &McpRegistry,
+) -> Vec<ToolResult> {
+    let mut results: Vec<Option<ToolResult>> = vec![None; tool_requests.len()];
+    let cwd = cwd.to_path_buf();
+    let mcp_registry = mcp_registry.clone();
+
+    thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for (idx, tool_request) in runnable {
+            let cwd = cwd.clone();
+            let mcp_registry = mcp_registry.clone();
+            handles.push((
+                idx,
+                scope.spawn(move || execute_with_mcp(&tool_request, &cwd, &mcp_registry)),
+            ));
+        }
+
+        for (idx, handle) in handles {
+            results[idx] = Some(match handle.join() {
+                Ok(result) => result,
+                Err(_) => ToolResult::failed(
+                    &tool_requests[idx],
+                    "read-only tool thread panicked",
+                    None,
+                ),
+            });
+        }
+    });
+
+    results
+        .into_iter()
+        .map(|result| result.expect("each read-only batch item has a result"))
+        .collect()
 }
 
 fn resolve_workspace_path(cwd: &Path, target: Option<&str>) -> Result<PathBuf, String> {

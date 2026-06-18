@@ -56,6 +56,39 @@ pub enum HistoryMode {
     Fork(String),
 }
 
+pub const DEFAULT_MAX_READ_PARALLEL_TOOLS: usize = 8;
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ToolConfig {
+    #[serde(default = "default_max_read_parallel")]
+    pub max_read_parallel: usize,
+}
+
+impl Default for ToolConfig {
+    fn default() -> Self {
+        Self {
+            max_read_parallel: DEFAULT_MAX_READ_PARALLEL_TOOLS,
+        }
+    }
+}
+
+impl ToolConfig {
+    const MAX_READ_PARALLEL_UPPER: usize = 32;
+
+    pub fn normalized(mut self) -> Self {
+        if self.max_read_parallel == 0 {
+            self.max_read_parallel = 1;
+        } else if self.max_read_parallel > Self::MAX_READ_PARALLEL_UPPER {
+            self.max_read_parallel = Self::MAX_READ_PARALLEL_UPPER;
+        }
+        self
+    }
+}
+
+fn default_max_read_parallel() -> usize {
+    DEFAULT_MAX_READ_PARALLEL_TOOLS
+}
+
 #[derive(Clone, Debug)]
 pub struct RunConfig {
     pub prompt: String,
@@ -74,6 +107,7 @@ pub struct RunConfig {
     pub permission_rules: PermissionRules,
     pub max_budget_usd: Option<f64>,
     pub subagents: SubagentConfig,
+    pub tools: ToolConfig,
     pub theme: ThemeName,
     pub vim_mode: bool,
     pub update_check: bool,

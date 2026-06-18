@@ -528,6 +528,32 @@ fn run_agent_loop(
                 continue;
             }
 
+            if tools::should_run_readonly_batch(config.tools.max_read_parallel, &tool_requests[index]) {
+                let batch_end = tools::collect_readonly_batch(config.tools.max_read_parallel, &tool_requests, index);
+                let results = execute_readonly_batch(
+                    cwd,
+                    events,
+                    sink,
+                    &tool_requests[index..batch_end],
+                    emit_deltas,
+                    mcp_registry,
+                    hooks,
+                )?;
+
+                for result in results {
+                    let result_content = agent_common::format_tool_result_for_model(&result);
+                    conversation.add_tool_result(result.id.clone(), result_content);
+                    if emit_deltas
+                        && let Some(writer) = history_writer.as_deref_mut()
+                        && let Some(message) = conversation.messages.last()
+                    {
+                        writer.append_message(message)?;
+                    }
+                }
+                index = batch_end;
+                continue;
+            }
+
             let tool_request = &tool_requests[index];
             let (status, result) = execute_tool_with_approval(
                 config,
@@ -758,6 +784,73 @@ fn collect_subagent_batch(
         end += 1;
     }
     end
+}
+
+fn execute_readonly_batch(
+    cwd: &Path,
+    events: &mut EventFactory,
+    sink: &mut EventSink<impl io::Write>,
+    tool_requests: &[tools::ToolRequest],
+    emit_deltas: bool,
+    mcp_registry: &McpRegistry,
+    hooks: &HookRunner,
+) -> io::Result<Vec<tools::ToolResult>> {
+    let mut hook_failed: Vec<Option<tools::ToolResult>> = vec![None; tool_requests.len()];
+    let mut runnable = Vec::new();
+
+    for (idx, tool_request) in tool_requests.iter().enumerate() {
+        if emit_deltas {
+            sink.emit(&events.tool_call_requested(tool_request))?;
+        }
+        if let Err(error) = hooks.run(
+            HookEvent::PreToolUse,
+            HookContext {
+                cwd: &cwd.display().to_string(),
+                session_status: None,
+                tool_request: Some(tool_request),
+                tool_result: None,
+                before_messages: None,
+                after_messages: None,
+            },
+        ) {
+            hook_failed[idx] = Some(tools::ToolResult::failed(
+                tool_request,
+                format!("pre_tool_use hook blocked tool: {error}"),
+                None,
+            ));
+        } else {
+            runnable.push((idx, tool_request.clone()));
+        }
+    }
+
+    let mut results = tools::run_readonly_batch_parallel(tool_requests, runnable, cwd, mcp_registry);
+
+    for (idx, failed) in hook_failed.into_iter().enumerate() {
+        if let Some(result) = failed {
+            results[idx] = result;
+        }
+    }
+
+    for (tool_request, result) in tool_requests.iter().zip(results.iter()) {
+        if emit_deltas {
+            sink.emit(&events.tool_call_completed(result))?;
+            if let Err(error) = hooks.run(
+                HookEvent::PostToolUse,
+                HookContext {
+                    cwd: &cwd.display().to_string(),
+                    session_status: None,
+                    tool_request: Some(tool_request),
+                    tool_result: Some(result),
+                    before_messages: None,
+                    after_messages: None,
+                },
+            ) {
+                sink.emit(&events.error(&format!("post_tool_use hook failed: {error}")))?;
+            }
+        }
+    }
+
+    Ok(results)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1155,6 +1248,7 @@ mod tests {
             mcp_servers: Vec::new(),
             hooks: Vec::new(),
             subagents,
+            tools: Default::default(),
             theme: crate::config::ThemeName::Dark,
             vim_mode: false,
             update_check: false,
@@ -1169,6 +1263,16 @@ mod tests {
             name: tools::ToolName::Subagent,
             action: ActionKind::Read,
             target: Some("task".to_string()),
+            raw_arguments: None,
+        }
+    }
+
+    fn tool_request(id: &str, name: tools::ToolName, action: ActionKind) -> tools::ToolRequest {
+        tools::ToolRequest {
+            id: id.to_string(),
+            name,
+            action,
+            target: Some("target".to_string()),
             raw_arguments: None,
         }
     }
@@ -1216,5 +1320,83 @@ mod tests {
         requests.push(subagent_request("c"));
 
         assert_eq!(collect_subagent_batch(&config, &requests, 0), 2);
+    }
+
+    #[test]
+    fn readonly_batch_respects_parallel_limit() {
+        let mut config = config(SubagentConfig::default());
+        config.tools.max_read_parallel = 2;
+        let requests = vec![
+            tool_request("a", tools::ToolName::ReadFile, ActionKind::Read),
+            tool_request("b", tools::ToolName::Grep, ActionKind::Read),
+            tool_request("c", tools::ToolName::ListFiles, ActionKind::Read),
+        ];
+
+        assert!(tools::should_run_readonly_batch(config.tools.max_read_parallel, &requests[0]));
+        assert_eq!(tools::collect_readonly_batch(config.tools.max_read_parallel, &requests, 0), 2);
+    }
+
+    #[test]
+    fn readonly_batch_stops_at_first_mutating_tool() {
+        let config = config(SubagentConfig::default());
+        let requests = vec![
+            tool_request("a", tools::ToolName::ReadFile, ActionKind::Read),
+            tool_request("b", tools::ToolName::Bash, ActionKind::Shell),
+            tool_request("c", tools::ToolName::Grep, ActionKind::Read),
+        ];
+
+        assert_eq!(tools::collect_readonly_batch(config.tools.max_read_parallel, &requests, 0), 1);
+        assert!(!tools::should_run_readonly_batch(config.tools.max_read_parallel, &requests[1]));
+    }
+
+    #[test]
+    fn readonly_batch_skips_approval_actions() {
+        let config = config(SubagentConfig::default());
+        let request = tool_request("a", tools::ToolName::ReadFile, ActionKind::Write);
+
+        assert!(!tools::should_run_readonly_batch(config.tools.max_read_parallel, &request));
+    }
+
+    #[test]
+    fn readonly_batch_executes_results_in_request_order() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "alpha").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "bravo").unwrap();
+        let requests = vec![
+            tools::ToolRequest {
+                target: Some("a.txt".to_string()),
+                ..tool_request("first", tools::ToolName::ReadFile, ActionKind::Read)
+            },
+            tools::ToolRequest {
+                target: Some("b.txt".to_string()),
+                ..tool_request("second", tools::ToolName::ReadFile, ActionKind::Read)
+            },
+        ];
+        let mut events = EventFactory::new("test-run".to_string());
+        let mut output = Vec::new();
+        let mut sink = EventSink::new(&mut output, OutputFormat::Jsonl);
+        let registry = McpRegistry::from_tools_for_test(Vec::new());
+        let hooks = HookRunner::default();
+
+        let results = execute_readonly_batch(
+            dir.path(),
+            &mut events,
+            &mut sink,
+            &requests,
+            true,
+            &registry,
+            &hooks,
+        )
+        .unwrap();
+
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| result.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second"]
+        );
+        assert_eq!(results[0].output.as_deref(), Some("alpha"));
+        assert_eq!(results[1].output.as_deref(), Some("bravo"));
     }
 }
