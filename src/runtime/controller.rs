@@ -69,7 +69,8 @@ impl AgentLoopResult {
 }
 
 pub fn run(config: RunConfig) -> i32 {
-    match run_inner(config) {
+    let stdout = io::stdout();
+    match run_inner(config, stdout.lock()) {
         Ok(status) => status.exit_code(),
         Err(error) => {
             eprintln!("orca: {error}");
@@ -78,7 +79,17 @@ pub fn run(config: RunConfig) -> i32 {
     }
 }
 
-fn run_inner(config: RunConfig) -> io::Result<RunStatus> {
+pub fn run_to_writer<W: io::Write>(config: RunConfig, writer: W) -> i32 {
+    match run_inner(config, writer) {
+        Ok(status) => status.exit_code(),
+        Err(error) => {
+            eprintln!("orca: {error}");
+            RunStatus::Failed.exit_code()
+        }
+    }
+}
+
+fn run_inner<W: io::Write>(config: RunConfig, writer: W) -> io::Result<RunStatus> {
     let cwd_path = config.cwd.clone().unwrap_or(std::env::current_dir()?);
     let cwd = cwd_path.display().to_string();
     let prompt = if config.prompt.trim().is_empty() {
@@ -88,8 +99,7 @@ fn run_inner(config: RunConfig) -> io::Result<RunStatus> {
     };
 
     let mut events = EventFactory::new(new_run_id());
-    let stdout = io::stdout();
-    let mut sink = EventSink::new(stdout.lock(), config.output_format);
+    let mut sink = EventSink::new(writer, config.output_format);
     let instructions = load_project_instructions(&cwd_path);
     let memory = memory::load_for_cwd(&cwd_path);
     let hooks = HookRunner::new(config.hooks.clone());
@@ -322,9 +332,7 @@ fn run_agent_loop(
                     conversation = conversation_with_hook_context(&conversation, &outcome);
                 }
                 Err(error) if emit_deltas => {
-                    sink.emit(&events.error(&format!(
-                        "on_budget_warning hook failed: {error}"
-                    )))?;
+                    sink.emit(&events.error(&format!("on_budget_warning hook failed: {error}")))?;
                 }
                 _ => {}
             }

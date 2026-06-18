@@ -19,6 +19,33 @@ Options:
 - `--model <name>` — Model override
 - `--base-url <url>` — API base URL override
 
+## Embedded Server Protocol
+
+```sh
+orca --mode=server
+```
+
+Server mode reads one JSON object per line from stdin and writes one JSON object per line to stdout. The initial supported operation is `submit`:
+
+```json
+{"id":1,"op":"submit","prompt":"fix the bug in main.rs"}
+```
+
+The response stream preserves the request `id` and emits compact protocol events derived from the normal runtime event stream:
+
+```jsonl
+{"id":1,"event":"turn_started","turn":1}
+{"id":1,"event":"reasoning_delta","text":"Let me look..."}
+{"id":1,"event":"tool_requested","tool":"read_file","target":"src/main.rs"}
+{"id":1,"event":"tool_completed","tool":"read_file","status":"completed"}
+{"id":1,"event":"message_delta","text":"I found the issue..."}
+{"id":1,"event":"turn_completed","status":"success"}
+```
+
+Unsupported operations and malformed requests emit an `error` event. Server mode exits when stdin closes.
+
+Requests are processed serially — the next `submit` is not read until the current one completes. Events are streamed as they occur (not batched).
+
 ## Event Envelope
 
 Every JSONL line is one event:

@@ -65,6 +65,7 @@ External tool commands run from the workspace directory. The raw JSON arguments 
 
 ```sh
 orca exec [options] <prompt>
+orca --mode=server
 ```
 
 Options:
@@ -84,6 +85,7 @@ Options:
 - top-level `--resume <session|latest>` — Open a saved conversation in TUI mode
 - top-level `--fork <session|latest>` — Fork a saved conversation in TUI mode
 - top-level `--session-picker` — Choose a saved conversation before entering TUI mode
+- top-level `--mode=server` — Read JSONL `submit` requests from stdin and emit protocol events to stdout
 
 ## Conversation History
 

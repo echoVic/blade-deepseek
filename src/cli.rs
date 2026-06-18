@@ -37,9 +37,9 @@ pub struct Cli {
     #[arg(long)]
     model: Option<String>,
 
-    /// Approval mode to use (overrides config file and ORCA_MODE env).
-    #[arg(long = "mode", alias = "approval-mode", value_enum)]
-    mode: Option<ApprovalMode>,
+    /// Approval mode to use, or 'server' to start stdin/stdout JSON-RPC mode.
+    #[arg(long = "mode", alias = "approval-mode")]
+    mode: Option<String>,
 
     /// API key to use (overrides config file and ORCA_API_KEY env).
     #[arg(long)]
@@ -48,6 +48,10 @@ pub struct Cli {
     /// API base URL (overrides config file and ORCA_BASE_URL env).
     #[arg(long)]
     base_url: Option<String>,
+
+    /// Provider implementation (internal, for testing).
+    #[arg(long, value_enum, default_value_t = ProviderKind::DeepSeek, hide = true)]
+    provider: ProviderKind,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -198,6 +202,10 @@ impl From<OutputFormatArg> for OutputFormat {
 
 pub fn run() -> i32 {
     let cli = Cli::parse();
+
+    if matches!(cli.mode.as_deref(), Some("server")) {
+        return run_server(cli);
+    }
 
     match cli.command {
         Some(Command::Exec(args)) => run_exec(args),
@@ -552,11 +560,21 @@ fn run_placeholder(cli: Cli) -> i32 {
     }
 
     let cwd = std::env::current_dir().unwrap_or_default();
+    let mode = match cli.mode {
+        Some(mode) => match parse_approval_mode_value(&mode) {
+            Ok(mode) => Some(mode),
+            Err(error) => {
+                eprintln!("orca: {error}");
+                return 1;
+            }
+        },
+        None => None,
+    };
     let file_config = match load_effective_file_config(
         &cwd,
         ConfigOverrides {
             model: cli.model,
-            mode: cli.mode,
+            mode,
             api_key: cli.api_key,
             base_url: cli.base_url,
         },
@@ -593,7 +611,7 @@ fn run_placeholder(cli: Cli) -> i32 {
         cwd: None,
         output_format: OutputFormat::Text,
         approval_mode: file_config.mode.unwrap_or_default(),
-        provider: ProviderKind::DeepSeek,
+        provider: cli.provider,
         verifier: None,
         model,
         api_key,
@@ -615,4 +633,64 @@ fn run_placeholder(cli: Cli) -> i32 {
     };
 
     app::run_tui(config)
+}
+
+fn run_server(cli: Cli) -> i32 {
+    if cli.command.is_some() || !cli.prompt.is_empty() {
+        eprintln!("orca: --mode=server cannot be combined with a subcommand or prompt");
+        return 1;
+    }
+
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let file_config = match load_effective_file_config(
+        &cwd,
+        ConfigOverrides {
+            model: cli.model,
+            mode: None,
+            api_key: cli.api_key,
+            base_url: cli.base_url,
+        },
+    ) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("orca: {error}");
+            return 1;
+        }
+    };
+
+    let model = match ModelSelection::parse(file_config.model) {
+        Ok(model) => model,
+        Err(error) => {
+            eprintln!("orca: {error}");
+            return 1;
+        }
+    };
+
+    let config = RunConfig {
+        prompt: String::new(),
+        cwd: None,
+        output_format: OutputFormat::Jsonl,
+        approval_mode: file_config.mode.unwrap_or_default(),
+        provider: cli.provider,
+        verifier: None,
+        model,
+        api_key: file_config.api_key,
+        base_url: file_config.base_url,
+        history_mode: HistoryMode::Disabled,
+        show_session_picker: false,
+        permission_rules: file_config.permissions,
+        max_budget_usd: None,
+        mcp_servers: file_config.mcp_servers,
+        hooks: file_config.hooks,
+        external_tools: crate::tools::external::load_default_external_tools(),
+        subagents: file_config.subagents.normalized(),
+        tools: file_config.tools.normalized(),
+        theme: file_config.theme,
+        vim_mode: file_config.vim_mode,
+        update_check: file_config.update_check,
+        desktop_notifications: false,
+        auto_memory: file_config.auto_memory,
+    };
+
+    crate::server::run(crate::server::ServerConfig { run_config: config })
 }
