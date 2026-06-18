@@ -1,0 +1,23 @@
+[package]
+name = "orca-tui"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+orca-core = { path = "../orca-core" }
+orca-mcp = { path = "../orca-mcp" }
+orca-tools = { path = "../orca-tools" }
+orca-provider = { path = "../orca-provider" }
+orca-approval = { path = "../orca-approval" }
+orca-runtime = { path = "../orca-runtime" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+tui-textarea = { workspace = true }
+pulldown-cmark = { workspace = true }
+unicode-width = { workspace = true }
+similar = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

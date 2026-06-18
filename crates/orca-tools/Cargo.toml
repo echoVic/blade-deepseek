@@ -1,0 +1,16 @@
+[package]
+name = "orca-tools"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+orca-core = { path = "../orca-core" }
+orca-mcp = { path = "../orca-mcp" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+toml = { workspace = true }
+dirs = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

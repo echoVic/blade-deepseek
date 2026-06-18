@@ -1,0 +1,23 @@
+[package]
+name = "orca-runtime"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+orca-core = { path = "../orca-core" }
+orca-mcp = { path = "../orca-mcp" }
+orca-tools = { path = "../orca-tools" }
+orca-provider = { path = "../orca-provider" }
+orca-approval = { path = "../orca-approval" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+toml = { workspace = true }
+dirs = { workspace = true }
+zstd = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

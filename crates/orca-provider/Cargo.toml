@@ -1,0 +1,13 @@
+[package]
+name = "orca-provider"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+orca-core = { path = "../orca-core" }
+orca-mcp = { path = "../orca-mcp" }
+orca-tools = { path = "../orca-tools" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+tiktoken-rs = { workspace = true }

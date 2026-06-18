@@ -129,6 +129,13 @@ dependencies = [
  "clap",
  "crossterm",
  "dirs",
+ "orca-approval",
+ "orca-core",
+ "orca-mcp",
+ "orca-provider",
+ "orca-runtime",
+ "orca-tools",
+ "orca-tui",
  "pulldown-cmark",
  "ratatui",
  "reqwest",
@@ -989,6 +996,106 @@ name = "option-ext"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
+
+[[package]]
+name = "orca-approval"
+version = "0.1.0"
+dependencies = [
+ "crossterm",
+ "orca-core",
+]
+
+[[package]]
+name = "orca-core"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "clap",
+ "dirs",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml",
+ "uuid",
+]
+
+[[package]]
+name = "orca-mcp"
+version = "0.1.0"
+dependencies = [
+ "orca-core",
+ "reqwest",
+ "serde_json",
+]
+
+[[package]]
+name = "orca-provider"
+version = "0.1.0"
+dependencies = [
+ "orca-core",
+ "orca-mcp",
+ "orca-tools",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tiktoken-rs",
+]
+
+[[package]]
+name = "orca-runtime"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "dirs",
+ "orca-approval",
+ "orca-core",
+ "orca-mcp",
+ "orca-provider",
+ "orca-tools",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "toml",
+ "uuid",
+ "zstd",
+]
+
+[[package]]
+name = "orca-tools"
+version = "0.1.0"
+dependencies = [
+ "dirs",
+ "orca-core",
+ "orca-mcp",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml",
+]
+
+[[package]]
+name = "orca-tui"
+version = "0.1.0"
+dependencies = [
+ "crossterm",
+ "orca-approval",
+ "orca-core",
+ "orca-mcp",
+ "orca-provider",
+ "orca-runtime",
+ "orca-tools",
+ "pulldown-cmark",
+ "ratatui",
+ "serde",
+ "serde_json",
+ "similar",
+ "tempfile",
+ "tui-textarea",
+ "unicode-width 0.2.0",
+]
 
 [[package]]
 name = "parking_lot"

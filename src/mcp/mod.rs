@@ -1,5 +1,13 @@
-pub mod client;
-pub mod transport;
-pub mod types;
+pub mod types {
+    pub use orca_core::mcp_types::*;
+}
 
-pub use client::{McpRegistry, initialize_registry};
+pub mod client {
+    pub use orca_mcp::client::*;
+}
+
+pub mod transport {
+    pub use orca_mcp::transport::*;
+}
+
+pub use orca_mcp::{McpRegistry, initialize_registry};
