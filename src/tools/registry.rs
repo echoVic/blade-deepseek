@@ -8,9 +8,10 @@ use serde_json::{Value, json};
 use crate::approval::policy::ActionKind;
 use crate::mcp::McpRegistry;
 use crate::mcp::types::McpTool;
+use crate::tools::external::ExternalToolConfig;
 use crate::tools::{
-    MAX_TOOL_OUTPUT_BYTES, ToolName, ToolRequest, ToolResult, bash, edit, git, grep, list_files,
-    read_file, update_plan, web_search, write_file,
+    MAX_TOOL_OUTPUT_BYTES, ToolName, ToolRequest, ToolResult, bash, edit, external, git, grep,
+    list_files, read_file, update_plan, web_search, write_file,
 };
 
 #[allow(dead_code)]
@@ -104,9 +105,15 @@ pub fn default_tool_registry() -> &'static ToolRegistry {
     &DEFAULT_REGISTRY
 }
 
-pub fn tool_registry_with_mcp(mcp_registry: Option<&McpRegistry>) -> ToolRegistry {
+pub fn tool_registry_with_mcp_and_external(
+    mcp_registry: Option<&McpRegistry>,
+    external_tools: &[ExternalToolConfig],
+) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     register_builtin_tools(&mut registry);
+    for tool in external_tools {
+        registry.register(ExternalTool::new(tool.clone()));
+    }
     if let Some(mcp_registry) = mcp_registry {
         for tool in mcp_registry.tools() {
             registry.register(McpProxyTool::new(tool.clone()));
@@ -490,6 +497,53 @@ impl Tool for McpProxyTool {
             Ok(result) => ToolResult::completed(request, result.output, false),
             Err(error) => ToolResult::failed(request, error, None),
         }
+    }
+}
+
+struct ExternalTool {
+    tool: ExternalToolConfig,
+}
+
+impl ExternalTool {
+    fn new(tool: ExternalToolConfig) -> Self {
+        Self { tool }
+    }
+}
+
+impl Tool for ExternalTool {
+    fn name(&self) -> &str {
+        &self.tool.name
+    }
+
+    fn description(&self) -> &str {
+        &self.tool.description
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "type": "function",
+            "function": {
+                "name": self.tool.name,
+                "description": self.tool.description,
+                "parameters": self.tool.parameters_schema()
+            }
+        })
+    }
+
+    fn action_kind(&self) -> ActionKind {
+        self.tool.action_kind
+    }
+
+    fn is_read_only(&self, _input: &ToolRequest) -> bool {
+        matches!(self.tool.action_kind, ActionKind::Read)
+    }
+
+    fn is_concurrent_safe(&self, input: &ToolRequest) -> bool {
+        self.is_read_only(input)
+    }
+
+    fn execute(&self, request: &ToolRequest, ctx: &ToolContext<'_>) -> ToolResult {
+        external::execute_external_tool(&self.tool, request, ctx.cwd, ctx.max_output_bytes)
     }
 }
 

@@ -24,12 +24,16 @@ fn exec_outputs_jsonl_contract_and_success_status() {
     assert!(events.len() >= 5);
     assert_eq!(events[0]["version"], "1");
     assert_eq!(events[0]["type"], "session.started");
-    assert!(events
-        .iter()
-        .any(|event| event["type"] == "assistant.reasoning.delta"));
-    assert!(events
-        .iter()
-        .any(|event| event["type"] == "assistant.message.delta"));
+    assert!(
+        events
+            .iter()
+            .any(|event| event["type"] == "assistant.reasoning.delta")
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event["type"] == "assistant.message.delta")
+    );
     assert_eq!(events.last().unwrap()["type"], "session.completed");
     assert_eq!(events.last().unwrap()["payload"]["status"], "success");
 
@@ -66,6 +70,83 @@ fn exec_emits_usage_event_when_provider_reports_usage() {
     assert_eq!(usage["payload"]["cache_tokens"], 10);
     assert_eq!(usage["payload"]["total_tokens"], 150);
     assert!(usage["payload"]["estimated_cost_usd"].as_f64().unwrap() > 0.0);
+}
+
+#[test]
+fn exec_pre_model_hook_injects_context_into_model_input() {
+    let home = TempDir::new().expect("temp home");
+    std::fs::write(
+        home.path().join("config.toml"),
+        r#"
+[[hooks]]
+event = "pre_model_call"
+command = "printf '%s' '{\"action\":\"inject\",\"context\":\"hooked policy context\"}'"
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .env("ORCA_HOME", home.path())
+        .args([
+            "exec",
+            "--output-format",
+            "jsonl",
+            "--provider",
+            "mock",
+            "mock_system_echo",
+        ])
+        .output()
+        .expect("run orca");
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+
+    let events = parse_jsonl(&output.stdout);
+    assert!(events.iter().any(|event| {
+        event["type"] == "assistant.message.delta"
+            && event["payload"]["text"]
+                .as_str()
+                .unwrap_or("")
+                .contains("hooked policy context")
+    }));
+}
+
+#[test]
+fn exec_post_model_hook_observes_usage_environment() {
+    let home = TempDir::new().expect("temp home");
+    let usage_path = home.path().join("usage.txt");
+    std::fs::write(
+        home.path().join("config.toml"),
+        format!(
+            r#"
+[[hooks]]
+event = "post_model_call"
+command = "printf '%s %s %s' \"$ORCA_USAGE_INPUT_TOKENS\" \"$ORCA_USAGE_OUTPUT_TOKENS\" \"$ORCA_USAGE_CACHE_TOKENS\" > {}"
+"#,
+            shell_escape(&usage_path)
+        ),
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .env("ORCA_HOME", home.path())
+        .args([
+            "exec",
+            "--output-format",
+            "jsonl",
+            "--provider",
+            "mock",
+            "mock_usage",
+        ])
+        .output()
+        .expect("run orca");
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        std::fs::read_to_string(&usage_path).expect("usage hook output"),
+        "120 30 10"
+    );
 }
 
 #[test]
@@ -241,4 +322,8 @@ fn parse_jsonl(stdout: &[u8]) -> Vec<Value> {
         .lines()
         .map(|line| serde_json::from_str(line).expect("valid jsonl line"))
         .collect()
+}
+
+fn shell_escape(path: &std::path::Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
 }

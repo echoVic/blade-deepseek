@@ -294,6 +294,7 @@ fn request_summary(
         model: Some(crate::model::auxiliary_model().to_string()),
         tools_override: Some(Vec::new()),
         mcp_registry: None,
+        external_tools: Vec::new(),
     };
 
     let mut summary_conversation = Conversation::new();
@@ -382,9 +383,7 @@ pub fn compact_with_counter(
     counter: &impl TokenCounter,
 ) -> Conversation {
     let micro_compacted = micro_compact_stale_tool_outputs(conversation);
-    if conversation_tokens_with_counter(&micro_compacted, counter)
-        <= config.effective_limit()
-    {
+    if conversation_tokens_with_counter(&micro_compacted, counter) <= config.effective_limit() {
         return normalize_compacted_conversation(micro_compacted);
     }
 
@@ -823,6 +822,7 @@ mod tests {
             model: None,
             tools_override: Some(Vec::new()),
             mcp_registry: None,
+            external_tools: Vec::new(),
         };
 
         let result = compact_with_summary(ProviderKind::DeepSeek, &conv, &config, &provider_config);

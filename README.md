@@ -39,6 +39,20 @@ api_key = "sk-..."
 base_url = "https://api.deepseek.com"
 ```
 
+Hooks may return structured JSON on stdout. `{"action":"deny","reason":"..."}` blocks, `{"action":"modify","modified_target":"..."}` rewrites a tool target, and `{"action":"inject","context":"..."}` adds model context. Plain non-JSON stdout is treated as injected context for compatibility. Supported events are `session_start`, `session_end`, `pre_tool_use`, `post_tool_use`, `pre_model_call`, `post_model_call`, `on_budget_warning`, `pre_compact`, and `post_compact`.
+
+Custom tools can be added with TOML descriptors under `~/.orca/tools/`:
+
+```toml
+name = "deploy"
+description = "Deploy the current branch"
+action_kind = "write"
+command = "./scripts/deploy.sh"
+schema = { target = { type = "string", description = "environment" } }
+```
+
+External tool commands run from the workspace directory. The raw JSON arguments are provided on stdin and in `ORCA_TOOL_ARGS`.
+
 ### Defaults
 
 - Model: `auto` (main loop uses `deepseek-v4-pro`, auxiliary tasks use `deepseek-v4-flash`)
@@ -97,7 +111,7 @@ In the TUI, `Esc` during an idle composer backtracks to the previous user messag
 
 ## Tools
 
-All 7 tools are fully implemented:
+Built-in tools:
 
 | Tool | Description |
 |------|-------------|

@@ -199,6 +199,9 @@ pub trait ModelProvider: Send + Sync {
 - `post_tool_use` — 工具执行后
 - `session_start` — 会话开始
 - `session_end` — 会话结束
+- `pre_model_call` — 模型调用前，可注入 system prompt 片段
+- `post_model_call` — 模型调用后，可观测 token 使用
+- `on_budget_warning` — 上下文即将溢出
 - `pre_compact` — 上下文压缩前
 - `post_compact` — 上下文压缩后
 
@@ -214,6 +217,8 @@ command = "echo 'bash executed: $ORCA_TOOL_TARGET' >> ~/.orca/audit.log"
 event = "session_end"
 command = "notify-send 'Orca session completed'"
 ```
+
+Hook 成功退出时可通过 stdout 返回 JSON：`{"action":"allow"}`、`{"action":"deny","reason":"..."}`、`{"action":"modify","modified_target":"..."}`、`{"action":"inject","context":"..."}`。非 JSON stdout 继续按上下文注入处理。
 
 **影响文件**:
 - 新增 `src/runtime/hooks.rs`

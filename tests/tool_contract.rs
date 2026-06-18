@@ -1,4 +1,5 @@
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -146,6 +147,86 @@ fn full_auto_allows_bash_tool() {
     assert_eq!(completed["payload"]["name"], "bash");
     assert_eq!(completed["payload"]["status"], "completed");
     assert_eq!(completed["payload"]["output"], "hi");
+}
+
+#[test]
+fn pre_tool_hook_can_modify_tool_target_before_execution() {
+    let home = make_temp_workspace("hook-modify-home");
+    fs::write(
+        home.join("config.toml"),
+        r#"
+[[hooks]]
+event = "pre_tool_use"
+tool = "bash"
+command = "printf '%s' '{\"action\":\"modify\",\"modified_target\":\"printf sanitized\"}'"
+"#,
+    )
+    .expect("write config");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .env("ORCA_HOME", &home)
+        .args([
+            "exec",
+            "--output-format",
+            "jsonl",
+            "--provider",
+            "mock",
+            "--approval-mode",
+            "full-auto",
+            "bash printf unsafe",
+        ])
+        .output()
+        .expect("run orca");
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+
+    let events = parse_jsonl(&output.stdout);
+    let completed = find_event(&events, "tool.call.completed");
+    assert_eq!(completed["payload"]["name"], "bash");
+    assert_eq!(completed["payload"]["status"], "completed");
+    assert_eq!(completed["payload"]["output"], "sanitized");
+}
+
+#[test]
+fn pre_tool_hook_json_deny_blocks_tool_even_when_exit_succeeds() {
+    let home = make_temp_workspace("hook-deny-home");
+    fs::write(
+        home.join("config.toml"),
+        r#"
+[[hooks]]
+event = "pre_tool_use"
+tool = "bash"
+command = "printf '%s' '{\"action\":\"deny\",\"reason\":\"blocked by hook\"}'"
+"#,
+    )
+    .expect("write config");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .env("ORCA_HOME", &home)
+        .args([
+            "exec",
+            "--output-format",
+            "jsonl",
+            "--provider",
+            "mock",
+            "--approval-mode",
+            "full-auto",
+            "bash printf unsafe",
+        ])
+        .output()
+        .expect("run orca");
+
+    assert_eq!(output.status.code(), Some(0));
+    let events = parse_jsonl(&output.stdout);
+    let completed = find_event(&events, "tool.call.completed");
+    assert_eq!(completed["payload"]["status"], "failed");
+    assert!(
+        completed["payload"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("blocked by hook")
+    );
 }
 
 #[test]
@@ -304,6 +385,74 @@ fn update_plan_emits_plan_updated_event() {
     );
 }
 
+#[test]
+fn external_tool_descriptor_runs_from_orca_tools_dir() {
+    let home = make_temp_workspace("external-home");
+    let tools_dir = home.join("tools");
+    fs::create_dir_all(&tools_dir).expect("tools dir");
+    let workspace = make_temp_workspace("external-workspace");
+    fs::create_dir_all(workspace.join("scripts")).expect("scripts dir");
+    let output_file = workspace.join("deploy-output.txt");
+    let script = workspace.join("scripts/deploy.sh");
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\ncat > {}\nprintf 'deploy ok'\n",
+            shell_escape(&output_file)
+        ),
+    )
+    .expect("write script");
+    let mut permissions = fs::metadata(&script).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&script, permissions).unwrap();
+    fs::write(
+        tools_dir.join("deploy.toml"),
+        r#"
+name = "deploy"
+description = "Deploy the current branch"
+action_kind = "write"
+command = "./scripts/deploy.sh"
+schema = { target = { type = "string", description = "environment" } }
+"#,
+    )
+    .expect("write descriptor");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .env("ORCA_HOME", &home)
+        .args([
+            "exec",
+            "--output-format",
+            "jsonl",
+            "--provider",
+            "mock",
+            "--approval-mode",
+            "full-auto",
+            "--cwd",
+            workspace.to_str().unwrap(),
+            r#"external deploy {"target":"staging"}"#,
+        ])
+        .output()
+        .expect("run orca");
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        fs::read_to_string(&output_file).expect("external tool stdin"),
+        r#"{"target":"staging"}"#
+    );
+
+    let events = parse_jsonl(&output.stdout);
+    let requested = find_event(&events, "tool.call.requested");
+    assert_eq!(requested["payload"]["name"], "deploy");
+    assert_eq!(requested["payload"]["action"], "write");
+    assert_eq!(requested["payload"]["target"], "deploy");
+
+    let completed = find_event(&events, "tool.call.completed");
+    assert_eq!(completed["payload"]["name"], "deploy");
+    assert_eq!(completed["payload"]["status"], "completed");
+    assert_eq!(completed["payload"]["output"], "deploy ok");
+}
+
 fn find_event<'a>(events: &'a [Value], event_type: &str) -> &'a Value {
     events
         .iter()
@@ -326,4 +475,8 @@ fn make_temp_workspace(name: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("orca-{name}-{nanos}"));
     fs::create_dir_all(&dir).expect("create temp workspace");
     dir
+}
+
+fn shell_escape(path: &std::path::Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
 }

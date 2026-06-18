@@ -14,6 +14,7 @@ use crate::mcp::McpRegistry;
 use crate::provider::conversation::{Conversation, RawToolCall};
 use crate::runtime::cancel::CancelToken;
 use crate::tools::ToolRequest;
+use crate::tools::external::ExternalToolConfig;
 
 #[derive(Clone)]
 pub struct ProviderConfig {
@@ -22,6 +23,7 @@ pub struct ProviderConfig {
     pub model: Option<String>,
     pub tools_override: Option<Vec<serde_json::Value>>,
     pub mcp_registry: Option<McpRegistry>,
+    pub external_tools: Vec<ExternalToolConfig>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -210,6 +212,26 @@ fn mock_call(conversation: &Conversation) -> ProviderResponse {
         };
     }
 
+    if prompt.trim() == "mock_system_echo" {
+        let systems = conversation
+            .messages
+            .iter()
+            .filter_map(|message| match message {
+                conversation::Message::System { content, .. } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" | ");
+        let message = format!("Mock system messages: {systems}");
+        return ProviderResponse {
+            steps: vec![ProviderStep::MessageDelta(message.clone())],
+            assistant_content: Some(message),
+            assistant_reasoning: None,
+            tool_calls: Vec::new(),
+            usage: None,
+        };
+    }
+
     if let Some(tool_request) = parse_mock_prompt(prompt) {
         let raw_call = RawToolCall {
             id: tool_request.id.clone(),
@@ -341,6 +363,18 @@ fn parse_mock_prompt(prompt: &str) -> Option<ToolRequest> {
             action: ActionKind::Shell,
             target: Some(rest.to_string()),
             raw_arguments: None,
+        });
+    }
+
+    if let Some(rest) = prompt.strip_prefix("external ")
+        && let Some((name, args)) = rest.trim().split_once(' ')
+    {
+        return Some(ToolRequest {
+            id: "mock-tool-1".to_string(),
+            name: ToolName::External(name.to_string()),
+            action: ActionKind::Write,
+            target: Some(name.to_string()),
+            raw_arguments: Some(args.to_string()),
         });
     }
 

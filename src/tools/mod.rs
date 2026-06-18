@@ -8,6 +8,7 @@ use crate::mcp::McpRegistry;
 
 pub mod bash;
 pub mod edit;
+pub mod external;
 pub mod git;
 pub mod grep;
 pub mod list_files;
@@ -32,6 +33,7 @@ pub enum ToolName {
     WebSearch,
     UpdatePlan,
     Mcp(String),
+    External(String),
 }
 
 impl ToolName {
@@ -48,6 +50,7 @@ impl ToolName {
             Self::WebSearch => "web_search",
             Self::UpdatePlan => "update_plan",
             Self::Mcp(name) => name,
+            Self::External(name) => name,
         }
     }
 
@@ -64,7 +67,7 @@ impl ToolName {
             "web_search" => Self::WebSearch,
             "update_plan" => Self::UpdatePlan,
             other if other.starts_with("mcp__") => Self::Mcp(other.to_string()),
-            _ => return None,
+            other => Self::External(other.to_string()),
         })
     }
 
@@ -91,9 +94,8 @@ impl<'de> Deserialize<'de> for ToolName {
         D: Deserializer<'de>,
     {
         let value = String::deserialize(deserializer)?;
-        Self::from_str(&value).ok_or_else(|| {
-            serde::de::Error::custom(format!("unknown tool name: {value}"))
-        })
+        Self::from_str(&value)
+            .ok_or_else(|| serde::de::Error::custom(format!("unknown tool name: {value}")))
     }
 }
 
@@ -176,22 +178,33 @@ impl ToolResult {
     }
 }
 
-pub fn execute(request: &ToolRequest, cwd: &Path) -> ToolResult {
-    let registry = registry::default_tool_registry();
-    let ctx = registry::ToolContext::new(cwd);
-    registry.execute(request, &ctx)
-}
-
 pub fn execute_with_mcp(
     request: &ToolRequest,
     cwd: &Path,
     mcp_registry: &McpRegistry,
 ) -> ToolResult {
+    execute_with_mcp_and_external(request, cwd, mcp_registry, &[])
+}
+
+pub fn execute_with_mcp_and_external(
+    request: &ToolRequest,
+    cwd: &Path,
+    mcp_registry: &McpRegistry,
+    external_tools: &[external::ExternalToolConfig],
+) -> ToolResult {
     if !matches!(&request.name, ToolName::Mcp(_)) {
-        return execute(request, cwd);
+        if external_tools.is_empty() {
+            let registry = registry::default_tool_registry();
+            let ctx = registry::ToolContext::new(cwd);
+            return registry.execute(request, &ctx);
+        }
+        let registry = registry::tool_registry_with_mcp_and_external(None, external_tools);
+        let ctx = registry::ToolContext::new(cwd);
+        return registry.execute(request, &ctx);
     }
 
-    let registry = registry::tool_registry_with_mcp(Some(mcp_registry));
+    let registry =
+        registry::tool_registry_with_mcp_and_external(Some(mcp_registry), external_tools);
     let ctx = registry::ToolContext::new(cwd).with_mcp(mcp_registry);
     registry.execute(request, &ctx)
 }
@@ -398,7 +411,7 @@ mod tests {
             }),
         }]);
 
-        let registry = registry::tool_registry_with_mcp(Some(&mcp_registry));
+        let registry = registry::tool_registry_with_mcp_and_external(Some(&mcp_registry), &[]);
         let tool = registry
             .get("mcp__demo__search")
             .expect("MCP tool is registered as a proxy tool");

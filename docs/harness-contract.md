@@ -74,7 +74,7 @@ The final `session.completed` event contains one of:
 
 ## Tool Contract
 
-All 7 tools are fully implemented:
+Built-in tools:
 
 | Tool | Action | Description |
 |------|--------|-------------|
@@ -89,6 +89,19 @@ All 7 tools are fully implemented:
 Tool events:
 - `tool.call.requested` — emitted before execution, contains `name`, `action`, `target`
 - `tool.call.completed` — emitted after execution, contains `name`, `status` (completed/failed/denied), `output`, `truncated`
+
+External tools:
+- Orca loads `~/.orca/tools/*.toml` at startup.
+- Each descriptor defines `name`, `description`, `action_kind`, `command`, and `schema`.
+- Descriptors are advertised to the model as function tools.
+- Commands run from the workspace directory with raw JSON arguments on stdin and in `ORCA_TOOL_ARGS`.
+
+Hook stdout protocol:
+- `{"action":"allow"}` allows the operation.
+- `{"action":"deny","reason":"..."}` blocks the hook target.
+- `{"action":"modify","modified_target":"..."}` rewrites a tool target.
+- `{"action":"inject","context":"..."}` injects model context.
+- Non-JSON stdout is treated as injected context.
 
 Subagent events:
 - `subagent.started` — emitted when the child agent starts, contains `id`, `description`

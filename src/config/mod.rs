@@ -8,6 +8,7 @@ use crate::mcp::types::McpServerConfig;
 use crate::model::ModelSelection;
 use crate::runtime::hooks::HookConfig;
 use crate::runtime::subagent_config::SubagentConfig;
+use crate::tools::external::ExternalToolConfig;
 
 pub mod file;
 
@@ -102,6 +103,7 @@ pub struct RunConfig {
     pub base_url: Option<String>,
     pub mcp_servers: Vec<McpServerConfig>,
     pub hooks: Vec<HookConfig>,
+    pub external_tools: Vec<ExternalToolConfig>,
     pub history_mode: HistoryMode,
     pub show_session_picker: bool,
     pub permission_rules: PermissionRules,
@@ -158,6 +160,7 @@ pub fn format_config_show(config: &RunConfig) -> String {
             "\n",
             "[counts]\n",
             "mcp_servers = {}\n",
+            "external_tools = {}\n",
             "hooks = {}\n",
             "permission_rules = {}"
         ),
@@ -178,6 +181,7 @@ pub fn format_config_show(config: &RunConfig) -> String {
         config.subagents.max_depth,
         config.subagents.max_parallel,
         config.mcp_servers.len(),
+        config.external_tools.len(),
         config.hooks.len(),
         config.permission_rules.rules.len()
     )
@@ -203,6 +207,7 @@ mod tests {
             base_url: Some("https://api.example".to_string()),
             mcp_servers: Vec::new(),
             hooks: Vec::new(),
+            external_tools: Vec::new(),
             history_mode: HistoryMode::Disabled,
             show_session_picker: false,
             permission_rules: PermissionRules::default(),

@@ -104,6 +104,7 @@ pub fn extract_project_memory(
             .or_else(|| Some("deepseek-v4-flash".to_string())),
         tools_override: Some(Vec::new()),
         mcp_registry: None,
+        external_tools: Vec::new(),
     };
     let response = provider::call(provider_kind, &conversation, &summary_config);
     if response

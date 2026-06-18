@@ -8,14 +8,18 @@ use crate::mcp::McpRegistry;
 use crate::model::ModelRouteContext;
 use crate::provider::conversation::Conversation;
 use crate::provider::tool_schema::{
-    deepseek_tools_schema_for_type_with_mcp, deepseek_tools_schema_with_mcp,
+    deepseek_tools_schema_for_type_with_mcp_and_external,
+    deepseek_tools_schema_with_mcp_and_external,
 };
 use crate::provider::{self, ProviderConfig, ProviderStep};
 use crate::runtime::agent_common;
 use crate::runtime::cancel::CancelToken;
 use crate::runtime::cost::CostTracker;
 use crate::runtime::history::{self, SessionWriter};
-use crate::runtime::hooks::{HookContext, HookEvent, HookRunner};
+use crate::runtime::hooks::{
+    HookContext, HookEvent, HookRunner, conversation_with_hook_context,
+    tool_request_with_hook_outcome,
+};
 use crate::runtime::instructions::{self, ProjectInstructions};
 use crate::runtime::memory::{self, MemoryBlock};
 use crate::runtime::subagent;
@@ -154,6 +158,23 @@ impl TuiConversationSession {
 
     pub fn compact(&mut self, config: &RunConfig, cwd: &Path) -> (usize, usize) {
         let before_messages = self.conversation.messages.len();
+        if let Ok(outcome) = self.hooks.run(
+            HookEvent::OnBudgetWarning,
+            HookContext {
+                cwd: &cwd.display().to_string(),
+                session_status: None,
+                tool_request: None,
+                tool_result: None,
+                before_messages: Some(before_messages),
+                after_messages: None,
+                usage: None,
+            },
+        ) {
+            if !outcome.injected_context.is_empty() {
+                self.conversation =
+                    conversation_with_hook_context(&self.conversation, &outcome);
+            }
+        }
         let _ = self.hooks.run(
             HookEvent::PreCompact,
             HookContext {
@@ -163,6 +184,7 @@ impl TuiConversationSession {
                 tool_result: None,
                 before_messages: Some(before_messages),
                 after_messages: None,
+                usage: None,
             },
         );
         let provider_config = ProviderConfig {
@@ -171,6 +193,7 @@ impl TuiConversationSession {
             model: Some(crate::model::auxiliary_model().to_string()),
             tools_override: Some(Vec::new()),
             mcp_registry: None,
+            external_tools: Vec::new(),
         };
         let compaction = provider::context::compact_with_summary(
             config.provider,
@@ -195,6 +218,7 @@ impl TuiConversationSession {
                 tool_result: None,
                 before_messages: Some(before_messages),
                 after_messages: Some(after_messages),
+                usage: None,
             },
         );
         (before_messages, after_messages)
@@ -243,8 +267,12 @@ pub fn run_agent_for_tui(
         api_key: config.api_key.clone(),
         base_url: config.base_url.clone(),
         model: Some(crate::model::FLASH_MODEL.to_string()),
-        tools_override: Some(deepseek_tools_schema_with_mcp(Some(&session.mcp_registry))),
+        tools_override: Some(deepseek_tools_schema_with_mcp_and_external(
+            Some(&session.mcp_registry),
+            &config.external_tools,
+        )),
         mcp_registry: Some(session.mcp_registry.clone()),
+        external_tools: config.external_tools.clone(),
     };
 
     let budget_model = config.model.as_option();
@@ -273,6 +301,29 @@ pub fn run_agent_for_tui(
 
         if provider::context::needs_compaction(&session.conversation, &ctx_config) {
             let before_messages = session.conversation.messages.len();
+            match session.hooks.run(
+                HookEvent::OnBudgetWarning,
+                HookContext {
+                    cwd: &cwd.display().to_string(),
+                    session_status: None,
+                    tool_request: None,
+                    tool_result: None,
+                    before_messages: Some(before_messages),
+                    after_messages: None,
+                    usage: None,
+                },
+            ) {
+                Ok(outcome) if !outcome.injected_context.is_empty() => {
+                    session.conversation =
+                        conversation_with_hook_context(&session.conversation, &outcome);
+                }
+                Err(error) => {
+                    let _ = event_tx.send(TuiEvent::Error(format!(
+                        "on_budget_warning hook failed: {error}"
+                    )));
+                }
+                _ => {}
+            }
             if let Err(error) = session.hooks.run(
                 HookEvent::PreCompact,
                 HookContext {
@@ -282,6 +333,7 @@ pub fn run_agent_for_tui(
                     tool_result: None,
                     before_messages: Some(before_messages),
                     after_messages: None,
+                    usage: None,
                 },
             ) {
                 let _ = event_tx.send(TuiEvent::Error(format!("pre_compact hook failed: {error}")));
@@ -309,6 +361,7 @@ pub fn run_agent_for_tui(
                     tool_result: None,
                     before_messages: Some(before_messages),
                     after_messages: Some(after_messages),
+                    usage: None,
                 },
             ) {
                 let _ = event_tx.send(TuiEvent::Error(format!(
@@ -333,10 +386,37 @@ pub fn run_agent_for_tui(
             Some(&route_decision.actual_model),
         );
 
+        let pre_model_outcome = match session.hooks.run(
+            HookEvent::PreModelCall,
+            HookContext {
+                cwd: &cwd.display().to_string(),
+                session_status: None,
+                tool_request: None,
+                tool_result: None,
+                before_messages: None,
+                after_messages: None,
+                usage: None,
+            },
+        ) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let _ = event_tx.send(TuiEvent::Error(format!(
+                    "pre_model_call hook failed: {error}"
+                )));
+                let _ = event_tx.send(TuiEvent::SessionCompleted {
+                    status: "failed".to_string(),
+                });
+                session.complete("failed");
+                return;
+            }
+        };
+        let model_conversation =
+            conversation_with_hook_context(&session.conversation, &pre_model_outcome);
+
         let tx = event_tx.clone();
         let response = provider::call_streaming(
             config.provider,
-            &session.conversation,
+            &model_conversation,
             &turn_provider_config,
             cancel,
             &mut |step| match step {
@@ -349,6 +429,23 @@ pub fn run_agent_for_tui(
                 _ => {}
             },
         );
+
+        if let Err(error) = session.hooks.run(
+            HookEvent::PostModelCall,
+            HookContext {
+                cwd: &cwd.display().to_string(),
+                session_status: None,
+                tool_request: None,
+                tool_result: None,
+                before_messages: None,
+                after_messages: None,
+                usage: response.usage.as_ref(),
+            },
+        ) {
+            let _ = event_tx.send(TuiEvent::Error(format!(
+                "post_model_call hook failed: {error}"
+            )));
+        }
 
         if let Some(usage) = response.usage
             && !usage.is_empty()
@@ -432,6 +529,7 @@ pub fn run_agent_for_tui(
                     model: Some(crate::model::auxiliary_model().to_string()),
                     tools_override: Some(Vec::new()),
                     mcp_registry: None,
+                    external_tools: Vec::new(),
                 };
                 if let Err(error) = memory::extract_project_memory(
                     config.provider,
@@ -626,7 +724,7 @@ fn execute_readonly_batch_for_tui(
             name: tool_request.name.as_str().to_string(),
             target: tool_request.target.clone(),
         });
-        if let Err(error) = hooks.run(
+        match hooks.run(
             HookEvent::PreToolUse,
             HookContext {
                 cwd: &cwd.display().to_string(),
@@ -635,15 +733,19 @@ fn execute_readonly_batch_for_tui(
                 tool_result: None,
                 before_messages: None,
                 after_messages: None,
+                usage: None,
             },
         ) {
-            hook_failed[idx] = Some(tools::ToolResult::failed(
-                tool_request,
-                format!("pre_tool_use hook blocked tool: {error}"),
-                None,
-            ));
-        } else {
-            runnable.push((idx, tool_request.clone()));
+            Ok(outcome) => {
+                runnable.push((idx, tool_request_with_hook_outcome(tool_request, &outcome)));
+            }
+            Err(error) => {
+                hook_failed[idx] = Some(tools::ToolResult::failed(
+                    tool_request,
+                    format!("pre_tool_use hook blocked tool: {error}"),
+                    None,
+                ));
+            }
         }
     }
 
@@ -677,6 +779,7 @@ fn execute_readonly_batch_for_tui(
                 tool_result: Some(result),
                 before_messages: None,
                 after_messages: None,
+                usage: None,
             },
         ) {
             let _ = event_tx.send(TuiEvent::Error(format!(
@@ -892,7 +995,7 @@ fn execute_tool_for_tui(
             name: tool_request.name.as_str().to_string(),
             target: tool_request.target.clone(),
         });
-        if let Err(error) = hooks.run(
+        let pre_tool_outcome = match hooks.run(
             HookEvent::PreToolUse,
             HookContext {
                 cwd: &cwd.display().to_string(),
@@ -901,38 +1004,50 @@ fn execute_tool_for_tui(
                 tool_result: None,
                 before_messages: None,
                 after_messages: None,
+                usage: None,
             },
         ) {
-            let result = tools::ToolResult::failed(
-                tool_request,
-                format!("pre_tool_use hook blocked tool: {error}"),
-                None,
-            );
-            let _ = event_tx.send(TuiEvent::ToolCompleted {
-                id: tool_request.id.clone(),
-                name: tool_request.name.as_str().to_string(),
-                status: "failed".to_string(),
-                output: result.error.clone().unwrap_or_default(),
-                diff: None,
-            });
-            return (true, result, None);
-        }
-        let before = diff::capture_before(tool_request, cwd);
-        let result = if tool_request.name == tools::ToolName::Bash {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let result = tools::ToolResult::failed(
+                    tool_request,
+                    format!("pre_tool_use hook blocked tool: {error}"),
+                    None,
+                );
+                let _ = event_tx.send(TuiEvent::ToolCompleted {
+                    id: tool_request.id.clone(),
+                    name: tool_request.name.as_str().to_string(),
+                    status: "failed".to_string(),
+                    output: result.error.clone().unwrap_or_default(),
+                    diff: None,
+                });
+                return (true, result, None);
+            }
+        };
+        let effective_tool_request =
+            tool_request_with_hook_outcome(tool_request, &pre_tool_outcome);
+        let execution_request = &effective_tool_request;
+        let before = diff::capture_before(execution_request, cwd);
+        let result = if execution_request.name == tools::ToolName::Bash {
             let mut on_output = |chunk: &str| {
                 let _ = event_tx.send(TuiEvent::ToolOutputDelta {
-                    id: tool_request.id.clone(),
+                    id: execution_request.id.clone(),
                     chunk: chunk.to_string(),
                 });
             };
             tools::bash::execute_streaming(
-                tool_request,
+                execution_request,
                 cwd,
                 tools::MAX_TOOL_OUTPUT_BYTES,
                 &mut on_output,
             )
         } else {
-            tools::execute_with_mcp(tool_request, cwd, mcp_registry)
+            tools::execute_with_mcp_and_external(
+                execution_request,
+                cwd,
+                mcp_registry,
+                &config.external_tools,
+            )
         };
         if matches!(result.status, tools::ToolStatus::Completed) {
             rendered_diff = before.and_then(diff::render_after);
@@ -978,6 +1093,7 @@ fn execute_tool_for_tui(
                 tool_result: Some(&result),
                 before_messages: None,
                 after_messages: None,
+                usage: None,
             },
         ) {
             let _ = event_tx.send(TuiEvent::Error(format!(
@@ -1146,11 +1262,13 @@ fn run_child_agent_for_tui(
         api_key: config.api_key.clone(),
         base_url: config.base_url.clone(),
         model: Some(crate::model::FLASH_MODEL.to_string()),
-        tools_override: Some(deepseek_tools_schema_for_type_with_mcp(
+        tools_override: Some(deepseek_tools_schema_for_type_with_mcp_and_external(
             subagent_type,
             Some(&mcp_registry),
+            &config.external_tools,
         )),
         mcp_registry: Some(mcp_registry.clone()),
+        external_tools: config.external_tools.clone(),
     };
 
     let budget_model = config.model.as_option();
@@ -1183,6 +1301,23 @@ fn run_child_agent_for_tui(
         }
 
         if provider::context::needs_compaction(&conversation, &ctx_config) {
+            let before_messages = conversation.messages.len();
+            if let Ok(outcome) = hooks.run(
+                HookEvent::OnBudgetWarning,
+                HookContext {
+                    cwd: &cwd.display().to_string(),
+                    session_status: None,
+                    tool_request: None,
+                    tool_result: None,
+                    before_messages: Some(before_messages),
+                    after_messages: None,
+                    usage: None,
+                },
+            ) {
+                if !outcome.injected_context.is_empty() {
+                    conversation = conversation_with_hook_context(&conversation, &outcome);
+                }
+            }
             conversation = provider::context::compact(&conversation, &ctx_config);
         }
 
@@ -1199,13 +1334,57 @@ fn run_child_agent_for_tui(
             Some(&route_decision.actual_model),
         );
 
+        let pre_model_outcome = match hooks.run(
+            HookEvent::PreModelCall,
+            HookContext {
+                cwd: &cwd.display().to_string(),
+                session_status: None,
+                tool_request: None,
+                tool_result: None,
+                before_messages: None,
+                after_messages: None,
+                usage: None,
+            },
+        ) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                return TuiAgentResult {
+                    status: "failed".to_string(),
+                    final_message: None,
+                    error: Some(format!("pre_model_call hook failed: {error}")),
+                    cost_tracker: child_cost_tracker,
+                };
+            }
+        };
+        let model_conversation = conversation_with_hook_context(&conversation, &pre_model_outcome);
+
         let response = provider::call_streaming(
             config.provider,
-            &conversation,
+            &model_conversation,
             &turn_provider_config,
             &child_cancel,
             &mut |_| {},
         );
+
+        if let Err(error) = hooks.run(
+            HookEvent::PostModelCall,
+            HookContext {
+                cwd: &cwd.display().to_string(),
+                session_status: None,
+                tool_request: None,
+                tool_result: None,
+                before_messages: None,
+                after_messages: None,
+                usage: response.usage.as_ref(),
+            },
+        ) {
+            return TuiAgentResult {
+                status: "failed".to_string(),
+                final_message: None,
+                error: Some(format!("post_model_call hook failed: {error}")),
+                cost_tracker: child_cost_tracker,
+            };
+        }
 
         if let Some(error) = response.steps.iter().find_map(|step| match step {
             ProviderStep::Error(message) => Some(message.clone()),
@@ -1342,6 +1521,7 @@ mod tests {
             max_budget_usd: None,
             mcp_servers: Vec::new(),
             hooks: Vec::new(),
+            external_tools: Vec::new(),
             subagents: Default::default(),
             tools: Default::default(),
             theme: crate::config::ThemeName::Dark,

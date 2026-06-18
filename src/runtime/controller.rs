@@ -13,14 +13,18 @@ use crate::mcp::McpRegistry;
 use crate::model::ModelRouteContext;
 use crate::provider::conversation::Conversation;
 use crate::provider::tool_schema::{
-    deepseek_tools_schema_for_type_with_mcp, deepseek_tools_schema_with_mcp,
+    deepseek_tools_schema_for_type_with_mcp_and_external,
+    deepseek_tools_schema_with_mcp_and_external,
 };
 use crate::provider::{self, ProviderConfig, ProviderStep};
 use crate::runtime::agent_common;
 use crate::runtime::cancel::CancelToken;
 use crate::runtime::cost::CostTracker;
 use crate::runtime::history::{self, SessionWriter};
-use crate::runtime::hooks::{HookContext, HookEvent, HookRunner};
+use crate::runtime::hooks::{
+    HookContext, HookEvent, HookRunner, conversation_with_hook_context,
+    tool_request_with_hook_outcome,
+};
 use crate::runtime::instructions::{self, ProjectInstructions};
 use crate::runtime::memory::{self, MemoryBlock};
 use crate::runtime::session::new_run_id;
@@ -152,6 +156,7 @@ fn run_inner(config: RunConfig) -> io::Result<RunStatus> {
             tool_result: None,
             before_messages: None,
             after_messages: None,
+            usage: None,
         },
     ) {
         sink.emit(&events.error(&format!("session_start hook failed: {error}")))?;
@@ -194,6 +199,7 @@ fn run_inner(config: RunConfig) -> io::Result<RunStatus> {
             tool_result: None,
             before_messages: None,
             after_messages: None,
+            usage: None,
         },
     ) {
         sink.emit(&events.error(&format!("session_end hook failed: {error}")))?;
@@ -231,12 +237,16 @@ fn run_agent_loop(
     let policy = ApprovalPolicy::new(config.approval_mode)
         .with_permission_rules(config.permission_rules.clone());
     let tools_override = if subagent_depth > 0 {
-        Some(deepseek_tools_schema_for_type_with_mcp(
+        Some(deepseek_tools_schema_for_type_with_mcp_and_external(
             subagent_type,
             Some(mcp_registry),
+            &config.external_tools,
         ))
     } else {
-        Some(deepseek_tools_schema_with_mcp(Some(mcp_registry)))
+        Some(deepseek_tools_schema_with_mcp_and_external(
+            Some(mcp_registry),
+            &config.external_tools,
+        ))
     };
     let provider_config = ProviderConfig {
         api_key: config.api_key.clone(),
@@ -244,6 +254,7 @@ fn run_agent_loop(
         model: config.model.as_option(),
         tools_override,
         mcp_registry: Some(mcp_registry.clone()),
+        external_tools: config.external_tools.clone(),
     };
 
     let system_prompt = agent_common::build_agent_system_prompt(
@@ -295,6 +306,28 @@ fn run_agent_loop(
 
         if provider::context::needs_compaction(&conversation, &ctx_config) {
             let before_messages = conversation.messages.len();
+            match hooks.run(
+                HookEvent::OnBudgetWarning,
+                HookContext {
+                    cwd: &cwd.display().to_string(),
+                    session_status: None,
+                    tool_request: None,
+                    tool_result: None,
+                    before_messages: Some(before_messages),
+                    after_messages: None,
+                    usage: None,
+                },
+            ) {
+                Ok(outcome) if !outcome.injected_context.is_empty() => {
+                    conversation = conversation_with_hook_context(&conversation, &outcome);
+                }
+                Err(error) if emit_deltas => {
+                    sink.emit(&events.error(&format!(
+                        "on_budget_warning hook failed: {error}"
+                    )))?;
+                }
+                _ => {}
+            }
             if emit_deltas
                 && let Err(error) = hooks.run(
                     HookEvent::PreCompact,
@@ -305,6 +338,7 @@ fn run_agent_loop(
                         tool_result: None,
                         before_messages: Some(before_messages),
                         after_messages: None,
+                        usage: None,
                     },
                 )
             {
@@ -334,6 +368,7 @@ fn run_agent_loop(
                         tool_result: None,
                         before_messages: Some(before_messages),
                         after_messages: Some(after_messages),
+                        usage: None,
                     },
                 )
             {
@@ -361,9 +396,32 @@ fn run_agent_loop(
             Some(&route_decision.actual_model),
         );
 
+        let pre_model_outcome = match hooks.run(
+            HookEvent::PreModelCall,
+            HookContext {
+                cwd: &cwd.display().to_string(),
+                session_status: None,
+                tool_request: None,
+                tool_result: None,
+                before_messages: None,
+                after_messages: None,
+                usage: None,
+            },
+        ) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let error = format!("pre_model_call hook failed: {error}");
+                if emit_deltas {
+                    sink.emit(&events.error(&error))?;
+                }
+                return Ok(AgentLoopResult::failure(RunStatus::Failed, error));
+            }
+        };
+        let model_conversation = conversation_with_hook_context(&conversation, &pre_model_outcome);
+
         let response = provider::call_streaming(
             config.provider,
-            &conversation,
+            &model_conversation,
             &turn_provider_config,
             cancel,
             &mut |step| {
@@ -381,6 +439,22 @@ fn run_agent_loop(
                 }
             },
         );
+
+        if let Err(error) = hooks.run(
+            HookEvent::PostModelCall,
+            HookContext {
+                cwd: &cwd.display().to_string(),
+                session_status: None,
+                tool_request: None,
+                tool_result: None,
+                before_messages: None,
+                after_messages: None,
+                usage: response.usage.as_ref(),
+            },
+        ) && emit_deltas
+        {
+            sink.emit(&events.error(&format!("post_model_call hook failed: {error}")))?;
+        }
 
         if emit_deltas
             && let Some(usage) = response.usage
@@ -469,6 +543,7 @@ fn run_agent_loop(
                     model: Some(crate::model::auxiliary_model().to_string()),
                     tools_override: Some(Vec::new()),
                     mcp_registry: None,
+                    external_tools: Vec::new(),
                 };
                 if let Err(error) = memory::extract_project_memory(
                     config.provider,
@@ -720,7 +795,7 @@ fn execute_tool_with_approval(
     if emit_deltas {
         sink.emit(&events.tool_call_requested(tool_request))?;
     }
-    if let Err(error) = hooks.run(
+    let pre_tool_outcome = match hooks.run(
         HookEvent::PreToolUse,
         HookContext {
             cwd: &cwd.display().to_string(),
@@ -729,25 +804,31 @@ fn execute_tool_with_approval(
             tool_result: None,
             before_messages: None,
             after_messages: None,
+            usage: None,
         },
     ) {
-        let result = tools::ToolResult::failed(
-            tool_request,
-            format!("pre_tool_use hook blocked tool: {error}"),
-            None,
-        );
-        if emit_deltas {
-            sink.emit(&events.tool_call_completed(&result))?;
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let result = tools::ToolResult::failed(
+                tool_request,
+                format!("pre_tool_use hook blocked tool: {error}"),
+                None,
+            );
+            if emit_deltas {
+                sink.emit(&events.tool_call_completed(&result))?;
+            }
+            return Ok((RunStatus::Failed, result));
         }
-        return Ok((RunStatus::Failed, result));
-    }
-    let result = if tool_request.name == tools::ToolName::Subagent {
+    };
+    let effective_tool_request = tool_request_with_hook_outcome(tool_request, &pre_tool_outcome);
+    let execution_request = &effective_tool_request;
+    let result = if execution_request.name == tools::ToolName::Subagent {
         execute_subagent_tool(
             config,
             cwd,
             events,
             sink,
-            tool_request,
+            execution_request,
             subagent_depth,
             instructions,
             memory,
@@ -758,7 +839,12 @@ fn execute_tool_with_approval(
             cancel,
         )?
     } else {
-        tools::execute_with_mcp(tool_request, cwd, mcp_registry)
+        tools::execute_with_mcp_and_external(
+            execution_request,
+            cwd,
+            mcp_registry,
+            &config.external_tools,
+        )
     };
     let is_failure = matches!(
         result.status,
@@ -766,10 +852,10 @@ fn execute_tool_with_approval(
     );
     if emit_deltas {
         sink.emit(&events.tool_call_completed(&result))?;
-        if tool_request.name == tools::ToolName::UpdatePlan
+        if execution_request.name == tools::ToolName::UpdatePlan
             && result.status == tools::ToolStatus::Completed
         {
-            match tools::update_plan::parse_args(tool_request) {
+            match tools::update_plan::parse_args(execution_request) {
                 Ok(update) => sink.emit(&events.plan_updated(&update))?,
                 Err(error) => {
                     sink.emit(&events.error(&format!("failed to render plan update: {error}")))?
@@ -781,10 +867,11 @@ fn execute_tool_with_approval(
             HookContext {
                 cwd: &cwd.display().to_string(),
                 session_status: None,
-                tool_request: Some(tool_request),
+                tool_request: Some(execution_request),
                 tool_result: Some(&result),
                 before_messages: None,
                 after_messages: None,
+                usage: None,
             },
         ) {
             sink.emit(&events.error(&format!("post_tool_use hook failed: {error}")))?;
@@ -839,7 +926,7 @@ fn execute_readonly_batch(
         if emit_deltas {
             sink.emit(&events.tool_call_requested(tool_request))?;
         }
-        if let Err(error) = hooks.run(
+        match hooks.run(
             HookEvent::PreToolUse,
             HookContext {
                 cwd: &cwd.display().to_string(),
@@ -848,15 +935,19 @@ fn execute_readonly_batch(
                 tool_result: None,
                 before_messages: None,
                 after_messages: None,
+                usage: None,
             },
         ) {
-            hook_failed[idx] = Some(tools::ToolResult::failed(
-                tool_request,
-                format!("pre_tool_use hook blocked tool: {error}"),
-                None,
-            ));
-        } else {
-            runnable.push((idx, tool_request.clone()));
+            Ok(outcome) => {
+                runnable.push((idx, tool_request_with_hook_outcome(tool_request, &outcome)));
+            }
+            Err(error) => {
+                hook_failed[idx] = Some(tools::ToolResult::failed(
+                    tool_request,
+                    format!("pre_tool_use hook blocked tool: {error}"),
+                    None,
+                ));
+            }
         }
     }
 
@@ -881,6 +972,7 @@ fn execute_readonly_batch(
                     tool_result: Some(result),
                     before_messages: None,
                     after_messages: None,
+                    usage: None,
                 },
             ) {
                 sink.emit(&events.error(&format!("post_tool_use hook failed: {error}")))?;
@@ -914,7 +1006,7 @@ fn execute_subagent_batch(
         if emit_deltas {
             sink.emit(&events.tool_call_requested(tool_request))?;
         }
-        if let Err(error) = hooks.run(
+        let pre_tool_outcome = match hooks.run(
             HookEvent::PreToolUse,
             HookContext {
                 cwd: &cwd.display().to_string(),
@@ -923,26 +1015,32 @@ fn execute_subagent_batch(
                 tool_result: None,
                 before_messages: None,
                 after_messages: None,
+                usage: None,
             },
         ) {
-            let result = tools::ToolResult::failed(
-                tool_request,
-                format!("pre_tool_use hook blocked tool: {error}"),
-                None,
-            );
-            if emit_deltas {
-                sink.emit(&events.tool_call_completed(&result))?;
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let result = tools::ToolResult::failed(
+                    tool_request,
+                    format!("pre_tool_use hook blocked tool: {error}"),
+                    None,
+                );
+                if emit_deltas {
+                    sink.emit(&events.tool_call_completed(&result))?;
+                }
+                results[idx] = Some((RunStatus::Failed, result));
+                continue;
             }
-            results[idx] = Some((RunStatus::Failed, result));
-            continue;
-        }
+        };
+        let effective_tool_request =
+            tool_request_with_hook_outcome(tool_request, &pre_tool_outcome);
 
-        let request = subagent::create_subagent_request(tool_request);
+        let request = subagent::create_subagent_request(&effective_tool_request);
         if emit_deltas {
             sink.emit(&events.subagent_started(&tool_request.id, &request.description))?;
         }
 
-        let child_tool_request = tool_request.clone();
+        let child_tool_request = effective_tool_request;
         let child_config = config.clone();
         let child_cwd = cwd.to_path_buf();
         let child_instructions = instructions.clone();
@@ -1023,6 +1121,7 @@ fn execute_subagent_batch(
                     tool_result: Some(&result),
                     before_messages: None,
                     after_messages: None,
+                    usage: None,
                 },
             ) {
                 sink.emit(&events.error(&format!("post_tool_use hook failed: {error}")))?;
@@ -1266,6 +1365,7 @@ mod tests {
     use crate::approval::policy::{ActionKind, ApprovalMode};
     use crate::config::{HistoryMode, OutputFormat, ProviderKind};
     use crate::model::ModelSelection;
+    use crate::runtime::hooks::HookOutcome;
     use crate::runtime::subagent_config::SubagentConfig;
 
     fn config(subagents: SubagentConfig) -> RunConfig {
@@ -1285,6 +1385,7 @@ mod tests {
             max_budget_usd: None,
             mcp_servers: Vec::new(),
             hooks: Vec::new(),
+            external_tools: Vec::new(),
             subagents,
             tools: Default::default(),
             theme: crate::config::ThemeName::Dark,
@@ -1462,5 +1563,26 @@ mod tests {
         );
         assert_eq!(results[0].output.as_deref(), Some("alpha"));
         assert_eq!(results[1].output.as_deref(), Some("bravo"));
+    }
+
+    #[test]
+    fn pre_model_hook_context_is_added_as_pinned_system_message() {
+        let mut conversation = Conversation::new();
+        conversation.add_system("base system".to_string());
+        conversation.add_user("do work".to_string());
+        let outcome = HookOutcome {
+            modified_target: None,
+            injected_context: vec!["policy hint".to_string(), "repo hint".to_string()],
+        };
+
+        let model_conversation = conversation_with_hook_context(&conversation, &outcome);
+
+        assert_eq!(conversation.messages.len(), 2);
+        assert_eq!(model_conversation.messages.len(), 3);
+        assert!(matches!(
+            model_conversation.messages.last(),
+            Some(crate::provider::conversation::Message::System { content, pinned: true })
+                if content.contains("policy hint") && content.contains("repo hint")
+        ));
     }
 }

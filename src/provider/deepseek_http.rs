@@ -3,7 +3,7 @@ use serde_json::Value;
 
 use crate::approval::policy::ActionKind;
 use crate::provider::conversation::Conversation;
-use crate::provider::tool_schema::deepseek_tools_schema_with_mcp;
+use crate::provider::tool_schema::deepseek_tools_schema_with_mcp_and_external;
 use crate::provider::{ProviderConfig, ProviderReplayState, ProviderResponse, ProviderStep, Usage};
 use crate::runtime::cancel::CancelToken;
 use crate::tools::{ToolRequest, registry};
@@ -164,10 +164,12 @@ fn request_chat_streaming(
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
 
     let messages = conversation_to_api_messages(conversation);
-    let tools = config
-        .tools_override
-        .clone()
-        .unwrap_or_else(|| deepseek_tools_schema_with_mcp(config.mcp_registry.as_ref()));
+    let tools = config.tools_override.clone().unwrap_or_else(|| {
+        deepseek_tools_schema_with_mcp_and_external(
+            config.mcp_registry.as_ref(),
+            &config.external_tools,
+        )
+    });
 
     let request = ChatRequest {
         model: model.to_string(),
@@ -222,7 +224,7 @@ fn request_chat_streaming(
                 arguments: tc.arguments.clone(),
             },
         };
-        match parse_tool_call(&tc_response) {
+        match parse_tool_call(&tc_response, &config.external_tools) {
             Ok(tool_request) => {
                 steps.push(ProviderStep::ToolCall(tool_request));
             }
@@ -287,10 +289,12 @@ fn request_chat(
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
 
     let messages = conversation_to_api_messages(conversation);
-    let tools = config
-        .tools_override
-        .clone()
-        .unwrap_or_else(|| deepseek_tools_schema_with_mcp(config.mcp_registry.as_ref()));
+    let tools = config.tools_override.clone().unwrap_or_else(|| {
+        deepseek_tools_schema_with_mcp_and_external(
+            config.mcp_registry.as_ref(),
+            &config.external_tools,
+        )
+    });
 
     let request = ChatRequest {
         model: model.to_string(),
@@ -363,7 +367,7 @@ fn request_chat(
                 arguments: tc.function.arguments.clone(),
             });
 
-            match parse_tool_call(tc) {
+            match parse_tool_call(tc, &config.external_tools) {
                 Ok(tool_request) => {
                     steps.push(ProviderStep::ToolCall(tool_request));
                 }
@@ -394,15 +398,25 @@ fn request_chat(
     })
 }
 
-fn parse_tool_call(tc: &ApiToolCallResponse) -> Result<ToolRequest, String> {
+fn parse_tool_call(
+    tc: &ApiToolCallResponse,
+    external_tools: &[crate::tools::external::ExternalToolConfig],
+) -> Result<ToolRequest, String> {
     let args: Value = serde_json::from_str(&tc.function.arguments)
         .map_err(|e| format!("invalid arguments JSON: {e}"))?;
 
     let schema_name = tc.function.name.as_str();
-    let registry = registry::default_tool_registry();
-    let Some(name) = registry::tool_name_from_schema_name(schema_name) else {
+    // ToolName::from_str has a catch-all that wraps unknown names as External(...),
+    // so we must gate on the registry to reject truly unknown tools.
+    let registry = registry::tool_registry_with_mcp_and_external(None, external_tools);
+    let is_known_tool = registry.get(schema_name).is_some()
+        || schema_name.starts_with("mcp__")
+        || external_tools.iter().any(|tool| tool.name == schema_name);
+    if !is_known_tool {
         return Err(format!("unknown tool: {schema_name}"));
-    };
+    }
+    let name = registry::tool_name_from_schema_name(schema_name)
+        .expect("known tool must parse to ToolName");
     let action = registry
         .get(schema_name)
         .map(|tool| tool.action_kind())
@@ -428,6 +442,7 @@ fn parse_tool_call(tc: &ApiToolCallResponse) -> Result<ToolRequest, String> {
             Some(format!("{count} items"))
         }
         other if other.starts_with("mcp__") => Some(other.to_string()),
+        other if external_tools.iter().any(|tool| tool.name == other) => Some(other.to_string()),
         _ => None,
     };
 
@@ -526,7 +541,7 @@ mod tests {
     #[test]
     fn parse_read_file() {
         let tc = make_tc("read_file", r#"{"path":"src/main.rs"}"#);
-        let req = parse_tool_call(&tc).unwrap();
+        let req = parse_tool_call(&tc, &[]).unwrap();
         assert_eq!(req.name, ToolName::ReadFile);
         assert_eq!(req.action, ActionKind::Read);
         assert_eq!(req.target.as_deref(), Some("src/main.rs"));
@@ -536,7 +551,7 @@ mod tests {
     #[test]
     fn parse_list_files_with_path() {
         let tc = make_tc("list_files", r#"{"path":"src/provider"}"#);
-        let req = parse_tool_call(&tc).unwrap();
+        let req = parse_tool_call(&tc, &[]).unwrap();
         assert_eq!(req.name, ToolName::ListFiles);
         assert_eq!(req.action, ActionKind::Read);
         assert_eq!(req.target.as_deref(), Some("src/provider"));
@@ -545,7 +560,7 @@ mod tests {
     #[test]
     fn parse_list_files_without_path_defaults_to_dot() {
         let tc = make_tc("list_files", r#"{}"#);
-        let req = parse_tool_call(&tc).unwrap();
+        let req = parse_tool_call(&tc, &[]).unwrap();
         assert_eq!(req.name, ToolName::ListFiles);
         assert_eq!(req.target.as_deref(), Some("."));
     }
@@ -553,7 +568,7 @@ mod tests {
     #[test]
     fn parse_grep() {
         let tc = make_tc("grep", r#"{"pattern":"fn main","path":"src"}"#);
-        let req = parse_tool_call(&tc).unwrap();
+        let req = parse_tool_call(&tc, &[]).unwrap();
         assert_eq!(req.name, ToolName::Grep);
         assert_eq!(req.action, ActionKind::Read);
         assert_eq!(req.target.as_deref(), Some("fn main"));
@@ -562,7 +577,7 @@ mod tests {
     #[test]
     fn parse_bash() {
         let tc = make_tc("bash", r#"{"command":"cargo test"}"#);
-        let req = parse_tool_call(&tc).unwrap();
+        let req = parse_tool_call(&tc, &[]).unwrap();
         assert_eq!(req.name, ToolName::Bash);
         assert_eq!(req.action, ActionKind::Shell);
         assert_eq!(req.target.as_deref(), Some("cargo test"));
@@ -571,7 +586,7 @@ mod tests {
     #[test]
     fn parse_edit() {
         let tc = make_tc("edit", r#"{"path":"foo.rs","old_text":"a","new_text":"b"}"#);
-        let req = parse_tool_call(&tc).unwrap();
+        let req = parse_tool_call(&tc, &[]).unwrap();
         assert_eq!(req.name, ToolName::Edit);
         assert_eq!(req.action, ActionKind::Write);
         assert_eq!(req.target.as_deref(), Some("foo.rs"));
@@ -581,7 +596,7 @@ mod tests {
     #[test]
     fn parse_git_status() {
         let tc = make_tc("git_status", r#"{}"#);
-        let req = parse_tool_call(&tc).unwrap();
+        let req = parse_tool_call(&tc, &[]).unwrap();
         assert_eq!(req.name, ToolName::GitStatus);
         assert_eq!(req.action, ActionKind::Read);
         assert_eq!(req.target.as_deref(), Some("."));
@@ -593,7 +608,7 @@ mod tests {
             "subagent",
             r#"{"description":"inspect repo","prompt":"inspect the repo and report"}"#,
         );
-        let req = parse_tool_call(&tc).unwrap();
+        let req = parse_tool_call(&tc, &[]).unwrap();
         assert_eq!(req.name, ToolName::Subagent);
         assert_eq!(req.action, ActionKind::Agent);
         assert_eq!(req.target.as_deref(), Some("inspect repo"));
@@ -603,7 +618,7 @@ mod tests {
     #[test]
     fn parse_mcp_tool() {
         let tc = make_tc("mcp__demo__search", r#"{"query":"orca"}"#);
-        let req = parse_tool_call(&tc).unwrap();
+        let req = parse_tool_call(&tc, &[]).unwrap();
         assert_eq!(req.name, ToolName::Mcp("mcp__demo__search".to_string()));
         assert_eq!(req.action, ActionKind::Read);
         assert_eq!(req.target.as_deref(), Some("mcp__demo__search"));
@@ -613,7 +628,7 @@ mod tests {
     #[test]
     fn parse_web_search() {
         let tc = make_tc("web_search", r#"{"query":"deepseek latest","count":3}"#);
-        let req = parse_tool_call(&tc).unwrap();
+        let req = parse_tool_call(&tc, &[]).unwrap();
         assert_eq!(req.name, ToolName::WebSearch);
         assert_eq!(req.action, ActionKind::Network);
         assert_eq!(req.target.as_deref(), Some("deepseek latest"));
@@ -626,7 +641,7 @@ mod tests {
             "update_plan",
             r#"{"plan":[{"step":"Inspect references","status":"completed"},{"step":"Patch Orca","status":"in_progress"}]}"#,
         );
-        let req = parse_tool_call(&tc).unwrap();
+        let req = parse_tool_call(&tc, &[]).unwrap();
         assert_eq!(req.name, ToolName::UpdatePlan);
         assert_eq!(req.action, ActionKind::Read);
         assert_eq!(req.target.as_deref(), Some("2 items"));
@@ -636,14 +651,14 @@ mod tests {
     #[test]
     fn parse_unknown_tool_returns_error() {
         let tc = make_tc("unknown_tool", r#"{}"#);
-        let err = parse_tool_call(&tc).unwrap_err();
+        let err = parse_tool_call(&tc, &[]).unwrap_err();
         assert!(err.contains("unknown tool"));
     }
 
     #[test]
     fn parse_invalid_json_returns_error() {
         let tc = make_tc("read_file", "not json");
-        let err = parse_tool_call(&tc).unwrap_err();
+        let err = parse_tool_call(&tc, &[]).unwrap_err();
         assert!(err.contains("invalid arguments JSON"));
     }
 }

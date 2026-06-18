@@ -2,19 +2,19 @@ use serde_json::Value;
 
 use crate::mcp::McpRegistry;
 use crate::runtime::subagent_types::SubagentType;
+use crate::tools::external::ExternalToolConfig;
 use crate::tools::registry::{self, ToolRegistry};
 
-pub fn deepseek_tools_schema() -> Vec<Value> {
-    let registry = registry::default_tool_registry();
-    deepseek_tools_schema_from_registry(registry)
-}
-
-pub fn deepseek_tools_schema_with_mcp(mcp_registry: Option<&McpRegistry>) -> Vec<Value> {
+pub fn deepseek_tools_schema_with_mcp_and_external(
+    mcp_registry: Option<&McpRegistry>,
+    external_tools: &[ExternalToolConfig],
+) -> Vec<Value> {
     if mcp_registry.is_none() {
-        return deepseek_tools_schema();
+        let registry = registry::tool_registry_with_mcp_and_external(None, external_tools);
+        return deepseek_tools_schema_from_registry(&registry);
     }
 
-    let registry = registry::tool_registry_with_mcp(mcp_registry);
+    let registry = registry::tool_registry_with_mcp_and_external(mcp_registry, external_tools);
     deepseek_tools_schema_from_registry(&registry)
 }
 
@@ -22,18 +22,21 @@ pub fn deepseek_tools_schema_from_registry(registry: &ToolRegistry) -> Vec<Value
     registry.iter().map(|tool| tool.schema()).collect()
 }
 
-pub fn deepseek_tools_schema_for_type_with_mcp(
+pub fn deepseek_tools_schema_for_type_with_mcp_and_external(
     subagent_type: &SubagentType,
     mcp_registry: Option<&McpRegistry>,
+    external_tools: &[ExternalToolConfig],
 ) -> Vec<Value> {
     let allowed = subagent_type.allowed_tools();
-    let registry = registry::tool_registry_with_mcp(mcp_registry);
+    let registry = registry::tool_registry_with_mcp_and_external(mcp_registry, external_tools);
 
     registry
         .iter()
         .filter(|tool| {
             let name = tool.name();
-            name.starts_with("mcp__") || (name != "subagent" && allowed.contains(&name))
+            name.starts_with("mcp__")
+                || external_tools.iter().any(|external| external.name == name)
+                || (name != "subagent" && allowed.contains(&name))
         })
         .map(|tool| tool.schema())
         .collect()
@@ -61,7 +64,7 @@ mod tests {
             }),
         }]);
 
-        let schema = deepseek_tools_schema_with_mcp(Some(&registry));
+        let schema = deepseek_tools_schema_with_mcp_and_external(Some(&registry), &[]);
         assert!(
             schema
                 .iter()
