@@ -12,6 +12,7 @@ pub mod git;
 pub mod grep;
 pub mod list_files;
 pub mod read_file;
+pub mod registry;
 pub mod update_plan;
 pub mod web_search;
 pub mod write_file;
@@ -50,10 +51,27 @@ impl ToolName {
         }
     }
 
+    pub fn from_str(s: &str) -> Option<Self> {
+        Some(match s {
+            "read_file" => Self::ReadFile,
+            "list_files" => Self::ListFiles,
+            "grep" => Self::Grep,
+            "bash" => Self::Bash,
+            "edit" => Self::Edit,
+            "write_file" => Self::WriteFile,
+            "git_status" => Self::GitStatus,
+            "subagent" => Self::Subagent,
+            "web_search" => Self::WebSearch,
+            "update_plan" => Self::UpdatePlan,
+            other if other.starts_with("mcp__") => Self::Mcp(other.to_string()),
+            _ => return None,
+        })
+    }
+
     pub fn is_read_only(&self) -> bool {
         matches!(
             self,
-            Self::ReadFile | Self::ListFiles | Self::Grep | Self::GitStatus | Self::WebSearch
+            Self::ReadFile | Self::ListFiles | Self::Grep | Self::GitStatus
         )
     }
 }
@@ -73,23 +91,8 @@ impl<'de> Deserialize<'de> for ToolName {
         D: Deserializer<'de>,
     {
         let value = String::deserialize(deserializer)?;
-        Ok(match value.as_str() {
-            "read_file" => Self::ReadFile,
-            "list_files" => Self::ListFiles,
-            "grep" => Self::Grep,
-            "bash" => Self::Bash,
-            "edit" => Self::Edit,
-            "write_file" => Self::WriteFile,
-            "git_status" => Self::GitStatus,
-            "subagent" => Self::Subagent,
-            "web_search" => Self::WebSearch,
-            "update_plan" => Self::UpdatePlan,
-            other if other.starts_with("mcp__") => Self::Mcp(other.to_string()),
-            other => {
-                return Err(serde::de::Error::custom(format!(
-                    "unknown tool name: {other}"
-                )));
-            }
+        Self::from_str(&value).ok_or_else(|| {
+            serde::de::Error::custom(format!("unknown tool name: {value}"))
         })
     }
 }
@@ -174,23 +177,9 @@ impl ToolResult {
 }
 
 pub fn execute(request: &ToolRequest, cwd: &Path) -> ToolResult {
-    match &request.name {
-        ToolName::ReadFile => read_file::execute(request, cwd, MAX_TOOL_OUTPUT_BYTES),
-        ToolName::ListFiles => list_files::execute(request, cwd, MAX_TOOL_OUTPUT_BYTES),
-        ToolName::GitStatus => git::status(request, cwd, MAX_TOOL_OUTPUT_BYTES),
-        ToolName::Grep => grep::execute(request, cwd, MAX_TOOL_OUTPUT_BYTES),
-        ToolName::Bash => bash::execute(request, cwd, MAX_TOOL_OUTPUT_BYTES),
-        ToolName::Edit => edit::execute(request, cwd),
-        ToolName::WriteFile => write_file::execute(request, cwd),
-        ToolName::WebSearch => web_search::execute(request, MAX_TOOL_OUTPUT_BYTES),
-        ToolName::UpdatePlan => update_plan::execute(request),
-        ToolName::Subagent => ToolResult::failed(
-            request,
-            "subagent tool must be executed by the runtime",
-            None,
-        ),
-        ToolName::Mcp(_) => ToolResult::failed(request, "MCP registry is not initialized", None),
-    }
+    let registry = registry::default_tool_registry();
+    let ctx = registry::ToolContext::new(cwd);
+    registry.execute(request, &ctx)
 }
 
 pub fn execute_with_mcp(
@@ -198,47 +187,29 @@ pub fn execute_with_mcp(
     cwd: &Path,
     mcp_registry: &McpRegistry,
 ) -> ToolResult {
-    match &request.name {
-        ToolName::Mcp(schema_name) => execute_mcp(request, schema_name, mcp_registry),
-        _ => execute(request, cwd),
+    if !matches!(&request.name, ToolName::Mcp(_)) {
+        return execute(request, cwd);
     }
+
+    let registry = registry::tool_registry_with_mcp(Some(mcp_registry));
+    let ctx = registry::ToolContext::new(cwd).with_mcp(mcp_registry);
+    registry.execute(request, &ctx)
 }
 
-fn execute_mcp(request: &ToolRequest, schema_name: &str, mcp_registry: &McpRegistry) -> ToolResult {
-    let Some(tool_ref) = mcp_registry.resolve_tool(schema_name) else {
-        return ToolResult::failed(request, format!("unknown MCP tool: {schema_name}"), None);
-    };
-    let arguments = match request
-        .raw_arguments
-        .as_deref()
-        .map(serde_json::from_str::<serde_json::Value>)
-        .transpose()
-    {
-        Ok(Some(value)) => value,
-        Ok(None) => serde_json::Value::Object(Default::default()),
-        Err(error) => {
-            return ToolResult::failed(
-                request,
-                format!("invalid MCP arguments JSON: {error}"),
-                None,
-            );
-        }
-    };
-
-    match mcp_registry.call_tool(&tool_ref, arguments) {
-        Ok(result) if result.is_error => ToolResult::failed(request, result.output, None),
-        Ok(result) => ToolResult::completed(request, result.output, false),
-        Err(error) => ToolResult::failed(request, error, None),
+fn is_concurrent_safe_read(request: &ToolRequest) -> bool {
+    if request.action != ActionKind::Read {
+        return false;
     }
+
+    let registry = registry::default_tool_registry();
+    registry
+        .get(request.name.as_str())
+        .map(|tool| tool.is_concurrent_safe(request))
+        .unwrap_or_else(|| request.name.is_read_only())
 }
 
-pub fn should_run_readonly_batch(
-    max_read_parallel: usize,
-    tool_request: &ToolRequest,
-) -> bool {
-    tool_request.name.is_read_only()
-        && !matches!(tool_request.action, ActionKind::Write | ActionKind::Shell)
-        && max_read_parallel > 1
+pub fn should_run_readonly_batch(max_read_parallel: usize, tool_request: &ToolRequest) -> bool {
+    is_concurrent_safe_read(tool_request) && max_read_parallel > 1
 }
 
 pub fn collect_readonly_batch(
@@ -248,10 +219,7 @@ pub fn collect_readonly_batch(
 ) -> usize {
     let max_end = (start + max_read_parallel).min(tool_requests.len());
     let mut end = start;
-    while end < max_end
-        && tool_requests[end].name.is_read_only()
-        && !matches!(tool_requests[end].action, ActionKind::Write | ActionKind::Shell)
-    {
+    while end < max_end && is_concurrent_safe_read(&tool_requests[end]) {
         end += 1;
     }
     end
@@ -281,11 +249,9 @@ pub fn run_readonly_batch_parallel(
         for (idx, handle) in handles {
             results[idx] = Some(match handle.join() {
                 Ok(result) => result,
-                Err(_) => ToolResult::failed(
-                    &tool_requests[idx],
-                    "read-only tool thread panicked",
-                    None,
-                ),
+                Err(_) => {
+                    ToolResult::failed(&tool_requests[idx], "read-only tool thread panicked", None)
+                }
             });
         }
     });
@@ -369,6 +335,8 @@ fn truncate_output(output: String, max_bytes: usize) -> (String, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mcp::types::McpTool;
+    use std::fs;
 
     #[test]
     fn micro_compact_preserves_head_and_tail() {
@@ -378,5 +346,93 @@ mod tests {
         assert!(truncated.starts_with("aaaa"));
         assert!(truncated.contains("micro-compacted"));
         assert!(truncated.ends_with("zzzz"));
+    }
+
+    #[test]
+    fn default_registry_exposes_builtin_tool_metadata() {
+        let registry = registry::default_tool_registry();
+
+        let tool = registry
+            .get("read_file")
+            .expect("read_file is registered as a tool");
+        let request = ToolRequest {
+            id: "read".to_string(),
+            name: ToolName::ReadFile,
+            action: ActionKind::Read,
+            target: Some("README.md".to_string()),
+            raw_arguments: None,
+        };
+
+        assert_eq!(tool.name(), "read_file");
+        assert_eq!(tool.action_kind(), ActionKind::Read);
+        assert!(tool.is_read_only(&request));
+        assert!(tool.is_concurrent_safe(&request));
+        assert_eq!(
+            registry.iter().next().map(|tool| tool.name()),
+            Some("read_file")
+        );
+
+        assert_eq!(
+            registry.get("web_search").unwrap().action_kind(),
+            ActionKind::Network
+        );
+        assert_eq!(
+            registry.get("subagent").unwrap().action_kind(),
+            ActionKind::Agent
+        );
+    }
+
+    #[test]
+    fn registry_can_include_mcp_proxy_tools() {
+        let mcp_registry = McpRegistry::from_tools_for_test(vec![McpTool {
+            server: "demo".to_string(),
+            name: "search".to_string(),
+            schema_name: "mcp__demo__search".to_string(),
+            description: Some("search docs".to_string()),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string" }
+                },
+                "required": ["query"]
+            }),
+        }]);
+
+        let registry = registry::tool_registry_with_mcp(Some(&mcp_registry));
+        let tool = registry
+            .get("mcp__demo__search")
+            .expect("MCP tool is registered as a proxy tool");
+        let request = ToolRequest {
+            id: "mcp".to_string(),
+            name: ToolName::Mcp("mcp__demo__search".to_string()),
+            action: ActionKind::Read,
+            target: Some("mcp__demo__search".to_string()),
+            raw_arguments: Some(r#"{"query":"orca"}"#.to_string()),
+        };
+
+        assert_eq!(tool.name(), "mcp__demo__search");
+        assert_eq!(tool.action_kind(), ActionKind::Write);
+        assert!(!tool.is_read_only(&request));
+        assert!(!tool.is_concurrent_safe(&request));
+    }
+
+    #[test]
+    fn registry_executes_builtin_tool_by_registered_name() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        fs::write(temp_dir.path().join("note.txt"), "hello registry\n").expect("fixture");
+        let registry = registry::default_tool_registry();
+        let request = ToolRequest {
+            id: "read".to_string(),
+            name: ToolName::ReadFile,
+            action: ActionKind::Read,
+            target: Some("note.txt".to_string()),
+            raw_arguments: None,
+        };
+        let ctx = registry::ToolContext::new(temp_dir.path());
+
+        let result = registry.execute(&request, &ctx);
+
+        assert_eq!(result.status, ToolStatus::Completed);
+        assert_eq!(result.output.as_deref(), Some("hello registry\n"));
     }
 }

@@ -6,7 +6,7 @@ use crate::provider::conversation::Conversation;
 use crate::provider::tool_schema::deepseek_tools_schema_with_mcp;
 use crate::provider::{ProviderConfig, ProviderReplayState, ProviderResponse, ProviderStep, Usage};
 use crate::runtime::cancel::CancelToken;
-use crate::tools::{ToolName, ToolRequest};
+use crate::tools::{ToolRequest, registry};
 
 const DEFAULT_BASE_URL: &str = "https://api.deepseek.com";
 const DEFAULT_MODEL: &str = "deepseek-v4-flash";
@@ -173,7 +173,9 @@ fn request_chat_streaming(
         model: model.to_string(),
         messages,
         stream: true,
-        stream_options: Some(StreamOptions { include_usage: true }),
+        stream_options: Some(StreamOptions {
+            include_usage: true,
+        }),
         tools: Some(tools),
     };
 
@@ -396,68 +398,37 @@ fn parse_tool_call(tc: &ApiToolCallResponse) -> Result<ToolRequest, String> {
     let args: Value = serde_json::from_str(&tc.function.arguments)
         .map_err(|e| format!("invalid arguments JSON: {e}"))?;
 
-    let (name, action, target) = match tc.function.name.as_str() {
-        "read_file" => (
-            ToolName::ReadFile,
-            ActionKind::Read,
-            args["path"].as_str().map(String::from),
-        ),
-        "list_files" => (
-            ToolName::ListFiles,
-            ActionKind::Read,
-            args["path"]
-                .as_str()
-                .map(String::from)
-                .or(Some(".".to_string())),
-        ),
-        "grep" => (
-            ToolName::Grep,
-            ActionKind::Read,
-            args["pattern"].as_str().map(String::from),
-        ),
-        "bash" => (
-            ToolName::Bash,
-            ActionKind::Shell,
-            args["command"].as_str().map(String::from),
-        ),
-        "edit" => (
-            ToolName::Edit,
-            ActionKind::Write,
-            args["path"].as_str().map(String::from),
-        ),
-        "write_file" => (
-            ToolName::WriteFile,
-            ActionKind::Write,
-            args["path"].as_str().map(String::from),
-        ),
-        "git_status" => (ToolName::GitStatus, ActionKind::Read, Some(".".to_string())),
-        "subagent" => (
-            ToolName::Subagent,
-            ActionKind::Read,
-            args["description"]
-                .as_str()
-                .map(String::from)
-                .or_else(|| args["prompt"].as_str().map(String::from)),
-        ),
-        "web_search" => (
-            ToolName::WebSearch,
-            ActionKind::Read,
-            args["query"].as_str().map(String::from),
-        ),
+    let schema_name = tc.function.name.as_str();
+    let registry = registry::default_tool_registry();
+    let Some(name) = registry::tool_name_from_schema_name(schema_name) else {
+        return Err(format!("unknown tool: {schema_name}"));
+    };
+    let action = registry
+        .get(schema_name)
+        .map(|tool| tool.action_kind())
+        .unwrap_or(ActionKind::Read);
+    let target = match schema_name {
+        "read_file" => args["path"].as_str().map(String::from),
+        "list_files" => args["path"]
+            .as_str()
+            .map(String::from)
+            .or(Some(".".to_string())),
+        "grep" => args["pattern"].as_str().map(String::from),
+        "bash" => args["command"].as_str().map(String::from),
+        "edit" => args["path"].as_str().map(String::from),
+        "write_file" => args["path"].as_str().map(String::from),
+        "git_status" => Some(".".to_string()),
+        "subagent" => args["description"]
+            .as_str()
+            .map(String::from)
+            .or_else(|| args["prompt"].as_str().map(String::from)),
+        "web_search" => args["query"].as_str().map(String::from),
         "update_plan" => {
             let count = args["plan"].as_array().map(|plan| plan.len()).unwrap_or(0);
-            (
-                ToolName::UpdatePlan,
-                ActionKind::Read,
-                Some(format!("{count} items")),
-            )
+            Some(format!("{count} items"))
         }
-        other if other.starts_with("mcp__") => (
-            ToolName::Mcp(other.to_string()),
-            ActionKind::Read,
-            Some(other.to_string()),
-        ),
-        other => return Err(format!("unknown tool: {other}")),
+        other if other.starts_with("mcp__") => Some(other.to_string()),
+        _ => None,
     };
 
     Ok(ToolRequest {
@@ -622,7 +593,7 @@ mod tests {
         );
         let req = parse_tool_call(&tc).unwrap();
         assert_eq!(req.name, ToolName::Subagent);
-        assert_eq!(req.action, ActionKind::Read);
+        assert_eq!(req.action, ActionKind::Agent);
         assert_eq!(req.target.as_deref(), Some("inspect repo"));
         assert!(req.raw_arguments.is_some());
     }
@@ -642,7 +613,7 @@ mod tests {
         let tc = make_tc("web_search", r#"{"query":"deepseek latest","count":3}"#);
         let req = parse_tool_call(&tc).unwrap();
         assert_eq!(req.name, ToolName::WebSearch);
-        assert_eq!(req.action, ActionKind::Read);
+        assert_eq!(req.action, ActionKind::Network);
         assert_eq!(req.target.as_deref(), Some("deepseek latest"));
         assert!(req.raw_arguments.is_some());
     }

@@ -33,6 +33,8 @@ impl ApprovalMode {
 pub enum ActionKind {
     Read,
     Write,
+    Network,
+    Agent,
     Shell,
 }
 
@@ -41,6 +43,8 @@ impl ActionKind {
         match self {
             Self::Read => "read",
             Self::Write => "write",
+            Self::Network => "network",
+            Self::Agent => "agent",
             Self::Shell => "shell",
         }
     }
@@ -128,10 +132,19 @@ impl ApprovalPolicy {
 
         let decision = match (self.mode, request.action) {
             (_, ActionKind::Read) => ApprovalDecision::Allow,
-            (ApprovalMode::Plan, ActionKind::Write | ActionKind::Shell) => ApprovalDecision::Deny,
-            (ApprovalMode::Suggest, ActionKind::Write | ActionKind::Shell) => ApprovalDecision::Ask,
+            (
+                ApprovalMode::Plan,
+                ActionKind::Write | ActionKind::Network | ActionKind::Agent | ActionKind::Shell,
+            ) => ApprovalDecision::Deny,
+            (
+                ApprovalMode::Suggest,
+                ActionKind::Write | ActionKind::Network | ActionKind::Agent | ActionKind::Shell,
+            ) => ApprovalDecision::Ask,
             (ApprovalMode::AutoEdit, ActionKind::Write) => ApprovalDecision::Allow,
-            (ApprovalMode::AutoEdit, ActionKind::Shell) => ApprovalDecision::Ask,
+            (
+                ApprovalMode::AutoEdit,
+                ActionKind::Network | ActionKind::Agent | ActionKind::Shell,
+            ) => ApprovalDecision::Ask,
             (ApprovalMode::FullAuto, _) => ApprovalDecision::Allow,
         };
 

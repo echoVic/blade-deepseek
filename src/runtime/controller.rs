@@ -528,8 +528,15 @@ fn run_agent_loop(
                 continue;
             }
 
-            if tools::should_run_readonly_batch(config.tools.max_read_parallel, &tool_requests[index]) {
-                let batch_end = tools::collect_readonly_batch(config.tools.max_read_parallel, &tool_requests, index);
+            if tools::should_run_readonly_batch(
+                config.tools.max_read_parallel,
+                &tool_requests[index],
+            ) {
+                let batch_end = tools::collect_readonly_batch(
+                    config.tools.max_read_parallel,
+                    &tool_requests,
+                    index,
+                );
                 let results = execute_readonly_batch(
                     cwd,
                     events,
@@ -823,7 +830,8 @@ fn execute_readonly_batch(
         }
     }
 
-    let mut results = tools::run_readonly_batch_parallel(tool_requests, runnable, cwd, mcp_registry);
+    let mut results =
+        tools::run_readonly_batch_parallel(tool_requests, runnable, cwd, mcp_registry);
 
     for (idx, failed) in hook_failed.into_iter().enumerate() {
         if let Some(result) = failed {
@@ -1332,8 +1340,14 @@ mod tests {
             tool_request("c", tools::ToolName::ListFiles, ActionKind::Read),
         ];
 
-        assert!(tools::should_run_readonly_batch(config.tools.max_read_parallel, &requests[0]));
-        assert_eq!(tools::collect_readonly_batch(config.tools.max_read_parallel, &requests, 0), 2);
+        assert!(tools::should_run_readonly_batch(
+            config.tools.max_read_parallel,
+            &requests[0]
+        ));
+        assert_eq!(
+            tools::collect_readonly_batch(config.tools.max_read_parallel, &requests, 0),
+            2
+        );
     }
 
     #[test]
@@ -1345,8 +1359,14 @@ mod tests {
             tool_request("c", tools::ToolName::Grep, ActionKind::Read),
         ];
 
-        assert_eq!(tools::collect_readonly_batch(config.tools.max_read_parallel, &requests, 0), 1);
-        assert!(!tools::should_run_readonly_batch(config.tools.max_read_parallel, &requests[1]));
+        assert_eq!(
+            tools::collect_readonly_batch(config.tools.max_read_parallel, &requests, 0),
+            1
+        );
+        assert!(!tools::should_run_readonly_batch(
+            config.tools.max_read_parallel,
+            &requests[1]
+        ));
     }
 
     #[test]
@@ -1354,7 +1374,21 @@ mod tests {
         let config = config(SubagentConfig::default());
         let request = tool_request("a", tools::ToolName::ReadFile, ActionKind::Write);
 
-        assert!(!tools::should_run_readonly_batch(config.tools.max_read_parallel, &request));
+        assert!(!tools::should_run_readonly_batch(
+            config.tools.max_read_parallel,
+            &request
+        ));
+    }
+
+    #[test]
+    fn readonly_batch_skips_network_actions() {
+        let config = config(SubagentConfig::default());
+        let request = tool_request("a", tools::ToolName::WebSearch, ActionKind::Network);
+
+        assert!(!tools::should_run_readonly_batch(
+            config.tools.max_read_parallel,
+            &request
+        ));
     }
 
     #[test]

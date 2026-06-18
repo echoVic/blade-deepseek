@@ -1,248 +1,25 @@
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use crate::mcp::McpRegistry;
 use crate::runtime::subagent_types::SubagentType;
+use crate::tools::registry::{self, ToolRegistry};
 
 pub fn deepseek_tools_schema() -> Vec<Value> {
-    builtin_tools_schema()
+    let registry = registry::default_tool_registry();
+    deepseek_tools_schema_from_registry(registry)
 }
 
 pub fn deepseek_tools_schema_with_mcp(mcp_registry: Option<&McpRegistry>) -> Vec<Value> {
-    let mut schema = builtin_tools_schema();
-    if let Some(registry) = mcp_registry {
-        schema.extend(
-            registry
-                .tools()
-                .iter()
-                .map(|tool| tool.to_deepseek_schema()),
-        );
+    if mcp_registry.is_none() {
+        return deepseek_tools_schema();
     }
-    schema
+
+    let registry = registry::tool_registry_with_mcp(mcp_registry);
+    deepseek_tools_schema_from_registry(&registry)
 }
 
-fn builtin_tools_schema() -> Vec<Value> {
-    vec![
-        json!({
-            "type": "function",
-            "function": {
-                "name": "read_file",
-                "description": "Read the contents of a file at the given path relative to workspace root.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "File path relative to workspace root"
-                        }
-                    },
-                    "required": ["path"]
-                }
-            }
-        }),
-        json!({
-            "type": "function",
-            "function": {
-                "name": "list_files",
-                "description": "List files and directories in the given path.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "Directory path relative to workspace root (default: '.')"
-                        }
-                    },
-                    "required": []
-                }
-            }
-        }),
-        json!({
-            "type": "function",
-            "function": {
-                "name": "grep",
-                "description": "Search for a regex pattern in files using ripgrep. Returns matching lines with line numbers.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "pattern": {
-                            "type": "string",
-                            "description": "Regex pattern to search for"
-                        },
-                        "path": {
-                            "type": "string",
-                            "description": "Directory or file to search in (default: '.')"
-                        }
-                    },
-                    "required": ["pattern"]
-                }
-            }
-        }),
-        json!({
-            "type": "function",
-            "function": {
-                "name": "bash",
-                "description": "Execute a shell command via sh -c. Use for running tests, builds, git operations, etc.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "command": {
-                            "type": "string",
-                            "description": "The shell command to execute"
-                        }
-                    },
-                    "required": ["command"]
-                }
-            }
-        }),
-        json!({
-            "type": "function",
-            "function": {
-                "name": "edit",
-                "description": "Edit a file by replacing exact text. The old_text must match exactly one location in the file.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "File path relative to workspace root"
-                        },
-                        "old_text": {
-                            "type": "string",
-                            "description": "Exact text to find (must match uniquely in the file)"
-                        },
-                        "new_text": {
-                            "type": "string",
-                            "description": "Replacement text"
-                        }
-                    },
-                    "required": ["path", "old_text", "new_text"]
-                }
-            }
-        }),
-        json!({
-            "type": "function",
-            "function": {
-                "name": "write_file",
-                "description": "Create or overwrite a file with the given content. Use for creating new files or completely replacing file contents.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "File path relative to workspace root"
-                        },
-                        "content": {
-                            "type": "string",
-                            "description": "The full content to write to the file"
-                        }
-                    },
-                    "required": ["path", "content"]
-                }
-            }
-        }),
-        json!({
-            "type": "function",
-            "function": {
-                "name": "git_status",
-                "description": "Show the git working tree status in short format.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {},
-                    "required": []
-                }
-            }
-        }),
-        json!({
-            "type": "function",
-            "function": {
-                "name": "web_search",
-                "description": "Search the web for current information using Brave Search. Returns top results with title, summary, and URL.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "query": {
-                            "type": "string",
-                            "description": "Search query"
-                        },
-                        "count": {
-                            "type": "integer",
-                            "description": "Number of results to return, 1-10 (default: 5)"
-                        }
-                    },
-                    "required": ["query"]
-                }
-            }
-        }),
-        json!({
-            "type": "function",
-            "function": {
-                "name": "subagent",
-                "description": "Launch a synchronous child agent for a complex, multi-step subtask. The child runs independently and returns a concise result summary.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "description": {
-                            "type": "string",
-                            "description": "Short 3-8 word label for the delegated task"
-                        },
-                        "prompt": {
-                            "type": "string",
-                            "description": "Full standalone instructions for the child agent"
-                        },
-                        "subagent_type": {
-                            "type": "string",
-                            "enum": ["general", "code_reviewer", "test_writer", "debugger", "documenter"],
-                            "description": "Optional specialized agent type that restricts tools and provides focused expertise"
-                        },
-                        "model": {
-                            "type": "string",
-                            "enum": ["auto", "deepseek-v4-flash", "deepseek-v4-pro"],
-                            "description": "Optional model override for this child agent. auto uses Orca's router, flash is faster, pro is stronger for deep reasoning."
-                        }
-                    },
-                    "required": ["description", "prompt"]
-                }
-            }
-        }),
-        json!({
-            "type": "function",
-            "function": {
-                "name": "update_plan",
-                "description": "Update the current task plan. Use for complex multi-step tasks or when the user asks for a todo/task list. At most one step may be in_progress. Maximum 50 items, each step max 200 chars.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "explanation": {
-                            "type": "string",
-                            "description": "Optional short explanation for this plan update"
-                        },
-                        "plan": {
-                            "type": "array",
-                            "description": "The complete current list of task steps",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "step": {
-                                        "type": "string",
-                                        "description": "Task step text"
-                                    },
-                                    "status": {
-                                        "type": "string",
-                                        "enum": ["pending", "in_progress", "completed"],
-                                        "description": "Step status"
-                                    }
-                                },
-                                "required": ["step", "status"],
-                                "additionalProperties": false
-                            }
-                        }
-                    },
-                    "required": ["plan"],
-                    "additionalProperties": false
-                }
-            }
-        }),
-    ]
+pub fn deepseek_tools_schema_from_registry(registry: &ToolRegistry) -> Vec<Value> {
+    registry.iter().map(|tool| tool.schema()).collect()
 }
 
 pub fn deepseek_tools_schema_for_type_with_mcp(
@@ -250,26 +27,16 @@ pub fn deepseek_tools_schema_for_type_with_mcp(
     mcp_registry: Option<&McpRegistry>,
 ) -> Vec<Value> {
     let allowed = subagent_type.allowed_tools();
-    let mut tools: Vec<Value> = deepseek_tools_schema()
-        .into_iter()
+    let registry = registry::tool_registry_with_mcp(mcp_registry);
+
+    registry
+        .iter()
         .filter(|tool| {
-            tool["function"]["name"]
-                .as_str()
-                .map(|name| name != "subagent" && allowed.contains(&name))
-                .unwrap_or(false)
+            let name = tool.name();
+            name.starts_with("mcp__") || (name != "subagent" && allowed.contains(&name))
         })
-        .collect();
-
-    if let Some(registry) = mcp_registry {
-        tools.extend(
-            registry
-                .tools()
-                .iter()
-                .map(|tool| tool.to_deepseek_schema()),
-        );
-    }
-
-    tools
+        .map(|tool| tool.schema())
+        .collect()
 }
 
 #[cfg(test)]
@@ -300,5 +67,13 @@ mod tests {
                 .iter()
                 .any(|tool| { tool["function"]["name"] == "mcp__demo__search" })
         );
+    }
+
+    #[test]
+    fn can_generate_schema_from_tool_registry() {
+        let registry = crate::tools::registry::default_tool_registry();
+        let expected: Vec<Value> = registry.iter().map(|tool| tool.schema()).collect();
+
+        assert_eq!(deepseek_tools_schema_from_registry(registry), expected);
     }
 }

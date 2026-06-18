@@ -56,5 +56,8 @@ pub fn format_tool_result_for_model(result: &tools::ToolResult) -> String {
 }
 
 pub fn requires_approval(action: ActionKind) -> bool {
-    matches!(action, ActionKind::Write | ActionKind::Shell)
+    matches!(
+        action,
+        ActionKind::Write | ActionKind::Network | ActionKind::Agent | ActionKind::Shell
+    )
 }
