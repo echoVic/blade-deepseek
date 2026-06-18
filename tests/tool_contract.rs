@@ -261,6 +261,49 @@ fn suggest_denies_edit_in_jsonl_mode() {
     assert_eq!(completed["payload"]["status"], "denied");
 }
 
+#[test]
+fn update_plan_emits_plan_updated_event() {
+    let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .args([
+            "exec",
+            "--output-format",
+            "jsonl",
+            "--provider",
+            "mock",
+            "plan implementing todo support",
+        ])
+        .output()
+        .expect("run orca");
+
+    assert_eq!(output.status.code(), Some(0));
+
+    let events = parse_jsonl(&output.stdout);
+    let requested = find_event(&events, "tool.call.requested");
+    assert_eq!(requested["payload"]["name"], "update_plan");
+    assert_eq!(requested["payload"]["action"], "read");
+    assert_eq!(requested["payload"]["target"], "3 items");
+
+    let plan = find_event(&events, "plan.updated");
+    assert_eq!(plan["payload"]["explanation"], "implementing todo support");
+    assert_eq!(plan["payload"]["plan"][0]["step"], "Inspect references");
+    assert_eq!(plan["payload"]["plan"][0]["status"], "completed");
+    assert_eq!(
+        plan["payload"]["plan"][1]["step"],
+        "Implement task plan support"
+    );
+    assert_eq!(plan["payload"]["plan"][1]["status"], "in_progress");
+
+    let completed = find_event(&events, "tool.call.completed");
+    assert_eq!(completed["payload"]["name"], "update_plan");
+    assert_eq!(completed["payload"]["status"], "completed");
+    assert!(
+        completed["payload"]["output"]
+            .as_str()
+            .unwrap()
+            .contains("Plan updated")
+    );
+}
+
 fn find_event<'a>(events: &'a [Value], event_type: &str) -> &'a Value {
     events
         .iter()

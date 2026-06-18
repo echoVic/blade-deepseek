@@ -65,6 +65,24 @@ impl<W: Write> EventSink<W> {
                 let status = event.payload["status"].as_str().unwrap_or("unknown");
                 writeln!(self.writer, "tool completed: {name} ({status})")
             }
+            EventType::PlanUpdated => {
+                if let Some(explanation) = event.payload["explanation"].as_str() {
+                    writeln!(self.writer, "{explanation}")?;
+                }
+                if let Some(plan) = event.payload["plan"].as_array() {
+                    for item in plan {
+                        let step = item["step"].as_str().unwrap_or("");
+                        let icon = match item["status"].as_str().unwrap_or("") {
+                            "completed" => "✓",
+                            "in_progress" => "→",
+                            "pending" => "•",
+                            _ => "·",
+                        };
+                        writeln!(self.writer, "  {icon} {step}")?;
+                    }
+                }
+                Ok(())
+            }
             EventType::SubagentStarted => {
                 let description = event.payload["description"].as_str().unwrap_or("subagent");
                 writeln!(self.writer, "subagent started: {description}")

@@ -546,6 +546,16 @@ fn run_agent_loop(
                 cancel,
             )?;
 
+            if tool_request.name == tools::ToolName::UpdatePlan
+                && result.status == tools::ToolStatus::Completed
+            {
+                if let Ok(update) = tools::update_plan::parse_args(tool_request) {
+                    if let Some(writer) = history_writer.as_deref_mut() {
+                        let _ = writer.append_plan_state(update.explanation, update.plan);
+                    }
+                }
+            }
+
             let result_content = agent_common::format_tool_result_for_model(&result);
             conversation.add_tool_result(tool_request.id.clone(), result_content);
             if emit_deltas
@@ -693,6 +703,16 @@ fn execute_tool_with_approval(
     );
     if emit_deltas {
         sink.emit(&events.tool_call_completed(&result))?;
+        if tool_request.name == tools::ToolName::UpdatePlan
+            && result.status == tools::ToolStatus::Completed
+        {
+            match tools::update_plan::parse_args(tool_request) {
+                Ok(update) => sink.emit(&events.plan_updated(&update))?,
+                Err(error) => {
+                    sink.emit(&events.error(&format!("failed to render plan update: {error}")))?
+                }
+            }
+        }
         if let Err(error) = hooks.run(
             HookEvent::PostToolUse,
             HookContext {

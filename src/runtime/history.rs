@@ -10,6 +10,7 @@ use uuid::Uuid;
 
 use crate::provider::conversation::{Conversation, Message, RawToolCall};
 use crate::runtime::cost::UsageTotals;
+use crate::tools::update_plan::{PlanItem, PlanStatus};
 
 const ORCA_HOME_ENV: &str = "ORCA_HOME";
 const SESSION_SCHEMA_VERSION: u32 = 1;
@@ -51,6 +52,7 @@ pub struct SessionTranscript {
     pub compactions: Vec<CompactionRecord>,
     pub summaries: Vec<ContextSummaryRecord>,
     pub usage: Option<UsageTotals>,
+    pub plan: Option<(Option<String>, Vec<PlanItem>)>,
     pub path: PathBuf,
 }
 
@@ -92,6 +94,11 @@ enum SessionRecord {
     ContextSummary(ContextSummaryRecord),
     #[serde(rename = "session.usage")]
     Usage(UsageTotals),
+    #[serde(rename = "plan.state")]
+    PlanState {
+        explanation: Option<String>,
+        plan: Vec<PlanItem>,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -237,6 +244,14 @@ impl SessionWriter {
 
     pub fn append_usage(&mut self, usage: UsageTotals) -> io::Result<()> {
         write_record(&self.path, &SessionRecord::Usage(usage))
+    }
+
+    pub fn append_plan_state(
+        &mut self,
+        explanation: Option<String>,
+        plan: Vec<PlanItem>,
+    ) -> io::Result<()> {
+        write_record(&self.path, &SessionRecord::PlanState { explanation, plan })
     }
 }
 
@@ -440,6 +455,7 @@ fn read_transcript(path: &Path) -> io::Result<SessionTranscript> {
     let mut compactions = Vec::new();
     let mut summaries = Vec::new();
     let mut usage = None;
+    let mut last_plan: Option<(Option<String>, Vec<PlanItem>)> = None;
 
     for record in records {
         match record {
@@ -449,6 +465,15 @@ fn read_transcript(path: &Path) -> io::Result<SessionTranscript> {
             SessionRecord::ContextCollapsed(record) => compactions.push(record),
             SessionRecord::ContextSummary(record) => summaries.push(record),
             SessionRecord::Usage(record) => usage = Some(record),
+            SessionRecord::PlanState { explanation, plan } => {
+                let all_done = !plan.is_empty()
+                    && plan.iter().all(|item| item.status == PlanStatus::Completed);
+                if plan.is_empty() || all_done {
+                    last_plan = None;
+                } else {
+                    last_plan = Some((explanation, plan));
+                }
+            }
         }
     }
 
@@ -465,6 +490,7 @@ fn read_transcript(path: &Path) -> io::Result<SessionTranscript> {
         compactions,
         summaries,
         usage,
+        plan: last_plan,
         path: path.to_path_buf(),
     })
 }
@@ -571,12 +597,7 @@ fn read_records(path: &Path) -> io::Result<Vec<SessionRecord>> {
         match serde_json::from_str(line) {
             Ok(record) => records.push(record),
             Err(_) if i == lines.len() - 1 => break,
-            Err(error) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("invalid session record in {}: {error}", path.display()),
-                ));
-            }
+            Err(_) => continue,
         }
     }
     Ok(records)
@@ -988,5 +1009,134 @@ mod tests {
             }
         }
         result.expect("compaction record persisted");
+    }
+
+    #[test]
+    fn plan_state_round_trips_through_session() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let home = tempfile::tempdir().expect("temp home");
+        let previous = std::env::var_os(ORCA_HOME_ENV);
+        unsafe {
+            std::env::set_var(ORCA_HOME_ENV, home.path());
+        }
+
+        let result = (|| {
+            let cwd = std::env::current_dir()?;
+            let mut writer = SessionWriter::start(&cwd, "mock", None, "plan test")?;
+            writer.append_plan_state(
+                Some("initial plan".to_string()),
+                vec![
+                    PlanItem { step: "Step 1".to_string(), status: PlanStatus::Completed },
+                    PlanItem { step: "Step 2".to_string(), status: PlanStatus::InProgress },
+                    PlanItem { step: "Step 3".to_string(), status: PlanStatus::Pending },
+                ],
+            )?;
+            let transcript = load_session("latest")?;
+            let (explanation, plan) = transcript.plan.expect("plan should be present");
+            assert_eq!(explanation.as_deref(), Some("initial plan"));
+            assert_eq!(plan.len(), 3);
+            assert_eq!(plan[0].step, "Step 1");
+            assert_eq!(plan[1].status, PlanStatus::InProgress);
+            Ok::<(), io::Error>(())
+        })();
+
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var(ORCA_HOME_ENV, previous);
+            } else {
+                std::env::remove_var(ORCA_HOME_ENV);
+            }
+        }
+        result.expect("plan state round-tripped");
+    }
+
+    #[test]
+    fn all_completed_plan_restores_as_none() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let home = tempfile::tempdir().expect("temp home");
+        let previous = std::env::var_os(ORCA_HOME_ENV);
+        unsafe {
+            std::env::set_var(ORCA_HOME_ENV, home.path());
+        }
+
+        let result = (|| {
+            let cwd = std::env::current_dir()?;
+            let mut writer = SessionWriter::start(&cwd, "mock", None, "done plan")?;
+            writer.append_plan_state(
+                None,
+                vec![
+                    PlanItem { step: "Done 1".to_string(), status: PlanStatus::Completed },
+                    PlanItem { step: "Done 2".to_string(), status: PlanStatus::Completed },
+                ],
+            )?;
+            let transcript = load_session("latest")?;
+            assert!(transcript.plan.is_none(), "all-completed plan should restore as None");
+            Ok::<(), io::Error>(())
+        })();
+
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var(ORCA_HOME_ENV, previous);
+            } else {
+                std::env::remove_var(ORCA_HOME_ENV);
+            }
+        }
+        result.expect("all-completed plan cleared");
+    }
+
+    #[test]
+    fn empty_plan_restores_as_none() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let home = tempfile::tempdir().expect("temp home");
+        let previous = std::env::var_os(ORCA_HOME_ENV);
+        unsafe {
+            std::env::set_var(ORCA_HOME_ENV, home.path());
+        }
+
+        let result = (|| {
+            let cwd = std::env::current_dir()?;
+            let mut writer = SessionWriter::start(&cwd, "mock", None, "empty plan")?;
+            writer.append_plan_state(None, vec![])?;
+            let transcript = load_session("latest")?;
+            assert!(transcript.plan.is_none(), "empty plan should restore as None");
+            Ok::<(), io::Error>(())
+        })();
+
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var(ORCA_HOME_ENV, previous);
+            } else {
+                std::env::remove_var(ORCA_HOME_ENV);
+            }
+        }
+        result.expect("empty plan cleared");
+    }
+
+    #[test]
+    fn session_without_plan_loads_normally() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let home = tempfile::tempdir().expect("temp home");
+        let previous = std::env::var_os(ORCA_HOME_ENV);
+        unsafe {
+            std::env::set_var(ORCA_HOME_ENV, home.path());
+        }
+
+        let result = (|| {
+            let cwd = std::env::current_dir()?;
+            let _writer = SessionWriter::start(&cwd, "mock", None, "no plan")?;
+            let transcript = load_session("latest")?;
+            assert!(transcript.plan.is_none(), "no plan records means plan is None");
+            assert_eq!(transcript.meta.title, "no plan");
+            Ok::<(), io::Error>(())
+        })();
+
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var(ORCA_HOME_ENV, previous);
+            } else {
+                std::env::remove_var(ORCA_HOME_ENV);
+            }
+        }
+        result.expect("session without plan loaded");
     }
 }

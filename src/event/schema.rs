@@ -7,6 +7,7 @@ use crate::approval::policy::{ApprovalRequest, ApprovalResolution};
 use crate::model::ModelRouteDecision;
 use crate::provider::ProviderReplayState;
 use crate::runtime::cost::UsageTotals;
+use crate::tools::update_plan::UpdatePlanArgs;
 use crate::tools::{ToolRequest, ToolResult};
 use crate::verification::VerificationResult;
 
@@ -47,6 +48,8 @@ pub enum EventType {
     ToolCallRequested,
     #[serde(rename = "tool.call.completed")]
     ToolCallCompleted,
+    #[serde(rename = "plan.updated")]
+    PlanUpdated,
     #[serde(rename = "subagent.started")]
     SubagentStarted,
     #[serde(rename = "subagent.completed")]
@@ -234,6 +237,10 @@ impl EventFactory {
         )
     }
 
+    pub fn plan_updated(&mut self, update: &UpdatePlanArgs) -> EventEnvelope {
+        self.make(EventType::PlanUpdated, json!(update))
+    }
+
     pub fn subagent_started(&mut self, id: &str, description: &str) -> EventEnvelope {
         self.make(
             EventType::SubagentStarted,
@@ -354,6 +361,9 @@ mod tests {
 
         let s = serde_json::to_string(&EventType::ToolCallCompleted).unwrap();
         assert_eq!(s, "\"tool.call.completed\"");
+
+        let s = serde_json::to_string(&EventType::PlanUpdated).unwrap();
+        assert_eq!(s, "\"plan.updated\"");
     }
 
     #[test]

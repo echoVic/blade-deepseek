@@ -291,6 +291,39 @@ fn parse_mock_prompt(prompt: &str) -> Option<ToolRequest> {
         });
     }
 
+    if let Some(rest) = prompt.strip_prefix("plan ") {
+        let explanation = if rest.trim().is_empty() {
+            None
+        } else {
+            Some(rest.trim())
+        };
+        let arguments = serde_json::json!({
+            "explanation": explanation,
+            "plan": [
+                {
+                    "step": "Inspect references",
+                    "status": "completed"
+                },
+                {
+                    "step": "Implement task plan support",
+                    "status": "in_progress"
+                },
+                {
+                    "step": "Verify behavior",
+                    "status": "pending"
+                }
+            ]
+        })
+        .to_string();
+        return Some(ToolRequest {
+            id: "mock-tool-1".to_string(),
+            name: ToolName::UpdatePlan,
+            action: ActionKind::Read,
+            target: Some("3 items".to_string()),
+            raw_arguments: Some(arguments),
+        });
+    }
+
     if let Some(rest) = prompt.strip_prefix("grep ") {
         return Some(ToolRequest {
             id: "mock-tool-1".to_string(),

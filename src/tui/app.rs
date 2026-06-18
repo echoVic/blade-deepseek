@@ -119,6 +119,9 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                     state.messages.push(chat_message);
                 }
             }
+            if let Some((explanation, plan)) = transcript.plan {
+                state.current_plan = Some((explanation, plan));
+            }
             if !state.messages.is_empty() {
                 let label = if matches!(config.history_mode, HistoryMode::Fork(_)) {
                     "Forked saved conversation."
@@ -331,6 +334,12 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                                         {
                                             state.messages.push(chat_message);
                                         }
+                                    }
+                                    if let Some((explanation, plan)) = &transcript.plan {
+                                        state.current_plan =
+                                            Some((explanation.clone(), plan.clone()));
+                                    } else {
+                                        state.current_plan = None;
                                     }
                                     state.messages.push(ChatMessage::System(
                                         "Resumed saved conversation.".to_string(),

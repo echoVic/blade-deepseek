@@ -11,6 +11,7 @@ pub mod git;
 pub mod grep;
 pub mod list_files;
 pub mod read_file;
+pub mod update_plan;
 pub mod web_search;
 pub mod write_file;
 
@@ -27,6 +28,7 @@ pub enum ToolName {
     GitStatus,
     Subagent,
     WebSearch,
+    UpdatePlan,
     Mcp(String),
 }
 
@@ -42,6 +44,7 @@ impl ToolName {
             Self::GitStatus => "git_status",
             Self::Subagent => "subagent",
             Self::WebSearch => "web_search",
+            Self::UpdatePlan => "update_plan",
             Self::Mcp(name) => name,
         }
     }
@@ -72,6 +75,7 @@ impl<'de> Deserialize<'de> for ToolName {
             "git_status" => Self::GitStatus,
             "subagent" => Self::Subagent,
             "web_search" => Self::WebSearch,
+            "update_plan" => Self::UpdatePlan,
             other if other.starts_with("mcp__") => Self::Mcp(other.to_string()),
             other => {
                 return Err(serde::de::Error::custom(format!(
@@ -160,6 +164,7 @@ pub fn execute(request: &ToolRequest, cwd: &Path) -> ToolResult {
         ToolName::Edit => edit::execute(request, cwd),
         ToolName::WriteFile => write_file::execute(request, cwd),
         ToolName::WebSearch => web_search::execute(request, MAX_TOOL_OUTPUT_BYTES),
+        ToolName::UpdatePlan => update_plan::execute(request),
         ToolName::Subagent => ToolResult::failed(
             request,
             "subagent tool must be executed by the runtime",

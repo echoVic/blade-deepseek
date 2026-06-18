@@ -24,23 +24,29 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
     let input_lines = textarea.lines().len().max(1) as u16;
     let input_height = input_lines + 2;
 
+    let plan_height = plan_panel_height(state);
+
     let chunks = Layout::vertical([
         Constraint::Min(5),
+        Constraint::Length(plan_height),
         Constraint::Length(input_height),
         Constraint::Length(1),
     ])
     .split(frame.area());
 
     render_messages(frame, chunks[0], state, theme);
-    render_input(frame, chunks[1], textarea);
-    render_status(frame, chunks[2], state, theme);
+    if plan_height > 0 {
+        render_plan_panel(frame, chunks[1], state, theme);
+    }
+    render_input(frame, chunks[2], textarea);
+    render_status(frame, chunks[3], state, theme);
 
     if state.slash_menu.is_some() {
-        render_slash_menu(frame, chunks[1], state, theme);
+        render_slash_menu(frame, chunks[2], state, theme);
     }
 
     if !state.mention_candidates.is_empty() && state.slash_menu.is_none() {
-        render_mention_candidates(frame, chunks[1], state, theme);
+        render_mention_candidates(frame, chunks[2], state, theme);
     }
 
     if state.status == AppStatus::WaitingApproval {
@@ -269,6 +275,9 @@ fn build_message_lines(state: &AppState, theme: &Theme) -> Vec<Line<'static>> {
                     append_diff_lines(&mut lines, diff, theme);
                 }
             }
+            ChatMessage::PlanUpdate { .. } => {
+                // Plan is rendered in the fixed bottom panel; skip inline rendering.
+            }
             ChatMessage::Subagent {
                 description,
                 status,
@@ -296,6 +305,85 @@ fn build_message_lines(state: &AppState, theme: &Theme) -> Vec<Line<'static>> {
     }
 
     lines
+}
+
+fn append_plan_lines(
+    lines: &mut Vec<Line<'static>>,
+    explanation: Option<&str>,
+    plan: &[crate::tools::update_plan::PlanItem],
+    theme: &Theme,
+) {
+    lines.push(Line::from(Span::styled(
+        "  task plan",
+        Style::default().fg(theme.border),
+    )));
+    if let Some(explanation) = explanation.filter(|text| !text.trim().is_empty()) {
+        lines.push(Line::from(Span::styled(
+            format!("    {explanation}"),
+            Style::default()
+                .fg(theme.muted)
+                .add_modifier(Modifier::ITALIC),
+        )));
+    }
+    if plan.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "    (empty)",
+            Style::default().fg(theme.muted),
+        )));
+        return;
+    }
+    for item in plan {
+        let (icon, color) = match item.status {
+            crate::tools::update_plan::PlanStatus::Completed => ("✓", theme.success),
+            crate::tools::update_plan::PlanStatus::InProgress => ("→", theme.warning),
+            crate::tools::update_plan::PlanStatus::Pending => ("•", theme.muted),
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("    {icon} "), Style::default().fg(color)),
+            Span::styled(item.step.clone(), Style::default().fg(color)),
+        ]));
+    }
+}
+
+fn plan_panel_height(state: &AppState) -> u16 {
+    match &state.current_plan {
+        Some((_, plan)) => {
+            let items = plan.len() as u16;
+            // 2 for border, 1 for title = items + 2, capped at 10
+            (items + 2).min(10)
+        }
+        None => 0,
+    }
+}
+
+fn render_plan_panel(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    let Some((_, plan)) = &state.current_plan else {
+        return;
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Task Plan ")
+        .border_style(Style::default().fg(theme.border));
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let mut lines = Vec::new();
+    for item in plan {
+        let (icon, color) = match item.status {
+            crate::tools::update_plan::PlanStatus::Completed => ("✓", theme.success),
+            crate::tools::update_plan::PlanStatus::InProgress => ("→", theme.warning),
+            crate::tools::update_plan::PlanStatus::Pending => ("•", theme.muted),
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {icon} "), Style::default().fg(color)),
+            Span::styled(item.step.clone(), Style::default().fg(color)),
+        ]));
+    }
+
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, inner);
 }
 
 fn append_subagent_lines(

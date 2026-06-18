@@ -444,6 +444,14 @@ fn parse_tool_call(tc: &ApiToolCallResponse) -> Result<ToolRequest, String> {
             ActionKind::Read,
             args["query"].as_str().map(String::from),
         ),
+        "update_plan" => {
+            let count = args["plan"].as_array().map(|plan| plan.len()).unwrap_or(0);
+            (
+                ToolName::UpdatePlan,
+                ActionKind::Read,
+                Some(format!("{count} items")),
+            )
+        }
         other if other.starts_with("mcp__") => (
             ToolName::Mcp(other.to_string()),
             ActionKind::Read,
@@ -636,6 +644,19 @@ mod tests {
         assert_eq!(req.name, ToolName::WebSearch);
         assert_eq!(req.action, ActionKind::Read);
         assert_eq!(req.target.as_deref(), Some("deepseek latest"));
+        assert!(req.raw_arguments.is_some());
+    }
+
+    #[test]
+    fn parse_update_plan() {
+        let tc = make_tc(
+            "update_plan",
+            r#"{"plan":[{"step":"Inspect references","status":"completed"},{"step":"Patch Orca","status":"in_progress"}]}"#,
+        );
+        let req = parse_tool_call(&tc).unwrap();
+        assert_eq!(req.name, ToolName::UpdatePlan);
+        assert_eq!(req.action, ActionKind::Read);
+        assert_eq!(req.target.as_deref(), Some("2 items"));
         assert!(req.raw_arguments.is_some());
     }
 

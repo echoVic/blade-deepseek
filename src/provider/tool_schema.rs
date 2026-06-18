@@ -204,6 +204,44 @@ fn builtin_tools_schema() -> Vec<Value> {
                 }
             }
         }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "update_plan",
+                "description": "Update the current task plan. Use for complex multi-step tasks or when the user asks for a todo/task list. At most one step may be in_progress. Maximum 50 items, each step max 200 chars.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "explanation": {
+                            "type": "string",
+                            "description": "Optional short explanation for this plan update"
+                        },
+                        "plan": {
+                            "type": "array",
+                            "description": "The complete current list of task steps",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "step": {
+                                        "type": "string",
+                                        "description": "Task step text"
+                                    },
+                                    "status": {
+                                        "type": "string",
+                                        "enum": ["pending", "in_progress", "completed"],
+                                        "description": "Step status"
+                                    }
+                                },
+                                "required": ["step", "status"],
+                                "additionalProperties": false
+                            }
+                        }
+                    },
+                    "required": ["plan"],
+                    "additionalProperties": false
+                }
+            }
+        }),
     ]
 }
 

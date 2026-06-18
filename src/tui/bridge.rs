@@ -491,6 +491,16 @@ pub fn run_agent_for_tui(
                 session.cost_tracker.merge(&c);
             }
 
+            if tool_request.name == tools::ToolName::UpdatePlan
+                && result.status == tools::ToolStatus::Completed
+            {
+                if let Ok(update) = tools::update_plan::parse_args(tool_request) {
+                    if let Some(writer) = &mut session.writer {
+                        let _ = writer.append_plan_state(update.explanation, update.plan);
+                    }
+                }
+            }
+
             let result_content = agent_common::format_tool_result_for_model(&result);
             session
                 .conversation
@@ -672,9 +682,14 @@ fn execute_tool_for_tui(
                     target: tool_request.target.clone(),
                 });
 
-                let allowed = match action_rx.recv() {
-                    Ok(UserAction::Approve(v)) => v,
-                    _ => false,
+                let allowed = loop {
+                    match action_rx.recv() {
+                        Ok(UserAction::Approve(v)) => break v,
+                        Ok(UserAction::Interrupt) => break false,
+                        Ok(UserAction::Cancel) => break false,
+                        Err(_) => break false,
+                        _ => continue,
+                    }
                 };
 
                 if !allowed {
@@ -767,6 +782,23 @@ fn execute_tool_for_tui(
             output: result.output.clone().unwrap_or_default(),
             diff: rendered_diff,
         });
+        if tool_request.name == tools::ToolName::UpdatePlan
+            && result.status == tools::ToolStatus::Completed
+        {
+            match tools::update_plan::parse_args(tool_request) {
+                Ok(update) => {
+                    let _ = event_tx.send(TuiEvent::PlanUpdated {
+                        explanation: update.explanation,
+                        plan: update.plan,
+                    });
+                }
+                Err(error) => {
+                    let _ = event_tx.send(TuiEvent::Error(format!(
+                        "failed to render plan update: {error}"
+                    )));
+                }
+            }
+        }
         if let Err(error) = hooks.run(
             HookEvent::PostToolUse,
             HookContext {

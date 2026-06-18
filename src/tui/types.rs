@@ -3,6 +3,7 @@ use std::time::Instant;
 
 use crate::runtime::cost::UsageTotals;
 use crate::runtime::history::SessionSummary;
+use crate::tools::update_plan::PlanItem;
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -21,6 +22,10 @@ pub enum TuiEvent {
         status: String,
         output: String,
         diff: Option<String>,
+    },
+    PlanUpdated {
+        explanation: Option<String>,
+        plan: Vec<PlanItem>,
     },
     SubagentStarted {
         id: String,
@@ -85,6 +90,10 @@ pub enum ChatMessage {
         output: Option<String>,
         diff: Option<String>,
     },
+    PlanUpdate {
+        explanation: Option<String>,
+        plan: Vec<PlanItem>,
+    },
     Subagent {
         id: String,
         description: String,
@@ -147,6 +156,7 @@ pub struct AppState {
     pub slash_menu: Option<SlashMenu>,
     pub mention_candidates: Vec<String>,
     pub mention_selected: usize,
+    pub current_plan: Option<(Option<String>, Vec<PlanItem>)>,
 }
 
 impl AppState {
@@ -174,6 +184,7 @@ impl AppState {
             slash_menu: None,
             mention_candidates: Vec::new(),
             mention_selected: 0,
+            current_plan: None,
         }
     }
 
@@ -289,7 +300,7 @@ impl AppState {
                 }
             }
             TuiEvent::ToolRequested { name, target } => {
-                if name == "subagent" {
+                if name == "subagent" || name == "update_plan" {
                     return;
                 }
                 self.messages.push(ChatMessage::ToolCall {
@@ -306,7 +317,7 @@ impl AppState {
                 output,
                 diff,
             } => {
-                if name == "subagent" {
+                if name == "subagent" || name == "update_plan" {
                     return;
                 }
                 let updated = if let Some(ChatMessage::ToolCall {
@@ -345,6 +356,15 @@ impl AppState {
                         diff,
                     });
                 }
+            }
+            TuiEvent::PlanUpdated { explanation, plan } => {
+                self.current_plan = if plan.is_empty() {
+                    None
+                } else {
+                    Some((explanation.clone(), plan.clone()))
+                };
+                self.messages
+                    .push(ChatMessage::PlanUpdate { explanation, plan });
             }
             TuiEvent::SubagentStarted { id, description } => {
                 self.messages.push(ChatMessage::Subagent {
@@ -542,5 +562,44 @@ mod tests {
         });
 
         assert!(state.messages.is_empty());
+    }
+
+    #[test]
+    fn update_plan_events_create_plan_message_without_tool_rows() {
+        let mut state = state();
+
+        state.update(TuiEvent::ToolRequested {
+            name: "update_plan".to_string(),
+            target: Some("2 items".to_string()),
+        });
+        state.update(TuiEvent::ToolCompleted {
+            name: "update_plan".to_string(),
+            status: "completed".to_string(),
+            output: "Plan updated".to_string(),
+            diff: None,
+        });
+        state.update(TuiEvent::PlanUpdated {
+            explanation: Some("starting".to_string()),
+            plan: vec![
+                PlanItem {
+                    step: "Inspect".to_string(),
+                    status: crate::tools::update_plan::PlanStatus::Completed,
+                },
+                PlanItem {
+                    step: "Patch".to_string(),
+                    status: crate::tools::update_plan::PlanStatus::InProgress,
+                },
+            ],
+        });
+
+        assert_eq!(state.messages.len(), 1);
+        match &state.messages[0] {
+            ChatMessage::PlanUpdate { explanation, plan } => {
+                assert_eq!(explanation.as_deref(), Some("starting"));
+                assert_eq!(plan.len(), 2);
+                assert_eq!(plan[1].step, "Patch");
+            }
+            other => panic!("expected plan update message, got {other:?}"),
+        }
     }
 }
