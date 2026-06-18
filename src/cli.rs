@@ -5,6 +5,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::approval::policy::ApprovalMode;
 use crate::config::file;
+use crate::config::file::ConfigOverrides;
 use crate::config::{HistoryMode, OutputFormat, ProviderKind, RunConfig};
 use crate::model::ModelSelection;
 use crate::runtime::controller;
@@ -32,6 +33,22 @@ pub struct Cli {
     #[arg(long)]
     session_picker: bool,
 
+    /// Model to use (overrides config file and ORCA_MODEL env).
+    #[arg(long)]
+    model: Option<String>,
+
+    /// Approval mode to use (overrides config file and ORCA_MODE env).
+    #[arg(long = "mode", alias = "approval-mode", value_enum)]
+    mode: Option<ApprovalMode>,
+
+    /// API key to use (overrides config file and ORCA_API_KEY env).
+    #[arg(long)]
+    api_key: Option<String>,
+
+    /// API base URL (overrides config file and ORCA_BASE_URL env).
+    #[arg(long)]
+    base_url: Option<String>,
+
     #[command(subcommand)]
     command: Option<Command>,
 
@@ -58,12 +75,16 @@ struct ExecArgs {
     cwd: Option<PathBuf>,
 
     /// Approval policy for tool actions.
-    #[arg(long, value_enum, default_value_t = ApprovalMode::Suggest)]
-    approval_mode: ApprovalMode,
+    #[arg(long = "mode", alias = "approval-mode", value_enum)]
+    approval_mode: Option<ApprovalMode>,
 
     /// Model to use (overrides config file and DEEPSEEK_MODEL env).
     #[arg(long)]
     model: Option<String>,
+
+    /// API key to use (overrides config file and ORCA_API_KEY env).
+    #[arg(long)]
+    api_key: Option<String>,
 
     /// API base URL (overrides config file and DEEPSEEK_BASE_URL env).
     #[arg(long)]
@@ -185,6 +206,39 @@ pub fn run() -> i32 {
     }
 }
 
+fn load_effective_file_config(
+    cwd: &std::path::Path,
+    cli: ConfigOverrides,
+) -> Result<file::FileConfig, String> {
+    let file_config = file::load_layered_config(cwd);
+    let env = env_overrides()?;
+    Ok(file::apply_override_layers(file_config, env, cli))
+}
+
+fn env_overrides() -> Result<ConfigOverrides, String> {
+    Ok(ConfigOverrides {
+        model: env::var("ORCA_MODEL")
+            .ok()
+            .or_else(|| env::var("DEEPSEEK_MODEL").ok()),
+        mode: match env::var("ORCA_MODE") {
+            Ok(mode) => Some(parse_approval_mode_value(&mode)?),
+            Err(_) => None,
+        },
+        api_key: env::var("ORCA_API_KEY")
+            .ok()
+            .or_else(|| env::var("DEEPSEEK_API_KEY").ok()),
+        base_url: env::var("ORCA_BASE_URL")
+            .ok()
+            .or_else(|| env::var("DEEPSEEK_BASE_URL").ok()),
+    })
+}
+
+fn parse_approval_mode_value(mode: &str) -> Result<ApprovalMode, String> {
+    ApprovalMode::from_str(mode, true).map_err(|_| {
+        format!("unsupported mode '{mode}'. Use suggest, auto-edit, full-auto, or plan")
+    })
+}
+
 fn run_exec(args: ExecArgs) -> i32 {
     if args.no_history && (args.resume.is_some() || args.fork.is_some() || args.continue_latest) {
         eprintln!("orca: --resume/--fork/--continue cannot be combined with --no-history");
@@ -201,13 +255,26 @@ fn run_exec(args: ExecArgs) -> i32 {
         return 1;
     }
 
-    let file_config = file::load_user_config();
-
     let prompt = args.prompt.join(" ");
     let cwd_for_mentions = args
         .cwd
         .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let file_config = match load_effective_file_config(
+        &cwd_for_mentions,
+        ConfigOverrides {
+            model: args.model,
+            mode: args.approval_mode,
+            api_key: args.api_key,
+            base_url: args.base_url,
+        },
+    ) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("orca: {error}");
+            return 1;
+        }
+    };
     let prompt = match crate::mentions::expand_file_mentions(&prompt, &cwd_for_mentions) {
         Ok(prompt) => prompt,
         Err(error) => {
@@ -216,17 +283,11 @@ fn run_exec(args: ExecArgs) -> i32 {
         }
     };
 
-    let api_key = env::var("DEEPSEEK_API_KEY").ok().or(file_config.api_key);
+    let api_key = file_config.api_key;
 
-    let base_url = args
-        .base_url
-        .or_else(|| env::var("DEEPSEEK_BASE_URL").ok())
-        .or(file_config.base_url);
+    let base_url = file_config.base_url;
 
-    let model = args
-        .model
-        .or_else(|| env::var("DEEPSEEK_MODEL").ok())
-        .or(file_config.model);
+    let model = file_config.model;
     let model = match ModelSelection::parse(model) {
         Ok(model) => model,
         Err(error) => {
@@ -248,7 +309,7 @@ fn run_exec(args: ExecArgs) -> i32 {
         prompt,
         cwd: args.cwd,
         output_format: output_format.into(),
-        approval_mode: args.approval_mode,
+        approval_mode: file_config.mode.unwrap_or_default(),
         provider: args.provider,
         verifier: args.verifier,
         model,
@@ -487,13 +548,28 @@ fn run_placeholder(cli: Cli) -> i32 {
         return 1;
     }
 
-    let file_config = file::load_user_config();
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let file_config = match load_effective_file_config(
+        &cwd,
+        ConfigOverrides {
+            model: cli.model,
+            mode: cli.mode,
+            api_key: cli.api_key,
+            base_url: cli.base_url,
+        },
+    ) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("orca: {error}");
+            return 1;
+        }
+    };
 
-    let api_key = env::var("DEEPSEEK_API_KEY").ok().or(file_config.api_key);
+    let api_key = file_config.api_key;
 
-    let base_url = env::var("DEEPSEEK_BASE_URL").ok().or(file_config.base_url);
+    let base_url = file_config.base_url;
 
-    let model = env::var("DEEPSEEK_MODEL").ok().or(file_config.model);
+    let model = file_config.model;
     let model = match ModelSelection::parse(model) {
         Ok(model) => model,
         Err(error) => {
@@ -513,7 +589,7 @@ fn run_placeholder(cli: Cli) -> i32 {
         prompt: cli.prompt.join(" "),
         cwd: None,
         output_format: OutputFormat::Text,
-        approval_mode: ApprovalMode::Suggest,
+        approval_mode: file_config.mode.unwrap_or_default(),
         provider: ProviderKind::DeepSeek,
         verifier: None,
         model,

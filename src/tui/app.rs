@@ -4,14 +4,14 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crossterm::ExecutableCommand;
 use crossterm::event::{
     self, Event, KeyCode, KeyEventKind, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
     PushKeyboardEnhancementFlags,
 };
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
-use ratatui::Terminal;
+use crossterm::ExecutableCommand;
 use ratatui::backend::CrosstermBackend;
+use ratatui::Terminal;
 use tui_textarea::{CursorMove, Input, TextArea};
 
 use crate::config::file::save_api_key;
@@ -23,8 +23,8 @@ use crate::runtime::history;
 use crate::tui::bridge;
 use crate::tui::commands::{self, SlashCommand};
 use crate::tui::shortcuts::{
-    ApprovalShortcut, GlobalShortcut, IdleShortcut, RunningShortcut, approval_shortcut,
-    global_shortcut, idle_shortcut, running_shortcut,
+    approval_shortcut, global_shortcut, idle_shortcut, running_shortcut, ApprovalShortcut,
+    GlobalShortcut, IdleShortcut, RunningShortcut,
 };
 use crate::tui::theme::Theme;
 use crate::tui::types::{
@@ -1159,7 +1159,7 @@ fn handle_slash_command(
     match command {
         SlashCommand::Help => {
             state.messages.push(ChatMessage::System(
-                "/help /model <name> /compact /clear /cost /history /mode <suggest|auto-edit|full-auto> /plan [off] /remember <note> /exit"
+                "/help /model <name> /compact /clear /cost /config show /history /mode <suggest|auto-edit|full-auto> /plan [off] /remember <note> /exit"
                     .to_string(),
             ));
         }
@@ -1196,6 +1196,13 @@ fn handle_slash_command(
                 state.usage.cache_tokens,
                 state.usage.estimated_cost_usd
             )));
+        }
+        SlashCommand::ConfigShow => {
+            state
+                .messages
+                .push(ChatMessage::System(crate::config::format_config_show(
+                    config,
+                )));
         }
         SlashCommand::Mode(Some(mode)) => match parse_approval_mode(&mode) {
             Some(approval_mode) => {

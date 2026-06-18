@@ -5,6 +5,7 @@ pub enum SlashCommand {
     Compact,
     Clear,
     Cost,
+    ConfigShow,
     History,
     Mode(Option<String>),
     Plan(Option<String>),
@@ -25,6 +26,7 @@ pub fn parse(input: &str) -> Option<SlashCommand> {
         "compact" => Some(SlashCommand::Compact),
         "clear" => Some(SlashCommand::Clear),
         "cost" => Some(SlashCommand::Cost),
+        "config" if parts.next() == Some("show") => Some(SlashCommand::ConfigShow),
         "history" => Some(SlashCommand::History),
         "mode" => Some(SlashCommand::Mode(
             parts.next().map(|mode| mode.to_string()),
@@ -50,6 +52,7 @@ pub fn all_commands() -> &'static [(&'static str, &'static str)] {
         ("/compact", "Compress conversation context"),
         ("/clear", "Clear message history"),
         ("/cost", "Show session cost"),
+        ("/config show", "Show merged config"),
         ("/mode", "Switch approval mode"),
         ("/plan", "Toggle plan mode"),
         ("/remember", "Save a note to memory"),
@@ -86,6 +89,11 @@ mod tests {
             parse("/plan off"),
             Some(SlashCommand::Plan(Some("off".to_string())))
         );
+    }
+
+    #[test]
+    fn parses_config_show_command() {
+        assert_eq!(parse("/config show"), Some(SlashCommand::ConfigShow));
     }
 
     #[test]

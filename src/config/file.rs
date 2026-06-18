@@ -3,16 +3,18 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
+use toml::Value;
 
-use crate::approval::policy::PermissionRules;
+use crate::approval::policy::{ApprovalMode, PermissionRules};
 use crate::config::{ThemeName, ToolConfig};
 use crate::runtime::subagent_config::SubagentConfig;
 
 const ORCA_HOME_ENV: &str = "ORCA_HOME";
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct FileConfig {
     pub model: Option<String>,
+    pub mode: Option<ApprovalMode>,
     pub api_key: Option<String>,
     pub base_url: Option<String>,
     #[serde(default)]
@@ -37,6 +39,35 @@ pub struct FileConfig {
     pub auto_memory: bool,
 }
 
+impl Default for FileConfig {
+    fn default() -> Self {
+        Self {
+            model: None,
+            mode: None,
+            api_key: None,
+            base_url: None,
+            mcp_servers: Vec::new(),
+            hooks: Vec::new(),
+            permissions: PermissionRules::default(),
+            subagents: SubagentConfig::default(),
+            tools: ToolConfig::default(),
+            theme: ThemeName::default(),
+            vim_mode: false,
+            update_check: true,
+            desktop_notifications: false,
+            auto_memory: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ConfigOverrides {
+    pub model: Option<String>,
+    pub mode: Option<ApprovalMode>,
+    pub api_key: Option<String>,
+    pub base_url: Option<String>,
+}
+
 fn default_true() -> bool {
     true
 }
@@ -47,23 +78,104 @@ fn config_dir() -> Option<PathBuf> {
         .or_else(|| dirs::home_dir().map(|h| h.join(".orca")))
 }
 
-pub fn load_user_config() -> FileConfig {
+pub fn load_layered_config(cwd: &Path) -> FileConfig {
     let Some(dir) = config_dir() else {
-        return FileConfig::default();
+        return load_layered_config_from_optional_paths(None, cwd);
     };
+    load_layered_config_from_optional_paths(Some(&dir.join("config.toml")), cwd)
+}
 
-    let mut config = load_toml(&dir.join("config.toml"));
+#[cfg(test)]
+fn load_layered_config_from_paths(user_path: &Path, project_root: &Path) -> FileConfig {
+    load_layered_config_from_optional_paths(Some(user_path), project_root)
+}
+
+fn load_layered_config_from_optional_paths(
+    user_path: Option<&Path>,
+    project_root: &Path,
+) -> FileConfig {
+    let mut merged = Value::Table(Default::default());
+    if let Some(path) = user_path {
+        if let Some(user) = load_toml_value(path) {
+            merge_toml_values(&mut merged, user);
+        }
+    }
+
+    if let Some(mut project) = load_toml_value(&project_root.join(".orca/config.toml")) {
+        remove_project_denied_fields(&mut project);
+        merge_toml_values(&mut merged, project);
+    }
+
+    let mut config: FileConfig = match merged.try_into() {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("orca: warning: config parse error, using defaults: {error}");
+            FileConfig::default()
+        }
+    };
     if config.api_key.is_none() {
-        config.api_key = load_auth_key(&dir.join("auth.json"));
+        if let Some(path) = user_path.and_then(Path::parent) {
+            config.api_key = load_auth_key(&path.join("auth.json"));
+        }
     }
     config
 }
 
-fn load_toml(path: &Path) -> FileConfig {
-    let Ok(content) = fs::read_to_string(path) else {
-        return FileConfig::default();
-    };
-    toml::from_str(&content).unwrap_or_default()
+fn load_toml_value(path: &Path) -> Option<Value> {
+    let content = fs::read_to_string(path).ok()?;
+    toml::from_str(&content).ok()
+}
+
+fn merge_toml_values(base: &mut Value, overlay: Value) {
+    match (base, overlay) {
+        (Value::Table(base), Value::Table(overlay)) => {
+            for (key, value) in overlay {
+                match base.get_mut(&key) {
+                    Some(existing) => merge_toml_values(existing, value),
+                    None => {
+                        base.insert(key, value);
+                    }
+                }
+            }
+        }
+        (Value::Array(base), Value::Array(overlay)) => {
+            base.extend(overlay);
+        }
+        (base, overlay) => *base = overlay,
+    }
+}
+
+fn remove_project_denied_fields(value: &mut Value) {
+    if let Some(table) = value.as_table_mut() {
+        table.remove("api_key");
+        table.remove("base_url");
+        table.remove("hooks");
+    }
+}
+
+pub fn apply_override_layers(
+    mut config: FileConfig,
+    env: ConfigOverrides,
+    cli: ConfigOverrides,
+) -> FileConfig {
+    apply_overrides(&mut config, env);
+    apply_overrides(&mut config, cli);
+    config
+}
+
+fn apply_overrides(config: &mut FileConfig, overrides: ConfigOverrides) {
+    if overrides.model.is_some() {
+        config.model = overrides.model;
+    }
+    if overrides.mode.is_some() {
+        config.mode = overrides.mode;
+    }
+    if overrides.api_key.is_some() {
+        config.api_key = overrides.api_key;
+    }
+    if overrides.base_url.is_some() {
+        config.base_url = overrides.base_url;
+    }
 }
 
 fn load_auth_key(path: &Path) -> Option<String> {
@@ -95,6 +207,13 @@ pub fn save_api_key(api_key: &str) {
 mod tests {
     use super::*;
 
+    fn load_toml(path: &Path) -> FileConfig {
+        let Ok(content) = fs::read_to_string(path) else {
+            return FileConfig::default();
+        };
+        toml::from_str(&content).unwrap_or_default()
+    }
+
     #[test]
     fn parse_full_config() {
         let toml = r#"
@@ -109,21 +228,30 @@ base_url = "https://custom.api.com"
     #[test]
     fn parse_permission_rules() {
         let toml = r#"
-[[permissions.allow]]
+[[permissions.rules]]
 tool = "bash"
 pattern = "cargo *"
+decision = "allow"
 
-[[permissions.deny]]
+[[permissions.rules]]
 tool = "write_file"
 pattern = "/etc/**"
+decision = "deny"
 "#;
         let config: FileConfig = toml::from_str(toml).unwrap();
-        assert_eq!(config.permissions.allow.len(), 1);
-        assert_eq!(config.permissions.allow[0].tool, "bash");
-        assert_eq!(config.permissions.allow[0].pattern, "cargo *");
-        assert_eq!(config.permissions.deny.len(), 1);
-        assert_eq!(config.permissions.deny[0].tool, "write_file");
-        assert_eq!(config.permissions.deny[0].pattern, "/etc/**");
+        assert_eq!(config.permissions.rules.len(), 2);
+        assert_eq!(config.permissions.rules[0].tool, "bash");
+        assert_eq!(config.permissions.rules[0].pattern, "cargo *");
+        assert_eq!(
+            config.permissions.rules[0].decision,
+            crate::approval::policy::Decision::Allow
+        );
+        assert_eq!(config.permissions.rules[1].tool, "write_file");
+        assert_eq!(config.permissions.rules[1].pattern, "/etc/**");
+        assert_eq!(
+            config.permissions.rules[1].decision,
+            crate::approval::policy::Decision::Deny
+        );
     }
 
     #[test]
@@ -244,5 +372,144 @@ auto_memory = true
     fn load_auth_key_missing_file() {
         let key = load_auth_key(Path::new("/nonexistent/auth.json"));
         assert!(key.is_none());
+    }
+
+    #[test]
+    fn layered_config_merges_user_and_project_with_project_security_deny_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let user_path = dir.path().join("user.toml");
+        let project_dir = dir.path().join("project");
+        std::fs::create_dir_all(project_dir.join(".orca")).unwrap();
+        let project_path = project_dir.join(".orca/config.toml");
+
+        std::fs::write(
+            &user_path,
+            r#"
+model = "deepseek-v4-pro"
+mode = "suggest"
+api_key = "sk-user"
+base_url = "https://user.example"
+
+[[hooks]]
+event = "post_tool_use"
+tool = "bash"
+command = "echo user"
+
+[tools]
+max_read_parallel = 4
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &project_path,
+            r#"
+model = "deepseek-v4-flash"
+mode = "full-auto"
+api_key = "sk-project"
+base_url = "https://project.example"
+
+[[hooks]]
+event = "post_tool_use"
+tool = "bash"
+command = "echo project"
+
+[[permissions.rules]]
+tool = "bash"
+pattern = "cargo *"
+decision = "allow"
+"#,
+        )
+        .unwrap();
+
+        let config = load_layered_config_from_paths(&user_path, &project_dir);
+
+        assert_eq!(config.model.as_deref(), Some("deepseek-v4-flash"));
+        assert_eq!(
+            config.mode,
+            Some(crate::approval::policy::ApprovalMode::FullAuto)
+        );
+        assert_eq!(config.api_key.as_deref(), Some("sk-user"));
+        assert_eq!(config.base_url.as_deref(), Some("https://user.example"));
+        assert_eq!(config.hooks.len(), 1);
+        assert_eq!(config.hooks[0].command, "echo user");
+        assert_eq!(config.permissions.rules.len(), 1);
+        assert_eq!(config.tools.max_read_parallel, 4);
+    }
+
+    #[test]
+    fn env_and_cli_layers_override_files_in_priority_order() {
+        let base = FileConfig {
+            model: Some("deepseek-v4-flash".to_string()),
+            mode: Some(crate::approval::policy::ApprovalMode::Suggest),
+            api_key: Some("sk-file".to_string()),
+            ..Default::default()
+        };
+
+        let env = ConfigOverrides {
+            model: Some("deepseek-v4-pro".to_string()),
+            mode: Some(crate::approval::policy::ApprovalMode::AutoEdit),
+            api_key: Some("sk-env".to_string()),
+            base_url: None,
+        };
+        let cli = ConfigOverrides {
+            model: Some("auto".to_string()),
+            mode: Some(crate::approval::policy::ApprovalMode::Plan),
+            api_key: Some("sk-cli".to_string()),
+            base_url: Some("https://cli.example".to_string()),
+        };
+
+        let config = apply_override_layers(base, env, cli);
+
+        assert_eq!(config.model.as_deref(), Some("auto"));
+        assert_eq!(
+            config.mode,
+            Some(crate::approval::policy::ApprovalMode::Plan)
+        );
+        assert_eq!(config.api_key.as_deref(), Some("sk-cli"));
+        assert_eq!(config.base_url.as_deref(), Some("https://cli.example"));
+    }
+
+    #[test]
+    fn layered_config_concatenates_permission_rules_from_both_layers() {
+        let dir = tempfile::tempdir().unwrap();
+        let user_path = dir.path().join("user.toml");
+        let project_dir = dir.path().join("project");
+        std::fs::create_dir_all(project_dir.join(".orca")).unwrap();
+        let project_path = project_dir.join(".orca/config.toml");
+
+        std::fs::write(
+            &user_path,
+            r#"
+[[permissions.rules]]
+tool = "bash"
+pattern = "rm -rf *"
+decision = "deny"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &project_path,
+            r#"
+[[permissions.rules]]
+tool = "bash"
+pattern = "cargo *"
+decision = "allow"
+"#,
+        )
+        .unwrap();
+
+        let config = load_layered_config_from_paths(&user_path, &project_dir);
+
+        assert_eq!(config.permissions.rules.len(), 2);
+        assert_eq!(config.permissions.rules[0].pattern, "rm -rf *");
+        assert_eq!(
+            config.permissions.rules[0].decision,
+            crate::approval::policy::Decision::Deny
+        );
+        assert_eq!(config.permissions.rules[1].pattern, "cargo *");
+        assert_eq!(
+            config.permissions.rules[1].decision,
+            crate::approval::policy::Decision::Allow
+        );
     }
 }

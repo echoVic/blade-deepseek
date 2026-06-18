@@ -1,17 +1,21 @@
 use serde::{Deserialize, Serialize};
 
+use crate::approval::policy::Decision;
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PermissionRule {
     pub tool: String,
     pub pattern: String,
+    pub decision: Decision,
 }
 
 impl PermissionRule {
     #[cfg(test)]
-    pub fn new(tool: impl Into<String>, pattern: impl Into<String>) -> Self {
+    pub fn new(tool: impl Into<String>, pattern: impl Into<String>, decision: Decision) -> Self {
         Self {
             tool: tool.into(),
             pattern: pattern.into(),
+            decision,
         }
     }
 }
@@ -19,21 +23,19 @@ impl PermissionRule {
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PermissionRules {
     #[serde(default)]
-    pub allow: Vec<PermissionRule>,
-    #[serde(default)]
-    pub deny: Vec<PermissionRule>,
+    pub rules: Vec<PermissionRule>,
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct CompiledPermissionRules {
-    allow: Vec<CompiledPermissionRule>,
-    deny: Vec<CompiledPermissionRule>,
+    rules: Vec<CompiledPermissionRule>,
 }
 
 #[derive(Clone, Debug)]
 struct CompiledPermissionRule {
     tool: String,
     pattern: CompiledGlob,
+    decision: Decision,
 }
 
 #[derive(Clone, Debug)]
@@ -44,25 +46,20 @@ struct CompiledGlob {
 impl CompiledPermissionRules {
     pub fn from_rules(rules: PermissionRules) -> Self {
         Self {
-            allow: rules
-                .allow
-                .into_iter()
-                .map(CompiledPermissionRule::new)
-                .collect(),
-            deny: rules
-                .deny
+            rules: rules
+                .rules
                 .into_iter()
                 .map(CompiledPermissionRule::new)
                 .collect(),
         }
     }
 
-    pub fn deny_matches(&self, tool: &str, target: Option<&str>) -> bool {
-        self.deny.iter().any(|rule| rule.matches(tool, target))
-    }
-
-    pub fn allow_matches(&self, tool: &str, target: Option<&str>) -> bool {
-        self.allow.iter().any(|rule| rule.matches(tool, target))
+    pub fn matching_decision(&self, tool: &str, target: Option<&str>) -> Option<Decision> {
+        self.rules
+            .iter()
+            .filter(|rule| rule.matches(tool, target))
+            .map(|rule| rule.decision)
+            .max()
     }
 }
 
@@ -71,6 +68,7 @@ impl CompiledPermissionRule {
         Self {
             tool: rule.tool,
             pattern: CompiledGlob::new(rule.pattern),
+            decision: rule.decision,
         }
     }
 
@@ -166,10 +164,12 @@ fn glob_match(pattern: &[u8], mut p: usize, value: &[u8], mut v: usize) -> bool 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::approval::policy::Decision;
 
     #[test]
     fn compiled_permission_rule_matches_tool_and_glob_pattern() {
-        let rule = CompiledPermissionRule::new(PermissionRule::new("bash", "cargo *"));
+        let rule =
+            CompiledPermissionRule::new(PermissionRule::new("bash", "cargo *", Decision::Allow));
 
         assert!(rule.matches("bash", Some("cargo test")));
         assert!(!rule.matches("bash", Some("npm test")));
@@ -180,15 +180,45 @@ mod tests {
     #[test]
     fn compiled_permission_rules_cache_globs_for_runtime_matching() {
         let rules = PermissionRules {
-            allow: vec![PermissionRule::new("bash", "cargo *")],
-            deny: vec![PermissionRule::new("bash", "rm -rf *")],
+            rules: vec![
+                PermissionRule::new("bash", "cargo *", Decision::Allow),
+                PermissionRule::new("bash", "rm -rf *", Decision::Deny),
+            ],
         };
 
         let compiled = CompiledPermissionRules::from_rules(rules);
 
-        assert!(compiled.allow_matches("bash", Some("cargo test")));
-        assert!(compiled.deny_matches("bash", Some("rm -rf target")));
-        assert!(!compiled.allow_matches("bash", Some("npm test")));
+        assert_eq!(
+            compiled.matching_decision("bash", Some("cargo test")),
+            Some(Decision::Allow)
+        );
+        assert_eq!(
+            compiled.matching_decision("bash", Some("rm -rf target")),
+            Some(Decision::Deny)
+        );
+        assert_eq!(compiled.matching_decision("bash", Some("npm test")), None);
+    }
+
+    #[test]
+    fn compiled_permission_rules_return_strictest_matching_decision() {
+        let rules = PermissionRules {
+            rules: vec![
+                PermissionRule::new("bash", "cargo *", Decision::Allow),
+                PermissionRule::new("bash", "cargo publish *", Decision::Prompt),
+                PermissionRule::new("bash", "cargo publish secret*", Decision::Deny),
+            ],
+        };
+
+        let compiled = CompiledPermissionRules::from_rules(rules);
+
+        assert_eq!(
+            compiled.matching_decision("bash", Some("cargo publish secret-crate")),
+            Some(Decision::Deny)
+        );
+        assert_eq!(
+            compiled.matching_decision("bash", Some("cargo publish public-crate")),
+            Some(Decision::Prompt)
+        );
     }
 
     #[test]

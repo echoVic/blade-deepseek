@@ -20,11 +20,9 @@ fn suggest_denies_write_in_jsonl_mode() {
     assert_eq!(output.status.code(), Some(3));
 
     let events = parse_jsonl(&output.stdout);
-    assert!(
-        events
-            .iter()
-            .any(|event| event["type"] == "approval.requested")
-    );
+    assert!(events
+        .iter()
+        .any(|event| event["type"] == "approval.requested"));
     assert!(events.iter().any(|event| {
         event["type"] == "approval.resolved" && event["payload"]["decision"] == "deny"
     }));
@@ -68,9 +66,10 @@ fn permission_allow_rule_allows_matching_shell_in_jsonl_mode() {
     std::fs::write(
         home.path().join("config.toml"),
         r#"
-[[permissions.allow]]
+[[permissions.rules]]
 tool = "bash"
 pattern = "echo *"
+decision = "allow"
 "#,
     )
     .expect("write config");
@@ -106,13 +105,15 @@ fn permission_deny_rule_overrides_matching_allow_rule() {
     std::fs::write(
         home.path().join("config.toml"),
         r#"
-[[permissions.allow]]
+[[permissions.rules]]
 tool = "bash"
 pattern = "echo *"
+decision = "allow"
 
-[[permissions.deny]]
+[[permissions.rules]]
 tool = "bash"
 pattern = "echo secret*"
+decision = "deny"
 "#,
     )
     .expect("write config");

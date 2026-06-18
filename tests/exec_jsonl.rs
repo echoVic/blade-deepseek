@@ -1,6 +1,7 @@
 use std::process::Command;
 
 use serde_json::Value;
+use tempfile::TempDir;
 
 #[test]
 fn exec_outputs_jsonl_contract_and_success_status() {
@@ -23,16 +24,12 @@ fn exec_outputs_jsonl_contract_and_success_status() {
     assert!(events.len() >= 5);
     assert_eq!(events[0]["version"], "1");
     assert_eq!(events[0]["type"], "session.started");
-    assert!(
-        events
-            .iter()
-            .any(|event| event["type"] == "assistant.reasoning.delta")
-    );
-    assert!(
-        events
-            .iter()
-            .any(|event| event["type"] == "assistant.message.delta")
-    );
+    assert!(events
+        .iter()
+        .any(|event| event["type"] == "assistant.reasoning.delta"));
+    assert!(events
+        .iter()
+        .any(|event| event["type"] == "assistant.message.delta"));
     assert_eq!(events.last().unwrap()["type"], "session.completed");
     assert_eq!(events.last().unwrap()["payload"]["status"], "success");
 
@@ -151,6 +148,60 @@ fn exec_explicit_model_disables_auto_route() {
     assert_eq!(routed["payload"]["requested_model"], "deepseek-v4-flash");
     assert_eq!(routed["payload"]["actual_model"], "deepseek-v4-flash");
     assert_eq!(routed["payload"]["reason"], "explicit");
+}
+
+#[test]
+fn exec_config_layers_respect_project_env_and_cli_precedence() {
+    let home = TempDir::new().expect("temp home");
+    let project = TempDir::new().expect("temp project");
+    std::fs::create_dir_all(project.path().join(".orca")).unwrap();
+    std::fs::write(
+        home.path().join("config.toml"),
+        r#"
+model = "deepseek-v4-flash"
+mode = "suggest"
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        project.path().join(".orca/config.toml"),
+        r#"
+model = "deepseek-v4-pro"
+mode = "auto-edit"
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .env("ORCA_HOME", home.path())
+        .env("ORCA_MODEL", "deepseek-v4-flash")
+        .env("ORCA_MODE", "full-auto")
+        .args([
+            "exec",
+            "--output-format",
+            "jsonl",
+            "--provider",
+            "mock",
+            "--cwd",
+            project.path().to_str().unwrap(),
+            "--model",
+            "auto",
+            "--mode",
+            "plan",
+            "hello",
+        ])
+        .output()
+        .expect("run orca");
+
+    assert_eq!(output.status.code(), Some(0));
+
+    let events = parse_jsonl(&output.stdout);
+    assert_eq!(events[0]["payload"]["approval_mode"], "plan");
+    let routed = events
+        .iter()
+        .find(|event| event["type"] == "model.routed")
+        .expect("model routed event");
+    assert_eq!(routed["payload"]["requested_model"], "auto");
 }
 
 #[test]

@@ -50,6 +50,14 @@ impl ActionKind {
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Decision {
+    Allow,
+    Prompt,
+    Deny,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalDecision {
@@ -87,8 +95,8 @@ impl ApprovalPolicy {
     }
 
     #[cfg(test)]
-    pub fn with_rules(mut self, allow: Vec<PermissionRule>, deny: Vec<PermissionRule>) -> Self {
-        self.rules = CompiledPermissionRules::from_rules(PermissionRules { allow, deny });
+    pub fn with_rules(mut self, rules: Vec<PermissionRule>) -> Self {
+        self.rules = CompiledPermissionRules::from_rules(PermissionRules { rules });
         self
     }
 
@@ -108,23 +116,18 @@ impl ApprovalPolicy {
         tool: &str,
         target: Option<&str>,
     ) -> ApprovalResolution {
-        if self.rules.deny_matches(tool, target) {
-            return ApprovalResolution {
-                id: request.id.clone(),
-                decision: ApprovalDecision::Deny,
-                reason: format!(
-                    "permission deny rule matches {tool} {}",
-                    target.unwrap_or("")
-                ),
+        if let Some(decision) = self.rules.matching_decision(tool, target) {
+            let approval_decision = match decision {
+                Decision::Allow => ApprovalDecision::Allow,
+                Decision::Prompt => ApprovalDecision::Ask,
+                Decision::Deny => ApprovalDecision::Deny,
             };
-        }
-
-        if self.rules.allow_matches(tool, target) {
             return ApprovalResolution {
                 id: request.id.clone(),
-                decision: ApprovalDecision::Allow,
+                decision: approval_decision,
                 reason: format!(
-                    "permission allow rule matches {tool} {}",
+                    "permission {} rule matches {tool} {}",
+                    decision.as_str(),
                     target.unwrap_or("")
                 ),
             };
@@ -168,6 +171,16 @@ impl ApprovalPolicy {
             id: request.id.clone(),
             decision,
             reason,
+        }
+    }
+}
+
+impl Decision {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Prompt => "prompt",
+            Self::Deny => "deny",
         }
     }
 }
@@ -274,8 +287,12 @@ mod tests {
 
     #[test]
     fn matching_deny_rule_overrides_full_auto() {
-        let policy = ApprovalPolicy::new(ApprovalMode::FullAuto)
-            .with_rules(Vec::new(), vec![PermissionRule::new("bash", "rm -rf *")]);
+        let policy =
+            ApprovalPolicy::new(ApprovalMode::FullAuto).with_rules(vec![PermissionRule::new(
+                "bash",
+                "rm -rf *",
+                Decision::Deny,
+            )]);
         let req = ApprovalRequest {
             id: "danger".to_string(),
             action: ActionKind::Shell,
@@ -290,8 +307,12 @@ mod tests {
 
     #[test]
     fn matching_allow_rule_overrides_suggest_prompt() {
-        let policy = ApprovalPolicy::new(ApprovalMode::Suggest)
-            .with_rules(vec![PermissionRule::new("bash", "cargo *")], Vec::new());
+        let policy =
+            ApprovalPolicy::new(ApprovalMode::Suggest).with_rules(vec![PermissionRule::new(
+                "bash",
+                "cargo *",
+                Decision::Allow,
+            )]);
         let req = ApprovalRequest {
             id: "cargo".to_string(),
             action: ActionKind::Shell,
@@ -306,8 +327,12 @@ mod tests {
 
     #[test]
     fn no_matching_rule_uses_mode_default() {
-        let policy = ApprovalPolicy::new(ApprovalMode::Suggest)
-            .with_rules(vec![PermissionRule::new("bash", "cargo *")], Vec::new());
+        let policy =
+            ApprovalPolicy::new(ApprovalMode::Suggest).with_rules(vec![PermissionRule::new(
+                "bash",
+                "cargo *",
+                Decision::Allow,
+            )]);
         let req = ApprovalRequest {
             id: "other".to_string(),
             action: ActionKind::Shell,
@@ -317,5 +342,44 @@ mod tests {
         let res = policy.resolve_for_tool(&req, "bash", Some("npm test"));
 
         assert_eq!(res.decision, ApprovalDecision::Ask);
+    }
+
+    #[test]
+    fn prompt_rule_overrides_full_auto_to_ask() {
+        let policy =
+            ApprovalPolicy::new(ApprovalMode::FullAuto).with_rules(vec![PermissionRule::new(
+                "bash",
+                "curl *",
+                Decision::Prompt,
+            )]);
+        let req = ApprovalRequest {
+            id: "curl".to_string(),
+            action: ActionKind::Shell,
+            description: "bash requested curl example.com".to_string(),
+        };
+
+        let res = policy.resolve_for_tool(&req, "bash", Some("curl example.com"));
+
+        assert_eq!(res.decision, ApprovalDecision::Ask);
+        assert!(res.reason.contains("permission prompt rule"));
+    }
+
+    #[test]
+    fn strictest_matching_rule_wins() {
+        let policy = ApprovalPolicy::new(ApprovalMode::Suggest).with_rules(vec![
+            PermissionRule::new("bash", "cargo *", Decision::Allow),
+            PermissionRule::new("bash", "cargo publish *", Decision::Prompt),
+            PermissionRule::new("bash", "cargo publish secret*", Decision::Deny),
+        ]);
+        let req = ApprovalRequest {
+            id: "publish".to_string(),
+            action: ActionKind::Shell,
+            description: "bash requested cargo publish secret-crate".to_string(),
+        };
+
+        let res = policy.resolve_for_tool(&req, "bash", Some("cargo publish secret-crate"));
+
+        assert_eq!(res.decision, ApprovalDecision::Deny);
+        assert!(res.reason.contains("permission deny rule"));
     }
 }

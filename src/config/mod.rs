@@ -114,3 +114,113 @@ pub struct RunConfig {
     pub desktop_notifications: bool,
     pub auto_memory: bool,
 }
+
+pub fn format_config_show(config: &RunConfig) -> String {
+    let api_key = if config.api_key.is_some() {
+        "<redacted>"
+    } else {
+        "<unset>"
+    };
+    let base_url = config.base_url.as_deref().unwrap_or("<default>");
+    let cwd = config
+        .cwd
+        .as_ref()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "<current>".to_string());
+    let verifier = config.verifier.as_deref().unwrap_or("<unset>");
+    let max_budget = config
+        .max_budget_usd
+        .map(|budget| budget.to_string())
+        .unwrap_or_else(|| "<unset>".to_string());
+
+    format!(
+        concat!(
+            "model = \"{}\"\n",
+            "mode = \"{}\"\n",
+            "api_key = \"{}\"\n",
+            "base_url = \"{}\"\n",
+            "provider = \"{}\"\n",
+            "cwd = \"{}\"\n",
+            "verifier = \"{}\"\n",
+            "max_budget_usd = \"{}\"\n",
+            "theme = \"{:?}\"\n",
+            "vim_mode = {}\n",
+            "update_check = {}\n",
+            "desktop_notifications = {}\n",
+            "auto_memory = {}\n",
+            "\n",
+            "[tools]\n",
+            "max_read_parallel = {}\n",
+            "\n",
+            "[subagents]\n",
+            "max_depth = {}\n",
+            "max_parallel = {}\n",
+            "\n",
+            "[counts]\n",
+            "mcp_servers = {}\n",
+            "hooks = {}\n",
+            "permission_rules = {}"
+        ),
+        config.model.display_name(),
+        config.approval_mode.as_str(),
+        api_key,
+        base_url,
+        config.provider.as_str(),
+        cwd,
+        verifier,
+        max_budget,
+        config.theme,
+        config.vim_mode,
+        config.update_check,
+        config.desktop_notifications,
+        config.auto_memory,
+        config.tools.max_read_parallel,
+        config.subagents.max_depth,
+        config.subagents.max_parallel,
+        config.mcp_servers.len(),
+        config.hooks.len(),
+        config.permission_rules.rules.len()
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::approval::policy::ApprovalMode;
+    use crate::model::ModelSelection;
+
+    #[test]
+    fn format_config_show_redacts_api_key_and_includes_effective_values() {
+        let config = RunConfig {
+            prompt: String::new(),
+            cwd: None,
+            output_format: OutputFormat::Text,
+            approval_mode: ApprovalMode::FullAuto,
+            provider: ProviderKind::Mock,
+            verifier: None,
+            model: ModelSelection::from_unchecked(Some("deepseek-v4-flash".to_string())),
+            api_key: Some("sk-secret".to_string()),
+            base_url: Some("https://api.example".to_string()),
+            mcp_servers: Vec::new(),
+            hooks: Vec::new(),
+            history_mode: HistoryMode::Disabled,
+            show_session_picker: false,
+            permission_rules: PermissionRules::default(),
+            max_budget_usd: Some(1.25),
+            subagents: SubagentConfig::default(),
+            tools: ToolConfig::default(),
+            theme: ThemeName::Dark,
+            vim_mode: true,
+            update_check: false,
+            desktop_notifications: true,
+            auto_memory: true,
+        };
+
+        let shown = format_config_show(&config);
+
+        assert!(shown.contains("model = \"deepseek-v4-flash\""));
+        assert!(shown.contains("mode = \"full-auto\""));
+        assert!(shown.contains("api_key = \"<redacted>\""));
+        assert!(!shown.contains("sk-secret"));
+    }
+}
