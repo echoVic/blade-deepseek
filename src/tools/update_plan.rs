@@ -2,9 +2,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::tools::{ToolRequest, ToolResult};
 
-const MAX_PLAN_ITEMS: usize = 50;
-const MAX_STEP_LEN: usize = 200;
-
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanStatus {
@@ -43,28 +40,10 @@ pub fn parse_args(request: &ToolRequest) -> Result<UpdatePlanArgs, String> {
 }
 
 fn validate_args(args: UpdatePlanArgs) -> Result<UpdatePlanArgs, String> {
-    if args.plan.len() > MAX_PLAN_ITEMS {
-        return Err(format!(
-            "update_plan accepts at most {MAX_PLAN_ITEMS} items, got {}",
-            args.plan.len()
-        ));
-    }
-    let mut in_progress = 0;
     for item in &args.plan {
         if item.step.trim().is_empty() {
             return Err("update_plan step cannot be empty".to_string());
         }
-        if item.step.len() > MAX_STEP_LEN {
-            return Err(format!(
-                "update_plan step exceeds {MAX_STEP_LEN} characters"
-            ));
-        }
-        if item.status == PlanStatus::InProgress {
-            in_progress += 1;
-        }
-    }
-    if in_progress > 1 {
-        return Err("update_plan accepts at most one in_progress step".to_string());
     }
     Ok(args)
 }
@@ -112,33 +91,12 @@ mod tests {
     }
 
     #[test]
-    fn rejects_multiple_in_progress_items() {
+    fn rejects_empty_step() {
         let error = parse_args(&request(
-            r#"{"plan":[{"step":"One","status":"in_progress"},{"step":"Two","status":"in_progress"}]}"#,
+            r#"{"plan":[{"step":"  ","status":"pending"}]}"#,
         ))
         .unwrap_err();
-
-        assert!(error.contains("at most one"));
-    }
-
-    #[test]
-    fn rejects_too_many_items() {
-        let items: Vec<String> = (0..51)
-            .map(|i| format!(r#"{{"step":"Step {i}","status":"pending"}}"#))
-            .collect();
-        let json = format!(r#"{{"plan":[{}]}}"#, items.join(","));
-        let error = parse_args(&request(&json)).unwrap_err();
-
-        assert!(error.contains("at most 50"));
-    }
-
-    #[test]
-    fn rejects_step_exceeding_length_limit() {
-        let long_step = "x".repeat(201);
-        let json = format!(r#"{{"plan":[{{"step":"{long_step}","status":"pending"}}]}}"#);
-        let error = parse_args(&request(&json)).unwrap_err();
-
-        assert!(error.contains("exceeds 200 characters"));
+        assert!(error.contains("cannot be empty"));
     }
 
     #[test]
