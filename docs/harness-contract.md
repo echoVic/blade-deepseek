@@ -19,6 +19,33 @@ Options:
 - `--model <name>` — Model override
 - `--base-url <url>` — API base URL override
 
+## Embedded Server Protocol
+
+```sh
+orca --mode=server
+```
+
+Server mode reads one JSON object per line from stdin and writes one JSON object per line to stdout. The initial supported operation is `submit`:
+
+```json
+{"id":1,"op":"submit","prompt":"fix the bug in main.rs"}
+```
+
+The response stream preserves the request `id` and emits compact protocol events derived from the normal runtime event stream:
+
+```jsonl
+{"id":1,"event":"turn_started","turn":1}
+{"id":1,"event":"reasoning_delta","text":"Let me look..."}
+{"id":1,"event":"tool_requested","tool":"read_file","target":"src/main.rs"}
+{"id":1,"event":"tool_completed","tool":"read_file","status":"completed"}
+{"id":1,"event":"message_delta","text":"I found the issue..."}
+{"id":1,"event":"turn_completed","status":"success"}
+```
+
+Unsupported operations and malformed requests emit an `error` event. Server mode exits when stdin closes.
+
+Requests are processed serially — the next `submit` is not read until the current one completes. Events are streamed as they occur (not batched).
+
 ## Event Envelope
 
 Every JSONL line is one event:
@@ -45,6 +72,8 @@ Every JSONL line is one event:
 - `approval.resolved`
 - `tool.call.requested`
 - `tool.call.completed`
+- `subagent.started`
+- `subagent.completed`
 - `verification.started`
 - `verification.completed`
 - `error`
@@ -72,7 +101,7 @@ The final `session.completed` event contains one of:
 
 ## Tool Contract
 
-All 6 tools are fully implemented:
+Built-in tools:
 
 | Tool | Action | Description |
 |------|--------|-------------|
@@ -82,10 +111,28 @@ All 6 tools are fully implemented:
 | `git_status` | read | Runs `git status --short` |
 | `bash` | shell | Executes via `sh -c`, requires approval unless `full-auto` |
 | `edit` | write | Exact text replacement, requires approval unless `full-auto` |
+| `subagent` | read | Runs a synchronous child agent with `description` and `prompt`, returning the child summary |
 
 Tool events:
 - `tool.call.requested` — emitted before execution, contains `name`, `action`, `target`
 - `tool.call.completed` — emitted after execution, contains `name`, `status` (completed/failed/denied), `output`, `truncated`
+
+External tools:
+- Orca loads `~/.orca/tools/*.toml` at startup.
+- Each descriptor defines `name`, `description`, `action_kind`, `command`, and `schema`.
+- Descriptors are advertised to the model as function tools.
+- Commands run from the workspace directory with raw JSON arguments on stdin and in `ORCA_TOOL_ARGS`.
+
+Hook stdout protocol:
+- `{"action":"allow"}` allows the operation.
+- `{"action":"deny","reason":"..."}` blocks the hook target.
+- `{"action":"modify","modified_target":"..."}` rewrites a tool target.
+- `{"action":"inject","context":"..."}` injects model context.
+- Non-JSON stdout is treated as injected context.
+
+Subagent events:
+- `subagent.started` — emitted when the child agent starts, contains `id`, `description`
+- `subagent.completed` — emitted when the child agent finishes, contains `id`, `description`, `status`, `output`, `error`
 
 ## Approval Policy
 
@@ -112,7 +159,7 @@ The default (and only production) provider is DeepSeek. Internal test providers 
 
 ### DeepSeek Provider
 
-- Default model: `deepseek-v4-flash`
+- Default model: `auto` (main loop uses `deepseek-v4-pro`, auxiliary tasks use `deepseek-v4-flash`)
 - Default base URL: `https://api.deepseek.com`
 - Streaming: SSE with real-time reasoning/content deltas
 - Authentication: `DEEPSEEK_API_KEY` (required)
@@ -135,6 +182,8 @@ The runtime executes a multi-turn agent loop (max 128 turns):
 2. If response contains tool calls → execute each tool → add results to conversation → next turn
 3. If response is a final message → return success
 4. If budget exhausted → return `budget_exhausted` (exit code 4)
+
+Subagents run the same loop as a child conversation in the same workspace. They inherit provider/model config and approval mode. Nested subagents are rejected in this MVP.
 
 Context window management:
 - Window size: 128K tokens (estimated as chars/4)

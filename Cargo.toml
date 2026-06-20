@@ -1,3 +1,28 @@
+[workspace]
+members = [".", "crates/*"]
+default-members = [".", "crates/*"]
+resolver = "3"
+
+[workspace.dependencies]
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+clap = { version = "4.5.50", features = ["derive"] }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.0", features = ["v4"] }
+tokio = { version = "1.48", features = ["rt-multi-thread", "macros", "process", "io-util", "sync", "time"] }
+reqwest = { version = "0.12.24", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+toml = "0.8"
+tiktoken-rs = "0.12.0"
+dirs = "6"
+crossterm = "0.28"
+ratatui = "0.29"
+tui-textarea = "0.7"
+pulldown-cmark = { version = "0.12", default-features = false }
+unicode-width = "0.2.0"
+zstd = "0.13"
+similar = "3.1.1"
+tempfile = "3.27.0"
+
 [package]
 name = "blade-deepseek"
 version = "0.1.0"
@@ -11,13 +36,30 @@ name = "orca"
 path = "src/main.rs"
 
 [dependencies]
-clap = { version = "4.5.50", features = ["derive"] }
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.145"
-reqwest = { version = "0.12.24", default-features = false, features = ["blocking", "json", "rustls-tls"] }
-toml = "0.8"
-dirs = "6"
-ratatui = "0.29"
-crossterm = "0.28"
-tui-textarea = "0.7"
-pulldown-cmark = { version = "0.12", default-features = false }
+orca-core = { path = "crates/orca-core" }
+orca-mcp = { path = "crates/orca-mcp" }
+orca-tools = { path = "crates/orca-tools" }
+orca-provider = { path = "crates/orca-provider" }
+orca-approval = { path = "crates/orca-approval" }
+orca-runtime = { path = "crates/orca-runtime" }
+orca-tui = { path = "crates/orca-tui" }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }
+toml = { workspace = true }
+tiktoken-rs = { workspace = true }
+dirs = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+tui-textarea = { workspace = true }
+pulldown-cmark = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+unicode-width = { workspace = true }
+zstd = { workspace = true }
+similar = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

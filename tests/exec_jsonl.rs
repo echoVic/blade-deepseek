@@ -1,11 +1,19 @@
 use std::process::Command;
 
 use serde_json::Value;
+use tempfile::TempDir;
 
 #[test]
 fn exec_outputs_jsonl_contract_and_success_status() {
     let output = Command::new(env!("CARGO_BIN_EXE_orca"))
-        .args(["exec", "--output-format", "jsonl", "--provider", "mock", "hello"])
+        .args([
+            "exec",
+            "--output-format",
+            "jsonl",
+            "--provider",
+            "mock",
+            "hello",
+        ])
         .output()
         .expect("run orca");
 
@@ -35,9 +43,287 @@ fn exec_outputs_jsonl_contract_and_success_status() {
     }
 }
 
+#[test]
+fn exec_emits_usage_event_when_provider_reports_usage() {
+    let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .args([
+            "exec",
+            "--output-format",
+            "jsonl",
+            "--provider",
+            "mock",
+            "mock_usage",
+        ])
+        .output()
+        .expect("run orca");
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+
+    let events = parse_jsonl(&output.stdout);
+    let usage = events
+        .iter()
+        .find(|event| event["type"] == "usage.updated")
+        .expect("usage event");
+    assert_eq!(usage["payload"]["input_tokens"], 120);
+    assert_eq!(usage["payload"]["output_tokens"], 30);
+    assert_eq!(usage["payload"]["cache_tokens"], 10);
+    assert_eq!(usage["payload"]["total_tokens"], 150);
+    assert!(usage["payload"]["estimated_cost_usd"].as_f64().unwrap() > 0.0);
+}
+
+#[test]
+fn exec_pre_model_hook_injects_context_into_model_input() {
+    let home = TempDir::new().expect("temp home");
+    std::fs::write(
+        home.path().join("config.toml"),
+        r#"
+[[hooks]]
+event = "pre_model_call"
+command = "printf '%s' '{\"action\":\"inject\",\"context\":\"hooked policy context\"}'"
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .env("ORCA_HOME", home.path())
+        .args([
+            "exec",
+            "--output-format",
+            "jsonl",
+            "--provider",
+            "mock",
+            "mock_system_echo",
+        ])
+        .output()
+        .expect("run orca");
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+
+    let events = parse_jsonl(&output.stdout);
+    assert!(events.iter().any(|event| {
+        event["type"] == "assistant.message.delta"
+            && event["payload"]["text"]
+                .as_str()
+                .unwrap_or("")
+                .contains("hooked policy context")
+    }));
+}
+
+#[test]
+fn exec_post_model_hook_observes_usage_environment() {
+    let home = TempDir::new().expect("temp home");
+    let usage_path = home.path().join("usage.txt");
+    std::fs::write(
+        home.path().join("config.toml"),
+        format!(
+            r#"
+[[hooks]]
+event = "post_model_call"
+command = "printf '%s %s %s' \"$ORCA_USAGE_INPUT_TOKENS\" \"$ORCA_USAGE_OUTPUT_TOKENS\" \"$ORCA_USAGE_CACHE_TOKENS\" > {}"
+"#,
+            shell_escape(&usage_path)
+        ),
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .env("ORCA_HOME", home.path())
+        .args([
+            "exec",
+            "--output-format",
+            "jsonl",
+            "--provider",
+            "mock",
+            "mock_usage",
+        ])
+        .output()
+        .expect("run orca");
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        std::fs::read_to_string(&usage_path).expect("usage hook output"),
+        "120 30 10"
+    );
+}
+
+#[test]
+fn exec_auto_model_defaults_to_pro() {
+    let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .args([
+            "exec",
+            "--output-format",
+            "jsonl",
+            "--provider",
+            "mock",
+            "hello",
+        ])
+        .output()
+        .expect("run orca");
+
+    assert_eq!(output.status.code(), Some(0));
+
+    let events = parse_jsonl(&output.stdout);
+    let routed = events
+        .iter()
+        .find(|event| event["type"] == "model.routed")
+        .expect("model routed event");
+    assert_eq!(routed["payload"]["requested_model"], Value::Null);
+    assert_eq!(routed["payload"]["actual_model"], "deepseek-v4-pro");
+    assert_eq!(routed["payload"]["reason"], "default_pro");
+}
+
+#[test]
+fn exec_auto_model_routes_any_prompt_to_pro() {
+    let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .args([
+            "exec",
+            "--output-format",
+            "jsonl",
+            "--provider",
+            "mock",
+            "--model",
+            "auto",
+            "review this migration plan",
+        ])
+        .output()
+        .expect("run orca");
+
+    assert_eq!(output.status.code(), Some(0));
+
+    let events = parse_jsonl(&output.stdout);
+    let routed = events
+        .iter()
+        .find(|event| event["type"] == "model.routed")
+        .expect("model routed event");
+    assert_eq!(routed["payload"]["requested_model"], "auto");
+    assert_eq!(routed["payload"]["actual_model"], "deepseek-v4-pro");
+    assert_eq!(routed["payload"]["reason"], "default_pro");
+}
+
+#[test]
+fn exec_explicit_model_disables_auto_route() {
+    let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .args([
+            "exec",
+            "--output-format",
+            "jsonl",
+            "--provider",
+            "mock",
+            "--model",
+            "deepseek-v4-flash",
+            "review this migration plan",
+        ])
+        .output()
+        .expect("run orca");
+
+    assert_eq!(output.status.code(), Some(0));
+
+    let events = parse_jsonl(&output.stdout);
+    let routed = events
+        .iter()
+        .find(|event| event["type"] == "model.routed")
+        .expect("model routed event");
+    assert_eq!(routed["payload"]["requested_model"], "deepseek-v4-flash");
+    assert_eq!(routed["payload"]["actual_model"], "deepseek-v4-flash");
+    assert_eq!(routed["payload"]["reason"], "explicit");
+}
+
+#[test]
+fn exec_config_layers_respect_project_env_and_cli_precedence() {
+    let home = TempDir::new().expect("temp home");
+    let project = TempDir::new().expect("temp project");
+    std::fs::create_dir_all(project.path().join(".orca")).unwrap();
+    std::fs::write(
+        home.path().join("config.toml"),
+        r#"
+model = "deepseek-v4-flash"
+mode = "suggest"
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        project.path().join(".orca/config.toml"),
+        r#"
+model = "deepseek-v4-pro"
+mode = "auto-edit"
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .env("ORCA_HOME", home.path())
+        .env("ORCA_MODEL", "deepseek-v4-flash")
+        .env("ORCA_MODE", "full-auto")
+        .args([
+            "exec",
+            "--output-format",
+            "jsonl",
+            "--provider",
+            "mock",
+            "--cwd",
+            project.path().to_str().unwrap(),
+            "--model",
+            "auto",
+            "--mode",
+            "plan",
+            "hello",
+        ])
+        .output()
+        .expect("run orca");
+
+    assert_eq!(output.status.code(), Some(0));
+
+    let events = parse_jsonl(&output.stdout);
+    assert_eq!(events[0]["payload"]["approval_mode"], "plan");
+    let routed = events
+        .iter()
+        .find(|event| event["type"] == "model.routed")
+        .expect("model routed event");
+    assert_eq!(routed["payload"]["requested_model"], "auto");
+}
+
+#[test]
+fn exec_stops_when_usage_exceeds_max_budget() {
+    let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .args([
+            "exec",
+            "--output-format",
+            "jsonl",
+            "--provider",
+            "mock",
+            "--max-budget",
+            "0.000001",
+            "mock_usage",
+        ])
+        .output()
+        .expect("run orca");
+
+    assert_eq!(output.status.code(), Some(4));
+
+    let events = parse_jsonl(&output.stdout);
+    assert!(events.iter().any(|event| {
+        event["type"] == "error"
+            && event["payload"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("budget")
+    }));
+    assert_eq!(
+        events.last().unwrap()["payload"]["status"],
+        "budget_exhausted"
+    );
+}
+
 fn parse_jsonl(stdout: &[u8]) -> Vec<Value> {
     String::from_utf8_lossy(stdout)
         .lines()
         .map(|line| serde_json::from_str(line).expect("valid jsonl line"))
         .collect()
+}
+
+fn shell_escape(path: &std::path::Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
 }

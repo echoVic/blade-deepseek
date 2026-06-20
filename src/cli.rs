@@ -5,8 +5,11 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::approval::policy::ApprovalMode;
 use crate::config::file;
-use crate::config::{OutputFormat, ProviderKind, RunConfig};
+use crate::config::file::ConfigOverrides;
+use crate::config::{HistoryMode, OutputFormat, ProviderKind, RunConfig};
+use crate::model::ModelSelection;
 use crate::runtime::controller;
+use crate::runtime::history;
 use crate::tui::app;
 
 #[derive(Debug, Parser)]
@@ -14,6 +17,42 @@ use crate::tui::app;
 #[command(version)]
 #[command(about = "A DeepSeek-native coding agent runtime by Blade.")]
 pub struct Cli {
+    /// Resume a saved conversation in TUI mode by ID, prefix, or 'latest'.
+    #[arg(long)]
+    resume: Option<String>,
+
+    /// Fork a saved conversation in TUI mode by ID, prefix, or 'latest'.
+    #[arg(long, alias = "fork-session")]
+    fork: Option<String>,
+
+    /// Continue the latest saved conversation in TUI mode.
+    #[arg(long = "continue", alias = "last")]
+    continue_latest: bool,
+
+    /// Show the TUI session picker at startup.
+    #[arg(long)]
+    session_picker: bool,
+
+    /// Model to use (overrides config file and ORCA_MODEL env).
+    #[arg(long)]
+    model: Option<String>,
+
+    /// Approval mode to use, or 'server' to start stdin/stdout JSON-RPC mode.
+    #[arg(long = "mode", alias = "approval-mode")]
+    mode: Option<String>,
+
+    /// API key to use (overrides config file and ORCA_API_KEY env).
+    #[arg(long)]
+    api_key: Option<String>,
+
+    /// API base URL (overrides config file and ORCA_BASE_URL env).
+    #[arg(long)]
+    base_url: Option<String>,
+
+    /// Provider implementation (internal, for testing).
+    #[arg(long, value_enum, default_value_t = ProviderKind::DeepSeek, hide = true)]
+    provider: ProviderKind,
+
     #[command(subcommand)]
     command: Option<Command>,
 
@@ -25,6 +64,8 @@ pub struct Cli {
 enum Command {
     /// Run a task and emit events.
     Exec(ExecArgs),
+    /// Inspect saved conversation history.
+    History(HistoryArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -38,12 +79,16 @@ struct ExecArgs {
     cwd: Option<PathBuf>,
 
     /// Approval policy for tool actions.
-    #[arg(long, value_enum, default_value_t = ApprovalMode::Suggest)]
-    approval_mode: ApprovalMode,
+    #[arg(long = "mode", alias = "approval-mode", value_enum)]
+    approval_mode: Option<ApprovalMode>,
 
     /// Model to use (overrides config file and DEEPSEEK_MODEL env).
     #[arg(long)]
     model: Option<String>,
+
+    /// API key to use (overrides config file and ORCA_API_KEY env).
+    #[arg(long)]
+    api_key: Option<String>,
 
     /// API base URL (overrides config file and DEEPSEEK_BASE_URL env).
     #[arg(long)]
@@ -53,6 +98,30 @@ struct ExecArgs {
     #[arg(long)]
     verifier: Option<String>,
 
+    /// Maximum estimated USD budget for this run.
+    #[arg(long)]
+    max_budget: Option<f64>,
+
+    /// Resume a saved history session by ID, prefix, or 'latest'.
+    #[arg(long)]
+    resume: Option<String>,
+
+    /// Fork a saved history session by ID, prefix, or 'latest'.
+    #[arg(long, alias = "fork-session")]
+    fork: Option<String>,
+
+    /// Continue from the latest saved conversation.
+    #[arg(long = "continue", alias = "last")]
+    continue_latest: bool,
+
+    /// Do not write this run to local history.
+    #[arg(long)]
+    no_history: bool,
+
+    /// Write local history even when using machine-readable jsonl output.
+    #[arg(long)]
+    save_history: bool,
+
     /// Provider implementation (internal, for testing).
     #[arg(long, value_enum, default_value_t = ProviderKind::DeepSeek, hide = true)]
     provider: ProviderKind,
@@ -61,7 +130,62 @@ struct ExecArgs {
     prompt: Vec<String>,
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
+#[derive(Debug, Parser)]
+struct HistoryArgs {
+    #[command(subcommand)]
+    command: HistoryCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum HistoryCommand {
+    /// List saved conversation sessions, newest first.
+    List {
+        /// Maximum number of sessions to print.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+
+        /// Include archived sessions.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Show a saved conversation transcript.
+    Show {
+        /// Session ID, prefix, or 'latest'.
+        session: String,
+    },
+    /// Archive an active conversation transcript.
+    Archive {
+        /// Session ID, prefix, or 'latest'.
+        session: String,
+    },
+    /// Delete a saved or archived conversation transcript.
+    Delete {
+        /// Session ID, prefix, or 'latest'.
+        session: String,
+    },
+    /// Rename a conversation transcript.
+    Rename {
+        /// Session ID, prefix, or 'latest'.
+        session: String,
+        /// New title.
+        title: String,
+    },
+    /// Search saved conversation transcripts.
+    Search {
+        /// Text to search for.
+        query: String,
+        /// Include archived sessions.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Compress a transcript with zstd.
+    Compress {
+        /// Session ID, prefix, or 'latest'.
+        session: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum OutputFormatArg {
     Jsonl,
     Text,
@@ -79,70 +203,494 @@ impl From<OutputFormatArg> for OutputFormat {
 pub fn run() -> i32 {
     let cli = Cli::parse();
 
+    if matches!(cli.mode.as_deref(), Some("server")) {
+        return run_server(cli);
+    }
+
     match cli.command {
         Some(Command::Exec(args)) => run_exec(args),
-        None => run_placeholder(cli.prompt),
+        Some(Command::History(args)) => run_history(args),
+        None => run_placeholder(cli),
     }
 }
 
+fn load_effective_file_config(
+    cwd: &std::path::Path,
+    cli: ConfigOverrides,
+) -> Result<file::FileConfig, String> {
+    let file_config = file::load_layered_config(cwd);
+    let env = env_overrides()?;
+    Ok(file::apply_override_layers(file_config, env, cli))
+}
+
+fn env_overrides() -> Result<ConfigOverrides, String> {
+    Ok(ConfigOverrides {
+        model: env::var("ORCA_MODEL")
+            .ok()
+            .or_else(|| env::var("DEEPSEEK_MODEL").ok()),
+        mode: match env::var("ORCA_MODE") {
+            Ok(mode) => Some(parse_approval_mode_value(&mode)?),
+            Err(_) => None,
+        },
+        api_key: env::var("ORCA_API_KEY")
+            .ok()
+            .or_else(|| env::var("DEEPSEEK_API_KEY").ok()),
+        base_url: env::var("ORCA_BASE_URL")
+            .ok()
+            .or_else(|| env::var("DEEPSEEK_BASE_URL").ok()),
+    })
+}
+
+fn parse_approval_mode_value(mode: &str) -> Result<ApprovalMode, String> {
+    ApprovalMode::from_str(mode, true).map_err(|_| {
+        format!("unsupported mode '{mode}'. Use suggest, auto-edit, full-auto, or plan")
+    })
+}
+
 fn run_exec(args: ExecArgs) -> i32 {
-    let file_config = file::load_user_config();
+    if args.no_history && (args.resume.is_some() || args.fork.is_some() || args.continue_latest) {
+        eprintln!("orca: --resume/--fork/--continue cannot be combined with --no-history");
+        return 1;
+    }
+    if args.no_history && args.save_history {
+        eprintln!("orca: --save-history cannot be combined with --no-history");
+        return 1;
+    }
+    let resume_like =
+        args.resume.is_some() as u8 + args.fork.is_some() as u8 + args.continue_latest as u8;
+    if resume_like > 1 {
+        eprintln!("orca: --resume, --fork, and --continue are mutually exclusive");
+        return 1;
+    }
 
     let prompt = args.prompt.join(" ");
+    let cwd_for_mentions = args
+        .cwd
+        .clone()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let file_config = match load_effective_file_config(
+        &cwd_for_mentions,
+        ConfigOverrides {
+            model: args.model,
+            mode: args.approval_mode,
+            api_key: args.api_key,
+            base_url: args.base_url,
+        },
+    ) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("orca: {error}");
+            return 1;
+        }
+    };
+    let prompt = match crate::mentions::expand_file_mentions(&prompt, &cwd_for_mentions) {
+        Ok(prompt) => prompt,
+        Err(error) => {
+            eprintln!("orca: {error}");
+            return 1;
+        }
+    };
 
-    let api_key = env::var("DEEPSEEK_API_KEY")
-        .ok()
-        .or(file_config.api_key);
+    let api_key = file_config.api_key;
 
-    let base_url = args
-        .base_url
-        .or_else(|| env::var("DEEPSEEK_BASE_URL").ok())
-        .or(file_config.base_url);
+    let base_url = file_config.base_url;
 
-    let model = args
-        .model
-        .or_else(|| env::var("DEEPSEEK_MODEL").ok())
-        .or(file_config.model);
+    let model = file_config.model;
+    let model = match ModelSelection::parse(model) {
+        Ok(model) => model,
+        Err(error) => {
+            eprintln!("orca: {error}");
+            return 1;
+        }
+    };
+
+    let output_format = args.output_format;
+    let fallback =
+        if args.no_history || (output_format == OutputFormatArg::Jsonl && !args.save_history) {
+            HistoryMode::Disabled
+        } else {
+            HistoryMode::Record
+        };
+    let history_mode = resolve_history_mode(args.resume, args.fork, args.continue_latest, fallback);
 
     let config = RunConfig {
         prompt,
         cwd: args.cwd,
-        output_format: args.output_format.into(),
-        approval_mode: args.approval_mode,
+        output_format: output_format.into(),
+        approval_mode: file_config.mode.unwrap_or_default(),
         provider: args.provider,
         verifier: args.verifier,
         model,
         api_key,
         base_url,
+        history_mode,
+        show_session_picker: false,
+        permission_rules: file_config.permissions,
+        max_budget_usd: args.max_budget,
+        mcp_servers: file_config.mcp_servers,
+        hooks: file_config.hooks,
+        external_tools: crate::tools::external::load_default_external_tools(),
+        subagents: file_config.subagents.normalized(),
+        tools: file_config.tools.normalized(),
+        theme: file_config.theme,
+        vim_mode: file_config.vim_mode,
+        update_check: file_config.update_check,
+        desktop_notifications: file_config.desktop_notifications,
+        auto_memory: file_config.auto_memory,
     };
 
     controller::run(config)
 }
 
-fn run_placeholder(prompt: Vec<String>) -> i32 {
-    let file_config = file::load_user_config();
+fn run_history(args: HistoryArgs) -> i32 {
+    match args.command {
+        HistoryCommand::List { limit, all } => {
+            match history::list_sessions_with_archived(limit, all) {
+                Ok(sessions) => {
+                    for session in sessions {
+                        let model = session.model.as_deref().unwrap_or("-");
+                        let state = if session.archived {
+                            "archived"
+                        } else {
+                            "active"
+                        };
+                        println!(
+                            "{}\t{}\t{}\t{}\t{}\t{}",
+                            session.session_id,
+                            session.updated_at.to_rfc3339(),
+                            state,
+                            session.provider,
+                            model,
+                            session.title
+                        );
+                    }
+                    0
+                }
+                Err(error) => {
+                    eprintln!("orca: failed to list history: {error}");
+                    1
+                }
+            }
+        }
+        HistoryCommand::Show { session } => match history::load_session(&session) {
+            Ok(transcript) => {
+                println!("Session: {}", transcript.meta.session_id);
+                println!("Title: {}", transcript.meta.title);
+                println!("Created: {}", transcript.meta.created_at.to_rfc3339());
+                println!("Provider: {}", transcript.meta.provider);
+                println!("Model: {}", transcript.meta.model.as_deref().unwrap_or("-"));
+                if let Some(parent_id) = &transcript.meta.parent_id {
+                    println!("Parent: {parent_id}");
+                }
+                println!("Forked: {}", transcript.meta.forked);
+                if !transcript.compactions.is_empty() {
+                    println!("Compactions: {}", transcript.compactions.len());
+                    for compaction in &transcript.compactions {
+                        println!(
+                            "  {} {} -> {} messages",
+                            compaction.collapsed_at.to_rfc3339(),
+                            compaction.before_messages,
+                            compaction.after_messages
+                        );
+                    }
+                }
+                if !transcript.summaries.is_empty() {
+                    println!("Summaries: {}", transcript.summaries.len());
+                    for summary in &transcript.summaries {
+                        println!(
+                            "  {} {} -> {} messages: {}",
+                            summary.summarized_at.to_rfc3339(),
+                            summary.before_messages,
+                            summary.after_messages,
+                            summary.summary.lines().next().unwrap_or_default()
+                        );
+                    }
+                }
+                if let Some(usage) = transcript.usage {
+                    println!(
+                        "Usage: input={} output={} cache={} total={}",
+                        usage.input_tokens,
+                        usage.output_tokens,
+                        usage.cache_tokens,
+                        usage.total_tokens()
+                    );
+                    println!("Estimated cost: ${:.6}", usage.estimated_cost_usd);
+                }
+                println!("CWD: {}", transcript.meta.cwd);
+                println!("Path: {}", transcript.path.display());
+                println!();
+                for message in transcript.messages {
+                    print_message(message);
+                }
+                0
+            }
+            Err(error) => {
+                eprintln!("orca: failed to show history: {error}");
+                1
+            }
+        },
+        HistoryCommand::Archive { session } => match history::archive_session(&session) {
+            Ok(path) => {
+                println!("archived {}", path.display());
+                0
+            }
+            Err(error) => {
+                eprintln!("orca: failed to archive history: {error}");
+                1
+            }
+        },
+        HistoryCommand::Delete { session } => match history::delete_session(&session) {
+            Ok(path) => {
+                println!("deleted {}", path.display());
+                0
+            }
+            Err(error) => {
+                eprintln!("orca: failed to delete history: {error}");
+                1
+            }
+        },
+        HistoryCommand::Rename { session, title } => {
+            match history::rename_session(&session, &title) {
+                Ok(path) => {
+                    println!("renamed {}", path.display());
+                    0
+                }
+                Err(error) => {
+                    eprintln!("orca: failed to rename history: {error}");
+                    1
+                }
+            }
+        }
+        HistoryCommand::Search { query, all } => match history::search_sessions(&query, all) {
+            Ok(hits) => {
+                for hit in hits {
+                    let state = if hit.archived { "archived" } else { "active" };
+                    println!(
+                        "{}\t{}\t{}\t{}:{}\t{}",
+                        hit.session_id,
+                        state,
+                        hit.title,
+                        hit.path.display(),
+                        hit.line_number,
+                        hit.line
+                    );
+                }
+                0
+            }
+            Err(error) => {
+                eprintln!("orca: failed to search history: {error}");
+                1
+            }
+        },
+        HistoryCommand::Compress { session } => match history::compress_session(&session) {
+            Ok(path) => {
+                println!("compressed {}", path.display());
+                0
+            }
+            Err(error) => {
+                eprintln!("orca: failed to compress history: {error}");
+                1
+            }
+        },
+    }
+}
 
-    let api_key = env::var("DEEPSEEK_API_KEY")
-        .ok()
-        .or(file_config.api_key);
+fn print_message(message: crate::provider::conversation::Message) {
+    use crate::provider::conversation::Message;
 
-    let base_url = env::var("DEEPSEEK_BASE_URL")
-        .ok()
-        .or(file_config.base_url);
+    match message {
+        Message::System { content, .. } => println!("[system]\n{}\n", content.trim()),
+        Message::User { content, .. } => println!("[user]\n{}\n", content.trim()),
+        Message::Assistant {
+            content,
+            reasoning_content,
+            tool_calls,
+            ..
+        } => {
+            println!("[assistant]");
+            if let Some(reasoning) = reasoning_content.filter(|text| !text.trim().is_empty()) {
+                println!("reasoning: {}", reasoning.trim());
+            }
+            if let Some(content) = content.filter(|text| !text.trim().is_empty()) {
+                println!("{}", content.trim());
+            }
+            for tool_call in tool_calls {
+                println!(
+                    "tool_call {} {} {}",
+                    tool_call.id, tool_call.function_name, tool_call.arguments
+                );
+            }
+            println!();
+        }
+        Message::Tool {
+            tool_call_id,
+            content,
+            ..
+        } => println!("[tool {tool_call_id}]\n{}\n", content.trim()),
+    }
+}
 
-    let model = env::var("DEEPSEEK_MODEL").ok().or(file_config.model);
+fn resolve_history_mode(
+    resume: Option<String>,
+    fork: Option<String>,
+    continue_latest: bool,
+    fallback: HistoryMode,
+) -> HistoryMode {
+    if let Some(selector) = fork {
+        HistoryMode::Fork(selector)
+    } else if let Some(selector) = resume.or_else(|| {
+        if continue_latest {
+            Some("latest".to_string())
+        } else {
+            None
+        }
+    }) {
+        HistoryMode::Resume(selector)
+    } else {
+        fallback
+    }
+}
+
+fn run_placeholder(cli: Cli) -> i32 {
+    let resume_like =
+        cli.resume.is_some() as u8 + cli.fork.is_some() as u8 + cli.continue_latest as u8;
+    if resume_like > 1 {
+        eprintln!("orca: --resume, --fork, and --continue are mutually exclusive");
+        return 1;
+    }
+
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let mode = match cli.mode {
+        Some(mode) => match parse_approval_mode_value(&mode) {
+            Ok(mode) => Some(mode),
+            Err(error) => {
+                eprintln!("orca: {error}");
+                return 1;
+            }
+        },
+        None => None,
+    };
+    let file_config = match load_effective_file_config(
+        &cwd,
+        ConfigOverrides {
+            model: cli.model,
+            mode,
+            api_key: cli.api_key,
+            base_url: cli.base_url,
+        },
+    ) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("orca: {error}");
+            return 1;
+        }
+    };
+
+    let api_key = file_config.api_key;
+
+    let base_url = file_config.base_url;
+
+    let model = file_config.model;
+    let model = match ModelSelection::parse(model) {
+        Ok(model) => model,
+        Err(error) => {
+            eprintln!("orca: {error}");
+            return 1;
+        }
+    };
+
+    let history_mode = resolve_history_mode(
+        cli.resume,
+        cli.fork,
+        cli.continue_latest,
+        HistoryMode::Record,
+    );
 
     let config = RunConfig {
-        prompt: prompt.join(" "),
+        prompt: cli.prompt.join(" "),
         cwd: None,
         output_format: OutputFormat::Text,
-        approval_mode: ApprovalMode::Suggest,
-        provider: ProviderKind::DeepSeek,
+        approval_mode: file_config.mode.unwrap_or_default(),
+        provider: cli.provider,
         verifier: None,
         model,
         api_key,
         base_url,
+        history_mode,
+        show_session_picker: cli.session_picker,
+        permission_rules: file_config.permissions,
+        max_budget_usd: None,
+        mcp_servers: file_config.mcp_servers,
+        hooks: file_config.hooks,
+        external_tools: crate::tools::external::load_default_external_tools(),
+        subagents: file_config.subagents.normalized(),
+        tools: file_config.tools.normalized(),
+        theme: file_config.theme,
+        vim_mode: file_config.vim_mode,
+        update_check: file_config.update_check,
+        desktop_notifications: file_config.desktop_notifications,
+        auto_memory: file_config.auto_memory,
     };
 
     app::run_tui(config)
+}
+
+fn run_server(cli: Cli) -> i32 {
+    if cli.command.is_some() || !cli.prompt.is_empty() {
+        eprintln!("orca: --mode=server cannot be combined with a subcommand or prompt");
+        return 1;
+    }
+
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let file_config = match load_effective_file_config(
+        &cwd,
+        ConfigOverrides {
+            model: cli.model,
+            mode: None,
+            api_key: cli.api_key,
+            base_url: cli.base_url,
+        },
+    ) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("orca: {error}");
+            return 1;
+        }
+    };
+
+    let model = match ModelSelection::parse(file_config.model) {
+        Ok(model) => model,
+        Err(error) => {
+            eprintln!("orca: {error}");
+            return 1;
+        }
+    };
+
+    let config = RunConfig {
+        prompt: String::new(),
+        cwd: None,
+        output_format: OutputFormat::Jsonl,
+        approval_mode: file_config.mode.unwrap_or_default(),
+        provider: cli.provider,
+        verifier: None,
+        model,
+        api_key: file_config.api_key,
+        base_url: file_config.base_url,
+        history_mode: HistoryMode::Disabled,
+        show_session_picker: false,
+        permission_rules: file_config.permissions,
+        max_budget_usd: None,
+        mcp_servers: file_config.mcp_servers,
+        hooks: file_config.hooks,
+        external_tools: crate::tools::external::load_default_external_tools(),
+        subagents: file_config.subagents.normalized(),
+        tools: file_config.tools.normalized(),
+        theme: file_config.theme,
+        vim_mode: file_config.vim_mode,
+        update_check: file_config.update_check,
+        desktop_notifications: false,
+        auto_memory: file_config.auto_memory,
+    };
+
+    crate::server::run(crate::server::ServerConfig { run_config: config })
 }

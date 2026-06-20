@@ -1,0 +1,64 @@
+use std::path::Path;
+
+use orca_core::approval_types::{ActionKind, ApprovalMode};
+use orca_core::subagent_types::SubagentType;
+use orca_core::tool_types::ToolResult;
+use orca_provider::system_prompt::build_system_prompt;
+
+use crate::instructions::ProjectInstructions;
+use crate::memory::MemoryBlock;
+
+pub fn build_agent_system_prompt(
+    cwd: &Path,
+    subagent_depth: u32,
+    subagent_type: &SubagentType,
+    instructions: Option<&ProjectInstructions>,
+    approval_mode: ApprovalMode,
+    memory: Option<&MemoryBlock>,
+) -> String {
+    let mut prompt = build_system_prompt(cwd);
+    if let Some(block) = memory.and_then(MemoryBlock::to_system_prompt_block) {
+        prompt.push_str("\n\n");
+        prompt.push_str(&block);
+    }
+    if let Some(block) = instructions.and_then(ProjectInstructions::to_system_prompt_block) {
+        prompt.push_str("\n\n");
+        prompt.push_str(&block);
+    }
+    if subagent_depth > 0 {
+        prompt.push_str(
+            "\n\n## Subagent Role\nYou are running as a synchronous subagent. Complete only the delegated task and return a concise report for the parent agent. Do not assume the user can see your intermediate tool output.",
+        );
+        let suffix = subagent_type.system_prompt_suffix();
+        if !suffix.is_empty() {
+            prompt.push_str(suffix);
+        }
+    }
+    if approval_mode == ApprovalMode::Plan {
+        prompt.push_str(
+            "\n\n## Plan Mode\nYou are in read-only planning mode. You may analyze and inspect context, but you must not modify files, run shell commands, or perform write actions.",
+        );
+    }
+    prompt
+}
+
+pub fn format_tool_result_for_model(result: &ToolResult) -> String {
+    match (&result.output, &result.error) {
+        (Some(output), _) => {
+            if result.truncated {
+                format!("{output}\n[output truncated]")
+            } else {
+                output.clone()
+            }
+        }
+        (_, Some(error)) => format!("ERROR: {error}"),
+        _ => "(no output)".to_string(),
+    }
+}
+
+pub fn requires_approval(action: ActionKind) -> bool {
+    matches!(
+        action,
+        ActionKind::Write | ActionKind::Network | ActionKind::Agent | ActionKind::Shell
+    )
+}

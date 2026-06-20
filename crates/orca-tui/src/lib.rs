@@ -1,0 +1,11 @@
+pub mod app;
+pub mod bridge;
+pub mod commands;
+pub mod diff;
+pub mod shortcuts;
+pub mod theme;
+pub mod types;
+pub mod ui;
+pub mod vim;
+
+pub use app::run_tui;
