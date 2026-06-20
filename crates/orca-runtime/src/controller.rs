@@ -1009,7 +1009,7 @@ fn execute_workflow_tool(
     if !config.workflows.enabled {
         return Ok(tool_types::ToolResult::failed(
             tool_request,
-            "workflow execution is disabled in config",
+            "workflows are disabled",
             None,
         ));
     }

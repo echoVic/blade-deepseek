@@ -2,6 +2,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use orca_core::config::WorkflowConfig;
 use orca_core::workflow_types::{WorkflowInput, WorkflowMeta};
 use sha2::{Digest, Sha256};
 
@@ -82,6 +83,13 @@ pub fn resolve_workflow_script_with_user_dir(
         meta,
         script,
     })
+}
+
+pub fn contains_workflow_keyword(prompt: &str, config: &WorkflowConfig) -> bool {
+    config.keyword_trigger_enabled
+        && prompt
+            .split_whitespace()
+            .any(|word| word == "ultracode")
 }
 
 fn resolve_path(cwd: &Path, raw_path: &str) -> PathBuf {
@@ -331,7 +339,9 @@ fn sha256_hex(input: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_workflow_meta;
+    use orca_core::config::WorkflowConfig;
+
+    use super::{contains_workflow_keyword, parse_workflow_meta};
 
     #[test]
     fn parser_accepts_double_quotes() {
@@ -341,5 +351,18 @@ mod tests {
         .unwrap();
         assert_eq!(meta.name, "audit");
         assert!(meta.phases.is_empty());
+    }
+
+    #[test]
+    fn workflow_keyword_requires_exact_word_and_enabled_switch() {
+        let enabled = WorkflowConfig::default();
+        assert!(contains_workflow_keyword("please run ultracode now", &enabled));
+        assert!(!contains_workflow_keyword("please run ultracode-now", &enabled));
+
+        let disabled = WorkflowConfig {
+            keyword_trigger_enabled: false,
+            ..WorkflowConfig::default()
+        };
+        assert!(!contains_workflow_keyword("please run ultracode now", &disabled));
     }
 }

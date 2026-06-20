@@ -65,6 +65,27 @@ fn workflow_run_named_script_resolves_project_workflow() {
 }
 
 #[test]
+fn disable_workflows_setting_blocks_launch() {
+    let temp = tempdir().unwrap();
+    fs::write(temp.path().join("config.toml"), "disableWorkflows = true\n").unwrap();
+    let script = temp.path().join("audit.js");
+    fs::write(
+        &script,
+        "export const meta = { name: 'audit', description: 'Audit code', phases: [] };\nexport default 'blocked';",
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .env("ORCA_HOME", temp.path())
+        .args(["workflow", "run", script.to_str().unwrap()])
+        .output()
+        .expect("run workflow");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("workflows are disabled"));
+}
+
+#[test]
 fn workflow_list_and_show_inspect_persisted_runs() {
     let temp = tempdir().unwrap();
     let script = temp.path().join("audit.js");

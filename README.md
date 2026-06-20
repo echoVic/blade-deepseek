@@ -87,6 +87,18 @@ Options:
 - top-level `--session-picker` — Choose a saved conversation before entering TUI mode
 - top-level `--mode=server` — Read JSONL `submit` requests from stdin and emit protocol events to stdout
 
+## Workflows
+
+`orca workflow run <script-or-name>` runs a Claude Code-style dynamic workflow.
+Named workflows resolve from the nearest `.claude/workflows/` directory first,
+then `~/.claude/workflows/`. Project workflows win over user workflows.
+
+Workflow scripts are JavaScript modules beginning with:
+
+```js
+export const meta = { name: "audit", description: "Audit code", phases: ["scan"] };
+```
+
 ## Conversation History
 
 Text-mode `orca exec` saves local JSONL transcripts under `~/.orca/sessions/YYYY/MM/DD/`.
