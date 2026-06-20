@@ -4,6 +4,10 @@ import vm from "node:vm";
 const scriptPath = process.argv[2];
 const argsJson = process.argv[3] ?? "null";
 const workflowArgs = JSON.parse(argsJson);
+const hostTestMode =
+  workflowArgs &&
+  typeof workflowArgs === "object" &&
+  workflowArgs.__orcaHostTestMode;
 const FORBIDDEN_IDENTIFIERS = new Set([
   "process",
   "require",
@@ -27,6 +31,7 @@ let callSeq = 0;
 let currentPhase = null;
 let stdinBuffer = "";
 const stdinResolvers = [];
+let stdinClosed = false;
 
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (chunk) => {
@@ -34,6 +39,7 @@ process.stdin.on("data", (chunk) => {
   flushStdinResolvers();
 });
 process.stdin.on("end", () => {
+  stdinClosed = true;
   flushStdinResolvers();
 });
 
@@ -104,7 +110,19 @@ function flushStdinResolvers() {
   while (stdinResolvers.length > 0) {
     const newlineIndex = stdinBuffer.indexOf("\n");
     if (newlineIndex === -1) {
-      return;
+      if (!stdinClosed) {
+        return;
+      }
+
+      const trailing = stdinBuffer.trim();
+      stdinBuffer = "";
+      const pending = stdinResolvers.shift();
+      if (trailing.length > 0) {
+        pending.reject(new Error(`Workflow host protocol ended with partial JSON: ${trailing}`));
+      } else {
+        pending.reject(new Error("Workflow host protocol closed before agent result"));
+      }
+      continue;
     }
 
     const line = stdinBuffer.slice(0, newlineIndex).trim();
@@ -632,6 +650,10 @@ function isIdentifierPart(char) {
 }
 
 try {
+  if (hostTestMode === "emit_invalid_json") {
+    process.stdout.write("not-json\n");
+    process.exit(0);
+  }
   const namespace = await loadWorkflowModule();
   emit({ type: "workflow_completed", result: namespace.default ?? null });
 } catch (error) {

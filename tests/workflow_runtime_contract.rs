@@ -5,7 +5,10 @@ use orca_core::config::{
     HistoryMode, OutputFormat, ProviderKind, RunConfig, ToolConfig, WorkflowConfig,
 };
 use orca_core::model::ModelSelection;
+use orca_core::task_types::TaskStatus;
+use orca_core::workflow_types::WorkflowRunStatus;
 use orca_runtime::tasks::TaskRegistry;
+use orca_runtime::workflow::state::WorkflowStateStore;
 use orca_runtime::workflow::{WorkflowLaunchRequest, WorkflowRunner};
 use tempfile::tempdir;
 
@@ -75,6 +78,49 @@ fn workflow_resume_uses_completed_agent_cache() {
         .unwrap();
 
     assert!(second.summary.contains("cached 1 agent"));
+}
+
+#[test]
+fn workflow_runner_marks_task_and_run_failed_on_host_error() {
+    if !orca_runtime::workflow::host::WorkflowHost::node_available() {
+        return;
+    }
+
+    let temp = tempdir().unwrap();
+    let script = temp.path().join("workflow.js");
+    fs::write(
+        &script,
+        "export const meta = { name: 'host-failure', description: 'Host failure test', phases: [] };\nconsole.log('not-json');\nexport default 'unreachable';",
+    )
+    .unwrap();
+
+    let config = mock_run_config(temp.path());
+    let tasks = TaskRegistry::new("session-1".to_string());
+    let session_dir = temp.path().join("session");
+    let runner = WorkflowRunner::new(config, tasks.clone(), session_dir.clone());
+
+    let error = runner
+        .launch(WorkflowLaunchRequest::from(orca_core::workflow_types::WorkflowInput {
+            script_path: Some(script.display().to_string()),
+            args: Some(serde_json::json!({
+                "__orcaHostTestMode": "emit_invalid_json"
+            })),
+            ..Default::default()
+        }))
+        .unwrap_err();
+
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+
+    let task = tasks.list().into_iter().next().expect("workflow task");
+    let record = tasks.get(&task.id).expect("task record");
+    assert_eq!(record.status, TaskStatus::Failed);
+    assert!(record.error.as_deref().is_some());
+
+    let run_id = record.workflow_run_id.as_deref().expect("run id");
+    let store = WorkflowStateStore::new(session_dir.join("workflow-runs"));
+    let state = store.load_run(run_id).expect("run state");
+    assert_eq!(state.status, WorkflowRunStatus::Failed);
+    assert!(state.error.as_deref().is_some());
 }
 
 fn mock_run_config(cwd: &std::path::Path) -> RunConfig {

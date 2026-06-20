@@ -1,4 +1,6 @@
 use std::fs;
+use std::io::{BufRead, BufReader};
+use std::process::{Command, Stdio};
 
 use orca_runtime::workflow::host::{HostEvent, WorkflowHost};
 use tempfile::tempdir;
@@ -67,9 +69,11 @@ fn host_ignores_export_mentions_in_comments_and_strings_when_loading_workflow_mo
 
     let events = WorkflowHost::run_collecting_events(&script, serde_json::json!(null)).unwrap();
 
-    assert!(events.iter().any(
-        |event| matches!(event, HostEvent::PhaseStarted { name } if name == "scan")
-    ));
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, HostEvent::PhaseStarted { name } if name == "scan"))
+    );
     assert!(events.iter().any(|event| {
         matches!(
             event,
@@ -257,4 +261,59 @@ fn host_returns_workflow_failed_event_for_script_exceptions() {
             HostEvent::WorkflowFailed { error } if error.contains("boom from script")
         )
     }));
+}
+
+#[test]
+fn host_reports_workflow_failed_when_stdin_closes_before_agent_result() {
+    if !WorkflowHost::node_available() {
+        return;
+    }
+
+    let temp = tempdir().unwrap();
+    let script = temp.path().join("workflow.js");
+    fs::write(
+        &script,
+        "export const meta = { name: 'stdin-eof-test', description: 'stdin eof', phases: [] };\nawait agent('inspect repo');\nexport default 'done';",
+    )
+    .unwrap();
+
+    let host = temp.path().join("host.mjs");
+    fs::write(
+        &host,
+        include_str!("../crates/orca-runtime/src/workflow/host.mjs"),
+    )
+    .unwrap();
+
+    let mut child = Command::new("node")
+        .arg(&host)
+        .arg(&script)
+        .arg("null")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+    let mut first_line = String::new();
+    reader.read_line(&mut first_line).unwrap();
+    assert!(first_line.contains("\"type\":\"agent_call\""));
+
+    let stdin = child.stdin.take().unwrap();
+    drop(stdin);
+
+    let mut remaining = Vec::new();
+    for line in reader.lines() {
+        remaining.push(line.unwrap());
+    }
+
+    let output = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "expected host to exit with workflow failure, status={:?}, stderr={stderr}",
+        output.status.code()
+    );
+    assert!(remaining.iter().any(|line| line.contains("\"type\":\"workflow_failed\"")));
 }

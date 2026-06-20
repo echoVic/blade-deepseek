@@ -118,7 +118,7 @@ impl WorkflowRunner {
         let mut failed_error = None;
         let mut completed_result = None;
 
-        let events = WorkflowHost::run_collecting_events_with_agent(
+        let events = match WorkflowHost::run_collecting_events_with_agent(
             &resolved.persisted_path,
             args,
             |call| {
@@ -131,7 +131,20 @@ impl WorkflowRunner {
                     &mut cached_agents,
                 )
             },
-        )?;
+        ) {
+            Ok(events) => events,
+            Err(error) => {
+                let message = error.to_string();
+                state.total_agent_count = total_agents;
+                state.status = WorkflowRunStatus::Failed;
+                state.error = Some(message.clone());
+                self.state.write_state(&state)?;
+                self.tasks
+                    .fail(&task.id, message.clone())
+                    .map_err(io::Error::other)?;
+                return Err(error);
+            }
+        };
 
         for event in events {
             match event {
