@@ -2,6 +2,8 @@ use std::fs;
 use std::io;
 use std::io::sink;
 use std::path::PathBuf;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use orca_core::approval_types::ApprovalMode;
 use orca_core::cancel::CancelToken;
@@ -12,7 +14,8 @@ use orca_core::event_sink::EventSink;
 use orca_core::subagent_types::SubagentType;
 use orca_core::task_types::TaskType;
 use orca_core::workflow_types::{
-    WorkflowAgentStatus, WorkflowInput, WorkflowOutput, WorkflowRunState, WorkflowRunStatus,
+    WorkflowAgentStatus, WorkflowInput, WorkflowOutput, WorkflowPhaseRecord, WorkflowRunState,
+    WorkflowRunStatus,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -70,6 +73,82 @@ pub struct WorkflowRunner {
     state: WorkflowStateStore,
 }
 
+#[derive(Clone, Debug, Default)]
+struct WorkflowExecutionCounters {
+    total_agents: u32,
+    active_agents: usize,
+}
+
+#[derive(Debug)]
+struct WorkflowExecutionGate {
+    counters: Mutex<WorkflowExecutionCounters>,
+    condvar: Condvar,
+}
+
+impl WorkflowExecutionGate {
+    fn new() -> Self {
+        Self {
+            counters: Mutex::new(WorkflowExecutionCounters::default()),
+            condvar: Condvar::new(),
+        }
+    }
+
+    fn begin_agent(
+        self: &Arc<Self>,
+        max_agents_per_run: u32,
+        max_concurrent_agents: usize,
+    ) -> io::Result<WorkflowAgentPermit> {
+        let mut counters = self
+            .counters
+            .lock()
+            .map_err(|_| io::Error::other("workflow execution counters poisoned"))?;
+        if counters.total_agents >= max_agents_per_run {
+            return Err(io::Error::other(format!(
+                "maximum workflow agent count {max_agents_per_run} exceeded"
+            )));
+        }
+        while counters.active_agents >= max_concurrent_agents {
+            counters = self
+                .condvar
+                .wait(counters)
+                .map_err(|_| io::Error::other("workflow execution counters poisoned"))?;
+        }
+        counters.total_agents += 1;
+        counters.active_agents += 1;
+        Ok(WorkflowAgentPermit {
+            gate: Arc::clone(self),
+        })
+    }
+
+    fn finish_agent(&self) {
+        if let Ok(mut counters) = self.counters.lock() {
+            if counters.active_agents > 0 {
+                counters.active_agents -= 1;
+            }
+            self.condvar.notify_one();
+        }
+    }
+
+    fn snapshot(&self) -> io::Result<WorkflowExecutionCounters> {
+        self.counters
+            .lock()
+            .map(|guard| guard.clone())
+            .map_err(|_| io::Error::other("workflow execution counters poisoned"))
+    }
+
+}
+
+#[derive(Debug)]
+struct WorkflowAgentPermit {
+    gate: Arc<WorkflowExecutionGate>,
+}
+
+impl Drop for WorkflowAgentPermit {
+    fn drop(&mut self) {
+        self.gate.finish_agent();
+    }
+}
+
 impl WorkflowRunner {
     pub fn new(config: RunConfig, tasks: TaskRegistry, session_dir: PathBuf) -> Self {
         let state = WorkflowStateStore::new(session_dir.join("workflow-runs"));
@@ -110,6 +189,7 @@ impl WorkflowRunner {
             script_digest: resolved.script_digest.clone(),
             args_digest: digest_value(request.input.args.as_ref().unwrap_or(&Value::Null)),
             status: WorkflowRunStatus::Queued,
+            phases: Vec::new(),
             total_agent_count: 0,
             final_summary: None,
             error: None,
@@ -126,28 +206,30 @@ impl WorkflowRunner {
         let args = request.input.args.clone().unwrap_or(Value::Null);
         let resume_from = request.input.resume_from_run_id.clone();
         let mut cached_agents = 0u32;
-        let mut total_agents = 0u32;
         let mut failed_error = None;
         let mut completed_result = None;
+        let gate = Arc::new(WorkflowExecutionGate::new());
+        let workflow_limits = self.config.workflows.clone();
 
         let events = match WorkflowHost::run_collecting_events_with_agent(
             &resolved.persisted_path,
             args,
             |call| {
-                total_agents += 1;
                 self.answer_agent_call(
                     &run_id,
                     resume_from.as_deref(),
                     &transcript_dir,
                     call,
                     &mut cached_agents,
+                    &gate,
+                    &workflow_limits,
                 )
             },
         ) {
             Ok(events) => events,
             Err(error) => {
                 let message = error.to_string();
-                state.total_agent_count = total_agents;
+                state.total_agent_count = gate.snapshot()?.total_agents;
                 state.status = WorkflowRunStatus::Failed;
                 state.error = Some(message.clone());
                 self.state.write_state(&state)?;
@@ -158,19 +240,42 @@ impl WorkflowRunner {
             }
         };
 
+        let mut phase_agent_baselines = std::collections::HashMap::new();
+        let mut agent_events_seen = 0u32;
         for event in events {
             match event {
+                HostEvent::PhaseStarted { name } => {
+                    phase_agent_baselines.insert(name.clone(), agent_events_seen);
+                    state.phases.push(WorkflowPhaseRecord {
+                        name,
+                        status: WorkflowRunStatus::Running,
+                        started_at_ms: Some(now_ms()),
+                        completed_at_ms: None,
+                        agent_count: 0,
+                    });
+                }
+                HostEvent::PhaseCompleted { name } => {
+                    if let Some(phase) = state.phases.iter_mut().rev().find(|phase| phase.name == name)
+                    {
+                        phase.status = WorkflowRunStatus::Completed;
+                        phase.completed_at_ms = Some(now_ms());
+                        let baseline = phase_agent_baselines.get(&name).copied().unwrap_or(0);
+                        phase.agent_count = agent_events_seen.saturating_sub(baseline);
+                    }
+                }
+                HostEvent::AgentCall { .. } => {
+                    agent_events_seen += 1;
+                }
                 HostEvent::WorkflowCompleted { result } => {
                     completed_result = Some(result_to_summary(&result));
                 }
                 HostEvent::WorkflowFailed { error } => {
                     failed_error = Some(error);
                 }
-                _ => {}
             }
         }
 
-        state.total_agent_count = total_agents;
+        state.total_agent_count = gate.snapshot()?.total_agents;
         if let Some(error) = failed_error {
             state.status = WorkflowRunStatus::Failed;
             state.error = Some(error.clone());
@@ -224,7 +329,21 @@ impl WorkflowRunner {
         transcript_dir: &std::path::Path,
         call: AgentCall,
         cached_agents: &mut u32,
+        gate: &Arc<WorkflowExecutionGate>,
+        workflow_limits: &orca_core::config::WorkflowConfig,
     ) -> io::Result<HostCommand> {
+        let _permit = match gate.begin_agent(
+            workflow_limits.max_agents_per_run,
+            workflow_limits.max_concurrent_agents,
+        ) {
+            Ok(permit) => permit,
+            Err(error) => {
+                return Ok(HostCommand::AgentError {
+                    call_id: call.call_id,
+                    error: error.to_string(),
+                });
+            }
+        };
         let hash = input_hash(&call.prompt, &call.opts);
         if let Some(resume_run_id) = resume_from {
             if let Some(cached_value) =
@@ -232,7 +351,8 @@ impl WorkflowRunner {
                     .find_cached_agent_value(resume_run_id, &call.call_path, &hash)
             {
                 *cached_agents += 1;
-                let output = result_to_summary(&cached_value);
+                let normalized_cached_value = normalize_cached_agent_result(&call, cached_value);
+                let output = result_to_summary(&normalized_cached_value);
                 let transcript_path = write_agent_transcript(transcript_dir, &call, &output, true)?;
                 self.state.record_agent_completed(
                     run_id,
@@ -243,14 +363,14 @@ impl WorkflowRunner {
                         opts: call.opts.clone(),
                         input_hash: hash,
                         status: WorkflowAgentStatus::Completed,
-                        output: Some(cached_value.clone()),
+                        output: Some(normalized_cached_value.clone()),
                         error: None,
                         transcript_path: Some(transcript_path.display().to_string()),
                     },
                 )?;
                 return Ok(HostCommand::AgentResult {
                     call_id: call.call_id,
-                    result: cached_value,
+                    result: normalized_cached_value,
                 });
             }
         }
@@ -260,6 +380,7 @@ impl WorkflowRunner {
                 let output = child_agent_output(&call.prompt, &output);
                 let transcript_path =
                     write_agent_transcript(transcript_dir, &call, &output, false)?;
+                let result = workflow_agent_result(&call, Value::String(output.clone()), false);
                 self.state.record_agent_completed(
                     run_id,
                     WorkflowAgentRecord {
@@ -269,7 +390,7 @@ impl WorkflowRunner {
                         opts: call.opts.clone(),
                         input_hash: hash,
                         status: WorkflowAgentStatus::Completed,
-                        output: Some(Value::String(output.clone())),
+                        output: Some(result.clone()),
                         error: None,
                         transcript_path: Some(transcript_path.display().to_string()),
                     },
@@ -277,7 +398,7 @@ impl WorkflowRunner {
 
                 Ok(HostCommand::AgentResult {
                     call_id: call.call_id,
-                    result: Value::String(output),
+                    result,
                 })
             }
             Err(error) => {
@@ -363,6 +484,13 @@ impl WorkflowRunner {
     }
 }
 
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 fn write_agent_transcript(
     transcript_dir: &std::path::Path,
     call: &AgentCall,
@@ -389,8 +517,45 @@ fn write_agent_transcript(
 fn result_to_summary(result: &Value) -> String {
     match result {
         Value::String(value) => value.clone(),
+        Value::Object(map) => map
+            .get("prompt")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+            .or_else(|| {
+                map.get("result")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+            })
+            .unwrap_or_else(|| result.to_string()),
         Value::Null => String::new(),
         value => value.to_string(),
+    }
+}
+
+fn workflow_agent_result(call: &AgentCall, result: Value, cached: bool) -> Value {
+    serde_json::json!({
+        "callId": call.call_id,
+        "callPath": call.call_path,
+        "phase": call.phase,
+        "prompt": call.prompt,
+        "opts": call.opts,
+        "cached": cached,
+        "result": result,
+    })
+}
+
+fn normalize_cached_agent_result(call: &AgentCall, cached_value: Value) -> Value {
+    match cached_value {
+        Value::Object(map)
+            if map.contains_key("callId")
+                && map.contains_key("callPath")
+                && map.contains_key("prompt")
+                && map.contains_key("cached") =>
+        {
+            Value::Object(map)
+        }
+        Value::Object(map) => Value::Object(map),
+        other => workflow_agent_result(call, other, true),
     }
 }
 

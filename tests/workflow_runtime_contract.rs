@@ -232,6 +232,89 @@ fn workflow_runner_marks_task_and_run_failed_on_child_agent_error() {
     );
 }
 
+#[test]
+fn parallel_preserves_order_and_records_phase() {
+    if !orca_runtime::workflow::host::WorkflowHost::node_available() {
+        return;
+    }
+
+    let temp = tempdir().unwrap();
+    let script = temp.path().join("workflow.js");
+    fs::write(
+        &script,
+        "export const meta = { name: 'parallel', description: 'Parallel test', phases: ['fanout'] };\nconst result = await phase('fanout', async () => parallel([agent('first'), agent('second')]));\nexport default result.map(item => item.prompt).join(',');",
+    )
+    .unwrap();
+
+    let config = mock_run_config(temp.path());
+    let tasks = TaskRegistry::new("session-1".to_string());
+    let session_dir = temp.path().join("session");
+    let runner = WorkflowRunner::new(config, tasks.clone(), session_dir.clone());
+    let launched = runner
+        .launch(WorkflowLaunchRequest::from_script_path(
+            script.display().to_string(),
+        ))
+        .unwrap();
+
+    assert!(launched.summary.contains("first,second"));
+
+    let run_id = launched.output.run_id.as_deref().expect("run id");
+    let store = WorkflowStateStore::new(session_dir.join("workflow-runs"));
+    let state = store.load_run(run_id).expect("run state");
+    assert_eq!(state.total_agent_count, 2);
+    assert_eq!(state.phases.len(), 1);
+    let phase = &state.phases[0];
+    assert_eq!(phase.name, "fanout");
+    assert_eq!(phase.status, WorkflowRunStatus::Completed);
+    assert_eq!(phase.agent_count, 2);
+    assert!(phase.started_at_ms.is_some());
+    assert!(phase.completed_at_ms.is_some());
+}
+
+#[test]
+fn agent_cap_failure_is_recorded() {
+    if !orca_runtime::workflow::host::WorkflowHost::node_available() {
+        return;
+    }
+
+    let temp = tempdir().unwrap();
+    let script = temp.path().join("workflow.js");
+    fs::write(
+        &script,
+        "export const meta = { name: 'cap', description: 'Cap test', phases: [] };\nfor (let i = 0; i < 1001; i++) await agent(`agent ${i}`);\nexport default 'unreachable';",
+    )
+    .unwrap();
+
+    let config = mock_run_config(temp.path());
+    let tasks = TaskRegistry::new("session-1".to_string());
+    let session_dir = temp.path().join("session");
+    let runner = WorkflowRunner::new(config, tasks.clone(), session_dir.clone());
+    let err = runner
+        .launch(WorkflowLaunchRequest::from_script_path(
+            script.display().to_string(),
+        ))
+        .unwrap_err();
+
+    assert!(err
+        .to_string()
+        .contains("maximum workflow agent count 1000 exceeded"));
+
+    let task = tasks.list().into_iter().next().expect("workflow task");
+    let record = tasks.get(&task.id).expect("task record");
+    let run_id = record.workflow_run_id.as_deref().expect("run id");
+    let store = WorkflowStateStore::new(session_dir.join("workflow-runs"));
+    let state = store.load_run(run_id).expect("run state");
+    assert_eq!(state.status, WorkflowRunStatus::Failed);
+    assert_eq!(state.total_agent_count, 1000);
+    assert!(
+        state
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("maximum workflow agent count 1000 exceeded")
+    );
+}
+
 fn mock_run_config(cwd: &std::path::Path) -> RunConfig {
     RunConfig {
         prompt: String::new(),

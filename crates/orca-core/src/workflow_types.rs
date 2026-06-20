@@ -74,6 +74,16 @@ pub enum WorkflowAgentStatus {
     Cancelled,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkflowPhaseRecord {
+    pub name: String,
+    pub status: WorkflowRunStatus,
+    pub started_at_ms: Option<i64>,
+    pub completed_at_ms: Option<i64>,
+    pub agent_count: u32,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkflowRunState {
@@ -86,6 +96,8 @@ pub struct WorkflowRunState {
     pub script_digest: String,
     pub args_digest: String,
     pub status: WorkflowRunStatus,
+    #[serde(default)]
+    pub phases: Vec<WorkflowPhaseRecord>,
     pub total_agent_count: u32,
     pub final_summary: Option<String>,
     pub error: Option<String>,
