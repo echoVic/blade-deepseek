@@ -3,6 +3,7 @@ use std::io;
 use std::io::sink;
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use orca_core::approval_types::ApprovalMode;
@@ -28,8 +29,8 @@ use crate::memory;
 use crate::tasks::TaskRegistry;
 
 use super::host::{AgentCall, HostCommand, HostEvent, WorkflowHost};
-use super::script::resolve_workflow_script;
-use super::state::{input_hash, WorkflowAgentRecord, WorkflowStateStore};
+use super::script::{ResolvedWorkflowScript, resolve_workflow_script};
+use super::state::{WorkflowAgentRecord, WorkflowStateStore, input_hash};
 
 #[derive(Clone, Debug, Default)]
 pub struct WorkflowLaunchRequest {
@@ -65,6 +66,22 @@ pub struct WorkflowLaunchResult {
     pub summary: String,
 }
 
+#[derive(Debug)]
+pub struct WorkflowBackgroundLaunch {
+    pub task_id: String,
+    pub run_id: String,
+    pub workflow_name: String,
+    pub phases: Vec<String>,
+    pub output: WorkflowOutput,
+    handle: thread::JoinHandle<io::Result<WorkflowLaunchResult>>,
+}
+
+impl WorkflowBackgroundLaunch {
+    pub fn join(self) -> thread::Result<io::Result<WorkflowLaunchResult>> {
+        self.handle.join()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct WorkflowRunner {
     config: RunConfig,
@@ -77,6 +94,15 @@ pub struct WorkflowRunner {
 struct WorkflowExecutionCounters {
     total_agents: u32,
     active_agents: usize,
+}
+
+#[derive(Clone, Debug)]
+struct PreparedWorkflowRun {
+    request: WorkflowLaunchRequest,
+    resolved: ResolvedWorkflowScript,
+    task_id: String,
+    run_id: String,
+    transcript_dir: PathBuf,
 }
 
 #[derive(Debug)]
@@ -135,7 +161,6 @@ impl WorkflowExecutionGate {
             .map(|guard| guard.clone())
             .map_err(|_| io::Error::other("workflow execution counters poisoned"))
     }
-
 }
 
 #[derive(Debug)]
@@ -161,14 +186,49 @@ impl WorkflowRunner {
     }
 
     pub fn launch(&self, request: WorkflowLaunchRequest) -> io::Result<WorkflowLaunchResult> {
-        self.run(request)
+        let prepared = self.prepare_launch(request)?;
+        self.execute_prepared(prepared)
     }
 
     pub fn resume(&self, request: WorkflowLaunchRequest) -> io::Result<WorkflowLaunchResult> {
-        self.run(request)
+        let prepared = self.prepare_launch(request)?;
+        self.execute_prepared(prepared)
     }
 
-    fn run(&self, request: WorkflowLaunchRequest) -> io::Result<WorkflowLaunchResult> {
+    pub fn launch_background(
+        &self,
+        request: WorkflowLaunchRequest,
+    ) -> io::Result<WorkflowBackgroundLaunch> {
+        let prepared = self.prepare_launch(request)?;
+        let task_id = prepared.task_id.clone();
+        let run_id = prepared.run_id.clone();
+        let workflow_name = prepared.resolved.meta.name.clone();
+        let phases = prepared.resolved.meta.phases.clone();
+        let output = WorkflowOutput {
+            status: "async_launched".to_string(),
+            task_id: task_id.clone(),
+            task_type: Some("local_workflow".to_string()),
+            workflow_name: Some(workflow_name.clone()),
+            run_id: Some(run_id.clone()),
+            summary: Some("Workflow launched".to_string()),
+            transcript_dir: Some(prepared.transcript_dir.display().to_string()),
+            script_path: Some(prepared.resolved.persisted_path.display().to_string()),
+            session_url: None,
+        };
+        let runner = self.clone();
+        let handle = thread::spawn(move || runner.execute_prepared(prepared));
+
+        Ok(WorkflowBackgroundLaunch {
+            task_id,
+            run_id,
+            workflow_name,
+            phases,
+            output,
+            handle,
+        })
+    }
+
+    fn prepare_launch(&self, request: WorkflowLaunchRequest) -> io::Result<PreparedWorkflowRun> {
         let cwd = self.config.cwd.clone().unwrap_or(std::env::current_dir()?);
         fs::create_dir_all(&self.session_dir)?;
 
@@ -203,6 +263,25 @@ impl WorkflowRunner {
         self.state.write_state(&state)?;
 
         let transcript_dir = self.state.transcript_dir(&run_id);
+
+        Ok(PreparedWorkflowRun {
+            request,
+            resolved,
+            task_id: task.id,
+            run_id,
+            transcript_dir,
+        })
+    }
+
+    fn execute_prepared(&self, prepared: PreparedWorkflowRun) -> io::Result<WorkflowLaunchResult> {
+        let PreparedWorkflowRun {
+            request,
+            resolved,
+            task_id,
+            run_id,
+            transcript_dir,
+        } = prepared;
+        let mut state = self.state.load_run(&run_id)?;
         let args = request.input.args.clone().unwrap_or(Value::Null);
         let resume_from = request.input.resume_from_run_id.clone();
         let mut cached_agents = 0u32;
@@ -234,7 +313,7 @@ impl WorkflowRunner {
                 state.error = Some(message.clone());
                 self.state.write_state(&state)?;
                 self.tasks
-                    .fail(&task.id, message.clone())
+                    .fail(&task_id, message.clone())
                     .map_err(io::Error::other)?;
                 return Err(error);
             }
@@ -255,7 +334,11 @@ impl WorkflowRunner {
                     });
                 }
                 HostEvent::PhaseCompleted { name } => {
-                    if let Some(phase) = state.phases.iter_mut().rev().find(|phase| phase.name == name)
+                    if let Some(phase) = state
+                        .phases
+                        .iter_mut()
+                        .rev()
+                        .find(|phase| phase.name == name)
                     {
                         phase.status = WorkflowRunStatus::Completed;
                         phase.completed_at_ms = Some(now_ms());
@@ -286,7 +369,7 @@ impl WorkflowRunner {
             state.error = Some(error.clone());
             self.state.write_state(&state)?;
             self.tasks
-                .fail(&task.id, error.clone())
+                .fail(&task_id, error.clone())
                 .map_err(io::Error::other)?;
             return Err(io::Error::other(error));
         }
@@ -307,15 +390,15 @@ impl WorkflowRunner {
         state.final_summary = Some(summary.clone());
         self.state.write_state(&state)?;
         self.tasks
-            .complete(&task.id, result.clone())
+            .complete(&task_id, result.clone())
             .map_err(io::Error::other)?;
 
         Ok(WorkflowLaunchResult {
-            task_id: task.id.clone(),
+            task_id: task_id.clone(),
             output: WorkflowOutput {
                 status: "completed".to_string(),
-                task_id: task.id,
-                task_type: Some(task_type_name(task.task_type).to_string()),
+                task_id,
+                task_type: Some(task_type_name(TaskType::Workflow).to_string()),
                 workflow_name: Some(resolved.meta.name),
                 run_id: Some(run_id),
                 summary: Some(summary.clone()),
@@ -434,7 +517,11 @@ impl WorkflowRunner {
     }
 
     fn run_child_agent_call(&self, call: &AgentCall) -> io::Result<String> {
-        let cwd = self.config.cwd.as_deref().unwrap_or(self.session_dir.as_path());
+        let cwd = self
+            .config
+            .cwd
+            .as_deref()
+            .unwrap_or(self.session_dir.as_path());
         let mut events = EventFactory::new(format!("workflow-child-{}", call.call_id));
         let mut sink = EventSink::new(sink(), self.config.output_format);
         let instructions = instructions::load_for_cwd_or_default(cwd);
@@ -480,9 +567,7 @@ impl WorkflowRunner {
         workflow_child_config
     }
 
-    fn workflow_child_runtime_parts(
-        config: &RunConfig,
-    ) -> (RunConfig, orca_mcp::McpRegistry) {
+    fn workflow_child_runtime_parts(config: &RunConfig) -> (RunConfig, orca_mcp::McpRegistry) {
         let workflow_child_config = Self::workflow_child_config(config);
         let mcp_registry = orca_mcp::initialize_registry(&workflow_child_config.mcp_servers);
         (workflow_child_config, mcp_registry)
@@ -526,7 +611,11 @@ fn result_to_summary(result: &Value) -> String {
             .get("result")
             .and_then(Value::as_str)
             .map(ToOwned::to_owned)
-            .or_else(|| map.get("prompt").and_then(Value::as_str).map(ToOwned::to_owned))
+            .or_else(|| {
+                map.get("prompt")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+            })
             .unwrap_or_else(|| result.to_string()),
         Value::Null => String::new(),
         value => value.to_string(),
@@ -589,9 +678,7 @@ fn child_agent_output(prompt: &str, final_message: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use orca_core::config::{
-        HistoryMode, OutputFormat, ProviderKind, ToolConfig, WorkflowConfig,
-    };
+    use orca_core::config::{HistoryMode, OutputFormat, ProviderKind, ToolConfig, WorkflowConfig};
     use orca_core::mcp_types::McpServerConfig;
     use orca_core::model::ModelSelection;
 

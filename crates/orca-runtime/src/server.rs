@@ -3,8 +3,8 @@ use std::io::{self, BufRead, Write};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use orca_core::config::{HistoryMode, OutputFormat, RunConfig};
 use crate::controller;
+use orca_core::config::{HistoryMode, OutputFormat, RunConfig};
 
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
@@ -162,6 +162,30 @@ fn map_runtime_event(line: &str) -> Option<Value> {
             "tool": payload["name"],
             "status": payload["status"]
         })),
+        "workflow.started" => Some(json!({
+            "event": "workflow_started",
+            "taskId": payload["taskId"],
+            "runId": payload["runId"],
+            "workflowName": payload["workflowName"]
+        })),
+        "workflow.result.available" => Some(json!({
+            "event": "workflow_result_available",
+            "taskId": payload["taskId"],
+            "runId": payload["runId"],
+            "result": payload["result"]
+        })),
+        "workflow.completed" => Some(json!({
+            "event": "workflow_completed",
+            "taskId": payload["taskId"],
+            "runId": payload["runId"],
+            "workflowName": payload["workflowName"]
+        })),
+        "workflow.failed" => Some(json!({
+            "event": "workflow_failed",
+            "taskId": payload["taskId"],
+            "runId": payload["runId"],
+            "error": payload["error"]
+        })),
         "error" => Some(json!({
             "event": "error",
             "message": payload["message"]
@@ -196,6 +220,19 @@ mod tests {
         assert_eq!(mapped["tool"], "read_file");
         assert_eq!(mapped["target"], "src/main.rs");
         assert!(mapped.get("type").is_none());
+    }
+
+    #[test]
+    fn maps_runtime_workflow_events_to_protocol_shape() {
+        let mapped = map_runtime_event(
+            r#"{"type":"workflow.started","payload":{"taskId":"task-1","runId":"workflow-run-1","workflowName":"audit"}}"#,
+        )
+        .expect("mapped event");
+
+        assert_eq!(mapped["event"], "workflow_started");
+        assert_eq!(mapped["taskId"], "task-1");
+        assert_eq!(mapped["runId"], "workflow-run-1");
+        assert_eq!(mapped["workflowName"], "audit");
     }
 
     #[test]

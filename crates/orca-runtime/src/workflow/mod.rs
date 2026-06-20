@@ -3,4 +3,6 @@ pub mod runner;
 pub mod script;
 pub mod state;
 
-pub use runner::{WorkflowLaunchRequest, WorkflowLaunchResult, WorkflowRunner};
+pub use runner::{
+    WorkflowBackgroundLaunch, WorkflowLaunchRequest, WorkflowLaunchResult, WorkflowRunner,
+};

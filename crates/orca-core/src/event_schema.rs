@@ -4,10 +4,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::approval_types::{ApprovalRequest, ApprovalResolution};
-use crate::model::ModelRouteDecision;
-use crate::provider_types::ProviderReplayState;
 use crate::cost_types::UsageTotals;
+use crate::model::ModelRouteDecision;
 use crate::plan_types::UpdatePlanArgs;
+use crate::provider_types::ProviderReplayState;
 use crate::tool_types::{ToolRequest, ToolResult};
 use crate::verification::VerificationResult;
 
@@ -133,6 +133,10 @@ pub struct EventFactory {
 impl EventFactory {
     pub fn new(run_id: String) -> Self {
         Self { run_id, seq: 0 }
+    }
+
+    pub fn run_id(&self) -> &str {
+        &self.run_id
     }
 
     pub fn session_started(
@@ -363,6 +367,17 @@ impl EventFactory {
                 "taskId": task_id,
                 "runId": run_id,
                 "result": result
+            }),
+        )
+    }
+
+    pub fn workflow_failed(&mut self, task_id: &str, run_id: &str, error: &str) -> EventEnvelope {
+        self.make(
+            EventType::WorkflowFailed,
+            json!({
+                "taskId": task_id,
+                "runId": run_id,
+                "error": error
             }),
         )
     }

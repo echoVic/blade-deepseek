@@ -3,7 +3,7 @@ use orca_core::config::ProviderKind;
 use orca_core::conversation::Conversation;
 use orca_core::provider_types::ProviderStep;
 use orca_core::tool_types::ToolName;
-use orca_provider::{call, ProviderConfig};
+use orca_provider::{ProviderConfig, call};
 use serde_json::Value;
 
 #[test]
@@ -65,4 +65,67 @@ fn mock_provider_can_request_workflow_tool() {
 
 fn expected_workflow_script() -> &'static str {
     "export const meta = { name: 'mock-workflow', description: 'Mock workflow', phases: ['main'] };\nconst result = await phase('main', async () => agent('inspect repo'));\nexport default result;"
+}
+
+#[test]
+fn workflow_tool_launches_background_task_and_returns_output() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_orca"))
+        .args([
+            "exec",
+            "--output-format",
+            "jsonl",
+            "--provider",
+            "mock",
+            "--approval-mode",
+            "full-auto",
+            "workflow inline",
+        ])
+        .output()
+        .expect("run orca");
+
+    assert_eq!(output.status.code(), Some(0));
+    let events = parse_jsonl(&output.stdout);
+
+    let completed = events
+        .iter()
+        .find(|event| {
+            event["type"] == "tool.call.completed" && event["payload"]["name"] == "Workflow"
+        })
+        .expect("workflow tool completed");
+    assert_eq!(completed["payload"]["status"], "completed");
+
+    let output_text = completed["payload"]["output"].as_str().unwrap();
+    let workflow_output: Value = serde_json::from_str(output_text).unwrap();
+    assert_eq!(workflow_output["status"], "async_launched");
+    assert_eq!(workflow_output["taskType"], "local_workflow");
+    assert!(
+        workflow_output["taskId"]
+            .as_str()
+            .unwrap()
+            .starts_with("task-")
+    );
+    assert!(
+        workflow_output["runId"]
+            .as_str()
+            .unwrap()
+            .starts_with("workflow-run-")
+    );
+
+    assert!(
+        events
+            .iter()
+            .any(|event| event["type"] == "workflow.started")
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event["type"] == "workflow.result.available")
+    );
+}
+
+fn parse_jsonl(stdout: &[u8]) -> Vec<Value> {
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("valid jsonl line"))
+        .collect()
 }

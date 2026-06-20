@@ -13,6 +13,7 @@ use orca_core::model::ModelRouteContext;
 use orca_core::provider_types::ProviderStep;
 use orca_core::subagent_types::SubagentType;
 use orca_core::tool_types;
+use orca_core::workflow_types::WorkflowInput;
 use orca_mcp::McpRegistry;
 use orca_provider::context;
 use orca_provider::tool_schema::{
@@ -33,6 +34,8 @@ use crate::instructions::{self, ProjectInstructions};
 use crate::memory::{self, MemoryBlock};
 use crate::session::new_run_id;
 use crate::subagent;
+use crate::tasks::TaskRegistry;
+use crate::workflow::{WorkflowBackgroundLaunch, WorkflowLaunchRequest, WorkflowRunner};
 use orca_core::hook_types::HookEvent;
 
 const DEFAULT_MAX_TURNS: u32 = 128;
@@ -50,6 +53,14 @@ struct SubagentExecutionResult {
     description: String,
     child: ChildAgentResult,
     cost_tracker: CostTracker,
+}
+
+#[derive(Debug)]
+struct BackgroundWorkflowRun {
+    task_id: String,
+    run_id: String,
+    workflow_name: String,
+    handle: WorkflowBackgroundLaunch,
 }
 
 impl AgentLoopResult {
@@ -101,6 +112,8 @@ fn run_inner<W: io::Write>(config: RunConfig, writer: W) -> io::Result<RunStatus
     };
 
     let mut events = EventFactory::new(new_run_id());
+    let task_registry = TaskRegistry::new(events.run_id().to_string());
+    let mut background_workflows = Vec::new();
     let mut sink = EventSink::new(writer, config.output_format);
     let instructions = load_project_instructions(&cwd_path);
     let memory = memory::load_for_cwd(&cwd_path);
@@ -193,8 +206,12 @@ fn run_inner<W: io::Write>(config: RunConfig, writer: W) -> io::Result<RunStatus
         &hooks,
         &mut cost_tracker,
         &cancel,
+        &task_registry,
+        &mut background_workflows,
     )?;
     let status = result.status;
+
+    observe_background_workflows(&config, &mut events, &mut sink, &mut background_workflows)?;
 
     let status =
         run_verifier_if_needed(status, config.verifier.as_deref(), &mut events, &mut sink)?;
@@ -242,6 +259,8 @@ fn run_agent_loop(
     hooks: &HookRunner,
     cost_tracker: &mut CostTracker,
     cancel: &CancelToken,
+    task_registry: &TaskRegistry,
+    background_workflows: &mut Vec<BackgroundWorkflowRun>,
 ) -> io::Result<AgentLoopResult> {
     let max_turns = DEFAULT_MAX_TURNS;
     let budget_model = config.model.as_option();
@@ -679,6 +698,8 @@ fn run_agent_loop(
                 hooks,
                 cost_tracker,
                 cancel,
+                task_registry,
+                background_workflows,
             )?;
 
             if tool_request.name == tool_types::ToolName::UpdatePlan
@@ -733,7 +754,9 @@ pub(crate) fn execute_child_agent_loop<W: io::Write>(
     runtime: &mut ChildAgentRuntime<'_, W>,
     child_cost_tracker: &mut CostTracker,
 ) -> io::Result<ChildAgentResult> {
-    run_agent_loop(
+    let task_registry = TaskRegistry::new(runtime.events.run_id().to_string());
+    let mut background_workflows = Vec::new();
+    let child = run_agent_loop(
         config,
         runtime.cwd,
         runtime.events,
@@ -750,8 +773,16 @@ pub(crate) fn execute_child_agent_loop<W: io::Write>(
         runtime.hooks,
         child_cost_tracker,
         runtime.cancel,
-    )
-    .map(|child| ChildAgentResult {
+        &task_registry,
+        &mut background_workflows,
+    )?;
+    observe_background_workflows(
+        config,
+        runtime.events,
+        runtime.sink,
+        &mut background_workflows,
+    )?;
+    Ok(ChildAgentResult {
         status: child.status,
         final_message: child.final_message,
         error: child.error,
@@ -773,6 +804,8 @@ fn execute_tool_with_approval(
     hooks: &HookRunner,
     cost_tracker: &mut CostTracker,
     cancel: &CancelToken,
+    task_registry: &TaskRegistry,
+    background_workflows: &mut Vec<BackgroundWorkflowRun>,
 ) -> io::Result<(RunStatus, tool_types::ToolResult)> {
     if agent_common::requires_approval(tool_request.action) {
         let approval = ApprovalRequest {
@@ -860,7 +893,18 @@ fn execute_tool_with_approval(
     };
     let effective_tool_request = tool_request_with_hook_outcome(tool_request, &pre_tool_outcome);
     let execution_request = &effective_tool_request;
-    let result = if execution_request.name == tool_types::ToolName::Subagent {
+    let result = if execution_request.name == tool_types::ToolName::Workflow {
+        execute_workflow_tool(
+            config,
+            cwd,
+            events,
+            sink,
+            execution_request,
+            emit_deltas,
+            task_registry,
+            background_workflows,
+        )?
+    } else if execution_request.name == tool_types::ToolName::Subagent {
         execute_subagent_tool(
             config,
             cwd,
@@ -923,6 +967,105 @@ fn execute_tool_with_approval(
     };
 
     Ok((status, result))
+}
+
+fn execute_workflow_tool(
+    config: &RunConfig,
+    cwd: &Path,
+    events: &mut EventFactory,
+    sink: &mut EventSink<impl io::Write>,
+    tool_request: &tool_types::ToolRequest,
+    emit_deltas: bool,
+    task_registry: &TaskRegistry,
+    background_workflows: &mut Vec<BackgroundWorkflowRun>,
+) -> io::Result<tool_types::ToolResult> {
+    if !config.workflows.enabled {
+        return Ok(tool_types::ToolResult::failed(
+            tool_request,
+            "workflow execution is disabled in config",
+            None,
+        ));
+    }
+
+    let input = parse_workflow_input(tool_request)?;
+    let session_dir = cwd
+        .join(".orca")
+        .join("workflow-sessions")
+        .join(task_registry.session_id());
+    let runner = WorkflowRunner::new(config.clone(), task_registry.clone(), session_dir);
+    let launch = runner.launch_background(WorkflowLaunchRequest::from(input))?;
+    if emit_deltas {
+        sink.emit(&events.workflow_started(
+            &launch.task_id,
+            &launch.run_id,
+            &launch.workflow_name,
+            &launch.phases,
+        ))?;
+    }
+    let output = serde_json::to_string(&launch.output)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    background_workflows.push(BackgroundWorkflowRun {
+        task_id: launch.task_id.clone(),
+        run_id: launch.run_id.clone(),
+        workflow_name: launch.workflow_name.clone(),
+        handle: launch,
+    });
+
+    Ok(tool_types::ToolResult::completed(
+        tool_request,
+        output,
+        false,
+    ))
+}
+
+fn parse_workflow_input(tool_request: &tool_types::ToolRequest) -> io::Result<WorkflowInput> {
+    let raw_arguments = tool_request.raw_arguments.as_deref().unwrap_or("{}");
+    serde_json::from_str(raw_arguments)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
+}
+
+fn observe_background_workflows(
+    config: &RunConfig,
+    events: &mut EventFactory,
+    sink: &mut EventSink<impl io::Write>,
+    background_workflows: &mut Vec<BackgroundWorkflowRun>,
+) -> io::Result<()> {
+    if config.output_format != OutputFormat::Jsonl {
+        return Ok(());
+    }
+
+    for workflow in background_workflows.drain(..) {
+        match workflow.handle.join() {
+            Ok(Ok(result)) => {
+                sink.emit(&events.workflow_completed(
+                    &workflow.task_id,
+                    &workflow.run_id,
+                    &workflow.workflow_name,
+                ))?;
+                sink.emit(&events.workflow_result_available(
+                    &workflow.task_id,
+                    &workflow.run_id,
+                    &result.summary,
+                ))?;
+            }
+            Ok(Err(error)) => {
+                sink.emit(&events.workflow_failed(
+                    &workflow.task_id,
+                    &workflow.run_id,
+                    &error.to_string(),
+                ))?;
+            }
+            Err(_) => {
+                sink.emit(&events.workflow_failed(
+                    &workflow.task_id,
+                    &workflow.run_id,
+                    "workflow thread panicked",
+                ))?;
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn should_run_subagent_batch(
