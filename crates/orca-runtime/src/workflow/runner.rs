@@ -270,6 +270,11 @@ impl WorkflowRunner {
                     completed_result = Some(result_to_summary(&result));
                 }
                 HostEvent::WorkflowFailed { error } => {
+                    finalize_open_phases_as_failed(
+                        &mut state.phases,
+                        &phase_agent_baselines,
+                        agent_events_seen,
+                    );
                     failed_error = Some(error);
                 }
             }
@@ -518,17 +523,29 @@ fn result_to_summary(result: &Value) -> String {
     match result {
         Value::String(value) => value.clone(),
         Value::Object(map) => map
-            .get("prompt")
+            .get("result")
             .and_then(Value::as_str)
             .map(ToOwned::to_owned)
-            .or_else(|| {
-                map.get("result")
-                    .and_then(Value::as_str)
-                    .map(ToOwned::to_owned)
-            })
+            .or_else(|| map.get("prompt").and_then(Value::as_str).map(ToOwned::to_owned))
             .unwrap_or_else(|| result.to_string()),
         Value::Null => String::new(),
         value => value.to_string(),
+    }
+}
+
+fn finalize_open_phases_as_failed(
+    phases: &mut [WorkflowPhaseRecord],
+    phase_agent_baselines: &std::collections::HashMap<String, u32>,
+    agent_events_seen: u32,
+) {
+    let completed_at_ms = now_ms();
+    for phase in phases.iter_mut().filter(|phase| {
+        phase.status == WorkflowRunStatus::Running && phase.completed_at_ms.is_none()
+    }) {
+        phase.status = WorkflowRunStatus::Failed;
+        phase.completed_at_ms = Some(completed_at_ms);
+        let baseline = phase_agent_baselines.get(&phase.name).copied().unwrap_or(0);
+        phase.agent_count = agent_events_seen.saturating_sub(baseline);
     }
 }
 
