@@ -1,0 +1,164 @@
+use std::fs;
+
+use orca_core::workflow_types::{
+    WorkflowAgentStatus, WorkflowInput, WorkflowMeta, WorkflowRunState, WorkflowRunStatus,
+};
+use orca_runtime::workflow::script::{
+    resolve_workflow_script, resolve_workflow_script_with_user_dir,
+};
+use orca_runtime::workflow::state::{WorkflowAgentCacheRecord, WorkflowStateStore};
+use serde_json::json;
+use tempfile::tempdir;
+
+#[test]
+fn inline_script_is_persisted_and_meta_is_extracted() {
+    let temp = tempdir().unwrap();
+    let session_dir = temp.path().join("session");
+    let input = WorkflowInput {
+        script: Some("export const meta = { name: 'audit', description: 'Audit code', phases: ['scan', 'review'] };\nexport default await agent('inspect repo');".to_string()),
+        ..Default::default()
+    };
+
+    let resolved = resolve_workflow_script(&input, temp.path(), &session_dir).unwrap();
+
+    assert_eq!(resolved.meta.name, "audit");
+    assert_eq!(resolved.meta.description, "Audit code");
+    assert_eq!(resolved.meta.phases, vec!["scan", "review"]);
+    assert!(resolved.persisted_path.exists());
+    assert!(
+        fs::read_to_string(&resolved.persisted_path)
+            .unwrap()
+            .contains("export const meta")
+    );
+    assert_eq!(resolved.script_digest.len(), 64);
+}
+
+#[test]
+fn script_path_takes_precedence_over_inline_script() {
+    let temp = tempdir().unwrap();
+    let session_dir = temp.path().join("session");
+    let source = temp.path().join("chosen.js");
+    fs::write(
+        &source,
+        "export const meta = { name: 'chosen', description: 'Chosen script', phases: [] };\nexport default 'ok';",
+    )
+    .unwrap();
+
+    let input = WorkflowInput {
+        script: Some(
+            "export const meta = { name: 'ignored', description: 'Ignored', phases: [] };"
+                .to_string(),
+        ),
+        script_path: Some(source.display().to_string()),
+        ..Default::default()
+    };
+
+    let resolved = resolve_workflow_script(&input, temp.path(), &session_dir).unwrap();
+    assert_eq!(resolved.meta.name, "chosen");
+    assert_eq!(resolved.original_path.as_deref(), Some(source.as_path()));
+}
+
+#[test]
+fn nearest_project_workflow_wins_over_user_workflow() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    let cwd = repo_root.join("packages/api");
+    fs::create_dir_all(repo_root.join(".claude/workflows")).unwrap();
+    fs::create_dir_all(temp.path().join("home/.claude/workflows")).unwrap();
+
+    fs::write(
+        repo_root.join(".claude/workflows/audit.js"),
+        "export const meta = { name: 'audit', description: 'Project audit', phases: [] };\nexport default 'project';",
+    )
+    .unwrap();
+    fs::write(
+        temp.path().join("home/.claude/workflows/audit.js"),
+        "export const meta = { name: 'audit', description: 'User audit', phases: [] };\nexport default 'user';",
+    )
+    .unwrap();
+
+    let input = WorkflowInput {
+        name: Some("audit".to_string()),
+        ..Default::default()
+    };
+
+    let resolved = resolve_workflow_script_with_user_dir(
+        &input,
+        &cwd,
+        &temp.path().join("session"),
+        &temp.path().join("home/.claude/workflows"),
+    )
+    .unwrap();
+
+    assert_eq!(resolved.meta.description, "Project audit");
+}
+
+#[test]
+fn missing_meta_fields_return_invalid_data_error() {
+    let temp = tempdir().unwrap();
+    let session_dir = temp.path().join("session");
+    let input = WorkflowInput {
+        script: Some(
+            "export const meta = { name: 'audit', description: 'Audit code' };\nexport default 'x';"
+                .to_string(),
+        ),
+        ..Default::default()
+    };
+
+    let error = resolve_workflow_script(&input, temp.path(), &session_dir).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+}
+
+#[test]
+fn state_store_round_trips_run_state_and_agent_cache() {
+    let temp = tempdir().unwrap();
+    let store = WorkflowStateStore::new(temp.path().join("runs"));
+    let state = WorkflowRunState {
+        run_id: "workflow-run-1".to_string(),
+        task_id: "task-1".to_string(),
+        session_id: "session-1".to_string(),
+        cwd: "/tmp/project".to_string(),
+        workflow_name: "audit".to_string(),
+        meta: WorkflowMeta {
+            name: "audit".to_string(),
+            description: "Audit code".to_string(),
+            phases: vec!["scan".to_string()],
+        },
+        script_digest: "abcd".repeat(16),
+        args_digest: "ef01".repeat(16),
+        status: WorkflowRunStatus::Queued,
+        total_agent_count: 1,
+        final_summary: None,
+        error: None,
+    };
+
+    store.create_run(&state).unwrap();
+    assert!(store.transcript_dir(&state.run_id).exists());
+
+    let loaded = store.load_run(&state.run_id).unwrap();
+    assert_eq!(loaded.workflow_name, "audit");
+
+    let updated_state = WorkflowRunState {
+        status: WorkflowRunStatus::Completed,
+        final_summary: Some("done".to_string()),
+        ..loaded
+    };
+    store.write_state(&updated_state).unwrap();
+
+    let record = WorkflowAgentCacheRecord {
+        call_path: "phases.scan".to_string(),
+        input_hash: "1234".to_string(),
+        output: json!({
+            "status": WorkflowAgentStatus::Completed,
+            "summary": "cached"
+        }),
+    };
+    store
+        .record_agent_completed(&updated_state.run_id, record.clone())
+        .unwrap();
+
+    let cached = store
+        .cached_agent_result(&updated_state.run_id, "phases.scan", "1234")
+        .unwrap();
+    assert_eq!(cached, Some(record));
+}
