@@ -22,7 +22,7 @@ use orca_provider::tool_schema::{
 use orca_provider::{self, ProviderConfig};
 use orca_tools;
 
-use crate::agent_child::{ChildAgentRequest, ChildAgentResult, run_child_agent};
+use crate::agent_child::{ChildAgentRequest, ChildAgentResult, ChildAgentRuntime, run_child_agent};
 use crate::agent_common;
 use crate::cost::CostTracker;
 use crate::history::{self, SessionWriter};
@@ -727,6 +727,37 @@ fn run_agent_loop(
     }
 }
 
+fn execute_child_agent_loop<W: io::Write>(
+    config: &RunConfig,
+    request: &ChildAgentRequest,
+    runtime: &mut ChildAgentRuntime<'_, W>,
+    child_cost_tracker: &mut CostTracker,
+) -> io::Result<ChildAgentResult> {
+    run_agent_loop(
+        config,
+        runtime.cwd,
+        runtime.events,
+        runtime.sink,
+        &request.prompt,
+        None,
+        None,
+        request.depth,
+        request.emit_deltas,
+        &request.subagent_type,
+        runtime.instructions,
+        runtime.memory,
+        runtime.mcp_registry,
+        runtime.hooks,
+        child_cost_tracker,
+        runtime.cancel,
+    )
+    .map(|child| ChildAgentResult {
+        status: child.status,
+        final_message: child.final_message,
+        error: child.error,
+    })
+}
+
 fn execute_tool_with_approval(
     config: &RunConfig,
     cwd: &Path,
@@ -1069,45 +1100,19 @@ fn execute_subagent_batch(
                 let mut child_events =
                     EventFactory::new(format!("subagent-{}", child_tool_request.id));
                 let mut child_sink = EventSink::new(io::sink(), child_config.output_format);
-                let (child, child_cost_tracker) = run_child_agent(
-                    &child_config,
-                    &child_request,
-                    |child_config, request, child_cost_tracker| {
-                        run_agent_loop(
-                            child_config,
-                            &child_cwd,
-                            &mut child_events,
-                            &mut child_sink,
-                            &request.prompt,
-                            None,
-                            None,
-                            request.depth,
-                            request.emit_deltas,
-                            &request.subagent_type,
-                            &child_instructions,
-                            &child_memory,
-                            &child_mcp_registry,
-                            &child_hooks,
-                            child_cost_tracker,
-                            &child_cancel,
-                        )
-                        .map(|child| ChildAgentResult {
-                            status: child.status,
-                            final_message: child.final_message,
-                            error: child.error,
-                        })
-                    },
-                )
-                .unwrap_or_else(|error| {
-                    (
-                        ChildAgentResult {
-                            status: RunStatus::Failed,
-                            final_message: None,
-                            error: Some(error.to_string()),
-                        },
-                        CostTracker::new(None),
-                    )
-                });
+                let mut child_runtime = ChildAgentRuntime::new(
+                    &child_cwd,
+                    &mut child_events,
+                    &mut child_sink,
+                    &child_instructions,
+                    &child_memory,
+                    &child_mcp_registry,
+                    &child_hooks,
+                    &child_cancel,
+                    execute_child_agent_loop,
+                );
+                let (child, child_cost_tracker) =
+                    run_child_agent(&child_config, &child_request, &mut child_runtime);
 
                 SubagentExecutionResult {
                     tool_request: child_tool_request,
@@ -1265,35 +1270,18 @@ fn execute_subagent_tool(
         depth: subagent_depth + 1,
         emit_deltas: false,
     };
-    let (child, child_cost_tracker) = run_child_agent(
-        config,
-        &child_request,
-        |child_config, request, child_cost_tracker| {
-            run_agent_loop(
-                child_config,
-                cwd,
-                events,
-                sink,
-                &request.prompt,
-                None,
-                None,
-                request.depth,
-                request.emit_deltas,
-                &request.subagent_type,
-                instructions,
-                memory,
-                mcp_registry,
-                hooks,
-                child_cost_tracker,
-                cancel,
-            )
-            .map(|child| ChildAgentResult {
-                status: child.status,
-                final_message: child.final_message,
-                error: child.error,
-            })
-        },
-    )?;
+    let mut runtime = ChildAgentRuntime::new(
+        cwd,
+        events,
+        sink,
+        instructions,
+        memory,
+        mcp_registry,
+        hooks,
+        cancel,
+        execute_child_agent_loop,
+    );
+    let (child, child_cost_tracker) = run_child_agent(config, &child_request, &mut runtime);
 
     cost_tracker.merge(&child_cost_tracker);
 
