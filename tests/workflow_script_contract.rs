@@ -218,10 +218,13 @@ fn state_store_reads_legacy_agent_cache_shape() {
         })
     );
 
-    let found = store.find_cached_agent(&state.run_id, "phases.scan", "1234");
+    let found = store.find_cached_agent_value(&state.run_id, "phases.scan", "1234");
     assert_eq!(
         found,
-        Some("{\"status\":\"completed\",\"summary\":\"cached\"}".to_string())
+        Some(json!({
+            "status": "completed",
+            "summary": "cached"
+        }))
     );
 }
 
@@ -262,8 +265,51 @@ fn state_store_reads_legacy_string_agent_cache_without_json_quoting() {
     )
     .unwrap();
 
-    let found = store.find_cached_agent(&state.run_id, "phases.scan", "1234");
-    assert_eq!(found, Some("legacy result".to_string()));
+    let found = store.find_cached_agent_value(&state.run_id, "phases.scan", "1234");
+    assert_eq!(found, Some(json!("legacy result")));
+}
+
+#[test]
+fn state_store_returns_legacy_object_cache_as_object_value() {
+    let temp = tempdir().unwrap();
+    let store = WorkflowStateStore::new(temp.path().join("runs"));
+    let state = WorkflowRunState {
+        run_id: "workflow-run-legacy-object-value".to_string(),
+        task_id: "task-legacy-object-value".to_string(),
+        session_id: "session-1".to_string(),
+        cwd: "/tmp/project".to_string(),
+        workflow_name: "audit".to_string(),
+        meta: WorkflowMeta {
+            name: "audit".to_string(),
+            description: "Audit code".to_string(),
+            phases: vec!["scan".to_string()],
+        },
+        script_digest: "abcd".repeat(16),
+        args_digest: "ef01".repeat(16),
+        status: WorkflowRunStatus::Completed,
+        total_agent_count: 1,
+        final_summary: Some("done".to_string()),
+        error: None,
+    };
+    store.create_run(&state).unwrap();
+
+    let legacy_record = serde_json::json!({
+        "phases.scan:1234": {
+            "call_path": "phases.scan",
+            "input_hash": "1234",
+            "output": {
+                "kind": "legacy-object"
+            }
+        }
+    });
+    fs::write(
+        store.run_dir(&state.run_id).join("agent-cache.json"),
+        serde_json::to_string_pretty(&legacy_record).unwrap(),
+    )
+    .unwrap();
+
+    let found = store.find_cached_agent_value(&state.run_id, "phases.scan", "1234");
+    assert_eq!(found, Some(json!({ "kind": "legacy-object" })));
 }
 
 #[test]

@@ -215,11 +215,15 @@ impl WorkflowRunner {
     ) -> io::Result<HostCommand> {
         let hash = input_hash(&call.prompt, &call.opts);
         if let Some(resume_run_id) = resume_from {
-            if let Some(output) =
+            if let Some(cached_value) =
                 self.state
-                    .find_cached_agent(resume_run_id, &call.call_path, &hash)
+                    .find_cached_agent_value(resume_run_id, &call.call_path, &hash)
             {
                 *cached_agents += 1;
+                let output = match &cached_value {
+                    Value::String(output) => output.clone(),
+                    other => other.to_string(),
+                };
                 let transcript_path = write_agent_transcript(transcript_dir, &call, &output, true)?;
                 self.state.record_agent_completed(
                     run_id,
@@ -237,7 +241,7 @@ impl WorkflowRunner {
                 )?;
                 return Ok(HostCommand::AgentResult {
                     call_id: call.call_id,
-                    result: Value::String(output),
+                    result: cached_value,
                 });
             }
         }

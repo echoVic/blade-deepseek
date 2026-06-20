@@ -95,6 +95,16 @@ impl WorkflowStateStore {
         call_path: &str,
         input_hash: &str,
     ) -> Option<String> {
+        self.find_cached_agent_value(run_id, call_path, input_hash)
+            .map(|value| value_to_output_string(value))
+    }
+
+    pub fn find_cached_agent_value(
+        &self,
+        run_id: &str,
+        call_path: &str,
+        input_hash: &str,
+    ) -> Option<Value> {
         let path = self.run_dir(run_id).join("agent-cache.json");
         if !path.exists() {
             return None;
@@ -104,7 +114,8 @@ impl WorkflowStateStore {
         cache
             .get(&cache_key(call_path, input_hash))
             .filter(|record| record.status == WorkflowAgentStatus::Completed)
-            .and_then(|record| record.output.clone())
+            .and_then(|record| record.output.as_deref())
+            .map(output_string_to_value)
     }
 
     pub fn cached_agent_result(

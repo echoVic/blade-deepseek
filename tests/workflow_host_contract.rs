@@ -317,3 +317,63 @@ fn host_reports_workflow_failed_when_stdin_closes_before_agent_result() {
     );
     assert!(remaining.iter().any(|line| line.contains("\"type\":\"workflow_failed\"")));
 }
+
+#[test]
+fn host_reports_workflow_failed_for_partial_trailing_json_on_stdin_eof() {
+    if !WorkflowHost::node_available() {
+        return;
+    }
+
+    let temp = tempdir().unwrap();
+    let script = temp.path().join("workflow.js");
+    fs::write(
+        &script,
+        "export const meta = { name: 'stdin-partial-json-test', description: 'stdin partial json', phases: [] };\nawait agent('inspect repo');\nexport default 'done';",
+    )
+    .unwrap();
+
+    let host = temp.path().join("host.mjs");
+    fs::write(
+        &host,
+        include_str!("../crates/orca-runtime/src/workflow/host.mjs"),
+    )
+    .unwrap();
+
+    let mut child = Command::new("node")
+        .arg(&host)
+        .arg(&script)
+        .arg("null")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+    let mut first_line = String::new();
+    reader.read_line(&mut first_line).unwrap();
+    assert!(first_line.contains("\"type\":\"agent_call\""));
+
+    let mut stdin = child.stdin.take().unwrap();
+    use std::io::Write;
+    stdin.write_all(br#"{"type":"agent_result""#).unwrap();
+    drop(stdin);
+
+    let mut remaining = Vec::new();
+    for line in reader.lines() {
+        remaining.push(line.unwrap());
+    }
+
+    let output = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "expected host to exit with workflow failure, status={:?}, stderr={stderr}",
+        output.status.code()
+    );
+    assert!(remaining.iter().any(|line| {
+        line.contains("\"type\":\"workflow_failed\"")
+            && line.contains("partial JSON")
+    }));
+}
