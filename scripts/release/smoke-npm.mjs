@@ -1,8 +1,7 @@
 #!/usr/bin/env node
 
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync } from "node:fs";
-import { cp, mkdir, symlink } from "node:fs/promises";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -65,23 +64,31 @@ async function main() {
 
   const platformPackageName = readJson(path.join(platformPackageDir, "package.json")).name;
   const tempDir = mkdtempSync(path.join(os.tmpdir(), "orca-npm-smoke-"));
-  const nodeModulesDir = path.join(tempDir, "node_modules", "@blade-ai");
-  const binDir = path.join(tempDir, "node_modules", ".bin");
-  await mkdir(nodeModulesDir, { recursive: true });
-  await mkdir(binDir, { recursive: true });
-  await cp(mainPackageDir, path.join(nodeModulesDir, "orca"), { recursive: true });
-  await cp(platformPackageDir, path.join(nodeModulesDir, platformPackageName.slice("@blade-ai/".length)), {
-    recursive: true
-  });
-  await symlink(
-    path.join("..", "@blade-ai", "orca", "bin", "orca.js"),
-    path.join(binDir, "orca")
-  );
+  writeFileSync(path.join(tempDir, "package.json"), JSON.stringify({
+    private: true,
+    dependencies: {
+      "@blade-ai/orca": `file:${mainPackageDir}`,
+      [platformPackageName]: `file:${platformPackageDir}`
+    }
+  }, null, 2));
 
-  const output = execFileSync(path.join("node_modules", ".bin", "orca"), ["--version"], {
+  execFileSync("npm", ["install", "--ignore-scripts"], {
     cwd: tempDir,
-    encoding: "utf8"
-  }).trim();
+    stdio: "inherit"
+  });
+
+  const output = execFileSync(
+    "node",
+    [
+      "--preserve-symlinks-main",
+      path.join(tempDir, "node_modules", ".bin", "orca"),
+      "--version"
+    ],
+    {
+      cwd: tempDir,
+      encoding: "utf8"
+    }
+  ).trim();
 
   if (!output.includes(`orca ${args.version}`)) {
     throw new Error(`Unexpected orca version output: ${output}`);

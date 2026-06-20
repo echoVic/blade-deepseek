@@ -14,8 +14,7 @@ Implemented the npm smoke test script that installs the staged `orca` packages i
 Executed:
 
 - `node --check scripts/release/smoke-npm.mjs`
-- `cargo build --release`
-- staged fixture packages under a temporary `.../npm/stage` directory with the Task 2 workflow
+- staged fixture packages under a temporary `.../npm/stage` directory by first running `scripts/release/stage-npm.mjs` against a throwaway artifact tree built from `target/release/orca`
 - `node scripts/release/smoke-npm.mjs --version 0.1.0 --stage-dir "$tmp/npm/stage"`
 
 Result:
@@ -30,7 +29,7 @@ The script now:
 - validates `--version` and `--stage-dir`
 - maps the current `process.platform` / `process.arch` to the expected staged platform package
 - reads the staged platform package name directly from JSON
-- constructs a throwaway local `node_modules` tree and runs the installed `orca` wrapper through `.bin`
+- creates a throwaway `package.json`, runs `npm install --ignore-scripts`, and launches the installed wrapper through Node's npm-managed `.bin` path with symlink preservation so package resolution happens from the installed tree
 
 ## Concerns
 
