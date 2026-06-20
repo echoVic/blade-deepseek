@@ -127,7 +127,11 @@ fn workflow_resume_replays_legacy_object_cache_as_object_value() {
             }
         }
     });
-    fs::write(cache_path, serde_json::to_string_pretty(&legacy_record).unwrap()).unwrap();
+    fs::write(
+        cache_path,
+        serde_json::to_string_pretty(&legacy_record).unwrap(),
+    )
+    .unwrap();
 
     let second = runner
         .launch(
@@ -214,25 +218,21 @@ fn workflow_runner_marks_task_and_run_failed_on_child_agent_error() {
     let task = tasks.list().into_iter().next().expect("workflow task");
     let record = tasks.get(&task.id).expect("task record");
     assert_eq!(record.status, TaskStatus::Failed);
-    assert!(
-        record
-            .error
-            .as_deref()
-            .unwrap_or_default()
-            .contains("mock child failure requested")
-    );
+    assert!(record
+        .error
+        .as_deref()
+        .unwrap_or_default()
+        .contains("mock child failure requested"));
 
     let run_id = record.workflow_run_id.as_deref().expect("run id");
     let store = WorkflowStateStore::new(session_dir.join("workflow-runs"));
     let state = store.load_run(run_id).expect("run state");
     assert_eq!(state.status, WorkflowRunStatus::Failed);
-    assert!(
-        state
-            .error
-            .as_deref()
-            .unwrap_or_default()
-            .contains("mock child failure requested")
-    );
+    assert!(state
+        .error
+        .as_deref()
+        .unwrap_or_default()
+        .contains("mock child failure requested"));
 }
 
 #[test]
@@ -272,6 +272,48 @@ fn parallel_preserves_order_and_records_phase() {
     assert_eq!(phase.agent_count, 2);
     assert!(phase.started_at_ms.is_some());
     assert!(phase.completed_at_ms.is_some());
+
+    assert!(store
+        .cached_agent_result(run_id, "fanout:1", &input_hash("first", &json!({})))
+        .unwrap()
+        .is_some());
+    assert!(store
+        .cached_agent_result(run_id, "fanout:2", &input_hash("second", &json!({})))
+        .unwrap()
+        .is_some());
+}
+
+#[test]
+fn workflow_runner_persists_marker_phase_for_following_agents() {
+    if !orca_runtime::workflow::host::WorkflowHost::node_available() {
+        return;
+    }
+
+    let temp = tempdir().unwrap();
+    let script = temp.path().join("workflow.js");
+    fs::write(
+        &script,
+        "export const meta = { name: 'marker-runtime', description: 'Marker runtime test', phases: ['scan'] };\nphase('scan');\nawait agent('inspect repo');\nexport default 'done';",
+    )
+    .unwrap();
+
+    let config = mock_run_config(temp.path());
+    let tasks = TaskRegistry::new("session-1".to_string());
+    let session_dir = temp.path().join("session");
+    let runner = WorkflowRunner::new(config, tasks, session_dir.clone());
+    let launched = runner
+        .launch(WorkflowLaunchRequest::from_script_path(
+            script.display().to_string(),
+        ))
+        .unwrap();
+
+    let run_id = launched.output.run_id.as_deref().expect("run id");
+    let store = WorkflowStateStore::new(session_dir.join("workflow-runs"));
+    let state = store.load_run(run_id).expect("run state");
+    assert_eq!(state.phases.len(), 1);
+    assert_eq!(state.phases[0].name, "scan");
+    assert_eq!(state.phases[0].status, WorkflowRunStatus::Completed);
+    assert_eq!(state.phases[0].agent_count, 1);
 }
 
 #[test]
@@ -424,13 +466,11 @@ fn agent_cap_failure_is_recorded() {
     let state = store.load_run(run_id).expect("run state");
     assert_eq!(state.status, WorkflowRunStatus::Failed);
     assert_eq!(state.total_agent_count, 1000);
-    assert!(
-        state
-            .error
-            .as_deref()
-            .unwrap_or_default()
-            .contains("maximum workflow agent count 1000 exceeded")
-    );
+    assert!(state
+        .error
+        .as_deref()
+        .unwrap_or_default()
+        .contains("maximum workflow agent count 1000 exceeded"));
 }
 
 fn mock_run_config(cwd: &std::path::Path) -> RunConfig {

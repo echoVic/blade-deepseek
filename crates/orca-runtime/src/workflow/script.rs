@@ -28,10 +28,22 @@ pub fn resolve_workflow_script(
     cwd: &Path,
     session_dir: &Path,
 ) -> io::Result<ResolvedWorkflowScript> {
+    let persisted_path = session_dir
+        .join("workflows")
+        .join("scripts")
+        .join("script.js");
+    resolve_workflow_script_to_path(input, cwd, &persisted_path)
+}
+
+pub fn resolve_workflow_script_to_path(
+    input: &WorkflowInput,
+    cwd: &Path,
+    persisted_path: &Path,
+) -> io::Result<ResolvedWorkflowScript> {
     let user_dir = dirs::home_dir()
         .map(|home| home.join(".claude").join("workflows"))
         .unwrap_or_else(|| PathBuf::from(".claude/workflows"));
-    resolve_workflow_script_with_user_dir(input, cwd, session_dir, &user_dir)
+    resolve_workflow_script_with_user_dir_to_path(input, cwd, &user_dir, persisted_path)
 }
 
 pub fn resolve_workflow_script_with_user_dir(
@@ -39,6 +51,19 @@ pub fn resolve_workflow_script_with_user_dir(
     cwd: &Path,
     session_dir: &Path,
     user_workflow_dir: &Path,
+) -> io::Result<ResolvedWorkflowScript> {
+    let persisted_path = session_dir
+        .join("workflows")
+        .join("scripts")
+        .join("script.js");
+    resolve_workflow_script_with_user_dir_to_path(input, cwd, user_workflow_dir, &persisted_path)
+}
+
+pub fn resolve_workflow_script_with_user_dir_to_path(
+    input: &WorkflowInput,
+    cwd: &Path,
+    user_workflow_dir: &Path,
+    persisted_path: &Path,
 ) -> io::Result<ResolvedWorkflowScript> {
     let (source_kind, original_path, script) = if let Some(script_path) = input
         .script_path
@@ -66,10 +91,6 @@ pub fn resolve_workflow_script_with_user_dir(
     };
 
     let meta = parse_workflow_meta(&script)?;
-    let persisted_path = session_dir
-        .join("workflows")
-        .join("scripts")
-        .join(format!("{}.js", meta.name));
     if let Some(parent) = persisted_path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -78,7 +99,7 @@ pub fn resolve_workflow_script_with_user_dir(
     Ok(ResolvedWorkflowScript {
         source_kind,
         original_path,
-        persisted_path,
+        persisted_path: persisted_path.to_path_buf(),
         script_digest: sha256_hex(script.as_bytes()),
         meta,
         script,
@@ -86,10 +107,7 @@ pub fn resolve_workflow_script_with_user_dir(
 }
 
 pub fn contains_workflow_keyword(prompt: &str, config: &WorkflowConfig) -> bool {
-    config.keyword_trigger_enabled
-        && prompt
-            .split_whitespace()
-            .any(|word| word == "ultracode")
+    config.keyword_trigger_enabled && prompt.split_whitespace().any(|word| word == "ultracode")
 }
 
 fn resolve_path(cwd: &Path, raw_path: &str) -> PathBuf {
@@ -356,13 +374,22 @@ mod tests {
     #[test]
     fn workflow_keyword_requires_exact_word_and_enabled_switch() {
         let enabled = WorkflowConfig::default();
-        assert!(contains_workflow_keyword("please run ultracode now", &enabled));
-        assert!(!contains_workflow_keyword("please run ultracode-now", &enabled));
+        assert!(contains_workflow_keyword(
+            "please run ultracode now",
+            &enabled
+        ));
+        assert!(!contains_workflow_keyword(
+            "please run ultracode-now",
+            &enabled
+        ));
 
         let disabled = WorkflowConfig {
             keyword_trigger_enabled: false,
             ..WorkflowConfig::default()
         };
-        assert!(!contains_workflow_keyword("please run ultracode now", &disabled));
+        assert!(!contains_workflow_keyword(
+            "please run ultracode now",
+            &disabled
+        ));
     }
 }

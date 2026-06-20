@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use orca_core::workflow_types::{WorkflowAgentStatus, WorkflowInput, WorkflowRunState};
 use serde::{Deserialize, Serialize};
@@ -107,6 +108,7 @@ impl Serialize for AgentOutputField {
 #[derive(Clone, Debug)]
 pub struct WorkflowStateStore {
     root: PathBuf,
+    agent_cache_write_lock: Arc<Mutex<()>>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -127,7 +129,10 @@ struct WorkflowStopRequest {
 
 impl WorkflowStateStore {
     pub fn new(root: PathBuf) -> Self {
-        Self { root }
+        Self {
+            root,
+            agent_cache_write_lock: Arc::new(Mutex::new(())),
+        }
     }
 
     pub fn run_dir(&self, run_id: &str) -> PathBuf {
@@ -224,6 +229,10 @@ impl WorkflowStateStore {
         run_id: &str,
         record: impl IntoWorkflowAgentRecord,
     ) -> io::Result<()> {
+        let _lock = self
+            .agent_cache_write_lock
+            .lock()
+            .map_err(|_| io::Error::other("workflow agent cache lock poisoned"))?;
         let record = record.into_workflow_agent_record();
         let path = self.run_dir(run_id).join("agent-cache.json");
         let mut cache = if path.exists() {

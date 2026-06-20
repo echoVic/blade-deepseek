@@ -5,9 +5,12 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use toml::Value;
 
-use crate::approval_types::ApprovalMode;
 use crate::approval_rules::PermissionRules;
-use crate::config::{ThemeName, ToolConfig, WorkflowConfig};
+use crate::approval_types::ApprovalMode;
+use crate::config::{
+    ThemeName, ToolConfig, WorkflowConfig, DEFAULT_MAX_WORKFLOW_AGENTS_PER_RUN,
+    DEFAULT_MAX_WORKFLOW_CONCURRENT_AGENTS,
+};
 use crate::subagent_config::SubagentConfig;
 
 const ORCA_HOME_ENV: &str = "ORCA_HOME";
@@ -171,10 +174,11 @@ impl WorkflowFileConfig {
             config.enabled = false;
         }
         if let Some(max_concurrent_agents) = self.max_concurrent_agents {
-            config.max_concurrent_agents = max_concurrent_agents;
+            config.max_concurrent_agents =
+                max_concurrent_agents.min(DEFAULT_MAX_WORKFLOW_CONCURRENT_AGENTS);
         }
         if let Some(max_agents_per_run) = self.max_agents_per_run {
-            config.max_agents_per_run = max_agents_per_run;
+            config.max_agents_per_run = max_agents_per_run.min(DEFAULT_MAX_WORKFLOW_AGENTS_PER_RUN);
         }
         if let Some(keyword_trigger_enabled) = self.workflow_keyword_trigger_enabled {
             config.keyword_trigger_enabled = keyword_trigger_enabled;
@@ -565,7 +569,12 @@ workflowKeywordTriggerEnabled = false
 "#,
         )
         .unwrap();
-        assert!(!keyword_disabled.workflows.resolved().keyword_trigger_enabled);
+        assert!(
+            !keyword_disabled
+                .workflows
+                .resolved()
+                .keyword_trigger_enabled
+        );
     }
 
     #[test]
@@ -588,7 +597,7 @@ workflowKeywordTriggerEnabled = true
     }
 
     #[test]
-    fn parse_workflow_config_preserves_numeric_values() {
+    fn parse_workflow_config_clamps_numeric_values_to_runtime_caps() {
         let toml = r#"
 [workflows]
 max_concurrent_agents = 128
@@ -596,8 +605,8 @@ max_agents_per_run = 12000
 "#;
         let config: FileConfig = toml::from_str(toml).unwrap();
         let workflows = config.workflows.resolved();
-        assert_eq!(workflows.max_concurrent_agents, 128);
-        assert_eq!(workflows.max_agents_per_run, 12_000);
+        assert_eq!(workflows.max_concurrent_agents, 16);
+        assert_eq!(workflows.max_agents_per_run, 1_000);
     }
 
     #[test]
@@ -742,10 +751,7 @@ decision = "allow"
         let config = apply_override_layers(base, env, cli);
 
         assert_eq!(config.model.as_deref(), Some("auto"));
-        assert_eq!(
-            config.mode,
-            Some(crate::approval_types::ApprovalMode::Plan)
-        );
+        assert_eq!(config.mode, Some(crate::approval_types::ApprovalMode::Plan));
         assert_eq!(config.api_key.as_deref(), Some("sk-cli"));
         assert_eq!(config.base_url.as_deref(), Some("https://cli.example"));
     }

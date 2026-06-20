@@ -4,7 +4,7 @@ use orca_core::workflow_types::{
     WorkflowAgentStatus, WorkflowInput, WorkflowMeta, WorkflowRunState, WorkflowRunStatus,
 };
 use orca_runtime::workflow::script::{
-    resolve_workflow_script, resolve_workflow_script_with_user_dir,
+    resolve_workflow_script, resolve_workflow_script_to_path, resolve_workflow_script_with_user_dir,
 };
 use orca_runtime::workflow::state::{
     WorkflowAgentCacheRecord, WorkflowAgentRecord, WorkflowStateStore,
@@ -27,12 +27,30 @@ fn inline_script_is_persisted_and_meta_is_extracted() {
     assert_eq!(resolved.meta.description, "Audit code");
     assert_eq!(resolved.meta.phases, vec!["scan", "review"]);
     assert!(resolved.persisted_path.exists());
-    assert!(
-        fs::read_to_string(&resolved.persisted_path)
-            .unwrap()
-            .contains("export const meta")
-    );
+    assert!(fs::read_to_string(&resolved.persisted_path)
+        .unwrap()
+        .contains("export const meta"));
     assert_eq!(resolved.script_digest.len(), 64);
+}
+
+#[test]
+fn workflow_scripts_can_be_persisted_per_run_with_same_meta_name() {
+    let temp = tempdir().unwrap();
+    let input = WorkflowInput {
+        script: Some("export const meta = { name: 'audit', description: 'Audit code', phases: [] };\nexport default 'ok';".to_string()),
+        ..Default::default()
+    };
+    let first_path = temp.path().join("session/workflow-runs/run-1/script.js");
+    let second_path = temp.path().join("session/workflow-runs/run-2/script.js");
+
+    let first = resolve_workflow_script_to_path(&input, temp.path(), &first_path).unwrap();
+    let second = resolve_workflow_script_to_path(&input, temp.path(), &second_path).unwrap();
+
+    assert_eq!(first.persisted_path, first_path);
+    assert_eq!(second.persisted_path, second_path);
+    assert_ne!(first.persisted_path, second.persisted_path);
+    assert!(first.persisted_path.exists());
+    assert!(second.persisted_path.exists());
 }
 
 #[test]

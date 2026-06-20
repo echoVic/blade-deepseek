@@ -1,6 +1,8 @@
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
+use std::thread;
+use std::time::Duration;
 
 use orca_runtime::workflow::host::{HostEvent, WorkflowHost};
 use tempfile::tempdir;
@@ -21,14 +23,87 @@ fn host_emits_phase_and_agent_call_events() {
 
     let events = WorkflowHost::run_collecting_events(&script, serde_json::json!({"x": 1})).unwrap();
 
-    assert!(
-        events
-            .iter()
-            .any(|event| matches!(event, HostEvent::PhaseStarted { name } if name == "scan"))
-    );
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, HostEvent::PhaseStarted { name } if name == "scan")));
     assert!(events.iter().any(
         |event| matches!(event, HostEvent::AgentCall { prompt, .. } if prompt == "inspect repo")
     ));
+}
+
+#[test]
+fn host_phase_marker_applies_to_following_agents_until_changed() {
+    if !WorkflowHost::node_available() {
+        return;
+    }
+
+    let temp = tempdir().unwrap();
+    let script = temp.path().join("workflow.js");
+    fs::write(
+        &script,
+        "export const meta = { name: 'marker-test', description: 'Marker phase test', phases: ['scan', 'review'] };\nphase('scan');\nawait agent('inspect repo');\nphase('review');\nawait agent('review findings');\nexport default 'done';",
+    )
+    .unwrap();
+
+    let events = WorkflowHost::run_collecting_events(&script, serde_json::json!(null)).unwrap();
+
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            HostEvent::AgentCall { prompt, phase, .. }
+                if prompt == "inspect repo" && phase.as_deref() == Some("scan")
+        )
+    }));
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            HostEvent::AgentCall { prompt, phase, .. }
+                if prompt == "review findings" && phase.as_deref() == Some("review")
+        )
+    }));
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, HostEvent::PhaseCompleted { name } if name == "scan")));
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, HostEvent::PhaseCompleted { name } if name == "review")));
+}
+
+#[test]
+fn host_parallel_routes_out_of_order_agent_results_by_call_id() {
+    if !WorkflowHost::node_available() {
+        return;
+    }
+
+    let temp = tempdir().unwrap();
+    let script = temp.path().join("workflow.js");
+    fs::write(
+        &script,
+        "export const meta = { name: 'parallel-host-test', description: 'Parallel host test', phases: [] };\nconst results = await parallel([agent('slow'), agent('fast')]);\nexport default results.map(item => item.prompt).join(',');",
+    )
+    .unwrap();
+
+    let events =
+        WorkflowHost::run_collecting_events_with_agent(&script, serde_json::json!(null), |call| {
+            if call.prompt == "slow" {
+                thread::sleep(Duration::from_millis(150));
+            }
+            Ok(orca_runtime::workflow::host::HostCommand::AgentResult {
+                call_id: call.call_id.clone(),
+                result: serde_json::json!({
+                    "prompt": call.prompt,
+                }),
+            })
+        })
+        .unwrap();
+
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            HostEvent::WorkflowCompleted { result }
+                if result.as_str() == Some("slow,fast")
+        )
+    }));
 }
 
 #[test]
@@ -69,11 +144,9 @@ fn host_ignores_export_mentions_in_comments_and_strings_when_loading_workflow_mo
 
     let events = WorkflowHost::run_collecting_events(&script, serde_json::json!(null)).unwrap();
 
-    assert!(
-        events
-            .iter()
-            .any(|event| matches!(event, HostEvent::PhaseStarted { name } if name == "scan"))
-    );
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, HostEvent::PhaseStarted { name } if name == "scan")));
     assert!(events.iter().any(|event| {
         matches!(
             event,
@@ -81,16 +154,12 @@ fn host_ignores_export_mentions_in_comments_and_strings_when_loading_workflow_mo
                 if prompt == "Prompt mentioning export default before the real workflow body"
         )
     }));
-    assert!(
-        events
-            .iter()
-            .any(|event| matches!(event, HostEvent::WorkflowCompleted { .. }))
-    );
-    assert!(
-        !events
-            .iter()
-            .any(|event| matches!(event, HostEvent::WorkflowFailed { .. }))
-    );
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, HostEvent::WorkflowCompleted { .. })));
+    assert!(!events
+        .iter()
+        .any(|event| matches!(event, HostEvent::WorkflowFailed { .. })));
 }
 
 #[test]
@@ -116,16 +185,12 @@ fn host_allows_blocked_words_in_comments_and_prompt_strings() {
                 if prompt == "inspect process usage and globalThis references"
         )
     }));
-    assert!(
-        events
-            .iter()
-            .any(|event| matches!(event, HostEvent::WorkflowCompleted { .. }))
-    );
-    assert!(
-        !events
-            .iter()
-            .any(|event| matches!(event, HostEvent::WorkflowFailed { .. }))
-    );
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, HostEvent::WorkflowCompleted { .. })));
+    assert!(!events
+        .iter()
+        .any(|event| matches!(event, HostEvent::WorkflowFailed { .. })));
 }
 
 #[test]
@@ -144,11 +209,9 @@ fn host_blocks_constructor_process_escape_attempts() {
 
     let events = WorkflowHost::run_collecting_events(&script, serde_json::json!(null)).unwrap();
 
-    assert!(
-        events
-            .iter()
-            .any(|event| matches!(event, HostEvent::WorkflowFailed { .. }))
-    );
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, HostEvent::WorkflowFailed { .. })));
     assert!(
         !events
             .iter()
@@ -203,11 +266,9 @@ fn host_blocks_constructor_builtin_module_escape_attempts() {
 
     let events = WorkflowHost::run_collecting_events(&script, serde_json::json!(null)).unwrap();
 
-    assert!(
-        events
-            .iter()
-            .any(|event| matches!(event, HostEvent::WorkflowFailed { .. }))
-    );
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, HostEvent::WorkflowFailed { .. })));
     assert!(!events.iter().any(|event| {
         matches!(event, HostEvent::AgentCall { prompt, .. } if prompt.starts_with("escaped fs "))
     }));
@@ -315,7 +376,9 @@ fn host_reports_workflow_failed_when_stdin_closes_before_agent_result() {
         "expected host to exit with workflow failure, status={:?}, stderr={stderr}",
         output.status.code()
     );
-    assert!(remaining.iter().any(|line| line.contains("\"type\":\"workflow_failed\"")));
+    assert!(remaining
+        .iter()
+        .any(|line| line.contains("\"type\":\"workflow_failed\"")));
 }
 
 #[test]
@@ -373,7 +436,6 @@ fn host_reports_workflow_failed_for_partial_trailing_json_on_stdin_eof() {
         output.status.code()
     );
     assert!(remaining.iter().any(|line| {
-        line.contains("\"type\":\"workflow_failed\"")
-            && line.contains("partial JSON")
+        line.contains("\"type\":\"workflow_failed\"") && line.contains("partial JSON")
     }));
 }

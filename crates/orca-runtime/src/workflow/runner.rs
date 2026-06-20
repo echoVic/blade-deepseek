@@ -2,6 +2,7 @@ use std::fs;
 use std::io;
 use std::io::sink;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -21,7 +22,7 @@ use orca_core::workflow_types::{
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::agent_child::{ChildAgentRequest, ChildAgentRuntime, run_child_agent};
+use crate::agent_child::{run_child_agent, ChildAgentRequest, ChildAgentRuntime};
 use crate::controller::execute_child_agent_loop;
 use crate::hooks::HookRunner;
 use crate::instructions;
@@ -29,8 +30,8 @@ use crate::memory;
 use crate::tasks::TaskRegistry;
 
 use super::host::{AgentCall, HostCommand, HostEvent, WorkflowHost};
-use super::script::{ResolvedWorkflowScript, resolve_workflow_script};
-use super::state::{WorkflowAgentRecord, WorkflowStateStore, WorkflowWorkerRecord, input_hash};
+use super::script::{resolve_workflow_script_to_path, ResolvedWorkflowScript};
+use super::state::{input_hash, WorkflowAgentRecord, WorkflowStateStore, WorkflowWorkerRecord};
 
 const STOP_REQUESTED_ERROR: &str = "__orca_workflow_stop_requested__";
 const STOPPED_SUMMARY: &str = "Workflow stopped";
@@ -244,8 +245,10 @@ impl WorkflowRunner {
         let cwd = self.config.cwd.clone().unwrap_or(std::env::current_dir()?);
         fs::create_dir_all(&self.session_dir)?;
 
-        let resolved = resolve_workflow_script(&request.input, &cwd, &self.session_dir)?;
         let run_id = format!("workflow-run-{}", uuid::Uuid::new_v4());
+        let persisted_script_path = self.state.run_dir(&run_id).join("script.js");
+        let resolved =
+            resolve_workflow_script_to_path(&request.input, &cwd, &persisted_script_path)?;
         let task = self.tasks.create_workflow(
             run_id.clone(),
             resolved.meta.name.clone(),
@@ -298,7 +301,7 @@ impl WorkflowRunner {
         let mut state = self.state.load_run(&run_id)?;
         let args = request.input.args.clone().unwrap_or(Value::Null);
         let resume_from = request.input.resume_from_run_id.clone();
-        let mut cached_agents = 0u32;
+        let cached_agents = Arc::new(AtomicU32::new(0));
         let mut failed_error = None;
         let mut completed_result = None;
         let gate = Arc::new(WorkflowExecutionGate::new());
@@ -325,7 +328,7 @@ impl WorkflowRunner {
                     resume_from.as_deref(),
                     &transcript_dir,
                     call,
-                    &mut cached_agents,
+                    Arc::clone(&cached_agents),
                     &gate,
                     &workflow_limits,
                 )
@@ -434,6 +437,7 @@ impl WorkflowRunner {
         }
 
         let result = completed_result.unwrap_or_default();
+        let cached_agents = cached_agents.load(Ordering::Relaxed);
         let cache_summary = if cached_agents == 1 {
             "cached 1 agent".to_string()
         } else {
@@ -476,7 +480,7 @@ impl WorkflowRunner {
         resume_from: Option<&str>,
         transcript_dir: &std::path::Path,
         call: AgentCall,
-        cached_agents: &mut u32,
+        cached_agents: Arc<AtomicU32>,
         gate: &Arc<WorkflowExecutionGate>,
         workflow_limits: &orca_core::config::WorkflowConfig,
     ) -> io::Result<HostCommand> {
@@ -504,7 +508,7 @@ impl WorkflowRunner {
                 self.state
                     .find_cached_agent_value(resume_run_id, &call.call_path, &hash)
             {
-                *cached_agents += 1;
+                cached_agents.fetch_add(1, Ordering::Relaxed);
                 let normalized_cached_value = normalize_cached_agent_result(&call, cached_value);
                 let output = result_to_summary(&normalized_cached_value);
                 let transcript_path = write_agent_transcript(transcript_dir, &call, &output, true)?;

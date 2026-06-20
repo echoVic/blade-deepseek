@@ -11,8 +11,8 @@ use std::time::SystemTime;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use orca_core::workflow_types::{WorkflowInput, WorkflowRunState};
-use orca_runtime::workflow::state::WorkflowStateStore;
 use orca_runtime::tasks::TaskRegistry;
+use orca_runtime::workflow::state::WorkflowStateStore;
 use orca_runtime::workflow::{WorkflowLaunchRequest, WorkflowRunner};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -690,6 +690,12 @@ fn run_workflow_command(args: WorkflowRunArgs) -> i32 {
         workflow_args,
         args.resume_from_run_id,
     );
+    if let Some(run_id) = input.resume_from_run_id.as_deref() {
+        eprintln!(
+            "orca: workflow resume from run '{run_id}' is only available inside the active Orca session that owns the workflow run"
+        );
+        return 1;
+    }
     let session_id = match resolve_workflow_session_id(&cwd, input.resume_from_run_id.as_deref()) {
         Ok(session_id) => session_id,
         Err(error) => {
@@ -827,35 +833,11 @@ fn workflow_resume_command(run_id: &str) -> i32 {
     let cwd = std::env::current_dir().unwrap_or_default();
     match find_workflow_by_run_id(&cwd, run_id) {
         Ok(Some(run)) => {
-            let launch_record = match load_workflow_cli_launch_record(&run.run_dir) {
-                Ok(record) => record,
-                Err(error) => {
-                    eprintln!("orca: failed to load persisted workflow launch input: {error}");
-                    return 1;
-                }
-            };
-            if let Err(error) = build_workflow_run_config(
-                Path::new(&launch_record.cwd),
-                launch_record.provider,
-                launch_record.model.clone(),
-                launch_record.api_key.clone(),
-                launch_record.base_url.clone(),
-            ) {
-                eprintln!("orca: {error}");
-                return 1;
-            }
-            let mut input = launch_record.input;
-            input.resume_from_run_id = Some(run_id.to_string());
-
-            spawn_workflow_worker(
-                Path::new(&launch_record.cwd),
-                run.session_id,
-                launch_record.provider,
-                launch_record.model,
-                launch_record.api_key,
-                launch_record.base_url,
-                &input,
-            )
+            eprintln!(
+                "orca: workflow run '{}' belongs to session '{}'; resume is only available inside that active Orca session",
+                run.state.run_id, run.session_id
+            );
+            1
         }
         Ok(None) => {
             eprintln!("orca: workflow run '{run_id}' not found");
@@ -1102,7 +1084,10 @@ fn workflow_session_root(cwd: &Path) -> PathBuf {
     cwd.join(".orca").join("workflow-sessions")
 }
 
-fn resolve_workflow_session_id(cwd: &Path, resume_from_run_id: Option<&str>) -> Result<String, String> {
+fn resolve_workflow_session_id(
+    cwd: &Path,
+    resume_from_run_id: Option<&str>,
+) -> Result<String, String> {
     match resume_from_run_id {
         Some(run_id) => find_workflow_by_run_id(cwd, run_id)?
             .map(|run| run.session_id)
@@ -1200,13 +1185,6 @@ fn write_workflow_cli_launch_record(
     let path = workflow_cli_launch_record_path(run_dir);
     let content = serde_json::to_string_pretty(record).map_err(|error| error.to_string())?;
     fs::write(path, content).map_err(|error| error.to_string())
-}
-
-fn load_workflow_cli_launch_record(run_dir: &Path) -> Result<WorkflowCliLaunchRecord, String> {
-    let path = workflow_cli_launch_record_path(run_dir);
-    let content = fs::read_to_string(&path).map_err(|error| error.to_string())?;
-    serde_json::from_str(&content)
-        .map_err(|error| format!("invalid workflow launch record at {}: {error}", path.display()))
 }
 
 fn workflow_cli_launch_record_path(run_dir: &Path) -> PathBuf {

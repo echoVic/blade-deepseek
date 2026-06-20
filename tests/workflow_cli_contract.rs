@@ -230,20 +230,17 @@ fn workflow_stop_requests_real_background_stop() {
 }
 
 #[test]
-fn workflow_resume_reuses_persisted_launch_input_and_cache() {
+fn workflow_resume_rejects_cross_process_cache_resume() {
     let temp = tempdir().unwrap();
-    let home = temp.path().join("home");
-    write_sleep_hook_config(&home, 1.0);
     let script = temp.path().join("resumable.js");
     fs::write(
         &script,
-        "export const meta = { name: 'resumable', description: 'Resumable workflow', phases: [] };\nawait agent('first');\nexport default await agent('second');",
+        "export const meta = { name: 'resumable', description: 'Resumable workflow', phases: [] };\nexport default await agent('first');",
     )
     .unwrap();
 
     let run = Command::new(env!("CARGO_BIN_EXE_orca"))
         .current_dir(temp.path())
-        .env("ORCA_HOME", &home)
         .args([
             "workflow",
             "run",
@@ -256,20 +253,7 @@ fn workflow_resume_reuses_persisted_launch_input_and_cache() {
 
     assert_eq!(run.status.code(), Some(0));
     let launched: Value = serde_json::from_slice(&run.stdout).unwrap();
-    let task_id = launched["taskId"].as_str().unwrap();
     let run_id = launched["runId"].as_str().unwrap();
-
-    thread::sleep(Duration::from_millis(250));
-
-    let stop = Command::new(env!("CARGO_BIN_EXE_orca"))
-        .current_dir(temp.path())
-        .args(["workflow", "stop", task_id])
-        .output()
-        .expect("stop workflow");
-    assert_eq!(stop.status.code(), Some(0));
-
-    wait_for_workflow_terminal_status(temp.path(), task_id);
-    assert_eq!(workflow_show(temp.path(), task_id)["status"], "stopped");
 
     let resume = Command::new(env!("CARGO_BIN_EXE_orca"))
         .current_dir(temp.path())
@@ -277,20 +261,14 @@ fn workflow_resume_reuses_persisted_launch_input_and_cache() {
         .output()
         .expect("resume workflow");
 
-    assert_eq!(resume.status.code(), Some(0));
-    let resumed: Value = serde_json::from_slice(&resume.stdout).unwrap();
-    assert_eq!(resumed["status"], "async_launched");
-    assert_ne!(resumed["runId"], run_id);
-
-    let resumed_task_id = resumed["taskId"].as_str().unwrap();
-    wait_for_workflow_terminal_status(temp.path(), resumed_task_id);
-    let shown = workflow_show(temp.path(), resumed_task_id);
-    assert_eq!(shown["status"], "completed");
     assert!(
-        shown["finalSummary"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("cached 1 agent")
+        !resume.status.success(),
+        "standalone CLI resume should not reuse a persisted cache"
+    );
+    let stderr = String::from_utf8_lossy(&resume.stderr);
+    assert!(
+        stderr.contains("only available inside that active Orca session"),
+        "unexpected stderr: {stderr}"
     );
 }
 
@@ -321,9 +299,7 @@ fn write_sleep_hook_config(home: &std::path::Path, seconds: f32) {
     fs::create_dir_all(home).unwrap();
     fs::write(
         home.join("config.toml"),
-        format!(
-            "[[hooks]]\nevent = \"pre_model_call\"\ncommand = \"sleep {seconds}\"\n"
-        ),
+        format!("[[hooks]]\nevent = \"pre_model_call\"\ncommand = \"sleep {seconds}\"\n"),
     )
     .unwrap();
 }

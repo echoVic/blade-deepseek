@@ -3,6 +3,8 @@ use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::thread;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -68,10 +70,10 @@ impl WorkflowHost {
     pub fn run_collecting_events_with_agent<F>(
         script_path: &Path,
         args: Value,
-        mut on_agent_call: F,
+        on_agent_call: F,
     ) -> io::Result<Vec<HostEvent>>
     where
-        F: FnMut(AgentCall) -> io::Result<HostCommand>,
+        F: Fn(AgentCall) -> io::Result<HostCommand> + Send + Sync,
     {
         let host_path = ensure_host_file()?;
         let args_json = serde_json::to_string(&args)
@@ -85,10 +87,11 @@ impl WorkflowHost {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?;
-        let mut stdin = child
+        let stdin = child
             .stdin
             .take()
             .ok_or_else(|| io::Error::other("failed to capture workflow host stdin"))?;
+        let stdin = Arc::new(Mutex::new(stdin));
 
         let stdout = child
             .stdout
@@ -98,48 +101,75 @@ impl WorkflowHost {
 
         let mut events = Vec::new();
         let mut workflow_failed = None;
-        for line in reader.lines() {
-            let line = line?;
-            if line.trim().is_empty() {
-                continue;
-            }
+        let agent_error = Arc::new(Mutex::new(None));
+        let on_agent_call = &on_agent_call;
+        thread::scope(|scope| -> io::Result<()> {
+            for line in reader.lines() {
+                let line = line?;
+                if line.trim().is_empty() {
+                    continue;
+                }
 
-            let event: HostEvent = serde_json::from_str(&line)
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-            if let HostEvent::WorkflowFailed { error } = &event {
-                workflow_failed = Some(error.clone());
-            }
-            let is_terminal = matches!(
-                event,
-                HostEvent::WorkflowCompleted { .. } | HostEvent::WorkflowFailed { .. }
-            );
-            if let HostEvent::AgentCall {
-                call_id,
-                call_path,
-                phase,
-                prompt,
-                opts,
-            } = &event
-            {
-                let command = on_agent_call(AgentCall {
-                    call_id: call_id.clone(),
-                    call_path: call_path.clone(),
-                    phase: phase.clone(),
-                    prompt: prompt.clone(),
-                    opts: opts.clone(),
-                })?;
-                let command_json = serde_json::to_string(&command)
+                let event: HostEvent = serde_json::from_str(&line)
                     .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-                stdin.write_all(command_json.as_bytes())?;
-                stdin.write_all(b"\n")?;
-                stdin.flush()?;
+                if let HostEvent::WorkflowFailed { error } = &event {
+                    workflow_failed = Some(error.clone());
+                }
+                let is_terminal = matches!(
+                    event,
+                    HostEvent::WorkflowCompleted { .. } | HostEvent::WorkflowFailed { .. }
+                );
+                if let HostEvent::AgentCall {
+                    call_id,
+                    call_path,
+                    phase,
+                    prompt,
+                    opts,
+                } = &event
+                {
+                    let call = AgentCall {
+                        call_id: call_id.clone(),
+                        call_path: call_path.clone(),
+                        phase: phase.clone(),
+                        prompt: prompt.clone(),
+                        opts: opts.clone(),
+                    };
+                    let writer = Arc::clone(&stdin);
+                    let error_slot = Arc::clone(&agent_error);
+                    scope.spawn(move || {
+                        let call_id = call.call_id.clone();
+                        let command = match on_agent_call(call) {
+                            Ok(command) => command,
+                            Err(error) => {
+                                record_first_agent_error(&error_slot, error.to_string());
+                                HostCommand::AgentError {
+                                    call_id,
+                                    error: "workflow host failed to answer agent call".to_string(),
+                                }
+                            }
+                        };
+
+                        if let Err(error) = write_host_command(&writer, &command) {
+                            record_first_agent_error(&error_slot, error.to_string());
+                        }
+                    });
+                }
+                events.push(event);
+                if is_terminal {
+                    break;
+                }
             }
-            events.push(event);
-            if is_terminal {
-                break;
-            }
-        }
+            Ok(())
+        })?;
         drop(stdin);
+
+        if let Some(error) = agent_error
+            .lock()
+            .map_err(|_| io::Error::other("workflow agent error lock poisoned"))?
+            .clone()
+        {
+            return Err(io::Error::other(error));
+        }
 
         let output = child.wait_with_output()?;
         if !output.status.success() {
@@ -160,6 +190,25 @@ impl WorkflowHost {
         }
 
         Ok(events)
+    }
+}
+
+fn write_host_command(writer: &Arc<Mutex<impl Write>>, command: &HostCommand) -> io::Result<()> {
+    let command_json = serde_json::to_string(command)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let mut writer = writer
+        .lock()
+        .map_err(|_| io::Error::other("workflow host stdin lock poisoned"))?;
+    writer.write_all(command_json.as_bytes())?;
+    writer.write_all(b"\n")?;
+    writer.flush()
+}
+
+fn record_first_agent_error(error_slot: &Arc<Mutex<Option<String>>>, error: String) {
+    if let Ok(mut slot) = error_slot.lock() {
+        if slot.is_none() {
+            *slot = Some(error);
+        }
     }
 }
 

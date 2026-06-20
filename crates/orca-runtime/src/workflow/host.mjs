@@ -25,8 +25,9 @@ const MODULE_SPECIFIER_CALLEES = new Set(["import", "require", "getBuiltinModule
 
 let callSeq = 0;
 let currentPhase = null;
+let activeMarkerPhase = null;
 let stdinBuffer = "";
-const stdinResolvers = [];
+const pendingAgentResolvers = new Map();
 let stdinClosed = false;
 
 process.stdin.setEncoding("utf8");
@@ -47,6 +48,7 @@ async function agent(prompt, opts = {}) {
   callSeq += 1;
   const callId = `agent-${callSeq}`;
   const callPath = `${currentPhase ?? "root"}:${callSeq}`;
+  const resultPromise = readProtocolMessage(callId);
   emit({
     type: "agent_call",
     call_id: callId,
@@ -56,10 +58,7 @@ async function agent(prompt, opts = {}) {
     opts,
   });
 
-  const message = await readProtocolMessage();
-  if (message.call_id !== callId) {
-    throw new Error(`Workflow host protocol mismatch for ${callId}`);
-  }
+  const message = await resultPromise;
   if (message.type === "agent_result") {
     return message.result;
   }
@@ -83,6 +82,18 @@ async function pipeline(items) {
 }
 
 async function phase(name, body) {
+  if (typeof body !== "function") {
+    if (activeMarkerPhase === name) {
+      currentPhase = name;
+      return undefined;
+    }
+    completeActiveMarkerPhase();
+    currentPhase = name;
+    activeMarkerPhase = name;
+    emit({ type: "phase_started", name });
+    return undefined;
+  }
+
   const prior = currentPhase;
   currentPhase = name;
   emit({ type: "phase_started", name });
@@ -95,15 +106,24 @@ async function phase(name, body) {
   }
 }
 
-function readProtocolMessage() {
+function completeActiveMarkerPhase() {
+  if (activeMarkerPhase === null) {
+    return;
+  }
+  const name = activeMarkerPhase;
+  activeMarkerPhase = null;
+  emit({ type: "phase_completed", name });
+}
+
+function readProtocolMessage(callId) {
   return new Promise((resolve, reject) => {
-    stdinResolvers.push({ resolve, reject });
+    pendingAgentResolvers.set(callId, { resolve, reject });
     flushStdinResolvers();
   });
 }
 
 function flushStdinResolvers() {
-  while (stdinResolvers.length > 0) {
+  while (true) {
     const newlineIndex = stdinBuffer.indexOf("\n");
     if (newlineIndex === -1) {
       if (!stdinClosed) {
@@ -112,13 +132,15 @@ function flushStdinResolvers() {
 
       const trailing = stdinBuffer.trim();
       stdinBuffer = "";
-      const pending = stdinResolvers.shift();
-      if (trailing.length > 0) {
-        pending.reject(new Error(`Workflow host protocol ended with partial JSON: ${trailing}`));
-      } else {
-        pending.reject(new Error("Workflow host protocol closed before agent result"));
+      for (const [callId, pending] of pendingAgentResolvers) {
+        if (trailing.length > 0) {
+          pending.reject(new Error(`Workflow host protocol ended with partial JSON: ${trailing}`));
+        } else {
+          pending.reject(new Error(`Workflow host protocol closed before result for ${callId}`));
+        }
       }
-      continue;
+      pendingAgentResolvers.clear();
+      return;
     }
 
     const line = stdinBuffer.slice(0, newlineIndex).trim();
@@ -127,11 +149,19 @@ function flushStdinResolvers() {
       continue;
     }
 
-    const pending = stdinResolvers.shift();
     try {
-      pending.resolve(JSON.parse(line));
+      const message = JSON.parse(line);
+      const pending = pendingAgentResolvers.get(message.call_id);
+      if (!pending) {
+        throw new Error(`Workflow host protocol received result for unknown call ${message.call_id}`);
+      }
+      pendingAgentResolvers.delete(message.call_id);
+      pending.resolve(message);
     } catch (error) {
-      pending.reject(error);
+      for (const pending of pendingAgentResolvers.values()) {
+        pending.reject(error);
+      }
+      pendingAgentResolvers.clear();
     }
   }
 }
@@ -647,6 +677,7 @@ function isIdentifierPart(char) {
 
 try {
   const namespace = await loadWorkflowModule();
+  completeActiveMarkerPhase();
   emit({ type: "workflow_completed", result: namespace.default ?? null });
 } catch (error) {
   emit({ type: "workflow_failed", error: error?.stack ?? String(error) });
