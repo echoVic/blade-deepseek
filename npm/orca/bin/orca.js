@@ -70,13 +70,14 @@ child.on("error", (error) => {
   process.exit(1);
 });
 
+const handledSignals = ["SIGINT", "SIGTERM", "SIGHUP"];
 const forwardSignal = (signal) => {
   if (!child.killed) {
     child.kill(signal);
   }
 };
 
-for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
+for (const signal of handledSignals) {
   process.on(signal, () => forwardSignal(signal));
 }
 
@@ -91,6 +92,9 @@ const result = await new Promise((resolve) => {
 });
 
 if (result.type === "signal") {
+  for (const signal of handledSignals) {
+    process.removeAllListeners(signal);
+  }
   process.kill(process.pid, result.signal);
 } else {
   process.exit(result.exitCode);

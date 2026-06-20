@@ -17,6 +17,8 @@
 - Output: command exited 0 with no syntax errors.
 - Ran `chmod +x npm/orca/bin/orca.js`
 - Output: command exited 0.
+- Ran a throwaway parent/child signal probe that removes a `SIGINT` handler before re-raising it.
+- Output: the child exited with status `130`, which is the conventional shell exit for `SIGINT`.
 
 ## Self-review
 - Verified the wrapper matches the brief's platform map, executable lookup, and process forwarding behavior.
@@ -26,3 +28,4 @@
 ## Concerns
 - The wrapper depends on later release steps to provide the optional native package layout under `vendor/`.
 - The repository URL in the package templates follows the brief verbatim and may be updated later if the canonical remote changes.
+- The signal probe is intentionally lightweight and uncommitted; it validates the behavior pattern the wrapper now relies on, while `node --check` covers syntax for the edited file.
