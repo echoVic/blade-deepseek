@@ -296,6 +296,46 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
         BuiltinExecutor::Subagent,
     ));
     registry.register(BuiltinTool::new(
+        "Workflow",
+        "Run a dynamic workflow: a JavaScript script that orchestrates many subagents in the background and returns one consolidated result.",
+        ActionKind::Agent,
+        json!({
+            "type": "object",
+            "properties": {
+                "script": {
+                    "type": "string",
+                    "description": "Self-contained workflow script beginning with export const meta = { name, description, phases }."
+                },
+                "name": {
+                    "type": "string",
+                    "description": "Name of a predefined workflow from .claude/workflows/ or the user workflow directory."
+                },
+                "description": {
+                    "type": "string",
+                    "description": "Compatibility field ignored by the runtime; use meta.description in the script."
+                },
+                "title": {
+                    "type": "string",
+                    "description": "Compatibility field ignored by the runtime; use meta.name in the script."
+                },
+                "args": {
+                    "type": "object",
+                    "description": "Structured input exposed to the workflow script as the global args value."
+                },
+                "scriptPath": {
+                    "type": "string",
+                    "description": "Path to a workflow script file. Takes precedence over script and name."
+                },
+                "resumeFromRunId": {
+                    "type": "string",
+                    "description": "Run id of a prior same-session workflow invocation to resume from."
+                }
+            },
+            "required": []
+        }),
+        BuiltinExecutor::Workflow,
+    ));
+    registry.register(BuiltinTool::new(
         "update_plan",
         "Update the current task plan. Use for complex multi-step tasks or when the user asks for a todo/task list. At most one step may be in_progress. Maximum 50 items, each step max 200 chars.",
         ActionKind::Read,
@@ -409,6 +449,11 @@ impl Tool for BuiltinTool {
                 "subagent tool must be executed by the runtime",
                 None,
             ),
+            BuiltinExecutor::Workflow => ToolResult::failed(
+                request,
+                "Workflow must be executed by the runtime controller",
+                None,
+            ),
             BuiltinExecutor::UpdatePlan => update_plan::execute(request),
         }
     }
@@ -425,6 +470,7 @@ enum BuiltinExecutor {
     GitStatus,
     WebSearch,
     Subagent,
+    Workflow,
     UpdatePlan,
 }
 
