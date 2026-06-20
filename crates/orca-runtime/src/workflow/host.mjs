@@ -73,9 +73,7 @@ async function phase(name, body) {
 async function loadWorkflowModule() {
   const source = await readFile(scriptPath, "utf8");
   guardWorkflowSource(source);
-  const transformed = source
-    .replace(/\bexport\s+const\s+meta\s*=/, "const meta =")
-    .replace(/\bexport\s+default\b/, "__workflow_default__ =");
+  const transformed = transformWorkflowSource(source);
 
   const context = vm.createContext(
     Object.assign(Object.create(null), {
@@ -112,6 +110,160 @@ async function loadWorkflowModule() {
   );
 
   return runner();
+}
+
+function transformWorkflowSource(source) {
+  const replacements = findWorkflowExportReplacements(source).sort((left, right) => right.start - left.start);
+  let transformed = source;
+
+  for (const replacement of replacements) {
+    transformed =
+      transformed.slice(0, replacement.start) +
+      replacement.text +
+      transformed.slice(replacement.end);
+  }
+
+  return transformed;
+}
+
+function findWorkflowExportReplacements(source) {
+  const replacements = [];
+  scanWorkflowExports(source, 0, null, replacements);
+  return replacements;
+}
+
+function scanWorkflowExports(source, startIndex, terminator, replacements) {
+  let index = startIndex;
+
+  while (index < source.length) {
+    const char = source[index];
+    const next = source[index + 1];
+
+    if (terminator && char === terminator) {
+      return index + 1;
+    }
+
+    if (isWhitespace(char)) {
+      index += 1;
+      continue;
+    }
+
+    if (char === "/" && next === "/") {
+      index = skipLineComment(source, index + 2);
+      continue;
+    }
+
+    if (char === "/" && next === "*") {
+      index = skipBlockComment(source, index + 2);
+      continue;
+    }
+
+    if (char === "'" || char === "\"") {
+      index = readQuotedString(source, index, char).nextIndex;
+      continue;
+    }
+
+    if (char === "`") {
+      index = scanTemplateLiteralForWorkflowExports(source, index + 1, replacements);
+      continue;
+    }
+
+    if (isIdentifierStart(char)) {
+      const exportMatch = matchWorkflowExport(source, index);
+      if (exportMatch) {
+        replacements.push(exportMatch);
+        index = exportMatch.end;
+        continue;
+      }
+
+      index = readIdentifierEnd(source, index + 1);
+      continue;
+    }
+
+    index += 1;
+  }
+
+  if (terminator) {
+    throw new Error(`Unterminated workflow syntax before ${terminator}`);
+  }
+
+  return index;
+}
+
+function scanTemplateLiteralForWorkflowExports(source, startIndex, replacements) {
+  let index = startIndex;
+
+  while (index < source.length) {
+    const char = source[index];
+    const next = source[index + 1];
+
+    if (char === "\\") {
+      index += 2;
+      continue;
+    }
+
+    if (char === "`") {
+      return index + 1;
+    }
+
+    if (char === "$" && next === "{") {
+      index = scanWorkflowExports(source, index + 2, "}", replacements);
+      continue;
+    }
+
+    index += 1;
+  }
+
+  throw new Error("Unterminated template literal in workflow script");
+}
+
+function matchWorkflowExport(source, startIndex) {
+  const exportEnd = readIdentifierEnd(source, startIndex + 1);
+  if (source.slice(startIndex, exportEnd) !== "export") {
+    return null;
+  }
+
+  const firstTokenStart = skipIgnorable(source, exportEnd);
+  if (firstTokenStart >= source.length || !isIdentifierStart(source[firstTokenStart])) {
+    return null;
+  }
+
+  const firstTokenEnd = readIdentifierEnd(source, firstTokenStart + 1);
+  const firstToken = source.slice(firstTokenStart, firstTokenEnd);
+
+  if (firstToken === "const") {
+    const secondTokenStart = skipIgnorable(source, firstTokenEnd);
+    if (secondTokenStart >= source.length || !isIdentifierStart(source[secondTokenStart])) {
+      return null;
+    }
+
+    const secondTokenEnd = readIdentifierEnd(source, secondTokenStart + 1);
+    const secondToken = source.slice(secondTokenStart, secondTokenEnd);
+    if (secondToken !== "meta") {
+      return null;
+    }
+
+    const equalsIndex = skipIgnorable(source, secondTokenEnd);
+    if (source[equalsIndex] !== "=") {
+      return null;
+    }
+
+    return {
+      start: startIndex,
+      end: firstTokenStart,
+      text: source.slice(exportEnd, firstTokenStart),
+    };
+  }
+
+  if (firstToken === "default") {
+    return {
+      start: startIndex,
+      end: firstTokenEnd,
+      text: `${source.slice(exportEnd, firstTokenStart)}__workflow_default__ =`,
+    };
+  }
+
+  return null;
 }
 
 function guardWorkflowSource(source) {
@@ -370,6 +522,34 @@ function nextNonWhitespaceChar(source, startIndex) {
     index += 1;
   }
   return source[index] ?? null;
+}
+
+function skipIgnorable(source, startIndex) {
+  let index = startIndex;
+
+  while (index < source.length) {
+    const char = source[index];
+    const next = source[index + 1];
+
+    if (isWhitespace(char)) {
+      index += 1;
+      continue;
+    }
+
+    if (char === "/" && next === "/") {
+      index = skipLineComment(source, index + 2);
+      continue;
+    }
+
+    if (char === "/" && next === "*") {
+      index = skipBlockComment(source, index + 2);
+      continue;
+    }
+
+    break;
+  }
+
+  return index;
 }
 
 function startsComputedProperty(lastTokenType) {

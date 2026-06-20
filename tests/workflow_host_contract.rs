@@ -52,6 +52,44 @@ fn host_exposes_args_global() {
 }
 
 #[test]
+fn host_ignores_export_mentions_in_comments_and_strings_when_loading_workflow_module() {
+    if !WorkflowHost::node_available() {
+        return;
+    }
+
+    let temp = tempdir().unwrap();
+    let script = temp.path().join("workflow.js");
+    fs::write(
+        &script,
+        "/* export const meta = { fake: true }; */\nconst prompt = 'Prompt mentioning export default before the real workflow body';\nexport const meta = { name: 'rewrite-guard-test', description: 'Syntax-aware export rewrite test', phases: ['scan'] };\nconst result = await phase('scan', async () => agent(prompt, { description: 'scan repo' }));\nexport default result;",
+    )
+    .unwrap();
+
+    let events = WorkflowHost::run_collecting_events(&script, serde_json::json!(null)).unwrap();
+
+    assert!(events.iter().any(
+        |event| matches!(event, HostEvent::PhaseStarted { name } if name == "scan")
+    ));
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            HostEvent::AgentCall { prompt, .. }
+                if prompt == "Prompt mentioning export default before the real workflow body"
+        )
+    }));
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, HostEvent::WorkflowCompleted { .. }))
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, HostEvent::WorkflowFailed { .. }))
+    );
+}
+
+#[test]
 fn host_allows_blocked_words_in_comments_and_prompt_strings() {
     if !WorkflowHost::node_available() {
         return;

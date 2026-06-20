@@ -219,6 +219,71 @@ test result: ok. 5 passed; 0 failed
 
 ---
 
+## Follow-up fix: syntax-aware export rewriting
+
+### Reviewer finding addressed
+
+Fixed `loadWorkflowModule()` in `crates/orca-runtime/src/workflow/host.mjs` so workflow export rewriting no longer uses raw whole-source regex replacement. The previous implementation could match `export const meta =` inside comments or `export default` inside prompt strings before the real module exports, leaving actual ESM syntax behind and breaking valid scripts at evaluation time.
+
+The host now performs a syntax-aware scan that:
+
+- skips line comments, block comments, single-quoted strings, double-quoted strings, and template literal text
+- still scans template interpolation code
+- rewrites only executable `export const meta =` to `const meta =`
+- rewrites only executable `export default` to `__workflow_default__ =`
+- preserves original comments and string contents exactly
+
+### TDD evidence
+
+#### RED
+
+Added a focused contract regression in `tests/workflow_host_contract.rs`:
+
+- `host_ignores_export_mentions_in_comments_and_strings_when_loading_workflow_module`
+
+Ran:
+
+```bash
+cargo test --test workflow_host_contract
+```
+
+Observed the expected failure before the fix: the new test did not receive the `PhaseStarted` event because the fake `export const meta =` mention in a block comment and the fake `export default` mention in a prompt string consumed the regex replacements before the real workflow exports.
+
+#### GREEN
+
+Replaced the regex-based export rewrite with a small source scanner in `host.mjs` and re-ran:
+
+```bash
+cargo test --test workflow_host_contract
+```
+
+Observed passing result:
+
+```text
+running 9 tests
+test host_allows_blocked_words_in_comments_and_prompt_strings ... ok
+test host_blocks_bracket_builtin_module_escape_attempts ... ok
+test host_blocks_bracket_constructor_process_escape_attempts ... ok
+test host_blocks_constructor_builtin_module_escape_attempts ... ok
+test host_blocks_constructor_process_escape_attempts ... ok
+test host_emits_phase_and_agent_call_events ... ok
+test host_exposes_args_global ... ok
+test host_ignores_export_mentions_in_comments_and_strings_when_loading_workflow_module ... ok
+test host_returns_workflow_failed_event_for_script_exceptions ... ok
+
+test result: ok. 9 passed; 0 failed
+```
+
+### Files changed for this follow-up
+
+- Modified `crates/orca-runtime/src/workflow/host.mjs`
+- Modified `tests/workflow_host_contract.rs`
+
+### Concerns
+
+- The export rewrite remains intentionally narrow to the current workflow contract and does not try to support arbitrary export forms beyond static `export const meta = ...` and `export default ...`.
+
+
 ## Follow-up fix: syntax-aware workflow guard
 
 ### Reviewer finding addressed
