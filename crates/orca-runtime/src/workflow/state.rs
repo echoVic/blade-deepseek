@@ -3,7 +3,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use orca_core::workflow_types::{WorkflowAgentStatus, WorkflowRunState};
+use orca_core::workflow_types::{WorkflowAgentStatus, WorkflowInput, WorkflowRunState};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -109,6 +109,22 @@ pub struct WorkflowStateStore {
     root: PathBuf,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkflowWorkerRecord {
+    pub pid: u32,
+    pub active: bool,
+    pub started_at_ms: i64,
+    pub completed_at_ms: Option<i64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkflowStopRequest {
+    stop_requested: bool,
+    requested_at_ms: i64,
+}
+
 impl WorkflowStateStore {
     pub fn new(root: PathBuf) -> Self {
         Self { root }
@@ -120,6 +136,22 @@ impl WorkflowStateStore {
 
     pub fn transcript_dir(&self, run_id: &str) -> PathBuf {
         self.run_dir(run_id).join("transcripts")
+    }
+
+    pub fn state_path(&self, run_id: &str) -> PathBuf {
+        self.run_dir(run_id).join("state.json")
+    }
+
+    pub fn launch_input_path(&self, run_id: &str) -> PathBuf {
+        self.run_dir(run_id).join("launch-input.json")
+    }
+
+    pub fn worker_path(&self, run_id: &str) -> PathBuf {
+        self.run_dir(run_id).join("worker.json")
+    }
+
+    pub fn stop_request_path(&self, run_id: &str) -> PathBuf {
+        self.run_dir(run_id).join("control.json")
     }
 
     pub fn create_run(&self, state: &WorkflowRunState) -> io::Result<()> {
@@ -134,11 +166,57 @@ impl WorkflowStateStore {
     pub fn write_state(&self, state: &WorkflowRunState) -> io::Result<()> {
         let run_dir = self.run_dir(&state.run_id);
         fs::create_dir_all(&run_dir)?;
-        write_json_pretty(&run_dir.join("state.json"), state)
+        write_json_pretty(&self.state_path(&state.run_id), state)
     }
 
     pub fn load_state(&self, run_id: &str) -> io::Result<WorkflowRunState> {
-        read_json(&self.run_dir(run_id).join("state.json"))
+        read_json(&self.state_path(run_id))
+    }
+
+    pub fn write_launch_input(&self, run_id: &str, input: &WorkflowInput) -> io::Result<()> {
+        write_json_pretty(&self.launch_input_path(run_id), input)
+    }
+
+    pub fn load_launch_input(&self, run_id: &str) -> io::Result<WorkflowInput> {
+        read_json(&self.launch_input_path(run_id))
+    }
+
+    pub fn write_worker_record(
+        &self,
+        run_id: &str,
+        worker: &WorkflowWorkerRecord,
+    ) -> io::Result<()> {
+        write_json_pretty(&self.worker_path(run_id), worker)
+    }
+
+    pub fn load_worker_record(&self, run_id: &str) -> io::Result<WorkflowWorkerRecord> {
+        read_json(&self.worker_path(run_id))
+    }
+
+    pub fn mark_worker_exited(&self, run_id: &str) -> io::Result<()> {
+        let mut worker = self.load_worker_record(run_id)?;
+        worker.active = false;
+        worker.completed_at_ms = Some(now_ms());
+        self.write_worker_record(run_id, &worker)
+    }
+
+    pub fn request_stop(&self, run_id: &str) -> io::Result<()> {
+        write_json_pretty(
+            &self.stop_request_path(run_id),
+            &WorkflowStopRequest {
+                stop_requested: true,
+                requested_at_ms: now_ms(),
+            },
+        )
+    }
+
+    pub fn stop_requested(&self, run_id: &str) -> io::Result<bool> {
+        let path = self.stop_request_path(run_id);
+        if !path.exists() {
+            return Ok(false);
+        }
+        let request: WorkflowStopRequest = read_json(&path)?;
+        Ok(request.stop_requested)
     }
 
     pub fn record_agent_completed(
@@ -213,6 +291,13 @@ impl WorkflowStateStore {
     }
 }
 
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 pub trait IntoWorkflowAgentRecord {
     fn into_workflow_agent_record(self) -> WorkflowAgentRecord;
 }
@@ -283,11 +368,13 @@ where
         String(String),
     }
 
-    Ok(match Option::<AgentOutputCompat>::deserialize(deserializer)? {
-        Some(AgentOutputCompat::Value(value)) => Some(value),
-        Some(AgentOutputCompat::String(output)) => Some(Value::String(output)),
-        None => None,
-    })
+    Ok(
+        match Option::<AgentOutputCompat>::deserialize(deserializer)? {
+            Some(AgentOutputCompat::Value(value)) => Some(value),
+            Some(AgentOutputCompat::String(output)) => Some(Value::String(output)),
+            None => None,
+        },
+    )
 }
 
 fn deserialize_agent_output_field<'de, D>(deserializer: D) -> Result<AgentOutputField, D::Error>

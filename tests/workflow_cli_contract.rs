@@ -1,5 +1,7 @@
 use std::fs;
 use std::process::Command;
+use std::thread;
+use std::time::Duration;
 
 use serde_json::Value;
 use tempfile::tempdir;
@@ -90,6 +92,8 @@ fn workflow_list_and_show_inspect_persisted_runs() {
     let task_id = launched["taskId"].as_str().unwrap();
     let run_id = launched["runId"].as_str().unwrap();
 
+    wait_for_workflow_terminal_status(temp.path(), task_id);
+
     let list = Command::new(env!("CARGO_BIN_EXE_orca"))
         .current_dir(temp.path())
         .args(["workflow", "list"])
@@ -120,18 +124,56 @@ fn workflow_list_and_show_inspect_persisted_runs() {
 }
 
 #[test]
-fn workflow_stop_and_resume_fail_clearly_without_live_registry_support() {
+fn workflow_run_returns_before_slow_workflow_completes() {
     let temp = tempdir().unwrap();
-    let script = temp.path().join("audit.js");
+    let home = temp.path().join("home");
+    write_sleep_hook_config(&home, 1.5);
+    let script = temp.path().join("slow.js");
     fs::write(
         &script,
-        "export const meta = { name: 'audit', description: 'Audit code', phases: [] };\nexport default await agent('inspect repo');",
+        "export const meta = { name: 'slow', description: 'Slow workflow', phases: [] };\nexport default await agent('inspect repo');",
     )
     .unwrap();
 
     let run = Command::new(env!("CARGO_BIN_EXE_orca"))
         .current_dir(temp.path())
-        .env("ORCA_HOME", temp.path().join("home"))
+        .env("ORCA_HOME", &home)
+        .args([
+            "workflow",
+            "run",
+            "--provider",
+            "mock",
+            script.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run workflow");
+
+    assert_eq!(run.status.code(), Some(0));
+    let launched: Value = serde_json::from_slice(&run.stdout).unwrap();
+    let task_id = launched["taskId"].as_str().unwrap();
+    let show = workflow_show(temp.path(), task_id);
+    assert!(show["status"] == "queued" || show["status"] == "running");
+
+    wait_for_workflow_terminal_status(temp.path(), task_id);
+    let completed = workflow_show(temp.path(), task_id);
+    assert_eq!(completed["status"], "completed");
+}
+
+#[test]
+fn workflow_stop_requests_real_background_stop() {
+    let temp = tempdir().unwrap();
+    let home = temp.path().join("home");
+    write_sleep_hook_config(&home, 1.0);
+    let script = temp.path().join("stoppable.js");
+    fs::write(
+        &script,
+        "export const meta = { name: 'stoppable', description: 'Stoppable workflow', phases: [] };\nawait agent('first');\nexport default await agent('second');",
+    )
+    .unwrap();
+
+    let run = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .current_dir(temp.path())
+        .env("ORCA_HOME", &home)
         .args([
             "workflow",
             "run",
@@ -147,17 +189,66 @@ fn workflow_stop_and_resume_fail_clearly_without_live_registry_support() {
     let task_id = launched["taskId"].as_str().unwrap();
     let run_id = launched["runId"].as_str().unwrap();
 
+    thread::sleep(Duration::from_millis(250));
+
     let stop = Command::new(env!("CARGO_BIN_EXE_orca"))
         .current_dir(temp.path())
         .args(["workflow", "stop", task_id])
         .output()
         .expect("stop workflow");
 
-    assert_eq!(stop.status.code(), Some(1));
-    assert!(
-        String::from_utf8_lossy(&stop.stderr)
-            .contains("cross-process workflow stop is not available")
-    );
+    assert_eq!(stop.status.code(), Some(0));
+    let stop_value: Value = serde_json::from_slice(&stop.stdout).unwrap();
+    assert_eq!(stop_value["status"], "stop_requested");
+    assert_eq!(stop_value["taskId"], task_id);
+    assert_eq!(stop_value["runId"], run_id);
+
+    wait_for_workflow_terminal_status(temp.path(), task_id);
+    let stopped = workflow_show(temp.path(), task_id);
+    assert_eq!(stopped["status"], "stopped");
+}
+
+#[test]
+fn workflow_resume_reuses_persisted_launch_input_and_cache() {
+    let temp = tempdir().unwrap();
+    let home = temp.path().join("home");
+    write_sleep_hook_config(&home, 1.0);
+    let script = temp.path().join("resumable.js");
+    fs::write(
+        &script,
+        "export const meta = { name: 'resumable', description: 'Resumable workflow', phases: [] };\nawait agent('first');\nexport default await agent('second');",
+    )
+    .unwrap();
+
+    let run = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .current_dir(temp.path())
+        .env("ORCA_HOME", &home)
+        .args([
+            "workflow",
+            "run",
+            "--provider",
+            "mock",
+            script.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run workflow");
+
+    assert_eq!(run.status.code(), Some(0));
+    let launched: Value = serde_json::from_slice(&run.stdout).unwrap();
+    let task_id = launched["taskId"].as_str().unwrap();
+    let run_id = launched["runId"].as_str().unwrap();
+
+    thread::sleep(Duration::from_millis(250));
+
+    let stop = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .current_dir(temp.path())
+        .args(["workflow", "stop", task_id])
+        .output()
+        .expect("stop workflow");
+    assert_eq!(stop.status.code(), Some(0));
+
+    wait_for_workflow_terminal_status(temp.path(), task_id);
+    assert_eq!(workflow_show(temp.path(), task_id)["status"], "stopped");
 
     let resume = Command::new(env!("CARGO_BIN_EXE_orca"))
         .current_dir(temp.path())
@@ -165,9 +256,53 @@ fn workflow_stop_and_resume_fail_clearly_without_live_registry_support() {
         .output()
         .expect("resume workflow");
 
-    assert_eq!(resume.status.code(), Some(1));
+    assert_eq!(resume.status.code(), Some(0));
+    let resumed: Value = serde_json::from_slice(&resume.stdout).unwrap();
+    assert_eq!(resumed["status"], "async_launched");
+    assert_ne!(resumed["runId"], run_id);
+
+    let resumed_task_id = resumed["taskId"].as_str().unwrap();
+    wait_for_workflow_terminal_status(temp.path(), resumed_task_id);
+    let shown = workflow_show(temp.path(), resumed_task_id);
+    assert_eq!(shown["status"], "completed");
     assert!(
-        String::from_utf8_lossy(&resume.stderr)
-            .contains("workflow resume from persisted state is not yet supported")
+        shown["finalSummary"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("cached 1 agent")
     );
+}
+
+fn workflow_show(cwd: &std::path::Path, task_id: &str) -> Value {
+    let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .current_dir(cwd)
+        .args(["workflow", "show", task_id])
+        .output()
+        .expect("show workflow");
+
+    assert_eq!(output.status.code(), Some(0));
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+fn wait_for_workflow_terminal_status(cwd: &std::path::Path, task_id: &str) {
+    for _ in 0..80 {
+        let shown = workflow_show(cwd, task_id);
+        let status = shown["status"].as_str().unwrap_or_default();
+        if matches!(status, "completed" | "failed" | "stopped" | "cancelled") {
+            return;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    panic!("workflow task {task_id} did not reach a terminal state");
+}
+
+fn write_sleep_hook_config(home: &std::path::Path, seconds: f32) {
+    fs::create_dir_all(home).unwrap();
+    fs::write(
+        home.join("config.toml"),
+        format!(
+            "[[hooks]]\nevent = \"pre_model_call\"\ncommand = \"sleep {seconds}\"\n"
+        ),
+    )
+    .unwrap();
 }

@@ -144,6 +144,16 @@ impl TaskRegistry {
         })
     }
 
+    pub fn stop(&self, id: &str, summary: String) -> Result<(), String> {
+        self.update_task(id, |record| {
+            record.status = TaskStatus::Stopped;
+            record.result = Some(summary);
+            record.error = None;
+            record.control.pause.store(false, Ordering::Release);
+            Ok(())
+        })
+    }
+
     pub fn request_stop(&self, id: &str) -> Result<(), String> {
         self.update_task(id, |record| {
             if is_terminal(record.status) {
@@ -209,10 +219,7 @@ fn new_task_id() -> String {
 fn is_terminal(status: TaskStatus) -> bool {
     matches!(
         status,
-        TaskStatus::Stopped
-            | TaskStatus::Completed
-            | TaskStatus::Failed
-            | TaskStatus::Cancelled
+        TaskStatus::Stopped | TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
     )
 }
 

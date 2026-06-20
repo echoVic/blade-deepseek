@@ -30,7 +30,10 @@ use crate::tasks::TaskRegistry;
 
 use super::host::{AgentCall, HostCommand, HostEvent, WorkflowHost};
 use super::script::{ResolvedWorkflowScript, resolve_workflow_script};
-use super::state::{WorkflowAgentRecord, WorkflowStateStore, input_hash};
+use super::state::{WorkflowAgentRecord, WorkflowStateStore, WorkflowWorkerRecord, input_hash};
+
+const STOP_REQUESTED_ERROR: &str = "__orca_workflow_stop_requested__";
+const STOPPED_SUMMARY: &str = "Workflow stopped";
 
 #[derive(Clone, Debug, Default)]
 pub struct WorkflowLaunchRequest {
@@ -215,6 +218,15 @@ impl WorkflowRunner {
             script_path: Some(prepared.resolved.persisted_path.display().to_string()),
             session_url: None,
         };
+        self.state.write_worker_record(
+            &run_id,
+            &WorkflowWorkerRecord {
+                pid: std::process::id(),
+                active: true,
+                started_at_ms: now_ms(),
+                completed_at_ms: None,
+            },
+        )?;
         let runner = self.clone();
         let handle = thread::spawn(move || runner.execute_prepared(prepared));
 
@@ -255,6 +267,7 @@ impl WorkflowRunner {
             error: None,
         };
         self.state.create_run(&state)?;
+        self.state.write_launch_input(&run_id, &request.input)?;
 
         self.tasks
             .mark_running(&task.id)
@@ -290,6 +303,18 @@ impl WorkflowRunner {
         let gate = Arc::new(WorkflowExecutionGate::new());
         let workflow_limits = self.config.workflows.clone();
 
+        if self.state.stop_requested(&run_id)? {
+            return self.finish_stopped_run(
+                state,
+                resolved.meta.name,
+                resolved.persisted_path,
+                transcript_dir,
+                task_id,
+                run_id,
+                gate.snapshot()?.total_agents,
+            );
+        }
+
         let events = match WorkflowHost::run_collecting_events_with_agent(
             &resolved.persisted_path,
             args,
@@ -315,6 +340,7 @@ impl WorkflowRunner {
                 self.tasks
                     .fail(&task_id, message.clone())
                     .map_err(io::Error::other)?;
+                let _ = self.state.mark_worker_exited(&run_id);
                 return Err(error);
             }
         };
@@ -353,11 +379,19 @@ impl WorkflowRunner {
                     completed_result = Some(result_to_summary(&result));
                 }
                 HostEvent::WorkflowFailed { error } => {
-                    finalize_open_phases_as_failed(
-                        &mut state.phases,
-                        &phase_agent_baselines,
-                        agent_events_seen,
-                    );
+                    if is_stop_requested_error(&error) {
+                        finalize_open_phases_as_stopped(
+                            &mut state.phases,
+                            &phase_agent_baselines,
+                            agent_events_seen,
+                        );
+                    } else {
+                        finalize_open_phases_as_failed(
+                            &mut state.phases,
+                            &phase_agent_baselines,
+                            agent_events_seen,
+                        );
+                    }
                     failed_error = Some(error);
                 }
             }
@@ -365,13 +399,37 @@ impl WorkflowRunner {
 
         state.total_agent_count = gate.snapshot()?.total_agents;
         if let Some(error) = failed_error {
+            if is_stop_requested_error(&error) {
+                return self.finish_stopped_run(
+                    state,
+                    resolved.meta.name,
+                    resolved.persisted_path,
+                    transcript_dir,
+                    task_id,
+                    run_id,
+                    gate.snapshot()?.total_agents,
+                );
+            }
             state.status = WorkflowRunStatus::Failed;
             state.error = Some(error.clone());
             self.state.write_state(&state)?;
             self.tasks
                 .fail(&task_id, error.clone())
                 .map_err(io::Error::other)?;
+            let _ = self.state.mark_worker_exited(&run_id);
             return Err(io::Error::other(error));
+        }
+
+        if self.state.stop_requested(&run_id)? {
+            return self.finish_stopped_run(
+                state,
+                resolved.meta.name,
+                resolved.persisted_path,
+                transcript_dir,
+                task_id,
+                run_id,
+                gate.snapshot()?.total_agents,
+            );
         }
 
         let result = completed_result.unwrap_or_default();
@@ -392,6 +450,7 @@ impl WorkflowRunner {
         self.tasks
             .complete(&task_id, result.clone())
             .map_err(io::Error::other)?;
+        let _ = self.state.mark_worker_exited(&run_id);
 
         Ok(WorkflowLaunchResult {
             task_id: task_id.clone(),
@@ -420,6 +479,12 @@ impl WorkflowRunner {
         gate: &Arc<WorkflowExecutionGate>,
         workflow_limits: &orca_core::config::WorkflowConfig,
     ) -> io::Result<HostCommand> {
+        if self.state.stop_requested(run_id)? {
+            return Ok(HostCommand::AgentError {
+                call_id: call.call_id,
+                error: STOP_REQUESTED_ERROR.to_string(),
+            });
+        }
         let _permit = match gate.begin_agent(
             workflow_limits.max_agents_per_run,
             workflow_limits.max_concurrent_agents,
@@ -572,6 +637,43 @@ impl WorkflowRunner {
         let mcp_registry = orca_mcp::initialize_registry(&workflow_child_config.mcp_servers);
         (workflow_child_config, mcp_registry)
     }
+
+    fn finish_stopped_run(
+        &self,
+        mut state: WorkflowRunState,
+        workflow_name: String,
+        script_path: PathBuf,
+        transcript_dir: PathBuf,
+        task_id: String,
+        run_id: String,
+        total_agent_count: u32,
+    ) -> io::Result<WorkflowLaunchResult> {
+        state.status = WorkflowRunStatus::Stopped;
+        state.total_agent_count = total_agent_count;
+        state.final_summary = Some(STOPPED_SUMMARY.to_string());
+        state.error = None;
+        self.state.write_state(&state)?;
+        self.tasks
+            .stop(&task_id, STOPPED_SUMMARY.to_string())
+            .map_err(io::Error::other)?;
+        let _ = self.state.mark_worker_exited(&run_id);
+
+        Ok(WorkflowLaunchResult {
+            task_id: task_id.clone(),
+            output: WorkflowOutput {
+                status: "stopped".to_string(),
+                task_id,
+                task_type: Some(task_type_name(TaskType::Workflow).to_string()),
+                workflow_name: Some(workflow_name),
+                run_id: Some(run_id),
+                summary: Some(STOPPED_SUMMARY.to_string()),
+                transcript_dir: Some(transcript_dir.display().to_string()),
+                script_path: Some(script_path.display().to_string()),
+                session_url: None,
+            },
+            summary: STOPPED_SUMMARY.to_string(),
+        })
+    }
 }
 
 fn now_ms() -> i64 {
@@ -636,6 +738,26 @@ fn finalize_open_phases_as_failed(
         let baseline = phase_agent_baselines.get(&phase.name).copied().unwrap_or(0);
         phase.agent_count = agent_events_seen.saturating_sub(baseline);
     }
+}
+
+fn finalize_open_phases_as_stopped(
+    phases: &mut [WorkflowPhaseRecord],
+    phase_agent_baselines: &std::collections::HashMap<String, u32>,
+    agent_events_seen: u32,
+) {
+    let completed_at_ms = now_ms();
+    for phase in phases.iter_mut().filter(|phase| {
+        phase.status == WorkflowRunStatus::Running && phase.completed_at_ms.is_none()
+    }) {
+        phase.status = WorkflowRunStatus::Stopped;
+        phase.completed_at_ms = Some(completed_at_ms);
+        let baseline = phase_agent_baselines.get(&phase.name).copied().unwrap_or(0);
+        phase.agent_count = agent_events_seen.saturating_sub(baseline);
+    }
+}
+
+fn is_stop_requested_error(error: &str) -> bool {
+    error.contains(STOP_REQUESTED_ERROR)
 }
 
 fn workflow_agent_result(call: &AgentCall, result: Value, cached: bool) -> Value {

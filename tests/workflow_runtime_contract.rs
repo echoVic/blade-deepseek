@@ -1,9 +1,12 @@
 use std::fs;
+use std::thread;
+use std::time::Duration;
 
 use orca_core::approval_types::ApprovalMode;
 use orca_core::config::{
     HistoryMode, OutputFormat, ProviderKind, RunConfig, ToolConfig, WorkflowConfig,
 };
+use orca_core::hook_types::{HookConfig, HookEvent};
 use orca_core::model::ModelSelection;
 use orca_core::task_types::TaskStatus;
 use orca_core::workflow_types::WorkflowRunStatus;
@@ -337,6 +340,53 @@ fn workflow_summary_prefers_child_result_over_agent_prompt() {
 
     assert!(launched.summary.contains("review this"));
     assert_ne!(launched.summary, "review this");
+}
+
+#[test]
+fn workflow_runner_stops_when_control_file_is_requested() {
+    if !orca_runtime::workflow::host::WorkflowHost::node_available() {
+        return;
+    }
+
+    let temp = tempdir().unwrap();
+    let script = temp.path().join("workflow.js");
+    fs::write(
+        &script,
+        "export const meta = { name: 'stop-control', description: 'Stop control test', phases: [] };\nawait agent('first');\nexport default await agent('second');",
+    )
+    .unwrap();
+
+    let mut config = mock_run_config(temp.path());
+    config.hooks = vec![HookConfig {
+        event: HookEvent::PreModelCall,
+        command: "sleep 1.0".to_string(),
+        tool: None,
+    }];
+    let tasks = TaskRegistry::new("session-1".to_string());
+    let session_dir = temp.path().join("session");
+    let runner = WorkflowRunner::new(config, tasks.clone(), session_dir.clone());
+
+    let launch = runner
+        .launch_background(WorkflowLaunchRequest::from_script_path(
+            script.display().to_string(),
+        ))
+        .unwrap();
+
+    thread::sleep(Duration::from_millis(250));
+    let store = WorkflowStateStore::new(session_dir.join("workflow-runs"));
+    store
+        .request_stop(launch.output.run_id.as_deref().unwrap())
+        .expect("request stop");
+
+    let result = launch.join().unwrap().unwrap();
+
+    assert_eq!(result.output.status, "stopped");
+    let record = tasks.get(&result.task_id).expect("task record");
+    assert_eq!(record.status, TaskStatus::Stopped);
+    let state = store
+        .load_run(result.output.run_id.as_deref().unwrap())
+        .expect("run state");
+    assert_eq!(state.status, WorkflowRunStatus::Stopped);
 }
 
 #[test]
