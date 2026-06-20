@@ -2,7 +2,9 @@ use std::fs;
 use std::io;
 use std::io::sink;
 use std::path::PathBuf;
+use std::sync::Mutex;
 
+use orca_core::approval_types::ApprovalMode;
 use orca_core::cancel::CancelToken;
 use orca_core::config::RunConfig;
 use orca_core::event_schema::EventFactory;
@@ -13,7 +15,6 @@ use orca_core::task_types::TaskType;
 use orca_core::workflow_types::{
     WorkflowAgentStatus, WorkflowInput, WorkflowOutput, WorkflowRunState, WorkflowRunStatus,
 };
-use orca_mcp::McpRegistry;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -68,6 +69,38 @@ pub struct WorkflowRunner {
     tasks: TaskRegistry,
     session_dir: PathBuf,
     state: WorkflowStateStore,
+}
+
+pub mod test_support {
+    use super::*;
+
+    #[derive(Clone, Debug)]
+    pub struct ChildRuntimeObservation {
+        pub prompt: String,
+        pub approval_mode: ApprovalMode,
+        pub registry_error_count: usize,
+    }
+
+    static CHILD_RUNTIME_OBSERVATIONS: Mutex<Vec<ChildRuntimeObservation>> = Mutex::new(Vec::new());
+
+    pub(crate) fn record_child_runtime_observation(observation: ChildRuntimeObservation) {
+        CHILD_RUNTIME_OBSERVATIONS
+            .lock()
+            .expect("observation lock")
+            .push(observation);
+    }
+
+    pub fn take_child_runtime_observation_for_prompt(
+        prompt: &str,
+    ) -> Option<ChildRuntimeObservation> {
+        let mut observations = CHILD_RUNTIME_OBSERVATIONS
+            .lock()
+            .expect("observation lock");
+        observations
+            .iter()
+            .rposition(|observation| observation.prompt == prompt)
+            .map(|index| observations.remove(index))
+    }
 }
 
 impl WorkflowRunner {
@@ -313,9 +346,16 @@ impl WorkflowRunner {
         let mut sink = EventSink::new(sink(), self.config.output_format);
         let instructions = instructions::load_for_cwd_or_default(cwd);
         let memory = memory::load_for_cwd(cwd);
-        let mcp_registry = McpRegistry::default();
+        let mut workflow_child_config = self.config.clone();
+        workflow_child_config.approval_mode = ApprovalMode::AutoEdit;
+        let mcp_registry = orca_mcp::initialize_registry(&workflow_child_config.mcp_servers);
         let hooks = HookRunner::new(self.config.hooks.clone());
         let cancel = CancelToken::new();
+        test_support::record_child_runtime_observation(test_support::ChildRuntimeObservation {
+            prompt: call.prompt.clone(),
+            approval_mode: workflow_child_config.approval_mode,
+            registry_error_count: mcp_registry.errors().len(),
+        });
         let child_request = ChildAgentRequest {
             prompt: call.prompt.clone(),
             subagent_type: SubagentType::General,
@@ -334,7 +374,7 @@ impl WorkflowRunner {
             &cancel,
             execute_child_agent_loop,
         );
-        let (result, _) = run_child_agent(&self.config, &child_request, &mut runtime);
+        let (result, _) = run_child_agent(&workflow_child_config, &child_request, &mut runtime);
 
         match result.status {
             RunStatus::Success => Ok(result.final_message.unwrap_or_default()),

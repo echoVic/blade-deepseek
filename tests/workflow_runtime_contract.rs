@@ -4,10 +4,14 @@ use orca_core::approval_types::ApprovalMode;
 use orca_core::config::{
     HistoryMode, OutputFormat, ProviderKind, RunConfig, ToolConfig, WorkflowConfig,
 };
+use orca_core::mcp_types::McpServerConfig;
 use orca_core::model::ModelSelection;
 use orca_core::task_types::TaskStatus;
 use orca_core::workflow_types::WorkflowRunStatus;
 use orca_runtime::tasks::TaskRegistry;
+use orca_runtime::workflow::runner::test_support::{
+    take_child_runtime_observation_for_prompt, ChildRuntimeObservation,
+};
 use orca_runtime::workflow::state::{input_hash, WorkflowStateStore};
 use orca_runtime::workflow::{WorkflowLaunchRequest, WorkflowRunner};
 use serde_json::json;
@@ -230,6 +234,75 @@ fn workflow_runner_marks_task_and_run_failed_on_child_agent_error() {
             .as_deref()
             .unwrap_or_default()
             .contains("mock child failure requested")
+    );
+}
+
+#[test]
+fn workflow_child_agent_forces_autoedit_approval_mode() {
+    if !orca_runtime::workflow::host::WorkflowHost::node_available() {
+        return;
+    }
+
+    let temp = tempdir().unwrap();
+    let script = temp.path().join("workflow.js");
+    fs::write(
+        &script,
+        "export const meta = { name: 'approval-mode', description: 'Approval mode test', phases: [] };\nawait agent('approval mode probe');\nexport default 'ok';",
+    )
+    .unwrap();
+
+    let mut config = mock_run_config(temp.path());
+    config.approval_mode = ApprovalMode::Suggest;
+    let tasks = TaskRegistry::new("session-1".to_string());
+    let runner = WorkflowRunner::new(config, tasks, temp.path().join("session"));
+
+    runner
+        .launch(WorkflowLaunchRequest::from_script_path(
+            script.display().to_string(),
+        ))
+        .unwrap();
+
+    let observation = take_child_runtime_observation_for_prompt("approval mode probe")
+        .expect("child runtime observation");
+    assert_eq!(observation.approval_mode, ApprovalMode::AutoEdit);
+}
+
+#[test]
+fn workflow_child_agent_initializes_registry_from_configured_mcp_servers() {
+    if !orca_runtime::workflow::host::WorkflowHost::node_available() {
+        return;
+    }
+
+    let temp = tempdir().unwrap();
+    let script = temp.path().join("workflow.js");
+    fs::write(
+        &script,
+        "export const meta = { name: 'mcp-registry', description: 'MCP registry test', phases: [] };\nawait agent('mcp registry probe');\nexport default 'ok';",
+    )
+    .unwrap();
+
+    let mut config = mock_run_config(temp.path());
+    config.mcp_servers = vec![McpServerConfig {
+        name: String::new(),
+        ..Default::default()
+    }];
+    let tasks = TaskRegistry::new("session-1".to_string());
+    let runner = WorkflowRunner::new(config, tasks, temp.path().join("session"));
+
+    runner
+        .launch(WorkflowLaunchRequest::from_script_path(
+            script.display().to_string(),
+        ))
+        .unwrap();
+
+    let ChildRuntimeObservation {
+        registry_error_count,
+        ..
+    } = take_child_runtime_observation_for_prompt("mcp registry probe")
+        .expect("child runtime observation");
+    assert!(
+        registry_error_count > 0,
+        "workflow child runtime should use initialized MCP registry from config"
     );
 }
 
