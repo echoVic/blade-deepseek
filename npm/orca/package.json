@@ -1,0 +1,22 @@
+{
+  "name": "@blade-ai/orca",
+  "version": "0.0.0-dev",
+  "description": "Orca CLI: a DeepSeek-native coding agent runtime by Blade.",
+  "license": "MIT",
+  "bin": {
+    "orca": "bin/orca.js"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=16"
+  },
+  "files": [
+    "bin/orca.js",
+    "README.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/echoVic/blade-deepseek.git",
+    "directory": "npm/orca"
+  }
+}

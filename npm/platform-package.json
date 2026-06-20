@@ -1,0 +1,14 @@
+{
+  "license": "MIT",
+  "files": [
+    "vendor",
+    "README.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/echoVic/blade-deepseek.git"
+  },
+  "engines": {
+    "node": ">=16"
+  }
+}
