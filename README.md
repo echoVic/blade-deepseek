@@ -4,6 +4,28 @@ Orca is a DeepSeek-native coding agent runtime by Blade.
 
 A local terminal coding agent built in Rust, focused on DeepSeek reasoning and tool-use semantics. It runs a multi-turn agent loop with SSE streaming, automatic context window management, and HTTP retry with exponential backoff.
 
+## Installation
+
+### npm
+
+```bash
+npm install -g @blade-ai/orca
+orca --version
+```
+
+The npm package installs a small Node.js launcher and the native `orca` binary for supported platforms.
+
+Supported platforms for `0.1.0`:
+
+- macOS Apple Silicon (`darwin/arm64`)
+- macOS Intel (`darwin/x64`)
+- Linux x64 (`linux/x64`)
+- Linux ARM64 (`linux/arm64`)
+
+### GitHub Releases
+
+Download the archive for your platform from the latest GitHub Release, extract it, and place `orca` on your `PATH`.
+
 ## Quick Start
 
 ```sh
