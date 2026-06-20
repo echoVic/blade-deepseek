@@ -62,3 +62,33 @@ Result:
 ## Concerns
 - The archive extraction path intentionally expects the tarball root to contain `orca` directly, matching the brief; if a later workflow nests archive contents differently, this script will need a follow-up adjustment.
 - The script eagerly clears both `stage/` and `tarballs/` under the selected output directory, which matches the brief but means callers should not reuse those directories for unrelated artifacts.
+
+## Follow-up review fix
+- Tightened `findBinaryForTarget()` so it now accepts only the two documented artifact locations:
+  - `<artifacts-dir>/orca-<target>/orca`
+  - `<artifacts-dir>/orca-<target>.tar.gz`
+- Removed the extra fallback lookups for `<artifacts-dir>/<targetTriple>/orca` and `<artifacts-dir>/orca` that could have selected an unintended binary.
+
+## Latest verification
+- Ran `node --check scripts/release/stage-npm.mjs`
+- Output: command exited 0 with no syntax errors.
+- Reran the fixture command from the brief:
+
+```bash
+tmp="$(mktemp -d)"
+for target in aarch64-apple-darwin x86_64-apple-darwin aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu; do
+  mkdir -p "$tmp/artifacts/orca-$target"
+  cp target/release/orca "$tmp/artifacts/orca-$target/orca"
+done
+node scripts/release/stage-npm.mjs --version 0.1.0 --artifacts-dir "$tmp/artifacts" --out-dir "$tmp/npm" --pack
+find "$tmp/npm/tarballs" -name '*.tgz' | wc -l
+```
+
+Result:
+- Packed all five expected packages:
+  - `@blade-ai/orca-darwin-arm64@0.1.0`
+  - `@blade-ai/orca-darwin-x64@0.1.0`
+  - `@blade-ai/orca-linux-arm64@0.1.0`
+  - `@blade-ai/orca-linux-x64@0.1.0`
+  - `@blade-ai/orca@0.1.0`
+- Final tarball count was `5`

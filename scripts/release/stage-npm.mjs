@@ -94,15 +94,9 @@ function ensureCleanDir(dir) {
 }
 
 function findBinaryForTarget(artifactsDir, targetTriple) {
-  const directCandidates = [
-    path.join(artifactsDir, `orca-${targetTriple}`, "orca"),
-    path.join(artifactsDir, targetTriple, "orca"),
-    path.join(artifactsDir, "orca")
-  ];
-  for (const candidate of directCandidates) {
-    if (existsSync(candidate)) {
-      return candidate;
-    }
+  const directBinary = path.join(artifactsDir, `orca-${targetTriple}`, "orca");
+  if (existsSync(directBinary)) {
+    return directBinary;
   }
 
   const archive = path.join(artifactsDir, `orca-${targetTriple}.tar.gz`);
