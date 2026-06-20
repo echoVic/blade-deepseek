@@ -116,27 +116,6 @@ impl Default for WorkflowConfig {
     }
 }
 
-impl WorkflowConfig {
-    const MAX_CONCURRENT_AGENTS_UPPER: usize = 64;
-    const MAX_AGENTS_PER_RUN_UPPER: u32 = 10_000;
-
-    pub fn normalized(mut self) -> Self {
-        if self.max_concurrent_agents == 0 {
-            self.max_concurrent_agents = 1;
-        } else if self.max_concurrent_agents > Self::MAX_CONCURRENT_AGENTS_UPPER {
-            self.max_concurrent_agents = Self::MAX_CONCURRENT_AGENTS_UPPER;
-        }
-
-        if self.max_agents_per_run == 0 {
-            self.max_agents_per_run = 1;
-        } else if self.max_agents_per_run > Self::MAX_AGENTS_PER_RUN_UPPER {
-            self.max_agents_per_run = Self::MAX_AGENTS_PER_RUN_UPPER;
-        }
-
-        self
-    }
-}
-
 fn default_workflows_enabled() -> bool {
     true
 }

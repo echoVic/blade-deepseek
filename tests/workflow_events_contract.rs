@@ -44,7 +44,7 @@ disableWorkflows = true
 "#,
     )
     .unwrap();
-    assert!(!disabled.workflows.normalized().enabled);
+    assert!(!disabled.workflows.resolved().enabled);
 
     let enabled: FileConfig = toml::from_str(
         r#"
@@ -53,7 +53,7 @@ enableWorkflows = false
 "#,
     )
     .unwrap();
-    assert!(!enabled.workflows.normalized().enabled);
+    assert!(!enabled.workflows.resolved().enabled);
 }
 
 #[test]
@@ -66,5 +66,5 @@ workflowKeywordTriggerEnabled = false
     )
     .unwrap();
 
-    assert!(!config.workflows.normalized().keyword_trigger_enabled);
+    assert!(!config.workflows.resolved().keyword_trigger_enabled);
 }

@@ -92,7 +92,7 @@ pub struct WorkflowFileConfig {
 }
 
 impl WorkflowFileConfig {
-    pub fn normalized(&self) -> WorkflowConfig {
+    pub fn resolved(&self) -> WorkflowConfig {
         let mut config = WorkflowConfig::default();
 
         if let Some(enabled) = self.enabled {
@@ -114,7 +114,7 @@ impl WorkflowFileConfig {
             config.keyword_trigger_enabled = keyword_trigger_enabled;
         }
 
-        config.normalized()
+        config
     }
 }
 
@@ -379,7 +379,7 @@ max_agents_per_run = 99
 workflowKeywordTriggerEnabled = false
 "#;
         let config: FileConfig = toml::from_str(toml).unwrap();
-        let workflows = config.workflows.normalized();
+        let workflows = config.workflows.resolved();
         assert!(!workflows.enabled);
         assert_eq!(workflows.max_concurrent_agents, 7);
         assert_eq!(workflows.max_agents_per_run, 99);
@@ -395,7 +395,7 @@ disableWorkflows = true
 "#,
         )
         .unwrap();
-        assert!(!disabled.workflows.normalized().enabled);
+        assert!(!disabled.workflows.resolved().enabled);
 
         let enabled_false: FileConfig = toml::from_str(
             r#"
@@ -404,7 +404,20 @@ enableWorkflows = false
 "#,
         )
         .unwrap();
-        assert!(!enabled_false.workflows.normalized().enabled);
+        assert!(!enabled_false.workflows.resolved().enabled);
+    }
+
+    #[test]
+    fn parse_workflow_config_preserves_numeric_values() {
+        let toml = r#"
+[workflows]
+max_concurrent_agents = 128
+max_agents_per_run = 12000
+"#;
+        let config: FileConfig = toml::from_str(toml).unwrap();
+        let workflows = config.workflows.resolved();
+        assert_eq!(workflows.max_concurrent_agents, 128);
+        assert_eq!(workflows.max_agents_per_run, 12_000);
     }
 
     #[test]
