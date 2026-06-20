@@ -727,7 +727,7 @@ fn run_agent_loop(
     }
 }
 
-fn execute_child_agent_loop<W: io::Write>(
+pub(crate) fn execute_child_agent_loop<W: io::Write>(
     config: &RunConfig,
     request: &ChildAgentRequest,
     runtime: &mut ChildAgentRuntime<'_, W>,

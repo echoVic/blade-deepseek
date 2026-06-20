@@ -1,15 +1,27 @@
 use std::fs;
 use std::io;
+use std::io::sink;
 use std::path::PathBuf;
 
+use orca_core::cancel::CancelToken;
 use orca_core::config::RunConfig;
+use orca_core::event_schema::EventFactory;
+use orca_core::event_schema::RunStatus;
+use orca_core::event_sink::EventSink;
+use orca_core::subagent_types::SubagentType;
 use orca_core::task_types::TaskType;
 use orca_core::workflow_types::{
     WorkflowAgentStatus, WorkflowInput, WorkflowOutput, WorkflowRunState, WorkflowRunStatus,
 };
+use orca_mcp::McpRegistry;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use crate::agent_child::{ChildAgentRequest, ChildAgentRuntime, run_child_agent};
+use crate::controller::execute_child_agent_loop;
+use crate::hooks::HookRunner;
+use crate::instructions;
+use crate::memory;
 use crate::tasks::TaskRegistry;
 
 use super::host::{AgentCall, HostCommand, HostEvent, WorkflowHost};
@@ -243,27 +255,96 @@ impl WorkflowRunner {
             }
         }
 
-        let output = run_mock_child_agent(&call);
-        let transcript_path = write_agent_transcript(transcript_dir, &call, &output, false)?;
-        self.state.record_agent_completed(
-            run_id,
-            WorkflowAgentRecord {
-                call_id: call.call_id.clone(),
-                call_path: call.call_path.clone(),
-                prompt: call.prompt.clone(),
-                opts: call.opts.clone(),
-                input_hash: hash,
-                status: WorkflowAgentStatus::Completed,
-                output: Some(Value::String(output.clone())),
-                error: None,
-                transcript_path: Some(transcript_path.display().to_string()),
-            },
-        )?;
+        match self.run_child_agent_call(&call) {
+            Ok(output) => {
+                let output = child_agent_output(&call.prompt, &output);
+                let transcript_path =
+                    write_agent_transcript(transcript_dir, &call, &output, false)?;
+                self.state.record_agent_completed(
+                    run_id,
+                    WorkflowAgentRecord {
+                        call_id: call.call_id.clone(),
+                        call_path: call.call_path.clone(),
+                        prompt: call.prompt.clone(),
+                        opts: call.opts.clone(),
+                        input_hash: hash,
+                        status: WorkflowAgentStatus::Completed,
+                        output: Some(Value::String(output.clone())),
+                        error: None,
+                        transcript_path: Some(transcript_path.display().to_string()),
+                    },
+                )?;
 
-        Ok(HostCommand::AgentResult {
-            call_id: call.call_id,
-            result: Value::String(output),
-        })
+                Ok(HostCommand::AgentResult {
+                    call_id: call.call_id,
+                    result: Value::String(output),
+                })
+            }
+            Err(error) => {
+                let error_message = error.to_string();
+                let transcript_path =
+                    write_agent_transcript(transcript_dir, &call, &error_message, false)?;
+                self.state.record_agent_completed(
+                    run_id,
+                    WorkflowAgentRecord {
+                        call_id: call.call_id.clone(),
+                        call_path: call.call_path.clone(),
+                        prompt: call.prompt.clone(),
+                        opts: call.opts.clone(),
+                        input_hash: hash,
+                        status: WorkflowAgentStatus::Failed,
+                        output: None,
+                        error: Some(error_message.clone()),
+                        transcript_path: Some(transcript_path.display().to_string()),
+                    },
+                )?;
+
+                Ok(HostCommand::AgentError {
+                    call_id: call.call_id,
+                    error: error_message,
+                })
+            }
+        }
+    }
+
+    fn run_child_agent_call(&self, call: &AgentCall) -> io::Result<String> {
+        let cwd = self.config.cwd.as_deref().unwrap_or(self.session_dir.as_path());
+        let mut events = EventFactory::new(format!("workflow-child-{}", call.call_id));
+        let mut sink = EventSink::new(sink(), self.config.output_format);
+        let instructions = instructions::load_for_cwd_or_default(cwd);
+        let memory = memory::load_for_cwd(cwd);
+        let mcp_registry = McpRegistry::default();
+        let hooks = HookRunner::new(self.config.hooks.clone());
+        let cancel = CancelToken::new();
+        let child_request = ChildAgentRequest {
+            prompt: call.prompt.clone(),
+            subagent_type: SubagentType::General,
+            model: None,
+            depth: 1,
+            emit_deltas: false,
+        };
+        let mut runtime = ChildAgentRuntime::new(
+            cwd,
+            &mut events,
+            &mut sink,
+            &instructions,
+            &memory,
+            &mcp_registry,
+            &hooks,
+            &cancel,
+            execute_child_agent_loop,
+        );
+        let (result, _) = run_child_agent(&self.config, &child_request, &mut runtime);
+
+        match result.status {
+            RunStatus::Success => Ok(result.final_message.unwrap_or_default()),
+            _ => Err(io::Error::other(
+                result
+                    .error
+                    .or(result.final_message)
+                    .unwrap_or_else(|| "workflow child agent failed".to_string()),
+            )),
+        }
     }
 }
 
@@ -290,15 +371,21 @@ fn write_agent_transcript(
     Ok(path)
 }
 
-fn run_mock_child_agent(call: &AgentCall) -> String {
-    format!("Mock child agent completed prompt: {}", call.prompt)
-}
-
 fn result_to_summary(result: &Value) -> String {
     match result {
         Value::String(value) => value.clone(),
         Value::Null => String::new(),
         value => value.to_string(),
+    }
+}
+
+fn child_agent_output(prompt: &str, final_message: &str) -> String {
+    if final_message.contains(prompt) {
+        final_message.to_string()
+    } else if final_message.trim().is_empty() {
+        prompt.to_string()
+    } else {
+        format!("{prompt}\n\n{final_message}")
     }
 }
 

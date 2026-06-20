@@ -39,7 +39,12 @@ fn workflow_runner_executes_agent_and_writes_state() {
 
     let record = tasks.get(&launched.task_id).unwrap();
     assert_eq!(record.status, orca_core::task_types::TaskStatus::Completed);
-    assert!(record.result.unwrap().contains("inspect repo"));
+    let result = record.result.unwrap();
+    assert!(result.contains("inspect repo"));
+    assert!(
+        !result.contains("Mock child agent completed prompt:"),
+        "workflow runner should use the real child-agent executor path"
+    );
     assert!(launched.output.script_path.unwrap().ends_with(".js"));
     assert!(launched
         .output
@@ -175,6 +180,57 @@ fn workflow_runner_marks_task_and_run_failed_on_host_error() {
     let state = store.load_run(run_id).expect("run state");
     assert_eq!(state.status, WorkflowRunStatus::Failed);
     assert!(state.error.as_deref().is_some());
+}
+
+#[test]
+fn workflow_runner_marks_task_and_run_failed_on_child_agent_error() {
+    if !orca_runtime::workflow::host::WorkflowHost::node_available() {
+        return;
+    }
+
+    let temp = tempdir().unwrap();
+    let script = temp.path().join("workflow.js");
+    fs::write(
+        &script,
+        "export const meta = { name: 'child-failure', description: 'Child failure test', phases: [] };\nawait agent('mock_fail');\nexport default 'unreachable';",
+    )
+    .unwrap();
+
+    let config = mock_run_config(temp.path());
+    let tasks = TaskRegistry::new("session-1".to_string());
+    let session_dir = temp.path().join("session");
+    let runner = WorkflowRunner::new(config, tasks.clone(), session_dir.clone());
+
+    let error = runner
+        .launch(WorkflowLaunchRequest::from_script_path(
+            script.display().to_string(),
+        ))
+        .unwrap_err();
+
+    assert!(error.to_string().contains("mock child failure requested"));
+
+    let task = tasks.list().into_iter().next().expect("workflow task");
+    let record = tasks.get(&task.id).expect("task record");
+    assert_eq!(record.status, TaskStatus::Failed);
+    assert!(
+        record
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("mock child failure requested")
+    );
+
+    let run_id = record.workflow_run_id.as_deref().expect("run id");
+    let store = WorkflowStateStore::new(session_dir.join("workflow-runs"));
+    let state = store.load_run(run_id).expect("run state");
+    assert_eq!(state.status, WorkflowRunStatus::Failed);
+    assert!(
+        state
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("mock child failure requested")
+    );
 }
 
 fn mock_run_config(cwd: &std::path::Path) -> RunConfig {

@@ -295,21 +295,29 @@ fn state_store_preserves_legacy_json_looking_string_cache_values() {
     };
     store.create_run(&state).unwrap();
 
-    let legacy_record = serde_json::json!({
-        "phases.scan:1234": {
-            "call_path": "phases.scan",
-            "input_hash": "1234",
-            "output": "123"
-        }
-    });
-    fs::write(
-        store.run_dir(&state.run_id).join("agent-cache.json"),
-        serde_json::to_string_pretty(&legacy_record).unwrap(),
-    )
-    .unwrap();
+    for (input_hash, output) in [
+        ("1234", "123"),
+        ("false", "false"),
+        ("null", "null"),
+        ("array", "[1]"),
+        ("object", "{\"k\":1}"),
+    ] {
+        let legacy_record = serde_json::json!({
+            format!("phases.scan:{input_hash}"): {
+                "call_path": "phases.scan",
+                "input_hash": input_hash,
+                "output": output
+            }
+        });
+        fs::write(
+            store.run_dir(&state.run_id).join("agent-cache.json"),
+            serde_json::to_string_pretty(&legacy_record).unwrap(),
+        )
+        .unwrap();
 
-    let found = store.find_cached_agent_value(&state.run_id, "phases.scan", "1234");
-    assert_eq!(found, Some(json!("123")));
+        let found = store.find_cached_agent_value(&state.run_id, "phases.scan", input_hash);
+        assert_eq!(found, Some(json!(output)), "case {output}");
+    }
 }
 
 #[test]
@@ -435,37 +443,46 @@ fn state_store_preserves_current_json_looking_string_outputs() {
     };
     store.create_run(&state).unwrap();
 
-    store
-        .record_agent_completed(
-            &state.run_id,
-            WorkflowAgentRecord {
-                call_id: "call-1".to_string(),
+    for (index, input_hash, output) in [
+        (1usize, "1234", "123"),
+        (2, "false", "false"),
+        (3, "null", "null"),
+        (4, "array", "[1]"),
+        (5, "object", "{\"k\":1}"),
+    ] {
+        store
+            .record_agent_completed(
+                &state.run_id,
+                WorkflowAgentRecord {
+                    call_id: format!("call-{index}"),
+                    call_path: "phases.scan".to_string(),
+                    prompt: "inspect repo".to_string(),
+                    opts: json!(null),
+                    input_hash: input_hash.to_string(),
+                    status: WorkflowAgentStatus::Completed,
+                    output: Some(json!(output)),
+                    error: None,
+                    transcript_path: None,
+                },
+            )
+            .unwrap();
+
+        let found = store.find_cached_agent_value(&state.run_id, "phases.scan", input_hash);
+        assert_eq!(found, Some(json!(output)), "find case {output}");
+
+        let cached = store
+            .cached_agent_result(&state.run_id, "phases.scan", input_hash)
+            .unwrap();
+        assert_eq!(
+            cached,
+            Some(WorkflowAgentCacheRecord {
                 call_path: "phases.scan".to_string(),
-                prompt: "inspect repo".to_string(),
-                opts: json!(null),
-                input_hash: "1234".to_string(),
-                status: WorkflowAgentStatus::Completed,
-                output: Some(json!("123")),
-                error: None,
-                transcript_path: None,
-            },
-        )
-        .unwrap();
-
-    let found = store.find_cached_agent_value(&state.run_id, "phases.scan", "1234");
-    assert_eq!(found, Some(json!("123")));
-
-    let cached = store
-        .cached_agent_result(&state.run_id, "phases.scan", "1234")
-        .unwrap();
-    assert_eq!(
-        cached,
-        Some(WorkflowAgentCacheRecord {
-            call_path: "phases.scan".to_string(),
-            input_hash: "1234".to_string(),
-            output: json!("123"),
-        })
-    );
+                input_hash: input_hash.to_string(),
+                output: json!(output),
+            }),
+            "cached case {output}"
+        );
+    }
 }
 
 #[test]
