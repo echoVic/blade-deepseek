@@ -3,6 +3,7 @@ use std::time::Instant;
 
 use orca_core::cost_types::UsageTotals;
 use orca_core::plan_types::PlanItem;
+use orca_core::task_types::BackgroundTaskSummary;
 use orca_runtime::history::SessionSummary;
 
 #[derive(Debug, Clone)]
@@ -121,6 +122,18 @@ pub struct ApprovalDialog {
     pub selected: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PanelMode {
+    Conversation,
+    Workflows,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct WorkflowPanelState {
+    pub selected: usize,
+    pub tasks: Vec<BackgroundTaskSummary>,
+}
+
 #[derive(Debug, Clone)]
 pub struct SlashMenuItem {
     pub command: &'static str,
@@ -166,6 +179,8 @@ pub struct AppState {
     pub mention_candidates: Vec<String>,
     pub mention_selected: usize,
     pub current_plan: Option<(Option<String>, Vec<PlanItem>)>,
+    pub panel_mode: PanelMode,
+    pub workflow_panel: WorkflowPanelState,
     pub tick: u64,
 }
 
@@ -195,6 +210,8 @@ impl AppState {
             mention_candidates: Vec::new(),
             mention_selected: 0,
             current_plan: None,
+            panel_mode: PanelMode::Conversation,
+            workflow_panel: WorkflowPanelState::default(),
             tick: 0,
         }
     }
@@ -225,6 +242,17 @@ impl AppState {
 
     pub fn toggle_shortcuts(&mut self) {
         self.show_shortcuts = !self.show_shortcuts;
+    }
+
+    pub fn show_workflows(&mut self) {
+        self.panel_mode = PanelMode::Workflows;
+        if self.workflow_panel.selected >= self.workflow_panel.tasks.len() {
+            self.workflow_panel.selected = self.workflow_panel.tasks.len().saturating_sub(1);
+        }
+    }
+
+    pub fn show_conversation(&mut self) {
+        self.panel_mode = PanelMode::Conversation;
     }
 
     pub fn advance_tick(&mut self) {
@@ -519,6 +547,7 @@ impl AppState {
 mod tests {
     use super::*;
     use orca_core::plan_types::PlanStatus;
+    use orca_core::task_types::{TaskStatus, TaskType};
 
     fn state() -> AppState {
         let (tx, _rx) = mpsc::channel();
@@ -698,5 +727,36 @@ mod tests {
             ChatMessage::ToolCall { expanded, .. } => assert!(*expanded),
             other => panic!("expected tool call, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn workflow_panel_state_defaults_to_empty() {
+        let state = state();
+
+        assert_eq!(state.panel_mode, PanelMode::Conversation);
+        assert_eq!(state.workflow_panel.selected, 0);
+        assert!(state.workflow_panel.tasks.is_empty());
+    }
+
+    #[test]
+    fn show_workflows_preserves_available_selection() {
+        let mut state = state();
+        state.workflow_panel.tasks = vec![BackgroundTaskSummary {
+            id: "task-1".to_string(),
+            task_type: TaskType::Workflow,
+            status: TaskStatus::Running,
+            description: "demo".to_string(),
+            command: None,
+            agent_type: None,
+            server: None,
+            tool: None,
+            name: Some("audit".to_string()),
+        }];
+        state.workflow_panel.selected = 9;
+
+        state.show_workflows();
+
+        assert_eq!(state.panel_mode, PanelMode::Workflows);
+        assert_eq!(state.workflow_panel.selected, 0);
     }
 }

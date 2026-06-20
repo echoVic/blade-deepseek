@@ -7,9 +7,11 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use tui_textarea::TextArea;
 use unicode_width::UnicodeWidthStr;
 
+use orca_core::task_types::TaskStatus;
+
 use crate::shortcuts::{self, ShortcutScope};
 use crate::theme::Theme;
-use crate::types::{AppState, AppStatus, ChatMessage};
+use crate::types::{AppState, AppStatus, ChatMessage, PanelMode};
 
 pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, theme: &Theme) {
     if state.status == AppStatus::Setup {
@@ -34,7 +36,10 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
     ])
     .split(frame.area());
 
-    render_messages(frame, chunks[0], state, theme);
+    match state.panel_mode {
+        PanelMode::Conversation => render_messages(frame, chunks[0], state, theme),
+        PanelMode::Workflows => render_workflows_panel(frame, chunks[0], state, theme),
+    }
     if plan_height > 0 {
         render_plan_panel(frame, chunks[1], state, theme);
     }
@@ -136,6 +141,66 @@ fn render_messages(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &
         .scroll((scroll, 0));
 
     frame.render_widget(paragraph, area);
+}
+
+fn render_workflows_panel(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Workflows ")
+        .border_style(Style::default().fg(theme.border));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let mut lines: Vec<Line<'static>> = vec![Line::from(vec![
+        Span::styled(" Name", Style::default().fg(theme.muted)),
+        Span::styled(" | ", Style::default().fg(theme.muted)),
+        Span::styled("Status", Style::default().fg(theme.muted)),
+        Span::styled(" | ", Style::default().fg(theme.muted)),
+        Span::styled("Task ID", Style::default().fg(theme.muted)),
+    ])];
+
+    if state.workflow_panel.tasks.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            " No workflow tasks available in this view yet.",
+            Style::default().fg(theme.muted),
+        )));
+        lines.push(Line::from(Span::styled(
+            " Run ID and phase count are not exposed by BackgroundTaskSummary.",
+            Style::default().fg(theme.muted),
+        )));
+    } else {
+        for (index, task) in state.workflow_panel.tasks.iter().enumerate() {
+            let selected = index == state.workflow_panel.selected;
+            let marker = if selected { ">" } else { " " };
+            let name = task.name.as_deref().unwrap_or(task.description.as_str());
+            let status = task_status_label(task.status);
+            let style = if selected {
+                Style::default()
+                    .fg(theme.border)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.text)
+            };
+
+            lines.push(Line::from(vec![
+                Span::styled(format!("{marker} {name}"), style),
+                Span::styled(" | ", Style::default().fg(theme.muted)),
+                Span::styled(status.to_string(), Style::default().fg(task_status_color(task.status, theme))),
+                Span::styled(" | ", Style::default().fg(theme.muted)),
+                Span::styled(task.id.clone(), Style::default().fg(theme.muted)),
+            ]));
+        }
+
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            " Run ID and phase count are unavailable from BackgroundTaskSummary.",
+            Style::default().fg(theme.muted),
+        )));
+    }
+
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, inner);
 }
 
 fn build_welcome_lines<'a>(state: &AppState, theme: &Theme) -> Vec<Line<'a>> {
@@ -460,6 +525,28 @@ fn append_tool_output_lines(
 fn spinner_frame(tick: u64) -> &'static str {
     const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     SPINNER_FRAMES[((tick / 2) as usize) % SPINNER_FRAMES.len()]
+}
+
+fn task_status_label(status: TaskStatus) -> &'static str {
+    match status {
+        TaskStatus::Queued => "queued",
+        TaskStatus::Running => "running",
+        TaskStatus::Paused => "paused",
+        TaskStatus::Stopping => "stopping",
+        TaskStatus::Stopped => "stopped",
+        TaskStatus::Completed => "completed",
+        TaskStatus::Failed => "failed",
+        TaskStatus::Cancelled => "cancelled",
+    }
+}
+
+fn task_status_color(status: TaskStatus, theme: &Theme) -> Color {
+    match status {
+        TaskStatus::Running | TaskStatus::Stopping => theme.warning,
+        TaskStatus::Completed => theme.success,
+        TaskStatus::Failed | TaskStatus::Cancelled => theme.error,
+        TaskStatus::Queued | TaskStatus::Paused | TaskStatus::Stopped => theme.muted,
+    }
 }
 
 fn render_input(frame: &mut Frame, area: Rect, textarea: &TextArea) {

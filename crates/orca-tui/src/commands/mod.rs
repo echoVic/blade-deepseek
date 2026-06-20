@@ -9,6 +9,7 @@ pub enum SlashCommand {
     History,
     Mode(Option<String>),
     Plan(Option<String>),
+    WorkflowList,
     Remember(String),
     Exit,
 }
@@ -32,6 +33,7 @@ pub fn parse(input: &str) -> Option<SlashCommand> {
             parts.next().map(|mode| mode.to_string()),
         )),
         "plan" => Some(SlashCommand::Plan(parts.next().map(str::to_string))),
+        "workflows" => Some(SlashCommand::WorkflowList),
         "remember" => {
             let note = parts.collect::<Vec<_>>().join(" ");
             if note.is_empty() {
@@ -55,6 +57,7 @@ pub fn all_commands() -> &'static [(&'static str, &'static str)] {
         ("/config show", "Show merged config"),
         ("/mode", "Switch approval mode"),
         ("/plan", "Toggle plan mode"),
+        ("/workflows", "Show workflow tasks"),
         ("/remember", "Save a note to memory"),
         ("/history", "Browse session history"),
         ("/exit", "Exit Orca"),
@@ -89,6 +92,11 @@ mod tests {
             parse("/plan off"),
             Some(SlashCommand::Plan(Some("off".to_string())))
         );
+    }
+
+    #[test]
+    fn parses_workflows_command() {
+        assert_eq!(parse("/workflows"), Some(SlashCommand::WorkflowList));
     }
 
     #[test]

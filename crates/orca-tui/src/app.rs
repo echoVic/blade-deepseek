@@ -31,7 +31,8 @@ use crate::shortcuts::{
 };
 use crate::theme::Theme;
 use crate::types::{
-    AppState, AppStatus, ChatMessage, SlashMenu, SlashMenuItem, SubMenu, TuiEvent, UserAction,
+    AppState, AppStatus, ChatMessage, PanelMode, SlashMenu, SlashMenuItem, SubMenu, TuiEvent,
+    UserAction,
 };
 use crate::ui;
 use crate::vim::VimState;
@@ -242,6 +243,14 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
 
                 if state.show_shortcuts && key.code == KeyCode::Esc {
                     state.show_shortcuts = false;
+                    continue;
+                }
+
+                if state.status == AppStatus::Idle
+                    && state.panel_mode == PanelMode::Workflows
+                    && key.code == KeyCode::Esc
+                {
+                    state.show_conversation();
                     continue;
                 }
 
@@ -1176,7 +1185,7 @@ fn handle_slash_command(
     match command {
         SlashCommand::Help => {
             state.messages.push(ChatMessage::System(
-                "/help /model <name> /compact /clear /cost /config show /history /mode <suggest|auto-edit|full-auto> /plan [off] /remember <note> /exit"
+                "/help /model <name> /compact /clear /cost /config show /history /mode <suggest|auto-edit|full-auto> /plan [off] /workflows /remember <note> /exit"
                     .to_string(),
             ));
         }
@@ -1264,6 +1273,12 @@ fn handle_slash_command(
                 "unsupported plan command. Use /plan or /plan off.".to_string(),
             )),
         },
+        SlashCommand::WorkflowList => {
+            state.show_workflows();
+            state.messages.push(ChatMessage::System(
+                "Opened workflows view. Press Esc to return to conversation.".to_string(),
+            ));
+        }
         SlashCommand::Remember(note) => {
             let remembered_note = note
                 .strip_prefix("project:")
