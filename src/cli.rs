@@ -20,7 +20,7 @@ use serde_json::Value;
 use crate::approval::policy::ApprovalMode;
 use crate::config::file;
 use crate::config::file::ConfigOverrides;
-use crate::config::{HistoryMode, OutputFormat, ProviderKind, RunConfig, WorkflowConfig};
+use crate::config::{HistoryMode, OutputFormat, ProviderKind, RunConfig};
 use crate::model::ModelSelection;
 use crate::runtime::controller;
 use crate::runtime::history;
@@ -378,71 +378,6 @@ fn load_effective_file_config(
     Ok(file::apply_override_layers(file_config, env, cli))
 }
 
-#[derive(Debug, Default, Deserialize)]
-struct LegacyWorkflowConfigOverrides {
-    #[serde(default, alias = "disableWorkflows")]
-    disable_workflows: Option<bool>,
-    #[serde(default, alias = "enableWorkflows")]
-    enable_workflows: Option<bool>,
-    #[serde(default, alias = "workflowKeywordTriggerEnabled")]
-    workflow_keyword_trigger_enabled: Option<bool>,
-}
-
-fn resolved_workflow_config(cwd: &Path, file_config: &file::FileConfig) -> WorkflowConfig {
-    let mut config = file_config.workflows.resolved();
-    let legacy = load_legacy_workflow_config_overrides(cwd);
-
-    if let Some(enable_workflows) = legacy.enable_workflows {
-        config.enabled = enable_workflows;
-    }
-    if legacy.disable_workflows.unwrap_or(false) {
-        config.enabled = false;
-    }
-    if let Some(keyword_trigger_enabled) = legacy.workflow_keyword_trigger_enabled {
-        config.keyword_trigger_enabled = keyword_trigger_enabled;
-    }
-
-    config
-}
-
-fn load_legacy_workflow_config_overrides(cwd: &Path) -> LegacyWorkflowConfigOverrides {
-    let mut merged = LegacyWorkflowConfigOverrides::default();
-    if let Some(user_path) = workflow_user_config_path() {
-        merge_legacy_workflow_config_overrides(&mut merged, &user_path);
-    }
-    merge_legacy_workflow_config_overrides(&mut merged, &cwd.join(".orca").join("config.toml"));
-    merged
-}
-
-fn merge_legacy_workflow_config_overrides(
-    merged: &mut LegacyWorkflowConfigOverrides,
-    path: &Path,
-) {
-    let Ok(contents) = fs::read_to_string(path) else {
-        return;
-    };
-    let Ok(parsed) = toml::from_str::<LegacyWorkflowConfigOverrides>(&contents) else {
-        return;
-    };
-
-    if parsed.disable_workflows.is_some() {
-        merged.disable_workflows = parsed.disable_workflows;
-    }
-    if parsed.enable_workflows.is_some() {
-        merged.enable_workflows = parsed.enable_workflows;
-    }
-    if parsed.workflow_keyword_trigger_enabled.is_some() {
-        merged.workflow_keyword_trigger_enabled = parsed.workflow_keyword_trigger_enabled;
-    }
-}
-
-fn workflow_user_config_path() -> Option<PathBuf> {
-    env::var_os("ORCA_HOME")
-        .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|home| home.join(".orca")))
-        .map(|dir| dir.join("config.toml"))
-}
-
 fn env_overrides() -> Result<ConfigOverrides, String> {
     Ok(ConfigOverrides {
         model: env::var("ORCA_MODEL")
@@ -511,7 +446,6 @@ fn run_exec(args: ExecArgs) -> i32 {
         }
     };
 
-    let workflows = resolved_workflow_config(&cwd_for_mentions, &file_config);
     let api_key = file_config.api_key;
     let base_url = file_config.base_url;
 
@@ -552,7 +486,7 @@ fn run_exec(args: ExecArgs) -> i32 {
         external_tools: crate::tools::external::load_default_external_tools(),
         subagents: file_config.subagents.normalized(),
         tools: file_config.tools.normalized(),
-        workflows,
+        workflows: file_config.workflows.resolved(),
         theme: file_config.theme,
         vim_mode: file_config.vim_mode,
         update_check: file_config.update_check,
@@ -1011,8 +945,7 @@ fn build_workflow_run_config(
             base_url: base_url_override,
         },
     )?;
-    let workflows = resolved_workflow_config(cwd, &file_config);
-    if !workflows.enabled {
+    if !file_config.workflows.resolved().enabled {
         return Err("workflows are disabled".to_string());
     }
     let model = ModelSelection::parse(file_config.model)?;
@@ -1036,7 +969,7 @@ fn build_workflow_run_config(
         external_tools: crate::tools::external::load_default_external_tools(),
         subagents: file_config.subagents.normalized(),
         tools: file_config.tools.normalized(),
-        workflows,
+        workflows: file_config.workflows.resolved(),
         theme: file_config.theme,
         vim_mode: file_config.vim_mode,
         update_check: file_config.update_check,
@@ -1371,7 +1304,6 @@ fn run_placeholder(cli: Cli) -> i32 {
         }
     };
 
-    let workflows = resolved_workflow_config(&cwd, &file_config);
     let api_key = file_config.api_key;
     let base_url = file_config.base_url;
 
@@ -1410,7 +1342,7 @@ fn run_placeholder(cli: Cli) -> i32 {
         external_tools: crate::tools::external::load_default_external_tools(),
         subagents: file_config.subagents.normalized(),
         tools: file_config.tools.normalized(),
-        workflows,
+        workflows: file_config.workflows.resolved(),
         theme: file_config.theme,
         vim_mode: file_config.vim_mode,
         update_check: file_config.update_check,
@@ -1444,7 +1376,6 @@ fn run_server(cli: Cli) -> i32 {
         }
     };
 
-    let workflows = resolved_workflow_config(&cwd, &file_config);
     let model = match ModelSelection::parse(file_config.model) {
         Ok(model) => model,
         Err(error) => {
@@ -1472,7 +1403,7 @@ fn run_server(cli: Cli) -> i32 {
         external_tools: crate::tools::external::load_default_external_tools(),
         subagents: file_config.subagents.normalized(),
         tools: file_config.tools.normalized(),
-        workflows,
+        workflows: file_config.workflows.resolved(),
         theme: file_config.theme,
         vim_mode: file_config.vim_mode,
         update_check: file_config.update_check,

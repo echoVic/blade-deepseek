@@ -13,11 +13,48 @@ use crate::subagent_config::SubagentConfig;
 const ORCA_HOME_ENV: &str = "ORCA_HOME";
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(from = "RawFileConfig")]
 pub struct FileConfig {
     pub model: Option<String>,
     pub mode: Option<ApprovalMode>,
     pub api_key: Option<String>,
     pub base_url: Option<String>,
+    #[serde(default)]
+    pub mcp_servers: Vec<crate::mcp_types::McpServerConfig>,
+    #[serde(default)]
+    pub hooks: Vec<crate::hook_types::HookConfig>,
+    #[serde(default)]
+    pub permissions: PermissionRules,
+    #[serde(default)]
+    pub subagents: SubagentConfig,
+    #[serde(default)]
+    pub tools: ToolConfig,
+    #[serde(default)]
+    pub workflows: WorkflowFileConfig,
+    #[serde(default)]
+    pub theme: ThemeName,
+    #[serde(default)]
+    pub vim_mode: bool,
+    #[serde(default = "default_true")]
+    pub update_check: bool,
+    #[serde(default)]
+    pub desktop_notifications: bool,
+    #[serde(default)]
+    pub auto_memory: bool,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct RawFileConfig {
+    pub model: Option<String>,
+    pub mode: Option<ApprovalMode>,
+    pub api_key: Option<String>,
+    pub base_url: Option<String>,
+    #[serde(default, alias = "disableWorkflows")]
+    legacy_disable_workflows: Option<bool>,
+    #[serde(default, alias = "enableWorkflows")]
+    legacy_enable_workflows: Option<bool>,
+    #[serde(default, alias = "workflowKeywordTriggerEnabled")]
+    legacy_workflow_keyword_trigger_enabled: Option<bool>,
     #[serde(default)]
     pub mcp_servers: Vec<crate::mcp_types::McpServerConfig>,
     #[serde(default)]
@@ -60,6 +97,35 @@ impl Default for FileConfig {
             update_check: true,
             desktop_notifications: false,
             auto_memory: false,
+        }
+    }
+}
+
+impl From<RawFileConfig> for FileConfig {
+    fn from(raw: RawFileConfig) -> Self {
+        let mut workflows = raw.workflows;
+        workflows.apply_legacy_top_level_aliases(
+            raw.legacy_disable_workflows,
+            raw.legacy_enable_workflows,
+            raw.legacy_workflow_keyword_trigger_enabled,
+        );
+
+        Self {
+            model: raw.model,
+            mode: raw.mode,
+            api_key: raw.api_key,
+            base_url: raw.base_url,
+            mcp_servers: raw.mcp_servers,
+            hooks: raw.hooks,
+            permissions: raw.permissions,
+            subagents: raw.subagents,
+            tools: raw.tools,
+            workflows,
+            theme: raw.theme,
+            vim_mode: raw.vim_mode,
+            update_check: raw.update_check,
+            desktop_notifications: raw.desktop_notifications,
+            auto_memory: raw.auto_memory,
         }
     }
 }
@@ -115,6 +181,27 @@ impl WorkflowFileConfig {
         }
 
         config
+    }
+
+    fn apply_legacy_top_level_aliases(
+        &mut self,
+        disable_workflows: Option<bool>,
+        enable_workflows: Option<bool>,
+        workflow_keyword_trigger_enabled: Option<bool>,
+    ) {
+        let nested_enabled_present = self.enabled.is_some()
+            || self.enable_workflows.is_some()
+            || self.disable_workflows.is_some();
+        if !nested_enabled_present {
+            if disable_workflows.unwrap_or(false) {
+                self.enabled = Some(false);
+            } else if let Some(enable_workflows) = enable_workflows {
+                self.enabled = Some(enable_workflows);
+            }
+        }
+        if self.workflow_keyword_trigger_enabled.is_none() {
+            self.workflow_keyword_trigger_enabled = workflow_keyword_trigger_enabled;
+        }
     }
 }
 
@@ -173,7 +260,9 @@ fn load_layered_config_from_optional_paths(
 
 fn load_toml_value(path: &Path) -> Option<Value> {
     let content = fs::read_to_string(path).ok()?;
-    toml::from_str(&content).ok()
+    let mut value = toml::from_str(&content).ok()?;
+    fold_legacy_workflow_settings_into_value(&mut value);
+    Some(value)
 }
 
 fn merge_toml_values(base: &mut Value, overlay: Value) {
@@ -201,6 +290,51 @@ fn remove_project_denied_fields(value: &mut Value) {
         table.remove("base_url");
         table.remove("hooks");
     }
+}
+
+fn fold_legacy_workflow_settings_into_value(value: &mut Value) {
+    let Some(root) = value.as_table_mut() else {
+        return;
+    };
+
+    let legacy_enabled = root
+        .get("disableWorkflows")
+        .and_then(Value::as_bool)
+        .filter(|disabled| *disabled)
+        .map(|_| false)
+        .or_else(|| root.get("enableWorkflows").and_then(Value::as_bool));
+    let legacy_keyword = root
+        .get("workflowKeywordTriggerEnabled")
+        .and_then(Value::as_bool);
+
+    let workflows = root
+        .entry("workflows")
+        .or_insert_with(|| Value::Table(Default::default()));
+    let Some(workflows_table) = workflows.as_table_mut() else {
+        return;
+    };
+
+    let nested_enabled_present = workflows_table.contains_key("enabled")
+        || workflows_table.contains_key("enableWorkflows")
+        || workflows_table.contains_key("disableWorkflows");
+    if !nested_enabled_present {
+        if let Some(enabled) = legacy_enabled {
+            workflows_table.insert("enabled".to_string(), Value::Boolean(enabled));
+        }
+    }
+
+    if !workflows_table.contains_key("workflowKeywordTriggerEnabled") {
+        if let Some(keyword_enabled) = legacy_keyword {
+            workflows_table.insert(
+                "workflowKeywordTriggerEnabled".to_string(),
+                Value::Boolean(keyword_enabled),
+            );
+        }
+    }
+
+    root.remove("disableWorkflows");
+    root.remove("enableWorkflows");
+    root.remove("workflowKeywordTriggerEnabled");
 }
 
 pub fn apply_override_layers(
@@ -408,6 +542,52 @@ enableWorkflows = false
     }
 
     #[test]
+    fn parse_top_level_workflow_legacy_aliases() {
+        let disabled: FileConfig = toml::from_str(
+            r#"
+disableWorkflows = true
+"#,
+        )
+        .unwrap();
+        assert!(!disabled.workflows.resolved().enabled);
+
+        let enabled_false: FileConfig = toml::from_str(
+            r#"
+enableWorkflows = false
+"#,
+        )
+        .unwrap();
+        assert!(!enabled_false.workflows.resolved().enabled);
+
+        let keyword_disabled: FileConfig = toml::from_str(
+            r#"
+workflowKeywordTriggerEnabled = false
+"#,
+        )
+        .unwrap();
+        assert!(!keyword_disabled.workflows.resolved().keyword_trigger_enabled);
+    }
+
+    #[test]
+    fn nested_workflow_values_override_top_level_legacy_aliases_in_same_file() {
+        let config: FileConfig = toml::from_str(
+            r#"
+disableWorkflows = true
+workflowKeywordTriggerEnabled = false
+
+[workflows]
+enabled = true
+workflowKeywordTriggerEnabled = true
+"#,
+        )
+        .unwrap();
+
+        let workflows = config.workflows.resolved();
+        assert!(workflows.enabled);
+        assert!(workflows.keyword_trigger_enabled);
+    }
+
+    #[test]
     fn parse_workflow_config_preserves_numeric_values() {
         let toml = r#"
 [workflows]
@@ -612,5 +792,37 @@ decision = "allow"
             config.permissions.rules[1].decision,
             crate::approval_types::Decision::Allow
         );
+    }
+
+    #[test]
+    fn layered_config_applies_top_level_workflow_legacy_aliases_with_project_precedence() {
+        let dir = tempfile::tempdir().unwrap();
+        let user_path = dir.path().join("user.toml");
+        let project_dir = dir.path().join("project");
+        std::fs::create_dir_all(project_dir.join(".orca")).unwrap();
+        let project_path = project_dir.join(".orca/config.toml");
+
+        std::fs::write(
+            &user_path,
+            r#"
+disableWorkflows = true
+workflowKeywordTriggerEnabled = false
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &project_path,
+            r#"
+enableWorkflows = true
+workflowKeywordTriggerEnabled = true
+"#,
+        )
+        .unwrap();
+
+        let config = load_layered_config_from_paths(&user_path, &project_dir);
+        let workflows = config.workflows.resolved();
+
+        assert!(workflows.enabled);
+        assert!(workflows.keyword_trigger_enabled);
     }
 }
