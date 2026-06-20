@@ -54,6 +54,32 @@ pub enum EventType {
     SubagentStarted,
     #[serde(rename = "subagent.completed")]
     SubagentCompleted,
+    #[serde(rename = "workflow.started")]
+    WorkflowStarted,
+    #[serde(rename = "workflow.resumed")]
+    WorkflowResumed,
+    #[serde(rename = "workflow.phase.started")]
+    WorkflowPhaseStarted,
+    #[serde(rename = "workflow.phase.completed")]
+    WorkflowPhaseCompleted,
+    #[serde(rename = "workflow.agent.started")]
+    WorkflowAgentStarted,
+    #[serde(rename = "workflow.agent.cached")]
+    WorkflowAgentCached,
+    #[serde(rename = "workflow.agent.completed")]
+    WorkflowAgentCompleted,
+    #[serde(rename = "workflow.agent.failed")]
+    WorkflowAgentFailed,
+    #[serde(rename = "workflow.paused")]
+    WorkflowPaused,
+    #[serde(rename = "workflow.stopped")]
+    WorkflowStopped,
+    #[serde(rename = "workflow.completed")]
+    WorkflowCompleted,
+    #[serde(rename = "workflow.failed")]
+    WorkflowFailed,
+    #[serde(rename = "workflow.result.available")]
+    WorkflowResultAvailable,
     #[serde(rename = "verification.started")]
     VerificationStarted,
     #[serde(rename = "verification.completed")]
@@ -267,6 +293,76 @@ impl EventFactory {
                 "status": status,
                 "output": output,
                 "error": error
+            }),
+        )
+    }
+
+    pub fn workflow_started(
+        &mut self,
+        task_id: &str,
+        run_id: &str,
+        workflow_name: &str,
+        phases: &[String],
+    ) -> EventEnvelope {
+        self.make(
+            EventType::WorkflowStarted,
+            json!({
+                "taskId": task_id,
+                "runId": run_id,
+                "workflowName": workflow_name,
+                "phases": phases
+            }),
+        )
+    }
+
+    pub fn workflow_agent_completed(
+        &mut self,
+        task_id: &str,
+        run_id: &str,
+        phase: &str,
+        agent_id: &str,
+        output: &str,
+    ) -> EventEnvelope {
+        self.make(
+            EventType::WorkflowAgentCompleted,
+            json!({
+                "taskId": task_id,
+                "runId": run_id,
+                "phase": phase,
+                "agentId": agent_id,
+                "output": output
+            }),
+        )
+    }
+
+    pub fn workflow_completed(
+        &mut self,
+        task_id: &str,
+        run_id: &str,
+        workflow_name: &str,
+    ) -> EventEnvelope {
+        self.make(
+            EventType::WorkflowCompleted,
+            json!({
+                "taskId": task_id,
+                "runId": run_id,
+                "workflowName": workflow_name
+            }),
+        )
+    }
+
+    pub fn workflow_result_available(
+        &mut self,
+        task_id: &str,
+        run_id: &str,
+        result: &str,
+    ) -> EventEnvelope {
+        self.make(
+            EventType::WorkflowResultAvailable,
+            json!({
+                "taskId": task_id,
+                "runId": run_id,
+                "result": result
             }),
         )
     }

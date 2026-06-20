@@ -92,6 +92,28 @@ impl<W: Write> EventSink<W> {
                 let status = event.payload["status"].as_str().unwrap_or("unknown");
                 writeln!(self.writer, "subagent completed: {description} ({status})")
             }
+            EventType::WorkflowStarted => {
+                let workflow_name = event.payload["workflowName"].as_str().unwrap_or("workflow");
+                writeln!(self.writer, "workflow started: {workflow_name}")
+            }
+            EventType::WorkflowResumed => writeln!(self.writer, "workflow resumed"),
+            EventType::WorkflowPhaseStarted => writeln!(self.writer, "workflow phase started"),
+            EventType::WorkflowPhaseCompleted => {
+                writeln!(self.writer, "workflow phase completed")
+            }
+            EventType::WorkflowAgentStarted => writeln!(self.writer, "workflow agent started"),
+            EventType::WorkflowAgentCached => writeln!(self.writer, "workflow agent cached"),
+            EventType::WorkflowAgentCompleted => {
+                writeln!(self.writer, "workflow agent completed")
+            }
+            EventType::WorkflowAgentFailed => writeln!(self.writer, "workflow agent failed"),
+            EventType::WorkflowPaused => writeln!(self.writer, "workflow paused"),
+            EventType::WorkflowStopped => writeln!(self.writer, "workflow stopped"),
+            EventType::WorkflowCompleted => writeln!(self.writer, "workflow completed"),
+            EventType::WorkflowFailed => writeln!(self.writer, "workflow failed"),
+            EventType::WorkflowResultAvailable => {
+                writeln!(self.writer, "workflow result available")
+            }
             EventType::VerificationStarted => writeln!(self.writer, "verification started"),
             EventType::VerificationCompleted => writeln!(self.writer, "verification completed"),
             EventType::Error => writeln!(

@@ -1528,6 +1528,7 @@ mod tests {
             external_tools: Vec::new(),
             subagents: Default::default(),
             tools: Default::default(),
+            workflows: Default::default(),
             theme: orca_core::config::ThemeName::Dark,
             vim_mode: false,
             update_check: false,

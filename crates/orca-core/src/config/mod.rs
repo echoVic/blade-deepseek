@@ -59,6 +59,8 @@ pub enum HistoryMode {
 }
 
 pub const DEFAULT_MAX_READ_PARALLEL_TOOLS: usize = 8;
+pub const DEFAULT_MAX_WORKFLOW_CONCURRENT_AGENTS: usize = 16;
+pub const DEFAULT_MAX_WORKFLOW_AGENTS_PER_RUN: u32 = 1000;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ToolConfig {
@@ -91,6 +93,66 @@ fn default_max_read_parallel() -> usize {
     DEFAULT_MAX_READ_PARALLEL_TOOLS
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WorkflowConfig {
+    #[serde(default = "default_workflows_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_max_workflow_concurrent_agents")]
+    pub max_concurrent_agents: usize,
+    #[serde(default = "default_max_workflow_agents_per_run")]
+    pub max_agents_per_run: u32,
+    #[serde(default = "default_workflow_keyword_trigger_enabled")]
+    pub keyword_trigger_enabled: bool,
+}
+
+impl Default for WorkflowConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_concurrent_agents: DEFAULT_MAX_WORKFLOW_CONCURRENT_AGENTS,
+            max_agents_per_run: DEFAULT_MAX_WORKFLOW_AGENTS_PER_RUN,
+            keyword_trigger_enabled: true,
+        }
+    }
+}
+
+impl WorkflowConfig {
+    const MAX_CONCURRENT_AGENTS_UPPER: usize = 64;
+    const MAX_AGENTS_PER_RUN_UPPER: u32 = 10_000;
+
+    pub fn normalized(mut self) -> Self {
+        if self.max_concurrent_agents == 0 {
+            self.max_concurrent_agents = 1;
+        } else if self.max_concurrent_agents > Self::MAX_CONCURRENT_AGENTS_UPPER {
+            self.max_concurrent_agents = Self::MAX_CONCURRENT_AGENTS_UPPER;
+        }
+
+        if self.max_agents_per_run == 0 {
+            self.max_agents_per_run = 1;
+        } else if self.max_agents_per_run > Self::MAX_AGENTS_PER_RUN_UPPER {
+            self.max_agents_per_run = Self::MAX_AGENTS_PER_RUN_UPPER;
+        }
+
+        self
+    }
+}
+
+fn default_workflows_enabled() -> bool {
+    true
+}
+
+fn default_max_workflow_concurrent_agents() -> usize {
+    DEFAULT_MAX_WORKFLOW_CONCURRENT_AGENTS
+}
+
+fn default_max_workflow_agents_per_run() -> u32 {
+    DEFAULT_MAX_WORKFLOW_AGENTS_PER_RUN
+}
+
+fn default_workflow_keyword_trigger_enabled() -> bool {
+    true
+}
+
 #[derive(Clone, Debug)]
 pub struct RunConfig {
     pub prompt: String,
@@ -111,6 +173,7 @@ pub struct RunConfig {
     pub max_budget_usd: Option<f64>,
     pub subagents: SubagentConfig,
     pub tools: ToolConfig,
+    pub workflows: WorkflowConfig,
     pub theme: ThemeName,
     pub vim_mode: bool,
     pub update_check: bool,
@@ -215,6 +278,7 @@ mod tests {
             max_budget_usd: Some(1.25),
             subagents: SubagentConfig::default(),
             tools: ToolConfig::default(),
+            workflows: WorkflowConfig::default(),
             theme: ThemeName::Dark,
             vim_mode: true,
             update_check: false,

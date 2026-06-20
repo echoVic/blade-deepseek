@@ -7,7 +7,7 @@ use toml::Value;
 
 use crate::approval_types::ApprovalMode;
 use crate::approval_rules::PermissionRules;
-use crate::config::{ThemeName, ToolConfig};
+use crate::config::{ThemeName, ToolConfig, WorkflowConfig};
 use crate::subagent_config::SubagentConfig;
 
 const ORCA_HOME_ENV: &str = "ORCA_HOME";
@@ -28,6 +28,8 @@ pub struct FileConfig {
     pub subagents: SubagentConfig,
     #[serde(default)]
     pub tools: ToolConfig,
+    #[serde(default)]
+    pub workflows: WorkflowFileConfig,
     #[serde(default)]
     pub theme: ThemeName,
     #[serde(default)]
@@ -52,6 +54,7 @@ impl Default for FileConfig {
             permissions: PermissionRules::default(),
             subagents: SubagentConfig::default(),
             tools: ToolConfig::default(),
+            workflows: WorkflowFileConfig::default(),
             theme: ThemeName::default(),
             vim_mode: false,
             update_check: true,
@@ -67,6 +70,52 @@ pub struct ConfigOverrides {
     pub mode: Option<ApprovalMode>,
     pub api_key: Option<String>,
     pub base_url: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct WorkflowFileConfig {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    #[serde(alias = "disableWorkflows")]
+    pub disable_workflows: Option<bool>,
+    #[serde(default)]
+    #[serde(alias = "enableWorkflows")]
+    pub enable_workflows: Option<bool>,
+    #[serde(default)]
+    pub max_concurrent_agents: Option<usize>,
+    #[serde(default)]
+    pub max_agents_per_run: Option<u32>,
+    #[serde(default)]
+    #[serde(alias = "workflowKeywordTriggerEnabled")]
+    pub workflow_keyword_trigger_enabled: Option<bool>,
+}
+
+impl WorkflowFileConfig {
+    pub fn normalized(&self) -> WorkflowConfig {
+        let mut config = WorkflowConfig::default();
+
+        if let Some(enabled) = self.enabled {
+            config.enabled = enabled;
+        }
+        if let Some(enable_workflows) = self.enable_workflows {
+            config.enabled = enable_workflows;
+        }
+        if self.disable_workflows.unwrap_or(false) {
+            config.enabled = false;
+        }
+        if let Some(max_concurrent_agents) = self.max_concurrent_agents {
+            config.max_concurrent_agents = max_concurrent_agents;
+        }
+        if let Some(max_agents_per_run) = self.max_agents_per_run {
+            config.max_agents_per_run = max_agents_per_run;
+        }
+        if let Some(keyword_trigger_enabled) = self.workflow_keyword_trigger_enabled {
+            config.keyword_trigger_enabled = keyword_trigger_enabled;
+        }
+
+        config.normalized()
+    }
 }
 
 fn default_true() -> bool {
@@ -318,6 +367,44 @@ max_read_parallel = 5
 "#;
         let config: FileConfig = toml::from_str(toml).unwrap();
         assert_eq!(config.tools.max_read_parallel, 5);
+    }
+
+    #[test]
+    fn parse_workflow_config() {
+        let toml = r#"
+[workflows]
+enabled = false
+max_concurrent_agents = 7
+max_agents_per_run = 99
+workflowKeywordTriggerEnabled = false
+"#;
+        let config: FileConfig = toml::from_str(toml).unwrap();
+        let workflows = config.workflows.normalized();
+        assert!(!workflows.enabled);
+        assert_eq!(workflows.max_concurrent_agents, 7);
+        assert_eq!(workflows.max_agents_per_run, 99);
+        assert!(!workflows.keyword_trigger_enabled);
+    }
+
+    #[test]
+    fn parse_workflow_enable_disable_aliases() {
+        let disabled: FileConfig = toml::from_str(
+            r#"
+[workflows]
+disableWorkflows = true
+"#,
+        )
+        .unwrap();
+        assert!(!disabled.workflows.normalized().enabled);
+
+        let enabled_false: FileConfig = toml::from_str(
+            r#"
+[workflows]
+enableWorkflows = false
+"#,
+        )
+        .unwrap();
+        assert!(!enabled_false.workflows.normalized().enabled);
     }
 
     #[test]
