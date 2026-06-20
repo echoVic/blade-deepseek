@@ -586,6 +586,90 @@ fn state_store_preserves_current_json_looking_string_outputs() {
 }
 
 #[test]
+fn state_store_preserves_missing_output_field_when_appending_completed_record() {
+    let temp = tempdir().unwrap();
+    let store = WorkflowStateStore::new(temp.path().join("runs"));
+    let state = WorkflowRunState {
+        run_id: "workflow-run-missing-output-fidelity".to_string(),
+        task_id: "task-missing-output-fidelity".to_string(),
+        session_id: "session-1".to_string(),
+        cwd: "/tmp/project".to_string(),
+        workflow_name: "audit".to_string(),
+        meta: WorkflowMeta {
+            name: "audit".to_string(),
+            description: "Audit code".to_string(),
+            phases: vec!["scan".to_string()],
+        },
+        script_digest: "abcd".repeat(16),
+        args_digest: "ef01".repeat(16),
+        status: WorkflowRunStatus::Completed,
+        total_agent_count: 2,
+        final_summary: Some("done".to_string()),
+        error: None,
+    };
+    store.create_run(&state).unwrap();
+
+    let cache_path = store.run_dir(&state.run_id).join("agent-cache.json");
+    let current_records = serde_json::json!({
+        "phases.scan:missing-output": {
+            "callId": "call-1",
+            "callPath": "phases.scan",
+            "prompt": "inspect repo",
+            "opts": null,
+            "inputHash": "missing-output",
+            "status": "completed",
+            "error": null,
+            "transcriptPath": null
+        }
+    });
+    fs::write(
+        &cache_path,
+        serde_json::to_string_pretty(&current_records).unwrap(),
+    )
+    .unwrap();
+
+    store
+        .record_agent_completed(
+            &state.run_id,
+            WorkflowAgentRecord {
+                call_id: "call-2".to_string(),
+                call_path: "phases.scan".to_string(),
+                prompt: "inspect repo again".to_string(),
+                opts: json!(null),
+                input_hash: "with-output".to_string(),
+                status: WorkflowAgentStatus::Completed,
+                output: Some(json!("cached result")),
+                error: None,
+                transcript_path: None,
+            },
+        )
+        .unwrap();
+
+    assert_eq!(
+        store.find_cached_agent_value(&state.run_id, "phases.scan", "missing-output"),
+        None
+    );
+    assert_eq!(
+        store
+            .cached_agent_result(&state.run_id, "phases.scan", "missing-output")
+            .unwrap(),
+        None
+    );
+
+    let rewritten_cache: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&cache_path).unwrap()).unwrap();
+    let original = &rewritten_cache["phases.scan:missing-output"];
+    assert!(
+        original.get("output").is_none(),
+        "missing output field should stay omitted after cache rewrite: {original}"
+    );
+    assert_eq!(
+        rewritten_cache["phases.scan:with-output"]["output"],
+        json!("cached result")
+    );
+}
+
+#[test]
 fn state_store_cached_agent_result_ignores_incomplete_or_outputless_current_records() {
     let temp = tempdir().unwrap();
     let store = WorkflowStateStore::new(temp.path().join("runs"));

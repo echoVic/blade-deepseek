@@ -36,6 +36,16 @@ struct CachedWorkflowAgentRecord {
     output_present: bool,
 }
 
+impl CachedWorkflowAgentRecord {
+    fn from_record(record: WorkflowAgentRecord) -> Self {
+        let output_present = record.output.is_some();
+        Self {
+            record,
+            output_present,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct WorkflowAgentRecordOnDisk {
@@ -46,6 +56,21 @@ struct WorkflowAgentRecordOnDisk {
     input_hash: String,
     status: WorkflowAgentStatus,
     #[serde(default, deserialize_with = "deserialize_agent_output_field")]
+    output: AgentOutputField,
+    error: Option<String>,
+    transcript_path: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkflowAgentRecordOnDiskWritable {
+    call_id: String,
+    call_path: String,
+    prompt: String,
+    opts: Value,
+    input_hash: String,
+    status: WorkflowAgentStatus,
+    #[serde(flatten)]
     output: AgentOutputField,
     error: Option<String>,
     transcript_path: Option<String>,
@@ -62,6 +87,21 @@ enum WorkflowAgentCacheFileOnDisk {
 struct AgentOutputField {
     present: bool,
     value: Option<Value>,
+}
+
+impl Serialize for AgentOutputField {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+
+        let mut map = serializer.serialize_map(if self.present { Some(1) } else { Some(0) })?;
+        if self.present {
+            map.serialize_entry("output", &self.value)?;
+        }
+        map.end()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -109,12 +149,15 @@ impl WorkflowStateStore {
         let record = record.into_workflow_agent_record();
         let path = self.run_dir(run_id).join("agent-cache.json");
         let mut cache = if path.exists() {
-            read_agent_cache_for_write(&path)?
+            read_agent_cache(&path)?
         } else {
             HashMap::new()
         };
-        cache.insert(cache_key(&record.call_path, &record.input_hash), record);
-        write_json_pretty(&path, &cache)
+        cache.insert(
+            cache_key(&record.call_path, &record.input_hash),
+            CachedWorkflowAgentRecord::from_record(record),
+        );
+        write_agent_cache(&path, &cache)
     }
 
     pub fn find_cached_agent(
@@ -299,11 +342,33 @@ fn read_agent_cache(path: &Path) -> io::Result<HashMap<String, CachedWorkflowAge
     })
 }
 
-fn read_agent_cache_for_write(path: &Path) -> io::Result<HashMap<String, WorkflowAgentRecord>> {
-    Ok(read_agent_cache(path)?
-        .into_iter()
-        .map(|(key, entry)| (key, entry.record))
-        .collect())
+fn write_agent_cache(
+    path: &Path,
+    cache: &HashMap<String, CachedWorkflowAgentRecord>,
+) -> io::Result<()> {
+    let on_disk: HashMap<String, WorkflowAgentRecordOnDiskWritable> = cache
+        .iter()
+        .map(|(key, entry)| {
+            (
+                key.clone(),
+                WorkflowAgentRecordOnDiskWritable {
+                    call_id: entry.record.call_id.clone(),
+                    call_path: entry.record.call_path.clone(),
+                    prompt: entry.record.prompt.clone(),
+                    opts: entry.record.opts.clone(),
+                    input_hash: entry.record.input_hash.clone(),
+                    status: entry.record.status,
+                    output: AgentOutputField {
+                        present: entry.output_present,
+                        value: entry.record.output.clone(),
+                    },
+                    error: entry.record.error.clone(),
+                    transcript_path: entry.record.transcript_path.clone(),
+                },
+            )
+        })
+        .collect();
+    write_json_pretty(path, &on_disk)
 }
 
 fn write_json_pretty<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {

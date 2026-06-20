@@ -313,8 +313,8 @@ impl WorkflowRunner {
         let mut sink = EventSink::new(sink(), self.config.output_format);
         let instructions = instructions::load_for_cwd_or_default(cwd);
         let memory = memory::load_for_cwd(cwd);
-        let workflow_child_config = Self::workflow_child_config(&self.config);
-        let mcp_registry = orca_mcp::initialize_registry(&workflow_child_config.mcp_servers);
+        let (workflow_child_config, mcp_registry) =
+            Self::workflow_child_runtime_parts(&self.config);
         let hooks = HookRunner::new(self.config.hooks.clone());
         let cancel = CancelToken::new();
         let child_request = ChildAgentRequest {
@@ -352,6 +352,14 @@ impl WorkflowRunner {
         let mut workflow_child_config = config.clone();
         workflow_child_config.approval_mode = ApprovalMode::AutoEdit;
         workflow_child_config
+    }
+
+    fn workflow_child_runtime_parts(
+        config: &RunConfig,
+    ) -> (RunConfig, orca_mcp::McpRegistry) {
+        let workflow_child_config = Self::workflow_child_config(config);
+        let mcp_registry = orca_mcp::initialize_registry(&workflow_child_config.mcp_servers);
+        (workflow_child_config, mcp_registry)
     }
 }
 
@@ -422,13 +430,28 @@ mod tests {
             ..Default::default()
         }];
 
-        let child_config = WorkflowRunner::workflow_child_config(&config);
-        let registry_error_count = orca_mcp::initialize_registry(&child_config.mcp_servers)
-            .errors()
-            .len();
+        let (_, registry) = WorkflowRunner::workflow_child_runtime_parts(&config);
+        let registry_error_count = registry.errors().len();
         assert!(
             registry_error_count > 0,
             "workflow child runtime should use initialized MCP registry from config"
+        );
+    }
+
+    #[test]
+    fn workflow_child_runtime_parts_force_autoedit_and_initialize_registry() {
+        let mut config = test_run_config();
+        config.approval_mode = ApprovalMode::Suggest;
+        config.mcp_servers = vec![McpServerConfig {
+            name: String::new(),
+            ..Default::default()
+        }];
+
+        let (child_config, registry) = WorkflowRunner::workflow_child_runtime_parts(&config);
+        assert_eq!(child_config.approval_mode, ApprovalMode::AutoEdit);
+        assert!(
+            !registry.errors().is_empty(),
+            "workflow child runtime should initialize MCP registry from configured servers"
         );
     }
 
