@@ -7,6 +7,7 @@ pub mod instructions;
 pub mod memory;
 pub mod mentions;
 pub mod notify;
+pub mod tasks;
 pub mod server;
 pub mod session;
 pub mod subagent;
