@@ -124,3 +124,68 @@ So local verification is limited to static YAML parsing and patch hygiene, plus 
 
 - The macOS matrix uses `macos-latest` for both Apple Silicon and x86_64 targets exactly as specified in the brief, but I could not run that matrix locally to prove hosted-runner compatibility.
 - No Actions-specific linter was available locally, so there is some residual risk beyond basic YAML syntax validity.
+
+## Review Finding Fix
+
+- Updated both `actions/download-artifact@v4` steps in `.github/workflows/release.yml` to set `merge-multiple: true`.
+- This keeps Task 2's `scripts/release/stage-npm.mjs` contract unchanged while making the workflow download layout match it.
+
+### Artifact Path Reasoning
+
+Before this change, downloading multiple artifacts to `dist/artifacts` would create one subdirectory per artifact name, so the binary for `aarch64-apple-darwin` would land at:
+
+```text
+dist/artifacts/orca-aarch64-apple-darwin/orca-aarch64-apple-darwin/orca
+```
+
+That does not satisfy `stage-npm.mjs`, which only accepts:
+
+```text
+dist/artifacts/orca-aarch64-apple-darwin/orca
+```
+
+or the archive fallback:
+
+```text
+dist/artifacts/orca-aarch64-apple-darwin.tar.gz
+```
+
+With `merge-multiple: true`, `actions/download-artifact` merges the contents of all named artifacts directly into `dist/artifacts`, so each uploaded file lands at the paths the release script already expects:
+
+```text
+dist/artifacts/orca-aarch64-apple-darwin/orca
+dist/artifacts/orca-aarch64-apple-darwin.tar.gz
+dist/artifacts/orca-aarch64-apple-darwin.tar.gz.sha256
+```
+
+The same applies for the other targets. This also keeps the release asset collection step working, because `find dist/artifacts -name '*.tar.gz'` and `find dist/artifacts -name '*.sha256'` still locate the packaged archives and checksums after the merged download.
+
+### Verification For This Fix
+
+#### 1. Required Ruby YAML parse
+
+Command:
+
+```bash
+ruby -e 'require "yaml"; YAML.load_file(".github/workflows/release.yml"); puts "ok"'
+```
+
+Output:
+
+```text
+ok
+```
+
+#### 2. Required patch hygiene check
+
+Command:
+
+```bash
+git diff --check
+```
+
+Output:
+
+```text
+[no output]
+```

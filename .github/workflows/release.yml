@@ -98,6 +98,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: dist/artifacts
+          merge-multiple: true
       - name: Collect release assets
         shell: bash
         run: |
@@ -126,6 +127,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: dist/artifacts
+          merge-multiple: true
       - name: Stage npm packages
         run: |
           node scripts/release/stage-npm.mjs \
