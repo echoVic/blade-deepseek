@@ -58,3 +58,18 @@ After adding the modules and enum variant, the same test suite passed cleanly:
 ## Concerns
 
 - None for this task. The implementation stays within the requested scope and the focused contract test is green.
+
+## Review Fix
+
+Resolved the follow-up review note for `ToolName::from_str`:
+
+- Added support for the lowercase `"workflow"` alias in `crates/orca-core/src/tool_types.rs`.
+- Extended `tests/workflow_types_contract.rs` so the round-trip test now checks `ToolName::from_str("workflow") == Some(ToolName::Workflow)`.
+
+Verification:
+
+```bash
+cargo test --test workflow_types_contract
+```
+
+Result: finished successfully, 5 tests passed, 0 failed.

@@ -50,6 +50,7 @@ fn workflow_output_serializes_claude_compatible_shape() {
 fn workflow_tool_name_round_trips() {
     assert_eq!(ToolName::Workflow.as_str(), "Workflow");
     assert_eq!(ToolName::from_str("Workflow"), Some(ToolName::Workflow));
+    assert_eq!(ToolName::from_str("workflow"), Some(ToolName::Workflow));
 }
 
 #[test]

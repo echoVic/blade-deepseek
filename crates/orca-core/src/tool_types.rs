@@ -50,7 +50,7 @@ impl ToolName {
             "write_file" => Self::WriteFile,
             "git_status" => Self::GitStatus,
             "subagent" => Self::Subagent,
-            "Workflow" => Self::Workflow,
+            "Workflow" | "workflow" => Self::Workflow,
             "web_search" => Self::WebSearch,
             "update_plan" => Self::UpdatePlan,
             other if other.starts_with("mcp__") => Self::Mcp(other.to_string()),
