@@ -4,10 +4,6 @@ import vm from "node:vm";
 const scriptPath = process.argv[2];
 const argsJson = process.argv[3] ?? "null";
 const workflowArgs = JSON.parse(argsJson);
-const hostTestMode =
-  workflowArgs &&
-  typeof workflowArgs === "object" &&
-  workflowArgs.__orcaHostTestMode;
 const FORBIDDEN_IDENTIFIERS = new Set([
   "process",
   "require",
@@ -650,10 +646,6 @@ function isIdentifierPart(char) {
 }
 
 try {
-  if (hostTestMode === "emit_invalid_json") {
-    process.stdout.write("not-json\n");
-    process.exit(0);
-  }
   const namespace = await loadWorkflowModule();
   emit({ type: "workflow_completed", result: namespace.default ?? null });
 } catch (error) {

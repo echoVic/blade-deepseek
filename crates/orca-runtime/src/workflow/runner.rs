@@ -2,7 +2,6 @@ use std::fs;
 use std::io;
 use std::io::sink;
 use std::path::PathBuf;
-use std::sync::Mutex;
 
 use orca_core::approval_types::ApprovalMode;
 use orca_core::cancel::CancelToken;
@@ -69,38 +68,6 @@ pub struct WorkflowRunner {
     tasks: TaskRegistry,
     session_dir: PathBuf,
     state: WorkflowStateStore,
-}
-
-pub mod test_support {
-    use super::*;
-
-    #[derive(Clone, Debug)]
-    pub struct ChildRuntimeObservation {
-        pub prompt: String,
-        pub approval_mode: ApprovalMode,
-        pub registry_error_count: usize,
-    }
-
-    static CHILD_RUNTIME_OBSERVATIONS: Mutex<Vec<ChildRuntimeObservation>> = Mutex::new(Vec::new());
-
-    pub(crate) fn record_child_runtime_observation(observation: ChildRuntimeObservation) {
-        CHILD_RUNTIME_OBSERVATIONS
-            .lock()
-            .expect("observation lock")
-            .push(observation);
-    }
-
-    pub fn take_child_runtime_observation_for_prompt(
-        prompt: &str,
-    ) -> Option<ChildRuntimeObservation> {
-        let mut observations = CHILD_RUNTIME_OBSERVATIONS
-            .lock()
-            .expect("observation lock");
-        observations
-            .iter()
-            .rposition(|observation| observation.prompt == prompt)
-            .map(|index| observations.remove(index))
-    }
 }
 
 impl WorkflowRunner {
@@ -346,16 +313,10 @@ impl WorkflowRunner {
         let mut sink = EventSink::new(sink(), self.config.output_format);
         let instructions = instructions::load_for_cwd_or_default(cwd);
         let memory = memory::load_for_cwd(cwd);
-        let mut workflow_child_config = self.config.clone();
-        workflow_child_config.approval_mode = ApprovalMode::AutoEdit;
+        let workflow_child_config = Self::workflow_child_config(&self.config);
         let mcp_registry = orca_mcp::initialize_registry(&workflow_child_config.mcp_servers);
         let hooks = HookRunner::new(self.config.hooks.clone());
         let cancel = CancelToken::new();
-        test_support::record_child_runtime_observation(test_support::ChildRuntimeObservation {
-            prompt: call.prompt.clone(),
-            approval_mode: workflow_child_config.approval_mode,
-            registry_error_count: mcp_registry.errors().len(),
-        });
         let child_request = ChildAgentRequest {
             prompt: call.prompt.clone(),
             subagent_type: SubagentType::General,
@@ -385,6 +346,12 @@ impl WorkflowRunner {
                     .unwrap_or_else(|| "workflow child agent failed".to_string()),
             )),
         }
+    }
+
+    fn workflow_child_config(config: &RunConfig) -> RunConfig {
+        let mut workflow_child_config = config.clone();
+        workflow_child_config.approval_mode = ApprovalMode::AutoEdit;
+        workflow_child_config
     }
 }
 
@@ -426,6 +393,72 @@ fn child_agent_output(prompt: &str, final_message: &str) -> String {
         prompt.to_string()
     } else {
         format!("{prompt}\n\n{final_message}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use orca_core::config::{
+        HistoryMode, OutputFormat, ProviderKind, ToolConfig, WorkflowConfig,
+    };
+    use orca_core::mcp_types::McpServerConfig;
+    use orca_core::model::ModelSelection;
+
+    #[test]
+    fn workflow_child_config_forces_autoedit_approval_mode() {
+        let mut config = test_run_config();
+        config.approval_mode = ApprovalMode::Suggest;
+
+        let child_config = WorkflowRunner::workflow_child_config(&config);
+        assert_eq!(child_config.approval_mode, ApprovalMode::AutoEdit);
+    }
+
+    #[test]
+    fn workflow_child_registry_uses_configured_mcp_servers() {
+        let mut config = test_run_config();
+        config.mcp_servers = vec![McpServerConfig {
+            name: String::new(),
+            ..Default::default()
+        }];
+
+        let child_config = WorkflowRunner::workflow_child_config(&config);
+        let registry_error_count = orca_mcp::initialize_registry(&child_config.mcp_servers)
+            .errors()
+            .len();
+        assert!(
+            registry_error_count > 0,
+            "workflow child runtime should use initialized MCP registry from config"
+        );
+    }
+
+    fn test_run_config() -> RunConfig {
+        RunConfig {
+            prompt: String::new(),
+            cwd: None,
+            output_format: OutputFormat::Jsonl,
+            approval_mode: ApprovalMode::FullAuto,
+            provider: ProviderKind::Mock,
+            verifier: None,
+            model: ModelSelection::from_unchecked(Some("auto".to_string())),
+            api_key: None,
+            base_url: None,
+            mcp_servers: Vec::new(),
+            hooks: Vec::new(),
+            external_tools: Vec::new(),
+            history_mode: HistoryMode::Disabled,
+            show_session_picker: false,
+            permission_rules: Default::default(),
+            max_budget_usd: None,
+            subagents: Default::default(),
+            tools: ToolConfig::default(),
+            workflows: WorkflowConfig::default(),
+            theme: Default::default(),
+            vim_mode: false,
+            update_check: false,
+            desktop_notifications: false,
+            auto_memory: false,
+        }
     }
 }
 
