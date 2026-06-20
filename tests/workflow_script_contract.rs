@@ -321,6 +321,47 @@ fn state_store_preserves_legacy_json_looking_string_cache_values() {
 }
 
 #[test]
+fn state_store_reads_legacy_null_agent_cache_as_null_value() {
+    let temp = tempdir().unwrap();
+    let store = WorkflowStateStore::new(temp.path().join("runs"));
+    let state = WorkflowRunState {
+        run_id: "workflow-run-legacy-null".to_string(),
+        task_id: "task-legacy-null".to_string(),
+        session_id: "session-1".to_string(),
+        cwd: "/tmp/project".to_string(),
+        workflow_name: "audit".to_string(),
+        meta: WorkflowMeta {
+            name: "audit".to_string(),
+            description: "Audit code".to_string(),
+            phases: vec!["scan".to_string()],
+        },
+        script_digest: "abcd".repeat(16),
+        args_digest: "ef01".repeat(16),
+        status: WorkflowRunStatus::Completed,
+        total_agent_count: 1,
+        final_summary: Some("done".to_string()),
+        error: None,
+    };
+    store.create_run(&state).unwrap();
+
+    let legacy_record = serde_json::json!({
+        "phases.scan:1234": {
+            "call_path": "phases.scan",
+            "input_hash": "1234",
+            "output": null
+        }
+    });
+    fs::write(
+        store.run_dir(&state.run_id).join("agent-cache.json"),
+        serde_json::to_string_pretty(&legacy_record).unwrap(),
+    )
+    .unwrap();
+
+    let found = store.find_cached_agent_value(&state.run_id, "phases.scan", "1234");
+    assert_eq!(found, Some(serde_json::Value::Null));
+}
+
+#[test]
 fn state_store_returns_legacy_object_cache_as_object_value() {
     let temp = tempdir().unwrap();
     let store = WorkflowStateStore::new(temp.path().join("runs"));
@@ -361,6 +402,65 @@ fn state_store_returns_legacy_object_cache_as_object_value() {
 
     let found = store.find_cached_agent_value(&state.run_id, "phases.scan", "1234");
     assert_eq!(found, Some(json!({ "kind": "legacy-object" })));
+}
+
+#[test]
+fn state_store_reads_current_null_output_as_null_value() {
+    let temp = tempdir().unwrap();
+    let store = WorkflowStateStore::new(temp.path().join("runs"));
+    let state = WorkflowRunState {
+        run_id: "workflow-run-current-null".to_string(),
+        task_id: "task-current-null".to_string(),
+        session_id: "session-1".to_string(),
+        cwd: "/tmp/project".to_string(),
+        workflow_name: "audit".to_string(),
+        meta: WorkflowMeta {
+            name: "audit".to_string(),
+            description: "Audit code".to_string(),
+            phases: vec!["scan".to_string()],
+        },
+        script_digest: "abcd".repeat(16),
+        args_digest: "ef01".repeat(16),
+        status: WorkflowRunStatus::Completed,
+        total_agent_count: 1,
+        final_summary: Some("done".to_string()),
+        error: None,
+    };
+    store.create_run(&state).unwrap();
+
+    let current_record = serde_json::json!({
+        "phases.scan:1234": {
+            "callId": "call-1",
+            "callPath": "phases.scan",
+            "prompt": "inspect repo",
+            "opts": null,
+            "inputHash": "1234",
+            "status": "completed",
+            "output": null,
+            "error": null,
+            "transcriptPath": null
+        }
+    });
+    fs::write(
+        store.run_dir(&state.run_id).join("agent-cache.json"),
+        serde_json::to_string_pretty(&current_record).unwrap(),
+    )
+    .unwrap();
+
+    let found = store.find_cached_agent_value(&state.run_id, "phases.scan", "1234");
+    assert_eq!(found, Some(serde_json::Value::Null));
+
+    let cached = store
+        .cached_agent_result(&state.run_id, "phases.scan", "1234")
+        .unwrap();
+    assert_eq!(
+        cached,
+        Some(WorkflowAgentCacheRecord {
+            call_path: "phases.scan".to_string(),
+            input_hash: "1234".to_string(),
+            output: serde_json::Value::Null,
+        })
+    );
 }
 
 #[test]
@@ -528,7 +628,6 @@ fn state_store_cached_agent_result_ignores_incomplete_or_outputless_current_reco
             "opts": null,
             "inputHash": "missing-output",
             "status": "completed",
-            "output": null,
             "error": null,
             "transcriptPath": null
         }
@@ -549,6 +648,10 @@ fn state_store_cached_agent_result_ignores_incomplete_or_outputless_current_reco
         store
             .cached_agent_result(&state.run_id, "phases.scan", "missing-output")
             .unwrap(),
+        None
+    );
+    assert_eq!(
+        store.find_cached_agent_value(&state.run_id, "phases.scan", "missing-output"),
         None
     );
 }
