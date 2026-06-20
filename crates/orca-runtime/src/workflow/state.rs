@@ -144,7 +144,7 @@ impl IntoWorkflowAgentRecord for WorkflowAgentCacheRecord {
             opts: Value::Null,
             input_hash: self.input_hash,
             status: WorkflowAgentStatus::Completed,
-            output: Some(self.output.to_string()),
+            output: Some(value_to_output_string(self.output)),
             error: None,
             transcript_path: None,
         }
@@ -153,15 +153,14 @@ impl IntoWorkflowAgentRecord for WorkflowAgentCacheRecord {
 
 impl From<&WorkflowAgentRecord> for WorkflowAgentCacheRecord {
     fn from(record: &WorkflowAgentRecord) -> Self {
-        let output = record
-            .output
-            .as_deref()
-            .and_then(|value| serde_json::from_str(value).ok())
-            .unwrap_or(Value::Null);
         Self {
             call_path: record.call_path.clone(),
             input_hash: record.input_hash.clone(),
-            output,
+            output: record
+                .output
+                .as_deref()
+                .map(output_string_to_value)
+                .unwrap_or(Value::Null),
         }
     }
 }
@@ -180,6 +179,17 @@ pub fn input_hash(prompt: &str, opts: &Value) -> String {
 
 fn cache_key(call_path: &str, input_hash: &str) -> String {
     format!("{call_path}:{input_hash}")
+}
+
+fn value_to_output_string(value: Value) -> String {
+    match value {
+        Value::String(output) => output,
+        other => other.to_string(),
+    }
+}
+
+fn output_string_to_value(output: &str) -> Value {
+    serde_json::from_str(output).unwrap_or_else(|_| Value::String(output.to_string()))
 }
 
 fn read_agent_cache(path: &Path) -> io::Result<HashMap<String, WorkflowAgentRecord>> {
