@@ -1,3 +1,4 @@
+pub mod agent_child;
 pub mod agent_common;
 pub mod controller;
 pub mod cost;

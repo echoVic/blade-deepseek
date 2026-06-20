@@ -3,39 +3,37 @@ use std::path::Path;
 use std::thread;
 
 use orca_approval::{ApprovalPolicy, prompt_user};
-use orca_core::approval_types::{
-    ApprovalDecision, ApprovalRequest, ApprovalResolution,
-};
+use orca_core::approval_types::{ApprovalDecision, ApprovalRequest, ApprovalResolution};
+use orca_core::cancel::CancelToken;
 use orca_core::config::{HistoryMode, OutputFormat, RunConfig};
+use orca_core::conversation::Conversation;
 use orca_core::event_schema::{EventFactory, RunStatus};
 use orca_core::event_sink::EventSink;
 use orca_core::model::ModelRouteContext;
-use orca_core::conversation::Conversation;
-use orca_core::cancel::CancelToken;
+use orca_core::provider_types::ProviderStep;
 use orca_core::subagent_types::SubagentType;
 use orca_core::tool_types;
 use orca_mcp::McpRegistry;
-use orca_core::provider_types::ProviderStep;
-use orca_provider::{self, ProviderConfig};
 use orca_provider::context;
 use orca_provider::tool_schema::{
     deepseek_tools_schema_for_type_with_mcp_and_external,
     deepseek_tools_schema_with_mcp_and_external,
 };
+use orca_provider::{self, ProviderConfig};
 use orca_tools;
 
+use crate::agent_child::{ChildAgentRequest, ChildAgentResult, run_child_agent};
 use crate::agent_common;
 use crate::cost::CostTracker;
 use crate::history::{self, SessionWriter};
 use crate::hooks::{
-    HookContext, HookRunner, conversation_with_hook_context,
-    tool_request_with_hook_outcome,
+    HookContext, HookRunner, conversation_with_hook_context, tool_request_with_hook_outcome,
 };
-use orca_core::hook_types::HookEvent;
 use crate::instructions::{self, ProjectInstructions};
 use crate::memory::{self, MemoryBlock};
 use crate::session::new_run_id;
 use crate::subagent;
+use orca_core::hook_types::HookEvent;
 
 const DEFAULT_MAX_TURNS: u32 = 128;
 
@@ -50,7 +48,7 @@ struct AgentLoopResult {
 struct SubagentExecutionResult {
     tool_request: tool_types::ToolRequest,
     description: String,
-    child: AgentLoopResult,
+    child: ChildAgentResult,
     cost_tracker: CostTracker,
 }
 
@@ -403,10 +401,7 @@ fn run_agent_loop(
         }
         let mut turn_provider_config = provider_config.clone();
         turn_provider_config.model = Some(route_decision.actual_model.clone());
-        context::apply_context_budget_hint(
-            &mut conversation,
-            Some(&route_decision.actual_model),
-        );
+        context::apply_context_budget_hint(&mut conversation, Some(&route_decision.actual_model));
 
         let pre_model_outcome = match hooks.run(
             HookEvent::PreModelCall,
@@ -507,9 +502,7 @@ fn run_agent_loop(
                 let after_messages = conversation.messages.len();
                 if emit_deltas && let Some(writer) = history_writer.as_deref_mut() {
                     writer.append_compaction(before_messages, after_messages)?;
-                    if let context::CompactionKind::RemoteSummary(summary) =
-                        compaction.kind
-                    {
+                    if let context::CompactionKind::RemoteSummary(summary) = compaction.kind {
                         writer.append_summary(before_messages, after_messages, summary)?;
                     }
                 }
@@ -692,8 +685,9 @@ fn run_agent_loop(
                 && result.status == tool_types::ToolStatus::Completed
             {
                 if let Ok(update) = orca_tools::update_plan::parse_args(tool_request) {
-                    conversation
-                        .replace_plan_state(orca_tools::update_plan::format_context_message(&update));
+                    conversation.replace_plan_state(
+                        orca_tools::update_plan::format_context_message(&update),
+                    );
                     if emit_deltas
                         && let Some(writer) = history_writer.as_deref_mut()
                         && let Some(message) = conversation.messages.last()
@@ -783,7 +777,8 @@ fn execute_tool_with_approval(
                     if emit_deltas {
                         sink.emit(&events.tool_call_requested(tool_request))?;
                     }
-                    let result = tool_types::ToolResult::denied(tool_request, final_resolution.reason);
+                    let result =
+                        tool_types::ToolResult::denied(tool_request, final_resolution.reason);
                     if emit_deltas {
                         sink.emit(&events.tool_call_completed(&result))?;
                     }
@@ -1012,7 +1007,8 @@ fn execute_subagent_batch(
     cancel: &CancelToken,
 ) -> io::Result<Vec<(RunStatus, tool_types::ToolResult)>> {
     let mut handles = Vec::new();
-    let mut results: Vec<Option<(RunStatus, tool_types::ToolResult)>> = vec![None; tool_requests.len()];
+    let mut results: Vec<Option<(RunStatus, tool_types::ToolResult)>> =
+        vec![None; tool_requests.len()];
 
     for (idx, tool_request) in tool_requests.iter().enumerate() {
         if emit_deltas {
@@ -1052,6 +1048,13 @@ fn execute_subagent_batch(
             sink.emit(&events.subagent_started(&tool_request.id, &request.description))?;
         }
 
+        let child_request = ChildAgentRequest {
+            prompt: request.prompt.clone(),
+            subagent_type: request.subagent_type,
+            model: request.model.clone(),
+            depth: subagent_depth + 1,
+            emit_deltas: false,
+        };
         let child_tool_request = effective_tool_request;
         let child_config = config.clone();
         let child_cwd = cwd.to_path_buf();
@@ -1066,31 +1069,44 @@ fn execute_subagent_batch(
                 let mut child_events =
                     EventFactory::new(format!("subagent-{}", child_tool_request.id));
                 let mut child_sink = EventSink::new(io::sink(), child_config.output_format);
-                let mut child_config = child_config;
-                child_config.model = child_config
-                    .model
-                    .with_subagent_override(request.model.clone());
-                let mut child_cost_tracker = CostTracker::new(child_config.model.as_deref());
-                let child = run_agent_loop(
+                let (child, child_cost_tracker) = run_child_agent(
                     &child_config,
-                    &child_cwd,
-                    &mut child_events,
-                    &mut child_sink,
-                    &request.prompt,
-                    None,
-                    None,
-                    subagent_depth + 1,
-                    false,
-                    &request.subagent_type,
-                    &child_instructions,
-                    &child_memory,
-                    &child_mcp_registry,
-                    &child_hooks,
-                    &mut child_cost_tracker,
-                    &child_cancel,
+                    &child_request,
+                    |child_config, request, child_cost_tracker| {
+                        run_agent_loop(
+                            child_config,
+                            &child_cwd,
+                            &mut child_events,
+                            &mut child_sink,
+                            &request.prompt,
+                            None,
+                            None,
+                            request.depth,
+                            request.emit_deltas,
+                            &request.subagent_type,
+                            &child_instructions,
+                            &child_memory,
+                            &child_mcp_registry,
+                            &child_hooks,
+                            child_cost_tracker,
+                            &child_cancel,
+                        )
+                        .map(|child| ChildAgentResult {
+                            status: child.status,
+                            final_message: child.final_message,
+                            error: child.error,
+                        })
+                    },
                 )
                 .unwrap_or_else(|error| {
-                    AgentLoopResult::failure(RunStatus::Failed, error.to_string())
+                    (
+                        ChildAgentResult {
+                            status: RunStatus::Failed,
+                            final_message: None,
+                            error: Some(error.to_string()),
+                        },
+                        CostTracker::new(None),
+                    )
                 });
 
                 SubagentExecutionResult {
@@ -1223,7 +1239,6 @@ fn execute_subagent_tool(
 ) -> io::Result<tool_types::ToolResult> {
     let request = subagent::create_subagent_request(tool_request);
     let description = request.description.clone();
-    let subagent_type = request.subagent_type;
 
     if emit_deltas {
         sink.emit(&events.subagent_started(&tool_request.id, &description))?;
@@ -1243,28 +1258,41 @@ fn execute_subagent_tool(
         return Ok(tool_types::ToolResult::failed(tool_request, error, None));
     }
 
-    let mut child_config = config.clone();
-    child_config.model = child_config
-        .model
-        .with_subagent_override(request.model.clone());
-    let mut child_cost_tracker = CostTracker::new(child_config.model.as_deref());
-    let child = run_agent_loop(
-        &child_config,
-        cwd,
-        events,
-        sink,
-        &request.prompt,
-        None,
-        None,
-        subagent_depth + 1,
-        false,
-        &subagent_type,
-        instructions,
-        memory,
-        mcp_registry,
-        hooks,
-        &mut child_cost_tracker,
-        cancel,
+    let child_request = ChildAgentRequest {
+        prompt: request.prompt,
+        subagent_type: request.subagent_type,
+        model: request.model,
+        depth: subagent_depth + 1,
+        emit_deltas: false,
+    };
+    let (child, child_cost_tracker) = run_child_agent(
+        config,
+        &child_request,
+        |child_config, request, child_cost_tracker| {
+            run_agent_loop(
+                child_config,
+                cwd,
+                events,
+                sink,
+                &request.prompt,
+                None,
+                None,
+                request.depth,
+                request.emit_deltas,
+                &request.subagent_type,
+                instructions,
+                memory,
+                mcp_registry,
+                hooks,
+                child_cost_tracker,
+                cancel,
+            )
+            .map(|child| ChildAgentResult {
+                status: child.status,
+                final_message: child.final_message,
+                error: child.error,
+            })
+        },
     )?;
 
     cost_tracker.merge(&child_cost_tracker);
@@ -1374,10 +1402,10 @@ fn load_project_instructions(cwd: &Path) -> ProjectInstructions {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hooks::HookOutcome;
     use orca_core::approval_types::{ActionKind, ApprovalMode};
     use orca_core::config::{HistoryMode, OutputFormat, ProviderKind};
     use orca_core::model::ModelSelection;
-    use crate::hooks::HookOutcome;
     use orca_core::subagent_config::SubagentConfig;
 
     fn config(subagents: SubagentConfig) -> RunConfig {
@@ -1419,7 +1447,11 @@ mod tests {
         }
     }
 
-    fn tool_request(id: &str, name: tool_types::ToolName, action: ActionKind) -> tool_types::ToolRequest {
+    fn tool_request(
+        id: &str,
+        name: tool_types::ToolName,
+        action: ActionKind,
+    ) -> tool_types::ToolRequest {
         tool_types::ToolRequest {
             id: id.to_string(),
             name,
