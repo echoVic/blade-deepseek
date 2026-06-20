@@ -1,7 +1,15 @@
 use std::env;
+use std::fs;
+use std::io::Write;
+use std::path::Path;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
+use orca_core::workflow_types::{WorkflowInput, WorkflowRunState};
+use orca_runtime::tasks::TaskRegistry;
+use orca_runtime::workflow::{WorkflowLaunchRequest, WorkflowRunner};
+use serde::Serialize;
+use serde_json::Value;
 
 use crate::approval::policy::ApprovalMode;
 use crate::config::file;
@@ -66,6 +74,8 @@ enum Command {
     Exec(ExecArgs),
     /// Inspect saved conversation history.
     History(HistoryArgs),
+    /// Run and inspect local workflows.
+    Workflow(WorkflowArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -134,6 +144,91 @@ struct ExecArgs {
 struct HistoryArgs {
     #[command(subcommand)]
     command: HistoryCommand,
+}
+
+#[derive(Debug, Parser)]
+struct WorkflowArgs {
+    #[command(subcommand)]
+    command: WorkflowCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum WorkflowCommand {
+    /// Launch a workflow script or named workflow.
+    Run(WorkflowRunArgs),
+    /// List persisted workflow runs for the current project.
+    List,
+    /// Show a persisted workflow run by task id.
+    Show { task_id: String },
+    /// Request stop for a workflow task.
+    Stop { task_id: String },
+    /// Resume a workflow run from a prior run id.
+    Resume { run_id: String },
+}
+
+#[derive(Debug, Parser)]
+struct WorkflowRunArgs {
+    /// Workspace directory.
+    #[arg(long)]
+    cwd: Option<PathBuf>,
+
+    /// Provider implementation (internal, for testing).
+    #[arg(long, value_enum, default_value_t = ProviderKind::DeepSeek, hide = true)]
+    provider: ProviderKind,
+
+    /// Model to use (overrides config file and ORCA_MODEL env).
+    #[arg(long)]
+    model: Option<String>,
+
+    /// API key to use (overrides config file and ORCA_API_KEY env).
+    #[arg(long)]
+    api_key: Option<String>,
+
+    /// API base URL (overrides config file and ORCA_BASE_URL env).
+    #[arg(long)]
+    base_url: Option<String>,
+
+    /// Workflow arguments as JSON.
+    #[arg(long)]
+    args: Option<String>,
+
+    /// Resume cached agent calls from a prior workflow run id.
+    #[arg(long = "resume-from-run-id")]
+    resume_from_run_id: Option<String>,
+
+    /// Workflow script path or named workflow.
+    script_or_name: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkflowListEntry {
+    task_id: String,
+    run_id: String,
+    session_id: String,
+    workflow_name: String,
+    status: orca_core::workflow_types::WorkflowRunStatus,
+    cwd: String,
+    total_agent_count: u32,
+    final_summary: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkflowShowEntry {
+    #[serde(flatten)]
+    state: WorkflowRunState,
+    session_id: String,
+    run_dir: String,
+    transcript_dir: String,
+}
+
+#[derive(Debug)]
+struct PersistedWorkflowRun {
+    session_id: String,
+    state: WorkflowRunState,
+    run_dir: PathBuf,
 }
 
 #[derive(Debug, Subcommand)]
@@ -210,6 +305,7 @@ pub fn run() -> i32 {
     match cli.command {
         Some(Command::Exec(args)) => run_exec(args),
         Some(Command::History(args)) => run_history(args),
+        Some(Command::Workflow(args)) => run_workflow(args),
         None => run_placeholder(cli),
     }
 }
@@ -494,6 +590,341 @@ fn run_history(args: HistoryArgs) -> i32 {
             }
         },
     }
+}
+
+fn run_workflow(args: WorkflowArgs) -> i32 {
+    match args.command {
+        WorkflowCommand::Run(args) => run_workflow_command(args),
+        WorkflowCommand::List => workflow_list_command(),
+        WorkflowCommand::Show { task_id } => workflow_show_command(&task_id),
+        WorkflowCommand::Stop { task_id } => workflow_stop_command(&task_id),
+        WorkflowCommand::Resume { run_id } => workflow_resume_command(&run_id),
+    }
+}
+
+fn run_workflow_command(args: WorkflowRunArgs) -> i32 {
+    let cwd = args
+        .cwd
+        .clone()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let file_config = match load_effective_file_config(
+        &cwd,
+        ConfigOverrides {
+            model: args.model,
+            mode: None,
+            api_key: args.api_key,
+            base_url: args.base_url,
+        },
+    ) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("orca: {error}");
+            return 1;
+        }
+    };
+    if !file_config.workflows.resolved().enabled {
+        eprintln!("orca: workflow execution is disabled in config");
+        return 1;
+    }
+
+    let model = match ModelSelection::parse(file_config.model) {
+        Ok(model) => model,
+        Err(error) => {
+            eprintln!("orca: {error}");
+            return 1;
+        }
+    };
+    let workflow_args = match parse_optional_json_arg(args.args.as_deref()) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("orca: {error}");
+            return 1;
+        }
+    };
+
+    let config = RunConfig {
+        prompt: String::new(),
+        cwd: Some(cwd.clone()),
+        output_format: OutputFormat::Jsonl,
+        approval_mode: file_config.mode.unwrap_or_default(),
+        provider: args.provider,
+        verifier: None,
+        model,
+        api_key: file_config.api_key,
+        base_url: file_config.base_url,
+        history_mode: HistoryMode::Disabled,
+        show_session_picker: false,
+        permission_rules: file_config.permissions,
+        max_budget_usd: None,
+        mcp_servers: file_config.mcp_servers,
+        hooks: file_config.hooks,
+        external_tools: crate::tools::external::load_default_external_tools(),
+        subagents: file_config.subagents.normalized(),
+        tools: file_config.tools.normalized(),
+        workflows: file_config.workflows.resolved(),
+        theme: file_config.theme,
+        vim_mode: file_config.vim_mode,
+        update_check: file_config.update_check,
+        desktop_notifications: false,
+        auto_memory: file_config.auto_memory,
+    };
+
+    let session_id = format!("workflow-cli-{}", uuid::Uuid::new_v4());
+    let session_dir = workflow_session_root(&cwd).join(&session_id);
+    let tasks = TaskRegistry::new(session_id);
+    let runner = WorkflowRunner::new(config, tasks, session_dir);
+    let request = workflow_launch_request(
+        &cwd,
+        &args.script_or_name,
+        workflow_args,
+        args.resume_from_run_id,
+    );
+
+    let launch = match runner.launch_background(request) {
+        Ok(launch) => launch,
+        Err(error) => {
+            eprintln!("orca: failed to launch workflow: {error}");
+            return 1;
+        }
+    };
+
+    if let Err(error) = print_json_stdout(&launch.output) {
+        eprintln!("orca: failed to write workflow output: {error}");
+        return 1;
+    }
+
+    match launch.join() {
+        Ok(Ok(_)) => 0,
+        Ok(Err(error)) => {
+            eprintln!("orca: workflow run failed after launch: {error}");
+            1
+        }
+        Err(_) => {
+            eprintln!("orca: workflow worker thread panicked");
+            1
+        }
+    }
+}
+
+fn workflow_list_command() -> i32 {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let mut runs = match load_persisted_workflow_runs(&cwd) {
+        Ok(runs) => runs,
+        Err(error) => {
+            eprintln!("orca: failed to list workflows: {error}");
+            return 1;
+        }
+    };
+    runs.sort_by(|left, right| right.state.run_id.cmp(&left.state.run_id));
+
+    let entries = runs
+        .into_iter()
+        .map(|run| WorkflowListEntry {
+            task_id: run.state.task_id,
+            run_id: run.state.run_id,
+            session_id: run.session_id,
+            workflow_name: run.state.workflow_name,
+            status: run.state.status,
+            cwd: run.state.cwd,
+            total_agent_count: run.state.total_agent_count,
+            final_summary: run.state.final_summary,
+            error: run.state.error,
+        })
+        .collect::<Vec<_>>();
+
+    match print_json_stdout(&entries) {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("orca: failed to print workflow list: {error}");
+            1
+        }
+    }
+}
+
+fn workflow_show_command(task_id: &str) -> i32 {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let run = match find_workflow_by_task_id(&cwd, task_id) {
+        Ok(Some(run)) => run,
+        Ok(None) => {
+            eprintln!("orca: workflow task '{task_id}' not found");
+            return 1;
+        }
+        Err(error) => {
+            eprintln!("orca: failed to show workflow: {error}");
+            return 1;
+        }
+    };
+
+    let response = WorkflowShowEntry {
+        session_id: run.session_id,
+        transcript_dir: run.run_dir.join("transcripts").display().to_string(),
+        run_dir: run.run_dir.display().to_string(),
+        state: run.state,
+    };
+
+    match print_json_stdout(&response) {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("orca: failed to print workflow details: {error}");
+            1
+        }
+    }
+}
+
+fn workflow_stop_command(task_id: &str) -> i32 {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    match find_workflow_by_task_id(&cwd, task_id) {
+        Ok(Some(_)) => {
+            eprintln!(
+                "orca: cross-process workflow stop is not available without a persistent workflow daemon"
+            );
+            1
+        }
+        Ok(None) => {
+            eprintln!("orca: workflow task '{task_id}' not found");
+            1
+        }
+        Err(error) => {
+            eprintln!("orca: failed to inspect workflow state: {error}");
+            1
+        }
+    }
+}
+
+fn workflow_resume_command(run_id: &str) -> i32 {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    match find_workflow_by_run_id(&cwd, run_id) {
+        Ok(Some(_)) => {
+            eprintln!(
+                "orca: workflow resume from persisted state is not yet supported because the original workflow input is not stored for cross-process replay"
+            );
+            1
+        }
+        Ok(None) => {
+            eprintln!("orca: workflow run '{run_id}' not found");
+            1
+        }
+        Err(error) => {
+            eprintln!("orca: failed to inspect workflow state: {error}");
+            1
+        }
+    }
+}
+
+fn parse_optional_json_arg(raw: Option<&str>) -> Result<Option<Value>, String> {
+    match raw {
+        Some(raw) => serde_json::from_str(raw)
+            .map(Some)
+            .map_err(|error| format!("invalid JSON for --args: {error}")),
+        None => Ok(None),
+    }
+}
+
+fn workflow_launch_request(
+    cwd: &Path,
+    script_or_name: &str,
+    args: Option<Value>,
+    resume_from_run_id: Option<String>,
+) -> WorkflowLaunchRequest {
+    let script_path = PathBuf::from(script_or_name);
+    let input = WorkflowInput {
+        script_path: if script_path.is_absolute() || cwd.join(script_or_name).exists() {
+            Some(script_or_name.to_string())
+        } else {
+            None
+        },
+        name: if script_path.is_absolute() || cwd.join(script_or_name).exists() {
+            None
+        } else {
+            Some(script_or_name.to_string())
+        },
+        description: None,
+        title: None,
+        script: None,
+        args,
+        resume_from_run_id,
+    };
+    WorkflowLaunchRequest::from(input)
+}
+
+fn workflow_session_root(cwd: &Path) -> PathBuf {
+    cwd.join(".orca").join("workflow-sessions")
+}
+
+fn load_persisted_workflow_runs(cwd: &Path) -> Result<Vec<PersistedWorkflowRun>, String> {
+    let root = workflow_session_root(cwd);
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut runs = Vec::new();
+    for session_entry in fs::read_dir(&root).map_err(|error| error.to_string())? {
+        let session_entry = session_entry.map_err(|error| error.to_string())?;
+        if !session_entry
+            .file_type()
+            .map_err(|error| error.to_string())?
+            .is_dir()
+        {
+            continue;
+        }
+        let session_id = session_entry.file_name().to_string_lossy().to_string();
+        let runs_dir = session_entry.path().join("workflow-runs");
+        if !runs_dir.exists() {
+            continue;
+        }
+        for run_entry in fs::read_dir(&runs_dir).map_err(|error| error.to_string())? {
+            let run_entry = run_entry.map_err(|error| error.to_string())?;
+            if !run_entry
+                .file_type()
+                .map_err(|error| error.to_string())?
+                .is_dir()
+            {
+                continue;
+            }
+            let state_path = run_entry.path().join("state.json");
+            if !state_path.exists() {
+                continue;
+            }
+            let state = read_workflow_state(&state_path)?;
+            runs.push(PersistedWorkflowRun {
+                session_id: session_id.clone(),
+                state,
+                run_dir: run_entry.path(),
+            });
+        }
+    }
+
+    Ok(runs)
+}
+
+fn find_workflow_by_task_id(
+    cwd: &Path,
+    task_id: &str,
+) -> Result<Option<PersistedWorkflowRun>, String> {
+    Ok(load_persisted_workflow_runs(cwd)?
+        .into_iter()
+        .find(|run| run.state.task_id == task_id))
+}
+
+fn find_workflow_by_run_id(
+    cwd: &Path,
+    run_id: &str,
+) -> Result<Option<PersistedWorkflowRun>, String> {
+    Ok(load_persisted_workflow_runs(cwd)?
+        .into_iter()
+        .find(|run| run.state.run_id == run_id))
+}
+
+fn read_workflow_state(path: &Path) -> Result<WorkflowRunState, String> {
+    let content = fs::read_to_string(path).map_err(|error| error.to_string())?;
+    serde_json::from_str(&content)
+        .map_err(|error| format!("invalid workflow state at {}: {error}", path.display()))
+}
+
+fn print_json_stdout(value: &impl Serialize) -> Result<(), String> {
+    let mut stdout = std::io::stdout().lock();
+    serde_json::to_writer(&mut stdout, value).map_err(|error| error.to_string())?;
+    stdout.write_all(b"\n").map_err(|error| error.to_string())
 }
 
 fn print_message(message: crate::provider::conversation::Message) {
