@@ -216,3 +216,67 @@ test result: ok. 5 passed; 0 failed
 
 - The guard is intentionally conservative and string-based; it protects the reviewed escape paths locally, but it may reject future workflow scripts that merely mention a prohibited token in source text.
 - This remains a compatibility-preserving hardening measure around Node `vm`, not a claim that `vm` itself is a security boundary.
+
+---
+
+## Follow-up fix: syntax-aware workflow guard
+
+### Reviewer finding addressed
+
+Narrowed `guardWorkflowSource()` in `crates/orca-runtime/src/workflow/host.mjs` so it only inspects executable workflow tokens instead of raw source text. Harmless mentions of blocked capability names inside comments and prompt strings now remain valid, while executable escape attempts such as constructor-based `process` recovery still fail before evaluation.
+
+### TDD evidence
+
+#### RED
+
+Added a focused contract regression in `tests/workflow_host_contract.rs`:
+
+- `host_allows_blocked_words_in_comments_and_prompt_strings`
+
+Ran:
+
+```bash
+cargo test --test workflow_host_contract
+```
+
+Observed the expected failure before the fix: the new test did not receive the `AgentCall` for `inspect process usage and globalThis references`, because the raw source regex guard rejected the script based on a comment and prompt text alone.
+
+#### GREEN
+
+Replaced the whole-source regex scan with a small lexical preflight in `host.mjs` that:
+
+- scans code tokens only
+- skips line comments, block comments, single-quoted strings, double-quoted strings, and template literal text
+- still scans template interpolation code
+- rejects prohibited identifiers in executable code (`process`, `require`, `constructor`, `__proto__`, `prototype`, `eval`, `Function`, `globalThis`)
+- rejects dynamic `import(`
+- rejects forbidden module specifiers when passed as first-argument code/module specifiers (`require(...)`, `import(...)`, `getBuiltinModule(...)`)
+
+Re-ran:
+
+```bash
+cargo test --test workflow_host_contract
+```
+
+Observed passing result:
+
+```text
+running 6 tests
+test host_emits_phase_and_agent_call_events ... ok
+test host_returns_workflow_failed_event_for_script_exceptions ... ok
+test host_blocks_constructor_process_escape_attempts ... ok
+test host_blocks_constructor_builtin_module_escape_attempts ... ok
+test host_allows_blocked_words_in_comments_and_prompt_strings ... ok
+test host_exposes_args_global ... ok
+
+test result: ok. 6 passed; 0 failed
+```
+
+### Files changed for this follow-up
+
+- Modified `crates/orca-runtime/src/workflow/host.mjs`
+- Modified `tests/workflow_host_contract.rs`
+
+### Concerns
+
+- The lexical preflight is intentionally small and local, not a complete JavaScript parser. It now matches the reviewed contract materially better by ignoring harmless text while still blocking the tested executable escape shapes.
