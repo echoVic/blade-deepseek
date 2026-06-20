@@ -220,10 +220,7 @@ impl WorkflowRunner {
                     .find_cached_agent_value(resume_run_id, &call.call_path, &hash)
             {
                 *cached_agents += 1;
-                let output = match &cached_value {
-                    Value::String(output) => output.clone(),
-                    other => other.to_string(),
-                };
+                let output = result_to_summary(&cached_value);
                 let transcript_path = write_agent_transcript(transcript_dir, &call, &output, true)?;
                 self.state.record_agent_completed(
                     run_id,
@@ -234,7 +231,7 @@ impl WorkflowRunner {
                         opts: call.opts.clone(),
                         input_hash: hash,
                         status: WorkflowAgentStatus::Completed,
-                        output: Some(output.clone()),
+                        output: Some(cached_value.clone()),
                         error: None,
                         transcript_path: Some(transcript_path.display().to_string()),
                     },
@@ -257,7 +254,7 @@ impl WorkflowRunner {
                 opts: call.opts.clone(),
                 input_hash: hash,
                 status: WorkflowAgentStatus::Completed,
-                output: Some(output.clone()),
+                output: Some(Value::String(output.clone())),
                 error: None,
                 transcript_path: Some(transcript_path.display().to_string()),
             },

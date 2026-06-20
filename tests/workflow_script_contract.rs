@@ -6,7 +6,9 @@ use orca_core::workflow_types::{
 use orca_runtime::workflow::script::{
     resolve_workflow_script, resolve_workflow_script_with_user_dir,
 };
-use orca_runtime::workflow::state::{WorkflowAgentCacheRecord, WorkflowStateStore};
+use orca_runtime::workflow::state::{
+    WorkflowAgentCacheRecord, WorkflowAgentRecord, WorkflowStateStore,
+};
 use serde_json::json;
 use tempfile::tempdir;
 
@@ -270,6 +272,47 @@ fn state_store_reads_legacy_string_agent_cache_without_json_quoting() {
 }
 
 #[test]
+fn state_store_preserves_legacy_json_looking_string_cache_values() {
+    let temp = tempdir().unwrap();
+    let store = WorkflowStateStore::new(temp.path().join("runs"));
+    let state = WorkflowRunState {
+        run_id: "workflow-run-legacy-json-string".to_string(),
+        task_id: "task-legacy-json-string".to_string(),
+        session_id: "session-1".to_string(),
+        cwd: "/tmp/project".to_string(),
+        workflow_name: "audit".to_string(),
+        meta: WorkflowMeta {
+            name: "audit".to_string(),
+            description: "Audit code".to_string(),
+            phases: vec!["scan".to_string()],
+        },
+        script_digest: "abcd".repeat(16),
+        args_digest: "ef01".repeat(16),
+        status: WorkflowRunStatus::Completed,
+        total_agent_count: 1,
+        final_summary: Some("done".to_string()),
+        error: None,
+    };
+    store.create_run(&state).unwrap();
+
+    let legacy_record = serde_json::json!({
+        "phases.scan:1234": {
+            "call_path": "phases.scan",
+            "input_hash": "1234",
+            "output": "123"
+        }
+    });
+    fs::write(
+        store.run_dir(&state.run_id).join("agent-cache.json"),
+        serde_json::to_string_pretty(&legacy_record).unwrap(),
+    )
+    .unwrap();
+
+    let found = store.find_cached_agent_value(&state.run_id, "phases.scan", "1234");
+    assert_eq!(found, Some(json!("123")));
+}
+
+#[test]
 fn state_store_returns_legacy_object_cache_as_object_value() {
     let temp = tempdir().unwrap();
     let store = WorkflowStateStore::new(temp.path().join("runs"));
@@ -365,5 +408,130 @@ fn state_store_reads_current_string_agent_output_as_string_value() {
             input_hash: "1234".to_string(),
             output: json!("current result"),
         })
+    );
+}
+
+#[test]
+fn state_store_preserves_current_json_looking_string_outputs() {
+    let temp = tempdir().unwrap();
+    let store = WorkflowStateStore::new(temp.path().join("runs"));
+    let state = WorkflowRunState {
+        run_id: "workflow-run-current-json-string".to_string(),
+        task_id: "task-current-json-string".to_string(),
+        session_id: "session-1".to_string(),
+        cwd: "/tmp/project".to_string(),
+        workflow_name: "audit".to_string(),
+        meta: WorkflowMeta {
+            name: "audit".to_string(),
+            description: "Audit code".to_string(),
+            phases: vec!["scan".to_string()],
+        },
+        script_digest: "abcd".repeat(16),
+        args_digest: "ef01".repeat(16),
+        status: WorkflowRunStatus::Completed,
+        total_agent_count: 1,
+        final_summary: Some("done".to_string()),
+        error: None,
+    };
+    store.create_run(&state).unwrap();
+
+    store
+        .record_agent_completed(
+            &state.run_id,
+            WorkflowAgentRecord {
+                call_id: "call-1".to_string(),
+                call_path: "phases.scan".to_string(),
+                prompt: "inspect repo".to_string(),
+                opts: json!(null),
+                input_hash: "1234".to_string(),
+                status: WorkflowAgentStatus::Completed,
+                output: Some(json!("123")),
+                error: None,
+                transcript_path: None,
+            },
+        )
+        .unwrap();
+
+    let found = store.find_cached_agent_value(&state.run_id, "phases.scan", "1234");
+    assert_eq!(found, Some(json!("123")));
+
+    let cached = store
+        .cached_agent_result(&state.run_id, "phases.scan", "1234")
+        .unwrap();
+    assert_eq!(
+        cached,
+        Some(WorkflowAgentCacheRecord {
+            call_path: "phases.scan".to_string(),
+            input_hash: "1234".to_string(),
+            output: json!("123"),
+        })
+    );
+}
+
+#[test]
+fn state_store_cached_agent_result_ignores_incomplete_or_outputless_current_records() {
+    let temp = tempdir().unwrap();
+    let store = WorkflowStateStore::new(temp.path().join("runs"));
+    let state = WorkflowRunState {
+        run_id: "workflow-run-current-incomplete".to_string(),
+        task_id: "task-current-incomplete".to_string(),
+        session_id: "session-1".to_string(),
+        cwd: "/tmp/project".to_string(),
+        workflow_name: "audit".to_string(),
+        meta: WorkflowMeta {
+            name: "audit".to_string(),
+            description: "Audit code".to_string(),
+            phases: vec!["scan".to_string()],
+        },
+        script_digest: "abcd".repeat(16),
+        args_digest: "ef01".repeat(16),
+        status: WorkflowRunStatus::Completed,
+        total_agent_count: 2,
+        final_summary: Some("done".to_string()),
+        error: None,
+    };
+    store.create_run(&state).unwrap();
+
+    let current_records = serde_json::json!({
+        "phases.scan:in-progress": {
+            "callId": "call-1",
+            "callPath": "phases.scan",
+            "prompt": "inspect repo",
+            "opts": null,
+            "inputHash": "in-progress",
+            "status": "running",
+            "output": "result",
+            "error": null,
+            "transcriptPath": null
+        },
+        "phases.scan:missing-output": {
+            "callId": "call-2",
+            "callPath": "phases.scan",
+            "prompt": "inspect repo",
+            "opts": null,
+            "inputHash": "missing-output",
+            "status": "completed",
+            "output": null,
+            "error": null,
+            "transcriptPath": null
+        }
+    });
+    fs::write(
+        store.run_dir(&state.run_id).join("agent-cache.json"),
+        serde_json::to_string_pretty(&current_records).unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        store
+            .cached_agent_result(&state.run_id, "phases.scan", "in-progress")
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        store
+            .cached_agent_result(&state.run_id, "phases.scan", "missing-output")
+            .unwrap(),
+        None
     );
 }

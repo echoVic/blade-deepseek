@@ -24,7 +24,8 @@ pub struct WorkflowAgentRecord {
     pub opts: Value,
     pub input_hash: String,
     pub status: WorkflowAgentStatus,
-    pub output: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_agent_output")]
+    pub output: Option<Value>,
     pub error: Option<String>,
     pub transcript_path: Option<String>,
 }
@@ -114,8 +115,7 @@ impl WorkflowStateStore {
         cache
             .get(&cache_key(call_path, input_hash))
             .filter(|record| record.status == WorkflowAgentStatus::Completed)
-            .and_then(|record| record.output.as_deref())
-            .map(output_string_to_value)
+            .and_then(|record| record.output.clone())
     }
 
     pub fn cached_agent_result(
@@ -132,7 +132,13 @@ impl WorkflowStateStore {
         let cache = read_agent_cache(&path)?;
         Ok(cache
             .get(&cache_key(call_path, input_hash))
-            .map(WorkflowAgentCacheRecord::from))
+            .filter(|record| record.status == WorkflowAgentStatus::Completed)
+            .and_then(|record| record.output.clone().map(|output| (record, output)))
+            .map(|(record, output)| WorkflowAgentCacheRecord {
+                call_path: record.call_path.clone(),
+                input_hash: record.input_hash.clone(),
+                output,
+            }))
     }
 }
 
@@ -155,7 +161,7 @@ impl IntoWorkflowAgentRecord for WorkflowAgentCacheRecord {
             opts: Value::Null,
             input_hash: self.input_hash,
             status: WorkflowAgentStatus::Completed,
-            output: Some(value_to_output_string(self.output)),
+            output: Some(self.output),
             error: None,
             transcript_path: None,
         }
@@ -167,11 +173,7 @@ impl From<&WorkflowAgentRecord> for WorkflowAgentCacheRecord {
         Self {
             call_path: record.call_path.clone(),
             input_hash: record.input_hash.clone(),
-            output: record
-                .output
-                .as_deref()
-                .map(output_string_to_value)
-                .unwrap_or(Value::Null),
+            output: record.output.clone().unwrap_or(Value::Null),
         }
     }
 }
@@ -199,8 +201,22 @@ fn value_to_output_string(value: Value) -> String {
     }
 }
 
-fn output_string_to_value(output: &str) -> Value {
-    serde_json::from_str(output).unwrap_or_else(|_| Value::String(output.to_string()))
+fn deserialize_optional_agent_output<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum AgentOutputCompat {
+        Value(Value),
+        String(String),
+    }
+
+    Ok(match Option::<AgentOutputCompat>::deserialize(deserializer)? {
+        Some(AgentOutputCompat::Value(value)) => Some(value),
+        Some(AgentOutputCompat::String(output)) => Some(Value::String(output)),
+        None => None,
+    })
 }
 
 fn read_agent_cache(path: &Path) -> io::Result<HashMap<String, WorkflowAgentRecord>> {
