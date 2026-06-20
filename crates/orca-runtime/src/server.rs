@@ -87,7 +87,13 @@ fn run_submit<W: Write>(
     run_config.desktop_notifications = false;
 
     let mut streaming_writer = ServerWriter::new(request.id, writer);
-    let _exit_code = controller::run_to_writer(run_config, &mut streaming_writer);
+    let _exit_code = controller::run_to_writer_with_options(
+        run_config,
+        &mut streaming_writer,
+        controller::ControllerRunOptions {
+            wait_for_background_workflows: false,
+        },
+    );
     streaming_writer.flush_remaining()
 }
 
@@ -208,6 +214,14 @@ fn write_protocol_event<W: Write>(writer: &mut W, id: &Value, mut event: Value) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use orca_core::approval_rules::PermissionRules;
+    use orca_core::approval_types::ApprovalMode;
+    use orca_core::config::{
+        HistoryMode, OutputFormat, ProviderKind, RunConfig, ThemeName, ToolConfig, WorkflowConfig,
+    };
+    use orca_core::model::ModelSelection;
+    use orca_core::subagent_config::SubagentConfig;
+    use std::io::Cursor;
 
     #[test]
     fn maps_runtime_tool_events_to_protocol_shape() {
@@ -236,6 +250,45 @@ mod tests {
     }
 
     #[test]
+    fn maps_runtime_workflow_result_available_event_to_protocol_shape() {
+        let mapped = map_runtime_event(
+            r#"{"type":"workflow.result.available","payload":{"taskId":"task-1","runId":"workflow-run-1","result":"done"}}"#,
+        )
+        .expect("mapped event");
+
+        assert_eq!(mapped["event"], "workflow_result_available");
+        assert_eq!(mapped["taskId"], "task-1");
+        assert_eq!(mapped["runId"], "workflow-run-1");
+        assert_eq!(mapped["result"], "done");
+    }
+
+    #[test]
+    fn maps_runtime_workflow_completed_event_to_protocol_shape() {
+        let mapped = map_runtime_event(
+            r#"{"type":"workflow.completed","payload":{"taskId":"task-1","runId":"workflow-run-1","workflowName":"audit"}}"#,
+        )
+        .expect("mapped event");
+
+        assert_eq!(mapped["event"], "workflow_completed");
+        assert_eq!(mapped["taskId"], "task-1");
+        assert_eq!(mapped["runId"], "workflow-run-1");
+        assert_eq!(mapped["workflowName"], "audit");
+    }
+
+    #[test]
+    fn maps_runtime_workflow_failed_event_to_protocol_shape() {
+        let mapped = map_runtime_event(
+            r#"{"type":"workflow.failed","payload":{"taskId":"task-1","runId":"workflow-run-1","error":"boom"}}"#,
+        )
+        .expect("mapped event");
+
+        assert_eq!(mapped["event"], "workflow_failed");
+        assert_eq!(mapped["taskId"], "task-1");
+        assert_eq!(mapped["runId"], "workflow-run-1");
+        assert_eq!(mapped["error"], "boom");
+    }
+
+    #[test]
     fn server_writer_streams_events_as_lines_arrive() {
         let mut output = Vec::new();
         let id = Value::from(42);
@@ -252,5 +305,84 @@ mod tests {
         assert_eq!(event["id"], 42);
         assert_eq!(event["event"], "message_delta");
         assert_eq!(event["text"], "hi");
+    }
+
+    #[test]
+    fn workflow_submit_does_not_wait_for_background_result() {
+        let input = Cursor::new(br#"{"id":7,"op":"submit","prompt":"workflow inline"}"#.to_vec());
+        let mut output = Vec::new();
+
+        run_with_io(
+            ServerConfig {
+                run_config: test_run_config(),
+            },
+            input,
+            &mut output,
+        )
+        .expect("server run");
+
+        let events = parse_jsonl(&output);
+        assert!(events.iter().all(|event| event["id"] == 7));
+        assert!(events.iter().any(|event| {
+            event["event"] == "tool_completed"
+                && event["tool"] == "Workflow"
+                && event["status"] == "completed"
+        }));
+        assert!(
+            events
+                .iter()
+                .any(|event| event["event"] == "workflow_started")
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event["event"] == "turn_completed")
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| event["event"] == "workflow_result_available")
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| event["event"] == "workflow_completed")
+        );
+    }
+
+    fn test_run_config() -> RunConfig {
+        RunConfig {
+            prompt: String::new(),
+            cwd: Some(std::env::current_dir().expect("cwd")),
+            output_format: OutputFormat::Text,
+            approval_mode: ApprovalMode::FullAuto,
+            provider: ProviderKind::Mock,
+            verifier: None,
+            model: ModelSelection::parse(None).expect("model"),
+            api_key: None,
+            base_url: None,
+            mcp_servers: Vec::new(),
+            hooks: Vec::new(),
+            external_tools: Vec::new(),
+            history_mode: HistoryMode::Disabled,
+            show_session_picker: false,
+            permission_rules: PermissionRules::default(),
+            max_budget_usd: None,
+            subagents: SubagentConfig::default(),
+            tools: ToolConfig::default(),
+            workflows: WorkflowConfig::default(),
+            theme: ThemeName::Dark,
+            vim_mode: false,
+            update_check: false,
+            desktop_notifications: false,
+            auto_memory: false,
+        }
+    }
+
+    fn parse_jsonl(stdout: &[u8]) -> Vec<Value> {
+        String::from_utf8_lossy(stdout)
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("valid jsonl line"))
+            .collect()
     }
 }

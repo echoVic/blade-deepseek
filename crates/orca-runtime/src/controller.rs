@@ -40,6 +40,19 @@ use orca_core::hook_types::HookEvent;
 
 const DEFAULT_MAX_TURNS: u32 = 128;
 
+#[derive(Clone, Copy, Debug)]
+pub struct ControllerRunOptions {
+    pub wait_for_background_workflows: bool,
+}
+
+impl ControllerRunOptions {
+    fn for_run_config(config: &RunConfig) -> Self {
+        Self {
+            wait_for_background_workflows: config.output_format == OutputFormat::Jsonl,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct AgentLoopResult {
     status: RunStatus,
@@ -83,7 +96,8 @@ impl AgentLoopResult {
 
 pub fn run(config: RunConfig) -> i32 {
     let stdout = io::stdout();
-    match run_inner(config, stdout.lock()) {
+    let options = ControllerRunOptions::for_run_config(&config);
+    match run_inner(config, stdout.lock(), options) {
         Ok(status) => status.exit_code(),
         Err(error) => {
             eprintln!("orca: {error}");
@@ -93,7 +107,16 @@ pub fn run(config: RunConfig) -> i32 {
 }
 
 pub fn run_to_writer<W: io::Write>(config: RunConfig, writer: W) -> i32 {
-    match run_inner(config, writer) {
+    let options = ControllerRunOptions::for_run_config(&config);
+    run_to_writer_with_options(config, writer, options)
+}
+
+pub fn run_to_writer_with_options<W: io::Write>(
+    config: RunConfig,
+    writer: W,
+    options: ControllerRunOptions,
+) -> i32 {
+    match run_inner(config, writer, options) {
         Ok(status) => status.exit_code(),
         Err(error) => {
             eprintln!("orca: {error}");
@@ -102,7 +125,11 @@ pub fn run_to_writer<W: io::Write>(config: RunConfig, writer: W) -> i32 {
     }
 }
 
-fn run_inner<W: io::Write>(config: RunConfig, writer: W) -> io::Result<RunStatus> {
+fn run_inner<W: io::Write>(
+    config: RunConfig,
+    writer: W,
+    options: ControllerRunOptions,
+) -> io::Result<RunStatus> {
     let cwd_path = config.cwd.clone().unwrap_or(std::env::current_dir()?);
     let cwd = cwd_path.display().to_string();
     let prompt = if config.prompt.trim().is_empty() {
@@ -211,7 +238,7 @@ fn run_inner<W: io::Write>(config: RunConfig, writer: W) -> io::Result<RunStatus
     )?;
     let status = result.status;
 
-    observe_background_workflows(&config, &mut events, &mut sink, &mut background_workflows)?;
+    observe_background_workflows(options, &mut events, &mut sink, &mut background_workflows)?;
 
     let status =
         run_verifier_if_needed(status, config.verifier.as_deref(), &mut events, &mut sink)?;
@@ -777,7 +804,7 @@ pub(crate) fn execute_child_agent_loop<W: io::Write>(
         &mut background_workflows,
     )?;
     observe_background_workflows(
-        config,
+        ControllerRunOptions::for_run_config(config),
         runtime.events,
         runtime.sink,
         &mut background_workflows,
@@ -1025,12 +1052,12 @@ fn parse_workflow_input(tool_request: &tool_types::ToolRequest) -> io::Result<Wo
 }
 
 fn observe_background_workflows(
-    config: &RunConfig,
+    options: ControllerRunOptions,
     events: &mut EventFactory,
     sink: &mut EventSink<impl io::Write>,
     background_workflows: &mut Vec<BackgroundWorkflowRun>,
 ) -> io::Result<()> {
-    if config.output_format != OutputFormat::Jsonl {
+    if !options.wait_for_background_workflows {
         return Ok(());
     }
 
