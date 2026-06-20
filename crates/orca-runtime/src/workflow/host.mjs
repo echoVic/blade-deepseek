@@ -4,6 +4,19 @@ import vm from "node:vm";
 const scriptPath = process.argv[2];
 const argsJson = process.argv[3] ?? "null";
 const workflowArgs = JSON.parse(argsJson);
+const FORBIDDEN_PATTERNS = [
+  /\bprocess\b/u,
+  /\brequire\b/u,
+  /\bimport\s*\(/u,
+  /\bconstructor\b/u,
+  /__proto__/u,
+  /\bprototype\b/u,
+  /\beval\b/u,
+  /\bFunction\b/u,
+  /\bglobalThis\b/u,
+  /node:fs/u,
+  /child_process/u,
+];
 
 let callSeq = 0;
 let currentPhase = null;
@@ -54,17 +67,26 @@ async function phase(name, body) {
 
 async function loadWorkflowModule() {
   const source = await readFile(scriptPath, "utf8");
+  guardWorkflowSource(source);
   const transformed = source
     .replace(/\bexport\s+const\s+meta\s*=/, "const meta =")
     .replace(/\bexport\s+default\b/, "__workflow_default__ =");
 
-  const context = vm.createContext({
-    args: workflowArgs,
-    agent,
-    parallel,
-    pipeline,
-    phase,
-  });
+  const context = vm.createContext(
+    Object.assign(Object.create(null), {
+      args: workflowArgs,
+      agent,
+      parallel,
+      pipeline,
+      phase,
+    }),
+    {
+      codeGeneration: {
+        strings: false,
+        wasm: false,
+      },
+    },
+  );
   const runner = vm.compileFunction(
     `
       "use strict";
@@ -85,6 +107,14 @@ async function loadWorkflowModule() {
   );
 
   return runner();
+}
+
+function guardWorkflowSource(source) {
+  for (const pattern of FORBIDDEN_PATTERNS) {
+    if (pattern.test(source)) {
+      throw new Error(`Workflow script contains prohibited syntax: ${pattern}`);
+    }
+  }
 }
 
 try {

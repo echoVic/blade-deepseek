@@ -52,7 +52,7 @@ fn host_exposes_args_global() {
 }
 
 #[test]
-fn host_hides_node_globals_from_workflow_scripts() {
+fn host_blocks_constructor_process_escape_attempts() {
     if !WorkflowHost::node_available() {
         return;
     }
@@ -61,7 +61,7 @@ fn host_hides_node_globals_from_workflow_scripts() {
     let script = temp.path().join("workflow.js");
     fs::write(
         &script,
-        "export const meta = { name: 'restricted-test', description: 'Restricted globals test', phases: [] };\nif (typeof process === 'undefined') {\n  await agent('restricted');\n} else {\n  await agent('process visible');\n}\nexport default null;",
+        "export const meta = { name: 'constructor-escape-test', description: 'Constructor process escape test', phases: [] };\nconst escaped = globalThis.constructor.constructor('return process')();\nawait agent(`escaped ${escaped.version}`);\nexport default null;",
     )
     .unwrap();
 
@@ -70,13 +70,42 @@ fn host_hides_node_globals_from_workflow_scripts() {
     assert!(
         events
             .iter()
-            .any(|event| matches!(event, HostEvent::AgentCall { prompt, .. } if prompt == "restricted"))
+            .any(|event| matches!(event, HostEvent::WorkflowFailed { .. }))
     );
     assert!(
         !events
             .iter()
-            .any(|event| matches!(event, HostEvent::AgentCall { prompt, .. } if prompt == "process visible"))
+            .any(|event| matches!(event, HostEvent::AgentCall { prompt, .. } if prompt.starts_with("escaped ")))
     );
+    assert!(!events.iter().any(|event| {
+        matches!(event, HostEvent::AgentCall { prompt, .. } if prompt == "escaped process")
+    }));
+}
+
+#[test]
+fn host_blocks_constructor_builtin_module_escape_attempts() {
+    if !WorkflowHost::node_available() {
+        return;
+    }
+
+    let temp = tempdir().unwrap();
+    let script = temp.path().join("workflow.js");
+    fs::write(
+        &script,
+        "export const meta = { name: 'builtin-escape-test', description: 'Built-in module escape test', phases: [] };\nconst processRef = globalThis.constructor.constructor('return process')();\nconst fsRef = processRef.getBuiltinModule('node:fs');\nawait agent(`escaped fs ${typeof fsRef.readFileSync}`);\nexport default null;",
+    )
+    .unwrap();
+
+    let events = WorkflowHost::run_collecting_events(&script, serde_json::json!(null)).unwrap();
+
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, HostEvent::WorkflowFailed { .. }))
+    );
+    assert!(!events.iter().any(|event| {
+        matches!(event, HostEvent::AgentCall { prompt, .. } if prompt.starts_with("escaped fs "))
+    }));
 }
 
 #[test]

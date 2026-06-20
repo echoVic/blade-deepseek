@@ -149,3 +149,70 @@ test result: ok. 4 passed; 0 failed
 - Protocol failures remain distinguishable from infrastructure failures:
   - returned events for `workflow_failed`
   - `Err` for spawn failure, missing stdout, invalid JSONL, and nonzero exit without a protocol failure event
+
+---
+
+## Follow-up fix: constructor escape guard
+
+### Reviewer finding addressed
+
+Fixed the remaining sandbox-escape gap in `crates/orca-runtime/src/workflow/host.mjs`. The prior `vm.createContext` plus `vm.compileFunction` approach could still recover Node capabilities through constructor/prototype access such as:
+
+- `globalThis.constructor.constructor("return process")()`
+- `process.getBuiltinModule("node:fs")`
+
+The host now performs a conservative source preflight before evaluation and rejects scripts containing prohibited capability or escape syntax. This keeps the supported workflow contract small and aligned with the allowed helper surface: `args`, `agent`, `parallel`, `pipeline`, and `phase`.
+
+### TDD evidence
+
+#### RED
+
+Added two regression tests in `tests/workflow_host_contract.rs`:
+
+- `host_blocks_constructor_process_escape_attempts`
+- `host_blocks_constructor_builtin_module_escape_attempts`
+
+Ran:
+
+```bash
+cargo test --test workflow_host_contract
+```
+
+Observed the expected failures before the fix: both tests showed that the host did not emit `WorkflowFailed` for the prohibited scripts.
+
+#### GREEN
+
+Updated `host.mjs` to:
+
+- pre-scan workflow source for prohibited tokens including `process`, `require`, `import(`, `constructor`, `__proto__`, `prototype`, `eval`, `Function`, `globalThis`, `node:fs`, and `child_process`
+- reject matching scripts before evaluation
+- create the vm context with disabled string/wasm code generation as a small extra hardening step
+
+Re-ran:
+
+```bash
+cargo test --test workflow_host_contract
+```
+
+Observed passing result:
+
+```text
+running 5 tests
+test host_blocks_constructor_process_escape_attempts ... ok
+test host_blocks_constructor_builtin_module_escape_attempts ... ok
+test host_exposes_args_global ... ok
+test host_emits_phase_and_agent_call_events ... ok
+test host_returns_workflow_failed_event_for_script_exceptions ... ok
+
+test result: ok. 5 passed; 0 failed
+```
+
+### Files changed for this follow-up
+
+- Modified `crates/orca-runtime/src/workflow/host.mjs`
+- Modified `tests/workflow_host_contract.rs`
+
+### Concerns
+
+- The guard is intentionally conservative and string-based; it protects the reviewed escape paths locally, but it may reject future workflow scripts that merely mention a prohibited token in source text.
+- This remains a compatibility-preserving hardening measure around Node `vm`, not a claim that `vm` itself is a security boundary.
