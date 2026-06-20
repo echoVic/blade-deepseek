@@ -66,3 +66,24 @@ Result:
 
 - The task intentionally leaves runtime workflow execution unimplemented, so any direct execution path will still fail after request emission
 - The mock-provider test is intentionally event-based and does not assert process exit success, per the task clarification
+
+## Review Fix Append
+
+Addressed the review notes by strengthening the test coverage in `tests/workflow_tool_contract.rs` only:
+- The schema test now asserts the registered `Workflow` tool reports `ActionKind::Agent`
+- The mock-provider test now calls `orca_provider::call` directly with `ProviderKind::Mock`, `orca_core::conversation::Conversation`, and `orca_provider::ProviderConfig`, then inspects `ProviderStep::ToolCall` for:
+  - `ToolName::Workflow`
+  - `ActionKind::Agent`
+  - raw JSON arguments containing `script`
+  - `args.mode == "inline"`
+
+Verification run:
+
+```bash
+cargo test --test workflow_tool_contract
+```
+
+Result:
+- `mock_provider_can_request_workflow_tool ... ok`
+- `workflow_schema_is_registered_with_official_fields ... ok`
+- `test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out`
