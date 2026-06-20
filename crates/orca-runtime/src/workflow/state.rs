@@ -3,15 +3,30 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use orca_core::workflow_types::WorkflowRunState;
+use orca_core::workflow_types::{WorkflowAgentStatus, WorkflowRunState};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WorkflowAgentCacheRecord {
     pub call_path: String,
     pub input_hash: String,
     pub output: Value,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkflowAgentRecord {
+    pub call_id: String,
+    pub call_path: String,
+    pub prompt: String,
+    pub opts: Value,
+    pub input_hash: String,
+    pub status: WorkflowAgentStatus,
+    pub output: Option<String>,
+    pub error: Option<String>,
+    pub transcript_path: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -54,16 +69,35 @@ impl WorkflowStateStore {
     pub fn record_agent_completed(
         &self,
         run_id: &str,
-        record: WorkflowAgentCacheRecord,
+        record: impl IntoWorkflowAgentRecord,
     ) -> io::Result<()> {
+        let record = record.into_workflow_agent_record();
         let path = self.run_dir(run_id).join("agent-cache.json");
-        let mut cache: HashMap<String, WorkflowAgentCacheRecord> = if path.exists() {
+        let mut cache: HashMap<String, WorkflowAgentRecord> = if path.exists() {
             read_json(&path)?
         } else {
             HashMap::new()
         };
         cache.insert(cache_key(&record.call_path, &record.input_hash), record);
         write_json_pretty(&path, &cache)
+    }
+
+    pub fn find_cached_agent(
+        &self,
+        run_id: &str,
+        call_path: &str,
+        input_hash: &str,
+    ) -> Option<String> {
+        let path = self.run_dir(run_id).join("agent-cache.json");
+        if !path.exists() {
+            return None;
+        }
+
+        let cache: HashMap<String, WorkflowAgentRecord> = read_json(&path).ok()?;
+        cache
+            .get(&cache_key(call_path, input_hash))
+            .filter(|record| record.status == WorkflowAgentStatus::Completed)
+            .and_then(|record| record.output.clone())
     }
 
     pub fn cached_agent_result(
@@ -77,9 +111,64 @@ impl WorkflowStateStore {
             return Ok(None);
         }
 
-        let cache: HashMap<String, WorkflowAgentCacheRecord> = read_json(&path)?;
-        Ok(cache.get(&cache_key(call_path, input_hash)).cloned())
+        let cache: HashMap<String, WorkflowAgentRecord> = read_json(&path)?;
+        Ok(cache
+            .get(&cache_key(call_path, input_hash))
+            .map(WorkflowAgentCacheRecord::from))
     }
+}
+
+pub trait IntoWorkflowAgentRecord {
+    fn into_workflow_agent_record(self) -> WorkflowAgentRecord;
+}
+
+impl IntoWorkflowAgentRecord for WorkflowAgentRecord {
+    fn into_workflow_agent_record(self) -> WorkflowAgentRecord {
+        self
+    }
+}
+
+impl IntoWorkflowAgentRecord for WorkflowAgentCacheRecord {
+    fn into_workflow_agent_record(self) -> WorkflowAgentRecord {
+        WorkflowAgentRecord {
+            call_id: self.call_path.clone(),
+            call_path: self.call_path,
+            prompt: String::new(),
+            opts: Value::Null,
+            input_hash: self.input_hash,
+            status: WorkflowAgentStatus::Completed,
+            output: Some(self.output.to_string()),
+            error: None,
+            transcript_path: None,
+        }
+    }
+}
+
+impl From<&WorkflowAgentRecord> for WorkflowAgentCacheRecord {
+    fn from(record: &WorkflowAgentRecord) -> Self {
+        let output = record
+            .output
+            .as_deref()
+            .and_then(|value| serde_json::from_str(value).ok())
+            .unwrap_or(Value::Null);
+        Self {
+            call_path: record.call_path.clone(),
+            input_hash: record.input_hash.clone(),
+            output,
+        }
+    }
+}
+
+pub fn input_hash(prompt: &str, opts: &Value) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(prompt.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(
+        serde_json::to_string(opts)
+            .unwrap_or_else(|_| "null".to_string())
+            .as_bytes(),
+    );
+    format!("{:x}", hasher.finalize())
 }
 
 fn cache_key(call_path: &str, input_hash: &str) -> String {

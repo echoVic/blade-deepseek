@@ -25,6 +25,17 @@ const MODULE_SPECIFIER_CALLEES = new Set(["import", "require", "getBuiltinModule
 
 let callSeq = 0;
 let currentPhase = null;
+let stdinBuffer = "";
+const stdinResolvers = [];
+
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => {
+  stdinBuffer += chunk;
+  flushStdinResolvers();
+});
+process.stdin.on("end", () => {
+  flushStdinResolvers();
+});
 
 function emit(value) {
   process.stdout.write(`${JSON.stringify(value)}\n`);
@@ -42,7 +53,19 @@ async function agent(prompt, opts = {}) {
     prompt,
     opts,
   });
-  return { callId, prompt, cached: false };
+
+  const message = await readProtocolMessage();
+  if (message.call_id !== callId) {
+    throw new Error(`Workflow host protocol mismatch for ${callId}`);
+  }
+  if (message.type === "agent_result") {
+    return message.result;
+  }
+  if (message.type === "agent_error") {
+    throw new Error(message.error ?? `Agent ${callId} failed`);
+  }
+
+  throw new Error(`Unexpected workflow host protocol message: ${message.type}`);
 }
 
 async function parallel(items) {
@@ -67,6 +90,35 @@ async function phase(name, body) {
     return result;
   } finally {
     currentPhase = prior;
+  }
+}
+
+function readProtocolMessage() {
+  return new Promise((resolve, reject) => {
+    stdinResolvers.push({ resolve, reject });
+    flushStdinResolvers();
+  });
+}
+
+function flushStdinResolvers() {
+  while (stdinResolvers.length > 0) {
+    const newlineIndex = stdinBuffer.indexOf("\n");
+    if (newlineIndex === -1) {
+      return;
+    }
+
+    const line = stdinBuffer.slice(0, newlineIndex).trim();
+    stdinBuffer = stdinBuffer.slice(newlineIndex + 1);
+    if (line.length === 0) {
+      continue;
+    }
+
+    const pending = stdinResolvers.shift();
+    try {
+      pending.resolve(JSON.parse(line));
+    } catch (error) {
+      pending.reject(error);
+    }
   }
 }
 
