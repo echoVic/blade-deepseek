@@ -75,19 +75,20 @@ async function main() {
   ensurePackageExists(platformPackageDir, "platform");
 
   const mainPackageName = readJson(path.join(mainPackageDir, "package.json")).name;
-  const platformPackageName = readJson(path.join(platformPackageDir, "package.json")).name;
+  const platformPackage = readJson(path.join(platformPackageDir, "package.json"));
+  const platformPackageAlias = `@blade-ai/${targetPackage}`;
   const mainPackageSpec = args.tarballsDir
     ? `file:${packageTarballPath(mainPackageName, args.version, args.tarballsDir)}`
     : `file:${mainPackageDir}`;
   const platformPackageSpec = args.tarballsDir
-    ? `file:${packageTarballPath(platformPackageName, args.version, args.tarballsDir)}`
+    ? `file:${packageTarballPath(platformPackage.name, platformPackage.version, args.tarballsDir)}`
     : `file:${platformPackageDir}`;
   const tempDir = mkdtempSync(path.join(os.tmpdir(), "orca-npm-smoke-"));
   writeFileSync(path.join(tempDir, "package.json"), JSON.stringify({
     private: true,
     dependencies: {
       [mainPackageName]: mainPackageSpec,
-      [platformPackageName]: platformPackageSpec
+      [platformPackageAlias]: platformPackageSpec
     }
   }, null, 2));
 

@@ -171,7 +171,11 @@ jobs:
             if npm view "${name}@${version}" version >/dev/null 2>&1; then
               echo "${name}@${version} already published; skipping"
             else
-              npm publish "$package_dir" --access public
+              tag="latest"
+              if [[ "$version" == *-* ]]; then
+                tag="native"
+              fi
+              npm publish "$package_dir" --access public --tag "$tag"
             fi
           done
       - name: Skip npm publish without token

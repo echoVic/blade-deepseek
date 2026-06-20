@@ -15,7 +15,7 @@ orca --version
 
 The npm package installs a small Node.js launcher and the native `orca` binary for supported platforms.
 
-Supported platforms for `0.1.0`:
+Supported npm platforms:
 
 - macOS Apple Silicon (`darwin/arm64`)
 - macOS Intel (`darwin/x64`)

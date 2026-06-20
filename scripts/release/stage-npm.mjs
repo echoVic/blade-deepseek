@@ -12,25 +12,29 @@ const repoRoot = path.resolve(path.dirname(__filename), "..", "..");
 
 const TARGETS = [
   {
-    packageName: "@blade-ai/orca-darwin-arm64",
+    aliasName: "@blade-ai/orca-darwin-arm64",
+    versionSuffix: "darwin-arm64",
     targetTriple: "aarch64-apple-darwin",
     os: "darwin",
     cpu: "arm64"
   },
   {
-    packageName: "@blade-ai/orca-darwin-x64",
+    aliasName: "@blade-ai/orca-darwin-x64",
+    versionSuffix: "darwin-x64",
     targetTriple: "x86_64-apple-darwin",
     os: "darwin",
     cpu: "x64"
   },
   {
-    packageName: "@blade-ai/orca-linux-arm64",
+    aliasName: "@blade-ai/orca-linux-arm64",
+    versionSuffix: "linux-arm64",
     targetTriple: "aarch64-unknown-linux-gnu",
     os: "linux",
     cpu: "arm64"
   },
   {
-    packageName: "@blade-ai/orca-linux-x64",
+    aliasName: "@blade-ai/orca-linux-x64",
+    versionSuffix: "linux-x64",
     targetTriple: "x86_64-unknown-linux-gnu",
     os: "linux",
     cpu: "x64"
@@ -114,7 +118,7 @@ function findBinaryForTarget(artifactsDir, targetTriple) {
 }
 
 async function stagePlatformPackage(target, version, artifactsDir, stageRoot) {
-  const packageDir = path.join(stageRoot, target.packageName.replace("@blade-ai/", ""));
+  const packageDir = path.join(stageRoot, target.aliasName.replace("@blade-ai/", ""));
   const vendorBin = path.join(packageDir, "vendor", target.targetTriple, "bin");
   mkdirSync(vendorBin, { recursive: true });
 
@@ -126,8 +130,8 @@ async function stagePlatformPackage(target, version, artifactsDir, stageRoot) {
   const template = readJson(path.join(repoRoot, "npm", "platform-package.json"));
   writeJson(path.join(packageDir, "package.json"), {
     ...template,
-    name: target.packageName,
-    version,
+    name: "@blade-ai/orca",
+    version: `${version}-${target.versionSuffix}`,
     description: `Native Orca binary for ${target.os}/${target.cpu}.`,
     os: [target.os],
     cpu: [target.cpu]
@@ -146,7 +150,10 @@ async function stageMainPackage(version, stageRoot) {
   const packageJson = readJson(packageJsonPath);
   packageJson.version = version;
   packageJson.optionalDependencies = Object.fromEntries(
-    TARGETS.map((target) => [target.packageName, version])
+    TARGETS.map((target) => [
+      target.aliasName,
+      `npm:@blade-ai/orca@${version}-${target.versionSuffix}`
+    ])
   );
   writeJson(packageJsonPath, packageJson);
   return packageDir;
