@@ -280,3 +280,77 @@ test result: ok. 6 passed; 0 failed
 ### Concerns
 
 - The lexical preflight is intentionally small and local, not a complete JavaScript parser. It now matches the reviewed contract materially better by ignoring harmless text while still blocking the tested executable escape shapes.
+
+---
+
+## Follow-up fix: explicit computed-property escape guard
+
+### Reviewer finding addressed
+
+Made the lexical preflight in `crates/orca-runtime/src/workflow/host.mjs` explicitly reject dangerous quoted computed-property names in executable code, so bracketed paths like `({})['constructor']['constructor'](...)` and `processRef['getBuiltinModule'](...)` are blocked by the scanner itself rather than only failing later at runtime.
+
+The change stays intentionally narrow:
+
+- only direct computed-property string literals are rejected
+- harmless mentions in comments, prompt strings, object values, and computed object keys remain allowed
+- the blocked computed-property names are `constructor`, `__proto__`, `prototype`, and `getBuiltinModule`
+
+### TDD evidence
+
+#### RED
+
+Strengthened the new bracket-path regression tests in `tests/workflow_host_contract.rs` so they require explicit lexical-preflight failure text:
+
+- `host_blocks_bracket_constructor_process_escape_attempts`
+- `host_blocks_bracket_builtin_module_escape_attempts`
+
+Ran:
+
+```bash
+cargo test --test workflow_host_contract
+```
+
+Observed expected failure before the fix:
+
+```text
+failures:
+    host_blocks_bracket_builtin_module_escape_attempts
+    host_blocks_bracket_constructor_process_escape_attempts
+```
+
+Both failures showed the host was returning `WorkflowFailed`, but not yet with the explicit `prohibited computed property: ...` message required by the tightened contract.
+
+#### GREEN
+
+Updated the scanner to track bracket context and last significant token kind, then reject dangerous quoted property names only when they are used as direct computed-property access.
+
+Re-ran:
+
+```bash
+cargo test --test workflow_host_contract
+```
+
+Observed passing result:
+
+```text
+running 8 tests
+test host_allows_blocked_words_in_comments_and_prompt_strings ... ok
+test host_blocks_bracket_builtin_module_escape_attempts ... ok
+test host_blocks_bracket_constructor_process_escape_attempts ... ok
+test host_blocks_constructor_builtin_module_escape_attempts ... ok
+test host_blocks_constructor_process_escape_attempts ... ok
+test host_emits_phase_and_agent_call_events ... ok
+test host_exposes_args_global ... ok
+test host_returns_workflow_failed_event_for_script_exceptions ... ok
+
+test result: ok. 8 passed; 0 failed
+```
+
+### Files changed for this follow-up
+
+- Modified `crates/orca-runtime/src/workflow/host.mjs`
+- Modified `tests/workflow_host_contract.rs`
+
+### Concerns
+
+- The computed-property detection is deliberately scoped to direct string-literal member access, which is the reviewer-reported gap. More elaborate expression forms would need their own contract coverage if the policy expands.

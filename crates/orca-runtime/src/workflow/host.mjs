@@ -14,6 +14,12 @@ const FORBIDDEN_IDENTIFIERS = new Set([
   "Function",
   "globalThis",
 ]);
+const FORBIDDEN_COMPUTED_PROPERTY_NAMES = new Set([
+  "constructor",
+  "__proto__",
+  "prototype",
+  "getBuiltinModule",
+]);
 const FORBIDDEN_MODULE_SPECIFIERS = new Set(["node:fs", "child_process"]);
 const MODULE_SPECIFIER_CALLEES = new Set(["import", "require", "getBuiltinModule"]);
 
@@ -109,12 +115,13 @@ async function loadWorkflowModule() {
 }
 
 function guardWorkflowSource(source) {
-  scanExecutableTokens(source, 0, null, []);
+  scanExecutableTokens(source, 0, null, [], []);
 }
 
-function scanExecutableTokens(source, startIndex, terminator, callStack) {
+function scanExecutableTokens(source, startIndex, terminator, callStack, bracketStack) {
   let index = startIndex;
   let pendingCallee = null;
+  let lastTokenType = null;
 
   while (index < source.length) {
     const char = source[index];
@@ -141,23 +148,28 @@ function scanExecutableTokens(source, startIndex, terminator, callStack) {
 
     if (char === "'") {
       const stringResult = readQuotedString(source, index, "'");
+      checkComputedPropertyName(source, index, stringResult.value, stringResult.nextIndex, bracketStack);
       checkModuleSpecifier(callStack, stringResult.value);
       index = stringResult.nextIndex;
       pendingCallee = null;
+      lastTokenType = "string";
       continue;
     }
 
     if (char === "\"") {
       const stringResult = readQuotedString(source, index, "\"");
+      checkComputedPropertyName(source, index, stringResult.value, stringResult.nextIndex, bracketStack);
       checkModuleSpecifier(callStack, stringResult.value);
       index = stringResult.nextIndex;
       pendingCallee = null;
+      lastTokenType = "string";
       continue;
     }
 
     if (char === "`") {
       index = scanTemplateLiteral(source, index + 1, callStack);
       pendingCallee = null;
+      lastTokenType = "string";
       continue;
     }
 
@@ -171,6 +183,7 @@ function scanExecutableTokens(source, startIndex, terminator, callStack) {
         throw new Error("Workflow script contains prohibited syntax: import(");
       }
       pendingCallee = ident;
+      lastTokenType = "identifier";
       index = identEnd;
       continue;
     }
@@ -178,6 +191,7 @@ function scanExecutableTokens(source, startIndex, terminator, callStack) {
     if (char === "(") {
       callStack.push({ callee: pendingCallee, argIndex: 0 });
       pendingCallee = null;
+      lastTokenType = "open_paren";
       index += 1;
       continue;
     }
@@ -185,6 +199,37 @@ function scanExecutableTokens(source, startIndex, terminator, callStack) {
     if (char === ")") {
       callStack.pop();
       pendingCallee = null;
+      lastTokenType = "close_paren";
+      index += 1;
+      continue;
+    }
+
+    if (char === "[") {
+      bracketStack.push({ computedProperty: startsComputedProperty(lastTokenType) });
+      pendingCallee = null;
+      lastTokenType = "open_bracket";
+      index += 1;
+      continue;
+    }
+
+    if (char === "]") {
+      bracketStack.pop();
+      pendingCallee = null;
+      lastTokenType = "close_bracket";
+      index += 1;
+      continue;
+    }
+
+    if (char === "{") {
+      pendingCallee = null;
+      lastTokenType = "open_brace";
+      index += 1;
+      continue;
+    }
+
+    if (char === "}") {
+      pendingCallee = null;
+      lastTokenType = "close_brace";
       index += 1;
       continue;
     }
@@ -194,6 +239,7 @@ function scanExecutableTokens(source, startIndex, terminator, callStack) {
         callStack[callStack.length - 1].argIndex += 1;
       }
       pendingCallee = null;
+      lastTokenType = "comma";
       index += 1;
       continue;
     }
@@ -201,6 +247,7 @@ function scanExecutableTokens(source, startIndex, terminator, callStack) {
     if (char !== ".") {
       pendingCallee = null;
     }
+    lastTokenType = "other";
     index += 1;
   }
 
@@ -227,7 +274,7 @@ function scanTemplateLiteral(source, startIndex, callStack) {
     }
 
     if (char === "$" && next === "{") {
-      index = scanExecutableTokens(source, index + 2, "}", []);
+      index = scanExecutableTokens(source, index + 2, "}", [], []);
       continue;
     }
 
@@ -270,6 +317,18 @@ function checkModuleSpecifier(callStack, value) {
   }
 }
 
+function checkComputedPropertyName(source, startIndex, value, nextIndex, bracketStack) {
+  const currentBracket = bracketStack[bracketStack.length - 1];
+  if (
+    currentBracket?.computedProperty &&
+    previousNonWhitespaceChar(source, startIndex) === "[" &&
+    nextNonWhitespaceChar(source, nextIndex) === "]" &&
+    FORBIDDEN_COMPUTED_PROPERTY_NAMES.has(value)
+  ) {
+    throw new Error(`Workflow script contains prohibited computed property: ${value}`);
+  }
+}
+
 function skipLineComment(source, startIndex) {
   let index = startIndex;
   while (index < source.length && source[index] !== "\n") {
@@ -297,12 +356,30 @@ function readIdentifierEnd(source, startIndex) {
   return index;
 }
 
+function previousNonWhitespaceChar(source, startIndex) {
+  let index = startIndex - 1;
+  while (index >= 0 && isWhitespace(source[index])) {
+    index -= 1;
+  }
+  return source[index] ?? null;
+}
+
 function nextNonWhitespaceChar(source, startIndex) {
   let index = startIndex;
   while (index < source.length && isWhitespace(source[index])) {
     index += 1;
   }
   return source[index] ?? null;
+}
+
+function startsComputedProperty(lastTokenType) {
+  return (
+    lastTokenType === "identifier" ||
+    lastTokenType === "string" ||
+    lastTokenType === "close_paren" ||
+    lastTokenType === "close_bracket" ||
+    lastTokenType === "close_brace"
+  );
 }
 
 function isWhitespace(char) {

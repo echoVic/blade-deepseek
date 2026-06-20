@@ -74,9 +74,11 @@ fn host_allows_blocked_words_in_comments_and_prompt_strings() {
                 if prompt == "inspect process usage and globalThis references"
         )
     }));
-    assert!(events.iter().any(
-        |event| matches!(event, HostEvent::WorkflowCompleted { .. })
-    ));
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, HostEvent::WorkflowCompleted { .. }))
+    );
     assert!(
         !events
             .iter()
@@ -116,6 +118,34 @@ fn host_blocks_constructor_process_escape_attempts() {
 }
 
 #[test]
+fn host_blocks_bracket_constructor_process_escape_attempts() {
+    if !WorkflowHost::node_available() {
+        return;
+    }
+
+    let temp = tempdir().unwrap();
+    let script = temp.path().join("workflow.js");
+    fs::write(
+        &script,
+        "export const meta = { name: 'bracket-constructor-escape-test', description: 'Bracket constructor process escape test', phases: [] };\nconst escaped = ({})['constructor']['constructor']('return process')();\nawait agent(`escaped ${escaped.version}`);\nexport default null;",
+    )
+    .unwrap();
+
+    let events = WorkflowHost::run_collecting_events(&script, serde_json::json!(null)).unwrap();
+
+    assert!(events.iter().any(|event| matches!(
+        event,
+        HostEvent::WorkflowFailed { error }
+            if error.contains("prohibited computed property: constructor")
+    )));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, HostEvent::AgentCall { prompt, .. } if prompt.starts_with("escaped ")))
+    );
+}
+
+#[test]
 fn host_blocks_constructor_builtin_module_escape_attempts() {
     if !WorkflowHost::node_available() {
         return;
@@ -136,6 +166,32 @@ fn host_blocks_constructor_builtin_module_escape_attempts() {
             .iter()
             .any(|event| matches!(event, HostEvent::WorkflowFailed { .. }))
     );
+    assert!(!events.iter().any(|event| {
+        matches!(event, HostEvent::AgentCall { prompt, .. } if prompt.starts_with("escaped fs "))
+    }));
+}
+
+#[test]
+fn host_blocks_bracket_builtin_module_escape_attempts() {
+    if !WorkflowHost::node_available() {
+        return;
+    }
+
+    let temp = tempdir().unwrap();
+    let script = temp.path().join("workflow.js");
+    fs::write(
+        &script,
+        "export const meta = { name: 'bracket-builtin-escape-test', description: 'Bracket built-in module escape test', phases: [] };\nconst processRef = { ['getBuiltinModule']: () => ({ readFileSync() {} }) };\nconst fsRef = processRef['getBuiltinModule']('node:fs');\nawait agent(`escaped fs ${typeof fsRef.readFileSync}`);\nexport default null;",
+    )
+    .unwrap();
+
+    let events = WorkflowHost::run_collecting_events(&script, serde_json::json!(null)).unwrap();
+
+    assert!(events.iter().any(|event| matches!(
+        event,
+        HostEvent::WorkflowFailed { error }
+            if error.contains("prohibited computed property: getBuiltinModule")
+    )));
     assert!(!events.iter().any(|event| {
         matches!(event, HostEvent::AgentCall { prompt, .. } if prompt.starts_with("escaped fs "))
     }));
