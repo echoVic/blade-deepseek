@@ -90,3 +90,62 @@ Re-ran after `cargo fmt` to verify the formatted tree stayed green.
 
 - `run_collecting_events` currently reads stdout line-by-line and only returns the collected events on success; if a later task needs partial events on failure, the API may want a richer error type carrying both events and failure context.
 - The stable temp host path is overwritten on each invocation, which matches the brief and is acceptable for current single-process contract coverage, but future concurrent workflow execution may want an atomic write or versioned strategy.
+
+---
+
+## Follow-up fix: reviewer findings
+
+### Summary
+
+Addressed the two reviewer findings inside the owned Task 6 files:
+
+1. `crates/orca-runtime/src/workflow/host.mjs` no longer executes workflow scripts through native Node ESM import. Instead, it reads the script source and evaluates it inside a `vm` context that only exposes `args`, `agent`, `parallel`, `pipeline`, and `phase`.
+2. `WorkflowHost::run_collecting_events` now returns collected protocol events when the JS host emitted `workflow_failed` and exited nonzero, preserving script-level failure visibility for callers.
+
+### TDD evidence
+
+#### RED
+
+Added two contract tests to `tests/workflow_host_contract.rs`:
+
+- `host_hides_node_globals_from_workflow_scripts`
+- `host_returns_workflow_failed_event_for_script_exceptions`
+
+Ran:
+
+```bash
+cargo test --test workflow_host_contract
+```
+
+Observed expected failures:
+
+- the restricted-globals test saw no `restricted` agent call because workflow scripts still had normal Node globals
+- the workflow-failure test received `Err(...)` instead of a returned `WorkflowFailed` event
+
+#### GREEN
+
+Implemented the host changes and re-ran:
+
+```bash
+cargo test --test workflow_host_contract
+```
+
+Observed passing result:
+
+```text
+running 4 tests
+test host_hides_node_globals_from_workflow_scripts ... ok
+test host_emits_phase_and_agent_call_events ... ok
+test host_exposes_args_global ... ok
+test host_returns_workflow_failed_event_for_script_exceptions ... ok
+
+test result: ok. 4 passed; 0 failed
+```
+
+### Notes on the fix
+
+- The JS host preserves the tested workflow authoring shape of `export const meta = ...` and `export default ...`.
+- Dynamic `import()` is explicitly rejected inside workflow scripts.
+- Protocol failures remain distinguishable from infrastructure failures:
+  - returned events for `workflow_failed`
+  - `Err` for spawn failure, missing stdout, invalid JSONL, and nonzero exit without a protocol failure event

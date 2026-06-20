@@ -1,6 +1,9 @@
+import { readFile } from "node:fs/promises";
+import vm from "node:vm";
+
 const scriptPath = process.argv[2];
 const argsJson = process.argv[3] ?? "null";
-globalThis.args = JSON.parse(argsJson);
+const workflowArgs = JSON.parse(argsJson);
 
 let callSeq = 0;
 let currentPhase = null;
@@ -9,7 +12,7 @@ function emit(value) {
   process.stdout.write(`${JSON.stringify(value)}\n`);
 }
 
-globalThis.agent = async function agent(prompt, opts = {}) {
+async function agent(prompt, opts = {}) {
   callSeq += 1;
   const callId = `agent-${callSeq}`;
   const callPath = `${currentPhase ?? "root"}:${callSeq}`;
@@ -22,21 +25,21 @@ globalThis.agent = async function agent(prompt, opts = {}) {
     opts,
   });
   return { callId, prompt, cached: false };
-};
+}
 
-globalThis.parallel = async function parallel(items) {
+async function parallel(items) {
   return Promise.all(items);
-};
+}
 
-globalThis.pipeline = async function pipeline(items) {
+async function pipeline(items) {
   let previous;
   for (const item of items) {
     previous = typeof item === "function" ? await item(previous) : await item;
   }
   return previous;
-};
+}
 
-globalThis.phase = async function phase(name, body) {
+async function phase(name, body) {
   const prior = currentPhase;
   currentPhase = name;
   emit({ type: "phase_started", name });
@@ -47,11 +50,46 @@ globalThis.phase = async function phase(name, body) {
   } finally {
     currentPhase = prior;
   }
-};
+}
+
+async function loadWorkflowModule() {
+  const source = await readFile(scriptPath, "utf8");
+  const transformed = source
+    .replace(/\bexport\s+const\s+meta\s*=/, "const meta =")
+    .replace(/\bexport\s+default\b/, "__workflow_default__ =");
+
+  const context = vm.createContext({
+    args: workflowArgs,
+    agent,
+    parallel,
+    pipeline,
+    phase,
+  });
+  const runner = vm.compileFunction(
+    `
+      "use strict";
+      return (async () => {
+        let __workflow_default__ = null;
+        ${transformed}
+        return { meta, default: __workflow_default__ };
+      })();
+    `,
+    [],
+    {
+      parsingContext: context,
+      filename: scriptPath,
+      importModuleDynamically() {
+        throw new Error("Dynamic import is not available in workflow scripts");
+      },
+    },
+  );
+
+  return runner();
+}
 
 try {
-  const module = await import(`file://${scriptPath}`);
-  emit({ type: "workflow_completed", result: module.default ?? null });
+  const namespace = await loadWorkflowModule();
+  emit({ type: "workflow_completed", result: namespace.default ?? null });
 } catch (error) {
   emit({ type: "workflow_failed", error: error?.stack ?? String(error) });
   process.exitCode = 1;

@@ -88,8 +88,8 @@ impl WorkflowHost {
 
         let output = child.wait_with_output()?;
         if !output.status.success() {
-            if let Some(error) = workflow_failed {
-                return Err(io::Error::other(format!("workflow host failed: {error}")));
+            if workflow_failed.is_some() {
+                return Ok(events);
             }
 
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
