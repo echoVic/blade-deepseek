@@ -15,7 +15,8 @@ const TARGETS = {
 function parseArgs(argv) {
   const args = {
     version: null,
-    stageDir: null
+    stageDir: null,
+    tarballsDir: null
   };
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -24,6 +25,8 @@ function parseArgs(argv) {
       args.version = argv[++index];
     } else if (arg === "--stage-dir") {
       args.stageDir = path.resolve(argv[++index]);
+    } else if (arg === "--tarballs-dir") {
+      args.tarballsDir = path.resolve(argv[++index]);
     } else {
       throw new Error(`Unknown argument: ${arg}`);
     }
@@ -48,6 +51,15 @@ function ensurePackageExists(dir, label) {
   }
 }
 
+function packageTarballPath(packageName, version, tarballsDir) {
+  const fileName = `${packageName.replace(/^@/, "").replace("/", "-")}-${version}.tgz`;
+  const tarball = path.join(tarballsDir, fileName);
+  if (!existsSync(tarball)) {
+    throw new Error(`Missing packed tarball for ${packageName} at ${tarball}`);
+  }
+  return tarball;
+}
+
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   const targetKey = `${process.platform}:${process.arch}`;
@@ -62,13 +74,20 @@ async function main() {
   ensurePackageExists(mainPackageDir, "main");
   ensurePackageExists(platformPackageDir, "platform");
 
+  const mainPackageName = readJson(path.join(mainPackageDir, "package.json")).name;
   const platformPackageName = readJson(path.join(platformPackageDir, "package.json")).name;
+  const mainPackageSpec = args.tarballsDir
+    ? `file:${packageTarballPath(mainPackageName, args.version, args.tarballsDir)}`
+    : `file:${mainPackageDir}`;
+  const platformPackageSpec = args.tarballsDir
+    ? `file:${packageTarballPath(platformPackageName, args.version, args.tarballsDir)}`
+    : `file:${platformPackageDir}`;
   const tempDir = mkdtempSync(path.join(os.tmpdir(), "orca-npm-smoke-"));
   writeFileSync(path.join(tempDir, "package.json"), JSON.stringify({
     private: true,
     dependencies: {
-      "@blade-ai/orca": `file:${mainPackageDir}`,
-      [platformPackageName]: `file:${platformPackageDir}`
+      [mainPackageName]: mainPackageSpec,
+      [platformPackageName]: platformPackageSpec
     }
   }, null, 2));
 
