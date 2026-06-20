@@ -26,6 +26,7 @@ pub struct TaskRecord {
     pub description: String,
     pub name: Option<String>,
     pub workflow_run_id: Option<String>,
+    pub phase_count: Option<usize>,
     pub result: Option<String>,
     pub error: Option<String>,
     pub control: TaskControl,
@@ -54,6 +55,7 @@ impl TaskRegistry {
         workflow_run_id: String,
         name: String,
         description: String,
+        phase_count: usize,
     ) -> TaskHandle {
         let id = new_task_id();
         let control = TaskControl {
@@ -67,6 +69,7 @@ impl TaskRegistry {
             description,
             name: Some(name),
             workflow_run_id: Some(workflow_run_id.clone()),
+            phase_count: Some(phase_count),
             result: None,
             error: None,
             control,
@@ -99,6 +102,8 @@ impl TaskRegistry {
                         server: None,
                         tool: None,
                         name: record.name.clone(),
+                        workflow_run_id: record.workflow_run_id.clone(),
+                        phase_count: record.phase_count,
                     })
                     .collect::<Vec<_>>()
             })
@@ -238,6 +243,7 @@ mod tests {
             "workflow-run-1".to_string(),
             "audit".to_string(),
             "Audit code".to_string(),
+            2,
         );
 
         assert!(task.id.starts_with("task-"));
@@ -248,6 +254,11 @@ mod tests {
         assert_eq!(list[0].task_type, TaskType::Workflow);
         assert_eq!(list[0].status, TaskStatus::Queued);
         assert_eq!(list[0].name.as_deref(), Some("audit"));
+        assert_eq!(
+            list[0].workflow_run_id.as_deref(),
+            Some("workflow-run-1")
+        );
+        assert_eq!(list[0].phase_count, Some(2));
     }
 
     #[test]
@@ -257,6 +268,7 @@ mod tests {
             "workflow-run-1".to_string(),
             "audit".to_string(),
             "Audit code".to_string(),
+            0,
         );
 
         registry.request_stop(&task.id).unwrap();
@@ -272,6 +284,7 @@ mod tests {
             "workflow-run-1".to_string(),
             "audit".to_string(),
             "Audit code".to_string(),
+            0,
         );
 
         registry.complete(&task.id, "done".to_string()).unwrap();
@@ -287,6 +300,7 @@ mod tests {
             "workflow-run-1".to_string(),
             "audit".to_string(),
             "Audit code".to_string(),
+            0,
         );
 
         registry.request_pause(&task.id).unwrap();
@@ -307,6 +321,7 @@ mod tests {
             "workflow-run-1".to_string(),
             "audit".to_string(),
             "Audit code".to_string(),
+            0,
         );
 
         registry.mark_running(&task.id).unwrap();
@@ -321,6 +336,7 @@ mod tests {
             "workflow-run-1".to_string(),
             "audit".to_string(),
             "Audit code".to_string(),
+            0,
         );
 
         registry.fail(&task.id, "boom".to_string()).unwrap();

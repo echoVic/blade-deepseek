@@ -751,6 +751,8 @@ mod tests {
             server: None,
             tool: None,
             name: Some("audit".to_string()),
+            workflow_run_id: Some("workflow-run-1".to_string()),
+            phase_count: Some(2),
         }];
         state.workflow_panel.selected = 9;
 

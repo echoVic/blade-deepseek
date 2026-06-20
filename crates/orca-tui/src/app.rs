@@ -1275,9 +1275,6 @@ fn handle_slash_command(
         },
         SlashCommand::WorkflowList => {
             state.show_workflows();
-            state.messages.push(ChatMessage::System(
-                "Opened workflows view. Press Esc to return to conversation.".to_string(),
-            ));
         }
         SlashCommand::Remember(note) => {
             let remembered_note = note

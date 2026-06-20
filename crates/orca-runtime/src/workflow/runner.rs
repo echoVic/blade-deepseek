@@ -250,6 +250,7 @@ impl WorkflowRunner {
             run_id.clone(),
             resolved.meta.name.clone(),
             resolved.meta.description.clone(),
+            resolved.meta.phases.len(),
         );
         let mut state = WorkflowRunState {
             run_id: run_id.clone(),

@@ -65,12 +65,16 @@ fn background_task_summary_matches_sdk_names() {
         server: None,
         tool: None,
         name: Some("audit".to_string()),
+        workflow_run_id: Some("workflow-run-1".to_string()),
+        phase_count: Some(2),
     };
 
     let value = serde_json::to_value(summary).unwrap();
     assert_eq!(value["type"], "workflow");
     assert_eq!(value["status"], "running");
     assert_eq!(value["name"], "audit");
+    assert_eq!(value["workflowRunId"], "workflow-run-1");
+    assert_eq!(value["phaseCount"], 2);
 }
 
 #[test]
