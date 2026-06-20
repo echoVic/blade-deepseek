@@ -1,5 +1,7 @@
 pub mod subagent_types;
 pub mod subagent_config;
+pub mod task_types;
+pub mod workflow_types;
 pub mod cancel;
 pub mod mcp_types;
 pub mod verification;
