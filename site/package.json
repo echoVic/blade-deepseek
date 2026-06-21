@@ -5,15 +5,15 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc -b && vite build",
+    "build": "tsc --noEmit && vite build",
     "preview": "vite preview"
   },
   "dependencies": {
-    "@vitejs/plugin-react": "^5.1.1",
-    "vite": "^7.2.7",
-    "typescript": "^5.9.3",
+    "@vitejs/plugin-react": "^6.0.2",
     "react": "^19.2.1",
-    "react-dom": "^19.2.1"
+    "react-dom": "^19.2.1",
+    "typescript": "^5.9.3",
+    "vite": "^8.0.16"
   },
   "devDependencies": {
     "@types/react": "^19.2.2",

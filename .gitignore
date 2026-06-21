@@ -4,3 +4,6 @@
 .env
 dist/
 .superpowers/
+.playwright-cli/
+node_modules/
+*.tsbuildinfo
