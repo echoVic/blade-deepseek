@@ -177,7 +177,7 @@ function App() {
     <main>
       <header className="nav">
         <a className="brand" href="#top" aria-label="Orca home">
-          <span className="brand-mark">O</span>
+          <img className="brand-mark" src="/orca-icon.svg" alt="" aria-hidden="true" />
           <span>Orca</span>
         </a>
         <nav aria-label="Main navigation">

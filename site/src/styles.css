@@ -58,14 +58,13 @@ main {
 }
 
 .brand-mark {
-  width: 30px;
-  height: 30px;
-  display: inline-grid;
-  place-items: center;
-  border: 1px solid rgba(238, 244, 241, 0.25);
-  background: #d8bb69;
-  color: #08100d;
-  font-weight: 900;
+  width: 44px;
+  height: 34px;
+  display: block;
+  border: 1px solid rgba(238, 244, 241, 0.18);
+  background: rgba(238, 244, 241, 0.06);
+  object-fit: contain;
+  padding: 3px;
 }
 
 .nav nav {
