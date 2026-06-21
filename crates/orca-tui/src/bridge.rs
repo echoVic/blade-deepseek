@@ -1007,8 +1007,10 @@ fn execute_tool_for_tui(
     mcp_registry: &McpRegistry,
     hooks: &HookRunner,
 ) -> (bool, tool_types::ToolResult, Option<CostTracker>) {
-    let action = approval_action_for_tool(tool_request, mcp_registry, &config.external_tools);
-    if agent_common::requires_approval(action) {
+    if let Some(action) =
+        approval_action_for_tool(tool_request, subagent_depth, mcp_registry, config)
+        && agent_common::requires_approval(action)
+    {
         let approval = ApprovalRequest {
             id: format!("approval-{}", tool_request.id),
             action,
@@ -1246,6 +1248,25 @@ fn execute_tool_for_tui(
 }
 
 fn approval_action_for_tool(
+    tool_request: &tool_types::ToolRequest,
+    subagent_depth: u32,
+    mcp_registry: &McpRegistry,
+    config: &RunConfig,
+) -> Option<orca_core::approval_types::ActionKind> {
+    if tool_request.name == tool_types::ToolName::Subagent
+        && subagent_depth >= config.subagents.max_depth
+    {
+        return None;
+    }
+    Some(orca_tools::canonical_action_kind_with_mcp_and_external(
+        tool_request,
+        Some(mcp_registry),
+        &config.external_tools,
+    ))
+}
+
+#[cfg(test)]
+fn canonical_action_for_tool(
     tool_request: &tool_types::ToolRequest,
     mcp_registry: &McpRegistry,
     external_tools: &[orca_core::external_config::ExternalToolConfig],
@@ -1757,7 +1778,7 @@ mod tests {
         let registry = McpRegistry::default();
 
         assert_eq!(
-            approval_action_for_tool(&request, &registry, &[]),
+            canonical_action_for_tool(&request, &registry, &[]),
             orca_core::approval_types::ActionKind::Shell
         );
     }
