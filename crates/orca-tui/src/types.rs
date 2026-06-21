@@ -50,6 +50,7 @@ pub enum TuiEvent {
         id: String,
         tool: String,
         target: Option<String>,
+        preview: Option<String>,
     },
     Notice(String),
     Error(String),
@@ -125,11 +126,78 @@ pub enum ChatMessage {
     System(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalOption {
+    /// Approve this single call.
+    Once,
+    /// Approve and remember this tool for the rest of the session.
+    AlwaysTool,
+    /// Approve and remember this tool + target for the rest of the session.
+    AlwaysTarget,
+    /// Reject this call.
+    Deny,
+}
+
+impl ApprovalOption {
+    pub fn key(self) -> char {
+        match self {
+            ApprovalOption::Once => 'y',
+            ApprovalOption::AlwaysTool => 'a',
+            ApprovalOption::AlwaysTarget => 'A',
+            ApprovalOption::Deny => 'n',
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ApprovalOption::Once => "approve once",
+            ApprovalOption::AlwaysTool => "always allow tool",
+            ApprovalOption::AlwaysTarget => "always allow tool + target",
+            ApprovalOption::Deny => "deny",
+        }
+    }
+
+    /// Whether choosing this option lets the tool run.
+    pub fn is_approve(self) -> bool {
+        !matches!(self, ApprovalOption::Deny)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ApprovalDialog {
     pub tool: String,
     pub target: Option<String>,
     pub selected: usize,
+    pub options: Vec<ApprovalOption>,
+    pub diff: Option<String>,
+}
+
+impl ApprovalDialog {
+    /// The four options shown when a target is present; without a target the
+    /// "always allow tool + target" option is dropped (nothing to scope to).
+    pub fn options_for(target: Option<&str>) -> Vec<ApprovalOption> {
+        if target.is_some() {
+            vec![
+                ApprovalOption::Once,
+                ApprovalOption::AlwaysTool,
+                ApprovalOption::AlwaysTarget,
+                ApprovalOption::Deny,
+            ]
+        } else {
+            vec![
+                ApprovalOption::Once,
+                ApprovalOption::AlwaysTool,
+                ApprovalOption::Deny,
+            ]
+        }
+    }
+
+    pub fn current(&self) -> ApprovalOption {
+        self.options
+            .get(self.selected)
+            .copied()
+            .unwrap_or(ApprovalOption::Deny)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,6 +245,9 @@ pub struct AppState {
     #[allow(dead_code)]
     pub event_tx: mpsc::Sender<UserAction>,
     pub approval_dialog: Option<ApprovalDialog>,
+    /// Tool / "tool\u{0}target" keys the user chose to always allow this
+    /// session. Checked when a new approval arrives so the dialog is skipped.
+    pub approval_allowlist: std::collections::HashSet<String>,
     pub setup_step: u8,
     pub show_shortcuts: bool,
     pub input_history: Vec<String>,
@@ -185,6 +256,7 @@ pub struct AppState {
     pub last_ctrl_c: Option<Instant>,
     pub session_picker_sessions: Vec<SessionSummary>,
     pub session_picker_selected: usize,
+    pub session_picker_query: String,
     pub usage: UsageTotals,
     pub slash_menu: Option<SlashMenu>,
     pub mention_candidates: Vec<String>,
@@ -215,6 +287,7 @@ impl AppState {
             cwd,
             event_tx,
             approval_dialog: None,
+            approval_allowlist: std::collections::HashSet::new(),
             setup_step: 0,
             show_shortcuts: false,
             input_history: Vec::new(),
@@ -223,6 +296,7 @@ impl AppState {
             last_ctrl_c: None,
             session_picker_sessions: Vec::new(),
             session_picker_selected: 0,
+            session_picker_query: String::new(),
             usage: UsageTotals::default(),
             slash_menu: None,
             mention_candidates: Vec::new(),
@@ -338,13 +412,62 @@ impl AppState {
         self.draft_before_history = None;
     }
 
+    /// Indices into `session_picker_sessions` whose title matches the current
+    /// query (case-insensitive substring). Empty query matches everything.
+    pub fn filtered_session_indices(&self) -> Vec<usize> {
+        if self.session_picker_query.is_empty() {
+            return (0..self.session_picker_sessions.len()).collect();
+        }
+        let needle = self.session_picker_query.to_lowercase();
+        self.session_picker_sessions
+            .iter()
+            .enumerate()
+            .filter(|(_, session)| session.title.to_lowercase().contains(&needle))
+            .map(|(index, _)| index)
+            .collect()
+    }
+
     pub fn select_previous_session(&mut self) {
-        self.session_picker_selected = self.session_picker_selected.saturating_sub(1);
+        let filtered = self.filtered_session_indices();
+        if filtered.is_empty() {
+            return;
+        }
+        let pos = filtered
+            .iter()
+            .position(|&i| i == self.session_picker_selected)
+            .unwrap_or(0);
+        let new_pos = pos.saturating_sub(1);
+        self.session_picker_selected = filtered[new_pos];
     }
 
     pub fn select_next_session(&mut self) {
-        if self.session_picker_selected + 1 < self.session_picker_sessions.len() {
-            self.session_picker_selected += 1;
+        let filtered = self.filtered_session_indices();
+        if filtered.is_empty() {
+            return;
+        }
+        let pos = filtered
+            .iter()
+            .position(|&i| i == self.session_picker_selected)
+            .unwrap_or(0);
+        let new_pos = (pos + 1).min(filtered.len() - 1);
+        self.session_picker_selected = filtered[new_pos];
+    }
+
+    /// Append a character to the search query and reset selection to the first
+    /// match so the highlighted row is always within the filtered set.
+    pub fn session_query_push(&mut self, ch: char) {
+        self.session_picker_query.push(ch);
+        self.reset_session_selection_to_first_match();
+    }
+
+    pub fn session_query_pop(&mut self) {
+        self.session_picker_query.pop();
+        self.reset_session_selection_to_first_match();
+    }
+
+    fn reset_session_selection_to_first_match(&mut self) {
+        if let Some(&first) = self.filtered_session_indices().first() {
+            self.session_picker_selected = first;
         }
     }
 
@@ -352,6 +475,33 @@ impl AppState {
         self.session_picker_sessions
             .get(self.session_picker_selected)
             .map(|session| session.session_id.clone())
+    }
+
+    /// Allowlist key for a tool alone.
+    pub fn approval_key_tool(tool: &str) -> String {
+        tool.to_string()
+    }
+
+    /// Allowlist key for a tool scoped to a specific target.
+    pub fn approval_key_target(tool: &str, target: &str) -> String {
+        format!("{tool}\u{0}{target}")
+    }
+
+    /// True if a pending approval for this tool/target was already granted an
+    /// "always allow" this session.
+    pub fn approval_is_allowlisted(&self, tool: &str, target: Option<&str>) -> bool {
+        if self
+            .approval_allowlist
+            .contains(&Self::approval_key_tool(tool))
+        {
+            return true;
+        }
+        if let Some(target) = target {
+            return self
+                .approval_allowlist
+                .contains(&Self::approval_key_target(tool, target));
+        }
+        false
     }
 
     pub fn update(&mut self, event: TuiEvent) {
@@ -502,12 +652,20 @@ impl AppState {
                     });
                 }
             }
-            TuiEvent::ApprovalNeeded { tool, target, .. } => {
+            TuiEvent::ApprovalNeeded {
+                tool,
+                target,
+                preview,
+                ..
+            } => {
                 self.status = AppStatus::WaitingApproval;
+                let options = ApprovalDialog::options_for(target.as_deref());
                 self.approval_dialog = Some(ApprovalDialog {
                     tool,
                     target,
                     selected: 0,
+                    options,
+                    diff: preview,
                 });
             }
             TuiEvent::Error(msg) => {
@@ -605,6 +763,119 @@ mod tests {
             "mock".to_string(),
             "/tmp".to_string(),
         )
+    }
+
+    fn session(id: &str, title: &str) -> SessionSummary {
+        use chrono::Utc;
+        use std::path::PathBuf;
+        SessionSummary {
+            session_id: id.to_string(),
+            title: title.to_string(),
+            cwd: "/tmp".to_string(),
+            provider: "deepseek".to_string(),
+            model: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            path: PathBuf::from("/tmp"),
+            archived: false,
+            parent_id: None,
+            forked: false,
+        }
+    }
+
+    #[test]
+    fn session_search_filters_by_title_and_keeps_selection_valid() {
+        let mut state = state();
+        state.session_picker_sessions = vec![
+            session("a", "fix the failing auth test"),
+            session("b", "add JWT auth middleware"),
+            session("c", "refactor parser entrypoint"),
+        ];
+        state.session_picker_selected = 0;
+
+        // No query → all match.
+        assert_eq!(state.filtered_session_indices(), vec![0, 1, 2]);
+
+        // Typing "auth" keeps only the two auth sessions and snaps selection
+        // to the first match.
+        for ch in "auth".chars() {
+            state.session_query_push(ch);
+        }
+        assert_eq!(state.filtered_session_indices(), vec![0, 1]);
+        assert_eq!(state.session_picker_selected, 0);
+
+        // Down moves within the filtered set, not the raw list.
+        state.select_next_session();
+        assert_eq!(state.session_picker_selected, 1);
+        state.select_next_session();
+        assert_eq!(state.session_picker_selected, 1); // clamped to last match
+
+        // Backspace widens the filter again.
+        state.session_query_pop();
+        assert_eq!(state.session_picker_query, "aut");
+        assert_eq!(state.filtered_session_indices(), vec![0, 1]);
+    }
+
+    #[test]
+    fn approval_dialog_has_four_options_with_target_and_three_without() {
+        let with_target = ApprovalDialog::options_for(Some("src/auth/token.rs"));
+        assert_eq!(
+            with_target,
+            vec![
+                ApprovalOption::Once,
+                ApprovalOption::AlwaysTool,
+                ApprovalOption::AlwaysTarget,
+                ApprovalOption::Deny,
+            ]
+        );
+        let without = ApprovalDialog::options_for(None);
+        assert_eq!(
+            without,
+            vec![
+                ApprovalOption::Once,
+                ApprovalOption::AlwaysTool,
+                ApprovalOption::Deny,
+            ]
+        );
+    }
+
+    #[test]
+    fn approval_allowlist_grants_matching_tool_and_target() {
+        let mut tool_scope = state();
+
+        // Initially nothing is allow-listed.
+        assert!(!tool_scope.approval_is_allowlisted("edit", Some("src/a.rs")));
+
+        // "Always allow tool" grants every target for that tool.
+        tool_scope
+            .approval_allowlist
+            .insert(AppState::approval_key_tool("edit"));
+        assert!(tool_scope.approval_is_allowlisted("edit", Some("src/a.rs")));
+        assert!(tool_scope.approval_is_allowlisted("edit", Some("src/b.rs")));
+        assert!(!tool_scope.approval_is_allowlisted("bash", Some("ls")));
+
+        // "Always allow tool + target" is scoped to that one target.
+        let mut scoped = state();
+        scoped
+            .approval_allowlist
+            .insert(AppState::approval_key_target("bash", "cargo test"));
+        assert!(scoped.approval_is_allowlisted("bash", Some("cargo test")));
+        assert!(!scoped.approval_is_allowlisted("bash", Some("rm -rf /")));
+    }
+
+    #[test]
+    fn approval_needed_event_populates_dialog_options_and_diff() {
+        let mut state = state();
+        state.update(TuiEvent::ApprovalNeeded {
+            id: "approval-1".to_string(),
+            tool: "edit".to_string(),
+            target: Some("src/auth/token.rs".to_string()),
+            preview: Some("@@ token.rs @@\n- a\n+ b".to_string()),
+        });
+        let dialog = state.approval_dialog.expect("dialog present");
+        assert_eq!(dialog.options.len(), 4);
+        assert!(dialog.diff.is_some());
+        assert_eq!(dialog.current(), ApprovalOption::Once);
     }
 
     #[test]

@@ -30,8 +30,8 @@ use crate::shortcuts::{
 };
 use crate::theme::Theme;
 use crate::types::{
-    AppState, AppStatus, ChatMessage, PanelMode, SlashMenu, SlashMenuItem, SubMenu, TuiEvent,
-    UserAction,
+    ApprovalOption, AppState, AppStatus, ChatMessage, PanelMode, SlashMenu, SlashMenuItem, SubMenu,
+    TuiEvent, UserAction,
 };
 use crate::ui;
 use crate::vim::VimState;
@@ -315,14 +315,8 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                     match key.code {
                         KeyCode::Up => state.select_previous_session(),
                         KeyCode::Down => state.select_next_session(),
-                        KeyCode::Char('n') | KeyCode::Char('N') => {
-                            state.status = AppStatus::Idle;
-                            state.session_picker_sessions.clear();
-                            config.history_mode = HistoryMode::Record;
-                            if let Ok(mut cfg) = shared_config.lock() {
-                                cfg.history_mode = HistoryMode::Record;
-                            }
-                        }
+                        KeyCode::Backspace => state.session_query_pop(),
+                        KeyCode::Char(c) => state.session_query_push(c),
                         KeyCode::Enter => {
                             if let Some(session_id) = state.selected_session_id() {
                                 config.history_mode = HistoryMode::Resume(session_id.clone());
@@ -357,43 +351,62 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                         KeyCode::Esc => {
                             state.status = AppStatus::Idle;
                             state.session_picker_sessions.clear();
+                            state.session_picker_query.clear();
                         }
                         _ => {}
                     }
                     continue;
                 }
 
-                // Approval dialog: selection and direct approve/deny shortcuts
+                // Approval dialog: 4-option selection + direct-key shortcuts.
                 if state.status == AppStatus::WaitingApproval {
+                    // Direct option keys (y / a / A / n) resolve immediately.
+                    if let KeyCode::Char(c) = key.code
+                        && let Some(option) = state
+                            .approval_dialog
+                            .as_ref()
+                            .and_then(|d| d.options.iter().copied().find(|o| o.key() == c))
+                    {
+                        resolve_approval_option(&mut state, &action_tx, option);
+                        continue;
+                    }
                     match approval_shortcut(*key) {
                         Some(ApprovalShortcut::SelectAllow) => {
                             if let Some(dialog) = &mut state.approval_dialog {
-                                dialog.selected = 0;
+                                dialog.selected = dialog.selected.saturating_sub(1);
                             }
                         }
                         Some(ApprovalShortcut::SelectDeny) => {
                             if let Some(dialog) = &mut state.approval_dialog {
-                                dialog.selected = 1;
+                                let last = dialog.options.len().saturating_sub(1);
+                                dialog.selected = (dialog.selected + 1).min(last);
                             }
                         }
                         Some(ApprovalShortcut::ToggleSelection) => {
                             if let Some(dialog) = &mut state.approval_dialog {
-                                dialog.selected = 1usize.saturating_sub(dialog.selected);
+                                let len = dialog.options.len().max(1);
+                                dialog.selected = (dialog.selected + 1) % len;
                             }
                         }
                         Some(ApprovalShortcut::Confirm) => {
-                            let approved = state
-                                .approval_dialog
-                                .as_ref()
-                                .map(|d| d.selected == 0)
-                                .unwrap_or(false);
-                            resolve_approval(&mut state, &action_tx, approved);
+                            let option = state.approval_dialog.as_ref().map(|d| d.current());
+                            if let Some(option) = option {
+                                resolve_approval_option(&mut state, &action_tx, option);
+                            }
                         }
                         Some(ApprovalShortcut::Approve) => {
-                            resolve_approval(&mut state, &action_tx, true);
+                            resolve_approval_option(
+                                &mut state,
+                                &action_tx,
+                                ApprovalOption::Once,
+                            );
                         }
                         Some(ApprovalShortcut::Deny) => {
-                            resolve_approval(&mut state, &action_tx, false);
+                            resolve_approval_option(
+                                &mut state,
+                                &action_tx,
+                                ApprovalOption::Deny,
+                            );
                         }
                         None => {}
                     }
@@ -603,6 +616,15 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
         }
 
         while let Ok(tui_event) = event_rx.try_recv() {
+            // Auto-approve tools the user chose to "always allow" this session,
+            // so a repeat request is granted without re-prompting.
+            if let TuiEvent::ApprovalNeeded { tool, target, .. } = &tui_event
+                && state.approval_is_allowlisted(tool, target.as_deref())
+            {
+                let _ = action_tx.send(UserAction::Approve(true));
+                state.status = AppStatus::Running;
+                continue;
+            }
             let backtracked_prompt = match &tui_event {
                 TuiEvent::Backtracked { prompt } => Some(prompt.clone()),
                 _ => None,
@@ -1054,6 +1076,35 @@ fn resolve_approval(state: &mut AppState, action_tx: &mpsc::Sender<UserAction>, 
         state.status = AppStatus::Idle;
     }
     state.approval_dialog = None;
+}
+
+/// Resolve the approval dialog by the chosen option. The "always allow"
+/// options record a session allowlist entry so later matching approvals are
+/// auto-granted (see the ApprovalNeeded handling in the event loop). The wire
+/// protocol stays a simple allow/deny bool.
+fn resolve_approval_option(
+    state: &mut AppState,
+    action_tx: &mpsc::Sender<UserAction>,
+    option: ApprovalOption,
+) {
+    if let Some(dialog) = &state.approval_dialog {
+        match option {
+            ApprovalOption::AlwaysTool => {
+                state
+                    .approval_allowlist
+                    .insert(AppState::approval_key_tool(&dialog.tool));
+            }
+            ApprovalOption::AlwaysTarget => {
+                if let Some(target) = &dialog.target {
+                    state
+                        .approval_allowlist
+                        .insert(AppState::approval_key_target(&dialog.tool, target));
+                }
+            }
+            ApprovalOption::Once | ApprovalOption::Deny => {}
+        }
+    }
+    resolve_approval(state, action_tx, option.is_approve());
 }
 
 fn ensure_tui_session(
