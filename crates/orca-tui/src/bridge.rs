@@ -17,6 +17,7 @@ use orca_core::tool_types;
 use orca_mcp::McpRegistry;
 use orca_provider::ProviderConfig;
 use orca_provider::tool_schema::{
+    deepseek_goal_tools_schema_with_mcp_and_external,
     deepseek_tools_schema_for_type_with_mcp_and_external,
     deepseek_tools_schema_with_mcp_and_external,
 };
@@ -284,6 +285,18 @@ fn load_project_instructions(cwd: &Path) -> ProjectInstructions {
     instructions::load_for_cwd_or_default(cwd)
 }
 
+fn tui_tools_schema(
+    mcp_registry: &McpRegistry,
+    external_tools: &[orca_core::external_config::ExternalToolConfig],
+    allow_goal_tools: bool,
+) -> Vec<serde_json::Value> {
+    if allow_goal_tools {
+        deepseek_goal_tools_schema_with_mcp_and_external(Some(mcp_registry), external_tools)
+    } else {
+        deepseek_tools_schema_with_mcp_and_external(Some(mcp_registry), external_tools)
+    }
+}
+
 pub fn run_agent_for_tui(
     config: &RunConfig,
     session: &mut TuiConversationSession,
@@ -291,20 +304,20 @@ pub fn run_agent_for_tui(
     event_tx: &Sender<TuiEvent>,
     action_rx: &Receiver<UserAction>,
     cancel: &CancelToken,
+    allow_goal_tools: bool,
 ) -> String {
     let cwd = config
         .cwd
         .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
 
+    let tools_override =
+        tui_tools_schema(&session.mcp_registry, &config.external_tools, allow_goal_tools);
     let provider_config = ProviderConfig {
         api_key: config.api_key.clone(),
         base_url: config.base_url.clone(),
         model: Some(orca_core::model::FLASH_MODEL.to_string()),
-        tools_override: Some(deepseek_tools_schema_with_mcp_and_external(
-            Some(&session.mcp_registry),
-            &config.external_tools,
-        )),
+        tools_override: Some(tools_override),
         mcp_registry: Some(session.mcp_registry.clone()),
         external_tools: config.external_tools.clone(),
     };
@@ -1670,6 +1683,7 @@ mod tests {
             &event_tx,
             &action_rx,
             &cancel,
+            false,
         );
         run_agent_for_tui(
             &config,
@@ -1678,6 +1692,7 @@ mod tests {
             &event_tx,
             &action_rx,
             &cancel,
+            false,
         );
 
         let events: Vec<TuiEvent> = event_rx.try_iter().collect();
@@ -1692,6 +1707,26 @@ mod tests {
                 .unwrap_or_default()
                 .contains("first prompt | mock_history_echo")
         );
+    }
+
+    #[test]
+    fn tui_tool_schema_exposes_goal_tool_only_for_goal_turns() {
+        let config = config();
+        let mut session =
+            TuiConversationSession::new_with_preloaded(&config, "first", None).expect("session");
+        session.replace_goal_context("goal instructions".to_string());
+
+        let base_names = tui_tools_schema(&session.mcp_registry, &config.external_tools, false)
+            .into_iter()
+            .filter_map(|tool| tool["function"]["name"].as_str().map(str::to_string))
+            .collect::<Vec<_>>();
+        let goal_names = tui_tools_schema(&session.mcp_registry, &config.external_tools, true)
+            .into_iter()
+            .filter_map(|tool| tool["function"]["name"].as_str().map(str::to_string))
+            .collect::<Vec<_>>();
+
+        assert!(!base_names.contains(&"update_goal".to_string()));
+        assert!(goal_names.contains(&"update_goal".to_string()));
     }
 
     #[test]
@@ -1710,6 +1745,7 @@ mod tests {
             &event_tx,
             &action_rx,
             &cancel,
+            false,
         );
         run_agent_for_tui(
             &config,
@@ -1718,6 +1754,7 @@ mod tests {
             &event_tx,
             &action_rx,
             &cancel,
+            false,
         );
 
         assert_eq!(
@@ -1732,6 +1769,7 @@ mod tests {
             &event_tx,
             &action_rx,
             &cancel,
+            false,
         );
 
         let events: Vec<TuiEvent> = event_rx.try_iter().collect();

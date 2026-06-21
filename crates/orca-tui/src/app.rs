@@ -1212,7 +1212,7 @@ fn run_goal_turns_for_tui(
         let before_usage = session.usage_totals();
         let started_at = std::time::Instant::now();
         let status =
-            bridge::run_agent_for_tui(config, session, &prompt, event_tx, action_rx, cancel);
+            bridge::run_agent_for_tui(config, session, &prompt, event_tx, action_rx, cancel, true);
         let after_usage = session.usage_totals();
         let token_delta = after_usage
             .input_tokens

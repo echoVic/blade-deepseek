@@ -1,6 +1,11 @@
 use std::path::Path;
 
+use orca_tools::registry;
+
+use crate::tool_schema::{ToolSchemaMode, tool_visible_in_schema_mode};
+
 pub fn build_system_prompt(cwd: &Path) -> String {
+    let tools = render_tool_prompt_section();
     format!(
         r#"You are Orca, an expert software engineering agent running in a terminal-based coding assistant. You are precise, safe, and helpful.
 
@@ -75,34 +80,9 @@ Start validation as specific as possible to the code you changed, then broaden:
 
 ## Available Tools
 
-### read_file
-Read file contents. Parameters: `path` (required).
+{tools}
 
-### glob
-Find files and directories matching a glob pattern. Parameters: `pattern` (required), `path` (optional, default ".").
-
-### grep
-Search for regex patterns using ripgrep. Parameters: `pattern` (required), `path` (optional, default ".").
-
-### bash
-Execute a shell command. Parameters: `command` (required).
-
-### edit
-Replace exact text in a file. The `old_text` must match exactly once.
-Parameters: `path` (required), `old_text` (required), `new_text` (required).
-
-### write_file
-Create or overwrite a file. Parameters: `path` (required), `content` (required).
-
-### git_status
-Show git working tree status. No parameters.
-
-### web_search
-Search the web. Parameters: `query` (required), `count` (optional, default 5, max 10).
-
-### update_plan
-Update the task plan. Parameters: `explanation` (optional), `plan` (required — list of items with `step` and `status`).
-Statuses: `pending`, `in_progress`, `completed`.
+Use `bash` for tests, builds, project scripts, and complex shell-only tasks. For file inspection, prefer `read_file`, `glob`, and `grep`.
 
 ## Safety Rules
 1. NEVER execute destructive commands (rm -rf /, rm -rf ~, mkfs, dd if=/dev/zero, etc.).
@@ -118,5 +98,52 @@ When done, respond concisely — like a teammate summarizing a PR. Structure you
 If there's a logical next step you can help with, suggest it briefly."#,
         cwd = cwd.display(),
         os = std::env::consts::OS,
+        tools = tools,
     )
+}
+
+fn render_tool_prompt_section() -> String {
+    let registry = registry::default_tool_registry();
+    let mut output = String::new();
+    for tool in registry
+        .model_visible_tools()
+        .filter(|tool| tool_visible_in_schema_mode(tool.name(), ToolSchemaMode::Base))
+    {
+        output.push_str(&format!(
+            "\n### {}\n{}\nParameters: `{}`.\n",
+            tool.name(),
+            tool.description(),
+            tool.spec().input_schema
+        ));
+    }
+    output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prompt_recommends_glob_and_hides_list_files() {
+        let prompt = build_system_prompt(std::path::Path::new("/repo"));
+
+        assert!(prompt.contains("### glob"));
+        assert!(!prompt.contains("### list_files"));
+        assert!(prompt.contains("prefer `read_file`, `glob`, and `grep`"));
+    }
+
+    #[test]
+    fn prompt_keeps_bash_for_tests_and_builds() {
+        let prompt = build_system_prompt(std::path::Path::new("/repo"));
+
+        assert!(prompt.contains("### bash"));
+        assert!(prompt.contains("tests, builds, project scripts"));
+    }
+
+    #[test]
+    fn prompt_hides_goal_only_tool_from_base_prompt() {
+        let prompt = build_system_prompt(std::path::Path::new("/repo"));
+
+        assert!(!prompt.contains("### update_goal"));
+    }
 }

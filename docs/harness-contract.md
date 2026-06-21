@@ -129,6 +129,8 @@ External tools:
 - Descriptors are advertised to the model as function tools.
 - Commands run from the workspace directory with raw JSON arguments on stdin and in `ORCA_TOOL_ARGS`.
 
+`glob` is the preferred file discovery tool. `list_files` remains accepted for compatibility but is not recommended in the system prompt.
+
 Hook stdout protocol:
 - `{"action":"allow"}` allows the operation.
 - `{"action":"deny","reason":"..."}` blocks the hook target.
