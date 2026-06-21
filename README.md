@@ -22,6 +22,20 @@ Supported npm platforms:
 - Linux x64 (`linux/x64`)
 - Linux ARM64 (`linux/arm64`)
 
+### curl
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/echoVic/blade-deepseek/main/install.sh | sh
+```
+
+The installer downloads the native binary for your platform from GitHub Releases.
+Set `INSTALL_DIR` to choose a destination and `ORCA_VERSION` to pin a version:
+
+```bash
+INSTALL_DIR=/usr/local/bin ORCA_VERSION=0.1.1 \
+  curl -fsSL https://raw.githubusercontent.com/echoVic/blade-deepseek/main/install.sh | sh
+```
+
 ### GitHub Releases
 
 Download the archive for your platform from the latest GitHub Release, extract it, and place `orca` on your `PATH`.
