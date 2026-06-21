@@ -4,7 +4,7 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-06-22
-Current baseline: v0.1.14 runtime posture summary baseline
+Current baseline: v0.1.15 fuzzy mention baseline
 
 ---
 
@@ -97,7 +97,7 @@ without destabilizing core runtime behavior.
 
 **Scope:**
 
-1. Fuzzy file search for TUI `@mention` and file discovery.
+1. Fuzzy file search for TUI `@mention` and file discovery. Fuzzy `@mention` fallback done in v0.1.15.
    - Use `.gitignore`-aware traversal.
    - Prefer a small crate boundary so provider/runtime do not own fuzzy matching.
 2. Sandbox/config summary. `/config show` runtime posture summary done in v0.1.14.

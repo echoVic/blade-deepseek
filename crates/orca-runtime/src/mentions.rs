@@ -2,6 +2,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 const MAX_MENTION_BYTES: usize = 32 * 1024;
+const MAX_FUZZY_MENTION_CANDIDATES: usize = 8;
+const MAX_FUZZY_MENTION_VISITS: usize = 2000;
 
 pub fn expand_file_mentions(input: &str, cwd: &Path) -> Result<String, String> {
     let mentions = find_mentions(input);
@@ -205,6 +207,14 @@ fn current_mention_prefix(input: &str) -> Option<(usize, &str)> {
 }
 
 fn mention_matches(cwd: &Path, prefix: &str) -> Vec<String> {
+    let exact_matches = prefix_mention_matches(cwd, prefix);
+    if !exact_matches.is_empty() || prefix.contains('/') || prefix.is_empty() {
+        return exact_matches;
+    }
+    fuzzy_mention_matches(cwd, prefix)
+}
+
+fn prefix_mention_matches(cwd: &Path, prefix: &str) -> Vec<String> {
     let (dir_prefix, file_prefix) = prefix.rsplit_once('/').unwrap_or(("", prefix));
     let search_dir = if dir_prefix.is_empty() {
         cwd.to_path_buf()
@@ -248,6 +258,103 @@ fn mention_matches(cwd: &Path, prefix: &str) -> Vec<String> {
     }
     matches.sort();
     matches
+}
+
+fn fuzzy_mention_matches(cwd: &Path, query: &str) -> Vec<String> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let Ok(cwd) = cwd.canonicalize() else {
+        return Vec::new();
+    };
+    let mut scored = Vec::new();
+    collect_fuzzy_mention_matches(&cwd, &cwd, query, &mut scored, &mut 0);
+    scored.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.1.len().cmp(&right.1.len()))
+            .then_with(|| left.1.cmp(&right.1))
+    });
+    scored
+        .into_iter()
+        .take(MAX_FUZZY_MENTION_CANDIDATES)
+        .map(|(_, candidate)| candidate)
+        .collect()
+}
+
+fn collect_fuzzy_mention_matches(
+    root: &Path,
+    dir: &Path,
+    query: &str,
+    scored: &mut Vec<(usize, String)>,
+    visited: &mut usize,
+) {
+    if *visited >= MAX_FUZZY_MENTION_VISITS {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut entries = entries.flatten().collect::<Vec<_>>();
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        if *visited >= MAX_FUZZY_MENTION_VISITS {
+            return;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name.starts_with('.') {
+            continue;
+        }
+        *visited += 1;
+        let path = entry.path();
+        let Ok(relative) = path.strip_prefix(root) else {
+            continue;
+        };
+        let candidate = relative.to_string_lossy().replace('\\', "/");
+        let candidate = if path.is_dir() {
+            format!("{candidate}/")
+        } else {
+            candidate
+        };
+        if let Some(score) = fuzzy_score(&candidate, query) {
+            scored.push((score, candidate));
+        }
+        if path.is_dir() {
+            collect_fuzzy_mention_matches(root, &path, query, scored, visited);
+        }
+    }
+}
+
+fn fuzzy_score(candidate: &str, query: &str) -> Option<usize> {
+    let candidate_lower = candidate.to_lowercase();
+    let query_lower = query.to_lowercase();
+    if candidate_lower.contains(&query_lower) {
+        return candidate_lower.find(&query_lower);
+    }
+    subsequence_score(&candidate_lower, &query_lower)
+}
+
+fn subsequence_score(candidate: &str, query: &str) -> Option<usize> {
+    let mut score = 0;
+    let mut last_match = 0;
+    let mut chars = candidate.char_indices();
+    for query_char in query.chars() {
+        let mut matched = None;
+        for (index, candidate_char) in chars.by_ref() {
+            if candidate_char == query_char {
+                matched = Some(index);
+                break;
+            }
+        }
+        let index = matched?;
+        score += index.saturating_sub(last_match);
+        last_match = index + query_char.len_utf8();
+    }
+    Some(score)
 }
 
 fn resolve_mention_dir(cwd: &Path, mention: &str) -> Result<PathBuf, String> {
@@ -584,5 +691,19 @@ mod tests {
         let completed = complete_file_mention(r#"read @"my dir/no"#, dir.path()).unwrap();
 
         assert!(completed.contains("my dir/notes.txt"));
+    }
+
+    #[test]
+    fn fuzzy_mention_candidates_match_path_initials() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("src/runtime/config");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("mod.rs"), "hello").unwrap();
+
+        let candidates = list_mention_candidates("@rcm", dir.path());
+
+        assert!(candidates.iter().any(|candidate| {
+            candidate == "src/runtime/config/mod.rs"
+        }));
     }
 }
