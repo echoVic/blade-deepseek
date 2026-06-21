@@ -12,7 +12,8 @@ use orca_core::tool_types::{MAX_TOOL_OUTPUT_BYTES, ToolName, ToolRequest, ToolRe
 use orca_mcp::McpRegistry;
 
 use crate::{
-    bash, edit, external, git, grep, list_files, read_file, update_plan, web_search, write_file,
+    bash, edit, external, git, grep, list_files, read_file, update_goal, update_plan, web_search,
+    write_file,
 };
 
 #[allow(dead_code)]
@@ -374,6 +375,32 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
         }),
         BuiltinExecutor::UpdatePlan,
     ));
+    registry.register(BuiltinTool::new(
+        "update_goal",
+        "Update the current persistent goal status. Use status complete when the goal is fully achieved, blocked when progress cannot continue without user input, active to resume, or paused to stop automatic continuation.",
+        ActionKind::Read,
+        json!({
+            "type": "object",
+            "properties": {
+                "status": {
+                    "type": "string",
+                    "enum": ["active", "paused", "blocked", "usage_limited", "budget_limited", "complete"],
+                    "description": "New goal status"
+                },
+                "objective": {
+                    "type": "string",
+                    "description": "Optional replacement objective"
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Optional short reason for the status update"
+                }
+            },
+            "required": [],
+            "additionalProperties": false
+        }),
+        BuiltinExecutor::UpdateGoal,
+    ));
 }
 
 struct BuiltinTool {
@@ -431,7 +458,11 @@ impl Tool for BuiltinTool {
     }
 
     fn is_concurrent_safe(&self, input: &ToolRequest) -> bool {
-        self.is_read_only(input) && !matches!(self.executor, BuiltinExecutor::UpdatePlan)
+        self.is_read_only(input)
+            && !matches!(
+                self.executor,
+                BuiltinExecutor::UpdatePlan | BuiltinExecutor::UpdateGoal
+            )
     }
 
     fn execute(&self, request: &ToolRequest, ctx: &ToolContext<'_>) -> ToolResult {
@@ -456,6 +487,7 @@ impl Tool for BuiltinTool {
                 "Workflow must be executed by the runtime controller",
                 None,
             ),
+            BuiltinExecutor::UpdateGoal => update_goal::execute(request),
             BuiltinExecutor::UpdatePlan => update_plan::execute(request),
         }
     }
@@ -473,6 +505,7 @@ enum BuiltinExecutor {
     WebSearch,
     Subagent,
     Workflow,
+    UpdateGoal,
     UpdatePlan,
 }
 

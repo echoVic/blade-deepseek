@@ -236,6 +236,10 @@ Hook 成功退出时可通过 stdout 返回 JSON：`{"action":"allow"}`、`{"act
 - `/cost` — 显示当前会话费用
 - `/history` — 列出最近会话
 - `/mode <suggest|auto-edit|full-auto>` — 切换审批模式
+- `/plan` / `/plan off` — 进入或退出只读计划模式
+- `/goal [<objective>|edit|pause|resume|clear]` — 管理持久化长期目标
+- `/workflows` — 查看后台 workflow 任务
+- `/remember <note>` — 写入用户或项目记忆
 - `/exit` — 退出
 
 **设计**:
@@ -244,8 +248,8 @@ Hook 成功退出时可通过 stdout 返回 JSON：`{"action":"allow"}`、`{"act
 - Tab 自动补全
 
 **影响文件**:
-- 新增 `src/tui/commands/` 模块
-- `src/tui/app.rs` — Submit 前检测 slash 命令
+- `crates/orca-tui/src/commands/mod.rs` — slash 命令解析和菜单
+- `crates/orca-tui/src/app.rs` — Submit 前检测 slash 命令并分发 TUI action
 
 ### 2.5 Web Search 工具
 
@@ -327,6 +331,25 @@ Hook 成功退出时可通过 stdout 返回 JSON：`{"action":"allow"}`、`{"act
 **影响文件**:
 - 新增 `src/runtime/memory.rs`
 - `src/runtime/agent_common.rs` — 注入 memory 到 prompt
+
+### 3.4b Persistent Goal Mode
+
+**目标**: 支持 Codex 风格 `/goal` 长期目标，目标跨 TUI 进程持久化，并在 active 状态下自动续跑。
+
+**当前状态**: 已实现。目标以 session id 为 key 写入 `$ORCA_HOME/goals_1.json` 或 `~/.orca/goals_1.json`；TUI 支持 `/goal`、`/goal <objective>`、`/goal edit <objective>`、`/goal pause`、`/goal resume`、`/goal clear`；模型可通过 `update_goal` 工具标记 `complete` 或 `blocked` 来停止续跑。
+
+**设计**:
+- `ThreadGoalStatus`: `active`, `paused`, `blocked`, `usage_limited`, `budget_limited`, `complete`
+- active goal 每个成功 turn 后自动提交 continuation prompt
+- 每轮注入单一 pinned goal state，避免重复堆叠上下文
+- 持久化 goal 依赖 recorded history；`--no-history` 会禁用 `/goal`
+
+**影响文件**:
+- `crates/orca-core/src/goal_types.rs`
+- `crates/orca-runtime/src/goals.rs`
+- `crates/orca-tools/src/update_goal.rs`
+- `crates/orca-tui/src/app.rs`
+- `crates/orca-tui/src/bridge.rs`
 
 ### 3.5 Auto-compact 优化
 

@@ -2,6 +2,7 @@ pub mod agent_child;
 pub mod agent_common;
 pub mod controller;
 pub mod cost;
+pub mod goals;
 pub mod history;
 pub mod hooks;
 pub mod instructions;

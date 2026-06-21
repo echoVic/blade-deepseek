@@ -24,7 +24,7 @@ use orca_runtime::history;
 use orca_runtime::mentions;
 
 use crate::bridge;
-use crate::commands::{self, SlashCommand};
+use crate::commands::{self, GoalSlashCommand, SlashCommand};
 use crate::shortcuts::{
     ApprovalShortcut, GlobalShortcut, IdleShortcut, RunningShortcut, approval_shortcut,
     global_shortcut, idle_shortcut, running_shortcut,
@@ -1066,6 +1066,165 @@ fn resolve_approval(state: &mut AppState, action_tx: &mpsc::Sender<UserAction>, 
     state.approval_dialog = None;
 }
 
+fn ensure_tui_session(
+    session: &mut Option<bridge::TuiConversationSession>,
+    config: &Arc<Mutex<RunConfig>>,
+    preloaded: &Arc<Mutex<Option<history::SessionTranscript>>>,
+    prompt_for_title: &str,
+    event_tx: &mpsc::Sender<TuiEvent>,
+) -> Option<String> {
+    if session.is_none() {
+        let cfg = config.lock().unwrap().clone();
+        let transcript = preloaded.lock().unwrap().take();
+        *session = match bridge::TuiConversationSession::new_with_preloaded(
+            &cfg,
+            prompt_for_title,
+            transcript,
+        ) {
+            Ok(session) => Some(session),
+            Err(error) => {
+                let _ = event_tx.send(TuiEvent::Error(format!(
+                    "failed to initialize conversation history: {error}"
+                )));
+                None
+            }
+        };
+    }
+    match session.as_ref().and_then(|session| session.session_id()) {
+        Some(session_id) => Some(session_id.to_string()),
+        None => {
+            let _ = event_tx.send(TuiEvent::Error(
+                "persistent goals require recorded history; enable history before using /goal"
+                    .to_string(),
+            ));
+            None
+        }
+    }
+}
+
+fn update_goal_status_for_session(
+    session_id: Option<&str>,
+    status: orca_core::goal_types::ThreadGoalStatus,
+    event_tx: &mpsc::Sender<TuiEvent>,
+) {
+    let Some(session_id) = session_id else {
+        let _ = event_tx.send(TuiEvent::Error(
+            "persistent goals require a saved session".to_string(),
+        ));
+        return;
+    };
+    let mut store = orca_runtime::goals::GoalStore::load_default();
+    match store.update(
+        session_id,
+        orca_core::goal_types::GoalUpdate {
+            objective: None,
+            status: Some(status),
+            token_budget: None,
+        },
+    ) {
+        Ok(Some(goal)) => {
+            let _ = event_tx.send(TuiEvent::GoalUpdated(goal));
+        }
+        Ok(None) => {
+            let _ = event_tx.send(TuiEvent::Error("no goal is currently set".to_string()));
+        }
+        Err(error) => {
+            let _ = event_tx.send(TuiEvent::Error(format!("failed to update goal: {error}")));
+        }
+    }
+}
+
+const MAX_GOAL_CONTINUATIONS: usize = 64;
+
+fn goal_continuation_prompt(objective: &str, continuation: usize) -> String {
+    format!(
+        "[Goal continuation #{continuation}]\nContinue working on this persistent goal:\n{objective}\n\nIf the goal is complete, call update_goal with status \"complete\". If it is genuinely blocked, call update_goal with status \"blocked\" and explain why."
+    )
+}
+
+fn run_goal_turns_for_tui(
+    config: &RunConfig,
+    session: &mut bridge::TuiConversationSession,
+    initial_prompt: &str,
+    event_tx: &mpsc::Sender<TuiEvent>,
+    action_rx: &mpsc::Receiver<UserAction>,
+    cancel: &CancelToken,
+    starting_continuation: usize,
+) {
+    let Some(session_id) = session.session_id().map(str::to_string) else {
+        let _ = event_tx.send(TuiEvent::Error(
+            "persistent goals require recorded history".to_string(),
+        ));
+        return;
+    };
+
+    let mut prompt = initial_prompt.to_string();
+    let mut continuation = starting_continuation;
+    loop {
+        if let Ok(Some(goal)) = orca_runtime::goals::GoalStore::load_default().get(&session_id)
+            && goal.status.should_continue()
+        {
+            session.replace_goal_context(
+                orca_runtime::agent_common::format_goal_mode_instructions(&goal),
+            );
+        }
+        let before_usage = session.usage_totals();
+        let started_at = std::time::Instant::now();
+        let status =
+            bridge::run_agent_for_tui(config, session, &prompt, event_tx, action_rx, cancel);
+        let after_usage = session.usage_totals();
+        let token_delta = after_usage
+            .input_tokens
+            .saturating_sub(before_usage.input_tokens)
+            .saturating_add(
+                after_usage
+                    .output_tokens
+                    .saturating_sub(before_usage.output_tokens),
+            )
+            .saturating_add(
+                after_usage
+                    .cache_tokens
+                    .saturating_sub(before_usage.cache_tokens),
+            ) as i64;
+        let elapsed_delta = started_at.elapsed().as_secs().min(i64::MAX as u64) as i64;
+        if token_delta > 0 || elapsed_delta > 0 {
+            if let Ok(Some(goal)) = orca_runtime::goals::GoalStore::load_default().account_usage(
+                &session_id,
+                token_delta,
+                elapsed_delta,
+            ) {
+                let _ = event_tx.send(TuiEvent::GoalStatus(Some(goal)));
+            }
+        }
+        if status != "success" {
+            break;
+        }
+
+        let goal = match orca_runtime::goals::GoalStore::load_default().get(&session_id) {
+            Ok(Some(goal)) => goal,
+            Ok(None) => break,
+            Err(error) => {
+                let _ = event_tx.send(TuiEvent::Error(format!("failed to read goal: {error}")));
+                break;
+            }
+        };
+        let _ = event_tx.send(TuiEvent::GoalStatus(Some(goal.clone())));
+        if !goal.status.should_continue() {
+            break;
+        }
+        continuation += 1;
+        if continuation > MAX_GOAL_CONTINUATIONS {
+            update_goal_status_for_session(
+                Some(&session_id),
+                orca_core::goal_types::ThreadGoalStatus::UsageLimited,
+                event_tx,
+            );
+            break;
+        }
+        prompt = goal_continuation_prompt(&goal.objective, continuation);
+    }
+}
+
 fn agent_loop_thread(
     config: Arc<Mutex<RunConfig>>,
     preloaded: Arc<Mutex<Option<history::SessionTranscript>>>,
@@ -1111,13 +1270,14 @@ fn agent_loop_thread(
                         session.add_pinned_context(context);
                     }
                 }
-                bridge::run_agent_for_tui(
+                run_goal_turns_for_tui(
                     &cfg,
                     session.as_mut().expect("session initialized"),
                     &prompt,
                     &event_tx,
                     &action_rx,
                     &cancel,
+                    0,
                 );
                 if cfg.desktop_notifications {
                     let _ = orca_runtime::notify::notify("Orca", "Task completed");
@@ -1168,6 +1328,138 @@ fn agent_loop_thread(
                     }
                 } else {
                     let _ = event_tx.send(TuiEvent::Error("nothing to backtrack".to_string()));
+                }
+            }
+            Ok(UserAction::GoalShow) => {
+                let Some(session_id) = session
+                    .as_ref()
+                    .and_then(|s| s.session_id().map(str::to_string))
+                else {
+                    let _ = event_tx.send(TuiEvent::Error(
+                        "persistent goals require a saved session; send a prompt first with history enabled".to_string(),
+                    ));
+                    continue;
+                };
+                let store = orca_runtime::goals::GoalStore::load_default();
+                match store.get(&session_id) {
+                    Ok(goal) => {
+                        let _ = event_tx.send(TuiEvent::GoalStatus(goal));
+                    }
+                    Err(error) => {
+                        let _ =
+                            event_tx.send(TuiEvent::Error(format!("failed to read goal: {error}")));
+                    }
+                }
+            }
+            Ok(UserAction::GoalSet(objective)) => {
+                let Some(session_id) =
+                    ensure_tui_session(&mut session, &config, &preloaded, &objective, &event_tx)
+                else {
+                    continue;
+                };
+                let mut store = orca_runtime::goals::GoalStore::load_default();
+                match store.replace(
+                    &session_id,
+                    &objective,
+                    orca_core::goal_types::ThreadGoalStatus::Active,
+                    None,
+                ) {
+                    Ok(goal) => {
+                        let _ = event_tx.send(TuiEvent::GoalUpdated(goal));
+                        let _ = event_tx.send(TuiEvent::Notice(
+                            "Starting goal. Automatic continuation will keep running while it remains active.".to_string(),
+                        ));
+                        if let Some(session) = session.as_mut() {
+                            let cfg = config.lock().unwrap().clone();
+                            run_goal_turns_for_tui(
+                                &cfg, session, &objective, &event_tx, &action_rx, &cancel, 0,
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        let _ =
+                            event_tx.send(TuiEvent::Error(format!("failed to set goal: {error}")));
+                    }
+                }
+            }
+            Ok(UserAction::GoalEdit(objective)) => {
+                let Some(session_id) = session
+                    .as_ref()
+                    .and_then(|s| s.session_id().map(str::to_string))
+                else {
+                    let _ = event_tx.send(TuiEvent::Error(
+                        "persistent goals require a saved session before editing".to_string(),
+                    ));
+                    continue;
+                };
+                let mut store = orca_runtime::goals::GoalStore::load_default();
+                match store.update(
+                    &session_id,
+                    orca_core::goal_types::GoalUpdate {
+                        objective: Some(objective),
+                        status: Some(orca_core::goal_types::ThreadGoalStatus::Active),
+                        token_budget: None,
+                    },
+                ) {
+                    Ok(Some(goal)) => {
+                        let _ = event_tx.send(TuiEvent::GoalUpdated(goal));
+                    }
+                    Ok(None) => {
+                        let _ =
+                            event_tx.send(TuiEvent::Error("no goal is currently set".to_string()));
+                    }
+                    Err(error) => {
+                        let _ =
+                            event_tx.send(TuiEvent::Error(format!("failed to edit goal: {error}")));
+                    }
+                }
+            }
+            Ok(UserAction::GoalClear) => {
+                let Some(session_id) = session
+                    .as_ref()
+                    .and_then(|s| s.session_id().map(str::to_string))
+                else {
+                    let _ = event_tx.send(TuiEvent::Error(
+                        "persistent goals require a saved session before clearing".to_string(),
+                    ));
+                    continue;
+                };
+                let mut store = orca_runtime::goals::GoalStore::load_default();
+                match store.clear(&session_id) {
+                    Ok(_) => {
+                        let _ = event_tx.send(TuiEvent::GoalCleared);
+                    }
+                    Err(error) => {
+                        let _ = event_tx
+                            .send(TuiEvent::Error(format!("failed to clear goal: {error}")));
+                    }
+                }
+            }
+            Ok(UserAction::GoalPause) => {
+                update_goal_status_for_session(
+                    session.as_ref().and_then(|s| s.session_id()),
+                    orca_core::goal_types::ThreadGoalStatus::Paused,
+                    &event_tx,
+                );
+            }
+            Ok(UserAction::GoalResume) => {
+                update_goal_status_for_session(
+                    session.as_ref().and_then(|s| s.session_id()),
+                    orca_core::goal_types::ThreadGoalStatus::Active,
+                    &event_tx,
+                );
+                if let Some(session) = session.as_mut() {
+                    if let Some(goal) = session
+                        .session_id()
+                        .and_then(|id| orca_runtime::goals::GoalStore::load_default().get(id).ok())
+                        .flatten()
+                    {
+                        let cfg = config.lock().unwrap().clone();
+                        let prompt = goal_continuation_prompt(&goal.objective, 1);
+                        run_goal_turns_for_tui(
+                            &cfg, session, &prompt, &event_tx, &action_rx, &cancel, 1,
+                        );
+                    }
                 }
             }
             Ok(UserAction::Cancel) | Err(_) => break,
@@ -1280,6 +1572,18 @@ fn handle_slash_command(
                 "unsupported plan command. Use /plan or /plan off.".to_string(),
             )),
         },
+        SlashCommand::Goal(goal_command) => {
+            let action = match goal_command {
+                GoalSlashCommand::Show => UserAction::GoalShow,
+                GoalSlashCommand::Set(objective) => UserAction::GoalSet(objective),
+                GoalSlashCommand::Edit(objective) => UserAction::GoalEdit(objective),
+                GoalSlashCommand::Clear => UserAction::GoalClear,
+                GoalSlashCommand::Pause => UserAction::GoalPause,
+                GoalSlashCommand::Resume => UserAction::GoalResume,
+            };
+            state.status = AppStatus::Running;
+            let _ = action_tx.send(action);
+        }
         SlashCommand::WorkflowList => {
             state.show_workflows();
         }

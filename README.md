@@ -33,7 +33,7 @@ Set `INSTALL_DIR` to choose a destination and `ORCA_VERSION` to pin a version:
 
 ```bash
 curl -fsSL https://orcaagent.dev/install.sh | \
-  INSTALL_DIR=/usr/local/bin ORCA_VERSION=0.1.3 sh
+  INSTALL_DIR=/usr/local/bin ORCA_VERSION=0.1.4 sh
 ```
 
 ### GitHub Releases
@@ -159,6 +159,23 @@ orca --session-picker
 
 In the TUI, `Esc` during an idle composer backtracks to the previous user message and places that prompt back in the input box for editing and re-asking.
 
+## Persistent Goal Mode
+
+TUI sessions support Codex-style persistent goals with `/goal`. A goal is stored by session id in `~/.orca/goals_1.json` or `$ORCA_HOME/goals_1.json`, so it survives process restarts when the session is saved.
+
+```text
+/goal                         # show the current goal
+/goal ship the refactor       # create or replace the active goal and start it
+/goal edit finish the parser  # update the objective and reactivate it
+/goal pause                   # stop automatic continuation
+/goal resume                  # reactivate and continue when idle
+/goal clear                   # delete the goal for this session
+```
+
+While a goal is active, Orca automatically starts another turn after a successful turn and injects goal-mode instructions as pinned context. The loop stops when the goal is paused, cleared, blocked, completed, budget-limited, interrupted, or reaches the continuation cap. The model can stop the loop with the `update_goal` tool by setting status `complete` or `blocked`.
+
+Persistent goals require recorded history. If history is disabled with `--no-history`, `/goal` reports an error instead of creating ephemeral goal state.
+
 ## Tools
 
 Built-in tools:
@@ -170,13 +187,19 @@ Built-in tools:
 | `grep` | Search with ripgrep (regex, line numbers) |
 | `bash` | Execute shell commands via `sh -c` |
 | `edit` | Exact text replacement in files |
+| `write_file` | Create or overwrite a file |
 | `git_status` | Show git working tree status |
+| `web_search` | Search the web for current information |
 | `subagent` | Run a synchronous child agent for a delegated task |
+| `Workflow` | Launch a background dynamic workflow |
+| `update_plan` | Update the visible task plan |
+| `update_goal` | Update active persistent goal status from goal mode |
 
 ## Architecture
 
 - **Agent Loop**: prompt → model → tool_call → execute → feed result → next turn (up to 128 turns)
 - **Subagents**: Synchronous child agent loops share the parent workspace, provider/model config, and approval policy, then return a concise result to the parent
+- **Persistent Goal Mode**: TUI sessions can persist a long-running objective, auto-continue successful turns, and stop through `/goal` controls or the `update_goal` tool
 - **SSE Streaming**: Real-time reasoning and content deltas via Server-Sent Events
 - **Context Window**: 128K tokens, 80% threshold compaction (preserves system + recent messages)
 - **Conversation History**: Local JSONL transcripts support listing, inspection, resume/fork, full-text search, archive/delete/rename, and zstd compression
@@ -211,4 +234,4 @@ Event types: `session.started`, `turn.started`, `assistant.reasoning.delta`, `as
 
 ## Status
 
-Production-ready agent loop with DeepSeek streaming provider. All 7 tools implemented, multi-turn conversation with context management, subagents, approval policies, and verification support.
+Production-ready agent loop with DeepSeek streaming provider. Core tools, multi-turn conversation, persistent goals, context management, subagents, workflows, approval policies, and verification support are implemented.

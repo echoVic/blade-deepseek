@@ -15,6 +15,7 @@ pub mod list_files;
 pub mod read_file;
 pub mod registry;
 pub mod sandbox;
+pub mod update_goal;
 pub mod update_plan;
 pub mod web_search;
 pub mod write_file;

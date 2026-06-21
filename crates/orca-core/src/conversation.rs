@@ -105,6 +105,15 @@ impl Conversation {
         self.messages.push(Message::pinned_system(content));
     }
 
+    pub fn replace_goal_state(&mut self, content: String) {
+        self.messages.retain(|msg| {
+            !matches!(msg, Message::System { content: c, pinned: true, .. } if c.starts_with("[Pinned goal state]"))
+        });
+        self.messages.push(Message::pinned_system(format!(
+            "[Pinned goal state]\n{content}"
+        )));
+    }
+
     pub fn add_user(&mut self, content: String) {
         self.messages.push(Message::user(content));
     }
@@ -188,6 +197,18 @@ mod tests {
         conv.add_user_pinned("keep this constraint".to_string());
 
         assert!(conv.messages[0].is_pinned());
+    }
+
+    #[test]
+    fn replace_goal_state_keeps_single_pinned_goal() {
+        let mut conv = Conversation::new();
+        conv.replace_goal_state("first".to_string());
+        conv.replace_goal_state("second".to_string());
+
+        assert_eq!(conv.messages.len(), 1);
+        assert!(
+            matches!(&conv.messages[0], Message::System { content, pinned: true } if content.contains("second"))
+        );
     }
 
     #[test]

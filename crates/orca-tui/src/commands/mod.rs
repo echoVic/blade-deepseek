@@ -9,9 +9,20 @@ pub enum SlashCommand {
     History,
     Mode(Option<String>),
     Plan(Option<String>),
+    Goal(GoalSlashCommand),
     WorkflowList,
     Remember(String),
     Exit,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GoalSlashCommand {
+    Show,
+    Set(String),
+    Edit(String),
+    Clear,
+    Pause,
+    Resume,
 }
 
 pub fn parse(input: &str) -> Option<SlashCommand> {
@@ -33,6 +44,7 @@ pub fn parse(input: &str) -> Option<SlashCommand> {
             parts.next().map(|mode| mode.to_string()),
         )),
         "plan" => Some(SlashCommand::Plan(parts.next().map(str::to_string))),
+        "goal" => parse_goal(parts.collect::<Vec<_>>().join(" ")).map(SlashCommand::Goal),
         "workflows" => Some(SlashCommand::WorkflowList),
         "remember" => {
             let note = parts.collect::<Vec<_>>().join(" ");
@@ -57,11 +69,37 @@ pub fn all_commands() -> &'static [(&'static str, &'static str)] {
         ("/config show", "Show merged config"),
         ("/mode", "Switch approval mode"),
         ("/plan", "Toggle plan mode"),
+        ("/goal", "Manage a persistent goal"),
         ("/workflows", "Show workflow tasks"),
         ("/remember", "Save a note to memory"),
         ("/history", "Browse session history"),
         ("/exit", "Exit Orca"),
     ]
+}
+
+fn parse_goal(args: String) -> Option<GoalSlashCommand> {
+    let trimmed = args.trim();
+    if trimmed.is_empty() {
+        return Some(GoalSlashCommand::Show);
+    }
+    match trimmed {
+        "clear" => Some(GoalSlashCommand::Clear),
+        "pause" => Some(GoalSlashCommand::Pause),
+        "resume" => Some(GoalSlashCommand::Resume),
+        "edit" => None,
+        _ => {
+            if let Some(rest) = trimmed.strip_prefix("edit ") {
+                let objective = rest.trim();
+                if objective.is_empty() {
+                    None
+                } else {
+                    Some(GoalSlashCommand::Edit(objective.to_string()))
+                }
+            } else {
+                Some(GoalSlashCommand::Set(trimmed.to_string()))
+            }
+        }
+    }
 }
 
 pub fn available_models() -> &'static [&'static str] {
@@ -92,6 +130,39 @@ mod tests {
             parse("/plan off"),
             Some(SlashCommand::Plan(Some("off".to_string())))
         );
+    }
+
+    #[test]
+    fn parses_goal_commands() {
+        assert_eq!(
+            parse("/goal"),
+            Some(SlashCommand::Goal(GoalSlashCommand::Show))
+        );
+        assert_eq!(
+            parse("/goal ship it"),
+            Some(SlashCommand::Goal(GoalSlashCommand::Set(
+                "ship it".to_string()
+            )))
+        );
+        assert_eq!(
+            parse("/goal edit better goal"),
+            Some(SlashCommand::Goal(GoalSlashCommand::Edit(
+                "better goal".to_string()
+            )))
+        );
+        assert_eq!(
+            parse("/goal clear"),
+            Some(SlashCommand::Goal(GoalSlashCommand::Clear))
+        );
+        assert_eq!(
+            parse("/goal pause"),
+            Some(SlashCommand::Goal(GoalSlashCommand::Pause))
+        );
+        assert_eq!(
+            parse("/goal resume"),
+            Some(SlashCommand::Goal(GoalSlashCommand::Resume))
+        );
+        assert_eq!(parse("/goal edit"), None);
     }
 
     #[test]

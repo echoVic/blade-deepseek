@@ -40,6 +40,10 @@ impl CostTracker {
         self.totals.cache_tokens += other.totals.cache_tokens;
         self.totals.estimated_cost_usd += other.totals.estimated_cost_usd;
     }
+
+    pub fn totals(&self) -> UsageTotals {
+        self.totals
+    }
 }
 
 impl ModelPricing {

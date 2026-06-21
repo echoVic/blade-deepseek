@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender};
 use std::thread;
 
@@ -7,6 +8,7 @@ use orca_core::approval_types::{ApprovalDecision, ApprovalRequest};
 use orca_core::cancel::CancelToken;
 use orca_core::config::RunConfig;
 use orca_core::conversation::Conversation;
+use orca_core::cost_types::UsageTotals;
 use orca_core::hook_types::HookEvent;
 use orca_core::model::ModelRouteContext;
 use orca_core::provider_types::ProviderStep;
@@ -44,6 +46,7 @@ struct TuiAgentResult {
 pub struct TuiConversationSession {
     conversation: Conversation,
     writer: Option<SessionWriter>,
+    session_id: Option<String>,
     instructions: ProjectInstructions,
     cost_tracker: CostTracker,
     mcp_registry: McpRegistry,
@@ -90,6 +93,7 @@ impl TuiConversationSession {
             }
         };
 
+        let mut session_id = None;
         let writer = match &config.history_mode {
             orca_core::config::HistoryMode::Disabled => None,
             orca_core::config::HistoryMode::Record | orca_core::config::HistoryMode::Resume(_) => {
@@ -99,6 +103,7 @@ impl TuiConversationSession {
                     config.model.as_history_value(),
                     prompt_for_title,
                 );
+                session_id = Some(meta.session_id.clone());
                 start_writer_with_messages(meta, &conversation)
             }
             orca_core::config::HistoryMode::Fork(_) => {
@@ -112,6 +117,7 @@ impl TuiConversationSession {
                     prompt_for_title,
                     parent_id,
                 );
+                session_id = Some(meta.session_id.clone());
                 start_writer_with_messages(meta, &conversation)
             }
         };
@@ -119,12 +125,21 @@ impl TuiConversationSession {
         Ok(Self {
             conversation,
             writer,
+            session_id,
             instructions,
             cost_tracker: CostTracker::new(None),
             mcp_registry,
             hooks,
             memory,
         })
+    }
+
+    pub fn session_id(&self) -> Option<&str> {
+        self.session_id.as_deref()
+    }
+
+    pub fn usage_totals(&self) -> UsageTotals {
+        self.cost_tracker.totals()
     }
 
     fn append_message(&mut self, message: &orca_core::conversation::Message) {
@@ -157,6 +172,10 @@ impl TuiConversationSession {
         if let Some(message) = self.conversation.messages.last().cloned() {
             self.append_message(&message);
         }
+    }
+
+    pub fn replace_goal_context(&mut self, content: String) {
+        self.conversation.replace_goal_state(content);
     }
 
     pub fn compact(&mut self, config: &RunConfig, cwd: &Path) -> (usize, usize) {
@@ -260,7 +279,7 @@ pub fn run_agent_for_tui(
     event_tx: &Sender<TuiEvent>,
     action_rx: &Receiver<UserAction>,
     cancel: &CancelToken,
-) {
+) -> String {
     let cwd = config
         .cwd
         .clone()
@@ -299,7 +318,7 @@ pub fn run_agent_for_tui(
                 status: "budget_exhausted".to_string(),
             });
             session.complete("budget_exhausted");
-            return;
+            return "budget_exhausted".to_string();
         }
 
         if orca_provider::context::needs_compaction(&session.conversation, &ctx_config) {
@@ -412,7 +431,7 @@ pub fn run_agent_for_tui(
                     status: "failed".to_string(),
                 });
                 session.complete("failed");
-                return;
+                return "failed".to_string();
             }
         };
         let model_conversation =
@@ -471,7 +490,7 @@ pub fn run_agent_for_tui(
                     status: "budget_exhausted".to_string(),
                 });
                 session.complete("budget_exhausted");
-                return;
+                return "budget_exhausted".to_string();
             }
         }
 
@@ -480,7 +499,7 @@ pub fn run_agent_for_tui(
                 status: "interrupted".to_string(),
             });
             session.complete("interrupted");
-            return;
+            return "interrupted".to_string();
         }
 
         if let Some(error) = response.steps.iter().find_map(|step| match step {
@@ -513,7 +532,7 @@ pub fn run_agent_for_tui(
                 status: "failed".to_string(),
             });
             session.complete("failed");
-            return;
+            return "failed".to_string();
         }
 
         reactive_compacted = false;
@@ -551,7 +570,7 @@ pub fn run_agent_for_tui(
                 status: "success".to_string(),
             });
             session.complete("success");
-            return;
+            return "success".to_string();
         }
 
         session.conversation.add_assistant(
@@ -599,7 +618,7 @@ pub fn run_agent_for_tui(
                             status: "approval_required".to_string(),
                         });
                         session.complete("approval_required");
-                        return;
+                        return "approval_required".to_string();
                     }
                 }
                 index = batch_end;
@@ -643,6 +662,7 @@ pub fn run_agent_for_tui(
                 event_tx,
                 action_rx,
                 0,
+                session.session_id.as_deref(),
                 &policy,
                 &session.instructions,
                 &session.memory,
@@ -683,7 +703,7 @@ pub fn run_agent_for_tui(
                     status: "approval_required".to_string(),
                 });
                 session.complete("approval_required");
-                return;
+                return "approval_required".to_string();
             }
             index += 1;
         }
@@ -903,6 +923,7 @@ fn execute_tool_for_tui(
     event_tx: &Sender<TuiEvent>,
     action_rx: &Receiver<UserAction>,
     subagent_depth: u32,
+    session_id: Option<&str>,
     policy: &ApprovalPolicy,
     instructions: &ProjectInstructions,
     memory: &MemoryBlock,
@@ -1047,6 +1068,32 @@ fn execute_tool_for_tui(
                 tool_types::MAX_TOOL_OUTPUT_BYTES,
                 &mut on_output,
             )
+        } else if execution_request.name == tool_types::ToolName::UpdateGoal {
+            let Some(session_id) = session_id.map(str::to_string) else {
+                return (
+                    true,
+                    tool_types::ToolResult::failed(
+                        execution_request,
+                        "update_goal requires a persistent goal session",
+                        None,
+                    ),
+                    None,
+                );
+            };
+            let handler = Arc::new(move |update: orca_core::goal_types::GoalUpdate| {
+                let mut store = orca_runtime::goals::GoalStore::load_default();
+                store
+                    .update(&session_id, update)
+                    .map_err(|error| error.to_string())
+            });
+            orca_tools::update_goal::with_goal_update_handler(handler, || {
+                orca_tools::execute_with_mcp_and_external(
+                    execution_request,
+                    cwd,
+                    mcp_registry,
+                    &config.external_tools,
+                )
+            })
         } else {
             orca_tools::execute_with_mcp_and_external(
                 execution_request,
@@ -1446,6 +1493,7 @@ fn run_child_agent_for_tui(
                     event_tx,
                     action_rx,
                     subagent_depth,
+                    None,
                     &policy,
                     instructions,
                     memory,

@@ -109,9 +109,14 @@ Built-in tools:
 | `list_files` | read | Lists one directory, sorted names |
 | `grep` | read | Regex search via `rg` with line numbers, `(no matches)` for empty results |
 | `git_status` | read | Runs `git status --short` |
+| `web_search` | network | Searches the web for current information |
 | `bash` | shell | Executes via `sh -c`, requires approval unless `full-auto` |
 | `edit` | write | Exact text replacement, requires approval unless `full-auto` |
-| `subagent` | read | Runs a synchronous child agent with `description` and `prompt`, returning the child summary |
+| `write_file` | write | Creates or overwrites a file, requires approval unless `full-auto` |
+| `subagent` | agent | Runs a synchronous child agent with `description` and `prompt`, returning the child summary |
+| `Workflow` | agent | Starts a background dynamic workflow |
+| `update_plan` | read | Updates the visible plan state |
+| `update_goal` | read | Updates the active persistent goal while goal mode is running |
 
 Tool events:
 - `tool.call.requested` — emitted before execution, contains `name`, `action`, `target`
@@ -133,6 +138,12 @@ Hook stdout protocol:
 Subagent events:
 - `subagent.started` — emitted when the child agent starts, contains `id`, `description`
 - `subagent.completed` — emitted when the child agent finishes, contains `id`, `description`, `status`, `output`, `error`
+
+Persistent goal mode:
+- `/goal` is a TUI feature, not a headless `orca exec` contract.
+- Goals are keyed by saved TUI session id and stored in `$ORCA_HOME/goals_1.json` or `~/.orca/goals_1.json`.
+- `update_goal` is advertised as a tool, but it only succeeds while a TUI goal turn has installed goal context. Outside goal mode it returns a failed tool result.
+- Active goals auto-continue after successful turns until the status becomes `paused`, `blocked`, `usage_limited`, `budget_limited`, or `complete`.
 
 ## Approval Policy
 

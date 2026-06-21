@@ -2,6 +2,7 @@ use std::sync::mpsc;
 use std::time::Instant;
 
 use orca_core::cost_types::UsageTotals;
+use orca_core::goal_types::ThreadGoal;
 use orca_core::plan_types::PlanItem;
 use orca_core::task_types::BackgroundTaskSummary;
 use orca_runtime::history::SessionSummary;
@@ -60,6 +61,9 @@ pub enum TuiEvent {
         before_messages: usize,
         after_messages: usize,
     },
+    GoalUpdated(ThreadGoal),
+    GoalCleared,
+    GoalStatus(Option<ThreadGoal>),
     Backtracked {
         prompt: String,
     },
@@ -71,6 +75,12 @@ pub enum UserAction {
     SetModel(String),
     Remember(String),
     Compact,
+    GoalShow,
+    GoalSet(String),
+    GoalEdit(String),
+    GoalClear,
+    GoalPause,
+    GoalResume,
     Approve(bool),
     Backtrack,
     Interrupt,
@@ -179,6 +189,7 @@ pub struct AppState {
     pub mention_candidates: Vec<String>,
     pub mention_selected: usize,
     pub current_plan: Option<(Option<String>, Vec<PlanItem>)>,
+    pub current_goal: Option<ThreadGoal>,
     pub panel_mode: PanelMode,
     pub workflow_panel: WorkflowPanelState,
     pub tick: u64,
@@ -210,6 +221,7 @@ impl AppState {
             mention_candidates: Vec::new(),
             mention_selected: 0,
             current_plan: None,
+            current_goal: None,
             panel_mode: PanelMode::Conversation,
             workflow_panel: WorkflowPanelState::default(),
             tick: 0,
@@ -511,6 +523,35 @@ impl AppState {
                 self.messages.push(ChatMessage::System(format!(
                     "Compacted conversation context: {before_messages} -> {after_messages} messages."
                 )));
+                self.status = AppStatus::Idle;
+            }
+            TuiEvent::GoalUpdated(goal) => {
+                let summary = orca_core::goal_types::goal_usage_summary(&goal);
+                let label = orca_core::goal_types::goal_status_label(goal.status);
+                self.current_goal = Some(goal);
+                self.messages
+                    .push(ChatMessage::System(format!("Goal {label}. {summary}")));
+                self.status = AppStatus::Idle;
+            }
+            TuiEvent::GoalCleared => {
+                self.current_goal = None;
+                self.messages
+                    .push(ChatMessage::System("Goal cleared.".to_string()));
+                self.status = AppStatus::Idle;
+            }
+            TuiEvent::GoalStatus(goal) => {
+                self.current_goal = goal.clone();
+                match goal {
+                    Some(goal) => {
+                        let label = orca_core::goal_types::goal_status_label(goal.status);
+                        let summary = orca_core::goal_types::goal_usage_summary(&goal);
+                        self.messages
+                            .push(ChatMessage::System(format!("Goal {label}. {summary}")));
+                    }
+                    None => self
+                        .messages
+                        .push(ChatMessage::System("No goal is currently set.".to_string())),
+                }
                 self.status = AppStatus::Idle;
             }
             TuiEvent::Backtracked { prompt } => {

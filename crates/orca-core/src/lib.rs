@@ -7,6 +7,7 @@ pub mod cost_types;
 pub mod event_schema;
 pub mod event_sink;
 pub mod external_config;
+pub mod goal_types;
 pub mod hook_types;
 pub mod mcp_types;
 pub mod model;
