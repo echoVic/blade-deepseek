@@ -185,6 +185,7 @@ pub struct AppState {
     pub last_ctrl_c: Option<Instant>,
     pub session_picker_sessions: Vec<SessionSummary>,
     pub session_picker_selected: usize,
+    pub session_picker_query: String,
     pub usage: UsageTotals,
     pub slash_menu: Option<SlashMenu>,
     pub mention_candidates: Vec<String>,
@@ -223,6 +224,7 @@ impl AppState {
             last_ctrl_c: None,
             session_picker_sessions: Vec::new(),
             session_picker_selected: 0,
+            session_picker_query: String::new(),
             usage: UsageTotals::default(),
             slash_menu: None,
             mention_candidates: Vec::new(),
@@ -338,13 +340,62 @@ impl AppState {
         self.draft_before_history = None;
     }
 
+    /// Indices into `session_picker_sessions` whose title matches the current
+    /// query (case-insensitive substring). Empty query matches everything.
+    pub fn filtered_session_indices(&self) -> Vec<usize> {
+        if self.session_picker_query.is_empty() {
+            return (0..self.session_picker_sessions.len()).collect();
+        }
+        let needle = self.session_picker_query.to_lowercase();
+        self.session_picker_sessions
+            .iter()
+            .enumerate()
+            .filter(|(_, session)| session.title.to_lowercase().contains(&needle))
+            .map(|(index, _)| index)
+            .collect()
+    }
+
     pub fn select_previous_session(&mut self) {
-        self.session_picker_selected = self.session_picker_selected.saturating_sub(1);
+        let filtered = self.filtered_session_indices();
+        if filtered.is_empty() {
+            return;
+        }
+        let pos = filtered
+            .iter()
+            .position(|&i| i == self.session_picker_selected)
+            .unwrap_or(0);
+        let new_pos = pos.saturating_sub(1);
+        self.session_picker_selected = filtered[new_pos];
     }
 
     pub fn select_next_session(&mut self) {
-        if self.session_picker_selected + 1 < self.session_picker_sessions.len() {
-            self.session_picker_selected += 1;
+        let filtered = self.filtered_session_indices();
+        if filtered.is_empty() {
+            return;
+        }
+        let pos = filtered
+            .iter()
+            .position(|&i| i == self.session_picker_selected)
+            .unwrap_or(0);
+        let new_pos = (pos + 1).min(filtered.len() - 1);
+        self.session_picker_selected = filtered[new_pos];
+    }
+
+    /// Append a character to the search query and reset selection to the first
+    /// match so the highlighted row is always within the filtered set.
+    pub fn session_query_push(&mut self, ch: char) {
+        self.session_picker_query.push(ch);
+        self.reset_session_selection_to_first_match();
+    }
+
+    pub fn session_query_pop(&mut self) {
+        self.session_picker_query.pop();
+        self.reset_session_selection_to_first_match();
+    }
+
+    fn reset_session_selection_to_first_match(&mut self) {
+        if let Some(&first) = self.filtered_session_indices().first() {
+            self.session_picker_selected = first;
         }
     }
 
@@ -605,6 +656,57 @@ mod tests {
             "mock".to_string(),
             "/tmp".to_string(),
         )
+    }
+
+    fn session(id: &str, title: &str) -> SessionSummary {
+        use chrono::Utc;
+        use std::path::PathBuf;
+        SessionSummary {
+            session_id: id.to_string(),
+            title: title.to_string(),
+            cwd: "/tmp".to_string(),
+            provider: "deepseek".to_string(),
+            model: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            path: PathBuf::from("/tmp"),
+            archived: false,
+            parent_id: None,
+            forked: false,
+        }
+    }
+
+    #[test]
+    fn session_search_filters_by_title_and_keeps_selection_valid() {
+        let mut state = state();
+        state.session_picker_sessions = vec![
+            session("a", "fix the failing auth test"),
+            session("b", "add JWT auth middleware"),
+            session("c", "refactor parser entrypoint"),
+        ];
+        state.session_picker_selected = 0;
+
+        // No query → all match.
+        assert_eq!(state.filtered_session_indices(), vec![0, 1, 2]);
+
+        // Typing "auth" keeps only the two auth sessions and snaps selection
+        // to the first match.
+        for ch in "auth".chars() {
+            state.session_query_push(ch);
+        }
+        assert_eq!(state.filtered_session_indices(), vec![0, 1]);
+        assert_eq!(state.session_picker_selected, 0);
+
+        // Down moves within the filtered set, not the raw list.
+        state.select_next_session();
+        assert_eq!(state.session_picker_selected, 1);
+        state.select_next_session();
+        assert_eq!(state.session_picker_selected, 1); // clamped to last match
+
+        // Backspace widens the filter again.
+        state.session_query_pop();
+        assert_eq!(state.session_picker_query, "aut");
+        assert_eq!(state.filtered_session_indices(), vec![0, 1]);
     }
 
     #[test]

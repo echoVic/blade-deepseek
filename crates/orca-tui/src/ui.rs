@@ -27,8 +27,10 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
     let input_height = input_lines + 2;
 
     let plan_height = plan_panel_height(state);
+    let goal_height: u16 = if state.current_goal.is_some() { 3 } else { 0 };
 
     let chunks = Layout::vertical([
+        Constraint::Length(goal_height),
         Constraint::Min(5),
         Constraint::Length(plan_height),
         Constraint::Length(input_height),
@@ -36,22 +38,25 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
     ])
     .split(frame.area());
 
+    if goal_height > 0 {
+        render_goal_banner(frame, chunks[0], state, theme);
+    }
     match state.panel_mode {
-        PanelMode::Conversation => render_messages(frame, chunks[0], state, theme),
-        PanelMode::Workflows => render_workflows_panel(frame, chunks[0], state, theme),
+        PanelMode::Conversation => render_messages(frame, chunks[1], state, theme),
+        PanelMode::Workflows => render_workflows_panel(frame, chunks[1], state, theme),
     }
     if plan_height > 0 {
-        render_plan_panel(frame, chunks[1], state, theme);
+        render_plan_panel(frame, chunks[2], state, theme);
     }
-    render_input(frame, chunks[2], textarea);
-    render_status(frame, chunks[3], state, theme);
+    render_input(frame, chunks[3], textarea);
+    render_status(frame, chunks[4], state, theme);
 
     if state.slash_menu.is_some() {
-        render_slash_menu(frame, chunks[2], state, theme);
+        render_slash_menu(frame, chunks[3], state, theme);
     }
 
     if !state.mention_candidates.is_empty() && state.slash_menu.is_none() {
-        render_mention_candidates(frame, chunks[2], state, theme);
+        render_mention_candidates(frame, chunks[3], state, theme);
     }
 
     if state.status == AppStatus::WaitingApproval {
@@ -63,6 +68,67 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
     }
 }
 
+fn render_goal_banner(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    use orca_core::goal_types::{
+        ThreadGoalStatus, format_goal_elapsed_seconds, format_tokens_compact, goal_status_label,
+    };
+
+    let Some(goal) = &state.current_goal else {
+        return;
+    };
+
+    let status_color = match goal.status {
+        ThreadGoalStatus::Active => theme.success,
+        ThreadGoalStatus::Paused => theme.warning,
+        ThreadGoalStatus::Blocked => theme.error,
+        ThreadGoalStatus::UsageLimited | ThreadGoalStatus::BudgetLimited => theme.warning,
+        ThreadGoalStatus::Complete => theme.success,
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title(" ⌖ Goal ")
+        .border_style(Style::default().fg(theme.border));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    // Truncate the objective to a single line; real usage stats follow.
+    let objective = goal.objective.replace('\n', " ");
+    let mut spans = vec![
+        Span::styled(
+            objective,
+            Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("  ", Style::default()),
+        Span::styled(
+            format!("● {}", goal_status_label(goal.status)),
+            Style::default().fg(status_color),
+        ),
+    ];
+    if goal.time_used_seconds > 0 {
+        spans.push(Span::styled(
+            format!("  · {}", format_goal_elapsed_seconds(goal.time_used_seconds)),
+            Style::default().fg(theme.muted),
+        ));
+    }
+    if goal.tokens_used > 0 {
+        spans.push(Span::styled(
+            format!("  · {} tok", format_tokens_compact(goal.tokens_used)),
+            Style::default().fg(theme.muted),
+        ));
+    }
+    if goal.status.should_continue() {
+        spans.push(Span::styled(
+            "  · auto-continue",
+            Style::default().fg(theme.muted),
+        ));
+    }
+
+    let paragraph = Paragraph::new(Line::from(spans)).wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, inner);
+}
+
 fn render_session_picker(frame: &mut Frame, state: &mut AppState, theme: &Theme) {
     let area = frame.area();
     let block = Block::default()
@@ -72,39 +138,99 @@ fn render_session_picker(frame: &mut Frame, state: &mut AppState, theme: &Theme)
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    let filtered = state.filtered_session_indices();
+    let total = state.session_picker_sessions.len();
+
     let mut lines = Vec::new();
+
+    // Search field: live query + match count.
+    let query_display = if state.session_picker_query.is_empty() {
+        Span::styled("type to filter…", Style::default().fg(theme.muted))
+    } else {
+        Span::styled(
+            state.session_picker_query.clone(),
+            Style::default().fg(theme.text),
+        )
+    };
+    lines.push(Line::from(vec![
+        Span::styled("⌕ ", Style::default().fg(theme.border)),
+        query_display,
+        Span::styled(
+            format!("    {}/{} matches", filtered.len(), total),
+            Style::default().fg(theme.muted),
+        ),
+    ]));
     lines.push(Line::from(Span::styled(
-        "Enter resume · n new session · Esc quit",
+        "↑↓ select · Enter resume · Backspace edit · Esc quit",
         Style::default().fg(theme.muted),
     )));
     lines.push(Line::from(""));
 
-    for (index, session) in state.session_picker_sessions.iter().enumerate() {
+    if filtered.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  No sessions match this filter.",
+            Style::default().fg(theme.muted),
+        )));
+    }
+
+    let needle = state.session_picker_query.to_lowercase();
+    for &index in &filtered {
+        let session = &state.session_picker_sessions[index];
         let selected = index == state.session_picker_selected;
         let marker = if selected { "> " } else { "  " };
-        let style = if selected {
+        let base = if selected {
             Style::default()
                 .fg(theme.border)
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(theme.text)
         };
-        lines.push(Line::from(vec![
-            Span::styled(marker, style),
-            Span::styled(session.title.clone(), style),
-            Span::styled(
-                format!(
-                    "  {}  {}",
-                    session.updated_at.format("%Y-%m-%d %H:%M"),
-                    session.provider
-                ),
-                Style::default().fg(theme.muted),
+
+        let mut spans = vec![Span::styled(marker, base)];
+        // Highlight the matched substring inside the title.
+        spans.extend(highlight_match(&session.title, &needle, base, theme));
+        spans.push(Span::styled(
+            format!(
+                "  {}  {}",
+                session.updated_at.format("%Y-%m-%d %H:%M"),
+                session.provider
             ),
-        ]));
+            Style::default().fg(theme.muted),
+        ));
+        lines.push(Line::from(spans));
     }
 
     let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
     frame.render_widget(paragraph, inner);
+}
+
+/// Split `text` into styled spans, highlighting the first case-insensitive
+/// occurrence of `needle` with the theme warning color. Empty needle returns
+/// the whole text in `base` style.
+fn highlight_match(
+    text: &str,
+    needle: &str,
+    base: Style,
+    theme: &Theme,
+) -> Vec<Span<'static>> {
+    if needle.is_empty() {
+        return vec![Span::styled(text.to_string(), base)];
+    }
+    let lower = text.to_lowercase();
+    let Some(start) = lower.find(needle) else {
+        return vec![Span::styled(text.to_string(), base)];
+    };
+    let end = start + needle.len();
+    let hl = base.fg(theme.warning).add_modifier(Modifier::BOLD);
+    let mut spans = Vec::new();
+    if start > 0 {
+        spans.push(Span::styled(text[..start].to_string(), base));
+    }
+    spans.push(Span::styled(text[start..end].to_string(), hl));
+    if end < text.len() {
+        spans.push(Span::styled(text[end..].to_string(), base));
+    }
+    spans
 }
 
 fn render_messages(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) {

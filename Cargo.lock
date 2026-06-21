@@ -1129,6 +1129,7 @@ dependencies = [
 name = "orca-tui"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "crossterm",
  "orca-approval",
  "orca-core",

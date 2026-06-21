@@ -315,14 +315,8 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                     match key.code {
                         KeyCode::Up => state.select_previous_session(),
                         KeyCode::Down => state.select_next_session(),
-                        KeyCode::Char('n') | KeyCode::Char('N') => {
-                            state.status = AppStatus::Idle;
-                            state.session_picker_sessions.clear();
-                            config.history_mode = HistoryMode::Record;
-                            if let Ok(mut cfg) = shared_config.lock() {
-                                cfg.history_mode = HistoryMode::Record;
-                            }
-                        }
+                        KeyCode::Backspace => state.session_query_pop(),
+                        KeyCode::Char(c) => state.session_query_push(c),
                         KeyCode::Enter => {
                             if let Some(session_id) = state.selected_session_id() {
                                 config.history_mode = HistoryMode::Resume(session_id.clone());
@@ -357,6 +351,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                         KeyCode::Esc => {
                             state.status = AppStatus::Idle;
                             state.session_picker_sessions.clear();
+                            state.session_picker_query.clear();
                         }
                         _ => {}
                     }
