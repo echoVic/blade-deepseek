@@ -4,7 +4,7 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-06-22
-Current baseline: v0.1.13 model runtime context baseline
+Current baseline: v0.1.14 runtime posture summary baseline
 
 ---
 
@@ -90,7 +90,7 @@ before adding larger ecosystem features.
 
 ### P2: User and Workflow Ergonomics
 
-**Release target:** v0.1.13
+**Release target:** v0.1.14-v0.1.16
 
 **Goal:** close the highest-value daily-use gaps visible from Codex and Claude
 without destabilizing core runtime behavior.
@@ -100,7 +100,7 @@ without destabilizing core runtime behavior.
 1. Fuzzy file search for TUI `@mention` and file discovery.
    - Use `.gitignore`-aware traversal.
    - Prefer a small crate boundary so provider/runtime do not own fuzzy matching.
-2. Sandbox/config summary.
+2. Sandbox/config summary. `/config show` runtime posture summary done in v0.1.14.
    - Show current approval mode, filesystem scope, network posture, and key limits in `/config show`.
    - Reuse the summary in startup/session events where appropriate.
 3. Structured user question tool.
@@ -115,7 +115,7 @@ without destabilizing core runtime behavior.
 
 ### Skills System
 
-**Release target:** v0.1.14
+**Release target:** v0.1.17
 
 **Goal:** add a first-class skill system that can load human-readable procedures
 from user and project directories and inject only relevant skill instructions.

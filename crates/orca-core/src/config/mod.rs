@@ -201,6 +201,7 @@ pub fn format_config_show(config: &RunConfig) -> String {
         .max_budget_usd
         .map(|budget| budget.to_string())
         .unwrap_or_else(|| "<unset>".to_string());
+    let runtime = runtime_summary(config);
 
     format!(
         concat!(
@@ -219,6 +220,16 @@ pub fn format_config_show(config: &RunConfig) -> String {
             "update_check = {}\n",
             "desktop_notifications = {}\n",
             "auto_memory = {}\n",
+            "\n",
+            "[runtime]\n",
+            "approval = \"{}\"\n",
+            "filesystem = \"{}\"\n",
+            "network = \"{}\"\n",
+            "history = \"{}\"\n",
+            "context_window = \"{}\"\n",
+            "auto_compact_token_limit = \"{}\"\n",
+            "tool_output_truncation = \"{}\"\n",
+            "workflow_agents = \"{}\"\n",
             "\n",
             "[tools]\n",
             "max_read_parallel = {}\n",
@@ -257,6 +268,14 @@ pub fn format_config_show(config: &RunConfig) -> String {
         config.update_check,
         config.desktop_notifications,
         config.auto_memory,
+        runtime.approval,
+        runtime.filesystem,
+        runtime.network,
+        runtime.history,
+        runtime.context_window,
+        runtime.auto_compact_token_limit,
+        runtime.tool_output_truncation,
+        runtime.workflow_agents,
         config.tools.max_read_parallel,
         config.tools.output_truncation,
         config.subagents.max_depth,
@@ -266,6 +285,66 @@ pub fn format_config_show(config: &RunConfig) -> String {
         config.hooks.len(),
         config.permission_rules.rules.len()
     )
+}
+
+struct RuntimeSummary {
+    approval: &'static str,
+    filesystem: &'static str,
+    network: &'static str,
+    history: &'static str,
+    context_window: String,
+    auto_compact_token_limit: String,
+    tool_output_truncation: String,
+    workflow_agents: String,
+}
+
+fn runtime_summary(config: &RunConfig) -> RuntimeSummary {
+    RuntimeSummary {
+        approval: config.approval_mode.as_str(),
+        filesystem: filesystem_posture(config.approval_mode),
+        network: network_posture(config),
+        history: history_posture(&config.history_mode),
+        context_window: config
+            .model_runtime
+            .context_window
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "<model-default>".to_string()),
+        auto_compact_token_limit: config
+            .model_runtime
+            .auto_compact_token_limit
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "<model-default>".to_string()),
+        tool_output_truncation: config.tools.output_truncation.to_string(),
+        workflow_agents: format!(
+            "max_parallel={}, max_per_run={}",
+            config.workflows.max_concurrent_agents, config.workflows.max_agents_per_run
+        ),
+    }
+}
+
+fn filesystem_posture(mode: ApprovalMode) -> &'static str {
+    match mode {
+        ApprovalMode::Plan => "read-only",
+        ApprovalMode::Suggest => "approval-required",
+        ApprovalMode::AutoEdit | ApprovalMode::FullAuto => "workspace-write",
+    }
+}
+
+fn network_posture(config: &RunConfig) -> &'static str {
+    if config.provider == ProviderKind::Mock && config.mcp_servers.is_empty() {
+        "not-configured"
+    } else {
+        "allowed"
+    }
+}
+
+fn history_posture(history_mode: &HistoryMode) -> &'static str {
+    match history_mode {
+        HistoryMode::Record => "recording",
+        HistoryMode::Disabled => "disabled",
+        HistoryMode::Resume(_) => "resume",
+        HistoryMode::Fork(_) => "fork",
+    }
 }
 
 #[cfg(test)]
@@ -282,7 +361,7 @@ mod tests {
             cwd: None,
             output_format: OutputFormat::Text,
             approval_mode: ApprovalMode::FullAuto,
-            provider: ProviderKind::Mock,
+            provider: ProviderKind::DeepSeekFixture,
             verifier: None,
             model: ModelSelection::from_unchecked(Some("deepseek-v4-flash".to_string())),
             model_runtime: ModelRuntimeConfig {
@@ -314,6 +393,11 @@ mod tests {
         assert!(shown.contains("model_context_window = \"128000\""));
         assert!(shown.contains("model_auto_compact_token_limit = \"96000\""));
         assert!(shown.contains("mode = \"full-auto\""));
+        assert!(shown.contains("[runtime]"));
+        assert!(shown.contains("filesystem = \"workspace-write\""));
+        assert!(shown.contains("network = \"allowed\""));
+        assert!(shown.contains("approval = \"full-auto\""));
+        assert!(shown.contains("history = \"disabled\""));
         assert!(shown.contains("api_key = \"<redacted>\""));
         assert!(!shown.contains("sk-secret"));
     }
