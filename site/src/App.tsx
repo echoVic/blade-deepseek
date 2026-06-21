@@ -190,9 +190,9 @@ function App() {
 
       <section className="hero" id="top">
         <div className="hero-copy">
-          <p className="eyebrow">Blade AI developer runtime</p>
+          <p className="eyebrow">DeepSeek-native coding agent</p>
           <h1>Orca</h1>
-          <p className="subtitle">A DeepSeek-native coding agent runtime by Blade.</p>
+          <p className="subtitle">A local coding agent built for DeepSeek.</p>
           <p className="hero-text">
             Run local coding tasks with streaming reasoning, workflow scripts,
             subagents, approvals, verification commands, and resumable history.
@@ -280,7 +280,7 @@ session.done     tests passed`}</pre>
 
       <section className="features" id="features">
         <div className="section-heading">
-          <p className="eyebrow">Runtime surface</p>
+          <p className="eyebrow">Agent surface</p>
           <h2>Everything a local coding agent needs to take a serious pass.</h2>
         </div>
         <div className="feature-grid">
@@ -329,7 +329,7 @@ $ orca workflow run audit`}</pre>
       </section>
 
       <footer>
-        <span>Orca by Blade</span>
+        <span>Orca</span>
         <div>
           <a href={links.github}>GitHub</a>
           <a href={links.npm}>npm</a>

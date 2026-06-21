@@ -19,7 +19,7 @@ fast, and easy to maintain, while leaving room for docs pages later.
 
 ## Positioning
 
-Orca is a DeepSeek-native coding agent runtime by Blade.
+Orca is a DeepSeek-native coding agent.
 
 The homepage should present Orca as a serious developer tool: terminal-first,
 practical, and capable. The visual tone should be hard-edged and technical,
@@ -100,7 +100,7 @@ The first viewport should make the product obvious immediately.
 Content:
 
 - Headline: "Orca"
-- Subheadline: "A DeepSeek-native coding agent runtime by Blade."
+- Subheadline: "A local coding agent built for DeepSeek."
 - Short value statement focused on local CLI execution, workflows, subagents,
   approvals, verification, and resumable history.
 - Install command block with npm/curl tabs.

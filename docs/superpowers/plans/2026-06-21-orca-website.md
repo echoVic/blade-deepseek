@@ -340,9 +340,9 @@ Create `site/index.html`:
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta
       name="description"
-      content="Orca is a DeepSeek-native coding agent runtime by Blade."
+      content="Orca is a DeepSeek-native coding agent."
     />
-    <title>Orca - DeepSeek-native coding agent runtime</title>
+    <title>Orca - DeepSeek-native coding agent</title>
   </head>
   <body>
     <div id="root"></div>
@@ -496,9 +496,9 @@ function App() {
 
       <section className="hero" id="top">
         <div className="hero-copy">
-          <p className="eyebrow">Blade AI developer runtime</p>
+          <p className="eyebrow">DeepSeek-native coding agent</p>
           <h1>Orca</h1>
-          <p className="subtitle">A DeepSeek-native coding agent runtime by Blade.</p>
+          <p className="subtitle">A local coding agent built for DeepSeek.</p>
           <p className="hero-text">
             Run local coding tasks with streaming reasoning, workflow scripts,
             subagents, approvals, verification commands, and resumable history.
@@ -607,7 +607,7 @@ $ orca workflow run audit`}</pre>
       </section>
 
       <footer>
-        <span>Orca by Blade</span>
+        <span>Orca</span>
         <div>
           <a href={links.github}>GitHub</a>
           <a href={links.npm}>npm</a>

@@ -1,6 +1,6 @@
 # Orca
 
-Orca is a DeepSeek-native coding agent runtime by Blade.
+Orca is a DeepSeek-native coding agent.
 
 A local terminal coding agent built in Rust, focused on DeepSeek reasoning and tool-use semantics. It runs a multi-turn agent loop with SSE streaming, automatic context window management, and HTTP retry with exponential backoff.
 

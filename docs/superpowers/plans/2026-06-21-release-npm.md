@@ -55,7 +55,7 @@ Create `npm/orca/package.json`:
 {
   "name": "@blade-ai/orca",
   "version": "0.0.0-dev",
-  "description": "Orca CLI: a DeepSeek-native coding agent runtime by Blade.",
+  "description": "Orca CLI: a DeepSeek-native coding agent.",
   "license": "MIT",
   "bin": {
     "orca": "bin/orca.js"
@@ -913,7 +913,7 @@ First public release of Orca.
 
 ## Highlights
 
-- DeepSeek-native coding agent runtime.
+- DeepSeek-native coding agent.
 - JSONL event stream for automation.
 - Approval modes and permission rules.
 - Local tool execution with sandboxing.

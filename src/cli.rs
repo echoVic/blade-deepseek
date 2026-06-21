@@ -29,7 +29,7 @@ use crate::tui::app;
 #[derive(Debug, Parser)]
 #[command(name = "orca")]
 #[command(version)]
-#[command(about = "A DeepSeek-native coding agent runtime by Blade.")]
+#[command(about = "A DeepSeek-native coding agent.")]
 pub struct Cli {
     /// Resume a saved conversation in TUI mode by ID, prefix, or 'latest'.
     #[arg(long)]
