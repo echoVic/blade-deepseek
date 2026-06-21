@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type KeyboardEvent } from "react";
 
 const npmCommand = "npm install -g @blade-ai/orca";
 const curlCommand =
@@ -98,33 +98,73 @@ function App() {
   const [mode, setMode] = useState<InstallMode>("npm");
   const [copyState, setCopyState] = useState<CopyState>("idle");
   const resetTimerRef = useRef<number | null>(null);
+  const tabRefs = useRef<Record<InstallMode, HTMLButtonElement | null>>({
+    npm: null,
+    curl: null,
+  });
   const command = mode === "npm" ? npmCommand : curlCommand;
+
+  function clearCopyResetTimer() {
+    if (resetTimerRef.current !== null) {
+      window.clearTimeout(resetTimerRef.current);
+      resetTimerRef.current = null;
+    }
+  }
+
+  function setInstallMode(nextMode: InstallMode) {
+    setMode(nextMode);
+    setCopyState("idle");
+    clearCopyResetTimer();
+  }
 
   useEffect(() => {
     if (copyState === "idle") {
       return;
     }
 
-    if (resetTimerRef.current !== null) {
-      window.clearTimeout(resetTimerRef.current);
-    }
+    clearCopyResetTimer();
 
     resetTimerRef.current = window.setTimeout(() => {
       setCopyState("idle");
       resetTimerRef.current = null;
     }, 1400);
 
-    return () => {
-      if (resetTimerRef.current !== null) {
-        window.clearTimeout(resetTimerRef.current);
-        resetTimerRef.current = null;
-      }
-    };
+    return clearCopyResetTimer;
   }, [copyState]);
 
   async function copyCommand() {
     const copied = await copyCommandText(command);
     setCopyState(copied ? "copied" : "failed");
+  }
+
+  function handleInstallTabKeyDown(
+    event: KeyboardEvent<HTMLButtonElement>,
+    currentMode: InstallMode,
+  ) {
+    let nextMode: InstallMode | null = null;
+
+    switch (event.key) {
+      case "ArrowLeft":
+      case "ArrowUp":
+        nextMode = currentMode === "npm" ? "curl" : "npm";
+        break;
+      case "ArrowRight":
+      case "ArrowDown":
+        nextMode = currentMode === "npm" ? "curl" : "npm";
+        break;
+      case "Home":
+        nextMode = "npm";
+        break;
+      case "End":
+        nextMode = "curl";
+        break;
+      default:
+        return;
+    }
+
+    event.preventDefault();
+    setInstallMode(nextMode);
+    tabRefs.current[nextMode]?.focus();
   }
 
   return (
@@ -157,24 +197,32 @@ function App() {
               <button
                 id={installTabIds.npm}
                 className={mode === "npm" ? "active" : ""}
-                onClick={() => setMode("npm")}
+                onClick={() => setInstallMode("npm")}
+                onKeyDown={(event) => handleInstallTabKeyDown(event, "npm")}
                 aria-selected={mode === "npm"}
                 aria-controls={installPanelId}
                 role="tab"
                 tabIndex={mode === "npm" ? 0 : -1}
                 type="button"
+                ref={(element) => {
+                  tabRefs.current.npm = element;
+                }}
               >
                 npm
               </button>
               <button
                 id={installTabIds.curl}
                 className={mode === "curl" ? "active" : ""}
-                onClick={() => setMode("curl")}
+                onClick={() => setInstallMode("curl")}
+                onKeyDown={(event) => handleInstallTabKeyDown(event, "curl")}
                 aria-selected={mode === "curl"}
                 aria-controls={installPanelId}
                 role="tab"
                 tabIndex={mode === "curl" ? 0 : -1}
                 type="button"
+                ref={(element) => {
+                  tabRefs.current.curl = element;
+                }}
               >
                 curl
               </button>
