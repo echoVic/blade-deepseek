@@ -52,7 +52,7 @@ pub fn execute_with_mcp_and_external(
     reg.execute(request, &ctx)
 }
 
-fn is_concurrent_safe_read(request: &ToolRequest) -> bool {
+pub fn tool_is_available_readonly_concurrent(request: &ToolRequest) -> bool {
     let reg = registry::default_tool_registry();
     reg.resolve(request.name.as_str())
         .map(|resolved| {
@@ -64,7 +64,7 @@ fn is_concurrent_safe_read(request: &ToolRequest) -> bool {
 }
 
 pub fn should_run_readonly_batch(max_read_parallel: usize, tool_request: &ToolRequest) -> bool {
-    is_concurrent_safe_read(tool_request) && max_read_parallel > 1
+    tool_is_available_readonly_concurrent(tool_request) && max_read_parallel > 1
 }
 
 pub fn collect_readonly_batch(
@@ -74,7 +74,7 @@ pub fn collect_readonly_batch(
 ) -> usize {
     let max_end = (start + max_read_parallel).min(tool_requests.len());
     let mut end = start;
-    while end < max_end && is_concurrent_safe_read(&tool_requests[end]) {
+    while end < max_end && tool_is_available_readonly_concurrent(&tool_requests[end]) {
         end += 1;
     }
     end

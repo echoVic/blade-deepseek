@@ -1705,9 +1705,20 @@ mod tests {
     }
 
     #[test]
-    fn readonly_batch_skips_approval_actions() {
+    fn readonly_batch_uses_spec_not_request_action() {
         let config = config(SubagentConfig::default());
         let request = tool_request("a", tool_types::ToolName::ReadFile, ActionKind::Write);
+
+        assert!(orca_tools::should_run_readonly_batch(
+            config.tools.max_read_parallel,
+            &request
+        ));
+    }
+
+    #[test]
+    fn readonly_batch_rejects_shell_by_capability() {
+        let config = config(SubagentConfig::default());
+        let request = tool_request("bash", tool_types::ToolName::Bash, ActionKind::Read);
 
         assert!(!orca_tools::should_run_readonly_batch(
             config.tools.max_read_parallel,
