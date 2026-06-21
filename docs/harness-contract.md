@@ -106,7 +106,8 @@ Built-in tools:
 | Tool | Action | Description |
 |------|--------|-------------|
 | `read_file` | read | Reads UTF-8 file content, truncated at 8KB |
-| `list_files` | read | Lists one directory, sorted names |
+| `glob` | read | Finds files and directories by glob pattern, sorted as workspace-relative paths; returns `(no matches)` when the path is missing or no entries match |
+| `list_files` | read | Compatibility alias for directory listing; returns sorted names and `(empty)` for missing directories |
 | `grep` | read | Regex search via `rg` with line numbers, `(no matches)` for empty results |
 | `git_status` | read | Runs `git status --short` |
 | `web_search` | network | Searches the web for current information |
