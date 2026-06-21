@@ -113,6 +113,9 @@ impl ToolName {
     }
 
     pub fn from_str(value: &str) -> Option<Self> {
+        if value.starts_with("mcp__") {
+            return Some(Self::Mcp(value.to_string()));
+        }
         if let Some((namespace, name)) = parse_namespaced_tool(value) {
             return Some(Self::namespaced(namespace, name));
         }
@@ -130,7 +133,6 @@ impl ToolName {
             "web_search" => Self::WebSearch,
             "update_goal" => Self::UpdateGoal,
             "update_plan" => Self::UpdatePlan,
-            other if other.starts_with("mcp__") => Self::Mcp(other.to_string()),
             other => Self::External(other.to_string()),
         })
     }
@@ -149,7 +151,7 @@ impl ToolName {
 
 fn parse_namespaced_tool(value: &str) -> Option<(&str, &str)> {
     let (namespace, name) = value.rsplit_once("__")?;
-    if namespace.starts_with("mcp__") && !name.is_empty() {
+    if !namespace.is_empty() && !name.is_empty() {
         Some((namespace, name))
     } else {
         None
@@ -226,17 +228,18 @@ impl CapabilitySet {
     }
 
     pub fn is_read_only(&self) -> bool {
-        self.capabilities.iter().all(|capability| {
-            matches!(
-                capability,
-                ToolCapability::FsRead
-                    | ToolCapability::FsList
-                    | ToolCapability::FsSearch
-                    | ToolCapability::GitInspect
-                    | ToolCapability::PlanUpdate
-                    | ToolCapability::GoalUpdate
-            )
-        })
+        !self.capabilities.is_empty()
+            && self.capabilities.iter().all(|capability| {
+                matches!(
+                    capability,
+                    ToolCapability::FsRead
+                        | ToolCapability::FsList
+                        | ToolCapability::FsSearch
+                        | ToolCapability::GitInspect
+                        | ToolCapability::PlanUpdate
+                        | ToolCapability::GoalUpdate
+                )
+            })
     }
 
     pub fn action_kind(&self) -> ActionKind {
@@ -496,9 +499,19 @@ mod tests {
     #[test]
     fn tool_name_preserves_mcp_namespace() {
         let name = ToolName::from_str("mcp__foo__exec_command").expect("mcp tool");
+        assert_eq!(name, ToolName::Mcp("mcp__foo__exec_command".to_string()));
         assert_eq!(name.namespace(), Some("mcp__foo"));
         assert_eq!(name.local_name(), "exec_command");
         assert_eq!(name.as_str(), "mcp__foo__exec_command");
+    }
+
+    #[test]
+    fn tool_name_helpers_support_non_legacy_namespaced_tools() {
+        let name = ToolName::namespaced("vendor", "inspect");
+        assert_eq!(name, ToolName::namespaced("vendor", "inspect"));
+        assert_eq!(name.namespace(), Some("vendor"));
+        assert_eq!(name.local_name(), "inspect");
+        assert_eq!(name.as_str(), "vendor__inspect");
     }
 
     #[test]
@@ -523,6 +536,11 @@ mod tests {
             CapabilitySet::agent_delegate().action_kind(),
             ActionKind::Agent
         );
+    }
+
+    #[test]
+    fn empty_capability_set_is_not_read_only() {
+        assert!(!CapabilitySet::new(Vec::new()).is_read_only());
     }
 
     #[test]
