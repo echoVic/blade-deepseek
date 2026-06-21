@@ -1,7 +1,6 @@
 use std::io;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
-use std::thread;
 use std::time::{Duration, Instant};
 
 use crossterm::ExecutableCommand;
@@ -151,24 +150,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
     let cancel_token = CancelToken::new();
     let agent_cancel = cancel_token.clone();
 
-    if config.update_check {
-        let tx = event_tx.clone();
-        let current_version = config.app_version.clone();
-        thread::spawn(
-            move || match orca_runtime::update_check::check_latest(&current_version) {
-                Ok(Some(info)) => {
-                    let _ = tx.send(TuiEvent::Notice(format!(
-                        "Update available: {} -> {} ({})",
-                        info.current, info.latest, info.url
-                    )));
-                }
-                Ok(None) => {}
-                Err(_) => {}
-            },
-        );
-    }
-
-    let _agent_handle = thread::spawn(move || {
+    let _agent_handle = std::thread::spawn(move || {
         agent_loop_thread(
             agent_config,
             agent_preloaded,

@@ -26,6 +26,12 @@ use crate::runtime::controller;
 use crate::runtime::history;
 use crate::tui::app;
 
+#[derive(Debug, Default, Eq, PartialEq)]
+struct TuiUpdatePreflight {
+    exit_code: Option<i32>,
+    message: String,
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "orca")]
 #[command(version)]
@@ -1331,7 +1337,38 @@ fn run_placeholder(cli: Cli) -> i32 {
         auto_memory: file_config.auto_memory,
     };
 
+    let preflight = tui_update_preflight(
+        config.update_check,
+        &config.app_version,
+        orca_runtime::update_check::check_latest,
+    );
+    if let Some(exit_code) = preflight.exit_code {
+        eprintln!("{}", preflight.message);
+        return exit_code;
+    }
+
     app::run_tui(config)
+}
+
+fn tui_update_preflight(
+    update_check: bool,
+    current_version: &str,
+    check_latest: impl FnOnce(&str) -> Result<Option<orca_runtime::update_check::UpdateInfo>, String>,
+) -> TuiUpdatePreflight {
+    if !update_check {
+        return TuiUpdatePreflight::default();
+    }
+
+    match check_latest(current_version) {
+        Ok(Some(info)) => TuiUpdatePreflight {
+            exit_code: Some(1),
+            message: format!(
+                "Update available: {} -> {} ({})\nPlease upgrade Orca before starting the TUI.",
+                info.current, info.latest, info.url
+            ),
+        },
+        Ok(None) | Err(_) => TuiUpdatePreflight::default(),
+    }
 }
 
 fn run_server(cli: Cli) -> i32 {
@@ -1394,4 +1431,48 @@ fn run_server(cli: Cli) -> i32 {
     };
 
     crate::server::run(crate::server::ServerConfig { run_config: config })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use orca_runtime::update_check::UpdateInfo;
+
+    #[test]
+    fn tui_preflight_blocks_tui_when_update_is_available() {
+        let outcome = tui_update_preflight(true, "0.1.7", |_| {
+            Ok(Some(UpdateInfo {
+                current: "0.1.7".to_string(),
+                latest: "0.1.8".to_string(),
+                url: "https://example.test/releases/tag/v0.1.8".to_string(),
+            }))
+        });
+
+        assert_eq!(outcome.exit_code, Some(1));
+        assert!(outcome.message.contains("Update available: 0.1.7 -> 0.1.8"));
+        assert!(
+            outcome
+                .message
+                .contains("https://example.test/releases/tag/v0.1.8")
+        );
+    }
+
+    #[test]
+    fn tui_preflight_allows_tui_when_update_check_is_disabled() {
+        let outcome = tui_update_preflight(false, "0.1.7", |_| {
+            panic!("update check should not run when disabled")
+        });
+
+        assert_eq!(outcome.exit_code, None);
+        assert!(outcome.message.is_empty());
+    }
+
+    #[test]
+    fn tui_preflight_allows_tui_when_check_fails() {
+        let outcome =
+            tui_update_preflight(true, "0.1.7", |_| Err("network unavailable".to_string()));
+
+        assert_eq!(outcome.exit_code, None);
+        assert!(outcome.message.is_empty());
+    }
 }
