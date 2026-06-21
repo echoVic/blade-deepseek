@@ -8,6 +8,7 @@ pub const MAX_TOOL_OUTPUT_BYTES: usize = 8 * 1024;
 pub enum ToolName {
     ReadFile,
     ListFiles,
+    Glob,
     Grep,
     Bash,
     Edit,
@@ -18,15 +19,60 @@ pub enum ToolName {
     WebSearch,
     UpdateGoal,
     UpdatePlan,
+    Namespaced {
+        namespace: String,
+        name: String,
+        serialized: String,
+    },
     Mcp(String),
     External(String),
 }
 
 impl ToolName {
-    pub fn as_str(&self) -> &str {
+    pub fn plain(name: impl Into<String>) -> Self {
+        let name = name.into();
+        match name.as_str() {
+            "read_file" => Self::ReadFile,
+            "list_files" => Self::ListFiles,
+            "glob" => Self::Glob,
+            "grep" => Self::Grep,
+            "bash" => Self::Bash,
+            "edit" => Self::Edit,
+            "write_file" => Self::WriteFile,
+            "git_status" => Self::GitStatus,
+            "subagent" => Self::Subagent,
+            "Workflow" | "workflow" => Self::Workflow,
+            "web_search" => Self::WebSearch,
+            "update_goal" => Self::UpdateGoal,
+            "update_plan" => Self::UpdatePlan,
+            other => Self::External(other.to_string()),
+        }
+    }
+
+    pub fn namespaced(namespace: impl Into<String>, name: impl Into<String>) -> Self {
+        let namespace = namespace.into();
+        let name = name.into();
+        let serialized = format!("{namespace}__{name}");
+        Self::Namespaced {
+            namespace,
+            name,
+            serialized,
+        }
+    }
+
+    pub fn namespace(&self) -> Option<&str> {
+        match self {
+            Self::Namespaced { namespace, .. } => Some(namespace),
+            Self::Mcp(name) => name.rsplit_once("__").map(|(namespace, _)| namespace),
+            _ => None,
+        }
+    }
+
+    pub fn local_name(&self) -> &str {
         match self {
             Self::ReadFile => "read_file",
             Self::ListFiles => "list_files",
+            Self::Glob => "glob",
             Self::Grep => "grep",
             Self::Bash => "bash",
             Self::Edit => "edit",
@@ -37,15 +83,43 @@ impl ToolName {
             Self::WebSearch => "web_search",
             Self::UpdateGoal => "update_goal",
             Self::UpdatePlan => "update_plan",
-            Self::Mcp(name) => name,
+            Self::Namespaced { name, .. } => name,
+            Self::Mcp(name) => name
+                .rsplit_once("__")
+                .map(|(_, local)| local)
+                .unwrap_or(name),
             Self::External(name) => name,
         }
     }
 
-    pub fn from_str(s: &str) -> Option<Self> {
-        Some(match s {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::ReadFile => "read_file",
+            Self::ListFiles => "list_files",
+            Self::Glob => "glob",
+            Self::Grep => "grep",
+            Self::Bash => "bash",
+            Self::Edit => "edit",
+            Self::WriteFile => "write_file",
+            Self::GitStatus => "git_status",
+            Self::Subagent => "subagent",
+            Self::Workflow => "Workflow",
+            Self::WebSearch => "web_search",
+            Self::UpdateGoal => "update_goal",
+            Self::UpdatePlan => "update_plan",
+            Self::Namespaced { serialized, .. } => serialized,
+            Self::Mcp(name) | Self::External(name) => name,
+        }
+    }
+
+    pub fn from_str(value: &str) -> Option<Self> {
+        if let Some((namespace, name)) = parse_namespaced_tool(value) {
+            return Some(Self::namespaced(namespace, name));
+        }
+        Some(match value {
             "read_file" => Self::ReadFile,
             "list_files" => Self::ListFiles,
+            "glob" => Self::Glob,
             "grep" => Self::Grep,
             "bash" => Self::Bash,
             "edit" => Self::Edit,
@@ -61,11 +135,24 @@ impl ToolName {
         })
     }
 
+    pub fn is_builtin(&self, builtin: &str) -> bool {
+        self.namespace().is_none() && self.as_str() == builtin
+    }
+
     pub fn is_read_only(&self) -> bool {
         matches!(
             self,
-            Self::ReadFile | Self::ListFiles | Self::Grep | Self::GitStatus
+            Self::ReadFile | Self::ListFiles | Self::Glob | Self::Grep | Self::GitStatus
         )
+    }
+}
+
+fn parse_namespaced_tool(value: &str) -> Option<(&str, &str)> {
+    let (namespace, name) = value.rsplit_once("__")?;
+    if namespace.starts_with("mcp__") && !name.is_empty() {
+        Some((namespace, name))
+    } else {
+        None
     }
 }
 
@@ -87,6 +174,171 @@ impl<'de> Deserialize<'de> for ToolName {
         Self::from_str(&value)
             .ok_or_else(|| serde::de::Error::custom(format!("unknown tool name: {value}")))
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ToolCapability {
+    FsRead,
+    FsList,
+    FsSearch,
+    FsWrite,
+    ShellExecute,
+    GitInspect,
+    NetworkSearch,
+    AgentDelegate,
+    WorkflowRun,
+    PlanUpdate,
+    GoalUpdate,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CapabilitySet {
+    capabilities: Vec<ToolCapability>,
+}
+
+impl CapabilitySet {
+    pub fn new(capabilities: Vec<ToolCapability>) -> Self {
+        Self { capabilities }
+    }
+
+    pub fn read_only_fs() -> Self {
+        Self::new(vec![ToolCapability::FsRead])
+    }
+
+    pub fn filesystem_write() -> Self {
+        Self::new(vec![ToolCapability::FsWrite])
+    }
+
+    pub fn shell_execute() -> Self {
+        Self::new(vec![ToolCapability::ShellExecute])
+    }
+
+    pub fn network_search() -> Self {
+        Self::new(vec![ToolCapability::NetworkSearch])
+    }
+
+    pub fn agent_delegate() -> Self {
+        Self::new(vec![ToolCapability::AgentDelegate])
+    }
+
+    pub fn contains(&self, capability: ToolCapability) -> bool {
+        self.capabilities.contains(&capability)
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        self.capabilities.iter().all(|capability| {
+            matches!(
+                capability,
+                ToolCapability::FsRead
+                    | ToolCapability::FsList
+                    | ToolCapability::FsSearch
+                    | ToolCapability::GitInspect
+                    | ToolCapability::PlanUpdate
+                    | ToolCapability::GoalUpdate
+            )
+        })
+    }
+
+    pub fn action_kind(&self) -> ActionKind {
+        if self.contains(ToolCapability::ShellExecute) {
+            ActionKind::Shell
+        } else if self.contains(ToolCapability::FsWrite) {
+            ActionKind::Write
+        } else if self.contains(ToolCapability::NetworkSearch) {
+            ActionKind::Network
+        } else if self.contains(ToolCapability::AgentDelegate)
+            || self.contains(ToolCapability::WorkflowRun)
+        {
+            ActionKind::Agent
+        } else {
+            ActionKind::Read
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ToolExposure {
+    Direct,
+    Deferred,
+    ModelOnly,
+    Hidden,
+}
+
+impl ToolExposure {
+    pub fn is_model_visible(self) -> bool {
+        matches!(self, Self::Direct | Self::ModelOnly)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RendererHint {
+    FileRead,
+    FileList,
+    FileSearch,
+    Shell,
+    Write,
+    Network,
+    Agent,
+    State,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResultSemantics {
+    Standard,
+    EmptyIsSuccess,
+    NoMatchesIsSuccess,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolResultKind {
+    Success,
+    Empty,
+    NoMatches,
+    Truncated,
+    PermissionDenied,
+    InvalidInput,
+    RuntimeError,
+}
+
+impl ToolResultKind {
+    pub fn success() -> Self {
+        Self::Success
+    }
+
+    pub fn is_success(&self) -> bool {
+        *self == Self::Success
+    }
+
+    pub fn status(self) -> ToolStatus {
+        match self {
+            Self::Success | Self::Empty | Self::NoMatches | Self::Truncated => {
+                ToolStatus::Completed
+            }
+            Self::PermissionDenied => ToolStatus::Denied,
+            Self::InvalidInput | Self::RuntimeError => ToolStatus::Failed,
+        }
+    }
+}
+
+impl Default for ToolResultKind {
+    fn default() -> Self {
+        Self::Success
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ToolSpec {
+    pub name: ToolName,
+    pub aliases: Vec<ToolName>,
+    pub description: String,
+    pub input_schema: serde_json::Value,
+    pub output_schema: Option<serde_json::Value>,
+    pub capabilities: CapabilitySet,
+    pub exposure: ToolExposure,
+    pub result_semantics: ResultSemantics,
+    pub renderer: RendererHint,
+    pub concurrent_safe: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -128,6 +380,11 @@ pub struct ToolResult {
     pub error: Option<String>,
     pub exit_code: Option<i32>,
     pub truncated: bool,
+    #[serde(
+        default = "ToolResultKind::success",
+        skip_serializing_if = "ToolResultKind::is_success"
+    )]
+    pub kind: ToolResultKind,
 }
 
 impl ToolResult {
@@ -140,6 +397,25 @@ impl ToolResult {
             error: None,
             exit_code: Some(0),
             truncated,
+            kind: ToolResultKind::Success,
+        }
+    }
+
+    pub fn completed_kind(
+        request: &ToolRequest,
+        output: String,
+        truncated: bool,
+        kind: ToolResultKind,
+    ) -> Self {
+        Self {
+            id: request.id.clone(),
+            name: request.name.clone(),
+            status: kind.status(),
+            output: Some(output),
+            error: None,
+            exit_code: Some(0),
+            truncated,
+            kind,
         }
     }
 
@@ -152,6 +428,7 @@ impl ToolResult {
             error: Some(error.into()),
             exit_code,
             truncated: false,
+            kind: ToolResultKind::RuntimeError,
         }
     }
 
@@ -164,6 +441,7 @@ impl ToolResult {
             error: Some(reason.into()),
             exit_code: None,
             truncated: false,
+            kind: ToolResultKind::PermissionDenied,
         }
     }
 }
@@ -197,4 +475,63 @@ pub fn truncate_output(output: String, max_bytes: usize) -> (String, bool) {
         format!("{}{}{}", &output[..head_end], marker, &output[tail_start..]),
         true,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tool_name_round_trips_plain_names() {
+        let name = ToolName::from_str("read_file").expect("known tool");
+        assert_eq!(name, ToolName::ReadFile);
+        assert_eq!(name.as_str(), "read_file");
+        assert_eq!(serde_json::to_string(&name).unwrap(), "\"read_file\"");
+        assert_eq!(
+            serde_json::from_str::<ToolName>("\"read_file\"").unwrap(),
+            name
+        );
+    }
+
+    #[test]
+    fn tool_name_preserves_mcp_namespace() {
+        let name = ToolName::from_str("mcp__foo__exec_command").expect("mcp tool");
+        assert_eq!(name.namespace(), Some("mcp__foo"));
+        assert_eq!(name.local_name(), "exec_command");
+        assert_eq!(name.as_str(), "mcp__foo__exec_command");
+    }
+
+    #[test]
+    fn capability_set_derives_action_kind() {
+        assert_eq!(
+            CapabilitySet::read_only_fs().action_kind(),
+            ActionKind::Read
+        );
+        assert_eq!(
+            CapabilitySet::filesystem_write().action_kind(),
+            ActionKind::Write
+        );
+        assert_eq!(
+            CapabilitySet::shell_execute().action_kind(),
+            ActionKind::Shell
+        );
+        assert_eq!(
+            CapabilitySet::network_search().action_kind(),
+            ActionKind::Network
+        );
+        assert_eq!(
+            CapabilitySet::agent_delegate().action_kind(),
+            ActionKind::Agent
+        );
+    }
+
+    #[test]
+    fn completed_result_kinds_remain_completed_status() {
+        assert_eq!(ToolResultKind::Success.status(), ToolStatus::Completed);
+        assert_eq!(ToolResultKind::Empty.status(), ToolStatus::Completed);
+        assert_eq!(ToolResultKind::NoMatches.status(), ToolStatus::Completed);
+        assert_eq!(ToolResultKind::Truncated.status(), ToolStatus::Completed);
+        assert_eq!(ToolResultKind::InvalidInput.status(), ToolStatus::Failed);
+        assert_eq!(ToolResultKind::RuntimeError.status(), ToolStatus::Failed);
+    }
 }
