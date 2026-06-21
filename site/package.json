@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
+    "check:seo": "node scripts/check-seo.mjs",
     "preview": "vite preview"
   },
   "dependencies": {
