@@ -73,6 +73,13 @@ fn git_status_emits_completed_tool_event() {
 
 #[test]
 fn grep_emits_completed_tool_event_with_matches() {
+    let temp_dir = make_temp_workspace("grep");
+    fs::write(
+        temp_dir.join("fixture.txt"),
+        "unique-orca-grep-fixture\nother line\n",
+    )
+    .expect("write grep fixture");
+
     let output = Command::new(env!("CARGO_BIN_EXE_orca"))
         .args([
             "exec",
@@ -80,7 +87,9 @@ fn grep_emits_completed_tool_event_with_matches() {
             "jsonl",
             "--provider",
             "mock",
-            "grep Orca",
+            "--cwd",
+            temp_dir.to_str().unwrap(),
+            "grep unique-orca-grep-fixture",
         ])
         .output()
         .expect("run orca");
@@ -91,7 +100,7 @@ fn grep_emits_completed_tool_event_with_matches() {
     let requested = find_event(&events, "tool.call.requested");
     assert_eq!(requested["payload"]["name"], "grep");
     assert_eq!(requested["payload"]["action"], "read");
-    assert_eq!(requested["payload"]["target"], "Orca");
+    assert_eq!(requested["payload"]["target"], "unique-orca-grep-fixture");
 
     let completed = find_event(&events, "tool.call.completed");
     assert_eq!(completed["payload"]["name"], "grep");
@@ -100,7 +109,7 @@ fn grep_emits_completed_tool_event_with_matches() {
         completed["payload"]["output"]
             .as_str()
             .unwrap()
-            .contains("README.md")
+            .contains("fixture.txt")
     );
 }
 
