@@ -33,7 +33,7 @@ Set `INSTALL_DIR` to choose a destination and `ORCA_VERSION` to pin a version:
 
 ```bash
 curl -fsSL https://orcaagent.dev/install.sh | \
-  INSTALL_DIR=/usr/local/bin ORCA_VERSION=0.1.9 sh
+  INSTALL_DIR=/usr/local/bin ORCA_VERSION=0.1.11 sh
 ```
 
 ### GitHub Releases
@@ -193,7 +193,8 @@ Built-in tools:
 | Tool | Description |
 |------|-------------|
 | `read_file` | Read file contents (UTF-8, truncated at 8KB) |
-| `list_files` | List directory entries |
+| `glob` | Find files and directories by glob pattern; preferred for file discovery |
+| `list_files` | Compatibility alias for directory listing |
 | `grep` | Search with ripgrep (regex, line numbers) |
 | `bash` | Execute shell commands via `sh -c` |
 | `edit` | Exact text replacement in files |
@@ -205,6 +206,10 @@ Built-in tools:
 | `update_plan` | Update the visible task plan |
 | `update_goal` | Update active persistent goal status from goal mode |
 
+Tools are registered through a canonical tool registry with capability metadata. Approval behavior is derived from those capabilities: read-only tools run directly, write tools follow write approval policy, shell tools follow shell approval policy, network tools follow network policy, and agent/workflow tools follow agent policy. `glob` is the model-facing file discovery tool; `list_files` remains accepted for older prompts and saved sessions.
+
+MCP tools and custom external tools can be added at startup. External tools live under `~/.orca/tools/*.toml` or `$ORCA_HOME/tools/*.toml`, and configured MCP server tools are exposed with namespaced tool names.
+
 ## Architecture
 
 - **Agent Loop**: prompt → model → tool_call → execute → feed result → next turn (up to 128 turns)
@@ -214,7 +219,7 @@ Built-in tools:
 - **Context Window**: DeepSeek V4 1M-token context, 80% threshold compaction with response reserve (preserves system + recent messages)
 - **Conversation History**: Local JSONL transcripts support listing, inspection, resume/fork, full-text search, archive/delete/rename, and zstd compression
 - **HTTP Client**: Singleton with 30s connect / 120s request / 300s streaming timeouts, exponential backoff retry (3 attempts, handles 429/5xx)
-- **Approval Policy**: Read operations always allowed; write/shell actions require interactive confirmation (suggest mode) or auto-allowed based on mode
+- **Approval Policy**: Tool capabilities drive approval; read operations are allowed, `suggest` asks for write/network/agent/shell, `auto-edit` allows writes but asks for network/agent/shell, and `full-auto` allows all
 - **Verification**: Optional post-completion verifier command with pass/fail status
 
 ## Event Stream (JSONL)

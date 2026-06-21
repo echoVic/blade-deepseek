@@ -47,7 +47,7 @@ Goal mode exposes `update_goal` to the model while a persistent goal turn is run
 {"status":"active","objective":"revised objective"}
 ```
 
-The tool is intentionally scoped to goal turns. Outside goal mode it fails with a clear message instead of creating hidden state.
+The tool is intentionally scoped to goal turns. Outside goal mode it is not advertised to the model, and direct calls fail with a clear message instead of creating hidden state.
 
 ## Continuation Rules
 

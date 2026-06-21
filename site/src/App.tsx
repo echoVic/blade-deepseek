@@ -9,6 +9,7 @@ import {
 
 const npmCommand = "npm install -g @blade-ai/orca";
 const curlCommand = "curl -fsSL https://orcaagent.dev/install.sh | sh";
+const releaseVersion = "v0.1.11";
 
 const links = {
   github: "https://github.com/echoVic/blade-deepseek",
@@ -26,20 +27,20 @@ const seoCopy = {
   en: {
     title: "Orca - DeepSeek-native terminal coding agent",
     description:
-      "Orca is a DeepSeek-native local coding agent for terminal workflows, approvals, subagents, resumable history, and verifier-gated automation.",
+      "Orca is a DeepSeek-native local coding agent for terminal workflows, spec-driven tools, approvals, persistent goals, resumable history, and verifier-gated automation.",
     ogTitle: "Orca - DeepSeek-native terminal coding agent",
     ogDescription:
-      "Run DeepSeek-native coding agent workflows locally with approvals, subagents, resumable history, and verifier-gated automation.",
+      "Run DeepSeek-native coding agent workflows locally with spec-driven tools, approvals, persistent goals, resumable history, and verifier-gated automation.",
     imageAlt: "Orca terminal coding agent product preview",
     locale: "en_US",
   },
   zh: {
     title: "Orca - DeepSeek 原生终端代码智能体",
     description:
-      "Orca 是 DeepSeek 原生的本地终端代码智能体，支持审批、子智能体、可恢复历史、工作流和 verifier 校验自动化。",
+      "Orca 是 DeepSeek 原生的本地终端代码智能体，支持规格驱动工具、审批、持久 goal、可恢复历史、工作流和 verifier 校验自动化。",
     ogTitle: "Orca - DeepSeek 原生终端代码智能体",
     ogDescription:
-      "在本地终端运行 DeepSeek 原生代码智能体工作流，覆盖审批、子智能体、可恢复历史和 verifier 校验自动化。",
+      "在本地终端运行 DeepSeek 原生代码智能体工作流，覆盖规格驱动工具、审批、持久 goal、可恢复历史和 verifier 校验自动化。",
     imageAlt: "Orca 终端代码智能体产品预览",
     locale: "zh_CN",
   },
@@ -64,18 +65,18 @@ const copy = {
       github: "GitHub",
     },
     hero: {
-      pill: "Rust-native · production-ready",
+      pill: "v0.1.11 · Rust-native",
       titlePrefix: "A",
       titleHighlight: "DeepSeek-native",
       titleSuffix: "coding agent, in your terminal.",
       subtitle:
-        "Orca is a local terminal coding agent built in Rust around DeepSeek's reasoning and tool-use semantics. Multi-turn agent loop, SSE streaming, 1M context with automatic compaction — one command, hand it the task.",
+        "Orca is a local terminal coding agent built in Rust around DeepSeek's reasoning and tool-use semantics. Multi-turn agent loop, spec-driven tools, SSE streaming, 1M context with automatic compaction — one command, hand it the task.",
       primary: "Get started",
       secondary: "View on GitHub",
       meta: {
         context: "context window",
         turns: "max turns",
-        tools: "built-in tools",
+        tools: "tool surfaces",
         platforms: "platforms",
       },
     },
@@ -96,11 +97,11 @@ const copy = {
       },
       {
         title: "Approval modes",
-        body: "Reads always run; writes and shell commands confirm by policy — suggest, auto-edit, or full-auto, your call.",
+        body: "Tool specs declare capabilities; reads run directly, while write, shell, network, and agent actions follow your configured approval policy.",
       },
       {
-        title: "Subagents & workflows",
-        body: "Synchronous subagents share the workspace and model config; JavaScript workflows launch with a single orca workflow run.",
+        title: "Tool registry",
+        body: "Built-ins, MCP tools, and TOML custom tools share one registry. glob is preferred for file discovery, with list_files kept for compatibility.",
       },
       {
         title: "Resumable history",
@@ -123,7 +124,7 @@ const copy = {
       },
       {
         title: "Hooks & custom tools",
-        body: "Lifecycle hooks return structured JSON to deny, modify, or inject context; TOML descriptors mount your own command tools.",
+        body: "Lifecycle hooks return structured JSON to deny, modify, or inject context; TOML descriptors and MCP servers mount additional tools.",
       },
       {
         title: "Structured event stream",
@@ -159,7 +160,7 @@ const copy = {
     specs: {
       context: "Context window, auto-compacted past the 80% threshold.",
       retries: "Exponential-backoff retries, handling 429 / 5xx automatically.",
-      tools: "Built-in tools spanning read/write, search, git, and subagents.",
+      tools: "Built-in, MCP, and external tools share one spec-driven registry.",
       rust: "Written in Rust, running as a single local binary.",
     },
     install: {
@@ -212,18 +213,18 @@ const copy = {
       github: "GitHub",
     },
     hero: {
-      pill: "Rust 原生 · 可用于生产",
+      pill: "v0.1.11 · Rust 原生",
       titlePrefix: "面向终端的",
       titleHighlight: "DeepSeek 原生",
       titleSuffix: "代码智能体。",
       subtitle:
-        "Orca 是一个用 Rust 构建的本地终端代码智能体，围绕 DeepSeek 的推理与工具调用语义设计。多轮智能体循环、SSE 流式输出、1M 上下文与自动压缩，一个命令就能把任务交给它。",
+        "Orca 是一个用 Rust 构建的本地终端代码智能体，围绕 DeepSeek 的推理与工具调用语义设计。多轮智能体循环、规格驱动工具、SSE 流式输出、1M 上下文与自动压缩，一个命令就能把任务交给它。",
       primary: "开始使用",
       secondary: "查看 GitHub",
       meta: {
         context: "上下文窗口",
         turns: "最大轮次",
-        tools: "内置工具",
+        tools: "工具面",
         platforms: "支持平台",
       },
     },
@@ -244,11 +245,11 @@ const copy = {
       },
       {
         title: "审批模式",
-        body: "读取默认放行，写入和 shell 命令按策略确认；可在 suggest、auto-edit、full-auto 之间切换。",
+        body: "工具规格声明能力；读取直接运行，写入、shell、网络和 agent 操作按你的审批策略执行。",
       },
       {
-        title: "子智能体与工作流",
-        body: "同步子智能体共享工作区和模型配置；JavaScript 工作流可通过 orca workflow run 一键启动。",
+        title: "工具注册表",
+        body: "内置工具、MCP 工具和 TOML 自定义工具共用同一注册表。glob 是首选文件发现工具，list_files 保留兼容。",
       },
       {
         title: "可恢复历史",
@@ -271,7 +272,7 @@ const copy = {
       },
       {
         title: "Hooks 与自定义工具",
-        body: "生命周期 hooks 返回结构化 JSON，可拒绝、修改或注入上下文；TOML 描述符可挂载自定义命令工具。",
+        body: "生命周期 hooks 返回结构化 JSON，可拒绝、修改或注入上下文；TOML 描述符和 MCP server 可挂载额外工具。",
       },
       {
         title: "结构化事件流",
@@ -306,7 +307,7 @@ const copy = {
     specs: {
       context: "上下文窗口，超过 80% 阈值后自动压缩。",
       retries: "指数退避重试，自动处理 429 / 5xx。",
-      tools: "内置工具覆盖读写、搜索、git 和子智能体。",
+      tools: "内置、MCP 和 external 工具共用规格驱动注册表。",
       rust: "Rust 编写，以单个本地二进制运行。",
     },
     install: {
@@ -363,7 +364,7 @@ const capabilityIcons = [
 
 const builtinTools = [
   "read_file",
-  "list_files",
+  "glob",
   "edit",
   "grep",
   "bash",
@@ -374,6 +375,8 @@ const builtinTools = [
   "Workflow",
   "update_plan",
   "update_goal",
+  "MCP",
+  "external",
 ];
 
 type InstallMode = "npm" | "curl";
@@ -918,7 +921,7 @@ function App() {
               <span className="l">{t.hero.meta.turns}</span>
             </div>
             <div>
-              <span className="k">12</span>
+              <span className="k">14</span>
               <span className="l">{t.hero.meta.tools}</span>
             </div>
             <div>
@@ -963,7 +966,7 @@ function App() {
               <span className="key">/goal</span> {t.tui.footerGoal} ·{" "}
               <span className="key">^c</span> {t.tui.footerExit}
             </span>
-            <span className="dim">1M · v0.1.9</span>
+            <span className="dim">1M · {releaseVersion}</span>
           </div>
         </div>
       </section>
@@ -1049,7 +1052,7 @@ function App() {
             <p>{t.specs.retries}</p>
           </div>
           <div>
-            <div className="num">12</div>
+            <div className="num">14</div>
             <p>{t.specs.tools}</p>
           </div>
           <div>

@@ -45,7 +45,7 @@ check(robotsTxt.includes(`Sitemap: ${canonicalUrl}sitemap.xml`), "robots.txt mis
 
 check(sitemapXml.includes("<urlset"), "sitemap.xml missing urlset");
 check(sitemapXml.includes(`<loc>${canonicalUrl}</loc>`), "sitemap.xml missing canonical loc");
-check(sitemapXml.includes("<lastmod>2026-06-21</lastmod>"), "sitemap.xml missing lastmod");
+check(sitemapXml.includes("<lastmod>2026-06-22</lastmod>"), "sitemap.xml missing lastmod");
 
 check(socialPng.subarray(1, 4).toString("ascii") === "PNG", "Social image is not a PNG");
 check(socialPng.readUInt32BE(16) === 1200, "Social PNG width must be 1200px");

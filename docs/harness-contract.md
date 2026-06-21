@@ -119,6 +119,8 @@ Built-in tools:
 | `update_plan` | read | Updates the visible plan state |
 | `update_goal` | read | Updates the active persistent goal while goal mode is running |
 
+Tools are registered through a canonical registry. Each tool spec declares its capability set, renderer hint, exposure, aliases, and concurrent-safety flag. Runtime approval derives from the resolved tool spec instead of a separate hard-coded name list.
+
 Tool events:
 - `tool.call.requested` — emitted before execution, contains `name`, `action`, `target`
 - `tool.call.completed` — emitted after execution, contains `name`, `status` (completed/failed/denied), `output`, `truncated`
@@ -150,13 +152,14 @@ Persistent goal mode:
 
 ## Approval Policy
 
-Three modes control which tool actions require user confirmation:
+Four modes control which tool actions require user confirmation:
 
-| Mode | read | write | shell |
-|------|------|-------|-------|
-| `suggest` (default) | allow | ask | ask |
-| `auto-edit` | allow | allow | ask |
-| `full-auto` | allow | allow | allow |
+| Mode | read | write | network | agent | shell |
+|------|------|-------|---------|-------|-------|
+| `suggest` (default) | allow | ask | ask | ask | ask |
+| `auto-edit` | allow | allow | ask | ask | ask |
+| `full-auto` | allow | allow | allow | allow | allow |
+| `plan` | allow | deny | deny | deny | deny |
 
 Behavior of `ask`:
 - In **text mode**: prompts the user interactively on stderr for y/n confirmation
@@ -210,6 +213,8 @@ Context window management:
 
 ## Configuration
 
-Priority: Environment variables > CLI arguments > Config file (`~/.config/orca/config.toml`) > Defaults.
+Priority: Environment variables > CLI arguments > config files > defaults.
 
-Config file fields: `model`, `api_key`, `base_url`.
+Config file path: `$ORCA_HOME/config.toml` or `~/.orca/config.toml`. Project overrides can also live at `.orca/config.toml` in the workspace.
+
+Config file fields include `model`, `api_key`, `base_url`, `approval_mode`, permission rules, hooks, MCP servers, and related runtime settings.
