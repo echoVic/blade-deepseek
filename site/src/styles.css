@@ -89,6 +89,12 @@ main {
   padding: 64px 0;
 }
 
+.hero > *,
+.workflow > *,
+.install-repeat > * {
+  min-width: 0;
+}
+
 .eyebrow {
   margin: 0 0 14px;
   color: #87d7bd;
@@ -230,6 +236,7 @@ pre {
 
 .terminal,
 .code-sample {
+  min-width: 0;
   border: 1px solid rgba(238, 244, 241, 0.14);
   background: #070b09;
   box-shadow: 0 30px 80px rgba(0, 0, 0, 0.42);
@@ -363,7 +370,7 @@ footer a:hover {
   .hero,
   .workflow,
   .install-repeat {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .hero {
