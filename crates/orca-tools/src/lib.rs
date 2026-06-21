@@ -16,6 +16,7 @@ pub mod list_files;
 pub mod read_file;
 pub mod registry;
 pub mod sandbox;
+pub mod skills;
 pub mod update_goal;
 pub mod update_plan;
 pub mod web_search;
@@ -313,6 +314,25 @@ mod tests {
                 .unwrap_or_default()
                 .contains("interactive TUI session")
         );
+    }
+
+    #[test]
+    fn skill_tools_are_model_visible_readonly_tools() {
+        let reg = registry::default_tool_registry();
+        for name in ["list_skills", "read_skill"] {
+            let tool = reg.get(name).expect("skill tool is registered");
+            let request = ToolRequest {
+                id: name.to_string(),
+                name: ToolName::plain(name),
+                action: ActionKind::Read,
+                target: None,
+                raw_arguments: Some(r#"{"id":"debugging"}"#.to_string()),
+            };
+
+            assert!(tool.spec().exposure.is_model_visible());
+            assert!(tool.is_read_only(&request));
+            assert!(tool.is_concurrent_safe(&request));
+        }
     }
 
     #[test]

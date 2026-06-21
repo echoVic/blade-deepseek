@@ -4,7 +4,7 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-06-22
-Current baseline: v0.1.16 structured user-input tool baseline
+Current baseline: v0.1.17 skills discovery baseline
 
 ---
 
@@ -122,14 +122,14 @@ from user and project directories and inject only relevant skill instructions.
 
 **Scope:**
 
-1. Skill discovery.
+1. Skill discovery. `list_skills` and `read_skill` tools done in v0.1.17.
    - User skills: `$ORCA_HOME/skills/*/SKILL.md` or `~/.orca/skills/*/SKILL.md`.
    - Project skills: `.orca/skills/*/SKILL.md`.
    - Manifest-free minimum viable format: directory name is the skill id.
-2. Skill metadata parsing.
+2. Skill metadata parsing. Frontmatter name/description parsing done in v0.1.17.
    - Frontmatter fields: `name`, `description`.
    - Body remains Markdown instructions.
-3. Skill selection.
+3. Skill selection. Manual list/read selection done in v0.1.17; prompt-time explicit skill inclusion remains follow-up.
    - Include explicitly named skills in the prompt.
    - Add a small `list_skills`/`read_skill` tool pair or equivalent registry output if prompt size becomes a concern.
 4. Safety.

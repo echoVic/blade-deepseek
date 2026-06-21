@@ -21,6 +21,8 @@ pub enum ToolName {
     UpdateGoal,
     UpdatePlan,
     RequestUserInput,
+    ListSkills,
+    ReadSkill,
     Namespaced {
         namespace: String,
         name: String,
@@ -48,6 +50,8 @@ impl ToolName {
             "update_goal" => Self::UpdateGoal,
             "update_plan" => Self::UpdatePlan,
             "request_user_input" => Self::RequestUserInput,
+            "list_skills" => Self::ListSkills,
+            "read_skill" => Self::ReadSkill,
             other => Self::External(other.to_string()),
         }
     }
@@ -87,6 +91,8 @@ impl ToolName {
             Self::UpdateGoal => "update_goal",
             Self::UpdatePlan => "update_plan",
             Self::RequestUserInput => "request_user_input",
+            Self::ListSkills => "list_skills",
+            Self::ReadSkill => "read_skill",
             Self::Namespaced { name, .. } => name,
             Self::Mcp(name) => name
                 .rsplit_once("__")
@@ -112,6 +118,8 @@ impl ToolName {
             Self::UpdateGoal => "update_goal",
             Self::UpdatePlan => "update_plan",
             Self::RequestUserInput => "request_user_input",
+            Self::ListSkills => "list_skills",
+            Self::ReadSkill => "read_skill",
             Self::Namespaced { serialized, .. } => serialized,
             Self::Mcp(name) | Self::External(name) => name,
         }
@@ -139,6 +147,8 @@ impl ToolName {
             "update_goal" => Self::UpdateGoal,
             "update_plan" => Self::UpdatePlan,
             "request_user_input" => Self::RequestUserInput,
+            "list_skills" => Self::ListSkills,
+            "read_skill" => Self::ReadSkill,
             other => Self::External(other.to_string()),
         })
     }
@@ -156,6 +166,8 @@ impl ToolName {
                 | Self::Grep
                 | Self::GitStatus
                 | Self::RequestUserInput
+                | Self::ListSkills
+                | Self::ReadSkill
         )
     }
 }
@@ -203,6 +215,7 @@ pub enum ToolCapability {
     PlanUpdate,
     GoalUpdate,
     UserInputRequest,
+    SkillRead,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -251,6 +264,7 @@ impl CapabilitySet {
                         | ToolCapability::PlanUpdate
                         | ToolCapability::GoalUpdate
                         | ToolCapability::UserInputRequest
+                        | ToolCapability::SkillRead
                 )
             })
     }

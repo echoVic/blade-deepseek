@@ -15,8 +15,8 @@ use orca_core::tool_types::{
 use orca_mcp::McpRegistry;
 
 use crate::{
-    bash, edit, external, git, glob, grep, list_files, read_file, update_goal, update_plan,
-    web_search, write_file,
+    bash, edit, external, git, glob, grep, list_files, read_file, skills, update_goal,
+    update_plan, web_search, write_file,
 };
 
 #[allow(dead_code)]
@@ -548,6 +548,45 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
     ));
     registry.register(BuiltinTool::new(
         builtin_spec(
+            "list_skills",
+            "List available user and project skills. Use before read_skill when the user asks for a skill or reusable procedure.",
+            json!({
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "additionalProperties": false
+            }),
+            CapabilitySet::new(vec![ToolCapability::SkillRead]),
+            ToolExposure::Direct,
+            RendererHint::State,
+            true,
+        ),
+        BuiltinExecutor::ListSkills,
+    ));
+    registry.register(BuiltinTool::new(
+        builtin_spec(
+            "read_skill",
+            "Read a skill's Markdown instructions by id after list_skills shows it is available.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "id": {
+                        "type": "string",
+                        "description": "Skill id, usually the skill directory name"
+                    }
+                },
+                "required": ["id"],
+                "additionalProperties": false
+            }),
+            CapabilitySet::new(vec![ToolCapability::SkillRead]),
+            ToolExposure::Direct,
+            RendererHint::State,
+            true,
+        ),
+        BuiltinExecutor::ReadSkill,
+    ));
+    registry.register(BuiltinTool::new(
+        builtin_spec(
             "request_user_input",
             "Ask the user a structured clarification question. Use only when progress requires user input; headless runs return a deterministic failure instead of blocking.",
             json!({
@@ -675,6 +714,8 @@ impl Tool for BuiltinTool {
             ),
             BuiltinExecutor::UpdateGoal => update_goal::execute(request),
             BuiltinExecutor::UpdatePlan => update_plan::execute(request),
+            BuiltinExecutor::ListSkills => skills::execute_list(request, ctx.cwd),
+            BuiltinExecutor::ReadSkill => skills::execute_read(request, ctx.cwd),
             BuiltinExecutor::RequestUserInput => ToolResult::failed(
                 request,
                 "request_user_input requires an interactive TUI session",
@@ -698,6 +739,8 @@ enum BuiltinExecutor {
     Workflow,
     UpdateGoal,
     UpdatePlan,
+    ListSkills,
+    ReadSkill,
     RequestUserInput,
 }
 
