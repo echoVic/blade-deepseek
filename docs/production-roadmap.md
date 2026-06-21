@@ -4,7 +4,7 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-06-22
-Current baseline: v0.1.18 explicit skill injection
+Current baseline: v0.1.19 TUI request_user_input answer loop
 
 ---
 
@@ -90,7 +90,7 @@ before adding larger ecosystem features.
 
 ### P2: User and Workflow Ergonomics
 
-**Release target:** v0.1.14-v0.1.16
+**Release target:** v0.1.14-v0.1.16, v0.1.19
 
 **Goal:** close the highest-value daily-use gaps visible from Codex and Claude
 without destabilizing core runtime behavior.
@@ -103,7 +103,7 @@ without destabilizing core runtime behavior.
 2. Sandbox/config summary. `/config show` runtime posture summary done in v0.1.14.
    - Show current approval mode, filesystem scope, network posture, and key limits in `/config show`.
    - Reuse the summary in startup/session events where appropriate.
-3. Structured user question tool. Model-visible nonblocking tool contract done in v0.1.16; full TUI answer loop remains follow-up.
+3. Structured user question tool. Model-visible nonblocking tool contract done in v0.1.16; TUI answer loop done in v0.1.19.
    - Provide a small, approval-safe mechanism for the model to request user input in TUI.
    - Keep headless JSONL behavior deterministic.
 

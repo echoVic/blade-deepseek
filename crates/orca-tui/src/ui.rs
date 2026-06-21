@@ -765,6 +765,7 @@ fn render_status(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
         AppStatus::Idle => ("● idle", theme.success),
         AppStatus::Running => ("● running", theme.warning),
         AppStatus::WaitingApproval => ("● approval", theme.approval),
+        AppStatus::WaitingUserInput => ("● input", theme.approval),
     };
 
     let scroll_hint = if !state.auto_scroll {
@@ -829,6 +830,7 @@ fn active_shortcut_scopes(state: &AppState) -> Vec<ShortcutScope> {
         AppStatus::Idle => vec![ShortcutScope::Global, ShortcutScope::Idle],
         AppStatus::Running => vec![ShortcutScope::Global, ShortcutScope::Running],
         AppStatus::WaitingApproval => vec![ShortcutScope::Global, ShortcutScope::Approval],
+        AppStatus::WaitingUserInput => vec![ShortcutScope::Global, ShortcutScope::Idle],
         AppStatus::Setup | AppStatus::SessionPicker => vec![ShortcutScope::Global],
     }
 }

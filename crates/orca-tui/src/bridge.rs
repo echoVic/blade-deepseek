@@ -30,6 +30,7 @@ use orca_runtime::hooks::{
 use orca_runtime::instructions::{self, ProjectInstructions};
 use orca_runtime::memory::{self, MemoryBlock};
 use orca_runtime::subagent;
+use serde::Deserialize;
 
 use crate::diff;
 use crate::types::{TuiEvent, UserAction};
@@ -42,6 +43,13 @@ struct TuiAgentResult {
     final_message: Option<String>,
     error: Option<String>,
     cost_tracker: CostTracker,
+}
+
+#[derive(Debug, Deserialize)]
+struct UserInputRequestArgs {
+    question: String,
+    #[serde(default)]
+    choices: Vec<String>,
 }
 
 fn tool_result_kind_label(kind: tool_types::ToolResultKind) -> &'static str {
@@ -1174,6 +1182,8 @@ fn execute_tool_for_tui(
                 config.tools.output_truncation,
                 &mut on_output,
             )
+        } else if execution_request.name == tool_types::ToolName::RequestUserInput {
+            execute_user_input_request_for_tui(execution_request, event_tx, action_rx)
         } else if execution_request.name == tool_types::ToolName::UpdateGoal {
             let Some(session_id) = session_id.map(str::to_string) else {
                 return (
@@ -1269,6 +1279,53 @@ fn execute_tool_for_tui(
         tool_types::ToolStatus::Failed | tool_types::ToolStatus::Denied
     );
     (failed, result, child_cost)
+}
+
+fn execute_user_input_request_for_tui(
+    request: &tool_types::ToolRequest,
+    event_tx: &Sender<TuiEvent>,
+    action_rx: &Receiver<UserAction>,
+) -> tool_types::ToolResult {
+    let args = match parse_user_input_request_args(request) {
+        Ok(args) => args,
+        Err(error) => return tool_types::ToolResult::failed(request, error, None),
+    };
+    let _ = event_tx.send(TuiEvent::UserInputRequested {
+        id: request.id.clone(),
+        question: args.question,
+        choices: args.choices,
+    });
+
+    loop {
+        match action_rx.recv() {
+            Ok(UserAction::RespondToUserInput(answer)) => {
+                return tool_types::ToolResult::completed(request, answer, false);
+            }
+            Ok(UserAction::Interrupt) | Ok(UserAction::Cancel) | Err(_) => {
+                return tool_types::ToolResult::failed(
+                    request,
+                    "user input request cancelled",
+                    None,
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
+fn parse_user_input_request_args(
+    request: &tool_types::ToolRequest,
+) -> Result<UserInputRequestArgs, String> {
+    let raw = request
+        .raw_arguments
+        .as_deref()
+        .ok_or_else(|| "missing request_user_input arguments JSON".to_string())?;
+    let args: UserInputRequestArgs = serde_json::from_str(raw)
+        .map_err(|error| format!("invalid request_user_input arguments JSON: {error}"))?;
+    if args.question.trim().is_empty() {
+        return Err("missing required request_user_input argument: question".to_string());
+    }
+    Ok(args)
 }
 
 fn approval_action_for_tool(
@@ -1868,5 +1925,46 @@ mod tests {
         let echoed = echoed.unwrap_or_default();
         assert!(echoed.contains("first prompt | mock_history_echo"));
         assert!(!echoed.contains("second prompt"));
+    }
+
+    #[test]
+    fn tui_request_user_input_waits_for_answer_and_continues() {
+        let config = config();
+        let (event_tx, event_rx) = mpsc::channel();
+        let (action_tx, action_rx) = mpsc::channel();
+        let cancel = CancelToken::new();
+        let mut session =
+            TuiConversationSession::new_with_preloaded(&config, "ask", None).expect("session");
+
+        let responder = std::thread::spawn(move || {
+            loop {
+                match event_rx.recv().expect("event") {
+                    TuiEvent::UserInputRequested { question, .. } => {
+                        assert_eq!(question, "Continue?");
+                        action_tx
+                            .send(UserAction::RespondToUserInput("yes".to_string()))
+                            .expect("send answer");
+                        break;
+                    }
+                    TuiEvent::SessionCompleted { status } => {
+                        panic!("completed before user input request: {status}");
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let status = run_agent_for_tui(
+            &config,
+            &mut session,
+            "ask Continue?",
+            &event_tx,
+            &action_rx,
+            &cancel,
+            false,
+        );
+
+        responder.join().expect("responder joined");
+        assert_eq!(status, "success");
     }
 }

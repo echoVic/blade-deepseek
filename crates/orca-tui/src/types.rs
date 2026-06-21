@@ -53,6 +53,11 @@ pub enum TuiEvent {
         target: Option<String>,
         preview: Option<String>,
     },
+    UserInputRequested {
+        id: String,
+        question: String,
+        choices: Vec<String>,
+    },
     Notice(String),
     Error(String),
     UsageUpdated(UsageTotals),
@@ -84,6 +89,7 @@ pub enum UserAction {
     GoalPause,
     GoalResume,
     Approve(bool),
+    RespondToUserInput(String),
     Backtrack,
     Interrupt,
     Cancel,
@@ -96,6 +102,7 @@ pub enum AppStatus {
     Idle,
     Running,
     WaitingApproval,
+    WaitingUserInput,
 }
 
 #[derive(Debug, Clone)]
@@ -674,6 +681,17 @@ impl AppState {
                     options,
                     diff: preview,
                 });
+            }
+            TuiEvent::UserInputRequested {
+                question, choices, ..
+            } => {
+                self.status = AppStatus::WaitingUserInput;
+                let mut message = question;
+                if !choices.is_empty() {
+                    message.push_str("\nChoices: ");
+                    message.push_str(&choices.join(", "));
+                }
+                self.messages.push(ChatMessage::System(message));
             }
             TuiEvent::Error(msg) => {
                 self.messages.push(ChatMessage::Error(msg));

@@ -414,7 +414,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                 }
 
                 // Normal Idle mode input
-                if state.status == AppStatus::Idle {
+                if matches!(state.status, AppStatus::Idle | AppStatus::WaitingUserInput) {
                     // Handle slash menu if open
                     if state.slash_menu.is_some() {
                         if handle_slash_menu_key(
@@ -471,11 +471,17 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                                         }
                                     }
                                 }
-                                state.record_prompt(text.clone());
-                                state.messages.push(ChatMessage::User(text.clone()));
-                                state.status = AppStatus::Running;
-                                state.scroll_to_bottom();
-                                let _ = action_tx.send(UserAction::Submit(text));
+                                if state.status == AppStatus::WaitingUserInput {
+                                    state.status = AppStatus::Running;
+                                    state.scroll_to_bottom();
+                                    let _ = action_tx.send(UserAction::RespondToUserInput(text));
+                                } else {
+                                    state.record_prompt(text.clone());
+                                    state.messages.push(ChatMessage::User(text.clone()));
+                                    state.status = AppStatus::Running;
+                                    state.scroll_to_bottom();
+                                    let _ = action_tx.send(UserAction::Submit(text));
+                                }
                                 vim_state.reset_insert(&mut textarea, &theme);
                                 textarea = make_textarea(&vim_state, &theme);
                             }
@@ -1504,7 +1510,7 @@ fn agent_loop_thread(
                 }
             }
             Ok(UserAction::Cancel) | Err(_) => break,
-            Ok(UserAction::Approve(_)) => {}
+            Ok(UserAction::Approve(_) | UserAction::RespondToUserInput(_)) => {}
         }
     }
 }

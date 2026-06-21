@@ -323,6 +323,23 @@ fn parse_mock_prompt(prompt: &str) -> Option<ToolRequest> {
         });
     }
 
+    if let Some(rest) = prompt.strip_prefix("ask ") {
+        let question = rest.trim();
+        return Some(ToolRequest {
+            id: "mock-tool-1".to_string(),
+            name: ToolName::RequestUserInput,
+            action: ActionKind::Read,
+            target: Some(question.to_string()),
+            raw_arguments: Some(
+                serde_json::json!({
+                    "question": question,
+                    "choices": ["yes", "no"]
+                })
+                .to_string(),
+            ),
+        });
+    }
+
     if let Some(rest) = prompt.strip_prefix("grep ") {
         return Some(ToolRequest {
             id: "mock-tool-1".to_string(),
