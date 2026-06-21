@@ -1,5 +1,6 @@
 use std::env;
 use std::fs;
+use std::io;
 use std::io::BufRead;
 use std::io::BufReader;
 use std::io::Write;
@@ -10,6 +11,10 @@ use std::process::Stdio;
 use std::time::SystemTime;
 
 use clap::{Parser, Subcommand, ValueEnum};
+use crossterm::ExecutableCommand;
+use crossterm::cursor;
+use crossterm::event::{self, Event as CrosstermEvent, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::terminal;
 use orca_core::workflow_types::{WorkflowInput, WorkflowRunState};
 use orca_runtime::tasks::TaskRegistry;
 use orca_runtime::workflow::state::WorkflowStateStore;
@@ -26,10 +31,35 @@ use crate::runtime::controller;
 use crate::runtime::history;
 use crate::tui::app;
 
-#[derive(Debug, Default, Eq, PartialEq)]
-struct TuiUpdatePreflight {
-    exit_code: Option<i32>,
-    message: String,
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum TuiUpdatePreflight {
+    Continue,
+    Prompt(orca_runtime::update_check::UpdateInfo),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UpdatePromptChoice {
+    UpdateNow,
+    Skip,
+    SkipUntilNext,
+}
+
+impl UpdatePromptChoice {
+    fn next(self) -> Self {
+        match self {
+            Self::UpdateNow => Self::Skip,
+            Self::Skip => Self::SkipUntilNext,
+            Self::SkipUntilNext => Self::UpdateNow,
+        }
+    }
+
+    fn prev(self) -> Self {
+        match self {
+            Self::UpdateNow => Self::SkipUntilNext,
+            Self::Skip => Self::UpdateNow,
+            Self::SkipUntilNext => Self::Skip,
+        }
+    }
 }
 
 #[derive(Debug, Parser)]
@@ -1337,14 +1367,24 @@ fn run_placeholder(cli: Cli) -> i32 {
         auto_memory: file_config.auto_memory,
     };
 
-    let preflight = tui_update_preflight(
+    match tui_update_preflight(
         config.update_check,
         &config.app_version,
-        orca_runtime::update_check::check_latest,
-    );
-    if let Some(exit_code) = preflight.exit_code {
-        eprintln!("{}", preflight.message);
-        return exit_code;
+        orca_runtime::update_check::check_latest_for_prompt,
+    ) {
+        TuiUpdatePreflight::Continue => {}
+        TuiUpdatePreflight::Prompt(info) => match prompt_for_update(&info) {
+            Ok(UpdatePromptChoice::UpdateNow) => return run_upgrade_command(),
+            Ok(UpdatePromptChoice::Skip) => {}
+            Ok(UpdatePromptChoice::SkipUntilNext) => {
+                if let Err(error) = orca_runtime::update_check::dismiss_version(&info.latest) {
+                    eprintln!("orca: warning: failed to save update dismissal: {error}");
+                }
+            }
+            Err(error) => {
+                eprintln!("orca: warning: failed to read update choice: {error}");
+            }
+        },
     }
 
     app::run_tui(config)
@@ -1356,18 +1396,153 @@ fn tui_update_preflight(
     check_latest: impl FnOnce(&str) -> Result<Option<orca_runtime::update_check::UpdateInfo>, String>,
 ) -> TuiUpdatePreflight {
     if !update_check {
-        return TuiUpdatePreflight::default();
+        return TuiUpdatePreflight::Continue;
     }
 
     match check_latest(current_version) {
-        Ok(Some(info)) => TuiUpdatePreflight {
-            exit_code: Some(1),
-            message: format!(
-                "Update available: {} -> {} ({})\nPlease upgrade Orca before starting the TUI.",
-                info.current, info.latest, info.url
-            ),
-        },
-        Ok(None) | Err(_) => TuiUpdatePreflight::default(),
+        Ok(Some(info)) => TuiUpdatePreflight::Prompt(info),
+        Ok(None) | Err(_) => TuiUpdatePreflight::Continue,
+    }
+}
+
+fn prompt_for_update(
+    info: &orca_runtime::update_check::UpdateInfo,
+) -> io::Result<UpdatePromptChoice> {
+    let mut stdout = io::stdout();
+    let mut highlighted = UpdatePromptChoice::UpdateNow;
+
+    terminal::enable_raw_mode()?;
+    let raw_mode = RawModeGuard;
+    render_update_prompt(&mut stdout, info, highlighted)?;
+
+    let choice = loop {
+        if let CrosstermEvent::Key(key) = event::read()? {
+            if key.kind == KeyEventKind::Release {
+                continue;
+            }
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('d'))
+            {
+                break UpdatePromptChoice::Skip;
+            }
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') => highlighted = highlighted.prev(),
+                KeyCode::Down | KeyCode::Char('j') => highlighted = highlighted.next(),
+                KeyCode::Char('1') => break UpdatePromptChoice::UpdateNow,
+                KeyCode::Char('2') => break UpdatePromptChoice::Skip,
+                KeyCode::Char('3') => break UpdatePromptChoice::SkipUntilNext,
+                KeyCode::Enter => break highlighted,
+                KeyCode::Esc => break UpdatePromptChoice::Skip,
+                _ => {}
+            }
+            render_update_prompt(&mut stdout, info, highlighted)?;
+        }
+    };
+
+    drop(raw_mode);
+    stdout.execute(cursor::MoveToColumn(0))?;
+    writeln!(stdout)?;
+    Ok(choice)
+}
+
+fn render_update_prompt(
+    stdout: &mut io::Stdout,
+    info: &orca_runtime::update_check::UpdateInfo,
+    highlighted: UpdatePromptChoice,
+) -> io::Result<()> {
+    stdout.execute(cursor::MoveToColumn(0))?;
+    stdout.execute(terminal::Clear(terminal::ClearType::FromCursorDown))?;
+    writeln!(
+        stdout,
+        "Update available! {} -> {}",
+        info.current, info.latest
+    )?;
+    writeln!(stdout, "Release notes: {}", info.url)?;
+    writeln!(stdout)?;
+    write_update_choice_row(
+        stdout,
+        1,
+        "Update now",
+        Some(upgrade_command_display()),
+        highlighted == UpdatePromptChoice::UpdateNow,
+    )?;
+    write_update_choice_row(
+        stdout,
+        2,
+        "Skip",
+        None,
+        highlighted == UpdatePromptChoice::Skip,
+    )?;
+    write_update_choice_row(
+        stdout,
+        3,
+        "Skip until next version",
+        None,
+        highlighted == UpdatePromptChoice::SkipUntilNext,
+    )?;
+    writeln!(stdout)?;
+    write!(stdout, "Use Up/Down or j/k, then Enter")?;
+    stdout.flush()
+}
+
+fn write_update_choice_row(
+    stdout: &mut io::Stdout,
+    number: usize,
+    label: &str,
+    detail: Option<&str>,
+    selected: bool,
+) -> io::Result<()> {
+    let marker = if selected { ">" } else { " " };
+    write!(stdout, "{marker} {number}. {label}")?;
+    if let Some(detail) = detail {
+        write!(stdout, " (runs `{detail}`)")?;
+    }
+    writeln!(stdout)
+}
+
+struct RawModeGuard;
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = terminal::disable_raw_mode();
+    }
+}
+
+fn upgrade_command_display() -> &'static str {
+    "npm install -g @blade-ai/orca@latest --registry https://registry.npmjs.org"
+}
+
+fn run_upgrade_command() -> i32 {
+    println!("Updating Orca...");
+    let status = match ProcessCommand::new("npm")
+        .args([
+            "install",
+            "-g",
+            "@blade-ai/orca@latest",
+            "--registry",
+            "https://registry.npmjs.org",
+        ])
+        .status()
+    {
+        Ok(status) => status,
+        Err(error) => {
+            eprintln!("orca: failed to start upgrade command: {error}");
+            return 1;
+        }
+    };
+
+    if status.success() {
+        println!("Upgrade successful. Please restart orca.");
+        0
+    } else {
+        eprintln!(
+            "orca: upgrade failed{}",
+            status
+                .code()
+                .map(|code| format!(" with exit code {code}"))
+                .unwrap_or_default()
+        );
+        1
     }
 }
 
@@ -1439,7 +1614,7 @@ mod tests {
     use orca_runtime::update_check::UpdateInfo;
 
     #[test]
-    fn tui_preflight_blocks_tui_when_update_is_available() {
+    fn tui_preflight_prompts_when_update_is_available() {
         let outcome = tui_update_preflight(true, "0.1.7", |_| {
             Ok(Some(UpdateInfo {
                 current: "0.1.7".to_string(),
@@ -1448,12 +1623,13 @@ mod tests {
             }))
         });
 
-        assert_eq!(outcome.exit_code, Some(1));
-        assert!(outcome.message.contains("Update available: 0.1.7 -> 0.1.8"));
-        assert!(
-            outcome
-                .message
-                .contains("https://example.test/releases/tag/v0.1.8")
+        assert_eq!(
+            outcome,
+            TuiUpdatePreflight::Prompt(UpdateInfo {
+                current: "0.1.7".to_string(),
+                latest: "0.1.8".to_string(),
+                url: "https://example.test/releases/tag/v0.1.8".to_string(),
+            })
         );
     }
 
@@ -1463,8 +1639,7 @@ mod tests {
             panic!("update check should not run when disabled")
         });
 
-        assert_eq!(outcome.exit_code, None);
-        assert!(outcome.message.is_empty());
+        assert_eq!(outcome, TuiUpdatePreflight::Continue);
     }
 
     #[test]
@@ -1472,7 +1647,26 @@ mod tests {
         let outcome =
             tui_update_preflight(true, "0.1.7", |_| Err("network unavailable".to_string()));
 
-        assert_eq!(outcome.exit_code, None);
-        assert!(outcome.message.is_empty());
+        assert_eq!(outcome, TuiUpdatePreflight::Continue);
+    }
+
+    #[test]
+    fn update_prompt_choice_navigation_wraps() {
+        assert_eq!(
+            UpdatePromptChoice::UpdateNow.next(),
+            UpdatePromptChoice::Skip
+        );
+        assert_eq!(
+            UpdatePromptChoice::Skip.next(),
+            UpdatePromptChoice::SkipUntilNext
+        );
+        assert_eq!(
+            UpdatePromptChoice::SkipUntilNext.next(),
+            UpdatePromptChoice::UpdateNow
+        );
+        assert_eq!(
+            UpdatePromptChoice::UpdateNow.prev(),
+            UpdatePromptChoice::SkipUntilNext
+        );
     }
 }

@@ -1,6 +1,11 @@
-use serde::Deserialize;
+use std::fs;
+use std::path::PathBuf;
+
+use serde::{Deserialize, Serialize};
 
 const RELEASES_URL: &str = "https://api.github.com/repos/echoVic/blade-deepseek/releases/latest";
+const ORCA_HOME_ENV: &str = "ORCA_HOME";
+const UPDATE_CACHE_FILE: &str = "update-cache.json";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UpdateInfo {
@@ -28,6 +33,23 @@ pub fn check_latest(current_version: &str) -> Result<Option<UpdateInfo>, String>
         .json()
         .map_err(|error| format!("invalid release response: {error}"))?;
     Ok(update_info_from_release(current_version, release))
+}
+
+pub fn check_latest_for_prompt(current_version: &str) -> Result<Option<UpdateInfo>, String> {
+    let Some(info) = check_latest(current_version)? else {
+        return Ok(None);
+    };
+    if should_prompt_for_update(&info, read_update_cache().skip_until_version.as_deref()) {
+        Ok(Some(info))
+    } else {
+        Ok(None)
+    }
+}
+
+pub fn dismiss_version(version: &str) -> Result<(), String> {
+    write_update_cache(&UpdatePromptCache {
+        skip_until_version: Some(normalize_version(version)),
+    })
 }
 
 fn update_info_from_release(current_version: &str, release: GitHubRelease) -> Option<UpdateInfo> {
@@ -68,6 +90,49 @@ fn parse_semver_core(version: &str) -> Option<(u64, u64, u64)> {
         return None;
     }
     Some((major, minor, patch))
+}
+
+fn should_prompt_for_update(info: &UpdateInfo, skip_until_version: Option<&str>) -> bool {
+    match skip_until_version {
+        Some(skipped) => is_newer_version(&info.latest, &normalize_version(skipped)),
+        None => true,
+    }
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+struct UpdatePromptCache {
+    skip_until_version: Option<String>,
+}
+
+fn read_update_cache() -> UpdatePromptCache {
+    let Some(path) = update_cache_path() else {
+        return UpdatePromptCache::default();
+    };
+    let Ok(contents) = fs::read_to_string(path) else {
+        return UpdatePromptCache::default();
+    };
+    serde_json::from_str(&contents).unwrap_or_default()
+}
+
+fn write_update_cache(cache: &UpdatePromptCache) -> Result<(), String> {
+    let Some(path) = update_cache_path() else {
+        return Err("cannot determine ORCA_HOME or home directory".to_string());
+    };
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("failed to create update cache directory: {error}"))?;
+    }
+    let contents = serde_json::to_string_pretty(cache)
+        .map_err(|error| format!("failed to serialize update cache: {error}"))?;
+    fs::write(path, format!("{contents}\n"))
+        .map_err(|error| format!("failed to write update cache: {error}"))
+}
+
+fn update_cache_path() -> Option<PathBuf> {
+    std::env::var_os(ORCA_HOME_ENV)
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".orca")))
+        .map(|home| home.join(UPDATE_CACHE_FILE))
 }
 
 #[cfg(test)]
@@ -125,5 +190,19 @@ mod tests {
         };
 
         assert_eq!(update_info_from_release("0.1.7-dev", release), None);
+    }
+
+    #[test]
+    fn skipped_version_suppresses_prompt_until_newer_release_exists() {
+        let info = UpdateInfo {
+            current: "0.1.7".to_string(),
+            latest: "0.1.8".to_string(),
+            url: "https://example.test/releases/tag/v0.1.8".to_string(),
+        };
+
+        assert!(!should_prompt_for_update(&info, Some("0.1.8")));
+        assert!(!should_prompt_for_update(&info, Some("0.1.9")));
+        assert!(should_prompt_for_update(&info, Some("0.1.7")));
+        assert!(should_prompt_for_update(&info, None));
     }
 }

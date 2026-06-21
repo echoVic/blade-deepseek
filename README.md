@@ -33,7 +33,7 @@ Set `INSTALL_DIR` to choose a destination and `ORCA_VERSION` to pin a version:
 
 ```bash
 curl -fsSL https://orcaagent.dev/install.sh | \
-  INSTALL_DIR=/usr/local/bin ORCA_VERSION=0.1.8 sh
+  INSTALL_DIR=/usr/local/bin ORCA_VERSION=0.1.9 sh
 ```
 
 ### GitHub Releases
@@ -73,6 +73,16 @@ Priority chain (highest wins): Environment variables > CLI arguments > Config fi
 model = "auto"
 api_key = "sk-..."
 base_url = "https://api.deepseek.com"
+```
+
+### Updates
+
+When `update_check` is enabled, Orca checks GitHub Releases before opening the interactive TUI. If a newer release is available, Orca shows a startup prompt with `Update now`, `Skip`, and `Skip until next version`. Choosing `Update now` runs the npm upgrade command and exits; choosing either skip option continues into the TUI.
+
+Disable the startup check with:
+
+```toml
+update_check = false
 ```
 
 Hooks may return structured JSON on stdout. `{"action":"deny","reason":"..."}` blocks, `{"action":"modify","modified_target":"..."}` rewrites a tool target, and `{"action":"inject","context":"..."}` adds model context. Plain non-JSON stdout is treated as injected context for compatibility. Supported events are `session_start`, `session_end`, `pre_tool_use`, `post_tool_use`, `pre_model_call`, `post_model_call`, `on_budget_warning`, `pre_compact`, and `post_compact`.
