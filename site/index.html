@@ -1,14 +1,95 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" dir="ltr">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="robots" content="index, follow" />
+    <meta name="theme-color" content="#111827" />
+    <meta name="color-scheme" content="dark" />
     <meta
       name="description"
-      content="Orca is a DeepSeek-native coding agent."
+      content="Orca is a DeepSeek-native local coding agent for terminal workflows, approvals, subagents, resumable history, and verifier-gated automation."
     />
+    <meta name="application-name" content="Orca" />
+    <meta name="apple-mobile-web-app-title" content="Orca" />
+    <meta name="format-detection" content="telephone=no" />
+    <link rel="canonical" href="https://orcaagent.dev/" />
     <link rel="icon" type="image/svg+xml" href="/orca-icon.svg" />
-    <title>Orca - DeepSeek-native coding agent</title>
+    <link rel="apple-touch-icon" href="/orca-icon.svg" />
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="Orca" />
+    <meta property="og:title" content="Orca - DeepSeek-native terminal coding agent" />
+    <meta
+      property="og:description"
+      content="Run DeepSeek-native coding agent workflows locally with approvals, subagents, resumable history, and verifier-gated automation."
+    />
+    <meta property="og:url" content="https://orcaagent.dev/" />
+    <meta property="og:image" content="https://orcaagent.dev/orca-social.png" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content="Orca terminal coding agent product preview" />
+    <meta property="og:locale" content="en_US" />
+    <meta property="og:locale:alternate" content="zh_CN" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="Orca - DeepSeek-native terminal coding agent" />
+    <meta
+      name="twitter:description"
+      content="Run DeepSeek-native coding agent workflows locally with approvals, subagents, resumable history, and verifier-gated automation."
+    />
+    <meta name="twitter:image" content="https://orcaagent.dev/orca-social.png" />
+    <meta name="twitter:image:alt" content="Orca terminal coding agent product preview" />
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@graph": [
+          {
+            "@type": "Organization",
+            "@id": "https://orcaagent.dev/#organization",
+            "name": "Orca",
+            "url": "https://orcaagent.dev/",
+            "logo": "https://orcaagent.dev/orca-icon.svg",
+            "sameAs": [
+              "https://github.com/echoVic/blade-deepseek",
+              "https://www.npmjs.com/package/@blade-ai/orca"
+            ]
+          },
+          {
+            "@type": "WebSite",
+            "@id": "https://orcaagent.dev/#website",
+            "name": "Orca",
+            "url": "https://orcaagent.dev/",
+            "inLanguage": ["en", "zh-CN"],
+            "publisher": {
+              "@id": "https://orcaagent.dev/#organization"
+            }
+          },
+          {
+            "@type": "SoftwareApplication",
+            "@id": "https://orcaagent.dev/#software",
+            "name": "Orca",
+            "url": "https://orcaagent.dev/",
+            "applicationCategory": "DeveloperApplication",
+            "applicationSubCategory": "AI coding agent",
+            "operatingSystem": "macOS, Linux",
+            "softwareVersion": "0.1.9",
+            "description": "Orca is a DeepSeek-native local coding agent for terminal workflows, approvals, subagents, resumable history, and verifier-gated automation.",
+            "programmingLanguage": "Rust",
+            "codeRepository": "https://github.com/echoVic/blade-deepseek",
+            "downloadUrl": "https://github.com/echoVic/blade-deepseek/releases/latest",
+            "installUrl": "https://www.npmjs.com/package/@blade-ai/orca",
+            "offers": {
+              "@type": "Offer",
+              "price": "0",
+              "priceCurrency": "USD"
+            },
+            "publisher": {
+              "@id": "https://orcaagent.dev/#organization"
+            }
+          }
+        ]
+      }
+    </script>
+    <title>Orca - DeepSeek-native terminal coding agent</title>
   </head>
   <body>
     <div id="root"></div>

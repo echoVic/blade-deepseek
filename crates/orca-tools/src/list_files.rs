@@ -1,4 +1,5 @@
 use std::fs;
+use std::io;
 use std::path::Path;
 
 use orca_core::tool_types::{ToolRequest, ToolResult, truncate_output};
@@ -12,6 +13,9 @@ pub fn execute(request: &ToolRequest, cwd: &Path, max_bytes: usize) -> ToolResul
     };
     let entries = match fs::read_dir(&path) {
         Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return ToolResult::completed(request, "(empty)".to_string(), false);
+        }
         Err(error) => {
             return ToolResult::failed(
                 request,
@@ -34,4 +38,44 @@ pub fn execute(request: &ToolRequest, cwd: &Path, max_bytes: usize) -> ToolResul
 
     let (output, truncated) = truncate_output(names.join("\n"), max_bytes);
     ToolResult::completed(request, output, truncated)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use orca_core::approval_types::ActionKind;
+    use orca_core::tool_types::{ToolName, ToolStatus};
+
+    use super::*;
+
+    #[test]
+    fn missing_directory_completes_with_empty_listing() {
+        let cwd = temp_dir("list-files-missing");
+        fs::create_dir_all(&cwd).expect("create temp workspace");
+        let request = ToolRequest {
+            id: "list-1".to_string(),
+            name: ToolName::ListFiles,
+            action: ActionKind::Read,
+            target: Some(".orca/workflows".to_string()),
+            raw_arguments: None,
+        };
+
+        let result = execute(&request, &cwd, 4096);
+
+        assert_eq!(result.status, ToolStatus::Completed);
+        assert_eq!(result.output.as_deref(), Some("(empty)"));
+        assert_eq!(result.error, None);
+    }
+
+    fn temp_dir(prefix: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "orca-{prefix}-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
 }

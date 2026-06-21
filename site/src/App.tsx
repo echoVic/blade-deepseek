@@ -19,6 +19,31 @@ const links = {
 type Locale = "en" | "zh";
 
 const localeStorageKey = "orca-site-locale";
+const canonicalUrl = "https://orcaagent.dev/";
+const socialImageUrl = `${canonicalUrl}orca-social.png`;
+
+const seoCopy = {
+  en: {
+    title: "Orca - DeepSeek-native terminal coding agent",
+    description:
+      "Orca is a DeepSeek-native local coding agent for terminal workflows, approvals, subagents, resumable history, and verifier-gated automation.",
+    ogTitle: "Orca - DeepSeek-native terminal coding agent",
+    ogDescription:
+      "Run DeepSeek-native coding agent workflows locally with approvals, subagents, resumable history, and verifier-gated automation.",
+    imageAlt: "Orca terminal coding agent product preview",
+    locale: "en_US",
+  },
+  zh: {
+    title: "Orca - DeepSeek 原生终端代码智能体",
+    description:
+      "Orca 是 DeepSeek 原生的本地终端代码智能体，支持审批、子智能体、可恢复历史、工作流和 verifier 校验自动化。",
+    ogTitle: "Orca - DeepSeek 原生终端代码智能体",
+    ogDescription:
+      "在本地终端运行 DeepSeek 原生代码智能体工作流，覆盖审批、子智能体、可恢复历史和 verifier 校验自动化。",
+    imageAlt: "Orca 终端代码智能体产品预览",
+    locale: "zh_CN",
+  },
+} as const;
 
 const copy = {
   en: {
@@ -422,6 +447,66 @@ function detectInitialLocale(): Locale {
   return window.navigator.language.toLowerCase().startsWith("zh") ? "zh" : "en";
 }
 
+function setMetaAttribute(
+  selector: string,
+  attributeName: "content" | "href",
+  value: string,
+  createElement: () => HTMLMetaElement | HTMLLinkElement,
+) {
+  const existing = document.head.querySelector<HTMLMetaElement | HTMLLinkElement>(selector);
+  const element = existing ?? createElement();
+
+  element.setAttribute(attributeName, value);
+
+  if (!existing) {
+    document.head.appendChild(element);
+  }
+}
+
+function setNamedMeta(name: string, content: string) {
+  setMetaAttribute(`meta[name="${name}"]`, "content", content, () => {
+    const meta = document.createElement("meta");
+    meta.setAttribute("name", name);
+    return meta;
+  });
+}
+
+function setPropertyMeta(property: string, content: string) {
+  setMetaAttribute(`meta[property="${property}"]`, "content", content, () => {
+    const meta = document.createElement("meta");
+    meta.setAttribute("property", property);
+    return meta;
+  });
+}
+
+function setCanonicalLink(href: string) {
+  setMetaAttribute('link[rel="canonical"]', "href", href, () => {
+    const link = document.createElement("link");
+    link.setAttribute("rel", "canonical");
+    return link;
+  });
+}
+
+function syncSeoHead(locale: Locale) {
+  const seo = seoCopy[locale];
+
+  document.documentElement.lang = locale === "zh" ? "zh-CN" : "en";
+  document.title = seo.title;
+  setCanonicalLink(canonicalUrl);
+  setNamedMeta("description", seo.description);
+  setNamedMeta("twitter:title", seo.ogTitle);
+  setNamedMeta("twitter:description", seo.ogDescription);
+  setNamedMeta("twitter:image", socialImageUrl);
+  setNamedMeta("twitter:image:alt", seo.imageAlt);
+  setPropertyMeta("og:title", seo.ogTitle);
+  setPropertyMeta("og:description", seo.ogDescription);
+  setPropertyMeta("og:url", canonicalUrl);
+  setPropertyMeta("og:image", socialImageUrl);
+  setPropertyMeta("og:image:alt", seo.imageAlt);
+  setPropertyMeta("og:locale", seo.locale);
+  setPropertyMeta("og:locale:alternate", locale === "zh" ? "en_US" : "zh_CN");
+}
+
 type TuiBlock = {
   kind: "user" | "reason" | "tool" | "approve" | "ok" | "done";
   content: ReactNode;
@@ -687,7 +772,7 @@ function App() {
 
   useEffect(() => {
     window.localStorage.setItem(localeStorageKey, locale);
-    document.documentElement.lang = locale === "zh" ? "zh-CN" : "en";
+    syncSeoHead(locale);
   }, [locale]);
 
   function clearCopyResetTimer() {
@@ -777,7 +862,7 @@ function App() {
             <a href="#capabilities">{t.nav.capabilities}</a>
             <a href="#workflow">{t.nav.workflow}</a>
             <a href="#install">{t.nav.install}</a>
-            <a className="nav-cta" href={links.github}>
+            <a className="nav-cta" href={links.github} rel="noreferrer">
               {t.nav.github}
             </a>
           </nav>
@@ -818,7 +903,7 @@ function App() {
             <a className="primary" href="#install">
               {t.hero.primary}
             </a>
-            <a className="secondary" href={links.github}>
+            <a className="secondary" href={links.github} rel="noreferrer">
               {t.hero.secondary}
             </a>
           </div>
@@ -883,10 +968,10 @@ function App() {
         </div>
       </section>
 
-      <section className="features" id="features">
+      <section className="features" id="features" aria-labelledby="features-heading">
         <div className="section-heading">
           <p className="eyebrow">{t.featuresEyebrow}</p>
-          <h2>{t.featuresTitle}</h2>
+          <h2 id="features-heading">{t.featuresTitle}</h2>
         </div>
         <div className="feature-grid">
           {t.features.map((feature) => (
@@ -898,10 +983,10 @@ function App() {
         </div>
       </section>
 
-      <section className="capabilities" id="capabilities">
+      <section className="capabilities" id="capabilities" aria-labelledby="capabilities-heading">
         <div className="cap-lead">
           <p className="eyebrow">{t.capabilitiesEyebrow}</p>
-          <h2>{t.capabilitiesTitle}</h2>
+          <h2 id="capabilities-heading">{t.capabilitiesTitle}</h2>
           <p className="subtitle">{t.capabilitiesSubtitle}</p>
           <div className="tools-wrap" aria-label={t.builtInToolsLabel}>
             {builtinTools.map((tool) => (
@@ -925,10 +1010,10 @@ function App() {
         </div>
       </section>
 
-      <section className="workflow" id="workflow">
+      <section className="workflow" id="workflow" aria-labelledby="workflow-heading">
         <div className="section-heading" style={{ marginBottom: 40 }}>
           <p className="eyebrow">{t.workflowEyebrow}</p>
-          <h2>{t.workflowTitle}</h2>
+          <h2 id="workflow-heading">{t.workflowTitle}</h2>
         </div>
         <div className="code-panel">
           <div className="code-tabs" role="tablist" aria-label={t.aria.commands}>
@@ -976,10 +1061,10 @@ function App() {
         </div>
       </section>
 
-      <section className="install-repeat" id="install" aria-label={t.aria.install}>
+      <section className="install-repeat" id="install" aria-labelledby="install-heading">
         <div>
           <p className="eyebrow">{t.install.eyebrow}</p>
-          <h2>{t.install.title}</h2>
+          <h2 id="install-heading">{t.install.title}</h2>
         </div>
         <div className="install-list">
           <div className="install-card" aria-label={t.install.cardLabel}>
@@ -1036,7 +1121,11 @@ function App() {
             </div>
           </div>
           <p>
-            {t.install.platforms} <a href={links.releases}>{t.install.releases}</a>.
+            {t.install.platforms}{" "}
+            <a href={links.releases} rel="noreferrer">
+              {t.install.releases}
+            </a>
+            .
           </p>
         </div>
       </section>
@@ -1047,9 +1136,15 @@ function App() {
           <span>Orca</span>
         </a>
         <div className="links">
-          <a href={links.github}>GitHub</a>
-          <a href={links.npm}>npm</a>
-          <a href={links.releases}>{t.install.releases}</a>
+          <a href={links.github} rel="noreferrer">
+            GitHub
+          </a>
+          <a href={links.npm} rel="noreferrer">
+            npm
+          </a>
+          <a href={links.releases} rel="noreferrer">
+            {t.install.releases}
+          </a>
         </div>
       </footer>
     </main>
