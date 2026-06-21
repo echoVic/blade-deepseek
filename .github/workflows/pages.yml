@@ -33,6 +33,10 @@ jobs:
         working-directory: site
       - run: npm run build
         working-directory: site
+      - name: Add custom domain and installer
+        run: |
+          cp install.sh site/dist/install.sh
+          printf 'orcaagent.dev\n' > site/dist/CNAME
       - uses: actions/configure-pages@v5
         with:
           enablement: true

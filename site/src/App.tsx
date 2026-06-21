@@ -1,8 +1,7 @@
 import { useEffect, useRef, useState, type KeyboardEvent } from "react";
 
 const npmCommand = "npm install -g @blade-ai/orca";
-const curlCommand =
-  "curl -fsSL https://raw.githubusercontent.com/echoVic/blade-deepseek/main/install.sh | sh";
+const curlCommand = "curl -fsSL https://orcaagent.dev/install.sh | sh";
 
 const links = {
   github: "https://github.com/echoVic/blade-deepseek",

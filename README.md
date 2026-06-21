@@ -25,14 +25,14 @@ Supported npm platforms:
 ### curl
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/echoVic/blade-deepseek/main/install.sh | sh
+curl -fsSL https://orcaagent.dev/install.sh | sh
 ```
 
 The installer downloads the native binary for your platform from GitHub Releases.
 Set `INSTALL_DIR` to choose a destination and `ORCA_VERSION` to pin a version:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/echoVic/blade-deepseek/main/install.sh | \
+curl -fsSL https://orcaagent.dev/install.sh | \
   INSTALL_DIR=/usr/local/bin ORCA_VERSION=0.1.3 sh
 ```
 
