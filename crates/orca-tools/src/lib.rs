@@ -287,6 +287,35 @@ mod tests {
     }
 
     #[test]
+    fn request_user_input_tool_is_model_visible_but_nonblocking_by_default() {
+        let reg = registry::default_tool_registry();
+        let tool = reg
+            .get("request_user_input")
+            .expect("request_user_input is registered");
+        let request = ToolRequest {
+            id: "ask".to_string(),
+            name: ToolName::plain("request_user_input"),
+            action: ActionKind::Read,
+            target: None,
+            raw_arguments: Some(r#"{"question":"Continue?","choices":["Yes","No"]}"#.to_string()),
+        };
+
+        assert!(tool.spec().exposure.is_model_visible());
+        assert!(tool.is_read_only(&request));
+        assert!(!tool.is_concurrent_safe(&request));
+
+        let result = reg.execute(&request, &registry::ToolContext::new(Path::new(".")));
+        assert_eq!(result.status, orca_core::tool_types::ToolStatus::Failed);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("interactive TUI session")
+        );
+    }
+
+    #[test]
     fn external_tool_cannot_shadow_builtin_list_files_alias() {
         let external_tools = vec![ExternalToolConfig {
             name: "list_files".to_string(),

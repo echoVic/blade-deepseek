@@ -4,7 +4,7 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-06-22
-Current baseline: v0.1.15 fuzzy mention baseline
+Current baseline: v0.1.16 structured user-input tool baseline
 
 ---
 
@@ -103,7 +103,7 @@ without destabilizing core runtime behavior.
 2. Sandbox/config summary. `/config show` runtime posture summary done in v0.1.14.
    - Show current approval mode, filesystem scope, network posture, and key limits in `/config show`.
    - Reuse the summary in startup/session events where appropriate.
-3. Structured user question tool.
+3. Structured user question tool. Model-visible nonblocking tool contract done in v0.1.16; full TUI answer loop remains follow-up.
    - Provide a small, approval-safe mechanism for the model to request user input in TUI.
    - Keep headless JSONL behavior deterministic.
 

@@ -20,6 +20,7 @@ pub enum ToolName {
     WebSearch,
     UpdateGoal,
     UpdatePlan,
+    RequestUserInput,
     Namespaced {
         namespace: String,
         name: String,
@@ -46,6 +47,7 @@ impl ToolName {
             "web_search" => Self::WebSearch,
             "update_goal" => Self::UpdateGoal,
             "update_plan" => Self::UpdatePlan,
+            "request_user_input" => Self::RequestUserInput,
             other => Self::External(other.to_string()),
         }
     }
@@ -84,6 +86,7 @@ impl ToolName {
             Self::WebSearch => "web_search",
             Self::UpdateGoal => "update_goal",
             Self::UpdatePlan => "update_plan",
+            Self::RequestUserInput => "request_user_input",
             Self::Namespaced { name, .. } => name,
             Self::Mcp(name) => name
                 .rsplit_once("__")
@@ -108,6 +111,7 @@ impl ToolName {
             Self::WebSearch => "web_search",
             Self::UpdateGoal => "update_goal",
             Self::UpdatePlan => "update_plan",
+            Self::RequestUserInput => "request_user_input",
             Self::Namespaced { serialized, .. } => serialized,
             Self::Mcp(name) | Self::External(name) => name,
         }
@@ -134,6 +138,7 @@ impl ToolName {
             "web_search" => Self::WebSearch,
             "update_goal" => Self::UpdateGoal,
             "update_plan" => Self::UpdatePlan,
+            "request_user_input" => Self::RequestUserInput,
             other => Self::External(other.to_string()),
         })
     }
@@ -145,7 +150,12 @@ impl ToolName {
     pub fn is_read_only(&self) -> bool {
         matches!(
             self,
-            Self::ReadFile | Self::ListFiles | Self::Glob | Self::Grep | Self::GitStatus
+            Self::ReadFile
+                | Self::ListFiles
+                | Self::Glob
+                | Self::Grep
+                | Self::GitStatus
+                | Self::RequestUserInput
         )
     }
 }
@@ -192,6 +202,7 @@ pub enum ToolCapability {
     WorkflowRun,
     PlanUpdate,
     GoalUpdate,
+    UserInputRequest,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -239,6 +250,7 @@ impl CapabilitySet {
                         | ToolCapability::GitInspect
                         | ToolCapability::PlanUpdate
                         | ToolCapability::GoalUpdate
+                        | ToolCapability::UserInputRequest
                 )
             })
     }

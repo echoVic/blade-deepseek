@@ -546,6 +546,35 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
         ),
         BuiltinExecutor::UpdateGoal,
     ));
+    registry.register(BuiltinTool::new(
+        builtin_spec(
+            "request_user_input",
+            "Ask the user a structured clarification question. Use only when progress requires user input; headless runs return a deterministic failure instead of blocking.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "question": {
+                        "type": "string",
+                        "description": "A concise question to show the user"
+                    },
+                    "choices": {
+                        "type": "array",
+                        "description": "Optional mutually exclusive answer choices",
+                        "items": {
+                            "type": "string"
+                        }
+                    }
+                },
+                "required": ["question"],
+                "additionalProperties": false
+            }),
+            CapabilitySet::new(vec![ToolCapability::UserInputRequest]),
+            ToolExposure::Direct,
+            RendererHint::State,
+            false,
+        ),
+        BuiltinExecutor::RequestUserInput,
+    ));
 }
 
 fn builtin_spec(
@@ -646,6 +675,11 @@ impl Tool for BuiltinTool {
             ),
             BuiltinExecutor::UpdateGoal => update_goal::execute(request),
             BuiltinExecutor::UpdatePlan => update_plan::execute(request),
+            BuiltinExecutor::RequestUserInput => ToolResult::failed(
+                request,
+                "request_user_input requires an interactive TUI session",
+                None,
+            ),
         }
     }
 }
@@ -664,6 +698,7 @@ enum BuiltinExecutor {
     Workflow,
     UpdateGoal,
     UpdatePlan,
+    RequestUserInput,
 }
 
 struct McpProxyTool {
