@@ -11,7 +11,7 @@ use orca_core::task_types::{TaskStatus, TaskType};
 
 use crate::shortcuts::{self, ShortcutScope};
 use crate::theme::Theme;
-use crate::types::{AppState, AppStatus, ChatMessage, PanelMode};
+use crate::types::{ApprovalOption, AppState, AppStatus, ChatMessage, PanelMode};
 
 pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, theme: &Theme) {
     if state.status == AppStatus::Setup {
@@ -939,51 +939,107 @@ fn render_approval_dialog(frame: &mut Frame, state: &AppState, theme: &Theme) {
     };
 
     let area = frame.area();
-    let width = 44u16.min(area.width.saturating_sub(4));
-    let height = 10u16.min(area.height.saturating_sub(4));
+    let target_str = dialog.target.as_deref().unwrap_or("(none)");
+
+    // Build the diff/preview lines (colored) if a preview is present.
+    let diff_lines: Vec<Line<'static>> = match &dialog.diff {
+        Some(diff) => diff
+            .lines()
+            .take(12)
+            .map(|line| {
+                let color = if line.starts_with('+') {
+                    theme.diff_add
+                } else if line.starts_with('-') {
+                    theme.diff_remove
+                } else if line.starts_with("@@") || line.starts_with('$') {
+                    theme.border
+                } else {
+                    theme.muted
+                };
+                Line::from(Span::styled(
+                    format!("  {line}"),
+                    Style::default().fg(color),
+                ))
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+    let diff_truncated = dialog
+        .diff
+        .as_ref()
+        .map(|d| d.lines().count() > 12)
+        .unwrap_or(false);
+
+    // Header (3) + diff + options + footer (2); clamp to the screen.
+    let option_count = dialog.options.len() as u16;
+    let diff_h = diff_lines.len() as u16 + if diff_truncated { 1 } else { 0 };
+    let content_h = 3 + diff_h + option_count + 3;
+    let width = 64u16.min(area.width.saturating_sub(4));
+    let height = content_h.min(area.height.saturating_sub(4)).max(8);
     let x = (area.width.saturating_sub(width)) / 2;
     let y = (area.height.saturating_sub(height)) / 2;
     let popup_area = Rect::new(x, y, width, height);
 
     frame.render_widget(Clear, popup_area);
 
-    let target_str = dialog.target.as_deref().unwrap_or("(none)");
-
-    let allow_style = if dialog.selected == 0 {
-        Style::default()
-            .fg(Color::Green)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(theme.text)
-    };
-    let deny_style = if dialog.selected == 1 {
-        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(theme.text)
-    };
-
-    let allow_prefix = if dialog.selected == 0 { "▸ " } else { "  " };
-    let deny_prefix = if dialog.selected == 1 { "▸ " } else { "  " };
-
-    let content = vec![
-        Line::from(""),
+    let mut content: Vec<Line<'static>> = vec![
         Line::from(vec![
-            Span::styled("  Tool: ", Style::default().fg(theme.muted)),
-            Span::styled(dialog.tool.clone(), Style::default().fg(theme.warning)),
+            Span::styled("  tool   ", Style::default().fg(theme.muted)),
+            Span::styled(
+                dialog.tool.clone(),
+                Style::default()
+                    .fg(theme.warning)
+                    .add_modifier(Modifier::BOLD),
+            ),
         ]),
         Line::from(vec![
-            Span::styled("  Target: ", Style::default().fg(theme.muted)),
+            Span::styled("  target ", Style::default().fg(theme.muted)),
             Span::styled(target_str.to_string(), Style::default().fg(theme.text)),
         ]),
         Line::from(""),
-        Line::from(Span::styled(format!("{allow_prefix}Allow"), allow_style)),
-        Line::from(Span::styled(format!("{deny_prefix}Deny"), deny_style)),
-        Line::from(""),
-        Line::from(Span::styled(
-            "  ↑↓ select, Enter confirm",
-            Style::default().fg(theme.muted),
-        )),
     ];
+
+    content.extend(diff_lines);
+    if diff_truncated {
+        content.push(Line::from(Span::styled(
+            "  … (preview truncated)",
+            Style::default().fg(theme.muted),
+        )));
+    }
+    if dialog.diff.is_some() {
+        content.push(Line::from(""));
+    }
+
+    // The four options, one per line, highlighted when selected.
+    for (i, option) in dialog.options.iter().enumerate() {
+        let selected = i == dialog.selected;
+        let prefix = if selected { "▸ " } else { "  " };
+        let key_color = match option {
+            ApprovalOption::Deny => theme.error,
+            _ => theme.success,
+        };
+        let label_style = if selected {
+            Style::default().fg(theme.text).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.muted)
+        };
+        content.push(Line::from(vec![
+            Span::styled(prefix, Style::default().fg(theme.border)),
+            Span::styled(
+                format!("[{}] ", option.key()),
+                Style::default()
+                    .fg(key_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(option.label().to_string(), label_style),
+        ]));
+    }
+
+    content.push(Line::from(""));
+    content.push(Line::from(Span::styled(
+        "  ↑↓ select · Enter confirm · y/a/A/n direct",
+        Style::default().fg(theme.muted),
+    )));
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -991,7 +1047,9 @@ fn render_approval_dialog(frame: &mut Frame, state: &AppState, theme: &Theme) {
         .title(" Approval Required ")
         .border_style(Style::default().fg(theme.approval));
 
-    let paragraph = Paragraph::new(content).block(block);
+    let paragraph = Paragraph::new(content)
+        .block(block)
+        .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, popup_area);
 }
 

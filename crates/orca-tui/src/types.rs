@@ -50,6 +50,7 @@ pub enum TuiEvent {
         id: String,
         tool: String,
         target: Option<String>,
+        preview: Option<String>,
     },
     Notice(String),
     Error(String),
@@ -125,11 +126,78 @@ pub enum ChatMessage {
     System(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalOption {
+    /// Approve this single call.
+    Once,
+    /// Approve and remember this tool for the rest of the session.
+    AlwaysTool,
+    /// Approve and remember this tool + target for the rest of the session.
+    AlwaysTarget,
+    /// Reject this call.
+    Deny,
+}
+
+impl ApprovalOption {
+    pub fn key(self) -> char {
+        match self {
+            ApprovalOption::Once => 'y',
+            ApprovalOption::AlwaysTool => 'a',
+            ApprovalOption::AlwaysTarget => 'A',
+            ApprovalOption::Deny => 'n',
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ApprovalOption::Once => "approve once",
+            ApprovalOption::AlwaysTool => "always allow tool",
+            ApprovalOption::AlwaysTarget => "always allow tool + target",
+            ApprovalOption::Deny => "deny",
+        }
+    }
+
+    /// Whether choosing this option lets the tool run.
+    pub fn is_approve(self) -> bool {
+        !matches!(self, ApprovalOption::Deny)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ApprovalDialog {
     pub tool: String,
     pub target: Option<String>,
     pub selected: usize,
+    pub options: Vec<ApprovalOption>,
+    pub diff: Option<String>,
+}
+
+impl ApprovalDialog {
+    /// The four options shown when a target is present; without a target the
+    /// "always allow tool + target" option is dropped (nothing to scope to).
+    pub fn options_for(target: Option<&str>) -> Vec<ApprovalOption> {
+        if target.is_some() {
+            vec![
+                ApprovalOption::Once,
+                ApprovalOption::AlwaysTool,
+                ApprovalOption::AlwaysTarget,
+                ApprovalOption::Deny,
+            ]
+        } else {
+            vec![
+                ApprovalOption::Once,
+                ApprovalOption::AlwaysTool,
+                ApprovalOption::Deny,
+            ]
+        }
+    }
+
+    pub fn current(&self) -> ApprovalOption {
+        self.options
+            .get(self.selected)
+            .copied()
+            .unwrap_or(ApprovalOption::Deny)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,6 +245,9 @@ pub struct AppState {
     #[allow(dead_code)]
     pub event_tx: mpsc::Sender<UserAction>,
     pub approval_dialog: Option<ApprovalDialog>,
+    /// Tool / "tool\u{0}target" keys the user chose to always allow this
+    /// session. Checked when a new approval arrives so the dialog is skipped.
+    pub approval_allowlist: std::collections::HashSet<String>,
     pub setup_step: u8,
     pub show_shortcuts: bool,
     pub input_history: Vec<String>,
@@ -216,6 +287,7 @@ impl AppState {
             cwd,
             event_tx,
             approval_dialog: None,
+            approval_allowlist: std::collections::HashSet::new(),
             setup_step: 0,
             show_shortcuts: false,
             input_history: Vec::new(),
@@ -405,6 +477,33 @@ impl AppState {
             .map(|session| session.session_id.clone())
     }
 
+    /// Allowlist key for a tool alone.
+    pub fn approval_key_tool(tool: &str) -> String {
+        tool.to_string()
+    }
+
+    /// Allowlist key for a tool scoped to a specific target.
+    pub fn approval_key_target(tool: &str, target: &str) -> String {
+        format!("{tool}\u{0}{target}")
+    }
+
+    /// True if a pending approval for this tool/target was already granted an
+    /// "always allow" this session.
+    pub fn approval_is_allowlisted(&self, tool: &str, target: Option<&str>) -> bool {
+        if self
+            .approval_allowlist
+            .contains(&Self::approval_key_tool(tool))
+        {
+            return true;
+        }
+        if let Some(target) = target {
+            return self
+                .approval_allowlist
+                .contains(&Self::approval_key_target(tool, target));
+        }
+        false
+    }
+
     pub fn update(&mut self, event: TuiEvent) {
         match event {
             TuiEvent::TurnStarted { .. } => {
@@ -553,12 +652,20 @@ impl AppState {
                     });
                 }
             }
-            TuiEvent::ApprovalNeeded { tool, target, .. } => {
+            TuiEvent::ApprovalNeeded {
+                tool,
+                target,
+                preview,
+                ..
+            } => {
                 self.status = AppStatus::WaitingApproval;
+                let options = ApprovalDialog::options_for(target.as_deref());
                 self.approval_dialog = Some(ApprovalDialog {
                     tool,
                     target,
                     selected: 0,
+                    options,
+                    diff: preview,
                 });
             }
             TuiEvent::Error(msg) => {
@@ -707,6 +814,68 @@ mod tests {
         state.session_query_pop();
         assert_eq!(state.session_picker_query, "aut");
         assert_eq!(state.filtered_session_indices(), vec![0, 1]);
+    }
+
+    #[test]
+    fn approval_dialog_has_four_options_with_target_and_three_without() {
+        let with_target = ApprovalDialog::options_for(Some("src/auth/token.rs"));
+        assert_eq!(
+            with_target,
+            vec![
+                ApprovalOption::Once,
+                ApprovalOption::AlwaysTool,
+                ApprovalOption::AlwaysTarget,
+                ApprovalOption::Deny,
+            ]
+        );
+        let without = ApprovalDialog::options_for(None);
+        assert_eq!(
+            without,
+            vec![
+                ApprovalOption::Once,
+                ApprovalOption::AlwaysTool,
+                ApprovalOption::Deny,
+            ]
+        );
+    }
+
+    #[test]
+    fn approval_allowlist_grants_matching_tool_and_target() {
+        let mut tool_scope = state();
+
+        // Initially nothing is allow-listed.
+        assert!(!tool_scope.approval_is_allowlisted("edit", Some("src/a.rs")));
+
+        // "Always allow tool" grants every target for that tool.
+        tool_scope
+            .approval_allowlist
+            .insert(AppState::approval_key_tool("edit"));
+        assert!(tool_scope.approval_is_allowlisted("edit", Some("src/a.rs")));
+        assert!(tool_scope.approval_is_allowlisted("edit", Some("src/b.rs")));
+        assert!(!tool_scope.approval_is_allowlisted("bash", Some("ls")));
+
+        // "Always allow tool + target" is scoped to that one target.
+        let mut scoped = state();
+        scoped
+            .approval_allowlist
+            .insert(AppState::approval_key_target("bash", "cargo test"));
+        assert!(scoped.approval_is_allowlisted("bash", Some("cargo test")));
+        assert!(!scoped.approval_is_allowlisted("bash", Some("rm -rf /")));
+    }
+
+    #[test]
+    fn approval_needed_event_populates_dialog_options_and_diff() {
+        let mut state = state();
+        state.update(TuiEvent::ApprovalNeeded {
+            id: "approval-1".to_string(),
+            tool: "edit".to_string(),
+            target: Some("src/auth/token.rs".to_string()),
+            preview: Some("@@ token.rs @@\n- a\n+ b".to_string()),
+        });
+        let dialog = state.approval_dialog.expect("dialog present");
+        assert_eq!(dialog.options.len(), 4);
+        assert!(dialog.diff.is_some());
+        assert_eq!(dialog.current(), ApprovalOption::Once);
     }
 
     #[test]

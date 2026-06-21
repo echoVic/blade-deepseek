@@ -916,6 +916,54 @@ fn execute_subagent_batch_for_tui(
         .collect()
 }
 
+/// Build a human-readable preview of what a tool call will do, parsed from its
+/// raw JSON arguments. Returns `None` when there is nothing meaningful to show.
+/// This is best-effort: the strings come straight from the pending request, so
+/// the diff/command shown is exactly what would run.
+fn build_approval_preview(request: &tool_types::ToolRequest) -> Option<String> {
+    use orca_core::tool_types::ToolName;
+
+    let raw = request.raw_arguments.as_deref()?;
+    let args: serde_json::Value = serde_json::from_str(raw).ok()?;
+
+    match &request.name {
+        ToolName::Edit => {
+            let path = args["path"].as_str().unwrap_or("(file)");
+            let old_text = args["old_text"].as_str().unwrap_or_default();
+            let new_text = args["new_text"].as_str().unwrap_or_default();
+            let mut out = format!("@@ {path} @@\n");
+            for line in old_text.lines() {
+                out.push_str(&format!("- {line}\n"));
+            }
+            for line in new_text.lines() {
+                out.push_str(&format!("+ {line}\n"));
+            }
+            Some(out.trim_end().to_string())
+        }
+        ToolName::WriteFile => {
+            let path = args["path"].as_str().unwrap_or("(file)");
+            let content = args["content"]
+                .as_str()
+                .or_else(|| args["contents"].as_str())
+                .unwrap_or_default();
+            let mut out = format!("@@ write {path} @@\n");
+            for line in content.lines().take(40) {
+                out.push_str(&format!("+ {line}\n"));
+            }
+            let total = content.lines().count();
+            if total > 40 {
+                out.push_str(&format!("+ … (+{} more lines)\n", total - 40));
+            }
+            Some(out.trim_end().to_string())
+        }
+        ToolName::Bash => {
+            let command = args["command"].as_str().or_else(|| args.as_str())?;
+            Some(format!("$ {command}"))
+        }
+        _ => None,
+    }
+}
+
 fn execute_tool_for_tui(
     config: &RunConfig,
     cwd: &Path,
@@ -953,6 +1001,7 @@ fn execute_tool_for_tui(
                     id: approval.id.clone(),
                     tool: tool_request.name.as_str().to_string(),
                     target: tool_request.target.clone(),
+                    preview: build_approval_preview(tool_request),
                 });
 
                 let allowed = loop {
