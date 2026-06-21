@@ -98,6 +98,7 @@ function App() {
   const [mode, setMode] = useState<InstallMode>("npm");
   const [copyState, setCopyState] = useState<CopyState>("idle");
   const resetTimerRef = useRef<number | null>(null);
+  const copyRequestRef = useRef(0);
   const tabRefs = useRef<Record<InstallMode, HTMLButtonElement | null>>({
     npm: null,
     curl: null,
@@ -113,6 +114,7 @@ function App() {
 
   function setInstallMode(nextMode: InstallMode) {
     setMode(nextMode);
+    copyRequestRef.current += 1;
     setCopyState("idle");
     clearCopyResetTimer();
   }
@@ -133,7 +135,12 @@ function App() {
   }, [copyState]);
 
   async function copyCommand() {
+    const requestId = ++copyRequestRef.current;
     const copied = await copyCommandText(command);
+    if (requestId !== copyRequestRef.current) {
+      return;
+    }
+
     setCopyState(copied ? "copied" : "failed");
   }
 

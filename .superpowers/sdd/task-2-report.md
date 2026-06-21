@@ -130,3 +130,37 @@ dist/assets/index-DWHWFtbY.css    4.70 kB │ gzip:  1.62 kB
 dist/assets/index-DvWWfkNA.js   200.03 kB │ gzip: 63.01 kB
 ✓ built in 289ms
 ```
+
+## Final Race Fix
+
+Applied the remaining copy-state race fix in `site/src/App.tsx`:
+
+- Added a `copyRequestRef` token so each copy action gets a unique request id.
+- Bumped that token whenever the install mode changes so any in-flight clipboard promise is ignored after a tab switch.
+- Kept the clipboard fallback path and install tab keyboard handling unchanged.
+
+Verification:
+
+```bash
+npm --prefix site run build
+```
+
+Relevant output:
+
+```text
+> orca-site@0.1.0 build
+> tsc -b && vite build
+
+vite v7.3.5 building client environment for production...
+transforming...
+✓ 29 modules transformed.
+rendering chunks...
+computing gzip size...
+dist/index.html                   0.57 kB │ gzip:  0.33 kB
+dist/assets/index-CD0O98qj.js   200.10 kB │ gzip: 63.01 kB
+✓ built in 313ms
+```
+
+Environment note:
+
+- The first build attempt failed because the local `site` dependencies were not installed yet (`sh: tsc: command not found`), so I ran `npm --prefix site install` and reran the build successfully.
