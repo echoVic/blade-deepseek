@@ -3,7 +3,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Gauge, Paragraph, Wrap};
 use tui_textarea::TextArea;
 use unicode_width::UnicodeWidthStr;
 
@@ -67,6 +67,7 @@ fn render_session_picker(frame: &mut Frame, state: &mut AppState, theme: &Theme)
     let area = frame.area();
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .title(" Resume Conversation ");
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -134,7 +135,10 @@ fn render_messages(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &
         state.scroll_offset
     };
 
-    let block = Block::default().borders(Borders::ALL).title(" Orca ");
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title(" Orca ");
     let paragraph = Paragraph::new(lines)
         .block(block)
         .wrap(Wrap { trim: false })
@@ -146,6 +150,7 @@ fn render_messages(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &
 fn render_workflows_panel(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) {
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .title(" Workflows ")
         .border_style(Style::default().fg(theme.border));
     let inner = block.inner(area);
@@ -158,58 +163,119 @@ fn render_workflows_panel(frame: &mut Frame, area: Rect, state: &mut AppState, t
         .filter(|task| task.task_type == TaskType::Workflow)
         .collect::<Vec<_>>();
 
-    let mut lines: Vec<Line<'static>> = vec![Line::from(vec![
-        Span::styled(" Name", Style::default().fg(theme.muted)),
-        Span::styled(" | ", Style::default().fg(theme.muted)),
-        Span::styled("Status", Style::default().fg(theme.muted)),
-        Span::styled(" | ", Style::default().fg(theme.muted)),
-        Span::styled("Run ID", Style::default().fg(theme.muted)),
-        Span::styled(" | ", Style::default().fg(theme.muted)),
-        Span::styled("Phases", Style::default().fg(theme.muted)),
-    ])];
-
     if workflow_tasks.is_empty() {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            " No workflow tasks available in this view yet.",
-            Style::default().fg(theme.muted),
-        )));
-    } else {
-        for (index, task) in workflow_tasks.iter().enumerate() {
-            let selected = index == state.workflow_panel.selected;
-            let marker = if selected { ">" } else { " " };
-            let name = task.name.as_deref().unwrap_or(task.description.as_str());
-            let status = task_status_label(task.status);
-            let run_id = task.workflow_run_id.as_deref().unwrap_or("-");
-            let phase_count = task
-                .phase_count
-                .map(|count| count.to_string())
-                .unwrap_or_else(|| "-".to_string());
-            let style = if selected {
-                Style::default()
-                    .fg(theme.border)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(theme.text)
-            };
-
-            lines.push(Line::from(vec![
-                Span::styled(format!("{marker} {name}"), style),
-                Span::styled(" | ", Style::default().fg(theme.muted)),
-                Span::styled(
-                    status.to_string(),
-                    Style::default().fg(task_status_color(task.status, theme)),
-                ),
-                Span::styled(" | ", Style::default().fg(theme.muted)),
-                Span::styled(run_id.to_string(), Style::default().fg(theme.muted)),
-                Span::styled(" | ", Style::default().fg(theme.muted)),
-                Span::styled(phase_count, Style::default().fg(theme.muted)),
-            ]));
-        }
+        let lines = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                " No workflow tasks available in this view yet.",
+                Style::default().fg(theme.muted),
+            )),
+        ];
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+        return;
     }
 
-    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
-    frame.render_widget(paragraph, inner);
+    // One header row + two rows per task (label line, gauge line).
+    let header_h: u16 = 1;
+    let row_h: u16 = 2;
+    let mut constraints = vec![Constraint::Length(header_h)];
+    constraints.extend(workflow_tasks.iter().map(|_| Constraint::Length(row_h)));
+    constraints.push(Constraint::Min(0));
+    let rows = Layout::vertical(constraints).split(inner);
+
+    let header = Paragraph::new(Line::from(vec![
+        Span::styled(" Name", Style::default().fg(theme.muted)),
+        Span::styled("   Status", Style::default().fg(theme.muted)),
+        Span::styled("        Run ID", Style::default().fg(theme.muted)),
+        Span::styled("      Phases", Style::default().fg(theme.muted)),
+    ]));
+    frame.render_widget(header, rows[0]);
+
+    for (index, task) in workflow_tasks.iter().enumerate() {
+        let row_area = rows[index + 1];
+        let selected = index == state.workflow_panel.selected;
+        let marker = if selected { ">" } else { " " };
+        let name = task.name.as_deref().unwrap_or(task.description.as_str());
+        let status = task_status_label(task.status);
+        let status_color = task_status_color(task.status, theme);
+        let run_id = task.workflow_run_id.as_deref().unwrap_or("-");
+        let phase_count = task
+            .phase_count
+            .map(|count| count.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let name_style = if selected {
+            Style::default()
+                .fg(theme.border)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.text)
+        };
+
+        // Split the row into a label line and a gauge line.
+        let parts = Layout::vertical([Constraint::Length(1), Constraint::Length(1)])
+            .split(row_area);
+
+        let label = Paragraph::new(Line::from(vec![
+            Span::styled(format!("{marker} {name}"), name_style),
+            Span::styled("  ", Style::default()),
+            Span::styled(status.to_string(), Style::default().fg(status_color)),
+            Span::styled(format!("  {run_id}"), Style::default().fg(theme.muted)),
+            Span::styled(
+                format!("  {phase_count} phases"),
+                Style::default().fg(theme.muted),
+            ),
+        ]));
+        frame.render_widget(label, parts[0]);
+
+        // Gauge ratio reflects lifecycle, not fabricated progress: terminal
+        // states fill the bar, queued/paused stay empty, and a running task
+        // shows a tick-driven activity pulse. The status word stays in the
+        // label so a moving bar can't be misread as a real percentage.
+        let ratio = workflow_gauge_ratio(task.status, state.tick);
+        let gauge = Gauge::default()
+            .gauge_style(Style::default().fg(status_color).bg(theme.muted))
+            .ratio(ratio)
+            .label(Span::styled(
+                workflow_gauge_label(task.status),
+                Style::default()
+                    .fg(theme.text)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        frame.render_widget(gauge, parts[1]);
+    }
+}
+
+/// Truthful gauge fill for a workflow lifecycle state.
+///
+/// We don't have a completed-phase count in the task model, so we never
+/// invent a percentage. Terminal states fill the bar; queued/paused are
+/// empty; running animates a bounded pulse from the UI tick.
+fn workflow_gauge_ratio(status: TaskStatus, tick: u64) -> f64 {
+    match status {
+        TaskStatus::Completed => 1.0,
+        TaskStatus::Failed | TaskStatus::Cancelled => 1.0,
+        TaskStatus::Queued | TaskStatus::Paused | TaskStatus::Stopped => 0.0,
+        TaskStatus::Running | TaskStatus::Stopping => {
+            // Triangle wave in [0.15, 0.85] so the bar visibly breathes.
+            let period = 20u64;
+            let phase = (tick % period) as f64 / period as f64;
+            let tri = if phase < 0.5 { phase * 2.0 } else { 2.0 - phase * 2.0 };
+            0.15 + tri * 0.7
+        }
+    }
+}
+
+fn workflow_gauge_label(status: TaskStatus) -> String {
+    match status {
+        TaskStatus::Completed => "done".to_string(),
+        TaskStatus::Failed => "failed".to_string(),
+        TaskStatus::Cancelled => "cancelled".to_string(),
+        TaskStatus::Queued => "queued".to_string(),
+        TaskStatus::Paused => "paused".to_string(),
+        TaskStatus::Stopped => "stopped".to_string(),
+        TaskStatus::Running => "running…".to_string(),
+        TaskStatus::Stopping => "stopping…".to_string(),
+    }
 }
 
 fn build_welcome_lines<'a>(state: &AppState, theme: &Theme) -> Vec<Line<'a>> {
@@ -399,6 +465,7 @@ fn render_plan_panel(frame: &mut Frame, area: Rect, state: &AppState, theme: &Th
 
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .title(" Task Plan ")
         .border_style(Style::default().fg(theme.border));
 
@@ -617,6 +684,7 @@ fn render_shortcuts(frame: &mut Frame, state: &AppState, theme: &Theme) {
 
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .title(" Shortcuts ")
         .border_style(Style::default().fg(theme.border));
     let paragraph = Paragraph::new(lines)
@@ -686,6 +754,7 @@ fn render_slash_menu(frame: &mut Frame, input_area: Rect, state: &AppState, them
 
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .title(title)
         .border_style(Style::default().fg(theme.border));
 
@@ -730,6 +799,7 @@ fn render_mention_candidates(frame: &mut Frame, input_area: Rect, state: &AppSta
 
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .title(" Files ")
         .border_style(Style::default().fg(theme.border));
 
@@ -791,6 +861,7 @@ fn render_approval_dialog(frame: &mut Frame, state: &AppState, theme: &Theme) {
 
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .title(" Approval Required ")
         .border_style(Style::default().fg(theme.approval));
 
@@ -850,6 +921,7 @@ fn render_setup(frame: &mut Frame, state: &AppState, textarea: &TextArea, _theme
 
             let block = Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .title(" Welcome ")
                 .border_style(Style::default().fg(Color::Cyan));
 
@@ -897,6 +969,7 @@ fn render_setup(frame: &mut Frame, state: &AppState, textarea: &TextArea, _theme
 
             let block = Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .title(" Setup ")
                 .border_style(Style::default().fg(Color::Cyan));
 
@@ -938,6 +1011,7 @@ fn render_setup(frame: &mut Frame, state: &AppState, textarea: &TextArea, _theme
 
             let block = Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .title(" Setup Complete ")
                 .border_style(Style::default().fg(Color::Green));
 
