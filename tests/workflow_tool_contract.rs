@@ -3,7 +3,7 @@ use orca_core::config::ProviderKind;
 use orca_core::conversation::Conversation;
 use orca_core::provider_types::ProviderStep;
 use orca_core::tool_types::ToolName;
-use orca_provider::{call, ProviderConfig};
+use orca_provider::{ProviderConfig, call};
 use serde_json::Value;
 
 #[test]
@@ -98,21 +98,29 @@ fn workflow_tool_launches_background_task_and_returns_output() {
     let workflow_output: Value = serde_json::from_str(output_text).unwrap();
     assert_eq!(workflow_output["status"], "async_launched");
     assert_eq!(workflow_output["taskType"], "local_workflow");
-    assert!(workflow_output["taskId"]
-        .as_str()
-        .unwrap()
-        .starts_with("task-"));
-    assert!(workflow_output["runId"]
-        .as_str()
-        .unwrap()
-        .starts_with("workflow-run-"));
+    assert!(
+        workflow_output["taskId"]
+            .as_str()
+            .unwrap()
+            .starts_with("task-")
+    );
+    assert!(
+        workflow_output["runId"]
+            .as_str()
+            .unwrap()
+            .starts_with("workflow-run-")
+    );
 
-    assert!(events
-        .iter()
-        .any(|event| event["type"] == "workflow.started"));
-    assert!(events
-        .iter()
-        .any(|event| event["type"] == "workflow.result.available"));
+    assert!(
+        events
+            .iter()
+            .any(|event| event["type"] == "workflow.started")
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event["type"] == "workflow.result.available")
+    );
     let result_available_index = events
         .iter()
         .position(|event| event["type"] == "workflow.result.available")

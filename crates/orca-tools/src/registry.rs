@@ -11,7 +11,9 @@ use orca_core::mcp_types::McpTool;
 use orca_core::tool_types::{MAX_TOOL_OUTPUT_BYTES, ToolName, ToolRequest, ToolResult};
 use orca_mcp::McpRegistry;
 
-use crate::{bash, edit, external, git, grep, list_files, read_file, update_plan, web_search, write_file};
+use crate::{
+    bash, edit, external, git, grep, list_files, read_file, update_plan, web_search, write_file,
+};
 
 #[allow(dead_code)]
 pub trait Tool: Send + Sync {

@@ -141,11 +141,11 @@ pub fn idle_shortcut(event: KeyEvent) -> Option<IdleShortcut> {
             KeyBinding::new(KeyCode::Char('n'), KeyModifiers::CONTROL),
         ),
         (
-            IdleShortcut::ScrollUp,
+            IdleShortcut::HistoryPrevious,
             KeyBinding::new(KeyCode::Up, KeyModifiers::NONE),
         ),
         (
-            IdleShortcut::ScrollDown,
+            IdleShortcut::HistoryNext,
             KeyBinding::new(KeyCode::Down, KeyModifiers::NONE),
         ),
         (
@@ -339,13 +339,8 @@ pub const SHORTCUT_HINTS: &[ShortcutHint] = &[
     },
     ShortcutHint {
         scope: ShortcutScope::Idle,
-        keys: "ctrl+p / ctrl+n",
+        keys: "up/down / ctrl+p/ctrl+n",
         action: "previous or next prompt",
-    },
-    ShortcutHint {
-        scope: ShortcutScope::Idle,
-        keys: "up/down",
-        action: "scroll one line",
     },
     ShortcutHint {
         scope: ShortcutScope::Idle,
@@ -492,6 +487,14 @@ mod tests {
         );
         assert_eq!(
             idle_shortcut(key(KeyCode::Char('n'), KeyModifiers::CONTROL)),
+            Some(IdleShortcut::HistoryNext)
+        );
+        assert_eq!(
+            idle_shortcut(key(KeyCode::Up, KeyModifiers::NONE)),
+            Some(IdleShortcut::HistoryPrevious)
+        );
+        assert_eq!(
+            idle_shortcut(key(KeyCode::Down, KeyModifiers::NONE)),
             Some(IdleShortcut::HistoryNext)
         );
     }

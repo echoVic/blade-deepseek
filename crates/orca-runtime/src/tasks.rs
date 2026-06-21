@@ -254,10 +254,7 @@ mod tests {
         assert_eq!(list[0].task_type, TaskType::Workflow);
         assert_eq!(list[0].status, TaskStatus::Queued);
         assert_eq!(list[0].name.as_deref(), Some("audit"));
-        assert_eq!(
-            list[0].workflow_run_id.as_deref(),
-            Some("workflow-run-1")
-        );
+        assert_eq!(list[0].workflow_run_id.as_deref(), Some("workflow-run-1"));
         assert_eq!(list[0].phase_count, Some(2));
     }
 

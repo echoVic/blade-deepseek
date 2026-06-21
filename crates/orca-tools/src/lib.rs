@@ -46,8 +46,7 @@ pub fn execute_with_mcp_and_external(
         return reg.execute(request, &ctx);
     }
 
-    let reg =
-        registry::tool_registry_with_mcp_and_external(Some(mcp_registry), external_tools);
+    let reg = registry::tool_registry_with_mcp_and_external(Some(mcp_registry), external_tools);
     let ctx = registry::ToolContext::new(cwd).with_mcp(mcp_registry);
     reg.execute(request, &ctx)
 }
@@ -191,10 +190,7 @@ mod tests {
         assert_eq!(tool.action_kind(), ActionKind::Read);
         assert!(tool.is_read_only(&request));
         assert!(tool.is_concurrent_safe(&request));
-        assert_eq!(
-            reg.iter().next().map(|tool| tool.name()),
-            Some("read_file")
-        );
+        assert_eq!(reg.iter().next().map(|tool| tool.name()), Some("read_file"));
 
         assert_eq!(
             reg.get("web_search").unwrap().action_kind(),

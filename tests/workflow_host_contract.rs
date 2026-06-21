@@ -23,9 +23,11 @@ fn host_emits_phase_and_agent_call_events() {
 
     let events = WorkflowHost::run_collecting_events(&script, serde_json::json!({"x": 1})).unwrap();
 
-    assert!(events
-        .iter()
-        .any(|event| matches!(event, HostEvent::PhaseStarted { name } if name == "scan")));
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, HostEvent::PhaseStarted { name } if name == "scan"))
+    );
     assert!(events.iter().any(
         |event| matches!(event, HostEvent::AgentCall { prompt, .. } if prompt == "inspect repo")
     ));
@@ -61,12 +63,16 @@ fn host_phase_marker_applies_to_following_agents_until_changed() {
                 if prompt == "review findings" && phase.as_deref() == Some("review")
         )
     }));
-    assert!(events
-        .iter()
-        .any(|event| matches!(event, HostEvent::PhaseCompleted { name } if name == "scan")));
-    assert!(events
-        .iter()
-        .any(|event| matches!(event, HostEvent::PhaseCompleted { name } if name == "review")));
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, HostEvent::PhaseCompleted { name } if name == "scan"))
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, HostEvent::PhaseCompleted { name } if name == "review"))
+    );
 }
 
 #[test]
@@ -144,9 +150,11 @@ fn host_ignores_export_mentions_in_comments_and_strings_when_loading_workflow_mo
 
     let events = WorkflowHost::run_collecting_events(&script, serde_json::json!(null)).unwrap();
 
-    assert!(events
-        .iter()
-        .any(|event| matches!(event, HostEvent::PhaseStarted { name } if name == "scan")));
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, HostEvent::PhaseStarted { name } if name == "scan"))
+    );
     assert!(events.iter().any(|event| {
         matches!(
             event,
@@ -154,12 +162,16 @@ fn host_ignores_export_mentions_in_comments_and_strings_when_loading_workflow_mo
                 if prompt == "Prompt mentioning export default before the real workflow body"
         )
     }));
-    assert!(events
-        .iter()
-        .any(|event| matches!(event, HostEvent::WorkflowCompleted { .. })));
-    assert!(!events
-        .iter()
-        .any(|event| matches!(event, HostEvent::WorkflowFailed { .. })));
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, HostEvent::WorkflowCompleted { .. }))
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, HostEvent::WorkflowFailed { .. }))
+    );
 }
 
 #[test]
@@ -185,12 +197,16 @@ fn host_allows_blocked_words_in_comments_and_prompt_strings() {
                 if prompt == "inspect process usage and globalThis references"
         )
     }));
-    assert!(events
-        .iter()
-        .any(|event| matches!(event, HostEvent::WorkflowCompleted { .. })));
-    assert!(!events
-        .iter()
-        .any(|event| matches!(event, HostEvent::WorkflowFailed { .. })));
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, HostEvent::WorkflowCompleted { .. }))
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, HostEvent::WorkflowFailed { .. }))
+    );
 }
 
 #[test]
@@ -209,9 +225,11 @@ fn host_blocks_constructor_process_escape_attempts() {
 
     let events = WorkflowHost::run_collecting_events(&script, serde_json::json!(null)).unwrap();
 
-    assert!(events
-        .iter()
-        .any(|event| matches!(event, HostEvent::WorkflowFailed { .. })));
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, HostEvent::WorkflowFailed { .. }))
+    );
     assert!(
         !events
             .iter()
@@ -266,9 +284,11 @@ fn host_blocks_constructor_builtin_module_escape_attempts() {
 
     let events = WorkflowHost::run_collecting_events(&script, serde_json::json!(null)).unwrap();
 
-    assert!(events
-        .iter()
-        .any(|event| matches!(event, HostEvent::WorkflowFailed { .. })));
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, HostEvent::WorkflowFailed { .. }))
+    );
     assert!(!events.iter().any(|event| {
         matches!(event, HostEvent::AgentCall { prompt, .. } if prompt.starts_with("escaped fs "))
     }));
@@ -376,9 +396,11 @@ fn host_reports_workflow_failed_when_stdin_closes_before_agent_result() {
         "expected host to exit with workflow failure, status={:?}, stderr={stderr}",
         output.status.code()
     );
-    assert!(remaining
-        .iter()
-        .any(|line| line.contains("\"type\":\"workflow_failed\"")));
+    assert!(
+        remaining
+            .iter()
+            .any(|line| line.contains("\"type\":\"workflow_failed\""))
+    );
 }
 
 #[test]

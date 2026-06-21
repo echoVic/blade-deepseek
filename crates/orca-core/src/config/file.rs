@@ -8,8 +8,8 @@ use toml::Value;
 use crate::approval_rules::PermissionRules;
 use crate::approval_types::ApprovalMode;
 use crate::config::{
-    ThemeName, ToolConfig, WorkflowConfig, DEFAULT_MAX_WORKFLOW_AGENTS_PER_RUN,
-    DEFAULT_MAX_WORKFLOW_CONCURRENT_AGENTS,
+    DEFAULT_MAX_WORKFLOW_AGENTS_PER_RUN, DEFAULT_MAX_WORKFLOW_CONCURRENT_AGENTS, ThemeName,
+    ToolConfig, WorkflowConfig,
 };
 use crate::subagent_config::SubagentConfig;
 

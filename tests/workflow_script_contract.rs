@@ -27,9 +27,11 @@ fn inline_script_is_persisted_and_meta_is_extracted() {
     assert_eq!(resolved.meta.description, "Audit code");
     assert_eq!(resolved.meta.phases, vec!["scan", "review"]);
     assert!(resolved.persisted_path.exists());
-    assert!(fs::read_to_string(&resolved.persisted_path)
-        .unwrap()
-        .contains("export const meta"));
+    assert!(
+        fs::read_to_string(&resolved.persisted_path)
+            .unwrap()
+            .contains("export const meta")
+    );
     assert_eq!(resolved.script_digest.len(), 64);
 }
 

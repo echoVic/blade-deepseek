@@ -11,7 +11,7 @@ use orca_core::model::ModelSelection;
 use orca_core::task_types::TaskStatus;
 use orca_core::workflow_types::WorkflowRunStatus;
 use orca_runtime::tasks::TaskRegistry;
-use orca_runtime::workflow::state::{input_hash, WorkflowStateStore};
+use orca_runtime::workflow::state::{WorkflowStateStore, input_hash};
 use orca_runtime::workflow::{WorkflowLaunchRequest, WorkflowRunner};
 use serde_json::json;
 use tempfile::tempdir;
@@ -49,11 +49,13 @@ fn workflow_runner_executes_agent_and_writes_state() {
         "workflow runner should use the real child-agent executor path"
     );
     assert!(launched.output.script_path.unwrap().ends_with(".js"));
-    assert!(launched
-        .output
-        .transcript_dir
-        .unwrap()
-        .contains("transcripts"));
+    assert!(
+        launched
+            .output
+            .transcript_dir
+            .unwrap()
+            .contains("transcripts")
+    );
 }
 
 #[test]
@@ -218,21 +220,25 @@ fn workflow_runner_marks_task_and_run_failed_on_child_agent_error() {
     let task = tasks.list().into_iter().next().expect("workflow task");
     let record = tasks.get(&task.id).expect("task record");
     assert_eq!(record.status, TaskStatus::Failed);
-    assert!(record
-        .error
-        .as_deref()
-        .unwrap_or_default()
-        .contains("mock child failure requested"));
+    assert!(
+        record
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("mock child failure requested")
+    );
 
     let run_id = record.workflow_run_id.as_deref().expect("run id");
     let store = WorkflowStateStore::new(session_dir.join("workflow-runs"));
     let state = store.load_run(run_id).expect("run state");
     assert_eq!(state.status, WorkflowRunStatus::Failed);
-    assert!(state
-        .error
-        .as_deref()
-        .unwrap_or_default()
-        .contains("mock child failure requested"));
+    assert!(
+        state
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("mock child failure requested")
+    );
 }
 
 #[test]
@@ -273,14 +279,18 @@ fn parallel_preserves_order_and_records_phase() {
     assert!(phase.started_at_ms.is_some());
     assert!(phase.completed_at_ms.is_some());
 
-    assert!(store
-        .cached_agent_result(run_id, "fanout:1", &input_hash("first", &json!({})))
-        .unwrap()
-        .is_some());
-    assert!(store
-        .cached_agent_result(run_id, "fanout:2", &input_hash("second", &json!({})))
-        .unwrap()
-        .is_some());
+    assert!(
+        store
+            .cached_agent_result(run_id, "fanout:1", &input_hash("first", &json!({})))
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        store
+            .cached_agent_result(run_id, "fanout:2", &input_hash("second", &json!({})))
+            .unwrap()
+            .is_some()
+    );
 }
 
 #[test]
@@ -455,9 +465,10 @@ fn agent_cap_failure_is_recorded() {
         ))
         .unwrap_err();
 
-    assert!(err
-        .to_string()
-        .contains("maximum workflow agent count 1000 exceeded"));
+    assert!(
+        err.to_string()
+            .contains("maximum workflow agent count 1000 exceeded")
+    );
 
     let task = tasks.list().into_iter().next().expect("workflow task");
     let record = tasks.get(&task.id).expect("task record");
@@ -466,11 +477,13 @@ fn agent_cap_failure_is_recorded() {
     let state = store.load_run(run_id).expect("run state");
     assert_eq!(state.status, WorkflowRunStatus::Failed);
     assert_eq!(state.total_agent_count, 1000);
-    assert!(state
-        .error
-        .as_deref()
-        .unwrap_or_default()
-        .contains("maximum workflow agent count 1000 exceeded"));
+    assert!(
+        state
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("maximum workflow agent count 1000 exceeded")
+    );
 }
 
 fn mock_run_config(cwd: &std::path::Path) -> RunConfig {

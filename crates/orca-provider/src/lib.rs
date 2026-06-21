@@ -7,13 +7,13 @@ pub mod system_prompt;
 pub mod tool_schema;
 
 use orca_core::approval_types::ActionKind;
+use orca_core::cancel::CancelToken;
 use orca_core::config::ProviderKind;
 use orca_core::conversation::{Conversation, Message, RawToolCall};
-use orca_core::cancel::CancelToken;
+use orca_core::external_config::ExternalToolConfig;
 use orca_core::provider_types::{ProviderResponse, ProviderStep, Usage};
 use orca_core::tool_types::{ToolName, ToolRequest};
 use orca_mcp::McpRegistry;
-use orca_core::external_config::ExternalToolConfig;
 
 #[derive(Clone)]
 pub struct ProviderConfig {

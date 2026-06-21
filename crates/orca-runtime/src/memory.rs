@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 
 use orca_core::config::ProviderKind;
 use orca_core::conversation::{Conversation, Message};
-use orca_provider::{self, ProviderConfig};
 use orca_core::provider_types::ProviderStep;
+use orca_provider::{self, ProviderConfig};
 
 #[derive(Clone, Debug, Default)]
 pub struct MemoryBlock {

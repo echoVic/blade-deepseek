@@ -3,13 +3,13 @@ use std::path::PathBuf;
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 
-use crate::approval_types::ApprovalMode;
 use crate::approval_rules::PermissionRules;
+use crate::approval_types::ApprovalMode;
+use crate::external_config::ExternalToolConfig;
+use crate::hook_types::HookConfig;
 use crate::mcp_types::McpServerConfig;
 use crate::model::ModelSelection;
-use crate::hook_types::HookConfig;
 use crate::subagent_config::SubagentConfig;
-use crate::external_config::ExternalToolConfig;
 
 pub mod file;
 

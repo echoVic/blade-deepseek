@@ -1,6 +1,6 @@
-use orca_core::approval_rules::{CompiledPermissionRules, PermissionRules};
 #[cfg(test)]
 use orca_core::approval_rules::PermissionRule;
+use orca_core::approval_rules::{CompiledPermissionRules, PermissionRules};
 use orca_core::approval_types::{
     ActionKind, ApprovalDecision, ApprovalMode, ApprovalRequest, ApprovalResolution, Decision,
 };

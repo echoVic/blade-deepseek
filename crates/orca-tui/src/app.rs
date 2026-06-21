@@ -482,13 +482,20 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                             state.reset_history_navigation();
                         }
                         Some(IdleShortcut::HistoryPrevious) => {
-                            let draft = textarea_text(&textarea);
-                            if let Some(history) = state.history_previous(draft) {
-                                textarea = make_textarea_with_text(&history, &vim_state, &theme);
+                            if key.code == KeyCode::Up && textarea.lines().len() > 1 {
+                                textarea.input(Input::from(ev));
+                            } else {
+                                let draft = textarea_text(&textarea);
+                                if let Some(history) = state.history_previous(draft) {
+                                    textarea =
+                                        make_textarea_with_text(&history, &vim_state, &theme);
+                                }
                             }
                         }
                         Some(IdleShortcut::HistoryNext) => {
-                            if let Some(history) = state.history_next() {
+                            if key.code == KeyCode::Down && textarea.lines().len() > 1 {
+                                textarea.input(Input::from(ev));
+                            } else if let Some(history) = state.history_next() {
                                 textarea = make_textarea_with_text(&history, &vim_state, &theme);
                             }
                         }

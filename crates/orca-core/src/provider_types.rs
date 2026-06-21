@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
-use crate::tool_types::ToolRequest;
 use crate::conversation::RawToolCall;
+use crate::tool_types::ToolRequest;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Usage {

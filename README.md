@@ -33,7 +33,7 @@ Set `INSTALL_DIR` to choose a destination and `ORCA_VERSION` to pin a version:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/echoVic/blade-deepseek/main/install.sh | \
-  INSTALL_DIR=/usr/local/bin ORCA_VERSION=0.1.2 sh
+  INSTALL_DIR=/usr/local/bin ORCA_VERSION=0.1.3 sh
 ```
 
 ### GitHub Releases

@@ -126,7 +126,9 @@ impl StdioTransport {
         let mut iterations = 0u32;
         loop {
             if iterations >= 1000 {
-                return Err(format!("MCP request '{method}' exceeded max notification count"));
+                return Err(format!(
+                    "MCP request '{method}' exceeded max notification count"
+                ));
             }
             if std::time::Instant::now() >= deadline {
                 return Err(format!("MCP request '{method}' timed out after 30s"));

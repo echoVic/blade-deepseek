@@ -17,7 +17,8 @@ fn workflow_events_serialize_with_expected_names() {
 #[test]
 fn workflow_event_factory_includes_run_and_task_ids() {
     let mut factory = EventFactory::new("run-outer".to_string());
-    let event = factory.workflow_started("task-1", "workflow-run-1", "audit", &["scan".to_string()]);
+    let event =
+        factory.workflow_started("task-1", "workflow-run-1", "audit", &["scan".to_string()]);
 
     assert_eq!(event.event_type, EventType::WorkflowStarted);
     assert_eq!(event.payload["taskId"], "task-1");

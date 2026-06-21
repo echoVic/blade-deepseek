@@ -195,7 +195,10 @@ fn current_mention_prefix(input: &str) -> Option<(usize, &str)> {
         .unwrap_or(0);
     let token = &input[token_start..cursor];
     let after_at = token.strip_prefix('@')?;
-    if after_at.starts_with('@') || after_at.starts_with("http://") || after_at.starts_with("https://") {
+    if after_at.starts_with('@')
+        || after_at.starts_with("http://")
+        || after_at.starts_with("https://")
+    {
         return None;
     }
     Some((token_start, after_at))
@@ -543,8 +546,7 @@ mod tests {
         fs::create_dir(&sub).unwrap();
         fs::write(sub.join("file.txt"), "content").unwrap();
 
-        let expanded =
-            expand_file_mentions(r#"read @"my dir/file.txt""#, dir.path()).unwrap();
+        let expanded = expand_file_mentions(r#"read @"my dir/file.txt""#, dir.path()).unwrap();
 
         assert!(expanded.contains(r#"<file path="my dir/file.txt">"#));
         assert!(expanded.contains("content</file>"));

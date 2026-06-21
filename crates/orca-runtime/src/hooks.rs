@@ -213,10 +213,7 @@ pub fn conversation_with_hook_context(
     conversation
 }
 
-pub fn tool_request_with_hook_outcome(
-    request: &ToolRequest,
-    outcome: &HookOutcome,
-) -> ToolRequest {
+pub fn tool_request_with_hook_outcome(request: &ToolRequest, outcome: &HookOutcome) -> ToolRequest {
     let mut request = request.clone();
     if let Some(target) = outcome.modified_target.as_ref() {
         request.target = Some(target.clone());

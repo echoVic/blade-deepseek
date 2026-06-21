@@ -4,7 +4,9 @@ use std::sync::Arc;
 use serde_json::Value;
 
 use crate::transport::{self, McpTransport};
-use orca_core::mcp_types::{CallToolResult, McpContent, McpServerConfig, McpTool, McpToolRef, ToolsListResult};
+use orca_core::mcp_types::{
+    CallToolResult, McpContent, McpServerConfig, McpTool, McpToolRef, ToolsListResult,
+};
 
 #[derive(Clone, Default)]
 pub struct McpRegistry {

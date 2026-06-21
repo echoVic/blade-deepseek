@@ -22,7 +22,7 @@ use orca_core::workflow_types::{
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::agent_child::{run_child_agent, ChildAgentRequest, ChildAgentRuntime};
+use crate::agent_child::{ChildAgentRequest, ChildAgentRuntime, run_child_agent};
 use crate::controller::execute_child_agent_loop;
 use crate::hooks::HookRunner;
 use crate::instructions;
@@ -30,8 +30,8 @@ use crate::memory;
 use crate::tasks::TaskRegistry;
 
 use super::host::{AgentCall, HostCommand, HostEvent, WorkflowHost};
-use super::script::{resolve_workflow_script_to_path, ResolvedWorkflowScript};
-use super::state::{input_hash, WorkflowAgentRecord, WorkflowStateStore, WorkflowWorkerRecord};
+use super::script::{ResolvedWorkflowScript, resolve_workflow_script_to_path};
+use super::state::{WorkflowAgentRecord, WorkflowStateStore, WorkflowWorkerRecord, input_hash};
 
 const STOP_REQUESTED_ERROR: &str = "__orca_workflow_stop_requested__";
 const STOPPED_SUMMARY: &str = "Workflow stopped";

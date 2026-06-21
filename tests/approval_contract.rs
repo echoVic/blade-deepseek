@@ -20,9 +20,11 @@ fn suggest_denies_write_in_jsonl_mode() {
     assert_eq!(output.status.code(), Some(3));
 
     let events = parse_jsonl(&output.stdout);
-    assert!(events
-        .iter()
-        .any(|event| event["type"] == "approval.requested"));
+    assert!(
+        events
+            .iter()
+            .any(|event| event["type"] == "approval.requested")
+    );
     assert!(events.iter().any(|event| {
         event["type"] == "approval.resolved" && event["payload"]["decision"] == "deny"
     }));

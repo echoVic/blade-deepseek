@@ -6,7 +6,7 @@ use crossterm::{
     execute, terminal,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen},
 };
-use std::io::{self, stdout, Write};
+use std::io::{self, Write, stdout};
 use std::time::Duration;
 
 fn main() -> io::Result<()> {

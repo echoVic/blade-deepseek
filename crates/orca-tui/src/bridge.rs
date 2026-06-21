@@ -7,23 +7,22 @@ use orca_core::approval_types::{ApprovalDecision, ApprovalRequest};
 use orca_core::cancel::CancelToken;
 use orca_core::config::RunConfig;
 use orca_core::conversation::Conversation;
+use orca_core::hook_types::HookEvent;
 use orca_core::model::ModelRouteContext;
 use orca_core::provider_types::ProviderStep;
 use orca_core::subagent_types::SubagentType;
 use orca_core::tool_types;
 use orca_mcp::McpRegistry;
+use orca_provider::ProviderConfig;
 use orca_provider::tool_schema::{
     deepseek_tools_schema_for_type_with_mcp_and_external,
     deepseek_tools_schema_with_mcp_and_external,
 };
-use orca_provider::ProviderConfig;
 use orca_runtime::agent_common;
 use orca_runtime::cost::CostTracker;
 use orca_runtime::history::{self, SessionWriter};
-use orca_core::hook_types::HookEvent;
 use orca_runtime::hooks::{
-    HookContext, HookRunner, conversation_with_hook_context,
-    tool_request_with_hook_outcome,
+    HookContext, HookRunner, conversation_with_hook_context, tool_request_with_hook_outcome,
 };
 use orca_runtime::instructions::{self, ProjectInstructions};
 use orca_runtime::memory::{self, MemoryBlock};
@@ -175,8 +174,7 @@ impl TuiConversationSession {
             },
         ) {
             if !outcome.injected_context.is_empty() {
-                self.conversation =
-                    conversation_with_hook_context(&self.conversation, &outcome);
+                self.conversation = conversation_with_hook_context(&self.conversation, &outcome);
             }
         }
         let _ = self.hooks.run(
@@ -209,7 +207,8 @@ impl TuiConversationSession {
         let after_messages = self.conversation.messages.len();
         if let Some(writer) = &mut self.writer {
             let _ = writer.append_compaction(before_messages, after_messages);
-            if let orca_provider::context::CompactionKind::RemoteSummary(summary) = compaction.kind {
+            if let orca_provider::context::CompactionKind::RemoteSummary(summary) = compaction.kind
+            {
                 let _ = writer.append_summary(before_messages, after_messages, summary);
             }
         }
@@ -352,7 +351,9 @@ pub fn run_agent_for_tui(
             let after_messages = session.conversation.messages.len();
             if let Some(writer) = &mut session.writer {
                 let _ = writer.append_compaction(before_messages, after_messages);
-                if let orca_provider::context::CompactionKind::RemoteSummary(summary) = compaction.kind {
+                if let orca_provider::context::CompactionKind::RemoteSummary(summary) =
+                    compaction.kind
+                {
                     let _ = writer.append_summary(before_messages, after_messages, summary);
                 }
             }
@@ -657,9 +658,9 @@ pub fn run_agent_for_tui(
                 && result.status == tool_types::ToolStatus::Completed
             {
                 if let Ok(update) = orca_tools::update_plan::parse_args(tool_request) {
-                    session
-                        .conversation
-                        .replace_plan_state(orca_tools::update_plan::format_context_message(&update));
+                    session.conversation.replace_plan_state(
+                        orca_tools::update_plan::format_context_message(&update),
+                    );
                     if let Some(message) = session.conversation.messages.last().cloned() {
                         session.append_message(&message);
                     }
@@ -961,7 +962,8 @@ fn execute_tool_for_tui(
                 }
             }
             ApprovalDecision::Deny => {
-                let result = tool_types::ToolResult::denied(tool_request, resolution.reason.clone());
+                let result =
+                    tool_types::ToolResult::denied(tool_request, resolution.reason.clone());
                 let _ = event_tx.send(TuiEvent::ToolRequested {
                     id: tool_request.id.clone(),
                     name: tool_request.name.as_str().to_string(),
