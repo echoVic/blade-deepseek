@@ -816,6 +816,18 @@ pub(crate) fn execute_child_agent_loop<W: io::Write>(
     })
 }
 
+fn approval_action_for_tool(
+    tool_request: &tool_types::ToolRequest,
+    mcp_registry: &McpRegistry,
+    external_tools: &[orca_core::external_config::ExternalToolConfig],
+) -> orca_core::approval_types::ActionKind {
+    orca_tools::canonical_action_kind_with_mcp_and_external(
+        tool_request,
+        Some(mcp_registry),
+        external_tools,
+    )
+}
+
 fn execute_tool_with_approval(
     config: &RunConfig,
     cwd: &Path,
@@ -834,14 +846,15 @@ fn execute_tool_with_approval(
     task_registry: &TaskRegistry,
     background_workflows: &mut Vec<BackgroundWorkflowRun>,
 ) -> io::Result<(RunStatus, tool_types::ToolResult)> {
-    if agent_common::requires_approval(tool_request.action) {
+    let action = approval_action_for_tool(tool_request, mcp_registry, &config.external_tools);
+    if agent_common::requires_approval(action) {
         let approval = ApprovalRequest {
             id: format!("approval-{}", tool_request.id),
-            action: tool_request.action,
+            action,
             description: format!(
                 "{} requested {}",
                 tool_request.name.as_str(),
-                tool_request.action.as_str()
+                action.as_str()
             ),
         };
         let resolution = policy.resolve_for_tool(
@@ -1724,6 +1737,17 @@ mod tests {
             config.tools.max_read_parallel,
             &request
         ));
+    }
+
+    #[test]
+    fn approval_action_rejects_caller_supplied_read_for_shell() {
+        let request = tool_request("bash", tool_types::ToolName::Bash, ActionKind::Read);
+        let registry = McpRegistry::default();
+
+        assert_eq!(
+            approval_action_for_tool(&request, &registry, &[]),
+            ActionKind::Shell
+        );
     }
 
     #[test]

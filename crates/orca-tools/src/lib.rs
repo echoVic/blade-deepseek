@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::thread;
 
+use orca_core::approval_types::ActionKind;
 use orca_core::external_config::ExternalToolConfig;
 use orca_core::tool_types::{ToolName, ToolRequest, ToolResult};
 use orca_mcp::McpRegistry;
@@ -61,6 +62,21 @@ pub fn tool_is_available_readonly_concurrent(request: &ToolRequest) -> bool {
                 && resolved.tool.is_concurrent_safe(request)
         })
         .unwrap_or(false)
+}
+
+pub fn canonical_action_kind(request: &ToolRequest) -> ActionKind {
+    canonical_action_kind_with_mcp_and_external(request, None, &[])
+}
+
+pub fn canonical_action_kind_with_mcp_and_external(
+    request: &ToolRequest,
+    mcp_registry: Option<&McpRegistry>,
+    external_tools: &[ExternalToolConfig],
+) -> ActionKind {
+    let reg = registry::tool_registry_with_mcp_and_external(mcp_registry, external_tools);
+    reg.resolve(request.name.as_str())
+        .map(|resolved| resolved.spec.capabilities.action_kind())
+        .unwrap_or(request.action)
 }
 
 pub fn should_run_readonly_batch(max_read_parallel: usize, tool_request: &ToolRequest) -> bool {
@@ -256,6 +272,19 @@ mod tests {
     }
 
     #[test]
+    fn canonical_action_kind_ignores_caller_supplied_read_for_shell() {
+        let request = ToolRequest {
+            id: "bash".to_string(),
+            name: ToolName::Bash,
+            action: ActionKind::Read,
+            target: Some("echo hi".to_string()),
+            raw_arguments: None,
+        };
+
+        assert_eq!(canonical_action_kind(&request), ActionKind::Shell);
+    }
+
+    #[test]
     fn registry_executes_glob_with_pattern_and_path() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         fs::create_dir_all(temp_dir.path().join("src/bin")).expect("fixture dir");
@@ -322,6 +351,34 @@ mod tests {
 
         assert_eq!(result.status, ToolStatus::Completed);
         assert_eq!(result.output.as_deref(), Some("(no matches)"));
+        assert_eq!(
+            result.kind,
+            orca_core::tool_types::ToolResultKind::NoMatches
+        );
+    }
+
+    #[test]
+    fn registry_executes_glob_with_truncated_kind() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        fs::create_dir_all(temp_dir.path().join("src")).expect("fixture dir");
+        fs::write(temp_dir.path().join("src/alpha.rs"), "alpha").expect("fixture");
+        fs::write(temp_dir.path().join("src/bravo.rs"), "bravo").expect("fixture");
+        let request = ToolRequest {
+            id: "glob".to_string(),
+            name: ToolName::Glob,
+            action: ActionKind::Read,
+            target: Some("src".to_string()),
+            raw_arguments: Some(r#"{"pattern":"*.rs","path":"src"}"#.to_string()),
+        };
+
+        let result = glob::execute(&request, temp_dir.path(), 12);
+
+        assert_eq!(result.status, ToolStatus::Completed);
+        assert_eq!(
+            result.kind,
+            orca_core::tool_types::ToolResultKind::Truncated
+        );
+        assert!(result.truncated);
     }
 
     #[test]

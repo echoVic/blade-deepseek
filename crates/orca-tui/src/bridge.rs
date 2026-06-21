@@ -311,8 +311,11 @@ pub fn run_agent_for_tui(
         .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
 
-    let tools_override =
-        tui_tools_schema(&session.mcp_registry, &config.external_tools, allow_goal_tools);
+    let tools_override = tui_tools_schema(
+        &session.mcp_registry,
+        &config.external_tools,
+        allow_goal_tools,
+    );
     let provider_config = ProviderConfig {
         api_key: config.api_key.clone(),
         base_url: config.base_url.clone(),
@@ -1004,14 +1007,15 @@ fn execute_tool_for_tui(
     mcp_registry: &McpRegistry,
     hooks: &HookRunner,
 ) -> (bool, tool_types::ToolResult, Option<CostTracker>) {
-    if agent_common::requires_approval(tool_request.action) {
+    let action = approval_action_for_tool(tool_request, mcp_registry, &config.external_tools);
+    if agent_common::requires_approval(action) {
         let approval = ApprovalRequest {
             id: format!("approval-{}", tool_request.id),
-            action: tool_request.action,
+            action,
             description: format!(
                 "{} requested {}",
                 tool_request.name.as_str(),
-                tool_request.action.as_str()
+                action.as_str()
             ),
         };
         let resolution = policy.resolve_for_tool(
@@ -1239,6 +1243,18 @@ fn execute_tool_for_tui(
         tool_types::ToolStatus::Failed | tool_types::ToolStatus::Denied
     );
     (failed, result, child_cost)
+}
+
+fn approval_action_for_tool(
+    tool_request: &tool_types::ToolRequest,
+    mcp_registry: &McpRegistry,
+    external_tools: &[orca_core::external_config::ExternalToolConfig],
+) -> orca_core::approval_types::ActionKind {
+    orca_tools::canonical_action_kind_with_mcp_and_external(
+        tool_request,
+        Some(mcp_registry),
+        external_tools,
+    )
 }
 
 fn execute_subagent_for_tui(
@@ -1727,6 +1743,23 @@ mod tests {
 
         assert!(!base_names.contains(&"update_goal".to_string()));
         assert!(goal_names.contains(&"update_goal".to_string()));
+    }
+
+    #[test]
+    fn tui_approval_action_rejects_caller_supplied_read_for_shell() {
+        let request = tool_types::ToolRequest {
+            id: "bash".to_string(),
+            name: tool_types::ToolName::Bash,
+            action: orca_core::approval_types::ActionKind::Read,
+            target: Some("echo hi".to_string()),
+            raw_arguments: None,
+        };
+        let registry = McpRegistry::default();
+
+        assert_eq!(
+            approval_action_for_tool(&request, &registry, &[]),
+            orca_core::approval_types::ActionKind::Shell
+        );
     }
 
     #[test]

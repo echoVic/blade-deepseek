@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use globset::{Glob, GlobSetBuilder};
-use orca_core::tool_types::{ToolRequest, ToolResult, truncate_output};
+use orca_core::tool_types::{ToolRequest, ToolResult, ToolResultKind, truncate_output};
 use serde::Deserialize;
 use walkdir::WalkDir;
 
@@ -24,7 +24,12 @@ pub fn execute(request: &ToolRequest, cwd: &Path, max_bytes: usize) -> ToolResul
         Err(error) => return ToolResult::failed(request, error, None),
     };
     if !search_root.exists() {
-        return ToolResult::completed(request, "(no matches)".to_string(), false);
+        return ToolResult::completed_kind(
+            request,
+            "(no matches)".to_string(),
+            false,
+            ToolResultKind::NoMatches,
+        );
     }
 
     let matcher = match build_matcher(&args.pattern) {
@@ -40,11 +45,25 @@ pub fn execute(request: &ToolRequest, cwd: &Path, max_bytes: usize) -> ToolResul
     matches.sort();
     matches.dedup();
     if matches.is_empty() {
-        return ToolResult::completed(request, "(no matches)".to_string(), false);
+        return ToolResult::completed_kind(
+            request,
+            "(no matches)".to_string(),
+            false,
+            ToolResultKind::NoMatches,
+        );
     }
 
     let (output, truncated) = truncate_output(matches.join("\n"), max_bytes);
-    ToolResult::completed(request, output, truncated)
+    ToolResult::completed_kind(
+        request,
+        output,
+        truncated,
+        if truncated {
+            ToolResultKind::Truncated
+        } else {
+            ToolResultKind::Success
+        },
+    )
 }
 
 fn parse_args(request: &ToolRequest) -> Result<GlobArgs, String> {
