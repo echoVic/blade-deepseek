@@ -4,7 +4,7 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-06-22
-Current baseline: v0.1.11 planning baseline
+Current baseline: v0.1.12 context reliability baseline
 
 ---
 
@@ -64,21 +64,23 @@ future work is not planned from stale assumptions.
 
 **Release target:** v0.1.12
 
+**Current status:** token/byte tool output truncation policy is implemented and configurable. Model metadata overrides remain queued for the next context-reliability patch.
+
 **Goal:** reduce context pollution and make model/runtime limits configurable
 before adding larger ecosystem features.
 
 **Scope:**
 
-1. Add a truncation policy abstraction inspired by Codex `utils/output-truncation`.
+1. Add a truncation policy abstraction inspired by Codex `utils/output-truncation`. Done in v0.1.12.
    - Support byte and token budgets.
    - Preserve explicit warnings with original line/token counts.
    - Keep existing default behavior compatible at 8 KiB unless configured.
-2. Add model metadata/config overrides.
+2. Add model metadata/config overrides. Pending.
    - Context window.
    - Auto-compact token limit.
    - Tool output token limit.
    - Reasoning/summary support flags where useful for DeepSeek models.
-3. Wire tool output truncation through built-in, MCP, and external tool result paths.
+3. Wire tool output truncation through built-in, MCP, and external tool result paths. Done for shell and external tool outputs in v0.1.12; other text tools continue using the policy-derived byte budget.
 
 **Out of scope for P1:**
 

@@ -3,7 +3,7 @@ use std::thread;
 
 use orca_core::approval_types::ActionKind;
 use orca_core::external_config::ExternalToolConfig;
-use orca_core::tool_types::{ToolName, ToolRequest, ToolResult};
+use orca_core::tool_types::{ToolName, ToolOutputTruncation, ToolRequest, ToolResult};
 use orca_mcp::McpRegistry;
 
 pub mod bash;
@@ -37,19 +37,38 @@ pub fn execute_with_mcp_and_external(
     mcp_registry: &McpRegistry,
     external_tools: &[ExternalToolConfig],
 ) -> ToolResult {
+    execute_with_mcp_external_and_policy(
+        request,
+        cwd,
+        mcp_registry,
+        external_tools,
+        ToolOutputTruncation::default(),
+    )
+}
+
+pub fn execute_with_mcp_external_and_policy(
+    request: &ToolRequest,
+    cwd: &Path,
+    mcp_registry: &McpRegistry,
+    external_tools: &[ExternalToolConfig],
+    output_truncation: ToolOutputTruncation,
+) -> ToolResult {
     if !matches!(&request.name, ToolName::Mcp(_)) {
         if external_tools.is_empty() {
             let reg = registry::default_tool_registry();
-            let ctx = registry::ToolContext::new(cwd);
+            let ctx =
+                registry::ToolContext::new(cwd).with_output_truncation(output_truncation);
             return reg.execute(request, &ctx);
         }
         let reg = registry::tool_registry_with_mcp_and_external(None, external_tools);
-        let ctx = registry::ToolContext::new(cwd);
+        let ctx = registry::ToolContext::new(cwd).with_output_truncation(output_truncation);
         return reg.execute(request, &ctx);
     }
 
     let reg = registry::tool_registry_with_mcp_and_external(Some(mcp_registry), external_tools);
-    let ctx = registry::ToolContext::new(cwd).with_mcp(mcp_registry);
+    let ctx = registry::ToolContext::new(cwd)
+        .with_output_truncation(output_truncation)
+        .with_mcp(mcp_registry);
     reg.execute(request, &ctx)
 }
 
@@ -102,6 +121,22 @@ pub fn run_readonly_batch_parallel(
     cwd: &Path,
     mcp_registry: &McpRegistry,
 ) -> Vec<ToolResult> {
+    run_readonly_batch_parallel_with_policy(
+        tool_requests,
+        runnable,
+        cwd,
+        mcp_registry,
+        ToolOutputTruncation::default(),
+    )
+}
+
+pub fn run_readonly_batch_parallel_with_policy(
+    tool_requests: &[ToolRequest],
+    runnable: Vec<(usize, ToolRequest)>,
+    cwd: &Path,
+    mcp_registry: &McpRegistry,
+    output_truncation: ToolOutputTruncation,
+) -> Vec<ToolResult> {
     let mut results: Vec<Option<ToolResult>> = vec![None; tool_requests.len()];
     let cwd = cwd.to_path_buf();
     let mcp_registry = mcp_registry.clone();
@@ -111,9 +146,18 @@ pub fn run_readonly_batch_parallel(
         for (idx, tool_request) in runnable {
             let cwd = cwd.clone();
             let mcp_registry = mcp_registry.clone();
+            let output_truncation = output_truncation.normalized();
             handles.push((
                 idx,
-                scope.spawn(move || execute_with_mcp(&tool_request, &cwd, &mcp_registry)),
+                scope.spawn(move || {
+                    execute_with_mcp_external_and_policy(
+                        &tool_request,
+                        &cwd,
+                        &mcp_registry,
+                        &[],
+                        output_truncation,
+                    )
+                }),
             ));
         }
 

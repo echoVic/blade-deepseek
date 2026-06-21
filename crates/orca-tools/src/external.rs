@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use orca_core::external_config::ExternalToolConfig;
-use orca_core::tool_types::{ToolRequest, ToolResult, truncate_output};
+use orca_core::tool_types::{
+    ToolOutputTruncation, ToolRequest, ToolResult, truncate_output_with_policy,
+};
 
 // Security: only loads from ORCA_HOME/tools/ (user-controlled), never from
 // project-level directories, to prevent repo poisoning attacks.
@@ -70,6 +72,20 @@ pub fn execute_external_tool(
     cwd: &Path,
     max_output_bytes: usize,
 ) -> ToolResult {
+    execute_external_tool_with_policy(
+        config,
+        request,
+        cwd,
+        ToolOutputTruncation::bytes(max_output_bytes),
+    )
+}
+
+pub fn execute_external_tool_with_policy(
+    config: &ExternalToolConfig,
+    request: &ToolRequest,
+    cwd: &Path,
+    output_truncation: ToolOutputTruncation,
+) -> ToolResult {
     let args = request.raw_arguments.as_deref().unwrap_or("{}");
     let mut child = match Command::new("sh")
         .arg("-c")
@@ -122,7 +138,7 @@ pub fn execute_external_tool(
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     if output.status.success() {
-        let (output, truncated) = truncate_output(stdout, max_output_bytes);
+        let (output, truncated) = truncate_output_with_policy(stdout, output_truncation);
         return ToolResult::completed(request, output, truncated);
     }
 

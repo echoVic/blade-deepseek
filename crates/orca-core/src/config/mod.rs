@@ -10,6 +10,7 @@ use crate::hook_types::HookConfig;
 use crate::mcp_types::McpServerConfig;
 use crate::model::ModelSelection;
 use crate::subagent_config::SubagentConfig;
+use crate::tool_types::ToolOutputTruncation;
 
 pub mod file;
 
@@ -66,12 +67,15 @@ pub const DEFAULT_MAX_WORKFLOW_AGENTS_PER_RUN: u32 = 1000;
 pub struct ToolConfig {
     #[serde(default = "default_max_read_parallel")]
     pub max_read_parallel: usize,
+    #[serde(default)]
+    pub output_truncation: ToolOutputTruncation,
 }
 
 impl Default for ToolConfig {
     fn default() -> Self {
         Self {
             max_read_parallel: DEFAULT_MAX_READ_PARALLEL_TOOLS,
+            output_truncation: ToolOutputTruncation::default(),
         }
     }
 }
@@ -85,6 +89,7 @@ impl ToolConfig {
         } else if self.max_read_parallel > Self::MAX_READ_PARALLEL_UPPER {
             self.max_read_parallel = Self::MAX_READ_PARALLEL_UPPER;
         }
+        self.output_truncation = self.output_truncation.normalized();
         self
     }
 }
@@ -197,6 +202,7 @@ pub fn format_config_show(config: &RunConfig) -> String {
             "\n",
             "[tools]\n",
             "max_read_parallel = {}\n",
+            "output_truncation = \"{}\"\n",
             "\n",
             "[subagents]\n",
             "max_depth = {}\n",
@@ -222,6 +228,7 @@ pub fn format_config_show(config: &RunConfig) -> String {
         config.desktop_notifications,
         config.auto_memory,
         config.tools.max_read_parallel,
+        config.tools.output_truncation,
         config.subagents.max_depth,
         config.subagents.max_parallel,
         config.mcp_servers.len(),

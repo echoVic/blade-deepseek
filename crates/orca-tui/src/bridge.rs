@@ -668,6 +668,7 @@ pub fn run_agent_for_tui(
                     event_tx,
                     &session.mcp_registry,
                     &session.hooks,
+                    config.tools.output_truncation,
                 );
                 for result in results {
                     let result_content = agent_common::format_tool_result_for_model(&result);
@@ -767,6 +768,7 @@ fn execute_readonly_batch_for_tui(
     event_tx: &Sender<TuiEvent>,
     mcp_registry: &McpRegistry,
     hooks: &HookRunner,
+    output_truncation: tool_types::ToolOutputTruncation,
 ) -> Vec<tool_types::ToolResult> {
     let mut hook_failed: Vec<Option<tool_types::ToolResult>> = vec![None; tool_requests.len()];
     let mut runnable = Vec::new();
@@ -802,8 +804,13 @@ fn execute_readonly_batch_for_tui(
         }
     }
 
-    let mut results =
-        orca_tools::run_readonly_batch_parallel(tool_requests, runnable, cwd, mcp_registry);
+    let mut results = orca_tools::run_readonly_batch_parallel_with_policy(
+        tool_requests,
+        runnable,
+        cwd,
+        mcp_registry,
+        output_truncation,
+    );
 
     for (idx, failed) in hook_failed.into_iter().enumerate() {
         if let Some(result) = failed {
@@ -1146,10 +1153,10 @@ fn execute_tool_for_tui(
                     chunk: chunk.to_string(),
                 });
             };
-            orca_tools::bash::execute_streaming(
+            orca_tools::bash::execute_streaming_with_policy(
                 execution_request,
                 cwd,
-                tool_types::MAX_TOOL_OUTPUT_BYTES,
+                config.tools.output_truncation,
                 &mut on_output,
             )
         } else if execution_request.name == tool_types::ToolName::UpdateGoal {
@@ -1171,19 +1178,21 @@ fn execute_tool_for_tui(
                     .map_err(|error| error.to_string())
             });
             orca_tools::update_goal::with_goal_update_handler(handler, || {
-                orca_tools::execute_with_mcp_and_external(
+                orca_tools::execute_with_mcp_external_and_policy(
                     execution_request,
                     cwd,
                     mcp_registry,
                     &config.external_tools,
+                    config.tools.output_truncation,
                 )
             })
         } else {
-            orca_tools::execute_with_mcp_and_external(
+            orca_tools::execute_with_mcp_external_and_policy(
                 execution_request,
                 cwd,
                 mcp_registry,
                 &config.external_tools,
+                config.tools.output_truncation,
             )
         };
         if matches!(result.status, tool_types::ToolStatus::Completed) {

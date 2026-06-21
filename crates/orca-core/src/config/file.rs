@@ -502,9 +502,30 @@ max_parallel = 6
         let toml = r#"
 [tools]
 max_read_parallel = 5
+output_truncation = { mode = "tokens", limit = 512 }
 "#;
         let config: FileConfig = toml::from_str(toml).unwrap();
         assert_eq!(config.tools.max_read_parallel, 5);
+        assert_eq!(
+            config.tools.output_truncation,
+            crate::tool_types::ToolOutputTruncation::tokens(512)
+        );
+    }
+
+    #[test]
+    fn parse_tool_config_normalizes_output_truncation_limit() {
+        let toml = r#"
+[tools]
+max_read_parallel = 0
+output_truncation = { mode = "bytes", limit = 0 }
+"#;
+        let config: FileConfig = toml::from_str(toml).unwrap();
+        let normalized = config.tools.normalized();
+        assert_eq!(normalized.max_read_parallel, 1);
+        assert_eq!(
+            normalized.output_truncation,
+            crate::tool_types::ToolOutputTruncation::bytes(1)
+        );
     }
 
     #[test]

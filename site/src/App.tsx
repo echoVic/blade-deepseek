@@ -9,7 +9,7 @@ import {
 
 const npmCommand = "npm install -g @blade-ai/orca";
 const curlCommand = "curl -fsSL https://orcaagent.dev/install.sh | sh";
-const releaseVersion = "v0.1.11";
+const releaseVersion = "v0.1.12";
 
 const links = {
   github: "https://github.com/echoVic/blade-deepseek",
@@ -65,7 +65,7 @@ const copy = {
       github: "GitHub",
     },
     hero: {
-      pill: "v0.1.11 · Rust-native",
+      pill: "v0.1.12 · Rust-native",
       titlePrefix: "A",
       titleHighlight: "DeepSeek-native",
       titleSuffix: "coding agent, in your terminal.",
@@ -213,7 +213,7 @@ const copy = {
       github: "GitHub",
     },
     hero: {
-      pill: "v0.1.11 · Rust 原生",
+      pill: "v0.1.12 · Rust 原生",
       titlePrefix: "面向终端的",
       titleHighlight: "DeepSeek 原生",
       titleSuffix: "代码智能体。",

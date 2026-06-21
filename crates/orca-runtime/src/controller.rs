@@ -693,6 +693,7 @@ fn run_agent_loop(
                     emit_deltas,
                     mcp_registry,
                     hooks,
+                    config.tools.output_truncation,
                 )?;
 
                 for result in results {
@@ -982,11 +983,12 @@ fn execute_tool_with_approval(
             cancel,
         )?
     } else {
-        orca_tools::execute_with_mcp_and_external(
+        orca_tools::execute_with_mcp_external_and_policy(
             execution_request,
             cwd,
             mcp_registry,
             &config.external_tools,
+            config.tools.output_truncation,
         )
     };
     let is_failure = matches!(
@@ -1160,6 +1162,7 @@ fn execute_readonly_batch(
     emit_deltas: bool,
     mcp_registry: &McpRegistry,
     hooks: &HookRunner,
+    output_truncation: tool_types::ToolOutputTruncation,
 ) -> io::Result<Vec<tool_types::ToolResult>> {
     let mut hook_failed: Vec<Option<tool_types::ToolResult>> = vec![None; tool_requests.len()];
     let mut runnable = Vec::new();
@@ -1193,8 +1196,13 @@ fn execute_readonly_batch(
         }
     }
 
-    let mut results =
-        orca_tools::run_readonly_batch_parallel(tool_requests, runnable, cwd, mcp_registry);
+    let mut results = orca_tools::run_readonly_batch_parallel_with_policy(
+        tool_requests,
+        runnable,
+        cwd,
+        mcp_registry,
+        output_truncation,
+    );
 
     for (idx, failed) in hook_failed.into_iter().enumerate() {
         if let Some(result) = failed {
@@ -1811,6 +1819,7 @@ mod tests {
             true,
             &registry,
             &hooks,
+            tool_types::ToolOutputTruncation::default(),
         )
         .unwrap();
 

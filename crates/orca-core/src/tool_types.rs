@@ -1,4 +1,5 @@
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::fmt;
 
 use crate::approval_types::ActionKind;
 
@@ -449,7 +450,72 @@ impl ToolResult {
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum ToolOutputTruncation {
+    Bytes { limit: usize },
+    Tokens { limit: usize },
+}
+
+impl ToolOutputTruncation {
+    pub fn bytes(limit: usize) -> Self {
+        Self::Bytes { limit }
+    }
+
+    pub fn tokens(limit: usize) -> Self {
+        Self::Tokens { limit }
+    }
+
+    pub fn limit(self) -> usize {
+        match self {
+            Self::Bytes { limit } | Self::Tokens { limit } => limit,
+        }
+    }
+
+    pub fn normalized(self) -> Self {
+        match self {
+            Self::Bytes { limit } => Self::Bytes {
+                limit: limit.max(1),
+            },
+            Self::Tokens { limit } => Self::Tokens {
+                limit: limit.max(1),
+            },
+        }
+    }
+}
+
+impl Default for ToolOutputTruncation {
+    fn default() -> Self {
+        Self::Bytes {
+            limit: MAX_TOOL_OUTPUT_BYTES,
+        }
+    }
+}
+
+impl fmt::Display for ToolOutputTruncation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Bytes { limit } => write!(f, "bytes:{limit}"),
+            Self::Tokens { limit } => write!(f, "tokens:{limit}"),
+        }
+    }
+}
+
 pub fn truncate_output(output: String, max_bytes: usize) -> (String, bool) {
+    truncate_output_with_policy(output, ToolOutputTruncation::bytes(max_bytes))
+}
+
+pub fn truncate_output_with_policy(
+    output: String,
+    policy: ToolOutputTruncation,
+) -> (String, bool) {
+    match policy.normalized() {
+        ToolOutputTruncation::Bytes { limit } => truncate_output_bytes(output, limit),
+        ToolOutputTruncation::Tokens { limit } => truncate_output_tokens(output, limit),
+    }
+}
+
+fn truncate_output_bytes(output: String, max_bytes: usize) -> (String, bool) {
     if output.len() <= max_bytes {
         return (output, false);
     }
@@ -478,6 +544,31 @@ pub fn truncate_output(output: String, max_bytes: usize) -> (String, bool) {
         format!("{}{}{}", &output[..head_end], marker, &output[tail_start..]),
         true,
     )
+}
+
+fn truncate_output_tokens(output: String, max_tokens: usize) -> (String, bool) {
+    let original_tokens = approx_tool_tokens(&output);
+    if original_tokens <= max_tokens {
+        return (output, false);
+    }
+
+    let line_count = output.lines().count();
+    let byte_budget = approx_bytes_for_tokens(max_tokens);
+    let (snippet, _) = truncate_output_bytes(output, byte_budget.max(1));
+    (
+        format!(
+            "Warning: truncated tool output\nOriginal token count: {original_tokens}\nOriginal line count: {line_count}\n\n{snippet}"
+        ),
+        true,
+    )
+}
+
+fn approx_tool_tokens(text: &str) -> usize {
+    text.split_whitespace().count().max((text.len() + 3) / 4)
+}
+
+fn approx_bytes_for_tokens(tokens: usize) -> usize {
+    tokens.saturating_mul(4)
 }
 
 #[cfg(test)]
@@ -551,5 +642,37 @@ mod tests {
         assert_eq!(ToolResultKind::Truncated.status(), ToolStatus::Completed);
         assert_eq!(ToolResultKind::InvalidInput.status(), ToolStatus::Failed);
         assert_eq!(ToolResultKind::RuntimeError.status(), ToolStatus::Failed);
+    }
+
+    #[test]
+    fn truncation_policy_bytes_keeps_existing_middle_compaction_marker() {
+        let policy = ToolOutputTruncation::bytes(64);
+        let text = "abcdefghijklmnopqrstuvwxyz".repeat(8);
+
+        let (output, truncated) = truncate_output_with_policy(text, policy);
+
+        assert!(truncated);
+        assert!(output.contains("tool output micro-compacted"));
+        assert!(output.starts_with("a"));
+        assert!(output.ends_with("z"));
+    }
+
+    #[test]
+    fn truncation_policy_tokens_reports_original_size_and_line_count() {
+        let policy = ToolOutputTruncation::tokens(16);
+        let text = format!(
+            "{}\n{}",
+            "alpha beta gamma delta epsilon zeta ".repeat(4),
+            "eta theta iota kappa lambda zeta ".repeat(4)
+        );
+
+        let (output, truncated) = truncate_output_with_policy(text, policy);
+
+        assert!(truncated);
+        assert!(output.starts_with("Warning: truncated tool output"));
+        assert!(output.contains("Original token count:"));
+        assert!(output.contains("Original line count: 2"));
+        assert!(output.contains("alpha"));
+        assert!(output.contains("zeta"));
     }
 }

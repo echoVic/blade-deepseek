@@ -10,7 +10,7 @@ use orca_core::external_config::ExternalToolConfig;
 use orca_core::mcp_types::McpTool;
 use orca_core::tool_types::{
     CapabilitySet, MAX_TOOL_OUTPUT_BYTES, RendererHint, ResultSemantics, ToolCapability,
-    ToolExposure, ToolName, ToolRequest, ToolResult, ToolSpec,
+    ToolExposure, ToolName, ToolOutputTruncation, ToolRequest, ToolResult, ToolSpec,
 };
 use orca_mcp::McpRegistry;
 
@@ -60,7 +60,7 @@ pub trait Tool: Send + Sync {
 
 pub struct ToolContext<'a> {
     pub cwd: &'a Path,
-    pub max_output_bytes: usize,
+    pub output_truncation: ToolOutputTruncation,
     pub mcp_registry: Option<&'a McpRegistry>,
 }
 
@@ -68,8 +68,20 @@ impl<'a> ToolContext<'a> {
     pub fn new(cwd: &'a Path) -> Self {
         Self {
             cwd,
-            max_output_bytes: MAX_TOOL_OUTPUT_BYTES,
+            output_truncation: ToolOutputTruncation::bytes(MAX_TOOL_OUTPUT_BYTES),
             mcp_registry: None,
+        }
+    }
+
+    pub fn with_output_truncation(mut self, output_truncation: ToolOutputTruncation) -> Self {
+        self.output_truncation = output_truncation.normalized();
+        self
+    }
+
+    pub fn max_output_bytes(&self) -> usize {
+        match self.output_truncation {
+            ToolOutputTruncation::Bytes { limit } => limit,
+            ToolOutputTruncation::Tokens { limit } => limit.saturating_mul(4),
         }
     }
 
@@ -609,17 +621,19 @@ impl Tool for BuiltinTool {
 
     fn execute(&self, request: &ToolRequest, ctx: &ToolContext<'_>) -> ToolResult {
         match self.executor {
-            BuiltinExecutor::ReadFile => read_file::execute(request, ctx.cwd, ctx.max_output_bytes),
+            BuiltinExecutor::ReadFile => read_file::execute(request, ctx.cwd, ctx.max_output_bytes()),
             BuiltinExecutor::Glob if request.name.as_str() == "list_files" => {
-                list_files::execute(request, ctx.cwd, ctx.max_output_bytes)
+                list_files::execute(request, ctx.cwd, ctx.max_output_bytes())
             }
-            BuiltinExecutor::Glob => glob::execute(request, ctx.cwd, ctx.max_output_bytes),
-            BuiltinExecutor::Grep => grep::execute(request, ctx.cwd, ctx.max_output_bytes),
-            BuiltinExecutor::Bash => bash::execute(request, ctx.cwd, ctx.max_output_bytes),
+            BuiltinExecutor::Glob => glob::execute(request, ctx.cwd, ctx.max_output_bytes()),
+            BuiltinExecutor::Grep => grep::execute(request, ctx.cwd, ctx.max_output_bytes()),
+            BuiltinExecutor::Bash => {
+                bash::execute_with_policy(request, ctx.cwd, ctx.output_truncation)
+            }
             BuiltinExecutor::Edit => edit::execute(request, ctx.cwd),
             BuiltinExecutor::WriteFile => write_file::execute(request, ctx.cwd),
-            BuiltinExecutor::GitStatus => git::status(request, ctx.cwd, ctx.max_output_bytes),
-            BuiltinExecutor::WebSearch => web_search::execute(request, ctx.max_output_bytes),
+            BuiltinExecutor::GitStatus => git::status(request, ctx.cwd, ctx.max_output_bytes()),
+            BuiltinExecutor::WebSearch => web_search::execute(request, ctx.max_output_bytes()),
             BuiltinExecutor::Subagent => ToolResult::failed(
                 request,
                 "subagent tool must be executed by the runtime",
@@ -757,7 +771,12 @@ impl Tool for ExternalTool {
     }
 
     fn execute(&self, request: &ToolRequest, ctx: &ToolContext<'_>) -> ToolResult {
-        external::execute_external_tool(&self.tool, request, ctx.cwd, ctx.max_output_bytes)
+        external::execute_external_tool_with_policy(
+            &self.tool,
+            request,
+            ctx.cwd,
+            ctx.output_truncation,
+        )
     }
 }
 

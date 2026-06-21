@@ -33,7 +33,7 @@ Set `INSTALL_DIR` to choose a destination and `ORCA_VERSION` to pin a version:
 
 ```bash
 curl -fsSL https://orcaagent.dev/install.sh | \
-  INSTALL_DIR=/usr/local/bin ORCA_VERSION=0.1.11 sh
+  INSTALL_DIR=/usr/local/bin ORCA_VERSION=0.1.12 sh
 ```
 
 ### GitHub Releases
@@ -98,6 +98,13 @@ schema = { target = { type = "string", description = "environment" } }
 ```
 
 External tool commands run from the workspace directory. The raw JSON arguments are provided on stdin and in `ORCA_TOOL_ARGS`.
+
+Tool output truncation can be configured under `[tools]`. Byte mode preserves the historical 8 KiB default; token mode adds an explicit warning with original token and line counts before compacting large outputs:
+
+```toml
+[tools]
+output_truncation = { mode = "tokens", limit = 2000 }
+```
 
 ### Defaults
 

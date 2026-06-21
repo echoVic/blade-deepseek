@@ -164,6 +164,46 @@ fn full_auto_allows_bash_tool() {
 }
 
 #[test]
+fn tool_output_truncation_policy_from_config_applies_to_bash() {
+    let home = make_temp_workspace("tool-truncation-home");
+    fs::write(
+        home.join("config.toml"),
+        r#"
+[tools]
+output_truncation = { mode = "tokens", limit = 12 }
+"#,
+    )
+    .expect("write config");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .env("ORCA_HOME", &home)
+        .args([
+            "exec",
+            "--output-format",
+            "jsonl",
+            "--provider",
+            "mock",
+            "--approval-mode",
+            "full-auto",
+            "bash printf 'alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma'",
+        ])
+        .output()
+        .expect("run orca");
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+
+    let events = parse_jsonl(&output.stdout);
+    let completed = find_event(&events, "tool.call.completed");
+    assert_eq!(completed["payload"]["name"], "bash");
+    assert_eq!(completed["payload"]["status"], "completed");
+    assert_eq!(completed["payload"]["truncated"], true);
+    let text = completed["payload"]["output"].as_str().unwrap();
+    assert!(text.contains("Warning: truncated tool output"));
+    assert!(text.contains("Original token count:"));
+}
+
+#[test]
 fn pre_tool_hook_can_modify_tool_target_before_execution() {
     let home = make_temp_workspace("hook-modify-home");
     fs::write(

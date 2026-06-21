@@ -4,11 +4,21 @@ use std::sync::mpsc;
 use std::time::Duration;
 use std::{io::BufRead, io::BufReader};
 
-use orca_core::tool_types::{ToolRequest, ToolResult, truncate_output};
+use orca_core::tool_types::{
+    ToolOutputTruncation, ToolRequest, ToolResult, truncate_output_with_policy,
+};
 
 use crate::sandbox;
 
 pub fn execute(request: &ToolRequest, cwd: &Path, max_bytes: usize) -> ToolResult {
+    execute_with_policy(request, cwd, ToolOutputTruncation::bytes(max_bytes))
+}
+
+pub fn execute_with_policy(
+    request: &ToolRequest,
+    cwd: &Path,
+    output_truncation: ToolOutputTruncation,
+) -> ToolResult {
     let Some(command) = request
         .target
         .as_deref()
@@ -26,7 +36,7 @@ pub fn execute(request: &ToolRequest, cwd: &Path, max_bytes: usize) -> ToolResul
             let stdout = String::from_utf8_lossy(&output.stdout)
                 .trim_end()
                 .to_string();
-            let (stdout, truncated) = truncate_output(stdout, max_bytes);
+            let (stdout, truncated) = truncate_output_with_policy(stdout, output_truncation);
             ToolResult::completed(request, stdout, truncated)
         }
         Ok(output) => {
@@ -43,7 +53,7 @@ pub fn execute(request: &ToolRequest, cwd: &Path, max_bytes: usize) -> ToolResul
             } else {
                 format!("{stdout}\n{stderr}")
             };
-            let (message, truncated) = truncate_output(message, max_bytes);
+            let (message, truncated) = truncate_output_with_policy(message, output_truncation);
             let mut result = ToolResult::failed(request, message, output.status.code());
             result.truncated = truncated;
             result
@@ -65,6 +75,20 @@ pub fn execute_streaming(
     request: &ToolRequest,
     cwd: &Path,
     max_bytes: usize,
+    on_output: &mut dyn FnMut(&str),
+) -> ToolResult {
+    execute_streaming_with_policy(
+        request,
+        cwd,
+        ToolOutputTruncation::bytes(max_bytes),
+        on_output,
+    )
+}
+
+pub fn execute_streaming_with_policy(
+    request: &ToolRequest,
+    cwd: &Path,
+    output_truncation: ToolOutputTruncation,
     on_output: &mut dyn FnMut(&str),
 ) -> ToolResult {
     let Some(command) = request
@@ -162,7 +186,7 @@ pub fn execute_streaming(
     let stdout = stdout.trim_end().to_string();
     let stderr = stderr.trim_end().to_string();
     if status.success() {
-        let (stdout, truncated) = truncate_output(stdout, max_bytes);
+        let (stdout, truncated) = truncate_output_with_policy(stdout, output_truncation);
         ToolResult::completed(request, stdout, truncated)
     } else {
         let message = if stderr.is_empty() {
@@ -172,7 +196,7 @@ pub fn execute_streaming(
         } else {
             format!("{stdout}\n{stderr}")
         };
-        let (message, truncated) = truncate_output(message, max_bytes);
+        let (message, truncated) = truncate_output_with_policy(message, output_truncation);
         let mut result = ToolResult::failed(request, message, status.code());
         result.truncated = truncated;
         result
