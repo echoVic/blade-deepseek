@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use serde_json::Value;
 
 use orca_core::external_config::ExternalToolConfig;
@@ -32,14 +34,22 @@ pub fn deepseek_tools_schema_for_type_with_mcp_and_external(
 ) -> Vec<Value> {
     let allowed = subagent_type.allowed_tools();
     let registry = registry::tool_registry_with_mcp_and_external(mcp_registry, external_tools);
+    let allowed_canonical_names = allowed
+        .iter()
+        .filter_map(|name| {
+            registry
+                .resolve(name)
+                .map(|resolved| resolved.tool.name().to_string())
+        })
+        .collect::<HashSet<_>>();
 
     registry
-        .iter()
+        .model_visible_tools()
         .filter(|tool| {
             let name = tool.name();
             name.starts_with("mcp__")
                 || external_tools.iter().any(|external| external.name == name)
-                || (name != "subagent" && allowed.contains(&name))
+                || (name != "subagent" && allowed_canonical_names.contains(name))
         })
         .map(|tool| tool.schema())
         .collect()
@@ -71,5 +81,22 @@ mod tests {
 
         assert!(names.contains(&"glob"));
         assert!(!names.contains(&"list_files"));
+    }
+
+    #[test]
+    fn typed_subagent_schema_resolves_allowed_list_files_alias_to_glob() {
+        let tools = deepseek_tools_schema_for_type_with_mcp_and_external(
+            &SubagentType::CodeReviewer,
+            None,
+            &[],
+        );
+        let names = tools
+            .iter()
+            .filter_map(|tool| tool["function"]["name"].as_str())
+            .collect::<Vec<_>>();
+
+        assert!(names.contains(&"glob"));
+        assert!(!names.contains(&"list_files"));
+        assert!(!names.contains(&"subagent"));
     }
 }

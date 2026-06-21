@@ -572,6 +572,29 @@ mod tests {
     }
 
     #[test]
+    fn parse_glob_with_pattern_and_path() {
+        let tc = make_tc("glob", r#"{"pattern":"**/*.rs","path":"src"}"#);
+        let req = parse_tool_call(&tc, &[]).unwrap();
+        assert_eq!(req.name, ToolName::Glob);
+        assert_eq!(req.action, ActionKind::Read);
+        assert_eq!(req.target.as_deref(), Some("src"));
+        assert_eq!(
+            req.raw_arguments.as_deref(),
+            Some(r#"{"pattern":"**/*.rs","path":"src"}"#)
+        );
+    }
+
+    #[test]
+    fn parse_glob_with_pattern_only_defaults_path_to_dot() {
+        let tc = make_tc("glob", r#"{"pattern":"*.rs"}"#);
+        let req = parse_tool_call(&tc, &[]).unwrap();
+        assert_eq!(req.name, ToolName::Glob);
+        assert_eq!(req.action, ActionKind::Read);
+        assert_eq!(req.target.as_deref(), Some("."));
+        assert_eq!(req.raw_arguments.as_deref(), Some(r#"{"pattern":"*.rs"}"#));
+    }
+
+    #[test]
     fn parse_grep() {
         let tc = make_tc("grep", r#"{"pattern":"fn main","path":"src"}"#);
         let req = parse_tool_call(&tc, &[]).unwrap();

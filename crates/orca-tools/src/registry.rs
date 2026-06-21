@@ -15,8 +15,8 @@ use orca_core::tool_types::{
 use orca_mcp::McpRegistry;
 
 use crate::{
-    bash, edit, external, git, grep, list_files, read_file, update_goal, update_plan, web_search,
-    write_file,
+    bash, edit, external, git, glob, grep, list_files, read_file, update_goal, update_plan,
+    web_search, write_file,
 };
 
 #[allow(dead_code)]
@@ -105,13 +105,16 @@ impl ToolRegistry {
         T: Tool + 'static,
     {
         let name = tool.name().to_string();
-        if self.by_name.contains_key(&name) {
+        if self.by_name.contains_key(&name) || self.aliases.contains_key(&name) {
             return;
         }
-        self.by_name.insert(name, self.tools.len());
+        let idx = self.tools.len();
+        self.by_name.insert(name, idx);
         for alias in &tool.spec().aliases {
-            self.aliases
-                .insert(alias.as_str().to_string(), self.tools.len());
+            let alias = alias.as_str().to_string();
+            if !self.by_name.contains_key(&alias) && !self.aliases.contains_key(&alias) {
+                self.aliases.insert(alias, idx);
+            }
         }
         self.tools.push(Box::new(tool));
     }
@@ -607,7 +610,10 @@ impl Tool for BuiltinTool {
     fn execute(&self, request: &ToolRequest, ctx: &ToolContext<'_>) -> ToolResult {
         match self.executor {
             BuiltinExecutor::ReadFile => read_file::execute(request, ctx.cwd, ctx.max_output_bytes),
-            BuiltinExecutor::Glob => list_files::execute(request, ctx.cwd, ctx.max_output_bytes),
+            BuiltinExecutor::Glob if request.name.as_str() == "list_files" => {
+                list_files::execute(request, ctx.cwd, ctx.max_output_bytes)
+            }
+            BuiltinExecutor::Glob => glob::execute(request, ctx.cwd, ctx.max_output_bytes),
             BuiltinExecutor::Grep => grep::execute(request, ctx.cwd, ctx.max_output_bytes),
             BuiltinExecutor::Bash => bash::execute(request, ctx.cwd, ctx.max_output_bytes),
             BuiltinExecutor::Edit => edit::execute(request, ctx.cwd),

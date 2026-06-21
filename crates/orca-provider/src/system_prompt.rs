@@ -78,8 +78,8 @@ Start validation as specific as possible to the code you changed, then broaden:
 ### read_file
 Read file contents. Parameters: `path` (required).
 
-### list_files
-List files and directories. Parameters: `path` (optional, default ".").
+### glob
+Find files and directories matching a glob pattern. Parameters: `pattern` (required), `path` (optional, default ".").
 
 ### grep
 Search for regex patterns using ripgrep. Parameters: `pattern` (required), `path` (optional, default ".").

@@ -9,6 +9,7 @@ pub mod bash;
 pub mod edit;
 pub mod external;
 pub mod git;
+pub mod glob;
 pub mod grep;
 pub mod list_files;
 pub mod read_file;
@@ -226,6 +227,22 @@ mod tests {
     }
 
     #[test]
+    fn external_tool_cannot_shadow_builtin_list_files_alias() {
+        let external_tools = vec![ExternalToolConfig {
+            name: "list_files".to_string(),
+            description: "external list files".to_string(),
+            action_kind: ActionKind::Shell,
+            command: "echo external".to_string(),
+            schema: serde_json::json!({}),
+        }];
+        let reg = registry::tool_registry_with_mcp_and_external(None, &external_tools);
+        let resolved = reg.resolve("list_files").expect("list_files alias");
+
+        assert_eq!(resolved.tool.name(), "glob");
+        assert_eq!(resolved.spec.capabilities.action_kind(), ActionKind::Read);
+    }
+
+    #[test]
     fn readonly_batch_ignores_caller_supplied_write_action_for_read_tool() {
         let request = ToolRequest {
             id: "read".to_string(),
@@ -236,6 +253,50 @@ mod tests {
         };
 
         assert!(should_run_readonly_batch(2, &request));
+    }
+
+    #[test]
+    fn registry_executes_glob_with_pattern_and_path() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        fs::create_dir_all(temp_dir.path().join("src/bin")).expect("fixture dir");
+        fs::write(temp_dir.path().join("src/lib.rs"), "lib").expect("fixture");
+        fs::write(temp_dir.path().join("src/bin/main.rs"), "main").expect("fixture");
+        fs::write(temp_dir.path().join("src/readme.md"), "readme").expect("fixture");
+        let reg = registry::default_tool_registry();
+        let request = ToolRequest {
+            id: "glob".to_string(),
+            name: ToolName::Glob,
+            action: ActionKind::Read,
+            target: Some("src".to_string()),
+            raw_arguments: Some(r#"{"pattern":"**/*.rs","path":"src"}"#.to_string()),
+        };
+
+        let result = reg.execute(&request, &registry::ToolContext::new(temp_dir.path()));
+
+        assert_eq!(result.status, ToolStatus::Completed);
+        assert_eq!(
+            result.output.as_deref(),
+            Some("src/bin/main.rs\nsrc/lib.rs")
+        );
+    }
+
+    #[test]
+    fn registry_executes_glob_with_no_matches() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        fs::create_dir_all(temp_dir.path()).expect("fixture dir");
+        let reg = registry::default_tool_registry();
+        let request = ToolRequest {
+            id: "glob".to_string(),
+            name: ToolName::Glob,
+            action: ActionKind::Read,
+            target: Some("missing".to_string()),
+            raw_arguments: Some(r#"{"pattern":"*.rs","path":"missing"}"#.to_string()),
+        };
+
+        let result = reg.execute(&request, &registry::ToolContext::new(temp_dir.path()));
+
+        assert_eq!(result.status, ToolStatus::Completed);
+        assert_eq!(result.output.as_deref(), Some("(no matches)"));
     }
 
     #[test]
