@@ -213,7 +213,6 @@ fn render_workflows_panel(frame: &mut Frame, area: Rect, state: &mut AppState, t
 }
 
 fn build_welcome_lines<'a>(state: &AppState, theme: &Theme) -> Vec<Line<'a>> {
-    let version = env!("CARGO_PKG_VERSION");
     let cyan = Style::default().fg(theme.border);
     let text = Style::default().fg(theme.text);
     let muted = Style::default().fg(theme.muted);
@@ -226,7 +225,7 @@ fn build_welcome_lines<'a>(state: &AppState, theme: &Theme) -> Vec<Line<'a>> {
         Line::from(Span::styled(" | |_| | | | (_| (_| |", cyan)),
         Line::from(vec![
             Span::styled("  \\___/|_|  \\___\\__,_|", cyan),
-            Span::styled(format!("  v{version}"), muted),
+            Span::styled(format!("  v{}", state.app_version), muted),
         ]),
         Line::from(""),
         Line::from(vec![
@@ -1197,5 +1196,36 @@ fn truncate_lines(text: &str, max_lines: usize) -> String {
     } else {
         let joined: String = lines[..max_lines].join(" ");
         format!("{joined}...")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    #[test]
+    fn welcome_lines_use_configured_app_version() {
+        let (tx, _rx) = mpsc::channel();
+        let state = AppState::new(
+            tx,
+            "9.8.7-test".to_string(),
+            "deepseek-v4-pro".to_string(),
+            "/tmp/project".to_string(),
+        );
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+
+        let rendered = build_welcome_lines(&state, &theme)
+            .into_iter()
+            .map(|line| {
+                line.spans
+                    .into_iter()
+                    .map(|span| span.content.into_owned())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("v9.8.7-test"));
     }
 }

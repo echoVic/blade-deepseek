@@ -92,7 +92,12 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
         .to_string();
     let cwd_display = shorten_home(&cwd_display);
 
-    let mut state = AppState::new(action_tx.clone(), model_name, cwd_display);
+    let mut state = AppState::new(
+        action_tx.clone(),
+        config.app_version.clone(),
+        model_name,
+        cwd_display,
+    );
     let theme = Theme::named(config.theme);
     if should_show_picker && !picker_sessions.is_empty() {
         state.status = AppStatus::SessionPicker;
@@ -148,16 +153,19 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
 
     if config.update_check {
         let tx = event_tx.clone();
-        thread::spawn(move || match orca_runtime::update_check::check_latest() {
-            Ok(Some(info)) => {
-                let _ = tx.send(TuiEvent::Notice(format!(
-                    "Update available: {} -> {} ({})",
-                    info.current, info.latest, info.url
-                )));
-            }
-            Ok(None) => {}
-            Err(_) => {}
-        });
+        let current_version = config.app_version.clone();
+        thread::spawn(
+            move || match orca_runtime::update_check::check_latest(&current_version) {
+                Ok(Some(info)) => {
+                    let _ = tx.send(TuiEvent::Notice(format!(
+                        "Update available: {} -> {} ({})",
+                        info.current, info.latest, info.url
+                    )));
+                }
+                Ok(None) => {}
+                Err(_) => {}
+            },
+        );
     }
 
     let _agent_handle = thread::spawn(move || {

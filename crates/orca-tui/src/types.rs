@@ -171,6 +171,7 @@ pub struct AppState {
     pub auto_scroll: bool,
     pub total_lines: u16,
     pub visible_height: u16,
+    pub app_version: String,
     pub model_name: String,
     pub cwd: String,
     #[allow(dead_code)]
@@ -196,7 +197,12 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(event_tx: mpsc::Sender<UserAction>, model_name: String, cwd: String) -> Self {
+    pub fn new(
+        event_tx: mpsc::Sender<UserAction>,
+        app_version: String,
+        model_name: String,
+        cwd: String,
+    ) -> Self {
         Self {
             messages: Vec::new(),
             status: AppStatus::Idle,
@@ -204,6 +210,7 @@ impl AppState {
             auto_scroll: true,
             total_lines: 0,
             visible_height: 0,
+            app_version,
             model_name,
             cwd,
             event_tx,
@@ -592,7 +599,12 @@ mod tests {
 
     fn state() -> AppState {
         let (tx, _rx) = mpsc::channel();
-        AppState::new(tx, "mock".to_string(), "/tmp".to_string())
+        AppState::new(
+            tx,
+            "0.0.0-test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        )
     }
 
     #[test]

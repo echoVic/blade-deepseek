@@ -128,6 +128,7 @@ mod tests {
 
     fn config(model: Option<&str>) -> RunConfig {
         RunConfig {
+            app_version: "0.0.0-test".to_string(),
             prompt: String::new(),
             cwd: None,
             output_format: OutputFormat::Text,

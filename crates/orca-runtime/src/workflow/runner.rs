@@ -853,6 +853,7 @@ mod tests {
 
     fn test_run_config() -> RunConfig {
         RunConfig {
+            app_version: "0.0.0-test".to_string(),
             prompt: String::new(),
             cwd: None,
             output_format: OutputFormat::Jsonl,

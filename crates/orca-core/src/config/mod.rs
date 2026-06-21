@@ -134,6 +134,7 @@ fn default_workflow_keyword_trigger_enabled() -> bool {
 
 #[derive(Clone, Debug)]
 pub struct RunConfig {
+    pub app_version: String,
     pub prompt: String,
     pub cwd: Option<PathBuf>,
     pub output_format: OutputFormat,
@@ -239,6 +240,7 @@ mod tests {
     #[test]
     fn format_config_show_redacts_api_key_and_includes_effective_values() {
         let config = RunConfig {
+            app_version: "0.0.0-test".to_string(),
             prompt: String::new(),
             cwd: None,
             output_format: OutputFormat::Text,

@@ -1568,6 +1568,7 @@ mod tests {
 
     fn config(subagents: SubagentConfig) -> RunConfig {
         RunConfig {
+            app_version: "0.0.0-test".to_string(),
             prompt: String::new(),
             cwd: None,
             output_format: OutputFormat::Text,

@@ -1560,6 +1560,7 @@ mod tests {
 
     fn config() -> RunConfig {
         RunConfig {
+            app_version: "0.0.0-test".to_string(),
             prompt: String::new(),
             cwd: std::env::current_dir().ok(),
             output_format: OutputFormat::Text,

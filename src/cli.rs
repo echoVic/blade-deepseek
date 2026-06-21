@@ -468,6 +468,7 @@ fn run_exec(args: ExecArgs) -> i32 {
     let history_mode = resolve_history_mode(args.resume, args.fork, args.continue_latest, fallback);
 
     let config = RunConfig {
+        app_version: env!("CARGO_PKG_VERSION").to_string(),
         prompt,
         cwd: args.cwd,
         output_format: output_format.into(),
@@ -933,6 +934,7 @@ fn build_workflow_run_config(
     let model = ModelSelection::parse(file_config.model)?;
 
     Ok(RunConfig {
+        app_version: env!("CARGO_PKG_VERSION").to_string(),
         prompt: String::new(),
         cwd: Some(cwd.to_path_buf()),
         output_format: OutputFormat::Jsonl,
@@ -1302,6 +1304,7 @@ fn run_placeholder(cli: Cli) -> i32 {
     );
 
     let config = RunConfig {
+        app_version: env!("CARGO_PKG_VERSION").to_string(),
         prompt: cli.prompt.join(" "),
         cwd: None,
         output_format: OutputFormat::Text,
@@ -1363,6 +1366,7 @@ fn run_server(cli: Cli) -> i32 {
     };
 
     let config = RunConfig {
+        app_version: env!("CARGO_PKG_VERSION").to_string(),
         prompt: String::new(),
         cwd: None,
         output_format: OutputFormat::Jsonl,

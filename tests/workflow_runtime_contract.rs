@@ -488,6 +488,7 @@ fn agent_cap_failure_is_recorded() {
 
 fn mock_run_config(cwd: &std::path::Path) -> RunConfig {
     RunConfig {
+        app_version: "0.0.0-test".to_string(),
         prompt: String::new(),
         cwd: Some(cwd.to_path_buf()),
         output_format: OutputFormat::Jsonl,
