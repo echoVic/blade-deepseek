@@ -1,7 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::thread;
 
-use orca_core::approval_types::ActionKind;
 use orca_core::external_config::ExternalToolConfig;
 use orca_core::tool_types::{ToolName, ToolRequest, ToolResult};
 use orca_mcp::McpRegistry;
@@ -53,14 +52,14 @@ pub fn execute_with_mcp_and_external(
 }
 
 fn is_concurrent_safe_read(request: &ToolRequest) -> bool {
-    if request.action != ActionKind::Read {
-        return false;
-    }
-
     let reg = registry::default_tool_registry();
-    reg.get(request.name.as_str())
-        .map(|tool| tool.is_concurrent_safe(request))
-        .unwrap_or_else(|| request.name.is_read_only())
+    reg.resolve(request.name.as_str())
+        .map(|resolved| {
+            resolved.spec.capabilities.is_read_only()
+                && resolved.spec.concurrent_safe
+                && resolved.tool.is_concurrent_safe(request)
+        })
+        .unwrap_or(false)
 }
 
 pub fn should_run_readonly_batch(max_read_parallel: usize, tool_request: &ToolRequest) -> bool {
@@ -159,6 +158,7 @@ pub fn resolve_workspace_path(cwd: &Path, target: Option<&str>) -> Result<PathBu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use orca_core::approval_types::ActionKind;
     use orca_core::tool_types::{ToolStatus, truncate_output};
     use std::fs;
 
@@ -201,6 +201,41 @@ mod tests {
             reg.get("subagent").unwrap().action_kind(),
             ActionKind::Agent
         );
+    }
+
+    #[test]
+    fn registry_resolves_list_files_to_discovery_capabilities() {
+        let reg = registry::default_tool_registry();
+        let resolved = reg.resolve("list_files").expect("list_files alias");
+
+        assert_eq!(resolved.tool.name(), "glob");
+        assert!(resolved.spec.capabilities.is_read_only());
+        assert_eq!(resolved.requested_name.as_str(), "list_files");
+    }
+
+    #[test]
+    fn model_visible_tools_hide_list_files_after_glob_exists() {
+        let reg = registry::default_tool_registry();
+        let names = reg
+            .model_visible_tools()
+            .map(|tool| tool.name().to_string())
+            .collect::<Vec<_>>();
+
+        assert!(names.contains(&"glob".to_string()));
+        assert!(!names.contains(&"list_files".to_string()));
+    }
+
+    #[test]
+    fn readonly_batch_ignores_caller_supplied_write_action_for_read_tool() {
+        let request = ToolRequest {
+            id: "read".to_string(),
+            name: ToolName::ReadFile,
+            action: ActionKind::Write,
+            target: Some("README.md".to_string()),
+            raw_arguments: None,
+        };
+
+        assert!(should_run_readonly_batch(2, &request));
     }
 
     #[test]

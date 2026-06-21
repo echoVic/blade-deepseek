@@ -19,7 +19,10 @@ pub fn deepseek_tools_schema_with_mcp_and_external(
 }
 
 pub fn deepseek_tools_schema_from_registry(registry: &ToolRegistry) -> Vec<Value> {
-    registry.iter().map(|tool| tool.schema()).collect()
+    registry
+        .model_visible_tools()
+        .map(|tool| tool.schema())
+        .collect()
 }
 
 pub fn deepseek_tools_schema_for_type_with_mcp_and_external(
@@ -49,8 +52,24 @@ mod tests {
     #[test]
     fn can_generate_schema_from_tool_registry() {
         let registry = orca_tools::registry::default_tool_registry();
-        let expected: Vec<Value> = registry.iter().map(|tool| tool.schema()).collect();
+        let expected: Vec<Value> = registry
+            .model_visible_tools()
+            .map(|tool| tool.schema())
+            .collect();
 
         assert_eq!(deepseek_tools_schema_from_registry(registry), expected);
+    }
+
+    #[test]
+    fn generated_schema_uses_model_visible_tools_only() {
+        let registry = orca_tools::registry::default_tool_registry();
+        let tools = deepseek_tools_schema_from_registry(registry);
+        let names = tools
+            .iter()
+            .filter_map(|tool| tool["function"]["name"].as_str())
+            .collect::<Vec<_>>();
+
+        assert!(names.contains(&"glob"));
+        assert!(!names.contains(&"list_files"));
     }
 }

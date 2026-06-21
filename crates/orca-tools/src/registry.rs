@@ -8,7 +8,10 @@ use serde_json::{Value, json};
 use orca_core::approval_types::ActionKind;
 use orca_core::external_config::ExternalToolConfig;
 use orca_core::mcp_types::McpTool;
-use orca_core::tool_types::{MAX_TOOL_OUTPUT_BYTES, ToolName, ToolRequest, ToolResult};
+use orca_core::tool_types::{
+    CapabilitySet, MAX_TOOL_OUTPUT_BYTES, RendererHint, ResultSemantics, ToolCapability,
+    ToolExposure, ToolName, ToolRequest, ToolResult, ToolSpec,
+};
 use orca_mcp::McpRegistry;
 
 use crate::{
@@ -18,11 +21,35 @@ use crate::{
 
 #[allow(dead_code)]
 pub trait Tool: Send + Sync {
-    fn name(&self) -> &str;
-    fn description(&self) -> &str;
-    fn schema(&self) -> Value;
-    fn action_kind(&self) -> ActionKind;
-    fn is_read_only(&self, input: &ToolRequest) -> bool;
+    fn spec(&self) -> &ToolSpec;
+
+    fn name(&self) -> &str {
+        self.spec().name.as_str()
+    }
+
+    fn description(&self) -> &str {
+        &self.spec().description
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "type": "function",
+            "function": {
+                "name": self.name(),
+                "description": self.description(),
+                "parameters": self.spec().input_schema
+            }
+        })
+    }
+
+    fn action_kind(&self) -> ActionKind {
+        self.spec().capabilities.action_kind()
+    }
+
+    fn is_read_only(&self, _input: &ToolRequest) -> bool {
+        self.spec().capabilities.is_read_only()
+    }
+
     fn is_concurrent_safe(&self, input: &ToolRequest) -> bool;
     fn execute(&self, request: &ToolRequest, ctx: &ToolContext<'_>) -> ToolResult;
 
@@ -52,9 +79,16 @@ impl<'a> ToolContext<'a> {
     }
 }
 
+pub struct ResolvedTool<'a> {
+    pub tool: &'a dyn Tool,
+    pub spec: &'a ToolSpec,
+    pub requested_name: ToolName,
+}
+
 pub struct ToolRegistry {
     tools: Vec<Box<dyn Tool>>,
     by_name: HashMap<String, usize>,
+    aliases: HashMap<String, usize>,
 }
 
 impl ToolRegistry {
@@ -62,6 +96,7 @@ impl ToolRegistry {
         Self {
             tools: Vec::new(),
             by_name: HashMap::new(),
+            aliases: HashMap::new(),
         }
     }
 
@@ -74,6 +109,10 @@ impl ToolRegistry {
             return;
         }
         self.by_name.insert(name, self.tools.len());
+        for alias in &tool.spec().aliases {
+            self.aliases
+                .insert(alias.as_str().to_string(), self.tools.len());
+        }
         self.tools.push(Box::new(tool));
     }
 
@@ -88,12 +127,40 @@ impl ToolRegistry {
         self.tools.iter().map(|tool| tool.as_ref())
     }
 
+    pub fn resolve(&self, name: &str) -> Option<ResolvedTool<'_>> {
+        if let Some(idx) = self.by_name.get(name) {
+            let tool = self.tools.get(*idx)?.as_ref();
+            return Some(ResolvedTool {
+                tool,
+                spec: tool.spec(),
+                requested_name: ToolName::from_str(name)?,
+            });
+        }
+        let idx = self.aliases.get(name)?;
+        let tool = self.tools.get(*idx)?.as_ref();
+        Some(ResolvedTool {
+            tool,
+            spec: tool.spec(),
+            requested_name: ToolName::from_str(name)?,
+        })
+    }
+
+    pub fn model_visible_tools(&self) -> impl Iterator<Item = &dyn Tool> {
+        self.tools
+            .iter()
+            .map(|tool| tool.as_ref())
+            .filter(|tool| tool.spec().exposure.is_model_visible())
+    }
+
     pub fn execute(&self, request: &ToolRequest, ctx: &ToolContext<'_>) -> ToolResult {
-        let name = request.name.as_str();
-        let Some(tool) = self.get(name) else {
-            return ToolResult::failed(request, format!("unknown tool: {name}"), None);
+        let Some(resolved) = self.resolve(request.name.as_str()) else {
+            return ToolResult::failed(
+                request,
+                format!("unknown tool: {}", request.name.as_str()),
+                None,
+            );
         };
-        tool.execute(request, ctx)
+        resolved.tool.execute(request, ctx)
     }
 }
 
@@ -126,351 +193,421 @@ pub fn tool_registry_with_mcp_and_external(
 
 fn register_builtin_tools(registry: &mut ToolRegistry) {
     registry.register(BuiltinTool::new(
-        "read_file",
-        "Read the contents of a file at the given path relative to workspace root.",
-        ActionKind::Read,
-        json!({
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "File path relative to workspace root"
-                }
-            },
-            "required": ["path"]
-        }),
+        builtin_spec(
+            "read_file",
+            "Read the contents of a file at the given path relative to workspace root.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "File path relative to workspace root"
+                    }
+                },
+                "required": ["path"]
+            }),
+            CapabilitySet::read_only_fs(),
+            ToolExposure::Direct,
+            RendererHint::FileRead,
+            true,
+        ),
         BuiltinExecutor::ReadFile,
     ));
-    registry.register(BuiltinTool::new(
-        "list_files",
-        "List files and directories in the given path.",
-        ActionKind::Read,
-        json!({
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Directory path relative to workspace root (default: '.')"
-                }
-            },
-            "required": []
-        }),
-        BuiltinExecutor::ListFiles,
-    ));
-    registry.register(BuiltinTool::new(
-        "grep",
-        "Search for a regex pattern in files using ripgrep. Returns matching lines with line numbers.",
-        ActionKind::Read,
+    let mut glob = builtin_spec(
+        "glob",
+        "Find files and directories matching a glob pattern. Use this for project file discovery.",
         json!({
             "type": "object",
             "properties": {
                 "pattern": {
                     "type": "string",
-                    "description": "Regex pattern to search for"
+                    "description": "Glob pattern such as **/*.rs"
                 },
                 "path": {
                     "type": "string",
-                    "description": "Directory or file to search in (default: '.')"
+                    "description": "Directory to search in (default: '.')"
                 }
             },
             "required": ["pattern"]
         }),
+        CapabilitySet::new(vec![ToolCapability::FsList, ToolCapability::FsSearch]),
+        ToolExposure::Direct,
+        RendererHint::FileSearch,
+        true,
+    );
+    glob.aliases.push(ToolName::plain("list_files"));
+    registry.register(BuiltinTool::new(glob, BuiltinExecutor::Glob));
+    registry.register(BuiltinTool::new(
+        builtin_spec(
+            "grep",
+            "Search for a regex pattern in files using ripgrep. Returns matching lines with line numbers.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "pattern": {
+                        "type": "string",
+                        "description": "Regex pattern to search for"
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Directory or file to search in (default: '.')"
+                    }
+                },
+                "required": ["pattern"]
+            }),
+            CapabilitySet::new(vec![ToolCapability::FsSearch]),
+            ToolExposure::Direct,
+            RendererHint::FileSearch,
+            true,
+        ),
         BuiltinExecutor::Grep,
     ));
     registry.register(BuiltinTool::new(
-        "bash",
-        "Execute a shell command via sh -c. Use for running tests, builds, git operations, etc.",
-        ActionKind::Shell,
-        json!({
-            "type": "object",
-            "properties": {
-                "command": {
-                    "type": "string",
-                    "description": "The shell command to execute"
-                }
-            },
-            "required": ["command"]
-        }),
+        builtin_spec(
+            "bash",
+            "Execute a shell command via sh -c. Use for running tests, builds, git operations, etc.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "The shell command to execute"
+                    }
+                },
+                "required": ["command"]
+            }),
+            CapabilitySet::shell_execute(),
+            ToolExposure::Direct,
+            RendererHint::Shell,
+            false,
+        ),
         BuiltinExecutor::Bash,
     ));
     registry.register(BuiltinTool::new(
-        "edit",
-        "Edit a file by replacing exact text. The old_text must match exactly one location in the file.",
-        ActionKind::Write,
-        json!({
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "File path relative to workspace root"
+        builtin_spec(
+            "edit",
+            "Edit a file by replacing exact text. The old_text must match exactly one location in the file.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "File path relative to workspace root"
+                    },
+                    "old_text": {
+                        "type": "string",
+                        "description": "Exact text to find (must match uniquely in the file)"
+                    },
+                    "new_text": {
+                        "type": "string",
+                        "description": "Replacement text"
+                    }
                 },
-                "old_text": {
-                    "type": "string",
-                    "description": "Exact text to find (must match uniquely in the file)"
-                },
-                "new_text": {
-                    "type": "string",
-                    "description": "Replacement text"
-                }
-            },
-            "required": ["path", "old_text", "new_text"]
-        }),
+                "required": ["path", "old_text", "new_text"]
+            }),
+            CapabilitySet::filesystem_write(),
+            ToolExposure::Direct,
+            RendererHint::Write,
+            false,
+        ),
         BuiltinExecutor::Edit,
     ));
     registry.register(BuiltinTool::new(
-        "write_file",
-        "Create or overwrite a file with the given content. Use for creating new files or completely replacing file contents.",
-        ActionKind::Write,
-        json!({
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "File path relative to workspace root"
+        builtin_spec(
+            "write_file",
+            "Create or overwrite a file with the given content. Use for creating new files or completely replacing file contents.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "File path relative to workspace root"
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "The full content to write to the file"
+                    }
                 },
-                "content": {
-                    "type": "string",
-                    "description": "The full content to write to the file"
-                }
-            },
-            "required": ["path", "content"]
-        }),
+                "required": ["path", "content"]
+            }),
+            CapabilitySet::filesystem_write(),
+            ToolExposure::Direct,
+            RendererHint::Write,
+            false,
+        ),
         BuiltinExecutor::WriteFile,
     ));
     registry.register(BuiltinTool::new(
-        "git_status",
-        "Show the git working tree status in short format.",
-        ActionKind::Read,
-        json!({
-            "type": "object",
-            "properties": {},
-            "required": []
-        }),
+        builtin_spec(
+            "git_status",
+            "Show the git working tree status in short format.",
+            json!({
+                "type": "object",
+                "properties": {},
+                "required": []
+            }),
+            CapabilitySet::new(vec![ToolCapability::GitInspect]),
+            ToolExposure::Direct,
+            RendererHint::State,
+            true,
+        ),
         BuiltinExecutor::GitStatus,
     ));
     registry.register(BuiltinTool::new(
-        "web_search",
-        "Search the web for current information using Brave Search. Returns top results with title, summary, and URL.",
-        ActionKind::Network,
-        json!({
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "Search query"
+        builtin_spec(
+            "web_search",
+            "Search the web for current information using Brave Search. Returns top results with title, summary, and URL.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search query"
+                    },
+                    "count": {
+                        "type": "integer",
+                        "description": "Number of results to return, 1-10 (default: 5)"
+                    }
                 },
-                "count": {
-                    "type": "integer",
-                    "description": "Number of results to return, 1-10 (default: 5)"
-                }
-            },
-            "required": ["query"]
-        }),
+                "required": ["query"]
+            }),
+            CapabilitySet::network_search(),
+            ToolExposure::Direct,
+            RendererHint::Network,
+            false,
+        ),
         BuiltinExecutor::WebSearch,
     ));
     registry.register(BuiltinTool::new(
-        "subagent",
-        "Launch a synchronous child agent for a complex, multi-step subtask. The child runs independently and returns a concise result summary.",
-        ActionKind::Agent,
-        json!({
-            "type": "object",
-            "properties": {
-                "description": {
-                    "type": "string",
-                    "description": "Short 3-8 word label for the delegated task"
+        builtin_spec(
+            "subagent",
+            "Launch a synchronous child agent for a complex, multi-step subtask. The child runs independently and returns a concise result summary.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "description": {
+                        "type": "string",
+                        "description": "Short 3-8 word label for the delegated task"
+                    },
+                    "prompt": {
+                        "type": "string",
+                        "description": "Full standalone instructions for the child agent"
+                    },
+                    "subagent_type": {
+                        "type": "string",
+                        "enum": ["general", "code_reviewer", "test_writer", "debugger", "documenter"],
+                        "description": "Optional specialized agent type that restricts tools and provides focused expertise"
+                    },
+                    "model": {
+                        "type": "string",
+                        "enum": ["auto", "deepseek-v4-flash", "deepseek-v4-pro"],
+                        "description": "Optional model override for this child agent. auto uses Orca's router, flash is faster, pro is stronger for deep reasoning."
+                    }
                 },
-                "prompt": {
-                    "type": "string",
-                    "description": "Full standalone instructions for the child agent"
-                },
-                "subagent_type": {
-                    "type": "string",
-                    "enum": ["general", "code_reviewer", "test_writer", "debugger", "documenter"],
-                    "description": "Optional specialized agent type that restricts tools and provides focused expertise"
-                },
-                "model": {
-                    "type": "string",
-                    "enum": ["auto", "deepseek-v4-flash", "deepseek-v4-pro"],
-                    "description": "Optional model override for this child agent. auto uses Orca's router, flash is faster, pro is stronger for deep reasoning."
-                }
-            },
-            "required": ["description", "prompt"]
-        }),
+                "required": ["description", "prompt"]
+            }),
+            CapabilitySet::agent_delegate(),
+            ToolExposure::Direct,
+            RendererHint::Agent,
+            false,
+        ),
         BuiltinExecutor::Subagent,
     ));
     registry.register(BuiltinTool::new(
-        "Workflow",
-        "Run a dynamic workflow: a JavaScript script that orchestrates many subagents in the background and returns one consolidated result.",
-        ActionKind::Agent,
-        json!({
-            "type": "object",
-            "properties": {
-                "script": {
-                    "type": "string",
-                    "description": "Self-contained workflow script beginning with export const meta = { name, description, phases }."
+        builtin_spec(
+            "Workflow",
+            "Run a dynamic workflow: a JavaScript script that orchestrates many subagents in the background and returns one consolidated result.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "script": {
+                        "type": "string",
+                        "description": "Self-contained workflow script beginning with export const meta = { name, description, phases }."
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Name of a predefined workflow from .orca/workflows/ or the user workflow directory."
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Compatibility field ignored by the runtime; use meta.description in the script."
+                    },
+                    "title": {
+                        "type": "string",
+                        "description": "Compatibility field ignored by the runtime; use meta.name in the script."
+                    },
+                    "args": {
+                        "type": "object",
+                        "description": "Structured input exposed to the workflow script as the global args value."
+                    },
+                    "scriptPath": {
+                        "type": "string",
+                        "description": "Path to a workflow script file. Takes precedence over script and name."
+                    },
+                    "resumeFromRunId": {
+                        "type": "string",
+                        "description": "Run id of a prior same-session workflow invocation to resume from."
+                    }
                 },
-                "name": {
-                    "type": "string",
-                    "description": "Name of a predefined workflow from .orca/workflows/ or the user workflow directory."
-                },
-                "description": {
-                    "type": "string",
-                    "description": "Compatibility field ignored by the runtime; use meta.description in the script."
-                },
-                "title": {
-                    "type": "string",
-                    "description": "Compatibility field ignored by the runtime; use meta.name in the script."
-                },
-                "args": {
-                    "type": "object",
-                    "description": "Structured input exposed to the workflow script as the global args value."
-                },
-                "scriptPath": {
-                    "type": "string",
-                    "description": "Path to a workflow script file. Takes precedence over script and name."
-                },
-                "resumeFromRunId": {
-                    "type": "string",
-                    "description": "Run id of a prior same-session workflow invocation to resume from."
-                }
-            },
-            "required": []
-        }),
+                "required": []
+            }),
+            CapabilitySet::new(vec![ToolCapability::WorkflowRun]),
+            ToolExposure::Direct,
+            RendererHint::Agent,
+            false,
+        ),
         BuiltinExecutor::Workflow,
     ));
     registry.register(BuiltinTool::new(
-        "update_plan",
-        "Update the current task plan. Use for complex multi-step tasks or when the user asks for a todo/task list. At most one step may be in_progress. Maximum 50 items, each step max 200 chars.",
-        ActionKind::Read,
-        json!({
-            "type": "object",
-            "properties": {
-                "explanation": {
-                    "type": "string",
-                    "description": "Optional short explanation for this plan update"
-                },
-                "plan": {
-                    "type": "array",
-                    "description": "The complete current list of task steps",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "step": {
-                                "type": "string",
-                                "description": "Task step text"
+        builtin_spec(
+            "update_plan",
+            "Update the current task plan. Use for complex multi-step tasks or when the user asks for a todo/task list. At most one step may be in_progress. Maximum 50 items, each step max 200 chars.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "explanation": {
+                        "type": "string",
+                        "description": "Optional short explanation for this plan update"
+                    },
+                    "plan": {
+                        "type": "array",
+                        "description": "The complete current list of task steps",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "step": {
+                                    "type": "string",
+                                    "description": "Task step text"
+                                },
+                                "status": {
+                                    "type": "string",
+                                    "enum": ["pending", "in_progress", "completed"],
+                                    "description": "Step status"
+                                }
                             },
-                            "status": {
-                                "type": "string",
-                                "enum": ["pending", "in_progress", "completed"],
-                                "description": "Step status"
-                            }
-                        },
-                        "required": ["step", "status"],
-                        "additionalProperties": false
+                            "required": ["step", "status"],
+                            "additionalProperties": false
+                        }
                     }
-                }
-            },
-            "required": ["plan"],
-            "additionalProperties": false
-        }),
+                },
+                "required": ["plan"],
+                "additionalProperties": false
+            }),
+            CapabilitySet::new(vec![ToolCapability::PlanUpdate]),
+            ToolExposure::Direct,
+            RendererHint::State,
+            false,
+        ),
         BuiltinExecutor::UpdatePlan,
     ));
     registry.register(BuiltinTool::new(
-        "update_goal",
-        "Update the current persistent goal status. Use status complete when the goal is fully achieved, blocked when progress cannot continue without user input, active to resume, or paused to stop automatic continuation.",
-        ActionKind::Read,
-        json!({
-            "type": "object",
-            "properties": {
-                "status": {
-                    "type": "string",
-                    "enum": ["active", "paused", "blocked", "usage_limited", "budget_limited", "complete"],
-                    "description": "New goal status"
+        builtin_spec(
+            "update_goal",
+            "Update the current persistent goal status. Use status complete when the goal is fully achieved, blocked when progress cannot continue without user input, active to resume, or paused to stop automatic continuation.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "status": {
+                        "type": "string",
+                        "enum": ["active", "paused", "blocked", "usage_limited", "budget_limited", "complete"],
+                        "description": "New goal status"
+                    },
+                    "objective": {
+                        "type": "string",
+                        "description": "Optional replacement objective"
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Optional short reason for the status update"
+                    }
                 },
-                "objective": {
-                    "type": "string",
-                    "description": "Optional replacement objective"
-                },
-                "reason": {
-                    "type": "string",
-                    "description": "Optional short reason for the status update"
-                }
-            },
-            "required": [],
-            "additionalProperties": false
-        }),
+                "required": [],
+                "additionalProperties": false
+            }),
+            CapabilitySet::new(vec![ToolCapability::GoalUpdate]),
+            ToolExposure::Direct,
+            RendererHint::State,
+            false,
+        ),
         BuiltinExecutor::UpdateGoal,
     ));
 }
 
+fn builtin_spec(
+    name: &str,
+    description: &str,
+    input_schema: Value,
+    capabilities: CapabilitySet,
+    exposure: ToolExposure,
+    renderer: RendererHint,
+    concurrent_safe: bool,
+) -> ToolSpec {
+    ToolSpec {
+        name: ToolName::plain(name),
+        aliases: Vec::new(),
+        description: description.to_string(),
+        input_schema,
+        output_schema: None,
+        capabilities,
+        exposure,
+        result_semantics: ResultSemantics::Standard,
+        renderer,
+        concurrent_safe,
+    }
+}
+
+fn capability_set_for_action_kind(action_kind: ActionKind) -> CapabilitySet {
+    match action_kind {
+        ActionKind::Read => CapabilitySet::read_only_fs(),
+        ActionKind::Write => CapabilitySet::filesystem_write(),
+        ActionKind::Network => CapabilitySet::network_search(),
+        ActionKind::Agent => CapabilitySet::agent_delegate(),
+        ActionKind::Shell => CapabilitySet::shell_execute(),
+    }
+}
+
+fn renderer_for_action_kind(action_kind: ActionKind) -> RendererHint {
+    match action_kind {
+        ActionKind::Read => RendererHint::FileRead,
+        ActionKind::Write => RendererHint::Write,
+        ActionKind::Network => RendererHint::Network,
+        ActionKind::Agent => RendererHint::Agent,
+        ActionKind::Shell => RendererHint::Shell,
+    }
+}
+
 struct BuiltinTool {
-    name: &'static str,
-    description: &'static str,
-    action_kind: ActionKind,
-    parameters: Value,
+    spec: ToolSpec,
     executor: BuiltinExecutor,
 }
 
 impl BuiltinTool {
-    fn new(
-        name: &'static str,
-        description: &'static str,
-        action_kind: ActionKind,
-        parameters: Value,
-        executor: BuiltinExecutor,
-    ) -> Self {
-        Self {
-            name,
-            description,
-            action_kind,
-            parameters,
-            executor,
-        }
+    fn new(spec: ToolSpec, executor: BuiltinExecutor) -> Self {
+        Self { spec, executor }
     }
 }
 
 impl Tool for BuiltinTool {
-    fn name(&self) -> &str {
-        self.name
-    }
-
-    fn description(&self) -> &str {
-        self.description
-    }
-
-    fn schema(&self) -> Value {
-        json!({
-            "type": "function",
-            "function": {
-                "name": self.name,
-                "description": self.description,
-                "parameters": self.parameters
-            }
-        })
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
     }
 
     fn action_kind(&self) -> ActionKind {
-        self.action_kind
+        self.spec.capabilities.action_kind()
     }
 
     fn is_read_only(&self, _input: &ToolRequest) -> bool {
-        matches!(self.action_kind, ActionKind::Read)
+        self.spec.capabilities.is_read_only()
     }
 
     fn is_concurrent_safe(&self, input: &ToolRequest) -> bool {
-        self.is_read_only(input)
-            && !matches!(
-                self.executor,
-                BuiltinExecutor::UpdatePlan | BuiltinExecutor::UpdateGoal
-            )
+        self.is_read_only(input) && self.spec.concurrent_safe
     }
 
     fn execute(&self, request: &ToolRequest, ctx: &ToolContext<'_>) -> ToolResult {
         match self.executor {
             BuiltinExecutor::ReadFile => read_file::execute(request, ctx.cwd, ctx.max_output_bytes),
-            BuiltinExecutor::ListFiles => {
-                list_files::execute(request, ctx.cwd, ctx.max_output_bytes)
-            }
+            BuiltinExecutor::Glob => list_files::execute(request, ctx.cwd, ctx.max_output_bytes),
             BuiltinExecutor::Grep => grep::execute(request, ctx.cwd, ctx.max_output_bytes),
             BuiltinExecutor::Bash => bash::execute(request, ctx.cwd, ctx.max_output_bytes),
             BuiltinExecutor::Edit => edit::execute(request, ctx.cwd),
@@ -496,7 +633,7 @@ impl Tool for BuiltinTool {
 #[derive(Clone, Copy)]
 enum BuiltinExecutor {
     ReadFile,
-    ListFiles,
+    Glob,
     Grep,
     Bash,
     Edit,
@@ -511,33 +648,34 @@ enum BuiltinExecutor {
 
 struct McpProxyTool {
     tool: McpTool,
+    spec: ToolSpec,
 }
 
 impl McpProxyTool {
     fn new(tool: McpTool) -> Self {
-        Self { tool }
+        let spec = ToolSpec {
+            name: ToolName::from_str(&tool.schema_name)
+                .unwrap_or_else(|| ToolName::Mcp(tool.schema_name.clone())),
+            aliases: Vec::new(),
+            description: tool
+                .description
+                .clone()
+                .unwrap_or_else(|| format!("MCP tool {} from {}", tool.name, tool.server)),
+            input_schema: tool.input_schema.clone(),
+            output_schema: None,
+            capabilities: CapabilitySet::filesystem_write(),
+            exposure: ToolExposure::Direct,
+            result_semantics: ResultSemantics::Standard,
+            renderer: RendererHint::Write,
+            concurrent_safe: false,
+        };
+        Self { tool, spec }
     }
 }
 
 impl Tool for McpProxyTool {
-    fn name(&self) -> &str {
-        &self.tool.schema_name
-    }
-
-    fn description(&self) -> &str {
-        self.tool.description.as_deref().unwrap_or("MCP tool")
-    }
-
-    fn schema(&self) -> Value {
-        self.tool.to_deepseek_schema()
-    }
-
-    fn action_kind(&self) -> ActionKind {
-        ActionKind::Write
-    }
-
-    fn is_read_only(&self, _input: &ToolRequest) -> bool {
-        false
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
     }
 
     fn is_concurrent_safe(&self, _input: &ToolRequest) -> bool {
@@ -582,44 +720,34 @@ impl Tool for McpProxyTool {
 
 struct ExternalTool {
     tool: ExternalToolConfig,
+    spec: ToolSpec,
 }
 
 impl ExternalTool {
     fn new(tool: ExternalToolConfig) -> Self {
-        Self { tool }
+        let spec = ToolSpec {
+            name: ToolName::plain(&tool.name),
+            aliases: Vec::new(),
+            description: tool.description.clone(),
+            input_schema: tool.parameters_schema(),
+            output_schema: None,
+            capabilities: capability_set_for_action_kind(tool.action_kind),
+            exposure: ToolExposure::Direct,
+            result_semantics: ResultSemantics::Standard,
+            renderer: renderer_for_action_kind(tool.action_kind),
+            concurrent_safe: matches!(tool.action_kind, ActionKind::Read),
+        };
+        Self { tool, spec }
     }
 }
 
 impl Tool for ExternalTool {
-    fn name(&self) -> &str {
-        &self.tool.name
-    }
-
-    fn description(&self) -> &str {
-        &self.tool.description
-    }
-
-    fn schema(&self) -> Value {
-        json!({
-            "type": "function",
-            "function": {
-                "name": self.tool.name,
-                "description": self.tool.description,
-                "parameters": self.tool.parameters_schema()
-            }
-        })
-    }
-
-    fn action_kind(&self) -> ActionKind {
-        self.tool.action_kind
-    }
-
-    fn is_read_only(&self, _input: &ToolRequest) -> bool {
-        matches!(self.tool.action_kind, ActionKind::Read)
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
     }
 
     fn is_concurrent_safe(&self, input: &ToolRequest) -> bool {
-        self.is_read_only(input)
+        self.is_read_only(input) && self.spec.concurrent_safe
     }
 
     fn execute(&self, request: &ToolRequest, ctx: &ToolContext<'_>) -> ToolResult {

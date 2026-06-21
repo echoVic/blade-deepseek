@@ -412,7 +412,8 @@ fn parse_tool_call(
     // ToolName::from_str has a catch-all that wraps unknown names as External(...),
     // so we must gate on the registry to reject truly unknown tools.
     let reg = registry::tool_registry_with_mcp_and_external(None, external_tools);
-    let is_known_tool = reg.get(schema_name).is_some()
+    let resolved = reg.resolve(schema_name);
+    let is_known_tool = resolved.is_some()
         || schema_name.starts_with("mcp__")
         || external_tools.iter().any(|tool| tool.name == schema_name);
     if !is_known_tool {
@@ -421,12 +422,16 @@ fn parse_tool_call(
     let name = registry::tool_name_from_schema_name(schema_name)
         .expect("known tool must parse to ToolName");
     let action = reg
-        .get(schema_name)
-        .map(|tool| tool.action_kind())
+        .resolve(schema_name)
+        .map(|resolved| resolved.spec.capabilities.action_kind())
         .unwrap_or(ActionKind::Read);
     let target = match schema_name {
         "read_file" => args["path"].as_str().map(String::from),
         "list_files" => args["path"]
+            .as_str()
+            .map(String::from)
+            .or(Some(".".to_string())),
+        "glob" => args["path"]
             .as_str()
             .map(String::from)
             .or(Some(".".to_string())),
