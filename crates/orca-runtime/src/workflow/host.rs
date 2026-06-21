@@ -3,6 +3,7 @@ use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -223,7 +224,28 @@ pub struct AgentCall {
 }
 
 fn ensure_host_file() -> io::Result<PathBuf> {
-    let path = env::temp_dir().join("orca-workflow-host.mjs");
+    static HOST_FILE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    let seq = HOST_FILE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let path = env::temp_dir().join(format!(
+        "orca-workflow-host-{}-{seq}.mjs",
+        std::process::id()
+    ));
     fs::write(&path, include_str!("host.mjs"))?;
     Ok(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_file_paths_are_unique_for_parallel_tests() {
+        let first = ensure_host_file().unwrap();
+        let second = ensure_host_file().unwrap();
+
+        assert_ne!(first, second);
+        assert!(first.exists());
+        assert!(second.exists());
+    }
 }
