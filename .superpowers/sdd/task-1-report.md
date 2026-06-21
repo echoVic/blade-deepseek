@@ -19,3 +19,7 @@ Implemented the curl-based installer exactly to the brief in `install.sh` and ad
 - `install.sh` installed Orca successfully into a temporary directory.
 - The installed binary reported `orca 0.1.1`.
 - No concerns to flag.
+
+## Review fix
+
+- Corrected the pinned curl install example in `README.md` so `INSTALL_DIR` and `ORCA_VERSION` are passed to the `sh` process on the right side of the pipe.

@@ -32,8 +32,8 @@ The installer downloads the native binary for your platform from GitHub Releases
 Set `INSTALL_DIR` to choose a destination and `ORCA_VERSION` to pin a version:
 
 ```bash
-INSTALL_DIR=/usr/local/bin ORCA_VERSION=0.1.1 \
-  curl -fsSL https://raw.githubusercontent.com/echoVic/blade-deepseek/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/echoVic/blade-deepseek/main/install.sh | \
+  INSTALL_DIR=/usr/local/bin ORCA_VERSION=0.1.1 sh
 ```
 
 ### GitHub Releases
