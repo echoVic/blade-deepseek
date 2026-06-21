@@ -2,7 +2,7 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-use orca_core::tool_types::{ToolRequest, ToolResult, truncate_output};
+use orca_core::tool_types::{ToolRequest, ToolResult, ToolResultKind, truncate_output};
 
 use crate::resolve_workspace_path;
 
@@ -14,7 +14,12 @@ pub fn execute(request: &ToolRequest, cwd: &Path, max_bytes: usize) -> ToolResul
     let entries = match fs::read_dir(&path) {
         Ok(entries) => entries,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return ToolResult::completed(request, "(empty)".to_string(), false);
+            return ToolResult::completed_kind(
+                request,
+                "(empty)".to_string(),
+                false,
+                ToolResultKind::Empty,
+            );
         }
         Err(error) => {
             return ToolResult::failed(
@@ -37,7 +42,17 @@ pub fn execute(request: &ToolRequest, cwd: &Path, max_bytes: usize) -> ToolResul
     names.sort();
 
     let (output, truncated) = truncate_output(names.join("\n"), max_bytes);
-    ToolResult::completed(request, output, truncated)
+    let kind = if output.is_empty() && !truncated {
+        ToolResultKind::Empty
+    } else {
+        ToolResultKind::Success
+    };
+    let output = if output.is_empty() && !truncated {
+        "(empty)".to_string()
+    } else {
+        output
+    };
+    ToolResult::completed_kind(request, output, truncated, kind)
 }
 
 #[cfg(test)]
@@ -46,7 +61,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use orca_core::approval_types::ActionKind;
-    use orca_core::tool_types::{ToolName, ToolStatus};
+    use orca_core::tool_types::{ToolName, ToolResultKind, ToolStatus};
 
     use super::*;
 
@@ -65,6 +80,7 @@ mod tests {
         let result = execute(&request, &cwd, 4096);
 
         assert_eq!(result.status, ToolStatus::Completed);
+        assert_eq!(result.kind, ToolResultKind::Empty);
         assert_eq!(result.output.as_deref(), Some("(empty)"));
         assert_eq!(result.error, None);
     }

@@ -1740,6 +1740,7 @@ fn chat_message_from_history(message: Message) -> Option<ChatMessage> {
             status: "completed".to_string(),
             output: Some(content),
             diff: None,
+            kind: None,
             expanded: false,
         }),
     }

@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use orca_core::tool_types::{ToolRequest, ToolResult, truncate_output};
+use orca_core::tool_types::{ToolRequest, ToolResult, ToolResultKind, truncate_output};
 
 pub fn execute(request: &ToolRequest, cwd: &Path, max_bytes: usize) -> ToolResult {
     let Some(pattern) = request
@@ -20,7 +20,12 @@ pub fn execute(request: &ToolRequest, cwd: &Path, max_bytes: usize) -> ToolResul
         .unwrap_or_else(|| ".".to_string());
 
     if !cwd.join(&search_path).exists() {
-        return ToolResult::completed(request, "(no matches)".to_string(), false);
+        return ToolResult::completed_kind(
+            request,
+            "(no matches)".to_string(),
+            false,
+            ToolResultKind::NoMatches,
+        );
     }
 
     let output = Command::new("rg")
@@ -34,9 +39,12 @@ pub fn execute(request: &ToolRequest, cwd: &Path, max_bytes: usize) -> ToolResul
             let (stdout, truncated) = truncate_output(stdout, max_bytes);
             ToolResult::completed(request, stdout, truncated)
         }
-        Ok(output) if output.status.code() == Some(1) => {
-            ToolResult::completed(request, "(no matches)".to_string(), false)
-        }
+        Ok(output) if output.status.code() == Some(1) => ToolResult::completed_kind(
+            request,
+            "(no matches)".to_string(),
+            false,
+            ToolResultKind::NoMatches,
+        ),
         Ok(output) => {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
             ToolResult::failed(request, stderr, output.status.code())
@@ -51,7 +59,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use orca_core::approval_types::ActionKind;
-    use orca_core::tool_types::{ToolName, ToolStatus};
+    use orca_core::tool_types::{ToolName, ToolResultKind, ToolStatus};
 
     use super::*;
 
@@ -70,6 +78,7 @@ mod tests {
         let result = execute(&request, &cwd, 4096);
 
         assert_eq!(result.status, ToolStatus::Completed);
+        assert_eq!(result.kind, ToolResultKind::NoMatches);
         assert_eq!(result.output.as_deref(), Some("(no matches)"));
         assert_eq!(result.error, None);
     }

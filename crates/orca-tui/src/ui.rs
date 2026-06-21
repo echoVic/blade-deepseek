@@ -504,9 +504,12 @@ fn build_message_lines(state: &AppState, theme: &Theme) -> Vec<Line<'static>> {
                 status,
                 output,
                 diff,
+                kind,
                 expanded,
                 ..
             } => {
+                let neutral_completed = status == "completed"
+                    && matches!(kind.as_deref(), Some("empty" | "no_matches"));
                 let icon = match status.as_str() {
                     "completed" => "✓",
                     "running" => spinner_frame(state.tick),
@@ -515,6 +518,7 @@ fn build_message_lines(state: &AppState, theme: &Theme) -> Vec<Line<'static>> {
                     _ => "·",
                 };
                 let color = match status.as_str() {
+                    "completed" if neutral_completed => theme.muted,
                     "completed" => theme.success,
                     "running" => theme.warning,
                     "denied" | "failed" => theme.error,

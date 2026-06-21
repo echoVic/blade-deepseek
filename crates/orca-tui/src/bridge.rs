@@ -43,6 +43,18 @@ struct TuiAgentResult {
     cost_tracker: CostTracker,
 }
 
+fn tool_result_kind_label(kind: tool_types::ToolResultKind) -> &'static str {
+    match kind {
+        tool_types::ToolResultKind::Success => "success",
+        tool_types::ToolResultKind::Empty => "empty",
+        tool_types::ToolResultKind::NoMatches => "no_matches",
+        tool_types::ToolResultKind::Truncated => "truncated",
+        tool_types::ToolResultKind::PermissionDenied => "permission_denied",
+        tool_types::ToolResultKind::InvalidInput => "invalid_input",
+        tool_types::ToolResultKind::RuntimeError => "runtime_error",
+    }
+}
+
 pub struct TuiConversationSession {
     conversation: Conversation,
     writer: Option<SessionWriter>,
@@ -794,6 +806,7 @@ fn execute_readonly_batch_for_tui(
                 .or_else(|| result.error.clone())
                 .unwrap_or_default(),
             diff: None,
+            kind: Some(tool_result_kind_label(result.kind).to_string()),
         });
         if let Err(error) = hooks.run(
             HookEvent::PostToolUse,
@@ -1027,6 +1040,7 @@ fn execute_tool_for_tui(
                         status: "denied".to_string(),
                         output: String::new(),
                         diff: None,
+                        kind: Some(tool_result_kind_label(result.kind).to_string()),
                     });
                     return (true, result, None);
                 }
@@ -1045,6 +1059,7 @@ fn execute_tool_for_tui(
                     status: "denied".to_string(),
                     output: String::new(),
                     diff: None,
+                    kind: Some(tool_result_kind_label(result.kind).to_string()),
                 });
                 return (true, result, None);
             }
@@ -1096,6 +1111,7 @@ fn execute_tool_for_tui(
                     status: "failed".to_string(),
                     output: result.error.clone().unwrap_or_default(),
                     diff: None,
+                    kind: Some(tool_result_kind_label(result.kind).to_string()),
                 });
                 return (true, result, None);
             }
@@ -1168,6 +1184,7 @@ fn execute_tool_for_tui(
                 .or_else(|| result.error.clone())
                 .unwrap_or_default(),
             diff: rendered_diff,
+            kind: Some(tool_result_kind_label(result.kind).to_string()),
         });
         if tool_request.name == tool_types::ToolName::UpdatePlan
             && result.status == tool_types::ToolStatus::Completed

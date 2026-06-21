@@ -30,6 +30,7 @@ pub enum TuiEvent {
         status: String,
         output: String,
         diff: Option<String>,
+        kind: Option<String>,
     },
     PlanUpdated {
         explanation: Option<String>,
@@ -109,6 +110,7 @@ pub enum ChatMessage {
         status: String,
         output: Option<String>,
         diff: Option<String>,
+        kind: Option<String>,
         expanded: bool,
     },
     PlanUpdate {
@@ -534,6 +536,7 @@ impl AppState {
                     status: "running".to_string(),
                     output: None,
                     diff: None,
+                    kind: None,
                     expanded: false,
                 });
             }
@@ -552,6 +555,7 @@ impl AppState {
                 status,
                 output,
                 diff,
+                kind,
             } => {
                 if name == "subagent" || name == "update_plan" {
                     return;
@@ -562,6 +566,7 @@ impl AppState {
                     status: s,
                     output: o,
                     diff: d,
+                    kind: k,
                     ..
                 }) = self.messages.iter_mut().rev().find(|message| {
                     matches!(message, ChatMessage::ToolCall { id: existing_id, .. } if existing_id == &id)
@@ -578,6 +583,7 @@ impl AppState {
                         };
                     }
                     *d = diff.clone();
+                    *k = kind.clone();
                     true
                 } else {
                     false
@@ -594,6 +600,7 @@ impl AppState {
                             Some(output)
                         },
                         diff,
+                        kind,
                         expanded: false,
                     });
                 }
@@ -959,6 +966,7 @@ mod tests {
             status: "completed".to_string(),
             output: "Subagent status: success".to_string(),
             diff: None,
+            kind: Some("success".to_string()),
         });
 
         assert!(state.messages.is_empty());
@@ -979,6 +987,7 @@ mod tests {
             status: "completed".to_string(),
             output: "Plan updated".to_string(),
             diff: None,
+            kind: Some("success".to_string()),
         });
         state.update(TuiEvent::PlanUpdated {
             explanation: Some("starting".to_string()),
@@ -1002,6 +1011,32 @@ mod tests {
                 assert_eq!(plan[1].step, "Patch");
             }
             other => panic!("expected plan update message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn completed_tool_event_preserves_result_kind() {
+        let mut state = state();
+
+        state.update(TuiEvent::ToolRequested {
+            id: "grep-1".to_string(),
+            name: "grep".to_string(),
+            target: Some("needle".to_string()),
+        });
+        state.update(TuiEvent::ToolCompleted {
+            id: "grep-1".to_string(),
+            name: "grep".to_string(),
+            status: "completed".to_string(),
+            output: "(no matches)".to_string(),
+            diff: None,
+            kind: Some("no_matches".to_string()),
+        });
+
+        match &state.messages[0] {
+            ChatMessage::ToolCall { kind, .. } => {
+                assert_eq!(kind.as_deref(), Some("no_matches"));
+            }
+            other => panic!("expected tool call, got {other:?}"),
         }
     }
 
