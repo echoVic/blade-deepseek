@@ -7,6 +7,9 @@ use serde_json::Value;
 
 #[test]
 fn read_file_emits_tool_request_and_completed_events() {
+    let temp_dir = make_temp_workspace("read-file");
+    fs::write(temp_dir.join("note.txt"), "orca read fixture\n").expect("write fixture");
+
     let output = Command::new(env!("CARGO_BIN_EXE_orca"))
         .args([
             "exec",
@@ -14,7 +17,9 @@ fn read_file_emits_tool_request_and_completed_events() {
             "jsonl",
             "--provider",
             "mock",
-            "read README.md",
+            "--cwd",
+            temp_dir.to_str().unwrap(),
+            "read note.txt",
         ])
         .output()
         .expect("run orca");
@@ -25,7 +30,7 @@ fn read_file_emits_tool_request_and_completed_events() {
     let requested = find_event(&events, "tool.call.requested");
     assert_eq!(requested["payload"]["name"], "read_file");
     assert_eq!(requested["payload"]["action"], "read");
-    assert_eq!(requested["payload"]["target"], "README.md");
+    assert_eq!(requested["payload"]["target"], "note.txt");
 
     let completed = find_event(&events, "tool.call.completed");
     assert_eq!(completed["payload"]["name"], "read_file");
@@ -35,7 +40,7 @@ fn read_file_emits_tool_request_and_completed_events() {
         completed["payload"]["output"]
             .as_str()
             .unwrap()
-            .contains("# Orca")
+            .contains("orca read fixture")
     );
 }
 

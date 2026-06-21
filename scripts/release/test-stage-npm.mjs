@@ -6,7 +6,11 @@ import os from "node:os";
 import path from "node:path";
 
 const repoRoot = path.resolve(import.meta.dirname, "..", "..");
-const VERSION = "0.1.1";
+const cargoToml = readFileSync(path.join(repoRoot, "Cargo.toml"), "utf8");
+const VERSION = cargoToml.match(/^version\s*=\s*"([^"]+)"/m)?.[1];
+if (!VERSION) {
+  throw new Error("Unable to read root package version from Cargo.toml");
+}
 
 const TARGETS = [
   ["orca-darwin-arm64", "aarch64-apple-darwin", "darwin-arm64"],
@@ -33,7 +37,7 @@ function assertExists(filePath) {
 
 function writeFakeBinary(filePath) {
   mkdirSync(path.dirname(filePath), { recursive: true });
-  writeFileSync(filePath, "#!/bin/sh\necho orca 0.1.1\n");
+  writeFileSync(filePath, `#!/bin/sh\necho orca ${VERSION}\n`);
 }
 
 const tempDir = mkdtempSync(path.join(os.tmpdir(), "orca-stage-test-"));
