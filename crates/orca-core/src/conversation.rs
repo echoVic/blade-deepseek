@@ -114,6 +114,19 @@ impl Conversation {
         )));
     }
 
+    pub fn replace_skill_context(&mut self, content: Option<String>) -> Option<&Message> {
+        self.messages.retain(|msg| {
+            !matches!(msg, Message::System { content: c, pinned: true, .. } if c.starts_with("[Pinned skill context]"))
+        });
+        if let Some(content) = content.filter(|text| !text.trim().is_empty()) {
+            self.messages.push(Message::pinned_system(format!(
+                "[Pinned skill context]\n{content}"
+            )));
+            return self.messages.last();
+        }
+        None
+    }
+
     pub fn add_user(&mut self, content: String) {
         self.messages.push(Message::user(content));
     }
@@ -209,6 +222,21 @@ mod tests {
         assert!(
             matches!(&conv.messages[0], Message::System { content, pinned: true } if content.contains("second"))
         );
+    }
+
+    #[test]
+    fn replace_skill_context_removes_previous_skill_context() {
+        let mut conv = Conversation::new();
+        conv.replace_skill_context(Some("first".to_string()));
+        conv.replace_skill_context(Some("second".to_string()));
+
+        assert_eq!(conv.messages.len(), 1);
+        assert!(
+            matches!(&conv.messages[0], Message::System { content, pinned: true } if content.contains("second"))
+        );
+
+        conv.replace_skill_context(None);
+        assert!(conv.messages.is_empty());
     }
 
     #[test]

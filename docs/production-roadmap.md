@@ -4,7 +4,7 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-06-22
-Current baseline: v0.1.17 skills discovery baseline
+Current baseline: v0.1.18 explicit skill injection
 
 ---
 
@@ -31,7 +31,7 @@ working baseline used to prioritize the next patch releases.
 | TUI | Markdown-ish rendering, themes, Vim mode, diff preview, slash commands | Codex/Claude richer terminal UX | Partial |
 | History | JSONL transcripts, resume/fork/search/archive/compress | Codex thread store with queryable metadata | Partial |
 | Release | GitHub release + npm alias distribution scripts | Codex npm/native release model | Implemented |
-| Skills | No first-class skill loader yet | Codex skills and plugin-provided skill bundles | Missing |
+| Skills | Markdown skill discovery, `list_skills`/`read_skill`, and explicit `$skill` prompt injection | Codex skills and plugin-provided skill bundles | Partial |
 
 ---
 
@@ -115,7 +115,7 @@ without destabilizing core runtime behavior.
 
 ### Skills System
 
-**Release target:** v0.1.17
+**Release target:** v0.1.17-v0.1.18
 
 **Goal:** add a first-class skill system that can load human-readable procedures
 from user and project directories and inject only relevant skill instructions.
@@ -129,7 +129,7 @@ from user and project directories and inject only relevant skill instructions.
 2. Skill metadata parsing. Frontmatter name/description parsing done in v0.1.17.
    - Frontmatter fields: `name`, `description`.
    - Body remains Markdown instructions.
-3. Skill selection. Manual list/read selection done in v0.1.17; prompt-time explicit skill inclusion remains follow-up.
+3. Skill selection. Manual list/read selection done in v0.1.17; prompt-time explicit skill inclusion done in v0.1.18.
    - Include explicitly named skills in the prompt.
    - Add a small `list_skills`/`read_skill` tool pair or equivalent registry output if prompt size becomes a concern.
 4. Safety.

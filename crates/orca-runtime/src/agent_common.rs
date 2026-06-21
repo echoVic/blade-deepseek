@@ -5,6 +5,7 @@ use orca_core::goal_types::ThreadGoal;
 use orca_core::subagent_types::SubagentType;
 use orca_core::tool_types::ToolResult;
 use orca_provider::system_prompt::build_system_prompt;
+use orca_tools::skills;
 
 use crate::instructions::ProjectInstructions;
 use crate::memory::MemoryBlock;
@@ -65,6 +66,23 @@ pub fn build_agent_system_prompt_with_goal(
         prompt.push_str(&format_goal_mode_instructions(goal));
     }
     prompt
+}
+
+pub fn explicit_skill_context(cwd: &Path, prompt: &str) -> Option<String> {
+    match skills::explicit_skill_prompt_block(cwd, prompt) {
+        Ok(block) => block,
+        Err(error) => {
+            eprintln!("orca: warning: failed to load explicit skills: {error}");
+            None
+        }
+    }
+}
+
+pub fn append_explicit_skill_context(system_prompt: &mut String, cwd: &Path, prompt: &str) {
+    if let Some(block) = explicit_skill_context(cwd, prompt) {
+        system_prompt.push_str("\n\n");
+        system_prompt.push_str(&block);
+    }
 }
 
 pub fn format_goal_mode_instructions(goal: &ThreadGoal) -> String {

@@ -84,6 +84,74 @@ pub fn discover(cwd: &Path, orca_home: Option<&Path>) -> Result<Vec<Skill>, Stri
     Ok(skills)
 }
 
+pub fn explicit_skill_prompt_block(cwd: &Path, prompt: &str) -> Result<Option<String>, String> {
+    let mentioned = mentioned_skill_ids(prompt);
+    if mentioned.is_empty() {
+        return Ok(None);
+    }
+    let skills = discover_from_env(cwd)?;
+    let selected = mentioned
+        .into_iter()
+        .filter_map(|id| skills.iter().find(|skill| skill.id == id).cloned())
+        .collect::<Vec<_>>();
+    Ok(format_skills_prompt_block(&selected))
+}
+
+pub fn mentioned_skill_ids(text: &str) -> Vec<String> {
+    let mut ids = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let bytes = text.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'$' {
+            index += 1;
+            continue;
+        }
+        index += 1;
+        let start = index;
+        while index < bytes.len() {
+            let byte = bytes[index];
+            if byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_' {
+                index += 1;
+            } else {
+                break;
+            }
+        }
+        if index == start {
+            continue;
+        }
+        let id = &text[start..index];
+        if seen.insert(id.to_string()) {
+            ids.push(id.to_string());
+        }
+    }
+    ids
+}
+
+pub fn format_skills_prompt_block(skills: &[Skill]) -> Option<String> {
+    if skills.is_empty() {
+        return None;
+    }
+    let mut block = String::from("<skills>\n");
+    for skill in skills {
+        block.push_str(&format!(
+            r#"<skill id="{}" name="{}" source="{}" path="{}">"#,
+            escape_attr(&skill.id),
+            escape_attr(&skill.name),
+            skill.source.as_str(),
+            escape_attr(&skill.path.display().to_string())
+        ));
+        block.push('\n');
+        block.push_str(&skill.body);
+        if !skill.body.ends_with('\n') {
+            block.push('\n');
+        }
+        block.push_str("</skill>\n");
+    }
+    block.push_str("</skills>");
+    Some(block)
+}
+
 fn collect_skills(
     skills_dir: &Path,
     source: SkillSource,
@@ -243,6 +311,14 @@ fn canonical_or_self(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
+fn escape_attr(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -293,6 +369,30 @@ mod tests {
         assert!(formatted.contains("# Debugging"));
         assert!(formatted.contains("Use logs first."));
         assert!(!formatted.contains("---"));
+    }
+
+    #[test]
+    fn mentioned_skill_ids_deduplicates_in_mention_order() {
+        let ids = mentioned_skill_ids("use $review then $debugging and $review again");
+
+        assert_eq!(ids, vec!["review", "debugging"]);
+    }
+
+    #[test]
+    fn format_skills_prompt_block_includes_skill_body() {
+        let skill = Skill {
+            id: "debugging".to_string(),
+            name: "Debugging".to_string(),
+            description: "Find root causes".to_string(),
+            source: SkillSource::User,
+            path: PathBuf::from("/tmp/SKILL.md"),
+            body: "Use logs first.".to_string(),
+        };
+
+        let block = format_skills_prompt_block(&[skill]).expect("skill block");
+
+        assert!(block.contains(r#"<skill id="debugging""#));
+        assert!(block.contains("Use logs first."));
     }
 
     fn write_skill(dir: &Path, name: &str, description: &str, body: &str) {

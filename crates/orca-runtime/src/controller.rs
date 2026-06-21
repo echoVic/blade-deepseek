@@ -316,7 +316,7 @@ fn run_agent_loop(
         external_tools: config.external_tools.clone(),
     };
 
-    let system_prompt = agent_common::build_agent_system_prompt(
+    let mut system_prompt = agent_common::build_agent_system_prompt(
         cwd,
         subagent_depth,
         subagent_type,
@@ -324,6 +324,7 @@ fn run_agent_loop(
         config.approval_mode,
         Some(memory),
     );
+    agent_common::append_explicit_skill_context(&mut system_prompt, cwd, prompt);
     let mut conversation = if let Some(resumed) = resumed {
         history::resume_conversation(resumed, system_prompt)
     } else {

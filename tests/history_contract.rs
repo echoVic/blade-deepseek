@@ -178,6 +178,45 @@ fn exec_injects_project_instructions_into_system_prompt() {
 }
 
 #[test]
+fn exec_injects_explicitly_mentioned_skill_into_system_prompt() {
+    let home = TempDir::new().expect("temp home");
+    let project = TempDir::new().expect("temp project");
+    std::fs::write(
+        project.path().join("Cargo.toml"),
+        "[package]\nname = \"probe\"\n",
+    )
+    .expect("write Cargo.toml");
+    let skill_dir = home.path().join("skills/debugging");
+    std::fs::create_dir_all(&skill_dir).expect("create skill dir");
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: Debugging\ndescription: Find root causes\n---\n\nUse logs first.\n",
+    )
+    .expect("write skill");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .current_dir(project.path())
+        .env("ORCA_HOME", home.path())
+        .args(["exec", "--provider", "mock", "please use $debugging"])
+        .output()
+        .expect("run orca");
+
+    assert_eq!(output.status.code(), Some(0));
+
+    let show = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .env("ORCA_HOME", home.path())
+        .args(["history", "show", "latest"])
+        .output()
+        .expect("show history");
+
+    assert_eq!(show.status.code(), Some(0));
+    let show_stdout = String::from_utf8_lossy(&show.stdout);
+    assert!(show_stdout.contains("<skills>"));
+    assert!(show_stdout.contains(r#"<skill id="debugging""#));
+    assert!(show_stdout.contains("Use logs first."));
+}
+
+#[test]
 fn exec_injects_user_instructions_before_project_instructions() {
     let home = TempDir::new().expect("temp home");
     let project = TempDir::new().expect("temp project");

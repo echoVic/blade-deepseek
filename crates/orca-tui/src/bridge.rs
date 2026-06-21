@@ -191,6 +191,10 @@ impl TuiConversationSession {
         self.conversation.replace_goal_state(content);
     }
 
+    fn replace_skill_context(&mut self, content: Option<String>) {
+        self.conversation.replace_skill_context(content);
+    }
+
     pub fn compact(&mut self, config: &RunConfig, cwd: &Path) -> (usize, usize) {
         let before_messages = self.conversation.messages.len();
         if let Ok(outcome) = self.hooks.run(
@@ -335,6 +339,7 @@ pub fn run_agent_for_tui(
     );
     let policy = ApprovalPolicy::new(config.approval_mode)
         .with_permission_rules(config.permission_rules.clone());
+    session.replace_skill_context(agent_common::explicit_skill_context(&cwd, prompt));
     session.conversation.add_user(prompt.to_string());
     if let Some(message) = session.conversation.messages.last().cloned() {
         session.append_message(&message);
