@@ -11,3 +11,6 @@ node_modules/
 
 # git worktrees
 .worktrees/
+
+# Superpowers local execution reports
+.superpowers/sdd/
