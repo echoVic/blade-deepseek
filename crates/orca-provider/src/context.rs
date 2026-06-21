@@ -5,7 +5,7 @@ use tiktoken_rs::cl100k_base_singleton;
 
 use crate::ProviderConfig;
 
-const DEFAULT_MAX_TOKENS: usize = 128_000;
+const DEFAULT_MAX_TOKENS: usize = 1_000_000;
 const COMPACTION_THRESHOLD: f64 = 0.80;
 const RESERVED_FOR_RESPONSE: usize = 4096;
 const STALE_TOOL_OUTPUT_BYTES: usize = 2048;
@@ -573,16 +573,17 @@ mod tests {
     fn context_config_uses_model_specific_token_limit() {
         assert_eq!(
             ContextConfig::for_model(Some("deepseek-chat")).max_tokens,
-            64_000
+            1_000_000
         );
         assert_eq!(
             ContextConfig::for_model(Some("deepseek-reasoner")).max_tokens,
-            128_000
+            1_000_000
         );
         assert_eq!(
             ContextConfig::for_model(Some(orca_core::model::PRO_MODEL)).max_tokens,
-            128_000
+            1_000_000
         );
+        assert_eq!(ContextConfig::default().max_tokens, 1_000_000);
     }
 
     #[test]
@@ -595,7 +596,7 @@ mod tests {
 
         assert!(matches!(
             &conv.messages[0],
-            Message::System { content, .. } if content.ends_with("[context: ~48K tokens remaining]")
+            Message::System { content, .. } if content.ends_with("[context: ~796K tokens remaining]")
         ));
     }
 

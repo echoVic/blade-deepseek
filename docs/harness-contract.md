@@ -197,7 +197,7 @@ The runtime executes a multi-turn agent loop (max 128 turns):
 Subagents run the same loop as a child conversation in the same workspace. They inherit provider/model config and approval mode. Nested subagents are rejected in this MVP.
 
 Context window management:
-- Window size: 128K tokens (estimated as chars/4)
+- Window size: DeepSeek V4 1M-token context window, compacted at the configured threshold with response reserve
 - Compaction threshold: 80% utilization
 - Strategy: preserve system message + most recent messages, truncate older history with a marker
 

@@ -142,10 +142,13 @@ pub fn allowed_models() -> &'static [&'static str] {
 
 pub fn max_context_tokens(model: Option<&str>) -> usize {
     match model {
-        Some(DEEPSEEK_CHAT_MODEL) | Some(FLASH_MODEL) => 64_000,
-        Some(DEEPSEEK_REASONER_MODEL) | Some(PRO_MODEL) => 128_000,
-        Some(AUTO_MODEL) | None => 128_000,
-        Some(_) => 128_000,
+        Some(DEEPSEEK_CHAT_MODEL)
+        | Some(DEEPSEEK_REASONER_MODEL)
+        | Some(FLASH_MODEL)
+        | Some(PRO_MODEL)
+        | Some(AUTO_MODEL)
+        | None => 1_000_000,
+        Some(_) => 1_000_000,
     }
 }
 
@@ -216,7 +219,15 @@ mod tests {
     fn supports_legacy_deepseek_model_budget_names() {
         assert!(validate_model("deepseek-chat").is_ok());
         assert!(validate_model("deepseek-reasoner").is_ok());
-        assert_eq!(max_context_tokens(Some("deepseek-chat")), 64_000);
-        assert_eq!(max_context_tokens(Some("deepseek-reasoner")), 128_000);
+        assert_eq!(max_context_tokens(Some("deepseek-chat")), 1_000_000);
+        assert_eq!(max_context_tokens(Some("deepseek-reasoner")), 1_000_000);
+    }
+
+    #[test]
+    fn v4_models_use_one_million_token_context_window() {
+        assert_eq!(max_context_tokens(Some(FLASH_MODEL)), 1_000_000);
+        assert_eq!(max_context_tokens(Some(PRO_MODEL)), 1_000_000);
+        assert_eq!(max_context_tokens(Some(AUTO_MODEL)), 1_000_000);
+        assert_eq!(max_context_tokens(None), 1_000_000);
     }
 }

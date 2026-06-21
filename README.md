@@ -33,7 +33,7 @@ Set `INSTALL_DIR` to choose a destination and `ORCA_VERSION` to pin a version:
 
 ```bash
 curl -fsSL https://orcaagent.dev/install.sh | \
-  INSTALL_DIR=/usr/local/bin ORCA_VERSION=0.1.4 sh
+  INSTALL_DIR=/usr/local/bin ORCA_VERSION=0.1.5 sh
 ```
 
 ### GitHub Releases
@@ -201,7 +201,7 @@ Built-in tools:
 - **Subagents**: Synchronous child agent loops share the parent workspace, provider/model config, and approval policy, then return a concise result to the parent
 - **Persistent Goal Mode**: TUI sessions can persist a long-running objective, auto-continue successful turns, and stop through `/goal` controls or the `update_goal` tool
 - **SSE Streaming**: Real-time reasoning and content deltas via Server-Sent Events
-- **Context Window**: 128K tokens, 80% threshold compaction (preserves system + recent messages)
+- **Context Window**: DeepSeek V4 1M-token context, 80% threshold compaction with response reserve (preserves system + recent messages)
 - **Conversation History**: Local JSONL transcripts support listing, inspection, resume/fork, full-text search, archive/delete/rename, and zstd compression
 - **HTTP Client**: Singleton with 30s connect / 120s request / 300s streaming timeouts, exponential backoff retry (3 attempts, handles 429/5xx)
 - **Approval Policy**: Read operations always allowed; write/shell actions require interactive confirmation (suggest mode) or auto-allowed based on mode
