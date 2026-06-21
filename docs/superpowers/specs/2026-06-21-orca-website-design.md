@@ -116,7 +116,7 @@ material.
 Show a compact grid of the most important capabilities:
 
 - DeepSeek-native reasoning and streaming.
-- Claude Code-style workflows.
+- Orca project and user workflows.
 - Subagents for delegated tasks.
 - Approval modes for safe edits.
 - Verification commands after runs.
@@ -212,4 +212,3 @@ Before shipping:
 - Hosted API.
 - Download mirror outside GitHub Releases.
 - Homebrew formula.
-

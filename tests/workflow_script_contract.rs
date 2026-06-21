@@ -83,16 +83,16 @@ fn nearest_project_workflow_wins_over_user_workflow() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
     let cwd = repo_root.join("packages/api");
-    fs::create_dir_all(repo_root.join(".claude/workflows")).unwrap();
-    fs::create_dir_all(temp.path().join("home/.claude/workflows")).unwrap();
+    fs::create_dir_all(repo_root.join(".orca/workflows")).unwrap();
+    fs::create_dir_all(temp.path().join("home/.orca/workflows")).unwrap();
 
     fs::write(
-        repo_root.join(".claude/workflows/audit.js"),
+        repo_root.join(".orca/workflows/audit.js"),
         "export const meta = { name: 'audit', description: 'Project audit', phases: [] };\nexport default 'project';",
     )
     .unwrap();
     fs::write(
-        temp.path().join("home/.claude/workflows/audit.js"),
+        temp.path().join("home/.orca/workflows/audit.js"),
         "export const meta = { name: 'audit', description: 'User audit', phases: [] };\nexport default 'user';",
     )
     .unwrap();
@@ -106,7 +106,7 @@ fn nearest_project_workflow_wins_over_user_workflow() {
         &input,
         &cwd,
         &temp.path().join("session"),
-        &temp.path().join("home/.claude/workflows"),
+        &temp.path().join("home/.orca/workflows"),
     )
     .unwrap();
 

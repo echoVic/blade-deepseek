@@ -308,7 +308,7 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
                 },
                 "name": {
                     "type": "string",
-                    "description": "Name of a predefined workflow from .claude/workflows/ or the user workflow directory."
+                    "description": "Name of a predefined workflow from .orca/workflows/ or the user workflow directory."
                 },
                 "description": {
                     "type": "string",

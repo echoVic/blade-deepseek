@@ -38,7 +38,7 @@ fn workflow_run_command_executes_script() {
 #[test]
 fn workflow_run_named_script_resolves_project_workflow() {
     let temp = tempdir().unwrap();
-    let dir = temp.path().join(".claude/workflows");
+    let dir = temp.path().join(".orca/workflows");
     fs::create_dir_all(&dir).unwrap();
     fs::write(
         dir.join("audit.js"),

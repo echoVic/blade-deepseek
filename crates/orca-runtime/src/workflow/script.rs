@@ -41,8 +41,8 @@ pub fn resolve_workflow_script_to_path(
     persisted_path: &Path,
 ) -> io::Result<ResolvedWorkflowScript> {
     let user_dir = dirs::home_dir()
-        .map(|home| home.join(".claude").join("workflows"))
-        .unwrap_or_else(|| PathBuf::from(".claude/workflows"));
+        .map(|home| home.join(".orca").join("workflows"))
+        .unwrap_or_else(|| PathBuf::from(".orca/workflows"));
     resolve_workflow_script_with_user_dir_to_path(input, cwd, &user_dir, persisted_path)
 }
 
@@ -122,7 +122,7 @@ fn resolve_path(cwd: &Path, raw_path: &str) -> PathBuf {
 fn find_named_workflow(cwd: &Path, name: &str, user_workflow_dir: &Path) -> io::Result<PathBuf> {
     for ancestor in cwd.ancestors() {
         let candidate = ancestor
-            .join(".claude")
+            .join(".orca")
             .join("workflows")
             .join(format!("{name}.js"));
         if candidate.exists() {

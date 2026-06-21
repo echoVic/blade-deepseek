@@ -125,9 +125,9 @@ Options:
 
 ## Workflows
 
-`orca workflow run <script-or-name>` runs a Claude Code-style dynamic workflow.
-Named workflows resolve from the nearest `.claude/workflows/` directory first,
-then `~/.claude/workflows/`. Project workflows win over user workflows.
+`orca workflow run <script-or-name>` runs an Orca dynamic workflow.
+Named workflows resolve from the nearest `.orca/workflows/` directory first,
+then `~/.orca/workflows/`. Project workflows win over user workflows.
 
 Workflow scripts are JavaScript modules beginning with:
 

@@ -17,7 +17,7 @@ const features = [
   },
   {
     title: "Dynamic workflows",
-    body: "Run Claude Code-style JavaScript workflows from project or user directories.",
+    body: "Run Orca JavaScript workflows from project or user directories.",
   },
   {
     title: "Subagents",
@@ -299,8 +299,8 @@ session.done     tests passed`}</pre>
           <p className="eyebrow">Workflow scripts</p>
           <h2>Project-scoped automation without leaving the CLI.</h2>
           <p>
-            Orca resolves named workflows from `.claude/workflows/` first, then
-            user workflows. Keep repeatable agent routines close to the code
+            Orca resolves named workflows from `.orca/workflows/` first, then
+            user workflows in `~/.orca/workflows/`. Keep repeatable agent routines close to the code
             they operate on.
           </p>
         </div>
