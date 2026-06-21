@@ -360,6 +360,7 @@ mod tests {
             provider: ProviderKind::Mock,
             verifier: None,
             model: ModelSelection::parse(None).expect("model"),
+            model_runtime: Default::default(),
             api_key: None,
             base_url: None,
             mcp_servers: Vec::new(),

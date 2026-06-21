@@ -63,6 +63,23 @@ pub const DEFAULT_MAX_READ_PARALLEL_TOOLS: usize = 8;
 pub const DEFAULT_MAX_WORKFLOW_CONCURRENT_AGENTS: usize = 16;
 pub const DEFAULT_MAX_WORKFLOW_AGENTS_PER_RUN: u32 = 1000;
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ModelRuntimeConfig {
+    #[serde(default)]
+    pub context_window: Option<usize>,
+    #[serde(default)]
+    pub auto_compact_token_limit: Option<usize>,
+}
+
+impl ModelRuntimeConfig {
+    pub fn normalized(self) -> Self {
+        Self {
+            context_window: self.context_window.map(|value| value.max(1)),
+            auto_compact_token_limit: self.auto_compact_token_limit.map(|value| value.max(1)),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ToolConfig {
     #[serde(default = "default_max_read_parallel")]
@@ -147,6 +164,7 @@ pub struct RunConfig {
     pub provider: ProviderKind,
     pub verifier: Option<String>,
     pub model: ModelSelection,
+    pub model_runtime: ModelRuntimeConfig,
     pub api_key: Option<String>,
     pub base_url: Option<String>,
     pub mcp_servers: Vec<McpServerConfig>,
@@ -191,6 +209,8 @@ pub fn format_config_show(config: &RunConfig) -> String {
             "api_key = \"{}\"\n",
             "base_url = \"{}\"\n",
             "provider = \"{}\"\n",
+            "model_context_window = \"{}\"\n",
+            "model_auto_compact_token_limit = \"{}\"\n",
             "cwd = \"{}\"\n",
             "verifier = \"{}\"\n",
             "max_budget_usd = \"{}\"\n",
@@ -219,6 +239,16 @@ pub fn format_config_show(config: &RunConfig) -> String {
         api_key,
         base_url,
         config.provider.as_str(),
+        config
+            .model_runtime
+            .context_window
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "<default>".to_string()),
+        config
+            .model_runtime
+            .auto_compact_token_limit
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "<default>".to_string()),
         cwd,
         verifier,
         max_budget,
@@ -255,6 +285,10 @@ mod tests {
             provider: ProviderKind::Mock,
             verifier: None,
             model: ModelSelection::from_unchecked(Some("deepseek-v4-flash".to_string())),
+            model_runtime: ModelRuntimeConfig {
+                context_window: Some(128_000),
+                auto_compact_token_limit: Some(96_000),
+            },
             api_key: Some("sk-secret".to_string()),
             base_url: Some("https://api.example".to_string()),
             mcp_servers: Vec::new(),
@@ -277,6 +311,8 @@ mod tests {
         let shown = format_config_show(&config);
 
         assert!(shown.contains("model = \"deepseek-v4-flash\""));
+        assert!(shown.contains("model_context_window = \"128000\""));
+        assert!(shown.contains("model_auto_compact_token_limit = \"96000\""));
         assert!(shown.contains("mode = \"full-auto\""));
         assert!(shown.contains("api_key = \"<redacted>\""));
         assert!(!shown.contains("sk-secret"));

@@ -232,7 +232,10 @@ impl TuiConversationSession {
         let compaction = orca_provider::context::compact_with_summary(
             config.provider,
             &self.conversation,
-            &orca_provider::context::ContextConfig::for_model(config.model.as_option().as_deref()),
+            &orca_provider::context::ContextConfig::for_model_with_runtime(
+                config.model.as_option().as_deref(),
+                &config.model_runtime,
+            ),
             &provider_config,
         );
         self.conversation = compaction.conversation;
@@ -326,7 +329,10 @@ pub fn run_agent_for_tui(
     };
 
     let budget_model = config.model.as_option();
-    let ctx_config = orca_provider::context::ContextConfig::for_model(budget_model.as_deref());
+    let ctx_config = orca_provider::context::ContextConfig::for_model_with_runtime(
+        budget_model.as_deref(),
+        &config.model_runtime,
+    );
     let policy = ApprovalPolicy::new(config.approval_mode)
         .with_permission_rules(config.permission_rules.clone());
     session.conversation.add_user(prompt.to_string());
@@ -433,9 +439,13 @@ pub fn run_agent_for_tui(
             .set_model(Some(&route_decision.actual_model));
         let mut turn_provider_config = provider_config.clone();
         turn_provider_config.model = Some(route_decision.actual_model.clone());
-        orca_provider::context::apply_context_budget_hint(
-            &mut session.conversation,
+        let turn_ctx_config = orca_provider::context::ContextConfig::for_model_with_runtime(
             Some(&route_decision.actual_model),
+            &config.model_runtime,
+        );
+        orca_provider::context::apply_context_budget_hint_with_config(
+            &mut session.conversation,
+            &turn_ctx_config,
         );
 
         let pre_model_outcome = match session.hooks.run(
@@ -1450,7 +1460,10 @@ fn run_child_agent_for_tui(
     };
 
     let budget_model = config.model.as_option();
-    let ctx_config = orca_provider::context::ContextConfig::for_model(budget_model.as_deref());
+    let ctx_config = orca_provider::context::ContextConfig::for_model_with_runtime(
+        budget_model.as_deref(),
+        &config.model_runtime,
+    );
     let mut conversation = Conversation::new();
     conversation.add_system(agent_common::build_agent_system_prompt(
         cwd,
@@ -1507,9 +1520,13 @@ fn run_child_agent_for_tui(
         child_cost_tracker.set_model(Some(&route_decision.actual_model));
         let mut turn_provider_config = provider_config.clone();
         turn_provider_config.model = Some(route_decision.actual_model.clone());
-        orca_provider::context::apply_context_budget_hint(
-            &mut conversation,
+        let turn_ctx_config = orca_provider::context::ContextConfig::for_model_with_runtime(
             Some(&route_decision.actual_model),
+            &config.model_runtime,
+        );
+        orca_provider::context::apply_context_budget_hint_with_config(
+            &mut conversation,
+            &turn_ctx_config,
         );
 
         let pre_model_outcome = match hooks.run(
@@ -1693,6 +1710,7 @@ mod tests {
             provider: ProviderKind::Mock,
             verifier: None,
             model: ModelSelection::parse(None).unwrap(),
+            model_runtime: Default::default(),
             api_key: None,
             base_url: None,
             history_mode: HistoryMode::Disabled,

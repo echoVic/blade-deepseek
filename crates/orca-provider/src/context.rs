@@ -1,4 +1,4 @@
-use orca_core::config::ProviderKind;
+use orca_core::config::{ModelRuntimeConfig, ProviderKind};
 use orca_core::conversation::{Conversation, Message};
 use orca_core::provider_types::ProviderStep;
 use tiktoken_rs::cl100k_base_singleton;
@@ -31,6 +31,7 @@ pub struct ContextConfig {
     pub max_tokens: usize,
     pub compaction_threshold: f64,
     pub reserved_for_response: usize,
+    pub auto_compact_token_limit: Option<usize>,
 }
 
 impl ContextConfig {
@@ -39,10 +40,23 @@ impl ContextConfig {
             max_tokens: orca_core::model::max_context_tokens(model),
             compaction_threshold: COMPACTION_THRESHOLD,
             reserved_for_response: RESERVED_FOR_RESPONSE,
+            auto_compact_token_limit: None,
         }
     }
 
+    pub fn for_model_with_runtime(model: Option<&str>, runtime: &ModelRuntimeConfig) -> Self {
+        let mut config = Self::for_model(model);
+        if let Some(context_window) = runtime.context_window {
+            config.max_tokens = context_window.max(1);
+        }
+        config.auto_compact_token_limit = runtime.auto_compact_token_limit;
+        config
+    }
+
     fn effective_limit(&self) -> usize {
+        if let Some(limit) = self.auto_compact_token_limit {
+            return limit.min(self.max_tokens).max(1);
+        }
         let threshold = self.compaction_threshold.clamp(0.1, 1.0);
         ((self.max_tokens as f64 * threshold) as usize).saturating_sub(self.reserved_for_response)
     }
@@ -54,6 +68,7 @@ impl Default for ContextConfig {
             max_tokens: DEFAULT_MAX_TOKENS,
             compaction_threshold: COMPACTION_THRESHOLD,
             reserved_for_response: RESERVED_FOR_RESPONSE,
+            auto_compact_token_limit: None,
         }
     }
 }
@@ -114,12 +129,27 @@ pub fn apply_context_budget_hint(conversation: &mut Conversation, model: Option<
     apply_context_budget_hint_with_counter(conversation, model, &DefaultTokenCounter);
 }
 
+pub fn apply_context_budget_hint_with_config(
+    conversation: &mut Conversation,
+    config: &ContextConfig,
+) {
+    apply_context_budget_hint_with_config_and_counter(conversation, config, &DefaultTokenCounter);
+}
+
 pub fn apply_context_budget_hint_with_counter(
     conversation: &mut Conversation,
     model: Option<&str>,
     counter: &impl TokenCounter,
 ) {
     let config = ContextConfig::for_model(model);
+    apply_context_budget_hint_with_config_and_counter(conversation, &config, counter);
+}
+
+fn apply_context_budget_hint_with_config_and_counter(
+    conversation: &mut Conversation,
+    config: &ContextConfig,
+    counter: &impl TokenCounter,
+) {
     let used = conversation_tokens_with_counter(conversation, counter);
     let remaining = config.effective_limit().saturating_sub(used);
     let hint = format!("[context: ~{}K tokens remaining]", (remaining + 999) / 1000);
@@ -587,6 +617,37 @@ mod tests {
     }
 
     #[test]
+    fn context_config_uses_model_runtime_overrides() {
+        let runtime = ModelRuntimeConfig {
+            context_window: Some(128_000),
+            auto_compact_token_limit: Some(96_000),
+        };
+
+        let config = ContextConfig::for_model_with_runtime(Some("deepseek-v4-pro"), &runtime);
+
+        assert_eq!(config.max_tokens, 128_000);
+        assert_eq!(config.effective_limit(), 96_000);
+    }
+
+    #[test]
+    fn budget_hint_uses_runtime_auto_compact_limit() {
+        let runtime = ModelRuntimeConfig {
+            context_window: Some(1_000),
+            auto_compact_token_limit: Some(42),
+        };
+        let config = ContextConfig::for_model_with_runtime(Some("deepseek-v4-pro"), &runtime);
+        let mut conv = Conversation::new();
+        conv.add_system("system prompt".to_string());
+
+        apply_context_budget_hint_with_config(&mut conv, &config);
+
+        let Message::System { content, .. } = &conv.messages[0] else {
+            panic!("expected system message");
+        };
+        assert!(content.ends_with("[context: ~1K tokens remaining]"));
+    }
+
+    #[test]
     fn system_prompt_budget_hint_uses_remaining_model_budget() {
         let mut conv = Conversation::new();
         conv.add_system("system prompt".to_string());
@@ -615,6 +676,7 @@ mod tests {
             max_tokens: 60,
             compaction_threshold: 1.0,
             reserved_for_response: 0,
+            auto_compact_token_limit: None,
         };
         // budget = 60 tokens
 
@@ -645,6 +707,7 @@ mod tests {
             max_tokens: 42,
             compaction_threshold: 1.0,
             reserved_for_response: 0,
+            auto_compact_token_limit: None,
         };
 
         let mut conv = Conversation::new();
@@ -671,6 +734,7 @@ mod tests {
             max_tokens: 80,
             compaction_threshold: 1.0,
             reserved_for_response: 0,
+            auto_compact_token_limit: None,
         };
 
         let mut conv = Conversation::new();
@@ -708,6 +772,7 @@ mod tests {
             max_tokens: 100,
             compaction_threshold: 0.5,
             reserved_for_response: 9999,
+            auto_compact_token_limit: None,
         };
         // 100 * 0.5 = 50, saturating_sub(9999) = 0 (not panic)
         assert_eq!(config.effective_limit(), 0);
@@ -719,6 +784,7 @@ mod tests {
             max_tokens: 1000,
             compaction_threshold: 0.0,
             reserved_for_response: 0,
+            auto_compact_token_limit: None,
         };
         // 0.0 clamped to 0.1 → 1000 * 0.1 = 100
         assert_eq!(below.effective_limit(), 100);
@@ -727,6 +793,7 @@ mod tests {
             max_tokens: 1000,
             compaction_threshold: 2.0,
             reserved_for_response: 0,
+            auto_compact_token_limit: None,
         };
         // 2.0 clamped to 1.0 → 1000 * 1.0 = 1000
         assert_eq!(above.effective_limit(), 1000);
@@ -738,6 +805,7 @@ mod tests {
             max_tokens: 200,
             compaction_threshold: 1.0,
             reserved_for_response: 0,
+            auto_compact_token_limit: None,
         };
 
         let mut conv = Conversation::new();
@@ -777,6 +845,7 @@ mod tests {
             max_tokens: 50,
             compaction_threshold: 1.0,
             reserved_for_response: 0,
+            auto_compact_token_limit: None,
         };
 
         let mut conv = Conversation::new();
@@ -815,6 +884,7 @@ mod tests {
             max_tokens: 40,
             compaction_threshold: 1.0,
             reserved_for_response: 0,
+            auto_compact_token_limit: None,
         };
         let provider_config = ProviderConfig {
             api_key: None,

@@ -861,6 +861,7 @@ mod tests {
             provider: ProviderKind::Mock,
             verifier: None,
             model: ModelSelection::from_unchecked(Some("auto".to_string())),
+            model_runtime: Default::default(),
             api_key: None,
             base_url: None,
             mcp_servers: Vec::new(),

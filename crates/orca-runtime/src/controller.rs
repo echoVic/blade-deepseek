@@ -291,7 +291,8 @@ fn run_agent_loop(
 ) -> io::Result<AgentLoopResult> {
     let max_turns = DEFAULT_MAX_TURNS;
     let budget_model = config.model.as_option();
-    let ctx_config = context::ContextConfig::for_model(budget_model.as_deref());
+    let ctx_config =
+        context::ContextConfig::for_model_with_runtime(budget_model.as_deref(), &config.model_runtime);
     let policy = ApprovalPolicy::new(config.approval_mode)
         .with_permission_rules(config.permission_rules.clone());
     let tools_override = if subagent_depth > 0 {
@@ -447,7 +448,11 @@ fn run_agent_loop(
         }
         let mut turn_provider_config = provider_config.clone();
         turn_provider_config.model = Some(route_decision.actual_model.clone());
-        context::apply_context_budget_hint(&mut conversation, Some(&route_decision.actual_model));
+        let turn_ctx_config = context::ContextConfig::for_model_with_runtime(
+            Some(&route_decision.actual_model),
+            &config.model_runtime,
+        );
+        context::apply_context_budget_hint_with_config(&mut conversation, &turn_ctx_config);
 
         let pre_model_outcome = match hooks.run(
             HookEvent::PreModelCall,
@@ -1618,6 +1623,7 @@ mod tests {
             provider: ProviderKind::Mock,
             verifier: None,
             model: ModelSelection::parse(None).unwrap(),
+            model_runtime: Default::default(),
             api_key: None,
             base_url: None,
             history_mode: HistoryMode::Disabled,

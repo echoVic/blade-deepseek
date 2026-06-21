@@ -4,7 +4,7 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-06-22
-Current baseline: v0.1.12 context reliability baseline
+Current baseline: v0.1.13 model runtime context baseline
 
 ---
 
@@ -62,9 +62,9 @@ future work is not planned from stale assumptions.
 
 ### P1: Context Reliability Foundations
 
-**Release target:** v0.1.12
+**Release target:** v0.1.12-v0.1.13
 
-**Current status:** token/byte tool output truncation policy is implemented and configurable. Model metadata overrides remain queued for the next context-reliability patch.
+**Current status:** token/byte tool output truncation policy and model runtime context overrides are implemented and configurable.
 
 **Goal:** reduce context pollution and make model/runtime limits configurable
 before adding larger ecosystem features.
@@ -75,7 +75,7 @@ before adding larger ecosystem features.
    - Support byte and token budgets.
    - Preserve explicit warnings with original line/token counts.
    - Keep existing default behavior compatible at 8 KiB unless configured.
-2. Add model metadata/config overrides. Pending.
+2. Add model metadata/config overrides. Context window and auto-compact token limit done in v0.1.13; tool output token limit is covered by `[tools].output_truncation`.
    - Context window.
    - Auto-compact token limit.
    - Tool output token limit.

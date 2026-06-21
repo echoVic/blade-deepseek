@@ -8,8 +8,8 @@ use toml::Value;
 use crate::approval_rules::PermissionRules;
 use crate::approval_types::ApprovalMode;
 use crate::config::{
-    DEFAULT_MAX_WORKFLOW_AGENTS_PER_RUN, DEFAULT_MAX_WORKFLOW_CONCURRENT_AGENTS, ThemeName,
-    ToolConfig, WorkflowConfig,
+    DEFAULT_MAX_WORKFLOW_AGENTS_PER_RUN, DEFAULT_MAX_WORKFLOW_CONCURRENT_AGENTS,
+    ModelRuntimeConfig, ThemeName, ToolConfig, WorkflowConfig,
 };
 use crate::subagent_config::SubagentConfig;
 
@@ -22,6 +22,8 @@ pub struct FileConfig {
     pub mode: Option<ApprovalMode>,
     pub api_key: Option<String>,
     pub base_url: Option<String>,
+    #[serde(default)]
+    pub model_runtime: ModelRuntimeConfig,
     #[serde(default)]
     pub mcp_servers: Vec<crate::mcp_types::McpServerConfig>,
     #[serde(default)]
@@ -59,6 +61,8 @@ struct RawFileConfig {
     #[serde(default, alias = "workflowKeywordTriggerEnabled")]
     legacy_workflow_keyword_trigger_enabled: Option<bool>,
     #[serde(default)]
+    pub model_runtime: ModelRuntimeConfig,
+    #[serde(default)]
     pub mcp_servers: Vec<crate::mcp_types::McpServerConfig>,
     #[serde(default)]
     pub hooks: Vec<crate::hook_types::HookConfig>,
@@ -89,6 +93,7 @@ impl Default for FileConfig {
             mode: None,
             api_key: None,
             base_url: None,
+            model_runtime: ModelRuntimeConfig::default(),
             mcp_servers: Vec::new(),
             hooks: Vec::new(),
             permissions: PermissionRules::default(),
@@ -118,6 +123,7 @@ impl From<RawFileConfig> for FileConfig {
             mode: raw.mode,
             api_key: raw.api_key,
             base_url: raw.base_url,
+            model_runtime: raw.model_runtime.normalized(),
             mcp_servers: raw.mcp_servers,
             hooks: raw.hooks,
             permissions: raw.permissions,
@@ -526,6 +532,18 @@ output_truncation = { mode = "bytes", limit = 0 }
             normalized.output_truncation,
             crate::tool_types::ToolOutputTruncation::bytes(1)
         );
+    }
+
+    #[test]
+    fn parse_model_runtime_config() {
+        let toml = r#"
+[model_runtime]
+context_window = 128000
+auto_compact_token_limit = 96000
+"#;
+        let config: FileConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.model_runtime.context_window, Some(128_000));
+        assert_eq!(config.model_runtime.auto_compact_token_limit, Some(96_000));
     }
 
     #[test]
