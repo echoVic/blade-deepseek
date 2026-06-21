@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 const npmCommand = "npm install -g @blade-ai/orca";
 const curlCommand =
@@ -38,16 +38,93 @@ const features = [
 ];
 
 type InstallMode = "npm" | "curl";
+type CopyState = "idle" | "copied" | "failed";
+
+const installTabIds = {
+  npm: "install-tab-npm",
+  curl: "install-tab-curl",
+} as const;
+
+const installPanelId = "install-panel";
+
+function fallbackCopyText(command: string) {
+  const textarea = document.createElement("textarea");
+
+  textarea.value = command;
+  textarea.setAttribute("readonly", "");
+  textarea.style.position = "fixed";
+  textarea.style.top = "0";
+  textarea.style.left = "0";
+  textarea.style.width = "1px";
+  textarea.style.height = "1px";
+  textarea.style.padding = "0";
+  textarea.style.border = "0";
+  textarea.style.outline = "0";
+  textarea.style.boxShadow = "none";
+  textarea.style.background = "transparent";
+  textarea.style.opacity = "0";
+
+  document.body.appendChild(textarea);
+
+  try {
+    textarea.focus();
+    textarea.select();
+    textarea.setSelectionRange(0, textarea.value.length);
+
+    return document.execCommand("copy");
+  } finally {
+    document.body.removeChild(textarea);
+  }
+}
+
+async function copyCommandText(command: string) {
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(command);
+      return true;
+    }
+  } catch {
+    // Fall through to the legacy clipboard path.
+  }
+
+  try {
+    return fallbackCopyText(command);
+  } catch {
+    return false;
+  }
+}
 
 function App() {
   const [mode, setMode] = useState<InstallMode>("npm");
-  const [copied, setCopied] = useState(false);
+  const [copyState, setCopyState] = useState<CopyState>("idle");
+  const resetTimerRef = useRef<number | null>(null);
   const command = mode === "npm" ? npmCommand : curlCommand;
 
+  useEffect(() => {
+    if (copyState === "idle") {
+      return;
+    }
+
+    if (resetTimerRef.current !== null) {
+      window.clearTimeout(resetTimerRef.current);
+    }
+
+    resetTimerRef.current = window.setTimeout(() => {
+      setCopyState("idle");
+      resetTimerRef.current = null;
+    }, 1400);
+
+    return () => {
+      if (resetTimerRef.current !== null) {
+        window.clearTimeout(resetTimerRef.current);
+        resetTimerRef.current = null;
+      }
+    };
+  }, [copyState]);
+
   async function copyCommand() {
-    await navigator.clipboard.writeText(command);
-    setCopied(true);
-    window.setTimeout(() => setCopied(false), 1400);
+    const copied = await copyCommandText(command);
+    setCopyState(copied ? "copied" : "failed");
   }
 
   return (
@@ -78,24 +155,44 @@ function App() {
           <div className="install-card" id="install" aria-label="Install Orca">
             <div className="tabs" role="tablist" aria-label="Install method">
               <button
+                id={installTabIds.npm}
                 className={mode === "npm" ? "active" : ""}
                 onClick={() => setMode("npm")}
+                aria-selected={mode === "npm"}
+                aria-controls={installPanelId}
+                role="tab"
+                tabIndex={mode === "npm" ? 0 : -1}
                 type="button"
               >
                 npm
               </button>
               <button
+                id={installTabIds.curl}
                 className={mode === "curl" ? "active" : ""}
                 onClick={() => setMode("curl")}
+                aria-selected={mode === "curl"}
+                aria-controls={installPanelId}
+                role="tab"
+                tabIndex={mode === "curl" ? 0 : -1}
                 type="button"
               >
                 curl
               </button>
             </div>
-            <div className="command-row">
+            <div
+              className="command-row"
+              id={installPanelId}
+              role="tabpanel"
+              aria-labelledby={mode === "npm" ? installTabIds.npm : installTabIds.curl}
+              tabIndex={0}
+            >
               <code>{command}</code>
               <button type="button" onClick={copyCommand} className="copy">
-                {copied ? "Copied" : "Copy"}
+                {copyState === "copied"
+                  ? "Copied"
+                  : copyState === "failed"
+                    ? "Failed"
+                    : "Copy"}
               </button>
             </div>
           </div>
