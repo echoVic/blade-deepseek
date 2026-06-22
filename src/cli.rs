@@ -46,6 +46,93 @@ enum UpdatePromptChoice {
     Quit,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum UpdateAction {
+    NpmGlobalLatest,
+    StandaloneInstaller { install_dir: Option<PathBuf> },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct UpdateCommand {
+    program: &'static str,
+    args: Vec<String>,
+    display: String,
+}
+
+impl UpdateAction {
+    fn command(&self) -> UpdateCommand {
+        match self {
+            Self::NpmGlobalLatest => UpdateCommand {
+                program: "npm",
+                args: vec![
+                    "install".to_string(),
+                    "-g".to_string(),
+                    "@blade-ai/orca@latest".to_string(),
+                    "--registry".to_string(),
+                    "https://registry.npmjs.org".to_string(),
+                ],
+                display:
+                    "npm install -g @blade-ai/orca@latest --registry https://registry.npmjs.org"
+                        .to_string(),
+            },
+            Self::StandaloneInstaller { install_dir } => {
+                standalone_update_command(install_dir.clone())
+            }
+        }
+    }
+
+    fn command_display(&self) -> String {
+        self.command().display
+    }
+}
+
+fn current_update_action() -> UpdateAction {
+    let current_exe = env::current_exe().ok();
+    update_action_from_env_and_exe(|name| env::var_os(name), current_exe.as_deref())
+}
+
+fn update_action_from_env_and_exe(
+    get_env: impl Fn(&str) -> Option<std::ffi::OsString>,
+    current_exe: Option<&Path>,
+) -> UpdateAction {
+    if get_env("ORCA_MANAGED_BY_NPM").is_some() {
+        UpdateAction::NpmGlobalLatest
+    } else {
+        UpdateAction::StandaloneInstaller {
+            install_dir: current_exe.and_then(|path| path.parent().map(Path::to_path_buf)),
+        }
+    }
+}
+
+fn standalone_update_command(install_dir: Option<PathBuf>) -> UpdateCommand {
+    let script = if install_dir.is_some() {
+        "tmp=$(mktemp) && trap 'rm -f \"$tmp\"' EXIT INT TERM && curl -fsSL https://orcaagent.dev/install.sh -o \"$tmp\" && ORCA_NON_INTERACTIVE=1 INSTALL_DIR=\"$1\" sh \"$tmp\""
+    } else {
+        "tmp=$(mktemp) && trap 'rm -f \"$tmp\"' EXIT INT TERM && curl -fsSL https://orcaagent.dev/install.sh -o \"$tmp\" && ORCA_NON_INTERACTIVE=1 sh \"$tmp\""
+    };
+    let mut args = vec![
+        "-c".to_string(),
+        script.to_string(),
+        "orca-update".to_string(),
+    ];
+    let display = if let Some(install_dir) = install_dir {
+        args.push(install_dir.display().to_string());
+        format!(
+            "curl -fsSL https://orcaagent.dev/install.sh -o <tmp> && ORCA_NON_INTERACTIVE=1 INSTALL_DIR={} sh <tmp>",
+            install_dir.display()
+        )
+    } else {
+        "curl -fsSL https://orcaagent.dev/install.sh -o <tmp> && ORCA_NON_INTERACTIVE=1 sh <tmp>"
+            .to_string()
+    };
+
+    UpdateCommand {
+        program: "sh",
+        args,
+        display,
+    }
+}
+
 impl UpdatePromptChoice {
     fn next(self) -> Self {
         match self {
@@ -1468,11 +1555,12 @@ fn render_update_prompt(
     )?;
     write!(stdout, "Release notes: {}\r\n", info.url)?;
     write!(stdout, "\r\n")?;
+    let update_command = upgrade_command_display();
     write_update_choice_row(
         stdout,
         1,
         "Update now",
-        Some(upgrade_command_display()),
+        Some(update_command.as_str()),
         highlighted == UpdatePromptChoice::UpdateNow,
     )?;
     write_update_choice_row(
@@ -1517,20 +1605,16 @@ impl Drop for RawModeGuard {
     }
 }
 
-fn upgrade_command_display() -> &'static str {
-    "npm install -g @blade-ai/orca@latest --registry https://registry.npmjs.org"
+fn upgrade_command_display() -> String {
+    current_update_action().command_display()
 }
 
 fn run_upgrade_command() -> i32 {
-    println!("Updating Orca...");
-    let status = match ProcessCommand::new("npm")
-        .args([
-            "install",
-            "-g",
-            "@blade-ai/orca@latest",
-            "--registry",
-            "https://registry.npmjs.org",
-        ])
+    let action = current_update_action();
+    println!("Updating Orca via `{}`...", action.command_display());
+    let command = action.command();
+    let status = match ProcessCommand::new(command.program)
+        .args(&command.args)
         .status()
     {
         Ok(status) => status,
@@ -1677,6 +1761,54 @@ mod tests {
         assert_eq!(
             UpdatePromptChoice::UpdateNow.prev(),
             UpdatePromptChoice::SkipUntilNext
+        );
+    }
+
+    #[test]
+    fn update_action_uses_npm_when_launched_from_npm_wrapper() {
+        let action = update_action_from_env_and_exe(
+            |name| match name {
+                "ORCA_MANAGED_BY_NPM" => Some("1".into()),
+                _ => None,
+            },
+            Some(Path::new("/custom/bin/orca")),
+        );
+
+        assert_eq!(
+            action.command_display(),
+            "npm install -g @blade-ai/orca@latest --registry https://registry.npmjs.org"
+        );
+    }
+
+    #[test]
+    fn update_action_reruns_standalone_installer_for_current_executable_dir() {
+        let action = update_action_from_env_and_exe(|_| None, Some(Path::new("/custom/bin/orca")));
+
+        assert_eq!(
+            action.command_display(),
+            "curl -fsSL https://orcaagent.dev/install.sh -o <tmp> && ORCA_NON_INTERACTIVE=1 INSTALL_DIR=/custom/bin sh <tmp>"
+        );
+    }
+
+    #[test]
+    fn standalone_update_command_downloads_before_running_installer() {
+        let action = update_action_from_env_and_exe(|_| None, Some(Path::new("/custom/bin/orca")));
+        let command = action.command();
+
+        assert_eq!(command.program, "sh");
+        assert!(command.args.iter().any(|arg| arg.contains("mktemp")));
+        assert!(
+            command
+                .args
+                .iter()
+                .any(|arg| arg.contains("curl -fsSL https://orcaagent.dev/install.sh -o \"$tmp\""))
+        );
+        assert!(command.args.iter().any(|arg| arg.contains("&& ORCA_NON_INTERACTIVE=1 INSTALL_DIR=\"$1\" sh \"$tmp\"")));
+        assert!(
+            !command
+                .args
+                .iter()
+                .any(|arg| arg.contains("| ORCA_NON_INTERACTIVE"))
         );
     }
 }

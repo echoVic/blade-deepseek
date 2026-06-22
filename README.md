@@ -77,7 +77,9 @@ base_url = "https://api.deepseek.com"
 
 ### Updates
 
-When `update_check` is enabled, Orca checks GitHub Releases before opening the interactive TUI. If a newer release is available, Orca shows a startup prompt with `Update now`, `Skip`, and `Skip until next version`. Choosing `Update now` runs the npm upgrade command and exits; choosing either skip option continues into the TUI.
+When `update_check` is enabled, Orca checks for a newer release before opening the interactive TUI. If a newer release is available, Orca shows a startup prompt with `Update now`, `Skip`, and `Skip until next version`. Choosing `Update now` updates the currently running install: npm-managed launches run the npm upgrade command, while direct binary launches rerun the curl installer into the current executable's directory. Choosing either skip option continues into the TUI.
+
+If you installed with curl and later switch to npm, make sure the npm global bin directory appears before `~/.local/bin` on `PATH`, or remove the older curl-installed `~/.local/bin/orca`. Otherwise your shell may keep running the curl-installed binary.
 
 Disable the startup check with:
 
