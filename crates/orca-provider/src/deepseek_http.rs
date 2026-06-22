@@ -656,7 +656,10 @@ mod tests {
 
     #[test]
     fn parse_web_search() {
-        let tc = make_tc("web_search", r#"{"query":"deepseek latest","count":3}"#);
+        let tc = make_tc(
+            "web_search",
+            r#"{"query":"deepseek latest","count":3,"fresh_days":30}"#,
+        );
         let req = parse_tool_call(&tc, &[]).unwrap();
         assert_eq!(req.name, ToolName::WebSearch);
         assert_eq!(req.action, ActionKind::Network);

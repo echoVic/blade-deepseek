@@ -84,6 +84,8 @@ Start validation as specific as possible to the code you changed, then broaden:
 
 Use `bash` for tests, builds, project scripts, and complex shell-only tasks. For file inspection, prefer `read_file`, `glob`, and `grep`.
 
+When using `web_search` for requests about latest news, recent updates, current status, today, this week, this month, or "最新/最近/今天", include a `fresh_days` value that matches the requested recency instead of relying on the query text alone. Examples: use `fresh_days: 1` for today/current breakage, `fresh_days: 7` for this week/recent updates, and `fresh_days: 30` for latest news or recent releases unless the user asks for a broader range.
+
 ## Safety Rules
 1. NEVER execute destructive commands (rm -rf /, rm -rf ~, mkfs, dd if=/dev/zero, etc.).
 2. NEVER expose, log, or transmit secrets, API keys, passwords, or credentials.
@@ -138,6 +140,15 @@ mod tests {
 
         assert!(prompt.contains("### bash"));
         assert!(prompt.contains("tests, builds, project scripts"));
+    }
+
+    #[test]
+    fn prompt_requires_fresh_days_for_recent_web_searches() {
+        let prompt = build_system_prompt(std::path::Path::new("/repo"));
+
+        assert!(prompt.contains("include a `fresh_days` value"));
+        assert!(prompt.contains("fresh_days: 30"));
+        assert!(prompt.contains("最新/最近/今天"));
     }
 
     #[test]

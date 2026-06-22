@@ -4,7 +4,7 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-06-22
-Current baseline: v0.1.23 release verification retry hardening and goal runtime hardening
+Current baseline: v0.1.24 release verification retry hardening and goal runtime hardening
 
 ---
 

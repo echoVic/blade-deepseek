@@ -8,6 +8,8 @@ struct SearchArgs {
     query: String,
     #[serde(default = "default_count")]
     count: usize,
+    #[serde(default, deserialize_with = "deserialize_freshness")]
+    freshness: Option<String>,
 }
 
 struct SearchResult {
@@ -76,10 +78,11 @@ struct BraveResult {
 
 fn search_brave(args: &SearchArgs, api_key: &str) -> Result<Vec<SearchResult>, String> {
     let count = args.count.clamp(1, 10);
+    let query_params = brave_query_params(args, count);
     let response = reqwest::blocking::Client::new()
         .get("https://api.search.brave.com/res/v1/web/search")
         .header("X-Subscription-Token", api_key)
-        .query(&[("q", args.query.as_str()), ("count", &count.to_string())])
+        .query(&query_params)
         .send()
         .map_err(|e| format!("web search request failed: {e}"))?;
 
@@ -106,10 +109,22 @@ fn search_brave(args: &SearchArgs, api_key: &str) -> Result<Vec<SearchResult>, S
         .collect())
 }
 
+fn brave_query_params(args: &SearchArgs, count: usize) -> Vec<(&'static str, String)> {
+    let mut params = vec![
+        ("q", args.query.clone()),
+        ("count", count.clamp(1, 10).to_string()),
+    ];
+    if let Some(freshness) = args.freshness.as_ref() {
+        params.push(("freshness", freshness.clone()));
+    }
+    params
+}
+
 // --- Exa MCP fallback (no API key required) ---
 
 fn search_exa(args: &SearchArgs) -> Result<Vec<SearchResult>, String> {
     let count = args.count.clamp(1, 10);
+    let query = exa_query(args);
     let request_body = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
@@ -117,7 +132,7 @@ fn search_exa(args: &SearchArgs) -> Result<Vec<SearchResult>, String> {
         "params": {
             "name": "web_search_exa",
             "arguments": {
-                "query": args.query,
+                "query": query,
                 "type": "auto",
                 "numResults": count
             }
@@ -215,6 +230,7 @@ fn parse_args(request: &ToolRequest) -> Result<SearchArgs, String> {
             .map(|query| SearchArgs {
                 query: query.to_string(),
                 count: default_count(),
+                freshness: infer_freshness(query),
             })
             .ok_or_else(|| "web_search query is required".to_string());
     };
@@ -223,11 +239,76 @@ fn parse_args(request: &ToolRequest) -> Result<SearchArgs, String> {
     if args.query.trim().is_empty() {
         return Err("web_search query is required".to_string());
     }
-    Ok(args)
+    Ok(SearchArgs {
+        freshness: args.freshness.or_else(|| infer_freshness(&args.query)),
+        ..args
+    })
 }
 
 fn default_count() -> usize {
     5
+}
+
+fn deserialize_freshness<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<String>::deserialize(deserializer)?;
+    Ok(raw.and_then(|value| {
+        let value = value.trim();
+        matches!(value, "pd" | "pw" | "pm" | "py" | _ if is_custom_freshness(value))
+            .then(|| value.to_string())
+    }))
+}
+
+fn infer_freshness(query: &str) -> Option<String> {
+    let query = query.to_ascii_lowercase();
+    if query
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .any(|token| {
+            matches!(
+                token,
+                "latest" | "current" | "recent" | "today" | "news" | "updates" | "update"
+            )
+        })
+    {
+        Some("pm".to_string())
+    } else {
+        None
+    }
+}
+
+fn is_custom_freshness(value: &str) -> bool {
+    let Some((start, end)) = value.split_once("to") else {
+        return false;
+    };
+    is_iso_date(start) && is_iso_date(end)
+}
+
+fn is_iso_date(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 10
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes
+            .iter()
+            .enumerate()
+            .all(|(idx, byte)| matches!(idx, 4 | 7) || byte.is_ascii_digit())
+}
+
+fn exa_query(args: &SearchArgs) -> String {
+    match args.freshness.as_deref() {
+        Some("pd") => format!("{} from the last 24 hours", args.query),
+        Some("pw") => format!("{} from the last 7 days", args.query),
+        Some("pm") => format!("{} from the last 31 days", args.query),
+        Some("py") => format!("{} from the last year", args.query),
+        Some(custom) => format!(
+            "{} published between {}",
+            args.query,
+            custom.replace("to", " and ")
+        ),
+        None => args.query.clone(),
+    }
 }
 
 #[cfg(test)]
@@ -262,6 +343,51 @@ mod tests {
         let args = parse_args(&request(None, Some("rust async".to_string()))).unwrap();
         assert_eq!(args.query, "rust async");
         assert_eq!(args.count, 5);
+    }
+
+    #[test]
+    fn parses_recency_intent_query_with_month_freshness() {
+        let args = parse_args(&request(
+            Some(r#"{"query":"deepseek latest news","count":3}"#.to_string()),
+            None,
+        ))
+        .unwrap();
+
+        assert_eq!(args.freshness.as_deref(), Some("pm"));
+    }
+
+    #[test]
+    fn brave_query_params_include_inferred_freshness() {
+        let args = parse_args(&request(
+            Some(r#"{"query":"deepseek latest news","count":3}"#.to_string()),
+            None,
+        ))
+        .unwrap();
+
+        let params = brave_query_params(&args, args.count);
+
+        assert_eq!(
+            params,
+            vec![
+                ("q", "deepseek latest news".to_string()),
+                ("count", "3".to_string()),
+                ("freshness", "pm".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn exa_query_includes_recency_window_when_backend_has_no_freshness_arg() {
+        let args = parse_args(&request(
+            Some(r#"{"query":"deepseek latest news","count":3}"#.to_string()),
+            None,
+        ))
+        .unwrap();
+
+        assert_eq!(
+            exa_query(&args),
+            "deepseek latest news from the last 31 days"
+        );
     }
 
     #[test]

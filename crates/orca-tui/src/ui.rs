@@ -29,14 +29,7 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
     let plan_height = plan_panel_height(state);
     let goal_height: u16 = if state.current_goal.is_some() { 3 } else { 0 };
 
-    let chunks = Layout::vertical([
-        Constraint::Length(goal_height),
-        Constraint::Min(5),
-        Constraint::Length(plan_height),
-        Constraint::Length(input_height),
-        Constraint::Length(1),
-    ])
-    .split(frame.area());
+    let chunks = main_layout(frame.area(), goal_height, plan_height, input_height);
 
     if goal_height > 0 {
         render_goal_banner(frame, chunks[0], state, theme);
@@ -66,6 +59,41 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
     if state.show_shortcuts {
         render_shortcuts(frame, state, theme);
     }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) struct AppLayout {
+    pub content: Rect,
+    pub input: Rect,
+}
+
+pub(crate) fn app_layout(area: Rect, state: &AppState, textarea: &TextArea) -> AppLayout {
+    let input_lines = textarea.lines().len().max(1) as u16;
+    let input_height = input_lines + 2;
+    let plan_height = plan_panel_height(state);
+    let goal_height: u16 = if state.current_goal.is_some() { 3 } else { 0 };
+    let chunks = main_layout(area, goal_height, plan_height, input_height);
+
+    AppLayout {
+        content: chunks[1],
+        input: chunks[3],
+    }
+}
+
+fn main_layout(
+    area: Rect,
+    goal_height: u16,
+    plan_height: u16,
+    input_height: u16,
+) -> std::rc::Rc<[Rect]> {
+    Layout::vertical([
+        Constraint::Length(goal_height),
+        Constraint::Min(5),
+        Constraint::Length(plan_height),
+        Constraint::Length(input_height),
+        Constraint::Length(1),
+    ])
+    .split(area)
 }
 
 fn render_goal_banner(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {

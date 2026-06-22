@@ -5,12 +5,14 @@ use std::time::{Duration, Instant};
 
 use crossterm::ExecutableCommand;
 use crossterm::event::{
-    self, Event, KeyCode, KeyEventKind, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind,
+    KeyboardEnhancementFlags, MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags,
     PushKeyboardEnhancementFlags,
 };
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use ratatui::layout::Rect;
 use tui_textarea::{CursorMove, Input, TextArea};
 
 use orca_core::approval_types::ApprovalMode;
@@ -50,6 +52,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
     terminal::enable_raw_mode()?;
     let mut stdout = io::stdout();
     stdout.execute(EnterAlternateScreen)?;
+    stdout.execute(EnableMouseCapture)?;
     // Kitty keyboard protocol: push enhancement AFTER entering alternate screen,
     // otherwise the terminal may reset the keyboard state stack on screen switch.
     let kbd_enhanced = stdout
@@ -180,6 +183,18 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
 
         if event::poll(Duration::from_millis(50))? {
             let ev = event::read()?;
+
+            if let Event::Mouse(mouse) = ev {
+                if let Some(scroll) =
+                    mouse_wheel_scroll_action(mouse, mouse_layout(&terminal, &state, &textarea)?)
+                {
+                    match scroll {
+                        MouseWheelScroll::Up => state.scroll_up(1),
+                        MouseWheelScroll::Down => state.scroll_down(1),
+                    }
+                }
+                continue;
+            }
 
             if let Event::Key(key) = &ev {
                 if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
@@ -642,6 +657,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
     if kbd_enhanced {
         let _ = io::stdout().execute(PopKeyboardEnhancementFlags);
     }
+    let _ = io::stdout().execute(DisableMouseCapture);
     io::stdout().execute(LeaveAlternateScreen)?;
     terminal::disable_raw_mode()?;
 
@@ -656,6 +672,92 @@ fn shorten_home(path: &str) -> String {
         }
     }
     path.to_string()
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MouseWheelScroll {
+    Up,
+    Down,
+}
+
+fn mouse_layout(
+    terminal: &Terminal<CrosstermBackend<std::io::Stdout>>,
+    state: &AppState,
+    textarea: &TextArea,
+) -> io::Result<ui::AppLayout> {
+    let size = terminal.size()?;
+    Ok(ui::app_layout(
+        Rect::new(0, 0, size.width, size.height),
+        state,
+        textarea,
+    ))
+}
+
+fn mouse_wheel_scroll_action(mouse: MouseEvent, layout: ui::AppLayout) -> Option<MouseWheelScroll> {
+    let inside_content = mouse.column >= layout.content.x
+        && mouse.column < layout.content.x.saturating_add(layout.content.width)
+        && mouse.row >= layout.content.y
+        && mouse.row < layout.content.y.saturating_add(layout.content.height);
+
+    if !inside_content {
+        return None;
+    }
+
+    match mouse.kind {
+        MouseEventKind::ScrollUp => Some(MouseWheelScroll::Up),
+        MouseEventKind::ScrollDown => Some(MouseWheelScroll::Down),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{MouseEvent, MouseEventKind};
+    use ratatui::layout::Rect;
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn wheel_over_composer_is_ignored() {
+        let layout = ui::AppLayout {
+            content: Rect::new(0, 3, 80, 18),
+            input: Rect::new(0, 21, 80, 3),
+        };
+
+        assert_eq!(
+            mouse_wheel_scroll_action(mouse(MouseEventKind::ScrollUp, 10, 22), layout),
+            None
+        );
+        assert_eq!(
+            mouse_wheel_scroll_action(mouse(MouseEventKind::ScrollDown, 10, 22), layout),
+            None
+        );
+    }
+
+    #[test]
+    fn wheel_over_content_scrolls_content() {
+        let layout = ui::AppLayout {
+            content: Rect::new(0, 3, 80, 18),
+            input: Rect::new(0, 21, 80, 3),
+        };
+
+        assert_eq!(
+            mouse_wheel_scroll_action(mouse(MouseEventKind::ScrollUp, 10, 10), layout),
+            Some(MouseWheelScroll::Up)
+        );
+        assert_eq!(
+            mouse_wheel_scroll_action(mouse(MouseEventKind::ScrollDown, 10, 10), layout),
+            Some(MouseWheelScroll::Down)
+        );
+    }
 }
 
 // --- Slash menu helpers ---

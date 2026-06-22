@@ -382,6 +382,10 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
                     "count": {
                         "type": "integer",
                         "description": "Number of results to return, 1-10 (default: 5)"
+                    },
+                    "freshness": {
+                        "type": "string",
+                        "description": "Optional recency filter. Use pd for last 24 hours, pw for last 7 days, pm for last 31 days, py for last year, or YYYY-MM-DDtoYYYY-MM-DD."
                     }
                 },
                 "required": ["query"]
