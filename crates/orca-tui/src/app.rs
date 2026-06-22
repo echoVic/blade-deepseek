@@ -693,16 +693,7 @@ fn mouse_layout(
     ))
 }
 
-fn mouse_wheel_scroll_action(mouse: MouseEvent, layout: ui::AppLayout) -> Option<MouseWheelScroll> {
-    let inside_content = mouse.column >= layout.content.x
-        && mouse.column < layout.content.x.saturating_add(layout.content.width)
-        && mouse.row >= layout.content.y
-        && mouse.row < layout.content.y.saturating_add(layout.content.height);
-
-    if !inside_content {
-        return None;
-    }
-
+fn mouse_wheel_scroll_action(mouse: MouseEvent, _layout: ui::AppLayout) -> Option<MouseWheelScroll> {
     match mouse.kind {
         MouseEventKind::ScrollUp => Some(MouseWheelScroll::Up),
         MouseEventKind::ScrollDown => Some(MouseWheelScroll::Down),
@@ -726,7 +717,7 @@ mod tests {
     }
 
     #[test]
-    fn wheel_over_composer_is_ignored() {
+    fn wheel_over_composer_scrolls_content() {
         let layout = ui::AppLayout {
             content: Rect::new(0, 3, 80, 18),
             input: Rect::new(0, 21, 80, 3),
@@ -734,11 +725,11 @@ mod tests {
 
         assert_eq!(
             mouse_wheel_scroll_action(mouse(MouseEventKind::ScrollUp, 10, 22), layout),
-            None
+            Some(MouseWheelScroll::Up)
         );
         assert_eq!(
             mouse_wheel_scroll_action(mouse(MouseEventKind::ScrollDown, 10, 22), layout),
-            None
+            Some(MouseWheelScroll::Down)
         );
     }
 
@@ -756,6 +747,44 @@ mod tests {
         assert_eq!(
             mouse_wheel_scroll_action(mouse(MouseEventKind::ScrollDown, 10, 10), layout),
             Some(MouseWheelScroll::Down)
+        );
+    }
+
+    #[test]
+    fn wheel_over_status_bar_scrolls_content() {
+        let layout = ui::AppLayout {
+            content: Rect::new(0, 3, 80, 18),
+            input: Rect::new(0, 21, 80, 3),
+        };
+
+        // Row 24 is below the input area (status bar region)
+        assert_eq!(
+            mouse_wheel_scroll_action(mouse(MouseEventKind::ScrollUp, 40, 24), layout),
+            Some(MouseWheelScroll::Up)
+        );
+        assert_eq!(
+            mouse_wheel_scroll_action(mouse(MouseEventKind::ScrollDown, 40, 24), layout),
+            Some(MouseWheelScroll::Down)
+        );
+    }
+
+    #[test]
+    fn non_scroll_mouse_events_are_ignored() {
+        let layout = ui::AppLayout {
+            content: Rect::new(0, 3, 80, 18),
+            input: Rect::new(0, 21, 80, 3),
+        };
+
+        assert_eq!(
+            mouse_wheel_scroll_action(
+                mouse(MouseEventKind::Down(crossterm::event::MouseButton::Left), 10, 10),
+                layout
+            ),
+            None
+        );
+        assert_eq!(
+            mouse_wheel_scroll_action(mouse(MouseEventKind::Moved, 10, 10), layout),
+            None
         );
     }
 }
