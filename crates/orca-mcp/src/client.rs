@@ -224,4 +224,28 @@ mod tests {
         let schema = normalize_schema(Value::Null);
         assert_eq!(schema["type"], "object");
     }
+
+    #[test]
+    fn tools_preserve_insertion_order() {
+        // The DeepSeek tool schema is byte-pinned for prefix caching, so the
+        // registry must expose tools in a stable order. `tools()` is backed by a
+        // Vec (insertion order), never a HashMap; lock that here so a future
+        // refactor to a map-backed store fails loudly.
+        let make = |schema_name: &str| McpTool {
+            server: "srv".to_string(),
+            name: schema_name.to_string(),
+            schema_name: schema_name.to_string(),
+            description: None,
+            input_schema: serde_json::json!({"type": "object"}),
+        };
+        let order = vec!["mcp__srv__zzz", "mcp__srv__aaa", "mcp__srv__mmm"];
+        let registry =
+            McpRegistry::from_tools_for_test(order.iter().map(|n| make(n)).collect::<Vec<_>>());
+        let got: Vec<&str> = registry
+            .tools()
+            .iter()
+            .map(|tool| tool.schema_name.as_str())
+            .collect();
+        assert_eq!(got, order);
+    }
 }
