@@ -116,7 +116,15 @@ fn conversation_tokens_with_counter(
         .messages
         .iter()
         .map(|message| message_tokens_with_counter(message, counter))
-        .sum()
+        .sum::<usize>()
+        + volatile_tokens_with_counter(conversation, counter)
+}
+
+fn volatile_tokens_with_counter(conversation: &Conversation, counter: &impl TokenCounter) -> usize {
+    if conversation.messages.is_empty() || conversation.volatile.is_empty() {
+        return 0;
+    }
+    counter.count_text(&conversation.volatile.render())
 }
 
 pub fn needs_compaction(conversation: &Conversation, config: &ContextConfig) -> bool {
@@ -202,6 +210,7 @@ fn summarize_collapsed_messages(
     )));
     result.messages.extend(pinned);
     result.messages.extend(kept);
+    result.volatile = conversation.volatile.clone();
     Some((result, summary))
 }
 
@@ -235,7 +244,8 @@ fn partition_for_compaction(
         .iter()
         .map(|message| message_tokens_with_counter(message, counter))
         .sum();
-    let mut budget = system_tokens + pinned_tokens + summary_tokens + 4;
+    let volatile_tokens = volatile_tokens_with_counter(conversation, counter);
+    let mut budget = system_tokens + pinned_tokens + summary_tokens + volatile_tokens + 4;
     for msg in droppable.iter().rev() {
         let msg_tokens = message_tokens_with_counter(msg, counter);
         if budget + msg_tokens > target_tokens {
@@ -409,6 +419,7 @@ pub fn compact_with_counter(
 
     let mut budget = system_tokens
         + pinned_tokens
+        + volatile_tokens_with_counter(&micro_compacted, counter)
         + counter.count_text("[Earlier conversation history was truncated to fit context window]")
         + 4;
 
@@ -435,6 +446,7 @@ pub fn compact_with_counter(
     }
     result.messages.extend(pinned);
     result.messages.extend(kept);
+    result.volatile = conversation.volatile.clone();
     result
 }
 
@@ -442,16 +454,19 @@ fn normalize_compacted_conversation(mut conversation: Conversation) -> Conversat
     if conversation.messages.len() <= 1 {
         return conversation;
     }
+    let volatile = conversation.volatile.clone();
     let system = conversation.messages.remove(0);
     normalize_tool_boundaries(&mut conversation.messages);
     let mut result = Conversation::new();
     result.messages.push(system);
     result.messages.extend(conversation.messages);
+    result.volatile = volatile;
     result
 }
 
 fn micro_compact_stale_tool_outputs(conversation: &Conversation) -> Conversation {
     let mut result = Conversation::new();
+    result.volatile = conversation.volatile.clone();
     let last_user_index = conversation
         .messages
         .iter()
@@ -580,6 +595,17 @@ mod tests {
         conv.add_user("hello world".to_string());
 
         assert_eq!(conversation_tokens_with_counter(&conv, &FixedCounter), 10);
+    }
+
+    #[test]
+    fn conversation_tokens_include_volatile_overlay() {
+        let mut conv = Conversation::new();
+        conv.add_system("system".to_string());
+        conv.add_user("hello world".to_string());
+        conv.replace_plan_state("plan".to_string());
+        conv.replace_goal_state("goal".to_string());
+
+        assert_eq!(conversation_tokens_with_counter(&conv, &FixedCounter), 11);
     }
 
     #[test]
@@ -862,5 +888,156 @@ mod tests {
         assert!(!is_prompt_too_long_error(
             "Response blocked by content filter"
         ));
+    }
+
+    /// The system prompt is the token-0 prefix that anchors the entire DeepSeek
+    /// prefix cache. Local truncation compaction must keep it byte-identical and
+    /// in position 0, otherwise every subsequent turn misses the cache wholesale.
+    #[test]
+    fn compaction_preserves_system_prompt_as_byte_identical_token_zero_prefix() {
+        let system = "you are orca, a precise coding agent";
+        // FixedCounter scores every non-empty message as 5 tokens (content 1 + 4
+        // overhead). Four messages = 20 tokens; a 16-token budget forces the
+        // truncation rebuild path while keeping the system prompt + newest turn.
+        let config = ContextConfig {
+            max_tokens: 16,
+            compaction_threshold: 1.0,
+            reserved_for_response: 0,
+            auto_compact_token_limit: None,
+        };
+
+        let mut conv = Conversation::new();
+        conv.add_system(system.to_string());
+        conv.add_user("old ".repeat(40));
+        conv.add_assistant(Some("old answer ".repeat(40)), None, vec![]);
+        conv.add_user("newest request".to_string());
+
+        let compacted = compact_with_counter(&conv, &config, &FixedCounter);
+
+        match &compacted.messages[0] {
+            Message::System { content, pinned } => {
+                assert_eq!(content, system, "system prompt bytes must be unchanged");
+                assert!(!pinned);
+            }
+            other => panic!("expected system prompt at position 0, found {other:?}"),
+        }
+        // Truncation must have happened (proves we exercised the rebuild path).
+        assert!(compacted.messages.len() < conv.messages.len());
+    }
+
+    /// Remote-summary compaction must *insert a new summary message* right after
+    /// the system prompt rather than rewriting any retained message in place.
+    /// Retained recent messages must stay byte-identical so the cache survives
+    /// from the summary boundary onward.
+    #[test]
+    fn summary_is_inserted_after_system_without_rewriting_kept_messages() {
+        // partition_for_compaction is the pure splitting step used by the remote
+        // summary path; it must not mutate the messages it keeps.
+        //
+        // FixedCounter scores each message as 5 tokens (content 1 + overhead 4).
+        // The partition budget starts at system(5) + summary reserve(257) + 4 =
+        // 266, then keeps recent messages until the limit. A 272-token effective
+        // limit keeps exactly the newest message and collapses the two before it.
+        let config = ContextConfig {
+            max_tokens: 1000,
+            compaction_threshold: 1.0,
+            reserved_for_response: 0,
+            auto_compact_token_limit: Some(272),
+        };
+
+        let mut conv = Conversation::new();
+        conv.add_system("system prompt".to_string());
+        conv.add_user("oldest".to_string());
+        conv.add_assistant(Some("older".to_string()), None, vec![]);
+        conv.add_user("keep me verbatim".to_string());
+
+        let (system_msg, _pinned, collapsed, kept) =
+            partition_for_compaction(&conv, &config, &FixedCounter)
+                .expect("partition should split this conversation");
+
+        // System prompt is carried through untouched.
+        assert!(
+            matches!(&system_msg, Some(Message::System { content, .. }) if content == "system prompt")
+        );
+        // The most recent message is kept verbatim, not rewritten.
+        assert!(
+            matches!(kept.last(), Some(Message::User { content, .. }) if content == "keep me verbatim")
+        );
+        // Something was actually collapsed (so the summary path is meaningful).
+        assert!(!collapsed.is_empty());
+
+        // Now assemble the summarized conversation the way summarize_collapsed_messages
+        // does, and confirm the layout: system, then a NEW summary system message,
+        // then the kept tail unchanged.
+        let mut result = Conversation::new();
+        result.messages.push(system_msg.unwrap());
+        result
+            .messages
+            .push(Message::system("[Summary of earlier conversation]\nX".to_string()));
+        result.messages.extend(kept);
+
+        assert!(
+            matches!(&result.messages[0], Message::System { content, .. } if content == "system prompt")
+        );
+        assert!(
+            matches!(&result.messages[1], Message::System { content, .. } if content.starts_with("[Summary of earlier conversation]"))
+        );
+        assert!(
+            matches!(result.messages.last(), Some(Message::User { content, .. }) if content == "keep me verbatim")
+        );
+    }
+
+    #[test]
+    fn compaction_inherits_volatile_state() {
+        let config = ContextConfig {
+            max_tokens: 16,
+            compaction_threshold: 1.0,
+            reserved_for_response: 0,
+            auto_compact_token_limit: None,
+        };
+
+        let mut conv = Conversation::new();
+        conv.add_system("sys".to_string());
+        conv.add_user("old ".repeat(40));
+        conv.add_assistant(Some("old answer ".repeat(40)), None, vec![]);
+        conv.add_user("newest".to_string());
+        conv.replace_plan_state("active plan".to_string());
+        conv.replace_goal_state("active goal".to_string());
+
+        let compacted = compact_with_counter(&conv, &config, &FixedCounter);
+
+        assert!(compacted.messages.len() < conv.messages.len());
+        assert_eq!(compacted.volatile.plan.as_deref(), Some("active plan"));
+        assert!(compacted.volatile.goal.as_ref().unwrap().contains("active goal"));
+    }
+
+    #[test]
+    fn micro_compaction_preserves_volatile_state_when_no_truncation_needed() {
+        let config = ContextConfig {
+            max_tokens: 1_000,
+            compaction_threshold: 1.0,
+            reserved_for_response: 0,
+            auto_compact_token_limit: Some(1_000),
+        };
+
+        let mut conv = Conversation::new();
+        conv.add_system("sys".to_string());
+        conv.add_user("inspect".to_string());
+        conv.add_assistant(
+            Some("calling read_file".to_string()),
+            None,
+            vec![RawToolCall {
+                id: "tc1".to_string(),
+                function_name: "read_file".to_string(),
+                arguments: r#"{"path":"large.log"}"#.to_string(),
+            }],
+        );
+        conv.add_tool_result("tc1".to_string(), "x".repeat(STALE_TOOL_OUTPUT_BYTES + 10));
+        conv.add_user("newest".to_string());
+        conv.replace_plan_state("active plan".to_string());
+
+        let compacted = compact_with_counter(&conv, &config, &FixedCounter);
+
+        assert_eq!(compacted.volatile.plan.as_deref(), Some("active plan"));
     }
 }

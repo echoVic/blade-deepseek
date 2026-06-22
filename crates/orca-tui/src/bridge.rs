@@ -104,7 +104,8 @@ impl TuiConversationSession {
                     Some(t) => t,
                     None => history::load_session(selector)?,
                 };
-                let conv = history::resume_conversation(&transcript, system_prompt);
+                let mut conv = history::resume_conversation(&transcript, system_prompt);
+                conv.strip_legacy_pinned_volatile();
                 (conv, Some(transcript))
             }
             orca_core::config::HistoryMode::Record | orca_core::config::HistoryMode::Disabled => {
@@ -730,9 +731,6 @@ pub fn run_agent_for_tui(
                     session.conversation.replace_plan_state(
                         orca_tools::update_plan::format_context_message(&update),
                     );
-                    if let Some(message) = session.conversation.messages.last().cloned() {
-                        session.append_message(&message);
-                    }
                     if let Some(writer) = &mut session.writer {
                         let _ = writer.append_plan_state(update.explanation, update.plan);
                     }

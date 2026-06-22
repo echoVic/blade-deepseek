@@ -78,15 +78,44 @@ impl Message {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct VolatileContext {
+    pub plan: Option<String>,
+    pub goal: Option<String>,
+    pub skill: Option<String>,
+}
+
+impl VolatileContext {
+    pub fn is_empty(&self) -> bool {
+        self.plan.is_none() && self.goal.is_none() && self.skill.is_none()
+    }
+
+    pub fn render(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(goal) = &self.goal {
+            parts.push(goal.as_str());
+        }
+        if let Some(plan) = &self.plan {
+            parts.push(plan.as_str());
+        }
+        if let Some(skill) = &self.skill {
+            parts.push(skill.as_str());
+        }
+        parts.join("\n\n")
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Conversation {
     pub messages: Vec<Message>,
+    pub volatile: VolatileContext,
 }
 
 impl Conversation {
     pub fn new() -> Self {
         Self {
             messages: Vec::new(),
+            volatile: VolatileContext::default(),
         }
     }
 
@@ -99,32 +128,33 @@ impl Conversation {
     }
 
     pub fn replace_plan_state(&mut self, content: String) {
-        self.messages.retain(|msg| {
-            !matches!(msg, Message::System { content: c, pinned: true, .. } if c.starts_with("[Pinned plan state]"))
-        });
-        self.messages.push(Message::pinned_system(content));
+        self.volatile.plan = Some(content);
     }
 
     pub fn replace_goal_state(&mut self, content: String) {
-        self.messages.retain(|msg| {
-            !matches!(msg, Message::System { content: c, pinned: true, .. } if c.starts_with("[Pinned goal state]"))
-        });
-        self.messages.push(Message::pinned_system(format!(
-            "[Pinned goal state]\n{content}"
-        )));
+        self.volatile.goal = Some(format!("[Goal state]\n{content}"));
     }
 
-    pub fn replace_skill_context(&mut self, content: Option<String>) -> Option<&Message> {
+    pub fn replace_skill_context(&mut self, content: Option<String>) {
+        self.volatile.skill = content
+            .filter(|text| !text.trim().is_empty())
+            .map(|text| format!("[Skill context]\n{text}"));
+    }
+
+    pub fn strip_legacy_pinned_volatile(&mut self) {
         self.messages.retain(|msg| {
-            !matches!(msg, Message::System { content: c, pinned: true, .. } if c.starts_with("[Pinned skill context]"))
+            if let Message::System {
+                content,
+                pinned: true,
+            } = msg
+            {
+                !content.starts_with("[Pinned plan state]")
+                    && !content.starts_with("[Pinned goal state]")
+                    && !content.starts_with("[Pinned skill context]")
+            } else {
+                true
+            }
         });
-        if let Some(content) = content.filter(|text| !text.trim().is_empty()) {
-            self.messages.push(Message::pinned_system(format!(
-                "[Pinned skill context]\n{content}"
-            )));
-            return self.messages.last();
-        }
-        None
     }
 
     pub fn add_user(&mut self, content: String) {
@@ -213,30 +243,27 @@ mod tests {
     }
 
     #[test]
-    fn replace_goal_state_keeps_single_pinned_goal() {
+    fn replace_goal_state_keeps_single_volatile_goal() {
         let mut conv = Conversation::new();
         conv.replace_goal_state("first".to_string());
         conv.replace_goal_state("second".to_string());
 
-        assert_eq!(conv.messages.len(), 1);
-        assert!(
-            matches!(&conv.messages[0], Message::System { content, pinned: true } if content.contains("second"))
-        );
+        assert!(conv.messages.is_empty());
+        assert!(conv.volatile.goal.as_ref().unwrap().contains("second"));
+        assert!(!conv.volatile.goal.as_ref().unwrap().contains("first"));
     }
 
     #[test]
-    fn replace_skill_context_removes_previous_skill_context() {
+    fn replace_skill_context_updates_volatile_skill() {
         let mut conv = Conversation::new();
         conv.replace_skill_context(Some("first".to_string()));
         conv.replace_skill_context(Some("second".to_string()));
 
-        assert_eq!(conv.messages.len(), 1);
-        assert!(
-            matches!(&conv.messages[0], Message::System { content, pinned: true } if content.contains("second"))
-        );
+        assert!(conv.messages.is_empty());
+        assert!(conv.volatile.skill.as_ref().unwrap().contains("second"));
 
         conv.replace_skill_context(None);
-        assert!(conv.messages.is_empty());
+        assert!(conv.volatile.skill.is_none());
     }
 
     #[test]
@@ -332,5 +359,141 @@ mod tests {
         assert_eq!(conv.backtrack_last_user(), Some("second".to_string()));
         assert_eq!(conv.messages.len(), 3);
         assert_eq!(conv.last_user_message(), Some("first"));
+    }
+
+    /// DeepSeek prefix cache requires that a normal turn only *appends* to the
+    /// conversation: the existing prefix (every earlier message) must stay
+    /// byte-identical so the server-side cache keeps hitting. This locks that
+    /// `add_*` never rewrites or reorders prior messages.
+    #[test]
+    fn turn_appends_never_mutate_the_existing_prefix() {
+        let mut conv = Conversation::new();
+        conv.add_system("system prompt".to_string());
+        conv.add_user("first request".to_string());
+        conv.add_assistant(
+            Some("calling a tool".to_string()),
+            None,
+            vec![RawToolCall {
+                id: "tc1".to_string(),
+                function_name: "read_file".to_string(),
+                arguments: r#"{"path":"x.rs"}"#.to_string(),
+            }],
+        );
+        conv.add_tool_result("tc1".to_string(), "file contents".to_string());
+
+        let prefix_snapshot = render_prefix(&conv);
+
+        // A second turn: append a new user message, assistant reply, and tool result.
+        conv.add_user("second request".to_string());
+        conv.add_assistant(Some("answer".to_string()), None, vec![]);
+
+        // The first four messages must be byte-identical to the snapshot.
+        let prefix_after = render_prefix(&conv);
+        assert_eq!(&prefix_after[..prefix_snapshot.len()], &prefix_snapshot[..]);
+        assert_eq!(prefix_snapshot.len(), 4);
+        assert_eq!(prefix_after.len(), 6);
+    }
+
+    /// Renders each message into a stable string so prefix equality can be
+    /// asserted across mutations.
+    fn render_prefix(conv: &Conversation) -> Vec<String> {
+        conv.messages
+            .iter()
+            .map(|message| match message {
+                Message::System { content, pinned } => format!("sys|{pinned}|{content}"),
+                Message::User { content, pinned } => format!("usr|{pinned}|{content}"),
+                Message::Assistant {
+                    content,
+                    reasoning_content,
+                    tool_calls,
+                    pinned,
+                } => format!(
+                    "ast|{pinned}|{content:?}|{reasoning_content:?}|{}",
+                    tool_calls
+                        .iter()
+                        .map(|tc| format!("{}:{}:{}", tc.id, tc.function_name, tc.arguments))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ),
+                Message::Tool {
+                    tool_call_id,
+                    content,
+                    pinned,
+                } => format!("tool|{pinned}|{tool_call_id}|{content}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn volatile_updates_never_touch_messages() {
+        let mut conv = Conversation::new();
+        conv.add_system("system".to_string());
+        conv.add_user("hello".to_string());
+        conv.add_assistant(Some("reply".to_string()), None, vec![]);
+
+        let snapshot = render_prefix(&conv);
+
+        conv.replace_plan_state("step 1: do X".to_string());
+        conv.replace_goal_state("build a widget".to_string());
+        conv.replace_skill_context(Some("rust expertise".to_string()));
+
+        assert_eq!(render_prefix(&conv), snapshot);
+        assert_eq!(conv.messages.len(), 3);
+        assert!(conv.volatile.plan.is_some());
+        assert!(conv.volatile.goal.is_some());
+        assert!(conv.volatile.skill.is_some());
+    }
+
+    #[test]
+    fn multiple_plan_updates_only_change_volatile_not_messages() {
+        let mut conv = Conversation::new();
+        conv.add_system("sys".to_string());
+        conv.add_user("do work".to_string());
+
+        let snapshot = render_prefix(&conv);
+
+        conv.replace_plan_state("plan v1".to_string());
+        conv.replace_plan_state("plan v2".to_string());
+        conv.replace_plan_state("plan v3".to_string());
+
+        assert_eq!(render_prefix(&conv), snapshot);
+        assert_eq!(conv.volatile.plan.as_deref(), Some("plan v3"));
+    }
+
+    #[test]
+    fn strip_legacy_pinned_volatile_removes_old_format_messages() {
+        let mut conv = Conversation::new();
+        conv.add_system("sys".to_string());
+        conv.add_user("hello".to_string());
+        conv.messages
+            .push(Message::pinned_system("[Pinned plan state]\nold plan".to_string()));
+        conv.messages
+            .push(Message::pinned_system("[Pinned goal state]\nold goal".to_string()));
+        conv.messages
+            .push(Message::pinned_system("[Pinned skill context]\nold skill".to_string()));
+        conv.add_assistant(Some("reply".to_string()), None, vec![]);
+
+        assert_eq!(conv.messages.len(), 6);
+        conv.strip_legacy_pinned_volatile();
+        assert_eq!(conv.messages.len(), 3);
+        assert!(matches!(&conv.messages[0], Message::System { content, pinned: false } if content == "sys"));
+        assert!(matches!(&conv.messages[1], Message::User { content, .. } if content == "hello"));
+        assert!(matches!(&conv.messages[2], Message::Assistant { .. }));
+    }
+
+    #[test]
+    fn strip_legacy_preserves_non_volatile_pinned() {
+        let mut conv = Conversation::new();
+        conv.add_system("sys".to_string());
+        conv.add_user_pinned("important constraint".to_string());
+        conv.messages
+            .push(Message::pinned_system("[Pinned plan state]\nold".to_string()));
+        conv.messages
+            .push(Message::pinned_system("[Hook context]\nkeep this".to_string()));
+
+        conv.strip_legacy_pinned_volatile();
+        assert_eq!(conv.messages.len(), 3);
+        assert!(conv.messages[1].is_pinned());
+        assert!(matches!(&conv.messages[2], Message::System { content, pinned: true } if content.contains("Hook context")));
     }
 }

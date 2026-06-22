@@ -464,7 +464,7 @@ fn parse_tool_call(
 }
 
 fn conversation_to_api_messages(conversation: &Conversation) -> Vec<ApiMessage> {
-    conversation
+    let mut messages: Vec<ApiMessage> = conversation
         .messages
         .iter()
         .map(|msg| match msg {
@@ -525,7 +525,21 @@ fn conversation_to_api_messages(conversation: &Conversation) -> Vec<ApiMessage> 
                 tool_call_id: Some(tool_call_id.clone()),
             },
         })
-        .collect()
+        .collect();
+
+    if !conversation.volatile.is_empty() {
+        let overlay = conversation.volatile.render();
+        if let Some(last) = messages.last_mut() {
+            let existing = last.content.take().unwrap_or_default();
+            last.content = Some(if existing.is_empty() {
+                overlay
+            } else {
+                format!("{existing}\n\n{overlay}")
+            });
+        }
+    }
+
+    messages
 }
 
 #[cfg(test)]
@@ -692,5 +706,70 @@ mod tests {
         let tc = make_tc("read_file", "not json");
         let err = parse_tool_call(&tc, &[]).unwrap_err();
         assert!(err.contains("invalid arguments JSON"));
+    }
+
+    #[test]
+    fn volatile_overlay_appended_to_last_message() {
+        let mut conv = Conversation::new();
+        conv.add_system("system prompt".to_string());
+        conv.add_user("do something".to_string());
+        conv.replace_plan_state("[Plan]\n1. step one".to_string());
+        conv.replace_goal_state("build a widget".to_string());
+
+        let messages = conversation_to_api_messages(&conv);
+        assert_eq!(messages.len(), 2);
+        let last_content = messages.last().unwrap().content.as_deref().unwrap();
+        assert!(last_content.starts_with("do something"));
+        assert!(last_content.contains("[Goal state]"));
+        assert!(last_content.contains("[Plan]"));
+    }
+
+    #[test]
+    fn volatile_overlay_on_tool_result() {
+        let mut conv = Conversation::new();
+        conv.add_system("sys".to_string());
+        conv.add_user("read a file".to_string());
+        conv.add_assistant(
+            None,
+            None,
+            vec![RawToolCall {
+                id: "tc1".to_string(),
+                function_name: "read_file".to_string(),
+                arguments: r#"{"path":"x"}"#.to_string(),
+            }],
+        );
+        conv.add_tool_result("tc1".to_string(), "file contents".to_string());
+        conv.replace_plan_state("updated plan".to_string());
+
+        let messages = conversation_to_api_messages(&conv);
+        assert_eq!(messages.len(), 4);
+        let last = messages.last().unwrap();
+        assert_eq!(last.role, "tool");
+        assert!(last.content.as_deref().unwrap().contains("updated plan"));
+        assert!(last.content.as_deref().unwrap().starts_with("file contents"));
+    }
+
+    #[test]
+    fn no_volatile_means_no_overlay() {
+        let mut conv = Conversation::new();
+        conv.add_system("sys".to_string());
+        conv.add_user("hello".to_string());
+
+        let messages = conversation_to_api_messages(&conv);
+        assert_eq!(messages[1].content.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn volatile_overlay_does_not_mutate_source_messages() {
+        let mut conv = Conversation::new();
+        conv.add_system("sys".to_string());
+        conv.add_user("original text".to_string());
+        conv.replace_plan_state("plan data".to_string());
+
+        let _ = conversation_to_api_messages(&conv);
+        assert_eq!(conv.messages.len(), 2);
+        assert!(
+            matches!(&conv.messages[1], Message::User { content, .. } if content == "original text")
+        );
     }
 }

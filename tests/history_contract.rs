@@ -178,7 +178,7 @@ fn exec_injects_project_instructions_into_system_prompt() {
 }
 
 #[test]
-fn exec_injects_explicitly_mentioned_skill_into_system_prompt() {
+fn exec_does_not_persist_explicitly_mentioned_skill_in_system_prompt() {
     let home = TempDir::new().expect("temp home");
     let project = TempDir::new().expect("temp project");
     std::fs::write(
@@ -211,9 +211,18 @@ fn exec_injects_explicitly_mentioned_skill_into_system_prompt() {
 
     assert_eq!(show.status.code(), Some(0));
     let show_stdout = String::from_utf8_lossy(&show.stdout);
-    assert!(show_stdout.contains("<skills>"));
-    assert!(show_stdout.contains(r#"<skill id="debugging""#));
-    assert!(show_stdout.contains("Use logs first."));
+    assert!(
+        !show_stdout.contains("<skills>"),
+        "explicit skills should ride the model-only volatile overlay, not the persisted system prompt"
+    );
+    assert!(
+        !show_stdout.contains(r#"<skill id="debugging""#),
+        "explicit skill metadata should not be persisted into history"
+    );
+    assert!(
+        !show_stdout.contains("Use logs first."),
+        "explicit skill body should not be persisted into history"
+    );
 }
 
 #[test]

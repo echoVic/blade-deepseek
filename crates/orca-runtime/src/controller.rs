@@ -318,7 +318,7 @@ fn run_agent_loop(
         external_tools: config.external_tools.clone(),
     };
 
-    let mut system_prompt = agent_common::build_agent_system_prompt(
+    let system_prompt = agent_common::build_agent_system_prompt(
         cwd,
         subagent_depth,
         subagent_type,
@@ -326,14 +326,16 @@ fn run_agent_loop(
         config.approval_mode,
         Some(memory),
     );
-    agent_common::append_explicit_skill_context(&mut system_prompt, cwd, prompt);
     let mut conversation = if let Some(resumed) = resumed {
-        history::resume_conversation(resumed, system_prompt)
+        let mut conv = history::resume_conversation(resumed, system_prompt);
+        conv.strip_legacy_pinned_volatile();
+        conv
     } else {
         let mut conversation = Conversation::new();
         conversation.add_system(system_prompt);
         conversation
     };
+    conversation.replace_skill_context(agent_common::explicit_skill_context(cwd, prompt));
     conversation.add_user(prompt.to_string());
 
     let mut history_writer = history_writer;
@@ -740,12 +742,6 @@ fn run_agent_loop(
                     conversation.replace_plan_state(
                         orca_tools::update_plan::format_context_message(&update),
                     );
-                    if emit_deltas
-                        && let Some(writer) = history_writer.as_deref_mut()
-                        && let Some(message) = conversation.messages.last()
-                    {
-                        writer.append_message(message)?;
-                    }
                     if let Some(writer) = history_writer.as_deref_mut() {
                         let _ = writer.append_plan_state(update.explanation, update.plan);
                     }
