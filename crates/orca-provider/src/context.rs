@@ -9,7 +9,6 @@ const DEFAULT_MAX_TOKENS: usize = 1_000_000;
 const COMPACTION_THRESHOLD: f64 = 0.80;
 const RESERVED_FOR_RESPONSE: usize = 4096;
 const STALE_TOOL_OUTPUT_BYTES: usize = 2048;
-const BUDGET_HINT_PREFIX: &str = "[context: ~";
 
 pub trait TokenCounter {
     fn count_text(&self, text: &str) -> usize;
@@ -53,7 +52,7 @@ impl ContextConfig {
         config
     }
 
-    fn effective_limit(&self) -> usize {
+    pub fn effective_limit(&self) -> usize {
         if let Some(limit) = self.auto_compact_token_limit {
             return limit.min(self.max_tokens).max(1);
         }
@@ -123,61 +122,6 @@ fn conversation_tokens_with_counter(
 pub fn needs_compaction(conversation: &Conversation, config: &ContextConfig) -> bool {
     let total = conversation_tokens(conversation);
     total > config.effective_limit()
-}
-
-pub fn apply_context_budget_hint(conversation: &mut Conversation, model: Option<&str>) {
-    apply_context_budget_hint_with_counter(conversation, model, &DefaultTokenCounter);
-}
-
-pub fn apply_context_budget_hint_with_config(
-    conversation: &mut Conversation,
-    config: &ContextConfig,
-) {
-    apply_context_budget_hint_with_config_and_counter(conversation, config, &DefaultTokenCounter);
-}
-
-pub fn apply_context_budget_hint_with_counter(
-    conversation: &mut Conversation,
-    model: Option<&str>,
-    counter: &impl TokenCounter,
-) {
-    let config = ContextConfig::for_model(model);
-    apply_context_budget_hint_with_config_and_counter(conversation, &config, counter);
-}
-
-fn apply_context_budget_hint_with_config_and_counter(
-    conversation: &mut Conversation,
-    config: &ContextConfig,
-    counter: &impl TokenCounter,
-) {
-    let used = conversation_tokens_with_counter(conversation, counter);
-    let remaining = config.effective_limit().saturating_sub(used);
-    let hint = format!("[context: ~{}K tokens remaining]", (remaining + 999) / 1000);
-
-    if let Some(Message::System { content, .. }) = conversation.messages.first_mut() {
-        let stripped = strip_budget_hint(content);
-        *content = if stripped.is_empty() {
-            hint
-        } else {
-            format!("{stripped}\n\n{hint}")
-        };
-    }
-}
-
-fn strip_budget_hint(content: &str) -> String {
-    let trimmed = content.trim_end();
-    let Some(line_start) = trimmed.rfind(BUDGET_HINT_PREFIX) else {
-        return trimmed.to_string();
-    };
-    if line_start > 0 && trimmed.as_bytes()[line_start - 1] != b'\n' {
-        return trimmed.to_string();
-    }
-    let candidate = &trimmed[line_start..];
-    if candidate.ends_with(" tokens remaining]") {
-        trimmed[..line_start].trim_end().to_string()
-    } else {
-        trimmed.to_string()
-    }
 }
 
 pub fn is_prompt_too_long_error(message: &str) -> bool {
@@ -630,44 +574,48 @@ mod tests {
     }
 
     #[test]
-    fn budget_hint_uses_runtime_auto_compact_limit() {
-        let runtime = ModelRuntimeConfig {
-            context_window: Some(1_000),
-            auto_compact_token_limit: Some(42),
-        };
-        let config = ContextConfig::for_model_with_runtime(Some("deepseek-v4-pro"), &runtime);
-        let mut conv = Conversation::new();
-        conv.add_system("system prompt".to_string());
-
-        apply_context_budget_hint_with_config(&mut conv, &config);
-
-        let Message::System { content, .. } = &conv.messages[0] else {
-            panic!("expected system message");
-        };
-        assert!(content.ends_with("[context: ~1K tokens remaining]"));
-    }
-
-    #[test]
-    fn system_prompt_budget_hint_uses_remaining_model_budget() {
-        let mut conv = Conversation::new();
-        conv.add_system("system prompt".to_string());
-        conv.add_user("active request".to_string());
-
-        apply_context_budget_hint_with_counter(&mut conv, Some("deepseek-chat"), &FixedCounter);
-
-        assert!(matches!(
-            &conv.messages[0],
-            Message::System { content, .. } if content.ends_with("[context: ~796K tokens remaining]")
-        ));
-    }
-
-    #[test]
     fn conversation_tokens_can_use_custom_counter() {
         let mut conv = Conversation::new();
         conv.add_system("system".to_string());
         conv.add_user("hello world".to_string());
 
         assert_eq!(conversation_tokens_with_counter(&conv, &FixedCounter), 10);
+    }
+
+    #[test]
+    fn no_message_is_annotated_with_a_context_budget_hint() {
+        // Budget/remaining context is local observability only; it must never be
+        // injected into upstream messages, which would break DeepSeek prefix cache.
+        let config = ContextConfig {
+            max_tokens: 1_000,
+            compaction_threshold: 1.0,
+            reserved_for_response: 0,
+            auto_compact_token_limit: Some(42),
+        };
+
+        let mut conv = Conversation::new();
+        conv.add_system("system prompt".to_string());
+        conv.add_user("active request".to_string());
+        conv.add_assistant(Some("answer".to_string()), None, vec![]);
+        conv.add_tool_result("tc1".to_string(), "tool output".to_string());
+
+        // Exercise compaction paths that rebuild the conversation; none should add a hint.
+        let compacted = compact(&conv, &config);
+
+        for conversation in [&conv, &compacted] {
+            for message in &conversation.messages {
+                if let Some(text) = message.content_str() {
+                    assert!(
+                        !text.contains("[context: ~"),
+                        "no message may carry a context budget hint, found: {text:?}"
+                    );
+                    assert!(
+                        !text.contains("tokens remaining"),
+                        "no message may carry a context budget hint, found: {text:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

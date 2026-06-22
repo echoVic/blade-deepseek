@@ -441,6 +441,11 @@ pub fn run_agent_for_tui(
             }
         }
 
+        let _ = event_tx.send(TuiEvent::ContextUpdated {
+            used_tokens: orca_provider::context::conversation_tokens(&session.conversation),
+            limit_tokens: ctx_config.effective_limit(),
+        });
+
         let _ = event_tx.send(TuiEvent::TurnStarted { turn });
 
         let route_decision = config.model.route(ModelRouteContext {
@@ -452,14 +457,6 @@ pub fn run_agent_for_tui(
             .set_model(Some(&route_decision.actual_model));
         let mut turn_provider_config = provider_config.clone();
         turn_provider_config.model = Some(route_decision.actual_model.clone());
-        let turn_ctx_config = orca_provider::context::ContextConfig::for_model_with_runtime(
-            Some(&route_decision.actual_model),
-            &config.model_runtime,
-        );
-        orca_provider::context::apply_context_budget_hint_with_config(
-            &mut session.conversation,
-            &turn_ctx_config,
-        );
 
         let pre_model_outcome = match session.hooks.run(
             HookEvent::PreModelCall,
@@ -1610,14 +1607,6 @@ fn run_child_agent_for_tui(
         child_cost_tracker.set_model(Some(&route_decision.actual_model));
         let mut turn_provider_config = provider_config.clone();
         turn_provider_config.model = Some(route_decision.actual_model.clone());
-        let turn_ctx_config = orca_provider::context::ContextConfig::for_model_with_runtime(
-            Some(&route_decision.actual_model),
-            &config.model_runtime,
-        );
-        orca_provider::context::apply_context_budget_hint_with_config(
-            &mut conversation,
-            &turn_ctx_config,
-        );
 
         let pre_model_outcome = match hooks.run(
             HookEvent::PreModelCall,

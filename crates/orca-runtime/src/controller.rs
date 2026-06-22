@@ -451,11 +451,6 @@ fn run_agent_loop(
         }
         let mut turn_provider_config = provider_config.clone();
         turn_provider_config.model = Some(route_decision.actual_model.clone());
-        let turn_ctx_config = context::ContextConfig::for_model_with_runtime(
-            Some(&route_decision.actual_model),
-            &config.model_runtime,
-        );
-        context::apply_context_budget_hint_with_config(&mut conversation, &turn_ctx_config);
 
         let pre_model_outcome = match hooks.run(
             HookEvent::PreModelCall,
