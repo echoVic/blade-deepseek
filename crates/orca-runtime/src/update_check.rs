@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 const RELEASES_URL: &str = "https://api.github.com/repos/echoVic/blade-deepseek/releases/latest";
+const NPM_REGISTRY_URL: &str = "https://registry.npmjs.org/@blade-ai/orca/latest";
 const ORCA_HOME_ENV: &str = "ORCA_HOME";
 const UPDATE_CACHE_FILE: &str = "update-cache.json";
 
@@ -20,10 +21,50 @@ struct GitHubRelease {
     html_url: String,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+struct NpmPackage {
+    version: String,
+}
+
 pub fn check_latest(current_version: &str) -> Result<Option<UpdateInfo>, String> {
+    match check_latest_npm(current_version) {
+        Ok(result) => Ok(result),
+        Err(_) => check_latest_github(current_version),
+    }
+}
+
+fn check_latest_npm(current_version: &str) -> Result<Option<UpdateInfo>, String> {
+    let response = reqwest::blocking::Client::new()
+        .get(NPM_REGISTRY_URL)
+        .header("User-Agent", "orca-update-check")
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .map_err(|error| format!("npm registry check failed: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!("npm registry returned HTTP {}", response.status()));
+    }
+    let pkg: NpmPackage = response
+        .json()
+        .map_err(|error| format!("invalid npm registry response: {error}"))?;
+    let latest = normalize_version(&pkg.version);
+    let current = normalize_version(current_version);
+    if !is_newer_version(&latest, &current) {
+        return Ok(None);
+    }
+    Ok(Some(UpdateInfo {
+        current,
+        url: format!(
+            "https://github.com/echoVic/blade-deepseek/releases/tag/v{latest}"
+        ),
+        latest,
+    }))
+}
+
+fn check_latest_github(current_version: &str) -> Result<Option<UpdateInfo>, String> {
     let response = reqwest::blocking::Client::new()
         .get(RELEASES_URL)
         .header("User-Agent", "orca-update-check")
+        .timeout(std::time::Duration::from_secs(5))
         .send()
         .map_err(|error| format!("failed to check latest release: {error}"))?;
     if !response.status().is_success() {
