@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use chrono::Local;
 use orca_tools::registry;
 
 use crate::tool_schema::{ToolSchemaMode, tool_visible_in_schema_mode};
@@ -12,6 +13,7 @@ pub fn build_system_prompt(cwd: &Path) -> String {
 ## Environment
 - Working directory: {cwd}
 - Operating system: {os}
+- Today's date: {today}
 
 # How you work
 
@@ -100,6 +102,7 @@ When done, respond concisely — like a teammate summarizing a PR. Structure you
 If there's a logical next step you can help with, suggest it briefly."#,
         cwd = cwd.display(),
         os = std::env::consts::OS,
+        today = Local::now().format("%Y-%m-%d"),
         tools = tools,
     )
 }

@@ -7,6 +7,7 @@ edition = "2024"
 orca-core = { path = "../orca-core" }
 orca-mcp = { path = "../orca-mcp" }
 orca-tools = { path = "../orca-tools" }
+chrono = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 reqwest = { workspace = true }
