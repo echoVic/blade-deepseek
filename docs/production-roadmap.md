@@ -4,7 +4,7 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-06-22
-Current baseline: v0.1.22 release verification and goal runtime hardening
+Current baseline: v0.1.23 release verification retry hardening and goal runtime hardening
 
 ---
 
@@ -30,7 +30,7 @@ working baseline used to prioritize the next patch releases.
 | Workflows | JavaScript workflow runner with task state | Codex automations/tasks concepts | Implemented; packaging/docs can improve |
 | TUI | Markdown-ish rendering, themes, Vim mode, diff preview, slash commands | Codex/Claude richer terminal UX | Partial |
 | History | JSONL transcripts, resume/fork/search/archive/compress | Codex thread store with queryable metadata | Partial |
-| Release | GitHub release + npm alias distribution scripts plus post-publish GitHub/npm/npm-exec verification | Codex npm/native release model | Implemented |
+| Release | GitHub release + npm alias distribution scripts plus retrying post-publish GitHub/npm/npm-exec verification | Codex npm/native release model | Implemented |
 | Skills | Markdown skill discovery, `list_skills`/`read_skill`, and explicit `$skill` prompt injection | Codex skills and plugin-provided skill bundles | Partial |
 
 ---

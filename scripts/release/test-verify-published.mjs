@@ -18,6 +18,7 @@ try {
   const binDir = path.join(tempDir, "bin");
   mkdirSync(binDir, { recursive: true });
   const logPath = path.join(tempDir, "calls.log");
+  const execAttemptsPath = path.join(tempDir, "npm-exec-attempts");
 
   writeExecutable(
     path.join(binDir, "gh"),
@@ -36,7 +37,20 @@ esac
 printf 'npm %s\\n' "$*" >> "${logPath}"
 case "$1 $2" in
   "view @blade-ai/orca@9.8.7") printf '"9.8.7"\\n' ;;
-  "exec --yes") printf 'orca 9.8.7\\n' ;;
+  "exec --yes")
+    attempts=0
+    if [ -f "${execAttemptsPath}" ]; then
+      attempts="$(cat "${execAttemptsPath}")"
+    fi
+    attempts=$((attempts + 1))
+    printf '%s' "$attempts" > "${execAttemptsPath}"
+    if [ "$attempts" -lt 3 ]; then
+      printf 'npm error code ETARGET\\n' >&2
+      printf 'npm error notarget No matching version found for @blade-ai/orca@9.8.7\\n' >&2
+      exit 1
+    fi
+    printf 'orca 9.8.7\\n'
+    ;;
   *) exit 43 ;;
 esac
 `,
@@ -54,6 +68,8 @@ esac
       "@blade-ai/orca",
       "--bin",
       "orca",
+      "--retry-delay-ms",
+      "1",
     ],
     {
       cwd: repoRoot,
@@ -85,6 +101,12 @@ esac
       throw new Error(`missing command ${expected} in log:\n${log}`);
     }
   }
+  const execAttempts = log
+    .split("\n")
+    .filter((line) => line === "npm exec --yes --package @blade-ai/orca@9.8.7 -- orca --version").length;
+  if (execAttempts !== 3) {
+    throw new Error(`expected 3 npm exec attempts, saw ${execAttempts}:\n${log}`);
+  }
 
   console.log("verify-published release checks ok");
 
@@ -101,6 +123,8 @@ esac
         "@blade-ai/orca",
         "--bin",
         "orca",
+        "--retry-delay-ms",
+        "1",
       ],
       {
         cwd: repoRoot,
