@@ -161,8 +161,12 @@ fn collect_skills(
     if !skills_dir.is_dir() {
         return Ok(());
     }
-    let entries = fs::read_dir(skills_dir)
-        .map_err(|error| format!("failed to read skills dir {}: {error}", skills_dir.display()))?;
+    let entries = fs::read_dir(skills_dir).map_err(|error| {
+        format!(
+            "failed to read skills dir {}: {error}",
+            skills_dir.display()
+        )
+    })?;
     for entry in entries.flatten() {
         let path = entry.path();
         if !path.is_dir() {
@@ -327,7 +331,11 @@ mod tests {
     fn discovers_user_and_project_skills_with_frontmatter() {
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
-        fs::write(project.path().join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        fs::write(
+            project.path().join("Cargo.toml"),
+            "[package]\nname = \"x\"\n",
+        )
+        .unwrap();
         write_skill(
             &home.path().join("skills/debugging"),
             "Debugging",
@@ -345,7 +353,11 @@ mod tests {
 
         assert!(skills.iter().any(|skill| skill.id == "debugging"));
         assert!(skills.iter().any(|skill| skill.id == "review"));
-        assert!(skills.iter().any(|skill| skill.description == "Review code safely"));
+        assert!(
+            skills
+                .iter()
+                .any(|skill| skill.description == "Review code safely")
+        );
     }
 
     #[test]
@@ -399,9 +411,7 @@ mod tests {
         fs::create_dir_all(dir).unwrap();
         fs::write(
             dir.join("SKILL.md"),
-            format!(
-                "---\nname: {name}\ndescription: {description}\n---\n\n{body}\n"
-            ),
+            format!("---\nname: {name}\ndescription: {description}\n---\n\n{body}\n"),
         )
         .unwrap();
     }

@@ -11,7 +11,7 @@ use orca_core::task_types::{TaskStatus, TaskType};
 
 use crate::shortcuts::{self, ShortcutScope};
 use crate::theme::Theme;
-use crate::types::{ApprovalOption, AppState, AppStatus, ChatMessage, PanelMode};
+use crate::types::{AppState, AppStatus, ApprovalOption, ChatMessage, PanelMode};
 
 pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, theme: &Theme) {
     if state.status == AppStatus::Setup {
@@ -108,7 +108,10 @@ fn render_goal_banner(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
     ];
     if goal.time_used_seconds > 0 {
         spans.push(Span::styled(
-            format!("  · {}", format_goal_elapsed_seconds(goal.time_used_seconds)),
+            format!(
+                "  · {}",
+                format_goal_elapsed_seconds(goal.time_used_seconds)
+            ),
             Style::default().fg(theme.muted),
         ));
     }
@@ -207,12 +210,7 @@ fn render_session_picker(frame: &mut Frame, state: &mut AppState, theme: &Theme)
 /// Split `text` into styled spans, highlighting the first case-insensitive
 /// occurrence of `needle` with the theme warning color. Empty needle returns
 /// the whole text in `base` style.
-fn highlight_match(
-    text: &str,
-    needle: &str,
-    base: Style,
-    theme: &Theme,
-) -> Vec<Span<'static>> {
+fn highlight_match(text: &str, needle: &str, base: Style, theme: &Theme) -> Vec<Span<'static>> {
     if needle.is_empty() {
         return vec![Span::styled(text.to_string(), base)];
     }
@@ -338,8 +336,8 @@ fn render_workflows_panel(frame: &mut Frame, area: Rect, state: &mut AppState, t
         };
 
         // Split the row into a label line and a gauge line.
-        let parts = Layout::vertical([Constraint::Length(1), Constraint::Length(1)])
-            .split(row_area);
+        let parts =
+            Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(row_area);
 
         let label = Paragraph::new(Line::from(vec![
             Span::styled(format!("{marker} {name}"), name_style),
@@ -363,9 +361,7 @@ fn render_workflows_panel(frame: &mut Frame, area: Rect, state: &mut AppState, t
             .ratio(ratio)
             .label(Span::styled(
                 workflow_gauge_label(task.status),
-                Style::default()
-                    .fg(theme.text)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
             ));
         frame.render_widget(gauge, parts[1]);
     }
@@ -385,7 +381,11 @@ fn workflow_gauge_ratio(status: TaskStatus, tick: u64) -> f64 {
             // Triangle wave in [0.15, 0.85] so the bar visibly breathes.
             let period = 20u64;
             let phase = (tick % period) as f64 / period as f64;
-            let tri = if phase < 0.5 { phase * 2.0 } else { 2.0 - phase * 2.0 };
+            let tri = if phase < 0.5 {
+                phase * 2.0
+            } else {
+                2.0 - phase * 2.0
+            };
             0.15 + tri * 0.7
         }
     }
@@ -1033,9 +1033,7 @@ fn render_approval_dialog(frame: &mut Frame, state: &AppState, theme: &Theme) {
             Span::styled(prefix, Style::default().fg(theme.border)),
             Span::styled(
                 format!("[{}] ", option.key()),
-                Style::default()
-                    .fg(key_color)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(key_color).add_modifier(Modifier::BOLD),
             ),
             Span::styled(option.label().to_string(), label_style),
         ]));

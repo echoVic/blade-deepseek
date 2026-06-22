@@ -291,8 +291,10 @@ fn run_agent_loop(
 ) -> io::Result<AgentLoopResult> {
     let max_turns = DEFAULT_MAX_TURNS;
     let budget_model = config.model.as_option();
-    let ctx_config =
-        context::ContextConfig::for_model_with_runtime(budget_model.as_deref(), &config.model_runtime);
+    let ctx_config = context::ContextConfig::for_model_with_runtime(
+        budget_model.as_deref(),
+        &config.model_runtime,
+    );
     let policy = ApprovalPolicy::new(config.approval_mode)
         .with_permission_rules(config.permission_rules.clone());
     let tools_override = if subagent_depth > 0 {

@@ -9,7 +9,7 @@ import {
 
 const npmCommand = "npm install -g @blade-ai/orca";
 const curlCommand = "curl -fsSL https://orcaagent.dev/install.sh | sh";
-const releaseVersion = "v0.1.21";
+const releaseVersion = "v0.1.22";
 
 const links = {
   github: "https://github.com/echoVic/blade-deepseek",
@@ -65,7 +65,7 @@ const copy = {
       github: "GitHub",
     },
     hero: {
-      pill: "v0.1.21 · Rust-native",
+      pill: "v0.1.22 · Rust-native",
       titlePrefix: "A",
       titleHighlight: "DeepSeek-native",
       titleSuffix: "coding agent, in your terminal.",
@@ -93,7 +93,7 @@ const copy = {
       },
       {
         title: "Persistent goal mode",
-        body: "Set a long-running objective with /goal; it auto-continues after each successful turn and survives process restarts.",
+        body: "Set a long-running objective with /goal; it auto-continues after each successful turn, survives restarts, and only lets the model complete or block after a goal audit.",
       },
       {
         title: "Approval modes",
@@ -213,7 +213,7 @@ const copy = {
       github: "GitHub",
     },
     hero: {
-      pill: "v0.1.21 · Rust 原生",
+      pill: "v0.1.22 · Rust 原生",
       titlePrefix: "面向终端的",
       titleHighlight: "DeepSeek 原生",
       titleSuffix: "代码智能体。",
@@ -241,7 +241,7 @@ const copy = {
       },
       {
         title: "持久化 goal 模式",
-        body: "用 /goal 设置长期目标；每轮成功后自动继续，并且能跨进程重启保留。",
+        body: "用 /goal 设置长期目标；每轮成功后自动继续，跨进程重启保留，并要求模型经过 goal 审计后才能完成或阻塞。",
       },
       {
         title: "审批模式",
@@ -374,6 +374,8 @@ const builtinTools = [
   "subagent",
   "Workflow",
   "update_plan",
+  "get_goal",
+  "create_goal",
   "update_goal",
   "MCP",
   "external",

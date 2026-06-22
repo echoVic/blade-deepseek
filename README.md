@@ -33,7 +33,7 @@ Set `INSTALL_DIR` to choose a destination and `ORCA_VERSION` to pin a version:
 
 ```bash
 curl -fsSL https://orcaagent.dev/install.sh | \
-  INSTALL_DIR=/usr/local/bin ORCA_VERSION=0.1.21 sh
+  INSTALL_DIR=/usr/local/bin ORCA_VERSION=0.1.22 sh
 ```
 
 ### GitHub Releases
@@ -189,7 +189,7 @@ TUI sessions support Codex-style persistent goals with `/goal`. A goal is stored
 /goal clear                   # delete the goal for this session
 ```
 
-While a goal is active, Orca automatically starts another turn after a successful turn and injects goal-mode instructions as pinned context. The loop stops when the goal is paused, cleared, blocked, completed, budget-limited, interrupted, or reaches the continuation cap. The model can stop the loop with the `update_goal` tool by setting status `complete` or `blocked`.
+While a goal is active, Orca automatically starts another turn after a successful turn and injects goal-mode instructions as pinned context. The loop stops when the goal is paused, cleared, blocked, completed, budget-limited, interrupted, or reaches the continuation cap. Goal turns expose `get_goal`, `create_goal`, and `update_goal`; the model can only use `update_goal` to mark the active goal `complete` or `blocked`, while `/goal` commands own pause, resume, edit, and clear.
 
 Persistent goals require recorded history. If history is disabled with `--no-history`, `/goal` reports an error instead of creating ephemeral goal state.
 
@@ -211,7 +211,9 @@ Built-in tools:
 | `subagent` | Run a synchronous child agent for a delegated task |
 | `Workflow` | Launch a background dynamic workflow |
 | `update_plan` | Update the visible task plan |
-| `update_goal` | Update active persistent goal status from goal mode |
+| `get_goal` | Read active persistent goal state during goal mode |
+| `create_goal` | Create a persistent goal during goal mode when no unfinished goal exists |
+| `update_goal` | Mark active persistent goal complete or blocked from goal mode |
 | `request_user_input` | Ask a structured clarification question; TUI answers continue the same turn |
 | `list_skills` | List Markdown skills from user and project skill directories |
 | `read_skill` | Read a skill's Markdown instructions by id |
@@ -226,13 +228,14 @@ MCP tools and custom external tools can be added at startup. External tools live
 
 - **Agent Loop**: prompt → model → tool_call → execute → feed result → next turn (up to 128 turns)
 - **Subagents**: Synchronous child agent loops share the parent workspace, provider/model config, and approval policy, then return a concise result to the parent
-- **Persistent Goal Mode**: TUI sessions can persist a long-running objective, auto-continue successful turns, and stop through `/goal` controls or the `update_goal` tool
+- **Persistent Goal Mode**: TUI sessions can persist a long-running objective, auto-continue successful turns, and stop through `/goal` controls or goal-mode tools
 - **SSE Streaming**: Real-time reasoning and content deltas via Server-Sent Events
 - **Context Window**: DeepSeek V4 1M-token context, 80% threshold compaction with response reserve (preserves system + recent messages)
 - **Conversation History**: Local JSONL transcripts support listing, inspection, resume/fork, full-text search, archive/delete/rename, and zstd compression
 - **HTTP Client**: Singleton with 30s connect / 120s request / 300s streaming timeouts, exponential backoff retry (3 attempts, handles 429/5xx)
 - **Approval Policy**: Tool capabilities drive approval; read operations are allowed, `suggest` asks for write/network/agent/shell, `auto-edit` allows writes but asks for network/agent/shell, and `full-auto` allows all
 - **Verification**: Optional post-completion verifier command with pass/fail status
+- **Release Gate**: `scripts/release/verify-published.mjs` checks the GitHub Release, npm registry, and `npm exec` smoke path after publishing
 
 ## Event Stream (JSONL)
 

@@ -30,7 +30,7 @@ use crate::shortcuts::{
 };
 use crate::theme::Theme;
 use crate::types::{
-    ApprovalOption, AppState, AppStatus, ChatMessage, PanelMode, SlashMenu, SlashMenuItem, SubMenu,
+    AppState, AppStatus, ApprovalOption, ChatMessage, PanelMode, SlashMenu, SlashMenuItem, SubMenu,
     TuiEvent, UserAction,
 };
 use crate::ui;
@@ -395,18 +395,10 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                             }
                         }
                         Some(ApprovalShortcut::Approve) => {
-                            resolve_approval_option(
-                                &mut state,
-                                &action_tx,
-                                ApprovalOption::Once,
-                            );
+                            resolve_approval_option(&mut state, &action_tx, ApprovalOption::Once);
                         }
                         Some(ApprovalShortcut::Deny) => {
-                            resolve_approval_option(
-                                &mut state,
-                                &action_tx,
-                                ApprovalOption::Deny,
-                            );
+                            resolve_approval_option(&mut state, &action_tx, ApprovalOption::Deny);
                         }
                         None => {}
                     }
@@ -1185,7 +1177,7 @@ const MAX_GOAL_CONTINUATIONS: usize = 64;
 
 fn goal_continuation_prompt(objective: &str, continuation: usize) -> String {
     format!(
-        "[Goal continuation #{continuation}]\nContinue working on this persistent goal:\n{objective}\n\nIf the goal is complete, call update_goal with status \"complete\". If it is genuinely blocked, call update_goal with status \"blocked\" and explain why."
+        "[Goal continuation #{continuation}]\nContinue working on this persistent goal:\n{objective}\n\nWork from current evidence. Preserve the full objective, verify every requirement before completion, and call update_goal only with status \"complete\" when the goal is actually finished or status \"blocked\" after the same blocker has repeated for at least three consecutive goal turns."
     )
 }
 

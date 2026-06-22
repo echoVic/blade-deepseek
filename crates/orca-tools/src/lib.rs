@@ -57,8 +57,7 @@ pub fn execute_with_mcp_external_and_policy(
     if !matches!(&request.name, ToolName::Mcp(_)) {
         if external_tools.is_empty() {
             let reg = registry::default_tool_registry();
-            let ctx =
-                registry::ToolContext::new(cwd).with_output_truncation(output_truncation);
+            let ctx = registry::ToolContext::new(cwd).with_output_truncation(output_truncation);
             return reg.execute(request, &ctx);
         }
         let reg = registry::tool_registry_with_mcp_and_external(None, external_tools);

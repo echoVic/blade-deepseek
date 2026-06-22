@@ -117,7 +117,9 @@ Built-in tools:
 | `subagent` | agent | Runs a synchronous child agent with `description` and `prompt`, returning the child summary |
 | `Workflow` | agent | Starts a background dynamic workflow |
 | `update_plan` | read | Updates the visible plan state |
-| `update_goal` | read | Updates the active persistent goal while goal mode is running |
+| `get_goal` | read | Reads active persistent goal state while goal mode is running |
+| `create_goal` | read | Creates a persistent goal while goal mode is running and no unfinished goal exists |
+| `update_goal` | read | Marks the active persistent goal complete or blocked while goal mode is running |
 
 Tools are registered through a canonical registry. Each tool spec declares its capability set, renderer hint, exposure, aliases, and concurrent-safety flag. Runtime approval derives from the resolved tool spec instead of a separate hard-coded name list.
 
@@ -147,7 +149,8 @@ Subagent events:
 Persistent goal mode:
 - `/goal` is a TUI feature, not a headless `orca exec` contract.
 - Goals are keyed by saved TUI session id and stored in `$ORCA_HOME/goals_1.json` or `~/.orca/goals_1.json`.
-- `update_goal` is advertised as a tool, but it only succeeds while a TUI goal turn has installed goal context. Outside goal mode it returns a failed tool result.
+- `get_goal`, `create_goal`, and `update_goal` are advertised only while a TUI goal turn has installed goal context. Outside goal mode they return failed tool results instead of creating hidden state.
+- `update_goal` only accepts `complete` or `blocked`; pause, resume, edit, clear, and budget/usage limiting are user or system controls.
 - Active goals auto-continue after successful turns until the status becomes `paused`, `blocked`, `usage_limited`, `budget_limited`, or `complete`.
 
 ## Approval Policy

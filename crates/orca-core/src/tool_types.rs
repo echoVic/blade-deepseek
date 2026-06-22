@@ -18,6 +18,8 @@ pub enum ToolName {
     Subagent,
     Workflow,
     WebSearch,
+    GetGoal,
+    CreateGoal,
     UpdateGoal,
     UpdatePlan,
     RequestUserInput,
@@ -47,6 +49,8 @@ impl ToolName {
             "subagent" => Self::Subagent,
             "Workflow" | "workflow" => Self::Workflow,
             "web_search" => Self::WebSearch,
+            "get_goal" => Self::GetGoal,
+            "create_goal" => Self::CreateGoal,
             "update_goal" => Self::UpdateGoal,
             "update_plan" => Self::UpdatePlan,
             "request_user_input" => Self::RequestUserInput,
@@ -88,6 +92,8 @@ impl ToolName {
             Self::Subagent => "subagent",
             Self::Workflow => "Workflow",
             Self::WebSearch => "web_search",
+            Self::GetGoal => "get_goal",
+            Self::CreateGoal => "create_goal",
             Self::UpdateGoal => "update_goal",
             Self::UpdatePlan => "update_plan",
             Self::RequestUserInput => "request_user_input",
@@ -115,6 +121,8 @@ impl ToolName {
             Self::Subagent => "subagent",
             Self::Workflow => "Workflow",
             Self::WebSearch => "web_search",
+            Self::GetGoal => "get_goal",
+            Self::CreateGoal => "create_goal",
             Self::UpdateGoal => "update_goal",
             Self::UpdatePlan => "update_plan",
             Self::RequestUserInput => "request_user_input",
@@ -144,6 +152,8 @@ impl ToolName {
             "subagent" => Self::Subagent,
             "Workflow" | "workflow" => Self::Workflow,
             "web_search" => Self::WebSearch,
+            "get_goal" => Self::GetGoal,
+            "create_goal" => Self::CreateGoal,
             "update_goal" => Self::UpdateGoal,
             "update_plan" => Self::UpdatePlan,
             "request_user_input" => Self::RequestUserInput,
@@ -165,6 +175,7 @@ impl ToolName {
                 | Self::Glob
                 | Self::Grep
                 | Self::GitStatus
+                | Self::GetGoal
                 | Self::RequestUserInput
                 | Self::ListSkills
                 | Self::ReadSkill
@@ -531,10 +542,7 @@ pub fn truncate_output(output: String, max_bytes: usize) -> (String, bool) {
     truncate_output_with_policy(output, ToolOutputTruncation::bytes(max_bytes))
 }
 
-pub fn truncate_output_with_policy(
-    output: String,
-    policy: ToolOutputTruncation,
-) -> (String, bool) {
+pub fn truncate_output_with_policy(output: String, policy: ToolOutputTruncation) -> (String, bool) {
     match policy.normalized() {
         ToolOutputTruncation::Bytes { limit } => truncate_output_bytes(output, limit),
         ToolOutputTruncation::Tokens { limit } => truncate_output_tokens(output, limit),

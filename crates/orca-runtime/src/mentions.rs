@@ -702,8 +702,10 @@ mod tests {
 
         let candidates = list_mention_candidates("@rcm", dir.path());
 
-        assert!(candidates.iter().any(|candidate| {
-            candidate == "src/runtime/config/mod.rs"
-        }));
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| { candidate == "src/runtime/config/mod.rs" })
+        );
     }
 }

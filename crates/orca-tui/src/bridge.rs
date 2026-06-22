@@ -1184,25 +1184,53 @@ fn execute_tool_for_tui(
             )
         } else if execution_request.name == tool_types::ToolName::RequestUserInput {
             execute_user_input_request_for_tui(execution_request, event_tx, action_rx)
-        } else if execution_request.name == tool_types::ToolName::UpdateGoal {
+        } else if matches!(
+            execution_request.name,
+            tool_types::ToolName::GetGoal
+                | tool_types::ToolName::CreateGoal
+                | tool_types::ToolName::UpdateGoal
+        ) {
             let Some(session_id) = session_id.map(str::to_string) else {
                 return (
                     true,
                     tool_types::ToolResult::failed(
                         execution_request,
-                        "update_goal requires a persistent goal session",
+                        "goal tools require a persistent goal session",
                         None,
                     ),
                     None,
                 );
             };
-            let handler = Arc::new(move |update: orca_core::goal_types::GoalUpdate| {
-                let mut store = orca_runtime::goals::GoalStore::load_default();
-                store
-                    .update(&session_id, update)
-                    .map_err(|error| error.to_string())
-            });
-            orca_tools::update_goal::with_goal_update_handler(handler, || {
+            let handler = Arc::new(
+                move |operation: orca_tools::update_goal::GoalToolOperation| {
+                    let mut store = orca_runtime::goals::GoalStore::load_default();
+                    match operation {
+                        orca_tools::update_goal::GoalToolOperation::Get => {
+                            store.get(&session_id).map_err(|error| error.to_string())
+                        }
+                        orca_tools::update_goal::GoalToolOperation::Create {
+                            objective,
+                            token_budget,
+                        } => match store.get(&session_id).map_err(|error| error.to_string())? {
+                            Some(goal) if goal.status.should_continue() => Ok(None),
+                            Some(goal) if !goal.status.is_terminal() => Ok(None),
+                            _ => store
+                                .replace(
+                                    &session_id,
+                                    &objective,
+                                    orca_core::goal_types::ThreadGoalStatus::Active,
+                                    token_budget,
+                                )
+                                .map(Some)
+                                .map_err(|error| error.to_string()),
+                        },
+                        orca_tools::update_goal::GoalToolOperation::Update(update) => store
+                            .update(&session_id, update)
+                            .map_err(|error| error.to_string()),
+                    }
+                },
+            );
+            orca_tools::update_goal::with_goal_handler(handler, || {
                 orca_tools::execute_with_mcp_external_and_policy(
                     execution_request,
                     cwd,

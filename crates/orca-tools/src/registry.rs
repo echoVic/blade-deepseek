@@ -15,8 +15,8 @@ use orca_core::tool_types::{
 use orca_mcp::McpRegistry;
 
 use crate::{
-    bash, edit, external, git, glob, grep, list_files, read_file, skills, update_goal,
-    update_plan, web_search, write_file,
+    bash, edit, external, git, glob, grep, list_files, read_file, skills, update_goal, update_plan,
+    web_search, write_file,
 };
 
 #[allow(dead_code)]
@@ -517,26 +517,64 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
     ));
     registry.register(BuiltinTool::new(
         builtin_spec(
+            "get_goal",
+            "Read the active persistent goal for the current goal-mode session, including objective, status, usage, and budget.",
+            json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+            CapabilitySet::new(vec![ToolCapability::GoalUpdate]),
+            ToolExposure::Direct,
+            RendererHint::State,
+            false,
+        ),
+        BuiltinExecutor::GetGoal,
+    ));
+    registry.register(BuiltinTool::new(
+        builtin_spec(
+            "create_goal",
+            "Create a new active persistent goal for the current goal-mode session. This cannot replace an unfinished goal; complete or block the existing goal first.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "objective": {
+                        "type": "string",
+                        "description": "User-facing goal objective to pursue"
+                    },
+                    "token_budget": {
+                        "type": "integer",
+                        "description": "Optional positive token budget for this goal"
+                    }
+                },
+                "required": ["objective"],
+                "additionalProperties": false
+            }),
+            CapabilitySet::new(vec![ToolCapability::GoalUpdate]),
+            ToolExposure::Direct,
+            RendererHint::State,
+            false,
+        ),
+        BuiltinExecutor::CreateGoal,
+    ));
+    registry.register(BuiltinTool::new(
+        builtin_spec(
             "update_goal",
-            "Update the current persistent goal status. Use status complete when the goal is fully achieved, blocked when progress cannot continue without user input, active to resume, or paused to stop automatic continuation.",
+            "Update the active persistent goal status from goal mode. The model may only set status to complete when the goal is fully achieved or blocked after the strict blocked audit is satisfied; pause, resume, clear, budget, and objective edits are controlled by the user or system.",
             json!({
                 "type": "object",
                 "properties": {
                     "status": {
                         "type": "string",
-                        "enum": ["active", "paused", "blocked", "usage_limited", "budget_limited", "complete"],
-                        "description": "New goal status"
-                    },
-                    "objective": {
-                        "type": "string",
-                        "description": "Optional replacement objective"
+                        "enum": ["blocked", "complete"],
+                        "description": "Terminal model-controlled goal status"
                     },
                     "reason": {
                         "type": "string",
                         "description": "Optional short reason for the status update"
                     }
                 },
-                "required": [],
+                "required": ["status"],
                 "additionalProperties": false
             }),
             CapabilitySet::new(vec![ToolCapability::GoalUpdate]),
@@ -689,7 +727,9 @@ impl Tool for BuiltinTool {
 
     fn execute(&self, request: &ToolRequest, ctx: &ToolContext<'_>) -> ToolResult {
         match self.executor {
-            BuiltinExecutor::ReadFile => read_file::execute(request, ctx.cwd, ctx.max_output_bytes()),
+            BuiltinExecutor::ReadFile => {
+                read_file::execute(request, ctx.cwd, ctx.max_output_bytes())
+            }
             BuiltinExecutor::Glob if request.name.as_str() == "list_files" => {
                 list_files::execute(request, ctx.cwd, ctx.max_output_bytes())
             }
@@ -712,7 +752,9 @@ impl Tool for BuiltinTool {
                 "Workflow must be executed by the runtime controller",
                 None,
             ),
-            BuiltinExecutor::UpdateGoal => update_goal::execute(request),
+            BuiltinExecutor::GetGoal => update_goal::execute_get(request),
+            BuiltinExecutor::CreateGoal => update_goal::execute_create(request),
+            BuiltinExecutor::UpdateGoal => update_goal::execute_update(request),
             BuiltinExecutor::UpdatePlan => update_plan::execute(request),
             BuiltinExecutor::ListSkills => skills::execute_list(request, ctx.cwd),
             BuiltinExecutor::ReadSkill => skills::execute_read(request, ctx.cwd),
@@ -737,6 +779,8 @@ enum BuiltinExecutor {
     WebSearch,
     Subagent,
     Workflow,
+    GetGoal,
+    CreateGoal,
     UpdateGoal,
     UpdatePlan,
     ListSkills,

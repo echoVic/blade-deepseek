@@ -4,7 +4,7 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-06-22
-Current baseline: v0.1.21 TUI update prompt bugfix
+Current baseline: v0.1.22 release verification and goal runtime hardening
 
 ---
 
@@ -26,11 +26,11 @@ working baseline used to prioritize the next patch releases.
 | Hooks | Lifecycle hooks with JSON stdout actions | Codex hooks runtime and schema validation | Implemented; schema docs/validation can improve |
 | Project instructions | User/project/rules files with includes | `AGENTS.md` style layered instructions | Implemented |
 | Memory | Manual `/remember` plus optional project extraction | Codex memories extension | Partial |
-| Persistent goals | `/goal` with persisted state and `update_goal` | Codex goal extension | Implemented |
+| Persistent goals | `/goal` with persisted state plus goal-scoped `get_goal`, `create_goal`, and narrow `update_goal` | Codex goal extension | Implemented |
 | Workflows | JavaScript workflow runner with task state | Codex automations/tasks concepts | Implemented; packaging/docs can improve |
 | TUI | Markdown-ish rendering, themes, Vim mode, diff preview, slash commands | Codex/Claude richer terminal UX | Partial |
 | History | JSONL transcripts, resume/fork/search/archive/compress | Codex thread store with queryable metadata | Partial |
-| Release | GitHub release + npm alias distribution scripts | Codex npm/native release model | Implemented |
+| Release | GitHub release + npm alias distribution scripts plus post-publish GitHub/npm/npm-exec verification | Codex npm/native release model | Implemented |
 | Skills | Markdown skill discovery, `list_skills`/`read_skill`, and explicit `$skill` prompt injection | Codex skills and plugin-provided skill bundles | Partial |
 
 ---
@@ -150,6 +150,7 @@ from user and project directories and inject only relevant skill instructions.
 | Priority | Item | Why Now | Risk |
 |----------|------|---------|------|
 | P0 | Roadmap/state baseline | Prevents stale planning and mixed release notes | Low |
+| P0 | Published release verification | Prevents local tags from being mistaken for GitHub/npm releases | Low |
 | P1 | Tool output truncation policies | Protects context window and makes long tasks more reliable | Low/Medium |
 | P1 | Model metadata overrides | Enables per-model context and truncation decisions | Medium |
 | P2 | Fuzzy file search | Improves everyday TUI ergonomics | Low/Medium |

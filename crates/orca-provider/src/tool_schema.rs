@@ -69,7 +69,7 @@ fn deepseek_tools_schema_from_registry_with_mode(
 }
 
 pub fn tool_visible_in_schema_mode(name: &str, mode: ToolSchemaMode) -> bool {
-    mode == ToolSchemaMode::Goal || name != "update_goal"
+    mode == ToolSchemaMode::Goal || !matches!(name, "get_goal" | "create_goal" | "update_goal")
 }
 
 pub fn deepseek_tools_schema_for_type_with_mcp_and_external(
@@ -138,11 +138,13 @@ mod tests {
             .filter_map(|tool| tool["function"]["name"].as_str())
             .collect::<Vec<_>>();
 
+        assert!(!names.contains(&"get_goal"));
+        assert!(!names.contains(&"create_goal"));
         assert!(!names.contains(&"update_goal"));
     }
 
     #[test]
-    fn goal_schema_exposes_goal_update_tool() {
+    fn goal_schema_exposes_goal_tools() {
         let registry = orca_tools::registry::default_tool_registry();
         let tools = deepseek_goal_tools_schema_from_registry(registry);
         let names = tools
@@ -150,6 +152,8 @@ mod tests {
             .filter_map(|tool| tool["function"]["name"].as_str())
             .collect::<Vec<_>>();
 
+        assert!(names.contains(&"get_goal"));
+        assert!(names.contains(&"create_goal"));
         assert!(names.contains(&"update_goal"));
     }
 

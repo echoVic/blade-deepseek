@@ -37,17 +37,20 @@ Persistent goals require recorded history so there is a stable session id. TUI s
 
 Terminal statuses are not downgraded by pause/block operations.
 
-## Agent Tool
+## Agent Tools
 
-Goal mode exposes `update_goal` to the model while a persistent goal turn is running:
+Goal mode exposes three scoped tools to the model while a persistent goal turn is running:
 
 ```json
+{}
+{"objective":"ship release verification","token_budget":100000}
 {"status":"complete"}
 {"status":"blocked","reason":"waiting for credentials"}
-{"status":"active","objective":"revised objective"}
 ```
 
-The tool is intentionally scoped to goal turns. Outside goal mode it is not advertised to the model, and direct calls fail with a clear message instead of creating hidden state.
+`get_goal` reads the current goal. `create_goal` creates a new active goal only when no unfinished goal exists. `update_goal` is intentionally narrow: the model can only mark the current goal `complete` or `blocked`. Pause, resume, edit, clear, budget-limited, and usage-limited transitions remain user/system controlled.
+
+The tools are intentionally scoped to goal turns. Outside goal mode they are not advertised to the model, and direct calls fail with a clear message instead of creating hidden state.
 
 ## Continuation Rules
 
@@ -65,5 +68,5 @@ Before each active turn, Orca injects a single pinned goal context block. The bl
 
 - Shared types live in `crates/orca-core/src/goal_types.rs`.
 - Persistence lives in `crates/orca-runtime/src/goals.rs`.
-- The model-facing tool lives in `crates/orca-tools/src/update_goal.rs`.
+- The model-facing goal tools live in `crates/orca-tools/src/update_goal.rs`.
 - TUI slash commands and continuation live in `crates/orca-tui/src/app.rs` and `crates/orca-tui/src/bridge.rs`.
