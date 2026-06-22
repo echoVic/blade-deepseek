@@ -186,6 +186,8 @@ pub fn compact_with_summary(
     }
 }
 
+const SMALL_DELTA_TOKEN_THRESHOLD: usize = 200;
+
 fn summarize_collapsed_messages(
     provider_kind: ProviderKind,
     conversation: &Conversation,
@@ -198,7 +200,23 @@ fn summarize_collapsed_messages(
         return None;
     }
 
-    let summary = request_summary(provider_kind, provider_config, &format_messages(&collapsed))?;
+    let delta_text = format_messages(&collapsed);
+    let delta_tokens = DefaultTokenCounter.count_text(&delta_text);
+
+    let summary = if let Some(existing) = &conversation.rolling_summary {
+        if delta_tokens < SMALL_DELTA_TOKEN_THRESHOLD {
+            existing.clone()
+        } else {
+            request_summary(
+                provider_kind,
+                provider_config,
+                Some(existing.as_str()),
+                &delta_text,
+            )?
+        }
+    } else {
+        request_summary(provider_kind, provider_config, None, &delta_text)?
+    };
 
     let mut result = Conversation::new();
     if let Some(system) = system_msg {
@@ -211,6 +229,7 @@ fn summarize_collapsed_messages(
     result.messages.extend(pinned);
     result.messages.extend(kept);
     result.volatile = conversation.volatile.clone();
+    result.rolling_summary = Some(summary.clone());
     Some((result, summary))
 }
 
@@ -272,6 +291,7 @@ fn partition_for_compaction(
 fn request_summary(
     provider_kind: ProviderKind,
     provider_config: &ProviderConfig,
+    previous_summary: Option<&str>,
     collapsed_text: &str,
 ) -> Option<String> {
     let summary_config = ProviderConfig {
@@ -283,13 +303,18 @@ fn request_summary(
         external_tools: Vec::new(),
     };
 
+    let user_prompt = match previous_summary {
+        Some(prev) => format!(
+            "You have a previous summary of older conversation history:\n\n{prev}\n\nNow summarize the following newly collapsed segment and merge it with the previous summary into one coherent updated summary:\n\n{collapsed_text}"
+        ),
+        None => format!("Summarize this collapsed conversation segment:\n\n{collapsed_text}"),
+    };
+
     let mut summary_conversation = Conversation::new();
     summary_conversation.add_system(
         "Summarize old agent conversation context for future continuation. Preserve user goals, decisions, file paths, tool results, blockers, and exact constraints. Be concise and factual.".to_string(),
     );
-    summary_conversation.add_user(format!(
-        "Summarize this collapsed conversation segment:\n\n{collapsed_text}"
-    ));
+    summary_conversation.add_user(user_prompt);
 
     let response = crate::call(provider_kind, &summary_conversation, &summary_config);
     if response
@@ -447,6 +472,7 @@ pub fn compact_with_counter(
     result.messages.extend(pinned);
     result.messages.extend(kept);
     result.volatile = conversation.volatile.clone();
+    result.rolling_summary = conversation.rolling_summary.clone();
     result
 }
 
@@ -455,18 +481,21 @@ fn normalize_compacted_conversation(mut conversation: Conversation) -> Conversat
         return conversation;
     }
     let volatile = conversation.volatile.clone();
+    let rolling_summary = conversation.rolling_summary.clone();
     let system = conversation.messages.remove(0);
     normalize_tool_boundaries(&mut conversation.messages);
     let mut result = Conversation::new();
     result.messages.push(system);
     result.messages.extend(conversation.messages);
     result.volatile = volatile;
+    result.rolling_summary = rolling_summary;
     result
 }
 
 fn micro_compact_stale_tool_outputs(conversation: &Conversation) -> Conversation {
     let mut result = Conversation::new();
     result.volatile = conversation.volatile.clone();
+    result.rolling_summary = conversation.rolling_summary.clone();
     let last_user_index = conversation
         .messages
         .iter()
@@ -878,6 +907,41 @@ mod tests {
     }
 
     #[test]
+    fn compact_with_existing_summary_falls_back_to_local_when_large_delta_summary_fails() {
+        let mut conv = Conversation::new();
+        conv.add_system("system".to_string());
+        conv.add_user("old ".repeat(400));
+        conv.add_assistant(Some("older answer ".repeat(400)), None, vec![]);
+        conv.add_user("newest request".to_string());
+        conv.rolling_summary = Some("previous summary only".to_string());
+
+        let config = ContextConfig {
+            max_tokens: 500,
+            compaction_threshold: 1.0,
+            reserved_for_response: 0,
+            auto_compact_token_limit: None,
+        };
+        let provider_config = ProviderConfig {
+            api_key: None,
+            base_url: None,
+            model: None,
+            tools_override: Some(Vec::new()),
+            mcp_registry: None,
+            external_tools: Vec::new(),
+        };
+
+        let result = compact_with_summary(ProviderKind::DeepSeek, &conv, &config, &provider_config);
+
+        assert!(
+            matches!(result.kind, CompactionKind::LocalTruncation),
+            "large deltas must not be dropped behind a stale rolling summary when summary fails"
+        );
+        assert!(result.conversation.messages.iter().any(|message| {
+            matches!(message, Message::System { content, .. } if content.contains("truncated to fit context window"))
+        }));
+    }
+
+    #[test]
     fn detects_prompt_too_long_provider_errors() {
         assert!(is_prompt_too_long_error(
             "DeepSeek provider error: prompt_too_long: context length exceeded"
@@ -971,9 +1035,9 @@ mod tests {
         // then the kept tail unchanged.
         let mut result = Conversation::new();
         result.messages.push(system_msg.unwrap());
-        result
-            .messages
-            .push(Message::system("[Summary of earlier conversation]\nX".to_string()));
+        result.messages.push(Message::system(
+            "[Summary of earlier conversation]\nX".to_string(),
+        ));
         result.messages.extend(kept);
 
         assert!(
@@ -1008,7 +1072,14 @@ mod tests {
 
         assert!(compacted.messages.len() < conv.messages.len());
         assert_eq!(compacted.volatile.plan.as_deref(), Some("active plan"));
-        assert!(compacted.volatile.goal.as_ref().unwrap().contains("active goal"));
+        assert!(
+            compacted
+                .volatile
+                .goal
+                .as_ref()
+                .unwrap()
+                .contains("active goal")
+        );
     }
 
     #[test]
@@ -1039,5 +1110,91 @@ mod tests {
         let compacted = compact_with_counter(&conv, &config, &FixedCounter);
 
         assert_eq!(compacted.volatile.plan.as_deref(), Some("active plan"));
+    }
+
+    #[test]
+    fn micro_compaction_preserves_rolling_summary_when_no_truncation_needed() {
+        let config = ContextConfig {
+            max_tokens: 1_000,
+            compaction_threshold: 1.0,
+            reserved_for_response: 0,
+            auto_compact_token_limit: Some(1_000),
+        };
+
+        let mut conv = Conversation::new();
+        conv.add_system("sys".to_string());
+        conv.add_user("inspect".to_string());
+        conv.add_assistant(
+            Some("calling read_file".to_string()),
+            None,
+            vec![RawToolCall {
+                id: "tc1".to_string(),
+                function_name: "read_file".to_string(),
+                arguments: r#"{"path":"large.log"}"#.to_string(),
+            }],
+        );
+        conv.add_tool_result("tc1".to_string(), "x".repeat(STALE_TOOL_OUTPUT_BYTES + 10));
+        conv.add_user("newest".to_string());
+        conv.rolling_summary = Some("existing rolling summary".to_string());
+
+        let compacted = compact_with_counter(&conv, &config, &FixedCounter);
+
+        assert_eq!(
+            compacted.rolling_summary.as_deref(),
+            Some("existing rolling summary")
+        );
+    }
+
+    #[test]
+    fn local_truncation_inherits_rolling_summary() {
+        let config = ContextConfig {
+            max_tokens: 16,
+            compaction_threshold: 1.0,
+            reserved_for_response: 0,
+            auto_compact_token_limit: None,
+        };
+
+        let mut conv = Conversation::new();
+        conv.add_system("sys".to_string());
+        conv.add_user("old ".repeat(40));
+        conv.add_assistant(Some("old ".repeat(40)), None, vec![]);
+        conv.add_user("newest".to_string());
+        conv.rolling_summary = Some("previously summarized context".to_string());
+
+        let compacted = compact_with_counter(&conv, &config, &FixedCounter);
+        assert_eq!(
+            compacted.rolling_summary.as_deref(),
+            Some("previously summarized context")
+        );
+    }
+
+    #[test]
+    fn no_truncation_normalization_preserves_rolling_summary() {
+        let config = ContextConfig {
+            max_tokens: 1_000,
+            compaction_threshold: 1.0,
+            reserved_for_response: 0,
+            auto_compact_token_limit: Some(1_000),
+        };
+
+        let mut conv = Conversation::new();
+        conv.add_system("sys".to_string());
+        conv.add_user("newest".to_string());
+        conv.rolling_summary = Some("existing rolling summary".to_string());
+
+        let compacted = compact_with_counter(&conv, &config, &FixedCounter);
+
+        assert_eq!(
+            compacted.rolling_summary.as_deref(),
+            Some("existing rolling summary")
+        );
+    }
+
+    #[test]
+    fn small_delta_token_threshold_is_reasonable() {
+        assert!(
+            SMALL_DELTA_TOKEN_THRESHOLD > 0 && SMALL_DELTA_TOKEN_THRESHOLD <= 500,
+            "threshold should be in a reasonable range"
+        );
     }
 }

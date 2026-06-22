@@ -394,6 +394,10 @@ pub fn resume_conversation(transcript: &SessionTranscript, system_prompt: String
     {
         conversation.messages.push(message.clone());
     }
+    conversation.rolling_summary = transcript
+        .summaries
+        .last()
+        .map(|record| record.summary.clone());
     conversation
 }
 
@@ -1213,5 +1217,72 @@ mod tests {
             }
         }
         result.expect("session without plan loaded");
+    }
+
+    #[test]
+    fn resume_restores_rolling_summary_from_last_context_summary_record() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let home = tempfile::tempdir().expect("temp home");
+        let previous = std::env::var_os(ORCA_HOME_ENV);
+        unsafe {
+            std::env::set_var(ORCA_HOME_ENV, home.path());
+        }
+
+        let result = (|| {
+            let cwd = std::env::current_dir()?;
+            let mut writer = SessionWriter::start(&cwd, "mock", None, "rolling summary")?;
+            writer.append_summary(10, 5, "first summary")?;
+            writer.append_summary(20, 8, "updated rolling summary")?;
+            let transcript = load_session("latest")?;
+
+            let conv = resume_conversation(&transcript, "new system prompt".to_string());
+            assert_eq!(
+                conv.rolling_summary.as_deref(),
+                Some("updated rolling summary"),
+                "should restore the last summary as rolling_summary"
+            );
+            Ok::<(), io::Error>(())
+        })();
+
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var(ORCA_HOME_ENV, previous);
+            } else {
+                std::env::remove_var(ORCA_HOME_ENV);
+            }
+        }
+        result.expect("rolling summary restored from history");
+    }
+
+    #[test]
+    fn resume_without_summaries_has_no_rolling_summary() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let home = tempfile::tempdir().expect("temp home");
+        let previous = std::env::var_os(ORCA_HOME_ENV);
+        unsafe {
+            std::env::set_var(ORCA_HOME_ENV, home.path());
+        }
+
+        let result = (|| {
+            let cwd = std::env::current_dir()?;
+            let _writer = SessionWriter::start(&cwd, "mock", None, "no summaries")?;
+            let transcript = load_session("latest")?;
+
+            let conv = resume_conversation(&transcript, "sys".to_string());
+            assert!(
+                conv.rolling_summary.is_none(),
+                "no summary records means no rolling_summary"
+            );
+            Ok::<(), io::Error>(())
+        })();
+
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var(ORCA_HOME_ENV, previous);
+            } else {
+                std::env::remove_var(ORCA_HOME_ENV);
+            }
+        }
+        result.expect("no rolling summary without records");
     }
 }

@@ -109,6 +109,7 @@ impl VolatileContext {
 pub struct Conversation {
     pub messages: Vec<Message>,
     pub volatile: VolatileContext,
+    pub rolling_summary: Option<String>,
 }
 
 impl Conversation {
@@ -116,6 +117,7 @@ impl Conversation {
         Self {
             messages: Vec::new(),
             volatile: VolatileContext::default(),
+            rolling_summary: None,
         }
     }
 
@@ -465,18 +467,23 @@ mod tests {
         let mut conv = Conversation::new();
         conv.add_system("sys".to_string());
         conv.add_user("hello".to_string());
-        conv.messages
-            .push(Message::pinned_system("[Pinned plan state]\nold plan".to_string()));
-        conv.messages
-            .push(Message::pinned_system("[Pinned goal state]\nold goal".to_string()));
-        conv.messages
-            .push(Message::pinned_system("[Pinned skill context]\nold skill".to_string()));
+        conv.messages.push(Message::pinned_system(
+            "[Pinned plan state]\nold plan".to_string(),
+        ));
+        conv.messages.push(Message::pinned_system(
+            "[Pinned goal state]\nold goal".to_string(),
+        ));
+        conv.messages.push(Message::pinned_system(
+            "[Pinned skill context]\nold skill".to_string(),
+        ));
         conv.add_assistant(Some("reply".to_string()), None, vec![]);
 
         assert_eq!(conv.messages.len(), 6);
         conv.strip_legacy_pinned_volatile();
         assert_eq!(conv.messages.len(), 3);
-        assert!(matches!(&conv.messages[0], Message::System { content, pinned: false } if content == "sys"));
+        assert!(
+            matches!(&conv.messages[0], Message::System { content, pinned: false } if content == "sys")
+        );
         assert!(matches!(&conv.messages[1], Message::User { content, .. } if content == "hello"));
         assert!(matches!(&conv.messages[2], Message::Assistant { .. }));
     }
@@ -486,14 +493,18 @@ mod tests {
         let mut conv = Conversation::new();
         conv.add_system("sys".to_string());
         conv.add_user_pinned("important constraint".to_string());
-        conv.messages
-            .push(Message::pinned_system("[Pinned plan state]\nold".to_string()));
-        conv.messages
-            .push(Message::pinned_system("[Hook context]\nkeep this".to_string()));
+        conv.messages.push(Message::pinned_system(
+            "[Pinned plan state]\nold".to_string(),
+        ));
+        conv.messages.push(Message::pinned_system(
+            "[Hook context]\nkeep this".to_string(),
+        ));
 
         conv.strip_legacy_pinned_volatile();
         assert_eq!(conv.messages.len(), 3);
         assert!(conv.messages[1].is_pinned());
-        assert!(matches!(&conv.messages[2], Message::System { content, pinned: true } if content.contains("Hook context")));
+        assert!(
+            matches!(&conv.messages[2], Message::System { content, pinned: true } if content.contains("Hook context"))
+        );
     }
 }
