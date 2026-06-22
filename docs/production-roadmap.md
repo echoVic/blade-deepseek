@@ -4,7 +4,7 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-06-22
-Current baseline: v0.1.20 documentation and website content refresh
+Current baseline: v0.1.21 TUI update prompt bugfix
 
 ---
 

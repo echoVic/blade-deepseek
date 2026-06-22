@@ -42,6 +42,8 @@ enum UpdatePromptChoice {
     UpdateNow,
     Skip,
     SkipUntilNext,
+    /// Ctrl-C / Ctrl-D: exit the process directly instead of entering the TUI.
+    Quit,
 }
 
 impl UpdatePromptChoice {
@@ -49,13 +51,13 @@ impl UpdatePromptChoice {
         match self {
             Self::UpdateNow => Self::Skip,
             Self::Skip => Self::SkipUntilNext,
-            Self::SkipUntilNext => Self::UpdateNow,
+            Self::SkipUntilNext | Self::Quit => Self::UpdateNow,
         }
     }
 
     fn prev(self) -> Self {
         match self {
-            Self::UpdateNow => Self::SkipUntilNext,
+            Self::UpdateNow | Self::Quit => Self::SkipUntilNext,
             Self::Skip => Self::UpdateNow,
             Self::SkipUntilNext => Self::Skip,
         }
@@ -1384,6 +1386,7 @@ fn run_placeholder(cli: Cli) -> i32 {
                     eprintln!("orca: warning: failed to save update dismissal: {error}");
                 }
             }
+            Ok(UpdatePromptChoice::Quit) => return 130,
             Err(error) => {
                 eprintln!("orca: warning: failed to read update choice: {error}");
             }
@@ -1426,7 +1429,7 @@ fn prompt_for_update(
             if key.modifiers.contains(KeyModifiers::CONTROL)
                 && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('d'))
             {
-                break UpdatePromptChoice::Skip;
+                break UpdatePromptChoice::Quit;
             }
             match key.code {
                 KeyCode::Up | KeyCode::Char('k') => highlighted = highlighted.prev(),
@@ -1455,13 +1458,16 @@ fn render_update_prompt(
 ) -> io::Result<()> {
     stdout.execute(cursor::MoveToColumn(0))?;
     stdout.execute(terminal::Clear(terminal::ClearType::FromCursorDown))?;
-    writeln!(
+    // Raw mode is enabled, so a bare `\n` only moves down without returning the
+    // cursor to column 0. Emit explicit CRLF on every line to keep the prompt
+    // left-aligned instead of cascading to the right.
+    write!(
         stdout,
-        "Update available! {} -> {}",
+        "Update available! {} -> {}\r\n",
         info.current, info.latest
     )?;
-    writeln!(stdout, "Release notes: {}", info.url)?;
-    writeln!(stdout)?;
+    write!(stdout, "Release notes: {}\r\n", info.url)?;
+    write!(stdout, "\r\n")?;
     write_update_choice_row(
         stdout,
         1,
@@ -1483,7 +1489,7 @@ fn render_update_prompt(
         None,
         highlighted == UpdatePromptChoice::SkipUntilNext,
     )?;
-    writeln!(stdout)?;
+    write!(stdout, "\r\n")?;
     write!(stdout, "Use Up/Down or j/k, then Enter")?;
     stdout.flush()
 }
@@ -1500,7 +1506,7 @@ fn write_update_choice_row(
     if let Some(detail) = detail {
         write!(stdout, " (runs `{detail}`)")?;
     }
-    writeln!(stdout)
+    write!(stdout, "\r\n")
 }
 
 struct RawModeGuard;
