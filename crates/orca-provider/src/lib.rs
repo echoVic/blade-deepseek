@@ -3,6 +3,7 @@ pub mod deepseek_fixture;
 pub mod deepseek_http;
 pub mod http_client;
 pub mod streaming;
+pub mod summary_cache;
 pub mod system_prompt;
 pub mod tool_schema;
 

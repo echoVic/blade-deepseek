@@ -203,7 +203,7 @@ fn summarize_collapsed_messages(
         return None;
     }
 
-    let delta_text = format_messages(&collapsed);
+    let delta_text = format_messages(&local_extractive_compaction(&collapsed));
     let delta_tokens = DefaultTokenCounter.count_text(&delta_text);
 
     let has_existing_summary =
@@ -347,10 +347,18 @@ fn request_summary(
     previous_summary: Option<&str>,
     collapsed_text: &str,
 ) -> Option<String> {
+    let cache_scope = summary_cache_scope(provider_kind, provider_config);
+    let cache_key =
+        crate::summary_cache::summary_key(&cache_scope, previous_summary, collapsed_text);
+    if let Some(cached) = crate::summary_cache::lookup(&cache_key) {
+        return Some(cached);
+    }
+
+    let summary_model = orca_core::model::auxiliary_model().to_string();
     let summary_config = ProviderConfig {
         api_key: provider_config.api_key.clone(),
         base_url: provider_config.base_url.clone(),
-        model: Some(orca_core::model::auxiliary_model().to_string()),
+        model: Some(summary_model),
         tools_override: Some(Vec::new()),
         mcp_registry: None,
         external_tools: Vec::new(),
@@ -364,9 +372,7 @@ fn request_summary(
     };
 
     let mut summary_conversation = Conversation::new();
-    summary_conversation.add_system(
-        "Summarize old agent conversation context for future continuation. Preserve user goals, decisions, file paths, tool results, blockers, and exact constraints. Be concise and factual.".to_string(),
-    );
+    summary_conversation.add_system(SUMMARY_SYSTEM_PROMPT.to_string());
     summary_conversation.add_user(user_prompt);
 
     let response = crate::call(provider_kind, &summary_conversation, &summary_config);
@@ -377,10 +383,96 @@ fn request_summary(
     {
         return None;
     }
-    response
+    let summary = response
         .assistant_content
         .map(|text| text.trim().to_string())
-        .filter(|text| !text.is_empty())
+        .filter(|text| !text.is_empty())?;
+    crate::summary_cache::store(&cache_key, &summary);
+    Some(summary)
+}
+
+const EXTRACTIVE_TOOL_OUTPUT_BYTES: usize = 1024;
+const EXTRACTIVE_HEAD_LINES: usize = 12;
+const EXTRACTIVE_TAIL_LINES: usize = 8;
+const EXTRACTIVE_HEAD_CHARS: usize = 384;
+const EXTRACTIVE_TAIL_CHARS: usize = 384;
+const SUMMARY_PROMPT_VERSION: &str = "summary-prompt-v1";
+const SUMMARY_SYSTEM_PROMPT: &str = "Summarize old agent conversation context for future continuation. Preserve user goals, decisions, file paths, tool results, blockers, and exact constraints. Be concise and factual.";
+
+fn summary_cache_scope(provider_kind: ProviderKind, provider_config: &ProviderConfig) -> String {
+    format!(
+        "provider={};base_url={};model={};prompt_version={};prompt={}",
+        provider_kind.as_str(),
+        provider_config.base_url.as_deref().unwrap_or("<default>"),
+        orca_core::model::auxiliary_model(),
+        SUMMARY_PROMPT_VERSION,
+        SUMMARY_SYSTEM_PROMPT
+    )
+}
+
+/// Deterministically shrink the collapsed delta before it reaches the remote
+/// summary model. Tool outputs (file reads, bash output, grep dumps) are the
+/// bulk of collapsed tokens and are highly compressible without an LLM call:
+/// we keep a head/tail extract plus a size marker. Natural-language turns
+/// (user/assistant) are left untouched so the remote summarizer keeps full
+/// fidelity on intent and decisions. This is purely local and deterministic,
+/// so identical inputs always yield identical output (which also stabilizes
+/// the summary hash cache).
+fn local_extractive_compaction(messages: &[Message]) -> Vec<Message> {
+    messages
+        .iter()
+        .map(|message| match message {
+            Message::Tool {
+                tool_call_id,
+                content,
+                pinned,
+            } if content.len() > EXTRACTIVE_TOOL_OUTPUT_BYTES => Message::Tool {
+                tool_call_id: tool_call_id.clone(),
+                content: extractive_summarize_output(content),
+                pinned: *pinned,
+            },
+            other => other.clone(),
+        })
+        .collect()
+}
+
+fn extractive_summarize_output(content: &str) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    if lines.len() <= EXTRACTIVE_HEAD_LINES + EXTRACTIVE_TAIL_LINES {
+        return extractive_summarize_single_span(content);
+    }
+    let head = lines[..EXTRACTIVE_HEAD_LINES].join("\n");
+    let tail = lines[lines.len() - EXTRACTIVE_TAIL_LINES..].join("\n");
+    let omitted = lines.len() - EXTRACTIVE_HEAD_LINES - EXTRACTIVE_TAIL_LINES;
+    format!(
+        "[extractive-compact] original_bytes={} original_lines={} omitted_lines={}\n{}\n... [{} lines omitted] ...\n{}",
+        content.len(),
+        lines.len(),
+        omitted,
+        head.trim_end(),
+        omitted,
+        tail.trim_start()
+    )
+}
+
+fn extractive_summarize_single_span(content: &str) -> String {
+    let char_count = content.chars().count();
+    if char_count <= EXTRACTIVE_HEAD_CHARS + EXTRACTIVE_TAIL_CHARS {
+        return content.to_string();
+    }
+    let head: String = content.chars().take(EXTRACTIVE_HEAD_CHARS).collect();
+    let tail_vec: Vec<char> = content.chars().rev().take(EXTRACTIVE_TAIL_CHARS).collect();
+    let tail: String = tail_vec.into_iter().rev().collect();
+    let omitted = char_count - EXTRACTIVE_HEAD_CHARS - EXTRACTIVE_TAIL_CHARS;
+    format!(
+        "[extractive-compact] original_bytes={} original_chars={} omitted_chars={}\n{}\n... [{} chars omitted] ...\n{}",
+        content.len(),
+        char_count,
+        omitted,
+        head.trim_end(),
+        omitted,
+        tail.trim_start()
+    )
 }
 
 fn format_messages(messages: &[Message]) -> String {
@@ -1357,5 +1449,107 @@ mod tests {
             MAX_SUMMARY_DELTAS > 0 && MAX_SUMMARY_DELTAS <= 10,
             "deltas cap should be reasonable"
         );
+    }
+
+    #[test]
+    fn extractive_compaction_shrinks_large_tool_output_with_head_and_tail() {
+        let big_output = (0..200)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let original_bytes = big_output.len();
+        let messages = vec![Message::Tool {
+            tool_call_id: "call_1".to_string(),
+            content: big_output,
+            pinned: false,
+        }];
+
+        let compacted = local_extractive_compaction(&messages);
+        let content = compacted[0].content_str().unwrap();
+
+        assert!(content.starts_with("[extractive-compact]"));
+        assert!(content.contains(&format!("original_bytes={original_bytes}")));
+        assert!(content.contains("line 0"));
+        assert!(content.contains("line 199"));
+        assert!(content.contains("lines omitted"));
+        assert!(
+            content.len() < original_bytes,
+            "extractive output must be smaller than the original"
+        );
+    }
+
+    #[test]
+    fn extractive_compaction_shrinks_large_single_line_tool_output() {
+        let big_output = format!(
+            "{{\"status\":\"ok\",\"payload\":\"{}\",\"tail\":\"final-value\"}}",
+            "x".repeat(8_000)
+        );
+        let original_bytes = big_output.len();
+        let messages = vec![Message::Tool {
+            tool_call_id: "call_1".to_string(),
+            content: big_output,
+            pinned: false,
+        }];
+
+        let compacted = local_extractive_compaction(&messages);
+        let content = compacted[0].content_str().unwrap();
+
+        assert!(content.starts_with("[extractive-compact]"));
+        assert!(content.contains(&format!("original_bytes={original_bytes}")));
+        assert!(content.contains("\"status\":\"ok\""));
+        assert!(content.contains("final-value"));
+        assert!(
+            content.len() < original_bytes,
+            "large single-line outputs must shrink before remote summary"
+        );
+    }
+
+    #[test]
+    fn extractive_compaction_leaves_small_tool_output_untouched() {
+        let small = "short output".to_string();
+        let messages = vec![Message::Tool {
+            tool_call_id: "call_1".to_string(),
+            content: small.clone(),
+            pinned: false,
+        }];
+
+        let compacted = local_extractive_compaction(&messages);
+        assert_eq!(compacted[0].content_str(), Some(small.as_str()));
+    }
+
+    #[test]
+    fn extractive_compaction_preserves_natural_language_turns() {
+        let long_user = "user intent ".repeat(200);
+        let long_assistant = "assistant decision ".repeat(200);
+        let messages = vec![
+            Message::user(long_user.clone()),
+            Message::Assistant {
+                content: Some(long_assistant.clone()),
+                reasoning_content: None,
+                tool_calls: vec![],
+                pinned: false,
+            },
+        ];
+
+        let compacted = local_extractive_compaction(&messages);
+        assert_eq!(compacted[0].content_str(), Some(long_user.as_str()));
+        assert_eq!(compacted[1].content_str(), Some(long_assistant.as_str()));
+    }
+
+    #[test]
+    fn extractive_compaction_is_deterministic() {
+        let big_output = (0..200)
+            .map(|i| format!("row {i} value"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let messages = vec![Message::Tool {
+            tool_call_id: "call_1".to_string(),
+            content: big_output,
+            pinned: false,
+        }];
+
+        let first = local_extractive_compaction(&messages);
+        let second = local_extractive_compaction(&messages);
+        assert_eq!(first[0].content_str(), second[0].content_str());
     }
 }
