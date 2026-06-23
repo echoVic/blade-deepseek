@@ -57,7 +57,9 @@ fn load_api_key() -> Option<String> {
     let path = dirs::home_dir()?.join(".orca").join("auth.json");
     let content = std::fs::read_to_string(path).ok()?;
     let map: HashMap<String, String> = serde_json::from_str(&content).ok()?;
-    map.get("DEEPSEEK_API_KEY").filter(|k| !k.is_empty()).cloned()
+    map.get("DEEPSEEK_API_KEY")
+        .filter(|k| !k.is_empty())
+        .cloned()
 }
 
 /// Send a collapsed-delta text through the real aux model exactly as
@@ -108,12 +110,12 @@ fn main() {
     // The micro-compacted text carries the "[tool output micro-compact]" marker,
     // so render_summary_delta passes it through unchanged -> identical framing
     // for an apples-to-apples comparison against the new extractive renderer.
-    let huge_old = render_summary_delta(&[user.clone(), tool(micro_compact_tool_output(&huge))]).text;
+    let huge_old =
+        render_summary_delta(&[user.clone(), tool(micro_compact_tool_output(&huge))]).text;
     let huge_new = render_summary_delta(&[user.clone(), tool(huge.clone())]).text;
 
     // mid: old without renderer (raw original delta) vs current renderer.
-    let mid_old = render_summary_delta(&[user.clone(), tool(mid.clone())])
-        .text; // current renderer
+    let mid_old = render_summary_delta(&[user.clone(), tool(mid.clone())]).text; // current renderer
     // For the un-rendered baseline we format the raw messages by sending the raw
     // content directly (no extractive step).
     let mid_raw = format!(

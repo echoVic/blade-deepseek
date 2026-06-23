@@ -223,7 +223,9 @@ mod tests {
         let external_names: Vec<&str> = names
             .iter()
             .copied()
-            .filter(|name| name.starts_with("zzz") || name.starts_with("aaa") || name.starts_with("mmm"))
+            .filter(|name| {
+                name.starts_with("zzz") || name.starts_with("aaa") || name.starts_with("mmm")
+            })
             .collect();
         assert_eq!(external_names, vec!["zzz_last", "aaa_first", "mmm_middle"]);
 

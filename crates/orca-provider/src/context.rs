@@ -557,7 +557,8 @@ fn render_tool_output(content: &str) -> (String, bool) {
     if bytes <= SUMMARY_KEEP_VERBATIM_BYTES {
         return (content.to_string(), false);
     }
-    let (head_lines, tail_lines, head_chars, tail_chars, max_bytes) = if bytes > SUMMARY_HUGE_BYTES {
+    let (head_lines, tail_lines, head_chars, tail_chars, max_bytes) = if bytes > SUMMARY_HUGE_BYTES
+    {
         (
             SUMMARY_HUGE_HEAD_LINES,
             SUMMARY_HUGE_TAIL_LINES,
@@ -607,7 +608,8 @@ fn extractive_render(
             tail.trim_start(),
             &format!("... [{omitted} lines omitted] ..."),
             max_bytes.saturating_sub(header.len() + 2),
-        );
+        )
+        .text;
         return format!("{header}\n{body}");
     }
     let char_count = content.chars().count();
@@ -617,29 +619,56 @@ fn extractive_render(
     let head: String = content.chars().take(head_chars).collect();
     let tail_vec: Vec<char> = content.chars().rev().take(tail_chars).collect();
     let tail: String = tail_vec.into_iter().rev().collect();
-    let omitted = char_count.saturating_sub(head_chars + tail_chars);
-    let header = format!(
+    let mut omitted = char_count.saturating_sub(head_chars + tail_chars);
+    let mut header = format!(
         "[extractive-compact] original_bytes={} original_chars={} omitted_chars={}",
         content.len(),
         char_count,
         omitted,
     );
-    let body = budget_trim_head_tail(
+    let mut trimmed = budget_trim_head_tail(
         head.trim_end(),
         tail.trim_start(),
         &format!("... [{omitted} chars omitted] ..."),
         max_bytes.saturating_sub(header.len() + 2),
     );
-    format!("{header}\n{body}")
+    let actual_omitted =
+        char_count.saturating_sub(trimmed.head_chars_kept + trimmed.tail_chars_kept);
+    if actual_omitted != omitted {
+        omitted = actual_omitted;
+        header = format!(
+            "[extractive-compact] original_bytes={} original_chars={} omitted_chars={}",
+            content.len(),
+            char_count,
+            omitted,
+        );
+        trimmed = budget_trim_head_tail(
+            head.trim_end(),
+            tail.trim_start(),
+            &format!("... [{omitted} chars omitted] ..."),
+            max_bytes.saturating_sub(header.len() + 2),
+        );
+    }
+    format!("{header}\n{}", trimmed.text)
 }
 
 /// Assemble `head`, a separator, and `tail` so the whole body fits in `budget`
 /// bytes. Head and tail are trimmed on char boundaries, splitting the remaining
 /// space evenly. The separator is always kept so the truncation stays visible.
-fn budget_trim_head_tail(head: &str, tail: &str, separator: &str, budget: usize) -> String {
+struct BudgetTrim {
+    text: String,
+    head_chars_kept: usize,
+    tail_chars_kept: usize,
+}
+
+fn budget_trim_head_tail(head: &str, tail: &str, separator: &str, budget: usize) -> BudgetTrim {
     let current = head.len() + 1 + separator.len() + 1 + tail.len();
     if current <= budget {
-        return format!("{head}\n{separator}\n{tail}");
+        return BudgetTrim {
+            text: format!("{head}\n{separator}\n{tail}"),
+            head_chars_kept: head.chars().count(),
+            tail_chars_kept: tail.chars().count(),
+        };
     }
     let frame = separator.len() + 2; // two newlines around the separator
     let available = budget.saturating_sub(frame);
@@ -647,7 +676,11 @@ fn budget_trim_head_tail(head: &str, tail: &str, separator: &str, budget: usize)
     let tail_budget = available - head_budget;
     let head_trimmed = take_chars_within_bytes(head, head_budget);
     let tail_trimmed = take_chars_within_bytes_rev(tail, tail_budget);
-    format!("{head_trimmed}\n{separator}\n{tail_trimmed}")
+    BudgetTrim {
+        text: format!("{head_trimmed}\n{separator}\n{tail_trimmed}"),
+        head_chars_kept: head_trimmed.chars().count(),
+        tail_chars_kept: tail_trimmed.chars().count(),
+    }
 }
 
 fn take_chars_within_bytes(text: &str, budget: usize) -> &str {
@@ -1936,5 +1969,28 @@ mod tests {
         assert!(compacted);
         assert!(rendered.len() <= SUMMARY_HUGE_MAX_BYTES);
         assert!(rendered.contains("original_bytes="));
+    }
+
+    #[test]
+    fn multibyte_tool_output_reports_omitted_chars_after_byte_budget_trim() {
+        let output = "界".repeat(500);
+        assert!(output.len() > SUMMARY_KEEP_VERBATIM_BYTES);
+
+        let (rendered, compacted) = render_tool_output(&output);
+
+        assert!(compacted);
+        assert!(rendered.len() <= SUMMARY_MEDIUM_MAX_BYTES);
+        let omitted = rendered
+            .lines()
+            .next()
+            .and_then(|line| line.split("omitted_chars=").nth(1))
+            .and_then(|value| value.parse::<usize>().ok())
+            .expect("omitted_chars metadata");
+        let kept_chars = rendered.matches('界').count();
+        assert_eq!(
+            omitted,
+            500usize.saturating_sub(kept_chars),
+            "metadata must reflect chars dropped by the hard byte budget: {rendered}"
+        );
     }
 }
