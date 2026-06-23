@@ -791,6 +791,97 @@ pre {
   font-size: 0.88em;
 }
 
+/* prefix-cache spotlight card (sits below feature-grid) */
+.cache-card {
+  display: grid;
+  grid-template-columns: 1.1fr 1fr;
+  gap: clamp(28px, 4vw, 56px);
+  align-items: center;
+  margin-top: 28px;
+  padding: clamp(28px, 4vw, 40px);
+  border: 1px solid color-mix(in oklch, var(--accent) 28%, transparent);
+  border-radius: 18px;
+  background:
+    linear-gradient(
+      135deg,
+      color-mix(in oklch, var(--accent) 9%, transparent),
+      transparent 62%
+    ),
+    var(--surface);
+  box-shadow: 0 30px 64px -40px oklch(8% 0.02 266);
+}
+
+.cache-card > * {
+  min-width: 0;
+}
+
+.cache-card .eyebrow {
+  margin-bottom: 14px;
+}
+
+.cache-card h3 {
+  margin-bottom: 10px;
+  font-size: clamp(1.3rem, 2.1vw, 1.7rem);
+  line-height: 1.2;
+  letter-spacing: -0.015em;
+  font-weight: 640;
+}
+
+.cache-card-copy p:last-child {
+  margin: 0;
+  max-width: 52ch;
+  color: var(--muted);
+  font-size: 0.95rem;
+  line-height: 1.65;
+}
+
+.cache-card-stats {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 18px;
+  padding: 20px;
+  border: 1px solid var(--border-soft);
+  border-radius: 14px;
+  background: var(--bg-deep);
+  font-family: var(--font-mono);
+}
+
+.cache-card-stats > div {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.cache-card-stats .num {
+  font-variant-numeric: tabular-nums;
+  font-size: clamp(1.5rem, 2.4vw, 1.95rem);
+  line-height: 1;
+  letter-spacing: -0.02em;
+  font-weight: 600;
+  color: var(--accent);
+}
+
+.cache-card-stats .l {
+  color: var(--faint);
+  font-size: 0.7rem;
+  line-height: 1.45;
+  letter-spacing: 0.01em;
+}
+
+@media (max-width: 860px) {
+  .cache-card {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+@media (max-width: 540px) {
+  .cache-card-stats {
+    grid-template-columns: 1fr;
+    gap: 14px;
+  }
+}
+
 /* capabilities split */
 .capabilities {
   display: grid;

@@ -79,6 +79,7 @@ const copy = {
         turns: "max turns",
         tools: "tool surfaces",
         platforms: "platforms",
+        cache: "prefix-cache hit",
       },
     },
     featuresEyebrow: "What you'll notice",
@@ -109,6 +110,16 @@ const copy = {
         body: "Local JSONL transcripts support list, search, --resume, --fork, archive, and optional zstd compression.",
       },
     ],
+    cacheCard: {
+      eyebrow: "Prefix cache",
+      title: "Tuned for DeepSeek prefix cache, end-to-end.",
+      body: "Nine rounds of real-API tuning. The wire prompt stays append-only at the byte level — system, tools, history, summary baseline — so multi-turn loops, compaction, and resume hold a stable prefix instead of redoing it each turn.",
+      stats: [
+        { k: "99%", l: "post-compaction main-loop hit (real API)" },
+        { k: "92%", l: "non-compacted short-task hit" },
+        { k: "0", l: "duplicate remote summary calls (hashed cache)" },
+      ],
+    },
     capabilitiesEyebrow: "Inside the engine",
     capabilitiesTitle: "Every turn stays in your control.",
     capabilitiesSubtitle:
@@ -160,7 +171,7 @@ const copy = {
     specsLabel: "Technical specs",
     specs: {
       context: "Context window, auto-compacted past the 80% threshold.",
-      retries: "Exponential-backoff retries, handling 429 / 5xx automatically.",
+      platforms: "Native binaries: macOS and Linux, arm64 and x64.",
       tools: "Built-in, MCP, and external tools share one spec-driven registry.",
       rust: "Written in Rust, running as a single local binary.",
     },
@@ -231,6 +242,7 @@ const copy = {
         turns: "最大轮次",
         tools: "工具面",
         platforms: "支持平台",
+        cache: "前缀缓存命中",
       },
     },
     featuresEyebrow: "你会注意到",
@@ -261,6 +273,16 @@ const copy = {
         body: "本地 JSONL 会话支持 list、search、--resume、--fork、archive，以及可选 zstd 压缩。",
       },
     ],
+    cacheCard: {
+      eyebrow: "前缀缓存",
+      title: "为 DeepSeek 前缀缓存做了端到端调优。",
+      body: "经过九轮真实 API 验证。Wire 层提示词字节级 append-only —— system、tools、history、summary baseline 全部稳定 —— 多轮循环、压缩与 resume 都复用同一段前缀，而不是每轮重发。",
+      stats: [
+        { k: "99%", l: "压缩后主链路命中（真实 API）" },
+        { k: "92%", l: "非压缩短任务命中" },
+        { k: "0", l: "重复 remote summary 调用（哈希缓存）" },
+      ],
+    },
     capabilitiesEyebrow: "引擎内部",
     capabilitiesTitle: "每一轮都在你的控制之下。",
     capabilitiesSubtitle:
@@ -311,7 +333,7 @@ const copy = {
     specsLabel: "技术规格",
     specs: {
       context: "上下文窗口，超过 80% 阈值后自动压缩。",
-      retries: "指数退避重试，自动处理 429 / 5xx。",
+      platforms: "原生二进制：macOS 与 Linux，arm64 / x64。",
       tools: "内置、MCP 和 external 工具共用规格驱动注册表。",
       rust: "Rust 编写，以单个本地二进制运行。",
     },
@@ -928,6 +950,10 @@ function App() {
               <span className="l">{t.hero.meta.context}</span>
             </div>
             <div>
+              <span className="k">99%</span>
+              <span className="l">{t.hero.meta.cache}</span>
+            </div>
+            <div>
               <span className="k">128</span>
               <span className="l">{t.hero.meta.turns}</span>
             </div>
@@ -995,6 +1021,21 @@ function App() {
             </article>
           ))}
         </div>
+        <article className="cache-card" aria-labelledby="cache-card-heading">
+          <div className="cache-card-copy">
+            <p className="eyebrow">{t.cacheCard.eyebrow}</p>
+            <h3 id="cache-card-heading">{t.cacheCard.title}</h3>
+            <p>{t.cacheCard.body}</p>
+          </div>
+          <div className="cache-card-stats" aria-hidden="true">
+            {t.cacheCard.stats.map((stat) => (
+              <div key={stat.l}>
+                <span className="num">{stat.k}</span>
+                <span className="l">{stat.l}</span>
+              </div>
+            ))}
+          </div>
+        </article>
       </section>
 
       <section className="capabilities" id="capabilities" aria-labelledby="capabilities-heading">
@@ -1058,9 +1099,9 @@ function App() {
           </div>
           <div>
             <div className="num">
-              3<span className="u">×</span>
+              4<span className="u">×</span>
             </div>
-            <p>{t.specs.retries}</p>
+            <p>{t.specs.platforms}</p>
           </div>
           <div>
             <div className="num">14</div>
