@@ -15,6 +15,7 @@ const links = {
   github: "https://github.com/echoVic/blade-deepseek",
   npm: "https://www.npmjs.com/package/@blade-ai/orca",
   releases: "https://github.com/echoVic/blade-deepseek/releases/latest",
+  telegram: "https://t.me/+11No1w5ZbTMyZTQ1",
 };
 
 type Locale = "en" | "zh";
@@ -175,6 +176,10 @@ const copy = {
         "Supported platforms: macOS arm64/x64 and Linux arm64/x64. Downloads are available on",
       releases: "GitHub Releases",
     },
+    community: {
+      qq: "QQ Group 472309526",
+      telegram: "Telegram",
+    },
     tui: {
       user: "fix the failing auth test",
       reasoning: "reasoning",
@@ -320,6 +325,10 @@ const copy = {
       failed: "复制失败",
       platforms: "支持平台：macOS arm64/x64 和 Linux arm64/x64。下载文件位于",
       releases: "GitHub Releases",
+    },
+    community: {
+      qq: "QQ 群 472309526",
+      telegram: "Telegram",
     },
     tui: {
       user: "修复失败的 auth 测试",
@@ -1149,6 +1158,10 @@ function App() {
           </a>
           <a href={links.releases} rel="noreferrer">
             {t.install.releases}
+          </a>
+          <span>{t.community.qq}</span>
+          <a href={links.telegram} rel="noreferrer">
+            {t.community.telegram}
           </a>
         </div>
       </footer>

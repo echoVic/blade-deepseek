@@ -286,6 +286,10 @@ h3 {
   min-width: 0;
 }
 
+.hero-copy {
+  align-self: start;
+}
+
 .subtitle {
   max-width: 56ch;
   margin-bottom: 22px;
@@ -1028,6 +1032,10 @@ footer .foot-brand .brand-mark {
 footer div.links {
   display: flex;
   gap: 18px;
+}
+
+footer div.links span {
+  color: var(--muted);
 }
 
 footer a:hover {

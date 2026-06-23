@@ -40,6 +40,11 @@ curl -fsSL https://orcaagent.dev/install.sh | \
 
 Download the archive for your platform from the latest GitHub Release, extract it, and place `orca` on your `PATH`.
 
+## Community
+
+- QQ group: `472309526`
+- Telegram: https://t.me/+11No1w5ZbTMyZTQ1
+
 ## Quick Start
 
 ```sh
