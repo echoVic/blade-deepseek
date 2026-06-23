@@ -10,6 +10,12 @@ const COMPACTION_THRESHOLD: f64 = 0.80;
 const RESERVED_FOR_RESPONSE: usize = 4096;
 const STALE_TOOL_OUTPUT_BYTES: usize = 2048;
 
+// Hysteresis: compaction triggers at effective_limit but compresses the kept
+// window down to this fraction so the next turn still has headroom before the
+// next trigger. Keeps the storm-quenching budget tight but not so tight that
+// useful context gets dropped on every cycle.
+const COMPACTION_TARGET_FRACTION: f64 = 0.60;
+
 pub trait TokenCounter {
     fn count_text(&self, text: &str) -> usize;
 }
@@ -58,6 +64,17 @@ impl ContextConfig {
         }
         let threshold = self.compaction_threshold.clamp(0.1, 1.0);
         ((self.max_tokens as f64 * threshold) as usize).saturating_sub(self.reserved_for_response)
+    }
+
+    /// Hysteresis target: when compaction triggers at `effective_limit()`, we
+    /// compress the kept window down to a smaller window so the next turn has
+    /// real headroom before the next trigger. Without this, every turn lands
+    /// just under the limit and next turn's wire prompt almost always re-fires
+    /// compaction (the "compaction storm" pathology).
+    pub fn target_compaction_limit(&self) -> usize {
+        let limit = self.effective_limit();
+        let scaled = ((limit as f64) * COMPACTION_TARGET_FRACTION) as usize;
+        scaled.max(1).min(limit)
     }
 }
 
@@ -133,6 +150,103 @@ pub fn needs_compaction(conversation: &Conversation, config: &ContextConfig) -> 
     total > config.effective_limit()
 }
 
+/// Wire-equivalent token count: estimates the byte-equivalent prompt the
+/// provider will actually send (`conversation_to_api_messages` + tool schema
+/// JSON), not just the in-memory `messages` token sum. This is what matters
+/// for `prompt_too_long` decisions and for the "compaction storm" check —
+/// without it, local budgeting passes while the real wire prompt is well past
+/// the limit (because injected `[Summary baseline]` / `[Summary update N]`
+/// system messages, the volatile overlay glued to the last message, and the
+/// tool schema JSON are all real tokens on the wire).
+pub fn wire_equivalent_tokens(
+    conversation: &Conversation,
+    provider_config: &ProviderConfig,
+) -> usize {
+    wire_equivalent_tokens_with_counter(conversation, provider_config, &DefaultTokenCounter)
+}
+
+pub fn needs_compaction_wire(
+    conversation: &Conversation,
+    config: &ContextConfig,
+    provider_config: &ProviderConfig,
+) -> bool {
+    wire_equivalent_tokens(conversation, provider_config) > config.effective_limit()
+}
+
+fn wire_equivalent_tokens_with_counter(
+    conversation: &Conversation,
+    provider_config: &ProviderConfig,
+    counter: &impl TokenCounter,
+) -> usize {
+    let mut tokens = 0;
+    let mut first_system_done = false;
+    let last_index = conversation.messages.len().saturating_sub(1);
+    let volatile_overlay = if conversation.volatile.is_empty() {
+        None
+    } else {
+        Some(conversation.volatile.render())
+    };
+
+    for (index, message) in conversation.messages.iter().enumerate() {
+        let mut message_tokens = message_tokens_with_counter(message, counter);
+        // The volatile overlay is appended ("\n\n{overlay}") to the very last
+        // wire message, regardless of role. Mirror that here so the wire count
+        // matches `conversation_to_api_messages`'s actual output.
+        if let Some(overlay) = volatile_overlay.as_deref()
+            && index == last_index
+        {
+            // 2 newlines + overlay text. The 2-byte separator is negligible in
+            // tokens; we count the overlay text only.
+            message_tokens += counter.count_text(overlay);
+        }
+        tokens += message_tokens;
+        if !first_system_done && matches!(message, Message::System { .. }) {
+            first_system_done = true;
+            tokens += inject_summary_tokens_with_counter(&conversation.summary, counter);
+        }
+    }
+
+    if !first_system_done && !conversation.summary.is_empty() {
+        tokens += inject_summary_tokens_with_counter(&conversation.summary, counter);
+    }
+
+    tokens += tools_schema_tokens_with_counter(provider_config, counter);
+    tokens
+}
+
+fn inject_summary_tokens_with_counter(
+    summary: &SummaryState,
+    counter: &impl TokenCounter,
+) -> usize {
+    let mut tokens = 0;
+    if let Some(baseline) = &summary.baseline {
+        let body = format!("[Summary baseline]\n{baseline}");
+        tokens += counter.count_text(&body) + 4;
+    }
+    for (i, delta) in summary.deltas.iter().enumerate() {
+        let body = format!("[Summary update {}]\n{delta}", i + 1);
+        tokens += counter.count_text(&body) + 4;
+    }
+    tokens
+}
+
+fn tools_schema_tokens_with_counter(
+    provider_config: &ProviderConfig,
+    counter: &impl TokenCounter,
+) -> usize {
+    let tools = provider_config.tools_override.clone().unwrap_or_else(|| {
+        crate::tool_schema::deepseek_tools_schema_with_mcp_and_external(
+            provider_config.mcp_registry.as_ref(),
+            &provider_config.external_tools,
+        )
+    });
+    if tools.is_empty() {
+        return 0;
+    }
+    let serialized = serde_json::to_string(&tools).unwrap_or_else(|_| String::from("[]"));
+    counter.count_text(&serialized)
+}
+
 pub fn is_prompt_too_long_error(message: &str) -> bool {
     let normalized = message.to_ascii_lowercase();
     normalized.contains("prompt_too_long")
@@ -164,7 +278,11 @@ pub fn compact_with_summary(
     provider_config: &ProviderConfig,
 ) -> CompactionResult {
     let micro_compacted = micro_compact_stale_tool_outputs(conversation);
-    if !needs_compaction(&micro_compacted, context_config) {
+    // Wire-equivalent gate: cheap micro compaction only counts as "enough"
+    // when the prompt the provider will actually receive (messages +
+    // injected summary + volatile overlay + tool schema JSON) is back under
+    // the limit, otherwise the next turn re-enters the storm.
+    if !needs_compaction_wire(&micro_compacted, context_config, provider_config) {
         return CompactionResult {
             conversation: micro_compacted,
             kind: CompactionKind::LocalTruncation,
@@ -188,7 +306,7 @@ pub fn compact_with_summary(
     }
 }
 
-const SMALL_DELTA_TOKEN_THRESHOLD: usize = 200;
+const DIRECT_SUMMARY_DELTA_TOKEN_THRESHOLD: usize = 800;
 const MAX_SUMMARY_DELTAS: usize = 5;
 const BASELINE_REBUILD_TOKEN_THRESHOLD: usize = 2000;
 
@@ -224,20 +342,20 @@ fn summarize_collapsed_messages(
         .collect();
     let rendered = render_summary_delta(&original_collapsed);
 
-    let has_existing_summary =
-        conversation.rolling_summary.is_some() || !conversation.summary.is_empty();
-    let new_delta =
-        if has_existing_summary && rendered.rendered_tokens_est < SMALL_DELTA_TOKEN_THRESHOLD {
-            rendered.text.trim().to_string()
-        } else {
-            request_summary(
-                provider_kind,
-                provider_config,
-                SUMMARY_PURPOSE_DELTA,
-                None,
-                &rendered,
-            )?
-        };
+    // Medium-and-smaller rendered deltas are cheap enough to keep directly.
+    // Returning None here means "fall back to local truncation", which would
+    // drop the collapsed facts.
+    let new_delta = if rendered.rendered_tokens_est < DIRECT_SUMMARY_DELTA_TOKEN_THRESHOLD {
+        rendered.text.trim().to_string()
+    } else {
+        request_summary(
+            provider_kind,
+            provider_config,
+            SUMMARY_PURPOSE_DELTA,
+            None,
+            &rendered,
+        )?
+    };
 
     let mut result = Conversation::new();
     if let Some(system) = system_msg {
@@ -317,7 +435,8 @@ fn partition_for_compaction(
     counter: &impl TokenCounter,
 ) -> Option<(Option<Message>, Vec<Message>, Vec<Message>, Vec<Message>)> {
     let messages = &conversation.messages;
-    let target_tokens = config.effective_limit();
+    // Hysteresis: compress to the target window, not just below the trigger.
+    let target_tokens = config.target_compaction_limit();
     let system_msg = messages.first().cloned();
     let system_tokens = system_msg
         .as_ref()
@@ -355,6 +474,7 @@ fn partition_for_compaction(
         budget += msg_tokens;
         kept.push((*msg).clone());
     }
+    keep_latest_droppable_if_empty(&mut kept, &droppable);
     kept.reverse();
     normalize_tool_boundaries(&mut kept);
 
@@ -409,6 +529,9 @@ fn request_summary(
     summary_conversation.add_user(user_prompt);
 
     let response = crate::call(provider_kind, &summary_conversation, &summary_config);
+    if let Some(usage) = response.usage {
+        emit_summary_usage_telemetry(purpose, usage);
+    }
     if response
         .steps
         .iter()
@@ -494,10 +617,12 @@ impl RenderedSummaryDelta {
 }
 
 /// Render the collapsed delta with the unified tool-output tier ruleset.
-/// Natural-language turns (user/assistant) are left untouched so the remote
-/// summarizer keeps full fidelity on intent and decisions. Tool outputs go
-/// through a single layered policy (`render_tool_output`). Identical inputs
-/// always yield identical output, which also stabilizes the summary hash cache.
+/// Both tool outputs and natural-language turns (user / assistant) go through
+/// a single layered policy (`render_tool_output`): identical inputs always
+/// yield identical output, which also stabilizes the summary hash cache and
+/// keeps huge stdin / piped user blobs from blowing past the renderer budget.
+/// Small content stays verbatim, so summary fidelity for normal turns is
+/// preserved.
 pub fn render_summary_delta(collapsed: &[Message]) -> RenderedSummaryDelta {
     let original_text = format_messages(collapsed);
     let mut compacted_tool_outputs = 0usize;
@@ -516,6 +641,36 @@ pub fn render_summary_delta(collapsed: &[Message]) -> RenderedSummaryDelta {
                 Message::Tool {
                     tool_call_id: tool_call_id.clone(),
                     content: rendered,
+                    pinned: *pinned,
+                }
+            }
+            Message::User { content, pinned } => {
+                let (rendered, compacted) = render_tool_output(content);
+                if compacted {
+                    compacted_tool_outputs += 1;
+                }
+                Message::User {
+                    content: rendered,
+                    pinned: *pinned,
+                }
+            }
+            Message::Assistant {
+                content,
+                reasoning_content: _,
+                tool_calls,
+                pinned,
+            } => {
+                let new_content = content.as_ref().map(|c| {
+                    let (rendered, compacted) = render_tool_output(c);
+                    if compacted {
+                        compacted_tool_outputs += 1;
+                    }
+                    rendered
+                });
+                Message::Assistant {
+                    content: new_content,
+                    reasoning_content: None,
+                    tool_calls: tool_calls.clone(),
                     pinned: *pinned,
                 }
             }
@@ -714,6 +869,13 @@ fn emit_summary_telemetry(purpose: &str, cache_hit: bool, rendered: &RenderedSum
     eprintln!("{}", format_summary_telemetry(purpose, cache_hit, rendered));
 }
 
+fn emit_summary_usage_telemetry(purpose: &str, usage: orca_core::provider_types::Usage) {
+    if std::env::var_os(SUMMARY_DEBUG_ENV).is_none() {
+        return;
+    }
+    eprintln!("{}", format_summary_usage_telemetry(purpose, usage));
+}
+
 fn format_summary_telemetry(
     purpose: &str,
     cache_hit: bool,
@@ -729,6 +891,21 @@ fn format_summary_telemetry(
         rendered.original_tokens_est,
         rendered.rendered_tokens_est,
         rendered.compacted_tool_outputs,
+    )
+}
+
+fn format_summary_usage_telemetry(
+    purpose: &str,
+    usage: orca_core::provider_types::Usage,
+) -> String {
+    let cache_hit_ratio = if usage.input_tokens == 0 {
+        0.0
+    } else {
+        usage.cache_tokens as f64 / usage.input_tokens as f64
+    };
+    format!(
+        "orca.remote_summary_usage purpose={} input_tokens={} output_tokens={} cache_tokens={} cache_hit_ratio={:.4}",
+        purpose, usage.input_tokens, usage.output_tokens, usage.cache_tokens, cache_hit_ratio,
     )
 }
 
@@ -801,7 +978,9 @@ pub fn compact_with_counter(
     }
 
     let messages = &micro_compacted.messages;
-    let target_tokens = config.effective_limit();
+    // Hysteresis: compress to the target window so the next turn does not
+    // immediately re-trigger compaction.
+    let target_tokens = config.target_compaction_limit();
 
     let system_msg = messages.first().cloned();
     let system_tokens = system_msg
@@ -859,6 +1038,7 @@ pub fn compact_with_counter(
         budget += msg_tokens;
         kept.push((*msg).clone());
     }
+    keep_latest_droppable_if_empty(&mut kept, &droppable);
     kept.reverse();
 
     normalize_tool_boundaries(&mut kept);
@@ -896,6 +1076,14 @@ fn normalize_compacted_conversation(mut conversation: Conversation) -> Conversat
     result.rolling_summary = rolling_summary;
     result.summary = summary;
     result
+}
+
+fn keep_latest_droppable_if_empty(kept: &mut Vec<Message>, droppable: &[&Message]) {
+    if kept.is_empty()
+        && let Some(message) = droppable.last()
+    {
+        kept.push((*message).clone());
+    }
 }
 
 fn micro_compact_stale_tool_outputs(conversation: &Conversation) -> Conversation {
@@ -992,6 +1180,41 @@ mod tests {
 
         let config = ContextConfig::default();
         assert!(!needs_compaction(&conv, &config));
+    }
+
+    #[test]
+    fn needs_compaction_wire_includes_tool_schema_tokens() {
+        let mut conv = Conversation::new();
+        conv.add_system("system".to_string());
+        conv.add_user("hello".to_string());
+
+        let config = ContextConfig {
+            max_tokens: 100,
+            compaction_threshold: 1.0,
+            reserved_for_response: 0,
+            auto_compact_token_limit: Some(100),
+        };
+        let provider_config = ProviderConfig {
+            api_key: None,
+            base_url: None,
+            model: None,
+            tools_override: Some(vec![serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": "large_tool",
+                    "description": "schema ".repeat(300),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {}
+                    }
+                }
+            })]),
+            mcp_registry: None,
+            external_tools: Vec::new(),
+        };
+
+        assert!(!needs_compaction(&conv, &config));
+        assert!(needs_compaction_wire(&conv, &config, &provider_config));
     }
 
     #[test]
@@ -1286,12 +1509,18 @@ mod tests {
     fn compact_with_summary_falls_back_to_local_when_provider_errors() {
         let mut conv = Conversation::new();
         conv.add_system("system".to_string());
-        conv.add_user("old ".repeat(100));
-        conv.add_assistant(Some("older answer".to_string()), None, vec![]);
+        for index in 0..6 {
+            conv.add_user(format!("old {index} {}", "x ".repeat(1_200)));
+            conv.add_assistant(
+                Some(format!("older answer {index} {}", "y ".repeat(1_200))),
+                None,
+                vec![],
+            );
+        }
         conv.add_user("newest request".to_string());
 
         let config = ContextConfig {
-            max_tokens: 40,
+            max_tokens: 500,
             compaction_threshold: 1.0,
             reserved_for_response: 0,
             auto_compact_token_limit: None,
@@ -1317,8 +1546,14 @@ mod tests {
     fn compact_with_existing_summary_falls_back_to_local_when_large_delta_summary_fails() {
         let mut conv = Conversation::new();
         conv.add_system("system".to_string());
-        conv.add_user("old ".repeat(400));
-        conv.add_assistant(Some("older answer ".repeat(400)), None, vec![]);
+        for index in 0..6 {
+            conv.add_user(format!("old {index} {}", "x ".repeat(1_200)));
+            conv.add_assistant(
+                Some(format!("older answer {index} {}", "y ".repeat(1_200))),
+                None,
+                vec![],
+            );
+        }
         conv.add_user("newest request".to_string());
         conv.rolling_summary = Some("previous summary only".to_string());
 
@@ -1346,6 +1581,136 @@ mod tests {
         assert!(result.conversation.messages.iter().any(|message| {
             matches!(message, Message::System { content, .. } if content.contains("truncated to fit context window"))
         }));
+    }
+
+    #[test]
+    fn compact_with_summary_keeps_oversized_current_user_and_summarizes_old_history() {
+        let mut conv = Conversation::new();
+        conv.add_system("system".to_string());
+        conv.add_user("alpha fact that must be summarized".to_string());
+        conv.add_assistant(Some("alpha acknowledged".to_string()), None, vec![]);
+        let oversized_current = "beta current turn ".repeat(2_000);
+        conv.add_user(oversized_current.clone());
+
+        let config = ContextConfig {
+            max_tokens: 10_000,
+            compaction_threshold: 1.0,
+            reserved_for_response: 0,
+            auto_compact_token_limit: Some(1_000),
+        };
+        let provider_config = ProviderConfig {
+            api_key: None,
+            base_url: None,
+            model: None,
+            tools_override: Some(Vec::new()),
+            mcp_registry: None,
+            external_tools: Vec::new(),
+        };
+
+        let result = compact_with_summary(ProviderKind::Mock, &conv, &config, &provider_config);
+
+        assert!(
+            matches!(result.kind, CompactionKind::RemoteSummary(_)),
+            "oversized current turns must not force local truncation of old history"
+        );
+        assert!(result.conversation.summary.baseline.is_some());
+        assert!(result.conversation.messages.iter().any(|message| {
+            matches!(message, Message::User { content, .. } if content == &oversized_current)
+        }));
+    }
+
+    #[test]
+    fn compact_with_summary_directly_preserves_medium_initial_delta_without_remote_call() {
+        let alpha: String = (0..700)
+            .map(|i| format!("alpha-cache-collision row {i:04}: stable fact A{}", i % 17))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let beta: String = (0..700)
+            .map(|i| format!("beta-cache-collision row {i:04}: stable fact B{}", i % 19))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut conv = Conversation::new();
+        conv.add_system("system".to_string());
+        conv.add_user(alpha);
+        conv.add_assistant(Some("alpha received".to_string()), None, vec![]);
+        conv.add_user(beta.clone());
+
+        let config = ContextConfig {
+            max_tokens: 50_000,
+            compaction_threshold: 1.0,
+            reserved_for_response: 0,
+            auto_compact_token_limit: Some(18_000),
+        };
+        let provider_config = ProviderConfig {
+            api_key: None,
+            base_url: None,
+            model: None,
+            tools_override: Some(Vec::new()),
+            mcp_registry: None,
+            external_tools: Vec::new(),
+        };
+
+        let result = compact_with_summary(ProviderKind::DeepSeek, &conv, &config, &provider_config);
+
+        assert!(
+            matches!(result.kind, CompactionKind::RemoteSummary(_)),
+            "medium rendered deltas should not require a remote summary call"
+        );
+        assert!(
+            result
+                .conversation
+                .summary
+                .baseline
+                .as_deref()
+                .is_some_and(|summary| summary.contains("alpha-cache-collision"))
+        );
+        assert!(result.conversation.messages.iter().any(|message| {
+            matches!(message, Message::User { content, .. } if content == &beta)
+        }));
+    }
+
+    #[test]
+    fn existing_summary_preserves_small_collapsed_delta_without_remote_call() {
+        let mut conv = Conversation::new();
+        conv.add_system("system".to_string());
+        conv.add_user("remember the user chose option B".to_string());
+        conv.add_user("current request".to_string());
+        conv.summary.baseline = Some("existing baseline".to_string());
+
+        let system_tokens = message_tokens(conv.messages.first().unwrap());
+        let summary_tokens = summary_state_tokens(&conv, &DefaultTokenCounter) + 256;
+        let newest_tokens = message_tokens(conv.messages.last().unwrap());
+        let target_tokens = system_tokens + summary_tokens + newest_tokens + 4;
+        let effective_limit = target_tokens.saturating_mul(5).div_ceil(3);
+        let config = ContextConfig {
+            max_tokens: 10_000,
+            compaction_threshold: 1.0,
+            reserved_for_response: 0,
+            auto_compact_token_limit: Some(effective_limit),
+        };
+        let provider_config = ProviderConfig {
+            api_key: None,
+            base_url: None,
+            model: None,
+            tools_override: Some(Vec::new()),
+            mcp_registry: None,
+            external_tools: Vec::new(),
+        };
+
+        let (_summary_conversation, delta) = summarize_collapsed_messages(
+            ProviderKind::DeepSeek,
+            &conv,
+            &conv,
+            &config,
+            &provider_config,
+        )
+        .expect("small collapsed deltas must be kept instead of falling back to local truncation");
+
+        assert!(delta.contains("remember the user chose option B"));
+        assert!(
+            DefaultTokenCounter.count_text(&delta) < DIRECT_SUMMARY_DELTA_TOKEN_THRESHOLD,
+            "test must exercise the small-delta path"
+        );
     }
 
     #[test]
@@ -1407,13 +1772,14 @@ mod tests {
         //
         // FixedCounter scores each message as 5 tokens (content 1 + overhead 4).
         // The partition budget starts at system(5) + summary reserve(257) + 4 =
-        // 266, then keeps recent messages until the limit. A 272-token effective
-        // limit keeps exactly the newest message and collapses the two before it.
+        // 266. With hysteresis, partition uses target_compaction_limit() = 60%
+        // of effective_limit. We pick 452 so target = 271 and exactly the
+        // newest message fits (266 + 5 = 271), collapsing the two before it.
         let config = ContextConfig {
             max_tokens: 1000,
             compaction_threshold: 1.0,
             reserved_for_response: 0,
-            auto_compact_token_limit: Some(272),
+            auto_compact_token_limit: Some(452),
         };
 
         let mut conv = Conversation::new();
@@ -1598,9 +1964,10 @@ mod tests {
     }
 
     #[test]
-    fn small_delta_token_threshold_is_reasonable() {
+    fn direct_summary_delta_token_threshold_is_reasonable() {
         assert!(
-            SMALL_DELTA_TOKEN_THRESHOLD > 0 && SMALL_DELTA_TOKEN_THRESHOLD <= 500,
+            DIRECT_SUMMARY_DELTA_TOKEN_THRESHOLD > 0
+                && DIRECT_SUMMARY_DELTA_TOKEN_THRESHOLD <= 1_000,
             "threshold should be in a reasonable range"
         );
     }
@@ -1830,13 +2197,16 @@ mod tests {
     }
 
     #[test]
-    fn render_summary_delta_preserves_natural_language_turns() {
-        let long_user = "user intent ".repeat(200);
-        let long_assistant = "assistant decision ".repeat(200);
+    fn render_summary_delta_keeps_small_natural_language_turns_verbatim() {
+        // Small natural-language turns must always pass through untouched so
+        // the remote summarizer keeps full fidelity on user intent and
+        // assistant decisions.
+        let user = "decide whether to ship now or wait for review".to_string();
+        let assistant = "I recommend waiting; the soak test failed twice.".to_string();
         let messages = vec![
-            Message::user(long_user.clone()),
+            Message::user(user.clone()),
             Message::Assistant {
-                content: Some(long_assistant.clone()),
+                content: Some(assistant.clone()),
                 reasoning_content: None,
                 tool_calls: vec![],
                 pinned: false,
@@ -1844,9 +2214,66 @@ mod tests {
         ];
 
         let rendered = render_summary_delta(&messages);
-        assert!(rendered.text.contains(long_user.trim()));
-        assert!(rendered.text.contains(long_assistant.trim()));
+        assert!(rendered.text.contains(&user));
+        assert!(rendered.text.contains(&assistant));
         assert_eq!(rendered.compacted_tool_outputs, 0);
+    }
+
+    #[test]
+    fn render_summary_delta_extractive_renders_huge_stdin_user_blobs() {
+        // Round 9 fix: piped/stdin user blobs that blow past the verbatim
+        // tier must go through the extractive renderer too. Otherwise huge
+        // single user messages drift the wire prompt and re-trigger the
+        // compaction storm even after micro/summary compaction.
+        let huge_stdin: String = (0..400)
+            .map(|i| format!("stdin row {i} payload chunk"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(huge_stdin.len() > SUMMARY_HUGE_BYTES);
+        let messages = vec![Message::user(huge_stdin.clone())];
+
+        let rendered = render_summary_delta(&messages);
+
+        assert!(rendered.text.contains("[extractive-compact]"));
+        assert!(rendered.rendered_bytes < rendered.original_bytes);
+        assert_eq!(rendered.compacted_tool_outputs, 1);
+    }
+
+    #[test]
+    fn render_summary_delta_extractive_renders_huge_assistant_content() {
+        let huge_assistant: String = (0..400)
+            .map(|i| format!("assistant row {i} long reasoning narrative"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(huge_assistant.len() > SUMMARY_HUGE_BYTES);
+        let messages = vec![Message::Assistant {
+            content: Some(huge_assistant.clone()),
+            reasoning_content: None,
+            tool_calls: vec![],
+            pinned: false,
+        }];
+
+        let rendered = render_summary_delta(&messages);
+
+        assert!(rendered.text.contains("[extractive-compact]"));
+        assert!(rendered.rendered_bytes < rendered.original_bytes);
+        assert_eq!(rendered.compacted_tool_outputs, 1);
+    }
+
+    #[test]
+    fn render_summary_delta_omits_assistant_reasoning_content() {
+        let messages = vec![Message::Assistant {
+            content: Some("final answer to preserve".to_string()),
+            reasoning_content: Some("private chain of thought should not persist".to_string()),
+            tool_calls: vec![],
+            pinned: false,
+        }];
+
+        let rendered = render_summary_delta(&messages);
+
+        assert!(rendered.text.contains("final answer to preserve"));
+        assert!(!rendered.text.contains("private chain of thought"));
+        assert!(!rendered.text.contains("reasoning:"));
     }
 
     #[test]
@@ -1914,6 +2341,24 @@ mod tests {
             !line.contains(" input_tokens_est="),
             "ambiguous token metric name should not be emitted"
         );
+    }
+
+    #[test]
+    fn summary_usage_telemetry_reports_provider_cache_tokens() {
+        let usage = orca_core::provider_types::Usage {
+            input_tokens: 1_000,
+            output_tokens: 25,
+            cache_tokens: 768,
+        };
+
+        let line = format_summary_usage_telemetry("delta", usage);
+
+        assert!(line.contains("orca.remote_summary_usage"));
+        assert!(line.contains("purpose=delta"));
+        assert!(line.contains("input_tokens=1000"));
+        assert!(line.contains("output_tokens=25"));
+        assert!(line.contains("cache_tokens=768"));
+        assert!(line.contains("cache_hit_ratio=0.7680"));
     }
 
     #[test]

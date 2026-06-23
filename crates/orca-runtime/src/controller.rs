@@ -345,6 +345,26 @@ fn run_agent_loop(
             for message in &conversation.messages {
                 writer.append_message(message)?;
             }
+            // Persist the inherited summary_state into the new transcript.
+            // Without this, multi-process `--continue` resumes (e.g. pipe-eval)
+            // load summary_state into memory but never write it back, so the
+            // next process that resumes from this new transcript loses the
+            // shape of the summary state — re-triggering compaction storms
+            // and shifting the wire prefix.
+            if !conversation.summary.is_empty() {
+                let inherited_marker = conversation
+                    .summary
+                    .latest_rolling()
+                    .map(|text| text.to_string())
+                    .unwrap_or_default();
+                let count = conversation.messages.len();
+                writer.append_summary_state(
+                    count,
+                    count,
+                    inherited_marker,
+                    &conversation.summary,
+                )?;
+            }
         } else {
             if let Some(system) = conversation.messages.first() {
                 writer.append_message(system)?;
@@ -369,7 +389,7 @@ fn run_agent_loop(
             return Ok(AgentLoopResult::failure(RunStatus::BudgetExhausted, error));
         }
 
-        if context::needs_compaction(&conversation, &ctx_config) {
+        if context::needs_compaction_wire(&conversation, &ctx_config, &provider_config) {
             let before_messages = conversation.messages.len();
             match hooks.run(
                 HookEvent::OnBudgetWarning,

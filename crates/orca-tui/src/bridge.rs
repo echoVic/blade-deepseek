@@ -294,6 +294,26 @@ fn start_writer_with_messages(
                     return None;
                 }
             }
+            // Mirror controller.rs: when resuming/forking inherits a
+            // summary_state, persist it into the new transcript so the next
+            // process that resumes from here doesn't lose the shape.
+            if !conversation.summary.is_empty() {
+                let inherited_marker = conversation
+                    .summary
+                    .latest_rolling()
+                    .map(|text| text.to_string())
+                    .unwrap_or_default();
+                let count = conversation.messages.len();
+                if let Err(error) = writer.append_summary_state(
+                    count,
+                    count,
+                    inherited_marker,
+                    &conversation.summary,
+                ) {
+                    eprintln!("orca: warning: history write failed: {error}");
+                    return None;
+                }
+            }
             Some(writer)
         }
         Err(error) => {
@@ -375,7 +395,11 @@ pub fn run_agent_for_tui(
             return "budget_exhausted".to_string();
         }
 
-        if orca_provider::context::needs_compaction(&session.conversation, &ctx_config) {
+        if orca_provider::context::needs_compaction_wire(
+            &session.conversation,
+            &ctx_config,
+            &provider_config,
+        ) {
             let before_messages = session.conversation.messages.len();
             match session.hooks.run(
                 HookEvent::OnBudgetWarning,
@@ -1592,7 +1616,11 @@ fn run_child_agent_for_tui(
             };
         }
 
-        if orca_provider::context::needs_compaction(&conversation, &ctx_config) {
+        if orca_provider::context::needs_compaction_wire(
+            &conversation,
+            &ctx_config,
+            &provider_config,
+        ) {
             let before_messages = conversation.messages.len();
             if let Ok(outcome) = hooks.run(
                 HookEvent::OnBudgetWarning,
