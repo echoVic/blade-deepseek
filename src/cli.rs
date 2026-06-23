@@ -3,6 +3,8 @@ use std::fs;
 use std::io;
 use std::io::BufRead;
 use std::io::BufReader;
+use std::io::IsTerminal;
+use std::io::Read;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
@@ -527,6 +529,58 @@ fn parse_approval_mode_value(mode: &str) -> Result<ApprovalMode, String> {
     })
 }
 
+fn read_stdin_text() -> Result<String, String> {
+    let mut buffer = String::new();
+    io::stdin()
+        .read_to_string(&mut buffer)
+        .map_err(|error| format!("failed to read stdin: {error}"))?;
+    Ok(buffer)
+}
+
+fn prompt_with_stdin_context(prompt: &str, stdin_text: &str) -> String {
+    let mut combined = format!("{prompt}\n\n<stdin>\n{stdin_text}");
+    if !stdin_text.ends_with('\n') {
+        combined.push('\n');
+    }
+    combined.push_str("</stdin>");
+    combined
+}
+
+fn resolve_exec_prompt_from_stdin(prompt_args: Vec<String>) -> Result<String, String> {
+    let force_stdin = prompt_args.len() == 1 && prompt_args[0] == "-";
+    let has_prompt = !prompt_args.is_empty() && !force_stdin;
+    let prompt = if has_prompt {
+        prompt_args.join(" ")
+    } else {
+        String::new()
+    };
+
+    if force_stdin || !has_prompt {
+        if io::stdin().is_terminal() {
+            return Err(
+                "No prompt provided. Either specify one as an argument or pipe the prompt into stdin."
+                    .to_string(),
+            );
+        }
+        let stdin_text = read_stdin_text()?;
+        if stdin_text.trim().is_empty() {
+            return Err("No prompt provided via stdin.".to_string());
+        }
+        return Ok(stdin_text);
+    }
+
+    if io::stdin().is_terminal() {
+        return Ok(prompt);
+    }
+
+    let stdin_text = read_stdin_text()?;
+    if stdin_text.trim().is_empty() {
+        Ok(prompt)
+    } else {
+        Ok(prompt_with_stdin_context(&prompt, &stdin_text))
+    }
+}
+
 fn run_exec(args: ExecArgs) -> i32 {
     if args.no_history && (args.resume.is_some() || args.fork.is_some() || args.continue_latest) {
         eprintln!("orca: --resume/--fork/--continue cannot be combined with --no-history");
@@ -543,7 +597,13 @@ fn run_exec(args: ExecArgs) -> i32 {
         return 1;
     }
 
-    let prompt = args.prompt.join(" ");
+    let prompt = match resolve_exec_prompt_from_stdin(args.prompt) {
+        Ok(prompt) => prompt,
+        Err(error) => {
+            eprintln!("orca: {error}");
+            return 1;
+        }
+    };
     let cwd_for_mentions = args
         .cwd
         .clone()

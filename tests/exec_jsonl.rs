@@ -1,4 +1,5 @@
-use std::process::Command;
+use std::io::Write;
+use std::process::{Command, Stdio};
 
 use serde_json::Value;
 use tempfile::TempDir;
@@ -41,6 +42,80 @@ fn exec_outputs_jsonl_contract_and_success_status() {
         assert_eq!(event["seq"], seq);
         assert!(event["run_id"].as_str().unwrap().starts_with("run-"));
     }
+}
+
+#[test]
+fn exec_reads_prompt_from_piped_stdin_when_prompt_is_omitted() {
+    let output = run_exec_with_stdin(
+        &["exec", "--output-format", "jsonl", "--provider", "mock"],
+        "prompt from stdin\n",
+    );
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+
+    let events = parse_jsonl(&output.stdout);
+    let turn_started = find_event(&events, "turn.started");
+    assert_eq!(turn_started["payload"]["prompt"], "prompt from stdin");
+}
+
+#[test]
+fn exec_dash_prompt_reads_piped_stdin_as_prompt() {
+    let output = run_exec_with_stdin(
+        &[
+            "exec",
+            "--output-format",
+            "jsonl",
+            "--provider",
+            "mock",
+            "-",
+        ],
+        "dash prompt from stdin\n",
+    );
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+
+    let events = parse_jsonl(&output.stdout);
+    let turn_started = find_event(&events, "turn.started");
+    assert_eq!(turn_started["payload"]["prompt"], "dash prompt from stdin");
+}
+
+#[test]
+fn exec_appends_piped_stdin_to_prompt_argument() {
+    let output = run_exec_with_stdin(
+        &[
+            "exec",
+            "--output-format",
+            "jsonl",
+            "--provider",
+            "mock",
+            "summarize this",
+        ],
+        "extra context\n",
+    );
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+
+    let events = parse_jsonl(&output.stdout);
+    let turn_started = find_event(&events, "turn.started");
+    assert_eq!(
+        turn_started["payload"]["prompt"],
+        "summarize this\n\n<stdin>\nextra context\n</stdin>"
+    );
+}
+
+#[test]
+fn exec_without_prompt_rejects_empty_piped_stdin() {
+    let output = run_exec_with_stdin(
+        &["exec", "--output-format", "jsonl", "--provider", "mock"],
+        "",
+    );
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("No prompt provided via stdin."));
+    assert!(output.stdout.is_empty());
 }
 
 #[test]
@@ -322,6 +397,32 @@ fn parse_jsonl(stdout: &[u8]) -> Vec<Value> {
         .lines()
         .map(|line| serde_json::from_str(line).expect("valid jsonl line"))
         .collect()
+}
+
+fn find_event<'a>(events: &'a [Value], event_type: &str) -> &'a Value {
+    events
+        .iter()
+        .find(|event| event["type"] == event_type)
+        .unwrap_or_else(|| panic!("missing {event_type}"))
+}
+
+fn run_exec_with_stdin(args: &[&str], stdin: &str) -> std::process::Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn orca");
+
+    {
+        let child_stdin = child.stdin.as_mut().expect("child stdin");
+        child_stdin
+            .write_all(stdin.as_bytes())
+            .expect("write child stdin");
+    }
+
+    child.wait_with_output().expect("wait for orca")
 }
 
 fn shell_escape(path: &std::path::Path) -> String {
