@@ -123,6 +123,19 @@ orca exec [options] <prompt>
 orca --mode=server
 ```
 
+For headless harnesses, `orca exec` also accepts prompt input from stdin:
+
+```sh
+printf 'fix the failing test\n' | orca exec --output-format jsonl
+printf 'review this diff\n' | orca exec --output-format jsonl -
+printf 'compiler output\n' | orca exec --output-format jsonl 'summarize this failure'
+```
+
+When no prompt argument is provided, stdin becomes the prompt. A lone `-` also
+forces reading the prompt from stdin. When a prompt argument and piped stdin are
+both provided, stdin is appended to the prompt inside a `<stdin>...</stdin>`
+context block.
+
 Options:
 
 - `--output-format text|jsonl` — Output format (default: text)

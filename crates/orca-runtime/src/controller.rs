@@ -318,7 +318,7 @@ fn run_agent_loop(
         external_tools: config.external_tools.clone(),
     };
 
-    let mut system_prompt = agent_common::build_agent_system_prompt(
+    let system_prompt = agent_common::build_agent_system_prompt(
         cwd,
         subagent_depth,
         subagent_type,
@@ -326,14 +326,17 @@ fn run_agent_loop(
         config.approval_mode,
         Some(memory),
     );
-    agent_common::append_explicit_skill_context(&mut system_prompt, cwd, prompt);
     let mut conversation = if let Some(resumed) = resumed {
-        history::resume_conversation(resumed, system_prompt)
+        let mut conv = history::resume_conversation(resumed, system_prompt);
+        conv.strip_legacy_pinned_volatile();
+        conv.strip_legacy_summary_messages();
+        conv
     } else {
         let mut conversation = Conversation::new();
         conversation.add_system(system_prompt);
         conversation
     };
+    conversation.replace_skill_context(agent_common::explicit_skill_context(cwd, prompt));
     conversation.add_user(prompt.to_string());
 
     let mut history_writer = history_writer;
@@ -415,7 +418,12 @@ fn run_agent_loop(
             if emit_deltas && let Some(writer) = history_writer.as_deref_mut() {
                 writer.append_compaction(before_messages, after_messages)?;
                 if let context::CompactionKind::RemoteSummary(summary) = compaction.kind {
-                    writer.append_summary(before_messages, after_messages, summary)?;
+                    writer.append_summary_state(
+                        before_messages,
+                        after_messages,
+                        summary,
+                        &conversation.summary,
+                    )?;
                 }
             }
             if emit_deltas
@@ -451,11 +459,6 @@ fn run_agent_loop(
         }
         let mut turn_provider_config = provider_config.clone();
         turn_provider_config.model = Some(route_decision.actual_model.clone());
-        let turn_ctx_config = context::ContextConfig::for_model_with_runtime(
-            Some(&route_decision.actual_model),
-            &config.model_runtime,
-        );
-        context::apply_context_budget_hint_with_config(&mut conversation, &turn_ctx_config);
 
         let pre_model_outcome = match hooks.run(
             HookEvent::PreModelCall,
@@ -557,7 +560,12 @@ fn run_agent_loop(
                 if emit_deltas && let Some(writer) = history_writer.as_deref_mut() {
                     writer.append_compaction(before_messages, after_messages)?;
                     if let context::CompactionKind::RemoteSummary(summary) = compaction.kind {
-                        writer.append_summary(before_messages, after_messages, summary)?;
+                        writer.append_summary_state(
+                            before_messages,
+                            after_messages,
+                            summary,
+                            &conversation.summary,
+                        )?;
                     }
                 }
                 reactive_compacted = true;
@@ -745,12 +753,6 @@ fn run_agent_loop(
                     conversation.replace_plan_state(
                         orca_tools::update_plan::format_context_message(&update),
                     );
-                    if emit_deltas
-                        && let Some(writer) = history_writer.as_deref_mut()
-                        && let Some(message) = conversation.messages.last()
-                    {
-                        writer.append_message(message)?;
-                    }
                     if let Some(writer) = history_writer.as_deref_mut() {
                         let _ = writer.append_plan_state(update.explanation, update.plan);
                     }

@@ -822,11 +822,33 @@ fn render_status(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
             ),
             Style::default().fg(theme.muted),
         ),
+        context_cell(state, theme),
         Span::styled(" | F1/ctrl+k shortcuts", Style::default().fg(theme.muted)),
     ]);
 
     let paragraph = Paragraph::new(line);
     frame.render_widget(paragraph, area);
+}
+
+/// Remaining context window as a percentage of the local compaction budget.
+/// Pure local observability — this value is never sent upstream, so it cannot
+/// affect DeepSeek's prefix cache. Hidden until a real budget is known.
+fn context_cell(state: &AppState, theme: &Theme) -> Span<'static> {
+    if state.context_limit_tokens == 0 {
+        return Span::raw("");
+    }
+    let remaining = state
+        .context_limit_tokens
+        .saturating_sub(state.context_used_tokens);
+    let percent = (remaining * 100) / state.context_limit_tokens;
+    let color = if percent > 50 {
+        theme.success
+    } else if percent >= 20 {
+        theme.warning
+    } else {
+        theme.error
+    };
+    Span::styled(format!(" | context: {percent}%"), Style::default().fg(color))
 }
 
 fn render_shortcuts(frame: &mut Frame, state: &AppState, theme: &Theme) {
@@ -1698,5 +1720,49 @@ mod tests {
             .join("\n");
 
         assert!(rendered.contains("v9.8.7-test"));
+    }
+
+    fn test_state() -> AppState {
+        let (tx, _rx) = mpsc::channel();
+        AppState::new(
+            tx,
+            "0.0.0".to_string(),
+            "deepseek".to_string(),
+            "/tmp".to_string(),
+        )
+    }
+
+    #[test]
+    fn context_cell_is_hidden_until_a_budget_is_known() {
+        let state = test_state();
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        // limit_tokens == 0 means no turn has reported a budget yet.
+        assert_eq!(context_cell(&state, &theme).content.as_ref(), "");
+    }
+
+    #[test]
+    fn context_cell_shows_remaining_percentage() {
+        let mut state = test_state();
+        state.context_limit_tokens = 1000;
+        state.context_used_tokens = 250;
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let cell = context_cell(&state, &theme);
+        assert_eq!(cell.content.as_ref(), " | context: 75%");
+        assert_eq!(cell.style.fg, Some(theme.success));
+    }
+
+    #[test]
+    fn context_cell_warns_then_errors_as_budget_shrinks() {
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+
+        let mut warn = test_state();
+        warn.context_limit_tokens = 1000;
+        warn.context_used_tokens = 700; // 30% remaining
+        assert_eq!(context_cell(&warn, &theme).style.fg, Some(theme.warning));
+
+        let mut danger = test_state();
+        danger.context_limit_tokens = 1000;
+        danger.context_used_tokens = 900; // 10% remaining
+        assert_eq!(context_cell(&danger, &theme).style.fg, Some(theme.error));
     }
 }

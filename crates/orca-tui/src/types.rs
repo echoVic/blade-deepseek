@@ -61,6 +61,10 @@ pub enum TuiEvent {
     Notice(String),
     Error(String),
     UsageUpdated(UsageTotals),
+    ContextUpdated {
+        used_tokens: usize,
+        limit_tokens: usize,
+    },
     SessionCompleted {
         status: String,
     },
@@ -267,6 +271,8 @@ pub struct AppState {
     pub session_picker_selected: usize,
     pub session_picker_query: String,
     pub usage: UsageTotals,
+    pub context_used_tokens: usize,
+    pub context_limit_tokens: usize,
     pub slash_menu: Option<SlashMenu>,
     pub mention_candidates: Vec<String>,
     pub mention_selected: usize,
@@ -307,6 +313,8 @@ impl AppState {
             session_picker_selected: 0,
             session_picker_query: String::new(),
             usage: UsageTotals::default(),
+            context_used_tokens: 0,
+            context_limit_tokens: 0,
             slash_menu: None,
             mention_candidates: Vec::new(),
             mention_selected: 0,
@@ -701,6 +709,13 @@ impl AppState {
             }
             TuiEvent::UsageUpdated(usage) => {
                 self.usage = usage;
+            }
+            TuiEvent::ContextUpdated {
+                used_tokens,
+                limit_tokens,
+            } => {
+                self.context_used_tokens = used_tokens;
+                self.context_limit_tokens = limit_tokens;
             }
             TuiEvent::SessionCompleted { .. } => {
                 self.promote_trailing_reasoning();

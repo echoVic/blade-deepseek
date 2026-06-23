@@ -1094,12 +1094,15 @@ name = "orca-provider"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "dirs",
  "orca-core",
  "orca-mcp",
  "orca-tools",
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
+ "tempfile",
  "tiktoken-rs",
 ]
 

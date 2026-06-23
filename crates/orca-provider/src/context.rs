@@ -1,5 +1,5 @@
 use orca_core::config::{ModelRuntimeConfig, ProviderKind};
-use orca_core::conversation::{Conversation, Message};
+use orca_core::conversation::{Conversation, Message, SummaryState};
 use orca_core::provider_types::ProviderStep;
 use tiktoken_rs::cl100k_base_singleton;
 
@@ -9,7 +9,6 @@ const DEFAULT_MAX_TOKENS: usize = 1_000_000;
 const COMPACTION_THRESHOLD: f64 = 0.80;
 const RESERVED_FOR_RESPONSE: usize = 4096;
 const STALE_TOOL_OUTPUT_BYTES: usize = 2048;
-const BUDGET_HINT_PREFIX: &str = "[context: ~";
 
 pub trait TokenCounter {
     fn count_text(&self, text: &str) -> usize;
@@ -53,7 +52,7 @@ impl ContextConfig {
         config
     }
 
-    fn effective_limit(&self) -> usize {
+    pub fn effective_limit(&self) -> usize {
         if let Some(limit) = self.auto_compact_token_limit {
             return limit.min(self.max_tokens).max(1);
         }
@@ -117,67 +116,21 @@ fn conversation_tokens_with_counter(
         .messages
         .iter()
         .map(|message| message_tokens_with_counter(message, counter))
-        .sum()
+        .sum::<usize>()
+        + volatile_tokens_with_counter(conversation, counter)
+        + summary_state_tokens(conversation, counter)
+}
+
+fn volatile_tokens_with_counter(conversation: &Conversation, counter: &impl TokenCounter) -> usize {
+    if conversation.messages.is_empty() || conversation.volatile.is_empty() {
+        return 0;
+    }
+    counter.count_text(&conversation.volatile.render())
 }
 
 pub fn needs_compaction(conversation: &Conversation, config: &ContextConfig) -> bool {
     let total = conversation_tokens(conversation);
     total > config.effective_limit()
-}
-
-pub fn apply_context_budget_hint(conversation: &mut Conversation, model: Option<&str>) {
-    apply_context_budget_hint_with_counter(conversation, model, &DefaultTokenCounter);
-}
-
-pub fn apply_context_budget_hint_with_config(
-    conversation: &mut Conversation,
-    config: &ContextConfig,
-) {
-    apply_context_budget_hint_with_config_and_counter(conversation, config, &DefaultTokenCounter);
-}
-
-pub fn apply_context_budget_hint_with_counter(
-    conversation: &mut Conversation,
-    model: Option<&str>,
-    counter: &impl TokenCounter,
-) {
-    let config = ContextConfig::for_model(model);
-    apply_context_budget_hint_with_config_and_counter(conversation, &config, counter);
-}
-
-fn apply_context_budget_hint_with_config_and_counter(
-    conversation: &mut Conversation,
-    config: &ContextConfig,
-    counter: &impl TokenCounter,
-) {
-    let used = conversation_tokens_with_counter(conversation, counter);
-    let remaining = config.effective_limit().saturating_sub(used);
-    let hint = format!("[context: ~{}K tokens remaining]", (remaining + 999) / 1000);
-
-    if let Some(Message::System { content, .. }) = conversation.messages.first_mut() {
-        let stripped = strip_budget_hint(content);
-        *content = if stripped.is_empty() {
-            hint
-        } else {
-            format!("{stripped}\n\n{hint}")
-        };
-    }
-}
-
-fn strip_budget_hint(content: &str) -> String {
-    let trimmed = content.trim_end();
-    let Some(line_start) = trimmed.rfind(BUDGET_HINT_PREFIX) else {
-        return trimmed.to_string();
-    };
-    if line_start > 0 && trimmed.as_bytes()[line_start - 1] != b'\n' {
-        return trimmed.to_string();
-    }
-    let candidate = &trimmed[line_start..];
-    if candidate.ends_with(" tokens remaining]") {
-        trimmed[..line_start].trim_end().to_string()
-    } else {
-        trimmed.to_string()
-    }
 }
 
 pub fn is_prompt_too_long_error(message: &str) -> bool {
@@ -210,16 +163,17 @@ pub fn compact_with_summary(
     context_config: &ContextConfig,
     provider_config: &ProviderConfig,
 ) -> CompactionResult {
-    let conversation = micro_compact_stale_tool_outputs(conversation);
-    if !needs_compaction(&conversation, context_config) {
+    let micro_compacted = micro_compact_stale_tool_outputs(conversation);
+    if !needs_compaction(&micro_compacted, context_config) {
         return CompactionResult {
-            conversation,
+            conversation: micro_compacted,
             kind: CompactionKind::LocalTruncation,
         };
     }
     match summarize_collapsed_messages(
         provider_kind,
-        &conversation,
+        conversation,
+        &micro_compacted,
         context_config,
         provider_config,
     ) {
@@ -228,14 +182,24 @@ pub fn compact_with_summary(
             kind: CompactionKind::RemoteSummary(summary),
         },
         None => CompactionResult {
-            conversation: compact(&conversation, context_config),
+            conversation: compact(&micro_compacted, context_config),
             kind: CompactionKind::LocalTruncation,
         },
     }
 }
 
+const SMALL_DELTA_TOKEN_THRESHOLD: usize = 200;
+const MAX_SUMMARY_DELTAS: usize = 5;
+const BASELINE_REBUILD_TOKEN_THRESHOLD: usize = 2000;
+
+/// `original_conversation` is the pre-micro-compaction input; `conversation` is
+/// the micro-compacted main-context view. The kept tail comes from the
+/// micro-compacted view (so main-context behavior is unchanged), but the
+/// summary delta is rendered from the ORIGINAL collapsed content so summary
+/// extractive rules are never masked by main-context micro compaction.
 fn summarize_collapsed_messages(
     provider_kind: ProviderKind,
+    original_conversation: &Conversation,
     conversation: &Conversation,
     context_config: &ContextConfig,
     provider_config: &ProviderConfig,
@@ -246,19 +210,105 @@ fn summarize_collapsed_messages(
         return None;
     }
 
-    let summary = request_summary(provider_kind, provider_config, &format_messages(&collapsed))?;
+    // Micro compaction is positional and in-place (it only rewrites Tool
+    // contents, never reorders or drops messages), so the original droppable
+    // list maps 1:1 onto the micro-compacted one. Taking the same prefix length
+    // recovers the ORIGINAL collapsed messages for summary rendering.
+    let original_collapsed: Vec<Message> = original_conversation
+        .messages
+        .iter()
+        .skip(1)
+        .filter(|message| !message.is_pinned())
+        .take(collapsed.len())
+        .cloned()
+        .collect();
+    let rendered = render_summary_delta(&original_collapsed);
+
+    let has_existing_summary =
+        conversation.rolling_summary.is_some() || !conversation.summary.is_empty();
+    let new_delta =
+        if has_existing_summary && rendered.rendered_tokens_est < SMALL_DELTA_TOKEN_THRESHOLD {
+            rendered.text.trim().to_string()
+        } else {
+            request_summary(
+                provider_kind,
+                provider_config,
+                SUMMARY_PURPOSE_DELTA,
+                None,
+                &rendered,
+            )?
+        };
 
     let mut result = Conversation::new();
     if let Some(system) = system_msg {
         result.messages.push(system);
     }
-    result.messages.push(Message::system(format!(
-        "[Summary of earlier conversation]\n{}",
-        summary.trim()
-    )));
     result.messages.extend(pinned);
     result.messages.extend(kept);
-    Some((result, summary))
+    result.volatile = conversation.volatile.clone();
+    result.rolling_summary = Some(new_delta.clone());
+
+    let mut summary = conversation.summary.clone();
+    if summary.baseline.is_none() {
+        summary.baseline = Some(new_delta.clone());
+    } else {
+        summary.deltas.push(new_delta.clone());
+        let needs_rebuild = summary.deltas.len() > MAX_SUMMARY_DELTAS
+            || summary_total_delta_tokens(&summary) > BASELINE_REBUILD_TOKEN_THRESHOLD;
+        if needs_rebuild {
+            let merged = rebuild_baseline(provider_kind, provider_config, &summary);
+            summary.baseline = Some(merged);
+            summary.deltas.clear();
+        }
+    }
+    result.summary = summary;
+
+    Some((result, new_delta))
+}
+
+fn summary_total_delta_tokens(summary: &SummaryState) -> usize {
+    summary
+        .deltas
+        .iter()
+        .map(|delta| DefaultTokenCounter.count_text(delta))
+        .sum()
+}
+
+fn summary_state_tokens(conversation: &Conversation, counter: &impl TokenCounter) -> usize {
+    let mut tokens = 0;
+    if let Some(baseline) = &conversation.summary.baseline {
+        tokens += counter.count_text(baseline) + counter.count_text("[Summary baseline]") + 4;
+    }
+    for (i, delta) in conversation.summary.deltas.iter().enumerate() {
+        tokens += counter.count_text(delta)
+            + counter.count_text(&format!("[Summary update {}]", i + 1))
+            + 4;
+    }
+    tokens
+}
+
+fn rebuild_baseline(
+    provider_kind: ProviderKind,
+    provider_config: &ProviderConfig,
+    summary: &SummaryState,
+) -> String {
+    let mut combined = String::new();
+    if let Some(baseline) = &summary.baseline {
+        combined.push_str(baseline);
+    }
+    for delta in &summary.deltas {
+        combined.push_str("\n\n");
+        combined.push_str(delta);
+    }
+    let rendered = RenderedSummaryDelta::from_plain(combined.clone());
+    request_summary(
+        provider_kind,
+        provider_config,
+        SUMMARY_PURPOSE_REBUILD,
+        None,
+        &rendered,
+    )
+    .unwrap_or(combined)
 }
 
 fn partition_for_compaction(
@@ -273,7 +323,11 @@ fn partition_for_compaction(
         .as_ref()
         .map(|message| message_tokens_with_counter(message, counter))
         .unwrap_or(0);
-    let summary_tokens = counter.count_text("[Summary of earlier conversation]") + 256;
+    let summary_tokens = if conversation.summary.is_empty() {
+        counter.count_text("[Summary baseline]") + 256
+    } else {
+        summary_state_tokens(conversation, counter) + 256
+    };
     let non_system: Vec<&Message> = messages.iter().skip(1).collect();
     let pinned: Vec<Message> = non_system
         .iter()
@@ -291,7 +345,8 @@ fn partition_for_compaction(
         .iter()
         .map(|message| message_tokens_with_counter(message, counter))
         .sum();
-    let mut budget = system_tokens + pinned_tokens + summary_tokens + 4;
+    let volatile_tokens = volatile_tokens_with_counter(conversation, counter);
+    let mut budget = system_tokens + pinned_tokens + summary_tokens + volatile_tokens + 4;
     for msg in droppable.iter().rev() {
         let msg_tokens = message_tokens_with_counter(msg, counter);
         if budget + msg_tokens > target_tokens {
@@ -318,24 +373,40 @@ fn partition_for_compaction(
 fn request_summary(
     provider_kind: ProviderKind,
     provider_config: &ProviderConfig,
-    collapsed_text: &str,
+    purpose: &str,
+    previous_summary: Option<&str>,
+    rendered: &RenderedSummaryDelta,
 ) -> Option<String> {
+    let collapsed_text = rendered.text.as_str();
+    let cache_scope = summary_cache_scope(provider_kind, provider_config);
+    let cache_key =
+        crate::summary_cache::summary_key(&cache_scope, purpose, previous_summary, collapsed_text);
+    if let Some(cached) = crate::summary_cache::lookup(&cache_key) {
+        emit_summary_telemetry(purpose, true, rendered);
+        return Some(cached);
+    }
+    emit_summary_telemetry(purpose, false, rendered);
+
+    let summary_model = orca_core::model::auxiliary_model().to_string();
     let summary_config = ProviderConfig {
         api_key: provider_config.api_key.clone(),
         base_url: provider_config.base_url.clone(),
-        model: Some(orca_core::model::auxiliary_model().to_string()),
+        model: Some(summary_model),
         tools_override: Some(Vec::new()),
         mcp_registry: None,
         external_tools: Vec::new(),
     };
 
+    let user_prompt = match previous_summary {
+        Some(prev) => format!(
+            "You have a previous summary of older conversation history:\n\n{prev}\n\nNow summarize the following newly collapsed segment and merge it with the previous summary into one coherent updated summary:\n\n{collapsed_text}"
+        ),
+        None => format!("Summarize this collapsed conversation segment:\n\n{collapsed_text}"),
+    };
+
     let mut summary_conversation = Conversation::new();
-    summary_conversation.add_system(
-        "Summarize old agent conversation context for future continuation. Preserve user goals, decisions, file paths, tool results, blockers, and exact constraints. Be concise and factual.".to_string(),
-    );
-    summary_conversation.add_user(format!(
-        "Summarize this collapsed conversation segment:\n\n{collapsed_text}"
-    ));
+    summary_conversation.add_system(SUMMARY_SYSTEM_PROMPT.to_string());
+    summary_conversation.add_user(user_prompt);
 
     let response = crate::call(provider_kind, &summary_conversation, &summary_config);
     if response
@@ -345,10 +416,287 @@ fn request_summary(
     {
         return None;
     }
-    response
+    let summary = response
         .assistant_content
         .map(|text| text.trim().to_string())
-        .filter(|text| !text.is_empty())
+        .filter(|text| !text.is_empty())?;
+    crate::summary_cache::store(&cache_key, &summary);
+    Some(summary)
+}
+
+// Summary-delta rendering tiers. These run on the ORIGINAL collapsed content
+// (never the micro-compacted main-context view), so huge tool outputs are
+// summarized by summary-specific extractive rules instead of being masked by
+// main-context micro compaction. A single layered ruleset is applied to every
+// tool output: tiny outputs are kept verbatim, mid-sized ones get a head/tail
+// extract, and huge ones get a more aggressive extract.
+const SUMMARY_KEEP_VERBATIM_BYTES: usize = 1024;
+const SUMMARY_HUGE_BYTES: usize = 8 * 1024;
+const SUMMARY_MEDIUM_HEAD_LINES: usize = 8;
+const SUMMARY_MEDIUM_TAIL_LINES: usize = 6;
+const SUMMARY_MEDIUM_HEAD_CHARS: usize = 384;
+const SUMMARY_MEDIUM_TAIL_CHARS: usize = 384;
+const SUMMARY_MEDIUM_MAX_BYTES: usize = 900;
+const SUMMARY_HUGE_HEAD_LINES: usize = 6;
+const SUMMARY_HUGE_TAIL_LINES: usize = 4;
+const SUMMARY_HUGE_HEAD_CHARS: usize = 320;
+const SUMMARY_HUGE_TAIL_CHARS: usize = 320;
+const SUMMARY_HUGE_MAX_BYTES: usize = 700;
+const ALREADY_COMPACTED_MARKERS: [&str; 2] =
+    ["[tool output micro-compact]", "[extractive-compact]"];
+const SUMMARY_PURPOSE_DELTA: &str = "delta";
+const SUMMARY_PURPOSE_REBUILD: &str = "rebuild_baseline";
+const SUMMARY_DEBUG_ENV: &str = "ORCA_SUMMARY_DEBUG";
+const SUMMARY_PROMPT_VERSION: &str = "summary-prompt-v1";
+const SUMMARY_SYSTEM_PROMPT: &str = "Summarize old agent conversation context for future continuation. Preserve user goals, decisions, file paths, tool results, blockers, and exact constraints. Be concise and factual.";
+
+fn summary_cache_scope(provider_kind: ProviderKind, provider_config: &ProviderConfig) -> String {
+    format!(
+        "provider={};base_url={};model={};prompt_version={};prompt={}",
+        provider_kind.as_str(),
+        provider_config.base_url.as_deref().unwrap_or("<default>"),
+        orca_core::model::auxiliary_model(),
+        SUMMARY_PROMPT_VERSION,
+        SUMMARY_SYSTEM_PROMPT
+    )
+}
+
+/// Deterministic, observable rendering of a collapsed conversation segment
+/// before it reaches the remote summary model. This is the single entry point
+/// for summary-delta input: it always runs on the ORIGINAL collapsed messages,
+/// never on the micro-compacted main-context view, so summary-specific
+/// extractive rules are never masked by main-context micro compaction.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RenderedSummaryDelta {
+    pub text: String,
+    pub original_bytes: usize,
+    pub rendered_bytes: usize,
+    pub original_tokens_est: usize,
+    pub rendered_tokens_est: usize,
+    pub compacted_tool_outputs: usize,
+}
+
+impl RenderedSummaryDelta {
+    /// Build metrics for a plain text input that needs no tool-output rendering
+    /// (e.g. the merged baseline-rebuild prompt). original == rendered.
+    fn from_plain(text: String) -> Self {
+        let bytes = text.len();
+        let tokens = DefaultTokenCounter.count_text(&text);
+        Self {
+            text,
+            original_bytes: bytes,
+            rendered_bytes: bytes,
+            original_tokens_est: tokens,
+            rendered_tokens_est: tokens,
+            compacted_tool_outputs: 0,
+        }
+    }
+}
+
+/// Render the collapsed delta with the unified tool-output tier ruleset.
+/// Natural-language turns (user/assistant) are left untouched so the remote
+/// summarizer keeps full fidelity on intent and decisions. Tool outputs go
+/// through a single layered policy (`render_tool_output`). Identical inputs
+/// always yield identical output, which also stabilizes the summary hash cache.
+pub fn render_summary_delta(collapsed: &[Message]) -> RenderedSummaryDelta {
+    let original_text = format_messages(collapsed);
+    let mut compacted_tool_outputs = 0usize;
+    let rendered_messages: Vec<Message> = collapsed
+        .iter()
+        .map(|message| match message {
+            Message::Tool {
+                tool_call_id,
+                content,
+                pinned,
+            } => {
+                let (rendered, compacted) = render_tool_output(content);
+                if compacted {
+                    compacted_tool_outputs += 1;
+                }
+                Message::Tool {
+                    tool_call_id: tool_call_id.clone(),
+                    content: rendered,
+                    pinned: *pinned,
+                }
+            }
+            other => other.clone(),
+        })
+        .collect();
+    let text = format_messages(&rendered_messages);
+    let counter = DefaultTokenCounter;
+    RenderedSummaryDelta {
+        original_bytes: original_text.len(),
+        rendered_bytes: text.len(),
+        original_tokens_est: counter.count_text(&original_text),
+        rendered_tokens_est: counter.count_text(&text),
+        compacted_tool_outputs,
+        text,
+    }
+}
+
+/// Unified tool-output tier policy. Returns the rendered content and whether it
+/// was compacted (for metrics):
+///   - already contains a compaction marker: keep as-is (no double compression)
+///   - <= 1KB: keep verbatim
+///   - 1KB - 8KB: extractive head/tail (medium tier), capped at a hard budget
+///   - > 8KB: more aggressive extractive (huge tier), capped at a tighter budget
+///
+/// The hard byte budget is the key follow-up: head/tail line counts alone do not
+/// bound the rendered size (long lines blow past them), so the real-API cost
+/// could exceed the old micro-compaction baseline. After the line/char extract
+/// we always trim to the tier budget while preserving the size metadata so the
+/// summarizer still sees this is truncated evidence.
+fn render_tool_output(content: &str) -> (String, bool) {
+    if ALREADY_COMPACTED_MARKERS
+        .iter()
+        .any(|marker| content.contains(marker))
+    {
+        return (content.to_string(), false);
+    }
+    let bytes = content.len();
+    if bytes <= SUMMARY_KEEP_VERBATIM_BYTES {
+        return (content.to_string(), false);
+    }
+    let (head_lines, tail_lines, head_chars, tail_chars, max_bytes) = if bytes > SUMMARY_HUGE_BYTES {
+        (
+            SUMMARY_HUGE_HEAD_LINES,
+            SUMMARY_HUGE_TAIL_LINES,
+            SUMMARY_HUGE_HEAD_CHARS,
+            SUMMARY_HUGE_TAIL_CHARS,
+            SUMMARY_HUGE_MAX_BYTES,
+        )
+    } else {
+        (
+            SUMMARY_MEDIUM_HEAD_LINES,
+            SUMMARY_MEDIUM_TAIL_LINES,
+            SUMMARY_MEDIUM_HEAD_CHARS,
+            SUMMARY_MEDIUM_TAIL_CHARS,
+            SUMMARY_MEDIUM_MAX_BYTES,
+        )
+    };
+    let rendered = extractive_render(
+        content, head_lines, tail_lines, head_chars, tail_chars, max_bytes,
+    );
+    // If the policy could not shrink the content (e.g. a small-span tier),
+    // report it as untouched so the metric reflects reality.
+    let compacted = rendered.len() < bytes;
+    (rendered, compacted)
+}
+
+fn extractive_render(
+    content: &str,
+    head_lines: usize,
+    tail_lines: usize,
+    head_chars: usize,
+    tail_chars: usize,
+    max_bytes: usize,
+) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    if lines.len() > head_lines + tail_lines {
+        let head = lines[..head_lines].join("\n");
+        let tail = lines[lines.len() - tail_lines..].join("\n");
+        let omitted = lines.len() - head_lines - tail_lines;
+        let header = format!(
+            "[extractive-compact] original_bytes={} original_lines={} omitted_lines={}",
+            content.len(),
+            lines.len(),
+            omitted,
+        );
+        let body = budget_trim_head_tail(
+            head.trim_end(),
+            tail.trim_start(),
+            &format!("... [{omitted} lines omitted] ..."),
+            max_bytes.saturating_sub(header.len() + 2),
+        );
+        return format!("{header}\n{body}");
+    }
+    let char_count = content.chars().count();
+    if char_count <= head_chars + tail_chars && content.len() <= max_bytes {
+        return content.to_string();
+    }
+    let head: String = content.chars().take(head_chars).collect();
+    let tail_vec: Vec<char> = content.chars().rev().take(tail_chars).collect();
+    let tail: String = tail_vec.into_iter().rev().collect();
+    let omitted = char_count.saturating_sub(head_chars + tail_chars);
+    let header = format!(
+        "[extractive-compact] original_bytes={} original_chars={} omitted_chars={}",
+        content.len(),
+        char_count,
+        omitted,
+    );
+    let body = budget_trim_head_tail(
+        head.trim_end(),
+        tail.trim_start(),
+        &format!("... [{omitted} chars omitted] ..."),
+        max_bytes.saturating_sub(header.len() + 2),
+    );
+    format!("{header}\n{body}")
+}
+
+/// Assemble `head`, a separator, and `tail` so the whole body fits in `budget`
+/// bytes. Head and tail are trimmed on char boundaries, splitting the remaining
+/// space evenly. The separator is always kept so the truncation stays visible.
+fn budget_trim_head_tail(head: &str, tail: &str, separator: &str, budget: usize) -> String {
+    let current = head.len() + 1 + separator.len() + 1 + tail.len();
+    if current <= budget {
+        return format!("{head}\n{separator}\n{tail}");
+    }
+    let frame = separator.len() + 2; // two newlines around the separator
+    let available = budget.saturating_sub(frame);
+    let head_budget = available / 2;
+    let tail_budget = available - head_budget;
+    let head_trimmed = take_chars_within_bytes(head, head_budget);
+    let tail_trimmed = take_chars_within_bytes_rev(tail, tail_budget);
+    format!("{head_trimmed}\n{separator}\n{tail_trimmed}")
+}
+
+fn take_chars_within_bytes(text: &str, budget: usize) -> &str {
+    let mut end = 0;
+    for (idx, ch) in text.char_indices() {
+        if idx + ch.len_utf8() > budget {
+            break;
+        }
+        end = idx + ch.len_utf8();
+    }
+    &text[..end]
+}
+
+fn take_chars_within_bytes_rev(text: &str, budget: usize) -> &str {
+    let mut start = text.len();
+    for (idx, _) in text.char_indices().rev() {
+        if text.len() - idx > budget {
+            break;
+        }
+        start = idx;
+    }
+    &text[start..]
+}
+
+/// Emit cheap, structured observability for a remote summary request. Off by
+/// default; set `ORCA_SUMMARY_DEBUG` to surface the metrics for evaluation.
+fn emit_summary_telemetry(purpose: &str, cache_hit: bool, rendered: &RenderedSummaryDelta) {
+    if std::env::var_os(SUMMARY_DEBUG_ENV).is_none() {
+        return;
+    }
+    eprintln!("{}", format_summary_telemetry(purpose, cache_hit, rendered));
+}
+
+fn format_summary_telemetry(
+    purpose: &str,
+    cache_hit: bool,
+    rendered: &RenderedSummaryDelta,
+) -> String {
+    format!(
+        "orca.remote_summary requested=1 purpose={} cache_hit={} cache_miss={} original_bytes={} rendered_bytes={} original_tokens_est={} rendered_tokens_est={} compacted_tool_outputs={}",
+        purpose,
+        cache_hit as u8,
+        (!cache_hit) as u8,
+        rendered.original_bytes,
+        rendered.rendered_bytes,
+        rendered.original_tokens_est,
+        rendered.rendered_tokens_est,
+        rendered.compacted_tool_outputs,
+    )
 }
 
 fn format_messages(messages: &[Message]) -> String {
@@ -465,6 +813,8 @@ pub fn compact_with_counter(
 
     let mut budget = system_tokens
         + pinned_tokens
+        + summary_state_tokens(&micro_compacted, counter)
+        + volatile_tokens_with_counter(&micro_compacted, counter)
         + counter.count_text("[Earlier conversation history was truncated to fit context window]")
         + 4;
 
@@ -491,6 +841,9 @@ pub fn compact_with_counter(
     }
     result.messages.extend(pinned);
     result.messages.extend(kept);
+    result.volatile = conversation.volatile.clone();
+    result.rolling_summary = conversation.rolling_summary.clone();
+    result.summary = conversation.summary.clone();
     result
 }
 
@@ -498,16 +851,25 @@ fn normalize_compacted_conversation(mut conversation: Conversation) -> Conversat
     if conversation.messages.len() <= 1 {
         return conversation;
     }
+    let volatile = conversation.volatile.clone();
+    let rolling_summary = conversation.rolling_summary.clone();
+    let summary = conversation.summary.clone();
     let system = conversation.messages.remove(0);
     normalize_tool_boundaries(&mut conversation.messages);
     let mut result = Conversation::new();
     result.messages.push(system);
     result.messages.extend(conversation.messages);
+    result.volatile = volatile;
+    result.rolling_summary = rolling_summary;
+    result.summary = summary;
     result
 }
 
 fn micro_compact_stale_tool_outputs(conversation: &Conversation) -> Conversation {
     let mut result = Conversation::new();
+    result.volatile = conversation.volatile.clone();
+    result.rolling_summary = conversation.rolling_summary.clone();
+    result.summary = conversation.summary.clone();
     let last_user_index = conversation
         .messages
         .iter()
@@ -630,44 +992,59 @@ mod tests {
     }
 
     #[test]
-    fn budget_hint_uses_runtime_auto_compact_limit() {
-        let runtime = ModelRuntimeConfig {
-            context_window: Some(1_000),
-            auto_compact_token_limit: Some(42),
-        };
-        let config = ContextConfig::for_model_with_runtime(Some("deepseek-v4-pro"), &runtime);
-        let mut conv = Conversation::new();
-        conv.add_system("system prompt".to_string());
-
-        apply_context_budget_hint_with_config(&mut conv, &config);
-
-        let Message::System { content, .. } = &conv.messages[0] else {
-            panic!("expected system message");
-        };
-        assert!(content.ends_with("[context: ~1K tokens remaining]"));
-    }
-
-    #[test]
-    fn system_prompt_budget_hint_uses_remaining_model_budget() {
-        let mut conv = Conversation::new();
-        conv.add_system("system prompt".to_string());
-        conv.add_user("active request".to_string());
-
-        apply_context_budget_hint_with_counter(&mut conv, Some("deepseek-chat"), &FixedCounter);
-
-        assert!(matches!(
-            &conv.messages[0],
-            Message::System { content, .. } if content.ends_with("[context: ~796K tokens remaining]")
-        ));
-    }
-
-    #[test]
     fn conversation_tokens_can_use_custom_counter() {
         let mut conv = Conversation::new();
         conv.add_system("system".to_string());
         conv.add_user("hello world".to_string());
 
         assert_eq!(conversation_tokens_with_counter(&conv, &FixedCounter), 10);
+    }
+
+    #[test]
+    fn conversation_tokens_include_volatile_overlay() {
+        let mut conv = Conversation::new();
+        conv.add_system("system".to_string());
+        conv.add_user("hello world".to_string());
+        conv.replace_plan_state("plan".to_string());
+        conv.replace_goal_state("goal".to_string());
+
+        assert_eq!(conversation_tokens_with_counter(&conv, &FixedCounter), 11);
+    }
+
+    #[test]
+    fn no_message_is_annotated_with_a_context_budget_hint() {
+        // Budget/remaining context is local observability only; it must never be
+        // injected into upstream messages, which would break DeepSeek prefix cache.
+        let config = ContextConfig {
+            max_tokens: 1_000,
+            compaction_threshold: 1.0,
+            reserved_for_response: 0,
+            auto_compact_token_limit: Some(42),
+        };
+
+        let mut conv = Conversation::new();
+        conv.add_system("system prompt".to_string());
+        conv.add_user("active request".to_string());
+        conv.add_assistant(Some("answer".to_string()), None, vec![]);
+        conv.add_tool_result("tc1".to_string(), "tool output".to_string());
+
+        // Exercise compaction paths that rebuild the conversation; none should add a hint.
+        let compacted = compact(&conv, &config);
+
+        for conversation in [&conv, &compacted] {
+            for message in &conversation.messages {
+                if let Some(text) = message.content_str() {
+                    assert!(
+                        !text.contains("[context: ~"),
+                        "no message may carry a context budget hint, found: {text:?}"
+                    );
+                    assert!(
+                        !text.contains("tokens remaining"),
+                        "no message may carry a context budget hint, found: {text:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -904,6 +1281,41 @@ mod tests {
     }
 
     #[test]
+    fn compact_with_existing_summary_falls_back_to_local_when_large_delta_summary_fails() {
+        let mut conv = Conversation::new();
+        conv.add_system("system".to_string());
+        conv.add_user("old ".repeat(400));
+        conv.add_assistant(Some("older answer ".repeat(400)), None, vec![]);
+        conv.add_user("newest request".to_string());
+        conv.rolling_summary = Some("previous summary only".to_string());
+
+        let config = ContextConfig {
+            max_tokens: 500,
+            compaction_threshold: 1.0,
+            reserved_for_response: 0,
+            auto_compact_token_limit: None,
+        };
+        let provider_config = ProviderConfig {
+            api_key: None,
+            base_url: None,
+            model: None,
+            tools_override: Some(Vec::new()),
+            mcp_registry: None,
+            external_tools: Vec::new(),
+        };
+
+        let result = compact_with_summary(ProviderKind::DeepSeek, &conv, &config, &provider_config);
+
+        assert!(
+            matches!(result.kind, CompactionKind::LocalTruncation),
+            "large deltas must not be dropped behind a stale rolling summary when summary fails"
+        );
+        assert!(result.conversation.messages.iter().any(|message| {
+            matches!(message, Message::System { content, .. } if content.contains("truncated to fit context window"))
+        }));
+    }
+
+    #[test]
     fn detects_prompt_too_long_provider_errors() {
         assert!(is_prompt_too_long_error(
             "DeepSeek provider error: prompt_too_long: context length exceeded"
@@ -914,5 +1326,615 @@ mod tests {
         assert!(!is_prompt_too_long_error(
             "Response blocked by content filter"
         ));
+    }
+
+    /// The system prompt is the token-0 prefix that anchors the entire DeepSeek
+    /// prefix cache. Local truncation compaction must keep it byte-identical and
+    /// in position 0, otherwise every subsequent turn misses the cache wholesale.
+    #[test]
+    fn compaction_preserves_system_prompt_as_byte_identical_token_zero_prefix() {
+        let system = "you are orca, a precise coding agent";
+        // FixedCounter scores every non-empty message as 5 tokens (content 1 + 4
+        // overhead). Four messages = 20 tokens; a 16-token budget forces the
+        // truncation rebuild path while keeping the system prompt + newest turn.
+        let config = ContextConfig {
+            max_tokens: 16,
+            compaction_threshold: 1.0,
+            reserved_for_response: 0,
+            auto_compact_token_limit: None,
+        };
+
+        let mut conv = Conversation::new();
+        conv.add_system(system.to_string());
+        conv.add_user("old ".repeat(40));
+        conv.add_assistant(Some("old answer ".repeat(40)), None, vec![]);
+        conv.add_user("newest request".to_string());
+
+        let compacted = compact_with_counter(&conv, &config, &FixedCounter);
+
+        match &compacted.messages[0] {
+            Message::System { content, pinned } => {
+                assert_eq!(content, system, "system prompt bytes must be unchanged");
+                assert!(!pinned);
+            }
+            other => panic!("expected system prompt at position 0, found {other:?}"),
+        }
+        // Truncation must have happened (proves we exercised the rebuild path).
+        assert!(compacted.messages.len() < conv.messages.len());
+    }
+
+    /// Remote-summary compaction must *insert a new summary message* right after
+    /// the system prompt rather than rewriting any retained message in place.
+    /// Retained recent messages must stay byte-identical so the cache survives
+    /// from the summary boundary onward.
+    #[test]
+    fn summary_is_inserted_after_system_without_rewriting_kept_messages() {
+        // partition_for_compaction is the pure splitting step used by the remote
+        // summary path; it must not mutate the messages it keeps.
+        //
+        // FixedCounter scores each message as 5 tokens (content 1 + overhead 4).
+        // The partition budget starts at system(5) + summary reserve(257) + 4 =
+        // 266, then keeps recent messages until the limit. A 272-token effective
+        // limit keeps exactly the newest message and collapses the two before it.
+        let config = ContextConfig {
+            max_tokens: 1000,
+            compaction_threshold: 1.0,
+            reserved_for_response: 0,
+            auto_compact_token_limit: Some(272),
+        };
+
+        let mut conv = Conversation::new();
+        conv.add_system("system prompt".to_string());
+        conv.add_user("oldest".to_string());
+        conv.add_assistant(Some("older".to_string()), None, vec![]);
+        conv.add_user("keep me verbatim".to_string());
+
+        let (system_msg, _pinned, collapsed, kept) =
+            partition_for_compaction(&conv, &config, &FixedCounter)
+                .expect("partition should split this conversation");
+
+        // System prompt is carried through untouched.
+        assert!(
+            matches!(&system_msg, Some(Message::System { content, .. }) if content == "system prompt")
+        );
+        // The most recent message is kept verbatim, not rewritten.
+        assert!(
+            matches!(kept.last(), Some(Message::User { content, .. }) if content == "keep me verbatim")
+        );
+        // Something was actually collapsed (so the summary path is meaningful).
+        assert!(!collapsed.is_empty());
+
+        // Now assemble the summarized conversation the way summarize_collapsed_messages
+        // does, and confirm the layout: system, then a NEW summary system message,
+        // then the kept tail unchanged.
+        let mut result = Conversation::new();
+        result.messages.push(system_msg.unwrap());
+        result.messages.push(Message::system(
+            "[Summary of earlier conversation]\nX".to_string(),
+        ));
+        result.messages.extend(kept);
+
+        assert!(
+            matches!(&result.messages[0], Message::System { content, .. } if content == "system prompt")
+        );
+        assert!(
+            matches!(&result.messages[1], Message::System { content, .. } if content.starts_with("[Summary of earlier conversation]"))
+        );
+        assert!(
+            matches!(result.messages.last(), Some(Message::User { content, .. }) if content == "keep me verbatim")
+        );
+    }
+
+    #[test]
+    fn compaction_inherits_volatile_state() {
+        let config = ContextConfig {
+            max_tokens: 16,
+            compaction_threshold: 1.0,
+            reserved_for_response: 0,
+            auto_compact_token_limit: None,
+        };
+
+        let mut conv = Conversation::new();
+        conv.add_system("sys".to_string());
+        conv.add_user("old ".repeat(40));
+        conv.add_assistant(Some("old answer ".repeat(40)), None, vec![]);
+        conv.add_user("newest".to_string());
+        conv.replace_plan_state("active plan".to_string());
+        conv.replace_goal_state("active goal".to_string());
+
+        let compacted = compact_with_counter(&conv, &config, &FixedCounter);
+
+        assert!(compacted.messages.len() < conv.messages.len());
+        assert_eq!(compacted.volatile.plan.as_deref(), Some("active plan"));
+        assert!(
+            compacted
+                .volatile
+                .goal
+                .as_ref()
+                .unwrap()
+                .contains("active goal")
+        );
+    }
+
+    #[test]
+    fn micro_compaction_preserves_volatile_state_when_no_truncation_needed() {
+        let config = ContextConfig {
+            max_tokens: 1_000,
+            compaction_threshold: 1.0,
+            reserved_for_response: 0,
+            auto_compact_token_limit: Some(1_000),
+        };
+
+        let mut conv = Conversation::new();
+        conv.add_system("sys".to_string());
+        conv.add_user("inspect".to_string());
+        conv.add_assistant(
+            Some("calling read_file".to_string()),
+            None,
+            vec![RawToolCall {
+                id: "tc1".to_string(),
+                function_name: "read_file".to_string(),
+                arguments: r#"{"path":"large.log"}"#.to_string(),
+            }],
+        );
+        conv.add_tool_result("tc1".to_string(), "x".repeat(STALE_TOOL_OUTPUT_BYTES + 10));
+        conv.add_user("newest".to_string());
+        conv.replace_plan_state("active plan".to_string());
+
+        let compacted = compact_with_counter(&conv, &config, &FixedCounter);
+
+        assert_eq!(compacted.volatile.plan.as_deref(), Some("active plan"));
+    }
+
+    #[test]
+    fn micro_compaction_preserves_rolling_summary_when_no_truncation_needed() {
+        let config = ContextConfig {
+            max_tokens: 1_000,
+            compaction_threshold: 1.0,
+            reserved_for_response: 0,
+            auto_compact_token_limit: Some(1_000),
+        };
+
+        let mut conv = Conversation::new();
+        conv.add_system("sys".to_string());
+        conv.add_user("inspect".to_string());
+        conv.add_assistant(
+            Some("calling read_file".to_string()),
+            None,
+            vec![RawToolCall {
+                id: "tc1".to_string(),
+                function_name: "read_file".to_string(),
+                arguments: r#"{"path":"large.log"}"#.to_string(),
+            }],
+        );
+        conv.add_tool_result("tc1".to_string(), "x".repeat(STALE_TOOL_OUTPUT_BYTES + 10));
+        conv.add_user("newest".to_string());
+        conv.rolling_summary = Some("existing rolling summary".to_string());
+
+        let compacted = compact_with_counter(&conv, &config, &FixedCounter);
+
+        assert_eq!(
+            compacted.rolling_summary.as_deref(),
+            Some("existing rolling summary")
+        );
+    }
+
+    #[test]
+    fn local_truncation_inherits_rolling_summary() {
+        let config = ContextConfig {
+            max_tokens: 16,
+            compaction_threshold: 1.0,
+            reserved_for_response: 0,
+            auto_compact_token_limit: None,
+        };
+
+        let mut conv = Conversation::new();
+        conv.add_system("sys".to_string());
+        conv.add_user("old ".repeat(40));
+        conv.add_assistant(Some("old ".repeat(40)), None, vec![]);
+        conv.add_user("newest".to_string());
+        conv.rolling_summary = Some("previously summarized context".to_string());
+
+        let compacted = compact_with_counter(&conv, &config, &FixedCounter);
+        assert_eq!(
+            compacted.rolling_summary.as_deref(),
+            Some("previously summarized context")
+        );
+    }
+
+    #[test]
+    fn no_truncation_normalization_preserves_rolling_summary() {
+        let config = ContextConfig {
+            max_tokens: 1_000,
+            compaction_threshold: 1.0,
+            reserved_for_response: 0,
+            auto_compact_token_limit: Some(1_000),
+        };
+
+        let mut conv = Conversation::new();
+        conv.add_system("sys".to_string());
+        conv.add_user("newest".to_string());
+        conv.rolling_summary = Some("existing rolling summary".to_string());
+
+        let compacted = compact_with_counter(&conv, &config, &FixedCounter);
+
+        assert_eq!(
+            compacted.rolling_summary.as_deref(),
+            Some("existing rolling summary")
+        );
+    }
+
+    #[test]
+    fn small_delta_token_threshold_is_reasonable() {
+        assert!(
+            SMALL_DELTA_TOKEN_THRESHOLD > 0 && SMALL_DELTA_TOKEN_THRESHOLD <= 500,
+            "threshold should be in a reasonable range"
+        );
+    }
+
+    #[test]
+    fn summary_state_renders_baseline_then_deltas_in_api_messages() {
+        let mut conv = Conversation::new();
+        conv.add_system("system prompt".to_string());
+        conv.add_user("hello".to_string());
+        conv.summary.baseline = Some("baseline facts".to_string());
+        conv.summary.deltas.push("delta 1 facts".to_string());
+        conv.summary.deltas.push("delta 2 facts".to_string());
+
+        let messages = crate::deepseek_http::conversation_to_api_messages(&conv);
+        assert_eq!(messages[0].content.as_deref(), Some("system prompt"));
+        assert!(
+            messages[1]
+                .content
+                .as_deref()
+                .unwrap()
+                .starts_with("[Summary baseline]")
+        );
+        assert!(
+            messages[2]
+                .content
+                .as_deref()
+                .unwrap()
+                .starts_with("[Summary update 1]")
+        );
+        assert!(
+            messages[3]
+                .content
+                .as_deref()
+                .unwrap()
+                .starts_with("[Summary update 2]")
+        );
+        assert_eq!(messages[4].content.as_deref(), Some("hello"));
+        assert_eq!(messages.len(), 5);
+    }
+
+    #[test]
+    fn empty_summary_state_adds_no_api_messages() {
+        let mut conv = Conversation::new();
+        conv.add_system("sys".to_string());
+        conv.add_user("hello".to_string());
+
+        let messages = crate::deepseek_http::conversation_to_api_messages(&conv);
+        assert_eq!(messages.len(), 2);
+    }
+
+    #[test]
+    fn summary_baseline_persists_through_local_truncation() {
+        let config = ContextConfig {
+            max_tokens: 16,
+            compaction_threshold: 1.0,
+            reserved_for_response: 0,
+            auto_compact_token_limit: None,
+        };
+
+        let mut conv = Conversation::new();
+        conv.add_system("sys".to_string());
+        conv.add_user("old ".repeat(40));
+        conv.add_assistant(Some("old ".repeat(40)), None, vec![]);
+        conv.add_user("newest".to_string());
+        conv.summary.baseline = Some("stable baseline".to_string());
+        conv.summary.deltas.push("delta 1".to_string());
+
+        let compacted = compact_with_counter(&conv, &config, &FixedCounter);
+        assert_eq!(
+            compacted.summary.baseline.as_deref(),
+            Some("stable baseline")
+        );
+        assert_eq!(compacted.summary.deltas.len(), 1);
+    }
+
+    #[test]
+    fn local_truncation_budget_counts_summary_state() {
+        let config = ContextConfig {
+            max_tokens: 25,
+            compaction_threshold: 1.0,
+            reserved_for_response: 0,
+            auto_compact_token_limit: None,
+        };
+
+        let mut conv = Conversation::new();
+        conv.add_system("sys".to_string());
+        conv.summary.baseline = Some("stable baseline".to_string());
+        for index in 0..5 {
+            conv.add_user(format!("message {index}"));
+        }
+
+        let compacted = compact_with_counter(&conv, &config, &FixedCounter);
+
+        assert!(
+            conversation_tokens_with_counter(&compacted, &FixedCounter) <= config.effective_limit(),
+            "local truncation must reserve budget for injected summary state"
+        );
+    }
+
+    #[test]
+    fn max_summary_deltas_is_bounded() {
+        assert!(
+            MAX_SUMMARY_DELTAS > 0 && MAX_SUMMARY_DELTAS <= 10,
+            "deltas cap should be reasonable"
+        );
+    }
+
+    #[test]
+    fn render_summary_delta_shrinks_large_tool_output_with_head_and_tail() {
+        let big_output = (0..200)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let messages = vec![Message::Tool {
+            tool_call_id: "call_1".to_string(),
+            content: big_output,
+            pinned: false,
+        }];
+
+        let rendered = render_summary_delta(&messages);
+
+        assert!(rendered.text.contains("[extractive-compact]"));
+        assert!(rendered.text.contains("line 0"));
+        assert!(rendered.text.contains("line 199"));
+        assert!(rendered.text.contains("lines omitted"));
+        assert!(
+            rendered.rendered_bytes < rendered.original_bytes,
+            "extractive output must be smaller than the original"
+        );
+        assert_eq!(rendered.compacted_tool_outputs, 1);
+    }
+
+    #[test]
+    fn render_summary_delta_shrinks_large_single_line_tool_output() {
+        let big_output = format!(
+            "{{\"status\":\"ok\",\"payload\":\"{}\",\"tail\":\"final-value\"}}",
+            "x".repeat(8_000)
+        );
+        let messages = vec![Message::Tool {
+            tool_call_id: "call_1".to_string(),
+            content: big_output,
+            pinned: false,
+        }];
+
+        let rendered = render_summary_delta(&messages);
+
+        assert!(rendered.text.contains("[extractive-compact]"));
+        assert!(rendered.text.contains("\"status\":\"ok\""));
+        assert!(rendered.text.contains("final-value"));
+        assert!(
+            rendered.rendered_bytes < rendered.original_bytes,
+            "large single-line outputs must shrink before remote summary"
+        );
+        assert_eq!(rendered.compacted_tool_outputs, 1);
+    }
+
+    #[test]
+    fn render_summary_delta_uses_more_aggressive_tier_for_huge_outputs() {
+        // Multi-line content so both tiers take the line-based extraction path.
+        let medium: String = (0..40)
+            .map(|i| format!("medium row {i} with some payload"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let huge: String = (0..400)
+            .map(|i| format!("huge row {i} with some payload text to inflate the byte size"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(medium.len() > SUMMARY_KEEP_VERBATIM_BYTES && medium.len() <= SUMMARY_HUGE_BYTES);
+        assert!(huge.len() > SUMMARY_HUGE_BYTES);
+
+        let medium_rendered = render_tool_output(&medium).0;
+        let huge_rendered = render_tool_output(&huge).0;
+
+        assert!(medium_rendered.contains("[extractive-compact]"));
+        assert!(huge_rendered.contains("[extractive-compact]"));
+        // The huge tier keeps strictly fewer head/tail lines than the medium tier.
+        assert!(
+            medium_rendered.contains(&format!(
+                "line {} omitted",
+                40 - SUMMARY_MEDIUM_HEAD_LINES - SUMMARY_MEDIUM_TAIL_LINES
+            )) || medium_rendered.contains("lines omitted")
+        );
+        assert!(
+            SUMMARY_HUGE_HEAD_LINES + SUMMARY_HUGE_TAIL_LINES
+                < SUMMARY_MEDIUM_HEAD_LINES + SUMMARY_MEDIUM_TAIL_LINES
+        );
+        // The first head line of the huge render is line 0; the line right after
+        // the kept head must be omitted (proves the shorter huge head was used).
+        assert!(huge_rendered.contains("huge row 0 "));
+        assert!(!huge_rendered.contains(&format!("huge row {} ", SUMMARY_HUGE_HEAD_LINES)));
+    }
+
+    #[test]
+    fn render_summary_delta_leaves_small_tool_output_untouched() {
+        let small = "short output".to_string();
+        let messages = vec![Message::Tool {
+            tool_call_id: "call_1".to_string(),
+            content: small.clone(),
+            pinned: false,
+        }];
+
+        let rendered = render_summary_delta(&messages);
+        assert!(rendered.text.contains(&small));
+        assert_eq!(rendered.compacted_tool_outputs, 0);
+    }
+
+    #[test]
+    fn render_summary_delta_does_not_recompact_already_compacted_output() {
+        let already = format!(
+            "[tool output micro-compact]\noriginal_bytes: 99999\nhead:\n{}\n\ntail:\n{}",
+            "h".repeat(400),
+            "t".repeat(400)
+        );
+        let messages = vec![Message::Tool {
+            tool_call_id: "call_1".to_string(),
+            content: already.clone(),
+            pinned: false,
+        }];
+
+        let rendered = render_summary_delta(&messages);
+        assert!(rendered.text.contains("[tool output micro-compact]"));
+        assert!(
+            !rendered.text.contains("[extractive-compact]"),
+            "already-compacted output must not be compacted a second time"
+        );
+        assert_eq!(rendered.compacted_tool_outputs, 0);
+    }
+
+    #[test]
+    fn render_summary_delta_preserves_natural_language_turns() {
+        let long_user = "user intent ".repeat(200);
+        let long_assistant = "assistant decision ".repeat(200);
+        let messages = vec![
+            Message::user(long_user.clone()),
+            Message::Assistant {
+                content: Some(long_assistant.clone()),
+                reasoning_content: None,
+                tool_calls: vec![],
+                pinned: false,
+            },
+        ];
+
+        let rendered = render_summary_delta(&messages);
+        assert!(rendered.text.contains(long_user.trim()));
+        assert!(rendered.text.contains(long_assistant.trim()));
+        assert_eq!(rendered.compacted_tool_outputs, 0);
+    }
+
+    #[test]
+    fn render_summary_delta_is_deterministic() {
+        let big_output = (0..200)
+            .map(|i| format!("row {i} value"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let messages = vec![Message::Tool {
+            tool_call_id: "call_1".to_string(),
+            content: big_output,
+            pinned: false,
+        }];
+
+        let first = render_summary_delta(&messages);
+        let second = render_summary_delta(&messages);
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn render_summary_delta_reports_metrics_for_mixed_segment() {
+        let big_output = (0..200)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let messages = vec![
+            Message::user("inspect the log".to_string()),
+            Message::Tool {
+                tool_call_id: "call_1".to_string(),
+                content: big_output,
+                pinned: false,
+            },
+            Message::Tool {
+                tool_call_id: "call_2".to_string(),
+                content: "tiny".to_string(),
+                pinned: false,
+            },
+        ];
+
+        let rendered = render_summary_delta(&messages);
+        assert!(rendered.original_bytes > rendered.rendered_bytes);
+        assert!(rendered.original_tokens_est >= rendered.rendered_tokens_est);
+        assert_eq!(
+            rendered.compacted_tool_outputs, 1,
+            "only the large tool output should count as compacted"
+        );
+    }
+
+    #[test]
+    fn summary_telemetry_reports_original_and_rendered_token_estimates() {
+        let rendered = RenderedSummaryDelta {
+            text: "rendered".to_string(),
+            original_bytes: 100,
+            rendered_bytes: 40,
+            original_tokens_est: 25,
+            rendered_tokens_est: 10,
+            compacted_tool_outputs: 2,
+        };
+
+        let line = format_summary_telemetry("delta", false, &rendered);
+
+        assert!(line.contains("original_tokens_est=25"));
+        assert!(line.contains("rendered_tokens_est=10"));
+        assert!(
+            !line.contains(" input_tokens_est="),
+            "ambiguous token metric name should not be emitted"
+        );
+    }
+
+    #[test]
+    fn huge_summary_renderer_is_no_larger_than_micro_compact_baseline() {
+        // The real-API target: the renderer must never make a huge tool output
+        // *more* expensive than the old micro-compaction path that the main
+        // context already applied. We assert byte parity against the exact same
+        // baseline (`micro_compact_tool_output`) the old path produced.
+        let huge = (0..600)
+            .map(|i| format!("row {i}: data payload chunk {i} with content"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let baseline = micro_compact_tool_output(&huge);
+        let (rendered, _) = render_tool_output(&huge);
+
+        assert!(
+            rendered.len() <= baseline.len(),
+            "huge renderer ({}) must not exceed micro-compact baseline ({})",
+            rendered.len(),
+            baseline.len()
+        );
+        assert!(rendered.len() <= SUMMARY_HUGE_MAX_BYTES);
+        // Evidence metadata must survive the hard budget.
+        assert!(rendered.contains("original_bytes="));
+    }
+
+    #[test]
+    fn medium_summary_renderer_stays_under_tool_budget() {
+        let medium = (0..120)
+            .map(|i| format!("2024-06-23 INFO worker[{i}] processed batch ok"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (rendered, compacted) = render_tool_output(&medium);
+
+        assert!(compacted);
+        assert!(
+            rendered.len() <= SUMMARY_MEDIUM_MAX_BYTES,
+            "medium renderer {} exceeds budget {}",
+            rendered.len(),
+            SUMMARY_MEDIUM_MAX_BYTES
+        );
+        assert!(rendered.contains("original_bytes="));
+        assert!(rendered.contains("original_lines="));
+    }
+
+    #[test]
+    fn single_line_huge_output_is_hard_trimmed_to_budget_with_metadata() {
+        // A huge single line cannot be split on newlines, so it must fall through
+        // to the char-level budget trim while keeping the size metadata.
+        let huge_line = format!("{{\"payload\":\"{}\"}}", "x".repeat(30_000));
+        let (rendered, compacted) = render_tool_output(&huge_line);
+
+        assert!(compacted);
+        assert!(rendered.len() <= SUMMARY_HUGE_MAX_BYTES);
+        assert!(rendered.contains("original_bytes="));
     }
 }

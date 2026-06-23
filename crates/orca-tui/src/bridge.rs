@@ -104,7 +104,9 @@ impl TuiConversationSession {
                     Some(t) => t,
                     None => history::load_session(selector)?,
                 };
-                let conv = history::resume_conversation(&transcript, system_prompt);
+                let mut conv = history::resume_conversation(&transcript, system_prompt);
+                conv.strip_legacy_pinned_volatile();
+                conv.strip_legacy_summary_messages();
                 (conv, Some(transcript))
             }
             orca_core::config::HistoryMode::Record | orca_core::config::HistoryMode::Disabled => {
@@ -256,7 +258,12 @@ impl TuiConversationSession {
             let _ = writer.append_compaction(before_messages, after_messages);
             if let orca_provider::context::CompactionKind::RemoteSummary(summary) = compaction.kind
             {
-                let _ = writer.append_summary(before_messages, after_messages, summary);
+                let _ = writer.append_summary_state(
+                    before_messages,
+                    after_messages,
+                    summary,
+                    &self.conversation.summary,
+                );
             }
         }
         let _ = self.hooks.run(
@@ -420,7 +427,12 @@ pub fn run_agent_for_tui(
                 if let orca_provider::context::CompactionKind::RemoteSummary(summary) =
                     compaction.kind
                 {
-                    let _ = writer.append_summary(before_messages, after_messages, summary);
+                    let _ = writer.append_summary_state(
+                        before_messages,
+                        after_messages,
+                        summary,
+                        &session.conversation.summary,
+                    );
                 }
             }
             if let Err(error) = session.hooks.run(
@@ -441,6 +453,11 @@ pub fn run_agent_for_tui(
             }
         }
 
+        let _ = event_tx.send(TuiEvent::ContextUpdated {
+            used_tokens: orca_provider::context::conversation_tokens(&session.conversation),
+            limit_tokens: ctx_config.effective_limit(),
+        });
+
         let _ = event_tx.send(TuiEvent::TurnStarted { turn });
 
         let route_decision = config.model.route(ModelRouteContext {
@@ -452,14 +469,6 @@ pub fn run_agent_for_tui(
             .set_model(Some(&route_decision.actual_model));
         let mut turn_provider_config = provider_config.clone();
         turn_provider_config.model = Some(route_decision.actual_model.clone());
-        let turn_ctx_config = orca_provider::context::ContextConfig::for_model_with_runtime(
-            Some(&route_decision.actual_model),
-            &config.model_runtime,
-        );
-        orca_provider::context::apply_context_budget_hint_with_config(
-            &mut session.conversation,
-            &turn_ctx_config,
-        );
 
         let pre_model_outcome = match session.hooks.run(
             HookEvent::PreModelCall,
@@ -572,7 +581,12 @@ pub fn run_agent_for_tui(
                     if let orca_provider::context::CompactionKind::RemoteSummary(summary) =
                         compaction.kind
                     {
-                        let _ = writer.append_summary(before_messages, after_messages, summary);
+                        let _ = writer.append_summary_state(
+                            before_messages,
+                            after_messages,
+                            summary,
+                            &session.conversation.summary,
+                        );
                     }
                 }
                 reactive_compacted = true;
@@ -733,9 +747,6 @@ pub fn run_agent_for_tui(
                     session.conversation.replace_plan_state(
                         orca_tools::update_plan::format_context_message(&update),
                     );
-                    if let Some(message) = session.conversation.messages.last().cloned() {
-                        session.append_message(&message);
-                    }
                     if let Some(writer) = &mut session.writer {
                         let _ = writer.append_plan_state(update.explanation, update.plan);
                     }
@@ -1610,14 +1621,6 @@ fn run_child_agent_for_tui(
         child_cost_tracker.set_model(Some(&route_decision.actual_model));
         let mut turn_provider_config = provider_config.clone();
         turn_provider_config.model = Some(route_decision.actual_model.clone());
-        let turn_ctx_config = orca_provider::context::ContextConfig::for_model_with_runtime(
-            Some(&route_decision.actual_model),
-            &config.model_runtime,
-        );
-        orca_provider::context::apply_context_budget_hint_with_config(
-            &mut conversation,
-            &turn_ctx_config,
-        );
 
         let pre_model_outcome = match hooks.run(
             HookEvent::PreModelCall,

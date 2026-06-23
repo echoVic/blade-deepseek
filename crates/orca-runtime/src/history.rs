@@ -8,7 +8,7 @@ use chrono::{DateTime, Datelike, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use orca_core::conversation::{Conversation, Message, RawToolCall};
+use orca_core::conversation::{Conversation, Message, RawToolCall, SummaryState};
 use orca_core::cost_types::UsageTotals;
 use orca_core::plan_types::{PlanItem, PlanStatus};
 
@@ -74,6 +74,8 @@ pub struct ContextSummaryRecord {
     pub before_messages: usize,
     pub after_messages: usize,
     pub summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_state: Option<SummaryState>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -256,6 +258,26 @@ impl SessionWriter {
                 before_messages,
                 after_messages,
                 summary: summary.into(),
+                summary_state: None,
+            }),
+        )
+    }
+
+    pub fn append_summary_state(
+        &mut self,
+        before_messages: usize,
+        after_messages: usize,
+        summary: impl Into<String>,
+        summary_state: &SummaryState,
+    ) -> io::Result<()> {
+        write_record(
+            &self.path,
+            &SessionRecord::ContextSummary(ContextSummaryRecord {
+                summarized_at: Utc::now(),
+                before_messages,
+                after_messages,
+                summary: summary.into(),
+                summary_state: Some(summary_state.clone()),
             }),
         )
     }
@@ -387,14 +409,110 @@ pub fn rename_session(selector: &str, title: &str) -> io::Result<PathBuf> {
 pub fn resume_conversation(transcript: &SessionTranscript, system_prompt: String) -> Conversation {
     let mut conversation = Conversation::new();
     conversation.add_system(system_prompt);
-    for message in transcript
-        .messages
+    let restored_messages = replay_compactions_for_resume(
+        &transcript.messages,
+        &transcript.compactions,
+        &transcript.summaries,
+    );
+    for message in restored_messages
         .iter()
         .filter(|message| !matches!(message, Message::System { .. }))
     {
         conversation.messages.push(message.clone());
     }
+    if let Some(summary_state) = transcript
+        .summaries
+        .iter()
+        .rev()
+        .find_map(|record| record.summary_state.clone())
+    {
+        conversation.summary = summary_state;
+        conversation.rolling_summary = transcript
+            .summaries
+            .last()
+            .map(|record| record.summary.clone());
+    } else if let Some(first_summary) = transcript.summaries.first() {
+        conversation.summary.baseline = Some(first_summary.summary.clone());
+        conversation.summary.deltas = transcript
+            .summaries
+            .iter()
+            .skip(1)
+            .map(|record| record.summary.clone())
+            .collect();
+        conversation.rolling_summary = transcript
+            .summaries
+            .last()
+            .map(|record| record.summary.clone());
+    }
     conversation
+}
+
+fn replay_compactions_for_resume(
+    messages: &[Message],
+    compactions: &[CompactionRecord],
+    summaries: &[ContextSummaryRecord],
+) -> Vec<Message> {
+    let summarized_compactions: HashSet<(usize, usize)> = summaries
+        .iter()
+        .map(|record| (record.before_messages, record.after_messages))
+        .collect();
+    let mut restored = messages.to_vec();
+    for compaction in compactions {
+        let has_remote_summary = summarized_compactions
+            .contains(&(compaction.before_messages, compaction.after_messages));
+        restored = replay_compaction_for_resume(restored, compaction, has_remote_summary);
+    }
+    restored
+}
+
+fn replay_compaction_for_resume(
+    messages: Vec<Message>,
+    compaction: &CompactionRecord,
+    has_remote_summary: bool,
+) -> Vec<Message> {
+    if compaction.before_messages == 0
+        || compaction.after_messages >= compaction.before_messages
+        || messages.len() < compaction.before_messages
+    {
+        return messages;
+    }
+
+    let prefix = &messages[..compaction.before_messages];
+    let suffix = &messages[compaction.before_messages..];
+    let system = prefix
+        .iter()
+        .find(|message| matches!(message, Message::System { .. }))
+        .cloned();
+    let pinned: Vec<Message> = prefix
+        .iter()
+        .filter(|message| !matches!(message, Message::System { .. }) && message.is_pinned())
+        .cloned()
+        .collect();
+
+    let structural_messages = usize::from(system.is_some()) + usize::from(!has_remote_summary);
+    let retained_non_system = compaction
+        .after_messages
+        .saturating_sub(structural_messages);
+    let retained_tail = retained_non_system.saturating_sub(pinned.len());
+    let mut tail: Vec<Message> = prefix
+        .iter()
+        .filter(|message| !matches!(message, Message::System { .. }) && !message.is_pinned())
+        .rev()
+        .take(retained_tail)
+        .cloned()
+        .collect();
+    tail.reverse();
+
+    let mut replayed = Vec::with_capacity(
+        usize::from(system.is_some()) + pinned.len() + tail.len() + suffix.len(),
+    );
+    if let Some(system) = system {
+        replayed.push(system);
+    }
+    replayed.extend(pinned);
+    replayed.extend(tail);
+    replayed.extend_from_slice(suffix);
+    replayed
 }
 
 pub fn create_meta(cwd: &Path, provider: &str, model: Option<String>, prompt: &str) -> SessionMeta {
@@ -1213,5 +1331,199 @@ mod tests {
             }
         }
         result.expect("session without plan loaded");
+    }
+
+    #[test]
+    fn resume_restores_rolling_summary_from_last_context_summary_record() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let home = tempfile::tempdir().expect("temp home");
+        let previous = std::env::var_os(ORCA_HOME_ENV);
+        unsafe {
+            std::env::set_var(ORCA_HOME_ENV, home.path());
+        }
+
+        let result = (|| {
+            let cwd = std::env::current_dir()?;
+            let mut writer = SessionWriter::start(&cwd, "mock", None, "rolling summary")?;
+            writer.append_summary(10, 5, "first summary")?;
+            writer.append_summary(20, 8, "updated rolling summary")?;
+            let transcript = load_session("latest")?;
+
+            let conv = resume_conversation(&transcript, "new system prompt".to_string());
+            assert_eq!(
+                conv.rolling_summary.as_deref(),
+                Some("updated rolling summary"),
+                "should restore the last summary as rolling_summary"
+            );
+            assert_eq!(
+                conv.summary.baseline.as_deref(),
+                Some("first summary"),
+                "first summary record should remain the stable baseline"
+            );
+            assert_eq!(
+                conv.summary.deltas,
+                vec!["updated rolling summary".to_string()],
+                "later summary records should resume as append-only deltas"
+            );
+            Ok::<(), io::Error>(())
+        })();
+
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var(ORCA_HOME_ENV, previous);
+            } else {
+                std::env::remove_var(ORCA_HOME_ENV);
+            }
+        }
+        result.expect("rolling summary restored from history");
+    }
+
+    #[test]
+    fn resume_without_summaries_has_no_rolling_summary() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let home = tempfile::tempdir().expect("temp home");
+        let previous = std::env::var_os(ORCA_HOME_ENV);
+        unsafe {
+            std::env::set_var(ORCA_HOME_ENV, home.path());
+        }
+
+        let result = (|| {
+            let cwd = std::env::current_dir()?;
+            let _writer = SessionWriter::start(&cwd, "mock", None, "no summaries")?;
+            let transcript = load_session("latest")?;
+
+            let conv = resume_conversation(&transcript, "sys".to_string());
+            assert!(
+                conv.rolling_summary.is_none(),
+                "no summary records means no rolling_summary"
+            );
+            Ok::<(), io::Error>(())
+        })();
+
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var(ORCA_HOME_ENV, previous);
+            } else {
+                std::env::remove_var(ORCA_HOME_ENV);
+            }
+        }
+        result.expect("no rolling summary without records");
+    }
+
+    #[test]
+    fn resume_prefers_persisted_summary_state_over_legacy_summary_list() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let home = tempfile::tempdir().expect("temp home");
+        let previous = std::env::var_os(ORCA_HOME_ENV);
+        unsafe {
+            std::env::set_var(ORCA_HOME_ENV, home.path());
+        }
+
+        let result = (|| {
+            let cwd = std::env::current_dir()?;
+            let mut writer = SessionWriter::start(&cwd, "mock", None, "summary state")?;
+            writer.append_summary(10, 5, "legacy baseline")?;
+            writer.append_summary(20, 8, "legacy delta")?;
+            writer.append_summary_state(
+                30,
+                9,
+                "new delta",
+                &SummaryState {
+                    baseline: Some("rebuilt baseline".to_string()),
+                    deltas: vec!["fresh delta".to_string()],
+                },
+            )?;
+            let transcript = load_session("latest")?;
+
+            let conv = resume_conversation(&transcript, "sys".to_string());
+            assert_eq!(
+                conv.summary.baseline.as_deref(),
+                Some("rebuilt baseline"),
+                "latest persisted summary_state should be exact resume source"
+            );
+            assert_eq!(conv.summary.deltas, vec!["fresh delta".to_string()]);
+            assert_eq!(conv.rolling_summary.as_deref(), Some("new delta"));
+            Ok::<(), io::Error>(())
+        })();
+
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var(ORCA_HOME_ENV, previous);
+            } else {
+                std::env::remove_var(ORCA_HOME_ENV);
+            }
+        }
+        result.expect("summary state restored from history");
+    }
+
+    #[test]
+    fn resume_replays_compaction_records_to_drop_collapsed_messages() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let home = tempfile::tempdir().expect("temp home");
+        let previous = std::env::var_os(ORCA_HOME_ENV);
+        unsafe {
+            std::env::set_var(ORCA_HOME_ENV, home.path());
+        }
+
+        let result = (|| {
+            let cwd = std::env::current_dir()?;
+            let mut writer = SessionWriter::start(&cwd, "mock", None, "compacted resume")?;
+            writer.append_message(&Message::system("old system".to_string()))?;
+            writer.append_message(&Message::user("collapsed old user".repeat(100)))?;
+            writer.append_message(&Message::Assistant {
+                content: Some("collapsed old assistant".repeat(100)),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                pinned: false,
+            })?;
+            writer.append_message(&Message::Assistant {
+                content: Some("kept tail before compaction".to_string()),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                pinned: false,
+            })?;
+            writer.append_compaction(4, 2)?;
+            writer.append_summary_state(
+                4,
+                2,
+                "summary of collapsed old messages",
+                &SummaryState {
+                    baseline: Some("summary baseline".to_string()),
+                    deltas: Vec::new(),
+                },
+            )?;
+            writer.append_message(&Message::user("new prompt after compaction".to_string()))?;
+
+            let transcript = load_session("latest")?;
+            let conv = resume_conversation(&transcript, "fresh system".to_string());
+            let rendered = conv
+                .messages
+                .iter()
+                .filter_map(Message::content_str)
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            assert!(
+                !rendered.contains("collapsed old user"),
+                "collapsed pre-compaction user message should not re-enter resumed context"
+            );
+            assert!(
+                !rendered.contains("collapsed old assistant"),
+                "collapsed pre-compaction assistant message should not re-enter resumed context"
+            );
+            assert!(rendered.contains("kept tail before compaction"));
+            assert!(rendered.contains("new prompt after compaction"));
+            assert_eq!(conv.summary.baseline.as_deref(), Some("summary baseline"));
+            Ok::<(), io::Error>(())
+        })();
+
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var(ORCA_HOME_ENV, previous);
+            } else {
+                std::env::remove_var(ORCA_HOME_ENV);
+            }
+        }
+        result.expect("compacted messages filtered on resume");
     }
 }

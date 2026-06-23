@@ -173,4 +173,88 @@ mod tests {
         assert!(!names.contains(&"list_files"));
         assert!(!names.contains(&"subagent"));
     }
+
+    // --- DeepSeek prefix-cache stability locks ---------------------------------
+    //
+    // The tool schema is part of the IMMUTABLE PREFIX sent to DeepSeek on every
+    // turn. If its byte serialization changes between turns the server-side
+    // prefix cache misses for the entire conversation. These tests pin the two
+    // properties that guarantee byte-stability: deterministic tool ordering and
+    // deterministic JSON key ordering.
+
+    fn external_tool(name: &str) -> ExternalToolConfig {
+        ExternalToolConfig {
+            name: name.to_string(),
+            description: format!("external {name}"),
+            action_kind: orca_core::approval_types::ActionKind::Read,
+            command: "true".to_string(),
+            schema: serde_json::json!({}),
+        }
+    }
+
+    #[test]
+    fn builtin_schema_bytes_are_identical_across_rebuilds() {
+        // Two independent builds of the base schema must serialize to the exact
+        // same bytes — anything else means a non-deterministic source crept in
+        // (e.g. a HashMap-backed iteration order).
+        let first = serde_json::to_string(&deepseek_tools_schema_with_mcp_and_external(None, &[]))
+            .expect("serialize first build");
+        let second = serde_json::to_string(&deepseek_tools_schema_with_mcp_and_external(None, &[]))
+            .expect("serialize second build");
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn external_tools_keep_config_order_after_builtins() {
+        let externals = [
+            external_tool("zzz_last"),
+            external_tool("aaa_first"),
+            external_tool("mmm_middle"),
+        ];
+        let tools = deepseek_tools_schema_with_mcp_and_external(None, &externals);
+        let names = tools
+            .iter()
+            .filter_map(|tool| tool["function"]["name"].as_str())
+            .collect::<Vec<_>>();
+
+        // Builtins come first; the external block preserves config order rather
+        // than being sorted (sorting would still be stable, but config order is
+        // what the registry guarantees and what we must lock).
+        let external_names: Vec<&str> = names
+            .iter()
+            .copied()
+            .filter(|name| name.starts_with("zzz") || name.starts_with("aaa") || name.starts_with("mmm"))
+            .collect();
+        assert_eq!(external_names, vec!["zzz_last", "aaa_first", "mmm_middle"]);
+
+        // Re-running with the same input is byte-identical.
+        let again = deepseek_tools_schema_with_mcp_and_external(None, &externals);
+        assert_eq!(
+            serde_json::to_string(&tools).unwrap(),
+            serde_json::to_string(&again).unwrap()
+        );
+    }
+
+    #[test]
+    fn json_object_keys_serialize_in_sorted_order() {
+        // serde_json without the `preserve_order` feature serializes object keys
+        // in sorted (BTreeMap) order. If a future dependency change enables
+        // `preserve_order`, key order would become insertion-dependent and the
+        // prefix cache could silently break. This test fails loudly in that case.
+        let value = serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "demo",
+                "description": "d",
+                "parameters": { "b": 1, "a": 2 }
+            }
+        });
+        let serialized = serde_json::to_string(&value).unwrap();
+        assert!(
+            serialized.find("\"a\"").unwrap() < serialized.find("\"b\"").unwrap(),
+            "object keys must serialize sorted; got {serialized}"
+        );
+        // Top-level: "function" sorts before "type".
+        assert!(serialized.find("\"function\"").unwrap() < serialized.find("\"type\"").unwrap());
+    }
 }

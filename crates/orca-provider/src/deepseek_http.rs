@@ -3,7 +3,7 @@ use serde_json::Value;
 
 use orca_core::approval_types::ActionKind;
 use orca_core::cancel::CancelToken;
-use orca_core::conversation::{Conversation, Message, RawToolCall};
+use orca_core::conversation::{Conversation, Message, RawToolCall, SummaryState};
 use orca_core::provider_types::{ProviderReplayState, ProviderResponse, ProviderStep, Usage};
 use orca_core::tool_types::ToolRequest;
 use orca_tools::registry;
@@ -31,16 +31,16 @@ struct StreamOptions {
 }
 
 #[derive(Debug, Serialize)]
-struct ApiMessage {
-    role: String,
+pub(crate) struct ApiMessage {
+    pub(crate) role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    content: Option<String>,
+    pub(crate) content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    reasoning_content: Option<String>,
+    pub(crate) reasoning_content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<ApiToolCallRequest>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tool_call_id: Option<String>,
+    pub(crate) tool_call_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -463,18 +463,28 @@ fn parse_tool_call(
     })
 }
 
-fn conversation_to_api_messages(conversation: &Conversation) -> Vec<ApiMessage> {
-    conversation
-        .messages
-        .iter()
-        .map(|msg| match msg {
-            Message::System { content, .. } => ApiMessage {
-                role: "system".to_string(),
-                content: Some(content.clone()),
-                reasoning_content: None,
-                tool_calls: None,
-                tool_call_id: None,
-            },
+pub(crate) fn conversation_to_api_messages(conversation: &Conversation) -> Vec<ApiMessage> {
+    let mut messages: Vec<ApiMessage> = Vec::new();
+    let mut first_system_done = false;
+
+    for msg in &conversation.messages {
+        let api_msg = match msg {
+            Message::System { content, .. } => {
+                let result = ApiMessage {
+                    role: "system".to_string(),
+                    content: Some(content.clone()),
+                    reasoning_content: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                };
+                if !first_system_done {
+                    first_system_done = true;
+                    messages.push(result);
+                    inject_summary_messages(&conversation.summary, &mut messages);
+                    continue;
+                }
+                result
+            }
             Message::User { content, .. } => ApiMessage {
                 role: "user".to_string(),
                 content: Some(content.clone()),
@@ -524,8 +534,48 @@ fn conversation_to_api_messages(conversation: &Conversation) -> Vec<ApiMessage> 
                 tool_calls: None,
                 tool_call_id: Some(tool_call_id.clone()),
             },
-        })
-        .collect()
+        };
+        messages.push(api_msg);
+    }
+
+    if !first_system_done && !conversation.summary.is_empty() {
+        inject_summary_messages(&conversation.summary, &mut messages);
+    }
+
+    if !conversation.volatile.is_empty() {
+        let overlay = conversation.volatile.render();
+        if let Some(last) = messages.last_mut() {
+            let existing = last.content.take().unwrap_or_default();
+            last.content = Some(if existing.is_empty() {
+                overlay
+            } else {
+                format!("{existing}\n\n{overlay}")
+            });
+        }
+    }
+
+    messages
+}
+
+fn inject_summary_messages(summary: &SummaryState, messages: &mut Vec<ApiMessage>) {
+    if let Some(baseline) = &summary.baseline {
+        messages.push(ApiMessage {
+            role: "system".to_string(),
+            content: Some(format!("[Summary baseline]\n{baseline}")),
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+        });
+    }
+    for (i, delta) in summary.deltas.iter().enumerate() {
+        messages.push(ApiMessage {
+            role: "system".to_string(),
+            content: Some(format!("[Summary update {}]\n{delta}", i + 1)),
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+        });
+    }
 }
 
 #[cfg(test)]
@@ -692,5 +742,75 @@ mod tests {
         let tc = make_tc("read_file", "not json");
         let err = parse_tool_call(&tc, &[]).unwrap_err();
         assert!(err.contains("invalid arguments JSON"));
+    }
+
+    #[test]
+    fn volatile_overlay_appended_to_last_message() {
+        let mut conv = Conversation::new();
+        conv.add_system("system prompt".to_string());
+        conv.add_user("do something".to_string());
+        conv.replace_plan_state("[Plan]\n1. step one".to_string());
+        conv.replace_goal_state("build a widget".to_string());
+
+        let messages = conversation_to_api_messages(&conv);
+        assert_eq!(messages.len(), 2);
+        let last_content = messages.last().unwrap().content.as_deref().unwrap();
+        assert!(last_content.starts_with("do something"));
+        assert!(last_content.contains("[Goal state]"));
+        assert!(last_content.contains("[Plan]"));
+    }
+
+    #[test]
+    fn volatile_overlay_on_tool_result() {
+        let mut conv = Conversation::new();
+        conv.add_system("sys".to_string());
+        conv.add_user("read a file".to_string());
+        conv.add_assistant(
+            None,
+            None,
+            vec![RawToolCall {
+                id: "tc1".to_string(),
+                function_name: "read_file".to_string(),
+                arguments: r#"{"path":"x"}"#.to_string(),
+            }],
+        );
+        conv.add_tool_result("tc1".to_string(), "file contents".to_string());
+        conv.replace_plan_state("updated plan".to_string());
+
+        let messages = conversation_to_api_messages(&conv);
+        assert_eq!(messages.len(), 4);
+        let last = messages.last().unwrap();
+        assert_eq!(last.role, "tool");
+        assert!(last.content.as_deref().unwrap().contains("updated plan"));
+        assert!(
+            last.content
+                .as_deref()
+                .unwrap()
+                .starts_with("file contents")
+        );
+    }
+
+    #[test]
+    fn no_volatile_means_no_overlay() {
+        let mut conv = Conversation::new();
+        conv.add_system("sys".to_string());
+        conv.add_user("hello".to_string());
+
+        let messages = conversation_to_api_messages(&conv);
+        assert_eq!(messages[1].content.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn volatile_overlay_does_not_mutate_source_messages() {
+        let mut conv = Conversation::new();
+        conv.add_system("sys".to_string());
+        conv.add_user("original text".to_string());
+        conv.replace_plan_state("plan data".to_string());
+
+        let _ = conversation_to_api_messages(&conv);
+        assert_eq!(conv.messages.len(), 2);
+        assert!(
+            matches!(&conv.messages[1], Message::User { content, .. } if content == "original text")
+        );
     }
 }
