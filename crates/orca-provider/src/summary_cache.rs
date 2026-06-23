@@ -10,12 +10,21 @@ const CACHE_SUBDIR: &str = "summary_cache";
 /// with the collapsed delta makes the key stable across resume/fork/replay:
 /// summarizing the same older history (after deterministic extractive
 /// compaction) always hashes to the same value, so the remote summary call is
-/// skipped entirely on repeated compaction of identical content.
-pub fn summary_key(scope: &str, previous_summary: Option<&str>, delta_text: &str) -> String {
+/// skipped entirely on repeated compaction of identical content. The `purpose`
+/// segment keeps semantically different requests (incremental delta summary vs
+/// baseline rebuild) in separate cache spaces even when their text collides.
+pub fn summary_key(
+    scope: &str,
+    purpose: &str,
+    previous_summary: Option<&str>,
+    delta_text: &str,
+) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"orca-summary-v2\n");
+    hasher.update(b"orca-summary-v3\n");
     hasher.update(b"scope:");
     hasher.update(scope.as_bytes());
+    hasher.update(b"\npurpose:");
+    hasher.update(purpose.as_bytes());
     match previous_summary {
         Some(prev) => {
             hasher.update(b"\nprev:");
@@ -101,11 +110,13 @@ mod tests {
     fn key_is_stable_for_identical_inputs() {
         let a = summary_key(
             "provider=deepseek;model=aux;prompt=v1",
+            "delta",
             Some("baseline"),
             "delta body",
         );
         let b = summary_key(
             "provider=deepseek;model=aux;prompt=v1",
+            "delta",
             Some("baseline"),
             "delta body",
         );
@@ -115,25 +126,51 @@ mod tests {
     #[test]
     fn key_changes_with_previous_summary_and_delta() {
         let scope = "provider=deepseek;model=aux;prompt=v1";
-        let base = summary_key(scope, None, "delta");
-        assert_ne!(base, summary_key(scope, Some("prev"), "delta"));
-        assert_ne!(base, summary_key(scope, None, "different delta"));
+        let base = summary_key(scope, "delta", None, "delta");
+        assert_ne!(base, summary_key(scope, "delta", Some("prev"), "delta"));
+        assert_ne!(base, summary_key(scope, "delta", None, "different delta"));
+    }
+
+    #[test]
+    fn key_changes_with_purpose() {
+        let scope = "provider=deepseek;model=aux;prompt=v1";
+        let delta = summary_key(scope, "delta", None, "same text");
+        let rebuild = summary_key(scope, "rebuild_baseline", None, "same text");
+        assert_ne!(
+            delta, rebuild,
+            "different purposes must not collide in cache space"
+        );
     }
 
     #[test]
     fn key_changes_with_summary_scope() {
-        let base = summary_key("provider=deepseek;model=aux;prompt=v1", None, "delta");
-        assert_ne!(
-            base,
-            summary_key("provider=mock;model=aux;prompt=v1", None, "delta")
+        let base = summary_key(
+            "provider=deepseek;model=aux;prompt=v1",
+            "delta",
+            None,
+            "delta",
         );
         assert_ne!(
             base,
-            summary_key("provider=deepseek;model=other-aux;prompt=v1", None, "delta")
+            summary_key("provider=mock;model=aux;prompt=v1", "delta", None, "delta")
         );
         assert_ne!(
             base,
-            summary_key("provider=deepseek;model=aux;prompt=v2", None, "delta")
+            summary_key(
+                "provider=deepseek;model=other-aux;prompt=v1",
+                "delta",
+                None,
+                "delta"
+            )
+        );
+        assert_ne!(
+            base,
+            summary_key(
+                "provider=deepseek;model=aux;prompt=v2",
+                "delta",
+                None,
+                "delta"
+            )
         );
     }
 
@@ -145,6 +182,7 @@ mod tests {
 
         let key = summary_key(
             "provider=deepseek;model=aux;prompt=v1",
+            "delta",
             None,
             "collapsed content",
         );
@@ -162,6 +200,7 @@ mod tests {
         assert!(
             lookup(&summary_key(
                 "provider=deepseek;model=aux;prompt=v1",
+                "delta",
                 None,
                 "never stored"
             ))

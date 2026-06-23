@@ -163,16 +163,17 @@ pub fn compact_with_summary(
     context_config: &ContextConfig,
     provider_config: &ProviderConfig,
 ) -> CompactionResult {
-    let conversation = micro_compact_stale_tool_outputs(conversation);
-    if !needs_compaction(&conversation, context_config) {
+    let micro_compacted = micro_compact_stale_tool_outputs(conversation);
+    if !needs_compaction(&micro_compacted, context_config) {
         return CompactionResult {
-            conversation,
+            conversation: micro_compacted,
             kind: CompactionKind::LocalTruncation,
         };
     }
     match summarize_collapsed_messages(
         provider_kind,
-        &conversation,
+        conversation,
+        &micro_compacted,
         context_config,
         provider_config,
     ) {
@@ -181,7 +182,7 @@ pub fn compact_with_summary(
             kind: CompactionKind::RemoteSummary(summary),
         },
         None => CompactionResult {
-            conversation: compact(&conversation, context_config),
+            conversation: compact(&micro_compacted, context_config),
             kind: CompactionKind::LocalTruncation,
         },
     }
@@ -191,8 +192,14 @@ const SMALL_DELTA_TOKEN_THRESHOLD: usize = 200;
 const MAX_SUMMARY_DELTAS: usize = 5;
 const BASELINE_REBUILD_TOKEN_THRESHOLD: usize = 2000;
 
+/// `original_conversation` is the pre-micro-compaction input; `conversation` is
+/// the micro-compacted main-context view. The kept tail comes from the
+/// micro-compacted view (so main-context behavior is unchanged), but the
+/// summary delta is rendered from the ORIGINAL collapsed content so summary
+/// extractive rules are never masked by main-context micro compaction.
 fn summarize_collapsed_messages(
     provider_kind: ProviderKind,
+    original_conversation: &Conversation,
     conversation: &Conversation,
     context_config: &ContextConfig,
     provider_config: &ProviderConfig,
@@ -203,20 +210,34 @@ fn summarize_collapsed_messages(
         return None;
     }
 
-    let delta_text = format_messages(&local_extractive_compaction(&collapsed));
-    let delta_tokens = DefaultTokenCounter.count_text(&delta_text);
+    // Micro compaction is positional and in-place (it only rewrites Tool
+    // contents, never reorders or drops messages), so the original droppable
+    // list maps 1:1 onto the micro-compacted one. Taking the same prefix length
+    // recovers the ORIGINAL collapsed messages for summary rendering.
+    let original_collapsed: Vec<Message> = original_conversation
+        .messages
+        .iter()
+        .skip(1)
+        .filter(|message| !message.is_pinned())
+        .take(collapsed.len())
+        .cloned()
+        .collect();
+    let rendered = render_summary_delta(&original_collapsed);
 
     let has_existing_summary =
         conversation.rolling_summary.is_some() || !conversation.summary.is_empty();
-    let new_delta = if has_existing_summary {
-        if delta_tokens < SMALL_DELTA_TOKEN_THRESHOLD {
-            delta_text.trim().to_string()
+    let new_delta =
+        if has_existing_summary && rendered.rendered_tokens_est < SMALL_DELTA_TOKEN_THRESHOLD {
+            rendered.text.trim().to_string()
         } else {
-            request_summary(provider_kind, provider_config, None, &delta_text)?
-        }
-    } else {
-        request_summary(provider_kind, provider_config, None, &delta_text)?
-    };
+            request_summary(
+                provider_kind,
+                provider_config,
+                SUMMARY_PURPOSE_DELTA,
+                None,
+                &rendered,
+            )?
+        };
 
     let mut result = Conversation::new();
     if let Some(system) = system_msg {
@@ -279,7 +300,15 @@ fn rebuild_baseline(
         combined.push_str("\n\n");
         combined.push_str(delta);
     }
-    request_summary(provider_kind, provider_config, None, &combined).unwrap_or(combined)
+    let rendered = RenderedSummaryDelta::from_plain(combined.clone());
+    request_summary(
+        provider_kind,
+        provider_config,
+        SUMMARY_PURPOSE_REBUILD,
+        None,
+        &rendered,
+    )
+    .unwrap_or(combined)
 }
 
 fn partition_for_compaction(
@@ -344,15 +373,19 @@ fn partition_for_compaction(
 fn request_summary(
     provider_kind: ProviderKind,
     provider_config: &ProviderConfig,
+    purpose: &str,
     previous_summary: Option<&str>,
-    collapsed_text: &str,
+    rendered: &RenderedSummaryDelta,
 ) -> Option<String> {
+    let collapsed_text = rendered.text.as_str();
     let cache_scope = summary_cache_scope(provider_kind, provider_config);
     let cache_key =
-        crate::summary_cache::summary_key(&cache_scope, previous_summary, collapsed_text);
+        crate::summary_cache::summary_key(&cache_scope, purpose, previous_summary, collapsed_text);
     if let Some(cached) = crate::summary_cache::lookup(&cache_key) {
+        emit_summary_telemetry(purpose, true, rendered);
         return Some(cached);
     }
+    emit_summary_telemetry(purpose, false, rendered);
 
     let summary_model = orca_core::model::auxiliary_model().to_string();
     let summary_config = ProviderConfig {
@@ -391,11 +424,27 @@ fn request_summary(
     Some(summary)
 }
 
-const EXTRACTIVE_TOOL_OUTPUT_BYTES: usize = 1024;
-const EXTRACTIVE_HEAD_LINES: usize = 12;
-const EXTRACTIVE_TAIL_LINES: usize = 8;
-const EXTRACTIVE_HEAD_CHARS: usize = 384;
-const EXTRACTIVE_TAIL_CHARS: usize = 384;
+// Summary-delta rendering tiers. These run on the ORIGINAL collapsed content
+// (never the micro-compacted main-context view), so huge tool outputs are
+// summarized by summary-specific extractive rules instead of being masked by
+// main-context micro compaction. A single layered ruleset is applied to every
+// tool output: tiny outputs are kept verbatim, mid-sized ones get a head/tail
+// extract, and huge ones get a more aggressive extract.
+const SUMMARY_KEEP_VERBATIM_BYTES: usize = 1024;
+const SUMMARY_HUGE_BYTES: usize = 8 * 1024;
+const SUMMARY_MEDIUM_HEAD_LINES: usize = 16;
+const SUMMARY_MEDIUM_TAIL_LINES: usize = 10;
+const SUMMARY_MEDIUM_HEAD_CHARS: usize = 768;
+const SUMMARY_MEDIUM_TAIL_CHARS: usize = 768;
+const SUMMARY_HUGE_HEAD_LINES: usize = 12;
+const SUMMARY_HUGE_TAIL_LINES: usize = 8;
+const SUMMARY_HUGE_HEAD_CHARS: usize = 512;
+const SUMMARY_HUGE_TAIL_CHARS: usize = 512;
+const ALREADY_COMPACTED_MARKERS: [&str; 2] =
+    ["[tool output micro-compact]", "[extractive-compact]"];
+const SUMMARY_PURPOSE_DELTA: &str = "delta";
+const SUMMARY_PURPOSE_REBUILD: &str = "rebuild_baseline";
+const SUMMARY_DEBUG_ENV: &str = "ORCA_SUMMARY_DEBUG";
 const SUMMARY_PROMPT_VERSION: &str = "summary-prompt-v1";
 const SUMMARY_SYSTEM_PROMPT: &str = "Summarize old agent conversation context for future continuation. Preserve user goals, decisions, file paths, tool results, blockers, and exact constraints. Be concise and factual.";
 
@@ -410,60 +459,148 @@ fn summary_cache_scope(provider_kind: ProviderKind, provider_config: &ProviderCo
     )
 }
 
-/// Deterministically shrink the collapsed delta before it reaches the remote
-/// summary model. Tool outputs (file reads, bash output, grep dumps) are the
-/// bulk of collapsed tokens and are highly compressible without an LLM call:
-/// we keep a head/tail extract plus a size marker. Natural-language turns
-/// (user/assistant) are left untouched so the remote summarizer keeps full
-/// fidelity on intent and decisions. This is purely local and deterministic,
-/// so identical inputs always yield identical output (which also stabilizes
-/// the summary hash cache).
-fn local_extractive_compaction(messages: &[Message]) -> Vec<Message> {
-    messages
+/// Deterministic, observable rendering of a collapsed conversation segment
+/// before it reaches the remote summary model. This is the single entry point
+/// for summary-delta input: it always runs on the ORIGINAL collapsed messages,
+/// never on the micro-compacted main-context view, so summary-specific
+/// extractive rules are never masked by main-context micro compaction.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RenderedSummaryDelta {
+    pub text: String,
+    pub original_bytes: usize,
+    pub rendered_bytes: usize,
+    pub original_tokens_est: usize,
+    pub rendered_tokens_est: usize,
+    pub compacted_tool_outputs: usize,
+}
+
+impl RenderedSummaryDelta {
+    /// Build metrics for a plain text input that needs no tool-output rendering
+    /// (e.g. the merged baseline-rebuild prompt). original == rendered.
+    fn from_plain(text: String) -> Self {
+        let bytes = text.len();
+        let tokens = DefaultTokenCounter.count_text(&text);
+        Self {
+            text,
+            original_bytes: bytes,
+            rendered_bytes: bytes,
+            original_tokens_est: tokens,
+            rendered_tokens_est: tokens,
+            compacted_tool_outputs: 0,
+        }
+    }
+}
+
+/// Render the collapsed delta with the unified tool-output tier ruleset.
+/// Natural-language turns (user/assistant) are left untouched so the remote
+/// summarizer keeps full fidelity on intent and decisions. Tool outputs go
+/// through a single layered policy (`render_tool_output`). Identical inputs
+/// always yield identical output, which also stabilizes the summary hash cache.
+pub fn render_summary_delta(collapsed: &[Message]) -> RenderedSummaryDelta {
+    let original_text = format_messages(collapsed);
+    let mut compacted_tool_outputs = 0usize;
+    let rendered_messages: Vec<Message> = collapsed
         .iter()
         .map(|message| match message {
             Message::Tool {
                 tool_call_id,
                 content,
                 pinned,
-            } if content.len() > EXTRACTIVE_TOOL_OUTPUT_BYTES => Message::Tool {
-                tool_call_id: tool_call_id.clone(),
-                content: extractive_summarize_output(content),
-                pinned: *pinned,
-            },
+            } => {
+                let (rendered, compacted) = render_tool_output(content);
+                if compacted {
+                    compacted_tool_outputs += 1;
+                }
+                Message::Tool {
+                    tool_call_id: tool_call_id.clone(),
+                    content: rendered,
+                    pinned: *pinned,
+                }
+            }
             other => other.clone(),
         })
-        .collect()
-}
-
-fn extractive_summarize_output(content: &str) -> String {
-    let lines: Vec<&str> = content.lines().collect();
-    if lines.len() <= EXTRACTIVE_HEAD_LINES + EXTRACTIVE_TAIL_LINES {
-        return extractive_summarize_single_span(content);
+        .collect();
+    let text = format_messages(&rendered_messages);
+    let counter = DefaultTokenCounter;
+    RenderedSummaryDelta {
+        original_bytes: original_text.len(),
+        rendered_bytes: text.len(),
+        original_tokens_est: counter.count_text(&original_text),
+        rendered_tokens_est: counter.count_text(&text),
+        compacted_tool_outputs,
+        text,
     }
-    let head = lines[..EXTRACTIVE_HEAD_LINES].join("\n");
-    let tail = lines[lines.len() - EXTRACTIVE_TAIL_LINES..].join("\n");
-    let omitted = lines.len() - EXTRACTIVE_HEAD_LINES - EXTRACTIVE_TAIL_LINES;
-    format!(
-        "[extractive-compact] original_bytes={} original_lines={} omitted_lines={}\n{}\n... [{} lines omitted] ...\n{}",
-        content.len(),
-        lines.len(),
-        omitted,
-        head.trim_end(),
-        omitted,
-        tail.trim_start()
-    )
 }
 
-fn extractive_summarize_single_span(content: &str) -> String {
+/// Unified tool-output tier policy. Returns the rendered content and whether it
+/// was compacted (for metrics):
+///   - already contains a compaction marker: keep as-is (no double compression)
+///   - <= 1KB: keep verbatim
+///   - 1KB - 8KB: extractive head/tail (medium tier)
+///   - > 8KB: more aggressive extractive (huge tier)
+fn render_tool_output(content: &str) -> (String, bool) {
+    if ALREADY_COMPACTED_MARKERS
+        .iter()
+        .any(|marker| content.contains(marker))
+    {
+        return (content.to_string(), false);
+    }
+    let bytes = content.len();
+    if bytes <= SUMMARY_KEEP_VERBATIM_BYTES {
+        return (content.to_string(), false);
+    }
+    let (head_lines, tail_lines, head_chars, tail_chars) = if bytes > SUMMARY_HUGE_BYTES {
+        (
+            SUMMARY_HUGE_HEAD_LINES,
+            SUMMARY_HUGE_TAIL_LINES,
+            SUMMARY_HUGE_HEAD_CHARS,
+            SUMMARY_HUGE_TAIL_CHARS,
+        )
+    } else {
+        (
+            SUMMARY_MEDIUM_HEAD_LINES,
+            SUMMARY_MEDIUM_TAIL_LINES,
+            SUMMARY_MEDIUM_HEAD_CHARS,
+            SUMMARY_MEDIUM_TAIL_CHARS,
+        )
+    };
+    let rendered = extractive_render(content, head_lines, tail_lines, head_chars, tail_chars);
+    // If the policy could not shrink the content (e.g. a small-span tier),
+    // report it as untouched so the metric reflects reality.
+    let compacted = rendered.len() < bytes;
+    (rendered, compacted)
+}
+
+fn extractive_render(
+    content: &str,
+    head_lines: usize,
+    tail_lines: usize,
+    head_chars: usize,
+    tail_chars: usize,
+) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    if lines.len() > head_lines + tail_lines {
+        let head = lines[..head_lines].join("\n");
+        let tail = lines[lines.len() - tail_lines..].join("\n");
+        let omitted = lines.len() - head_lines - tail_lines;
+        return format!(
+            "[extractive-compact] original_bytes={} original_lines={} omitted_lines={}\n{}\n... [{} lines omitted] ...\n{}",
+            content.len(),
+            lines.len(),
+            omitted,
+            head.trim_end(),
+            omitted,
+            tail.trim_start()
+        );
+    }
     let char_count = content.chars().count();
-    if char_count <= EXTRACTIVE_HEAD_CHARS + EXTRACTIVE_TAIL_CHARS {
+    if char_count <= head_chars + tail_chars {
         return content.to_string();
     }
-    let head: String = content.chars().take(EXTRACTIVE_HEAD_CHARS).collect();
-    let tail_vec: Vec<char> = content.chars().rev().take(EXTRACTIVE_TAIL_CHARS).collect();
+    let head: String = content.chars().take(head_chars).collect();
+    let tail_vec: Vec<char> = content.chars().rev().take(tail_chars).collect();
     let tail: String = tail_vec.into_iter().rev().collect();
-    let omitted = char_count - EXTRACTIVE_HEAD_CHARS - EXTRACTIVE_TAIL_CHARS;
+    let omitted = char_count - head_chars - tail_chars;
     format!(
         "[extractive-compact] original_bytes={} original_chars={} omitted_chars={}\n{}\n... [{} chars omitted] ...\n{}",
         content.len(),
@@ -472,6 +609,33 @@ fn extractive_summarize_single_span(content: &str) -> String {
         head.trim_end(),
         omitted,
         tail.trim_start()
+    )
+}
+
+/// Emit cheap, structured observability for a remote summary request. Off by
+/// default; set `ORCA_SUMMARY_DEBUG` to surface the metrics for evaluation.
+fn emit_summary_telemetry(purpose: &str, cache_hit: bool, rendered: &RenderedSummaryDelta) {
+    if std::env::var_os(SUMMARY_DEBUG_ENV).is_none() {
+        return;
+    }
+    eprintln!("{}", format_summary_telemetry(purpose, cache_hit, rendered));
+}
+
+fn format_summary_telemetry(
+    purpose: &str,
+    cache_hit: bool,
+    rendered: &RenderedSummaryDelta,
+) -> String {
+    format!(
+        "orca.remote_summary requested=1 purpose={} cache_hit={} cache_miss={} original_bytes={} rendered_bytes={} original_tokens_est={} rendered_tokens_est={} compacted_tool_outputs={}",
+        purpose,
+        cache_hit as u8,
+        (!cache_hit) as u8,
+        rendered.original_bytes,
+        rendered.rendered_bytes,
+        rendered.original_tokens_est,
+        rendered.rendered_tokens_est,
+        rendered.compacted_tool_outputs,
     )
 }
 
@@ -1452,60 +1616,92 @@ mod tests {
     }
 
     #[test]
-    fn extractive_compaction_shrinks_large_tool_output_with_head_and_tail() {
+    fn render_summary_delta_shrinks_large_tool_output_with_head_and_tail() {
         let big_output = (0..200)
             .map(|i| format!("line {i}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let original_bytes = big_output.len();
         let messages = vec![Message::Tool {
             tool_call_id: "call_1".to_string(),
             content: big_output,
             pinned: false,
         }];
 
-        let compacted = local_extractive_compaction(&messages);
-        let content = compacted[0].content_str().unwrap();
+        let rendered = render_summary_delta(&messages);
 
-        assert!(content.starts_with("[extractive-compact]"));
-        assert!(content.contains(&format!("original_bytes={original_bytes}")));
-        assert!(content.contains("line 0"));
-        assert!(content.contains("line 199"));
-        assert!(content.contains("lines omitted"));
+        assert!(rendered.text.contains("[extractive-compact]"));
+        assert!(rendered.text.contains("line 0"));
+        assert!(rendered.text.contains("line 199"));
+        assert!(rendered.text.contains("lines omitted"));
         assert!(
-            content.len() < original_bytes,
+            rendered.rendered_bytes < rendered.original_bytes,
             "extractive output must be smaller than the original"
         );
+        assert_eq!(rendered.compacted_tool_outputs, 1);
     }
 
     #[test]
-    fn extractive_compaction_shrinks_large_single_line_tool_output() {
+    fn render_summary_delta_shrinks_large_single_line_tool_output() {
         let big_output = format!(
             "{{\"status\":\"ok\",\"payload\":\"{}\",\"tail\":\"final-value\"}}",
             "x".repeat(8_000)
         );
-        let original_bytes = big_output.len();
         let messages = vec![Message::Tool {
             tool_call_id: "call_1".to_string(),
             content: big_output,
             pinned: false,
         }];
 
-        let compacted = local_extractive_compaction(&messages);
-        let content = compacted[0].content_str().unwrap();
+        let rendered = render_summary_delta(&messages);
 
-        assert!(content.starts_with("[extractive-compact]"));
-        assert!(content.contains(&format!("original_bytes={original_bytes}")));
-        assert!(content.contains("\"status\":\"ok\""));
-        assert!(content.contains("final-value"));
+        assert!(rendered.text.contains("[extractive-compact]"));
+        assert!(rendered.text.contains("\"status\":\"ok\""));
+        assert!(rendered.text.contains("final-value"));
         assert!(
-            content.len() < original_bytes,
+            rendered.rendered_bytes < rendered.original_bytes,
             "large single-line outputs must shrink before remote summary"
         );
+        assert_eq!(rendered.compacted_tool_outputs, 1);
     }
 
     #[test]
-    fn extractive_compaction_leaves_small_tool_output_untouched() {
+    fn render_summary_delta_uses_more_aggressive_tier_for_huge_outputs() {
+        // Multi-line content so both tiers take the line-based extraction path.
+        let medium: String = (0..40)
+            .map(|i| format!("medium row {i} with some payload"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let huge: String = (0..400)
+            .map(|i| format!("huge row {i} with some payload text to inflate the byte size"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(medium.len() > SUMMARY_KEEP_VERBATIM_BYTES && medium.len() <= SUMMARY_HUGE_BYTES);
+        assert!(huge.len() > SUMMARY_HUGE_BYTES);
+
+        let medium_rendered = render_tool_output(&medium).0;
+        let huge_rendered = render_tool_output(&huge).0;
+
+        assert!(medium_rendered.contains("[extractive-compact]"));
+        assert!(huge_rendered.contains("[extractive-compact]"));
+        // The huge tier keeps strictly fewer head/tail lines than the medium tier.
+        assert!(
+            medium_rendered.contains(&format!(
+                "line {} omitted",
+                40 - SUMMARY_MEDIUM_HEAD_LINES - SUMMARY_MEDIUM_TAIL_LINES
+            )) || medium_rendered.contains("lines omitted")
+        );
+        assert!(
+            SUMMARY_HUGE_HEAD_LINES + SUMMARY_HUGE_TAIL_LINES
+                < SUMMARY_MEDIUM_HEAD_LINES + SUMMARY_MEDIUM_TAIL_LINES
+        );
+        // The first head line of the huge render is line 0; the line right after
+        // the kept head must be omitted (proves the shorter huge head was used).
+        assert!(huge_rendered.contains("huge row 0 "));
+        assert!(!huge_rendered.contains(&format!("huge row {} ", SUMMARY_HUGE_HEAD_LINES)));
+    }
+
+    #[test]
+    fn render_summary_delta_leaves_small_tool_output_untouched() {
         let small = "short output".to_string();
         let messages = vec![Message::Tool {
             tool_call_id: "call_1".to_string(),
@@ -1513,12 +1709,35 @@ mod tests {
             pinned: false,
         }];
 
-        let compacted = local_extractive_compaction(&messages);
-        assert_eq!(compacted[0].content_str(), Some(small.as_str()));
+        let rendered = render_summary_delta(&messages);
+        assert!(rendered.text.contains(&small));
+        assert_eq!(rendered.compacted_tool_outputs, 0);
     }
 
     #[test]
-    fn extractive_compaction_preserves_natural_language_turns() {
+    fn render_summary_delta_does_not_recompact_already_compacted_output() {
+        let already = format!(
+            "[tool output micro-compact]\noriginal_bytes: 99999\nhead:\n{}\n\ntail:\n{}",
+            "h".repeat(400),
+            "t".repeat(400)
+        );
+        let messages = vec![Message::Tool {
+            tool_call_id: "call_1".to_string(),
+            content: already.clone(),
+            pinned: false,
+        }];
+
+        let rendered = render_summary_delta(&messages);
+        assert!(rendered.text.contains("[tool output micro-compact]"));
+        assert!(
+            !rendered.text.contains("[extractive-compact]"),
+            "already-compacted output must not be compacted a second time"
+        );
+        assert_eq!(rendered.compacted_tool_outputs, 0);
+    }
+
+    #[test]
+    fn render_summary_delta_preserves_natural_language_turns() {
         let long_user = "user intent ".repeat(200);
         let long_assistant = "assistant decision ".repeat(200);
         let messages = vec![
@@ -1531,13 +1750,14 @@ mod tests {
             },
         ];
 
-        let compacted = local_extractive_compaction(&messages);
-        assert_eq!(compacted[0].content_str(), Some(long_user.as_str()));
-        assert_eq!(compacted[1].content_str(), Some(long_assistant.as_str()));
+        let rendered = render_summary_delta(&messages);
+        assert!(rendered.text.contains(long_user.trim()));
+        assert!(rendered.text.contains(long_assistant.trim()));
+        assert_eq!(rendered.compacted_tool_outputs, 0);
     }
 
     #[test]
-    fn extractive_compaction_is_deterministic() {
+    fn render_summary_delta_is_deterministic() {
         let big_output = (0..200)
             .map(|i| format!("row {i} value"))
             .collect::<Vec<_>>()
@@ -1548,8 +1768,58 @@ mod tests {
             pinned: false,
         }];
 
-        let first = local_extractive_compaction(&messages);
-        let second = local_extractive_compaction(&messages);
-        assert_eq!(first[0].content_str(), second[0].content_str());
+        let first = render_summary_delta(&messages);
+        let second = render_summary_delta(&messages);
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn render_summary_delta_reports_metrics_for_mixed_segment() {
+        let big_output = (0..200)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let messages = vec![
+            Message::user("inspect the log".to_string()),
+            Message::Tool {
+                tool_call_id: "call_1".to_string(),
+                content: big_output,
+                pinned: false,
+            },
+            Message::Tool {
+                tool_call_id: "call_2".to_string(),
+                content: "tiny".to_string(),
+                pinned: false,
+            },
+        ];
+
+        let rendered = render_summary_delta(&messages);
+        assert!(rendered.original_bytes > rendered.rendered_bytes);
+        assert!(rendered.original_tokens_est >= rendered.rendered_tokens_est);
+        assert_eq!(
+            rendered.compacted_tool_outputs, 1,
+            "only the large tool output should count as compacted"
+        );
+    }
+
+    #[test]
+    fn summary_telemetry_reports_original_and_rendered_token_estimates() {
+        let rendered = RenderedSummaryDelta {
+            text: "rendered".to_string(),
+            original_bytes: 100,
+            rendered_bytes: 40,
+            original_tokens_est: 25,
+            rendered_tokens_est: 10,
+            compacted_tool_outputs: 2,
+        };
+
+        let line = format_summary_telemetry("delta", false, &rendered);
+
+        assert!(line.contains("original_tokens_est=25"));
+        assert!(line.contains("rendered_tokens_est=10"));
+        assert!(
+            !line.contains(" input_tokens_est="),
+            "ambiguous token metric name should not be emitted"
+        );
     }
 }
