@@ -432,14 +432,16 @@ fn request_summary(
 // extract, and huge ones get a more aggressive extract.
 const SUMMARY_KEEP_VERBATIM_BYTES: usize = 1024;
 const SUMMARY_HUGE_BYTES: usize = 8 * 1024;
-const SUMMARY_MEDIUM_HEAD_LINES: usize = 16;
-const SUMMARY_MEDIUM_TAIL_LINES: usize = 10;
-const SUMMARY_MEDIUM_HEAD_CHARS: usize = 768;
-const SUMMARY_MEDIUM_TAIL_CHARS: usize = 768;
-const SUMMARY_HUGE_HEAD_LINES: usize = 12;
-const SUMMARY_HUGE_TAIL_LINES: usize = 8;
-const SUMMARY_HUGE_HEAD_CHARS: usize = 512;
-const SUMMARY_HUGE_TAIL_CHARS: usize = 512;
+const SUMMARY_MEDIUM_HEAD_LINES: usize = 8;
+const SUMMARY_MEDIUM_TAIL_LINES: usize = 6;
+const SUMMARY_MEDIUM_HEAD_CHARS: usize = 384;
+const SUMMARY_MEDIUM_TAIL_CHARS: usize = 384;
+const SUMMARY_MEDIUM_MAX_BYTES: usize = 900;
+const SUMMARY_HUGE_HEAD_LINES: usize = 6;
+const SUMMARY_HUGE_TAIL_LINES: usize = 4;
+const SUMMARY_HUGE_HEAD_CHARS: usize = 320;
+const SUMMARY_HUGE_TAIL_CHARS: usize = 320;
+const SUMMARY_HUGE_MAX_BYTES: usize = 700;
 const ALREADY_COMPACTED_MARKERS: [&str; 2] =
     ["[tool output micro-compact]", "[extractive-compact]"];
 const SUMMARY_PURPOSE_DELTA: &str = "delta";
@@ -536,8 +538,14 @@ pub fn render_summary_delta(collapsed: &[Message]) -> RenderedSummaryDelta {
 /// was compacted (for metrics):
 ///   - already contains a compaction marker: keep as-is (no double compression)
 ///   - <= 1KB: keep verbatim
-///   - 1KB - 8KB: extractive head/tail (medium tier)
-///   - > 8KB: more aggressive extractive (huge tier)
+///   - 1KB - 8KB: extractive head/tail (medium tier), capped at a hard budget
+///   - > 8KB: more aggressive extractive (huge tier), capped at a tighter budget
+///
+/// The hard byte budget is the key follow-up: head/tail line counts alone do not
+/// bound the rendered size (long lines blow past them), so the real-API cost
+/// could exceed the old micro-compaction baseline. After the line/char extract
+/// we always trim to the tier budget while preserving the size metadata so the
+/// summarizer still sees this is truncated evidence.
 fn render_tool_output(content: &str) -> (String, bool) {
     if ALREADY_COMPACTED_MARKERS
         .iter()
@@ -549,12 +557,13 @@ fn render_tool_output(content: &str) -> (String, bool) {
     if bytes <= SUMMARY_KEEP_VERBATIM_BYTES {
         return (content.to_string(), false);
     }
-    let (head_lines, tail_lines, head_chars, tail_chars) = if bytes > SUMMARY_HUGE_BYTES {
+    let (head_lines, tail_lines, head_chars, tail_chars, max_bytes) = if bytes > SUMMARY_HUGE_BYTES {
         (
             SUMMARY_HUGE_HEAD_LINES,
             SUMMARY_HUGE_TAIL_LINES,
             SUMMARY_HUGE_HEAD_CHARS,
             SUMMARY_HUGE_TAIL_CHARS,
+            SUMMARY_HUGE_MAX_BYTES,
         )
     } else {
         (
@@ -562,9 +571,12 @@ fn render_tool_output(content: &str) -> (String, bool) {
             SUMMARY_MEDIUM_TAIL_LINES,
             SUMMARY_MEDIUM_HEAD_CHARS,
             SUMMARY_MEDIUM_TAIL_CHARS,
+            SUMMARY_MEDIUM_MAX_BYTES,
         )
     };
-    let rendered = extractive_render(content, head_lines, tail_lines, head_chars, tail_chars);
+    let rendered = extractive_render(
+        content, head_lines, tail_lines, head_chars, tail_chars, max_bytes,
+    );
     // If the policy could not shrink the content (e.g. a small-span tier),
     // report it as untouched so the metric reflects reality.
     let compacted = rendered.len() < bytes;
@@ -577,39 +589,87 @@ fn extractive_render(
     tail_lines: usize,
     head_chars: usize,
     tail_chars: usize,
+    max_bytes: usize,
 ) -> String {
     let lines: Vec<&str> = content.lines().collect();
     if lines.len() > head_lines + tail_lines {
         let head = lines[..head_lines].join("\n");
         let tail = lines[lines.len() - tail_lines..].join("\n");
         let omitted = lines.len() - head_lines - tail_lines;
-        return format!(
-            "[extractive-compact] original_bytes={} original_lines={} omitted_lines={}\n{}\n... [{} lines omitted] ...\n{}",
+        let header = format!(
+            "[extractive-compact] original_bytes={} original_lines={} omitted_lines={}",
             content.len(),
             lines.len(),
             omitted,
-            head.trim_end(),
-            omitted,
-            tail.trim_start()
         );
+        let body = budget_trim_head_tail(
+            head.trim_end(),
+            tail.trim_start(),
+            &format!("... [{omitted} lines omitted] ..."),
+            max_bytes.saturating_sub(header.len() + 2),
+        );
+        return format!("{header}\n{body}");
     }
     let char_count = content.chars().count();
-    if char_count <= head_chars + tail_chars {
+    if char_count <= head_chars + tail_chars && content.len() <= max_bytes {
         return content.to_string();
     }
     let head: String = content.chars().take(head_chars).collect();
     let tail_vec: Vec<char> = content.chars().rev().take(tail_chars).collect();
     let tail: String = tail_vec.into_iter().rev().collect();
-    let omitted = char_count - head_chars - tail_chars;
-    format!(
-        "[extractive-compact] original_bytes={} original_chars={} omitted_chars={}\n{}\n... [{} chars omitted] ...\n{}",
+    let omitted = char_count.saturating_sub(head_chars + tail_chars);
+    let header = format!(
+        "[extractive-compact] original_bytes={} original_chars={} omitted_chars={}",
         content.len(),
         char_count,
         omitted,
+    );
+    let body = budget_trim_head_tail(
         head.trim_end(),
-        omitted,
-        tail.trim_start()
-    )
+        tail.trim_start(),
+        &format!("... [{omitted} chars omitted] ..."),
+        max_bytes.saturating_sub(header.len() + 2),
+    );
+    format!("{header}\n{body}")
+}
+
+/// Assemble `head`, a separator, and `tail` so the whole body fits in `budget`
+/// bytes. Head and tail are trimmed on char boundaries, splitting the remaining
+/// space evenly. The separator is always kept so the truncation stays visible.
+fn budget_trim_head_tail(head: &str, tail: &str, separator: &str, budget: usize) -> String {
+    let current = head.len() + 1 + separator.len() + 1 + tail.len();
+    if current <= budget {
+        return format!("{head}\n{separator}\n{tail}");
+    }
+    let frame = separator.len() + 2; // two newlines around the separator
+    let available = budget.saturating_sub(frame);
+    let head_budget = available / 2;
+    let tail_budget = available - head_budget;
+    let head_trimmed = take_chars_within_bytes(head, head_budget);
+    let tail_trimmed = take_chars_within_bytes_rev(tail, tail_budget);
+    format!("{head_trimmed}\n{separator}\n{tail_trimmed}")
+}
+
+fn take_chars_within_bytes(text: &str, budget: usize) -> &str {
+    let mut end = 0;
+    for (idx, ch) in text.char_indices() {
+        if idx + ch.len_utf8() > budget {
+            break;
+        }
+        end = idx + ch.len_utf8();
+    }
+    &text[..end]
+}
+
+fn take_chars_within_bytes_rev(text: &str, budget: usize) -> &str {
+    let mut start = text.len();
+    for (idx, _) in text.char_indices().rev() {
+        if text.len() - idx > budget {
+            break;
+        }
+        start = idx;
+    }
+    &text[start..]
 }
 
 /// Emit cheap, structured observability for a remote summary request. Off by
@@ -1821,5 +1881,60 @@ mod tests {
             !line.contains(" input_tokens_est="),
             "ambiguous token metric name should not be emitted"
         );
+    }
+
+    #[test]
+    fn huge_summary_renderer_is_no_larger_than_micro_compact_baseline() {
+        // The real-API target: the renderer must never make a huge tool output
+        // *more* expensive than the old micro-compaction path that the main
+        // context already applied. We assert byte parity against the exact same
+        // baseline (`micro_compact_tool_output`) the old path produced.
+        let huge = (0..600)
+            .map(|i| format!("row {i}: data payload chunk {i} with content"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let baseline = micro_compact_tool_output(&huge);
+        let (rendered, _) = render_tool_output(&huge);
+
+        assert!(
+            rendered.len() <= baseline.len(),
+            "huge renderer ({}) must not exceed micro-compact baseline ({})",
+            rendered.len(),
+            baseline.len()
+        );
+        assert!(rendered.len() <= SUMMARY_HUGE_MAX_BYTES);
+        // Evidence metadata must survive the hard budget.
+        assert!(rendered.contains("original_bytes="));
+    }
+
+    #[test]
+    fn medium_summary_renderer_stays_under_tool_budget() {
+        let medium = (0..120)
+            .map(|i| format!("2024-06-23 INFO worker[{i}] processed batch ok"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (rendered, compacted) = render_tool_output(&medium);
+
+        assert!(compacted);
+        assert!(
+            rendered.len() <= SUMMARY_MEDIUM_MAX_BYTES,
+            "medium renderer {} exceeds budget {}",
+            rendered.len(),
+            SUMMARY_MEDIUM_MAX_BYTES
+        );
+        assert!(rendered.contains("original_bytes="));
+        assert!(rendered.contains("original_lines="));
+    }
+
+    #[test]
+    fn single_line_huge_output_is_hard_trimmed_to_budget_with_metadata() {
+        // A huge single line cannot be split on newlines, so it must fall through
+        // to the char-level budget trim while keeping the size metadata.
+        let huge_line = format!("{{\"payload\":\"{}\"}}", "x".repeat(30_000));
+        let (rendered, compacted) = render_tool_output(&huge_line);
+
+        assert!(compacted);
+        assert!(rendered.len() <= SUMMARY_HUGE_MAX_BYTES);
+        assert!(rendered.contains("original_bytes="));
     }
 }
