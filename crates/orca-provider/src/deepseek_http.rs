@@ -3,7 +3,7 @@ use serde_json::Value;
 
 use orca_core::approval_types::ActionKind;
 use orca_core::cancel::CancelToken;
-use orca_core::conversation::{Conversation, Message, RawToolCall};
+use orca_core::conversation::{Conversation, Message, RawToolCall, SummaryState};
 use orca_core::provider_types::{ProviderReplayState, ProviderResponse, ProviderStep, Usage};
 use orca_core::tool_types::ToolRequest;
 use orca_tools::registry;
@@ -31,16 +31,16 @@ struct StreamOptions {
 }
 
 #[derive(Debug, Serialize)]
-struct ApiMessage {
-    role: String,
+pub(crate) struct ApiMessage {
+    pub(crate) role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    content: Option<String>,
+    pub(crate) content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    reasoning_content: Option<String>,
+    pub(crate) reasoning_content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<ApiToolCallRequest>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tool_call_id: Option<String>,
+    pub(crate) tool_call_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -463,18 +463,28 @@ fn parse_tool_call(
     })
 }
 
-fn conversation_to_api_messages(conversation: &Conversation) -> Vec<ApiMessage> {
-    let mut messages: Vec<ApiMessage> = conversation
-        .messages
-        .iter()
-        .map(|msg| match msg {
-            Message::System { content, .. } => ApiMessage {
-                role: "system".to_string(),
-                content: Some(content.clone()),
-                reasoning_content: None,
-                tool_calls: None,
-                tool_call_id: None,
-            },
+pub(crate) fn conversation_to_api_messages(conversation: &Conversation) -> Vec<ApiMessage> {
+    let mut messages: Vec<ApiMessage> = Vec::new();
+    let mut first_system_done = false;
+
+    for msg in &conversation.messages {
+        let api_msg = match msg {
+            Message::System { content, .. } => {
+                let result = ApiMessage {
+                    role: "system".to_string(),
+                    content: Some(content.clone()),
+                    reasoning_content: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                };
+                if !first_system_done {
+                    first_system_done = true;
+                    messages.push(result);
+                    inject_summary_messages(&conversation.summary, &mut messages);
+                    continue;
+                }
+                result
+            }
             Message::User { content, .. } => ApiMessage {
                 role: "user".to_string(),
                 content: Some(content.clone()),
@@ -524,8 +534,13 @@ fn conversation_to_api_messages(conversation: &Conversation) -> Vec<ApiMessage> 
                 tool_calls: None,
                 tool_call_id: Some(tool_call_id.clone()),
             },
-        })
-        .collect();
+        };
+        messages.push(api_msg);
+    }
+
+    if !first_system_done && !conversation.summary.is_empty() {
+        inject_summary_messages(&conversation.summary, &mut messages);
+    }
 
     if !conversation.volatile.is_empty() {
         let overlay = conversation.volatile.render();
@@ -540,6 +555,27 @@ fn conversation_to_api_messages(conversation: &Conversation) -> Vec<ApiMessage> 
     }
 
     messages
+}
+
+fn inject_summary_messages(summary: &SummaryState, messages: &mut Vec<ApiMessage>) {
+    if let Some(baseline) = &summary.baseline {
+        messages.push(ApiMessage {
+            role: "system".to_string(),
+            content: Some(format!("[Summary baseline]\n{baseline}")),
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+        });
+    }
+    for (i, delta) in summary.deltas.iter().enumerate() {
+        messages.push(ApiMessage {
+            role: "system".to_string(),
+            content: Some(format!("[Summary update {}]\n{delta}", i + 1)),
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+        });
+    }
 }
 
 #[cfg(test)]
@@ -746,7 +782,12 @@ mod tests {
         let last = messages.last().unwrap();
         assert_eq!(last.role, "tool");
         assert!(last.content.as_deref().unwrap().contains("updated plan"));
-        assert!(last.content.as_deref().unwrap().starts_with("file contents"));
+        assert!(
+            last.content
+                .as_deref()
+                .unwrap()
+                .starts_with("file contents")
+        );
     }
 
     #[test]

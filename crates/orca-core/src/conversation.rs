@@ -105,11 +105,47 @@ impl VolatileContext {
     }
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct SummaryState {
+    pub baseline: Option<String>,
+    pub deltas: Vec<String>,
+}
+
+impl SummaryState {
+    pub fn is_empty(&self) -> bool {
+        self.baseline.is_none() && self.deltas.is_empty()
+    }
+
+    pub fn latest_rolling(&self) -> Option<&str> {
+        if let Some(last_delta) = self.deltas.last() {
+            Some(last_delta.as_str())
+        } else {
+            self.baseline.as_deref()
+        }
+    }
+
+    pub fn total_tokens(&self, counter: &impl TokenCountable) -> usize {
+        let mut total = 0;
+        if let Some(baseline) = &self.baseline {
+            total += counter.count(baseline);
+        }
+        for delta in &self.deltas {
+            total += counter.count(delta);
+        }
+        total
+    }
+}
+
+pub trait TokenCountable {
+    fn count(&self, text: &str) -> usize;
+}
+
 #[derive(Clone, Debug)]
 pub struct Conversation {
     pub messages: Vec<Message>,
     pub volatile: VolatileContext,
     pub rolling_summary: Option<String>,
+    pub summary: SummaryState,
 }
 
 impl Conversation {
@@ -118,6 +154,7 @@ impl Conversation {
             messages: Vec::new(),
             volatile: VolatileContext::default(),
             rolling_summary: None,
+            summary: SummaryState::default(),
         }
     }
 
@@ -156,6 +193,17 @@ impl Conversation {
             } else {
                 true
             }
+        });
+    }
+
+    pub fn strip_legacy_summary_messages(&mut self) {
+        self.messages.retain(|msg| {
+            !matches!(
+                msg,
+                Message::System { content, pinned: false }
+                if content.starts_with("[Summary of earlier conversation]")
+                || content.starts_with("[Earlier conversation history was truncated")
+            )
         });
     }
 

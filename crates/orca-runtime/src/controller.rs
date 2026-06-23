@@ -329,6 +329,7 @@ fn run_agent_loop(
     let mut conversation = if let Some(resumed) = resumed {
         let mut conv = history::resume_conversation(resumed, system_prompt);
         conv.strip_legacy_pinned_volatile();
+        conv.strip_legacy_summary_messages();
         conv
     } else {
         let mut conversation = Conversation::new();
@@ -417,7 +418,12 @@ fn run_agent_loop(
             if emit_deltas && let Some(writer) = history_writer.as_deref_mut() {
                 writer.append_compaction(before_messages, after_messages)?;
                 if let context::CompactionKind::RemoteSummary(summary) = compaction.kind {
-                    writer.append_summary(before_messages, after_messages, summary)?;
+                    writer.append_summary_state(
+                        before_messages,
+                        after_messages,
+                        summary,
+                        &conversation.summary,
+                    )?;
                 }
             }
             if emit_deltas
@@ -554,7 +560,12 @@ fn run_agent_loop(
                 if emit_deltas && let Some(writer) = history_writer.as_deref_mut() {
                     writer.append_compaction(before_messages, after_messages)?;
                     if let context::CompactionKind::RemoteSummary(summary) = compaction.kind {
-                        writer.append_summary(before_messages, after_messages, summary)?;
+                        writer.append_summary_state(
+                            before_messages,
+                            after_messages,
+                            summary,
+                            &conversation.summary,
+                        )?;
                     }
                 }
                 reactive_compacted = true;

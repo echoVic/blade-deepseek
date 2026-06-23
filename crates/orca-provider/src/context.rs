@@ -1,5 +1,5 @@
 use orca_core::config::{ModelRuntimeConfig, ProviderKind};
-use orca_core::conversation::{Conversation, Message};
+use orca_core::conversation::{Conversation, Message, SummaryState};
 use orca_core::provider_types::ProviderStep;
 use tiktoken_rs::cl100k_base_singleton;
 
@@ -118,6 +118,7 @@ fn conversation_tokens_with_counter(
         .map(|message| message_tokens_with_counter(message, counter))
         .sum::<usize>()
         + volatile_tokens_with_counter(conversation, counter)
+        + summary_state_tokens(conversation, counter)
 }
 
 fn volatile_tokens_with_counter(conversation: &Conversation, counter: &impl TokenCounter) -> usize {
@@ -187,6 +188,8 @@ pub fn compact_with_summary(
 }
 
 const SMALL_DELTA_TOKEN_THRESHOLD: usize = 200;
+const MAX_SUMMARY_DELTAS: usize = 5;
+const BASELINE_REBUILD_TOKEN_THRESHOLD: usize = 2000;
 
 fn summarize_collapsed_messages(
     provider_kind: ProviderKind,
@@ -203,16 +206,13 @@ fn summarize_collapsed_messages(
     let delta_text = format_messages(&collapsed);
     let delta_tokens = DefaultTokenCounter.count_text(&delta_text);
 
-    let summary = if let Some(existing) = &conversation.rolling_summary {
+    let has_existing_summary =
+        conversation.rolling_summary.is_some() || !conversation.summary.is_empty();
+    let new_delta = if has_existing_summary {
         if delta_tokens < SMALL_DELTA_TOKEN_THRESHOLD {
-            existing.clone()
+            delta_text.trim().to_string()
         } else {
-            request_summary(
-                provider_kind,
-                provider_config,
-                Some(existing.as_str()),
-                &delta_text,
-            )?
+            request_summary(provider_kind, provider_config, None, &delta_text)?
         }
     } else {
         request_summary(provider_kind, provider_config, None, &delta_text)?
@@ -222,15 +222,64 @@ fn summarize_collapsed_messages(
     if let Some(system) = system_msg {
         result.messages.push(system);
     }
-    result.messages.push(Message::system(format!(
-        "[Summary of earlier conversation]\n{}",
-        summary.trim()
-    )));
     result.messages.extend(pinned);
     result.messages.extend(kept);
     result.volatile = conversation.volatile.clone();
-    result.rolling_summary = Some(summary.clone());
-    Some((result, summary))
+    result.rolling_summary = Some(new_delta.clone());
+
+    let mut summary = conversation.summary.clone();
+    if summary.baseline.is_none() {
+        summary.baseline = Some(new_delta.clone());
+    } else {
+        summary.deltas.push(new_delta.clone());
+        let needs_rebuild = summary.deltas.len() > MAX_SUMMARY_DELTAS
+            || summary_total_delta_tokens(&summary) > BASELINE_REBUILD_TOKEN_THRESHOLD;
+        if needs_rebuild {
+            let merged = rebuild_baseline(provider_kind, provider_config, &summary);
+            summary.baseline = Some(merged);
+            summary.deltas.clear();
+        }
+    }
+    result.summary = summary;
+
+    Some((result, new_delta))
+}
+
+fn summary_total_delta_tokens(summary: &SummaryState) -> usize {
+    summary
+        .deltas
+        .iter()
+        .map(|delta| DefaultTokenCounter.count_text(delta))
+        .sum()
+}
+
+fn summary_state_tokens(conversation: &Conversation, counter: &impl TokenCounter) -> usize {
+    let mut tokens = 0;
+    if let Some(baseline) = &conversation.summary.baseline {
+        tokens += counter.count_text(baseline) + counter.count_text("[Summary baseline]") + 4;
+    }
+    for (i, delta) in conversation.summary.deltas.iter().enumerate() {
+        tokens += counter.count_text(delta)
+            + counter.count_text(&format!("[Summary update {}]", i + 1))
+            + 4;
+    }
+    tokens
+}
+
+fn rebuild_baseline(
+    provider_kind: ProviderKind,
+    provider_config: &ProviderConfig,
+    summary: &SummaryState,
+) -> String {
+    let mut combined = String::new();
+    if let Some(baseline) = &summary.baseline {
+        combined.push_str(baseline);
+    }
+    for delta in &summary.deltas {
+        combined.push_str("\n\n");
+        combined.push_str(delta);
+    }
+    request_summary(provider_kind, provider_config, None, &combined).unwrap_or(combined)
 }
 
 fn partition_for_compaction(
@@ -245,7 +294,11 @@ fn partition_for_compaction(
         .as_ref()
         .map(|message| message_tokens_with_counter(message, counter))
         .unwrap_or(0);
-    let summary_tokens = counter.count_text("[Summary of earlier conversation]") + 256;
+    let summary_tokens = if conversation.summary.is_empty() {
+        counter.count_text("[Summary baseline]") + 256
+    } else {
+        summary_state_tokens(conversation, counter) + 256
+    };
     let non_system: Vec<&Message> = messages.iter().skip(1).collect();
     let pinned: Vec<Message> = non_system
         .iter()
@@ -444,6 +497,7 @@ pub fn compact_with_counter(
 
     let mut budget = system_tokens
         + pinned_tokens
+        + summary_state_tokens(&micro_compacted, counter)
         + volatile_tokens_with_counter(&micro_compacted, counter)
         + counter.count_text("[Earlier conversation history was truncated to fit context window]")
         + 4;
@@ -473,6 +527,7 @@ pub fn compact_with_counter(
     result.messages.extend(kept);
     result.volatile = conversation.volatile.clone();
     result.rolling_summary = conversation.rolling_summary.clone();
+    result.summary = conversation.summary.clone();
     result
 }
 
@@ -482,6 +537,7 @@ fn normalize_compacted_conversation(mut conversation: Conversation) -> Conversat
     }
     let volatile = conversation.volatile.clone();
     let rolling_summary = conversation.rolling_summary.clone();
+    let summary = conversation.summary.clone();
     let system = conversation.messages.remove(0);
     normalize_tool_boundaries(&mut conversation.messages);
     let mut result = Conversation::new();
@@ -489,6 +545,7 @@ fn normalize_compacted_conversation(mut conversation: Conversation) -> Conversat
     result.messages.extend(conversation.messages);
     result.volatile = volatile;
     result.rolling_summary = rolling_summary;
+    result.summary = summary;
     result
 }
 
@@ -496,6 +553,7 @@ fn micro_compact_stale_tool_outputs(conversation: &Conversation) -> Conversation
     let mut result = Conversation::new();
     result.volatile = conversation.volatile.clone();
     result.rolling_summary = conversation.rolling_summary.clone();
+    result.summary = conversation.summary.clone();
     let last_user_index = conversation
         .messages
         .iter()
@@ -1195,6 +1253,109 @@ mod tests {
         assert!(
             SMALL_DELTA_TOKEN_THRESHOLD > 0 && SMALL_DELTA_TOKEN_THRESHOLD <= 500,
             "threshold should be in a reasonable range"
+        );
+    }
+
+    #[test]
+    fn summary_state_renders_baseline_then_deltas_in_api_messages() {
+        let mut conv = Conversation::new();
+        conv.add_system("system prompt".to_string());
+        conv.add_user("hello".to_string());
+        conv.summary.baseline = Some("baseline facts".to_string());
+        conv.summary.deltas.push("delta 1 facts".to_string());
+        conv.summary.deltas.push("delta 2 facts".to_string());
+
+        let messages = crate::deepseek_http::conversation_to_api_messages(&conv);
+        assert_eq!(messages[0].content.as_deref(), Some("system prompt"));
+        assert!(
+            messages[1]
+                .content
+                .as_deref()
+                .unwrap()
+                .starts_with("[Summary baseline]")
+        );
+        assert!(
+            messages[2]
+                .content
+                .as_deref()
+                .unwrap()
+                .starts_with("[Summary update 1]")
+        );
+        assert!(
+            messages[3]
+                .content
+                .as_deref()
+                .unwrap()
+                .starts_with("[Summary update 2]")
+        );
+        assert_eq!(messages[4].content.as_deref(), Some("hello"));
+        assert_eq!(messages.len(), 5);
+    }
+
+    #[test]
+    fn empty_summary_state_adds_no_api_messages() {
+        let mut conv = Conversation::new();
+        conv.add_system("sys".to_string());
+        conv.add_user("hello".to_string());
+
+        let messages = crate::deepseek_http::conversation_to_api_messages(&conv);
+        assert_eq!(messages.len(), 2);
+    }
+
+    #[test]
+    fn summary_baseline_persists_through_local_truncation() {
+        let config = ContextConfig {
+            max_tokens: 16,
+            compaction_threshold: 1.0,
+            reserved_for_response: 0,
+            auto_compact_token_limit: None,
+        };
+
+        let mut conv = Conversation::new();
+        conv.add_system("sys".to_string());
+        conv.add_user("old ".repeat(40));
+        conv.add_assistant(Some("old ".repeat(40)), None, vec![]);
+        conv.add_user("newest".to_string());
+        conv.summary.baseline = Some("stable baseline".to_string());
+        conv.summary.deltas.push("delta 1".to_string());
+
+        let compacted = compact_with_counter(&conv, &config, &FixedCounter);
+        assert_eq!(
+            compacted.summary.baseline.as_deref(),
+            Some("stable baseline")
+        );
+        assert_eq!(compacted.summary.deltas.len(), 1);
+    }
+
+    #[test]
+    fn local_truncation_budget_counts_summary_state() {
+        let config = ContextConfig {
+            max_tokens: 25,
+            compaction_threshold: 1.0,
+            reserved_for_response: 0,
+            auto_compact_token_limit: None,
+        };
+
+        let mut conv = Conversation::new();
+        conv.add_system("sys".to_string());
+        conv.summary.baseline = Some("stable baseline".to_string());
+        for index in 0..5 {
+            conv.add_user(format!("message {index}"));
+        }
+
+        let compacted = compact_with_counter(&conv, &config, &FixedCounter);
+
+        assert!(
+            conversation_tokens_with_counter(&compacted, &FixedCounter) <= config.effective_limit(),
+            "local truncation must reserve budget for injected summary state"
+        );
+    }
+
+    #[test]
+    fn max_summary_deltas_is_bounded() {
+        assert!(
+            MAX_SUMMARY_DELTAS > 0 && MAX_SUMMARY_DELTAS <= 10,
+            "deltas cap should be reasonable"
         );
     }
 }

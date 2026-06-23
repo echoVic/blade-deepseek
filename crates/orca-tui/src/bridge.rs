@@ -106,6 +106,7 @@ impl TuiConversationSession {
                 };
                 let mut conv = history::resume_conversation(&transcript, system_prompt);
                 conv.strip_legacy_pinned_volatile();
+                conv.strip_legacy_summary_messages();
                 (conv, Some(transcript))
             }
             orca_core::config::HistoryMode::Record | orca_core::config::HistoryMode::Disabled => {
@@ -257,7 +258,12 @@ impl TuiConversationSession {
             let _ = writer.append_compaction(before_messages, after_messages);
             if let orca_provider::context::CompactionKind::RemoteSummary(summary) = compaction.kind
             {
-                let _ = writer.append_summary(before_messages, after_messages, summary);
+                let _ = writer.append_summary_state(
+                    before_messages,
+                    after_messages,
+                    summary,
+                    &self.conversation.summary,
+                );
             }
         }
         let _ = self.hooks.run(
@@ -421,7 +427,12 @@ pub fn run_agent_for_tui(
                 if let orca_provider::context::CompactionKind::RemoteSummary(summary) =
                     compaction.kind
                 {
-                    let _ = writer.append_summary(before_messages, after_messages, summary);
+                    let _ = writer.append_summary_state(
+                        before_messages,
+                        after_messages,
+                        summary,
+                        &session.conversation.summary,
+                    );
                 }
             }
             if let Err(error) = session.hooks.run(
@@ -570,7 +581,12 @@ pub fn run_agent_for_tui(
                     if let orca_provider::context::CompactionKind::RemoteSummary(summary) =
                         compaction.kind
                     {
-                        let _ = writer.append_summary(before_messages, after_messages, summary);
+                        let _ = writer.append_summary_state(
+                            before_messages,
+                            after_messages,
+                            summary,
+                            &session.conversation.summary,
+                        );
                     }
                 }
                 reactive_compacted = true;
