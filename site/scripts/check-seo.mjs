@@ -3,6 +3,9 @@ import { readFileSync } from "node:fs";
 const root = new URL("..", import.meta.url);
 const canonicalUrl = "https://orcaagent.dev/";
 const indexHtml = readFileSync(new URL("index.html", root), "utf8");
+const appSource = readFileSync(new URL("src/App.tsx", root), "utf8");
+const styles = readFileSync(new URL("src/styles.css", root), "utf8");
+const readme = readFileSync(new URL("../README.md", root), "utf8");
 const robotsTxt = readFileSync(new URL("public/robots.txt", root), "utf8");
 const sitemapXml = readFileSync(new URL("public/sitemap.xml", root), "utf8");
 const socialPng = readFileSync(new URL("public/orca-social.png", root));
@@ -50,6 +53,21 @@ check(sitemapXml.includes("<lastmod>2026-06-22</lastmod>"), "sitemap.xml missing
 check(socialPng.subarray(1, 4).toString("ascii") === "PNG", "Social image is not a PNG");
 check(socialPng.readUInt32BE(16) === 1200, "Social PNG width must be 1200px");
 check(socialPng.readUInt32BE(20) === 630, "Social PNG height must be 630px");
+
+check(appSource.includes("472309526"), "Homepage missing official QQ group");
+check(
+  appSource.includes("https://t.me/+11No1w5ZbTMyZTQ1"),
+  "Homepage missing official Telegram group",
+);
+check(readme.includes("472309526"), "README missing official QQ group");
+check(
+  readme.includes("https://t.me/+11No1w5ZbTMyZTQ1"),
+  "README missing official Telegram group",
+);
+check(
+  /\.hero-copy\s*\{[^}]*align-self:\s*start;/s.test(styles),
+  "Hero copy must stay top-aligned while the terminal animation grows",
+);
 
 const jsonLdBlocks = [
   ...indexHtml.matchAll(
