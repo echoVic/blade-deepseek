@@ -2,8 +2,12 @@ import { readFileSync } from "node:fs";
 
 const root = new URL("..", import.meta.url);
 const canonicalUrl = "https://orcaagent.dev/";
+const changelogUrl = "https://orcaagent.dev/changelog/";
 const indexHtml = readFileSync(new URL("index.html", root), "utf8");
+const changelogHtml = readFileSync(new URL("changelog/index.html", root), "utf8");
+const sharedSource = readFileSync(new URL("src/shared.ts", root), "utf8");
 const appSource = readFileSync(new URL("src/App.tsx", root), "utf8");
+const changelogSource = readFileSync(new URL("src/changelog/Changelog.tsx", root), "utf8");
 const styles = readFileSync(new URL("src/styles.css", root), "utf8");
 const readme = readFileSync(new URL("../README.md", root), "utf8");
 const robotsTxt = readFileSync(new URL("public/robots.txt", root), "utf8");
@@ -48,7 +52,25 @@ check(robotsTxt.includes(`Sitemap: ${canonicalUrl}sitemap.xml`), "robots.txt mis
 
 check(sitemapXml.includes("<urlset"), "sitemap.xml missing urlset");
 check(sitemapXml.includes(`<loc>${canonicalUrl}</loc>`), "sitemap.xml missing canonical loc");
-check(sitemapXml.includes("<lastmod>2026-06-22</lastmod>"), "sitemap.xml missing lastmod");
+check(sitemapXml.includes(`<loc>${changelogUrl}</loc>`), "sitemap.xml missing changelog loc");
+check(sitemapXml.includes("<lastmod>2026-06-24</lastmod>"), "sitemap.xml missing lastmod");
+
+check(
+  changelogHtml.includes(`<link rel="canonical" href="${changelogUrl}" />`),
+  "changelog page missing canonical URL",
+);
+check(
+  changelogHtml.includes(`<meta property="og:url" content="${changelogUrl}" />`),
+  "changelog page missing og:url",
+);
+check(
+  changelogHtml.includes('<title>Orca changelog</title>'),
+  "changelog page missing title",
+);
+check(
+  /releases\.map/.test(changelogSource),
+  "Changelog component must render releases list",
+);
 
 check(socialPng.subarray(1, 4).toString("ascii") === "PNG", "Social image is not a PNG");
 check(socialPng.readUInt32BE(16) === 1200, "Social PNG width must be 1200px");
@@ -56,8 +78,8 @@ check(socialPng.readUInt32BE(20) === 630, "Social PNG height must be 630px");
 
 check(appSource.includes("472309526"), "Homepage missing official QQ group");
 check(
-  appSource.includes("https://t.me/+11No1w5ZbTMyZTQ1"),
-  "Homepage missing official Telegram group",
+  sharedSource.includes("https://t.me/+11No1w5ZbTMyZTQ1"),
+  "Site shared.ts missing official Telegram group link",
 );
 check(readme.includes("472309526"), "README missing official QQ group");
 check(

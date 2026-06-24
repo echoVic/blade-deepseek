@@ -1,0 +1,118 @@
+export type Locale = "en" | "zh";
+
+export const localeStorageKey = "orca-site-locale";
+export const canonicalOrigin = "https://orcaagent.dev";
+export const socialImageUrl = `${canonicalOrigin}/orca-social.png`;
+
+export const releaseVersion = "v0.1.28";
+
+export const releases = [
+  {
+    version: "v0.1.28",
+    date: "2026-06-24",
+    url: "https://github.com/echoVic/blade-deepseek/releases/tag/v0.1.28",
+  },
+  {
+    version: "v0.1.27",
+    date: "2026-06-23",
+    url: "https://github.com/echoVic/blade-deepseek/releases/tag/v0.1.27",
+  },
+  {
+    version: "v0.1.26",
+    date: "2026-06-22",
+    url: "https://github.com/echoVic/blade-deepseek/releases/tag/v0.1.26",
+  },
+  {
+    version: "v0.1.25",
+    date: "2026-06-22",
+    url: "https://github.com/echoVic/blade-deepseek/releases/tag/v0.1.25",
+  },
+] as const;
+
+export type ReleaseEntry = (typeof releases)[number];
+export type ReleaseVersion = ReleaseEntry["version"];
+
+export const links = {
+  github: "https://github.com/echoVic/blade-deepseek",
+  npm: "https://www.npmjs.com/package/@blade-ai/orca",
+  releases: "https://github.com/echoVic/blade-deepseek/releases/latest",
+  telegram: "https://t.me/+11No1w5ZbTMyZTQ1",
+  home: "/",
+  changelog: "/changelog/",
+} as const;
+
+export function detectInitialLocale(): Locale {
+  if (typeof window === "undefined") {
+    return "en";
+  }
+  const stored = window.localStorage.getItem(localeStorageKey);
+  if (stored === "en" || stored === "zh") {
+    return stored;
+  }
+  return window.navigator.language.toLowerCase().startsWith("zh") ? "zh" : "en";
+}
+
+function setMetaAttribute(
+  selector: string,
+  attributeName: "content" | "href",
+  value: string,
+  createElement: () => HTMLMetaElement | HTMLLinkElement,
+) {
+  const existing = document.head.querySelector<HTMLMetaElement | HTMLLinkElement>(selector);
+  const element = existing ?? createElement();
+  element.setAttribute(attributeName, value);
+  if (!existing) {
+    document.head.appendChild(element);
+  }
+}
+
+export function setNamedMeta(name: string, content: string) {
+  setMetaAttribute(`meta[name="${name}"]`, "content", content, () => {
+    const meta = document.createElement("meta");
+    meta.setAttribute("name", name);
+    return meta;
+  });
+}
+
+export function setPropertyMeta(property: string, content: string) {
+  setMetaAttribute(`meta[property="${property}"]`, "content", content, () => {
+    const meta = document.createElement("meta");
+    meta.setAttribute("property", property);
+    return meta;
+  });
+}
+
+export function setCanonicalLink(href: string) {
+  setMetaAttribute('link[rel="canonical"]', "href", href, () => {
+    const link = document.createElement("link");
+    link.setAttribute("rel", "canonical");
+    return link;
+  });
+}
+
+export type SeoEntry = {
+  title: string;
+  description: string;
+  ogTitle: string;
+  ogDescription: string;
+  imageAlt: string;
+  locale: string;
+};
+
+export function applySeoHead(locale: Locale, seo: SeoEntry, canonicalUrl: string) {
+  document.documentElement.lang = locale === "zh" ? "zh-CN" : "en";
+  document.title = seo.title;
+  setCanonicalLink(canonicalUrl);
+  setNamedMeta("description", seo.description);
+  setNamedMeta("twitter:title", seo.ogTitle);
+  setNamedMeta("twitter:description", seo.ogDescription);
+  setNamedMeta("twitter:image", socialImageUrl);
+  setNamedMeta("twitter:image:alt", seo.imageAlt);
+  setPropertyMeta("og:title", seo.ogTitle);
+  setPropertyMeta("og:description", seo.ogDescription);
+  setPropertyMeta("og:url", canonicalUrl);
+  setPropertyMeta("og:image", socialImageUrl);
+  setPropertyMeta("og:image:alt", seo.imageAlt);
+  setPropertyMeta("og:locale", seo.locale);
+  setPropertyMeta("og:locale:alternate", locale === "zh" ? "en_US" : "zh_CN");
+}

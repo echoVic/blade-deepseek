@@ -1,28 +1,26 @@
 import {
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-  type KeyboardEvent,
-  type ReactNode,
+    useEffect,
+    useMemo,
+    useRef,
+    useState,
+    type KeyboardEvent,
+    type ReactNode,
 } from "react";
+import {
+    applySeoHead,
+    canonicalOrigin,
+    detectInitialLocale,
+    links,
+    localeStorageKey,
+    releaseVersion,
+    type Locale,
+    type SeoEntry
+} from "./shared";
 
 const npmCommand = "npm install -g @blade-ai/orca";
 const curlCommand = "curl -fsSL https://orcaagent.dev/install.sh | sh";
-const releaseVersion = "v0.1.25";
 
-const links = {
-  github: "https://github.com/echoVic/blade-deepseek",
-  npm: "https://www.npmjs.com/package/@blade-ai/orca",
-  releases: "https://github.com/echoVic/blade-deepseek/releases/latest",
-  telegram: "https://t.me/+11No1w5ZbTMyZTQ1",
-};
-
-type Locale = "en" | "zh";
-
-const localeStorageKey = "orca-site-locale";
-const canonicalUrl = "https://orcaagent.dev/";
-const socialImageUrl = `${canonicalUrl}orca-social.png`;
+const canonicalUrl = `${canonicalOrigin}/`;
 
 const seoCopy = {
   en: {
@@ -63,10 +61,11 @@ const copy = {
       capabilities: "Capabilities",
       workflow: "Workflow",
       install: "Install",
+      changelog: "Changelog",
       github: "GitHub",
     },
     hero: {
-      pill: "v0.1.25 · Rust-native",
+      pill: "v0.1.28 · Rust-native",
       titlePrefix: "A",
       titleHighlight: "DeepSeek-native",
       titleSuffix: "coding agent, in your terminal.",
@@ -226,10 +225,11 @@ const copy = {
       capabilities: "能力",
       workflow: "工作流",
       install: "安装",
+      changelog: "更新日志",
       github: "GitHub",
     },
     hero: {
-      pill: "v0.1.25 · Rust 原生",
+      pill: "v0.1.28 · Rust 原生",
       titlePrefix: "面向终端的",
       titleHighlight: "DeepSeek 原生",
       titleSuffix: "代码智能体。",
@@ -468,79 +468,6 @@ async function copyCommandText(command: string) {
   } catch {
     return false;
   }
-}
-
-function detectInitialLocale(): Locale {
-  if (typeof window === "undefined") {
-    return "en";
-  }
-
-  const stored = window.localStorage.getItem(localeStorageKey);
-  if (stored === "en" || stored === "zh") {
-    return stored;
-  }
-
-  return window.navigator.language.toLowerCase().startsWith("zh") ? "zh" : "en";
-}
-
-function setMetaAttribute(
-  selector: string,
-  attributeName: "content" | "href",
-  value: string,
-  createElement: () => HTMLMetaElement | HTMLLinkElement,
-) {
-  const existing = document.head.querySelector<HTMLMetaElement | HTMLLinkElement>(selector);
-  const element = existing ?? createElement();
-
-  element.setAttribute(attributeName, value);
-
-  if (!existing) {
-    document.head.appendChild(element);
-  }
-}
-
-function setNamedMeta(name: string, content: string) {
-  setMetaAttribute(`meta[name="${name}"]`, "content", content, () => {
-    const meta = document.createElement("meta");
-    meta.setAttribute("name", name);
-    return meta;
-  });
-}
-
-function setPropertyMeta(property: string, content: string) {
-  setMetaAttribute(`meta[property="${property}"]`, "content", content, () => {
-    const meta = document.createElement("meta");
-    meta.setAttribute("property", property);
-    return meta;
-  });
-}
-
-function setCanonicalLink(href: string) {
-  setMetaAttribute('link[rel="canonical"]', "href", href, () => {
-    const link = document.createElement("link");
-    link.setAttribute("rel", "canonical");
-    return link;
-  });
-}
-
-function syncSeoHead(locale: Locale) {
-  const seo = seoCopy[locale];
-
-  document.documentElement.lang = locale === "zh" ? "zh-CN" : "en";
-  document.title = seo.title;
-  setCanonicalLink(canonicalUrl);
-  setNamedMeta("description", seo.description);
-  setNamedMeta("twitter:title", seo.ogTitle);
-  setNamedMeta("twitter:description", seo.ogDescription);
-  setNamedMeta("twitter:image", socialImageUrl);
-  setNamedMeta("twitter:image:alt", seo.imageAlt);
-  setPropertyMeta("og:title", seo.ogTitle);
-  setPropertyMeta("og:description", seo.ogDescription);
-  setPropertyMeta("og:url", canonicalUrl);
-  setPropertyMeta("og:image", socialImageUrl);
-  setPropertyMeta("og:image:alt", seo.imageAlt);
-  setPropertyMeta("og:locale", seo.locale);
-  setPropertyMeta("og:locale:alternate", locale === "zh" ? "en_US" : "zh_CN");
 }
 
 type TuiBlock = {
@@ -808,7 +735,7 @@ function App() {
 
   useEffect(() => {
     window.localStorage.setItem(localeStorageKey, locale);
-    syncSeoHead(locale);
+    applySeoHead(locale, seoCopy[locale] satisfies SeoEntry, canonicalUrl);
   }, [locale]);
 
   function clearCopyResetTimer() {
@@ -898,6 +825,7 @@ function App() {
             <a href="#capabilities">{t.nav.capabilities}</a>
             <a href="#workflow">{t.nav.workflow}</a>
             <a href="#install">{t.nav.install}</a>
+            <a href={links.changelog}>{t.nav.changelog}</a>
             <a className="nav-cta" href={links.github} rel="noreferrer">
               {t.nav.github}
             </a>

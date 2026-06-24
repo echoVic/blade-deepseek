@@ -1062,6 +1062,133 @@ pre {
   font-size: 0.85rem;
 }
 
+/* changelog */
+.changelog-hero {
+  padding: clamp(56px, 9vw, 112px) 0 clamp(28px, 4vw, 48px);
+}
+
+.changelog-hero h1 {
+  margin-bottom: 14px;
+  font-size: clamp(2.1rem, 4.4vw, 3.4rem);
+}
+
+.changelog-hero .subtitle {
+  margin-bottom: 0;
+}
+
+.changelog-page {
+  padding: clamp(20px, 4vw, 48px) 0 clamp(56px, 8vw, 96px);
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.changelog-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 14px;
+}
+
+.changelog-item a {
+  display: block;
+  padding: 22px 24px;
+  border: 1px solid var(--border-soft);
+  border-radius: 14px;
+  background: var(--surface);
+  transition: border-color 0.2s, background 0.2s, transform 0.2s;
+}
+
+.changelog-item a:hover {
+  border-color: color-mix(in oklch, var(--accent) 40%, transparent);
+  background: var(--surface-2);
+  transform: translateY(-2px);
+}
+
+.changelog-meta {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 8px;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.changelog-version {
+  color: var(--accent);
+  font-size: 0.95rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.changelog-latest {
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 0.62rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.changelog-date {
+  margin-left: auto;
+  color: var(--faint);
+  font-size: 0.78rem;
+}
+
+.changelog-summary {
+  margin: 0 0 10px;
+  color: var(--muted);
+  font-size: 0.92rem;
+  line-height: 1.6;
+}
+
+.changelog-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--accent);
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  letter-spacing: 0.02em;
+}
+
+.changelog-link::after {
+  content: "→";
+  transition: transform 0.15s;
+}
+
+.changelog-item a:hover .changelog-link::after {
+  transform: translateX(3px);
+}
+
+@media (max-width: 540px) {
+  .changelog-item a {
+    padding: 18px 18px;
+  }
+
+  .changelog-meta {
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  .changelog-date {
+    margin-left: 0;
+    width: 100%;
+  }
+}
+
 /* install-repeat */
 .install-repeat {
   display: grid;
