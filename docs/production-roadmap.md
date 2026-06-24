@@ -4,7 +4,7 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-06-25
-Current baseline: v0.1.30 workflow runtime and TUI experience overhaul
+Current baseline: v0.1.31 runtime-owned interactive session boundary
 
 ---
 
@@ -40,108 +40,93 @@ working baseline used to prioritize the next patch releases.
 The next work should land as independent patch releases. Each release must be
 verified before the next phase starts.
 
-### P0: Roadmap and State Baseline
+### P0: Session Runtime Unification
 
-**Release target:** v0.1.11
+**Release target:** v0.1.31
 
-**Goal:** make docs and release metadata reflect the actual current product so
-future work is not planned from stale assumptions.
+**Goal:** move long-lived interactive session state from the TUI bridge into
+`orca-runtime`, creating the runtime boundary needed for a Codex-style protocol
+layer.
 
 **Deliverables:**
 
-- Refresh this roadmap with current-state evidence.
-- Keep README, website, tool comparison docs, and release notes aligned with the current patch version.
-- Record the next implementation priorities: P1 context reliability, P2 user/workflow ergonomics, and skills.
+- Add `orca_runtime::session::InteractiveSession`.
+- Centralize conversation, history writer, session id, project instructions,
+  memory, hooks, MCP registry, cost tracking, and workflow task registry in
+  runtime.
+- Keep `TuiConversationSession` as a compatibility wrapper that delegates to the
+  runtime session.
+- Preserve current TUI event names, JSONL behavior, workflows, goals, backtrack,
+  compaction, and request-user-input continuation.
+- Document the boundary in
+  `docs/superpowers/specs/2026-06-25-session-runtime-unification-design.md`.
 
 **Verification:**
 
-- `cargo test`
+- `cargo fmt -- --check`
+- `cargo test --workspace --all-targets`
 - `npm --prefix site run build`
+- `npm --prefix site run check:seo`
 - `node scripts/release/test-stage-npm.mjs`
 - `git diff --check`
+- Post-publish `scripts/release/verify-published.mjs` for GitHub Release, npm,
+  and `npm exec` smoke verification.
 
-### P1: Context Reliability Foundations
+### P1: Protocol And Event Boundary
 
-**Release target:** v0.1.12-v0.1.13
+**Release target:** v0.1.32
 
-**Current status:** token/byte tool output truncation policy and model runtime context overrides are implemented and configurable.
-
-**Goal:** reduce context pollution and make model/runtime limits configurable
-before adding larger ecosystem features.
+**Goal:** introduce a runtime protocol boundary so TUI/headless clients can send
+commands and consume versioned events without owning turn execution details.
 
 **Scope:**
 
-1. Add a truncation policy abstraction inspired by Codex `utils/output-truncation`. Done in v0.1.12.
-   - Support byte and token budgets.
-   - Preserve explicit warnings with original line/token counts.
-   - Keep existing default behavior compatible at 8 KiB unless configured.
-2. Add model metadata/config overrides. Context window and auto-compact token limit done in v0.1.13; tool output token limit is covered by `[tools].output_truncation`.
-   - Context window.
-   - Auto-compact token limit.
-   - Tool output token limit.
-   - Reasoning/summary support flags where useful for DeepSeek models.
-3. Wire tool output truncation through built-in, MCP, and external tool result paths. Done for shell and external tool outputs in v0.1.12; other text tools continue using the policy-derived byte budget.
+1. Define an `orca-runtime` protocol module inspired by Codex protocol types.
+   - User input, approval responses, cancel/backtrack, goal operations, and
+     workflow controls should be commands.
+   - Session lifecycle, assistant deltas, reasoning, tool calls, workflow/task
+     updates, approvals, errors, and completion should be events.
+2. Add a runtime event adapter for the current TUI bridge.
+   - Preserve existing display behavior while sourcing events from runtime.
+   - Keep JSONL output names stable for this release unless explicitly versioned.
+3. Move more turn-loop orchestration behind runtime-owned APIs.
+   - The TUI may still render and request approvals.
+   - Runtime should own command handling and event emission.
 
 **Out of scope for P1:**
 
-- Remote LLM summary compaction.
-- New providers.
-- Full shell session/PTY support.
+- Full app-server transport.
+- Remote UI clients.
+- Tool-system rewrite.
+- Background shell/PTTY sessions.
 
-### P2: User and Workflow Ergonomics
+### P2: Tool System Convergence
 
-**Release target:** v0.1.14-v0.1.16, v0.1.19
+**Release target:** v0.1.33+
 
-**Goal:** close the highest-value daily-use gaps visible from Codex and Claude
-without destabilizing core runtime behavior.
-
-**Scope:**
-
-1. Fuzzy file search for TUI `@mention` and file discovery. Fuzzy `@mention` fallback done in v0.1.15.
-   - Use `.gitignore`-aware traversal.
-   - Prefer a small crate boundary so provider/runtime do not own fuzzy matching.
-2. Sandbox/config summary. `/config show` runtime posture summary done in v0.1.14.
-   - Show current approval mode, filesystem scope, network posture, and key limits in `/config show`.
-   - Reuse the summary in startup/session events where appropriate.
-3. Structured user question tool. Model-visible nonblocking tool contract done in v0.1.16; TUI answer loop done in v0.1.19.
-   - Provide a small, approval-safe mechanism for the model to request user input in TUI.
-   - Keep headless JSONL behavior deterministic.
-
-**Out of scope for P2:**
-
-- Full background shell sessions.
-- Image/PDF/Notebook readers.
-- Worktree automation.
-
-### Skills System
-
-**Release target:** v0.1.17-v0.1.18
-
-**Goal:** add a first-class skill system that can load human-readable procedures
-from user and project directories and inject only relevant skill instructions.
+**Goal:** reduce the remaining divergence between built-in tools, MCP tools,
+external tools, approvals, and future plugin-provided tools.
 
 **Scope:**
 
-1. Skill discovery. `list_skills` and `read_skill` tools done in v0.1.17.
-   - User skills: `$ORCA_HOME/skills/*/SKILL.md` or `~/.orca/skills/*/SKILL.md`.
-   - Project skills: `.orca/skills/*/SKILL.md`.
-   - Manifest-free minimum viable format: directory name is the skill id.
-2. Skill metadata parsing. Frontmatter name/description parsing done in v0.1.17.
-   - Frontmatter fields: `name`, `description`.
-   - Body remains Markdown instructions.
-3. Skill selection. Manual list/read selection done in v0.1.17; prompt-time explicit skill inclusion done in v0.1.18.
-   - Include explicitly named skills in the prompt.
-   - Add a small `list_skills`/`read_skill` tool pair or equivalent registry output if prompt size becomes a concern.
-4. Safety.
-   - Skills are instructions, not executable code.
-   - Project skills cannot read outside the workspace during discovery.
-   - Invalid skills are skipped with diagnostics.
+1. Normalize tool invocation records across all tool sources.
+2. Move approval classification and result shaping into a shared runtime path.
+3. Prepare for long-running shell sessions, worktree automation, and async
+   subagents without adding them in the same patch.
 
-**Out of scope for first skills release:**
+### Skills And Plugins
 
-- Plugin installation marketplace.
-- Skill-provided MCP servers.
-- Executable skill scripts.
+**Release target:** after P2 unless P1 uncovers a smaller safe slice.
+
+**Goal:** evolve the existing Markdown skill loading into a plugin-compatible
+instruction and capability system.
+
+**Scope:**
+
+- Keep current `list_skills`, `read_skill`, and explicit `$skill` injection
+  stable.
+- Add richer skill manifests only after protocol/tool boundaries can carry
+  plugin-provided capabilities cleanly.
 
 ---
 
@@ -149,14 +134,13 @@ from user and project directories and inject only relevant skill instructions.
 
 | Priority | Item | Why Now | Risk |
 |----------|------|---------|------|
-| P0 | Roadmap/state baseline | Prevents stale planning and mixed release notes | Low |
+| P0 | Runtime-owned interactive session | Removes duplicated TUI/runtime state before deeper refactors | Medium |
 | P0 | Published release verification | Prevents local tags from being mistaken for GitHub/npm releases | Low |
-| P1 | Tool output truncation policies | Protects context window and makes long tasks more reliable | Low/Medium |
-| P1 | Model metadata overrides | Enables per-model context and truncation decisions | Medium |
-| P2 | Fuzzy file search | Improves everyday TUI ergonomics | Low/Medium |
-| P2 | Sandbox/config summary | Makes safety posture visible to users | Low |
-| P2 | Structured user question tool | Reduces brittle ad-hoc clarification patterns | Medium |
-| Skills | Skill discovery and loading | Unlocks reusable domain procedures without full plugins | Medium |
+| P1 | Runtime protocol commands/events | Gives TUI/headless surfaces a shared contract | Medium |
+| P1 | TUI event adapter | Lets UI behavior stay stable while ownership moves runtime-side | Medium |
+| P2 | Unified tool invocation records | Reduces drift across built-in, MCP, and external tools | Medium |
+| P2 | Shared approval/result shaping | Keeps policy decisions consistent across tool sources | Medium |
+| Skills | Plugin-compatible skill manifests | Unlocks reusable instruction bundles after runtime contracts stabilize | Medium |
 | Later | Shell sessions / PTY | High value, larger runtime surface | High |
 | Later | Remote compaction | High value, model-dependent behavior | Medium/High |
 | Later | Worktree automation | High value, more filesystem/git risk | High |
@@ -171,11 +155,12 @@ from user and project directories and inject only relevant skill instructions.
 | Tokenizer | `tiktoken-rs` BPE | Good enough for DeepSeek-compatible accounting until a DeepSeek-specific tokenizer is required |
 | Config format | TOML | Keep user-facing config stable |
 | Tool registry | `ToolSpec` capability registry | All built-ins, MCP, and external tools should flow through this path |
-| Default truncation | Byte budget, 8 KiB compatibility | P1 should add token-aware policy without breaking existing callers |
+| Default truncation | Byte/token policy with compatibility defaults | Keep result budgets consistent as tool execution centralizes |
 | MCP transport | stdio and SSE | Keep routing namespaced as `mcp__server__tool` |
 | Sandbox | macOS Seatbelt first, graceful fallback elsewhere | Add summaries before adding more platform sandboxes |
-| History | JSONL transcript files | Introduce ThreadStore trait before considering SQLite metadata |
-| Skills | Markdown `SKILL.md` files | Start with instruction loading, not executable plugins |
+| History | JSONL transcript files | Runtime now owns interactive writer setup; introduce ThreadStore trait before considering SQLite metadata |
+| Interactive session | `orca_runtime::session::InteractiveSession` | TUI wrapper is temporary while protocol/events are extracted |
+| Skills | Markdown `SKILL.md` files | Keep instruction loading stable before adding plugin-provided capabilities |
 
 ---
 

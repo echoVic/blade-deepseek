@@ -17,6 +17,9 @@ use orca_core::plan_types::{PlanItem, PlanStatus};
 const ORCA_HOME_ENV: &str = "ORCA_HOME";
 const SESSION_SCHEMA_VERSION: u32 = 1;
 
+#[cfg(test)]
+pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SessionMeta {
     pub schema_version: u32,
@@ -1106,9 +1109,6 @@ fn title_from_prompt(prompt: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn title_from_prompt_normalizes_whitespace_and_truncates() {
@@ -1119,7 +1119,7 @@ mod tests {
 
     #[test]
     fn writer_persists_compaction_records() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = TEST_ENV_LOCK.lock().expect("env lock");
         let home = tempfile::tempdir().expect("temp home");
         let previous = std::env::var_os(ORCA_HOME_ENV);
         unsafe {
@@ -1152,7 +1152,7 @@ mod tests {
 
     #[test]
     fn writer_round_trips_pinned_messages() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = TEST_ENV_LOCK.lock().expect("env lock");
         let home = tempfile::tempdir().expect("temp home");
         let previous = std::env::var_os(ORCA_HOME_ENV);
         unsafe {
@@ -1185,7 +1185,7 @@ mod tests {
 
     #[test]
     fn plan_state_round_trips_through_session() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = TEST_ENV_LOCK.lock().expect("env lock");
         let home = tempfile::tempdir().expect("temp home");
         let previous = std::env::var_os(ORCA_HOME_ENV);
         unsafe {
@@ -1233,7 +1233,7 @@ mod tests {
 
     #[test]
     fn all_completed_plan_restores_as_none() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = TEST_ENV_LOCK.lock().expect("env lock");
         let home = tempfile::tempdir().expect("temp home");
         let previous = std::env::var_os(ORCA_HOME_ENV);
         unsafe {
@@ -1276,7 +1276,7 @@ mod tests {
 
     #[test]
     fn empty_plan_restores_as_none() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = TEST_ENV_LOCK.lock().expect("env lock");
         let home = tempfile::tempdir().expect("temp home");
         let previous = std::env::var_os(ORCA_HOME_ENV);
         unsafe {
@@ -1307,7 +1307,7 @@ mod tests {
 
     #[test]
     fn session_without_plan_loads_normally() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = TEST_ENV_LOCK.lock().expect("env lock");
         let home = tempfile::tempdir().expect("temp home");
         let previous = std::env::var_os(ORCA_HOME_ENV);
         unsafe {
@@ -1338,7 +1338,7 @@ mod tests {
 
     #[test]
     fn resume_restores_rolling_summary_from_last_context_summary_record() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = TEST_ENV_LOCK.lock().expect("env lock");
         let home = tempfile::tempdir().expect("temp home");
         let previous = std::env::var_os(ORCA_HOME_ENV);
         unsafe {
@@ -1383,7 +1383,7 @@ mod tests {
 
     #[test]
     fn resume_without_summaries_has_no_rolling_summary() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = TEST_ENV_LOCK.lock().expect("env lock");
         let home = tempfile::tempdir().expect("temp home");
         let previous = std::env::var_os(ORCA_HOME_ENV);
         unsafe {
@@ -1456,7 +1456,7 @@ mod tests {
 
     #[test]
     fn resume_prefers_persisted_summary_state_over_legacy_summary_list() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = TEST_ENV_LOCK.lock().expect("env lock");
         let home = tempfile::tempdir().expect("temp home");
         let previous = std::env::var_os(ORCA_HOME_ENV);
         unsafe {
@@ -1502,7 +1502,7 @@ mod tests {
 
     #[test]
     fn resume_replays_compaction_records_to_drop_collapsed_messages() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = TEST_ENV_LOCK.lock().expect("env lock");
         let home = tempfile::tempdir().expect("temp home");
         let previous = std::env::var_os(ORCA_HOME_ENV);
         unsafe {

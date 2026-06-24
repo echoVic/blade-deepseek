@@ -13,7 +13,6 @@ use orca_core::hook_types::HookEvent;
 use orca_core::model::ModelRouteContext;
 use orca_core::provider_types::ProviderStep;
 use orca_core::subagent_types::SubagentType;
-use orca_core::task_types::TaskStatus;
 use orca_core::tool_types;
 use orca_core::workflow_types::WorkflowInput;
 use orca_mcp::McpRegistry;
@@ -25,12 +24,13 @@ use orca_provider::tool_schema::{
 };
 use orca_runtime::agent_common;
 use orca_runtime::cost::CostTracker;
-use orca_runtime::history::{self, SessionWriter};
+use orca_runtime::history;
 use orca_runtime::hooks::{
     HookContext, HookRunner, conversation_with_hook_context, tool_request_with_hook_outcome,
 };
-use orca_runtime::instructions::{self, ProjectInstructions};
+use orca_runtime::instructions::ProjectInstructions;
 use orca_runtime::memory::{self, MemoryBlock};
+use orca_runtime::session::InteractiveSession;
 use orca_runtime::subagent;
 use orca_runtime::tasks::TaskRegistry;
 use orca_runtime::workflow::{WorkflowLaunchRequest, WorkflowRunner};
@@ -69,15 +69,7 @@ fn tool_result_kind_label(kind: tool_types::ToolResultKind) -> &'static str {
 }
 
 pub struct TuiConversationSession {
-    conversation: Conversation,
-    writer: Option<SessionWriter>,
-    session_id: Option<String>,
-    instructions: ProjectInstructions,
-    cost_tracker: CostTracker,
-    mcp_registry: McpRegistry,
-    hooks: HookRunner,
-    memory: MemoryBlock,
-    task_registry: TaskRegistry,
+    runtime: InteractiveSession,
 }
 
 impl TuiConversationSession {
@@ -86,267 +78,94 @@ impl TuiConversationSession {
         prompt_for_title: &str,
         preloaded: Option<history::SessionTranscript>,
     ) -> std::io::Result<Self> {
-        let cwd = config
-            .cwd
-            .clone()
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-        let instructions = load_project_instructions(&cwd);
-        let memory = memory::load_for_cwd(&cwd);
-        let mcp_registry = orca_mcp::initialize_registry(&config.mcp_servers);
-        let hooks = HookRunner::new(config.hooks.clone());
-        let system_prompt = agent_common::build_agent_system_prompt(
-            &cwd,
-            0,
-            &SubagentType::General,
-            Some(&instructions),
-            config.approval_mode,
-            Some(&memory),
-        );
-        let (conversation, loaded_transcript) = match &config.history_mode {
-            orca_core::config::HistoryMode::Resume(selector)
-            | orca_core::config::HistoryMode::Fork(selector) => {
-                let transcript = match preloaded {
-                    Some(t) => t,
-                    None => history::load_session(selector)?,
-                };
-                let mut conv = history::resume_conversation(&transcript, system_prompt);
-                conv.strip_legacy_pinned_volatile();
-                conv.strip_legacy_summary_messages();
-                (conv, Some(transcript))
-            }
-            orca_core::config::HistoryMode::Record | orca_core::config::HistoryMode::Disabled => {
-                let mut conversation = Conversation::new();
-                conversation.add_system(system_prompt);
-                (conversation, None)
-            }
-        };
-
-        let mut session_id = None;
-        let writer = match &config.history_mode {
-            orca_core::config::HistoryMode::Disabled => None,
-            orca_core::config::HistoryMode::Record | orca_core::config::HistoryMode::Resume(_) => {
-                let meta = history::create_meta(
-                    &cwd,
-                    config.provider.as_str(),
-                    config.model.as_history_value(),
-                    prompt_for_title,
-                );
-                session_id = Some(meta.session_id.clone());
-                start_writer_with_messages(meta, &conversation)
-            }
-            orca_core::config::HistoryMode::Fork(_) => {
-                let parent_id = loaded_transcript
-                    .map(|transcript| transcript.meta.session_id)
-                    .unwrap_or_default();
-                let meta = history::create_fork_meta(
-                    &cwd,
-                    config.provider.as_str(),
-                    config.model.as_history_value(),
-                    prompt_for_title,
-                    parent_id,
-                );
-                session_id = Some(meta.session_id.clone());
-                start_writer_with_messages(meta, &conversation)
-            }
-        };
-
-        let task_session_id = session_id
-            .clone()
-            .unwrap_or_else(orca_runtime::session::new_run_id);
-
         Ok(Self {
-            conversation,
-            writer,
-            session_id,
-            instructions,
-            cost_tracker: CostTracker::new(None),
-            mcp_registry,
-            hooks,
-            memory,
-            task_registry: TaskRegistry::new(task_session_id),
+            runtime: InteractiveSession::new_with_preloaded(config, prompt_for_title, preloaded)?,
         })
     }
 
-    pub fn session_id(&self) -> Option<&str> {
-        self.session_id.as_deref()
+    pub fn runtime_session(&self) -> &InteractiveSession {
+        &self.runtime
     }
 
-    pub fn usage_totals(&self) -> UsageTotals {
-        self.cost_tracker.totals()
+    fn conversation(&self) -> &orca_core::conversation::Conversation {
+        self.runtime.conversation()
     }
 
-    pub fn has_active_workflows(&self) -> bool {
-        self.task_registry.list().iter().any(|task| {
-            matches!(
-                task.status,
-                TaskStatus::Queued
-                    | TaskStatus::Running
-                    | TaskStatus::Paused
-                    | TaskStatus::Stopping
-            )
-        })
+    fn conversation_mut(&mut self) -> &mut orca_core::conversation::Conversation {
+        self.runtime.conversation_mut()
+    }
+
+    fn writer_mut(&mut self) -> Option<&mut orca_runtime::history::SessionWriter> {
+        self.runtime.writer_mut()
+    }
+
+    fn instructions(&self) -> &ProjectInstructions {
+        self.runtime.instructions()
+    }
+
+    fn cost_tracker_mut(&mut self) -> &mut CostTracker {
+        self.runtime.cost_tracker_mut()
+    }
+
+    fn mcp_registry(&self) -> &McpRegistry {
+        self.runtime.mcp_registry()
+    }
+
+    fn hooks(&self) -> &HookRunner {
+        self.runtime.hooks()
+    }
+
+    fn memory(&self) -> &MemoryBlock {
+        self.runtime.memory()
+    }
+
+    fn task_registry(&self) -> &TaskRegistry {
+        self.runtime.task_registry()
     }
 
     fn append_message(&mut self, message: &orca_core::conversation::Message) {
-        if let Some(writer) = &mut self.writer {
-            if let Err(error) = writer.append_message(message) {
-                eprintln!("orca: warning: history write failed: {error}");
-                self.writer = None;
-            }
-        }
+        self.runtime.append_message(message);
     }
 
     fn complete(&mut self, status: &str) {
-        if let Some(writer) = &mut self.writer {
-            if let Err(error) = writer.complete(status) {
-                eprintln!("orca: warning: history completion write failed: {error}");
-            }
-        }
+        self.runtime.complete(status);
+    }
+
+    pub fn session_id(&self) -> Option<&str> {
+        self.runtime.session_id()
+    }
+
+    pub fn usage_totals(&self) -> UsageTotals {
+        self.runtime.usage_totals()
+    }
+
+    pub fn has_active_workflows(&self) -> bool {
+        self.runtime.has_active_workflows()
     }
 
     pub fn backtrack_last_user(&mut self) -> Option<String> {
-        self.conversation.backtrack_last_user()
+        self.runtime.backtrack_last_user()
     }
 
     pub fn set_model(&mut self, model: Option<&str>) {
-        self.cost_tracker.set_model(model);
+        self.runtime.set_model(model);
     }
 
     pub fn add_pinned_context(&mut self, content: String) {
-        self.conversation.add_user_pinned(content);
-        if let Some(message) = self.conversation.messages.last().cloned() {
-            self.append_message(&message);
-        }
+        self.runtime.add_pinned_context(content);
     }
 
     pub fn replace_goal_context(&mut self, content: String) {
-        self.conversation.replace_goal_state(content);
+        self.runtime.replace_goal_context(content);
     }
 
     fn replace_skill_context(&mut self, content: Option<String>) {
-        self.conversation.replace_skill_context(content);
+        self.runtime.replace_skill_context(content);
     }
 
     pub fn compact(&mut self, config: &RunConfig, cwd: &Path) -> (usize, usize) {
-        let before_messages = self.conversation.messages.len();
-        if let Ok(outcome) = self.hooks.run(
-            HookEvent::OnBudgetWarning,
-            HookContext {
-                cwd: &cwd.display().to_string(),
-                session_status: None,
-                tool_request: None,
-                tool_result: None,
-                before_messages: Some(before_messages),
-                after_messages: None,
-                usage: None,
-            },
-        ) {
-            if !outcome.injected_context.is_empty() {
-                self.conversation = conversation_with_hook_context(&self.conversation, &outcome);
-            }
-        }
-        let _ = self.hooks.run(
-            HookEvent::PreCompact,
-            HookContext {
-                cwd: &cwd.display().to_string(),
-                session_status: None,
-                tool_request: None,
-                tool_result: None,
-                before_messages: Some(before_messages),
-                after_messages: None,
-                usage: None,
-            },
-        );
-        let provider_config = ProviderConfig {
-            api_key: config.api_key.clone(),
-            base_url: config.base_url.clone(),
-            model: Some(orca_core::model::auxiliary_model().to_string()),
-            tools_override: Some(Vec::new()),
-            mcp_registry: None,
-            external_tools: Vec::new(),
-        };
-        let compaction = orca_provider::context::compact_with_summary(
-            config.provider,
-            &self.conversation,
-            &orca_provider::context::ContextConfig::for_model_with_runtime(
-                config.model.as_option().as_deref(),
-                &config.model_runtime,
-            ),
-            &provider_config,
-        );
-        self.conversation = compaction.conversation;
-        let after_messages = self.conversation.messages.len();
-        if let Some(writer) = &mut self.writer {
-            let _ = writer.append_compaction(before_messages, after_messages);
-            if let orca_provider::context::CompactionKind::RemoteSummary(summary) = compaction.kind
-            {
-                let _ = writer.append_summary_state(
-                    before_messages,
-                    after_messages,
-                    summary,
-                    &self.conversation.summary,
-                );
-            }
-        }
-        let _ = self.hooks.run(
-            HookEvent::PostCompact,
-            HookContext {
-                cwd: &cwd.display().to_string(),
-                session_status: None,
-                tool_request: None,
-                tool_result: None,
-                before_messages: Some(before_messages),
-                after_messages: Some(after_messages),
-                usage: None,
-            },
-        );
-        (before_messages, after_messages)
+        self.runtime.compact(config, cwd)
     }
-}
-
-fn start_writer_with_messages(
-    meta: history::SessionMeta,
-    conversation: &Conversation,
-) -> Option<SessionWriter> {
-    match SessionWriter::start_from_meta(meta) {
-        Ok(mut writer) => {
-            for message in &conversation.messages {
-                if let Err(error) = writer.append_message(message) {
-                    eprintln!("orca: warning: history write failed: {error}");
-                    return None;
-                }
-            }
-            // Mirror controller.rs: when resuming/forking inherits a
-            // summary_state, persist it into the new transcript so the next
-            // process that resumes from here doesn't lose the shape.
-            if !conversation.summary.is_empty() {
-                let inherited_marker = conversation
-                    .summary
-                    .latest_rolling()
-                    .map(|text| text.to_string())
-                    .unwrap_or_default();
-                let count = conversation.messages.len();
-                if let Err(error) = writer.append_summary_state(
-                    count,
-                    count,
-                    inherited_marker,
-                    &conversation.summary,
-                ) {
-                    eprintln!("orca: warning: history write failed: {error}");
-                    return None;
-                }
-            }
-            Some(writer)
-        }
-        Err(error) => {
-            eprintln!("orca: warning: failed to initialize history: {error}");
-            None
-        }
-    }
-}
-
-fn load_project_instructions(cwd: &Path) -> ProjectInstructions {
-    instructions::load_for_cwd_or_default(cwd)
 }
 
 fn tui_tools_schema(
@@ -376,7 +195,7 @@ pub fn run_agent_for_tui(
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
 
     let tools_override = tui_tools_schema(
-        &session.mcp_registry,
+        session.mcp_registry(),
         &config.external_tools,
         allow_goal_tools,
     );
@@ -385,7 +204,7 @@ pub fn run_agent_for_tui(
         base_url: config.base_url.clone(),
         model: Some(orca_core::model::FLASH_MODEL.to_string()),
         tools_override: Some(tools_override),
-        mcp_registry: Some(session.mcp_registry.clone()),
+        mcp_registry: Some(session.mcp_registry().clone()),
         external_tools: config.external_tools.clone(),
     };
 
@@ -397,8 +216,8 @@ pub fn run_agent_for_tui(
     let policy = ApprovalPolicy::new(config.approval_mode)
         .with_permission_rules(config.permission_rules.clone());
     session.replace_skill_context(agent_common::explicit_skill_context(&cwd, prompt));
-    session.conversation.add_user(prompt.to_string());
-    if let Some(message) = session.conversation.messages.last().cloned() {
+    session.conversation_mut().add_user(prompt.to_string());
+    if let Some(message) = session.conversation().messages.last().cloned() {
         session.append_message(&message);
     }
 
@@ -418,89 +237,15 @@ pub fn run_agent_for_tui(
         }
 
         if orca_provider::context::needs_compaction_wire(
-            &session.conversation,
+            session.conversation(),
             &ctx_config,
             &provider_config,
         ) {
-            let before_messages = session.conversation.messages.len();
-            match session.hooks.run(
-                HookEvent::OnBudgetWarning,
-                HookContext {
-                    cwd: &cwd.display().to_string(),
-                    session_status: None,
-                    tool_request: None,
-                    tool_result: None,
-                    before_messages: Some(before_messages),
-                    after_messages: None,
-                    usage: None,
-                },
-            ) {
-                Ok(outcome) if !outcome.injected_context.is_empty() => {
-                    session.conversation =
-                        conversation_with_hook_context(&session.conversation, &outcome);
-                }
-                Err(error) => {
-                    let _ = event_tx.send(TuiEvent::Error(format!(
-                        "on_budget_warning hook failed: {error}"
-                    )));
-                }
-                _ => {}
-            }
-            if let Err(error) = session.hooks.run(
-                HookEvent::PreCompact,
-                HookContext {
-                    cwd: &cwd.display().to_string(),
-                    session_status: None,
-                    tool_request: None,
-                    tool_result: None,
-                    before_messages: Some(before_messages),
-                    after_messages: None,
-                    usage: None,
-                },
-            ) {
-                let _ = event_tx.send(TuiEvent::Error(format!("pre_compact hook failed: {error}")));
-            }
-            let compaction = orca_provider::context::compact_with_summary(
-                config.provider,
-                &session.conversation,
-                &ctx_config,
-                &provider_config,
-            );
-            session.conversation = compaction.conversation;
-            let after_messages = session.conversation.messages.len();
-            if let Some(writer) = &mut session.writer {
-                let _ = writer.append_compaction(before_messages, after_messages);
-                if let orca_provider::context::CompactionKind::RemoteSummary(summary) =
-                    compaction.kind
-                {
-                    let _ = writer.append_summary_state(
-                        before_messages,
-                        after_messages,
-                        summary,
-                        &session.conversation.summary,
-                    );
-                }
-            }
-            if let Err(error) = session.hooks.run(
-                HookEvent::PostCompact,
-                HookContext {
-                    cwd: &cwd.display().to_string(),
-                    session_status: None,
-                    tool_request: None,
-                    tool_result: None,
-                    before_messages: Some(before_messages),
-                    after_messages: Some(after_messages),
-                    usage: None,
-                },
-            ) {
-                let _ = event_tx.send(TuiEvent::Error(format!(
-                    "post_compact hook failed: {error}"
-                )));
-            }
+            session.compact(config, &cwd);
         }
 
         let _ = event_tx.send(TuiEvent::ContextUpdated {
-            used_tokens: orca_provider::context::conversation_tokens(&session.conversation),
+            used_tokens: orca_provider::context::conversation_tokens(session.conversation()),
             limit_tokens: ctx_config.effective_limit(),
         });
 
@@ -511,12 +256,12 @@ pub fn run_agent_for_tui(
             subagent_model: None,
         });
         session
-            .cost_tracker
+            .cost_tracker_mut()
             .set_model(Some(&route_decision.actual_model));
         let mut turn_provider_config = provider_config.clone();
         turn_provider_config.model = Some(route_decision.actual_model.clone());
 
-        let pre_model_outcome = match session.hooks.run(
+        let pre_model_outcome = match session.hooks().run(
             HookEvent::PreModelCall,
             HookContext {
                 cwd: &cwd.display().to_string(),
@@ -541,7 +286,7 @@ pub fn run_agent_for_tui(
             }
         };
         let model_conversation =
-            conversation_with_hook_context(&session.conversation, &pre_model_outcome);
+            conversation_with_hook_context(session.conversation(), &pre_model_outcome);
 
         let tx = event_tx.clone();
         let response = orca_provider::call_streaming(
@@ -560,7 +305,7 @@ pub fn run_agent_for_tui(
             },
         );
 
-        if let Err(error) = session.hooks.run(
+        if let Err(error) = session.hooks().run(
             HookEvent::PostModelCall,
             HookContext {
                 cwd: &cwd.display().to_string(),
@@ -580,9 +325,9 @@ pub fn run_agent_for_tui(
         if let Some(usage) = response.usage
             && !usage.is_empty()
         {
-            let totals = session.cost_tracker.add_usage(usage);
+            let totals = session.cost_tracker_mut().add_usage(usage);
             let _ = event_tx.send(TuiEvent::UsageUpdated(totals));
-            if let Some(writer) = &mut session.writer {
+            if let Some(writer) = session.writer_mut() {
                 let _ = writer.append_usage(totals);
             }
             if let Some(max_budget) = config.max_budget_usd
@@ -613,16 +358,17 @@ pub fn run_agent_for_tui(
             _ => None,
         }) {
             if orca_provider::context::is_prompt_too_long_error(&error) && !reactive_compacted {
-                let before_messages = session.conversation.messages.len();
+                let before_messages = session.conversation().messages.len();
                 let compaction = orca_provider::context::compact_with_summary(
                     config.provider,
-                    &session.conversation,
+                    session.conversation(),
                     &ctx_config,
                     &provider_config,
                 );
-                session.conversation = compaction.conversation;
-                let after_messages = session.conversation.messages.len();
-                if let Some(writer) = &mut session.writer {
+                *session.conversation_mut() = compaction.conversation;
+                let after_messages = session.conversation().messages.len();
+                let summary_state = session.conversation().summary.clone();
+                if let Some(writer) = session.writer_mut() {
                     let _ = writer.append_compaction(before_messages, after_messages);
                     if let orca_provider::context::CompactionKind::RemoteSummary(summary) =
                         compaction.kind
@@ -631,7 +377,7 @@ pub fn run_agent_for_tui(
                             before_messages,
                             after_messages,
                             summary,
-                            &session.conversation.summary,
+                            &summary_state,
                         );
                     }
                 }
@@ -649,12 +395,12 @@ pub fn run_agent_for_tui(
         reactive_compacted = false;
 
         if response.tool_calls.is_empty() {
-            session.conversation.add_assistant(
+            session.conversation_mut().add_assistant(
                 response.assistant_content,
                 response.assistant_reasoning,
                 vec![],
             );
-            if let Some(message) = session.conversation.messages.last().cloned() {
+            if let Some(message) = session.conversation().messages.last().cloned() {
                 session.append_message(&message);
             }
             if config.auto_memory {
@@ -670,7 +416,7 @@ pub fn run_agent_for_tui(
                     config.provider,
                     &provider_config,
                     &cwd,
-                    &session.conversation.messages,
+                    &session.conversation().messages,
                 ) {
                     let _ = event_tx.send(TuiEvent::Error(format!(
                         "memory extraction failed: {error}"
@@ -684,12 +430,12 @@ pub fn run_agent_for_tui(
             return "success".to_string();
         }
 
-        session.conversation.add_assistant(
+        session.conversation_mut().add_assistant(
             response.assistant_content,
             response.assistant_reasoning,
             response.tool_calls.clone(),
         );
-        if let Some(message) = session.conversation.messages.last().cloned() {
+        if let Some(message) = session.conversation().messages.last().cloned() {
             session.append_message(&message);
         }
 
@@ -711,17 +457,17 @@ pub fn run_agent_for_tui(
                     &tool_requests[index..batch_end],
                     event_tx,
                     0,
-                    &session.instructions,
-                    &session.memory,
-                    &session.hooks,
+                    session.instructions(),
+                    session.memory(),
+                    session.hooks(),
                 );
                 for (should_stop, result, child_cost) in results {
-                    session.cost_tracker.merge(&child_cost);
+                    session.cost_tracker_mut().merge(&child_cost);
                     let result_content = agent_common::format_tool_result_for_model(&result);
                     session
-                        .conversation
+                        .conversation_mut()
                         .add_tool_result(result.id.clone(), result_content);
-                    if let Some(message) = session.conversation.messages.last().cloned() {
+                    if let Some(message) = session.conversation().messages.last().cloned() {
                         session.append_message(&message);
                     }
                     if should_stop {
@@ -749,16 +495,16 @@ pub fn run_agent_for_tui(
                     &cwd,
                     &tool_requests[index..batch_end],
                     event_tx,
-                    &session.mcp_registry,
-                    &session.hooks,
+                    session.mcp_registry(),
+                    session.hooks(),
                     config.tools.output_truncation,
                 );
                 for result in results {
                     let result_content = agent_common::format_tool_result_for_model(&result);
                     session
-                        .conversation
+                        .conversation_mut()
                         .add_tool_result(result.id.clone(), result_content);
-                    if let Some(message) = session.conversation.messages.last().cloned() {
+                    if let Some(message) = session.conversation().messages.last().cloned() {
                         session.append_message(&message);
                     }
                 }
@@ -774,27 +520,27 @@ pub fn run_agent_for_tui(
                 event_tx,
                 action_rx,
                 0,
-                session.session_id.as_deref(),
+                session.session_id(),
                 &policy,
-                &session.instructions,
-                &session.memory,
-                &session.mcp_registry,
-                &session.hooks,
-                Some(&session.task_registry),
+                session.instructions(),
+                session.memory(),
+                session.mcp_registry(),
+                session.hooks(),
+                Some(session.task_registry()),
             );
 
             if let Some(c) = child_cost {
-                session.cost_tracker.merge(&c);
+                session.cost_tracker_mut().merge(&c);
             }
 
             if tool_request.name == tool_types::ToolName::UpdatePlan
                 && result.status == tool_types::ToolStatus::Completed
             {
                 if let Ok(update) = orca_tools::update_plan::parse_args(tool_request) {
-                    session.conversation.replace_plan_state(
+                    session.conversation_mut().replace_plan_state(
                         orca_tools::update_plan::format_context_message(&update),
                     );
-                    if let Some(writer) = &mut session.writer {
+                    if let Some(writer) = session.writer_mut() {
                         let _ = writer.append_plan_state(update.explanation, update.plan);
                     }
                 }
@@ -802,9 +548,9 @@ pub fn run_agent_for_tui(
 
             let result_content = agent_common::format_tool_result_for_model(&result);
             session
-                .conversation
+                .conversation_mut()
                 .add_tool_result(tool_request.id.clone(), result_content);
-            if let Some(message) = session.conversation.messages.last().cloned() {
+            if let Some(message) = session.conversation().messages.last().cloned() {
                 session.append_message(&message);
             }
 
@@ -2063,17 +1809,39 @@ mod tests {
             TuiConversationSession::new_with_preloaded(&config, "first", None).expect("session");
         session.replace_goal_context("goal instructions".to_string());
 
-        let base_names = tui_tools_schema(&session.mcp_registry, &config.external_tools, false)
+        let base_names = tui_tools_schema(session.mcp_registry(), &config.external_tools, false)
             .into_iter()
             .filter_map(|tool| tool["function"]["name"].as_str().map(str::to_string))
             .collect::<Vec<_>>();
-        let goal_names = tui_tools_schema(&session.mcp_registry, &config.external_tools, true)
+        let goal_names = tui_tools_schema(session.mcp_registry(), &config.external_tools, true)
             .into_iter()
             .filter_map(|tool| tool["function"]["name"].as_str().map(str::to_string))
             .collect::<Vec<_>>();
 
         assert!(!base_names.contains(&"update_goal".to_string()));
         assert!(goal_names.contains(&"update_goal".to_string()));
+    }
+
+    #[test]
+    fn tui_session_exposes_runtime_owned_workflow_state() {
+        let config = config();
+        let session = TuiConversationSession::new_with_preloaded(&config, "workflow state", None)
+            .expect("session");
+
+        assert!(!session.runtime_session().has_active_workflows());
+        let handle = session.runtime_session().task_registry().create_workflow(
+            "run-1".to_string(),
+            "demo".to_string(),
+            "demo workflow".to_string(),
+            1,
+        );
+        session
+            .runtime_session()
+            .task_registry()
+            .mark_running(&handle.id)
+            .expect("running");
+
+        assert!(session.has_active_workflows());
     }
 
     #[test]
