@@ -9,7 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use orca_core::approval_types::ApprovalMode;
 use orca_core::cancel::CancelToken;
-use orca_core::config::RunConfig;
+use orca_core::config::{OutputFormat, RunConfig};
 use orca_core::event_schema::EventFactory;
 use orca_core::event_schema::RunStatus;
 use orca_core::event_sink::EventSink;
@@ -319,7 +319,9 @@ impl WorkflowRunner {
             );
         }
 
-        let events = match WorkflowHost::run_collecting_events_with_agent(
+        let mut phase_agent_baselines = std::collections::HashMap::new();
+        let mut agent_events_seen = 0u32;
+        let events = match WorkflowHost::run_collecting_events_with_agent_and_event_callback(
             &resolved.persisted_path,
             args,
             |call| {
@@ -332,6 +334,17 @@ impl WorkflowRunner {
                     &gate,
                     &workflow_limits,
                 )
+            },
+            |event| {
+                apply_host_event_to_state(
+                    event,
+                    &mut state,
+                    &mut phase_agent_baselines,
+                    &mut agent_events_seen,
+                    &mut completed_result,
+                    &mut failed_error,
+                );
+                self.state.write_state(&state)
             },
         ) {
             Ok(events) => events,
@@ -349,57 +362,7 @@ impl WorkflowRunner {
             }
         };
 
-        let mut phase_agent_baselines = std::collections::HashMap::new();
-        let mut agent_events_seen = 0u32;
-        for event in events {
-            match event {
-                HostEvent::PhaseStarted { name } => {
-                    phase_agent_baselines.insert(name.clone(), agent_events_seen);
-                    state.phases.push(WorkflowPhaseRecord {
-                        name,
-                        status: WorkflowRunStatus::Running,
-                        started_at_ms: Some(now_ms()),
-                        completed_at_ms: None,
-                        agent_count: 0,
-                    });
-                }
-                HostEvent::PhaseCompleted { name } => {
-                    if let Some(phase) = state
-                        .phases
-                        .iter_mut()
-                        .rev()
-                        .find(|phase| phase.name == name)
-                    {
-                        phase.status = WorkflowRunStatus::Completed;
-                        phase.completed_at_ms = Some(now_ms());
-                        let baseline = phase_agent_baselines.get(&name).copied().unwrap_or(0);
-                        phase.agent_count = agent_events_seen.saturating_sub(baseline);
-                    }
-                }
-                HostEvent::AgentCall { .. } => {
-                    agent_events_seen += 1;
-                }
-                HostEvent::WorkflowCompleted { result } => {
-                    completed_result = Some(result_to_summary(&result));
-                }
-                HostEvent::WorkflowFailed { error } => {
-                    if is_stop_requested_error(&error) {
-                        finalize_open_phases_as_stopped(
-                            &mut state.phases,
-                            &phase_agent_baselines,
-                            agent_events_seen,
-                        );
-                    } else {
-                        finalize_open_phases_as_failed(
-                            &mut state.phases,
-                            &phase_agent_baselines,
-                            agent_events_seen,
-                        );
-                    }
-                    failed_error = Some(error);
-                }
-            }
-        }
+        let _ = events;
 
         state.total_agent_count = gate.snapshot()?.total_agents;
         if let Some(error) = failed_error {
@@ -633,7 +596,10 @@ impl WorkflowRunner {
 
     fn workflow_child_config(config: &RunConfig) -> RunConfig {
         let mut workflow_child_config = config.clone();
-        workflow_child_config.approval_mode = ApprovalMode::AutoEdit;
+        if workflow_child_config.approval_mode != ApprovalMode::FullAuto {
+            workflow_child_config.approval_mode = ApprovalMode::AutoEdit;
+        }
+        workflow_child_config.output_format = OutputFormat::Jsonl;
         workflow_child_config
     }
 
@@ -688,6 +654,74 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+fn apply_host_event_to_state(
+    event: &HostEvent,
+    state: &mut WorkflowRunState,
+    phase_agent_baselines: &mut std::collections::HashMap<String, u32>,
+    agent_events_seen: &mut u32,
+    completed_result: &mut Option<String>,
+    failed_error: &mut Option<String>,
+) {
+    match event {
+        HostEvent::PhaseStarted { name } => {
+            phase_agent_baselines.insert(name.clone(), *agent_events_seen);
+            state.phases.push(WorkflowPhaseRecord {
+                name: name.clone(),
+                status: WorkflowRunStatus::Running,
+                started_at_ms: Some(now_ms()),
+                completed_at_ms: None,
+                agent_count: 0,
+            });
+        }
+        HostEvent::PhaseCompleted { name } => {
+            if let Some(phase) = state
+                .phases
+                .iter_mut()
+                .rev()
+                .find(|phase| phase.name == *name)
+            {
+                phase.status = WorkflowRunStatus::Completed;
+                phase.completed_at_ms = Some(now_ms());
+                let baseline = phase_agent_baselines.get(name).copied().unwrap_or(0);
+                phase.agent_count = agent_events_seen.saturating_sub(baseline);
+            }
+        }
+        HostEvent::AgentCall { phase, .. } => {
+            *agent_events_seen += 1;
+            state.total_agent_count = *agent_events_seen;
+            if let Some(phase_name) = phase
+                && let Some(phase) = state
+                    .phases
+                    .iter_mut()
+                    .rev()
+                    .find(|phase| phase.name == *phase_name)
+            {
+                let baseline = phase_agent_baselines.get(phase_name).copied().unwrap_or(0);
+                phase.agent_count = agent_events_seen.saturating_sub(baseline);
+            }
+        }
+        HostEvent::WorkflowCompleted { result } => {
+            *completed_result = Some(result_to_summary(result));
+        }
+        HostEvent::WorkflowFailed { error } => {
+            if is_stop_requested_error(error) {
+                finalize_open_phases_as_stopped(
+                    &mut state.phases,
+                    phase_agent_baselines,
+                    *agent_events_seen,
+                );
+            } else {
+                finalize_open_phases_as_failed(
+                    &mut state.phases,
+                    phase_agent_baselines,
+                    *agent_events_seen,
+                );
+            }
+            *failed_error = Some(error.clone());
+        }
+    }
+}
+
 fn write_agent_transcript(
     transcript_dir: &std::path::Path,
     call: &AgentCall,
@@ -714,10 +748,13 @@ fn write_agent_transcript(
 fn result_to_summary(result: &Value) -> String {
     match result {
         Value::String(value) => value.clone(),
-        Value::Object(map) => map
-            .get("result")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned)
+        Value::Object(map) => summary_from_dsl_phases(map.get("phases"))
+            .or_else(|| {
+                map.get("result").and_then(|value| match value {
+                    Value::String(text) => Some(text.clone()),
+                    other => Some(result_to_summary(other)),
+                })
+            })
             .or_else(|| {
                 map.get("prompt")
                     .and_then(Value::as_str)
@@ -727,6 +764,22 @@ fn result_to_summary(result: &Value) -> String {
         Value::Null => String::new(),
         value => value.to_string(),
     }
+}
+
+fn summary_from_dsl_phases(phases: Option<&Value>) -> Option<String> {
+    let phases = phases?.as_array()?;
+    for phase in phases.iter().rev() {
+        let Some(results) = phase.get("results").and_then(Value::as_array) else {
+            continue;
+        };
+        for result in results.iter().rev() {
+            let summary = result_to_summary(result);
+            if !summary.trim().is_empty() {
+                return Some(summary);
+            }
+        }
+    }
+    None
 }
 
 fn finalize_open_phases_as_failed(
@@ -810,12 +863,30 @@ mod tests {
     use orca_core::model::ModelSelection;
 
     #[test]
-    fn workflow_child_config_forces_autoedit_approval_mode() {
+    fn workflow_child_config_defaults_to_autoedit_approval_mode() {
         let mut config = test_run_config();
         config.approval_mode = ApprovalMode::Suggest;
 
         let child_config = WorkflowRunner::workflow_child_config(&config);
         assert_eq!(child_config.approval_mode, ApprovalMode::AutoEdit);
+    }
+
+    #[test]
+    fn workflow_child_config_preserves_fullauto_approval_mode() {
+        let mut config = test_run_config();
+        config.approval_mode = ApprovalMode::FullAuto;
+
+        let child_config = WorkflowRunner::workflow_child_config(&config);
+        assert_eq!(child_config.approval_mode, ApprovalMode::FullAuto);
+    }
+
+    #[test]
+    fn workflow_child_config_disables_interactive_text_prompts() {
+        let mut config = test_run_config();
+        config.output_format = OutputFormat::Text;
+
+        let child_config = WorkflowRunner::workflow_child_config(&config);
+        assert_eq!(child_config.output_format, OutputFormat::Jsonl);
     }
 
     #[test]
@@ -835,9 +906,10 @@ mod tests {
     }
 
     #[test]
-    fn workflow_child_runtime_parts_force_autoedit_and_initialize_registry() {
+    fn workflow_child_runtime_parts_make_child_noninteractive_and_initialize_registry() {
         let mut config = test_run_config();
         config.approval_mode = ApprovalMode::Suggest;
+        config.output_format = OutputFormat::Text;
         config.mcp_servers = vec![McpServerConfig {
             name: String::new(),
             ..Default::default()
@@ -845,6 +917,7 @@ mod tests {
 
         let (child_config, registry) = WorkflowRunner::workflow_child_runtime_parts(&config);
         assert_eq!(child_config.approval_mode, ApprovalMode::AutoEdit);
+        assert_eq!(child_config.output_format, OutputFormat::Jsonl);
         assert!(
             !registry.errors().is_empty(),
             "workflow child runtime should initialize MCP registry from configured servers"

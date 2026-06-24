@@ -175,6 +175,88 @@ fn host_ignores_export_mentions_in_comments_and_strings_when_loading_workflow_mo
 }
 
 #[test]
+fn host_executes_top_level_phase_task_definitions() {
+    if !WorkflowHost::node_available() {
+        return;
+    }
+
+    let temp = tempdir().unwrap();
+    let script = temp.path().join("workflow.js");
+    fs::write(
+        &script,
+        "export const meta = { name: 'dsl-test', description: 'DSL test' };\nexport const phases = [{ name: 'scan', tasks: [{ type: 'agent', description: 'scan repo', prompt: 'inspect repo', model: 'deepseek-v4-flash' }] }, { name: 'review', tasks: [{ type: 'agent', description: 'review scan', prompt: 'review previous output' }] }];",
+    )
+    .unwrap();
+
+    let events = WorkflowHost::run_collecting_events(&script, serde_json::json!(null)).unwrap();
+
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, HostEvent::PhaseStarted { name } if name == "scan"))
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, HostEvent::PhaseStarted { name } if name == "review"))
+    );
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            HostEvent::AgentCall { prompt, opts, .. }
+                if prompt == "inspect repo" && opts["description"] == "scan repo"
+        )
+    }));
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            HostEvent::AgentCall { prompt, .. }
+                if prompt.contains("[Previous phase outputs]") && prompt.contains("review previous output")
+        )
+    }));
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, HostEvent::WorkflowCompleted { .. }))
+    );
+}
+
+#[test]
+fn host_executes_meta_phase_task_definitions() {
+    if !WorkflowHost::node_available() {
+        return;
+    }
+
+    let temp = tempdir().unwrap();
+    let script = temp.path().join("workflow.js");
+    fs::write(
+        &script,
+        "export const meta = { name: 'dsl-test', description: 'DSL test', phases: [{ name: 'scan', tasks: [{ description: 'scan repo', prompt: 'inspect repo' }] }] };",
+    )
+    .unwrap();
+
+    let events = WorkflowHost::run_collecting_events(&script, serde_json::json!(null)).unwrap();
+
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, HostEvent::PhaseStarted { name } if name == "scan"))
+    );
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            HostEvent::AgentCall { prompt, opts, .. }
+                if prompt == "inspect repo" && opts["description"] == "scan repo"
+        )
+    }));
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, HostEvent::WorkflowCompleted { .. }))
+    );
+}
+
+#[test]
 fn host_allows_blocked_words_in_comments_and_prompt_strings() {
     if !WorkflowHost::node_available() {
         return;

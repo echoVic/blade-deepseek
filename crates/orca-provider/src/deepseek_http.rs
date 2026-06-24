@@ -3,7 +3,9 @@ use serde_json::Value;
 
 use orca_core::approval_types::ActionKind;
 use orca_core::cancel::CancelToken;
-use orca_core::conversation::{Conversation, Message, RawToolCall, SummaryState};
+use orca_core::conversation::{
+    Conversation, Message, RawToolCall, SummaryState, normalize_tool_boundaries,
+};
 use orca_core::provider_types::{ProviderReplayState, ProviderResponse, ProviderStep, Usage};
 use orca_core::tool_types::ToolRequest;
 use orca_tools::registry;
@@ -466,8 +468,10 @@ fn parse_tool_call(
 pub(crate) fn conversation_to_api_messages(conversation: &Conversation) -> Vec<ApiMessage> {
     let mut messages: Vec<ApiMessage> = Vec::new();
     let mut first_system_done = false;
+    let mut safe_messages = conversation.messages.clone();
+    normalize_tool_boundaries(&mut safe_messages);
 
-    for msg in &conversation.messages {
+    for msg in &safe_messages {
         let api_msg = match msg {
             Message::System { content, .. } => {
                 let result = ApiMessage {
@@ -812,5 +816,40 @@ mod tests {
         assert!(
             matches!(&conv.messages[1], Message::User { content, .. } if content == "original text")
         );
+    }
+
+    #[test]
+    fn api_messages_drop_incomplete_tool_call_boundaries_without_mutating_source() {
+        let mut conv = Conversation::new();
+        conv.add_system("sys".to_string());
+        conv.add_user("start".to_string());
+        conv.add_assistant(
+            None,
+            None,
+            vec![RawToolCall {
+                id: "tc1".to_string(),
+                function_name: "read_file".to_string(),
+                arguments: r#"{"path":"x"}"#.to_string(),
+            }],
+        );
+        conv.add_user("resume after failed turn".to_string());
+
+        let messages = conversation_to_api_messages(&conv);
+
+        assert!(
+            messages.iter().all(|message| message.tool_calls.is_none()),
+            "provider request must not include assistant tool calls without matching tool results"
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.role.as_str())
+                .collect::<Vec<_>>(),
+            vec!["system", "user", "user"]
+        );
+        assert!(matches!(
+            &conv.messages[2],
+            Message::Assistant { tool_calls, .. } if tool_calls.len() == 1
+        ));
     }
 }

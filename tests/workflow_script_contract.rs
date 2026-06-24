@@ -36,6 +36,24 @@ fn inline_script_is_persisted_and_meta_is_extracted() {
 }
 
 #[test]
+fn inline_script_accepts_top_level_phase_objects() {
+    let temp = tempdir().unwrap();
+    let session_dir = temp.path().join("session");
+    let input = WorkflowInput {
+        script: Some(
+            "export const meta = { name: 'audit', description: 'Audit code' };\nexport const phases = [{ name: 'scan', tasks: [{ type: 'agent', prompt: 'inspect repo' }] }, { name: 'review', tasks: [] }];".to_string(),
+        ),
+        ..Default::default()
+    };
+
+    let resolved = resolve_workflow_script(&input, temp.path(), &session_dir).unwrap();
+
+    assert_eq!(resolved.meta.name, "audit");
+    assert_eq!(resolved.meta.description, "Audit code");
+    assert_eq!(resolved.meta.phases, vec!["scan", "review"]);
+}
+
+#[test]
 fn workflow_scripts_can_be_persisted_per_run_with_same_meta_name() {
     let temp = tempdir().unwrap();
     let input = WorkflowInput {

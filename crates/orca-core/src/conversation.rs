@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RawToolCall {
@@ -256,6 +257,56 @@ impl Conversation {
         self.messages.truncate(index);
         Some(prompt)
     }
+}
+
+pub fn normalize_tool_boundaries(messages: &mut Vec<Message>) {
+    let mut normalized = Vec::with_capacity(messages.len());
+    let mut index = 0usize;
+
+    while index < messages.len() {
+        match &messages[index] {
+            Message::Tool { .. } => {
+                index += 1;
+            }
+            Message::Assistant { tool_calls, .. } if !tool_calls.is_empty() => {
+                let expected = tool_calls
+                    .iter()
+                    .map(|tool_call| tool_call.id.as_str())
+                    .collect::<HashSet<_>>();
+                let mut seen = HashSet::new();
+                let mut collected_tools = Vec::new();
+                let mut next = index + 1;
+
+                while next < messages.len() {
+                    let Message::Tool { tool_call_id, .. } = &messages[next] else {
+                        break;
+                    };
+                    if !expected.contains(tool_call_id.as_str()) {
+                        break;
+                    }
+                    if seen.insert(tool_call_id.as_str()) {
+                        collected_tools.push(messages[next].clone());
+                    }
+                    next += 1;
+                    if seen.len() == expected.len() {
+                        break;
+                    }
+                }
+
+                if seen.len() == expected.len() {
+                    normalized.push(messages[index].clone());
+                    normalized.extend(collected_tools);
+                }
+                index = next.max(index + 1);
+            }
+            message => {
+                normalized.push(message.clone());
+                index += 1;
+            }
+        }
+    }
+
+    *messages = normalized;
 }
 
 #[cfg(test)]
@@ -553,6 +604,62 @@ mod tests {
         assert!(conv.messages[1].is_pinned());
         assert!(
             matches!(&conv.messages[2], Message::System { content, pinned: true } if content.contains("Hook context"))
+        );
+    }
+
+    #[test]
+    fn normalize_tool_boundaries_drops_incomplete_assistant_tool_call() {
+        let mut messages = vec![
+            Message::user("before".to_string()),
+            Message::Assistant {
+                content: None,
+                reasoning_content: None,
+                tool_calls: vec![RawToolCall {
+                    id: "call_1".to_string(),
+                    function_name: "read_file".to_string(),
+                    arguments: "{}".to_string(),
+                }],
+                pinned: false,
+            },
+            Message::user("after".to_string()),
+        ];
+
+        normalize_tool_boundaries(&mut messages);
+
+        assert_eq!(messages.len(), 2);
+        assert!(matches!(&messages[0], Message::User { content, .. } if content == "before"));
+        assert!(matches!(&messages[1], Message::User { content, .. } if content == "after"));
+    }
+
+    #[test]
+    fn normalize_tool_boundaries_keeps_complete_assistant_tool_call() {
+        let mut messages = vec![
+            Message::Assistant {
+                content: None,
+                reasoning_content: None,
+                tool_calls: vec![RawToolCall {
+                    id: "call_1".to_string(),
+                    function_name: "read_file".to_string(),
+                    arguments: "{}".to_string(),
+                }],
+                pinned: false,
+            },
+            Message::Tool {
+                tool_call_id: "call_1".to_string(),
+                content: "ok".to_string(),
+                pinned: false,
+            },
+        ];
+
+        normalize_tool_boundaries(&mut messages);
+
+        assert_eq!(messages.len(), 2);
+        assert!(matches!(
+            &messages[0],
+            Message::Assistant { tool_calls, .. } if tool_calls.len() == 1
+        ));
+        assert!(
+            matches!(&messages[1], Message::Tool { tool_call_id, .. } if tool_call_id == "call_1")
         );
     }
 }

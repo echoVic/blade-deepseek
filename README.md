@@ -165,6 +165,9 @@ Options:
 `orca workflow run <script-or-name>` runs an Orca dynamic workflow.
 Named workflows resolve from the nearest `.orca/workflows/` directory first,
 then `~/.orca/workflows/`. Project workflows win over user workflows.
+Workflow tool calls launch background tasks and return task metadata immediately;
+the final workflow report is delivered back into the active TUI session as a
+task notification.
 
 Workflow scripts are JavaScript modules beginning with:
 

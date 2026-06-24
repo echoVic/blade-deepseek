@@ -37,6 +37,21 @@ impl GoalStore {
         Ok(self.load()?.goals.get(session_id).cloned())
     }
 
+    pub fn latest_active(&self) -> io::Result<Option<ThreadGoal>> {
+        Ok(self
+            .load()?
+            .goals
+            .values()
+            .filter(|goal| goal.status == ThreadGoalStatus::Active)
+            .max_by(|left, right| {
+                left.updated_at
+                    .cmp(&right.updated_at)
+                    .then_with(|| left.created_at.cmp(&right.created_at))
+                    .then_with(|| left.session_id.cmp(&right.session_id))
+            })
+            .cloned())
+    }
+
     pub fn replace(
         &mut self,
         session_id: &str,
@@ -232,6 +247,26 @@ mod tests {
             .expect("goal exists");
         assert_eq!(accounted.tokens_used, 300);
         assert_eq!(accounted.time_used_seconds, 12);
+    }
+
+    #[test]
+    fn latest_active_returns_most_recent_active_goal() {
+        let dir = tempdir().unwrap();
+        let mut store = GoalStore::with_path(dir.path().join("goals_1.json"));
+        store
+            .replace("active-1", "old", ThreadGoalStatus::Active, None)
+            .unwrap();
+        store
+            .replace("paused", "paused", ThreadGoalStatus::Paused, None)
+            .unwrap();
+        store
+            .replace("active-2", "new", ThreadGoalStatus::Active, None)
+            .unwrap();
+
+        let latest = store.latest_active().unwrap().expect("active goal");
+
+        assert_eq!(latest.session_id, "active-2");
+        assert_eq!(latest.objective, "new");
     }
 
     #[test]

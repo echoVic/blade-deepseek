@@ -563,13 +563,13 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
     registry.register(BuiltinTool::new(
         builtin_spec(
             "Workflow",
-            "Run a dynamic workflow: a JavaScript script that orchestrates many subagents in the background and returns one consolidated result.",
+            "Launch a dynamic workflow: a JavaScript script that orchestrates many subagents in the background. The tool returns task metadata immediately; the final report is delivered later as a task notification.",
             json!({
                 "type": "object",
                 "properties": {
                     "script": {
                         "type": "string",
-                        "description": "Self-contained workflow script beginning with export const meta = { name, description, phases }."
+                        "description": "Self-contained workflow script. Use export const meta = { name, description, phases: [{ name, tasks }] }, or export const meta = { name, description } plus export const phases = [{ name, tasks }]. String phase names are for hand-written agent()/phase() scripts."
                     },
                     "name": {
                         "type": "string",

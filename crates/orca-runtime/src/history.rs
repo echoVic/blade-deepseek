@@ -8,7 +8,9 @@ use chrono::{DateTime, Datelike, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use orca_core::conversation::{Conversation, Message, RawToolCall, SummaryState};
+use orca_core::conversation::{
+    Conversation, Message, RawToolCall, SummaryState, normalize_tool_boundaries,
+};
 use orca_core::cost_types::UsageTotals;
 use orca_core::plan_types::{PlanItem, PlanStatus};
 
@@ -409,15 +411,16 @@ pub fn rename_session(selector: &str, title: &str) -> io::Result<PathBuf> {
 pub fn resume_conversation(transcript: &SessionTranscript, system_prompt: String) -> Conversation {
     let mut conversation = Conversation::new();
     conversation.add_system(system_prompt);
-    let restored_messages = replay_compactions_for_resume(
+    let mut restored_messages = replay_compactions_for_resume(
         &transcript.messages,
         &transcript.compactions,
         &transcript.summaries,
-    );
-    for message in restored_messages
-        .iter()
-        .filter(|message| !matches!(message, Message::System { .. }))
-    {
+    )
+    .into_iter()
+    .filter(|message| !matches!(message, Message::System { .. }))
+    .collect::<Vec<_>>();
+    normalize_tool_boundaries(&mut restored_messages);
+    for message in restored_messages.iter() {
         conversation.messages.push(message.clone());
     }
     if let Some(summary_state) = transcript
@@ -1408,6 +1411,47 @@ mod tests {
             }
         }
         result.expect("no rolling summary without records");
+    }
+
+    #[test]
+    fn resume_drops_incomplete_assistant_tool_call_turns() {
+        let cwd = std::env::current_dir().unwrap();
+        let transcript = SessionTranscript {
+            meta: create_meta(&cwd, "mock", None, "bad tool boundary"),
+            messages: vec![
+                Message::user("start".to_string()),
+                Message::Assistant {
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: vec![RawToolCall {
+                        id: "call_1".to_string(),
+                        function_name: "read_file".to_string(),
+                        arguments: "{\"path\":\"README.md\"}".to_string(),
+                    }],
+                    pinned: false,
+                },
+                Message::user("continue after failed turn".to_string()),
+            ],
+            compactions: Vec::new(),
+            summaries: Vec::new(),
+            usage: None,
+            plan: None,
+            path: cwd.join("bad-tool-boundary.jsonl"),
+        };
+
+        let conv = resume_conversation(&transcript, "sys".to_string());
+
+        assert!(
+            !conv.messages.iter().any(|message| matches!(
+                message,
+                Message::Assistant { tool_calls, .. } if !tool_calls.is_empty()
+            )),
+            "resumed conversation must not contain assistant tool calls without tool results"
+        );
+        assert!(conv.messages.iter().any(|message| matches!(
+            message,
+            Message::User { content, .. } if content == "continue after failed turn"
+        )));
     }
 
     #[test]

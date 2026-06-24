@@ -13,6 +13,8 @@ use crate::shortcuts::{self, ShortcutScope};
 use crate::theme::Theme;
 use crate::types::{AppState, AppStatus, ApprovalOption, ChatMessage, PanelMode};
 
+const MODAL_BACKGROUND_MESSAGE_LIMIT: usize = 80;
+
 pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, theme: &Theme) {
     if state.status == AppStatus::Setup {
         render_setup(frame, state, textarea, theme);
@@ -34,8 +36,15 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
     if goal_height > 0 {
         render_goal_banner(frame, chunks[0], state, theme);
     }
+    let compact_conversation_background = state.status == AppStatus::WaitingApproval;
     match state.panel_mode {
-        PanelMode::Conversation => render_messages(frame, chunks[1], state, theme),
+        PanelMode::Conversation => render_messages(
+            frame,
+            chunks[1],
+            state,
+            theme,
+            compact_conversation_background,
+        ),
         PanelMode::Workflows => render_workflows_panel(frame, chunks[1], state, theme),
     }
     if plan_height > 0 {
@@ -259,13 +268,19 @@ fn highlight_match(text: &str, needle: &str, base: Style, theme: &Theme) -> Vec<
     spans
 }
 
-fn render_messages(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) {
+fn render_messages(
+    frame: &mut Frame,
+    area: Rect,
+    state: &mut AppState,
+    theme: &Theme,
+    compact_background: bool,
+) {
     let content_width = area.width.saturating_sub(2) as usize;
 
     let lines = if state.messages.is_empty() {
         build_welcome_lines(state, theme)
     } else {
-        build_message_lines(state, theme, content_width)
+        build_message_lines(state, theme, content_width, compact_background)
     };
 
     let visible_height = area.height.saturating_sub(2);
@@ -519,10 +534,36 @@ fn visual_wrapped_line_count(text: &str, width: usize) -> usize {
     line_count + usize::from(current_width > 0)
 }
 
-fn build_message_lines(state: &AppState, theme: &Theme, width: usize) -> Vec<Line<'static>> {
-    let mut lines: Vec<Line<'static>> = Vec::new();
+fn rendered_message_window(
+    messages: &[ChatMessage],
+    compact_background: bool,
+) -> (&[ChatMessage], usize) {
+    if !compact_background || messages.len() <= MODAL_BACKGROUND_MESSAGE_LIMIT {
+        return (messages, 0);
+    }
 
-    for msg in &state.messages {
+    let skipped = messages.len() - MODAL_BACKGROUND_MESSAGE_LIMIT;
+    (&messages[skipped..], skipped)
+}
+
+fn build_message_lines(
+    state: &AppState,
+    theme: &Theme,
+    width: usize,
+    compact_background: bool,
+) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let (messages, skipped) = rendered_message_window(&state.messages, compact_background);
+
+    if skipped > 0 {
+        lines.push(Line::from(Span::styled(
+            format!("Showing latest {MODAL_BACKGROUND_MESSAGE_LIMIT} messages while dialog is open; {skipped} older messages hidden."),
+            Style::default().fg(theme.muted),
+        )));
+        lines.push(Line::from(""));
+    }
+
+    for msg in messages {
         match msg {
             ChatMessage::User(text) => {
                 lines.push(Line::from(vec![
@@ -817,15 +858,6 @@ fn render_input(frame: &mut Frame, area: Rect, textarea: &TextArea) {
 }
 
 fn render_status(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
-    let (status_text, color) = match &state.status {
-        AppStatus::Setup => ("● setup", theme.border),
-        AppStatus::SessionPicker => ("● sessions", theme.border),
-        AppStatus::Idle => ("● idle", theme.success),
-        AppStatus::Running => ("● running", theme.warning),
-        AppStatus::WaitingApproval => ("● approval", theme.approval),
-        AppStatus::WaitingUserInput => ("● input", theme.approval),
-    };
-
     let scroll_hint = if !state.auto_scroll {
         format!(
             " | scroll: {}/{}",
@@ -837,7 +869,7 @@ fn render_status(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
     };
 
     let line = Line::from(vec![
-        Span::styled(format!(" {status_text}"), Style::default().fg(color)),
+        status_cell(state, theme),
         Span::styled(scroll_hint, Style::default().fg(theme.muted)),
         Span::styled(
             format!(" | model: {}", state.model_name),
@@ -857,6 +889,39 @@ fn render_status(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
 
     let paragraph = Paragraph::new(line);
     frame.render_widget(paragraph, area);
+}
+
+fn status_cell(state: &AppState, theme: &Theme) -> Span<'static> {
+    let (status_text, color) = match &state.status {
+        AppStatus::Setup => ("● setup".to_string(), theme.border),
+        AppStatus::SessionPicker => ("● sessions".to_string(), theme.border),
+        AppStatus::Idle => ("● idle".to_string(), theme.success),
+        AppStatus::Running => {
+            let elapsed = state
+                .running_started_at
+                .map(|started| format_elapsed_compact(started.elapsed().as_secs()))
+                .unwrap_or_else(|| "0s".to_string());
+            (format!("● running {elapsed}"), theme.warning)
+        }
+        AppStatus::WaitingApproval => ("● approval".to_string(), theme.approval),
+        AppStatus::WaitingUserInput => ("● input".to_string(), theme.approval),
+    };
+    Span::styled(format!(" {status_text}"), Style::default().fg(color))
+}
+
+fn format_elapsed_compact(elapsed_secs: u64) -> String {
+    if elapsed_secs < 60 {
+        return format!("{elapsed_secs}s");
+    }
+    if elapsed_secs < 3600 {
+        let minutes = elapsed_secs / 60;
+        let seconds = elapsed_secs % 60;
+        return format!("{minutes}m {seconds:02}s");
+    }
+    let hours = elapsed_secs / 3600;
+    let minutes = (elapsed_secs % 3600) / 60;
+    let seconds = elapsed_secs % 60;
+    format!("{hours}h {minutes:02}m {seconds:02}s")
 }
 
 /// Remaining context window as a percentage of the local compaction budget.
@@ -1734,6 +1799,7 @@ fn truncate_lines(text: &str, max_lines: usize) -> String {
 mod tests {
     use super::*;
     use std::sync::mpsc;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn welcome_lines_use_configured_app_version() {
@@ -1805,6 +1871,18 @@ mod tests {
     }
 
     #[test]
+    fn running_status_shows_elapsed_time() {
+        let mut state = test_state();
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        state.status = AppStatus::Running;
+        state.running_started_at = Some(Instant::now() - Duration::from_secs(65));
+
+        let cell = status_cell(&state, &theme);
+        assert_eq!(cell.content.as_ref(), " ● running 1m 05s");
+        assert_eq!(cell.style.fg, Some(theme.warning));
+    }
+
+    #[test]
     fn wrapped_line_count_matches_ratatui_word_wrap() {
         let line = Line::from("alpha bravo charlie");
 
@@ -1816,5 +1894,33 @@ mod tests {
         let line = Line::from("abcdefghijkl");
 
         assert_eq!(wrapped_line_count(&line, 5), 3);
+    }
+
+    #[test]
+    fn modal_message_window_limits_background_history() {
+        let messages = (0..200)
+            .map(|index| ChatMessage::System(format!("message {index}")))
+            .collect::<Vec<_>>();
+
+        let (visible, skipped) = rendered_message_window(&messages, true);
+
+        assert_eq!(visible.len(), MODAL_BACKGROUND_MESSAGE_LIMIT);
+        assert_eq!(skipped, 120);
+        assert!(matches!(
+            visible.first(),
+            Some(ChatMessage::System(text)) if text == "message 120"
+        ));
+    }
+
+    #[test]
+    fn normal_message_window_keeps_full_history() {
+        let messages = (0..200)
+            .map(|index| ChatMessage::System(format!("message {index}")))
+            .collect::<Vec<_>>();
+
+        let (visible, skipped) = rendered_message_window(&messages, false);
+
+        assert_eq!(visible.len(), 200);
+        assert_eq!(skipped, 0);
     }
 }

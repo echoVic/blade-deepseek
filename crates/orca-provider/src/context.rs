@@ -1,5 +1,5 @@
 use orca_core::config::{ModelRuntimeConfig, ProviderKind};
-use orca_core::conversation::{Conversation, Message, SummaryState};
+use orca_core::conversation::{Conversation, Message, SummaryState, normalize_tool_boundaries};
 use orca_core::provider_types::ProviderStep;
 use tiktoken_rs::cl100k_base_singleton;
 
@@ -1127,21 +1127,6 @@ fn micro_compact_tool_output(content: &str) -> String {
         head.trim_end(),
         tail.trim_start()
     )
-}
-
-fn normalize_tool_boundaries(messages: &mut Vec<Message>) {
-    let leading_tools = messages
-        .iter()
-        .take_while(|msg| matches!(msg, Message::Tool { .. }))
-        .count();
-    if leading_tools > 0 {
-        messages.drain(..leading_tools);
-    }
-    if let Some(Message::Assistant { tool_calls, .. }) = messages.last()
-        && !tool_calls.is_empty()
-    {
-        messages.pop();
-    }
 }
 
 #[cfg(test)]

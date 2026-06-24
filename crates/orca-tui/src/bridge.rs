@@ -13,7 +13,9 @@ use orca_core::hook_types::HookEvent;
 use orca_core::model::ModelRouteContext;
 use orca_core::provider_types::ProviderStep;
 use orca_core::subagent_types::SubagentType;
+use orca_core::task_types::TaskStatus;
 use orca_core::tool_types;
+use orca_core::workflow_types::WorkflowInput;
 use orca_mcp::McpRegistry;
 use orca_provider::ProviderConfig;
 use orca_provider::tool_schema::{
@@ -30,6 +32,8 @@ use orca_runtime::hooks::{
 use orca_runtime::instructions::{self, ProjectInstructions};
 use orca_runtime::memory::{self, MemoryBlock};
 use orca_runtime::subagent;
+use orca_runtime::tasks::TaskRegistry;
+use orca_runtime::workflow::{WorkflowLaunchRequest, WorkflowRunner};
 use serde::Deserialize;
 
 use crate::diff;
@@ -73,6 +77,7 @@ pub struct TuiConversationSession {
     mcp_registry: McpRegistry,
     hooks: HookRunner,
     memory: MemoryBlock,
+    task_registry: TaskRegistry,
 }
 
 impl TuiConversationSession {
@@ -145,6 +150,10 @@ impl TuiConversationSession {
             }
         };
 
+        let task_session_id = session_id
+            .clone()
+            .unwrap_or_else(orca_runtime::session::new_run_id);
+
         Ok(Self {
             conversation,
             writer,
@@ -154,6 +163,7 @@ impl TuiConversationSession {
             mcp_registry,
             hooks,
             memory,
+            task_registry: TaskRegistry::new(task_session_id),
         })
     }
 
@@ -163,6 +173,18 @@ impl TuiConversationSession {
 
     pub fn usage_totals(&self) -> UsageTotals {
         self.cost_tracker.totals()
+    }
+
+    pub fn has_active_workflows(&self) -> bool {
+        self.task_registry.list().iter().any(|task| {
+            matches!(
+                task.status,
+                TaskStatus::Queued
+                    | TaskStatus::Running
+                    | TaskStatus::Paused
+                    | TaskStatus::Stopping
+            )
+        })
     }
 
     fn append_message(&mut self, message: &orca_core::conversation::Message) {
@@ -758,6 +780,7 @@ pub fn run_agent_for_tui(
                 &session.memory,
                 &session.mcp_registry,
                 &session.hooks,
+                Some(&session.task_registry),
             );
 
             if let Some(c) = child_cost {
@@ -786,11 +809,16 @@ pub fn run_agent_for_tui(
             }
 
             if should_stop {
+                let status = if matches!(result.status, tool_types::ToolStatus::Denied) {
+                    "approval_required"
+                } else {
+                    "failed"
+                };
                 let _ = event_tx.send(TuiEvent::SessionCompleted {
-                    status: "approval_required".to_string(),
+                    status: status.to_string(),
                 });
-                session.complete("approval_required");
-                return "approval_required".to_string();
+                session.complete(status);
+                return status.to_string();
             }
             index += 1;
         }
@@ -1071,6 +1099,7 @@ fn execute_tool_for_tui(
     memory: &MemoryBlock,
     mcp_registry: &McpRegistry,
     hooks: &HookRunner,
+    task_registry: Option<&TaskRegistry>,
 ) -> (bool, tool_types::ToolResult, Option<CostTracker>) {
     if let Some(action) =
         approval_action_for_tool(tool_request, subagent_depth, mcp_registry, config)
@@ -1219,6 +1248,19 @@ fn execute_tool_for_tui(
             )
         } else if execution_request.name == tool_types::ToolName::RequestUserInput {
             execute_user_input_request_for_tui(execution_request, event_tx, action_rx)
+        } else if execution_request.name == tool_types::ToolName::Workflow {
+            let Some(task_registry) = task_registry else {
+                return (
+                    true,
+                    tool_types::ToolResult::failed(
+                        execution_request,
+                        "workflow tools require a main TUI session",
+                        None,
+                    ),
+                    None,
+                );
+            };
+            execute_workflow_for_tui(config, cwd, execution_request, event_tx, task_registry)
         } else if matches!(
             execution_request.name,
             tool_types::ToolName::GetGoal
@@ -1342,6 +1384,117 @@ fn execute_tool_for_tui(
         tool_types::ToolStatus::Failed | tool_types::ToolStatus::Denied
     );
     (failed, result, child_cost)
+}
+
+fn execute_workflow_for_tui(
+    config: &RunConfig,
+    cwd: &Path,
+    request: &tool_types::ToolRequest,
+    event_tx: &Sender<TuiEvent>,
+    task_registry: &TaskRegistry,
+) -> tool_types::ToolResult {
+    if !config.workflows.enabled {
+        return tool_types::ToolResult::failed(request, "workflows are disabled", None);
+    }
+
+    let input = match parse_workflow_input(request) {
+        Ok(input) => input,
+        Err(error) => return tool_types::ToolResult::invalid_input(request, error.to_string()),
+    };
+    let session_dir = cwd
+        .join(".orca")
+        .join("workflow-sessions")
+        .join(task_registry.session_id());
+    let runner = WorkflowRunner::new(config.clone(), task_registry.clone(), session_dir);
+    let launch = match runner.launch_background(WorkflowLaunchRequest::from(input)) {
+        Ok(launch) => launch,
+        Err(error) => return tool_types::ToolResult::failed(request, error.to_string(), None),
+    };
+
+    let task_id = launch.task_id.clone();
+    let run_id = launch.run_id.clone();
+    let workflow_name = launch.workflow_name.clone();
+    let tool_use_id = request.id.clone();
+    let output = match serde_json::to_string(&launch.output) {
+        Ok(output) => output,
+        Err(error) => return tool_types::ToolResult::failed(request, error.to_string(), None),
+    };
+    let _ = event_tx.send(TuiEvent::WorkflowTasksUpdated {
+        tasks: task_registry.list(),
+    });
+
+    let notify_tx = event_tx.clone();
+    let notify_registry = task_registry.clone();
+    thread::spawn(move || {
+        let notification = match launch.join() {
+            Ok(Ok(result)) => WorkflowTerminalNotification {
+                task_id: result.task_id,
+                run_id,
+                tool_use_id,
+                status: "completed".to_string(),
+                summary: result.summary,
+            },
+            Ok(Err(error)) => WorkflowTerminalNotification {
+                task_id,
+                run_id,
+                tool_use_id,
+                status: "failed".to_string(),
+                summary: error.to_string(),
+            },
+            Err(_) => WorkflowTerminalNotification {
+                task_id,
+                run_id,
+                tool_use_id,
+                status: "failed".to_string(),
+                summary: "workflow thread panicked".to_string(),
+            },
+        };
+        let _ = notify_tx.send(TuiEvent::WorkflowTasksUpdated {
+            tasks: notify_registry.list(),
+        });
+        let prompt = notification.to_prompt();
+        let _ = notify_tx.send(TuiEvent::WorkflowNotification {
+            prompt,
+            status: notification.status,
+            summary: format!("{}: {}", workflow_name, notification.summary),
+        });
+    });
+
+    tool_types::ToolResult::completed(request, output, false)
+}
+
+struct WorkflowTerminalNotification {
+    task_id: String,
+    run_id: String,
+    tool_use_id: String,
+    status: String,
+    summary: String,
+}
+
+impl WorkflowTerminalNotification {
+    fn to_prompt(&self) -> String {
+        format!(
+            "<task-notification>\n<task-id>{}</task-id>\n<tool-use-id>{}</tool-use-id>\n<run-id>{}</run-id>\n<status>{}</status>\n<summary>{}</summary>\n</task-notification>\n\nA background workflow finished. Use this result to continue the current task.",
+            xml_escape(&self.task_id),
+            xml_escape(&self.tool_use_id),
+            xml_escape(&self.run_id),
+            xml_escape(&self.status),
+            xml_escape(&self.summary)
+        )
+    }
+}
+
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn parse_workflow_input(request: &tool_types::ToolRequest) -> std::io::Result<WorkflowInput> {
+    let raw_arguments = request.raw_arguments.as_deref().unwrap_or("{}");
+    serde_json::from_str(raw_arguments)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))
 }
 
 fn execute_user_input_request_for_tui(
@@ -1762,6 +1915,7 @@ fn run_child_agent_for_tui(
                     memory,
                     &mcp_registry,
                     hooks,
+                    None,
                 );
 
                 if let Some(c) = child_cost {
@@ -1816,6 +1970,7 @@ fn run_child_agent_for_tui_silent(
 mod tests {
     use super::*;
     use std::sync::mpsc;
+    use std::time::{Duration, Instant};
 
     use orca_core::approval_types::ApprovalMode;
     use orca_core::config::{HistoryMode, OutputFormat, ProviderKind, RunConfig};
@@ -1849,6 +2004,13 @@ mod tests {
             update_check: false,
             desktop_notifications: false,
             auto_memory: false,
+        }
+    }
+
+    fn full_auto_config() -> RunConfig {
+        RunConfig {
+            approval_mode: ApprovalMode::FullAuto,
+            ..config()
         }
     }
 
@@ -1912,6 +2074,81 @@ mod tests {
 
         assert!(!base_names.contains(&"update_goal".to_string()));
         assert!(goal_names.contains(&"update_goal".to_string()));
+    }
+
+    #[test]
+    fn tui_workflow_tool_launches_runtime_instead_of_placeholder_executor() {
+        let config = full_auto_config();
+        let (event_tx, event_rx) = mpsc::channel();
+        let (_action_tx, action_rx) = mpsc::channel();
+        let cancel = CancelToken::new();
+        let mut session =
+            TuiConversationSession::new_with_preloaded(&config, "workflow inline", None)
+                .expect("session");
+
+        run_agent_for_tui(
+            &config,
+            &mut session,
+            "workflow inline",
+            &event_tx,
+            &action_rx,
+            &cancel,
+            false,
+        );
+
+        let mut events: Vec<TuiEvent> = event_rx.try_iter().collect();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline
+            && !events
+                .iter()
+                .any(|event| matches!(event, TuiEvent::WorkflowNotification { .. }))
+        {
+            if let Ok(event) = event_rx.recv_timeout(Duration::from_millis(50)) {
+                events.push(event);
+            }
+        }
+        let workflow = events
+            .iter()
+            .find_map(|event| match event {
+                TuiEvent::ToolCompleted {
+                    name,
+                    status,
+                    output,
+                    ..
+                } if name == "Workflow" => Some((status.as_str(), output.as_str())),
+                _ => None,
+            })
+            .expect("workflow tool completion");
+
+        assert_eq!(workflow.0, "completed");
+        assert!(
+            workflow.1.contains("\"status\":\"async_launched\""),
+            "expected async workflow launch output, got {}",
+            workflow.1
+        );
+        assert!(
+            !workflow
+                .1
+                .contains("Workflow must be executed by the runtime controller"),
+            "TUI must not route Workflow through the placeholder executor"
+        );
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                TuiEvent::WorkflowTasksUpdated { tasks }
+                if tasks.iter().any(|task| task.workflow_run_id.is_some())
+            )
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                TuiEvent::WorkflowNotification { prompt, status, summary }
+                if prompt.contains("<task-notification>")
+                    && prompt.contains("<status>completed</status>")
+                    && *status == "completed"
+                    && summary.contains("mock-workflow")
+            )
+        }));
     }
 
     #[test]

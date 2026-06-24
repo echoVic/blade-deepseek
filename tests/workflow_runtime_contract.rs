@@ -395,6 +395,101 @@ fn workflow_summary_prefers_child_result_over_agent_prompt() {
 }
 
 #[test]
+fn workflow_summary_uses_last_dsl_phase_result() {
+    if !orca_runtime::workflow::host::WorkflowHost::node_available() {
+        return;
+    }
+
+    let temp = tempdir().unwrap();
+    let script = temp.path().join("workflow.js");
+    fs::write(
+        &script,
+        "export const meta = { name: 'dsl-summary', description: 'DSL summary', phases: [{ name: 'roles', tasks: [{ prompt: 'role draft' }] }, { name: 'synthesis', tasks: [{ prompt: 'final plan' }] }] };",
+    )
+    .unwrap();
+
+    let config = mock_run_config(temp.path());
+    let tasks = TaskRegistry::new("session-1".to_string());
+    let runner = WorkflowRunner::new(config, tasks.clone(), temp.path().join("session"));
+    let launched = runner
+        .launch(WorkflowLaunchRequest::from_script_path(
+            script.display().to_string(),
+        ))
+        .unwrap();
+
+    assert!(launched.summary.contains("final plan"));
+
+    let run_id = launched.output.run_id.as_deref().expect("run id");
+    let store = WorkflowStateStore::new(temp.path().join("session").join("workflow-runs"));
+    let state = store.load_run(run_id).expect("run state");
+    assert_eq!(state.status, WorkflowRunStatus::Completed);
+    assert_eq!(state.total_agent_count, 2);
+    assert_eq!(state.phases.len(), 2);
+    assert_eq!(state.phases[0].name, "roles");
+    assert_eq!(state.phases[0].agent_count, 1);
+    assert_eq!(state.phases[1].name, "synthesis");
+    assert_eq!(state.phases[1].agent_count, 1);
+    assert!(
+        state
+            .final_summary
+            .as_deref()
+            .unwrap_or_default()
+            .contains("final plan")
+    );
+}
+
+#[test]
+fn workflow_runner_streams_running_phase_progress_to_state() {
+    if !orca_runtime::workflow::host::WorkflowHost::node_available() {
+        return;
+    }
+
+    let temp = tempdir().unwrap();
+    let script = temp.path().join("workflow.js");
+    fs::write(
+        &script,
+        "export const meta = { name: 'live-state', description: 'Live state test', phases: ['scan'] };\nconst result = await phase('scan', async () => agent('inspect repo'));\nexport default result;",
+    )
+    .unwrap();
+
+    let mut config = mock_run_config(temp.path());
+    config.hooks = vec![HookConfig {
+        event: HookEvent::PreModelCall,
+        command: "sleep 1.0".to_string(),
+        tool: None,
+    }];
+    let tasks = TaskRegistry::new("session-1".to_string());
+    let session_dir = temp.path().join("session");
+    let runner = WorkflowRunner::new(config, tasks, session_dir.clone());
+    let launch = runner
+        .launch_background(WorkflowLaunchRequest::from_script_path(
+            script.display().to_string(),
+        ))
+        .unwrap();
+
+    let store = WorkflowStateStore::new(session_dir.join("workflow-runs"));
+    let run_id = launch.output.run_id.as_deref().expect("run id");
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let mut live_state = None;
+    while std::time::Instant::now() < deadline {
+        let state = store.load_run(run_id).expect("run state");
+        if state.status == WorkflowRunStatus::Running && state.total_agent_count == 1 {
+            live_state = Some(state);
+            break;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+
+    let live_state = live_state.expect("running state should include live phase progress");
+    assert_eq!(live_state.phases.len(), 1);
+    assert_eq!(live_state.phases[0].name, "scan");
+    assert_eq!(live_state.phases[0].status, WorkflowRunStatus::Running);
+    assert_eq!(live_state.phases[0].agent_count, 1);
+
+    launch.join().unwrap().unwrap();
+}
+
+#[test]
 fn workflow_runner_stops_when_control_file_is_requested() {
     if !orca_runtime::workflow::host::WorkflowHost::node_available() {
         return;

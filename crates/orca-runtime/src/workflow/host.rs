@@ -76,6 +76,24 @@ impl WorkflowHost {
     where
         F: Fn(AgentCall) -> io::Result<HostCommand> + Send + Sync,
     {
+        Self::run_collecting_events_with_agent_and_event_callback(
+            script_path,
+            args,
+            on_agent_call,
+            |_| Ok(()),
+        )
+    }
+
+    pub fn run_collecting_events_with_agent_and_event_callback<F, E>(
+        script_path: &Path,
+        args: Value,
+        on_agent_call: F,
+        mut on_event: E,
+    ) -> io::Result<Vec<HostEvent>>
+    where
+        F: Fn(AgentCall) -> io::Result<HostCommand> + Send + Sync,
+        E: FnMut(&HostEvent) -> io::Result<()>,
+    {
         let host_path = ensure_host_file()?;
         let args_json = serde_json::to_string(&args)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
@@ -120,6 +138,7 @@ impl WorkflowHost {
                     event,
                     HostEvent::WorkflowCompleted { .. } | HostEvent::WorkflowFailed { .. }
                 );
+                on_event(&event)?;
                 if let HostEvent::AgentCall {
                     call_id,
                     call_path,

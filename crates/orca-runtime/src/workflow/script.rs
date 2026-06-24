@@ -174,11 +174,35 @@ fn parse_workflow_meta(script: &str) -> io::Result<WorkflowMeta> {
         }
     }
 
+    if phases.is_none() {
+        phases = parse_exported_phases(script)?;
+    }
+
     Ok(WorkflowMeta {
         name: name.ok_or_else(|| missing_meta_field("name"))?,
         description: description.ok_or_else(|| missing_meta_field("description"))?,
         phases: phases.ok_or_else(|| missing_meta_field("phases"))?,
     })
+}
+
+fn parse_exported_phases(script: &str) -> io::Result<Option<Vec<String>>> {
+    let Some(export_index) = script.find("export const phases") else {
+        return Ok(None);
+    };
+    let Some(equals_offset) = script[export_index..].find('=') else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "missing phases assignment",
+        ));
+    };
+    let value_start = export_index + equals_offset + 1;
+    let array_start = script[value_start..]
+        .find('[')
+        .map(|offset| value_start + offset)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing phases array"))?;
+    let array_end = find_matching_bracket(script, array_start)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "unterminated phases array"))?;
+    parse_phase_names(&script[array_start..=array_end]).map(Some)
 }
 
 fn find_matching_brace(script: &str, object_start: usize) -> Option<usize> {
@@ -207,6 +231,44 @@ fn find_matching_brace(script: &str, object_start: usize) -> Option<usize> {
             '\'' | '"' => quote = Some(ch),
             '{' => depth += 1,
             '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(absolute);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn find_matching_bracket(script: &str, array_start: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+
+    for (index, ch) in script[array_start..].char_indices() {
+        let absolute = array_start + index;
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                continue;
+            }
+            if ch == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            '[' => depth += 1,
+            ']' => {
                 depth -= 1;
                 if depth == 0 {
                     return Some(absolute);
@@ -323,6 +385,10 @@ fn parse_quoted_string(input: &str) -> io::Result<String> {
 }
 
 fn parse_phases(input: &str) -> io::Result<Vec<String>> {
+    parse_phase_names(input)
+}
+
+fn parse_phase_names(input: &str) -> io::Result<Vec<String>> {
     let trimmed = input.trim();
     if !trimmed.starts_with('[') || !trimmed.ends_with(']') {
         return Err(io::Error::new(
@@ -338,8 +404,36 @@ fn parse_phases(input: &str) -> io::Result<Vec<String>> {
 
     split_top_level(body, ',')
         .into_iter()
-        .map(parse_quoted_string)
+        .map(parse_phase_name)
         .collect()
+}
+
+fn parse_phase_name(input: &str) -> io::Result<String> {
+    let trimmed = input.trim();
+    if trimmed.starts_with('\'') || trimmed.starts_with('"') {
+        return parse_quoted_string(trimmed);
+    }
+    if !trimmed.starts_with('{') || !trimmed.ends_with('}') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "expected quoted string or phase object",
+        ));
+    }
+
+    let body = &trimmed[1..trimmed.len() - 1];
+    for field in split_top_level(body, ',') {
+        let Some((key, value)) = split_key_value(field.trim()) else {
+            continue;
+        };
+        if key.trim() == "name" {
+            return parse_quoted_string(value);
+        }
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        "workflow phase object missing `name`",
+    ))
 }
 
 fn missing_meta_field(field: &str) -> io::Error {
@@ -369,6 +463,16 @@ mod tests {
         .unwrap();
         assert_eq!(meta.name, "audit");
         assert!(meta.phases.is_empty());
+    }
+
+    #[test]
+    fn parser_accepts_phases_exported_separately_from_meta() {
+        let meta = parse_workflow_meta(
+            "export const meta = { name: \"audit\", description: \"Audit code\" };\nexport const phases = [\"scan\", \"review\"];",
+        )
+        .unwrap();
+        assert_eq!(meta.name, "audit");
+        assert_eq!(meta.phases, vec!["scan", "review"]);
     }
 
     #[test]

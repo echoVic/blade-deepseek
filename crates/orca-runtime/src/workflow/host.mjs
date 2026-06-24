@@ -81,6 +81,61 @@ async function pipeline(items) {
   return previous;
 }
 
+async function runWorkflowPhases(phaseDefinitions) {
+  let previousPhaseResults = [];
+  const allPhaseResults = [];
+
+  for (const phaseDefinition of phaseDefinitions) {
+    const phaseName = String(phaseDefinition?.name ?? phaseDefinition?.description ?? `phase-${allPhaseResults.length + 1}`);
+    const tasks = Array.isArray(phaseDefinition?.tasks) ? phaseDefinition.tasks : [];
+    const phaseResults = await phase(phaseName, async () => runWorkflowTasks(tasks, previousPhaseResults, phaseDefinition));
+    previousPhaseResults = phaseResults;
+    allPhaseResults.push({ name: phaseName, results: phaseResults });
+  }
+
+  return { phases: allPhaseResults };
+}
+
+async function runWorkflowTasks(tasks, previousPhaseResults, phaseDefinition) {
+  if (tasks.length === 0) {
+    return [];
+  }
+
+  if (phaseDefinition?.parallel === true) {
+    return Promise.all(tasks.map((task) => runWorkflowTask(task, previousPhaseResults)));
+  }
+
+  const results = [];
+  for (const task of tasks) {
+    results.push(await runWorkflowTask(task, previousPhaseResults));
+  }
+  return results;
+}
+
+async function runWorkflowTask(task, previousPhaseResults) {
+  if (task?.type && task.type !== "agent") {
+    throw new Error(`Unsupported workflow task type: ${task.type}`);
+  }
+  const prompt = task?.prompt;
+  if (typeof prompt !== "string" || prompt.trim().length === 0) {
+    throw new Error("Workflow task missing `prompt`");
+  }
+
+  const opts = Object.assign(Object.create(null), task);
+  delete opts.type;
+  delete opts.prompt;
+
+  return agent(enrichTaskPrompt(prompt, previousPhaseResults), opts);
+}
+
+function enrichTaskPrompt(prompt, previousPhaseResults) {
+  if (!Array.isArray(previousPhaseResults) || previousPhaseResults.length === 0) {
+    return prompt;
+  }
+
+  return `${prompt}\n\n[Previous phase outputs]\n${JSON.stringify(previousPhaseResults, null, 2)}`;
+}
+
 async function phase(name, body) {
   if (typeof body !== "function") {
     if (activeMarkerPhase === name) {
@@ -191,8 +246,14 @@ async function loadWorkflowModule() {
       "use strict";
       return (async () => {
         let __workflow_default__ = null;
+        let __workflow_default_set__ = false;
         ${transformed}
-        return { meta, default: __workflow_default__ };
+        return {
+          meta,
+          phases: typeof phases === "undefined" ? null : phases,
+          default: __workflow_default__,
+          defaultSet: __workflow_default_set__,
+        };
       })();
     `,
     [],
@@ -335,7 +396,7 @@ function matchWorkflowExport(source, startIndex) {
 
     const secondTokenEnd = readIdentifierEnd(source, secondTokenStart + 1);
     const secondToken = source.slice(secondTokenStart, secondTokenEnd);
-    if (secondToken !== "meta") {
+    if (secondToken !== "meta" && secondToken !== "phases") {
       return null;
     }
 
@@ -355,7 +416,7 @@ function matchWorkflowExport(source, startIndex) {
     return {
       start: startIndex,
       end: firstTokenEnd,
-      text: `${source.slice(exportEnd, firstTokenStart)}__workflow_default__ =`,
+      text: `${source.slice(exportEnd, firstTokenStart)}__workflow_default_set__ = true; __workflow_default__ =`,
     };
   }
 
@@ -677,8 +738,18 @@ function isIdentifierPart(char) {
 
 try {
   const namespace = await loadWorkflowModule();
+  const phaseDefinitions = Array.isArray(namespace.phases)
+    ? namespace.phases
+    : Array.isArray(namespace.meta?.phases)
+      ? namespace.meta.phases
+      : null;
+  const result = namespace.defaultSet
+    ? namespace.default
+    : Array.isArray(phaseDefinitions) && phaseDefinitions.some((phaseDefinition) => typeof phaseDefinition === "object")
+      ? await runWorkflowPhases(phaseDefinitions)
+      : null;
   completeActiveMarkerPhase();
-  emit({ type: "workflow_completed", result: namespace.default ?? null });
+  emit({ type: "workflow_completed", result: result ?? null });
 } catch (error) {
   emit({ type: "workflow_failed", error: error?.stack ?? String(error) });
   process.exitCode = 1;

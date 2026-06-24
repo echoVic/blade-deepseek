@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::sync::mpsc;
 use std::time::Instant;
 
@@ -46,6 +47,14 @@ pub enum TuiEvent {
         status: String,
         output: Option<String>,
         error: Option<String>,
+    },
+    WorkflowTasksUpdated {
+        tasks: Vec<BackgroundTaskSummary>,
+    },
+    WorkflowNotification {
+        prompt: String,
+        status: String,
+        summary: String,
     },
     ApprovalNeeded {
         id: String,
@@ -195,10 +204,8 @@ impl ApprovalDialog {
     /// only shown when a target is present AND the tool is likely to be
     /// called again with the same target (e.g. reading a fixed file path).
     pub fn options_for(tool: &str, target: Option<&str>) -> Vec<ApprovalOption> {
-        let show_always_target = target.is_some()
-            && !Self::DYNAMIC_TARGET_TOOLS
-                .iter()
-                .any(|t| tool.contains(t));
+        let show_always_target =
+            target.is_some() && !Self::DYNAMIC_TARGET_TOOLS.iter().any(|t| tool.contains(t));
 
         if show_always_target {
             vec![
@@ -259,6 +266,7 @@ pub struct SubMenu {
 pub struct AppState {
     pub messages: Vec<ChatMessage>,
     pub status: AppStatus,
+    pub running_started_at: Option<Instant>,
     pub scroll_offset: u16,
     pub auto_scroll: bool,
     pub total_lines: u16,
@@ -291,6 +299,7 @@ pub struct AppState {
     pub current_goal: Option<ThreadGoal>,
     pub panel_mode: PanelMode,
     pub workflow_panel: WorkflowPanelState,
+    pub pending_workflow_notifications: VecDeque<String>,
     pub tick: u64,
 }
 
@@ -304,6 +313,7 @@ impl AppState {
         Self {
             messages: Vec::new(),
             status: AppStatus::Idle,
+            running_started_at: None,
             scroll_offset: 0,
             auto_scroll: true,
             total_lines: 0,
@@ -333,7 +343,29 @@ impl AppState {
             current_goal: None,
             panel_mode: PanelMode::Conversation,
             workflow_panel: WorkflowPanelState::default(),
+            pending_workflow_notifications: VecDeque::new(),
             tick: 0,
+        }
+    }
+
+    pub fn enter_running(&mut self) {
+        if self.running_started_at.is_none() {
+            self.running_started_at = Some(Instant::now());
+        }
+        self.status = AppStatus::Running;
+    }
+
+    pub fn set_status(&mut self, status: AppStatus) {
+        if status == AppStatus::Running {
+            self.enter_running();
+        } else if matches!(
+            status,
+            AppStatus::WaitingApproval | AppStatus::WaitingUserInput
+        ) {
+            self.status = status;
+        } else {
+            self.status = status;
+            self.running_started_at = None;
         }
     }
 
@@ -535,7 +567,7 @@ impl AppState {
     pub fn update(&mut self, event: TuiEvent) {
         match event {
             TuiEvent::TurnStarted { .. } => {
-                self.status = AppStatus::Running;
+                self.enter_running();
             }
             TuiEvent::ReasoningDelta(text) => {
                 if let Some(ChatMessage::Reasoning(existing)) = self.messages.last_mut() {
@@ -685,13 +717,29 @@ impl AppState {
                     });
                 }
             }
+            TuiEvent::WorkflowTasksUpdated { tasks } => {
+                self.workflow_panel.tasks = tasks;
+                if self.workflow_panel.selected >= self.workflow_panel.tasks.len() {
+                    self.workflow_panel.selected = self.workflow_panel.tasks.len().saturating_sub(1);
+                }
+            }
+            TuiEvent::WorkflowNotification {
+                prompt,
+                status,
+                summary,
+            } => {
+                self.pending_workflow_notifications.push_back(prompt);
+                self.messages.push(ChatMessage::System(format!(
+                    "Workflow {status}. {summary}"
+                )));
+            }
             TuiEvent::ApprovalNeeded {
                 tool,
                 target,
                 preview,
                 ..
             } => {
-                self.status = AppStatus::WaitingApproval;
+                self.set_status(AppStatus::WaitingApproval);
                 let options = ApprovalDialog::options_for(&tool, target.as_deref());
                 self.approval_dialog = Some(ApprovalDialog {
                     tool,
@@ -704,7 +752,7 @@ impl AppState {
             TuiEvent::UserInputRequested {
                 question, choices, ..
             } => {
-                self.status = AppStatus::WaitingUserInput;
+                self.set_status(AppStatus::WaitingUserInput);
                 let mut message = question;
                 if !choices.is_empty() {
                     message.push_str("\nChoices: ");
@@ -730,7 +778,7 @@ impl AppState {
             }
             TuiEvent::SessionCompleted { .. } => {
                 self.promote_trailing_reasoning();
-                self.status = AppStatus::Idle;
+                self.set_status(AppStatus::Idle);
             }
             TuiEvent::Compacted {
                 before_messages,
@@ -739,26 +787,33 @@ impl AppState {
                 self.messages.push(ChatMessage::System(format!(
                     "Compacted conversation context: {before_messages} -> {after_messages} messages."
                 )));
-                self.status = AppStatus::Idle;
+                self.set_status(AppStatus::Idle);
             }
             TuiEvent::GoalUpdated(goal) => {
                 let summary = orca_core::goal_types::goal_usage_summary(&goal);
                 let label = orca_core::goal_types::goal_status_label(goal.status);
+                let should_keep_running =
+                    self.status == AppStatus::Running && goal.status.should_continue();
                 self.current_goal = Some(goal);
                 self.messages
                     .push(ChatMessage::System(format!("Goal {label}. {summary}")));
-                self.status = AppStatus::Idle;
+                if !should_keep_running {
+                    self.set_status(AppStatus::Idle);
+                }
             }
             TuiEvent::GoalCleared => {
                 self.current_goal = None;
                 self.messages
                     .push(ChatMessage::System("Goal cleared.".to_string()));
-                self.status = AppStatus::Idle;
+                self.set_status(AppStatus::Idle);
             }
             TuiEvent::GoalStatus(goal) => {
                 self.current_goal = goal.clone();
+                let mut should_keep_running = false;
                 match goal {
                     Some(goal) => {
+                        should_keep_running =
+                            self.status == AppStatus::Running && goal.status.should_continue();
                         let label = orca_core::goal_types::goal_status_label(goal.status);
                         let summary = orca_core::goal_types::goal_usage_summary(&goal);
                         self.messages
@@ -768,7 +823,9 @@ impl AppState {
                         .messages
                         .push(ChatMessage::System("No goal is currently set.".to_string())),
                 }
-                self.status = AppStatus::Idle;
+                if !should_keep_running {
+                    self.set_status(AppStatus::Idle);
+                }
             }
             TuiEvent::Backtracked { prompt } => {
                 self.remove_after_last_user();
@@ -776,7 +833,7 @@ impl AppState {
                     "Backtracked to previous prompt: {}",
                     prompt.trim()
                 )));
-                self.status = AppStatus::Idle;
+                self.set_status(AppStatus::Idle);
             }
         }
     }
@@ -1175,5 +1232,101 @@ mod tests {
 
         assert_eq!(state.panel_mode, PanelMode::Workflows);
         assert_eq!(state.workflow_panel.selected, 0);
+    }
+
+    #[test]
+    fn workflow_events_update_panel_and_queue_model_notification() {
+        let mut state = state();
+        state.workflow_panel.selected = 9;
+
+        state.update(TuiEvent::WorkflowTasksUpdated {
+            tasks: vec![BackgroundTaskSummary {
+                id: "task-1".to_string(),
+                task_type: TaskType::Workflow,
+                status: TaskStatus::Completed,
+                description: "demo".to_string(),
+                command: None,
+                agent_type: None,
+                server: None,
+                tool: None,
+                name: Some("audit".to_string()),
+                workflow_run_id: Some("workflow-run-1".to_string()),
+                phase_count: Some(2),
+            }],
+        });
+        state.update(TuiEvent::WorkflowNotification {
+            prompt: "<task-notification>done</task-notification>".to_string(),
+            status: "completed".to_string(),
+            summary: "audit: done".to_string(),
+        });
+
+        assert_eq!(state.workflow_panel.tasks.len(), 1);
+        assert_eq!(state.workflow_panel.selected, 0);
+        assert_eq!(
+            state.pending_workflow_notifications.pop_front().as_deref(),
+            Some("<task-notification>done</task-notification>")
+        );
+        assert!(matches!(
+            state.messages.last(),
+            Some(ChatMessage::System(message)) if message.contains("Workflow completed. audit: done")
+        ));
+    }
+
+    #[test]
+    fn active_goal_updates_do_not_mark_running_app_idle() {
+        let mut state = state();
+        state.status = AppStatus::Running;
+        let goal = ThreadGoal {
+            session_id: "session-1".to_string(),
+            objective: "keep going".to_string(),
+            status: orca_core::goal_types::ThreadGoalStatus::Active,
+            token_budget: None,
+            tokens_used: 10,
+            time_used_seconds: 1,
+            created_at: 1,
+            updated_at: 1,
+        };
+
+        state.update(TuiEvent::GoalStatus(Some(goal.clone())));
+        assert_eq!(state.status, AppStatus::Running);
+
+        state.update(TuiEvent::GoalUpdated(goal));
+        assert_eq!(state.status, AppStatus::Running);
+    }
+
+    #[test]
+    fn running_timer_starts_and_stops_with_running_status() {
+        let mut state = state();
+        assert!(state.running_started_at.is_none());
+
+        state.update(TuiEvent::TurnStarted { turn: 1 });
+        assert!(state.running_started_at.is_some());
+
+        state.update(TuiEvent::SessionCompleted {
+            status: "success".to_string(),
+        });
+        assert_eq!(state.status, AppStatus::Idle);
+        assert!(state.running_started_at.is_none());
+    }
+
+    #[test]
+    fn approval_round_trip_preserves_running_timer() {
+        let mut state = state();
+        state.update(TuiEvent::TurnStarted { turn: 1 });
+        let started_at = Instant::now() - std::time::Duration::from_secs(65);
+        state.running_started_at = Some(started_at);
+
+        state.update(TuiEvent::ApprovalNeeded {
+            id: "approval-1".to_string(),
+            tool: "bash".to_string(),
+            target: Some("cargo test".to_string()),
+            preview: None,
+        });
+        assert_eq!(state.status, AppStatus::WaitingApproval);
+        assert_eq!(state.running_started_at, Some(started_at));
+
+        state.enter_running();
+        assert_eq!(state.status, AppStatus::Running);
+        assert_eq!(state.running_started_at, Some(started_at));
     }
 }

@@ -174,7 +174,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
     } else {
         if let Some(prompt) = initial_prompt.clone() {
             state.messages.push(ChatMessage::User(prompt.clone()));
-            state.status = AppStatus::Running;
+            state.enter_running();
             let _ = action_tx.send(UserAction::Submit(prompt));
         }
         make_textarea(&vim_state, &theme)
@@ -309,13 +309,13 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                             // Completion screen — Enter to start
                             match key.code {
                                 KeyCode::Enter => {
-                                    state.status = AppStatus::Idle;
+                                    state.set_status(AppStatus::Idle);
                                     state.setup_step = 0;
                                     textarea = make_textarea(&vim_state, &theme);
 
                                     if let Some(prompt) = initial_prompt.clone() {
                                         state.messages.push(ChatMessage::User(prompt.clone()));
-                                        state.status = AppStatus::Running;
+                                        state.enter_running();
                                         let _ = action_tx.send(UserAction::Submit(prompt));
                                     }
                                 }
@@ -365,11 +365,11 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                                         *preloaded = Some(transcript);
                                     }
                                 }
-                                state.status = AppStatus::Idle;
+                                state.set_status(AppStatus::Idle);
                             }
                         }
                         KeyCode::Esc => {
-                            state.status = AppStatus::Idle;
+                            state.set_status(AppStatus::Idle);
                             state.session_picker_sessions.clear();
                             state.session_picker_query.clear();
                         }
@@ -477,20 +477,16 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                                             textarea = make_textarea(&vim_state, &theme);
                                             continue;
                                         }
-                                        SlashOutcome::Exit(code) => {
-                                            exit_code = code;
-                                            break;
-                                        }
                                     }
                                 }
                                 if state.status == AppStatus::WaitingUserInput {
-                                    state.status = AppStatus::Running;
+                                    state.enter_running();
                                     state.scroll_to_bottom();
                                     let _ = action_tx.send(UserAction::RespondToUserInput(text));
                                 } else {
                                     state.record_prompt(text.clone());
                                     state.messages.push(ChatMessage::User(text.clone()));
-                                    state.status = AppStatus::Running;
+                                    state.enter_running();
                                     state.scroll_to_bottom();
                                     let _ = action_tx.send(UserAction::Submit(text));
                                 }
@@ -640,7 +636,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                 && state.approval_is_allowlisted(tool, target.as_deref())
             {
                 let _ = action_tx.send(UserAction::Approve(true));
-                state.status = AppStatus::Running;
+                state.enter_running();
                 continue;
             }
             let backtracked_prompt = match &tui_event {
@@ -652,6 +648,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                 vim_state.reset_insert(&mut textarea, &theme);
                 textarea = make_textarea_with_text(&prompt, &vim_state, &theme);
             }
+            submit_pending_workflow_notification(&mut state, &action_tx);
             if state.auto_scroll {
                 state.scroll_to_bottom();
             }
@@ -667,6 +664,20 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
     terminal::disable_raw_mode()?;
 
     Ok(exit_code)
+}
+
+fn submit_pending_workflow_notification(
+    state: &mut AppState,
+    action_tx: &mpsc::Sender<UserAction>,
+) {
+    if state.status != AppStatus::Idle {
+        return;
+    }
+    if let Some(prompt) = state.pending_workflow_notifications.pop_front() {
+        state.enter_running();
+        state.scroll_to_bottom();
+        let _ = action_tx.send(UserAction::Submit(prompt));
+    }
 }
 
 fn shorten_home(path: &str) -> String {
@@ -857,7 +868,6 @@ mod tests {
             UserAction::GoalEdit("better goal".to_string()),
             UserAction::GoalClear,
             UserAction::GoalPause,
-            UserAction::GoalResume,
         ];
 
         for action in cases {
@@ -889,6 +899,95 @@ mod tests {
                 other => panic!("expected goal control error, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn empty_recorded_agent_loop_goal_resume_without_active_goal_reports_none() {
+        with_orca_home(|_| {
+            let config = Arc::new(Mutex::new(test_config(HistoryMode::Record)));
+            let preloaded = Arc::new(Mutex::new(None));
+            let (event_tx, event_rx) = mpsc::channel();
+            let (action_tx, action_rx) = mpsc::channel();
+            let cancel = CancelToken::new();
+
+            let handle = std::thread::spawn({
+                let config = Arc::clone(&config);
+                let preloaded = Arc::clone(&preloaded);
+                let cancel = cancel.clone();
+                move || agent_loop_thread(config, preloaded, event_tx, action_rx, cancel)
+            });
+
+            action_tx.send(UserAction::GoalResume).unwrap();
+            let event = event_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            cancel.cancel();
+            action_tx.send(UserAction::Cancel).unwrap();
+            handle.join().unwrap();
+
+            assert!(matches!(event, TuiEvent::GoalStatus(None)));
+        });
+    }
+
+    #[test]
+    fn empty_recorded_agent_loop_goal_resume_restores_latest_active_goal() {
+        with_orca_home(|home| {
+            let mut writer =
+                history::SessionWriter::start(home, "mock", Some("auto".to_string()), "goal")
+                    .unwrap();
+            writer
+                .append_message(&orca_core::conversation::Message::user(
+                    "previous goal work".to_string(),
+                ))
+                .unwrap();
+            writer.complete("approval_required").unwrap();
+            let old_session_id = history::load_session("latest").unwrap().meta.session_id;
+
+            orca_runtime::goals::GoalStore::load_default()
+                .replace(
+                    &old_session_id,
+                    "resume me",
+                    orca_core::goal_types::ThreadGoalStatus::Active,
+                    None,
+                )
+                .unwrap();
+
+            let config = Arc::new(Mutex::new(test_config(HistoryMode::Record)));
+            let preloaded = Arc::new(Mutex::new(None));
+            let (event_tx, event_rx) = mpsc::channel();
+            let (action_tx, action_rx) = mpsc::channel();
+            let cancel = CancelToken::new();
+
+            let handle = std::thread::spawn({
+                let config = Arc::clone(&config);
+                let preloaded = Arc::clone(&preloaded);
+                let cancel = cancel.clone();
+                move || agent_loop_thread(config, preloaded, event_tx, action_rx, cancel)
+            });
+
+            action_tx.send(UserAction::GoalResume).unwrap();
+            let event = event_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            cancel.cancel();
+            action_tx.send(UserAction::Cancel).unwrap();
+            handle.join().unwrap();
+
+            let new_session_id = match event {
+                TuiEvent::GoalUpdated(goal) => {
+                    assert_eq!(goal.objective, "resume me");
+                    assert_eq!(goal.status, orca_core::goal_types::ThreadGoalStatus::Active);
+                    assert_ne!(goal.session_id, old_session_id);
+                    goal.session_id
+                }
+                other => panic!("expected resumed goal update, got {other:?}"),
+            };
+            let store = orca_runtime::goals::GoalStore::load_default();
+            assert_eq!(
+                store.get(&old_session_id).unwrap().unwrap().status,
+                orca_core::goal_types::ThreadGoalStatus::Paused
+            );
+            assert_eq!(
+                store.get(&new_session_id).unwrap().unwrap().status,
+                orca_core::goal_types::ThreadGoalStatus::Active
+            );
+        });
     }
 
     #[test]
@@ -1015,6 +1114,186 @@ mod tests {
             }
             other => panic!("expected recorded-history error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn idle_app_submits_pending_workflow_notification() {
+        let (mut state, _rx) = test_state();
+        let (action_tx, action_rx) = mpsc::channel();
+        state
+            .pending_workflow_notifications
+            .push_back("<task-notification>done</task-notification>".to_string());
+
+        submit_pending_workflow_notification(&mut state, &action_tx);
+
+        assert_eq!(state.status, AppStatus::Running);
+        assert!(matches!(
+            action_rx.try_recv(),
+            Ok(UserAction::Submit(prompt)) if prompt == "<task-notification>done</task-notification>"
+        ));
+    }
+
+    #[test]
+    fn slash_menu_tab_opens_history_picker_like_enter() {
+        with_orca_home(|home| {
+            orca_runtime::history::SessionWriter::start(
+                home,
+                "mock",
+                Some("auto".to_string()),
+                "history tab test",
+            )
+            .unwrap();
+
+            let (mut state, _rx) = test_state();
+            state.status = AppStatus::Idle;
+            state.slash_menu = Some(SlashMenu {
+                items: commands::all_commands()
+                    .iter()
+                    .map(|(command, description)| SlashMenuItem {
+                        command,
+                        description,
+                    })
+                    .collect(),
+                selected: commands::all_commands()
+                    .iter()
+                    .position(|(command, _)| *command == "/history")
+                    .unwrap(),
+                sub_menu: None,
+            });
+            let mut config = test_config(HistoryMode::Record);
+            let shared_config = Arc::new(Mutex::new(config.clone()));
+            let (action_tx, _action_rx) = mpsc::channel();
+            let theme = Theme::named(ThemeName::Dark);
+            let mut textarea = make_textarea(&VimState::new(false), &theme);
+            let vim_state = VimState::new(false);
+            let event = Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Tab,
+                crossterm::event::KeyModifiers::NONE,
+            ));
+            let key = match &event {
+                Event::Key(key) => key,
+                _ => unreachable!(),
+            };
+
+            assert!(handle_slash_menu_key(
+                &event,
+                key,
+                &mut state,
+                &mut config,
+                &shared_config,
+                &action_tx,
+                &mut textarea,
+                &vim_state,
+                &theme,
+            ));
+
+            assert_eq!(state.status, AppStatus::SessionPicker);
+            assert!(!state.session_picker_sessions.is_empty());
+            assert!(state.slash_menu.is_none());
+        });
+    }
+
+    #[test]
+    fn slash_menu_tab_completes_goal_objective_prefix_without_dispatching() {
+        let (mut state, _rx) = test_state();
+        state.status = AppStatus::Idle;
+        state.slash_menu = Some(SlashMenu {
+            items: commands::all_commands()
+                .iter()
+                .map(|(command, description)| SlashMenuItem {
+                    command,
+                    description,
+                })
+                .collect(),
+            selected: commands::all_commands()
+                .iter()
+                .position(|(command, _)| *command == "/goal")
+                .unwrap(),
+            sub_menu: None,
+        });
+        let mut config = test_config(HistoryMode::Record);
+        let shared_config = Arc::new(Mutex::new(config.clone()));
+        let (action_tx, action_rx) = mpsc::channel();
+        let theme = Theme::named(ThemeName::Dark);
+        let mut textarea = make_textarea(&VimState::new(false), &theme);
+        let vim_state = VimState::new(false);
+        let event = Event::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Tab,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        let key = match &event {
+            Event::Key(key) => key,
+            _ => unreachable!(),
+        };
+
+        assert!(handle_slash_menu_key(
+            &event,
+            key,
+            &mut state,
+            &mut config,
+            &shared_config,
+            &action_tx,
+            &mut textarea,
+            &vim_state,
+            &theme,
+        ));
+
+        assert_eq!(textarea_text(&textarea), "/goal ");
+        assert_eq!(state.status, AppStatus::Idle);
+        assert!(state.slash_menu.is_none());
+        assert!(action_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn slash_submenu_tab_applies_model_like_enter() {
+        let (mut state, _rx) = test_state();
+        state.slash_menu = Some(SlashMenu {
+            items: Vec::new(),
+            selected: 0,
+            sub_menu: Some(SubMenu {
+                title: "/model".to_string(),
+                items: vec!["deepseek-v4-pro".to_string()],
+                selected: 0,
+            }),
+        });
+        let mut config = test_config(HistoryMode::Record);
+        let shared_config = Arc::new(Mutex::new(config.clone()));
+        let (action_tx, action_rx) = mpsc::channel();
+        let theme = Theme::named(ThemeName::Dark);
+        let mut textarea = make_textarea(&VimState::new(false), &theme);
+        let vim_state = VimState::new(false);
+        let event = Event::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Tab,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        let key = match &event {
+            Event::Key(key) => key,
+            _ => unreachable!(),
+        };
+
+        assert!(handle_slash_menu_key(
+            &event,
+            key,
+            &mut state,
+            &mut config,
+            &shared_config,
+            &action_tx,
+            &mut textarea,
+            &vim_state,
+            &theme,
+        ));
+
+        assert_eq!(state.model_name, "deepseek-v4-pro");
+        assert_eq!(config.model.display_name(), "deepseek-v4-pro");
+        assert_eq!(
+            shared_config.lock().unwrap().model.display_name(),
+            "deepseek-v4-pro"
+        );
+        assert!(matches!(
+            action_rx.try_recv(),
+            Ok(UserAction::SetModel(model)) if model == "deepseek-v4-pro"
+        ));
+        assert!(state.slash_menu.is_none());
     }
 
     #[test]
@@ -1238,15 +1517,7 @@ fn handle_slash_menu_key(
                 }
                 return true;
             }
-            KeyCode::Tab => {
-                let chosen = sub.items[sub.selected].clone();
-                let value = chosen.split_whitespace().next().unwrap_or(&chosen);
-                *textarea =
-                    make_textarea_with_text(&format!("{} {value}", sub.title), vim_state, theme);
-                state.slash_menu = None;
-                return true;
-            }
-            KeyCode::Enter => {
+            KeyCode::Tab | KeyCode::Enter => {
                 let chosen = sub.items[sub.selected].clone();
                 // Execute the sub-command
                 if sub.title == "/model" {
@@ -1304,146 +1575,39 @@ fn handle_slash_menu_key(
         }
         KeyCode::Tab => {
             let selected_cmd = menu.items[menu.selected].command;
-            // Tab acts like Enter — directly execute the selected command
-            match selected_cmd {
-                "/model" => {
-                    let models: Vec<String> = commands::available_models()
-                        .iter()
-                        .map(|s| match *s {
-                            "auto" => "auto (pro + flash for aux)".to_string(),
-                            other => other.to_string(),
-                        })
-                        .collect();
-                    state.slash_menu = Some(SlashMenu {
-                        items: menu.items.clone(),
-                        selected: menu.selected,
-                        sub_menu: Some(SubMenu {
-                            title: "/model".to_string(),
-                            items: models,
-                            selected: 0,
-                        }),
-                    });
-                }
-                "/mode" => {
-                    let modes = vec![
-                        "suggest".to_string(),
-                        "auto-edit".to_string(),
-                        "full-auto".to_string(),
-                    ];
-                    state.slash_menu = Some(SlashMenu {
-                        items: menu.items.clone(),
-                        selected: menu.selected,
-                        sub_menu: Some(SubMenu {
-                            title: "/mode".to_string(),
-                            items: modes,
-                            selected: 0,
-                        }),
-                    });
-                }
-                "/remember" => {
-                    *textarea = make_textarea_with_text("/remember ", vim_state, theme);
-                    state.slash_menu = None;
-                }
-                _ => {
-                    *textarea = make_textarea_with_text(selected_cmd, vim_state, theme);
-                    state.slash_menu = None;
-                    if let Some(outcome) =
-                        handle_slash_command(selected_cmd, config, shared_config, state, action_tx)
-                    {
-                        match outcome {
-                            SlashOutcome::Continue => {
-                                *textarea = make_textarea(vim_state, theme);
-                            }
-                            SlashOutcome::Exit(_) => {}
-                        }
-                    }
-                    *textarea = make_textarea(vim_state, theme);
-                }
+            if selected_cmd == "/goal" {
+                *textarea = make_textarea_with_text("/goal ", vim_state, theme);
+                state.slash_menu = None;
+                return true;
             }
+            select_slash_menu_command(
+                selected_cmd,
+                menu.items.clone(),
+                menu.selected,
+                state,
+                config,
+                shared_config,
+                action_tx,
+                textarea,
+                vim_state,
+                theme,
+            );
             true
         }
         KeyCode::Enter => {
             let selected_cmd = menu.items[menu.selected].command;
-            match selected_cmd {
-                "/model" => {
-                    let models: Vec<String> = commands::available_models()
-                        .iter()
-                        .map(|s| match *s {
-                            "auto" => "auto (pro + flash for aux)".to_string(),
-                            other => other.to_string(),
-                        })
-                        .collect();
-                    state.slash_menu = Some(SlashMenu {
-                        items: menu.items.clone(),
-                        selected: menu.selected,
-                        sub_menu: Some(SubMenu {
-                            title: "/model".to_string(),
-                            items: models,
-                            selected: 0,
-                        }),
-                    });
-                }
-                "/mode" => {
-                    let modes = vec![
-                        "suggest".to_string(),
-                        "auto-edit".to_string(),
-                        "full-auto".to_string(),
-                    ];
-                    state.slash_menu = Some(SlashMenu {
-                        items: menu.items.clone(),
-                        selected: menu.selected,
-                        sub_menu: Some(SubMenu {
-                            title: "/mode".to_string(),
-                            items: modes,
-                            selected: 0,
-                        }),
-                    });
-                }
-                "/remember" => {
-                    // Leave "/remember " in textarea for user to type the note
-                    *textarea = make_textarea_with_text("/remember ", vim_state, theme);
-                    state.slash_menu = None;
-                }
-                "/history" => {
-                    // Open session picker directly
-                    state.slash_menu = None;
-                    *textarea = make_textarea(vim_state, theme);
-                    match orca_runtime::history::list_sessions(20) {
-                        Ok(sessions) if !sessions.is_empty() => {
-                            state.session_picker_sessions = sessions;
-                            state.session_picker_selected = 0;
-                            state.status = AppStatus::SessionPicker;
-                        }
-                        Ok(_) => {
-                            state
-                                .messages
-                                .push(ChatMessage::System("No saved sessions.".to_string()));
-                        }
-                        Err(e) => {
-                            state
-                                .messages
-                                .push(ChatMessage::Error(format!("failed to list history: {e}")));
-                        }
-                    }
-                }
-                _ => {
-                    // Fill command into textarea and submit
-                    *textarea = make_textarea_with_text(selected_cmd, vim_state, theme);
-                    state.slash_menu = None;
-                    // Auto-execute the command
-                    if let Some(outcome) =
-                        handle_slash_command(selected_cmd, config, shared_config, state, action_tx)
-                    {
-                        match outcome {
-                            SlashOutcome::Continue => {
-                                *textarea = make_textarea(vim_state, theme);
-                            }
-                            SlashOutcome::Exit(_) => {}
-                        }
-                    }
-                    *textarea = make_textarea(vim_state, theme);
-                }
-            }
+            select_slash_menu_command(
+                selected_cmd,
+                menu.items.clone(),
+                menu.selected,
+                state,
+                config,
+                shared_config,
+                action_tx,
+                textarea,
+                vim_state,
+                theme,
+            );
             true
         }
         KeyCode::Esc => {
@@ -1455,6 +1619,96 @@ fn handle_slash_menu_key(
             textarea.input(Input::from(ev.clone()));
             update_slash_menu(textarea, state);
             true
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn select_slash_menu_command(
+    selected_cmd: &'static str,
+    menu_items: Vec<SlashMenuItem>,
+    selected: usize,
+    state: &mut AppState,
+    config: &mut RunConfig,
+    shared_config: &Arc<Mutex<RunConfig>>,
+    action_tx: &mpsc::Sender<UserAction>,
+    textarea: &mut TextArea,
+    vim_state: &VimState,
+    theme: &Theme,
+) {
+    match selected_cmd {
+        "/model" => {
+            let models: Vec<String> = commands::available_models()
+                .iter()
+                .map(|s| match *s {
+                    "auto" => "auto (pro + flash for aux)".to_string(),
+                    other => other.to_string(),
+                })
+                .collect();
+            state.slash_menu = Some(SlashMenu {
+                items: menu_items,
+                selected,
+                sub_menu: Some(SubMenu {
+                    title: "/model".to_string(),
+                    items: models,
+                    selected: 0,
+                }),
+            });
+        }
+        "/mode" => {
+            let modes = vec![
+                "suggest".to_string(),
+                "auto-edit".to_string(),
+                "full-auto".to_string(),
+            ];
+            state.slash_menu = Some(SlashMenu {
+                items: menu_items,
+                selected,
+                sub_menu: Some(SubMenu {
+                    title: "/mode".to_string(),
+                    items: modes,
+                    selected: 0,
+                }),
+            });
+        }
+        "/remember" => {
+            *textarea = make_textarea_with_text("/remember ", vim_state, theme);
+            state.slash_menu = None;
+        }
+        "/history" => {
+            state.slash_menu = None;
+            *textarea = make_textarea(vim_state, theme);
+            match orca_runtime::history::list_sessions(20) {
+                Ok(sessions) if !sessions.is_empty() => {
+                    state.session_picker_sessions = sessions;
+                    state.session_picker_selected = 0;
+                    state.status = AppStatus::SessionPicker;
+                }
+                Ok(_) => {
+                    state
+                        .messages
+                        .push(ChatMessage::System("No saved sessions.".to_string()));
+                }
+                Err(e) => {
+                    state
+                        .messages
+                        .push(ChatMessage::Error(format!("failed to list history: {e}")));
+                }
+            }
+        }
+        _ => {
+            *textarea = make_textarea_with_text(selected_cmd, vim_state, theme);
+            state.slash_menu = None;
+            if let Some(outcome) =
+                handle_slash_command(selected_cmd, config, shared_config, state, action_tx)
+            {
+                match outcome {
+                    SlashOutcome::Continue => {
+                        *textarea = make_textarea(vim_state, theme);
+                    }
+                }
+            }
+            *textarea = make_textarea(vim_state, theme);
         }
     }
 }
@@ -1505,9 +1759,9 @@ fn make_setup_textarea<'a>(theme: &Theme) -> TextArea<'a> {
 fn resolve_approval(state: &mut AppState, action_tx: &mpsc::Sender<UserAction>, approved: bool) {
     let _ = action_tx.send(UserAction::Approve(approved));
     if approved {
-        state.status = AppStatus::Running;
+        state.enter_running();
     } else {
-        state.status = AppStatus::Idle;
+        state.set_status(AppStatus::Idle);
     }
     state.approval_dialog = None;
 }
@@ -1615,15 +1869,7 @@ fn existing_goal_session_id(
     config: &Arc<Mutex<RunConfig>>,
     event_tx: &mpsc::Sender<TuiEvent>,
 ) -> Option<String> {
-    if let Some(session_id) = session.and_then(|session| session.session_id().map(str::to_string)) {
-        return Some(session_id);
-    }
-    if let Some(session_id) = preloaded
-        .lock()
-        .unwrap()
-        .as_ref()
-        .map(|transcript| transcript.meta.session_id.clone())
-    {
+    if let Some(session_id) = current_goal_session_id(session, preloaded) {
         return Some(session_id);
     }
 
@@ -1635,6 +1881,20 @@ fn existing_goal_session_id(
     };
     let _ = event_tx.send(TuiEvent::Error(message.to_string()));
     None
+}
+
+fn current_goal_session_id(
+    session: Option<&bridge::TuiConversationSession>,
+    preloaded: &Arc<Mutex<Option<history::SessionTranscript>>>,
+) -> Option<String> {
+    if let Some(session_id) = session.and_then(|session| session.session_id().map(str::to_string)) {
+        return Some(session_id);
+    }
+    preloaded
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|transcript| transcript.meta.session_id.clone())
 }
 
 const MAX_GOAL_CONTINUATIONS: usize = 64;
@@ -1700,6 +1960,19 @@ fn run_goal_turns_for_tui(
             }
         }
         if status != "success" {
+            if let Ok(Some(goal)) = orca_runtime::goals::GoalStore::load_default().get(&session_id)
+                && goal.status.should_continue()
+            {
+                let _ = event_tx.send(TuiEvent::Notice(format!(
+                    "Goal paused because the last turn ended with status `{status}`. Resolve the issue, then use /goal resume to continue."
+                )));
+            }
+            break;
+        }
+        if session.has_active_workflows() {
+            let _ = event_tx.send(TuiEvent::Notice(
+                "Goal is waiting for active workflow tasks to finish.".to_string(),
+            ));
             break;
         }
 
@@ -1713,6 +1986,10 @@ fn run_goal_turns_for_tui(
         };
         let _ = event_tx.send(TuiEvent::GoalStatus(Some(goal.clone())));
         if !goal.status.should_continue() {
+            let label = orca_core::goal_types::goal_status_label(goal.status);
+            let _ = event_tx.send(TuiEvent::Notice(format!(
+                "Goal auto-continuation stopped because the goal is {label}."
+            )));
             break;
         }
         continuation += 1;
@@ -1722,9 +1999,118 @@ fn run_goal_turns_for_tui(
                 orca_core::goal_types::ThreadGoalStatus::UsageLimited,
                 event_tx,
             );
+            let _ = event_tx.send(TuiEvent::Notice(
+                "Goal auto-continuation stopped after reaching the continuation limit.".to_string(),
+            ));
             break;
         }
         prompt = goal_continuation_prompt(&goal.objective, continuation);
+    }
+}
+
+fn resume_latest_active_goal_for_tui(
+    session: &mut Option<bridge::TuiConversationSession>,
+    config: &Arc<Mutex<RunConfig>>,
+    preloaded: &Arc<Mutex<Option<history::SessionTranscript>>>,
+    event_tx: &mpsc::Sender<TuiEvent>,
+    action_rx: &mpsc::Receiver<UserAction>,
+    cancel: &CancelToken,
+) {
+    if matches!(config.lock().unwrap().history_mode, HistoryMode::Disabled) {
+        let _ = event_tx.send(TuiEvent::Error(
+            "persistent goals require recorded history; enable history before using /goal"
+                .to_string(),
+        ));
+        return;
+    }
+
+    let mut store = orca_runtime::goals::GoalStore::load_default();
+    let goal = match store.latest_active() {
+        Ok(Some(goal)) => goal,
+        Ok(None) => {
+            let _ = event_tx.send(TuiEvent::GoalStatus(None));
+            return;
+        }
+        Err(error) => {
+            let _ = event_tx.send(TuiEvent::Error(format!("failed to read goals: {error}")));
+            return;
+        }
+    };
+
+    let transcript = match history::load_session(&goal.session_id) {
+        Ok(transcript) => transcript,
+        Err(error) => {
+            let _ = event_tx.send(TuiEvent::Error(format!(
+                "failed to load goal session {}: {error}",
+                goal.session_id
+            )));
+            return;
+        }
+    };
+
+    let mut cfg = config.lock().unwrap().clone();
+    cfg.history_mode = HistoryMode::Resume(goal.session_id.clone());
+    if let Ok(mut shared) = config.lock() {
+        shared.history_mode = cfg.history_mode.clone();
+    }
+    *preloaded.lock().unwrap() = None;
+
+    let resumed = match bridge::TuiConversationSession::new_with_preloaded(
+        &cfg,
+        &goal.objective,
+        Some(transcript),
+    ) {
+        Ok(session) => session,
+        Err(error) => {
+            let _ = event_tx.send(TuiEvent::Error(format!(
+                "failed to initialize resumed goal session: {error}"
+            )));
+            return;
+        }
+    };
+
+    let Some(new_session_id) = resumed.session_id().map(str::to_string) else {
+        let _ = event_tx.send(TuiEvent::Error(
+            "persistent goals require recorded history; enable history before using /goal"
+                .to_string(),
+        ));
+        return;
+    };
+
+    if new_session_id != goal.session_id {
+        let _ = store.update(
+            &goal.session_id,
+            orca_core::goal_types::GoalUpdate {
+                objective: None,
+                status: Some(orca_core::goal_types::ThreadGoalStatus::Paused),
+                token_budget: None,
+            },
+        );
+    }
+    let active_goal = match store.replace(
+        &new_session_id,
+        &goal.objective,
+        orca_core::goal_types::ThreadGoalStatus::Active,
+        goal.token_budget,
+    ) {
+        Ok(goal) => goal,
+        Err(error) => {
+            let _ = event_tx.send(TuiEvent::Error(format!(
+                "failed to resume goal in new session: {error}"
+            )));
+            return;
+        }
+    };
+
+    *session = Some(resumed);
+    let _ = event_tx.send(TuiEvent::GoalUpdated(active_goal.clone()));
+    let _ = event_tx.send(TuiEvent::Notice(
+        "Resumed latest active goal in a restored session.".to_string(),
+    ));
+
+    if let Some(session) = session.as_mut() {
+        let prompt = goal_continuation_prompt(&active_goal.objective, 1);
+        run_goal_turns_for_tui(&cfg, session, &prompt, event_tx, action_rx, cancel, 1);
     }
 }
 
@@ -1955,9 +2341,15 @@ fn agent_loop_thread(
                 }
             }
             Ok(UserAction::GoalResume) => {
-                let Some(session_id) =
-                    existing_goal_session_id(session.as_ref(), &preloaded, &config, &event_tx)
-                else {
+                let Some(session_id) = current_goal_session_id(session.as_ref(), &preloaded) else {
+                    resume_latest_active_goal_for_tui(
+                        &mut session,
+                        &config,
+                        &preloaded,
+                        &event_tx,
+                        &action_rx,
+                        &cancel,
+                    );
                     continue;
                 };
                 update_goal_status_for_session(
@@ -1988,7 +2380,6 @@ fn agent_loop_thread(
 
 enum SlashOutcome {
     Continue,
-    Exit(i32),
 }
 
 fn handle_slash_command(
@@ -2000,12 +2391,6 @@ fn handle_slash_command(
 ) -> Option<SlashOutcome> {
     let command = commands::parse(text)?;
     match command {
-        SlashCommand::Help => {
-            state.messages.push(ChatMessage::System(
-                "/help /model <name> /compact /clear /cost /config show /history /mode <suggest|auto-edit|full-auto> /plan [off] /workflows /remember <note> /exit"
-                    .to_string(),
-            ));
-        }
         SlashCommand::Model(Some(model)) => match commands::validate_model(&model) {
             Ok(()) => {
                 config.model = ModelSelection::from_unchecked(Some(model.clone()));
@@ -2025,11 +2410,6 @@ fn handle_slash_command(
                 "Current model: {}",
                 state.model_name
             )));
-        }
-        SlashCommand::Clear => {
-            state.messages.clear();
-            state.scroll_offset = 0;
-            state.auto_scroll = true;
         }
         SlashCommand::Cost => {
             state.messages.push(ChatMessage::System(format!(
@@ -2099,7 +2479,7 @@ fn handle_slash_command(
                 GoalSlashCommand::Pause => UserAction::GoalPause,
                 GoalSlashCommand::Resume => UserAction::GoalResume,
             };
-            state.status = AppStatus::Running;
+            state.enter_running();
             let _ = action_tx.send(action);
         }
         SlashCommand::WorkflowList => {
@@ -2134,7 +2514,7 @@ fn handle_slash_command(
             }
         }
         SlashCommand::Compact => {
-            state.status = AppStatus::Running;
+            state.enter_running();
             let _ = action_tx.send(UserAction::Compact);
         }
         SlashCommand::History => match history::list_sessions(10) {
@@ -2162,7 +2542,6 @@ fn handle_slash_command(
                 "failed to list history: {error}"
             ))),
         },
-        SlashCommand::Exit => return Some(SlashOutcome::Exit(0)),
     }
     state.scroll_to_bottom();
     Some(SlashOutcome::Continue)

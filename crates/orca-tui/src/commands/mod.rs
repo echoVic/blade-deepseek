@@ -1,9 +1,7 @@
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SlashCommand {
-    Help,
     Model(Option<String>),
     Compact,
-    Clear,
     Cost,
     ConfigShow,
     History,
@@ -12,7 +10,6 @@ pub enum SlashCommand {
     Goal(GoalSlashCommand),
     WorkflowList,
     Remember(String),
-    Exit,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -31,12 +28,10 @@ pub fn parse(input: &str) -> Option<SlashCommand> {
     let mut parts = rest.split_whitespace();
     let command = parts.next()?;
     match command {
-        "help" => Some(SlashCommand::Help),
         "model" => Some(SlashCommand::Model(
             parts.next().map(|name| name.to_string()),
         )),
         "compact" => Some(SlashCommand::Compact),
-        "clear" => Some(SlashCommand::Clear),
         "cost" => Some(SlashCommand::Cost),
         "config" if parts.next() == Some("show") => Some(SlashCommand::ConfigShow),
         "history" => Some(SlashCommand::History),
@@ -54,17 +49,14 @@ pub fn parse(input: &str) -> Option<SlashCommand> {
                 Some(SlashCommand::Remember(note))
             }
         }
-        "exit" => Some(SlashCommand::Exit),
         _ => None,
     }
 }
 
 pub fn all_commands() -> &'static [(&'static str, &'static str)] {
     &[
-        ("/help", "Show available commands"),
         ("/model", "Switch model: auto, flash, or pro"),
         ("/compact", "Compress conversation context"),
-        ("/clear", "Clear message history"),
         ("/cost", "Show session cost"),
         ("/config show", "Show merged config"),
         ("/mode", "Switch approval mode"),
@@ -73,7 +65,6 @@ pub fn all_commands() -> &'static [(&'static str, &'static str)] {
         ("/workflows", "Show workflow tasks"),
         ("/remember", "Save a note to memory"),
         ("/history", "Browse session history"),
-        ("/exit", "Exit Orca"),
     ]
 }
 
@@ -181,6 +172,21 @@ mod tests {
             parse("/remember prefers rust"),
             Some(SlashCommand::Remember("prefers rust".to_string()))
         );
+    }
+
+    #[test]
+    fn removed_terminal_aliases_are_not_slash_commands() {
+        assert_eq!(parse("/help"), None);
+        assert_eq!(parse("/clear"), None);
+        assert_eq!(parse("/exit"), None);
+
+        let command_names = all_commands()
+            .iter()
+            .map(|(command, _)| *command)
+            .collect::<Vec<_>>();
+        assert!(!command_names.contains(&"/help"));
+        assert!(!command_names.contains(&"/clear"));
+        assert!(!command_names.contains(&"/exit"));
     }
 
     #[test]
