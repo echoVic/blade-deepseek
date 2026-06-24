@@ -3,8 +3,8 @@
 > Goal: evolve Orca into a production-grade DeepSeek-native agent runtime.
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
-Last updated: 2026-06-22
-Current baseline: v0.1.25 inject current date in system prompt, fix mouse scroll in all regions
+Last updated: 2026-06-25
+Current baseline: v0.1.30 workflow runtime and TUI experience overhaul
 
 ---
 
@@ -27,8 +27,8 @@ working baseline used to prioritize the next patch releases.
 | Project instructions | User/project/rules files with includes | `AGENTS.md` style layered instructions | Implemented |
 | Memory | Manual `/remember` plus optional project extraction | Codex memories extension | Partial |
 | Persistent goals | `/goal` with persisted state plus goal-scoped `get_goal`, `create_goal`, and narrow `update_goal` | Codex goal extension | Implemented |
-| Workflows | JavaScript workflow runner with task state | Codex automations/tasks concepts | Implemented; packaging/docs can improve |
-| TUI | Markdown-ish rendering, themes, Vim mode, diff preview, slash commands | Codex/Claude richer terminal UX | Partial |
+| Workflows | JavaScript workflow DSL, multi-stage runner, task state, notifications, and runtime status events | Codex automations/tasks concepts | Implemented; packaging/docs can improve |
+| TUI | Markdown-ish rendering, themes, Vim mode, diff preview, slash commands, workflow panel, elapsed timers, and clearer approval dialogs | Codex/Claude richer terminal UX | Partial |
 | History | JSONL transcripts, resume/fork/search/archive/compress | Codex thread store with queryable metadata | Partial |
 | Release | GitHub release + npm alias distribution scripts plus retrying post-publish GitHub/npm/npm-exec verification | Codex npm/native release model | Implemented |
 | Skills | Markdown skill discovery, `list_skills`/`read_skill`, and explicit `$skill` prompt injection | Codex skills and plugin-provided skill bundles | Partial |

@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.30":
+        "Workflow DSL and multi-stage runtime overhaul; TUI now shows workflow/task progress, elapsed time, notifications, and clearer approval choices.",
       "v0.1.29":
         "Refactor TUI session preloading for clarity; extract goal session ID helper; add unit tests for session restoration and goal control flow.",
       "v0.1.28":
@@ -63,8 +65,6 @@ const copy = {
         "Kill the cache-compaction storm: wire-equivalent gating + 60% hysteresis, persist inherited summary state across --continue and --fork.",
       "v0.1.26":
         "Update check falls back to npm registry (no rate limit); table rendering rewritten with progressive degradation down to narrow terminals.",
-      "v0.1.25":
-        "Inject today's date into the system prompt so web search uses the correct year; mouse wheel scrolls regardless of cursor region.",
     },
     foot: {
       releases: "GitHub Releases",
@@ -92,6 +92,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.30":
+        "重构 workflow DSL 与多阶段运行时；TUI 现在展示 workflow/task 进度、运行时长、通知和更清晰的审批选项。",
       "v0.1.29":
         "重构 TUI 会话预加载逻辑，提取 goal session ID 辅助函数，新增会话恢复与目标控制流的单元测试。",
       "v0.1.28":
@@ -100,8 +102,6 @@ const copy = {
         "终结缓存压缩风暴：按真实 wire 提示词触发 + 60% 压缩滞后，--continue 与 --fork 现在会持久化继承的 summary 状态。",
       "v0.1.26":
         "版本更新检查优先走 npm registry（无限流），表格渲染重写为渐进降级，窄终端也能读。",
-      "v0.1.25":
-        "向系统提示词注入当前日期，让网络搜索使用正确年份；鼠标滚轮在任何位置都能滚动正文。",
     },
     foot: {
       releases: "GitHub Releases",
