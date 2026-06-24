@@ -65,7 +65,7 @@ const copy = {
       github: "GitHub",
     },
     hero: {
-      pill: "v0.1.31 · Rust-native",
+      pill: "v0.1.32 · Rust-native",
       titlePrefix: "A",
       titleHighlight: "DeepSeek-native",
       titleSuffix: "coding agent, in your terminal.",
@@ -229,7 +229,7 @@ const copy = {
       github: "GitHub",
     },
     hero: {
-      pill: "v0.1.31 · Rust 原生",
+      pill: "v0.1.32 · Rust 原生",
       titlePrefix: "面向终端的",
       titleHighlight: "DeepSeek 原生",
       titleSuffix: "代码智能体。",

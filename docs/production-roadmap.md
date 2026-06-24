@@ -4,7 +4,7 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-06-25
-Current baseline: v0.1.31 runtime-owned interactive session boundary
+Current baseline: v0.1.32 typed runtime protocol boundary for server mode
 
 ---
 
@@ -44,6 +44,8 @@ verified before the next phase starts.
 
 **Release target:** v0.1.31
 
+**Current status:** done in v0.1.31.
+
 **Goal:** move long-lived interactive session state from the TUI bridge into
 `orca-runtime`, creating the runtime boundary needed for a Codex-style protocol
 layer.
@@ -76,20 +78,24 @@ layer.
 
 **Release target:** v0.1.32
 
+**Current status:** server-mode submissions and server-facing events now flow
+through `orca_runtime::protocol` with typed `Submission`, `ClientOp`, and
+`ServerEvent` values while preserving the legacy flat JSON wire format.
+
 **Goal:** introduce a runtime protocol boundary so TUI/headless clients can send
 commands and consume versioned events without owning turn execution details.
 
 **Scope:**
 
-1. Define an `orca-runtime` protocol module inspired by Codex protocol types.
+1. Define an `orca-runtime` protocol module inspired by Codex protocol types. Done in v0.1.32 for server mode.
    - User input, approval responses, cancel/backtrack, goal operations, and
      workflow controls should be commands.
    - Session lifecycle, assistant deltas, reasoning, tool calls, workflow/task
      updates, approvals, errors, and completion should be events.
-2. Add a runtime event adapter for the current TUI bridge.
-   - Preserve existing display behavior while sourcing events from runtime.
+2. Add a runtime event adapter. Server-mode adapter done in v0.1.32; TUI adapter remains P2/P3 follow-up.
+   - Preserve existing display behavior while sourcing events from runtime where practical.
    - Keep JSONL output names stable for this release unless explicitly versioned.
-3. Move more turn-loop orchestration behind runtime-owned APIs.
+3. Move more turn-loop orchestration behind runtime-owned APIs. Still open after v0.1.32.
    - The TUI may still render and request approvals.
    - Runtime should own command handling and event emission.
 

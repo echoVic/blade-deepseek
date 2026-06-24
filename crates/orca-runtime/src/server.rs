@@ -1,21 +1,14 @@
 use std::io::{self, BufRead, Write};
 
-use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use crate::controller;
+use crate::protocol::{self, ClientOp, ServerEvent, Submission};
 use orca_core::config::{HistoryMode, OutputFormat, RunConfig};
 
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
     pub run_config: RunConfig,
-}
-
-#[derive(Debug, Deserialize)]
-struct ProtocolRequest {
-    id: Value,
-    op: String,
-    prompt: Option<String>,
 }
 
 pub fn run(config: ServerConfig) -> i32 {
@@ -45,48 +38,34 @@ fn run_with_io<R: BufRead, W: Write>(
 }
 
 fn handle_line<W: Write>(config: &ServerConfig, line: &str, writer: &mut W) -> io::Result<()> {
-    let request = match serde_json::from_str::<ProtocolRequest>(line) {
-        Ok(request) => request,
+    let submission = match Submission::decode(line) {
+        Ok(submission) => submission,
         Err(error) => {
-            write_protocol_event(
-                writer,
-                &Value::Null,
-                json!({
-                    "event": "error",
-                    "message": format!("invalid request: {error}")
-                }),
-            )?;
+            protocol::write_server_event(writer, &error.id, ServerEvent::error(error.message))?;
             return Ok(());
         }
     };
 
-    match request.op.as_str() {
-        "submit" => run_submit(config, request, writer),
-        op => write_protocol_event(
-            writer,
-            &request.id,
-            json!({
-                "event": "error",
-                "message": format!("unsupported op: {op}")
-            }),
-        ),
+    match &submission.op {
+        ClientOp::Submit { .. } => run_submit(config, submission, writer),
     }
 }
 
 fn run_submit<W: Write>(
     config: &ServerConfig,
-    request: ProtocolRequest,
+    submission: Submission,
     writer: &mut W,
 ) -> io::Result<()> {
     let mut run_config = config.run_config.clone();
-    run_config.prompt = request.prompt.unwrap_or_default();
+    let ClientOp::Submit { prompt } = submission.op;
+    run_config.prompt = prompt;
     // Defensive: force JSONL output and disable history regardless of config file settings.
     run_config.output_format = OutputFormat::Jsonl;
     run_config.history_mode = HistoryMode::Disabled;
     run_config.show_session_picker = false;
     run_config.desktop_notifications = false;
 
-    let mut streaming_writer = ServerWriter::new(request.id, writer);
+    let mut streaming_writer = ServerWriter::new(submission.id, writer);
     let _exit_code = controller::run_to_writer_with_options(
         run_config,
         &mut streaming_writer,
@@ -117,7 +96,7 @@ impl<'a, W: Write> ServerWriter<'a, W> {
             let line = String::from_utf8_lossy(&self.buffer).to_string();
             self.buffer.clear();
             if let Some(event) = map_runtime_event(&line) {
-                write_protocol_event(self.inner, &self.id, event)?;
+                protocol::write_server_event(self.inner, &self.id, event)?;
             }
         }
         Ok(())
@@ -131,7 +110,7 @@ impl<W: Write> Write for ServerWriter<'_, W> {
             let line = String::from_utf8_lossy(&self.buffer[..pos]).to_string();
             self.buffer.drain(..=pos);
             if let Some(event) = map_runtime_event(&line) {
-                write_protocol_event(self.inner, &self.id, event)?;
+                protocol::write_server_event(self.inner, &self.id, event)?;
             }
         }
         Ok(buf.len())
@@ -142,73 +121,8 @@ impl<W: Write> Write for ServerWriter<'_, W> {
     }
 }
 
-fn map_runtime_event(line: &str) -> Option<Value> {
-    let event: Value = serde_json::from_str(line).ok()?;
-    let payload = &event["payload"];
-    match event["type"].as_str()? {
-        "turn.started" => Some(json!({
-            "event": "turn_started",
-            "turn": payload["turn"]
-        })),
-        "assistant.reasoning.delta" => Some(json!({
-            "event": "reasoning_delta",
-            "text": payload["text"]
-        })),
-        "assistant.message.delta" => Some(json!({
-            "event": "message_delta",
-            "text": payload["text"]
-        })),
-        "tool.call.requested" => Some(json!({
-            "event": "tool_requested",
-            "tool": payload["name"],
-            "target": payload["target"]
-        })),
-        "tool.call.completed" => Some(json!({
-            "event": "tool_completed",
-            "tool": payload["name"],
-            "status": payload["status"]
-        })),
-        "workflow.started" => Some(json!({
-            "event": "workflow_started",
-            "taskId": payload["taskId"],
-            "runId": payload["runId"],
-            "workflowName": payload["workflowName"]
-        })),
-        "workflow.result.available" => Some(json!({
-            "event": "workflow_result_available",
-            "taskId": payload["taskId"],
-            "runId": payload["runId"],
-            "result": payload["result"]
-        })),
-        "workflow.completed" => Some(json!({
-            "event": "workflow_completed",
-            "taskId": payload["taskId"],
-            "runId": payload["runId"],
-            "workflowName": payload["workflowName"]
-        })),
-        "workflow.failed" => Some(json!({
-            "event": "workflow_failed",
-            "taskId": payload["taskId"],
-            "runId": payload["runId"],
-            "error": payload["error"]
-        })),
-        "error" => Some(json!({
-            "event": "error",
-            "message": payload["message"]
-        })),
-        "session.completed" => Some(json!({
-            "event": "turn_completed",
-            "status": payload["status"]
-        })),
-        _ => None,
-    }
-}
-
-fn write_protocol_event<W: Write>(writer: &mut W, id: &Value, mut event: Value) -> io::Result<()> {
-    event["id"] = id.clone();
-    serde_json::to_writer(&mut *writer, &event)?;
-    writeln!(writer)?;
-    writer.flush()
+fn map_runtime_event(line: &str) -> Option<ServerEvent> {
+    protocol::map_runtime_event_line(line)
 }
 
 #[cfg(test)]
@@ -229,6 +143,7 @@ mod tests {
             r#"{"type":"tool.call.requested","payload":{"name":"read_file","target":"src/main.rs"}}"#,
         )
         .expect("mapped event");
+        let mapped = protocol::legacy_json_event(Value::from(1), mapped);
 
         assert_eq!(mapped["event"], "tool_requested");
         assert_eq!(mapped["tool"], "read_file");
@@ -242,6 +157,7 @@ mod tests {
             r#"{"type":"workflow.started","payload":{"taskId":"task-1","runId":"workflow-run-1","workflowName":"audit"}}"#,
         )
         .expect("mapped event");
+        let mapped = protocol::legacy_json_event(Value::from(1), mapped);
 
         assert_eq!(mapped["event"], "workflow_started");
         assert_eq!(mapped["taskId"], "task-1");
@@ -255,6 +171,7 @@ mod tests {
             r#"{"type":"workflow.result.available","payload":{"taskId":"task-1","runId":"workflow-run-1","result":"done"}}"#,
         )
         .expect("mapped event");
+        let mapped = protocol::legacy_json_event(Value::from(1), mapped);
 
         assert_eq!(mapped["event"], "workflow_result_available");
         assert_eq!(mapped["taskId"], "task-1");
@@ -268,6 +185,7 @@ mod tests {
             r#"{"type":"workflow.completed","payload":{"taskId":"task-1","runId":"workflow-run-1","workflowName":"audit"}}"#,
         )
         .expect("mapped event");
+        let mapped = protocol::legacy_json_event(Value::from(1), mapped);
 
         assert_eq!(mapped["event"], "workflow_completed");
         assert_eq!(mapped["taskId"], "task-1");
@@ -281,6 +199,7 @@ mod tests {
             r#"{"type":"workflow.failed","payload":{"taskId":"task-1","runId":"workflow-run-1","error":"boom"}}"#,
         )
         .expect("mapped event");
+        let mapped = protocol::legacy_json_event(Value::from(1), mapped);
 
         assert_eq!(mapped["event"], "workflow_failed");
         assert_eq!(mapped["taskId"], "task-1");
