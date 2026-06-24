@@ -1099,7 +1099,7 @@ fn render_approval_dialog(frame: &mut Frame, state: &AppState, theme: &Theme) {
         content.push(Line::from(""));
     }
 
-    // The four options, one per line, highlighted when selected.
+    // The options, one per line, highlighted when selected.
     for (i, option) in dialog.options.iter().enumerate() {
         let selected = i == dialog.selected;
         let prefix = if selected { "▸ " } else { "  " };
@@ -1112,13 +1112,18 @@ fn render_approval_dialog(frame: &mut Frame, state: &AppState, theme: &Theme) {
         } else {
             Style::default().fg(theme.muted)
         };
+        let label_text = match option {
+            ApprovalOption::AlwaysTool => format!("always allow \"{}\"", dialog.tool),
+            ApprovalOption::AlwaysTarget => "always allow this exact call".to_string(),
+            _ => option.label().to_string(),
+        };
         content.push(Line::from(vec![
             Span::styled(prefix, Style::default().fg(theme.border)),
             Span::styled(
                 format!("[{}] ", option.key()),
                 Style::default().fg(key_color).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(option.label().to_string(), label_style),
+            Span::styled(label_text, label_style),
         ]));
     }
 

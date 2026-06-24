@@ -163,9 +163,9 @@ impl ApprovalOption {
 
     pub fn label(self) -> &'static str {
         match self {
-            ApprovalOption::Once => "approve once",
-            ApprovalOption::AlwaysTool => "always allow tool",
-            ApprovalOption::AlwaysTarget => "always allow tool + target",
+            ApprovalOption::Once => "allow this once",
+            ApprovalOption::AlwaysTool => "always allow",
+            ApprovalOption::AlwaysTarget => "always allow this exact call",
             ApprovalOption::Deny => "deny",
         }
     }
@@ -186,10 +186,21 @@ pub struct ApprovalDialog {
 }
 
 impl ApprovalDialog {
-    /// The four options shown when a target is present; without a target the
-    /// "always allow tool + target" option is dropped (nothing to scope to).
-    pub fn options_for(target: Option<&str>) -> Vec<ApprovalOption> {
-        if target.is_some() {
+    /// Tools whose target is inherently dynamic (e.g. search queries) —
+    /// the "always allow this exact call" option would never match again,
+    /// so we hide it to reduce noise.
+    const DYNAMIC_TARGET_TOOLS: &[&str] = &["web_search", "search", "grep"];
+
+    /// Returns the set of options to display. The `AlwaysTarget` option is
+    /// only shown when a target is present AND the tool is likely to be
+    /// called again with the same target (e.g. reading a fixed file path).
+    pub fn options_for(tool: &str, target: Option<&str>) -> Vec<ApprovalOption> {
+        let show_always_target = target.is_some()
+            && !Self::DYNAMIC_TARGET_TOOLS
+                .iter()
+                .any(|t| tool.contains(t));
+
+        if show_always_target {
             vec![
                 ApprovalOption::Once,
                 ApprovalOption::AlwaysTool,
@@ -681,7 +692,7 @@ impl AppState {
                 ..
             } => {
                 self.status = AppStatus::WaitingApproval;
-                let options = ApprovalDialog::options_for(target.as_deref());
+                let options = ApprovalDialog::options_for(&tool, target.as_deref());
                 self.approval_dialog = Some(ApprovalDialog {
                     tool,
                     target,
@@ -858,7 +869,8 @@ mod tests {
 
     #[test]
     fn approval_dialog_has_four_options_with_target_and_three_without() {
-        let with_target = ApprovalDialog::options_for(Some("src/auth/token.rs"));
+        // Static-target tool (like read_file) shows AlwaysTarget option.
+        let with_target = ApprovalDialog::options_for("read_file", Some("src/auth/token.rs"));
         assert_eq!(
             with_target,
             vec![
@@ -868,9 +880,20 @@ mod tests {
                 ApprovalOption::Deny,
             ]
         );
-        let without = ApprovalDialog::options_for(None);
+        // No target — AlwaysTarget is hidden.
+        let without = ApprovalDialog::options_for("read_file", None);
         assert_eq!(
             without,
+            vec![
+                ApprovalOption::Once,
+                ApprovalOption::AlwaysTool,
+                ApprovalOption::Deny,
+            ]
+        );
+        // Dynamic-target tool (web_search) — AlwaysTarget is hidden even with a target.
+        let dynamic = ApprovalDialog::options_for("web_search", Some("some query"));
+        assert_eq!(
+            dynamic,
             vec![
                 ApprovalOption::Once,
                 ApprovalOption::AlwaysTool,
