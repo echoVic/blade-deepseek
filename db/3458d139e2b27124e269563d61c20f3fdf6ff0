@@ -1,0 +1,69 @@
+crates/orca-provider/src/deepseek_fixture.rs
+  s_810605d84b7f5d::t_e6863606521e69 11 gitai:{"mixed_line_ranges":[{"Single":11}],"operations":[]}
+crates/orca-tui/src/commands/mod.rs
+  s_810605d84b7f5d::t_82c713b066af38 195-196 gitai:{"mixed_line_ranges":[{"Range":[195,196]}],"operations":[]}
+crates/orca-tools/src/registry.rs
+  s_810605d84b7f5d::t_f4fe41232b9f4c 264-309,1040-1077
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "db3458d139e2b27124e269563d61c20f3fdf6ff0",
+  "prompts": {},
+  "humans": {
+    "h_ec28e579c94ea6": {
+      "author": "echoVic <137844255@qq.com>"
+    }
+  },
+  "sessions": {
+    "s_810605d84b7f5d": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a33aa139ec2b7adfd9a0c81",
+        "model": "c_o_new__dev"
+      },
+      "human_author": "echoVic <137844255@qq.com>"
+    }
+  },
+  "attestation_metadata": {
+    "crates/orca-provider/src/deepseek_fixture.rs": [
+      {
+        "hash": "s_810605d84b7f5d::t_e6863606521e69",
+        "line_ranges": [
+          {
+            "Single": 11
+          }
+        ],
+        "mixed_line_ranges": [
+          {
+            "Single": 11
+          }
+        ],
+        "operations": []
+      }
+    ],
+    "crates/orca-tui/src/commands/mod.rs": [
+      {
+        "hash": "s_810605d84b7f5d::t_82c713b066af38",
+        "line_ranges": [
+          {
+            "Range": [
+              195,
+              196
+            ]
+          }
+        ],
+        "mixed_line_ranges": [
+          {
+            "Range": [
+              195,
+              196
+            ]
+          }
+        ],
+        "operations": []
+      }
+    ]
+  },
+  "remote_transcripts": {}
+}
