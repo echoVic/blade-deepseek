@@ -1,0 +1,14 @@
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "b49aab6e9be7575e5eaf42c89da7d47d5684ff1f",
+  "prompts": {},
+  "humans": {
+    "h_ec28e579c94ea6": {
+      "author": "echoVic <137844255@qq.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
