@@ -117,7 +117,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
         Some(config.prompt.clone())
     };
 
-    if matches!(
+    let startup_preloaded_transcript = if matches!(
         config.history_mode,
         HistoryMode::Resume(_) | HistoryMode::Fork(_)
     ) {
@@ -125,13 +125,13 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
             HistoryMode::Resume(selector) | HistoryMode::Fork(selector) => selector,
             HistoryMode::Record | HistoryMode::Disabled => "",
         }) {
-            for message in transcript.messages {
-                if let Some(chat_message) = chat_message_from_history(message) {
+            for message in &transcript.messages {
+                if let Some(chat_message) = chat_message_from_history(message.clone()) {
                     state.messages.push(chat_message);
                 }
             }
-            if let Some((explanation, plan)) = transcript.plan {
-                state.current_plan = Some((explanation, plan));
+            if let Some((explanation, plan)) = &transcript.plan {
+                state.current_plan = Some((explanation.clone(), plan.clone()));
             }
             if !state.messages.is_empty() {
                 let label = if matches!(config.history_mode, HistoryMode::Fork(_)) {
@@ -141,13 +141,18 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                 };
                 state.messages.push(ChatMessage::System(label.to_string()));
             }
+            Some(transcript)
+        } else {
+            None
         }
-    }
+    } else {
+        None
+    };
 
     let shared_config = Arc::new(Mutex::new(config.clone()));
     let agent_config = Arc::clone(&shared_config);
     let preloaded_transcript: Arc<Mutex<Option<history::SessionTranscript>>> =
-        Arc::new(Mutex::new(None));
+        Arc::new(Mutex::new(startup_preloaded_transcript));
     let agent_preloaded = Arc::clone(&preloaded_transcript);
     let agent_event_tx = event_tx.clone();
     let cancel_token = CancelToken::new();
@@ -708,7 +713,13 @@ fn mouse_wheel_scroll_action(
 mod tests {
     use super::*;
     use crossterm::event::{MouseEvent, MouseEventKind};
+    use orca_core::config::{
+        ModelRuntimeConfig, OutputFormat, ProviderKind, ThemeName, ToolConfig, WorkflowConfig,
+    };
     use ratatui::layout::Rect;
+    use tempfile::tempdir;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
         MouseEvent {
@@ -716,6 +727,293 @@ mod tests {
             column,
             row,
             modifiers: crossterm::event::KeyModifiers::NONE,
+        }
+    }
+
+    fn test_config(history_mode: HistoryMode) -> RunConfig {
+        RunConfig {
+            app_version: "0.0.0-test".to_string(),
+            prompt: String::new(),
+            cwd: None,
+            output_format: OutputFormat::Text,
+            approval_mode: ApprovalMode::Suggest,
+            provider: ProviderKind::Mock,
+            verifier: None,
+            model: ModelSelection::from_unchecked(Some("auto".to_string())),
+            model_runtime: ModelRuntimeConfig::default(),
+            api_key: Some("sk-test".to_string()),
+            base_url: None,
+            mcp_servers: Vec::new(),
+            hooks: Vec::new(),
+            external_tools: Vec::new(),
+            history_mode,
+            show_session_picker: false,
+            permission_rules: Default::default(),
+            max_budget_usd: None,
+            subagents: Default::default(),
+            tools: ToolConfig::default(),
+            workflows: WorkflowConfig::default(),
+            theme: ThemeName::Dark,
+            vim_mode: false,
+            update_check: false,
+            desktop_notifications: false,
+            auto_memory: false,
+        }
+    }
+
+    fn test_state() -> (AppState, mpsc::Receiver<UserAction>) {
+        let (tx, rx) = mpsc::channel();
+        (
+            AppState::new(
+                tx,
+                "0.0.0-test".to_string(),
+                "auto".to_string(),
+                "/tmp".to_string(),
+            ),
+            rx,
+        )
+    }
+
+    fn transcript(session_id: &str) -> history::SessionTranscript {
+        history::SessionTranscript {
+            meta: history::SessionMeta {
+                schema_version: 1,
+                session_id: session_id.to_string(),
+                cwd: "/tmp".to_string(),
+                provider: "mock".to_string(),
+                model: Some("auto".to_string()),
+                title: "resumed goal".to_string(),
+                created_at: chrono::Utc::now(),
+                parent_id: None,
+                forked: false,
+            },
+            messages: Vec::new(),
+            compactions: Vec::new(),
+            summaries: Vec::new(),
+            usage: None,
+            plan: None,
+            path: std::path::PathBuf::from("/tmp/resumed-goal.jsonl"),
+        }
+    }
+
+    fn with_orca_home<T>(f: impl FnOnce(&std::path::Path) -> T) -> T {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let home = tempdir().unwrap();
+        let previous = std::env::var_os("ORCA_HOME");
+        unsafe {
+            std::env::set_var("ORCA_HOME", home.path());
+        }
+        let result = f(home.path());
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var("ORCA_HOME", previous);
+            } else {
+                std::env::remove_var("ORCA_HOME");
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn empty_recorded_session_goal_show_dispatches_agent_action() {
+        let (mut state, rx) = test_state();
+        let (action_tx, action_rx) = mpsc::channel();
+        let mut config = test_config(HistoryMode::Record);
+        let shared_config = Arc::new(Mutex::new(config.clone()));
+
+        handle_slash_command("/goal", &mut config, &shared_config, &mut state, &action_tx);
+
+        assert!(rx.try_recv().is_err());
+        assert!(matches!(action_rx.try_recv(), Ok(UserAction::GoalShow)));
+        assert_eq!(state.status, AppStatus::Running);
+    }
+
+    #[test]
+    fn empty_recorded_agent_loop_goal_show_reports_no_goal() {
+        let config = Arc::new(Mutex::new(test_config(HistoryMode::Record)));
+        let preloaded = Arc::new(Mutex::new(None));
+        let (event_tx, event_rx) = mpsc::channel();
+        let (action_tx, action_rx) = mpsc::channel();
+        let cancel = CancelToken::new();
+
+        let handle = std::thread::spawn({
+            let config = Arc::clone(&config);
+            let preloaded = Arc::clone(&preloaded);
+            let cancel = cancel.clone();
+            move || agent_loop_thread(config, preloaded, event_tx, action_rx, cancel)
+        });
+
+        action_tx.send(UserAction::GoalShow).unwrap();
+        let event = event_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        action_tx.send(UserAction::Cancel).unwrap();
+        handle.join().unwrap();
+
+        assert!(matches!(event, TuiEvent::GoalStatus(None)));
+    }
+
+    #[test]
+    fn empty_recorded_agent_loop_goal_controls_report_session_not_started() {
+        let cases = [
+            UserAction::GoalEdit("better goal".to_string()),
+            UserAction::GoalClear,
+            UserAction::GoalPause,
+            UserAction::GoalResume,
+        ];
+
+        for action in cases {
+            let config = Arc::new(Mutex::new(test_config(HistoryMode::Record)));
+            let preloaded = Arc::new(Mutex::new(None));
+            let (event_tx, event_rx) = mpsc::channel();
+            let (action_tx, action_rx) = mpsc::channel();
+            let cancel = CancelToken::new();
+
+            let handle = std::thread::spawn({
+                let config = Arc::clone(&config);
+                let preloaded = Arc::clone(&preloaded);
+                let cancel = cancel.clone();
+                move || agent_loop_thread(config, preloaded, event_tx, action_rx, cancel)
+            });
+
+            action_tx.send(action).unwrap();
+            let event = event_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            action_tx.send(UserAction::Cancel).unwrap();
+            handle.join().unwrap();
+
+            match event {
+                TuiEvent::Error(message) => {
+                    assert_eq!(
+                        message,
+                        "The session must start before you can change a goal."
+                    );
+                }
+                other => panic!("expected goal control error, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn preloaded_resume_goal_pause_updates_persisted_goal_before_live_session_exists() {
+        with_orca_home(|_| {
+            let session_id = "resume-goal-session";
+            orca_runtime::goals::GoalStore::load_default()
+                .replace(
+                    session_id,
+                    "resumed objective",
+                    orca_core::goal_types::ThreadGoalStatus::Active,
+                    None,
+                )
+                .unwrap();
+
+            let config = Arc::new(Mutex::new(test_config(HistoryMode::Resume(
+                session_id.to_string(),
+            ))));
+            let preloaded = Arc::new(Mutex::new(Some(transcript(session_id))));
+            let (event_tx, event_rx) = mpsc::channel();
+            let (action_tx, action_rx) = mpsc::channel();
+            let cancel = CancelToken::new();
+
+            let handle = std::thread::spawn({
+                let config = Arc::clone(&config);
+                let preloaded = Arc::clone(&preloaded);
+                let cancel = cancel.clone();
+                move || agent_loop_thread(config, preloaded, event_tx, action_rx, cancel)
+            });
+
+            action_tx.send(UserAction::GoalPause).unwrap();
+            let event = event_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            action_tx.send(UserAction::Cancel).unwrap();
+            handle.join().unwrap();
+
+            match event {
+                TuiEvent::GoalUpdated(goal) => {
+                    assert_eq!(goal.session_id, session_id);
+                    assert_eq!(goal.status, orca_core::goal_types::ThreadGoalStatus::Paused);
+                }
+                other => panic!("expected paused goal update, got {other:?}"),
+            }
+            let reloaded = orca_runtime::goals::GoalStore::load_default()
+                .get(session_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                reloaded.status,
+                orca_core::goal_types::ThreadGoalStatus::Paused
+            );
+        });
+    }
+
+    #[test]
+    fn preloaded_resume_goal_show_reads_persisted_goal_before_live_session_exists() {
+        with_orca_home(|_| {
+            let session_id = "resume-goal-show-session";
+            orca_runtime::goals::GoalStore::load_default()
+                .replace(
+                    session_id,
+                    "show resumed objective",
+                    orca_core::goal_types::ThreadGoalStatus::Active,
+                    None,
+                )
+                .unwrap();
+
+            let config = Arc::new(Mutex::new(test_config(HistoryMode::Resume(
+                session_id.to_string(),
+            ))));
+            let preloaded = Arc::new(Mutex::new(Some(transcript(session_id))));
+            let (event_tx, event_rx) = mpsc::channel();
+            let (action_tx, action_rx) = mpsc::channel();
+            let cancel = CancelToken::new();
+
+            let handle = std::thread::spawn({
+                let config = Arc::clone(&config);
+                let preloaded = Arc::clone(&preloaded);
+                let cancel = cancel.clone();
+                move || agent_loop_thread(config, preloaded, event_tx, action_rx, cancel)
+            });
+
+            action_tx.send(UserAction::GoalShow).unwrap();
+            let event = event_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            action_tx.send(UserAction::Cancel).unwrap();
+            handle.join().unwrap();
+
+            match event {
+                TuiEvent::GoalStatus(Some(goal)) => {
+                    assert_eq!(goal.session_id, session_id);
+                    assert_eq!(goal.objective, "show resumed objective");
+                    assert_eq!(goal.status, orca_core::goal_types::ThreadGoalStatus::Active);
+                }
+                other => panic!("expected resumed goal status, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn disabled_history_goal_show_still_reports_recorded_history_requirement() {
+        let config = Arc::new(Mutex::new(test_config(HistoryMode::Disabled)));
+        let preloaded = Arc::new(Mutex::new(None));
+        let (event_tx, event_rx) = mpsc::channel();
+        let (action_tx, action_rx) = mpsc::channel();
+        let cancel = CancelToken::new();
+
+        let handle = std::thread::spawn({
+            let config = Arc::clone(&config);
+            let preloaded = Arc::clone(&preloaded);
+            let cancel = cancel.clone();
+            move || agent_loop_thread(config, preloaded, event_tx, action_rx, cancel)
+        });
+
+        action_tx.send(UserAction::GoalShow).unwrap();
+        let event = event_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        action_tx.send(UserAction::Cancel).unwrap();
+        handle.join().unwrap();
+
+        match event {
+            TuiEvent::Error(message) => {
+                assert_eq!(
+                    message,
+                    "persistent goals require recorded history; enable history before using /goal"
+                );
+            }
+            other => panic!("expected recorded-history error, got {other:?}"),
         }
     }
 
@@ -1311,6 +1609,34 @@ fn update_goal_status_for_session(
     }
 }
 
+fn existing_goal_session_id(
+    session: Option<&bridge::TuiConversationSession>,
+    preloaded: &Arc<Mutex<Option<history::SessionTranscript>>>,
+    config: &Arc<Mutex<RunConfig>>,
+    event_tx: &mpsc::Sender<TuiEvent>,
+) -> Option<String> {
+    if let Some(session_id) = session.and_then(|session| session.session_id().map(str::to_string)) {
+        return Some(session_id);
+    }
+    if let Some(session_id) = preloaded
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|transcript| transcript.meta.session_id.clone())
+    {
+        return Some(session_id);
+    }
+
+    let history_mode = config.lock().unwrap().history_mode.clone();
+    let message = if matches!(history_mode, HistoryMode::Disabled) {
+        "persistent goals require recorded history; enable history before using /goal"
+    } else {
+        "The session must start before you can change a goal."
+    };
+    let _ = event_tx.send(TuiEvent::Error(message.to_string()));
+    None
+}
+
 const MAX_GOAL_CONTINUATIONS: usize = 64;
 
 fn goal_continuation_prompt(objective: &str, continuation: usize) -> String {
@@ -1508,13 +1834,26 @@ fn agent_loop_thread(
                 }
             }
             Ok(UserAction::GoalShow) => {
-                let Some(session_id) = session
+                let session_id = session
                     .as_ref()
                     .and_then(|s| s.session_id().map(str::to_string))
-                else {
-                    let _ = event_tx.send(TuiEvent::Error(
-                        "persistent goals require a saved session; send a prompt first with history enabled".to_string(),
-                    ));
+                    .or_else(|| {
+                        preloaded
+                            .lock()
+                            .unwrap()
+                            .as_ref()
+                            .map(|transcript| transcript.meta.session_id.clone())
+                    });
+                let Some(session_id) = session_id else {
+                    let history_mode = config.lock().unwrap().history_mode.clone();
+                    if matches!(history_mode, HistoryMode::Disabled) {
+                        let _ = event_tx.send(TuiEvent::Error(
+                            "persistent goals require recorded history; enable history before using /goal"
+                                .to_string(),
+                        ));
+                    } else {
+                        let _ = event_tx.send(TuiEvent::GoalStatus(None));
+                    }
                     continue;
                 };
                 let store = orca_runtime::goals::GoalStore::load_default();
@@ -1560,13 +1899,9 @@ fn agent_loop_thread(
                 }
             }
             Ok(UserAction::GoalEdit(objective)) => {
-                let Some(session_id) = session
-                    .as_ref()
-                    .and_then(|s| s.session_id().map(str::to_string))
+                let Some(session_id) =
+                    existing_goal_session_id(session.as_ref(), &preloaded, &config, &event_tx)
                 else {
-                    let _ = event_tx.send(TuiEvent::Error(
-                        "persistent goals require a saved session before editing".to_string(),
-                    ));
                     continue;
                 };
                 let mut store = orca_runtime::goals::GoalStore::load_default();
@@ -1592,13 +1927,9 @@ fn agent_loop_thread(
                 }
             }
             Ok(UserAction::GoalClear) => {
-                let Some(session_id) = session
-                    .as_ref()
-                    .and_then(|s| s.session_id().map(str::to_string))
+                let Some(session_id) =
+                    existing_goal_session_id(session.as_ref(), &preloaded, &config, &event_tx)
                 else {
-                    let _ = event_tx.send(TuiEvent::Error(
-                        "persistent goals require a saved session before clearing".to_string(),
-                    ));
                     continue;
                 };
                 let mut store = orca_runtime::goals::GoalStore::load_default();
@@ -1613,21 +1944,31 @@ fn agent_loop_thread(
                 }
             }
             Ok(UserAction::GoalPause) => {
-                update_goal_status_for_session(
-                    session.as_ref().and_then(|s| s.session_id()),
-                    orca_core::goal_types::ThreadGoalStatus::Paused,
-                    &event_tx,
-                );
+                if let Some(session_id) =
+                    existing_goal_session_id(session.as_ref(), &preloaded, &config, &event_tx)
+                {
+                    update_goal_status_for_session(
+                        Some(&session_id),
+                        orca_core::goal_types::ThreadGoalStatus::Paused,
+                        &event_tx,
+                    );
+                }
             }
             Ok(UserAction::GoalResume) => {
+                let Some(session_id) =
+                    existing_goal_session_id(session.as_ref(), &preloaded, &config, &event_tx)
+                else {
+                    continue;
+                };
                 update_goal_status_for_session(
-                    session.as_ref().and_then(|s| s.session_id()),
+                    Some(&session_id),
                     orca_core::goal_types::ThreadGoalStatus::Active,
                     &event_tx,
                 );
                 if let Some(session) = session.as_mut() {
                     if let Some(goal) = session
                         .session_id()
+                        .filter(|id| *id == session_id)
                         .and_then(|id| orca_runtime::goals::GoalStore::load_default().get(id).ok())
                         .flatten()
                     {
