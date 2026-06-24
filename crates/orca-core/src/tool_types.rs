@@ -473,6 +473,19 @@ impl ToolResult {
         }
     }
 
+    pub fn invalid_input(request: &ToolRequest, error: impl Into<String>) -> Self {
+        Self {
+            id: request.id.clone(),
+            name: request.name.clone(),
+            status: ToolStatus::Failed,
+            output: None,
+            error: Some(error.into()),
+            exit_code: None,
+            truncated: false,
+            kind: ToolResultKind::InvalidInput,
+        }
+    }
+
     pub fn denied(request: &ToolRequest, reason: impl Into<String>) -> Self {
         Self {
             id: request.id.clone(),

@@ -197,7 +197,7 @@ pub enum SubagentStatus {
 **设计**:
 ```rust
 pub struct SubagentConfig {
-    pub model: Option<String>,      // "deepseek-v4-flash" | "deepseek-reasoner"
+    pub model: Option<String>,      // "deepseek-v4-flash" | "deepseek-v4-pro"
     pub max_turns: Option<u32>,     // 覆盖默认的128轮
     pub temperature: Option<f32>,   // 温度参数
 }
@@ -205,7 +205,7 @@ pub struct SubagentConfig {
 
 **使用场景**:
 - 简单任务用 flash 模型（快速、便宜）
-- 复杂推理用 reasoner 模型（深度思考）
+- 复杂推理用 pro 模型（深度思考）
 - 并行多个子代理用不同模型
 
 #### 2.5 专用子代理类型
@@ -535,7 +535,7 @@ orca exec "refactor auth module in an isolated environment"
     "description": "Analyze authentication module",
     "prompt": "Read the auth/ directory and analyze security vulnerabilities",
     "mode": "async",
-    "model": "deepseek-reasoner",
+    "model": "deepseek-v4-pro",
     "type": "CodeReviewer",
     "isolation": "worktree",
     "max_turns": 64

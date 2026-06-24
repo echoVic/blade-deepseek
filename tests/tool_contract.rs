@@ -440,6 +440,53 @@ fn update_plan_emits_plan_updated_event() {
 }
 
 #[test]
+fn malformed_update_plan_is_schema_failed_and_can_be_retried() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .current_dir(temp.path())
+        .args([
+            "exec",
+            "--output-format",
+            "jsonl",
+            "--provider",
+            "mock",
+            "bad_plan_then_fix",
+        ])
+        .output()
+        .expect("run orca");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let events = parse_jsonl(&output.stdout);
+    let failed_plan = events
+        .iter()
+        .find(|event| {
+            event["type"] == "tool.call.completed"
+                && event["payload"]["name"] == "update_plan"
+                && event["payload"]["status"] == "failed"
+        })
+        .expect("malformed update_plan should fail before execution");
+    assert!(
+        failed_plan["payload"]["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("tool arguments failed schema validation"),
+        "error={failed_plan:?}"
+    );
+    let plan_updates = events
+        .iter()
+        .filter(|event| event["type"] == "plan.updated")
+        .count();
+    assert_eq!(plan_updates, 1, "events={events:?}");
+    assert_eq!(events.last().unwrap()["type"], "session.completed");
+    assert_eq!(events.last().unwrap()["payload"]["status"], "success");
+}
+
+#[test]
 fn external_tool_descriptor_runs_from_orca_tools_dir() {
     let home = make_temp_workspace("external-home");
     let tools_dir = home.join("tools");

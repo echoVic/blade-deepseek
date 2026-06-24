@@ -107,6 +107,46 @@ fn mock_call(conversation: &Conversation) -> ProviderResponse {
         .messages
         .iter()
         .any(|m| matches!(m, Message::Tool { .. }));
+    let prompt = conversation.last_user_message().unwrap_or("");
+
+    if prompt.trim() == "bad_plan_then_fix" && has_tool_results {
+        let has_fixed_plan = conversation.messages.iter().any(|m| match m {
+            Message::Tool { content, .. } => content.contains("Plan updated"),
+            _ => false,
+        });
+        if has_fixed_plan {
+            let msg = "Mock completed after fixing malformed tool arguments.".to_string();
+            return ProviderResponse {
+                steps: vec![ProviderStep::MessageDelta(msg.clone())],
+                assistant_content: Some(msg),
+                assistant_reasoning: None,
+                tool_calls: Vec::new(),
+                usage: None,
+            };
+        }
+        let saw_schema_error = conversation.messages.iter().any(|m| match m {
+            Message::Tool { content, .. } => {
+                content.contains("tool arguments failed schema validation")
+            }
+            _ => false,
+        });
+        if saw_schema_error {
+            let tool_request =
+                valid_mock_plan_request(Some("Recovered from schema validation failure"));
+            let raw_call = RawToolCall {
+                id: tool_request.id.clone(),
+                function_name: tool_request.name.as_str().to_string(),
+                arguments: tool_request.raw_arguments.clone().unwrap_or_default(),
+            };
+            return ProviderResponse {
+                steps: vec![ProviderStep::ToolCall(tool_request)],
+                assistant_content: None,
+                assistant_reasoning: None,
+                tool_calls: vec![raw_call],
+                usage: None,
+            };
+        }
+    }
 
     if has_tool_results {
         let msg = "Mock completed after tool execution.".to_string();
@@ -121,8 +161,6 @@ fn mock_call(conversation: &Conversation) -> ProviderResponse {
             usage: None,
         };
     }
-
-    let prompt = conversation.last_user_message().unwrap_or("");
 
     if prompt.trim() == "mock_fail" {
         return ProviderResponse {
@@ -232,12 +270,13 @@ fn parse_mock_prompt(prompt: &str) -> Option<ToolRequest> {
     let prompt = prompt.trim();
 
     if let Some(rest) = prompt.strip_prefix("read ") {
+        let path = rest.to_string();
         return Some(ToolRequest {
             id: "mock-tool-1".to_string(),
             name: ToolName::ReadFile,
             action: ActionKind::Read,
-            target: Some(rest.to_string()),
-            raw_arguments: None,
+            target: Some(path.clone()),
+            raw_arguments: Some(serde_json::json!({ "path": path }).to_string()),
         });
     }
 
@@ -297,30 +336,25 @@ fn parse_mock_prompt(prompt: &str) -> Option<ToolRequest> {
         } else {
             Some(rest.trim())
         };
-        let arguments = serde_json::json!({
-            "explanation": explanation,
-            "plan": [
-                {
-                    "step": "Inspect references",
-                    "status": "completed"
-                },
-                {
-                    "step": "Implement task plan support",
-                    "status": "in_progress"
-                },
-                {
-                    "step": "Verify behavior",
-                    "status": "pending"
-                }
-            ]
-        })
-        .to_string();
+        return Some(valid_mock_plan_request(explanation));
+    }
+
+    if prompt == "bad_plan_then_fix" {
         return Some(ToolRequest {
             id: "mock-tool-1".to_string(),
             name: ToolName::UpdatePlan,
             action: ActionKind::Read,
-            target: Some("3 items".to_string()),
-            raw_arguments: Some(arguments),
+            target: Some("1 items".to_string()),
+            raw_arguments: Some(
+                serde_json::json!({
+                    "plan": [
+                        {
+                            "completed": "Inspect references"
+                        }
+                    ]
+                })
+                .to_string(),
+            ),
         });
     }
 
@@ -342,22 +376,24 @@ fn parse_mock_prompt(prompt: &str) -> Option<ToolRequest> {
     }
 
     if let Some(rest) = prompt.strip_prefix("grep ") {
+        let pattern = rest.to_string();
         return Some(ToolRequest {
             id: "mock-tool-1".to_string(),
             name: ToolName::Grep,
             action: ActionKind::Read,
-            target: Some(rest.to_string()),
-            raw_arguments: None,
+            target: Some(pattern.clone()),
+            raw_arguments: Some(serde_json::json!({ "pattern": pattern }).to_string()),
         });
     }
 
     if let Some(rest) = prompt.strip_prefix("bash ") {
+        let command = rest.to_string();
         return Some(ToolRequest {
             id: "mock-tool-1".to_string(),
             name: ToolName::Bash,
             action: ActionKind::Shell,
-            target: Some(rest.to_string()),
-            raw_arguments: None,
+            target: Some(command.clone()),
+            raw_arguments: Some(serde_json::json!({ "command": command }).to_string()),
         });
     }
 
@@ -411,4 +447,32 @@ fn parse_mock_prompt(prompt: &str) -> Option<ToolRequest> {
     }
 
     None
+}
+
+fn valid_mock_plan_request(explanation: Option<&str>) -> ToolRequest {
+    let arguments = serde_json::json!({
+        "explanation": explanation,
+        "plan": [
+            {
+                "step": "Inspect references",
+                "status": "completed"
+            },
+            {
+                "step": "Implement task plan support",
+                "status": "in_progress"
+            },
+            {
+                "step": "Verify behavior",
+                "status": "pending"
+            }
+        ]
+    })
+    .to_string();
+    ToolRequest {
+        id: "mock-tool-1".to_string(),
+        name: ToolName::UpdatePlan,
+        action: ActionKind::Read,
+        target: Some("3 items".to_string()),
+        raw_arguments: Some(arguments),
+    }
 }

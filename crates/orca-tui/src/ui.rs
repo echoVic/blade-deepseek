@@ -476,18 +476,47 @@ fn build_welcome_lines<'a>(state: &AppState, theme: &Theme) -> Vec<Line<'a>> {
 }
 
 fn wrapped_line_count(line: &Line, width: usize) -> usize {
-    if width == 0 {
-        return 1;
-    }
-    let line_width: usize = line
+    let text = line
         .spans
         .iter()
-        .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
-        .sum();
-    if line_width == 0 {
+        .map(|span| span.content.as_ref())
+        .collect::<String>();
+    visual_wrapped_line_count(&text, width)
+}
+
+fn visual_wrapped_line_count(text: &str, width: usize) -> usize {
+    if width == 0 || text.is_empty() {
         return 1;
     }
-    (line_width + width - 1) / width
+
+    let mut line_count = 0usize;
+    let mut current_width = 0usize;
+
+    for segment in text.split_inclusive(|c: char| c.is_whitespace() || c == '/' || c == '-') {
+        let mut segment_width = UnicodeWidthStr::width(segment);
+        if segment_width == 0 {
+            continue;
+        }
+
+        if segment_width > width {
+            if current_width > 0 {
+                line_count += 1;
+            }
+            line_count += segment_width / width;
+            segment_width %= width;
+            current_width = segment_width;
+            continue;
+        }
+
+        if current_width == 0 || current_width + segment_width <= width {
+            current_width += segment_width;
+        } else {
+            line_count += 1;
+            current_width = segment_width;
+        }
+    }
+
+    line_count + usize::from(current_width > 0)
 }
 
 fn build_message_lines(state: &AppState, theme: &Theme, width: usize) -> Vec<Line<'static>> {
@@ -848,7 +877,10 @@ fn context_cell(state: &AppState, theme: &Theme) -> Span<'static> {
     } else {
         theme.error
     };
-    Span::styled(format!(" | context: {percent}%"), Style::default().fg(color))
+    Span::styled(
+        format!(" | context: {percent}%"),
+        Style::default().fg(color),
+    )
 }
 
 fn render_shortcuts(frame: &mut Frame, state: &AppState, theme: &Theme) {
@@ -1603,7 +1635,8 @@ fn render_table_as_records(
 
     for (row_idx, row) in rows.iter().enumerate().skip(1) {
         let record_label = format!("─── Record {} ", row_idx);
-        let fill = "─".repeat(available_width.saturating_sub(UnicodeWidthStr::width(record_label.as_str())));
+        let fill = "─"
+            .repeat(available_width.saturating_sub(UnicodeWidthStr::width(record_label.as_str())));
         lines.push(Line::from(vec![
             Span::styled(record_label, separator_style),
             Span::styled(fill, separator_style),
@@ -1764,5 +1797,19 @@ mod tests {
         danger.context_limit_tokens = 1000;
         danger.context_used_tokens = 900; // 10% remaining
         assert_eq!(context_cell(&danger, &theme).style.fg, Some(theme.error));
+    }
+
+    #[test]
+    fn wrapped_line_count_matches_ratatui_word_wrap() {
+        let line = Line::from("alpha bravo charlie");
+
+        assert_eq!(wrapped_line_count(&line, 10), 3);
+    }
+
+    #[test]
+    fn wrapped_line_count_hard_wraps_long_tokens() {
+        let line = Line::from("abcdefghijkl");
+
+        assert_eq!(wrapped_line_count(&line, 5), 3);
     }
 }

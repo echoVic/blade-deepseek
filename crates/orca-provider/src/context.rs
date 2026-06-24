@@ -1220,11 +1220,7 @@ mod tests {
     #[test]
     fn context_config_uses_model_specific_token_limit() {
         assert_eq!(
-            ContextConfig::for_model(Some("deepseek-chat")).max_tokens,
-            1_000_000
-        );
-        assert_eq!(
-            ContextConfig::for_model(Some("deepseek-reasoner")).max_tokens,
+            ContextConfig::for_model(Some(orca_core::model::FLASH_MODEL)).max_tokens,
             1_000_000
         );
         assert_eq!(

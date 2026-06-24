@@ -896,6 +896,24 @@ fn execute_tool_with_approval(
     task_registry: &TaskRegistry,
     background_workflows: &mut Vec<BackgroundWorkflowRun>,
 ) -> io::Result<(RunStatus, tool_types::ToolResult)> {
+    if let Err(error) = orca_tools::validate_with_mcp_and_external(
+        tool_request,
+        Some(mcp_registry),
+        &config.external_tools,
+    ) {
+        if emit_deltas {
+            sink.emit(&events.tool_call_requested(tool_request))?;
+        }
+        let result = tool_types::ToolResult::invalid_input(
+            tool_request,
+            format!("tool arguments failed schema validation: {error}"),
+        );
+        if emit_deltas {
+            sink.emit(&events.tool_call_completed(&result))?;
+        }
+        return Ok((RunStatus::Failed, result));
+    }
+
     if let Some(action) =
         approval_action_for_tool(tool_request, subagent_depth, mcp_registry, config)
         && agent_common::requires_approval(action)
@@ -985,6 +1003,20 @@ fn execute_tool_with_approval(
     };
     let effective_tool_request = tool_request_with_hook_outcome(tool_request, &pre_tool_outcome);
     let execution_request = &effective_tool_request;
+    if let Err(error) = orca_tools::validate_with_mcp_and_external(
+        execution_request,
+        Some(mcp_registry),
+        &config.external_tools,
+    ) {
+        let result = tool_types::ToolResult::invalid_input(
+            execution_request,
+            format!("tool arguments failed schema validation: {error}"),
+        );
+        if emit_deltas {
+            sink.emit(&events.tool_call_completed(&result))?;
+        }
+        return Ok((RunStatus::Failed, result));
+    }
     let result = if execution_request.name == tool_types::ToolName::Workflow {
         execute_workflow_tool(
             config,
@@ -1287,6 +1319,19 @@ fn execute_subagent_batch(
         if emit_deltas {
             sink.emit(&events.tool_call_requested(tool_request))?;
         }
+        if let Err(error) =
+            orca_tools::validate_with_mcp_and_external(tool_request, Some(mcp_registry), &[])
+        {
+            let result = tool_types::ToolResult::invalid_input(
+                tool_request,
+                format!("tool arguments failed schema validation: {error}"),
+            );
+            if emit_deltas {
+                sink.emit(&events.tool_call_completed(&result))?;
+            }
+            results[idx] = Some((RunStatus::Failed, result));
+            continue;
+        }
         let pre_tool_outcome = match hooks.run(
             HookEvent::PreToolUse,
             HookContext {
@@ -1315,6 +1360,21 @@ fn execute_subagent_batch(
         };
         let effective_tool_request =
             tool_request_with_hook_outcome(tool_request, &pre_tool_outcome);
+        if let Err(error) = orca_tools::validate_with_mcp_and_external(
+            &effective_tool_request,
+            Some(mcp_registry),
+            &[],
+        ) {
+            let result = tool_types::ToolResult::invalid_input(
+                &effective_tool_request,
+                format!("tool arguments failed schema validation: {error}"),
+            );
+            if emit_deltas {
+                sink.emit(&events.tool_call_completed(&result))?;
+            }
+            results[idx] = Some((RunStatus::Failed, result));
+            continue;
+        }
 
         let request = subagent::create_subagent_request(&effective_tool_request);
         if emit_deltas {
@@ -1829,10 +1889,12 @@ mod tests {
         let requests = vec![
             tool_types::ToolRequest {
                 target: Some("a.txt".to_string()),
+                raw_arguments: Some(r#"{"path":"a.txt"}"#.to_string()),
                 ..tool_request("first", tool_types::ToolName::ReadFile, ActionKind::Read)
             },
             tool_types::ToolRequest {
                 target: Some("b.txt".to_string()),
+                raw_arguments: Some(r#"{"path":"b.txt"}"#.to_string()),
                 ..tool_request("second", tool_types::ToolName::ReadFile, ActionKind::Read)
             },
         ];

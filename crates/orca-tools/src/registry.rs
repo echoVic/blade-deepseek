@@ -175,7 +175,135 @@ impl ToolRegistry {
                 None,
             );
         };
+        if let Err(error) = validate_arguments(request, &resolved.spec.input_schema) {
+            return ToolResult::invalid_input(
+                request,
+                format!("tool arguments failed schema validation: {error}"),
+            );
+        }
         resolved.tool.execute(request, ctx)
+    }
+}
+
+pub fn validate_tool_request(registry: &ToolRegistry, request: &ToolRequest) -> Result<(), String> {
+    let Some(resolved) = registry.resolve(request.name.as_str()) else {
+        return Err(format!("unknown tool: {}", request.name.as_str()));
+    };
+    validate_arguments(request, &resolved.spec.input_schema)
+}
+
+fn validate_arguments(request: &ToolRequest, schema: &Value) -> Result<(), String> {
+    let raw = request.raw_arguments.as_deref().unwrap_or("{}");
+    let value: Value = serde_json::from_str(raw)
+        .map_err(|error| format!("arguments are not valid JSON: {error}"))?;
+    validate_value("$", &value, schema)
+}
+
+fn validate_value(path: &str, value: &Value, schema: &Value) -> Result<(), String> {
+    if let Some(expected_type) = schema.get("type").and_then(Value::as_str) {
+        match expected_type {
+            "object" => validate_object(path, value, schema)?,
+            "array" => validate_array(path, value, schema)?,
+            "string" if !value.is_string() => {
+                return Err(format!(
+                    "{path}: expected string, got {}",
+                    value_type(value)
+                ));
+            }
+            "number" if !value.is_number() => {
+                return Err(format!(
+                    "{path}: expected number, got {}",
+                    value_type(value)
+                ));
+            }
+            "integer" if value.as_i64().is_none() && value.as_u64().is_none() => {
+                return Err(format!(
+                    "{path}: expected integer, got {}",
+                    value_type(value)
+                ));
+            }
+            "boolean" if !value.is_boolean() => {
+                return Err(format!(
+                    "{path}: expected boolean, got {}",
+                    value_type(value)
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(values) = schema.get("enum").and_then(Value::as_array)
+        && !values.iter().any(|allowed| allowed == value)
+    {
+        let allowed = values
+            .iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!("{path}: expected one of [{allowed}], got {value}"));
+    }
+
+    Ok(())
+}
+
+fn validate_object(path: &str, value: &Value, schema: &Value) -> Result<(), String> {
+    let Some(object) = value.as_object() else {
+        return Err(format!(
+            "{path}: expected object, got {}",
+            value_type(value)
+        ));
+    };
+    let properties = schema.get("properties").and_then(Value::as_object);
+
+    if let Some(required) = schema.get("required").and_then(Value::as_array) {
+        for field in required.iter().filter_map(Value::as_str) {
+            if !object.contains_key(field) {
+                return Err(format!("{path}: missing required property \"{field}\""));
+            }
+        }
+    }
+
+    if schema.get("additionalProperties").and_then(Value::as_bool) == Some(false)
+        && let Some(properties) = properties
+    {
+        for key in object.keys() {
+            if !properties.contains_key(key) {
+                return Err(format!("{path}: unexpected property \"{key}\""));
+            }
+        }
+    }
+
+    if let Some(properties) = properties {
+        for (key, child_schema) in properties {
+            if let Some(child_value) = object.get(key) {
+                validate_value(&format!("{path}.{key}"), child_value, child_schema)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_array(path: &str, value: &Value, schema: &Value) -> Result<(), String> {
+    let Some(items) = value.as_array() else {
+        return Err(format!("{path}: expected array, got {}", value_type(value)));
+    };
+    if let Some(item_schema) = schema.get("items") {
+        for (idx, item) in items.iter().enumerate() {
+            validate_value(&format!("{path}[{idx}]"), item, item_schema)?;
+        }
+    }
+    Ok(())
+}
+
+fn value_type(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
     }
 }
 
@@ -908,4 +1036,42 @@ impl Tool for ExternalTool {
 
 pub fn tool_name_from_schema_name(name: &str) -> Option<ToolName> {
     ToolName::from_str(name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(name: ToolName, raw_arguments: &str) -> ToolRequest {
+        ToolRequest {
+            id: "call-1".to_string(),
+            name,
+            action: ActionKind::Read,
+            target: None,
+            raw_arguments: Some(raw_arguments.to_string()),
+        }
+    }
+
+    #[test]
+    fn registry_rejects_arguments_that_do_not_match_tool_schema() {
+        let registry = default_tool_registry();
+        let result = registry.execute(
+            &request(
+                ToolName::UpdatePlan,
+                r#"{"plan":[{"completed":"Inspect references"}]}"#,
+            ),
+            &ToolContext::new(Path::new(".")),
+        );
+
+        assert_eq!(result.status, orca_core::tool_types::ToolStatus::Failed);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("tool arguments failed schema validation"),
+            "error={:?}",
+            result.error
+        );
+    }
 }

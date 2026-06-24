@@ -693,7 +693,10 @@ fn mouse_layout(
     ))
 }
 
-fn mouse_wheel_scroll_action(mouse: MouseEvent, _layout: ui::AppLayout) -> Option<MouseWheelScroll> {
+fn mouse_wheel_scroll_action(
+    mouse: MouseEvent,
+    _layout: ui::AppLayout,
+) -> Option<MouseWheelScroll> {
     match mouse.kind {
         MouseEventKind::ScrollUp => Some(MouseWheelScroll::Up),
         MouseEventKind::ScrollDown => Some(MouseWheelScroll::Down),
@@ -777,7 +780,11 @@ mod tests {
 
         assert_eq!(
             mouse_wheel_scroll_action(
-                mouse(MouseEventKind::Down(crossterm::event::MouseButton::Left), 10, 10),
+                mouse(
+                    MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                    10,
+                    10
+                ),
                 layout
             ),
             None

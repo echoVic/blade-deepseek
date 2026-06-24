@@ -53,9 +53,7 @@ fn check_latest_npm(current_version: &str) -> Result<Option<UpdateInfo>, String>
     }
     Ok(Some(UpdateInfo {
         current,
-        url: format!(
-            "https://github.com/echoVic/blade-deepseek/releases/tag/v{latest}"
-        ),
+        url: format!("https://github.com/echoVic/blade-deepseek/releases/tag/v{latest}"),
         latest,
     }))
 }

@@ -22,7 +22,7 @@ pub mod update_plan;
 pub mod web_search;
 pub mod write_file;
 
-pub use registry::{Tool, ToolContext, ToolRegistry};
+pub use registry::{Tool, ToolContext, ToolRegistry, validate_tool_request};
 
 pub fn execute_with_mcp(
     request: &ToolRequest,
@@ -70,6 +70,15 @@ pub fn execute_with_mcp_external_and_policy(
         .with_output_truncation(output_truncation)
         .with_mcp(mcp_registry);
     reg.execute(request, &ctx)
+}
+
+pub fn validate_with_mcp_and_external(
+    request: &ToolRequest,
+    mcp_registry: Option<&McpRegistry>,
+    external_tools: &[ExternalToolConfig],
+) -> Result<(), String> {
+    let reg = registry::tool_registry_with_mcp_and_external(mcp_registry, external_tools);
+    registry::validate_tool_request(&reg, request)
 }
 
 pub fn tool_is_available_readonly_concurrent(request: &ToolRequest) -> bool {
@@ -483,7 +492,7 @@ mod tests {
             name: ToolName::ReadFile,
             action: ActionKind::Read,
             target: Some("note.txt".to_string()),
-            raw_arguments: None,
+            raw_arguments: Some(r#"{"path":"note.txt"}"#.to_string()),
         };
         let ctx = registry::ToolContext::new(temp_dir.path());
 

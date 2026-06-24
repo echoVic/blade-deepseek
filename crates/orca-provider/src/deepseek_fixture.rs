@@ -8,7 +8,7 @@ pub fn plan() -> Vec<ProviderStep> {
         name: ToolName::ReadFile,
         action: ActionKind::Read,
         target: Some("README.md".to_string()),
-        raw_arguments: None,
+        raw_arguments: Some(serde_json::json!({ "path": "README.md" }).to_string()),
     };
 
     vec![

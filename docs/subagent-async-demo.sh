@@ -169,7 +169,7 @@ cat << 'EOF'
     "description": "分析认证模块安全性",
     "prompt": "深入分析 auth/ 目录，识别潜在的安全漏洞",
     "mode": "async",
-    "model": "deepseek-reasoner",
+    "model": "deepseek-v4-pro",
     "type": "CodeReviewer"
   }
 }
