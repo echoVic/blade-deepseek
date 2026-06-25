@@ -86,4 +86,6 @@ pub struct BackgroundTaskSummary {
     pub workflow_progress: Option<WorkflowTaskProgress>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workflow_agents: Vec<WorkflowAgentTaskSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<UsageTotals>,
 }

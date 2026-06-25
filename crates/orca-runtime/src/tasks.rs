@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use orca_core::cancel::CancelToken;
+use orca_core::cost_types::UsageTotals;
 use orca_core::task_types::{
     BackgroundTaskSummary, TaskStatus, TaskType, WorkflowAgentTaskSummary, WorkflowTaskProgress,
 };
@@ -41,6 +42,7 @@ pub struct TaskRecord {
     pub phase_count: Option<usize>,
     pub workflow_progress: Option<WorkflowTaskProgress>,
     pub workflow_agents: Vec<WorkflowAgentTaskSummary>,
+    pub usage: Option<UsageTotals>,
     pub result: Option<String>,
     pub error: Option<String>,
     pub control: TaskControl,
@@ -74,6 +76,7 @@ struct PersistedTaskRecord {
     workflow_progress: Option<WorkflowTaskProgress>,
     #[serde(default)]
     workflow_agents: Vec<WorkflowAgentTaskSummary>,
+    usage: Option<UsageTotals>,
     result: Option<String>,
     error: Option<String>,
 }
@@ -140,6 +143,7 @@ impl TaskRegistry {
             phase_count: Some(phase_count),
             workflow_progress: None,
             workflow_agents: Vec::new(),
+            usage: None,
             result: None,
             error: None,
             control,
@@ -176,6 +180,7 @@ impl TaskRegistry {
             phase_count: None,
             workflow_progress: None,
             workflow_agents: Vec::new(),
+            usage: None,
             result: None,
             error: None,
             control,
@@ -213,6 +218,7 @@ impl TaskRegistry {
                         phase_count: record.phase_count,
                         workflow_progress: record.workflow_progress,
                         workflow_agents: record.workflow_agents.clone(),
+                        usage: record.usage,
                     })
                     .collect::<Vec<_>>()
             })
@@ -277,6 +283,15 @@ impl TaskRegistry {
     }
 
     pub fn complete(&self, id: &str, result: String) -> Result<(), String> {
+        self.complete_with_usage(id, result, None)
+    }
+
+    pub fn complete_with_usage(
+        &self,
+        id: &str,
+        result: String,
+        usage: Option<UsageTotals>,
+    ) -> Result<(), String> {
         self.update_task(id, |record| {
             record.status = TaskStatus::Completed;
             if record.started_at_ms.is_none() {
@@ -285,12 +300,22 @@ impl TaskRegistry {
             record.completed_at_ms = Some(now_ms());
             record.result = Some(result);
             record.error = None;
+            record.usage = usage;
             record.control.pause.store(false, Ordering::Release);
             Ok(())
         })
     }
 
     pub fn fail(&self, id: &str, error: String) -> Result<(), String> {
+        self.fail_with_usage(id, error, None)
+    }
+
+    pub fn fail_with_usage(
+        &self,
+        id: &str,
+        error: String,
+        usage: Option<UsageTotals>,
+    ) -> Result<(), String> {
         self.update_task(id, |record| {
             record.status = TaskStatus::Failed;
             if record.started_at_ms.is_none() {
@@ -299,6 +324,7 @@ impl TaskRegistry {
             record.completed_at_ms = Some(now_ms());
             record.error = Some(error);
             record.result = None;
+            record.usage = usage;
             record.control.pause.store(false, Ordering::Release);
             Ok(())
         })
@@ -496,6 +522,7 @@ impl PersistedTaskRecord {
             phase_count: self.phase_count,
             workflow_progress: self.workflow_progress,
             workflow_agents: self.workflow_agents,
+            usage: self.usage,
             result: self.result,
             error: self.error,
             control: new_task_control(),
@@ -525,6 +552,7 @@ impl From<&TaskRecord> for PersistedTaskRecord {
             phase_count: record.phase_count,
             workflow_progress: record.workflow_progress,
             workflow_agents: record.workflow_agents.clone(),
+            usage: record.usage,
             result: record.result.clone(),
             error: record.error.clone(),
         }
@@ -792,6 +820,27 @@ mod tests {
         let record = registry.get(&task.id).unwrap();
         assert_eq!(record.status, TaskStatus::Completed);
         assert_eq!(record.result.as_deref(), Some("done"));
+    }
+
+    #[test]
+    fn complete_with_usage_stores_task_usage() {
+        let registry = TaskRegistry::new("session-1".to_string());
+        let task = registry.create_subagent("inspect auth".to_string(), None);
+        let usage = UsageTotals {
+            input_tokens: 120,
+            output_tokens: 30,
+            cache_tokens: 10,
+            estimated_cost_usd: 0.0000252,
+        };
+
+        registry
+            .complete_with_usage(&task.id, "done".to_string(), Some(usage))
+            .unwrap();
+
+        let record = registry.get(&task.id).unwrap();
+        assert_eq!(record.usage, Some(usage));
+        let summary = registry.list().into_iter().next().unwrap();
+        assert_eq!(summary.usage, Some(usage));
     }
 
     #[test]

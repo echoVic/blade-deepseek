@@ -7,6 +7,7 @@ use orca_core::approval_types::{ApprovalDecision, ApprovalRequest, ApprovalResol
 use orca_core::cancel::CancelToken;
 use orca_core::config::{HistoryMode, OutputFormat, RunConfig};
 use orca_core::conversation::Conversation;
+use orca_core::cost_types::UsageTotals;
 use orca_core::event_schema::{EventFactory, RunStatus};
 use orca_core::event_sink::EventSink;
 use orca_core::model::ModelRouteContext;
@@ -1749,23 +1750,24 @@ fn launch_async_subagent(
             &child_cancel,
             execute_child_agent_loop,
         );
-        let (child, _child_cost_tracker) =
+        let (child, child_cost_tracker) =
             run_child_agent(&child_config, &child_request, &mut child_runtime);
         drop(child_runtime);
         let worktree = worktree_guard.and_then(|guard| guard.finish().ok());
+        let usage = usage_totals_if_non_empty(child_cost_tracker.totals());
         if child.status == RunStatus::Success {
             let mut output = child
                 .final_message
                 .unwrap_or_else(|| "(subagent completed without a final message)".to_string());
             append_worktree_outcome(&mut output, worktree.as_ref());
-            let _ = child_registry.complete(&thread_agent_id, output);
+            let _ = child_registry.complete_with_usage(&thread_agent_id, output, usage);
         } else {
             let mut error = child
                 .error
                 .or(child.final_message)
                 .unwrap_or_else(|| format!("subagent ended with status {:?}", child.status));
             append_worktree_outcome(&mut error, worktree.as_ref());
-            let _ = child_registry.fail(&thread_agent_id, error);
+            let _ = child_registry.fail_with_usage(&thread_agent_id, error, usage);
         }
     });
 
@@ -1812,9 +1814,28 @@ fn execute_subagent_status_tool(
         "completed_at_ms": record.completed_at_ms,
         "output": record.result,
         "error": record.error,
+        "usage": record.usage.map(usage_totals_json),
     })
     .to_string();
     tool_types::ToolResult::completed(tool_request, output, false)
+}
+
+fn usage_totals_if_non_empty(usage: UsageTotals) -> Option<UsageTotals> {
+    if usage.total_tokens() == 0 && usage.cache_tokens == 0 && usage.estimated_cost_usd == 0.0 {
+        None
+    } else {
+        Some(usage)
+    }
+}
+
+fn usage_totals_json(usage: UsageTotals) -> serde_json::Value {
+    serde_json::json!({
+        "input_tokens": usage.input_tokens,
+        "output_tokens": usage.output_tokens,
+        "cache_tokens": usage.cache_tokens,
+        "total_tokens": usage.total_tokens(),
+        "estimated_cost_usd": usage.estimated_cost_usd,
+    })
 }
 
 fn resolve_interactive(

@@ -1230,6 +1230,7 @@ mod tests {
             phase_count: Some(2),
             workflow_progress: None,
             workflow_agents: Vec::new(),
+            usage: None,
         }];
         state.workflow_panel.selected = 9;
 
@@ -1262,6 +1263,7 @@ mod tests {
                 phase_count: Some(2),
                 workflow_progress: None,
                 workflow_agents: Vec::new(),
+                usage: None,
             }],
         });
         state.update(TuiEvent::WorkflowNotification {

@@ -573,6 +573,13 @@ fn subagent_progress_label(task: &BackgroundTaskSummary) -> String {
         parts.push(agent_type.to_string());
     }
     parts.push(elapsed_label(task));
+    if let Some(usage) = task.usage {
+        parts.push(format!(
+            "{} tok ${:.6}",
+            usage.total_tokens(),
+            usage.estimated_cost_usd
+        ));
+    }
     parts.join(", ")
 }
 
@@ -2315,6 +2322,7 @@ mod tests {
                 failed_phases: 0,
             }),
             workflow_agents: Vec::new(),
+            usage: None,
         };
 
         assert_eq!(
@@ -2341,6 +2349,12 @@ mod tests {
             phase_count: None,
             workflow_progress: None,
             workflow_agents: Vec::new(),
+            usage: Some(orca_core::cost_types::UsageTotals {
+                input_tokens: 120,
+                output_tokens: 30,
+                cache_tokens: 10,
+                estimated_cost_usd: 0.0000252,
+            }),
             created_at_ms: 1_000,
             started_at_ms: Some(1_000),
             completed_at_ms: None,
@@ -2357,6 +2371,7 @@ mod tests {
 
         assert!(rendered.contains("inspect auth"));
         assert!(rendered.contains("subagent"));
+        assert!(rendered.contains("150 tok"));
     }
 
     #[test]
@@ -2392,6 +2407,7 @@ mod tests {
                     estimated_cost_usd: 0.0000252,
                 }),
             }],
+            usage: None,
             created_at_ms: 1_000,
             started_at_ms: Some(1_000),
             completed_at_ms: Some(2_000),

@@ -1493,17 +1493,18 @@ fn launch_async_subagent_for_tui(
             &child_memory,
             &child_hooks,
         );
+        let usage = usage_totals_if_non_empty(child.cost_tracker.totals());
         if child.status == "success" {
             let output = child
                 .final_message
                 .unwrap_or_else(|| "(subagent completed without a final message)".to_string());
-            let _ = child_registry.complete(&thread_agent_id, output);
+            let _ = child_registry.complete_with_usage(&thread_agent_id, output, usage);
         } else {
             let error = child
                 .error
                 .or(child.final_message)
                 .unwrap_or_else(|| format!("subagent ended with status {}", child.status));
-            let _ = child_registry.fail(&thread_agent_id, error);
+            let _ = child_registry.fail_with_usage(&thread_agent_id, error, usage);
         }
         let _ = child_event_tx.send(TuiEvent::WorkflowTasksUpdated {
             tasks: child_registry.list(),
@@ -1560,10 +1561,29 @@ fn execute_subagent_status_for_tui(
             "completed_at_ms": record.completed_at_ms,
             "output": record.result,
             "error": record.error,
+            "usage": record.usage.map(usage_totals_json),
         })
         .to_string(),
         false,
     )
+}
+
+fn usage_totals_if_non_empty(usage: UsageTotals) -> Option<UsageTotals> {
+    if usage.total_tokens() == 0 && usage.cache_tokens == 0 && usage.estimated_cost_usd == 0.0 {
+        None
+    } else {
+        Some(usage)
+    }
+}
+
+fn usage_totals_json(usage: UsageTotals) -> serde_json::Value {
+    serde_json::json!({
+        "input_tokens": usage.input_tokens,
+        "output_tokens": usage.output_tokens,
+        "cache_tokens": usage.cache_tokens,
+        "total_tokens": usage.total_tokens(),
+        "estimated_cost_usd": usage.estimated_cost_usd,
+    })
 }
 
 fn child_result_to_tui_tool_result(
@@ -2405,7 +2425,7 @@ mod tests {
             raw_arguments: Some(
                 serde_json::json!({
                     "description": "async child",
-                    "prompt": "simple audit",
+                    "prompt": "mock_usage",
                     "mode": "async"
                 })
                 .to_string(),
@@ -2442,7 +2462,6 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-
         let status_request = tool_types::ToolRequest {
             id: "subagent-status".to_string(),
             name: tool_types::ToolName::SubagentStatus,
@@ -2464,5 +2483,10 @@ mod tests {
                 .unwrap()
                 .contains("Mock runtime completed")
         );
+        assert_eq!(payload["usage"]["input_tokens"], 120);
+        assert_eq!(payload["usage"]["output_tokens"], 30);
+        assert_eq!(payload["usage"]["cache_tokens"], 10);
+        assert_eq!(payload["usage"]["total_tokens"], 150);
+        assert!(payload["usage"]["estimated_cost_usd"].as_f64().unwrap() > 0.0);
     }
 }

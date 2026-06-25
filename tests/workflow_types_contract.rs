@@ -80,6 +80,7 @@ fn background_task_summary_matches_sdk_names() {
             failed_phases: 0,
         }),
         workflow_agents: Vec::new(),
+        usage: None,
     };
 
     let value = serde_json::to_value(summary).unwrap();
@@ -91,6 +92,7 @@ fn background_task_summary_matches_sdk_names() {
     assert_eq!(value["workflowProgress"]["totalAgents"], 5);
     assert_eq!(value["workflowProgress"]["completedAgents"], 3);
     assert_eq!(value["workflowProgress"]["failedAgents"], 1);
+    assert!(value.get("usage").is_none());
 }
 
 #[test]
