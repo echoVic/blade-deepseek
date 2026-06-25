@@ -113,6 +113,52 @@ fn host_parallel_routes_out_of_order_agent_results_by_call_id() {
 }
 
 #[test]
+fn host_can_conditionally_spawn_agents_from_args() {
+    if !WorkflowHost::node_available() {
+        return;
+    }
+
+    let temp = tempdir().unwrap();
+    let script = temp.path().join("workflow.js");
+    fs::write(
+        &script,
+        "export const meta = { name: 'dynamic-host-test', description: 'Dynamic host test', phases: ['fanout'] };\n\
+         const prompts = args.enabled ? args.prompts : [];\n\
+         const results = await phase('fanout', async () => parallel(prompts.map((prompt) => agent(prompt))));\n\
+         export default results.map(item => item.prompt);",
+    )
+    .unwrap();
+
+    let events = WorkflowHost::run_collecting_events(
+        &script,
+        serde_json::json!({
+            "enabled": true,
+            "prompts": ["scan", "review", "docs"]
+        }),
+    )
+    .unwrap();
+
+    let prompts = events
+        .iter()
+        .filter_map(|event| match event {
+            HostEvent::AgentCall { prompt, phase, .. } if phase.as_deref() == Some("fanout") => {
+                Some(prompt.as_str())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(prompts, vec!["scan", "review", "docs"]);
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            HostEvent::WorkflowCompleted { result }
+                if result.as_array().map(|items| items.len()) == Some(3)
+        )
+    }));
+}
+
+#[test]
 fn host_phase_fallback_continue_emits_failed_phase_and_continues() {
     if !WorkflowHost::node_available() {
         return;

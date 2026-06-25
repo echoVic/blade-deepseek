@@ -235,6 +235,7 @@ impl ApprovalDialog {
 pub enum PanelMode {
     Conversation,
     Workflows,
+    Agents,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -399,6 +400,13 @@ impl AppState {
 
     pub fn show_workflows(&mut self) {
         self.panel_mode = PanelMode::Workflows;
+        if self.workflow_panel.selected >= self.workflow_panel.tasks.len() {
+            self.workflow_panel.selected = self.workflow_panel.tasks.len().saturating_sub(1);
+        }
+    }
+
+    pub fn show_agents(&mut self) {
+        self.panel_mode = PanelMode::Agents;
         if self.workflow_panel.selected >= self.workflow_panel.tasks.len() {
             self.workflow_panel.selected = self.workflow_panel.tasks.len().saturating_sub(1);
         }
@@ -1238,6 +1246,17 @@ mod tests {
         state.show_workflows();
 
         assert_eq!(state.panel_mode, PanelMode::Workflows);
+        assert_eq!(state.workflow_panel.selected, 0);
+    }
+
+    #[test]
+    fn show_agents_uses_dedicated_panel_mode() {
+        let mut state = state();
+        state.workflow_panel.selected = 9;
+
+        state.show_agents();
+
+        assert_eq!(state.panel_mode, PanelMode::Agents);
         assert_eq!(state.workflow_panel.selected, 0);
     }
 

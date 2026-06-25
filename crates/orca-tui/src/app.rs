@@ -2536,6 +2536,9 @@ fn handle_slash_command(
         SlashCommand::WorkflowList => {
             state.show_workflows();
         }
+        SlashCommand::AgentDashboard => {
+            state.show_agents();
+        }
         SlashCommand::Remember(note) => {
             let remembered_note = note
                 .strip_prefix("project:")

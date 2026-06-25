@@ -9,6 +9,7 @@ pub enum SlashCommand {
     Plan(Option<String>),
     Goal(GoalSlashCommand),
     WorkflowList,
+    AgentDashboard,
     Remember(String),
 }
 
@@ -41,6 +42,7 @@ pub fn parse(input: &str) -> Option<SlashCommand> {
         "plan" => Some(SlashCommand::Plan(parts.next().map(str::to_string))),
         "goal" => parse_goal(parts.collect::<Vec<_>>().join(" ")).map(SlashCommand::Goal),
         "workflows" => Some(SlashCommand::WorkflowList),
+        "agents" => Some(SlashCommand::AgentDashboard),
         "remember" => {
             let note = parts.collect::<Vec<_>>().join(" ");
             if note.is_empty() {
@@ -63,6 +65,7 @@ pub fn all_commands() -> &'static [(&'static str, &'static str)] {
         ("/plan", "Toggle plan mode"),
         ("/goal", "Manage a persistent goal"),
         ("/workflows", "Show workflow tasks"),
+        ("/agents", "Show workflow agent dashboard"),
         ("/remember", "Save a note to memory"),
         ("/history", "Browse session history"),
     ]
@@ -159,6 +162,11 @@ mod tests {
     #[test]
     fn parses_workflows_command() {
         assert_eq!(parse("/workflows"), Some(SlashCommand::WorkflowList));
+    }
+
+    #[test]
+    fn parses_agents_command() {
+        assert_eq!(parse("/agents"), Some(SlashCommand::AgentDashboard));
     }
 
     #[test]
