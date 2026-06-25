@@ -4,6 +4,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use orca_core::cost_types::UsageTotals;
+use orca_core::task_types::WorkflowAgentTaskSummary;
 use orca_core::workflow_types::{WorkflowAgentStatus, WorkflowInput, WorkflowRunState};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -35,6 +37,8 @@ pub struct WorkflowAgentRecord {
     pub output: Option<Value>,
     pub error: Option<String>,
     pub transcript_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<UsageTotals>,
 }
 
 #[derive(Clone, Debug)]
@@ -72,6 +76,8 @@ struct WorkflowAgentRecordOnDisk {
     output: AgentOutputField,
     error: Option<String>,
     transcript_path: Option<String>,
+    #[serde(default)]
+    usage: Option<UsageTotals>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -90,6 +96,8 @@ struct WorkflowAgentRecordOnDiskWritable {
     output: AgentOutputField,
     error: Option<String>,
     transcript_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    usage: Option<UsageTotals>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -346,6 +354,35 @@ impl WorkflowStateStore {
         }
         Ok(counts)
     }
+
+    pub fn agent_summaries(&self, run_id: &str) -> io::Result<Vec<WorkflowAgentTaskSummary>> {
+        let path = self.run_dir(run_id).join("agent-cache.json");
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+
+        let cache = read_agent_cache(&path)?;
+        let mut summaries = cache
+            .values()
+            .map(|entry| WorkflowAgentTaskSummary {
+                call_id: entry.record.call_id.clone(),
+                call_path: entry.record.call_path.clone(),
+                status: entry.record.status,
+                attempt: entry.record.attempt,
+                max_attempts: entry.record.max_attempts,
+                previous_errors: entry.record.previous_errors.clone(),
+                error: entry.record.error.clone(),
+                transcript_path: entry.record.transcript_path.clone(),
+                usage: entry.record.usage,
+            })
+            .collect::<Vec<_>>();
+        summaries.sort_by(|left, right| {
+            left.call_path
+                .cmp(&right.call_path)
+                .then_with(|| left.call_id.cmp(&right.call_id))
+        });
+        Ok(summaries)
+    }
 }
 
 fn now_ms() -> i64 {
@@ -384,6 +421,7 @@ impl IntoWorkflowAgentRecord for WorkflowAgentCacheRecord {
             output: Some(self.output),
             error: None,
             transcript_path: None,
+            usage: None,
         }
     }
 }
@@ -475,6 +513,7 @@ fn read_agent_cache(path: &Path) -> io::Result<HashMap<String, CachedWorkflowAge
                             output: record.output.value,
                             error: record.error,
                             transcript_path: record.transcript_path,
+                            usage: record.usage,
                         },
                         output_present: record.output.present,
                     },
@@ -521,6 +560,7 @@ fn write_agent_cache(
                     },
                     error: entry.record.error.clone(),
                     transcript_path: entry.record.transcript_path.clone(),
+                    usage: entry.record.usage,
                 },
             )
         })

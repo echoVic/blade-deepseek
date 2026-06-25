@@ -1229,6 +1229,7 @@ mod tests {
             workflow_run_id: Some("workflow-run-1".to_string()),
             phase_count: Some(2),
             workflow_progress: None,
+            workflow_agents: Vec::new(),
         }];
         state.workflow_panel.selected = 9;
 
@@ -1260,6 +1261,7 @@ mod tests {
                 workflow_run_id: Some("workflow-run-1".to_string()),
                 phase_count: Some(2),
                 workflow_progress: None,
+                workflow_agents: Vec::new(),
             }],
         });
         state.update(TuiEvent::WorkflowNotification {

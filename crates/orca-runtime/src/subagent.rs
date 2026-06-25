@@ -8,12 +8,19 @@ pub struct SubagentRequest {
     pub subagent_type: SubagentType,
     pub model: Option<String>,
     pub mode: SubagentMode,
+    pub isolation: SubagentIsolation,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SubagentMode {
     Sync,
     Async,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SubagentIsolation {
+    None,
+    Worktree,
 }
 
 pub fn extract_subagent_field(tool_request: &ToolRequest, field: &str) -> Option<String> {
@@ -39,6 +46,10 @@ pub fn create_subagent_request(tool_request: &ToolRequest) -> SubagentRequest {
         Some("async") => SubagentMode::Async,
         _ => SubagentMode::Sync,
     };
+    let isolation = match extract_subagent_field(tool_request, "isolation").as_deref() {
+        Some("worktree") => SubagentIsolation::Worktree,
+        _ => SubagentIsolation::None,
+    };
 
     SubagentRequest {
         description,
@@ -46,6 +57,7 @@ pub fn create_subagent_request(tool_request: &ToolRequest) -> SubagentRequest {
         subagent_type,
         model,
         mode,
+        isolation,
     }
 }
 
@@ -67,7 +79,8 @@ mod tests {
                     "description": "review code",
                     "prompt": "review src/main.rs for bugs",
                     "subagent_type": "code_reviewer",
-                    "model": "deepseek-v4-pro"
+                    "model": "deepseek-v4-pro",
+                    "isolation": "worktree"
                 })
                 .to_string(),
             ),
@@ -78,6 +91,7 @@ mod tests {
         assert_eq!(result.subagent_type, SubagentType::CodeReviewer);
         assert_eq!(result.model.as_deref(), Some("deepseek-v4-pro"));
         assert_eq!(result.mode, SubagentMode::Sync);
+        assert_eq!(result.isolation, SubagentIsolation::Worktree);
     }
 
     #[test]

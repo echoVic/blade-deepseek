@@ -279,6 +279,15 @@ fn workflow_runner_retries_transient_child_agent_failure() {
     assert_eq!(progress.running_agents, 0);
     assert_eq!(progress.completed_agents, 1);
     assert_eq!(progress.failed_agents, 1);
+    assert_eq!(record.workflow_agents.len(), 1);
+    assert_eq!(record.workflow_agents[0].call_path, "root:1");
+    assert_eq!(
+        record.workflow_agents[0].status,
+        orca_core::workflow_types::WorkflowAgentStatus::Completed
+    );
+    assert_eq!(record.workflow_agents[0].attempt, 2);
+    assert_eq!(record.workflow_agents[0].max_attempts, 2);
+    assert_eq!(record.workflow_agents[0].previous_errors.len(), 1);
 
     let run_id = record.workflow_run_id.as_deref().expect("run id");
     let store = WorkflowStateStore::new(session_dir.join("workflow-runs"));
@@ -299,6 +308,39 @@ fn workflow_runner_retries_transient_child_agent_failure() {
     assert_eq!(record["attempt"], 2);
     assert_eq!(record["maxAttempts"], 2);
     assert_eq!(record["previousErrors"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn workflow_agent_summary_surfaces_token_usage() {
+    if !orca_runtime::workflow::host::WorkflowHost::node_available() {
+        return;
+    }
+
+    let temp = tempdir().unwrap();
+    let script = temp.path().join("workflow.js");
+    fs::write(
+        &script,
+        "export const meta = { name: 'usage', description: 'Usage test', phases: [] };\n\
+         export default await agent('mock_usage');",
+    )
+    .unwrap();
+
+    let config = mock_run_config(temp.path());
+    let tasks = TaskRegistry::new("session-1".to_string());
+    let runner = WorkflowRunner::new(config, tasks.clone(), temp.path().join("session"));
+    let launched = runner
+        .launch(WorkflowLaunchRequest::from_script_path(
+            script.display().to_string(),
+        ))
+        .expect("usage workflow runs");
+
+    let record = tasks.get(&launched.task_id).expect("task record");
+    let usage = record.workflow_agents[0]
+        .usage
+        .expect("agent usage should be surfaced");
+    assert_eq!(usage.input_tokens, 120);
+    assert_eq!(usage.output_tokens, 30);
+    assert_eq!(usage.cache_tokens, 10);
 }
 
 #[test]

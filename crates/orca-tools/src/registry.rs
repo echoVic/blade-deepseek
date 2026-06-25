@@ -554,6 +554,11 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
                         "type": "string",
                         "enum": ["sync", "async"],
                         "description": "sync blocks until completion. async launches the child in the background and returns an agent_id for subagent_status."
+                    },
+                    "isolation": {
+                        "type": "string",
+                        "enum": ["none", "worktree"],
+                        "description": "none uses the current checkout. worktree runs the child in a detached git worktree and preserves it if the child leaves file changes."
                     }
                 },
                 "required": ["description", "prompt"]

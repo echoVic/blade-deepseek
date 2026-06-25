@@ -613,6 +613,7 @@ fn state_store_preserves_current_json_looking_string_outputs() {
                     output: Some(json!(output)),
                     error: None,
                     transcript_path: None,
+                    usage: None,
                 },
             )
             .unwrap();
@@ -695,6 +696,7 @@ fn state_store_preserves_missing_output_field_when_appending_completed_record() 
                 output: Some(json!("cached result")),
                 error: None,
                 transcript_path: None,
+                usage: None,
             },
         )
         .unwrap();

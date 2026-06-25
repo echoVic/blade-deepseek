@@ -1,5 +1,8 @@
 use serde::{Deserialize, Serialize};
 
+use crate::cost_types::UsageTotals;
+use crate::workflow_types::WorkflowAgentStatus;
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
@@ -34,7 +37,25 @@ pub struct WorkflowTaskProgress {
     pub failed_phases: usize,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkflowAgentTaskSummary {
+    pub call_id: String,
+    pub call_path: String,
+    pub status: WorkflowAgentStatus,
+    pub attempt: u32,
+    pub max_attempts: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub previous_errors: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transcript_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<UsageTotals>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BackgroundTaskSummary {
     pub id: String,
@@ -63,4 +84,6 @@ pub struct BackgroundTaskSummary {
     pub phase_count: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workflow_progress: Option<WorkflowTaskProgress>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workflow_agents: Vec<WorkflowAgentTaskSummary>,
 }

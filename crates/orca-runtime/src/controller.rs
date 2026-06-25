@@ -31,7 +31,7 @@ use crate::hooks::{HookContext, HookRunner, conversation_with_hook_context};
 use crate::instructions::{self, ProjectInstructions};
 use crate::memory::{self, MemoryBlock};
 use crate::session::new_run_id;
-use crate::subagent::{self, SubagentMode};
+use crate::subagent::{self, SubagentIsolation, SubagentMode};
 use crate::tasks::TaskRegistry;
 use crate::tool_invocation::{
     apply_pre_tool_outcome, apply_pre_tool_outcome_with_external, approval_request_for_invocation,
@@ -39,6 +39,7 @@ use crate::tool_invocation::{
     validate_tool_invocation_with_external,
 };
 use crate::workflow::{WorkflowBackgroundLaunch, WorkflowLaunchRequest, WorkflowRunner};
+use crate::worktree::{WorktreeGuard, WorktreeOutcome};
 use orca_core::hook_types::HookEvent;
 
 const DEFAULT_MAX_TURNS: u32 = 128;
@@ -69,6 +70,7 @@ struct SubagentExecutionResult {
     description: String,
     child: ChildAgentResult,
     cost_tracker: CostTracker,
+    worktree: Option<WorktreeOutcome>,
 }
 
 #[derive(Debug)]
@@ -543,14 +545,15 @@ fn run_agent_loop(
             sink.emit(&events.error(&format!("post_model_call hook failed: {error}")))?;
         }
 
-        if emit_deltas
-            && let Some(usage) = response.usage
+        if let Some(usage) = response.usage
             && !usage.is_empty()
         {
             let totals = cost_tracker.add_usage(usage);
-            sink.emit(&events.usage_updated(totals))?;
-            if let Some(writer) = history_writer.as_deref_mut() {
-                writer.append_usage(totals)?;
+            if emit_deltas {
+                sink.emit(&events.usage_updated(totals))?;
+                if let Some(writer) = history_writer.as_deref_mut() {
+                    writer.append_usage(totals)?;
+                }
             }
             if let Some(max_budget) = config.max_budget_usd
                 && totals.estimated_cost_usd > max_budget
@@ -559,7 +562,9 @@ fn run_agent_loop(
                     "budget exhausted: estimated cost ${:.6} exceeded limit ${:.6}",
                     totals.estimated_cost_usd, max_budget
                 );
-                sink.emit(&events.error(&error))?;
+                if emit_deltas {
+                    sink.emit(&events.error(&error))?;
+                }
                 return Ok(AgentLoopResult::failure(RunStatus::BudgetExhausted, error));
             }
         }
@@ -1169,7 +1174,7 @@ fn should_run_subagent_batch(
     tool_request.name == tool_types::ToolName::Subagent
         && subagent_depth < config.subagents.max_depth
         && config.subagents.max_parallel > 1
-        && subagent::create_subagent_request(tool_request).mode == SubagentMode::Sync
+        && is_batchable_subagent_request(tool_request)
 }
 
 fn collect_subagent_batch(
@@ -1179,13 +1184,18 @@ fn collect_subagent_batch(
 ) -> usize {
     let max_end = (start + config.subagents.max_parallel).min(tool_requests.len());
     let mut end = start;
-    while end < max_end
-        && tool_requests[end].name == tool_types::ToolName::Subagent
-        && subagent::create_subagent_request(&tool_requests[end]).mode == SubagentMode::Sync
-    {
+    while end < max_end && is_batchable_subagent_request(&tool_requests[end]) {
         end += 1;
     }
     end
+}
+
+fn is_batchable_subagent_request(tool_request: &tool_types::ToolRequest) -> bool {
+    if tool_request.name != tool_types::ToolName::Subagent {
+        return false;
+    }
+    let request = subagent::create_subagent_request(tool_request);
+    request.mode == SubagentMode::Sync && request.isolation == SubagentIsolation::None
 }
 
 fn execute_readonly_batch(
@@ -1400,6 +1410,7 @@ fn execute_subagent_batch(
                     description: request.description,
                     child,
                     cost_tracker: child_cost_tracker,
+                    worktree: None,
                 }
             }),
         ));
@@ -1458,11 +1469,12 @@ fn subagent_execution_to_tool_result(
 ) -> io::Result<(RunStatus, tool_types::ToolResult)> {
     match execution.child.status {
         RunStatus::Success => {
-            let output = execution
+            let mut output = execution
                 .child
                 .final_message
                 .clone()
                 .unwrap_or_else(|| "(subagent completed without a final message)".to_string());
+            append_worktree_outcome(&mut output, execution.worktree.as_ref());
             if emit_deltas {
                 sink.emit(&events.subagent_completed(
                     &execution.tool_request.id,
@@ -1482,11 +1494,12 @@ fn subagent_execution_to_tool_result(
             ))
         }
         status => {
-            let error = execution
+            let mut error = execution
                 .child
                 .error
                 .clone()
                 .unwrap_or_else(|| format!("subagent ended with status {status:?}"));
+            append_worktree_outcome(&mut error, execution.worktree.as_ref());
             if emit_deltas {
                 sink.emit(&events.subagent_completed(
                     &execution.tool_request.id,
@@ -1505,6 +1518,20 @@ fn subagent_execution_to_tool_result(
                 ),
             ))
         }
+    }
+}
+
+fn append_worktree_outcome(output: &mut String, outcome: Option<&WorktreeOutcome>) {
+    if let Some(outcome) = outcome {
+        let status = if outcome.preserved {
+            "preserved"
+        } else {
+            "cleaned"
+        };
+        output.push_str(&format!(
+            "\n\nWorktree {status}: {}",
+            outcome.path.display()
+        ));
     }
 }
 
@@ -1561,6 +1588,30 @@ fn execute_subagent_tool(
         ));
     }
 
+    let worktree_guard = if request.isolation == SubagentIsolation::Worktree {
+        match WorktreeGuard::create(cwd) {
+            Ok(guard) => Some(guard),
+            Err(error) => {
+                let error = format!("failed to create subagent worktree: {error}");
+                if emit_deltas {
+                    sink.emit(&events.subagent_completed(
+                        &tool_request.id,
+                        &description,
+                        RunStatus::Failed,
+                        None,
+                        Some(&error),
+                    ))?;
+                }
+                return Ok(tool_types::ToolResult::failed(tool_request, error, None));
+            }
+        }
+    } else {
+        None
+    };
+    let child_cwd = worktree_guard
+        .as_ref()
+        .map(|guard| guard.path())
+        .unwrap_or(cwd);
     let child_request = ChildAgentRequest {
         prompt: request.prompt,
         subagent_type: request.subagent_type,
@@ -1569,7 +1620,7 @@ fn execute_subagent_tool(
         emit_deltas: false,
     };
     let mut runtime = ChildAgentRuntime::new(
-        cwd,
+        child_cwd,
         events,
         sink,
         instructions,
@@ -1580,14 +1631,20 @@ fn execute_subagent_tool(
         execute_child_agent_loop,
     );
     let (child, child_cost_tracker) = run_child_agent(config, &child_request, &mut runtime);
+    drop(runtime);
+    let worktree = worktree_guard
+        .map(WorktreeGuard::finish)
+        .transpose()
+        .map_err(io::Error::other)?;
 
     cost_tracker.merge(&child_cost_tracker);
 
     match child.status {
         RunStatus::Success => {
-            let output = child
+            let mut output = child
                 .final_message
                 .unwrap_or_else(|| "(subagent completed without a final message)".to_string());
+            append_worktree_outcome(&mut output, worktree.as_ref());
             if emit_deltas {
                 sink.emit(&events.subagent_completed(
                     &tool_request.id,
@@ -1604,9 +1661,10 @@ fn execute_subagent_tool(
             ))
         }
         status => {
-            let error = child
+            let mut error = child
                 .error
                 .unwrap_or_else(|| format!("subagent ended with status {status:?}"));
+            append_worktree_outcome(&mut error, worktree.as_ref());
             if emit_deltas {
                 sink.emit(&events.subagent_completed(
                     &tool_request.id,
@@ -1644,6 +1702,18 @@ fn launch_async_subagent(
         .and_then(|value| value.as_str().map(str::to_string));
     let task = task_registry.create_subagent(request.description.clone(), agent_type);
     let agent_id = task.id.clone();
+    let worktree_guard = if request.isolation == SubagentIsolation::Worktree {
+        match WorktreeGuard::create(cwd) {
+            Ok(guard) => Some(guard),
+            Err(error) => {
+                let error = format!("failed to create subagent worktree: {error}");
+                let _ = task_registry.fail(&agent_id, error.clone());
+                return tool_types::ToolResult::failed(tool_request, error, None);
+            }
+        }
+    } else {
+        None
+    };
     let child_request = ChildAgentRequest {
         prompt: request.prompt,
         subagent_type: request.subagent_type,
@@ -1652,7 +1722,10 @@ fn launch_async_subagent(
         emit_deltas: false,
     };
     let child_config = config.clone();
-    let child_cwd = cwd.to_path_buf();
+    let child_cwd = worktree_guard
+        .as_ref()
+        .map(|guard| guard.path().to_path_buf())
+        .unwrap_or_else(|| cwd.to_path_buf());
     let child_instructions = instructions.clone();
     let child_memory = memory.clone();
     let child_mcp_registry = mcp_registry.clone();
@@ -1678,16 +1751,20 @@ fn launch_async_subagent(
         );
         let (child, _child_cost_tracker) =
             run_child_agent(&child_config, &child_request, &mut child_runtime);
+        drop(child_runtime);
+        let worktree = worktree_guard.and_then(|guard| guard.finish().ok());
         if child.status == RunStatus::Success {
-            let output = child
+            let mut output = child
                 .final_message
                 .unwrap_or_else(|| "(subagent completed without a final message)".to_string());
+            append_worktree_outcome(&mut output, worktree.as_ref());
             let _ = child_registry.complete(&thread_agent_id, output);
         } else {
-            let error = child
+            let mut error = child
                 .error
                 .or(child.final_message)
                 .unwrap_or_else(|| format!("subagent ended with status {:?}", child.status));
+            append_worktree_outcome(&mut error, worktree.as_ref());
             let _ = child_registry.fail(&thread_agent_id, error);
         }
     });

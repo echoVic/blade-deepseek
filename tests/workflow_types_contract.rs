@@ -79,6 +79,7 @@ fn background_task_summary_matches_sdk_names() {
             running_phases: 1,
             failed_phases: 0,
         }),
+        workflow_agents: Vec::new(),
     };
 
     let value = serde_json::to_value(summary).unwrap();

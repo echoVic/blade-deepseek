@@ -330,10 +330,15 @@ fn parse_mock_prompt(prompt: &str) -> Option<ToolRequest> {
     }
 
     if let Some(rest) = prompt.strip_prefix("subagent ") {
-        let (mode, description) = if let Some(description) = rest.trim().strip_prefix("async ") {
-            (Some("async"), description.trim())
+        let (isolation, rest) = if let Some(description) = rest.trim().strip_prefix("worktree ") {
+            (Some("worktree"), description.trim())
         } else {
             (None, rest.trim())
+        };
+        let (mode, description) = if let Some(description) = rest.strip_prefix("async ") {
+            (Some("async"), description.trim())
+        } else {
+            (None, rest)
         };
         let prompt = if description == "mock_fail" {
             "mock_fail".to_string()
@@ -346,6 +351,9 @@ fn parse_mock_prompt(prompt: &str) -> Option<ToolRequest> {
         });
         if let Some(mode) = mode {
             arguments["mode"] = serde_json::Value::String(mode.to_string());
+        }
+        if let Some(isolation) = isolation {
+            arguments["isolation"] = serde_json::Value::String(isolation.to_string());
         }
         return Some(ToolRequest {
             id: "mock-tool-1".to_string(),

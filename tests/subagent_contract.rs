@@ -181,6 +181,70 @@ fn nested_subagent_calls_are_rejected() {
 }
 
 #[test]
+fn default_subagent_depth_allows_one_nested_child() {
+    let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .args([
+            "exec",
+            "--output-format",
+            "jsonl",
+            "--provider",
+            "mock",
+            "subagent subagent inner task",
+        ])
+        .output()
+        .expect("run orca");
+
+    assert_eq!(output.status.code(), Some(0));
+    let events = parse_jsonl(&output.stdout);
+    let completed = find_event(&events, "subagent.completed");
+    assert_eq!(completed["payload"]["status"], "success");
+    assert_eq!(events.last().unwrap()["payload"]["status"], "success");
+}
+
+#[test]
+fn worktree_isolated_subagent_writes_outside_parent_worktree() {
+    let repo = tempdir().expect("temp repo");
+    run_git(repo.path(), &["init"]);
+    run_git(repo.path(), &["config", "user.email", "orca@example.test"]);
+    run_git(repo.path(), &["config", "user.name", "Orca Test"]);
+    std::fs::write(repo.path().join("file.txt"), "placeholder").expect("seed file");
+    run_git(repo.path(), &["add", "file.txt"]);
+    run_git(repo.path(), &["commit", "-m", "seed"]);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .current_dir(repo.path())
+        .args([
+            "exec",
+            "--output-format",
+            "jsonl",
+            "--provider",
+            "mock",
+            "--mode",
+            "full-auto",
+            "subagent worktree edit file.txt :: placeholder => child",
+        ])
+        .output()
+        .expect("run orca");
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(repo.path().join("file.txt")).unwrap(),
+        "placeholder"
+    );
+    let worktrees = repo.path().join(".orca/worktrees");
+    let changed_worktree = std::fs::read_dir(&worktrees)
+        .expect("worktree directory")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.join("file.txt").exists())
+        .expect("dirty worktree was preserved");
+    assert_eq!(
+        std::fs::read_to_string(changed_worktree.join("file.txt")).unwrap(),
+        "child"
+    );
+}
+
+#[test]
 fn subagent_child_failure_fails_parent_run() {
     let output = Command::new(env!("CARGO_BIN_EXE_orca"))
         .args([
@@ -217,6 +281,21 @@ fn find_event<'a>(events: &'a [Value], event_type: &str) -> &'a Value {
         .iter()
         .find(|event| event["type"] == event_type)
         .unwrap_or_else(|| panic!("missing {event_type}"))
+}
+
+fn run_git(cwd: &std::path::Path, args: &[&str]) {
+    let output = Command::new("git")
+        .current_dir(cwd)
+        .args(args)
+        .output()
+        .expect("run git");
+    assert!(
+        output.status.success(),
+        "git {:?} failed: {}{}",
+        args,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 fn parse_jsonl(stdout: &[u8]) -> Vec<Value> {

@@ -10,6 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use orca_core::approval_types::ApprovalMode;
 use orca_core::cancel::CancelToken;
 use orca_core::config::{OutputFormat, RunConfig};
+use orca_core::cost_types::UsageTotals;
 use orca_core::event_schema::EventFactory;
 use orca_core::event_schema::RunStatus;
 use orca_core::event_sink::EventSink;
@@ -111,6 +112,12 @@ struct PreparedWorkflowRun {
     task_id: String,
     run_id: String,
     transcript_dir: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+struct WorkflowChildAgentCallOutput {
+    message: String,
+    usage: UsageTotals,
 }
 
 #[derive(Debug)]
@@ -486,6 +493,7 @@ impl WorkflowRunner {
                         output: Some(normalized_cached_value.clone()),
                         error: None,
                         transcript_path: Some(transcript_path.display().to_string()),
+                        usage: None,
                     },
                 )?;
                 if let Ok(state) = self.state.load_run(run_id) {
@@ -521,8 +529,8 @@ impl WorkflowRunner {
             };
 
             match self.run_child_agent_call(&call) {
-                Ok(output) => {
-                    let output = child_agent_output(&call.prompt, &output);
+                Ok(child_output) => {
+                    let output = child_agent_output(&call.prompt, &child_output.message);
                     let transcript_path =
                         write_agent_transcript(transcript_dir, &call, &output, false)?;
                     let result = workflow_agent_result(&call, Value::String(output.clone()), false);
@@ -541,6 +549,7 @@ impl WorkflowRunner {
                             output: Some(result.clone()),
                             error: None,
                             transcript_path: Some(transcript_path.display().to_string()),
+                            usage: Some(child_output.usage),
                         },
                     )?;
                     if let Ok(state) = self.state.load_run(run_id) {
@@ -572,6 +581,7 @@ impl WorkflowRunner {
                             output: None,
                             error: Some(error_message.clone()),
                             transcript_path: Some(transcript_path.display().to_string()),
+                            usage: None,
                         },
                     )?;
                     if let Ok(state) = self.state.load_run(run_id) {
@@ -597,7 +607,7 @@ impl WorkflowRunner {
         })
     }
 
-    fn run_child_agent_call(&self, call: &AgentCall) -> io::Result<String> {
+    fn run_child_agent_call(&self, call: &AgentCall) -> io::Result<WorkflowChildAgentCallOutput> {
         let cwd = self
             .config
             .cwd
@@ -629,10 +639,15 @@ impl WorkflowRunner {
             &cancel,
             execute_child_agent_loop,
         );
-        let (result, _) = run_child_agent(&workflow_child_config, &child_request, &mut runtime);
+        let (result, child_cost_tracker) =
+            run_child_agent(&workflow_child_config, &child_request, &mut runtime);
+        let usage = child_cost_tracker.totals();
 
         match result.status {
-            RunStatus::Success => Ok(result.final_message.unwrap_or_default()),
+            RunStatus::Success => Ok(WorkflowChildAgentCallOutput {
+                message: result.final_message.unwrap_or_default(),
+                usage,
+            }),
             _ => Err(io::Error::other(
                 result
                     .error
@@ -732,6 +747,9 @@ impl WorkflowRunner {
         };
         self.tasks
             .update_workflow_progress(task_id, progress)
+            .map_err(io::Error::other)?;
+        self.tasks
+            .update_workflow_agents(task_id, self.state.agent_summaries(&state.run_id)?)
             .map_err(io::Error::other)
     }
 }

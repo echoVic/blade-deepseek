@@ -8,7 +8,10 @@ use std::ops::Range;
 use tui_textarea::TextArea;
 use unicode_width::UnicodeWidthStr;
 
-use orca_core::task_types::{BackgroundTaskSummary, TaskStatus, TaskType};
+use orca_core::task_types::{
+    BackgroundTaskSummary, TaskStatus, TaskType, WorkflowAgentTaskSummary,
+};
+use orca_core::workflow_types::WorkflowAgentStatus;
 
 use crate::shortcuts::{self, ShortcutScope};
 use crate::theme::Theme;
@@ -337,11 +340,19 @@ fn render_workflows_panel(frame: &mut Frame, area: Rect, state: &mut AppState, t
         return;
     }
 
-    // One header row + two rows per task (label line, gauge line).
+    // One header row + task rows. The selected workflow expands into
+    // per-agent rows so the panel can act as a lightweight dashboard.
     let header_h: u16 = 1;
     let row_h: u16 = 2;
     let mut constraints = vec![Constraint::Length(header_h)];
-    constraints.extend(tasks.iter().map(|_| Constraint::Length(row_h)));
+    constraints.extend(tasks.iter().enumerate().map(|(index, task)| {
+        let agent_rows = if index == state.workflow_panel.selected {
+            task.workflow_agents.len() as u16
+        } else {
+            0
+        };
+        Constraint::Length(row_h.saturating_add(agent_rows))
+    }));
     constraints.push(Constraint::Min(0));
     let rows = Layout::vertical(constraints).split(inner);
 
@@ -370,9 +381,12 @@ fn render_workflows_panel(frame: &mut Frame, area: Rect, state: &mut AppState, t
             Style::default().fg(theme.text)
         };
 
-        // Split the row into a label line and a gauge line.
-        let parts =
-            Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(row_area);
+        // Split the row into a label line, a gauge line, and optional agent rows.
+        let mut row_constraints = vec![Constraint::Length(1), Constraint::Length(1)];
+        if selected {
+            row_constraints.extend(task.workflow_agents.iter().map(|_| Constraint::Length(1)));
+        }
+        let parts = Layout::vertical(row_constraints).split(row_area);
 
         let label = Paragraph::new(Line::from(vec![
             Span::styled(format!("{marker} {name}"), name_style),
@@ -397,6 +411,13 @@ fn render_workflows_panel(frame: &mut Frame, area: Rect, state: &mut AppState, t
                 Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
             ));
         frame.render_widget(gauge, parts[1]);
+
+        if selected {
+            for (agent_index, agent) in task.workflow_agents.iter().enumerate() {
+                let line = Paragraph::new(agent_row_label(agent, theme));
+                frame.render_widget(line, parts[agent_index + 2]);
+            }
+        }
     }
 }
 
@@ -487,6 +508,63 @@ fn workflow_progress_label(task: &BackgroundTaskSummary) -> String {
         progress.completed_phases, phase_total
     ));
     parts.join(", ")
+}
+
+fn agent_row_label<'a>(agent: &WorkflowAgentTaskSummary, theme: &Theme) -> Line<'a> {
+    let status = workflow_agent_status_label(agent.status);
+    let status_color = workflow_agent_status_color(agent.status, theme);
+    let attempt = format!("attempt {}/{}", agent.attempt, agent.max_attempts);
+    let retry = if agent.previous_errors.is_empty() {
+        "retry errors 0".to_string()
+    } else {
+        format!("retry errors {}", agent.previous_errors.len())
+    };
+    let usage = agent
+        .usage
+        .map(|usage| {
+            format!(
+                "  {} tok ${:.6}",
+                usage.total_tokens(),
+                usage.estimated_cost_usd
+            )
+        })
+        .unwrap_or_default();
+    let error = agent
+        .error
+        .as_deref()
+        .or_else(|| agent.previous_errors.last().map(String::as_str));
+    let detail = error.map(|error| format!("  {error}")).unwrap_or_default();
+
+    Line::from(vec![
+        Span::styled("    ", Style::default()),
+        Span::styled(agent.call_path.clone(), Style::default().fg(theme.text)),
+        Span::styled("  ", Style::default()),
+        Span::styled(status, Style::default().fg(status_color)),
+        Span::styled(format!("  {attempt}"), Style::default().fg(theme.muted)),
+        Span::styled(format!("  {retry}"), Style::default().fg(theme.muted)),
+        Span::styled(usage, Style::default().fg(theme.muted)),
+        Span::styled(detail, Style::default().fg(theme.error)),
+    ])
+}
+
+fn workflow_agent_status_label(status: WorkflowAgentStatus) -> &'static str {
+    match status {
+        WorkflowAgentStatus::Pending => "pending",
+        WorkflowAgentStatus::Running => "running",
+        WorkflowAgentStatus::Cached => "cached",
+        WorkflowAgentStatus::Completed => "completed",
+        WorkflowAgentStatus::Failed => "failed",
+        WorkflowAgentStatus::Cancelled => "cancelled",
+    }
+}
+
+fn workflow_agent_status_color(status: WorkflowAgentStatus, theme: &Theme) -> Color {
+    match status {
+        WorkflowAgentStatus::Completed | WorkflowAgentStatus::Cached => theme.success,
+        WorkflowAgentStatus::Failed | WorkflowAgentStatus::Cancelled => theme.error,
+        WorkflowAgentStatus::Running => theme.warning,
+        WorkflowAgentStatus::Pending => theme.muted,
+    }
 }
 
 fn subagent_progress_label(task: &BackgroundTaskSummary) -> String {
@@ -2236,6 +2314,7 @@ mod tests {
                 running_phases: 1,
                 failed_phases: 0,
             }),
+            workflow_agents: Vec::new(),
         };
 
         assert_eq!(
@@ -2261,6 +2340,7 @@ mod tests {
             workflow_run_id: None,
             phase_count: None,
             workflow_progress: None,
+            workflow_agents: Vec::new(),
             created_at_ms: 1_000,
             started_at_ms: Some(1_000),
             completed_at_ms: None,
@@ -2277,6 +2357,61 @@ mod tests {
 
         assert!(rendered.contains("inspect auth"));
         assert!(rendered.contains("subagent"));
+    }
+
+    #[test]
+    fn workflows_panel_renders_selected_workflow_agent_rows() {
+        let mut state = test_state();
+        state.panel_mode = PanelMode::Workflows;
+        state.workflow_panel.tasks = vec![BackgroundTaskSummary {
+            id: "task-workflow".to_string(),
+            task_type: TaskType::Workflow,
+            status: TaskStatus::Completed,
+            description: "Audit".to_string(),
+            command: None,
+            agent_type: None,
+            server: None,
+            tool: None,
+            name: Some("audit".to_string()),
+            workflow_run_id: Some("workflow-run-1".to_string()),
+            phase_count: Some(1),
+            workflow_progress: None,
+            workflow_agents: vec![orca_core::task_types::WorkflowAgentTaskSummary {
+                call_id: "agent-1".to_string(),
+                call_path: "root:1".to_string(),
+                status: orca_core::workflow_types::WorkflowAgentStatus::Completed,
+                attempt: 2,
+                max_attempts: 2,
+                previous_errors: vec!["first attempt failed".to_string()],
+                error: None,
+                transcript_path: Some("/tmp/agent-1.json".to_string()),
+                usage: Some(orca_core::cost_types::UsageTotals {
+                    input_tokens: 120,
+                    output_tokens: 30,
+                    cache_tokens: 10,
+                    estimated_cost_usd: 0.0000252,
+                }),
+            }],
+            created_at_ms: 1_000,
+            started_at_ms: Some(1_000),
+            completed_at_ms: Some(2_000),
+        }];
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let textarea = TextArea::default();
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 16))
+            .expect("test backend");
+
+        terminal
+            .draw(|frame| render(frame, &mut state, &textarea, &theme))
+            .expect("draw");
+        let rendered = format!("{:?}", terminal.backend().buffer());
+
+        assert!(rendered.contains("root:1"));
+        assert!(rendered.contains("completed"));
+        assert!(rendered.contains("attempt 2/2"));
+        assert!(rendered.contains("retry errors 1"));
+        assert!(rendered.contains("150 tok"));
+        assert!(rendered.contains("$0.000025"));
     }
 
     #[test]

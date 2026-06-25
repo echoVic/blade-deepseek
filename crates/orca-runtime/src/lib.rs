@@ -17,3 +17,4 @@ pub mod tasks;
 pub mod tool_invocation;
 pub mod update_check;
 pub mod workflow;
+pub mod worktree;

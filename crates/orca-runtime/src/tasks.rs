@@ -7,7 +7,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use orca_core::cancel::CancelToken;
-use orca_core::task_types::{BackgroundTaskSummary, TaskStatus, TaskType, WorkflowTaskProgress};
+use orca_core::task_types::{
+    BackgroundTaskSummary, TaskStatus, TaskType, WorkflowAgentTaskSummary, WorkflowTaskProgress,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug)]
@@ -38,6 +40,7 @@ pub struct TaskRecord {
     pub workflow_run_id: Option<String>,
     pub phase_count: Option<usize>,
     pub workflow_progress: Option<WorkflowTaskProgress>,
+    pub workflow_agents: Vec<WorkflowAgentTaskSummary>,
     pub result: Option<String>,
     pub error: Option<String>,
     pub control: TaskControl,
@@ -69,6 +72,8 @@ struct PersistedTaskRecord {
     workflow_run_id: Option<String>,
     phase_count: Option<usize>,
     workflow_progress: Option<WorkflowTaskProgress>,
+    #[serde(default)]
+    workflow_agents: Vec<WorkflowAgentTaskSummary>,
     result: Option<String>,
     error: Option<String>,
 }
@@ -134,6 +139,7 @@ impl TaskRegistry {
             workflow_run_id: Some(workflow_run_id.clone()),
             phase_count: Some(phase_count),
             workflow_progress: None,
+            workflow_agents: Vec::new(),
             result: None,
             error: None,
             control,
@@ -169,6 +175,7 @@ impl TaskRegistry {
             workflow_run_id: None,
             phase_count: None,
             workflow_progress: None,
+            workflow_agents: Vec::new(),
             result: None,
             error: None,
             control,
@@ -205,6 +212,7 @@ impl TaskRegistry {
                         workflow_run_id: record.workflow_run_id.clone(),
                         phase_count: record.phase_count,
                         workflow_progress: record.workflow_progress,
+                        workflow_agents: record.workflow_agents.clone(),
                     })
                     .collect::<Vec<_>>()
             })
@@ -237,6 +245,17 @@ impl TaskRegistry {
     ) -> Result<(), String> {
         self.update_task(id, |record| {
             record.workflow_progress = Some(progress);
+            Ok(())
+        })
+    }
+
+    pub fn update_workflow_agents(
+        &self,
+        id: &str,
+        agents: Vec<WorkflowAgentTaskSummary>,
+    ) -> Result<(), String> {
+        self.update_task(id, |record| {
+            record.workflow_agents = agents;
             Ok(())
         })
     }
@@ -476,6 +495,7 @@ impl PersistedTaskRecord {
             workflow_run_id: self.workflow_run_id,
             phase_count: self.phase_count,
             workflow_progress: self.workflow_progress,
+            workflow_agents: self.workflow_agents,
             result: self.result,
             error: self.error,
             control: new_task_control(),
@@ -504,6 +524,7 @@ impl From<&TaskRecord> for PersistedTaskRecord {
             workflow_run_id: record.workflow_run_id.clone(),
             phase_count: record.phase_count,
             workflow_progress: record.workflow_progress,
+            workflow_agents: record.workflow_agents.clone(),
             result: record.result.clone(),
             error: record.error.clone(),
         }
