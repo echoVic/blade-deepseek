@@ -318,7 +318,7 @@ TuiEvent::SubagentCompleted { id, ... } => {
 
 **限制** ⚠️:
 - 只支持一层嵌套（`MAX_SUBAGENT_DEPTH=1`）
-- 子代理无法并行执行（同步阻塞模型）
+- 子代理支持批量并行执行（默认 `max_parallel = 6`），但仍不是异步非阻塞模型
 - 子代理的中间步骤对用户不可见（`emit_deltas=false`）
 - 共享相同的 provider 配置（无法为子任务选择不同模型）
 - 无超时控制（理论上可能无限循环）
