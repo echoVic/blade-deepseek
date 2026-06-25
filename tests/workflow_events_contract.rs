@@ -34,6 +34,7 @@ fn workflow_config_defaults_match_public_limits() {
     assert_eq!(config.max_concurrent_agents, 16);
     assert_eq!(config.max_agents_per_run, 1000);
     assert_eq!(config.max_agent_retries, 1);
+    assert_eq!(config.max_agent_tokens, None);
     assert!(config.keyword_trigger_enabled);
 }
 

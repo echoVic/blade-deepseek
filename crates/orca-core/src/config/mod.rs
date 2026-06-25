@@ -127,6 +127,8 @@ pub struct WorkflowConfig {
     pub max_agents_per_run: u32,
     #[serde(default = "default_max_workflow_agent_retries")]
     pub max_agent_retries: u32,
+    #[serde(default)]
+    pub max_agent_tokens: Option<u64>,
     #[serde(default = "default_workflow_keyword_trigger_enabled")]
     pub keyword_trigger_enabled: bool,
 }
@@ -138,6 +140,7 @@ impl Default for WorkflowConfig {
             max_concurrent_agents: DEFAULT_MAX_WORKFLOW_CONCURRENT_AGENTS,
             max_agents_per_run: DEFAULT_MAX_WORKFLOW_AGENTS_PER_RUN,
             max_agent_retries: DEFAULT_MAX_WORKFLOW_AGENT_RETRIES,
+            max_agent_tokens: None,
             keyword_trigger_enabled: true,
         }
     }
@@ -325,8 +328,14 @@ fn runtime_summary(config: &RunConfig) -> RuntimeSummary {
             .unwrap_or_else(|| "<model-default>".to_string()),
         tool_output_truncation: config.tools.output_truncation.to_string(),
         workflow_agents: format!(
-            "max_parallel={}, max_per_run={}",
-            config.workflows.max_concurrent_agents, config.workflows.max_agents_per_run
+            "max_parallel={}, max_per_run={}, max_agent_tokens={}",
+            config.workflows.max_concurrent_agents,
+            config.workflows.max_agents_per_run,
+            config
+                .workflows
+                .max_agent_tokens
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "<unset>".to_string())
         ),
     }
 }

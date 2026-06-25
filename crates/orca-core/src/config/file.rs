@@ -164,6 +164,8 @@ pub struct WorkflowFileConfig {
     #[serde(default)]
     pub max_agent_retries: Option<u32>,
     #[serde(default)]
+    pub max_agent_tokens: Option<u64>,
+    #[serde(default)]
     #[serde(alias = "workflowKeywordTriggerEnabled")]
     pub workflow_keyword_trigger_enabled: Option<bool>,
 }
@@ -190,6 +192,9 @@ impl WorkflowFileConfig {
         }
         if let Some(max_agent_retries) = self.max_agent_retries {
             config.max_agent_retries = max_agent_retries.min(MAX_WORKFLOW_AGENT_RETRIES);
+        }
+        if let Some(max_agent_tokens) = self.max_agent_tokens {
+            config.max_agent_tokens = Some(max_agent_tokens.max(1));
         }
         if let Some(keyword_trigger_enabled) = self.workflow_keyword_trigger_enabled {
             config.keyword_trigger_enabled = keyword_trigger_enabled;
@@ -559,6 +564,7 @@ enabled = false
 max_concurrent_agents = 7
 max_agents_per_run = 99
 max_agent_retries = 1
+max_agent_tokens = 12345
 workflowKeywordTriggerEnabled = false
 "#;
         let config: FileConfig = toml::from_str(toml).unwrap();
@@ -567,6 +573,7 @@ workflowKeywordTriggerEnabled = false
         assert_eq!(workflows.max_concurrent_agents, 7);
         assert_eq!(workflows.max_agents_per_run, 99);
         assert_eq!(workflows.max_agent_retries, 1);
+        assert_eq!(workflows.max_agent_tokens, Some(12_345));
         assert!(!workflows.keyword_trigger_enabled);
     }
 

@@ -122,6 +122,23 @@ struct WorkflowChildAgentCallOutput {
     worktree: Option<WorktreeOutcome>,
 }
 
+#[derive(Clone, Debug)]
+struct WorkflowChildAgentCallError {
+    message: String,
+    usage: Option<UsageTotals>,
+    retryable: bool,
+}
+
+impl From<io::Error> for WorkflowChildAgentCallError {
+    fn from(error: io::Error) -> Self {
+        Self {
+            message: error.to_string(),
+            usage: None,
+            retryable: true,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct WorkflowExecutionGate {
     counters: Mutex<WorkflowExecutionCounters>,
@@ -566,7 +583,11 @@ impl WorkflowRunner {
                 }
                 Err(error) => {
                     drop(_permit);
-                    let error_message = error.to_string();
+                    let WorkflowChildAgentCallError {
+                        message: error_message,
+                        usage,
+                        retryable,
+                    } = error;
                     let transcript_path =
                         write_agent_transcript(transcript_dir, &call, &error_message, false)?;
                     self.state.record_agent_completed(
@@ -584,14 +605,14 @@ impl WorkflowRunner {
                             output: None,
                             error: Some(error_message.clone()),
                             transcript_path: Some(transcript_path.display().to_string()),
-                            usage: None,
+                            usage,
                         },
                     )?;
                     if let Ok(state) = self.state.load_run(run_id) {
                         let _ = self.refresh_task_progress(task_id, &state);
                     }
 
-                    if attempt < max_attempts {
+                    if attempt < max_attempts && retryable {
                         previous_errors.push(error_message);
                         continue;
                     }
@@ -610,7 +631,10 @@ impl WorkflowRunner {
         })
     }
 
-    fn run_child_agent_call(&self, call: &AgentCall) -> io::Result<WorkflowChildAgentCallOutput> {
+    fn run_child_agent_call(
+        &self,
+        call: &AgentCall,
+    ) -> Result<WorkflowChildAgentCallOutput, WorkflowChildAgentCallError> {
         let cwd = self
             .config
             .cwd
@@ -658,18 +682,38 @@ impl WorkflowRunner {
         let worktree = worktree_guard.map(WorktreeGuard::finish).transpose()?;
 
         match result.status {
-            RunStatus::Success => Ok(WorkflowChildAgentCallOutput {
-                message: result.final_message.unwrap_or_default(),
-                usage,
-                worktree,
-            }),
+            RunStatus::Success => {
+                if let Some(max_agent_tokens) = self.config.workflows.max_agent_tokens {
+                    let total_tokens = usage.total_tokens();
+                    if total_tokens > max_agent_tokens {
+                        let mut error = format!(
+                            "{total_tokens} tokens exceeded per-agent token budget {max_agent_tokens}"
+                        );
+                        append_worktree_outcome(&mut error, worktree.as_ref());
+                        return Err(WorkflowChildAgentCallError {
+                            message: error,
+                            usage: Some(usage),
+                            retryable: false,
+                        });
+                    }
+                }
+                Ok(WorkflowChildAgentCallOutput {
+                    message: result.final_message.unwrap_or_default(),
+                    usage,
+                    worktree,
+                })
+            }
             _ => {
                 let mut error = result
                     .error
                     .or(result.final_message)
                     .unwrap_or_else(|| "workflow child agent failed".to_string());
                 append_worktree_outcome(&mut error, worktree.as_ref());
-                Err(io::Error::other(error))
+                Err(WorkflowChildAgentCallError {
+                    message: error,
+                    usage: Some(usage),
+                    retryable: true,
+                })
             }
         }
     }

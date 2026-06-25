@@ -9,7 +9,7 @@
 
 ## Executive Summary
 
-Orca has a **production-grade workflow runtime** that supports concurrent agent fan-out (up to 16 agents in parallel, 1000 per run by default). The `subagent` tool (model-facing) supports **parallel batching up to 6** (via `SubagentConfig.max_parallel`), default nesting depth **2**, optional git worktree isolation (`isolation: "worktree"`), plus an **async mode** (`mode: "async"` returning an `agent_id` for `subagent_status`). In headless/`exec`, async subagents are worker-backed: the launching process records a durable task under `.orca/task-sessions`, spawns a hidden `subagent-worker` process, and later `subagent_status` calls can resolve prior `agent_id` values across process boundaries. Completed async subagent records include token/cost usage; legacy queued/running records without a worker owner still recover as failed interruption records instead of pretending process-local execution survived. The **workflow system** (`WorkflowRunner` + `WorkflowHost`) achieves true concurrency via `thread::scope().spawn()` for up to 16 concurrent agents, supports opt-in workflow-agent worktree isolation through `{ isolation: "worktree" }`, retries transient child-agent failures once by default, supports opt-in phase fallback via `phase(name, body, { fallback: "continue" })`, supports explicit fallback values via `{ fallback: { value } }`, and supports recovery functions via `{ fallback: async ({ error }) => ... }`. The system still lacks agent teams and agent-to-agent communication. Workflow observability includes phase tracking, per-agent status rows, retry/failure detail, token usage, retry attempt telemetry, failed-but-continued phases, failed phase fallback/error rows, and lifecycle timestamps in `/workflows`.
+Orca has a **production-grade workflow runtime** that supports concurrent agent fan-out (up to 16 agents in parallel, 1000 per run by default). The `subagent` tool (model-facing) supports **parallel batching up to 6** (via `SubagentConfig.max_parallel`), default nesting depth **2**, optional git worktree isolation (`isolation: "worktree"`), plus an **async mode** (`mode: "async"` returning an `agent_id` for `subagent_status`). In headless/`exec`, async subagents are worker-backed: the launching process records a durable task under `.orca/task-sessions`, spawns a hidden `subagent-worker` process, and later `subagent_status` calls can resolve prior `agent_id` values across process boundaries. Completed async subagent records include token/cost usage; legacy queued/running records without a worker owner still recover as failed interruption records instead of pretending process-local execution survived. The **workflow system** (`WorkflowRunner` + `WorkflowHost`) achieves true concurrency via `thread::scope().spawn()` for up to 16 concurrent agents, supports opt-in workflow-agent worktree isolation through `{ isolation: "worktree" }`, retries transient child-agent failures once by default, supports opt-in phase fallback via `phase(name, body, { fallback: "continue" })`, supports explicit fallback values via `{ fallback: { value } }`, supports recovery functions via `{ fallback: async ({ error }) => ... }`, and can enforce a per-agent hard token budget with `[workflows] max_agent_tokens = ...`. Remaining gaps include agent teams, agent-to-agent communication, shared task lists, structured typed output, and resume/fork stress coverage. Workflow observability includes phase tracking, per-agent status rows, retry/failure detail, token usage, retry attempt telemetry, failed-but-continued phases, failed phase fallback/error rows, and lifecycle timestamps in `/workflows`.
 
 ---
 
@@ -195,12 +195,12 @@ All Phase 1 findings above were **cross-validated by the orchestrator** against 
 | **Reusable Workflow Scripts** | ✅ PRESENT | `.orca/workflows/*.js` + `~/.orca/workflows/*.js` + named workflow resolution | ✓ |
 | **Workflow Progress/Status** | ⚠️ PARTIAL+ | `WorkflowRunState` tracks phases, agent_count, phase error, and fallback policy; TUI polls `WorkflowTasksUpdated` and shows real agent/phase counts plus failed phase detail in `/workflows` | P2 |
 | **Fan-out to 8+ agents** | ✅ PRESENT | Default 16 concurrent, 1000 per run. Confirmed in this audit: 8 agents launched concurrently | ✓ |
-| **Agent Budget/Token Tracking** | ⚠️ PARTIAL | `CostTracker` totals are now persisted per workflow child agent and shown in `/workflows`; configurable per-agent hard budgets remain open | P2 |
+| **Agent Budget/Token Tracking** | ✅ PRESENT | `CostTracker` totals are persisted per workflow child agent, shown in `/workflows`, and `[workflows] max_agent_tokens = ...` fails child agents whose reported usage exceeds the hard token budget | ✓ |
 | **Resume/Fork Workflows** | ⚠️ PARTIAL | `resumeFromRunId` in `WorkflowInput` exists; state persistence supports it; not tested for complex workflows | P2 |
 | **Error Recovery** | ✅ PRESENT | Child-agent failures are retried once by default (`max_agent_retries` configurable up to 5), retry telemetry is persisted, phases can opt into `fallback: "continue"`, `{ fallback: { value } }`, or `fallback: async ({ error }) => ...`; failed phase fallback/error detail is visible in `/workflows` | ✓ |
 | **Structured Agent Output** | ⚠️ PARTIAL | Workflow agents return `Value` (JSON); subagent tool returns text; no schema validation | P2 |
 
-**Overall gap**: Orca's **workflow system** is architecturally capable of concurrent agent fan-out (confirmed 8+ agents) with observability (phase tracking, agent statuses, retry attempts, lifecycle timestamps, per-agent token usage, and bounded child-agent retry). The TUI now has `/workflows` for task-oriented progress and `/agents` for a dedicated workflow-agent dashboard across runs, while model-facing subagents have worker-backed async/status handles in headless/`exec` and optional worktree isolation for file-writing tasks. Workflow agents can also opt into worktree isolation, and phases can opt into continue-on-failure, explicit fallback-value recovery, or async recovery functions. The remaining gaps are team grouping and agent-to-agent coordination.
+**Overall gap**: Orca's **workflow system** is architecturally capable of concurrent agent fan-out (confirmed 8+ agents) with observability (phase tracking, agent statuses, retry attempts, lifecycle timestamps, per-agent token usage, per-agent hard token budgets, and bounded child-agent retry). The TUI now has `/workflows` for task-oriented progress and `/agents` for a dedicated workflow-agent dashboard across runs, while model-facing subagents have worker-backed async/status handles in headless/`exec` and optional worktree isolation for file-writing tasks. Workflow agents can also opt into worktree isolation, and phases can opt into continue-on-failure, explicit fallback-value recovery, or async recovery functions. The remaining gaps are team grouping, agent-to-agent coordination, shared task lists, structured typed output, and resume/fork stress coverage.
 
 ### Reviewer 3: Actionability of Next Steps
 
@@ -228,7 +228,7 @@ All recommended next steps are **implementable within current architecture**:
 | 8+ agent fan-out | ✅ Yes | 16 concurrent default, 1000/run max. Confirmed: 8 launched this audit |
 | Workflow progress observability | ✅ Yes (data) / ⚠️ Partial++ (UI) | `/workflows` shows live agent/phase counts, async subagent rows, failed phase fallback/error rows, and selected workflow agent rows; `/agents` shows all workflow agents across runs; team grouping remains open |
 | Agent count tracking | ✅ Yes | `WorkflowTaskProgress` exposes total/running/completed/failed agents to TUI task summaries |
-| Token usage tracking | ✅ Yes | `CostTracker` per child agent; workflow child totals are persisted and shown in `/workflows` |
+| Token usage tracking | ✅ Yes | `CostTracker` per child agent; workflow child totals are persisted and shown in `/workflows`; `[workflows] max_agent_tokens` enforces per-agent hard token budgets |
 | Elapsed time tracking | ✅ Yes | `WorkflowWorkerRecord.started_at_ms/completed_at_ms` |
 | Reusable workflow scripts | ✅ Yes | Named workflows, `.orca/workflows/*.js` |
 | Agent-to-agent communication | ❌ No | One-way: host → agent → result |
@@ -291,7 +291,7 @@ All recommended next steps are **implementable within current architecture**:
 
 6. **Subagent depth > 1**: ✅ Implemented. Default `DEFAULT_MAX_SUBAGENT_DEPTH` is now 2, while explicit `max_depth = 1` remains a hard stop. Files: `subagent_config.rs`, `controller.rs`.
 
-7. **Per-agent token budget**: Partially implemented. Workflow child `CostTracker` totals are persisted and shown in `/workflows`; per-agent hard budget configuration remains open. Files: `cost.rs`, `workflow/state.rs`, `workflow/runner.rs`, `ui.rs`.
+7. **Per-agent token budget**: ✅ Implemented. Workflow child `CostTracker` totals are persisted and shown in `/workflows`; `[workflows] max_agent_tokens = <tokens>` fails a child agent when reported input + output tokens exceed the configured hard budget while preserving usage evidence on the failed agent row. Files: `config/mod.rs`, `config/file.rs`, `workflow/state.rs`, `workflow/runner.rs`, `ui.rs`.
 
 ### P2 — Future enhancements
 
@@ -300,6 +300,8 @@ All recommended next steps are **implementable within current architecture**:
 9. **Structured typed output**: Schema-validated agent return types. Files: `workflow_types.rs`, `script.rs`.
 
 10. **Agent teams**: Named agent groups with role-based tool access. Files: `subagent_types.rs`, `config/mod.rs`.
+
+11. **Resume/fork stress coverage**: Exercise complex workflow resume/fork paths across phases, cached agents, failed phases, and fallback recovery. Files: `workflow/state.rs`, `workflow/runner.rs`, `tests/workflow_runtime_contract.rs`.
 
 ---
 
@@ -327,6 +329,7 @@ All recommended next steps are **implementable within current architecture**:
 - ✅ Workflow phases can now run async fallback functions via `{ fallback: async ({ error }) => ... }`
 - ✅ `/workflows` selected workflow rows now show per-agent status, attempt/max-attempt, retry/failure detail, token count, and estimated cost
 - ✅ Workflow child-agent usage is now counted even when child agents run with `emit_deltas = false`
+- ✅ Workflow agents can now enforce per-agent hard token budgets via `[workflows] max_agent_tokens`
 - ✅ Default model-facing subagent nesting depth is now 2; explicit `max_depth = 1` still blocks nested calls
 - ✅ Model-facing `subagent` supports git worktree isolation with dirty worktree preservation and clean worktree removal
 - ✅ Workflow agents support opt-in git worktree isolation via `agent(prompt, { isolation: "worktree" })`
