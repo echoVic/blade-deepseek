@@ -616,6 +616,53 @@ fn phase_fallback_value_is_returned_and_recorded() {
 }
 
 #[test]
+fn phase_fallback_function_runs_recovery_agent_and_is_recorded() {
+    if !orca_runtime::workflow::host::WorkflowHost::node_available() {
+        return;
+    }
+
+    let temp = tempdir().unwrap();
+    let script = temp.path().join("workflow.js");
+    fs::write(
+        &script,
+        "export const meta = { name: 'phase-fallback-function', description: 'Phase fallback function test', phases: ['scan', 'review'] };\n\
+         const scan = await phase('scan', async () => agent('mock_fail'), { fallback: async ({ error }) => agent(`recover ${error.includes('mock child failure requested')}`) });\n\
+         const review = await phase('review', async () => agent(`review recovered=${scan.prompt}`));\n\
+         export default review.result;",
+    )
+    .unwrap();
+
+    let mut config = mock_run_config(temp.path());
+    config.workflows.max_agent_retries = 0;
+    let tasks = TaskRegistry::new("session-1".to_string());
+    let session_dir = temp.path().join("session");
+    let runner = WorkflowRunner::new(config, tasks.clone(), session_dir.clone());
+    let launched = runner
+        .launch(WorkflowLaunchRequest::from_script_path(
+            script.display().to_string(),
+        ))
+        .expect("workflow completes with fallback function");
+
+    assert!(launched.summary.contains("review recovered=recover true"));
+    let record = tasks.get(&launched.task_id).expect("task record");
+    let progress = record.workflow_progress.expect("workflow progress");
+    assert_eq!(progress.completed_phases, 1);
+    assert_eq!(progress.failed_phases, 1);
+    assert_eq!(progress.failed_agents, 1);
+
+    let run_id = launched.output.run_id.as_deref().expect("run id");
+    let store = WorkflowStateStore::new(session_dir.join("workflow-runs"));
+    let state = store.load_run(run_id).expect("run state");
+    assert_eq!(state.status, WorkflowRunStatus::Completed);
+    assert_eq!(state.phases[0].name, "scan");
+    assert_eq!(state.phases[0].status, WorkflowRunStatus::Failed);
+    assert_eq!(state.phases[0].fallback.as_deref(), Some("function"));
+    assert_eq!(state.phases[0].agent_count, 2);
+    assert_eq!(state.phases[1].name, "review");
+    assert_eq!(state.phases[1].status, WorkflowRunStatus::Completed);
+}
+
+#[test]
 fn workflow_summary_prefers_child_result_over_agent_prompt() {
     if !orca_runtime::workflow::host::WorkflowHost::node_available() {
         return;

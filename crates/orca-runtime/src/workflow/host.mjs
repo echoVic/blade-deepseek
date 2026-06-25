@@ -170,6 +170,10 @@ async function phase(name, body, opts = {}) {
       emit({ type: "phase_failed", name, error: message, fallback: "value" });
       return opts.fallback.value;
     }
+    if (typeof opts?.fallback === "function") {
+      emit({ type: "phase_failed", name, error: message, fallback: "function" });
+      return await opts.fallback({ name, error: message });
+    }
     throw error;
   } finally {
     currentPhase = prior;

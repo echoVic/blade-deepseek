@@ -269,6 +269,62 @@ fn host_phase_fallback_value_returns_value_to_following_phase() {
 }
 
 #[test]
+fn host_phase_fallback_function_can_run_recovery_agent() {
+    if !WorkflowHost::node_available() {
+        return;
+    }
+
+    let temp = tempdir().unwrap();
+    let script = temp.path().join("workflow.js");
+    fs::write(
+        &script,
+        "export const meta = { name: 'fallback-function-test', description: 'Fallback function test', phases: ['scan', 'review'] };\n\
+         const scan = await phase('scan', async () => agent('fail scan'), { fallback: async ({ error }) => agent(`recover ${error}`) });\n\
+         const review = await phase('review', async () => agent(`review recovered=${scan.prompt}`));\n\
+         export default { scan, review };",
+    )
+    .unwrap();
+
+    let events =
+        WorkflowHost::run_collecting_events_with_agent(&script, serde_json::json!(null), |call| {
+            if call.prompt == "fail scan" {
+                Ok(orca_runtime::workflow::host::HostCommand::AgentError {
+                    call_id: call.call_id.clone(),
+                    error: "scan failed".to_string(),
+                })
+            } else {
+                Ok(orca_runtime::workflow::host::HostCommand::AgentResult {
+                    call_id: call.call_id.clone(),
+                    result: serde_json::json!({ "prompt": call.prompt }),
+                })
+            }
+        })
+        .unwrap();
+
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            HostEvent::PhaseFailed { name, error, fallback }
+                if name == "scan" && error.contains("scan failed") && fallback.as_deref() == Some("function")
+        )
+    }));
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            HostEvent::AgentCall { prompt, phase, .. }
+                if prompt == "recover scan failed" && phase.as_deref() == Some("scan")
+        )
+    }));
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            HostEvent::AgentCall { prompt, phase, .. }
+                if prompt == "review recovered=recover scan failed" && phase.as_deref() == Some("review")
+        )
+    }));
+}
+
+#[test]
 fn host_exposes_args_global() {
     if !WorkflowHost::node_available() {
         return;
