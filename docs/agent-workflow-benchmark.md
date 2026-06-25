@@ -9,7 +9,7 @@
 
 ## Executive Summary
 
-Orca has a **production-grade workflow runtime** that supports concurrent agent fan-out (up to 16 agents in parallel, 1000 per run by default). The `subagent` tool (model-facing) supports **parallel batching up to 6** (via `SubagentConfig.max_parallel`) plus a **session-local async mode** (`mode: "async"` returning an `agent_id` for `subagent_status`). The **workflow system** (`WorkflowRunner` + `WorkflowHost`) achieves true concurrency via `thread::scope().spawn()` for up to 16 concurrent agents and now retries transient child-agent failures once by default. The system still lacks agent teams, worktree isolation, durable async subagent persistence, phase-level fallback policy controls, and agent-to-agent communication. Workflow observability includes phase tracking, agent status, retry attempt telemetry, and lifecycle timestamps; the TUI now exposes workflow and async subagent task rows, while token and failure-detail dashboards remain open.
+Orca has a **production-grade workflow runtime** that supports concurrent agent fan-out (up to 16 agents in parallel, 1000 per run by default). The `subagent` tool (model-facing) supports **parallel batching up to 6** (via `SubagentConfig.max_parallel`) plus a **session-local async mode** (`mode: "async"` returning an `agent_id` for `subagent_status`). Async subagent handles are now persisted under `.orca/task-sessions`, so later `subagent_status` calls can resolve prior `agent_id` values; if the original process exited while an async subagent was still queued/running, the recovered record is marked `failed` with an interruption error instead of pretending execution survived. The **workflow system** (`WorkflowRunner` + `WorkflowHost`) achieves true concurrency via `thread::scope().spawn()` for up to 16 concurrent agents and now retries transient child-agent failures once by default. The system still lacks agent teams, worktree isolation, cross-process async subagent execution, phase-level fallback policy controls, and agent-to-agent communication. Workflow observability includes phase tracking, agent status, retry attempt telemetry, and lifecycle timestamps; the TUI now exposes workflow and async subagent task rows, while token and failure-detail dashboards remain open.
 
 ---
 
@@ -188,7 +188,7 @@ All Phase 1 findings above were **cross-validated by the orchestrator** against 
 | **Agent Teams** | ❌ GAP | No team_name or agent grouping concept in types | P2 |
 | **Dynamic Workflows** | ⚠️ PARTIAL | JS DSL supports `Promise.all()` fan-out but agent spawning is fixed at script load | P1 |
 | **Worktrees** | ❌ GAP | `.worktrees/` directory exists but no isolation mode in subagent/workflow | P1 |
-| **Async model-facing subagents** | ⚠️ PARTIAL | `subagent` accepts `mode: "async"` and returns `agent_id`; `subagent_status` reads session-local task status/result plus lifecycle timestamps; no persistence across process/session exit | P0 done / durability open |
+| **Async model-facing subagents** | ⚠️ PARTIAL | `subagent` accepts `mode: "async"` and returns `agent_id`; `subagent_status` reads current or persisted task status/result plus lifecycle timestamps. Handles survive process/session boundaries, but execution itself remains process-local | P0 handle durability done / cross-process execution open |
 | **Observability: token/elapsed/agent count** | ⚠️ PARTIAL | `/workflows` now receives live agent/phase progress counts and renders elapsed async subagent rows; token and failure details are still not exposed as a full dashboard | P1 |
 | **Agent Communication** | ❌ GAP | No message passing between agents; `WorkflowHost` routes calls one-way | P2 |
 | **Shared Task List** | ❌ GAP | No work queue; agents are stateless, results collected by `Promise.all()` | P2 |
@@ -200,7 +200,7 @@ All Phase 1 findings above were **cross-validated by the orchestrator** against 
 | **Error Recovery** | ⚠️ PARTIAL | Child-agent failures are retried once by default (`max_agent_retries` configurable up to 5), with attempt/max-attempt/previous-error telemetry persisted in agent records; phase-level fallback policy is still missing | P1 |
 | **Structured Agent Output** | ⚠️ PARTIAL | Workflow agents return `Value` (JSON); subagent tool returns text; no schema validation | P2 |
 
-**Overall gap**: Orca's **workflow system** is architecturally capable of concurrent agent fan-out (confirmed 8+ agents) with observability (phase tracking, agent statuses, retry attempts, lifecycle timestamps, and bounded child-agent retry). The first TUI exposure now shows live agent/phase counts and async subagent task rows in `/workflows`, while model-facing subagents have a session-local async/status path. The remaining gaps are durable async persistence, richer agent dashboard, worktree isolation, phase-level fallback policy, and team coordination.
+**Overall gap**: Orca's **workflow system** is architecturally capable of concurrent agent fan-out (confirmed 8+ agents) with observability (phase tracking, agent statuses, retry attempts, lifecycle timestamps, and bounded child-agent retry). The first TUI exposure now shows live agent/phase counts and async subagent task rows in `/workflows`, while model-facing subagents have async/status handles that can be queried across later runs. The remaining gaps are cross-process async execution, richer agent dashboard, worktree isolation, phase-level fallback policy, and team coordination.
 
 ### Reviewer 3: Actionability of Next Steps
 
@@ -208,8 +208,8 @@ All recommended next steps are **implementable within current architecture**:
 
 | Step | Effort | Key files | Blocker? |
 |------|--------|-----------|----------|
-| P0: Async subagent mode | ✅ Implemented (session-local) | `subagent.rs`, `controller.rs`, `bridge.rs`, `tasks.rs` | Remaining: persistence/durable process lifetime |
-| P0: Subagent status query tool | ✅ Implemented (session-local) | `tools/registry.rs`, `controller.rs`, `bridge.rs`, `tasks.rs` | Remaining: durable persistence and token/failure-detail telemetry |
+| P0: Async subagent mode | ✅ Implemented (process-local execution + durable handles) | `subagent.rs`, `controller.rs`, `bridge.rs`, `tasks.rs` | Remaining: cross-process execution, not handle persistence |
+| P0: Subagent status query tool | ✅ Implemented (current or persisted handles) | `tools/registry.rs`, `controller.rs`, `bridge.rs`, `tasks.rs` | Remaining: token/failure-detail telemetry |
 | P1: Subagent depth > 1 | 2-3 days | `agent_child.rs`, `controller.rs` | No — depth field exists, just needs recursion guard |
 | P1: TUI agent dashboard | 3-5 days | `tui/app.rs`, `tui/ui.rs` | No — `WorkflowRunState` data available |
 | P1: Worktree isolation | 3-5 days | `sandbox/`, git worktree commands | `.worktrees/` dir exists |
@@ -236,7 +236,7 @@ All recommended next steps are **implementable within current architecture**:
 | Agent view / team dashboard | ⚠️ Partial | `/workflows` lists workflow and async subagent tasks with status/details; no dedicated dashboard or team view |
 | Dynamic agent spawning | ⚠️ Partial | Fixed at script load; no conditional spawn |
 | Worktree isolation | ❌ No | `.worktrees/` dir exists, isolation not wired |
-| Async subagent (model tool) | ⚠️ Partial | `mode: "async"` launches background subagent and returns `agent_id`; `subagent_status` queries session-local result plus lifecycle timestamps; not durable across process/session exit |
+| Async subagent (model tool) | ⚠️ Partial | `mode: "async"` launches background subagent and returns `agent_id`; `subagent_status` queries current or persisted results plus lifecycle timestamps; interrupted process-local executions recover as failed records |
 | Workflow resume/fork | ⚠️ Partial | `resumeFromRunId` exists, not stress-tested |
 | Structured typed output | ⚠️ Partial | JSON `Value` return; no schema validation |
 
@@ -277,9 +277,9 @@ All recommended next steps are **implementable within current architecture**:
 
 ### P0 — Production blockers
 
-1. **Durable async subagent handles**: Persist async subagent records beyond the current in-memory `TaskRegistry`, and define what happens when `orca exec` exits while a background subagent is still running. Files: `tasks.rs`, `history.rs`, `controller.rs`.
+1. **Durable async subagent handles**: ✅ Implemented. Async subagent records persist beyond the current in-memory `TaskRegistry` in `.orca/task-sessions`, and later `subagent_status` calls can resolve prior `agent_id` values. If `orca exec` exits while process-local async work is still active, the recovered record is marked failed with an interruption error. Remaining work is cross-process execution, not handle durability. Files: `tasks.rs`, `controller.rs`, `session.rs`.
 
-2. **Subagent status/progress visibility**: Baseline visibility is now implemented. `subagent_status` returns session-local status/result/error plus lifecycle timestamps, and `/workflows` renders async subagent task rows with status, agent type, and elapsed time. Remaining work: token usage, failure detail rows, and durable cross-session persistence. Files: `tasks.rs`, `bridge.rs`, `ui.rs`.
+2. **Subagent status/progress visibility**: Baseline visibility is now implemented. `subagent_status` returns current or persisted status/result/error plus lifecycle timestamps, and `/workflows` renders async subagent task rows with status, agent type, and elapsed time. Remaining work: token usage and failure detail rows. Files: `tasks.rs`, `bridge.rs`, `ui.rs`.
 
 3. **Workflow retry policy UX**: Child-agent retry telemetry now persists `attempt`, `maxAttempts`, and `previousErrors` in workflow agent records, and task progress accounts for failed retry attempts instead of leaving phantom running agents. Remaining work: optional phase-level fallback policy and richer UI surfacing. Files: `workflow/runner.rs`, `workflow/state.rs`, `workflow/host.rs`, `ui.rs`.
 
@@ -315,5 +315,7 @@ All recommended next steps are **implementable within current architecture**:
 - ✅ `/workflows` now receives live workflow progress summaries with total/running/completed/failed agent counts, phase counts, and background task lifecycle timestamps
 - ✅ `/workflows` now renders async subagent task rows with status, agent type, and elapsed time
 - ✅ Async subagent regression coverage now verifies `mode: "async"` bypasses sync batching, returns an `agent_id`, and exposes timestamped `subagent_status`
+- ✅ Async subagent handles now persist under `.orca/task-sessions`, and `subagent_status` can resolve a prior `agent_id` from a later run
+- ✅ Interrupted process-local async tasks now recover as failed records with an explicit interruption error
 - ✅ Workflow child-agent failures now get bounded retry coverage via `max_agent_retries`
 - ✅ Workflow retry telemetry now persists attempt/max-attempt/previous-error data and keeps retry task progress consistent

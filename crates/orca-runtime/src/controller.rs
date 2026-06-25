@@ -142,7 +142,7 @@ fn run_inner<W: io::Write>(
     };
 
     let mut events = EventFactory::new(new_run_id());
-    let task_registry = TaskRegistry::new(events.run_id().to_string());
+    let task_registry = TaskRegistry::new_for_cwd(events.run_id().to_string(), &cwd_path);
     let mut background_workflows = Vec::new();
     let mut sink = EventSink::new(writer, config.output_format);
     let instructions = load_project_instructions(&cwd_path);
@@ -815,7 +815,7 @@ pub(crate) fn execute_child_agent_loop<W: io::Write>(
     runtime: &mut ChildAgentRuntime<'_, W>,
     child_cost_tracker: &mut CostTracker,
 ) -> io::Result<ChildAgentResult> {
-    let task_registry = TaskRegistry::new(runtime.events.run_id().to_string());
+    let task_registry = TaskRegistry::new_for_cwd(runtime.events.run_id().to_string(), runtime.cwd);
     let mut background_workflows = Vec::new();
     let child = run_agent_loop(
         config,

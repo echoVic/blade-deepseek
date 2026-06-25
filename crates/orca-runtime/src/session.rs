@@ -120,7 +120,7 @@ impl InteractiveSession {
             mcp_registry,
             hooks,
             memory,
-            task_registry: TaskRegistry::new(task_session_id),
+            task_registry: TaskRegistry::new_for_cwd(task_session_id, &cwd),
         })
     }
 

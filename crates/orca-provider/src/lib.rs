@@ -356,6 +356,17 @@ fn parse_mock_prompt(prompt: &str) -> Option<ToolRequest> {
         });
     }
 
+    if let Some(rest) = prompt.strip_prefix("subagent_status ") {
+        let agent_id = rest.trim();
+        return Some(ToolRequest {
+            id: "mock-tool-1".to_string(),
+            name: ToolName::SubagentStatus,
+            action: ActionKind::Read,
+            target: Some(agent_id.to_string()),
+            raw_arguments: Some(serde_json::json!({ "agent_id": agent_id }).to_string()),
+        });
+    }
+
     if let Some(rest) = prompt.strip_prefix("workflow ") {
         let mode = rest.trim();
         let script = "export const meta = { name: 'mock-workflow', description: 'Mock workflow', phases: ['main'] };\nconst result = await phase('main', async () => agent('inspect repo'));\nexport default result;";

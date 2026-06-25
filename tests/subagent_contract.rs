@@ -55,7 +55,9 @@ fn subagent_tool_runs_child_agent_and_emits_events() {
 
 #[test]
 fn async_subagent_launches_without_blocking_parent_tool() {
+    let cwd = tempdir().expect("temp cwd");
     let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .current_dir(cwd.path())
         .args([
             "exec",
             "--output-format",
@@ -79,9 +81,63 @@ fn async_subagent_launches_without_blocking_parent_tool() {
     let payload: Value =
         serde_json::from_str(completed["payload"]["output"].as_str().unwrap()).unwrap();
     assert_eq!(payload["status"], "async_launched");
-    assert!(payload["agent_id"].as_str().unwrap().starts_with("task-"));
+    let agent_id = payload["agent_id"].as_str().unwrap();
+    assert!(agent_id.starts_with("task-"));
     assert_eq!(payload["description"], "inspect repo");
     assert_eq!(events.last().unwrap()["payload"]["status"], "success");
+
+    let index_path = cwd.path().join(".orca/task-sessions/task-index.json");
+    let index: Value = serde_json::from_str(&std::fs::read_to_string(index_path).unwrap()).unwrap();
+    assert!(index.get(agent_id).is_some());
+}
+
+#[test]
+fn subagent_status_can_read_persisted_async_handle() {
+    let cwd = tempdir().expect("temp cwd");
+    let launched = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .current_dir(cwd.path())
+        .args([
+            "exec",
+            "--output-format",
+            "jsonl",
+            "--provider",
+            "mock",
+            "--approval-mode",
+            "full-auto",
+            "subagent async inspect repo",
+        ])
+        .output()
+        .expect("run orca");
+    assert_eq!(launched.status.code(), Some(0));
+    let launch_events = parse_jsonl(&launched.stdout);
+    let launch_completed = find_event(&launch_events, "tool.call.completed");
+    let launch_payload: Value =
+        serde_json::from_str(launch_completed["payload"]["output"].as_str().unwrap()).unwrap();
+    let agent_id = launch_payload["agent_id"].as_str().unwrap();
+
+    let status = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .current_dir(cwd.path())
+        .args([
+            "exec",
+            "--output-format",
+            "jsonl",
+            "--provider",
+            "mock",
+            "--approval-mode",
+            "full-auto",
+            &format!("subagent_status {agent_id}"),
+        ])
+        .output()
+        .expect("run orca");
+    assert_eq!(status.status.code(), Some(0));
+    let status_events = parse_jsonl(&status.stdout);
+    let status_completed = find_event(&status_events, "tool.call.completed");
+    assert_eq!(status_completed["payload"]["name"], "subagent_status");
+    let status_payload: Value =
+        serde_json::from_str(status_completed["payload"]["output"].as_str().unwrap()).unwrap();
+    assert_eq!(status_payload["agent_id"], agent_id);
+    assert_eq!(status_payload["description"], "inspect repo");
+    assert!(status_payload["status"].is_string());
 }
 
 #[test]

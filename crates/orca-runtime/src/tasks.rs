@@ -1,15 +1,20 @@
 use std::collections::HashMap;
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use orca_core::cancel::CancelToken;
 use orca_core::task_types::{BackgroundTaskSummary, TaskStatus, TaskType, WorkflowTaskProgress};
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug)]
 pub struct TaskRegistry {
     session_id: String,
     inner: Arc<Mutex<HashMap<String, TaskRecord>>>,
+    persistence: Option<Arc<TaskPersistence>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -44,12 +49,59 @@ pub struct TaskControl {
     pub pause: Arc<AtomicBool>,
 }
 
+#[derive(Clone, Debug)]
+struct TaskPersistence {
+    root: PathBuf,
+    session_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct PersistedTaskRecord {
+    id: String,
+    task_type: TaskType,
+    status: TaskStatus,
+    description: String,
+    created_at_ms: i64,
+    started_at_ms: Option<i64>,
+    completed_at_ms: Option<i64>,
+    name: Option<String>,
+    agent_type: Option<String>,
+    workflow_run_id: Option<String>,
+    phase_count: Option<usize>,
+    workflow_progress: Option<WorkflowTaskProgress>,
+    result: Option<String>,
+    error: Option<String>,
+}
+
 impl TaskRegistry {
     pub fn new(session_id: String) -> Self {
         Self {
             session_id,
             inner: Arc::new(Mutex::new(HashMap::new())),
+            persistence: None,
         }
+    }
+
+    pub fn new_persistent(session_id: String, root: PathBuf) -> io::Result<Self> {
+        let persistence = Arc::new(TaskPersistence::new(root, session_id.clone()));
+        let mut records = persistence.load_session_records(&session_id)?;
+        let mut changed = false;
+        for record in records.values_mut() {
+            changed |= mark_interrupted_if_active(record);
+        }
+        if changed {
+            persistence.write_session_records(&session_id, &records)?;
+        }
+        Ok(Self {
+            session_id,
+            inner: Arc::new(Mutex::new(records)),
+            persistence: Some(persistence),
+        })
+    }
+
+    pub fn new_for_cwd(session_id: String, cwd: &Path) -> Self {
+        Self::new_persistent(session_id.clone(), cwd.join(".orca").join("task-sessions"))
+            .unwrap_or_else(|_| Self::new(session_id))
     }
 
     pub fn session_id(&self) -> &str {
@@ -87,10 +139,8 @@ impl TaskRegistry {
             control,
         };
 
-        self.with_tasks(|tasks| {
-            tasks.insert(id.clone(), record);
-        })
-        .expect("task registry lock poisoned");
+        self.insert_task(id.clone(), record)
+            .expect("task registry insert failed");
 
         TaskHandle {
             id,
@@ -124,10 +174,8 @@ impl TaskRegistry {
             control,
         };
 
-        self.with_tasks(|tasks| {
-            tasks.insert(id.clone(), record);
-        })
-        .expect("task registry lock poisoned");
+        self.insert_task(id.clone(), record)
+            .expect("task registry insert failed");
 
         TaskHandle {
             id,
@@ -166,8 +214,20 @@ impl TaskRegistry {
     }
 
     pub fn get(&self, id: &str) -> Option<TaskRecord> {
-        self.with_tasks(|tasks| tasks.get(id).cloned())
+        if let Some(record) = self
+            .with_tasks(|tasks| tasks.get(id).cloned())
             .expect("task registry lock poisoned")
+        {
+            return Some(record);
+        }
+
+        let persistence = self.persistence.as_ref()?;
+        let record = persistence.load_record_by_id(id).ok()??;
+        self.with_tasks(|tasks| {
+            tasks.insert(id.to_string(), record.clone());
+        })
+        .expect("task registry lock poisoned");
+        Some(record)
     }
 
     pub fn update_workflow_progress(
@@ -293,9 +353,27 @@ impl TaskRegistry {
             let record = tasks
                 .get_mut(id)
                 .ok_or_else(|| format!("task '{id}' not found"))?;
-            update(record)
+            update(record)?;
+            self.persist_current_session(tasks)
         })
         .map_err(|_| "task registry lock poisoned".to_string())?
+    }
+
+    fn insert_task(&self, id: String, record: TaskRecord) -> Result<(), String> {
+        self.with_tasks(|tasks| {
+            tasks.insert(id, record);
+            self.persist_current_session(tasks)
+        })
+        .map_err(|_| "task registry lock poisoned".to_string())?
+    }
+
+    fn persist_current_session(&self, tasks: &HashMap<String, TaskRecord>) -> Result<(), String> {
+        let Some(persistence) = &self.persistence else {
+            return Ok(());
+        };
+        persistence
+            .write_current_session(tasks)
+            .map_err(|error| error.to_string())
     }
 
     fn with_tasks<R, F>(&self, f: F) -> Result<R, ()>
@@ -304,6 +382,138 @@ impl TaskRegistry {
     {
         let mut tasks = self.inner.lock().map_err(|_| ())?;
         Ok(f(&mut tasks))
+    }
+}
+
+impl TaskPersistence {
+    fn new(root: PathBuf, session_id: String) -> Self {
+        Self { root, session_id }
+    }
+
+    fn write_current_session(&self, tasks: &HashMap<String, TaskRecord>) -> io::Result<()> {
+        self.write_session_records(&self.session_id, tasks)?;
+        let mut index = self.load_index()?;
+        for id in tasks.keys() {
+            index.insert(id.clone(), self.session_id.clone());
+        }
+        self.write_index(&index)
+    }
+
+    fn load_record_by_id(&self, id: &str) -> io::Result<Option<TaskRecord>> {
+        let index = self.load_index()?;
+        let Some(session_id) = index.get(id) else {
+            return Ok(None);
+        };
+        let mut records = self.load_session_records(session_id)?;
+        let Some(record) = records.get_mut(id) else {
+            return Ok(None);
+        };
+        if mark_interrupted_if_active(record) {
+            self.write_session_records(session_id, &records)?;
+        }
+        Ok(records.get(id).cloned())
+    }
+
+    fn load_session_records(&self, session_id: &str) -> io::Result<HashMap<String, TaskRecord>> {
+        let path = self.session_tasks_path(session_id);
+        if !path.exists() {
+            return Ok(HashMap::new());
+        }
+        let records: HashMap<String, PersistedTaskRecord> = read_json(&path)?;
+        Ok(records
+            .into_iter()
+            .map(|(id, record)| (id, TaskRecord::from_persisted(record)))
+            .collect())
+    }
+
+    fn write_session_records(
+        &self,
+        session_id: &str,
+        records: &HashMap<String, TaskRecord>,
+    ) -> io::Result<()> {
+        let persisted = records
+            .iter()
+            .map(|(id, record)| (id.clone(), PersistedTaskRecord::from(record)))
+            .collect::<HashMap<_, _>>();
+        write_json_pretty(&self.session_tasks_path(session_id), &persisted)
+    }
+
+    fn load_index(&self) -> io::Result<HashMap<String, String>> {
+        let path = self.index_path();
+        if !path.exists() {
+            return Ok(HashMap::new());
+        }
+        read_json(&path)
+    }
+
+    fn write_index(&self, index: &HashMap<String, String>) -> io::Result<()> {
+        write_json_pretty(&self.index_path(), index)
+    }
+
+    fn session_tasks_path(&self, session_id: &str) -> PathBuf {
+        self.root
+            .join(safe_path_component(session_id))
+            .join("tasks.json")
+    }
+
+    fn index_path(&self) -> PathBuf {
+        self.root.join("task-index.json")
+    }
+}
+
+impl PersistedTaskRecord {
+    fn into_task_record(self) -> TaskRecord {
+        TaskRecord {
+            id: self.id,
+            task_type: self.task_type,
+            status: self.status,
+            description: self.description,
+            created_at_ms: self.created_at_ms,
+            started_at_ms: self.started_at_ms,
+            completed_at_ms: self.completed_at_ms,
+            name: self.name,
+            agent_type: self.agent_type,
+            workflow_run_id: self.workflow_run_id,
+            phase_count: self.phase_count,
+            workflow_progress: self.workflow_progress,
+            result: self.result,
+            error: self.error,
+            control: new_task_control(),
+        }
+    }
+}
+
+impl TaskRecord {
+    fn from_persisted(record: PersistedTaskRecord) -> Self {
+        record.into_task_record()
+    }
+}
+
+impl From<&TaskRecord> for PersistedTaskRecord {
+    fn from(record: &TaskRecord) -> Self {
+        Self {
+            id: record.id.clone(),
+            task_type: record.task_type,
+            status: record.status,
+            description: record.description.clone(),
+            created_at_ms: record.created_at_ms,
+            started_at_ms: record.started_at_ms,
+            completed_at_ms: record.completed_at_ms,
+            name: record.name.clone(),
+            agent_type: record.agent_type.clone(),
+            workflow_run_id: record.workflow_run_id.clone(),
+            phase_count: record.phase_count,
+            workflow_progress: record.workflow_progress,
+            result: record.result.clone(),
+            error: record.error.clone(),
+        }
+    }
+}
+
+fn new_task_control() -> TaskControl {
+    TaskControl {
+        cancel: CancelToken::new(),
+        pause: Arc::new(AtomicBool::new(false)),
     }
 }
 
@@ -325,13 +535,110 @@ fn is_terminal(status: TaskStatus) -> bool {
     )
 }
 
+fn mark_interrupted_if_active(record: &mut TaskRecord) -> bool {
+    if is_terminal(record.status) {
+        return false;
+    }
+    record.status = TaskStatus::Failed;
+    if record.started_at_ms.is_none() {
+        record.started_at_ms = Some(now_ms());
+    }
+    record.completed_at_ms = Some(now_ms());
+    record.result = None;
+    record.error = Some(format!(
+        "{} interrupted before completion; async task execution is process-local",
+        task_type_label(record.task_type)
+    ));
+    record.control.cancel.cancel();
+    record.control.pause.store(false, Ordering::Release);
+    true
+}
+
+fn task_type_label(task_type: TaskType) -> &'static str {
+    match task_type {
+        TaskType::Workflow => "workflow",
+        TaskType::Subagent => "subagent",
+        TaskType::Shell => "shell",
+        TaskType::Monitor => "monitor",
+    }
+}
+
+fn safe_path_component(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 fn task_state_error(action: &str, status: TaskStatus) -> String {
     format!("cannot {action} task in {status:?} state")
+}
+
+fn write_json_pretty<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let content = serde_json::to_string_pretty(value)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("tasks");
+    let temp_path = path.with_file_name(format!(
+        ".{file_name}.tmp-{}-{}",
+        std::process::id(),
+        now_ms()
+    ));
+    fs::write(&temp_path, content)?;
+    fs::rename(&temp_path, path).inspect_err(|_| {
+        let _ = fs::remove_file(&temp_path);
+    })
+}
+
+fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> io::Result<T> {
+    let content = fs::read_to_string(path)?;
+    serde_json::from_str(&content)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn persistent_registry_recovers_interrupted_subagent_task_by_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry =
+            TaskRegistry::new_persistent("session-1".to_string(), temp.path().join("tasks"))
+                .unwrap();
+        let task =
+            registry.create_subagent("inspect auth".to_string(), Some("general".to_string()));
+        registry.mark_running(&task.id).unwrap();
+
+        let reloaded =
+            TaskRegistry::new_persistent("session-2".to_string(), temp.path().join("tasks"))
+                .unwrap();
+        let recovered = reloaded.get(&task.id).expect("persistent task record");
+
+        assert_eq!(recovered.task_type, TaskType::Subagent);
+        assert_eq!(recovered.status, TaskStatus::Failed);
+        assert_eq!(recovered.description, "inspect auth");
+        assert_eq!(recovered.agent_type.as_deref(), Some("general"));
+        assert!(
+            recovered
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("interrupted before completion")
+        );
+        assert!(recovered.completed_at_ms.is_some());
+    }
 
     #[test]
     fn registry_creates_and_lists_workflow_tasks() {
