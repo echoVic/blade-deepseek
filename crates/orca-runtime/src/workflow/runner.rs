@@ -34,7 +34,8 @@ use crate::worktree::{WorktreeGuard, WorktreeOutcome};
 use super::host::{AgentCall, HostCommand, HostEvent, WorkflowHost};
 use super::script::{ResolvedWorkflowScript, resolve_workflow_script_to_path};
 use super::state::{
-    WorkflowAgentRecord, WorkflowStateStore, WorkflowWorkerRecord, input_hash, workflow_agent_team,
+    WorkflowAgentRecord, WorkflowAgentStatusCounts, WorkflowStateStore, WorkflowWorkerRecord,
+    input_hash, workflow_agent_team,
 };
 
 const STOP_REQUESTED_ERROR: &str = "__orca_workflow_stop_requested__";
@@ -390,7 +391,11 @@ impl WorkflowRunner {
             Ok(events) => events,
             Err(error) => {
                 let message = error.to_string();
-                state.total_agent_count = gate.snapshot()?.total_agents;
+                let counts = self.state.agent_status_counts(&run_id)?;
+                state.total_agent_count = gate
+                    .snapshot()?
+                    .total_agents
+                    .max(terminal_agent_count(&counts));
                 state.status = WorkflowRunStatus::Failed;
                 state.error = Some(message.clone());
                 self.state.write_state(&state)?;
@@ -404,7 +409,11 @@ impl WorkflowRunner {
 
         let _ = events;
 
-        state.total_agent_count = gate.snapshot()?.total_agents;
+        let counts = self.state.agent_status_counts(&run_id)?;
+        state.total_agent_count = gate
+            .snapshot()?
+            .total_agents
+            .max(terminal_agent_count(&counts));
         if let Some(error) = failed_error {
             if is_stop_requested_error(&error) {
                 return self.finish_stopped_run(
@@ -546,7 +555,7 @@ impl WorkflowRunner {
                         opts: call.opts.clone(),
                         team: workflow_agent_team(&call.opts),
                         input_hash: hash,
-                        status: WorkflowAgentStatus::Completed,
+                        status: WorkflowAgentStatus::Cached,
                         attempt: 1,
                         max_attempts: 1,
                         previous_errors: Vec::new(),
@@ -846,11 +855,7 @@ impl WorkflowRunner {
 
     fn refresh_task_progress(&self, task_id: &str, state: &WorkflowRunState) -> io::Result<()> {
         let counts = self.state.agent_status_counts(&state.run_id)?;
-        let terminal_agents = counts
-            .completed
-            .saturating_add(counts.failed)
-            .saturating_add(counts.cancelled)
-            .saturating_add(counts.cached);
+        let terminal_agents = terminal_agent_count(&counts);
         let running_agents = state.total_agent_count.saturating_sub(terminal_agents);
         let progress = WorkflowTaskProgress {
             total_agents: state.total_agent_count,
@@ -890,6 +895,14 @@ impl WorkflowRunner {
             .update_workflow_agents(task_id, self.state.agent_summaries(&state.run_id)?)
             .map_err(io::Error::other)
     }
+}
+
+fn terminal_agent_count(counts: &WorkflowAgentStatusCounts) -> u32 {
+    counts
+        .completed
+        .saturating_add(counts.failed)
+        .saturating_add(counts.cancelled)
+        .saturating_add(counts.cached)
 }
 
 fn workflow_phase_summaries(state: &WorkflowRunState) -> Vec<WorkflowPhaseTaskSummary> {

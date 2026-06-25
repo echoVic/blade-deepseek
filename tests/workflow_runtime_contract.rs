@@ -10,7 +10,7 @@ use orca_core::config::{
 use orca_core::hook_types::{HookConfig, HookEvent};
 use orca_core::model::ModelSelection;
 use orca_core::task_types::TaskStatus;
-use orca_core::workflow_types::WorkflowRunStatus;
+use orca_core::workflow_types::{WorkflowAgentStatus, WorkflowRunStatus};
 use orca_runtime::tasks::TaskRegistry;
 use orca_runtime::workflow::state::{WorkflowStateStore, input_hash};
 use orca_runtime::workflow::{WorkflowLaunchRequest, WorkflowRunner};
@@ -147,6 +147,83 @@ fn workflow_resume_replays_legacy_object_cache_as_object_value() {
     assert_eq!(record.status, TaskStatus::Completed);
     assert_eq!(record.result.as_deref(), Some("legacy-object"));
     assert!(second.summary.contains("cached 1 agent"));
+}
+
+#[test]
+fn workflow_resume_reuses_complex_fallback_agents_as_cached_rows() {
+    if !orca_runtime::workflow::host::WorkflowHost::node_available() {
+        return;
+    }
+
+    let temp = tempdir().unwrap();
+    let script = temp.path().join("workflow.js");
+    fs::write(
+        &script,
+        "export const meta = { name: 'resume-stress', description: 'Resume stress test', phases: ['scan', 'review'] };\n\
+         const scan = await phase('scan', async () => agent('mock_fail'), { fallback: async ({ error }) => agent(`recover ${error.includes('mock child failure requested')}`) });\n\
+         const review = await phase('review', async () => agent(`review recovered=${scan.prompt}`));\n\
+         export default { scan: scan.prompt, review: review.result };",
+    )
+    .unwrap();
+
+    let mut config = mock_run_config(temp.path());
+    config.workflows.max_agent_retries = 0;
+    let tasks = TaskRegistry::new("session-1".to_string());
+    let session_dir = temp.path().join("session");
+    let runner = WorkflowRunner::new(config, tasks.clone(), session_dir.clone());
+
+    let first = runner
+        .launch(WorkflowLaunchRequest::from_script_path(
+            script.display().to_string(),
+        ))
+        .expect("first workflow completes with fallback");
+    let first_run_id = first.output.run_id.clone().expect("first run id");
+    let second = runner
+        .launch(
+            WorkflowLaunchRequest::from_script_path(script.display().to_string())
+                .with_resume_from(first_run_id),
+        )
+        .expect("resumed workflow completes with cached fallback agents");
+    let second_run_id = second.output.run_id.clone().expect("second run id");
+    let third = runner
+        .launch(
+            WorkflowLaunchRequest::from_script_path(script.display().to_string())
+                .with_resume_from(second_run_id),
+        )
+        .expect("second-generation resume reuses cached rows");
+
+    assert!(second.summary.contains("cached 2 agents"));
+    assert!(second.summary.contains("review recovered=recover true"));
+    assert!(third.summary.contains("cached 2 agents"));
+
+    let record = tasks.get(&second.task_id).expect("task record");
+    assert_eq!(record.status, TaskStatus::Completed);
+    let progress = record.workflow_progress.expect("workflow progress");
+    assert_eq!(progress.total_agents, 3);
+    assert_eq!(progress.completed_agents, 2);
+    assert_eq!(progress.failed_agents, 1);
+    assert_eq!(progress.failed_phases, 1);
+    assert_eq!(record.workflow_agents.len(), 3);
+
+    let agent_statuses = record
+        .workflow_agents
+        .iter()
+        .map(|agent| (agent.call_path.as_str(), agent.status))
+        .collect::<Vec<_>>();
+    assert!(agent_statuses.contains(&("scan:1", WorkflowAgentStatus::Failed)));
+    assert!(agent_statuses.contains(&("scan:2", WorkflowAgentStatus::Cached)));
+    assert!(agent_statuses.contains(&("review:3", WorkflowAgentStatus::Cached)));
+
+    let run_id = second.output.run_id.as_deref().expect("resumed run id");
+    let store = WorkflowStateStore::new(session_dir.join("workflow-runs"));
+    let state = store.load_run(run_id).expect("resumed run state");
+    assert_eq!(state.status, WorkflowRunStatus::Completed);
+    assert_eq!(state.phases[0].name, "scan");
+    assert_eq!(state.phases[0].status, WorkflowRunStatus::Failed);
+    assert_eq!(state.phases[0].fallback.as_deref(), Some("function"));
+    assert_eq!(state.phases[0].agent_count, 2);
+    assert_eq!(state.phases[1].name, "review");
+    assert_eq!(state.phases[1].status, WorkflowRunStatus::Completed);
 }
 
 #[test]

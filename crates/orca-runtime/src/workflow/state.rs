@@ -308,7 +308,7 @@ impl WorkflowStateStore {
         let cache = read_agent_cache(&path).ok()?;
         cache
             .get(&cache_key(call_path, input_hash))
-            .filter(|entry| entry.record.status == WorkflowAgentStatus::Completed)
+            .filter(|entry| is_reusable_cached_status(entry.record.status))
             .filter(|entry| entry.output_present)
             .map(|entry| entry.record.output.clone().unwrap_or(Value::Null))
     }
@@ -327,7 +327,7 @@ impl WorkflowStateStore {
         let cache = read_agent_cache(&path)?;
         Ok(cache
             .get(&cache_key(call_path, input_hash))
-            .filter(|entry| entry.record.status == WorkflowAgentStatus::Completed)
+            .filter(|entry| is_reusable_cached_status(entry.record.status))
             .filter(|entry| entry.output_present)
             .map(|entry| WorkflowAgentCacheRecord {
                 call_path: entry.record.call_path.clone(),
@@ -394,6 +394,13 @@ impl WorkflowStateStore {
         });
         Ok(summaries)
     }
+}
+
+fn is_reusable_cached_status(status: WorkflowAgentStatus) -> bool {
+    matches!(
+        status,
+        WorkflowAgentStatus::Completed | WorkflowAgentStatus::Cached
+    )
 }
 
 fn now_ms() -> i64 {
