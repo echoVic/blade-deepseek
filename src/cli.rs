@@ -21,6 +21,7 @@ use orca_core::workflow_types::{WorkflowInput, WorkflowRunState};
 use orca_runtime::tasks::TaskRegistry;
 use orca_runtime::workflow::state::WorkflowStateStore;
 use orca_runtime::workflow::{WorkflowLaunchRequest, WorkflowRunner};
+use orca_runtime::{controller::AsyncSubagentWorktree, subagent::SubagentRequest};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -209,6 +210,9 @@ enum Command {
     History(HistoryArgs),
     /// Run and inspect local workflows.
     Workflow(WorkflowArgs),
+    /// Execute a persisted async subagent task.
+    #[command(hide = true)]
+    SubagentWorker(SubagentWorkerArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -366,6 +370,57 @@ struct WorkflowWorkerArgs {
     input_json: String,
 }
 
+#[derive(Debug, Parser)]
+struct SubagentWorkerArgs {
+    /// Workspace directory that owns .orca/task-sessions.
+    #[arg(long)]
+    cwd: PathBuf,
+
+    /// Workspace directory where the child agent should execute.
+    #[arg(long)]
+    child_cwd: PathBuf,
+
+    /// Provider implementation (internal, for testing).
+    #[arg(long, value_enum, default_value_t = ProviderKind::DeepSeek, hide = true)]
+    provider: ProviderKind,
+
+    /// Model to use (overrides config file and ORCA_MODEL env).
+    #[arg(long)]
+    model: Option<String>,
+
+    /// API key to use (overrides config file and ORCA_API_KEY env).
+    #[arg(long)]
+    api_key: Option<String>,
+
+    /// API base URL (overrides config file and ORCA_BASE_URL env).
+    #[arg(long)]
+    base_url: Option<String>,
+
+    /// Persisted task session identifier.
+    #[arg(long)]
+    session_id: String,
+
+    /// Persisted async subagent task identifier.
+    #[arg(long)]
+    agent_id: String,
+
+    /// Child subagent depth.
+    #[arg(long)]
+    subagent_depth: u32,
+
+    /// Full subagent request payload as JSON.
+    #[arg(long)]
+    request_json: String,
+
+    /// Parent git repository root for isolated worktree cleanup.
+    #[arg(long)]
+    worktree_repo_root: Option<PathBuf>,
+
+    /// Child git worktree path for isolated worktree cleanup.
+    #[arg(long)]
+    worktree_path: Option<PathBuf>,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct WorkflowListEntry {
@@ -492,6 +547,7 @@ pub fn run() -> i32 {
         Some(Command::Exec(args)) => run_exec(args),
         Some(Command::History(args)) => run_history(args),
         Some(Command::Workflow(args)) => run_workflow(args),
+        Some(Command::SubagentWorker(args)) => run_subagent_worker(args),
         None => run_placeholder(cli),
     }
 }
@@ -848,6 +904,48 @@ fn run_workflow(args: WorkflowArgs) -> i32 {
     }
 }
 
+fn run_subagent_worker(args: SubagentWorkerArgs) -> i32 {
+    let request: SubagentRequest = match serde_json::from_str(&args.request_json) {
+        Ok(request) => request,
+        Err(error) => {
+            eprintln!("orca: invalid subagent worker request JSON: {error}");
+            return 1;
+        }
+    };
+    let config = match build_worker_run_config(
+        &args.cwd,
+        args.provider,
+        args.model.clone(),
+        args.api_key.clone(),
+        args.base_url.clone(),
+    ) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("orca: {error}");
+            return 1;
+        }
+    };
+    let worktree = match (args.worktree_repo_root, args.worktree_path) {
+        (Some(repo_root), Some(path)) => Some(AsyncSubagentWorktree { repo_root, path }),
+        (None, None) => None,
+        _ => {
+            eprintln!("orca: --worktree-repo-root and --worktree-path must be provided together");
+            return 1;
+        }
+    };
+
+    controller::run_async_subagent_worker(
+        config,
+        args.cwd,
+        args.child_cwd,
+        args.session_id,
+        args.agent_id,
+        request,
+        args.subagent_depth,
+        worktree,
+    )
+}
+
 fn run_workflow_command(args: WorkflowRunArgs) -> i32 {
     let cwd = args
         .cwd
@@ -1117,6 +1215,54 @@ fn build_workflow_run_config(
     if !file_config.workflows.resolved().enabled {
         return Err("workflows are disabled".to_string());
     }
+    let model = ModelSelection::parse(file_config.model)?;
+
+    Ok(RunConfig {
+        app_version: env!("CARGO_PKG_VERSION").to_string(),
+        prompt: String::new(),
+        cwd: Some(cwd.to_path_buf()),
+        output_format: OutputFormat::Jsonl,
+        approval_mode: file_config.mode.unwrap_or_default(),
+        provider,
+        verifier: None,
+        model,
+        model_runtime: file_config.model_runtime,
+        api_key: file_config.api_key,
+        base_url: file_config.base_url,
+        history_mode: HistoryMode::Disabled,
+        show_session_picker: false,
+        permission_rules: file_config.permissions,
+        max_budget_usd: None,
+        mcp_servers: file_config.mcp_servers,
+        hooks: file_config.hooks,
+        external_tools: crate::tools::external::load_default_external_tools(),
+        subagents: file_config.subagents.normalized(),
+        tools: file_config.tools.normalized(),
+        workflows: file_config.workflows.resolved(),
+        theme: file_config.theme,
+        vim_mode: file_config.vim_mode,
+        update_check: file_config.update_check,
+        desktop_notifications: false,
+        auto_memory: file_config.auto_memory,
+    })
+}
+
+fn build_worker_run_config(
+    cwd: &Path,
+    provider: ProviderKind,
+    model_override: Option<String>,
+    api_key_override: Option<String>,
+    base_url_override: Option<String>,
+) -> Result<RunConfig, String> {
+    let file_config = load_effective_file_config(
+        cwd,
+        ConfigOverrides {
+            model: model_override,
+            mode: None,
+            api_key: api_key_override,
+            base_url: base_url_override,
+        },
+    )?;
     let model = ModelSelection::parse(file_config.model)?;
 
     Ok(RunConfig {

@@ -1,4 +1,6 @@
 use std::process::Command;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use tempfile::tempdir;
@@ -138,6 +140,47 @@ fn subagent_status_can_read_persisted_async_handle() {
     assert_eq!(status_payload["agent_id"], agent_id);
     assert_eq!(status_payload["description"], "inspect repo");
     assert!(status_payload["status"].is_string());
+}
+
+#[test]
+fn async_subagent_completes_after_launching_exec_process_exits() {
+    let cwd = tempdir().expect("temp cwd");
+    let orca_home = tempdir().expect("temp orca home");
+    write_sleep_hook_config(orca_home.path(), 0.4);
+    let launched = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .current_dir(cwd.path())
+        .env("ORCA_HOME", orca_home.path())
+        .args([
+            "exec",
+            "--output-format",
+            "jsonl",
+            "--provider",
+            "mock",
+            "--approval-mode",
+            "full-auto",
+            "subagent async mock_usage",
+        ])
+        .output()
+        .expect("run orca");
+    assert_eq!(launched.status.code(), Some(0));
+    let launch_events = parse_jsonl(&launched.stdout);
+    let launch_completed = find_event(&launch_events, "tool.call.completed");
+    let launch_payload: Value =
+        serde_json::from_str(launch_completed["payload"]["output"].as_str().unwrap()).unwrap();
+    let agent_id = launch_payload["agent_id"].as_str().unwrap().to_string();
+
+    let status_payload = poll_subagent_status(cwd.path(), orca_home.path(), &agent_id);
+
+    assert_eq!(status_payload["agent_id"], agent_id);
+    assert_eq!(status_payload["description"], "mock_usage");
+    assert_eq!(status_payload["status"], "completed");
+    assert!(
+        status_payload["output"]
+            .as_str()
+            .unwrap()
+            .contains("Mock runtime completed with usage accounting")
+    );
+    assert_eq!(status_payload["usage"]["total_tokens"], 150);
 }
 
 #[test]
@@ -303,4 +346,59 @@ fn parse_jsonl(stdout: &[u8]) -> Vec<Value> {
         .lines()
         .map(|line| serde_json::from_str(line).expect("valid jsonl line"))
         .collect()
+}
+
+fn poll_subagent_status(
+    cwd: &std::path::Path,
+    orca_home: &std::path::Path,
+    agent_id: &str,
+) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut last_payload = None;
+    while Instant::now() < deadline {
+        let status = Command::new(env!("CARGO_BIN_EXE_orca"))
+            .current_dir(cwd)
+            .env("ORCA_HOME", orca_home)
+            .args([
+                "exec",
+                "--output-format",
+                "jsonl",
+                "--provider",
+                "mock",
+                "--approval-mode",
+                "full-auto",
+                &format!("subagent_status {agent_id}"),
+            ])
+            .output()
+            .expect("run orca");
+        assert_eq!(status.status.code(), Some(0));
+        let status_events = parse_jsonl(&status.stdout);
+        let status_completed = find_event(&status_events, "tool.call.completed");
+        let status_payload: Value =
+            serde_json::from_str(status_completed["payload"]["output"].as_str().unwrap()).unwrap();
+        if status_payload["status"] == "completed" {
+            return status_payload;
+        }
+        assert_ne!(
+            status_payload["status"], "failed",
+            "async subagent failed before completion: {status_payload}"
+        );
+        last_payload = Some(status_payload);
+        thread::sleep(Duration::from_millis(50));
+    }
+    panic!(
+        "async subagent did not complete before timeout; last status: {}",
+        last_payload
+            .map(|payload| payload.to_string())
+            .unwrap_or_else(|| "<none>".to_string())
+    );
+}
+
+fn write_sleep_hook_config(home: &std::path::Path, seconds: f32) {
+    std::fs::create_dir_all(home).expect("create ORCA_HOME");
+    std::fs::write(
+        home.join("config.toml"),
+        format!("[[hooks]]\nevent = \"pre_model_call\"\ncommand = \"sleep {seconds}\"\n"),
+    )
+    .expect("write hook config");
 }

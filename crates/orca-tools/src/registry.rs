@@ -573,7 +573,7 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
     registry.register(BuiltinTool::new(
         builtin_spec(
             "subagent_status",
-            "Query the status and result of an async subagent launched in this session.",
+            "Query the status and result of an async subagent by agent_id, including durable headless worker results from prior processes.",
             json!({
                 "type": "object",
                 "properties": {

@@ -1,5 +1,7 @@
 use std::io;
 use std::path::Path;
+use std::path::PathBuf;
+use std::process::{Command as ProcessCommand, Stdio};
 use std::thread;
 
 use orca_approval::{ApprovalPolicy, prompt_user};
@@ -80,6 +82,12 @@ struct BackgroundWorkflowRun {
     run_id: String,
     workflow_name: String,
     handle: WorkflowBackgroundLaunch,
+}
+
+#[derive(Clone, Debug)]
+pub struct AsyncSubagentWorktree {
+    pub repo_root: PathBuf,
+    pub path: PathBuf,
 }
 
 impl AgentLoopResult {
@@ -1580,11 +1588,6 @@ fn execute_subagent_tool(
             tool_request,
             request,
             subagent_depth,
-            instructions,
-            memory,
-            mcp_registry,
-            hooks,
-            cancel,
             task_registry,
         ));
     }
@@ -1691,11 +1694,6 @@ fn launch_async_subagent(
     tool_request: &tool_types::ToolRequest,
     request: subagent::SubagentRequest,
     subagent_depth: u32,
-    instructions: &ProjectInstructions,
-    memory: &MemoryBlock,
-    mcp_registry: &McpRegistry,
-    hooks: &HookRunner,
-    cancel: &CancelToken,
     task_registry: &TaskRegistry,
 ) -> tool_types::ToolResult {
     let agent_type = serde_json::to_value(&request.subagent_type)
@@ -1715,61 +1713,40 @@ fn launch_async_subagent(
     } else {
         None
     };
-    let child_request = ChildAgentRequest {
-        prompt: request.prompt,
-        subagent_type: request.subagent_type,
-        model: request.model,
-        depth: subagent_depth + 1,
-        emit_deltas: false,
-    };
-    let child_config = config.clone();
     let child_cwd = worktree_guard
         .as_ref()
         .map(|guard| guard.path().to_path_buf())
         .unwrap_or_else(|| cwd.to_path_buf());
-    let child_instructions = instructions.clone();
-    let child_memory = memory.clone();
-    let child_mcp_registry = mcp_registry.clone();
-    let child_hooks = hooks.clone();
-    let child_cancel = cancel.clone();
-    let child_registry = task_registry.clone();
-    let thread_agent_id = agent_id.clone();
-
-    thread::spawn(move || {
-        let _ = child_registry.mark_running(&thread_agent_id);
-        let mut child_events = EventFactory::new(format!("subagent-{thread_agent_id}"));
-        let mut child_sink = EventSink::new(io::sink(), child_config.output_format);
-        let mut child_runtime = ChildAgentRuntime::new(
-            &child_cwd,
-            &mut child_events,
-            &mut child_sink,
-            &child_instructions,
-            &child_memory,
-            &child_mcp_registry,
-            &child_hooks,
-            &child_cancel,
-            execute_child_agent_loop,
-        );
-        let (child, child_cost_tracker) =
-            run_child_agent(&child_config, &child_request, &mut child_runtime);
-        drop(child_runtime);
-        let worktree = worktree_guard.and_then(|guard| guard.finish().ok());
-        let usage = usage_totals_if_non_empty(child_cost_tracker.totals());
-        if child.status == RunStatus::Success {
-            let mut output = child
-                .final_message
-                .unwrap_or_else(|| "(subagent completed without a final message)".to_string());
-            append_worktree_outcome(&mut output, worktree.as_ref());
-            let _ = child_registry.complete_with_usage(&thread_agent_id, output, usage);
-        } else {
-            let mut error = child
-                .error
-                .or(child.final_message)
-                .unwrap_or_else(|| format!("subagent ended with status {:?}", child.status));
-            append_worktree_outcome(&mut error, worktree.as_ref());
-            let _ = child_registry.fail_with_usage(&thread_agent_id, error, usage);
-        }
+    let worktree = worktree_guard.as_ref().map(|guard| AsyncSubagentWorktree {
+        repo_root: guard.repo_root().to_path_buf(),
+        path: guard.path().to_path_buf(),
     });
+    if let Err(error) = task_registry.mark_worker_spawned(&agent_id, 0) {
+        let _ = task_registry.fail(&agent_id, error.clone());
+        return tool_types::ToolResult::failed(tool_request, error, None);
+    }
+    match spawn_async_subagent_worker(
+        config,
+        cwd,
+        &child_cwd,
+        task_registry.session_id(),
+        &agent_id,
+        &request,
+        subagent_depth + 1,
+        worktree.as_ref(),
+    ) {
+        Ok(pid) => {
+            let _ = task_registry.mark_worker_spawned(&agent_id, pid);
+            std::mem::forget(worktree_guard);
+        }
+        Err(error) => {
+            let worktree = worktree_guard.and_then(|guard| guard.finish().ok());
+            let mut error = format!("failed to start async subagent worker: {error}");
+            append_worktree_outcome(&mut error, worktree.as_ref());
+            let _ = task_registry.fail(&agent_id, error.clone());
+            return tool_types::ToolResult::failed(tool_request, error, None);
+        }
+    }
 
     let output = serde_json::json!({
         "status": "async_launched",
@@ -1778,6 +1755,132 @@ fn launch_async_subagent(
     })
     .to_string();
     tool_types::ToolResult::completed(tool_request, output, false)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_async_subagent_worker(
+    config: &RunConfig,
+    cwd: &Path,
+    child_cwd: &Path,
+    task_session_id: &str,
+    agent_id: &str,
+    request: &subagent::SubagentRequest,
+    child_depth: u32,
+    worktree: Option<&AsyncSubagentWorktree>,
+) -> Result<u32, String> {
+    let current_exe = std::env::current_exe().map_err(|error| error.to_string())?;
+    let request_json = serde_json::to_string(request).map_err(|error| error.to_string())?;
+    let mut command = ProcessCommand::new(current_exe);
+    command
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .arg("subagent-worker")
+        .arg("--cwd")
+        .arg(cwd)
+        .arg("--child-cwd")
+        .arg(child_cwd)
+        .arg("--provider")
+        .arg(config.provider.as_str())
+        .arg("--session-id")
+        .arg(task_session_id)
+        .arg("--agent-id")
+        .arg(agent_id)
+        .arg("--subagent-depth")
+        .arg(child_depth.to_string())
+        .arg("--request-json")
+        .arg(request_json);
+    if let Some(model) = config.model.as_history_value() {
+        command.arg("--model").arg(model);
+    }
+    if let Some(api_key) = config.api_key.as_deref() {
+        command.arg("--api-key").arg(api_key);
+    }
+    if let Some(base_url) = config.base_url.as_deref() {
+        command.arg("--base-url").arg(base_url);
+    }
+    if let Some(worktree) = worktree {
+        command
+            .arg("--worktree-repo-root")
+            .arg(&worktree.repo_root)
+            .arg("--worktree-path")
+            .arg(&worktree.path);
+    }
+    command
+        .spawn()
+        .map(|child| child.id())
+        .map_err(|error| error.to_string())
+}
+
+pub fn run_async_subagent_worker(
+    config: RunConfig,
+    cwd: PathBuf,
+    child_cwd: PathBuf,
+    task_session_id: String,
+    agent_id: String,
+    request: subagent::SubagentRequest,
+    child_depth: u32,
+    worktree: Option<AsyncSubagentWorktree>,
+) -> i32 {
+    let task_registry = TaskRegistry::new_for_cwd(task_session_id, &cwd);
+    let _ = task_registry.mark_running(&agent_id);
+    let instructions = load_project_instructions(&cwd);
+    let memory = memory::load_for_cwd(&cwd);
+    let hooks = HookRunner::new(config.hooks.clone());
+    let mcp_registry = orca_mcp::initialize_registry(&config.mcp_servers);
+    let cancel = CancelToken::new();
+    let child_request = ChildAgentRequest {
+        prompt: request.prompt,
+        subagent_type: request.subagent_type,
+        model: request.model,
+        depth: child_depth,
+        emit_deltas: false,
+    };
+    let mut child_events = EventFactory::new(format!("subagent-{agent_id}"));
+    let mut child_sink = EventSink::new(io::sink(), config.output_format);
+    let mut child_runtime = ChildAgentRuntime::new(
+        &child_cwd,
+        &mut child_events,
+        &mut child_sink,
+        &instructions,
+        &memory,
+        &mcp_registry,
+        &hooks,
+        &cancel,
+        execute_child_agent_loop,
+    );
+    let (child, child_cost_tracker) = run_child_agent(&config, &child_request, &mut child_runtime);
+    drop(child_runtime);
+    let worktree = worktree.and_then(|worktree| {
+        WorktreeGuard::finish_existing(worktree.repo_root, worktree.path).ok()
+    });
+    let usage = usage_totals_if_non_empty(child_cost_tracker.totals());
+    if child.status == RunStatus::Success {
+        let mut output = child
+            .final_message
+            .unwrap_or_else(|| "(subagent completed without a final message)".to_string());
+        append_worktree_outcome(&mut output, worktree.as_ref());
+        if task_registry
+            .complete_with_usage(&agent_id, output, usage)
+            .is_ok()
+        {
+            return 0;
+        }
+    } else {
+        let mut error = child
+            .error
+            .or(child.final_message)
+            .unwrap_or_else(|| format!("subagent ended with status {:?}", child.status));
+        append_worktree_outcome(&mut error, worktree.as_ref());
+        if task_registry
+            .fail_with_usage(&agent_id, error, usage)
+            .is_ok()
+        {
+            return 1;
+        }
+    }
+    1
 }
 
 fn execute_subagent_status_tool(

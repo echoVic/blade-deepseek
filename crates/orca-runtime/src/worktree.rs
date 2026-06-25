@@ -34,8 +34,16 @@ impl WorktreeGuard {
         &self.path
     }
 
+    pub fn repo_root(&self) -> &Path {
+        &self.repo_root
+    }
+
     pub fn finish(self) -> io::Result<WorktreeOutcome> {
         let Self { repo_root, path } = self;
+        Self::finish_existing(repo_root, path)
+    }
+
+    pub fn finish_existing(repo_root: PathBuf, path: PathBuf) -> io::Result<WorktreeOutcome> {
         let status = git_output(&path, &["status", "--short"])?;
         let dirty = !status.trim().is_empty();
         if !dirty {

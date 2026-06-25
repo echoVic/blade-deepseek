@@ -47,6 +47,7 @@ pub struct TaskRecord {
     pub usage: Option<UsageTotals>,
     pub result: Option<String>,
     pub error: Option<String>,
+    pub worker_pid: Option<u32>,
     pub control: TaskControl,
 }
 
@@ -83,6 +84,8 @@ struct PersistedTaskRecord {
     usage: Option<UsageTotals>,
     result: Option<String>,
     error: Option<String>,
+    #[serde(default)]
+    worker_pid: Option<u32>,
 }
 
 impl TaskRegistry {
@@ -151,6 +154,7 @@ impl TaskRegistry {
             usage: None,
             result: None,
             error: None,
+            worker_pid: None,
             control,
         };
 
@@ -189,6 +193,7 @@ impl TaskRegistry {
             usage: None,
             result: None,
             error: None,
+            worker_pid: None,
             control,
         };
 
@@ -300,6 +305,16 @@ impl TaskRegistry {
         })
     }
 
+    pub fn mark_worker_spawned(&self, id: &str, pid: u32) -> Result<(), String> {
+        self.update_task(id, |record| {
+            if is_terminal(record.status) {
+                return Err(task_state_error("mark_worker_spawned", record.status));
+            }
+            record.worker_pid = Some(pid);
+            Ok(())
+        })
+    }
+
     pub fn complete(&self, id: &str, result: String) -> Result<(), String> {
         self.complete_with_usage(id, result, None)
     }
@@ -319,6 +334,7 @@ impl TaskRegistry {
             record.result = Some(result);
             record.error = None;
             record.usage = usage;
+            record.worker_pid = None;
             record.control.pause.store(false, Ordering::Release);
             Ok(())
         })
@@ -343,6 +359,7 @@ impl TaskRegistry {
             record.error = Some(error);
             record.result = None;
             record.usage = usage;
+            record.worker_pid = None;
             record.control.pause.store(false, Ordering::Release);
             Ok(())
         })
@@ -357,6 +374,7 @@ impl TaskRegistry {
             record.completed_at_ms = Some(now_ms());
             record.result = Some(summary);
             record.error = None;
+            record.worker_pid = None;
             record.control.pause.store(false, Ordering::Release);
             Ok(())
         })
@@ -544,6 +562,7 @@ impl PersistedTaskRecord {
             usage: self.usage,
             result: self.result,
             error: self.error,
+            worker_pid: self.worker_pid,
             control: new_task_control(),
         }
     }
@@ -575,6 +594,7 @@ impl From<&TaskRecord> for PersistedTaskRecord {
             usage: record.usage,
             result: record.result.clone(),
             error: record.error.clone(),
+            worker_pid: record.worker_pid,
         }
     }
 }
@@ -606,6 +626,9 @@ fn is_terminal(status: TaskStatus) -> bool {
 
 fn mark_interrupted_if_active(record: &mut TaskRecord) -> bool {
     if is_terminal(record.status) {
+        return false;
+    }
+    if record.task_type == TaskType::Subagent && record.worker_pid.is_some() {
         return false;
     }
     record.status = TaskStatus::Failed;
@@ -707,6 +730,28 @@ mod tests {
                 .contains("interrupted before completion")
         );
         assert!(recovered.completed_at_ms.is_some());
+    }
+
+    #[test]
+    fn persistent_registry_keeps_worker_owned_subagent_active() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry =
+            TaskRegistry::new_persistent("session-1".to_string(), temp.path().join("tasks"))
+                .unwrap();
+        let task =
+            registry.create_subagent("inspect auth".to_string(), Some("general".to_string()));
+        registry.mark_running(&task.id).unwrap();
+        registry.mark_worker_spawned(&task.id, 12345).unwrap();
+
+        let reloaded =
+            TaskRegistry::new_persistent("session-2".to_string(), temp.path().join("tasks"))
+                .unwrap();
+        let recovered = reloaded.get(&task.id).expect("persistent task record");
+
+        assert_eq!(recovered.status, TaskStatus::Running);
+        assert_eq!(recovered.error, None);
+        assert_eq!(recovered.worker_pid, Some(12345));
+        assert_eq!(recovered.completed_at_ms, None);
     }
 
     #[test]

@@ -1,7 +1,8 @@
 use orca_core::subagent_types::SubagentType;
 use orca_core::tool_types::ToolRequest;
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SubagentRequest {
     pub description: String,
     pub prompt: String,
@@ -11,13 +12,15 @@ pub struct SubagentRequest {
     pub isolation: SubagentIsolation,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SubagentMode {
     Sync,
     Async,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SubagentIsolation {
     None,
     Worktree,
