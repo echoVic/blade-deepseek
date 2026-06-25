@@ -4,7 +4,7 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
-use orca_runtime::workflow::host::{HostEvent, WorkflowHost};
+use orca_runtime::workflow::host::{HostEvent, WorkflowHost, WorkflowHostIpcPaths};
 use tempfile::tempdir;
 
 #[test]
@@ -246,6 +246,61 @@ fn host_task_list_distributes_shared_work_to_parallel_agents() {
                                 && item["result"]["prompt"].as_str().is_some()
                         })
                     }) == Some(true)
+        )
+    }));
+}
+
+#[test]
+fn host_ipc_paths_preserve_messages_and_tasks_across_host_restarts() {
+    if !WorkflowHost::node_available() {
+        return;
+    }
+
+    let temp = tempdir().unwrap();
+    let ipc_paths = WorkflowHostIpcPaths {
+        mailbox_path: temp.path().join("mailbox.json"),
+        task_lists_path: temp.path().join("task-lists.json"),
+    };
+    let writer_script = temp.path().join("writer.js");
+    fs::write(
+        &writer_script,
+        "export const meta = { name: 'ipc-writer', description: 'IPC writer', phases: [] };\n\
+         sendMessage('findings', { severity: 'high' }, { from: 'scanner' });\n\
+         createTaskList('audit', [{ area: 'api' }]);\n\
+         claimTask('audit', { by: 'worker-a' });\n\
+         export default 'written';",
+    )
+    .unwrap();
+    WorkflowHost::run_collecting_events_with_ipc_paths(
+        &writer_script,
+        serde_json::json!(null),
+        &ipc_paths,
+    )
+    .unwrap();
+
+    let reader_script = temp.path().join("reader.js");
+    fs::write(
+        &reader_script,
+        "export const meta = { name: 'ipc-reader', description: 'IPC reader', phases: [] };\n\
+         export default { messages: readMessages('findings'), tasks: listTasks('audit') };",
+    )
+    .unwrap();
+    let events = WorkflowHost::run_collecting_events_with_ipc_paths(
+        &reader_script,
+        serde_json::json!(null),
+        &ipc_paths,
+    )
+    .unwrap();
+
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            HostEvent::WorkflowCompleted { result }
+                if result["messages"][0]["from"] == "scanner"
+                    && result["messages"][0]["message"]["severity"] == "high"
+                    && result["tasks"][0]["id"] == "workflow-task-1"
+                    && result["tasks"][0]["status"] == "running"
+                    && result["tasks"][0]["claimedBy"] == "worker-a"
         )
     }));
 }

@@ -50,6 +50,12 @@ pub enum HostCommand {
 #[derive(Clone, Debug, Default)]
 pub struct WorkflowHost;
 
+#[derive(Clone, Debug)]
+pub struct WorkflowHostIpcPaths {
+    pub mailbox_path: PathBuf,
+    pub task_lists_path: PathBuf,
+}
+
 impl WorkflowHost {
     pub fn node_available() -> bool {
         Command::new("node")
@@ -74,6 +80,29 @@ impl WorkflowHost {
         })
     }
 
+    pub fn run_collecting_events_with_ipc_paths(
+        script_path: &Path,
+        args: Value,
+        ipc_paths: &WorkflowHostIpcPaths,
+    ) -> io::Result<Vec<HostEvent>> {
+        Self::run_collecting_events_with_agent_and_event_callback_inner(
+            script_path,
+            args,
+            Some(ipc_paths),
+            |call| {
+                Ok(HostCommand::AgentResult {
+                    call_id: call.call_id.clone(),
+                    result: serde_json::json!({
+                        "callId": call.call_id,
+                        "prompt": call.prompt,
+                        "cached": false,
+                    }),
+                })
+            },
+            |_| Ok(()),
+        )
+    }
+
     pub fn run_collecting_events_with_agent<F>(
         script_path: &Path,
         args: Value,
@@ -94,6 +123,46 @@ impl WorkflowHost {
         script_path: &Path,
         args: Value,
         on_agent_call: F,
+        on_event: E,
+    ) -> io::Result<Vec<HostEvent>>
+    where
+        F: Fn(AgentCall) -> io::Result<HostCommand> + Send + Sync,
+        E: FnMut(&HostEvent) -> io::Result<()>,
+    {
+        Self::run_collecting_events_with_agent_and_event_callback_inner(
+            script_path,
+            args,
+            None,
+            on_agent_call,
+            on_event,
+        )
+    }
+
+    pub fn run_collecting_events_with_agent_and_event_callback_with_ipc_paths<F, E>(
+        script_path: &Path,
+        args: Value,
+        ipc_paths: &WorkflowHostIpcPaths,
+        on_agent_call: F,
+        on_event: E,
+    ) -> io::Result<Vec<HostEvent>>
+    where
+        F: Fn(AgentCall) -> io::Result<HostCommand> + Send + Sync,
+        E: FnMut(&HostEvent) -> io::Result<()>,
+    {
+        Self::run_collecting_events_with_agent_and_event_callback_inner(
+            script_path,
+            args,
+            Some(ipc_paths),
+            on_agent_call,
+            on_event,
+        )
+    }
+
+    fn run_collecting_events_with_agent_and_event_callback_inner<F, E>(
+        script_path: &Path,
+        args: Value,
+        ipc_paths: Option<&WorkflowHostIpcPaths>,
+        on_agent_call: F,
         mut on_event: E,
     ) -> io::Result<Vec<HostEvent>>
     where
@@ -104,10 +173,14 @@ impl WorkflowHost {
         let args_json = serde_json::to_string(&args)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
 
-        let mut child = Command::new("node")
-            .arg(&host_path)
-            .arg(script_path)
-            .arg(args_json)
+        let mut command = Command::new("node");
+        command.arg(&host_path).arg(script_path).arg(args_json);
+        if let Some(ipc_paths) = ipc_paths {
+            command
+                .arg(&ipc_paths.mailbox_path)
+                .arg(&ipc_paths.task_lists_path);
+        }
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

@@ -32,7 +32,7 @@ use crate::schema_validation::validate_json_schema_subset;
 use crate::tasks::TaskRegistry;
 use crate::worktree::{WorktreeGuard, WorktreeOutcome};
 
-use super::host::{AgentCall, HostCommand, HostEvent, WorkflowHost};
+use super::host::{AgentCall, HostCommand, HostEvent, WorkflowHost, WorkflowHostIpcPaths};
 use super::ipc::WorkflowIpcContext;
 use super::script::{ResolvedWorkflowScript, resolve_workflow_script_to_path};
 use super::state::{
@@ -348,7 +348,14 @@ impl WorkflowRunner {
         let mut failed_error = None;
         let mut completed_result = None;
         let gate = Arc::new(WorkflowExecutionGate::new());
-        let workflow_ipc = WorkflowIpcContext::new();
+        let ipc_paths = WorkflowHostIpcPaths {
+            mailbox_path: self.state.mailbox_path(&run_id),
+            task_lists_path: self.state.task_lists_path(&run_id),
+        };
+        let workflow_ipc = WorkflowIpcContext::new_durable(
+            ipc_paths.mailbox_path.clone(),
+            ipc_paths.task_lists_path.clone(),
+        )?;
         let workflow_limits = self.config.workflows.clone();
 
         if self.state.stop_requested(&run_id)? {
@@ -365,53 +372,55 @@ impl WorkflowRunner {
 
         let mut phase_agent_baselines = std::collections::HashMap::new();
         let mut agent_events_seen = 0u32;
-        let events = match WorkflowHost::run_collecting_events_with_agent_and_event_callback(
-            &resolved.persisted_path,
-            args,
-            |call| {
-                self.answer_agent_call(
-                    &run_id,
-                    &task_id,
-                    resume_from.as_deref(),
-                    &transcript_dir,
-                    call,
-                    Arc::clone(&cached_agents),
-                    &gate,
-                    &workflow_ipc,
-                    &workflow_limits,
-                )
-            },
-            |event| {
-                apply_host_event_to_state(
-                    event,
-                    &mut state,
-                    &mut phase_agent_baselines,
-                    &mut agent_events_seen,
-                    &mut completed_result,
-                    &mut failed_error,
-                );
-                self.state.write_state(&state)?;
-                self.refresh_task_progress(&task_id, &state)
-            },
-        ) {
-            Ok(events) => events,
-            Err(error) => {
-                let message = error.to_string();
-                let counts = self.state.agent_status_counts(&run_id)?;
-                state.total_agent_count = gate
-                    .snapshot()?
-                    .total_agents
-                    .max(terminal_agent_count(&counts));
-                state.status = WorkflowRunStatus::Failed;
-                state.error = Some(message.clone());
-                self.state.write_state(&state)?;
-                self.tasks
-                    .fail(&task_id, message.clone())
-                    .map_err(io::Error::other)?;
-                let _ = self.state.mark_worker_exited(&run_id);
-                return Err(error);
-            }
-        };
+        let events =
+            match WorkflowHost::run_collecting_events_with_agent_and_event_callback_with_ipc_paths(
+                &resolved.persisted_path,
+                args,
+                &ipc_paths,
+                |call| {
+                    self.answer_agent_call(
+                        &run_id,
+                        &task_id,
+                        resume_from.as_deref(),
+                        &transcript_dir,
+                        call,
+                        Arc::clone(&cached_agents),
+                        &gate,
+                        &workflow_ipc,
+                        &workflow_limits,
+                    )
+                },
+                |event| {
+                    apply_host_event_to_state(
+                        event,
+                        &mut state,
+                        &mut phase_agent_baselines,
+                        &mut agent_events_seen,
+                        &mut completed_result,
+                        &mut failed_error,
+                    );
+                    self.state.write_state(&state)?;
+                    self.refresh_task_progress(&task_id, &state)
+                },
+            ) {
+                Ok(events) => events,
+                Err(error) => {
+                    let message = error.to_string();
+                    let counts = self.state.agent_status_counts(&run_id)?;
+                    state.total_agent_count = gate
+                        .snapshot()?
+                        .total_agents
+                        .max(terminal_agent_count(&counts));
+                    state.status = WorkflowRunStatus::Failed;
+                    state.error = Some(message.clone());
+                    self.state.write_state(&state)?;
+                    self.tasks
+                        .fail(&task_id, message.clone())
+                        .map_err(io::Error::other)?;
+                    let _ = self.state.mark_worker_exited(&run_id);
+                    return Err(error);
+                }
+            };
 
         let _ = events;
 

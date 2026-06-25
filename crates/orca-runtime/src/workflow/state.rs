@@ -196,6 +196,14 @@ impl WorkflowStateStore {
         self.run_dir(run_id).join("control.json")
     }
 
+    pub fn mailbox_path(&self, run_id: &str) -> PathBuf {
+        self.run_dir(run_id).join("mailbox.json")
+    }
+
+    pub fn task_lists_path(&self, run_id: &str) -> PathBuf {
+        self.run_dir(run_id).join("task-lists.json")
+    }
+
     pub fn create_run(&self, state: &WorkflowRunState) -> io::Result<()> {
         fs::create_dir_all(self.transcript_dir(&state.run_id))?;
         self.write_state(state)

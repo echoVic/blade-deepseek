@@ -1,6 +1,11 @@
 use std::collections::HashMap;
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 #[derive(Clone, Debug)]
@@ -11,12 +16,39 @@ pub(crate) struct WorkflowIpcContext {
 }
 
 impl WorkflowIpcContext {
+    #[allow(dead_code)]
     pub(crate) fn new() -> Self {
         Self {
             mailbox: Arc::new(WorkflowMailbox::default()),
             task_lists: Arc::new(WorkflowTaskLists::default()),
             sender: "workflow-agent".to_string(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_durable_mailbox(mailbox_path: PathBuf) -> io::Result<Self> {
+        Ok(Self {
+            mailbox: Arc::new(WorkflowMailbox::durable(mailbox_path)?),
+            task_lists: Arc::new(WorkflowTaskLists::default()),
+            sender: "workflow-agent".to_string(),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_durable_task_lists(task_lists_path: PathBuf) -> io::Result<Self> {
+        Ok(Self {
+            mailbox: Arc::new(WorkflowMailbox::default()),
+            task_lists: Arc::new(WorkflowTaskLists::durable(task_lists_path)?),
+            sender: "workflow-agent".to_string(),
+        })
+    }
+
+    pub(crate) fn new_durable(mailbox_path: PathBuf, task_lists_path: PathBuf) -> io::Result<Self> {
+        Ok(Self {
+            mailbox: Arc::new(WorkflowMailbox::durable(mailbox_path)?),
+            task_lists: Arc::new(WorkflowTaskLists::durable(task_lists_path)?),
+            sender: "workflow-agent".to_string(),
+        })
     }
 
     pub(crate) fn for_sender(&self, sender: impl Into<String>) -> Self {
@@ -74,18 +106,41 @@ impl WorkflowIpcContext {
     }
 }
 
-#[derive(Default, Debug)]
+#[derive(Debug)]
 struct WorkflowMailbox {
     state: Mutex<WorkflowMailboxState>,
+    durable_path: Option<PathBuf>,
 }
 
-#[derive(Default, Debug)]
+#[derive(Clone, Default, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct WorkflowMailboxState {
     next_seq: u64,
     channels: HashMap<String, Vec<Value>>,
 }
 
+impl Default for WorkflowMailbox {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new(WorkflowMailboxState::default()),
+            durable_path: None,
+        }
+    }
+}
+
 impl WorkflowMailbox {
+    fn durable(path: PathBuf) -> io::Result<Self> {
+        let state = if path.exists() {
+            read_mailbox_state(&path)?
+        } else {
+            WorkflowMailboxState::default()
+        };
+        Ok(Self {
+            state: Mutex::new(state),
+            durable_path: Some(path),
+        })
+    }
+
     fn send_message(&self, channel: &str, from: &str, message: Value) -> Result<Value, String> {
         let channel = normalize_channel(channel)?;
         let from = normalize_sender(from);
@@ -105,6 +160,7 @@ impl WorkflowMailbox {
             .entry(channel)
             .or_default()
             .push(entry.clone());
+        self.persist_locked_state(&state)?;
         Ok(entry)
     }
 
@@ -130,8 +186,55 @@ impl WorkflowMailbox {
             .remove(&channel)
             .map(|items| items.len())
             .unwrap_or(0);
+        self.persist_locked_state(&state)?;
         Ok(json!({ "cleared": cleared }))
     }
+
+    fn persist_locked_state(&self, state: &WorkflowMailboxState) -> Result<(), String> {
+        let Some(path) = &self.durable_path else {
+            return Ok(());
+        };
+        write_mailbox_state(path, state).map_err(|error| {
+            format!(
+                "failed to persist workflow mailbox {}: {error}",
+                path.display()
+            )
+        })
+    }
+}
+
+fn read_mailbox_state(path: &Path) -> io::Result<WorkflowMailboxState> {
+    let content = fs::read_to_string(path)?;
+    serde_json::from_str(&content)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+fn write_mailbox_state(path: &Path, state: &WorkflowMailboxState) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let content = serde_json::to_string_pretty(state)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("mailbox");
+    let temp_path = path.with_file_name(format!(
+        ".{file_name}.tmp-{}-{}",
+        std::process::id(),
+        now_ms()
+    ));
+    fs::write(&temp_path, content)?;
+    fs::rename(&temp_path, path).inspect_err(|_| {
+        let _ = fs::remove_file(&temp_path);
+    })
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 fn normalize_channel(channel: &str) -> Result<String, String> {
@@ -151,18 +254,21 @@ fn normalize_sender(sender: &str) -> String {
     }
 }
 
-#[derive(Default, Debug)]
+#[derive(Debug)]
 struct WorkflowTaskLists {
     state: Mutex<WorkflowTaskListState>,
+    durable_path: Option<PathBuf>,
 }
 
-#[derive(Default, Debug)]
+#[derive(Clone, Default, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct WorkflowTaskListState {
     next_task_seq: u64,
     lists: HashMap<String, Vec<WorkflowTaskItem>>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct WorkflowTaskItem {
     id: String,
     status: WorkflowTaskStatus,
@@ -172,14 +278,36 @@ struct WorkflowTaskItem {
     result: Value,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 enum WorkflowTaskStatus {
     Pending,
     Running,
     Completed,
 }
 
+impl Default for WorkflowTaskLists {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new(WorkflowTaskListState::default()),
+            durable_path: None,
+        }
+    }
+}
+
 impl WorkflowTaskLists {
+    fn durable(path: PathBuf) -> io::Result<Self> {
+        let state = if path.exists() {
+            read_task_list_state(&path)?
+        } else {
+            WorkflowTaskListState::default()
+        };
+        Ok(Self {
+            state: Mutex::new(state),
+            durable_path: Some(path),
+        })
+    }
+
     fn create_task_list(&self, name: &str, items: Vec<Value>) -> Result<Value, String> {
         let name = normalize_task_list_name(name)?;
         let mut state = self
@@ -201,6 +329,7 @@ impl WorkflowTaskLists {
             })
             .collect::<Vec<_>>();
         state.lists.insert(name.clone(), tasks);
+        self.persist_locked_state(&state)?;
         Ok(tasks_to_value(
             state.lists.get(&name).expect("inserted task list"),
         ))
@@ -222,7 +351,9 @@ impl WorkflowTaskLists {
         };
         task.status = WorkflowTaskStatus::Running;
         task.claimed_by = Some(by);
-        Ok(task_to_value(task))
+        let value = task_to_value(task);
+        self.persist_locked_state(&state)?;
+        Ok(value)
     }
 
     fn complete_task(
@@ -249,7 +380,9 @@ impl WorkflowTaskLists {
         task.status = WorkflowTaskStatus::Completed;
         task.completed_by = Some(by);
         task.result = result;
-        Ok(task_to_value(task))
+        let value = task_to_value(task);
+        self.persist_locked_state(&state)?;
+        Ok(value)
     }
 
     fn list_tasks(&self, name: &str) -> Result<Value, String> {
@@ -262,6 +395,45 @@ impl WorkflowTaskLists {
             state.lists.get(&name).map(Vec::as_slice).unwrap_or(&[]),
         ))
     }
+
+    fn persist_locked_state(&self, state: &WorkflowTaskListState) -> Result<(), String> {
+        let Some(path) = &self.durable_path else {
+            return Ok(());
+        };
+        write_task_list_state(path, state).map_err(|error| {
+            format!(
+                "failed to persist workflow task lists {}: {error}",
+                path.display()
+            )
+        })
+    }
+}
+
+fn read_task_list_state(path: &Path) -> io::Result<WorkflowTaskListState> {
+    let content = fs::read_to_string(path)?;
+    serde_json::from_str(&content)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+fn write_task_list_state(path: &Path, state: &WorkflowTaskListState) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let content = serde_json::to_string_pretty(state)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("task-lists");
+    let temp_path = path.with_file_name(format!(
+        ".{file_name}.tmp-{}-{}",
+        std::process::id(),
+        now_ms()
+    ));
+    fs::write(&temp_path, content)?;
+    fs::rename(&temp_path, path).inspect_err(|_| {
+        let _ = fs::remove_file(&temp_path);
+    })
 }
 
 fn tasks_to_value(tasks: &[WorkflowTaskItem]) -> Value {
@@ -311,5 +483,58 @@ fn normalize_task_worker(worker: &str) -> String {
         "workflow-agent".to_string()
     } else {
         worker.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+    use tempfile::tempdir;
+
+    use super::WorkflowIpcContext;
+
+    #[test]
+    fn durable_mailbox_preserves_messages_across_context_reloads() {
+        let temp = tempdir().unwrap();
+        let mailbox_path = temp.path().join("mailbox.json");
+        let first = WorkflowIpcContext::new_durable_mailbox(mailbox_path.clone()).unwrap();
+
+        let sent = first
+            .send_message("findings", Some("scanner"), json!({ "severity": "high" }))
+            .expect("send durable message");
+        assert_eq!(sent["seq"], 1);
+
+        let second = WorkflowIpcContext::new_durable_mailbox(mailbox_path).unwrap();
+        let messages = second
+            .read_messages("findings")
+            .expect("read durable messages");
+
+        assert_eq!(messages.as_array().unwrap().len(), 1);
+        assert_eq!(messages[0]["from"], "scanner");
+        assert_eq!(messages[0]["message"]["severity"], "high");
+    }
+
+    #[test]
+    fn durable_task_lists_preserve_claimed_tasks_across_context_reloads() {
+        let temp = tempdir().unwrap();
+        let task_lists_path = temp.path().join("task-lists.json");
+        let first = WorkflowIpcContext::new_durable_task_lists(task_lists_path.clone()).unwrap();
+
+        first
+            .create_task_list("audit", vec![json!({ "area": "api" })])
+            .expect("create durable task list");
+        let claimed = first
+            .claim_task("audit", Some("worker-a"))
+            .expect("claim durable task");
+        assert_eq!(claimed["id"], "workflow-task-1");
+        assert_eq!(claimed["status"], "running");
+
+        let second = WorkflowIpcContext::new_durable_task_lists(task_lists_path).unwrap();
+        let tasks = second.list_tasks("audit").expect("list durable tasks");
+
+        assert_eq!(tasks.as_array().unwrap().len(), 1);
+        assert_eq!(tasks[0]["id"], "workflow-task-1");
+        assert_eq!(tasks[0]["status"], "running");
+        assert_eq!(tasks[0]["claimedBy"], "worker-a");
     }
 }

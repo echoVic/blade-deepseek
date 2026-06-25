@@ -1,8 +1,12 @@
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
+import { dirname } from "node:path";
 import vm from "node:vm";
 
 const scriptPath = process.argv[2];
 const argsJson = process.argv[3] ?? "null";
+const mailboxPath = process.argv[4] ?? null;
+const taskListsPath = process.argv[5] ?? null;
 const workflowArgs = JSON.parse(argsJson);
 const FORBIDDEN_IDENTIFIERS = new Set([
   "process",
@@ -24,14 +28,16 @@ const FORBIDDEN_MODULE_SPECIFIERS = new Set(["node:fs", "child_process"]);
 const MODULE_SPECIFIER_CALLEES = new Set(["import", "require", "getBuiltinModule"]);
 
 let callSeq = 0;
-let messageSeq = 0;
-let taskSeq = 0;
 let currentPhase = null;
 let activeMarkerPhase = null;
 let stdinBuffer = "";
 const pendingAgentResolvers = new Map();
-const messageChannels = new Map();
-const taskLists = new Map();
+const mailboxState = loadMailboxState();
+let messageSeq = mailboxState.nextSeq;
+const messageChannels = new Map(Object.entries(mailboxState.channels));
+const taskListState = loadTaskListState();
+let taskSeq = taskListState.nextTaskSeq;
+const taskLists = new Map(Object.entries(taskListState.lists));
 let stdinClosed = false;
 
 process.stdin.setEncoding("utf8");
@@ -98,6 +104,7 @@ function sendMessage(channel, message, opts = {}) {
   const messages = messageChannels.get(channelName) ?? [];
   messages.push(entry);
   messageChannels.set(channelName, messages);
+  persistMailboxState();
   return cloneMessageValue(entry);
 }
 
@@ -110,6 +117,7 @@ function clearMessages(channel) {
   const channelName = normalizeMessageChannel(channel);
   const count = (messageChannels.get(channelName) ?? []).length;
   messageChannels.delete(channelName);
+  persistMailboxState();
   return count;
 }
 
@@ -131,6 +139,7 @@ function createTaskList(name, items = []) {
     };
   });
   taskLists.set(listName, tasks);
+  persistTaskListState();
   return listTasks(listName);
 }
 
@@ -143,6 +152,7 @@ function claimTask(name, opts = {}) {
 
   task.status = "running";
   task.claimedBy = normalizeTaskWorker(opts?.by ?? opts?.from);
+  persistTaskListState();
   return cloneMessageValue(task);
 }
 
@@ -151,6 +161,7 @@ function completeTask(name, taskId, result = null, opts = {}) {
   task.status = "completed";
   task.completedBy = normalizeTaskWorker(opts?.by ?? opts?.from);
   task.result = cloneMessageValue(result);
+  persistTaskListState();
   return cloneMessageValue(task);
 }
 
@@ -203,6 +214,64 @@ function cloneMessageValue(value) {
     return null;
   }
   return JSON.parse(JSON.stringify(value));
+}
+
+function loadMailboxState() {
+  if (mailboxPath === null || !existsSync(mailboxPath)) {
+    return { nextSeq: 0, channels: Object.create(null) };
+  }
+  const state = JSON.parse(readFileSync(mailboxPath, "utf8"));
+  return {
+    nextSeq: Number(state?.nextSeq ?? 0),
+    channels: state?.channels && typeof state.channels === "object" ? state.channels : Object.create(null),
+  };
+}
+
+function persistMailboxState() {
+  if (mailboxPath === null) {
+    return;
+  }
+  writeJsonAtomic(mailboxPath, {
+    nextSeq: messageSeq,
+    channels: Object.fromEntries(messageChannels),
+  });
+}
+
+function loadTaskListState() {
+  if (taskListsPath === null || !existsSync(taskListsPath)) {
+    return { nextTaskSeq: 0, lists: Object.create(null) };
+  }
+  const state = JSON.parse(readFileSync(taskListsPath, "utf8"));
+  return {
+    nextTaskSeq: Number(state?.nextTaskSeq ?? 0),
+    lists: state?.lists && typeof state.lists === "object" ? state.lists : Object.create(null),
+  };
+}
+
+function persistTaskListState() {
+  if (taskListsPath === null) {
+    return;
+  }
+  writeJsonAtomic(taskListsPath, {
+    nextTaskSeq: taskSeq,
+    lists: Object.fromEntries(taskLists),
+  });
+}
+
+function writeJsonAtomic(path, value) {
+  mkdirSync(dirname(path), { recursive: true });
+  const tempPath = `${path}.tmp-${process.pid}-${Date.now()}`;
+  writeFileSync(tempPath, JSON.stringify(value, null, 2));
+  try {
+    renameSync(tempPath, path);
+  } catch (error) {
+    try {
+      rmSync(tempPath, { force: true });
+    } catch {
+      // Ignore cleanup errors; the original rename error is more useful.
+    }
+    throw error;
+  }
 }
 
 async function runWorkflowPhases(phaseDefinitions) {
