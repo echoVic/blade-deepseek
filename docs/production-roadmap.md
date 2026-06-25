@@ -3,8 +3,8 @@
 > Goal: evolve Orca into a production-grade DeepSeek-native agent runtime.
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
-Last updated: 2026-06-25
-Current baseline: v0.1.34 real API release gate
+Last updated: 2026-06-26
+Current baseline: v0.1.36 workflow isolation and recovery
 
 ---
 
@@ -27,7 +27,7 @@ working baseline used to prioritize the next patch releases.
 | Project instructions | User/project/rules files with includes | `AGENTS.md` style layered instructions | Implemented |
 | Memory | Manual `/remember` plus optional project extraction | Codex memories extension | Partial |
 | Persistent goals | `/goal` with persisted state plus goal-scoped `get_goal`, `create_goal`, and narrow `update_goal` | Codex goal extension | Implemented |
-| Workflows | JavaScript workflow DSL, multi-stage runner, task state, notifications, and runtime status events | Codex automations/tasks concepts | Implemented; packaging/docs can improve |
+| Workflows | JavaScript workflow DSL, multi-stage runner, task state, notifications, runtime status events, and worktree-isolated/recoverable agent runs | Codex automations/tasks concepts | Implemented; packaging/docs can improve |
 | TUI | Markdown-ish rendering, themes, Vim mode, diff preview, slash commands, workflow panel, elapsed timers, and clearer approval dialogs | Codex/Claude richer terminal UX | Partial |
 | History | JSONL transcripts, resume/fork/search/archive/compress | Codex thread store with queryable metadata | Partial |
 | Release | GitHub release + npm alias distribution scripts, retrying post-publish GitHub/npm/npm-exec verification, and a reusable real API e2e release gate | Codex npm/native release model | Implemented |

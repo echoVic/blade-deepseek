@@ -155,7 +155,7 @@ All 8 agents were launched concurrently via `Promise.all()` in the `research` ph
 | Harness contract | `docs/harness-contract.md` — JSONL event contract | `docs/harness-contract.md` |
 | Roadmap for concurrency | "Later: Worktree automation", "Later: Shell sessions/PTY" | `docs/production-roadmap.md` Priority Matrix |
 | Gaps vs Claude Code | Documented in `subagent-enhancement-plan.md` with `sdk-tools.d.ts` comparison | Section 1.2 in subagent plan |
-| Current version | v0.1.35 (as of release notes) | `docs/releases/v0.1.35.md` |
+| Current version | v0.1.36 (as of release notes) | `docs/releases/v0.1.36.md` |
 
 ---
 
