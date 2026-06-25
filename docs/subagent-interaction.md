@@ -327,7 +327,7 @@ orca exec "analyze the codebase and refactor the auth module"
 
 ### 限制
 - ❌ 只支持一层嵌套（深度=1）
-- ❌ 子代理无法并行执行（同步模型）
+- ✅ 子代理支持批量并行执行（默认 `max_parallel = 6`），但仍不是异步非阻塞模式
 - ❌ 子代理的中间步骤不向用户显示（emit_deltas=false）
 - ❌ 共享相同的 provider 配置（无法为子任务选择不同模型）
 

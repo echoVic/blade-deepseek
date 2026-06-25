@@ -1734,10 +1734,12 @@ mod tests {
             subagent_request("c"),
             subagent_request("d"),
             subagent_request("e"),
+            subagent_request("f"),
+            subagent_request("g"),
         ];
 
         assert!(should_run_subagent_batch(&config, &requests[0], 0));
-        assert_eq!(collect_subagent_batch(&config, &requests, 0), 4);
+        assert_eq!(collect_subagent_batch(&config, &requests, 0), 6);
     }
 
     #[test]
