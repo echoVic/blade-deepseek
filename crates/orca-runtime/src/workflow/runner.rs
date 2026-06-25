@@ -497,6 +497,38 @@ impl WorkflowRunner {
             {
                 cached_agents.fetch_add(1, Ordering::Relaxed);
                 let normalized_cached_value = normalize_cached_agent_result(&call, cached_value);
+                if let Err(error_message) =
+                    validate_workflow_agent_schema(&call, &normalized_cached_value)
+                {
+                    let transcript_path =
+                        write_agent_transcript(transcript_dir, &call, &error_message, true)?;
+                    self.state.record_agent_completed(
+                        run_id,
+                        WorkflowAgentRecord {
+                            call_id: call.call_id.clone(),
+                            call_path: call.call_path.clone(),
+                            prompt: call.prompt.clone(),
+                            opts: call.opts.clone(),
+                            team: workflow_agent_team(&call.opts),
+                            input_hash: hash,
+                            status: WorkflowAgentStatus::Failed,
+                            attempt: 1,
+                            max_attempts: 1,
+                            previous_errors: Vec::new(),
+                            output: Some(normalized_cached_value),
+                            error: Some(error_message.clone()),
+                            transcript_path: Some(transcript_path.display().to_string()),
+                            usage: None,
+                        },
+                    )?;
+                    if let Ok(state) = self.state.load_run(run_id) {
+                        let _ = self.refresh_task_progress(task_id, &state);
+                    }
+                    return Ok(HostCommand::AgentError {
+                        call_id: call.call_id,
+                        error: error_message,
+                    });
+                }
                 let output = result_to_summary(&normalized_cached_value);
                 let transcript_path = write_agent_transcript(transcript_dir, &call, &output, true)?;
                 self.state.record_agent_completed(
@@ -557,6 +589,35 @@ impl WorkflowRunner {
                     let transcript_path =
                         write_agent_transcript(transcript_dir, &call, &output, false)?;
                     let result = workflow_agent_result(&call, Value::String(output.clone()), false);
+                    if let Err(error_message) = validate_workflow_agent_schema(&call, &result) {
+                        self.state.record_agent_completed(
+                            run_id,
+                            WorkflowAgentRecord {
+                                call_id: call.call_id.clone(),
+                                call_path: call.call_path.clone(),
+                                prompt: call.prompt.clone(),
+                                opts: call.opts.clone(),
+                                team: workflow_agent_team(&call.opts),
+                                input_hash: hash.clone(),
+                                status: WorkflowAgentStatus::Failed,
+                                attempt,
+                                max_attempts,
+                                previous_errors: previous_errors.clone(),
+                                output: Some(result),
+                                error: Some(error_message.clone()),
+                                transcript_path: Some(transcript_path.display().to_string()),
+                                usage: Some(child_output.usage),
+                            },
+                        )?;
+                        if let Ok(state) = self.state.load_run(run_id) {
+                            let _ = self.refresh_task_progress(task_id, &state);
+                        }
+
+                        return Ok(HostCommand::AgentError {
+                            call_id: call.call_id,
+                            error: error_message,
+                        });
+                    }
                     self.state.record_agent_completed(
                         run_id,
                         WorkflowAgentRecord {
@@ -846,6 +907,126 @@ fn now_ms() -> i64 {
 
 fn workflow_agent_uses_worktree(opts: &Value) -> bool {
     opts.get("isolation").and_then(Value::as_str) == Some("worktree")
+}
+
+fn validate_workflow_agent_schema(call: &AgentCall, result: &Value) -> Result<(), String> {
+    let Some(schema) = call.opts.get("schema") else {
+        return Ok(());
+    };
+    validate_json_schema_subset(schema, result, "$").map_err(|error| {
+        format!(
+            "workflow agent output schema validation failed for {}: {error}",
+            call.call_id
+        )
+    })
+}
+
+fn validate_json_schema_subset(schema: &Value, value: &Value, path: &str) -> Result<(), String> {
+    let schema_object = schema
+        .as_object()
+        .ok_or_else(|| format!("{path} schema must be an object"))?;
+
+    if let Some(expected_type) = schema_object.get("type") {
+        validate_schema_type(expected_type, value, path)?;
+    }
+
+    if let Some(required) = schema_object.get("required") {
+        let required = required
+            .as_array()
+            .ok_or_else(|| format!("{path}.required must be an array"))?;
+        let object = value
+            .as_object()
+            .ok_or_else(|| format!("{path} expected object for required fields"))?;
+        for required_field in required {
+            let field = required_field
+                .as_str()
+                .ok_or_else(|| format!("{path}.required entries must be strings"))?;
+            if !object.contains_key(field) {
+                return Err(format!("{path}.{field} is required"));
+            }
+        }
+    }
+
+    if let Some(properties) = schema_object.get("properties") {
+        let properties = properties
+            .as_object()
+            .ok_or_else(|| format!("{path}.properties must be an object"))?;
+        let Some(object) = value.as_object() else {
+            return Ok(());
+        };
+        for (property, property_schema) in properties {
+            if let Some(property_value) = object.get(property) {
+                validate_json_schema_subset(
+                    property_schema,
+                    property_value,
+                    &format!("{path}.{property}"),
+                )?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_schema_type(expected_type: &Value, value: &Value, path: &str) -> Result<(), String> {
+    if let Some(expected) = expected_type.as_str() {
+        return validate_schema_type_name(expected, value, path);
+    }
+
+    let expected_types = expected_type
+        .as_array()
+        .ok_or_else(|| format!("{path}.type must be a string or array"))?;
+    let mut expected_names = Vec::new();
+    for expected_type in expected_types {
+        let expected = expected_type
+            .as_str()
+            .ok_or_else(|| format!("{path}.type entries must be strings"))?;
+        expected_names.push(expected);
+        if schema_type_matches(expected, value) {
+            return Ok(());
+        }
+    }
+    Err(format!(
+        "{path} expected one of {}, got {}",
+        expected_names.join(", "),
+        json_type_name(value)
+    ))
+}
+
+fn validate_schema_type_name(expected: &str, value: &Value, path: &str) -> Result<(), String> {
+    if schema_type_matches(expected, value) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{path} expected {expected}, got {}",
+            json_type_name(value)
+        ))
+    }
+}
+
+fn schema_type_matches(expected: &str, value: &Value) -> bool {
+    match expected {
+        "object" => value.is_object(),
+        "array" => value.is_array(),
+        "string" => value.is_string(),
+        "number" => value.is_number(),
+        "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
+        "boolean" => value.is_boolean(),
+        "null" => value.is_null(),
+        _ => false,
+    }
+}
+
+fn json_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(number) if number.is_i64() || number.is_u64() => "integer",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
 }
 
 fn append_worktree_outcome(output: &mut String, outcome: Option<&WorktreeOutcome>) {

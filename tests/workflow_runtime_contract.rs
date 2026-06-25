@@ -464,6 +464,115 @@ fn workflow_agent_token_budget_fails_agent_after_usage_exceeds_limit() {
 }
 
 #[test]
+fn workflow_agent_schema_failure_fails_agent_and_run() {
+    if !orca_runtime::workflow::host::WorkflowHost::node_available() {
+        return;
+    }
+
+    let temp = tempdir().unwrap();
+    let script = temp.path().join("workflow.js");
+    fs::write(
+        &script,
+        "export const meta = { name: 'schema-failure', description: 'Schema failure test', phases: [] };\n\
+         export default await agent('mock_usage', {\n\
+           schema: {\n\
+             type: 'object',\n\
+             required: ['result'],\n\
+             properties: { result: { type: 'object' } }\n\
+           }\n\
+         });",
+    )
+    .unwrap();
+
+    let config = mock_run_config(temp.path());
+    let tasks = TaskRegistry::new("session-1".to_string());
+    let session_dir = temp.path().join("session");
+    let runner = WorkflowRunner::new(config, tasks.clone(), session_dir.clone());
+    let error = runner
+        .launch(WorkflowLaunchRequest::from_script_path(
+            script.display().to_string(),
+        ))
+        .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("workflow agent output schema validation failed"),
+        "error should explain schema validation failure: {error}"
+    );
+    assert!(
+        error.to_string().contains("result"),
+        "schema error should identify the failing property: {error}"
+    );
+
+    let task = tasks.list().into_iter().next().expect("workflow task");
+    let record = tasks.get(&task.id).expect("task record");
+    assert_eq!(record.status, TaskStatus::Failed);
+    assert_eq!(record.workflow_agents.len(), 1);
+    let agent = &record.workflow_agents[0];
+    assert_eq!(
+        agent.status,
+        orca_core::workflow_types::WorkflowAgentStatus::Failed
+    );
+    assert!(
+        agent
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("workflow agent output schema validation failed")
+    );
+
+    let run_id = record.workflow_run_id.as_deref().expect("run id");
+    let store = WorkflowStateStore::new(session_dir.join("workflow-runs"));
+    let state = store.load_run(run_id).expect("run state");
+    assert_eq!(state.status, WorkflowRunStatus::Failed);
+}
+
+#[test]
+fn workflow_agent_schema_accepts_matching_output() {
+    if !orca_runtime::workflow::host::WorkflowHost::node_available() {
+        return;
+    }
+
+    let temp = tempdir().unwrap();
+    let script = temp.path().join("workflow.js");
+    fs::write(
+        &script,
+        "export const meta = { name: 'schema-success', description: 'Schema success test', phases: [] };\n\
+         const result = await agent('mock_usage', {\n\
+           schema: {\n\
+             type: 'object',\n\
+             required: ['prompt', 'result'],\n\
+             properties: {\n\
+               prompt: { type: 'string' },\n\
+               result: { type: 'string' }\n\
+             }\n\
+           }\n\
+         });\n\
+         export default `${result.prompt}:${typeof result.result}`;",
+    )
+    .unwrap();
+
+    let config = mock_run_config(temp.path());
+    let tasks = TaskRegistry::new("session-1".to_string());
+    let runner = WorkflowRunner::new(config, tasks.clone(), temp.path().join("session"));
+    let launched = runner
+        .launch(WorkflowLaunchRequest::from_script_path(
+            script.display().to_string(),
+        ))
+        .expect("schema-matching workflow runs");
+
+    assert_eq!(launched.summary, "mock_usage:string");
+    let record = tasks.get(&launched.task_id).expect("task record");
+    assert_eq!(record.status, TaskStatus::Completed);
+    assert_eq!(record.workflow_agents.len(), 1);
+    assert_eq!(
+        record.workflow_agents[0].status,
+        orca_core::workflow_types::WorkflowAgentStatus::Completed
+    );
+}
+
+#[test]
 fn workflow_agent_worktree_isolation_preserves_parent_checkout() {
     if !orca_runtime::workflow::host::WorkflowHost::node_available() {
         return;
