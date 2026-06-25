@@ -4,7 +4,7 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-06-25
-Current baseline: v0.1.33 runtime tool invocation convergence
+Current baseline: v0.1.34 real API release gate
 
 ---
 
@@ -30,7 +30,7 @@ working baseline used to prioritize the next patch releases.
 | Workflows | JavaScript workflow DSL, multi-stage runner, task state, notifications, and runtime status events | Codex automations/tasks concepts | Implemented; packaging/docs can improve |
 | TUI | Markdown-ish rendering, themes, Vim mode, diff preview, slash commands, workflow panel, elapsed timers, and clearer approval dialogs | Codex/Claude richer terminal UX | Partial |
 | History | JSONL transcripts, resume/fork/search/archive/compress | Codex thread store with queryable metadata | Partial |
-| Release | GitHub release + npm alias distribution scripts plus retrying post-publish GitHub/npm/npm-exec verification | Codex npm/native release model | Implemented |
+| Release | GitHub release + npm alias distribution scripts, retrying post-publish GitHub/npm/npm-exec verification, and a reusable real API e2e release gate | Codex npm/native release model | Implemented |
 | Skills | Markdown skill discovery, `list_skills`/`read_skill`, and explicit `$skill` prompt injection | Codex skills and plugin-provided skill bundles | Partial |
 
 ---
@@ -129,8 +129,8 @@ external tools, approvals, and future plugin-provided tools.
 
 ### Skills And Plugins
 
-**Release target:** after the real API e2e script, TUI runtime protocol adapter,
-and shell session/PTTY releases.
+**Release target:** after the TUI runtime protocol adapter and shell
+session/PTTY releases.
 
 **Goal:** evolve the existing Markdown skill loading into a plugin-compatible
 instruction and capability system.
@@ -150,6 +150,7 @@ instruction and capability system.
 |----------|------|---------|------|
 | P0 | Runtime-owned interactive session | Removes duplicated TUI/runtime state before deeper refactors | Medium |
 | P0 | Published release verification | Prevents local tags from being mistaken for GitHub/npm releases | Low |
+| P0 | Real API e2e release gate | Prevents local-only tests from being mistaken for provider/CLI/server readiness. Done in v0.1.34 | Low |
 | P1 | Runtime protocol commands/events | Gives TUI/headless surfaces a shared contract | Medium |
 | P1 | TUI event adapter | Lets UI behavior stay stable while ownership moves runtime-side | Medium |
 | P2 | Unified tool invocation records | Reduces drift across built-in, MCP, and external tools | Medium |
@@ -185,5 +186,6 @@ Every patch phase must satisfy:
 1. Version references are aligned across `Cargo.toml`, `Cargo.lock`, README, website metadata, and release notes.
 2. Tests relevant to the touched surface pass fresh.
 3. Release staging still validates with the current version.
-4. `git diff --check` is clean.
-5. The release note describes user-visible changes and follow-up scope.
+4. `node scripts/release/real-api-e2e.mjs` passes with a real DeepSeek API key before tagging.
+5. `git diff --check` is clean.
+6. The release note describes user-visible changes and follow-up scope.
