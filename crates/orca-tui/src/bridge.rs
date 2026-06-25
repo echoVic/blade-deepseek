@@ -995,6 +995,7 @@ fn execute_tool_for_tui(
                 execution_request,
                 cwd,
                 config.tools.output_truncation,
+                std::time::Duration::from_secs(config.tools.shell_timeout_secs.max(1)),
                 &mut on_output,
             )
         } else if execution_request.name == tool_types::ToolName::RequestUserInput {
@@ -1078,6 +1079,7 @@ fn execute_tool_for_tui(
                     mcp_registry,
                     &config.external_tools,
                     config.tools.output_truncation,
+                    config.tools.shell_timeout_secs,
                 )
             })
         } else {
@@ -1087,6 +1089,7 @@ fn execute_tool_for_tui(
                 mcp_registry,
                 &config.external_tools,
                 config.tools.output_truncation,
+                config.tools.shell_timeout_secs,
             )
         };
         if matches!(result.status, tool_types::ToolStatus::Completed) {
