@@ -123,8 +123,8 @@
 - [x] Add `docs/releases/v0.1.33.md`.
 - [x] Update site version and changelog.
 - [x] Run release-prep verification again.
-- [ ] Commit P2 implementation and docs.
-- [ ] Push `main`.
-- [ ] Create and push tag `v0.1.33`.
-- [ ] Wait for GitHub Actions release workflow to complete.
-- [ ] Run `node scripts/release/verify-published.mjs --version 0.1.33 --repo echoVic/blade-deepseek --package @blade-ai/orca --bin orca`.
+- [x] Commit P2 implementation and docs.
+- [x] Push `main`.
+- [x] Create and push tag `v0.1.33`.
+- [x] Wait for GitHub Actions release workflow to complete.
+- [x] Run `node scripts/release/verify-published.mjs --version 0.1.33 --repo echoVic/blade-deepseek --package @blade-ai/orca --bin orca`.
