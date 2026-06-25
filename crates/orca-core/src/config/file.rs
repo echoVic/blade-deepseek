@@ -10,6 +10,7 @@ use crate::approval_types::ApprovalMode;
 use crate::config::{
     DEFAULT_MAX_WORKFLOW_AGENTS_PER_RUN, DEFAULT_MAX_WORKFLOW_CONCURRENT_AGENTS,
     MAX_WORKFLOW_AGENT_RETRIES, ModelRuntimeConfig, ThemeName, ToolConfig, WorkflowConfig,
+    WorkflowTeamConfig,
 };
 use crate::subagent_config::SubagentConfig;
 
@@ -168,6 +169,8 @@ pub struct WorkflowFileConfig {
     #[serde(default)]
     #[serde(alias = "workflowKeywordTriggerEnabled")]
     pub workflow_keyword_trigger_enabled: Option<bool>,
+    #[serde(default)]
+    pub teams: HashMap<String, WorkflowTeamConfig>,
 }
 
 impl WorkflowFileConfig {
@@ -199,6 +202,11 @@ impl WorkflowFileConfig {
         if let Some(keyword_trigger_enabled) = self.workflow_keyword_trigger_enabled {
             config.keyword_trigger_enabled = keyword_trigger_enabled;
         }
+        config.teams = self
+            .teams
+            .iter()
+            .map(|(name, policy)| (name.clone(), policy.clone().normalized()))
+            .collect();
 
         config
     }
@@ -575,6 +583,27 @@ workflowKeywordTriggerEnabled = false
         assert_eq!(workflows.max_agent_retries, 1);
         assert_eq!(workflows.max_agent_tokens, Some(12_345));
         assert!(!workflows.keyword_trigger_enabled);
+    }
+
+    #[test]
+    fn parse_workflow_team_policies() {
+        let toml = r#"
+[workflows.teams.backend]
+max_agent_retries = 0
+max_agent_tokens = 100
+
+[workflows.teams.frontend]
+max_agent_retries = 2
+"#;
+        let config: FileConfig = toml::from_str(toml).unwrap();
+        let workflows = config.workflows.resolved();
+        let backend = workflows.teams.get("backend").expect("backend policy");
+        assert_eq!(backend.max_agent_retries, Some(0));
+        assert_eq!(backend.max_agent_tokens, Some(100));
+
+        let frontend = workflows.teams.get("frontend").expect("frontend policy");
+        assert_eq!(frontend.max_agent_retries, Some(2));
+        assert_eq!(frontend.max_agent_tokens, None);
     }
 
     #[test]

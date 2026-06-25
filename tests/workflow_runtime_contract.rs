@@ -5,6 +5,7 @@ use std::time::Duration;
 use orca_core::approval_types::ApprovalMode;
 use orca_core::config::{
     HistoryMode, OutputFormat, ProviderKind, RunConfig, ToolConfig, WorkflowConfig,
+    WorkflowTeamConfig,
 };
 use orca_core::hook_types::{HookConfig, HookEvent};
 use orca_core::model::ModelSelection;
@@ -389,6 +390,66 @@ fn workflow_agent_summary_surfaces_team_from_agent_options() {
     let summaries = store.agent_summaries(run_id).expect("agent summaries");
     assert_eq!(summaries[0].team.as_deref(), Some("backend"));
     assert_eq!(summaries[1].team.as_deref(), Some("frontend"));
+}
+
+#[test]
+fn workflow_team_policy_enforces_team_token_budget() {
+    if !orca_runtime::workflow::host::WorkflowHost::node_available() {
+        return;
+    }
+
+    let temp = tempdir().unwrap();
+    let script = temp.path().join("workflow.js");
+    fs::write(
+        &script,
+        "export const meta = { name: 'team-policy', description: 'Team policy test', phases: [] };\n\
+         export default await agent('mock_usage', { team: 'backend' });",
+    )
+    .unwrap();
+
+    let mut config = mock_run_config(temp.path());
+    config.workflows.teams.insert(
+        "backend".to_string(),
+        WorkflowTeamConfig {
+            max_agent_retries: Some(0),
+            max_agent_tokens: Some(100),
+        },
+    );
+    let tasks = TaskRegistry::new("session-1".to_string());
+    let session_dir = temp.path().join("session");
+    let runner = WorkflowRunner::new(config, tasks.clone(), session_dir.clone());
+    let error = runner
+        .launch(WorkflowLaunchRequest::from_script_path(
+            script.display().to_string(),
+        ))
+        .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("150 tokens exceeded per-agent token budget 100"),
+        "team token budget should fail backend agent: {error}"
+    );
+
+    let task = tasks.list().into_iter().next().expect("workflow task");
+    let record = tasks.get(&task.id).expect("task record");
+    assert_eq!(record.status, TaskStatus::Failed);
+    assert_eq!(record.workflow_agents.len(), 1);
+    let agent = &record.workflow_agents[0];
+    assert_eq!(agent.team.as_deref(), Some("backend"));
+    assert_eq!(
+        agent.status,
+        orca_core::workflow_types::WorkflowAgentStatus::Failed
+    );
+    assert_eq!(agent.attempt, 1);
+    assert_eq!(agent.max_attempts, 1);
+    assert_eq!(
+        agent
+            .usage
+            .expect("usage should be preserved")
+            .total_tokens(),
+        150
+    );
 }
 
 #[test]

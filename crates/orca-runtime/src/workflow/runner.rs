@@ -131,6 +131,12 @@ struct WorkflowChildAgentCallError {
     retryable: bool,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct WorkflowAgentExecutionPolicy {
+    max_agent_retries: u32,
+    max_agent_tokens: Option<u64>,
+}
+
 impl From<io::Error> for WorkflowChildAgentCallError {
     fn from(error: io::Error) -> Self {
         Self {
@@ -560,7 +566,8 @@ impl WorkflowRunner {
             }
         }
 
-        let max_attempts = workflow_limits.max_agent_retries.saturating_add(1).max(1);
+        let execution_policy = workflow_agent_execution_policy(&call, workflow_limits);
+        let max_attempts = execution_policy.max_agent_retries.saturating_add(1).max(1);
         let mut previous_errors = Vec::new();
         for attempt in 1..=max_attempts {
             if self.state.stop_requested(run_id)? {
@@ -582,7 +589,7 @@ impl WorkflowRunner {
                 }
             };
 
-            match self.run_child_agent_call(&call) {
+            match self.run_child_agent_call(&call, execution_policy.max_agent_tokens) {
                 Ok(child_output) => {
                     let mut output = child_agent_output(&call.prompt, &child_output.message);
                     append_worktree_outcome(&mut output, child_output.worktree.as_ref());
@@ -700,6 +707,7 @@ impl WorkflowRunner {
     fn run_child_agent_call(
         &self,
         call: &AgentCall,
+        max_agent_tokens: Option<u64>,
     ) -> Result<WorkflowChildAgentCallOutput, WorkflowChildAgentCallError> {
         let cwd = self
             .config
@@ -749,7 +757,7 @@ impl WorkflowRunner {
 
         match result.status {
             RunStatus::Success => {
-                if let Some(max_agent_tokens) = self.config.workflows.max_agent_tokens {
+                if let Some(max_agent_tokens) = max_agent_tokens {
                     let total_tokens = usage.total_tokens();
                     if total_tokens > max_agent_tokens {
                         let mut error = format!(
@@ -907,6 +915,29 @@ fn now_ms() -> i64 {
 
 fn workflow_agent_uses_worktree(opts: &Value) -> bool {
     opts.get("isolation").and_then(Value::as_str) == Some("worktree")
+}
+
+fn workflow_agent_execution_policy(
+    call: &AgentCall,
+    workflow_limits: &orca_core::config::WorkflowConfig,
+) -> WorkflowAgentExecutionPolicy {
+    let mut policy = WorkflowAgentExecutionPolicy {
+        max_agent_retries: workflow_limits.max_agent_retries,
+        max_agent_tokens: workflow_limits.max_agent_tokens,
+    };
+
+    if let Some(team) = workflow_agent_team(&call.opts)
+        && let Some(team_policy) = workflow_limits.teams.get(&team)
+    {
+        if let Some(max_agent_retries) = team_policy.max_agent_retries {
+            policy.max_agent_retries = max_agent_retries;
+        }
+        if let Some(max_agent_tokens) = team_policy.max_agent_tokens {
+            policy.max_agent_tokens = Some(max_agent_tokens);
+        }
+    }
+
+    policy
 }
 
 fn validate_workflow_agent_schema(call: &AgentCall, result: &Value) -> Result<(), String> {

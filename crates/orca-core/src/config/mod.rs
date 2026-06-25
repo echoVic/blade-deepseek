@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use clap::ValueEnum;
@@ -118,6 +119,26 @@ fn default_max_read_parallel() -> usize {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WorkflowTeamConfig {
+    #[serde(default)]
+    pub max_agent_retries: Option<u32>,
+    #[serde(default)]
+    pub max_agent_tokens: Option<u64>,
+}
+
+impl WorkflowTeamConfig {
+    pub fn normalized(mut self) -> Self {
+        if let Some(max_agent_retries) = self.max_agent_retries {
+            self.max_agent_retries = Some(max_agent_retries.min(MAX_WORKFLOW_AGENT_RETRIES));
+        }
+        if let Some(max_agent_tokens) = self.max_agent_tokens {
+            self.max_agent_tokens = Some(max_agent_tokens.max(1));
+        }
+        self
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WorkflowConfig {
     #[serde(default = "default_workflows_enabled")]
     pub enabled: bool,
@@ -131,6 +152,8 @@ pub struct WorkflowConfig {
     pub max_agent_tokens: Option<u64>,
     #[serde(default = "default_workflow_keyword_trigger_enabled")]
     pub keyword_trigger_enabled: bool,
+    #[serde(default)]
+    pub teams: HashMap<String, WorkflowTeamConfig>,
 }
 
 impl Default for WorkflowConfig {
@@ -142,6 +165,7 @@ impl Default for WorkflowConfig {
             max_agent_retries: DEFAULT_MAX_WORKFLOW_AGENT_RETRIES,
             max_agent_tokens: None,
             keyword_trigger_enabled: true,
+            teams: HashMap::new(),
         }
     }
 }
