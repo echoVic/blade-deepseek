@@ -113,10 +113,13 @@ fn workflow_list_and_show_inspect_persisted_runs() {
     let task_id = launched["taskId"].as_str().unwrap();
     let run_id = launched["runId"].as_str().unwrap();
 
-    wait_for_workflow_terminal_status(temp.path(), task_id);
+    let home = temp.path().join("home");
+
+    wait_for_workflow_terminal_status(temp.path(), Some(&home), task_id);
 
     let list = Command::new(env!("CARGO_BIN_EXE_orca"))
         .current_dir(temp.path())
+        .env("ORCA_HOME", &home)
         .args(["workflow", "list"])
         .output()
         .expect("list workflows");
@@ -132,6 +135,7 @@ fn workflow_list_and_show_inspect_persisted_runs() {
 
     let show = Command::new(env!("CARGO_BIN_EXE_orca"))
         .current_dir(temp.path())
+        .env("ORCA_HOME", &home)
         .args(["workflow", "show", task_id])
         .output()
         .expect("show workflow");
@@ -172,11 +176,11 @@ fn workflow_run_returns_before_slow_workflow_completes() {
     assert_eq!(run.status.code(), Some(0));
     let launched: Value = serde_json::from_slice(&run.stdout).unwrap();
     let task_id = launched["taskId"].as_str().unwrap();
-    let show = workflow_show(temp.path(), task_id);
+    let show = workflow_show(temp.path(), Some(&home), task_id);
     assert!(show["status"] == "queued" || show["status"] == "running");
 
-    wait_for_workflow_terminal_status(temp.path(), task_id);
-    let completed = workflow_show(temp.path(), task_id);
+    wait_for_workflow_terminal_status(temp.path(), Some(&home), task_id);
+    let completed = workflow_show(temp.path(), Some(&home), task_id);
     assert_eq!(completed["status"], "completed");
 }
 
@@ -214,6 +218,7 @@ fn workflow_stop_requests_real_background_stop() {
 
     let stop = Command::new(env!("CARGO_BIN_EXE_orca"))
         .current_dir(temp.path())
+        .env("ORCA_HOME", &home)
         .args(["workflow", "stop", task_id])
         .output()
         .expect("stop workflow");
@@ -224,8 +229,8 @@ fn workflow_stop_requests_real_background_stop() {
     assert_eq!(stop_value["taskId"], task_id);
     assert_eq!(stop_value["runId"], run_id);
 
-    wait_for_workflow_terminal_status(temp.path(), task_id);
-    let stopped = workflow_show(temp.path(), task_id);
+    wait_for_workflow_terminal_status(temp.path(), Some(&home), task_id);
+    let stopped = workflow_show(temp.path(), Some(&home), task_id);
     assert_eq!(stopped["status"], "stopped");
 }
 
@@ -272,9 +277,13 @@ fn workflow_resume_rejects_cross_process_cache_resume() {
     );
 }
 
-fn workflow_show(cwd: &std::path::Path, task_id: &str) -> Value {
-    let output = Command::new(env!("CARGO_BIN_EXE_orca"))
-        .current_dir(cwd)
+fn workflow_show(cwd: &std::path::Path, home: Option<&std::path::Path>, task_id: &str) -> Value {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_orca"));
+    command.current_dir(cwd);
+    if let Some(home) = home {
+        command.env("ORCA_HOME", home);
+    }
+    let output = command
         .args(["workflow", "show", task_id])
         .output()
         .expect("show workflow");
@@ -283,9 +292,13 @@ fn workflow_show(cwd: &std::path::Path, task_id: &str) -> Value {
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
-fn wait_for_workflow_terminal_status(cwd: &std::path::Path, task_id: &str) {
+fn wait_for_workflow_terminal_status(
+    cwd: &std::path::Path,
+    home: Option<&std::path::Path>,
+    task_id: &str,
+) {
     for _ in 0..80 {
-        let shown = workflow_show(cwd, task_id);
+        let shown = workflow_show(cwd, home, task_id);
         let status = shown["status"].as_str().unwrap_or_default();
         if matches!(status, "completed" | "failed" | "stopped" | "cancelled") {
             return;
