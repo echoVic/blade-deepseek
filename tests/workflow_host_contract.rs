@@ -159,6 +159,44 @@ fn host_can_conditionally_spawn_agents_from_args() {
 }
 
 #[test]
+fn host_message_channel_passes_agent_findings_to_later_agents() {
+    if !WorkflowHost::node_available() {
+        return;
+    }
+
+    let temp = tempdir().unwrap();
+    let script = temp.path().join("workflow.js");
+    fs::write(
+        &script,
+        "export const meta = { name: 'message-channel-test', description: 'Message channel test', phases: ['scan', 'review'] };\n\
+         const scan = await phase('scan', async () => agent('inspect api'));\n\
+         sendMessage('findings', { prompt: scan.prompt, severity: 'high' }, { from: 'scanner' });\n\
+         const messages = readMessages('findings');\n\
+         const review = await phase('review', async () => agent(`review ${messages[0].from} ${messages[0].message.severity} ${messages[0].message.prompt}`));\n\
+         const cleared = clearMessages('findings');\n\
+         export default { review, messageCount: messages.length, cleared, remaining: readMessages('findings').length };",
+    )
+    .unwrap();
+
+    let events = WorkflowHost::run_collecting_events(&script, serde_json::json!(null)).unwrap();
+
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            HostEvent::AgentCall { prompt, phase, .. }
+                if prompt == "review scanner high inspect api" && phase.as_deref() == Some("review")
+        )
+    }));
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            HostEvent::WorkflowCompleted { result }
+                if result["messageCount"] == 1 && result["cleared"] == 1 && result["remaining"] == 0
+        )
+    }));
+}
+
+#[test]
 fn host_phase_fallback_continue_emits_failed_phase_and_continues() {
     if !WorkflowHost::node_available() {
         return;

@@ -24,10 +24,12 @@ const FORBIDDEN_MODULE_SPECIFIERS = new Set(["node:fs", "child_process"]);
 const MODULE_SPECIFIER_CALLEES = new Set(["import", "require", "getBuiltinModule"]);
 
 let callSeq = 0;
+let messageSeq = 0;
 let currentPhase = null;
 let activeMarkerPhase = null;
 let stdinBuffer = "";
 const pendingAgentResolvers = new Map();
+const messageChannels = new Map();
 let stdinClosed = false;
 
 process.stdin.setEncoding("utf8");
@@ -79,6 +81,54 @@ async function pipeline(items) {
     previous = typeof item === "function" ? await item(previous) : await item;
   }
   return previous;
+}
+
+function sendMessage(channel, message, opts = {}) {
+  const channelName = normalizeMessageChannel(channel);
+  messageSeq += 1;
+  const entry = {
+    seq: messageSeq,
+    channel: channelName,
+    from: normalizeMessageSender(opts?.from),
+    phase: currentPhase,
+    message: cloneMessageValue(message),
+  };
+  const messages = messageChannels.get(channelName) ?? [];
+  messages.push(entry);
+  messageChannels.set(channelName, messages);
+  return cloneMessageValue(entry);
+}
+
+function readMessages(channel) {
+  const channelName = normalizeMessageChannel(channel);
+  return (messageChannels.get(channelName) ?? []).map(cloneMessageValue);
+}
+
+function clearMessages(channel) {
+  const channelName = normalizeMessageChannel(channel);
+  const count = (messageChannels.get(channelName) ?? []).length;
+  messageChannels.delete(channelName);
+  return count;
+}
+
+function normalizeMessageChannel(channel) {
+  const channelName = String(channel ?? "").trim();
+  if (channelName.length === 0) {
+    throw new Error("Workflow message channel must be a non-empty string");
+  }
+  return channelName;
+}
+
+function normalizeMessageSender(from) {
+  const sender = String(from ?? currentPhase ?? "workflow").trim();
+  return sender.length === 0 ? "workflow" : sender;
+}
+
+function cloneMessageValue(value) {
+  if (typeof value === "undefined") {
+    return null;
+  }
+  return JSON.parse(JSON.stringify(value));
 }
 
 async function runWorkflowPhases(phaseDefinitions) {
@@ -252,6 +302,9 @@ async function loadWorkflowModule() {
       parallel,
       pipeline,
       phase,
+      sendMessage,
+      readMessages,
+      clearMessages,
     }),
     {
       codeGeneration: {
