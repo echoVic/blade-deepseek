@@ -344,6 +344,54 @@ fn workflow_agent_summary_surfaces_token_usage() {
 }
 
 #[test]
+fn workflow_agent_summary_surfaces_team_from_agent_options() {
+    if !orca_runtime::workflow::host::WorkflowHost::node_available() {
+        return;
+    }
+
+    let temp = tempdir().unwrap();
+    let script = temp.path().join("workflow.js");
+    fs::write(
+        &script,
+        "export const meta = { name: 'teams', description: 'Team test', phases: [] };\n\
+         await Promise.all([\n\
+           agent('inspect api', { team: 'backend' }),\n\
+           agent('inspect ui', { team: 'frontend' })\n\
+         ]);\n\
+         export default 'done';",
+    )
+    .unwrap();
+
+    let config = mock_run_config(temp.path());
+    let tasks = TaskRegistry::new("session-1".to_string());
+    let session_dir = temp.path().join("session");
+    let runner = WorkflowRunner::new(config, tasks.clone(), session_dir.clone());
+    let launched = runner
+        .launch(WorkflowLaunchRequest::from_script_path(
+            script.display().to_string(),
+        ))
+        .expect("team workflow runs");
+
+    let record = tasks.get(&launched.task_id).expect("task record");
+    assert_eq!(record.workflow_agents.len(), 2);
+    let teams = record
+        .workflow_agents
+        .iter()
+        .map(|agent| (agent.call_path.as_str(), agent.team.as_deref()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        teams,
+        vec![("root:1", Some("backend")), ("root:2", Some("frontend")),]
+    );
+
+    let run_id = launched.output.run_id.as_deref().expect("run id");
+    let store = WorkflowStateStore::new(session_dir.join("workflow-runs"));
+    let summaries = store.agent_summaries(run_id).expect("agent summaries");
+    assert_eq!(summaries[0].team.as_deref(), Some("backend"));
+    assert_eq!(summaries[1].team.as_deref(), Some("frontend"));
+}
+
+#[test]
 fn workflow_agent_token_budget_fails_agent_after_usage_exceeds_limit() {
     if !orca_runtime::workflow::host::WorkflowHost::node_available() {
         return;

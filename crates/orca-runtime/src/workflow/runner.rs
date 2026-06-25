@@ -33,7 +33,9 @@ use crate::worktree::{WorktreeGuard, WorktreeOutcome};
 
 use super::host::{AgentCall, HostCommand, HostEvent, WorkflowHost};
 use super::script::{ResolvedWorkflowScript, resolve_workflow_script_to_path};
-use super::state::{WorkflowAgentRecord, WorkflowStateStore, WorkflowWorkerRecord, input_hash};
+use super::state::{
+    WorkflowAgentRecord, WorkflowStateStore, WorkflowWorkerRecord, input_hash, workflow_agent_team,
+};
 
 const STOP_REQUESTED_ERROR: &str = "__orca_workflow_stop_requested__";
 const STOPPED_SUMMARY: &str = "Workflow stopped";
@@ -504,6 +506,7 @@ impl WorkflowRunner {
                         call_path: call.call_path.clone(),
                         prompt: call.prompt.clone(),
                         opts: call.opts.clone(),
+                        team: workflow_agent_team(&call.opts),
                         input_hash: hash,
                         status: WorkflowAgentStatus::Completed,
                         attempt: 1,
@@ -561,6 +564,7 @@ impl WorkflowRunner {
                             call_path: call.call_path.clone(),
                             prompt: call.prompt.clone(),
                             opts: call.opts.clone(),
+                            team: workflow_agent_team(&call.opts),
                             input_hash: hash.clone(),
                             status: WorkflowAgentStatus::Completed,
                             attempt,
@@ -597,6 +601,7 @@ impl WorkflowRunner {
                             call_path: call.call_path.clone(),
                             prompt: call.prompt.clone(),
                             opts: call.opts.clone(),
+                            team: workflow_agent_team(&call.opts),
                             input_hash: hash.clone(),
                             status: WorkflowAgentStatus::Failed,
                             attempt,

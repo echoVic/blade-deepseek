@@ -601,6 +601,11 @@ fn agent_row_label<'a>(agent: &WorkflowAgentTaskSummary, theme: &Theme) -> Line<
     } else {
         format!("retry errors {}", agent.previous_errors.len())
     };
+    let team = agent
+        .team
+        .as_deref()
+        .map(|team| format!("  team {team}"))
+        .unwrap_or_default();
     let usage = agent
         .usage
         .map(|usage| {
@@ -622,6 +627,7 @@ fn agent_row_label<'a>(agent: &WorkflowAgentTaskSummary, theme: &Theme) -> Line<
         Span::styled(agent.call_path.clone(), Style::default().fg(theme.text)),
         Span::styled("  ", Style::default()),
         Span::styled(status, Style::default().fg(status_color)),
+        Span::styled(team, Style::default().fg(theme.muted)),
         Span::styled(format!("  {attempt}"), Style::default().fg(theme.muted)),
         Span::styled(format!("  {retry}"), Style::default().fg(theme.muted)),
         Span::styled(usage, Style::default().fg(theme.muted)),
@@ -637,6 +643,11 @@ fn agent_dashboard_row_label<'a>(
     let status = workflow_agent_status_label(agent.status);
     let status_color = workflow_agent_status_color(agent.status, theme);
     let attempt = format!("attempt {}/{}", agent.attempt, agent.max_attempts);
+    let team = agent
+        .team
+        .as_deref()
+        .map(|team| format!("  team {team}"))
+        .unwrap_or_default();
     let usage = agent
         .usage
         .map(|usage| {
@@ -666,6 +677,7 @@ fn agent_dashboard_row_label<'a>(
         Span::styled(agent.call_path.clone(), Style::default().fg(theme.text)),
         Span::styled("  ", Style::default()),
         Span::styled(status, Style::default().fg(status_color)),
+        Span::styled(team, Style::default().fg(theme.muted)),
         Span::styled(format!("  {attempt}"), Style::default().fg(theme.muted)),
         Span::styled(usage, Style::default().fg(theme.muted)),
         Span::styled(retry, Style::default().fg(theme.muted)),
@@ -2590,6 +2602,7 @@ mod tests {
             workflow_agents: vec![orca_core::task_types::WorkflowAgentTaskSummary {
                 call_id: "agent-1".to_string(),
                 call_path: "root:1".to_string(),
+                team: Some("backend".to_string()),
                 status: orca_core::workflow_types::WorkflowAgentStatus::Completed,
                 attempt: 2,
                 max_attempts: 2,
@@ -2619,6 +2632,7 @@ mod tests {
         let rendered = format!("{:?}", terminal.backend().buffer());
 
         assert!(rendered.contains("root:1"));
+        assert!(rendered.contains("team backend"));
         assert!(rendered.contains("scan"));
         assert!(rendered.contains("fallback value"));
         assert!(rendered.contains("scan failed"));
@@ -2659,6 +2673,8 @@ mod tests {
         assert!(rendered.contains("audit"));
         assert!(rendered.contains("review"));
         assert!(rendered.contains("scan"));
+        assert!(rendered.contains("team scan"));
+        assert!(rendered.contains("team review"));
         assert!(rendered.contains("root:scan"));
         assert!(rendered.contains("root:review"));
         assert!(rendered.contains("running"));
@@ -2688,6 +2704,7 @@ mod tests {
             workflow_agents: vec![orca_core::task_types::WorkflowAgentTaskSummary {
                 call_id: format!("agent-{call_suffix}"),
                 call_path: format!("root:{call_suffix}"),
+                team: Some(call_suffix.to_string()),
                 status,
                 attempt: 1,
                 max_attempts: 2,

@@ -42,6 +42,8 @@ pub struct WorkflowTaskProgress {
 pub struct WorkflowAgentTaskSummary {
     pub call_id: String,
     pub call_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub team: Option<String>,
     pub status: WorkflowAgentStatus,
     pub attempt: u32,
     pub max_attempts: u32,

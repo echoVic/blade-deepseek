@@ -25,6 +25,8 @@ pub struct WorkflowAgentRecord {
     pub call_path: String,
     pub prompt: String,
     pub opts: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team: Option<String>,
     pub input_hash: String,
     pub status: WorkflowAgentStatus,
     #[serde(default = "default_agent_attempt")]
@@ -64,6 +66,8 @@ struct WorkflowAgentRecordOnDisk {
     call_path: String,
     prompt: String,
     opts: Value,
+    #[serde(default)]
+    team: Option<String>,
     input_hash: String,
     status: WorkflowAgentStatus,
     #[serde(default = "default_agent_attempt")]
@@ -87,6 +91,8 @@ struct WorkflowAgentRecordOnDiskWritable {
     call_path: String,
     prompt: String,
     opts: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    team: Option<String>,
     input_hash: String,
     status: WorkflowAgentStatus,
     attempt: u32,
@@ -367,6 +373,11 @@ impl WorkflowStateStore {
             .map(|entry| WorkflowAgentTaskSummary {
                 call_id: entry.record.call_id.clone(),
                 call_path: entry.record.call_path.clone(),
+                team: entry
+                    .record
+                    .team
+                    .clone()
+                    .or_else(|| workflow_agent_team(&entry.record.opts)),
                 status: entry.record.status,
                 attempt: entry.record.attempt,
                 max_attempts: entry.record.max_attempts,
@@ -413,6 +424,7 @@ impl IntoWorkflowAgentRecord for WorkflowAgentCacheRecord {
             call_path: self.call_path,
             prompt: String::new(),
             opts: Value::Null,
+            team: None,
             input_hash: self.input_hash,
             status: WorkflowAgentStatus::Completed,
             attempt: 1,
@@ -505,6 +517,7 @@ fn read_agent_cache(path: &Path) -> io::Result<HashMap<String, CachedWorkflowAge
                             call_path: record.call_path,
                             prompt: record.prompt,
                             opts: record.opts,
+                            team: record.team,
                             input_hash: record.input_hash,
                             status: record.status,
                             attempt: record.attempt,
@@ -549,6 +562,11 @@ fn write_agent_cache(
                     call_path: entry.record.call_path.clone(),
                     prompt: entry.record.prompt.clone(),
                     opts: entry.record.opts.clone(),
+                    team: entry
+                        .record
+                        .team
+                        .clone()
+                        .or_else(|| workflow_agent_team(&entry.record.opts)),
                     input_hash: entry.record.input_hash.clone(),
                     status: entry.record.status,
                     attempt: entry.record.attempt,
@@ -566,6 +584,14 @@ fn write_agent_cache(
         })
         .collect();
     write_json_pretty(path, &on_disk)
+}
+
+pub fn workflow_agent_team(opts: &Value) -> Option<String> {
+    opts.get("team")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|team| !team.is_empty())
+        .map(str::to_string)
 }
 
 fn write_json_pretty<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
