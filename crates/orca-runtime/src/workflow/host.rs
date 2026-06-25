@@ -19,6 +19,10 @@ pub enum HostEvent {
     PhaseCompleted {
         name: String,
     },
+    PhaseFailed {
+        name: String,
+        error: String,
+    },
     AgentCall {
         call_id: String,
         call_path: String,

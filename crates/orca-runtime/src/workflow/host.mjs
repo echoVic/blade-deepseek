@@ -88,7 +88,11 @@ async function runWorkflowPhases(phaseDefinitions) {
   for (const phaseDefinition of phaseDefinitions) {
     const phaseName = String(phaseDefinition?.name ?? phaseDefinition?.description ?? `phase-${allPhaseResults.length + 1}`);
     const tasks = Array.isArray(phaseDefinition?.tasks) ? phaseDefinition.tasks : [];
-    const phaseResults = await phase(phaseName, async () => runWorkflowTasks(tasks, previousPhaseResults, phaseDefinition));
+    const phaseResults = await phase(
+      phaseName,
+      async () => runWorkflowTasks(tasks, previousPhaseResults, phaseDefinition),
+      phaseDefinition
+    );
     previousPhaseResults = phaseResults;
     allPhaseResults.push({ name: phaseName, results: phaseResults });
   }
@@ -136,7 +140,7 @@ function enrichTaskPrompt(prompt, previousPhaseResults) {
   return `${prompt}\n\n[Previous phase outputs]\n${JSON.stringify(previousPhaseResults, null, 2)}`;
 }
 
-async function phase(name, body) {
+async function phase(name, body, opts = {}) {
   if (typeof body !== "function") {
     if (activeMarkerPhase === name) {
       currentPhase = name;
@@ -156,6 +160,13 @@ async function phase(name, body) {
     const result = typeof body === "function" ? await body() : undefined;
     emit({ type: "phase_completed", name });
     return result;
+  } catch (error) {
+    if (opts?.fallback === "continue") {
+      const message = error instanceof Error ? error.message : String(error);
+      emit({ type: "phase_failed", name, error: message });
+      return { fallback: "continue", error: message };
+    }
+    throw error;
   } finally {
     currentPhase = prior;
   }

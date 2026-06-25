@@ -828,6 +828,19 @@ fn apply_host_event_to_state(
                 phase.agent_count = agent_events_seen.saturating_sub(baseline);
             }
         }
+        HostEvent::PhaseFailed { name, .. } => {
+            if let Some(phase) = state
+                .phases
+                .iter_mut()
+                .rev()
+                .find(|phase| phase.name == *name)
+            {
+                phase.status = WorkflowRunStatus::Failed;
+                phase.completed_at_ms = Some(now_ms());
+                let baseline = phase_agent_baselines.get(name).copied().unwrap_or(0);
+                phase.agent_count = agent_events_seen.saturating_sub(baseline);
+            }
+        }
         HostEvent::AgentCall { phase, .. } => {
             *agent_events_seen += 1;
             state.total_agent_count = *agent_events_seen;

@@ -113,6 +113,60 @@ fn host_parallel_routes_out_of_order_agent_results_by_call_id() {
 }
 
 #[test]
+fn host_phase_fallback_continue_emits_failed_phase_and_continues() {
+    if !WorkflowHost::node_available() {
+        return;
+    }
+
+    let temp = tempdir().unwrap();
+    let script = temp.path().join("workflow.js");
+    fs::write(
+        &script,
+        "export const meta = { name: 'fallback-host-test', description: 'Fallback host test', phases: ['scan', 'review'] };\n\
+         const scan = await phase('scan', async () => agent('fail scan'), { fallback: 'continue' });\n\
+         const review = await phase('review', async () => agent('review anyway'));\n\
+         export default { scan, review };",
+    )
+    .unwrap();
+
+    let events =
+        WorkflowHost::run_collecting_events_with_agent(&script, serde_json::json!(null), |call| {
+            if call.prompt == "fail scan" {
+                Ok(orca_runtime::workflow::host::HostCommand::AgentError {
+                    call_id: call.call_id.clone(),
+                    error: "scan failed".to_string(),
+                })
+            } else {
+                Ok(orca_runtime::workflow::host::HostCommand::AgentResult {
+                    call_id: call.call_id.clone(),
+                    result: serde_json::json!({ "prompt": call.prompt }),
+                })
+            }
+        })
+        .unwrap();
+
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            HostEvent::PhaseFailed { name, error }
+                if name == "scan" && error.contains("scan failed")
+        )
+    }));
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            HostEvent::AgentCall { prompt, phase, .. }
+                if prompt == "review anyway" && phase.as_deref() == Some("review")
+        )
+    }));
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, HostEvent::WorkflowCompleted { .. }))
+    );
+}
+
+#[test]
 fn host_exposes_args_global() {
     if !WorkflowHost::node_available() {
         return;
