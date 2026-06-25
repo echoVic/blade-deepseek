@@ -27,14 +27,17 @@ use crate::agent_child::{ChildAgentRequest, ChildAgentResult, ChildAgentRuntime,
 use crate::agent_common;
 use crate::cost::CostTracker;
 use crate::history::{self, SessionWriter};
-use crate::hooks::{
-    HookContext, HookRunner, conversation_with_hook_context, tool_request_with_hook_outcome,
-};
+use crate::hooks::{HookContext, HookRunner, conversation_with_hook_context};
 use crate::instructions::{self, ProjectInstructions};
 use crate::memory::{self, MemoryBlock};
 use crate::session::new_run_id;
 use crate::subagent;
 use crate::tasks::TaskRegistry;
+use crate::tool_invocation::{
+    apply_pre_tool_outcome, apply_pre_tool_outcome_with_external, approval_request_for_invocation,
+    prepare_tool_invocation, prepare_tool_invocation_with_external, validate_tool_invocation,
+    validate_tool_invocation_with_external,
+};
 use crate::workflow::{WorkflowBackgroundLaunch, WorkflowLaunchRequest, WorkflowRunner};
 use orca_core::hook_types::HookEvent;
 
@@ -847,24 +850,6 @@ pub(crate) fn execute_child_agent_loop<W: io::Write>(
     })
 }
 
-fn approval_action_for_tool(
-    tool_request: &tool_types::ToolRequest,
-    subagent_depth: u32,
-    mcp_registry: &McpRegistry,
-    config: &RunConfig,
-) -> Option<orca_core::approval_types::ActionKind> {
-    if tool_request.name == tool_types::ToolName::Subagent
-        && subagent_depth >= config.subagents.max_depth
-    {
-        return None;
-    }
-    Some(orca_tools::canonical_action_kind_with_mcp_and_external(
-        tool_request,
-        Some(mcp_registry),
-        &config.external_tools,
-    ))
-}
-
 #[cfg(test)]
 fn canonical_action_for_tool(
     tool_request: &tool_types::ToolRequest,
@@ -896,37 +881,21 @@ fn execute_tool_with_approval(
     task_registry: &TaskRegistry,
     background_workflows: &mut Vec<BackgroundWorkflowRun>,
 ) -> io::Result<(RunStatus, tool_types::ToolResult)> {
-    if let Err(error) = orca_tools::validate_with_mcp_and_external(
-        tool_request,
-        Some(mcp_registry),
-        &config.external_tools,
-    ) {
+    let invocation = prepare_tool_invocation(tool_request, subagent_depth, mcp_registry, config);
+    if let Err(error) = validate_tool_invocation(&invocation, mcp_registry, config) {
         if emit_deltas {
             sink.emit(&events.tool_call_requested(tool_request))?;
         }
-        let result = tool_types::ToolResult::invalid_input(
-            tool_request,
-            format!("tool arguments failed schema validation: {error}"),
-        );
+        let result = error.into_result();
         if emit_deltas {
             sink.emit(&events.tool_call_completed(&result))?;
         }
         return Ok((RunStatus::Failed, result));
     }
 
-    if let Some(action) =
-        approval_action_for_tool(tool_request, subagent_depth, mcp_registry, config)
-        && agent_common::requires_approval(action)
+    if let Some(approval) = approval_request_for_invocation(&invocation)
+        && agent_common::requires_approval(approval.action)
     {
-        let approval = ApprovalRequest {
-            id: format!("approval-{}", tool_request.id),
-            action,
-            description: format!(
-                "{} requested {}",
-                tool_request.name.as_str(),
-                action.as_str()
-            ),
-        };
         let resolution = policy.resolve_for_tool(
             &approval,
             tool_request.name.as_str(),
@@ -1001,22 +970,18 @@ fn execute_tool_with_approval(
             return Ok((RunStatus::Failed, result));
         }
     };
-    let effective_tool_request = tool_request_with_hook_outcome(tool_request, &pre_tool_outcome);
-    let execution_request = &effective_tool_request;
-    if let Err(error) = orca_tools::validate_with_mcp_and_external(
-        execution_request,
-        Some(mcp_registry),
-        &config.external_tools,
-    ) {
-        let result = tool_types::ToolResult::invalid_input(
-            execution_request,
-            format!("tool arguments failed schema validation: {error}"),
-        );
-        if emit_deltas {
-            sink.emit(&events.tool_call_completed(&result))?;
-        }
-        return Ok((RunStatus::Failed, result));
-    }
+    let invocation =
+        match apply_pre_tool_outcome(invocation, &pre_tool_outcome, mcp_registry, config) {
+            Ok(invocation) => invocation,
+            Err(error) => {
+                let result = error.into_result();
+                if emit_deltas {
+                    sink.emit(&events.tool_call_completed(&result))?;
+                }
+                return Ok((RunStatus::Failed, result));
+            }
+        };
+    let execution_request = &invocation.effective;
     let result = if execution_request.name == tool_types::ToolName::Workflow {
         execute_workflow_tool(
             config,
@@ -1230,6 +1195,8 @@ fn execute_readonly_batch(
     let mut runnable = Vec::new();
 
     for (idx, tool_request) in tool_requests.iter().enumerate() {
+        let invocation =
+            prepare_tool_invocation_with_external(tool_request, 0, u32::MAX, mcp_registry, &[]);
         if emit_deltas {
             sink.emit(&events.tool_call_requested(tool_request))?;
         }
@@ -1246,7 +1213,11 @@ fn execute_readonly_batch(
             },
         ) {
             Ok(outcome) => {
-                runnable.push((idx, tool_request_with_hook_outcome(tool_request, &outcome)));
+                match apply_pre_tool_outcome_with_external(invocation, &outcome, mcp_registry, &[])
+                {
+                    Ok(invocation) => runnable.push((idx, invocation.effective)),
+                    Err(error) => hook_failed[idx] = Some(error.into_result()),
+                }
             }
             Err(error) => {
                 hook_failed[idx] = Some(tool_types::ToolResult::failed(
@@ -1316,16 +1287,18 @@ fn execute_subagent_batch(
         vec![None; tool_requests.len()];
 
     for (idx, tool_request) in tool_requests.iter().enumerate() {
+        let invocation = prepare_tool_invocation_with_external(
+            tool_request,
+            subagent_depth,
+            config.subagents.max_depth,
+            mcp_registry,
+            &[],
+        );
         if emit_deltas {
             sink.emit(&events.tool_call_requested(tool_request))?;
         }
-        if let Err(error) =
-            orca_tools::validate_with_mcp_and_external(tool_request, Some(mcp_registry), &[])
-        {
-            let result = tool_types::ToolResult::invalid_input(
-                tool_request,
-                format!("tool arguments failed schema validation: {error}"),
-            );
+        if let Err(error) = validate_tool_invocation_with_external(&invocation, mcp_registry, &[]) {
+            let result = error.into_result();
             if emit_deltas {
                 sink.emit(&events.tool_call_completed(&result))?;
             }
@@ -1358,25 +1331,24 @@ fn execute_subagent_batch(
                 continue;
             }
         };
-        let effective_tool_request =
-            tool_request_with_hook_outcome(tool_request, &pre_tool_outcome);
-        if let Err(error) = orca_tools::validate_with_mcp_and_external(
-            &effective_tool_request,
-            Some(mcp_registry),
+        let invocation = match apply_pre_tool_outcome_with_external(
+            invocation,
+            &pre_tool_outcome,
+            mcp_registry,
             &[],
         ) {
-            let result = tool_types::ToolResult::invalid_input(
-                &effective_tool_request,
-                format!("tool arguments failed schema validation: {error}"),
-            );
-            if emit_deltas {
-                sink.emit(&events.tool_call_completed(&result))?;
+            Ok(invocation) => invocation,
+            Err(error) => {
+                let result = error.into_result();
+                if emit_deltas {
+                    sink.emit(&events.tool_call_completed(&result))?;
+                }
+                results[idx] = Some((RunStatus::Failed, result));
+                continue;
             }
-            results[idx] = Some((RunStatus::Failed, result));
-            continue;
-        }
+        };
 
-        let request = subagent::create_subagent_request(&effective_tool_request);
+        let request = subagent::create_subagent_request(&invocation.effective);
         if emit_deltas {
             sink.emit(&events.subagent_started(&tool_request.id, &request.description))?;
         }
@@ -1388,7 +1360,7 @@ fn execute_subagent_batch(
             depth: subagent_depth + 1,
             emit_deltas: false,
         };
-        let child_tool_request = effective_tool_request;
+        let child_tool_request = invocation.effective;
         let child_config = config.clone();
         let child_cwd = cwd.to_path_buf();
         let child_instructions = instructions.clone();

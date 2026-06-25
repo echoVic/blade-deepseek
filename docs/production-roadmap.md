@@ -4,7 +4,7 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-06-25
-Current baseline: v0.1.32 typed runtime protocol boundary for server mode
+Current baseline: v0.1.33 runtime tool invocation convergence
 
 ---
 
@@ -108,21 +108,29 @@ commands and consume versioned events without owning turn execution details.
 
 ### P2: Tool System Convergence
 
-**Release target:** v0.1.33+
+**Release target:** v0.1.33
+
+**Current status:** runtime tool invocation preparation, approval request
+construction, and hook-modified request validation now flow through
+`orca_runtime::tool_invocation` for normal controller execution, readonly
+batches, subagent batches, and TUI approval prompts.
 
 **Goal:** reduce the remaining divergence between built-in tools, MCP tools,
 external tools, approvals, and future plugin-provided tools.
 
 **Scope:**
 
-1. Normalize tool invocation records across all tool sources.
-2. Move approval classification and result shaping into a shared runtime path.
+1. Normalize tool invocation records across all tool sources. Done in v0.1.33
+   for built-in, MCP, and TOML external tools.
+2. Move approval classification and validation result shaping into a shared
+   runtime path. Done in v0.1.33.
 3. Prepare for long-running shell sessions, worktree automation, and async
-   subagents without adding them in the same patch.
+   subagents without adding them in the same patch. Still open after v0.1.33.
 
 ### Skills And Plugins
 
-**Release target:** after P2 unless P1 uncovers a smaller safe slice.
+**Release target:** after the real API e2e script, TUI runtime protocol adapter,
+and shell session/PTTY releases.
 
 **Goal:** evolve the existing Markdown skill loading into a plugin-compatible
 instruction and capability system.

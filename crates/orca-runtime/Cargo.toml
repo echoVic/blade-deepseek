@@ -21,4 +21,5 @@ tokio = { workspace = true }
 sha2 = { workspace = true }
 
 [dev-dependencies]
+orca-mcp = { path = "../orca-mcp", features = ["test-utils"] }
 tempfile = { workspace = true }

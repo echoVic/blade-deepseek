@@ -103,7 +103,7 @@ fn connect_server(
 }
 
 impl McpRegistry {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn from_tools_for_test(tools: Vec<McpTool>) -> Self {
         let lookup = tools
             .iter()

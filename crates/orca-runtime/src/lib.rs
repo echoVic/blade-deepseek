@@ -14,5 +14,6 @@ pub mod server;
 pub mod session;
 pub mod subagent;
 pub mod tasks;
+pub mod tool_invocation;
 pub mod update_check;
 pub mod workflow;

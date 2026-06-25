@@ -4,7 +4,7 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::thread;
 
 use orca_approval::ApprovalPolicy;
-use orca_core::approval_types::{ApprovalDecision, ApprovalRequest};
+use orca_core::approval_types::ApprovalDecision;
 use orca_core::cancel::CancelToken;
 use orca_core::config::RunConfig;
 use orca_core::conversation::Conversation;
@@ -33,6 +33,7 @@ use orca_runtime::memory::{self, MemoryBlock};
 use orca_runtime::session::InteractiveSession;
 use orca_runtime::subagent;
 use orca_runtime::tasks::TaskRegistry;
+use orca_runtime::tool_invocation::{approval_request_for_invocation, prepare_tool_invocation};
 use orca_runtime::workflow::{WorkflowLaunchRequest, WorkflowRunner};
 use serde::Deserialize;
 
@@ -847,19 +848,10 @@ fn execute_tool_for_tui(
     hooks: &HookRunner,
     task_registry: Option<&TaskRegistry>,
 ) -> (bool, tool_types::ToolResult, Option<CostTracker>) {
-    if let Some(action) =
-        approval_action_for_tool(tool_request, subagent_depth, mcp_registry, config)
-        && agent_common::requires_approval(action)
+    let invocation = prepare_tool_invocation(tool_request, subagent_depth, mcp_registry, config);
+    if let Some(approval) = approval_request_for_invocation(&invocation)
+        && agent_common::requires_approval(approval.action)
     {
-        let approval = ApprovalRequest {
-            id: format!("approval-{}", tool_request.id),
-            action,
-            description: format!(
-                "{} requested {}",
-                tool_request.name.as_str(),
-                action.as_str()
-            ),
-        };
         let resolution = policy.resolve_for_tool(
             &approval,
             tool_request.name.as_str(),
@@ -1288,24 +1280,6 @@ fn parse_user_input_request_args(
         return Err("missing required request_user_input argument: question".to_string());
     }
     Ok(args)
-}
-
-fn approval_action_for_tool(
-    tool_request: &tool_types::ToolRequest,
-    subagent_depth: u32,
-    mcp_registry: &McpRegistry,
-    config: &RunConfig,
-) -> Option<orca_core::approval_types::ActionKind> {
-    if tool_request.name == tool_types::ToolName::Subagent
-        && subagent_depth >= config.subagents.max_depth
-    {
-        return None;
-    }
-    Some(orca_tools::canonical_action_kind_with_mcp_and_external(
-        tool_request,
-        Some(mcp_registry),
-        &config.external_tools,
-    ))
 }
 
 #[cfg(test)]
