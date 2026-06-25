@@ -29,6 +29,7 @@ use crate::hooks::HookRunner;
 use crate::instructions;
 use crate::memory;
 use crate::tasks::TaskRegistry;
+use crate::worktree::{WorktreeGuard, WorktreeOutcome};
 
 use super::host::{AgentCall, HostCommand, HostEvent, WorkflowHost};
 use super::script::{ResolvedWorkflowScript, resolve_workflow_script_to_path};
@@ -118,6 +119,7 @@ struct PreparedWorkflowRun {
 struct WorkflowChildAgentCallOutput {
     message: String,
     usage: UsageTotals,
+    worktree: Option<WorktreeOutcome>,
 }
 
 #[derive(Debug)]
@@ -530,7 +532,8 @@ impl WorkflowRunner {
 
             match self.run_child_agent_call(&call) {
                 Ok(child_output) => {
-                    let output = child_agent_output(&call.prompt, &child_output.message);
+                    let mut output = child_agent_output(&call.prompt, &child_output.message);
+                    append_worktree_outcome(&mut output, child_output.worktree.as_ref());
                     let transcript_path =
                         write_agent_transcript(transcript_dir, &call, &output, false)?;
                     let result = workflow_agent_result(&call, Value::String(output.clone()), false);
@@ -613,6 +616,15 @@ impl WorkflowRunner {
             .cwd
             .as_deref()
             .unwrap_or(self.session_dir.as_path());
+        let worktree_guard = if workflow_agent_uses_worktree(&call.opts) {
+            Some(WorktreeGuard::create(cwd)?)
+        } else {
+            None
+        };
+        let child_cwd = worktree_guard
+            .as_ref()
+            .map(|guard| guard.path())
+            .unwrap_or(cwd);
         let mut events = EventFactory::new(format!("workflow-child-{}", call.call_id));
         let mut sink = EventSink::new(sink(), self.config.output_format);
         let instructions = instructions::load_for_cwd_or_default(cwd);
@@ -629,7 +641,7 @@ impl WorkflowRunner {
             emit_deltas: false,
         };
         let mut runtime = ChildAgentRuntime::new(
-            cwd,
+            child_cwd,
             &mut events,
             &mut sink,
             &instructions,
@@ -641,19 +653,24 @@ impl WorkflowRunner {
         );
         let (result, child_cost_tracker) =
             run_child_agent(&workflow_child_config, &child_request, &mut runtime);
+        drop(runtime);
         let usage = child_cost_tracker.totals();
+        let worktree = worktree_guard.map(WorktreeGuard::finish).transpose()?;
 
         match result.status {
             RunStatus::Success => Ok(WorkflowChildAgentCallOutput {
                 message: result.final_message.unwrap_or_default(),
                 usage,
+                worktree,
             }),
-            _ => Err(io::Error::other(
-                result
+            _ => {
+                let mut error = result
                     .error
                     .or(result.final_message)
-                    .unwrap_or_else(|| "workflow child agent failed".to_string()),
-            )),
+                    .unwrap_or_else(|| "workflow child agent failed".to_string());
+                append_worktree_outcome(&mut error, worktree.as_ref());
+                Err(io::Error::other(error))
+            }
         }
     }
 
@@ -759,6 +776,24 @@ fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as i64)
         .unwrap_or(0)
+}
+
+fn workflow_agent_uses_worktree(opts: &Value) -> bool {
+    opts.get("isolation").and_then(Value::as_str) == Some("worktree")
+}
+
+fn append_worktree_outcome(output: &mut String, outcome: Option<&WorktreeOutcome>) {
+    if let Some(outcome) = outcome {
+        let status = if outcome.preserved {
+            "preserved"
+        } else {
+            "cleaned"
+        };
+        output.push_str(&format!(
+            "\n\nWorktree {status}: {}",
+            outcome.path.display()
+        ));
+    }
 }
 
 fn apply_host_event_to_state(

@@ -344,6 +344,53 @@ fn workflow_agent_summary_surfaces_token_usage() {
 }
 
 #[test]
+fn workflow_agent_worktree_isolation_preserves_parent_checkout() {
+    if !orca_runtime::workflow::host::WorkflowHost::node_available() {
+        return;
+    }
+
+    let repo = tempdir().unwrap();
+    run_git(repo.path(), &["init"]);
+    run_git(repo.path(), &["config", "user.email", "orca@example.test"]);
+    run_git(repo.path(), &["config", "user.name", "Orca Test"]);
+    fs::write(repo.path().join("file.txt"), "placeholder").unwrap();
+    run_git(repo.path(), &["add", "file.txt"]);
+    run_git(repo.path(), &["commit", "-m", "seed"]);
+
+    let script = repo.path().join("workflow.js");
+    fs::write(
+        &script,
+        "export const meta = { name: 'workflow-worktree', description: 'Worktree test', phases: [] };\n\
+         export default await agent('edit file.txt :: placeholder => child', { isolation: 'worktree' });",
+    )
+    .unwrap();
+
+    let config = mock_run_config(repo.path());
+    let tasks = TaskRegistry::new("session-1".to_string());
+    let runner = WorkflowRunner::new(config, tasks.clone(), repo.path().join("session"));
+    runner
+        .launch(WorkflowLaunchRequest::from_script_path(
+            script.display().to_string(),
+        ))
+        .expect("workflow runs");
+
+    assert_eq!(
+        fs::read_to_string(repo.path().join("file.txt")).unwrap(),
+        "placeholder"
+    );
+    let changed_worktree = fs::read_dir(repo.path().join(".orca/worktrees"))
+        .expect("worktree directory")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.join("file.txt").exists())
+        .expect("dirty workflow worktree was preserved");
+    assert_eq!(
+        fs::read_to_string(changed_worktree.join("file.txt")).unwrap(),
+        "child"
+    );
+}
+
+#[test]
 fn parallel_preserves_order_and_records_phase() {
     if !orca_runtime::workflow::host::WorkflowHost::node_available() {
         return;
@@ -712,4 +759,19 @@ fn mock_run_config(cwd: &std::path::Path) -> RunConfig {
         desktop_notifications: false,
         auto_memory: false,
     }
+}
+
+fn run_git(cwd: &std::path::Path, args: &[&str]) {
+    let output = std::process::Command::new("git")
+        .current_dir(cwd)
+        .args(args)
+        .output()
+        .expect("run git");
+    assert!(
+        output.status.success(),
+        "git {:?} failed: {}{}",
+        args,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

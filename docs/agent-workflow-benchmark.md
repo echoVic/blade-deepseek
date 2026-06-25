@@ -9,7 +9,7 @@
 
 ## Executive Summary
 
-Orca has a **production-grade workflow runtime** that supports concurrent agent fan-out (up to 16 agents in parallel, 1000 per run by default). The `subagent` tool (model-facing) supports **parallel batching up to 6** (via `SubagentConfig.max_parallel`), default nesting depth **2**, optional git worktree isolation (`isolation: "worktree"`), plus a **session-local async mode** (`mode: "async"` returning an `agent_id` for `subagent_status`). Async subagent handles are now persisted under `.orca/task-sessions`, so later `subagent_status` calls can resolve prior `agent_id` values; if the original process exited while an async subagent was still queued/running, the recovered record is marked `failed` with an interruption error instead of pretending execution survived. The **workflow system** (`WorkflowRunner` + `WorkflowHost`) achieves true concurrency via `thread::scope().spawn()` for up to 16 concurrent agents and now retries transient child-agent failures once by default. The system still lacks agent teams, workflow-agent worktree isolation, cross-process async subagent execution, phase-level fallback policy controls, and agent-to-agent communication. Workflow observability includes phase tracking, per-agent status rows, retry/failure detail, token usage, retry attempt telemetry, and lifecycle timestamps in `/workflows`.
+Orca has a **production-grade workflow runtime** that supports concurrent agent fan-out (up to 16 agents in parallel, 1000 per run by default). The `subagent` tool (model-facing) supports **parallel batching up to 6** (via `SubagentConfig.max_parallel`), default nesting depth **2**, optional git worktree isolation (`isolation: "worktree"`), plus a **session-local async mode** (`mode: "async"` returning an `agent_id` for `subagent_status`). Async subagent handles are now persisted under `.orca/task-sessions`, so later `subagent_status` calls can resolve prior `agent_id` values; if the original process exited while an async subagent was still queued/running, the recovered record is marked `failed` with an interruption error instead of pretending execution survived. The **workflow system** (`WorkflowRunner` + `WorkflowHost`) achieves true concurrency via `thread::scope().spawn()` for up to 16 concurrent agents, supports opt-in workflow-agent worktree isolation through `{ isolation: "worktree" }`, and now retries transient child-agent failures once by default. The system still lacks agent teams, cross-process async subagent execution, phase-level fallback policy controls, and agent-to-agent communication. Workflow observability includes phase tracking, per-agent status rows, retry/failure detail, token usage, retry attempt telemetry, and lifecycle timestamps in `/workflows`.
 
 ---
 
@@ -151,7 +151,7 @@ All 8 agents were launched concurrently via `Promise.all()` in the `research` ph
 |----------|--------|-----------------|
 | Stated scope | DeepSeek-native coding agent, headless harness contract first | `.boss/orca-codex-harness/prd.md:1-6` |
 | Explicit non-goals | Full Blade TS features, Web UI, VSCode, complete MCP/skills/subagents (in v1) | `.boss/orca-codex-harness/prd.md:9` |
-| Documented subagent limits | Partially stale — older plan docs still describe async/status as future work; current code now has session-local async launch/status, default depth 2, and model-facing worktree isolation; workflow-agent isolation remains open | `docs/subagent-enhancement-plan.md`, `controller.rs`, `tools/registry.rs` |
+| Documented subagent limits | Partially stale — older plan docs still describe async/status as future work; current code now has session-local async launch/status, default depth 2, model-facing worktree isolation, and opt-in workflow-agent worktree isolation | `docs/subagent-enhancement-plan.md`, `controller.rs`, `tools/registry.rs` |
 | Harness contract | `docs/harness-contract.md` — JSONL event contract | `docs/harness-contract.md` |
 | Roadmap for concurrency | "Later: Worktree automation", "Later: Shell sessions/PTY" | `docs/production-roadmap.md` Priority Matrix |
 | Gaps vs Claude Code | Documented in `subagent-enhancement-plan.md` with `sdk-tools.d.ts` comparison | Section 1.2 in subagent plan |
@@ -187,7 +187,7 @@ All Phase 1 findings above were **cross-validated by the orchestrator** against 
 | **Agent View / Team Dashboard** | ⚠️ PARTIAL+ | `/workflows` expands the selected workflow into per-agent rows with status, attempts, retry/failure detail, and token/cost usage; no dedicated team dashboard | P1 |
 | **Agent Teams** | ❌ GAP | No team_name or agent grouping concept in types | P2 |
 | **Dynamic Workflows** | ⚠️ PARTIAL | JS DSL supports `Promise.all()` fan-out but agent spawning is fixed at script load | P1 |
-| **Worktrees** | ⚠️ PARTIAL | Model-facing `subagent` supports `isolation: "worktree"` under `.orca/worktrees`, preserving dirty child worktrees and cleaning empty ones; workflow agents are not isolated yet | P1 |
+| **Worktrees** | ✅ PRESENT | Model-facing `subagent` and workflow `agent(..., { isolation: "worktree" })` both use detached worktrees under `.orca/worktrees`, preserving dirty child worktrees and cleaning empty ones | ✓ |
 | **Async model-facing subagents** | ⚠️ PARTIAL | `subagent` accepts `mode: "async"` and returns `agent_id`; `subagent_status` reads current or persisted task status/result plus lifecycle timestamps. Handles survive process/session boundaries, but execution itself remains process-local | P0 handle durability done / cross-process execution open |
 | **Observability: token/elapsed/agent count** | ⚠️ PARTIAL+ | `/workflows` now receives live agent/phase progress counts, renders elapsed async subagent rows, and shows selected workflow agent retry/failure detail plus token/cost usage | P1 |
 | **Agent Communication** | ❌ GAP | No message passing between agents; `WorkflowHost` routes calls one-way | P2 |
@@ -200,7 +200,7 @@ All Phase 1 findings above were **cross-validated by the orchestrator** against 
 | **Error Recovery** | ⚠️ PARTIAL | Child-agent failures are retried once by default (`max_agent_retries` configurable up to 5), with attempt/max-attempt/previous-error telemetry persisted in agent records; phase-level fallback policy is still missing | P1 |
 | **Structured Agent Output** | ⚠️ PARTIAL | Workflow agents return `Value` (JSON); subagent tool returns text; no schema validation | P2 |
 
-**Overall gap**: Orca's **workflow system** is architecturally capable of concurrent agent fan-out (confirmed 8+ agents) with observability (phase tracking, agent statuses, retry attempts, lifecycle timestamps, per-agent token usage, and bounded child-agent retry). The first TUI dashboard layer now shows live agent/phase counts, async subagent task rows, and selected workflow per-agent rows in `/workflows`, while model-facing subagents have async/status handles that can be queried across later runs and optional worktree isolation for file-writing tasks. The remaining gaps are cross-process async execution, richer dedicated/team dashboard, workflow-agent worktree isolation, phase-level fallback policy, and team coordination.
+**Overall gap**: Orca's **workflow system** is architecturally capable of concurrent agent fan-out (confirmed 8+ agents) with observability (phase tracking, agent statuses, retry attempts, lifecycle timestamps, per-agent token usage, and bounded child-agent retry). The first TUI dashboard layer now shows live agent/phase counts, async subagent task rows, and selected workflow per-agent rows in `/workflows`, while model-facing subagents have async/status handles that can be queried across later runs and optional worktree isolation for file-writing tasks. Workflow agents can also opt into worktree isolation. The remaining gaps are cross-process async execution, richer dedicated/team dashboard, phase-level fallback policy, and team coordination.
 
 ### Reviewer 3: Actionability of Next Steps
 
@@ -212,7 +212,7 @@ All recommended next steps are **implementable within current architecture**:
 | P0: Subagent status query tool | ✅ Implemented (current or persisted handles) | `tools/registry.rs`, `controller.rs`, `bridge.rs`, `tasks.rs` | Remaining: token/failure-detail telemetry |
 | P1: Subagent depth > 1 | ✅ Implemented | `subagent_config.rs`, `controller.rs`, `subagent_contract.rs` | Default `max_depth` is now 2; explicit `max_depth = 1` still blocks nested subagents |
 | P1: TUI agent dashboard | 3-5 days | `tui/app.rs`, `tui/ui.rs` | No — `WorkflowRunState` data available |
-| P1: Worktree isolation | 3-5 days | `sandbox/`, git worktree commands | `.worktrees/` dir exists |
+| P1: Worktree isolation | ✅ Implemented | `worktree.rs`, `subagent.rs`, `controller.rs`, `workflow/runner.rs` | Model-facing and workflow agents can opt into isolated git worktrees |
 | P1: Agent error retry | ✅ Implemented (bounded child-agent retry + telemetry) | `workflow/runner.rs`, `workflow/state.rs`, `config/mod.rs` | Remaining: phase-level fallback policy |
 | P2: Agent communication | 5-7 days | `workflow/host.rs`, new message channel | Moderate — requires new IPC |
 | P2: Shared task list | 3-5 days | New `tasks.rs` module, workflow JS API | Moderate — stateful agent coordination |
@@ -235,7 +235,7 @@ All recommended next steps are **implementable within current architecture**:
 | Shared task list | ❌ No | Agents are independent, stateless |
 | Agent view / team dashboard | ⚠️ Partial+ | `/workflows` lists workflow and async subagent tasks and expands the selected workflow into per-agent rows; no dedicated team view |
 | Dynamic agent spawning | ⚠️ Partial | Fixed at script load; no conditional spawn |
-| Worktree isolation | ⚠️ Partial | `subagent` supports `isolation: "worktree"` under `.orca/worktrees`; workflow agents are not isolated yet |
+| Worktree isolation | ✅ Yes | `subagent` supports `isolation: "worktree"`; workflow agents support `agent(prompt, { isolation: "worktree" })` |
 | Async subagent (model tool) | ⚠️ Partial | `mode: "async"` launches background subagent and returns `agent_id`; `subagent_status` queries current or persisted results plus lifecycle timestamps; interrupted process-local executions recover as failed records |
 | Workflow resume/fork | ⚠️ Partial | `resumeFromRunId` exists, not stress-tested |
 | Structured typed output | ⚠️ Partial | JSON `Value` return; no schema validation |
@@ -287,7 +287,7 @@ All recommended next steps are **implementable within current architecture**:
 
 4. **TUI agent dashboard**: First layer implemented in `/workflows`: selected workflow expands into per-agent rows with status, attempts, retry/failure details, token usage, and cost. Remaining work: dedicated dashboard surface and team grouping. Files: `task_types.rs`, `workflow/state.rs`, `workflow/runner.rs`, `tui/ui.rs`.
 
-5. **Worktree isolation**: Model-facing subagents now support `isolation: "worktree"` with detached git worktrees under `.orca/worktrees`; clean worktrees are removed, dirty worktrees are preserved for review. Remaining work: workflow-agent isolation. Files: `worktree.rs`, `subagent.rs`, `controller.rs`.
+5. **Worktree isolation**: ✅ Implemented for model-facing subagents and workflow agents. `isolation: "worktree"` / `agent(prompt, { isolation: "worktree" })` create detached git worktrees under `.orca/worktrees`; clean worktrees are removed, dirty worktrees are preserved for review. Files: `worktree.rs`, `subagent.rs`, `controller.rs`, `workflow/runner.rs`.
 
 6. **Subagent depth > 1**: ✅ Implemented. Default `DEFAULT_MAX_SUBAGENT_DEPTH` is now 2, while explicit `max_depth = 1` remains a hard stop. Files: `subagent_config.rs`, `controller.rs`.
 
@@ -323,3 +323,4 @@ All recommended next steps are **implementable within current architecture**:
 - ✅ Workflow child-agent usage is now counted even when child agents run with `emit_deltas = false`
 - ✅ Default model-facing subagent nesting depth is now 2; explicit `max_depth = 1` still blocks nested calls
 - ✅ Model-facing `subagent` supports git worktree isolation with dirty worktree preservation and clean worktree removal
+- ✅ Workflow agents support opt-in git worktree isolation via `agent(prompt, { isolation: "worktree" })`
