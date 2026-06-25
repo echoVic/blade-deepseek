@@ -290,6 +290,7 @@ pub fn run_agent_for_tui(
             conversation_with_hook_context(session.conversation(), &pre_model_outcome);
 
         let tx = event_tx.clone();
+        let mut emitted_message_delta = false;
         let response = orca_provider::call_streaming(
             config.provider,
             &model_conversation,
@@ -300,6 +301,7 @@ pub fn run_agent_for_tui(
                     let _ = tx.send(TuiEvent::ReasoningDelta(text.to_string()));
                 }
                 ProviderStep::MessageDelta(text) => {
+                    emitted_message_delta = true;
                     let _ = tx.send(TuiEvent::MessageDelta(text.to_string()));
                 }
                 _ => {}
@@ -396,6 +398,12 @@ pub fn run_agent_for_tui(
         reactive_compacted = false;
 
         if response.tool_calls.is_empty() {
+            if !emitted_message_delta
+                && let Some(content) = response.assistant_content.as_deref()
+                && !content.is_empty()
+            {
+                let _ = event_tx.send(TuiEvent::MessageDelta(content.to_string()));
+            }
             session.conversation_mut().add_assistant(
                 response.assistant_content,
                 response.assistant_reasoning,
@@ -719,7 +727,7 @@ fn execute_subagent_batch_for_tui(
                 error: Some(error.clone()),
             });
             results[idx] = Some((
-                true,
+                false,
                 tool_types::ToolResult::failed(tool_request, error, None),
                 CostTracker::new(None),
             ));
@@ -769,7 +777,7 @@ fn execute_subagent_batch_for_tui(
                     output: None,
                     error: result.error.clone(),
                 });
-                results[idx] = Some((true, result, CostTracker::new(None)));
+                results[idx] = Some((false, result, CostTracker::new(None)));
                 continue;
             }
         };
@@ -1117,11 +1125,17 @@ fn execute_tool_for_tui(
         }
     }
 
-    let failed = matches!(
-        result.status,
-        tool_types::ToolStatus::Failed | tool_types::ToolStatus::Denied
-    );
-    (failed, result, child_cost)
+    let should_stop = should_stop_after_tui_tool_result(tool_request, &result);
+    (should_stop, result, child_cost)
+}
+
+fn should_stop_after_tui_tool_result(
+    tool_request: &tool_types::ToolRequest,
+    result: &tool_types::ToolResult,
+) -> bool {
+    matches!(result.status, tool_types::ToolStatus::Denied)
+        || (tool_request.name == tool_types::ToolName::RequestUserInput
+            && result.status == tool_types::ToolStatus::Failed)
 }
 
 fn execute_workflow_for_tui(
@@ -1423,7 +1437,7 @@ fn child_result_to_tui_tool_result(
             error: Some(error.clone()),
         });
         (
-            true,
+            false,
             tool_types::ToolResult::failed(tool_request, error, None),
             cost_tracker,
         )
@@ -1777,6 +1791,35 @@ mod tests {
     }
 
     #[test]
+    fn tui_displays_final_assistant_content_without_stream_delta() {
+        let config = config();
+        let (event_tx, event_rx) = mpsc::channel();
+        let (_action_tx, action_rx) = mpsc::channel();
+        let cancel = CancelToken::new();
+        let mut session =
+            TuiConversationSession::new_with_preloaded(&config, "silent", None).expect("session");
+
+        let status = run_agent_for_tui(
+            &config,
+            &mut session,
+            "mock_silent_final",
+            &event_tx,
+            &action_rx,
+            &cancel,
+            false,
+        );
+
+        let events: Vec<TuiEvent> = event_rx.try_iter().collect();
+        assert_eq!(status, "success");
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                TuiEvent::MessageDelta(text) if text.contains("Mock silent final response.")
+            )
+        }));
+    }
+
+    #[test]
     fn tui_tool_schema_exposes_goal_tool_only_for_goal_turns() {
         let config = config();
         let mut session =
@@ -2004,5 +2047,123 @@ mod tests {
 
         responder.join().expect("responder joined");
         assert_eq!(status, "success");
+    }
+
+    #[test]
+    fn tui_request_user_input_cancel_stops_turn() {
+        let config = config();
+        let (event_tx, event_rx) = mpsc::channel();
+        let (action_tx, action_rx) = mpsc::channel();
+        let cancel = CancelToken::new();
+        let mut session =
+            TuiConversationSession::new_with_preloaded(&config, "ask", None).expect("session");
+
+        let responder = std::thread::spawn(move || {
+            loop {
+                match event_rx.recv().expect("event") {
+                    TuiEvent::UserInputRequested { .. } => {
+                        action_tx.send(UserAction::Cancel).expect("send cancel");
+                        break;
+                    }
+                    TuiEvent::SessionCompleted { status } => {
+                        panic!("completed before user input request: {status}");
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let status = run_agent_for_tui(
+            &config,
+            &mut session,
+            "ask Continue?",
+            &event_tx,
+            &action_rx,
+            &cancel,
+            false,
+        );
+
+        responder.join().expect("responder joined");
+        assert_eq!(status, "failed");
+    }
+
+    #[test]
+    fn tui_child_agent_recovers_from_invalid_tool_arguments() {
+        let config = full_auto_config();
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let hooks = HookRunner::default();
+
+        let child = run_child_agent_for_tui_silent(
+            &config,
+            config.cwd.as_deref().unwrap_or_else(|| Path::new(".")),
+            "bad_plan_then_fix",
+            1,
+            &SubagentType::General,
+            &instructions,
+            &memory,
+            &hooks,
+        );
+
+        assert_eq!(child.status, "success");
+        assert!(
+            child
+                .final_message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Mock completed after fixing malformed tool arguments")
+        );
+    }
+
+    #[test]
+    fn tui_subagent_batch_records_child_failure_without_stopping_batch() {
+        let config = full_auto_config();
+        let (event_tx, _event_rx) = mpsc::channel();
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let hooks = HookRunner::default();
+        let failing = tool_types::ToolRequest {
+            id: "subagent-failing".to_string(),
+            name: tool_types::ToolName::Subagent,
+            action: orca_core::approval_types::ActionKind::Agent,
+            target: Some("failing child".to_string()),
+            raw_arguments: Some(
+                serde_json::json!({
+                    "description": "failing child",
+                    "prompt": "mock_fail"
+                })
+                .to_string(),
+            ),
+        };
+        let succeeding = tool_types::ToolRequest {
+            id: "subagent-succeeding".to_string(),
+            name: tool_types::ToolName::Subagent,
+            action: orca_core::approval_types::ActionKind::Agent,
+            target: Some("succeeding child".to_string()),
+            raw_arguments: Some(
+                serde_json::json!({
+                    "description": "succeeding child",
+                    "prompt": "simple audit"
+                })
+                .to_string(),
+            ),
+        };
+
+        let results = execute_subagent_batch_for_tui(
+            &config,
+            config.cwd.as_deref().unwrap_or_else(|| Path::new(".")),
+            &[failing, succeeding],
+            &event_tx,
+            0,
+            &instructions,
+            &memory,
+            &hooks,
+        );
+
+        assert_eq!(results.len(), 2);
+        assert!(!results[0].0, "child failure should not stop parent batch");
+        assert_eq!(results[0].1.status, tool_types::ToolStatus::Failed);
+        assert!(!results[1].0);
+        assert_eq!(results[1].1.status, tool_types::ToolStatus::Completed);
     }
 }

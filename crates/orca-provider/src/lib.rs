@@ -233,6 +233,16 @@ fn mock_call(conversation: &Conversation) -> ProviderResponse {
         };
     }
 
+    if prompt.trim() == "mock_silent_final" {
+        return ProviderResponse {
+            steps: Vec::new(),
+            assistant_content: Some("Mock silent final response.".to_string()),
+            assistant_reasoning: None,
+            tool_calls: Vec::new(),
+            usage: None,
+        };
+    }
+
     if let Some(tool_request) = parse_mock_prompt(prompt) {
         let raw_call = RawToolCall {
             id: tool_request.id.clone(),
