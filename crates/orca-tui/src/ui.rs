@@ -318,23 +318,18 @@ fn render_workflows_panel(frame: &mut Frame, area: Rect, state: &mut AppState, t
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .title(" Workflows ")
+        .title(" Tasks ")
         .border_style(Style::default().fg(theme.border));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let workflow_tasks = state
-        .workflow_panel
-        .tasks
-        .iter()
-        .filter(|task| task.task_type == TaskType::Workflow)
-        .collect::<Vec<_>>();
+    let tasks = state.workflow_panel.tasks.iter().collect::<Vec<_>>();
 
-    if workflow_tasks.is_empty() {
+    if tasks.is_empty() {
         let lines = vec![
             Line::from(""),
             Line::from(Span::styled(
-                " No workflow tasks available in this view yet.",
+                " No background tasks available in this view yet.",
                 Style::default().fg(theme.muted),
             )),
         ];
@@ -346,27 +341,27 @@ fn render_workflows_panel(frame: &mut Frame, area: Rect, state: &mut AppState, t
     let header_h: u16 = 1;
     let row_h: u16 = 2;
     let mut constraints = vec![Constraint::Length(header_h)];
-    constraints.extend(workflow_tasks.iter().map(|_| Constraint::Length(row_h)));
+    constraints.extend(tasks.iter().map(|_| Constraint::Length(row_h)));
     constraints.push(Constraint::Min(0));
     let rows = Layout::vertical(constraints).split(inner);
 
     let header = Paragraph::new(Line::from(vec![
         Span::styled(" Name", Style::default().fg(theme.muted)),
-        Span::styled("   Status", Style::default().fg(theme.muted)),
-        Span::styled("        Run ID", Style::default().fg(theme.muted)),
-        Span::styled("      Phases", Style::default().fg(theme.muted)),
+        Span::styled("   Type", Style::default().fg(theme.muted)),
+        Span::styled("       Status", Style::default().fg(theme.muted)),
+        Span::styled("      Detail", Style::default().fg(theme.muted)),
     ]));
     frame.render_widget(header, rows[0]);
 
-    for (index, task) in workflow_tasks.iter().enumerate() {
+    for (index, task) in tasks.iter().enumerate() {
         let row_area = rows[index + 1];
         let selected = index == state.workflow_panel.selected;
         let marker = if selected { ">" } else { " " };
         let name = task.name.as_deref().unwrap_or(task.description.as_str());
+        let task_type = task_type_label(task);
         let status = task_status_label(task.status);
         let status_color = task_status_color(task.status, theme);
-        let run_id = task.workflow_run_id.as_deref().unwrap_or("-");
-        let progress = workflow_progress_label(task);
+        let detail = task_detail_label(task);
         let name_style = if selected {
             Style::default()
                 .fg(theme.border)
@@ -382,9 +377,10 @@ fn render_workflows_panel(frame: &mut Frame, area: Rect, state: &mut AppState, t
         let label = Paragraph::new(Line::from(vec![
             Span::styled(format!("{marker} {name}"), name_style),
             Span::styled("  ", Style::default()),
+            Span::styled(task_type, Style::default().fg(theme.muted)),
+            Span::styled("  ", Style::default()),
             Span::styled(status.to_string(), Style::default().fg(status_color)),
-            Span::styled(format!("  {run_id}"), Style::default().fg(theme.muted)),
-            Span::styled(format!("  {progress}"), Style::default().fg(theme.muted)),
+            Span::styled(format!("  {detail}"), Style::default().fg(theme.muted)),
         ]));
         frame.render_widget(label, parts[0]);
 
@@ -441,6 +437,23 @@ fn workflow_gauge_label(status: TaskStatus) -> String {
     }
 }
 
+fn task_type_label(task: &BackgroundTaskSummary) -> &'static str {
+    match task.task_type {
+        TaskType::Workflow => "workflow",
+        TaskType::Subagent => "subagent",
+        TaskType::Shell => "shell",
+        TaskType::Monitor => "monitor",
+    }
+}
+
+fn task_detail_label(task: &BackgroundTaskSummary) -> String {
+    match task.task_type {
+        TaskType::Workflow => workflow_progress_label(task),
+        TaskType::Subagent => subagent_progress_label(task),
+        TaskType::Shell | TaskType::Monitor => elapsed_label(task),
+    }
+}
+
 fn workflow_progress_label(task: &BackgroundTaskSummary) -> String {
     let total_phases = task.phase_count.unwrap_or_default();
     let Some(progress) = task.workflow_progress else {
@@ -474,6 +487,34 @@ fn workflow_progress_label(task: &BackgroundTaskSummary) -> String {
         progress.completed_phases, phase_total
     ));
     parts.join(", ")
+}
+
+fn subagent_progress_label(task: &BackgroundTaskSummary) -> String {
+    let mut parts = Vec::new();
+    if let Some(agent_type) = task.agent_type.as_deref() {
+        parts.push(agent_type.to_string());
+    }
+    parts.push(elapsed_label(task));
+    parts.join(", ")
+}
+
+fn elapsed_label(task: &BackgroundTaskSummary) -> String {
+    let Some(started_at_ms) = task.started_at_ms else {
+        return "not started".to_string();
+    };
+    let end_ms = task.completed_at_ms.unwrap_or_else(current_time_ms);
+    let elapsed_ms = end_ms.saturating_sub(started_at_ms);
+    format!(
+        "elapsed {}",
+        format_elapsed_compact((elapsed_ms / 1000) as u64)
+    )
+}
+
+fn current_time_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 fn build_welcome_lines<'a>(state: &AppState, theme: &Theme) -> Vec<Line<'a>> {
@@ -2176,6 +2217,9 @@ mod tests {
             task_type: TaskType::Workflow,
             status: TaskStatus::Running,
             description: "Audit".to_string(),
+            created_at_ms: 1_000,
+            started_at_ms: Some(1_000),
+            completed_at_ms: None,
             command: None,
             agent_type: None,
             server: None,
@@ -2198,6 +2242,41 @@ mod tests {
             workflow_progress_label(&task),
             "agents 2/5, running 2, failed 1, phases 1/3"
         );
+    }
+
+    #[test]
+    fn workflows_panel_renders_async_subagent_tasks() {
+        let mut state = test_state();
+        state.panel_mode = PanelMode::Workflows;
+        state.workflow_panel.tasks = vec![BackgroundTaskSummary {
+            id: "task-subagent".to_string(),
+            task_type: TaskType::Subagent,
+            status: TaskStatus::Running,
+            description: "inspect auth".to_string(),
+            command: None,
+            agent_type: Some("general".to_string()),
+            server: None,
+            tool: None,
+            name: None,
+            workflow_run_id: None,
+            phase_count: None,
+            workflow_progress: None,
+            created_at_ms: 1_000,
+            started_at_ms: Some(1_000),
+            completed_at_ms: None,
+        }];
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let textarea = TextArea::default();
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 16))
+            .expect("test backend");
+
+        terminal
+            .draw(|frame| render(frame, &mut state, &textarea, &theme))
+            .expect("draw");
+        let rendered = format!("{:?}", terminal.backend().buffer());
+
+        assert!(rendered.contains("inspect auth"));
+        assert!(rendered.contains("subagent"));
     }
 
     #[test]

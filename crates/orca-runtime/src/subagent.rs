@@ -7,6 +7,13 @@ pub struct SubagentRequest {
     pub prompt: String,
     pub subagent_type: SubagentType,
     pub model: Option<String>,
+    pub mode: SubagentMode,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SubagentMode {
+    Sync,
+    Async,
 }
 
 pub fn extract_subagent_field(tool_request: &ToolRequest, field: &str) -> Option<String> {
@@ -28,12 +35,17 @@ pub fn create_subagent_request(tool_request: &ToolRequest) -> SubagentRequest {
         .unwrap_or_default();
     let model = extract_subagent_field(tool_request, "model")
         .filter(|model| orca_core::model::validate_model(model).is_ok());
+    let mode = match extract_subagent_field(tool_request, "mode").as_deref() {
+        Some("async") => SubagentMode::Async,
+        _ => SubagentMode::Sync,
+    };
 
     SubagentRequest {
         description,
         prompt,
         subagent_type,
         model,
+        mode,
     }
 }
 
@@ -65,6 +77,27 @@ mod tests {
         assert_eq!(result.prompt, "review src/main.rs for bugs");
         assert_eq!(result.subagent_type, SubagentType::CodeReviewer);
         assert_eq!(result.model.as_deref(), Some("deepseek-v4-pro"));
+        assert_eq!(result.mode, SubagentMode::Sync);
+    }
+
+    #[test]
+    fn create_request_parses_async_mode() {
+        let req = ToolRequest {
+            id: "t4".to_string(),
+            name: ToolName::Subagent,
+            action: ActionKind::Read,
+            target: Some("async task".to_string()),
+            raw_arguments: Some(
+                serde_json::json!({
+                    "description": "async task",
+                    "prompt": "inspect later",
+                    "mode": "async"
+                })
+                .to_string(),
+            ),
+        };
+        let result = create_subagent_request(&req);
+        assert_eq!(result.mode, SubagentMode::Async);
     }
 
     #[test]

@@ -31,7 +31,7 @@ use orca_runtime::hooks::{
 use orca_runtime::instructions::ProjectInstructions;
 use orca_runtime::memory::{self, MemoryBlock};
 use orca_runtime::session::InteractiveSession;
-use orca_runtime::subagent;
+use orca_runtime::subagent::{self, SubagentMode};
 use orca_runtime::tasks::TaskRegistry;
 use orca_runtime::tool_invocation::{approval_request_for_invocation, prepare_tool_invocation};
 use orca_runtime::workflow::{WorkflowLaunchRequest, WorkflowRunner};
@@ -588,6 +588,7 @@ fn should_run_subagent_batch(
     tool_request.name == tool_types::ToolName::Subagent
         && subagent_depth < config.subagents.max_depth
         && config.subagents.max_parallel > 1
+        && subagent::create_subagent_request(tool_request).mode == SubagentMode::Sync
 }
 
 fn collect_subagent_batch(
@@ -597,7 +598,10 @@ fn collect_subagent_batch(
 ) -> usize {
     let max_end = (start + config.subagents.max_parallel).min(tool_requests.len());
     let mut end = start;
-    while end < max_end && tool_requests[end].name == tool_types::ToolName::Subagent {
+    while end < max_end
+        && tool_requests[end].name == tool_types::ToolName::Subagent
+        && subagent::create_subagent_request(&tool_requests[end]).mode == SubagentMode::Sync
+    {
         end += 1;
     }
     end
@@ -937,6 +941,7 @@ fn execute_tool_for_tui(
             instructions,
             memory,
             hooks,
+            task_registry,
         );
         (r, Some(c))
     } else {
@@ -1007,6 +1012,19 @@ fn execute_tool_for_tui(
                 );
             };
             execute_workflow_for_tui(config, cwd, execution_request, event_tx, task_registry)
+        } else if execution_request.name == tool_types::ToolName::SubagentStatus {
+            let Some(task_registry) = task_registry else {
+                return (
+                    true,
+                    tool_types::ToolResult::failed(
+                        execution_request,
+                        "subagent_status requires a main TUI session",
+                        None,
+                    ),
+                    None,
+                );
+            };
+            execute_subagent_status_for_tui(execution_request, task_registry)
         } else if matches!(
             execution_request.name,
             tool_types::ToolName::GetGoal
@@ -1325,10 +1343,11 @@ fn execute_subagent_for_tui(
     instructions: &ProjectInstructions,
     memory: &MemoryBlock,
     hooks: &HookRunner,
+    task_registry: Option<&TaskRegistry>,
 ) -> (tool_types::ToolResult, CostTracker) {
     let request = subagent::create_subagent_request(tool_request);
     let description = request.description.clone();
-    let subagent_type = request.subagent_type;
+    let subagent_type = request.subagent_type.clone();
 
     let _ = event_tx.send(TuiEvent::SubagentStarted {
         id: tool_request.id.clone(),
@@ -1348,6 +1367,32 @@ fn execute_subagent_for_tui(
             tool_types::ToolResult::failed(tool_request, error, None),
             CostTracker::new(None),
         );
+    }
+
+    if request.mode == SubagentMode::Async {
+        let Some(task_registry) = task_registry else {
+            return (
+                tool_types::ToolResult::failed(
+                    tool_request,
+                    "async subagents require a main TUI session",
+                    None,
+                ),
+                CostTracker::new(None),
+            );
+        };
+        let result = launch_async_subagent_for_tui(
+            config,
+            cwd,
+            tool_request,
+            request,
+            event_tx,
+            subagent_depth,
+            instructions,
+            memory,
+            hooks,
+            task_registry,
+        );
+        return (result, CostTracker::new(None));
     }
 
     let mut child_config = config.clone();
@@ -1402,6 +1447,123 @@ fn execute_subagent_for_tui(
             child.cost_tracker,
         )
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_async_subagent_for_tui(
+    config: &RunConfig,
+    cwd: &Path,
+    tool_request: &tool_types::ToolRequest,
+    request: subagent::SubagentRequest,
+    event_tx: &Sender<TuiEvent>,
+    subagent_depth: u32,
+    instructions: &ProjectInstructions,
+    memory: &MemoryBlock,
+    hooks: &HookRunner,
+    task_registry: &TaskRegistry,
+) -> tool_types::ToolResult {
+    let agent_type = serde_json::to_value(&request.subagent_type)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string));
+    let task = task_registry.create_subagent(request.description.clone(), agent_type);
+    let agent_id = task.id.clone();
+    let mut child_config = config.clone();
+    child_config.model = child_config
+        .model
+        .with_subagent_override(request.model.clone());
+    let child_cwd = cwd.to_path_buf();
+    let child_prompt = request.prompt;
+    let child_type = request.subagent_type;
+    let child_instructions = instructions.clone();
+    let child_memory = memory.clone();
+    let child_hooks = hooks.clone();
+    let child_registry = task_registry.clone();
+    let child_event_tx = event_tx.clone();
+    let thread_agent_id = agent_id.clone();
+
+    thread::spawn(move || {
+        let _ = child_registry.mark_running(&thread_agent_id);
+        let child = run_child_agent_for_tui_silent(
+            &child_config,
+            &child_cwd,
+            &child_prompt,
+            subagent_depth + 1,
+            &child_type,
+            &child_instructions,
+            &child_memory,
+            &child_hooks,
+        );
+        if child.status == "success" {
+            let output = child
+                .final_message
+                .unwrap_or_else(|| "(subagent completed without a final message)".to_string());
+            let _ = child_registry.complete(&thread_agent_id, output);
+        } else {
+            let error = child
+                .error
+                .or(child.final_message)
+                .unwrap_or_else(|| format!("subagent ended with status {}", child.status));
+            let _ = child_registry.fail(&thread_agent_id, error);
+        }
+        let _ = child_event_tx.send(TuiEvent::WorkflowTasksUpdated {
+            tasks: child_registry.list(),
+        });
+    });
+
+    let _ = event_tx.send(TuiEvent::WorkflowTasksUpdated {
+        tasks: task_registry.list(),
+    });
+    tool_types::ToolResult::completed(
+        tool_request,
+        serde_json::json!({
+            "status": "async_launched",
+            "agent_id": agent_id,
+            "description": request.description,
+        })
+        .to_string(),
+        false,
+    )
+}
+
+fn execute_subagent_status_for_tui(
+    tool_request: &tool_types::ToolRequest,
+    task_registry: &TaskRegistry,
+) -> tool_types::ToolResult {
+    let agent_id = subagent::extract_subagent_field(tool_request, "agent_id")
+        .or_else(|| tool_request.target.clone());
+    let Some(agent_id) = agent_id else {
+        return tool_types::ToolResult::invalid_input(tool_request, "missing agent_id");
+    };
+    let Some(record) = task_registry.get(&agent_id) else {
+        return tool_types::ToolResult::failed(
+            tool_request,
+            format!("subagent '{agent_id}' not found"),
+            None,
+        );
+    };
+    if record.task_type != orca_core::task_types::TaskType::Subagent {
+        return tool_types::ToolResult::failed(
+            tool_request,
+            format!("task '{agent_id}' is not a subagent"),
+            None,
+        );
+    }
+    tool_types::ToolResult::completed(
+        tool_request,
+        serde_json::json!({
+            "agent_id": agent_id,
+            "status": record.status,
+            "description": record.description,
+            "agent_type": record.agent_type,
+            "created_at_ms": record.created_at_ms,
+            "started_at_ms": record.started_at_ms,
+            "completed_at_ms": record.completed_at_ms,
+            "output": record.result,
+            "error": record.error,
+        })
+        .to_string(),
+        false,
+    )
 }
 
 fn child_result_to_tui_tool_result(
@@ -2185,5 +2347,122 @@ mod tests {
         assert_eq!(results[0].1.status, tool_types::ToolStatus::Failed);
         assert!(!results[1].0);
         assert_eq!(results[1].1.status, tool_types::ToolStatus::Completed);
+    }
+
+    #[test]
+    fn tui_async_subagent_skips_sync_batch_path() {
+        let config = full_auto_config();
+        let request = tool_types::ToolRequest {
+            id: "subagent-async".to_string(),
+            name: tool_types::ToolName::Subagent,
+            action: orca_core::approval_types::ActionKind::Agent,
+            target: Some("async child".to_string()),
+            raw_arguments: Some(
+                serde_json::json!({
+                    "description": "async child",
+                    "prompt": "simple audit",
+                    "mode": "async"
+                })
+                .to_string(),
+            ),
+        };
+        let requests = vec![request, {
+            tool_types::ToolRequest {
+                id: "subagent-sync".to_string(),
+                name: tool_types::ToolName::Subagent,
+                action: orca_core::approval_types::ActionKind::Agent,
+                target: Some("sync child".to_string()),
+                raw_arguments: Some(
+                    serde_json::json!({
+                        "description": "sync child",
+                        "prompt": "simple audit"
+                    })
+                    .to_string(),
+                ),
+            }
+        }];
+
+        assert!(!should_run_subagent_batch(&config, &requests[0], 0));
+        assert_eq!(collect_subagent_batch(&config, &requests, 0), 0);
+        assert!(should_run_subagent_batch(&config, &requests[1], 0));
+        assert_eq!(collect_subagent_batch(&config, &requests, 1), 2);
+    }
+
+    #[test]
+    fn tui_async_subagent_launches_task_and_status_returns_result() {
+        let config = full_auto_config();
+        let (event_tx, _event_rx) = mpsc::channel();
+        let (_action_tx, action_rx) = mpsc::channel();
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let hooks = HookRunner::default();
+        let registry = TaskRegistry::new("session-async".to_string());
+        let request = tool_types::ToolRequest {
+            id: "subagent-async".to_string(),
+            name: tool_types::ToolName::Subagent,
+            action: orca_core::approval_types::ActionKind::Agent,
+            target: Some("async child".to_string()),
+            raw_arguments: Some(
+                serde_json::json!({
+                    "description": "async child",
+                    "prompt": "simple audit",
+                    "mode": "async"
+                })
+                .to_string(),
+            ),
+        };
+
+        let (result, _cost) = execute_subagent_for_tui(
+            &config,
+            config.cwd.as_deref().unwrap_or_else(|| Path::new(".")),
+            &request,
+            &event_tx,
+            &action_rx,
+            0,
+            &instructions,
+            &memory,
+            &hooks,
+            Some(&registry),
+        );
+
+        assert_eq!(result.status, tool_types::ToolStatus::Completed);
+        let launched: serde_json::Value =
+            serde_json::from_str(result.output.as_deref().expect("launch output")).unwrap();
+        assert_eq!(launched["status"], "async_launched");
+        let agent_id = launched["agent_id"].as_str().expect("agent id");
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            if registry
+                .get(agent_id)
+                .map(|record| record.status == orca_core::task_types::TaskStatus::Completed)
+                .unwrap_or(false)
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let status_request = tool_types::ToolRequest {
+            id: "subagent-status".to_string(),
+            name: tool_types::ToolName::SubagentStatus,
+            action: orca_core::approval_types::ActionKind::Read,
+            target: None,
+            raw_arguments: Some(serde_json::json!({ "agent_id": agent_id }).to_string()),
+        };
+        let status = execute_subagent_status_for_tui(&status_request, &registry);
+        assert_eq!(status.status, tool_types::ToolStatus::Completed);
+        let payload: serde_json::Value =
+            serde_json::from_str(status.output.as_deref().expect("status output")).unwrap();
+        assert_eq!(payload["status"], "completed");
+        assert!(payload["created_at_ms"].as_i64().unwrap() > 0);
+        assert!(payload["started_at_ms"].as_i64().unwrap() > 0);
+        assert!(payload["completed_at_ms"].as_i64().unwrap() > 0);
+        assert!(
+            payload["output"]
+                .as_str()
+                .unwrap()
+                .contains("Mock runtime completed")
+        );
     }
 }

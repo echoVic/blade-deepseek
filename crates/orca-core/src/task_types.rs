@@ -42,6 +42,11 @@ pub struct BackgroundTaskSummary {
     pub task_type: TaskType,
     pub status: TaskStatus,
     pub description: String,
+    pub created_at_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at_ms: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

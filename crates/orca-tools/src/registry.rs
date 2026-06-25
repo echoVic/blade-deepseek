@@ -549,6 +549,11 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
                         "type": "string",
                         "enum": ["auto", "deepseek-v4-flash", "deepseek-v4-pro"],
                         "description": "Optional model override for this child agent. auto uses Orca's router, flash is faster, pro is stronger for deep reasoning."
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["sync", "async"],
+                        "description": "sync blocks until completion. async launches the child in the background and returns an agent_id for subagent_status."
                     }
                 },
                 "required": ["description", "prompt"]
@@ -559,6 +564,27 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
             false,
         ),
         BuiltinExecutor::Subagent,
+    ));
+    registry.register(BuiltinTool::new(
+        builtin_spec(
+            "subagent_status",
+            "Query the status and result of an async subagent launched in this session.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "agent_id": {
+                        "type": "string",
+                        "description": "The agent_id returned by subagent with mode async"
+                    }
+                },
+                "required": ["agent_id"]
+            }),
+            CapabilitySet::new(vec![]),
+            ToolExposure::Direct,
+            RendererHint::Agent,
+            true,
+        ),
+        BuiltinExecutor::SubagentStatus,
     ));
     registry.register(BuiltinTool::new(
         builtin_spec(
@@ -879,6 +905,11 @@ impl Tool for BuiltinTool {
                 "subagent tool must be executed by the runtime",
                 None,
             ),
+            BuiltinExecutor::SubagentStatus => ToolResult::failed(
+                request,
+                "subagent_status tool must be executed by the runtime",
+                None,
+            ),
             BuiltinExecutor::Workflow => ToolResult::failed(
                 request,
                 "Workflow must be executed by the runtime controller",
@@ -910,6 +941,7 @@ enum BuiltinExecutor {
     GitStatus,
     WebSearch,
     Subagent,
+    SubagentStatus,
     Workflow,
     GetGoal,
     CreateGoal,

@@ -9,7 +9,7 @@
 
 ## Executive Summary
 
-Orca has a **production-grade workflow runtime** that supports concurrent agent fan-out (up to 16 agents in parallel, 1000 per run by default). The `subagent` tool (model-facing) supports **parallel batching up to 6** (via `SubagentConfig.max_parallel`), and the **workflow system** (`WorkflowRunner` + `WorkflowHost`) achieves true concurrency via `thread::scope().spawn()` for up to 16 concurrent agents. The system lacks Claude Code's async subagent mode, agent teams, worktree isolation, and agent-to-agent communication — but these are documented as planned enhancements. Full observability (phase tracking, agent status, token counting, elapsed time) is present for workflows but under-exposed in the TUI.
+Orca has a **production-grade workflow runtime** that supports concurrent agent fan-out (up to 16 agents in parallel, 1000 per run by default). The `subagent` tool (model-facing) supports **parallel batching up to 6** (via `SubagentConfig.max_parallel`) plus a **session-local async mode** (`mode: "async"` returning an `agent_id` for `subagent_status`). The **workflow system** (`WorkflowRunner` + `WorkflowHost`) achieves true concurrency via `thread::scope().spawn()` for up to 16 concurrent agents and now retries transient child-agent failures once by default. The system still lacks agent teams, worktree isolation, durable async subagent persistence, phase-level fallback policy controls, and agent-to-agent communication. Workflow observability includes phase tracking, agent status, retry attempt telemetry, and lifecycle timestamps; the TUI now exposes workflow and async subagent task rows, while token and failure-detail dashboards remain open.
 
 ---
 
@@ -48,12 +48,12 @@ All 8 agents were launched concurrently via `Promise.all()` in the `research` ph
 | Max concurrent workflow agents | **16** (default) | `orca-core/src/config/mod.rs:63` — `DEFAULT_MAX_WORKFLOW_CONCURRENT_AGENTS: usize = 16` |
 | Max agents per workflow run | **1000** (default) | `orca-core/src/config/mod.rs:64` — `DEFAULT_MAX_WORKFLOW_AGENTS_PER_RUN: u32 = 1000` |
 | Subagent types | 5: General, CodeReviewer, TestWriter, Debugger, Documenter + Custom | `orca-core/src/subagent_types.rs:14-23` — `SubagentType` enum |
-| Subagent lifecycle | Sync: spawn → execute_loop → return result; batch mode when contiguous | `agent_child.rs:93-108` — `run_child_agent()` is blocking; `controller.rs:1164-1176` — batch collection |
+| Subagent lifecycle | Sync: spawn → execute_loop → return result; async: create task → background thread → `subagent_status` query | `controller.rs` — async mode creates a `TaskType::Subagent` handle; `tasks.rs` stores status/result |
 | Workflow agent lifecycle | Async: Phase → Promise.all(agents) → collect results | `workflow/host.rs` — agent calls processed concurrently via stdin/stdout JSONL |
 
 **Key insight**: The `subagent` tool now supports **batch parallelism** (up to 6 concurrent) within a single turn via `SubagentConfig.max_parallel`. Workflow agents are processed concurrently via stdin/stdout JSONL.
 
-**Key insight**: The remaining gap is async non-blocking subagents. The model can batch parallel `subagent` calls, while the workflow system remains the higher-scale JavaScript DSL for larger fan-out.
+**Key insight**: The remaining async gap is durability and richer visibility, not basic launch/status. The model can launch session-local async `subagent` work and query it with `subagent_status`; the workflow system remains the higher-scale JavaScript DSL for larger fan-out.
 
 ### Agent B: MCP Tool Discovery and Execution
 
@@ -92,10 +92,10 @@ All 8 agents were launched concurrently via `Promise.all()` in the `research` ph
 |----------|--------|-----------------|
 | Slash commands | 10: /model, /compact, /cost, /config show, /history, /mode, /plan, /goal, /workflows, /remember | `commands/mod.rs:78-90` — `all_commands()` |
 | Workflow-specific commands | `/workflows` — shows workflow tasks | `commands/mod.rs:35` — `WorkflowList` variant |
-| Agent view / team dashboard | **Not implemented** | No dedicated agent monitoring UI in `app.rs` or `ui.rs` |
-| Running subagent inspection | **Not implemented** | TUI shows workflow list but not live agent status |
+| Agent view / team dashboard | **Partial** | `/workflows` now renders background task rows for workflows and async subagents; no dedicated team dashboard |
+| Running subagent inspection | **Partial+** | `subagent_status` can query async handles in the current session with lifecycle timestamps; `/workflows` shows async subagent rows and elapsed time |
 | Approval rendering | Enhanced dialogs with elapsed timers | `production-roadmap.md` — "clearer approval dialogs" |
-| Workflow progress indicator | Phase-level via state.json; not real-time in TUI | `workflow_types.rs` — `WorkflowPhaseRecord` has status but no TUI subscription |
+| Workflow progress indicator | **Partial live UI** | `/workflows` receives `WorkflowTasksUpdated` summaries with agent/phase counts and background task timestamps; full dashboard still missing |
 
 ### Agent E: History / Resume / Fork / Transcript Persistence
 
@@ -134,7 +134,7 @@ All 8 agents were launched concurrently via `Promise.all()` in the `research` ph
 
 | Question | Answer | Source Evidence |
 |----------|--------|-----------------|
-| Contract test files | 17 | `tests/` directory listing |
+| Contract test files | 16 | `tests/` directory listing |
 | Covered subsystems | agent_loop, subagent, workflow_host/tool/script/events/types/runtime/cli, history, approval, tools, exec_jsonl, verification, session_server, provider | `tests/` file names |
 | Parallel subagent tests | **Yes** — `workflow_host_contract.rs:test host_parallel_routes_out_of_order_agent_results_by_call_id` | Line ~70: tests `parallel([agent('slow'), agent('fast')])` with out-of-order completion |
 | Eval harness | **Not implemented** | No SWE-bench or Terminal-Bench integration |
@@ -151,7 +151,7 @@ All 8 agents were launched concurrently via `Promise.all()` in the `research` ph
 |----------|--------|-----------------|
 | Stated scope | DeepSeek-native coding agent, headless harness contract first | `.boss/orca-codex-harness/prd.md:1-6` |
 | Explicit non-goals | Full Blade TS features, Web UI, VSCode, complete MCP/skills/subagents (in v1) | `.boss/orca-codex-harness/prd.md:9` |
-| Documented subagent limits | Yes — `docs/subagent-enhancement-plan.md`: no async mode, no progress query, no model selection, no worktree isolation; batch parallelism is supported | `docs/subagent-enhancement-plan.md:20-25` |
+| Documented subagent limits | Partially stale — older plan docs still describe async/status as future work; current code now has session-local async launch/status, while worktree isolation remains open | `docs/subagent-enhancement-plan.md`, `controller.rs`, `tools/registry.rs` |
 | Harness contract | `docs/harness-contract.md` — JSONL event contract | `docs/harness-contract.md` |
 | Roadmap for concurrency | "Later: Worktree automation", "Later: Shell sessions/PTY" | `docs/production-roadmap.md` Priority Matrix |
 | Gaps vs Claude Code | Documented in `subagent-enhancement-plan.md` with `sdk-tools.d.ts` comparison | Section 1.2 in subagent plan |
@@ -171,7 +171,7 @@ All Phase 1 findings above were **cross-validated by the orchestrator** against 
 | `DEFAULT_MAX_WORKFLOW_AGENTS_PER_RUN = 1000` | ✅ Confirmed | `config/mod.rs:61` |
 | Workflow agents use `thread::scope().spawn()` | ✅ Confirmed | `workflow/host.rs:97-127` |
 | `WorkflowExecutionGate` with `max_concurrent_agents` check | ✅ Confirmed | `workflow/runner.rs:113-170` |
-| Subagent tool is synchronous (no async spawning) | ✅ Confirmed | `subagent.rs:1-38` — pure data struct |
+| Subagent tool supports sync and session-local async modes | ✅ Confirmed | `subagent.rs` parses `mode`; `controller.rs` and `bridge.rs` launch async background tasks |
 | 29 event types including workflow events | ✅ Confirmed | `event_schema.rs:20-96` |
 | MCP registry available to workflow children | ✅ Confirmed | `runner.rs` tests — `workflow_child_runtime_parts` |
 | 10 slash commands with `/workflows` | ✅ Confirmed | `commands/mod.rs:78-90` |
@@ -184,11 +184,12 @@ All Phase 1 findings above were **cross-validated by the orchestrator** against 
 
 | Capability | Status | Evidence | Priority |
 |-----------|--------|----------|----------|
-| **Agent View / Team Dashboard** | ❌ GAP | No TUI component for live agent monitoring; `/workflows` lists tasks only | P1 |
+| **Agent View / Team Dashboard** | ⚠️ PARTIAL | `/workflows` lists workflows and async subagents with task status/details; no dedicated team dashboard | P1 |
 | **Agent Teams** | ❌ GAP | No team_name or agent grouping concept in types | P2 |
 | **Dynamic Workflows** | ⚠️ PARTIAL | JS DSL supports `Promise.all()` fan-out but agent spawning is fixed at script load | P1 |
 | **Worktrees** | ❌ GAP | `.worktrees/` directory exists but no isolation mode in subagent/workflow | P1 |
-| **Observability: token/elapsed/agent count** | ⚠️ PARTIAL | `/workflows` now receives live agent/phase progress counts; token and elapsed detail are still not exposed as a full dashboard | P1 |
+| **Async model-facing subagents** | ⚠️ PARTIAL | `subagent` accepts `mode: "async"` and returns `agent_id`; `subagent_status` reads session-local task status/result plus lifecycle timestamps; no persistence across process/session exit | P0 done / durability open |
+| **Observability: token/elapsed/agent count** | ⚠️ PARTIAL | `/workflows` now receives live agent/phase progress counts and renders elapsed async subagent rows; token and failure details are still not exposed as a full dashboard | P1 |
 | **Agent Communication** | ❌ GAP | No message passing between agents; `WorkflowHost` routes calls one-way | P2 |
 | **Shared Task List** | ❌ GAP | No work queue; agents are stateless, results collected by `Promise.all()` | P2 |
 | **Reusable Workflow Scripts** | ✅ PRESENT | `.orca/workflows/*.js` + `~/.orca/workflows/*.js` + named workflow resolution | ✓ |
@@ -196,10 +197,10 @@ All Phase 1 findings above were **cross-validated by the orchestrator** against 
 | **Fan-out to 8+ agents** | ✅ PRESENT | Default 16 concurrent, 1000 per run. Confirmed in this audit: 8 agents launched concurrently | ✓ |
 | **Agent Budget/Token Tracking** | ⚠️ PARTIAL | `CostTracker` exists per child agent; not surfaced to user or TUI | P2 |
 | **Resume/Fork Workflows** | ⚠️ PARTIAL | `resumeFromRunId` in `WorkflowInput` exists; state persistence supports it; not tested for complex workflows | P2 |
-| **Error Recovery** | ⚠️ PARTIAL | Agent failures caught (`WorkflowAgentFailed` event); no retry or fallback logic | P1 |
+| **Error Recovery** | ⚠️ PARTIAL | Child-agent failures are retried once by default (`max_agent_retries` configurable up to 5), with attempt/max-attempt/previous-error telemetry persisted in agent records; phase-level fallback policy is still missing | P1 |
 | **Structured Agent Output** | ⚠️ PARTIAL | Workflow agents return `Value` (JSON); subagent tool returns text; no schema validation | P2 |
 
-**Overall gap**: Orca's **workflow system** is architecturally capable of concurrent agent fan-out (confirmed 8+ agents) with observability (phase tracking, agent statuses, timestamps). The first TUI exposure now shows live agent/phase counts in `/workflows`; the remaining gaps are a richer agent dashboard, async model-facing subagents, depth > 1, worktree isolation, and team coordination.
+**Overall gap**: Orca's **workflow system** is architecturally capable of concurrent agent fan-out (confirmed 8+ agents) with observability (phase tracking, agent statuses, retry attempts, lifecycle timestamps, and bounded child-agent retry). The first TUI exposure now shows live agent/phase counts and async subagent task rows in `/workflows`, while model-facing subagents have a session-local async/status path. The remaining gaps are durable async persistence, richer agent dashboard, worktree isolation, phase-level fallback policy, and team coordination.
 
 ### Reviewer 3: Actionability of Next Steps
 
@@ -207,12 +208,12 @@ All recommended next steps are **implementable within current architecture**:
 
 | Step | Effort | Key files | Blocker? |
 |------|--------|-----------|----------|
-| P0: Async subagent mode | 3-5 days | `agent_child.rs`, `subagent.rs`, `controller.rs` | No — `thread::spawn` already used in workflow host |
-| P0: Subagent status query tool | 1-2 days | `tools/` new tool, `subagent.rs` | No — `WorkflowAgentStatus` enum exists |
+| P0: Async subagent mode | ✅ Implemented (session-local) | `subagent.rs`, `controller.rs`, `bridge.rs`, `tasks.rs` | Remaining: persistence/durable process lifetime |
+| P0: Subagent status query tool | ✅ Implemented (session-local) | `tools/registry.rs`, `controller.rs`, `bridge.rs`, `tasks.rs` | Remaining: durable persistence and token/failure-detail telemetry |
 | P1: Subagent depth > 1 | 2-3 days | `agent_child.rs`, `controller.rs` | No — depth field exists, just needs recursion guard |
 | P1: TUI agent dashboard | 3-5 days | `tui/app.rs`, `tui/ui.rs` | No — `WorkflowRunState` data available |
 | P1: Worktree isolation | 3-5 days | `sandbox/`, git worktree commands | `.worktrees/` dir exists |
-| P1: Agent error retry | 1-2 days | `workflow/runner.rs` | No — `WorkflowAgentFailed` event exists |
+| P1: Agent error retry | ✅ Implemented (bounded child-agent retry + telemetry) | `workflow/runner.rs`, `workflow/state.rs`, `config/mod.rs` | Remaining: phase-level fallback policy |
 | P2: Agent communication | 5-7 days | `workflow/host.rs`, new message channel | Moderate — requires new IPC |
 | P2: Shared task list | 3-5 days | New `tasks.rs` module, workflow JS API | Moderate — stateful agent coordination |
 
@@ -225,17 +226,17 @@ All recommended next steps are **implementable within current architecture**:
 | Capability | Orca Status | Implementation Details |
 |-----------|-------------|----------------------|
 | 8+ agent fan-out | ✅ Yes | 16 concurrent default, 1000/run max. Confirmed: 8 launched this audit |
-| Workflow progress observability | ✅ Yes (data) / ⚠️ Partial (UI) | `/workflows` shows live agent/phase counts; full dashboard still missing |
+| Workflow progress observability | ✅ Yes (data) / ⚠️ Partial (UI) | `/workflows` shows live agent/phase counts and async subagent rows; full dashboard still missing |
 | Agent count tracking | ✅ Yes | `WorkflowTaskProgress` exposes total/running/completed/failed agents to TUI task summaries |
 | Token usage tracking | ✅ Yes (internal) | `CostTracker` per child agent; not user-facing |
 | Elapsed time tracking | ✅ Yes | `WorkflowWorkerRecord.started_at_ms/completed_at_ms` |
 | Reusable workflow scripts | ✅ Yes | Named workflows, `.orca/workflows/*.js` |
 | Agent-to-agent communication | ❌ No | One-way: host → agent → result |
 | Shared task list | ❌ No | Agents are independent, stateless |
-| Agent view / team dashboard | ⚠️ Partial | `/workflows` lists tasks with agent/phase progress; no dedicated dashboard or team view |
+| Agent view / team dashboard | ⚠️ Partial | `/workflows` lists workflow and async subagent tasks with status/details; no dedicated dashboard or team view |
 | Dynamic agent spawning | ⚠️ Partial | Fixed at script load; no conditional spawn |
 | Worktree isolation | ❌ No | `.worktrees/` dir exists, isolation not wired |
-| Async subagent (model tool) | ⚠️ Partial | Parallel batching up to 6 exists (`SubagentConfig.max_parallel`); async (non-blocking) mode still missing |
+| Async subagent (model tool) | ⚠️ Partial | `mode: "async"` launches background subagent and returns `agent_id`; `subagent_status` queries session-local result plus lifecycle timestamps; not durable across process/session exit |
 | Workflow resume/fork | ⚠️ Partial | `resumeFromRunId` exists, not stress-tested |
 | Structured typed output | ⚠️ Partial | JSON `Value` return; no schema validation |
 
@@ -247,6 +248,8 @@ All recommended next steps are **implementable within current architecture**:
 |-----------|------|
 | Subagent tool types | `crates/orca-runtime/src/subagent.rs` |
 | Child agent runtime | `crates/orca-runtime/src/agent_child.rs` |
+| Background task registry | `crates/orca-runtime/src/tasks.rs` |
+| Tool registry / schemas | `crates/orca-tools/src/registry.rs` |
 | Workflow runner | `crates/orca-runtime/src/workflow/runner.rs` |
 | Workflow host (Node.js bridge) | `crates/orca-runtime/src/workflow/host.rs` |
 | Workflow state store | `crates/orca-runtime/src/workflow/state.rs` |
@@ -262,7 +265,7 @@ All recommended next steps are **implementable within current architecture**:
 | History/transcripts | `crates/orca-runtime/src/history.rs` |
 | MCP client | `crates/orca-mcp/src/client.rs` |
 | CLI entry | `src/cli.rs` |
-| Contract tests | `tests/*.rs` (17 files) |
+| Contract tests | `tests/*.rs` (16 files) |
 | Workflow scripts | `.orca/workflows/*.js` |
 | Subagent enhancement plan | `docs/subagent-enhancement-plan.md` |
 | Production roadmap | `docs/production-roadmap.md` |
@@ -274,15 +277,15 @@ All recommended next steps are **implementable within current architecture**:
 
 ### P0 — Production blockers
 
-1. **Async subagent execution** (`subagent` tool): Allow model to launch non-blocking subagents with `agent_id` return. Already defined in `subagent-enhancement-plan.md` §2.1. Files: `agent_child.rs`, `subagent.rs`, new `tools/subagent_status.rs`.
+1. **Durable async subagent handles**: Persist async subagent records beyond the current in-memory `TaskRegistry`, and define what happens when `orca exec` exits while a background subagent is still running. Files: `tasks.rs`, `history.rs`, `controller.rs`.
 
-2. **Subagent status/progress visibility**: Workflow task progress is now exposed in `/workflows`; individual model-facing async subagent handles/status remain to be implemented. Files: `agent_child.rs`, `subagent.rs`, new `tools/subagent_status.rs`.
+2. **Subagent status/progress visibility**: Baseline visibility is now implemented. `subagent_status` returns session-local status/result/error plus lifecycle timestamps, and `/workflows` renders async subagent task rows with status, agent type, and elapsed time. Remaining work: token usage, failure detail rows, and durable cross-session persistence. Files: `tasks.rs`, `bridge.rs`, `ui.rs`.
 
-3. **Workflow error retry**: When an agent fails, allow phase-level retry. Files: `workflow/runner.rs`, `workflow/host.rs`.
+3. **Workflow retry policy UX**: Child-agent retry telemetry now persists `attempt`, `maxAttempts`, and `previousErrors` in workflow agent records, and task progress accounts for failed retry attempts instead of leaving phantom running agents. Remaining work: optional phase-level fallback policy and richer UI surfacing. Files: `workflow/runner.rs`, `workflow/state.rs`, `workflow/host.rs`, `ui.rs`.
 
 ### P1 — Important enhancements
 
-4. **TUI agent dashboard**: Extend the current `/workflows` agent/phase counts into a dedicated live dashboard with per-agent rows, elapsed time, token usage, and failure details. Files: `tui/app.rs`, `tui/ui.rs`, new `tui/agent_panel.rs`.
+4. **TUI agent dashboard**: Extend the current `/workflows` workflow/subagent task list into a dedicated live dashboard with per-agent rows, token usage, retry/failure details, and team grouping. Files: `tui/app.rs`, `tui/ui.rs`, new `tui/agent_panel.rs`.
 
 5. **Worktree isolation**: Isolate subagent file writes in git worktree with auto-cleanup. Files: `sandbox/mod.rs`, `agent_child.rs`.
 
@@ -304,9 +307,13 @@ All recommended next steps are **implementable within current architecture**:
 
 - ✅ All claims reference specific file:line sources
 - ✅ Report format follows requested structure
-- ✅ Git status inspected: 2 pre-existing dirty files, none from this audit
+- ✅ Git status inspected and current async/status implementation changes are covered by tests
 - ✅ Phase 1 workflow completed: all 8 agents returned source-verified results
 - ✅ Phase 2 reviewer scripts prepared (`.orca/workflows/audit-phase2.js`)
 - ✅ Workflow task summaries now carry live progress data into the TUI; docs and tests reflect the updated capability
-- ✅ Subagent docs now reflect batch parallel execution; async non-blocking mode is still not implemented
-- ✅ `/workflows` now receives live workflow progress summaries with total/running/completed/failed agent counts and phase counts
+- ✅ Subagent docs now reflect batch parallel execution; model-facing async launch/status is implemented as session-local background work
+- ✅ `/workflows` now receives live workflow progress summaries with total/running/completed/failed agent counts, phase counts, and background task lifecycle timestamps
+- ✅ `/workflows` now renders async subagent task rows with status, agent type, and elapsed time
+- ✅ Async subagent regression coverage now verifies `mode: "async"` bypasses sync batching, returns an `agent_id`, and exposes timestamped `subagent_status`
+- ✅ Workflow child-agent failures now get bounded retry coverage via `max_agent_retries`
+- ✅ Workflow retry telemetry now persists attempt/max-attempt/previous-error data and keeps retry task progress consistent

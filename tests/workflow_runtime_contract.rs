@@ -242,6 +242,66 @@ fn workflow_runner_marks_task_and_run_failed_on_child_agent_error() {
 }
 
 #[test]
+fn workflow_runner_retries_transient_child_agent_failure() {
+    if !orca_runtime::workflow::host::WorkflowHost::node_available() {
+        return;
+    }
+
+    let temp = tempdir().unwrap();
+    let flaky_prompt = format!("mock_flaky_once {}", uuid::Uuid::new_v4());
+    let script = temp.path().join("workflow.js");
+    fs::write(
+        &script,
+        format!(
+            "export const meta = {{ name: 'child-retry', description: 'Child retry test', phases: [] }};\nconst result = await agent({});\nexport default result.result;",
+            serde_json::to_string(&flaky_prompt).unwrap()
+        ),
+    )
+    .unwrap();
+
+    let config = mock_run_config(temp.path());
+    let tasks = TaskRegistry::new("session-1".to_string());
+    let session_dir = temp.path().join("session");
+    let runner = WorkflowRunner::new(config, tasks.clone(), session_dir.clone());
+
+    let launched = runner
+        .launch(WorkflowLaunchRequest::from_script_path(
+            script.display().to_string(),
+        ))
+        .unwrap();
+
+    assert!(launched.summary.contains("Mock runtime completed"));
+
+    let record = tasks.get(&launched.task_id).expect("task record");
+    assert_eq!(record.status, TaskStatus::Completed);
+    let progress = record.workflow_progress.expect("workflow progress");
+    assert_eq!(progress.total_agents, 2);
+    assert_eq!(progress.running_agents, 0);
+    assert_eq!(progress.completed_agents, 1);
+    assert_eq!(progress.failed_agents, 1);
+
+    let run_id = record.workflow_run_id.as_deref().expect("run id");
+    let store = WorkflowStateStore::new(session_dir.join("workflow-runs"));
+    let state = store.load_run(run_id).expect("run state");
+    assert_eq!(state.status, WorkflowRunStatus::Completed);
+    assert_eq!(state.total_agent_count, 2);
+    assert!(
+        store
+            .cached_agent_result(run_id, "root:1", &input_hash(&flaky_prompt, &json!({})))
+            .unwrap()
+            .is_some()
+    );
+    let cache_path = store.run_dir(run_id).join("agent-cache.json");
+    let cache_json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(cache_path).unwrap()).unwrap();
+    let cache_key = format!("root:1:{}", input_hash(&flaky_prompt, &json!({})));
+    let record = &cache_json[cache_key];
+    assert_eq!(record["attempt"], 2);
+    assert_eq!(record["maxAttempts"], 2);
+    assert_eq!(record["previousErrors"].as_array().unwrap().len(), 1);
+}
+
+#[test]
 fn parallel_preserves_order_and_records_phase() {
     if !orca_runtime::workflow::host::WorkflowHost::node_available() {
         return;

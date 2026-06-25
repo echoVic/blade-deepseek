@@ -25,6 +25,12 @@ pub struct WorkflowAgentRecord {
     pub opts: Value,
     pub input_hash: String,
     pub status: WorkflowAgentStatus,
+    #[serde(default = "default_agent_attempt")]
+    pub attempt: u32,
+    #[serde(default = "default_agent_attempt")]
+    pub max_attempts: u32,
+    #[serde(default)]
+    pub previous_errors: Vec<String>,
     #[serde(default, deserialize_with = "deserialize_optional_agent_output")]
     pub output: Option<Value>,
     pub error: Option<String>,
@@ -56,6 +62,12 @@ struct WorkflowAgentRecordOnDisk {
     opts: Value,
     input_hash: String,
     status: WorkflowAgentStatus,
+    #[serde(default = "default_agent_attempt")]
+    attempt: u32,
+    #[serde(default = "default_agent_attempt")]
+    max_attempts: u32,
+    #[serde(default)]
+    previous_errors: Vec<String>,
     #[serde(default, deserialize_with = "deserialize_agent_output_field")]
     output: AgentOutputField,
     error: Option<String>,
@@ -71,6 +83,9 @@ struct WorkflowAgentRecordOnDiskWritable {
     opts: Value,
     input_hash: String,
     status: WorkflowAgentStatus,
+    attempt: u32,
+    max_attempts: u32,
+    previous_errors: Vec<String>,
     #[serde(flatten)]
     output: AgentOutputField,
     error: Option<String>,
@@ -317,8 +332,13 @@ impl WorkflowStateStore {
         let mut counts = WorkflowAgentStatusCounts::default();
         for entry in cache.values() {
             match entry.record.status {
-                WorkflowAgentStatus::Completed => counts.completed += 1,
-                WorkflowAgentStatus::Failed => counts.failed += 1,
+                WorkflowAgentStatus::Completed => {
+                    counts.completed += 1;
+                    counts.failed += entry.record.previous_errors.len() as u32;
+                }
+                WorkflowAgentStatus::Failed => {
+                    counts.failed += entry.record.previous_errors.len() as u32 + 1;
+                }
                 WorkflowAgentStatus::Cancelled => counts.cancelled += 1,
                 WorkflowAgentStatus::Cached => counts.cached += 1,
                 WorkflowAgentStatus::Pending | WorkflowAgentStatus::Running => {}
@@ -333,6 +353,10 @@ fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis() as i64)
         .unwrap_or(0)
+}
+
+fn default_agent_attempt() -> u32 {
+    1
 }
 
 pub trait IntoWorkflowAgentRecord {
@@ -354,6 +378,9 @@ impl IntoWorkflowAgentRecord for WorkflowAgentCacheRecord {
             opts: Value::Null,
             input_hash: self.input_hash,
             status: WorkflowAgentStatus::Completed,
+            attempt: 1,
+            max_attempts: 1,
+            previous_errors: Vec::new(),
             output: Some(self.output),
             error: None,
             transcript_path: None,
@@ -442,6 +469,9 @@ fn read_agent_cache(path: &Path) -> io::Result<HashMap<String, CachedWorkflowAge
                             opts: record.opts,
                             input_hash: record.input_hash,
                             status: record.status,
+                            attempt: record.attempt,
+                            max_attempts: record.max_attempts,
+                            previous_errors: record.previous_errors,
                             output: record.output.value,
                             error: record.error,
                             transcript_path: record.transcript_path,
@@ -482,6 +512,9 @@ fn write_agent_cache(
                     opts: entry.record.opts.clone(),
                     input_hash: entry.record.input_hash.clone(),
                     status: entry.record.status,
+                    attempt: entry.record.attempt,
+                    max_attempts: entry.record.max_attempts,
+                    previous_errors: entry.record.previous_errors.clone(),
                     output: AgentOutputField {
                         present: entry.output_present,
                         value: entry.record.output.clone(),
@@ -501,7 +534,19 @@ fn write_json_pretty<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
     }
     let content = serde_json::to_string_pretty(value)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    fs::write(path, content)
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("state");
+    let temp_path = path.with_file_name(format!(
+        ".{file_name}.tmp-{}-{}",
+        std::process::id(),
+        now_ms()
+    ));
+    fs::write(&temp_path, content)?;
+    fs::rename(&temp_path, path).inspect_err(|_| {
+        let _ = fs::remove_file(&temp_path);
+    })
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> io::Result<T> {

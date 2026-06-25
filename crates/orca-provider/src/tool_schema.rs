@@ -144,6 +144,26 @@ mod tests {
     }
 
     #[test]
+    fn base_schema_exposes_async_subagent_and_status_tool() {
+        let registry = orca_tools::registry::default_tool_registry();
+        let tools = deepseek_tools_schema_from_registry(registry);
+        let subagent = tools
+            .iter()
+            .find(|tool| tool["function"]["name"] == "subagent")
+            .expect("subagent schema");
+        let names = tools
+            .iter()
+            .filter_map(|tool| tool["function"]["name"].as_str())
+            .collect::<Vec<_>>();
+
+        assert!(names.contains(&"subagent_status"));
+        assert_eq!(
+            subagent["function"]["parameters"]["properties"]["mode"]["enum"],
+            serde_json::json!(["sync", "async"])
+        );
+    }
+
+    #[test]
     fn goal_schema_exposes_goal_tools() {
         let registry = orca_tools::registry::default_tool_registry();
         let tools = deepseek_goal_tools_schema_from_registry(registry);

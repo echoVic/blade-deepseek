@@ -174,6 +174,35 @@ fn mock_call(conversation: &Conversation) -> ProviderResponse {
         };
     }
 
+    if let Some(key) = prompt.trim().strip_prefix("mock_flaky_once ") {
+        static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+            std::sync::OnceLock::new();
+        let seen = SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+        let should_fail = seen
+            .lock()
+            .map(|mut keys| keys.insert(key.to_string()))
+            .unwrap_or(false);
+        if should_fail {
+            return ProviderResponse {
+                steps: vec![ProviderStep::Error(format!(
+                    "mock transient failure requested for {key}"
+                ))],
+                assistant_content: None,
+                assistant_reasoning: None,
+                tool_calls: Vec::new(),
+                usage: None,
+            };
+        }
+        let message = format!("Mock runtime completed after transient failure for {key}.");
+        return ProviderResponse {
+            steps: vec![ProviderStep::MessageDelta(message.clone())],
+            assistant_content: Some(message),
+            assistant_reasoning: None,
+            tool_calls: Vec::new(),
+            usage: None,
+        };
+    }
+
     if prompt.trim() == "mock_usage" {
         let reasoning = "Mock runtime is preserving the DeepSeek reasoning channel.";
         let message = "Mock runtime completed with usage accounting.";
@@ -301,24 +330,29 @@ fn parse_mock_prompt(prompt: &str) -> Option<ToolRequest> {
     }
 
     if let Some(rest) = prompt.strip_prefix("subagent ") {
-        let description = rest.trim();
+        let (mode, description) = if let Some(description) = rest.trim().strip_prefix("async ") {
+            (Some("async"), description.trim())
+        } else {
+            (None, rest.trim())
+        };
         let prompt = if description == "mock_fail" {
             "mock_fail".to_string()
         } else {
             description.to_string()
         };
+        let mut arguments = serde_json::json!({
+            "description": description,
+            "prompt": prompt
+        });
+        if let Some(mode) = mode {
+            arguments["mode"] = serde_json::Value::String(mode.to_string());
+        }
         return Some(ToolRequest {
             id: "mock-tool-1".to_string(),
             name: ToolName::Subagent,
             action: ActionKind::Read,
             target: Some(description.to_string()),
-            raw_arguments: Some(
-                serde_json::json!({
-                    "description": description,
-                    "prompt": prompt
-                })
-                .to_string(),
-            ),
+            raw_arguments: Some(arguments.to_string()),
         });
     }
 
@@ -484,5 +518,45 @@ fn valid_mock_plan_request(explanation: Option<&str>) -> ToolRequest {
         action: ActionKind::Read,
         target: Some("3 items".to_string()),
         raw_arguments: Some(arguments),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mock_prompt_parses_async_subagent_mode() {
+        let request = parse_mock_prompt("subagent async inspect repo").expect("tool request");
+        assert_eq!(request.name, ToolName::Subagent);
+        assert_eq!(request.target.as_deref(), Some("inspect repo"));
+
+        let arguments: serde_json::Value =
+            serde_json::from_str(request.raw_arguments.as_deref().unwrap()).unwrap();
+        assert_eq!(arguments["description"], "inspect repo");
+        assert_eq!(arguments["prompt"], "inspect repo");
+        assert_eq!(arguments["mode"], "async");
+    }
+
+    #[test]
+    fn mock_flaky_once_fails_once_then_succeeds() {
+        let mut conversation = Conversation::new();
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        conversation.add_user(format!("mock_flaky_once {unique}"));
+
+        let first = mock_call(&conversation);
+        assert!(matches!(first.steps.first(), Some(ProviderStep::Error(_))));
+
+        let second = mock_call(&conversation);
+        assert!(
+            second
+                .assistant_content
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Mock runtime completed after transient failure")
+        );
     }
 }

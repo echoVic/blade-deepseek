@@ -9,7 +9,7 @@ use crate::approval_rules::PermissionRules;
 use crate::approval_types::ApprovalMode;
 use crate::config::{
     DEFAULT_MAX_WORKFLOW_AGENTS_PER_RUN, DEFAULT_MAX_WORKFLOW_CONCURRENT_AGENTS,
-    ModelRuntimeConfig, ThemeName, ToolConfig, WorkflowConfig,
+    MAX_WORKFLOW_AGENT_RETRIES, ModelRuntimeConfig, ThemeName, ToolConfig, WorkflowConfig,
 };
 use crate::subagent_config::SubagentConfig;
 
@@ -162,6 +162,8 @@ pub struct WorkflowFileConfig {
     #[serde(default)]
     pub max_agents_per_run: Option<u32>,
     #[serde(default)]
+    pub max_agent_retries: Option<u32>,
+    #[serde(default)]
     #[serde(alias = "workflowKeywordTriggerEnabled")]
     pub workflow_keyword_trigger_enabled: Option<bool>,
 }
@@ -185,6 +187,9 @@ impl WorkflowFileConfig {
         }
         if let Some(max_agents_per_run) = self.max_agents_per_run {
             config.max_agents_per_run = max_agents_per_run.min(DEFAULT_MAX_WORKFLOW_AGENTS_PER_RUN);
+        }
+        if let Some(max_agent_retries) = self.max_agent_retries {
+            config.max_agent_retries = max_agent_retries.min(MAX_WORKFLOW_AGENT_RETRIES);
         }
         if let Some(keyword_trigger_enabled) = self.workflow_keyword_trigger_enabled {
             config.keyword_trigger_enabled = keyword_trigger_enabled;
@@ -553,6 +558,7 @@ auto_compact_token_limit = 96000
 enabled = false
 max_concurrent_agents = 7
 max_agents_per_run = 99
+max_agent_retries = 1
 workflowKeywordTriggerEnabled = false
 "#;
         let config: FileConfig = toml::from_str(toml).unwrap();
@@ -560,6 +566,7 @@ workflowKeywordTriggerEnabled = false
         assert!(!workflows.enabled);
         assert_eq!(workflows.max_concurrent_agents, 7);
         assert_eq!(workflows.max_agents_per_run, 99);
+        assert_eq!(workflows.max_agent_retries, 1);
         assert!(!workflows.keyword_trigger_enabled);
     }
 
@@ -641,11 +648,13 @@ workflowKeywordTriggerEnabled = true
 [workflows]
 max_concurrent_agents = 128
 max_agents_per_run = 12000
+max_agent_retries = 99
 "#;
         let config: FileConfig = toml::from_str(toml).unwrap();
         let workflows = config.workflows.resolved();
         assert_eq!(workflows.max_concurrent_agents, 16);
         assert_eq!(workflows.max_agents_per_run, 1_000);
+        assert_eq!(workflows.max_agent_retries, 5);
     }
 
     #[test]

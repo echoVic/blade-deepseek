@@ -62,6 +62,8 @@ pub enum HistoryMode {
 pub const DEFAULT_MAX_READ_PARALLEL_TOOLS: usize = 8;
 pub const DEFAULT_MAX_WORKFLOW_CONCURRENT_AGENTS: usize = 16;
 pub const DEFAULT_MAX_WORKFLOW_AGENTS_PER_RUN: u32 = 1000;
+pub const DEFAULT_MAX_WORKFLOW_AGENT_RETRIES: u32 = 1;
+pub const MAX_WORKFLOW_AGENT_RETRIES: u32 = 5;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ModelRuntimeConfig {
@@ -123,6 +125,8 @@ pub struct WorkflowConfig {
     pub max_concurrent_agents: usize,
     #[serde(default = "default_max_workflow_agents_per_run")]
     pub max_agents_per_run: u32,
+    #[serde(default = "default_max_workflow_agent_retries")]
+    pub max_agent_retries: u32,
     #[serde(default = "default_workflow_keyword_trigger_enabled")]
     pub keyword_trigger_enabled: bool,
 }
@@ -133,6 +137,7 @@ impl Default for WorkflowConfig {
             enabled: true,
             max_concurrent_agents: DEFAULT_MAX_WORKFLOW_CONCURRENT_AGENTS,
             max_agents_per_run: DEFAULT_MAX_WORKFLOW_AGENTS_PER_RUN,
+            max_agent_retries: DEFAULT_MAX_WORKFLOW_AGENT_RETRIES,
             keyword_trigger_enabled: true,
         }
     }
@@ -148,6 +153,10 @@ fn default_max_workflow_concurrent_agents() -> usize {
 
 fn default_max_workflow_agents_per_run() -> u32 {
     DEFAULT_MAX_WORKFLOW_AGENTS_PER_RUN
+}
+
+fn default_max_workflow_agent_retries() -> u32 {
+    DEFAULT_MAX_WORKFLOW_AGENT_RETRIES
 }
 
 fn default_workflow_keyword_trigger_enabled() -> bool {

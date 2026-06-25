@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use orca_core::cancel::CancelToken;
 use orca_core::task_types::{BackgroundTaskSummary, TaskStatus, TaskType, WorkflowTaskProgress};
@@ -24,7 +25,11 @@ pub struct TaskRecord {
     pub task_type: TaskType,
     pub status: TaskStatus,
     pub description: String,
+    pub created_at_ms: i64,
+    pub started_at_ms: Option<i64>,
+    pub completed_at_ms: Option<i64>,
     pub name: Option<String>,
+    pub agent_type: Option<String>,
     pub workflow_run_id: Option<String>,
     pub phase_count: Option<usize>,
     pub workflow_progress: Option<WorkflowTaskProgress>,
@@ -59,6 +64,7 @@ impl TaskRegistry {
         phase_count: usize,
     ) -> TaskHandle {
         let id = new_task_id();
+        let created_at_ms = now_ms();
         let control = TaskControl {
             cancel: CancelToken::new(),
             pause: Arc::new(AtomicBool::new(false)),
@@ -68,7 +74,11 @@ impl TaskRegistry {
             task_type: TaskType::Workflow,
             status: TaskStatus::Queued,
             description,
+            created_at_ms,
+            started_at_ms: None,
+            completed_at_ms: None,
             name: Some(name),
+            agent_type: None,
             workflow_run_id: Some(workflow_run_id.clone()),
             phase_count: Some(phase_count),
             workflow_progress: None,
@@ -89,6 +99,43 @@ impl TaskRegistry {
         }
     }
 
+    pub fn create_subagent(&self, description: String, agent_type: Option<String>) -> TaskHandle {
+        let id = new_task_id();
+        let created_at_ms = now_ms();
+        let control = TaskControl {
+            cancel: CancelToken::new(),
+            pause: Arc::new(AtomicBool::new(false)),
+        };
+        let record = TaskRecord {
+            id: id.clone(),
+            task_type: TaskType::Subagent,
+            status: TaskStatus::Queued,
+            description,
+            created_at_ms,
+            started_at_ms: None,
+            completed_at_ms: None,
+            name: None,
+            agent_type,
+            workflow_run_id: None,
+            phase_count: None,
+            workflow_progress: None,
+            result: None,
+            error: None,
+            control,
+        };
+
+        self.with_tasks(|tasks| {
+            tasks.insert(id.clone(), record);
+        })
+        .expect("task registry lock poisoned");
+
+        TaskHandle {
+            id,
+            task_type: TaskType::Subagent,
+            workflow_run_id: None,
+        }
+    }
+
     pub fn list(&self) -> Vec<BackgroundTaskSummary> {
         let mut summaries = self
             .with_tasks(|tasks| {
@@ -99,8 +146,11 @@ impl TaskRegistry {
                         task_type: record.task_type,
                         status: record.status,
                         description: record.description.clone(),
+                        created_at_ms: record.created_at_ms,
+                        started_at_ms: record.started_at_ms,
+                        completed_at_ms: record.completed_at_ms,
                         command: None,
-                        agent_type: None,
+                        agent_type: record.agent_type.clone(),
                         server: None,
                         tool: None,
                         name: record.name.clone(),
@@ -138,6 +188,10 @@ impl TaskRegistry {
             }
 
             record.status = TaskStatus::Running;
+            if record.started_at_ms.is_none() {
+                record.started_at_ms = Some(now_ms());
+            }
+            record.completed_at_ms = None;
             record.control.pause.store(false, Ordering::Release);
             Ok(())
         })
@@ -146,6 +200,10 @@ impl TaskRegistry {
     pub fn complete(&self, id: &str, result: String) -> Result<(), String> {
         self.update_task(id, |record| {
             record.status = TaskStatus::Completed;
+            if record.started_at_ms.is_none() {
+                record.started_at_ms = Some(now_ms());
+            }
+            record.completed_at_ms = Some(now_ms());
             record.result = Some(result);
             record.error = None;
             record.control.pause.store(false, Ordering::Release);
@@ -156,6 +214,10 @@ impl TaskRegistry {
     pub fn fail(&self, id: &str, error: String) -> Result<(), String> {
         self.update_task(id, |record| {
             record.status = TaskStatus::Failed;
+            if record.started_at_ms.is_none() {
+                record.started_at_ms = Some(now_ms());
+            }
+            record.completed_at_ms = Some(now_ms());
             record.error = Some(error);
             record.result = None;
             record.control.pause.store(false, Ordering::Release);
@@ -166,6 +228,10 @@ impl TaskRegistry {
     pub fn stop(&self, id: &str, summary: String) -> Result<(), String> {
         self.update_task(id, |record| {
             record.status = TaskStatus::Stopped;
+            if record.started_at_ms.is_none() {
+                record.started_at_ms = Some(now_ms());
+            }
+            record.completed_at_ms = Some(now_ms());
             record.result = Some(summary);
             record.error = None;
             record.control.pause.store(false, Ordering::Release);
@@ -180,6 +246,9 @@ impl TaskRegistry {
             }
 
             record.status = TaskStatus::Stopping;
+            if record.started_at_ms.is_none() {
+                record.started_at_ms = Some(now_ms());
+            }
             record.control.cancel.cancel();
             Ok(())
         })
@@ -192,6 +261,9 @@ impl TaskRegistry {
             }
 
             record.status = TaskStatus::Paused;
+            if record.started_at_ms.is_none() {
+                record.started_at_ms = Some(now_ms());
+            }
             record.control.pause.store(true, Ordering::Release);
             Ok(())
         })
@@ -204,6 +276,10 @@ impl TaskRegistry {
             }
 
             record.status = TaskStatus::Running;
+            if record.started_at_ms.is_none() {
+                record.started_at_ms = Some(now_ms());
+            }
+            record.completed_at_ms = None;
             record.control.pause.store(false, Ordering::Release);
             Ok(())
         })
@@ -233,6 +309,13 @@ impl TaskRegistry {
 
 fn new_task_id() -> String {
     format!("task-{}", uuid::Uuid::new_v4())
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 fn is_terminal(status: TaskStatus) -> bool {
@@ -270,6 +353,45 @@ mod tests {
         assert_eq!(list[0].name.as_deref(), Some("audit"));
         assert_eq!(list[0].workflow_run_id.as_deref(), Some("workflow-run-1"));
         assert_eq!(list[0].phase_count, Some(2));
+    }
+
+    #[test]
+    fn registry_creates_and_lists_subagent_tasks() {
+        let registry = TaskRegistry::new("session-1".to_string());
+        let task =
+            registry.create_subagent("inspect auth".to_string(), Some("general".to_string()));
+
+        assert!(task.id.starts_with("task-"));
+        assert_eq!(task.task_type, TaskType::Subagent);
+
+        let list = registry.list();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].task_type, TaskType::Subagent);
+        assert_eq!(list[0].status, TaskStatus::Queued);
+        assert_eq!(list[0].description, "inspect auth");
+        assert_eq!(list[0].agent_type.as_deref(), Some("general"));
+        assert!(list[0].created_at_ms > 0);
+        assert_eq!(list[0].started_at_ms, None);
+        assert_eq!(list[0].completed_at_ms, None);
+    }
+
+    #[test]
+    fn registry_tracks_task_lifecycle_timestamps() {
+        let registry = TaskRegistry::new("session-1".to_string());
+        let task = registry.create_subagent("inspect auth".to_string(), None);
+
+        registry.mark_running(&task.id).unwrap();
+        let running = registry.get(&task.id).unwrap();
+        assert!(running.started_at_ms.is_some());
+        assert_eq!(running.completed_at_ms, None);
+
+        registry
+            .complete(&task.id, "finished audit".to_string())
+            .unwrap();
+        let completed = registry.list().into_iter().next().unwrap();
+        assert_eq!(completed.status, TaskStatus::Completed);
+        assert!(completed.started_at_ms.is_some());
+        assert!(completed.completed_at_ms.is_some());
     }
 
     #[test]

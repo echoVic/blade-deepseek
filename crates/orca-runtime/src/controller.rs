@@ -31,7 +31,7 @@ use crate::hooks::{HookContext, HookRunner, conversation_with_hook_context};
 use crate::instructions::{self, ProjectInstructions};
 use crate::memory::{self, MemoryBlock};
 use crate::session::new_run_id;
-use crate::subagent;
+use crate::subagent::{self, SubagentMode};
 use crate::tasks::TaskRegistry;
 use crate::tool_invocation::{
     apply_pre_tool_outcome, apply_pre_tool_outcome_with_external, approval_request_for_invocation,
@@ -1008,7 +1008,10 @@ fn execute_tool_with_approval(
             emit_deltas,
             cost_tracker,
             cancel,
+            task_registry,
         )?
+    } else if execution_request.name == tool_types::ToolName::SubagentStatus {
+        execute_subagent_status_tool(execution_request, task_registry)
     } else {
         orca_tools::execute_with_mcp_external_and_policy(
             execution_request,
@@ -1166,6 +1169,7 @@ fn should_run_subagent_batch(
     tool_request.name == tool_types::ToolName::Subagent
         && subagent_depth < config.subagents.max_depth
         && config.subagents.max_parallel > 1
+        && subagent::create_subagent_request(tool_request).mode == SubagentMode::Sync
 }
 
 fn collect_subagent_batch(
@@ -1175,7 +1179,10 @@ fn collect_subagent_batch(
 ) -> usize {
     let max_end = (start + config.subagents.max_parallel).min(tool_requests.len());
     let mut end = start;
-    while end < max_end && tool_requests[end].name == tool_types::ToolName::Subagent {
+    while end < max_end
+        && tool_requests[end].name == tool_types::ToolName::Subagent
+        && subagent::create_subagent_request(&tool_requests[end]).mode == SubagentMode::Sync
+    {
         end += 1;
     }
     end
@@ -1515,6 +1522,7 @@ fn execute_subagent_tool(
     emit_deltas: bool,
     cost_tracker: &mut CostTracker,
     cancel: &CancelToken,
+    task_registry: &TaskRegistry,
 ) -> io::Result<tool_types::ToolResult> {
     let request = subagent::create_subagent_request(tool_request);
     let description = request.description.clone();
@@ -1535,6 +1543,22 @@ fn execute_subagent_tool(
             ))?;
         }
         return Ok(tool_types::ToolResult::failed(tool_request, error, None));
+    }
+
+    if request.mode == SubagentMode::Async {
+        return Ok(launch_async_subagent(
+            config,
+            cwd,
+            tool_request,
+            request,
+            subagent_depth,
+            instructions,
+            memory,
+            mcp_registry,
+            hooks,
+            cancel,
+            task_registry,
+        ));
     }
 
     let child_request = ChildAgentRequest {
@@ -1599,6 +1623,121 @@ fn execute_subagent_tool(
             ))
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_async_subagent(
+    config: &RunConfig,
+    cwd: &Path,
+    tool_request: &tool_types::ToolRequest,
+    request: subagent::SubagentRequest,
+    subagent_depth: u32,
+    instructions: &ProjectInstructions,
+    memory: &MemoryBlock,
+    mcp_registry: &McpRegistry,
+    hooks: &HookRunner,
+    cancel: &CancelToken,
+    task_registry: &TaskRegistry,
+) -> tool_types::ToolResult {
+    let agent_type = serde_json::to_value(&request.subagent_type)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string));
+    let task = task_registry.create_subagent(request.description.clone(), agent_type);
+    let agent_id = task.id.clone();
+    let child_request = ChildAgentRequest {
+        prompt: request.prompt,
+        subagent_type: request.subagent_type,
+        model: request.model,
+        depth: subagent_depth + 1,
+        emit_deltas: false,
+    };
+    let child_config = config.clone();
+    let child_cwd = cwd.to_path_buf();
+    let child_instructions = instructions.clone();
+    let child_memory = memory.clone();
+    let child_mcp_registry = mcp_registry.clone();
+    let child_hooks = hooks.clone();
+    let child_cancel = cancel.clone();
+    let child_registry = task_registry.clone();
+    let thread_agent_id = agent_id.clone();
+
+    thread::spawn(move || {
+        let _ = child_registry.mark_running(&thread_agent_id);
+        let mut child_events = EventFactory::new(format!("subagent-{thread_agent_id}"));
+        let mut child_sink = EventSink::new(io::sink(), child_config.output_format);
+        let mut child_runtime = ChildAgentRuntime::new(
+            &child_cwd,
+            &mut child_events,
+            &mut child_sink,
+            &child_instructions,
+            &child_memory,
+            &child_mcp_registry,
+            &child_hooks,
+            &child_cancel,
+            execute_child_agent_loop,
+        );
+        let (child, _child_cost_tracker) =
+            run_child_agent(&child_config, &child_request, &mut child_runtime);
+        if child.status == RunStatus::Success {
+            let output = child
+                .final_message
+                .unwrap_or_else(|| "(subagent completed without a final message)".to_string());
+            let _ = child_registry.complete(&thread_agent_id, output);
+        } else {
+            let error = child
+                .error
+                .or(child.final_message)
+                .unwrap_or_else(|| format!("subagent ended with status {:?}", child.status));
+            let _ = child_registry.fail(&thread_agent_id, error);
+        }
+    });
+
+    let output = serde_json::json!({
+        "status": "async_launched",
+        "agent_id": agent_id,
+        "description": request.description,
+    })
+    .to_string();
+    tool_types::ToolResult::completed(tool_request, output, false)
+}
+
+fn execute_subagent_status_tool(
+    tool_request: &tool_types::ToolRequest,
+    task_registry: &TaskRegistry,
+) -> tool_types::ToolResult {
+    let agent_id = subagent::extract_subagent_field(tool_request, "agent_id")
+        .or_else(|| tool_request.target.clone());
+    let Some(agent_id) = agent_id else {
+        return tool_types::ToolResult::invalid_input(tool_request, "missing agent_id");
+    };
+    let Some(record) = task_registry.get(&agent_id) else {
+        return tool_types::ToolResult::failed(
+            tool_request,
+            format!("subagent '{agent_id}' not found"),
+            None,
+        );
+    };
+    if record.task_type != orca_core::task_types::TaskType::Subagent {
+        return tool_types::ToolResult::failed(
+            tool_request,
+            format!("task '{agent_id}' is not a subagent"),
+            None,
+        );
+    }
+
+    let output = serde_json::json!({
+        "agent_id": agent_id,
+        "status": record.status,
+        "description": record.description,
+        "agent_type": record.agent_type,
+        "created_at_ms": record.created_at_ms,
+        "started_at_ms": record.started_at_ms,
+        "completed_at_ms": record.completed_at_ms,
+        "output": record.result,
+        "error": record.error,
+    })
+    .to_string();
+    tool_types::ToolResult::completed(tool_request, output, false)
 }
 
 fn resolve_interactive(
@@ -1743,6 +1882,27 @@ mod tests {
     }
 
     #[test]
+    fn async_subagent_skips_sync_batch_path() {
+        let config = config(SubagentConfig::default());
+        let request = tool_types::ToolRequest {
+            id: "async".to_string(),
+            name: tool_types::ToolName::Subagent,
+            action: ActionKind::Agent,
+            target: Some("async task".to_string()),
+            raw_arguments: Some(
+                serde_json::json!({
+                    "description": "async task",
+                    "prompt": "inspect later",
+                    "mode": "async"
+                })
+                .to_string(),
+            ),
+        };
+
+        assert!(!should_run_subagent_batch(&config, &request, 0));
+    }
+
+    #[test]
     fn max_parallel_one_uses_sequential_subagent_path() {
         let config = config(
             SubagentConfig {
@@ -1770,6 +1930,59 @@ mod tests {
         requests.push(subagent_request("c"));
 
         assert_eq!(collect_subagent_batch(&config, &requests, 0), 2);
+    }
+
+    #[test]
+    fn subagent_batch_stops_at_first_async_subagent() {
+        let config = config(SubagentConfig::default());
+        let async_request = tool_types::ToolRequest {
+            id: "async".to_string(),
+            name: tool_types::ToolName::Subagent,
+            action: ActionKind::Agent,
+            target: Some("async task".to_string()),
+            raw_arguments: Some(
+                serde_json::json!({
+                    "description": "async task",
+                    "prompt": "inspect later",
+                    "mode": "async"
+                })
+                .to_string(),
+            ),
+        };
+        let requests = vec![subagent_request("a"), async_request, subagent_request("b")];
+
+        assert_eq!(collect_subagent_batch(&config, &requests, 0), 1);
+    }
+
+    #[test]
+    fn subagent_status_returns_session_local_task_result() {
+        let registry = TaskRegistry::new("session-status".to_string());
+        let task =
+            registry.create_subagent("inspect auth".to_string(), Some("general".to_string()));
+        registry
+            .complete(&task.id, "finished async audit".to_string())
+            .unwrap();
+        let request = tool_types::ToolRequest {
+            id: "status".to_string(),
+            name: tool_types::ToolName::SubagentStatus,
+            action: ActionKind::Read,
+            target: None,
+            raw_arguments: Some(serde_json::json!({ "agent_id": task.id }).to_string()),
+        };
+
+        let result = execute_subagent_status_tool(&request, &registry);
+
+        assert_eq!(result.status, tool_types::ToolStatus::Completed);
+        let payload: serde_json::Value =
+            serde_json::from_str(result.output.as_deref().unwrap()).unwrap();
+        assert_eq!(payload["status"], "completed");
+        assert_eq!(payload["description"], "inspect auth");
+        assert_eq!(payload["agent_type"], "general");
+        assert!(payload["created_at_ms"].as_i64().unwrap() > 0);
+        assert!(payload["started_at_ms"].as_i64().unwrap() > 0);
+        assert!(payload["completed_at_ms"].as_i64().unwrap() > 0);
+        assert_eq!(payload["output"], "finished async audit");
+        assert_eq!(payload["error"], serde_json::Value::Null);
     }
 
     #[test]

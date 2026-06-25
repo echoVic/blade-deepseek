@@ -421,6 +421,7 @@ impl WorkflowRunner {
         state.status = WorkflowRunStatus::Completed;
         state.final_summary = Some(summary.clone());
         self.state.write_state(&state)?;
+        self.refresh_task_progress(&task_id, &state)?;
         self.tasks
             .complete(&task_id, result.clone())
             .map_err(io::Error::other)?;
@@ -460,18 +461,6 @@ impl WorkflowRunner {
                 error: STOP_REQUESTED_ERROR.to_string(),
             });
         }
-        let _permit = match gate.begin_agent(
-            workflow_limits.max_agents_per_run,
-            workflow_limits.max_concurrent_agents,
-        ) {
-            Ok(permit) => permit,
-            Err(error) => {
-                return Ok(HostCommand::AgentError {
-                    call_id: call.call_id,
-                    error: error.to_string(),
-                });
-            }
-        };
         let hash = input_hash(&call.prompt, &call.opts);
         if let Some(resume_run_id) = resume_from {
             if let Some(cached_value) =
@@ -491,6 +480,9 @@ impl WorkflowRunner {
                         opts: call.opts.clone(),
                         input_hash: hash,
                         status: WorkflowAgentStatus::Completed,
+                        attempt: 1,
+                        max_attempts: 1,
+                        previous_errors: Vec::new(),
                         output: Some(normalized_cached_value.clone()),
                         error: None,
                         transcript_path: Some(transcript_path.display().to_string()),
@@ -506,63 +498,103 @@ impl WorkflowRunner {
             }
         }
 
-        match self.run_child_agent_call(&call) {
-            Ok(output) => {
-                let output = child_agent_output(&call.prompt, &output);
-                let transcript_path =
-                    write_agent_transcript(transcript_dir, &call, &output, false)?;
-                let result = workflow_agent_result(&call, Value::String(output.clone()), false);
-                self.state.record_agent_completed(
-                    run_id,
-                    WorkflowAgentRecord {
-                        call_id: call.call_id.clone(),
-                        call_path: call.call_path.clone(),
-                        prompt: call.prompt.clone(),
-                        opts: call.opts.clone(),
-                        input_hash: hash,
-                        status: WorkflowAgentStatus::Completed,
-                        output: Some(result.clone()),
-                        error: None,
-                        transcript_path: Some(transcript_path.display().to_string()),
-                    },
-                )?;
-                if let Ok(state) = self.state.load_run(run_id) {
-                    let _ = self.refresh_task_progress(task_id, &state);
-                }
-
-                Ok(HostCommand::AgentResult {
+        let max_attempts = workflow_limits.max_agent_retries.saturating_add(1).max(1);
+        let mut previous_errors = Vec::new();
+        for attempt in 1..=max_attempts {
+            if self.state.stop_requested(run_id)? {
+                return Ok(HostCommand::AgentError {
                     call_id: call.call_id,
-                    result,
-                })
+                    error: STOP_REQUESTED_ERROR.to_string(),
+                });
             }
-            Err(error) => {
-                let error_message = error.to_string();
-                let transcript_path =
-                    write_agent_transcript(transcript_dir, &call, &error_message, false)?;
-                self.state.record_agent_completed(
-                    run_id,
-                    WorkflowAgentRecord {
-                        call_id: call.call_id.clone(),
-                        call_path: call.call_path.clone(),
-                        prompt: call.prompt.clone(),
-                        opts: call.opts.clone(),
-                        input_hash: hash,
-                        status: WorkflowAgentStatus::Failed,
-                        output: None,
-                        error: Some(error_message.clone()),
-                        transcript_path: Some(transcript_path.display().to_string()),
-                    },
-                )?;
-                if let Ok(state) = self.state.load_run(run_id) {
-                    let _ = self.refresh_task_progress(task_id, &state);
+            let _permit = match gate.begin_agent(
+                workflow_limits.max_agents_per_run,
+                workflow_limits.max_concurrent_agents,
+            ) {
+                Ok(permit) => permit,
+                Err(error) => {
+                    return Ok(HostCommand::AgentError {
+                        call_id: call.call_id,
+                        error: error.to_string(),
+                    });
                 }
+            };
 
-                Ok(HostCommand::AgentError {
-                    call_id: call.call_id,
-                    error: error_message,
-                })
+            match self.run_child_agent_call(&call) {
+                Ok(output) => {
+                    let output = child_agent_output(&call.prompt, &output);
+                    let transcript_path =
+                        write_agent_transcript(transcript_dir, &call, &output, false)?;
+                    let result = workflow_agent_result(&call, Value::String(output.clone()), false);
+                    self.state.record_agent_completed(
+                        run_id,
+                        WorkflowAgentRecord {
+                            call_id: call.call_id.clone(),
+                            call_path: call.call_path.clone(),
+                            prompt: call.prompt.clone(),
+                            opts: call.opts.clone(),
+                            input_hash: hash.clone(),
+                            status: WorkflowAgentStatus::Completed,
+                            attempt,
+                            max_attempts,
+                            previous_errors: previous_errors.clone(),
+                            output: Some(result.clone()),
+                            error: None,
+                            transcript_path: Some(transcript_path.display().to_string()),
+                        },
+                    )?;
+                    if let Ok(state) = self.state.load_run(run_id) {
+                        let _ = self.refresh_task_progress(task_id, &state);
+                    }
+
+                    return Ok(HostCommand::AgentResult {
+                        call_id: call.call_id,
+                        result,
+                    });
+                }
+                Err(error) => {
+                    drop(_permit);
+                    let error_message = error.to_string();
+                    let transcript_path =
+                        write_agent_transcript(transcript_dir, &call, &error_message, false)?;
+                    self.state.record_agent_completed(
+                        run_id,
+                        WorkflowAgentRecord {
+                            call_id: call.call_id.clone(),
+                            call_path: call.call_path.clone(),
+                            prompt: call.prompt.clone(),
+                            opts: call.opts.clone(),
+                            input_hash: hash.clone(),
+                            status: WorkflowAgentStatus::Failed,
+                            attempt,
+                            max_attempts,
+                            previous_errors: previous_errors.clone(),
+                            output: None,
+                            error: Some(error_message.clone()),
+                            transcript_path: Some(transcript_path.display().to_string()),
+                        },
+                    )?;
+                    if let Ok(state) = self.state.load_run(run_id) {
+                        let _ = self.refresh_task_progress(task_id, &state);
+                    }
+
+                    if attempt < max_attempts {
+                        previous_errors.push(error_message);
+                        continue;
+                    }
+
+                    return Ok(HostCommand::AgentError {
+                        call_id: call.call_id,
+                        error: error_message,
+                    });
+                }
             }
         }
+
+        Ok(HostCommand::AgentError {
+            call_id: call.call_id,
+            error: "workflow child agent exhausted retry attempts".to_string(),
+        })
     }
 
     fn run_child_agent_call(&self, call: &AgentCall) -> io::Result<String> {

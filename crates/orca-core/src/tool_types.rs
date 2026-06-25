@@ -16,6 +16,7 @@ pub enum ToolName {
     WriteFile,
     GitStatus,
     Subagent,
+    SubagentStatus,
     Workflow,
     WebSearch,
     GetGoal,
@@ -47,6 +48,7 @@ impl ToolName {
             "write_file" => Self::WriteFile,
             "git_status" => Self::GitStatus,
             "subagent" => Self::Subagent,
+            "subagent_status" => Self::SubagentStatus,
             "Workflow" | "workflow" => Self::Workflow,
             "web_search" => Self::WebSearch,
             "get_goal" => Self::GetGoal,
@@ -90,6 +92,7 @@ impl ToolName {
             Self::WriteFile => "write_file",
             Self::GitStatus => "git_status",
             Self::Subagent => "subagent",
+            Self::SubagentStatus => "subagent_status",
             Self::Workflow => "Workflow",
             Self::WebSearch => "web_search",
             Self::GetGoal => "get_goal",
@@ -119,6 +122,7 @@ impl ToolName {
             Self::WriteFile => "write_file",
             Self::GitStatus => "git_status",
             Self::Subagent => "subagent",
+            Self::SubagentStatus => "subagent_status",
             Self::Workflow => "Workflow",
             Self::WebSearch => "web_search",
             Self::GetGoal => "get_goal",
@@ -150,6 +154,7 @@ impl ToolName {
             "write_file" => Self::WriteFile,
             "git_status" => Self::GitStatus,
             "subagent" => Self::Subagent,
+            "subagent_status" => Self::SubagentStatus,
             "Workflow" | "workflow" => Self::Workflow,
             "web_search" => Self::WebSearch,
             "get_goal" => Self::GetGoal,
@@ -175,6 +180,7 @@ impl ToolName {
                 | Self::Glob
                 | Self::Grep
                 | Self::GitStatus
+                | Self::SubagentStatus
                 | Self::GetGoal
                 | Self::RequestUserInput
                 | Self::ListSkills

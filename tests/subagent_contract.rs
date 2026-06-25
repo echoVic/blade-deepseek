@@ -54,6 +54,37 @@ fn subagent_tool_runs_child_agent_and_emits_events() {
 }
 
 #[test]
+fn async_subagent_launches_without_blocking_parent_tool() {
+    let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .args([
+            "exec",
+            "--output-format",
+            "jsonl",
+            "--provider",
+            "mock",
+            "--approval-mode",
+            "full-auto",
+            "subagent async inspect repo",
+        ])
+        .output()
+        .expect("run orca");
+
+    assert_eq!(output.status.code(), Some(0));
+
+    let events = parse_jsonl(&output.stdout);
+    let completed = find_event(&events, "tool.call.completed");
+    assert_eq!(completed["payload"]["name"], "subagent");
+    assert_eq!(completed["payload"]["status"], "completed");
+
+    let payload: Value =
+        serde_json::from_str(completed["payload"]["output"].as_str().unwrap()).unwrap();
+    assert_eq!(payload["status"], "async_launched");
+    assert!(payload["agent_id"].as_str().unwrap().starts_with("task-"));
+    assert_eq!(payload["description"], "inspect repo");
+    assert_eq!(events.last().unwrap()["payload"]["status"], "success");
+}
+
+#[test]
 fn nested_subagent_calls_are_rejected() {
     let orca_home = tempdir().expect("temp orca home");
     std::fs::write(
