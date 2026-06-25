@@ -549,6 +549,8 @@ impl WorkflowRunner {
                             output: Some(normalized_cached_value),
                             error: Some(error_message.clone()),
                             transcript_path: Some(transcript_path.display().to_string()),
+                            started_at_ms: Some(now_ms()),
+                            completed_at_ms: Some(now_ms()),
                             usage: None,
                         },
                     )?;
@@ -578,6 +580,8 @@ impl WorkflowRunner {
                         output: Some(normalized_cached_value.clone()),
                         error: None,
                         transcript_path: Some(transcript_path.display().to_string()),
+                        started_at_ms: Some(now_ms()),
+                        completed_at_ms: Some(now_ms()),
                         usage: None,
                     },
                 )?;
@@ -613,9 +617,35 @@ impl WorkflowRunner {
                     });
                 }
             };
+            let started_at_ms = now_ms();
+            self.state.record_agent_completed(
+                run_id,
+                WorkflowAgentRecord {
+                    call_id: call.call_id.clone(),
+                    call_path: call.call_path.clone(),
+                    prompt: call.prompt.clone(),
+                    opts: call.opts.clone(),
+                    team: workflow_agent_team(&call.opts),
+                    input_hash: hash.clone(),
+                    status: WorkflowAgentStatus::Running,
+                    attempt,
+                    max_attempts,
+                    previous_errors: previous_errors.clone(),
+                    output: None,
+                    error: None,
+                    transcript_path: None,
+                    started_at_ms: Some(started_at_ms),
+                    completed_at_ms: None,
+                    usage: None,
+                },
+            )?;
+            if let Ok(state) = self.state.load_run(run_id) {
+                let _ = self.refresh_task_progress(task_id, &state);
+            }
 
             match self.run_child_agent_call(&call, workflow_ipc, &execution_policy) {
                 Ok(child_output) => {
+                    let completed_at_ms = now_ms();
                     let mut output = child_agent_output(&call.prompt, &child_output.message);
                     append_worktree_outcome(&mut output, child_output.worktree.as_ref());
                     let transcript_path =
@@ -638,6 +668,8 @@ impl WorkflowRunner {
                                 output: Some(result),
                                 error: Some(error_message.clone()),
                                 transcript_path: Some(transcript_path.display().to_string()),
+                                started_at_ms: Some(started_at_ms),
+                                completed_at_ms: Some(completed_at_ms),
                                 usage: Some(child_output.usage),
                             },
                         )?;
@@ -666,6 +698,8 @@ impl WorkflowRunner {
                             output: Some(result.clone()),
                             error: None,
                             transcript_path: Some(transcript_path.display().to_string()),
+                            started_at_ms: Some(started_at_ms),
+                            completed_at_ms: Some(completed_at_ms),
                             usage: Some(child_output.usage),
                         },
                     )?;
@@ -679,6 +713,7 @@ impl WorkflowRunner {
                     });
                 }
                 Err(error) => {
+                    let completed_at_ms = now_ms();
                     drop(_permit);
                     let WorkflowChildAgentCallError {
                         message: error_message,
@@ -703,6 +738,8 @@ impl WorkflowRunner {
                             output: None,
                             error: Some(error_message.clone()),
                             transcript_path: Some(transcript_path.display().to_string()),
+                            started_at_ms: Some(started_at_ms),
+                            completed_at_ms: Some(completed_at_ms),
                             usage,
                         },
                     )?;

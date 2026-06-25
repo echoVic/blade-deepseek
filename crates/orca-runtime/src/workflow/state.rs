@@ -40,6 +40,10 @@ pub struct WorkflowAgentRecord {
     pub error: Option<String>,
     pub transcript_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<UsageTotals>,
 }
 
@@ -81,6 +85,10 @@ struct WorkflowAgentRecordOnDisk {
     error: Option<String>,
     transcript_path: Option<String>,
     #[serde(default)]
+    started_at_ms: Option<i64>,
+    #[serde(default)]
+    completed_at_ms: Option<i64>,
+    #[serde(default)]
     usage: Option<UsageTotals>,
 }
 
@@ -102,6 +110,10 @@ struct WorkflowAgentRecordOnDiskWritable {
     output: AgentOutputField,
     error: Option<String>,
     transcript_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    started_at_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    completed_at_ms: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     usage: Option<UsageTotals>,
 }
@@ -392,6 +404,8 @@ impl WorkflowStateStore {
                 previous_errors: entry.record.previous_errors.clone(),
                 error: entry.record.error.clone(),
                 transcript_path: entry.record.transcript_path.clone(),
+                started_at_ms: entry.record.started_at_ms,
+                completed_at_ms: entry.record.completed_at_ms,
                 usage: entry.record.usage,
             })
             .collect::<Vec<_>>();
@@ -448,6 +462,8 @@ impl IntoWorkflowAgentRecord for WorkflowAgentCacheRecord {
             output: Some(self.output),
             error: None,
             transcript_path: None,
+            started_at_ms: None,
+            completed_at_ms: None,
             usage: None,
         }
     }
@@ -541,6 +557,8 @@ fn read_agent_cache(path: &Path) -> io::Result<HashMap<String, CachedWorkflowAge
                             output: record.output.value,
                             error: record.error,
                             transcript_path: record.transcript_path,
+                            started_at_ms: record.started_at_ms,
+                            completed_at_ms: record.completed_at_ms,
                             usage: record.usage,
                         },
                         output_present: record.output.present,
@@ -593,6 +611,8 @@ fn write_agent_cache(
                     },
                     error: entry.record.error.clone(),
                     transcript_path: entry.record.transcript_path.clone(),
+                    started_at_ms: entry.record.started_at_ms,
+                    completed_at_ms: entry.record.completed_at_ms,
                     usage: entry.record.usage,
                 },
             )

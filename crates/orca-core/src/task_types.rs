@@ -54,6 +54,10 @@ pub struct WorkflowAgentTaskSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transcript_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<UsageTotals>,
 }
 

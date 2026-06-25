@@ -614,6 +614,8 @@ fn state_store_preserves_current_json_looking_string_outputs() {
                     output: Some(json!(output)),
                     error: None,
                     transcript_path: None,
+                    started_at_ms: Some(1_000 + index as i64),
+                    completed_at_ms: Some(2_000 + index as i64),
                     usage: None,
                 },
             )
@@ -698,6 +700,8 @@ fn state_store_preserves_missing_output_field_when_appending_completed_record() 
                 output: Some(json!("cached result")),
                 error: None,
                 transcript_path: None,
+                started_at_ms: Some(1_000),
+                completed_at_ms: Some(2_000),
                 usage: None,
             },
         )

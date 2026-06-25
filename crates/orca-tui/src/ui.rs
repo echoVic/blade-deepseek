@@ -606,6 +606,9 @@ fn agent_row_label<'a>(agent: &WorkflowAgentTaskSummary, theme: &Theme) -> Line<
         .as_deref()
         .map(|team| format!("  team {team}"))
         .unwrap_or_default();
+    let elapsed = agent_elapsed_label(agent)
+        .map(|elapsed| format!("  {elapsed}"))
+        .unwrap_or_default();
     let usage = agent
         .usage
         .map(|usage| {
@@ -630,6 +633,7 @@ fn agent_row_label<'a>(agent: &WorkflowAgentTaskSummary, theme: &Theme) -> Line<
         Span::styled(team, Style::default().fg(theme.muted)),
         Span::styled(format!("  {attempt}"), Style::default().fg(theme.muted)),
         Span::styled(format!("  {retry}"), Style::default().fg(theme.muted)),
+        Span::styled(elapsed, Style::default().fg(theme.muted)),
         Span::styled(usage, Style::default().fg(theme.muted)),
         Span::styled(detail, Style::default().fg(theme.error)),
     ])
@@ -647,6 +651,9 @@ fn agent_dashboard_row_label<'a>(
         .team
         .as_deref()
         .map(|team| format!("  team {team}"))
+        .unwrap_or_default();
+    let elapsed = agent_elapsed_label(agent)
+        .map(|elapsed| format!("  {elapsed}"))
         .unwrap_or_default();
     let usage = agent
         .usage
@@ -679,6 +686,7 @@ fn agent_dashboard_row_label<'a>(
         Span::styled(status, Style::default().fg(status_color)),
         Span::styled(team, Style::default().fg(theme.muted)),
         Span::styled(format!("  {attempt}"), Style::default().fg(theme.muted)),
+        Span::styled(elapsed, Style::default().fg(theme.muted)),
         Span::styled(usage, Style::default().fg(theme.muted)),
         Span::styled(retry, Style::default().fg(theme.muted)),
         Span::styled(error, Style::default().fg(theme.error)),
@@ -792,6 +800,16 @@ fn elapsed_label(task: &BackgroundTaskSummary) -> String {
         "elapsed {}",
         format_elapsed_compact((elapsed_ms / 1000) as u64)
     )
+}
+
+fn agent_elapsed_label(agent: &WorkflowAgentTaskSummary) -> Option<String> {
+    let started_at_ms = agent.started_at_ms?;
+    let end_ms = agent.completed_at_ms.unwrap_or_else(current_time_ms);
+    let elapsed_ms = end_ms.saturating_sub(started_at_ms);
+    Some(format!(
+        "elapsed {}",
+        format_elapsed_compact((elapsed_ms / 1000) as u64)
+    ))
 }
 
 fn current_time_ms() -> i64 {
@@ -2609,6 +2627,8 @@ mod tests {
                 previous_errors: vec!["first attempt failed".to_string()],
                 error: None,
                 transcript_path: Some("/tmp/agent-1.json".to_string()),
+                started_at_ms: Some(1_000),
+                completed_at_ms: Some(3_500),
                 usage: Some(orca_core::cost_types::UsageTotals {
                     input_tokens: 120,
                     output_tokens: 30,
@@ -2639,6 +2659,7 @@ mod tests {
         assert!(rendered.contains("completed"));
         assert!(rendered.contains("attempt 2/2"));
         assert!(rendered.contains("retry errors 1"));
+        assert!(rendered.contains("elapsed 2s"));
         assert!(rendered.contains("150 tok"));
         assert!(rendered.contains("$0.000025"));
     }
@@ -2711,6 +2732,8 @@ mod tests {
                 previous_errors: Vec::new(),
                 error: None,
                 transcript_path: None,
+                started_at_ms: Some(1_000),
+                completed_at_ms: Some(4_000),
                 usage: Some(orca_core::cost_types::UsageTotals {
                     input_tokens: 120,
                     output_tokens: 30,

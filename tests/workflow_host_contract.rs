@@ -113,6 +113,60 @@ fn host_parallel_routes_out_of_order_agent_results_by_call_id() {
 }
 
 #[test]
+fn host_parallel_fans_out_eight_agents_and_preserves_result_order() {
+    if !WorkflowHost::node_available() {
+        return;
+    }
+
+    let temp = tempdir().unwrap();
+    let script = temp.path().join("workflow.js");
+    fs::write(
+        &script,
+        "export const meta = { name: 'eight-agent-host-test', description: 'Eight agent host test', phases: ['research'] };\n\
+         const prompts = Array.from({ length: 8 }, (_, index) => `agent-${index + 1}`);\n\
+         const results = await phase('research', async () => parallel(prompts.map(prompt => agent(prompt))));\n\
+         export default results.map(item => item.prompt);",
+    )
+    .unwrap();
+
+    let events =
+        WorkflowHost::run_collecting_events_with_agent(&script, serde_json::json!(null), |call| {
+            let index = call
+                .prompt
+                .strip_prefix("agent-")
+                .and_then(|suffix| suffix.parse::<u64>().ok())
+                .unwrap_or(0);
+            thread::sleep(Duration::from_millis((9 - index) * 10));
+            Ok(orca_runtime::workflow::host::HostCommand::AgentResult {
+                call_id: call.call_id.clone(),
+                result: serde_json::json!({
+                    "prompt": call.prompt,
+                }),
+            })
+        })
+        .unwrap();
+
+    let research_calls = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                HostEvent::AgentCall { phase, .. } if phase.as_deref() == Some("research")
+            )
+        })
+        .count();
+    assert_eq!(research_calls, 8);
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            HostEvent::WorkflowCompleted { result }
+                if result.as_array().map(|items| items.iter().map(|item| item.as_str().unwrap_or_default()).collect::<Vec<_>>())
+                    == Some(vec!["agent-1", "agent-2", "agent-3", "agent-4", "agent-5", "agent-6", "agent-7", "agent-8"])
+        )
+    }));
+}
+
+#[test]
 fn host_can_conditionally_spawn_agents_from_args() {
     if !WorkflowHost::node_available() {
         return;

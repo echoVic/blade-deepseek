@@ -3,6 +3,8 @@
 **日期**: 2026-06-16  
 **目标**: 参考 Claude Code 的 Agent 工具，增强 Orca 的 subagent 功能
 
+> **状态更新（2026-06-26）**: 本文最初是实现方案，后续章节中的代码结构和 checklist 保留为历史设计记录。当前代码已经支持默认嵌套深度 2、批量并行 `max_parallel = 6`、`model` 覆盖、`mode: "async"`、`subagent_status`、headless/`exec` worker-backed 持久 async handles、TUI session-local async handles、`isolation: "worktree"`、专用 `subagent_type`、可选 `schema` 校验，以及 completed async usage/timestamp/status 查询。最新对标状态以 `docs/agent-workflow-benchmark.md` 和 contract tests 为准。
+
 ---
 
 ## 一、现状分析
@@ -11,19 +13,18 @@
 
 **特性**:
 - ✅ 同步阻塞执行
-- ✅ 深度限制（MAX_DEPTH=1）
+- ✅ 默认深度限制为 2，可通过 `[subagents] max_depth` 配置；显式 `max_depth = 1` 仍可阻止嵌套
 - ✅ 独立的系统提示
 - ✅ 完整的事件追踪（4个事件）
 - ✅ 错误隔离和传播
 - ✅ TUI专用渲染
-
-**限制**:
-- ❌ 无异步模式
 - ✅ 支持批量并行执行（默认 `max_parallel = 6`）
-- ❌ 无进度查询
-- ❌ 无模型选择
-- ❌ 无隔离环境（worktree）
-- ❌ 子代理中间步骤不可见
+- ✅ 支持模型覆盖（`auto` / `deepseek-v4-flash` / `deepseek-v4-pro`）
+- ✅ 支持 async 模式：headless/`exec` 使用 worker-backed 持久 task handle，TUI 使用 session-local handle
+- ✅ 支持 `subagent_status` 查询 current/persisted async 状态、结果、错误、生命周期时间戳和 usage
+- ✅ 支持 `isolation: "worktree"`，干净 worktree 自动清理，脏 worktree 保留供审查
+- ✅ 支持可选 `schema` 校验，覆盖 sync、batch、async worker 完成路径
+- ⚠️ 子代理中间推理/工具步骤仍主要通过事件流和任务状态间接观察，完整可交互 step-level 控制仍是未来增强方向
 
 ### 1.2 Claude Code Agent 工具特性
 

@@ -959,7 +959,7 @@ fn workflow_runner_persists_marker_phase_for_following_agents() {
     let config = mock_run_config(temp.path());
     let tasks = TaskRegistry::new("session-1".to_string());
     let session_dir = temp.path().join("session");
-    let runner = WorkflowRunner::new(config, tasks, session_dir.clone());
+    let runner = WorkflowRunner::new(config, tasks.clone(), session_dir.clone());
     let launched = runner
         .launch(WorkflowLaunchRequest::from_script_path(
             script.display().to_string(),
@@ -1255,22 +1255,34 @@ fn workflow_runner_streams_running_phase_progress_to_state() {
     }];
     let tasks = TaskRegistry::new("session-1".to_string());
     let session_dir = temp.path().join("session");
-    let runner = WorkflowRunner::new(config, tasks, session_dir.clone());
+    let runner = WorkflowRunner::new(config, tasks.clone(), session_dir.clone());
     let launch = runner
         .launch_background(WorkflowLaunchRequest::from_script_path(
             script.display().to_string(),
         ))
         .unwrap();
+    let task_id = launch.task_id.clone();
 
     let store = WorkflowStateStore::new(session_dir.join("workflow-runs"));
     let run_id = launch.output.run_id.as_deref().expect("run id");
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
     let mut live_state = None;
+    let mut live_task = None;
     while std::time::Instant::now() < deadline {
         let state = store.load_run(run_id).expect("run state");
         if state.status == WorkflowRunStatus::Running && state.total_agent_count == 1 {
-            live_state = Some(state);
-            break;
+            if let Some(task) = tasks.get(&task_id)
+                && task.workflow_agents.iter().any(|agent| {
+                    agent.call_path == "scan:1"
+                        && agent.status == WorkflowAgentStatus::Running
+                        && agent.started_at_ms.is_some()
+                        && agent.completed_at_ms.is_none()
+                })
+            {
+                live_state = Some(state);
+                live_task = Some(task);
+                break;
+            }
         }
         thread::sleep(Duration::from_millis(25));
     }
@@ -1280,8 +1292,27 @@ fn workflow_runner_streams_running_phase_progress_to_state() {
     assert_eq!(live_state.phases[0].name, "scan");
     assert_eq!(live_state.phases[0].status, WorkflowRunStatus::Running);
     assert_eq!(live_state.phases[0].agent_count, 1);
+    let live_task = live_task.expect("task summary should include running agent row");
+    let live_agent = live_task
+        .workflow_agents
+        .iter()
+        .find(|agent| agent.call_path == "scan:1")
+        .expect("running agent summary");
+    assert_eq!(live_agent.status, WorkflowAgentStatus::Running);
+    assert!(live_agent.started_at_ms.is_some());
+    assert_eq!(live_agent.completed_at_ms, None);
 
     launch.join().unwrap().unwrap();
+
+    let completed_task = tasks.get(&task_id).expect("completed task");
+    let completed_agent = completed_task
+        .workflow_agents
+        .iter()
+        .find(|agent| agent.call_path == "scan:1")
+        .expect("completed agent summary");
+    assert_eq!(completed_agent.status, WorkflowAgentStatus::Completed);
+    assert!(completed_agent.started_at_ms.is_some());
+    assert!(completed_agent.completed_at_ms.is_some());
 }
 
 #[test]
