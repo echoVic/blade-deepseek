@@ -15,7 +15,7 @@ use orca_core::event_schema::EventFactory;
 use orca_core::event_schema::RunStatus;
 use orca_core::event_sink::EventSink;
 use orca_core::subagent_types::SubagentType;
-use orca_core::task_types::{TaskType, WorkflowTaskProgress};
+use orca_core::task_types::{TaskType, WorkflowPhaseTaskSummary, WorkflowTaskProgress};
 use orca_core::workflow_types::{
     WorkflowAgentStatus, WorkflowInput, WorkflowOutput, WorkflowPhaseRecord, WorkflowRunState,
     WorkflowRunStatus,
@@ -766,9 +766,26 @@ impl WorkflowRunner {
             .update_workflow_progress(task_id, progress)
             .map_err(io::Error::other)?;
         self.tasks
+            .update_workflow_phases(task_id, workflow_phase_summaries(state))
+            .map_err(io::Error::other)?;
+        self.tasks
             .update_workflow_agents(task_id, self.state.agent_summaries(&state.run_id)?)
             .map_err(io::Error::other)
     }
+}
+
+fn workflow_phase_summaries(state: &WorkflowRunState) -> Vec<WorkflowPhaseTaskSummary> {
+    state
+        .phases
+        .iter()
+        .map(|phase| WorkflowPhaseTaskSummary {
+            name: phase.name.clone(),
+            status: phase.status,
+            agent_count: phase.agent_count,
+            error: phase.error.clone(),
+            fallback: phase.fallback.clone(),
+        })
+        .collect()
 }
 
 fn now_ms() -> i64 {
@@ -813,6 +830,8 @@ fn apply_host_event_to_state(
                 started_at_ms: Some(now_ms()),
                 completed_at_ms: None,
                 agent_count: 0,
+                error: None,
+                fallback: None,
             });
         }
         HostEvent::PhaseCompleted { name } => {
@@ -828,7 +847,11 @@ fn apply_host_event_to_state(
                 phase.agent_count = agent_events_seen.saturating_sub(baseline);
             }
         }
-        HostEvent::PhaseFailed { name, .. } => {
+        HostEvent::PhaseFailed {
+            name,
+            error,
+            fallback,
+        } => {
             if let Some(phase) = state
                 .phases
                 .iter_mut()
@@ -839,6 +862,8 @@ fn apply_host_event_to_state(
                 phase.completed_at_ms = Some(now_ms());
                 let baseline = phase_agent_baselines.get(name).copied().unwrap_or(0);
                 phase.agent_count = agent_events_seen.saturating_sub(baseline);
+                phase.error = Some(error.clone());
+                phase.fallback = fallback.clone();
             }
         }
         HostEvent::AgentCall { phase, .. } => {

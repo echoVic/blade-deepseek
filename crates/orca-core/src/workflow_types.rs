@@ -82,6 +82,10 @@ pub struct WorkflowPhaseRecord {
     pub started_at_ms: Option<i64>,
     pub completed_at_ms: Option<i64>,
     pub agent_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

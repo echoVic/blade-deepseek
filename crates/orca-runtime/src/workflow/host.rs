@@ -22,6 +22,8 @@ pub enum HostEvent {
     PhaseFailed {
         name: String,
         error: String,
+        #[serde(default)]
+        fallback: Option<String>,
     },
     AgentCall {
         call_id: String,

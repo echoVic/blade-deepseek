@@ -11,7 +11,7 @@ use unicode_width::UnicodeWidthStr;
 use orca_core::task_types::{
     BackgroundTaskSummary, TaskStatus, TaskType, WorkflowAgentTaskSummary,
 };
-use orca_core::workflow_types::WorkflowAgentStatus;
+use orca_core::workflow_types::{WorkflowAgentStatus, WorkflowRunStatus};
 
 use crate::shortcuts::{self, ShortcutScope};
 use crate::theme::Theme;
@@ -341,17 +341,17 @@ fn render_workflows_panel(frame: &mut Frame, area: Rect, state: &mut AppState, t
     }
 
     // One header row + task rows. The selected workflow expands into
-    // per-agent rows so the panel can act as a lightweight dashboard.
+    // phase and per-agent rows so the panel can act as a lightweight dashboard.
     let header_h: u16 = 1;
     let row_h: u16 = 2;
     let mut constraints = vec![Constraint::Length(header_h)];
     constraints.extend(tasks.iter().enumerate().map(|(index, task)| {
-        let agent_rows = if index == state.workflow_panel.selected {
-            task.workflow_agents.len() as u16
+        let detail_rows = if index == state.workflow_panel.selected {
+            workflow_phase_detail_rows(task).len() as u16 + task.workflow_agents.len() as u16
         } else {
             0
         };
-        Constraint::Length(row_h.saturating_add(agent_rows))
+        Constraint::Length(row_h.saturating_add(detail_rows))
     }));
     constraints.push(Constraint::Min(0));
     let rows = Layout::vertical(constraints).split(inner);
@@ -384,6 +384,11 @@ fn render_workflows_panel(frame: &mut Frame, area: Rect, state: &mut AppState, t
         // Split the row into a label line, a gauge line, and optional agent rows.
         let mut row_constraints = vec![Constraint::Length(1), Constraint::Length(1)];
         if selected {
+            row_constraints.extend(
+                workflow_phase_detail_rows(task)
+                    .iter()
+                    .map(|_| Constraint::Length(1)),
+            );
             row_constraints.extend(task.workflow_agents.iter().map(|_| Constraint::Length(1)));
         }
         let parts = Layout::vertical(row_constraints).split(row_area);
@@ -413,12 +418,35 @@ fn render_workflows_panel(frame: &mut Frame, area: Rect, state: &mut AppState, t
         frame.render_widget(gauge, parts[1]);
 
         if selected {
+            let phase_rows = workflow_phase_detail_rows(task);
+            for (phase_index, phase) in phase_rows.iter().enumerate() {
+                let line = Paragraph::new(workflow_phase_row_label(phase, theme));
+                frame.render_widget(line, parts[phase_index + 2]);
+            }
             for (agent_index, agent) in task.workflow_agents.iter().enumerate() {
                 let line = Paragraph::new(agent_row_label(agent, theme));
-                frame.render_widget(line, parts[agent_index + 2]);
+                frame.render_widget(line, parts[phase_rows.len() + agent_index + 2]);
             }
         }
     }
+}
+
+fn workflow_phase_detail_rows(
+    task: &BackgroundTaskSummary,
+) -> Vec<&orca_core::task_types::WorkflowPhaseTaskSummary> {
+    task.workflow_phases
+        .iter()
+        .filter(|phase| {
+            phase.error.is_some()
+                || phase.fallback.is_some()
+                || matches!(
+                    phase.status,
+                    WorkflowRunStatus::Failed
+                        | WorkflowRunStatus::Cancelled
+                        | WorkflowRunStatus::Stopped
+                )
+        })
+        .collect()
 }
 
 /// Truthful gauge fill for a workflow lifecycle state.
@@ -545,6 +573,67 @@ fn agent_row_label<'a>(agent: &WorkflowAgentTaskSummary, theme: &Theme) -> Line<
         Span::styled(usage, Style::default().fg(theme.muted)),
         Span::styled(detail, Style::default().fg(theme.error)),
     ])
+}
+
+fn workflow_phase_row_label<'a>(
+    phase: &orca_core::task_types::WorkflowPhaseTaskSummary,
+    theme: &Theme,
+) -> Line<'a> {
+    let status = task_status_from_workflow_status(phase.status);
+    let status_color = task_status_color(status, theme);
+    let fallback = phase
+        .fallback
+        .as_deref()
+        .map(|fallback| format!("  fallback {fallback}"))
+        .unwrap_or_default();
+    let error = phase
+        .error
+        .as_deref()
+        .map(|error| format!("  {error}"))
+        .unwrap_or_default();
+
+    Line::from(vec![
+        Span::styled("    phase ", Style::default().fg(theme.muted)),
+        Span::styled(phase.name.clone(), Style::default().fg(theme.text)),
+        Span::styled("  ", Style::default()),
+        Span::styled(
+            workflow_run_status_label(phase.status),
+            Style::default().fg(status_color),
+        ),
+        Span::styled(
+            format!("  agents {}", phase.agent_count),
+            Style::default().fg(theme.muted),
+        ),
+        Span::styled(fallback, Style::default().fg(theme.muted)),
+        Span::styled(error, Style::default().fg(theme.error)),
+    ])
+}
+
+fn workflow_run_status_label(status: WorkflowRunStatus) -> &'static str {
+    match status {
+        WorkflowRunStatus::Queued => "queued",
+        WorkflowRunStatus::Running => "running",
+        WorkflowRunStatus::AsyncLaunched => "async",
+        WorkflowRunStatus::Paused => "paused",
+        WorkflowRunStatus::Stopping => "stopping",
+        WorkflowRunStatus::Stopped => "stopped",
+        WorkflowRunStatus::Completed => "completed",
+        WorkflowRunStatus::Failed => "failed",
+        WorkflowRunStatus::Cancelled => "cancelled",
+    }
+}
+
+fn task_status_from_workflow_status(status: WorkflowRunStatus) -> TaskStatus {
+    match status {
+        WorkflowRunStatus::Queued => TaskStatus::Queued,
+        WorkflowRunStatus::Running | WorkflowRunStatus::AsyncLaunched => TaskStatus::Running,
+        WorkflowRunStatus::Paused => TaskStatus::Paused,
+        WorkflowRunStatus::Stopping => TaskStatus::Stopping,
+        WorkflowRunStatus::Stopped => TaskStatus::Stopped,
+        WorkflowRunStatus::Completed => TaskStatus::Completed,
+        WorkflowRunStatus::Failed => TaskStatus::Failed,
+        WorkflowRunStatus::Cancelled => TaskStatus::Cancelled,
+    }
 }
 
 fn workflow_agent_status_label(status: WorkflowAgentStatus) -> &'static str {
@@ -2321,6 +2410,7 @@ mod tests {
                 running_phases: 1,
                 failed_phases: 0,
             }),
+            workflow_phases: Vec::new(),
             workflow_agents: Vec::new(),
             usage: None,
         };
@@ -2348,6 +2438,7 @@ mod tests {
             workflow_run_id: None,
             phase_count: None,
             workflow_progress: None,
+            workflow_phases: Vec::new(),
             workflow_agents: Vec::new(),
             usage: Some(orca_core::cost_types::UsageTotals {
                 input_tokens: 120,
@@ -2391,6 +2482,13 @@ mod tests {
             workflow_run_id: Some("workflow-run-1".to_string()),
             phase_count: Some(1),
             workflow_progress: None,
+            workflow_phases: vec![orca_core::task_types::WorkflowPhaseTaskSummary {
+                name: "scan".to_string(),
+                status: orca_core::workflow_types::WorkflowRunStatus::Failed,
+                agent_count: 1,
+                error: Some("scan failed".to_string()),
+                fallback: Some("value".to_string()),
+            }],
             workflow_agents: vec![orca_core::task_types::WorkflowAgentTaskSummary {
                 call_id: "agent-1".to_string(),
                 call_path: "root:1".to_string(),
@@ -2423,6 +2521,9 @@ mod tests {
         let rendered = format!("{:?}", terminal.backend().buffer());
 
         assert!(rendered.contains("root:1"));
+        assert!(rendered.contains("scan"));
+        assert!(rendered.contains("fallback value"));
+        assert!(rendered.contains("scan failed"));
         assert!(rendered.contains("completed"));
         assert!(rendered.contains("attempt 2/2"));
         assert!(rendered.contains("retry errors 1"));

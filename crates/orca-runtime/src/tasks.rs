@@ -9,7 +9,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use orca_core::cancel::CancelToken;
 use orca_core::cost_types::UsageTotals;
 use orca_core::task_types::{
-    BackgroundTaskSummary, TaskStatus, TaskType, WorkflowAgentTaskSummary, WorkflowTaskProgress,
+    BackgroundTaskSummary, TaskStatus, TaskType, WorkflowAgentTaskSummary,
+    WorkflowPhaseTaskSummary, WorkflowTaskProgress,
 };
 use serde::{Deserialize, Serialize};
 
@@ -41,6 +42,7 @@ pub struct TaskRecord {
     pub workflow_run_id: Option<String>,
     pub phase_count: Option<usize>,
     pub workflow_progress: Option<WorkflowTaskProgress>,
+    pub workflow_phases: Vec<WorkflowPhaseTaskSummary>,
     pub workflow_agents: Vec<WorkflowAgentTaskSummary>,
     pub usage: Option<UsageTotals>,
     pub result: Option<String>,
@@ -74,6 +76,8 @@ struct PersistedTaskRecord {
     workflow_run_id: Option<String>,
     phase_count: Option<usize>,
     workflow_progress: Option<WorkflowTaskProgress>,
+    #[serde(default)]
+    workflow_phases: Vec<WorkflowPhaseTaskSummary>,
     #[serde(default)]
     workflow_agents: Vec<WorkflowAgentTaskSummary>,
     usage: Option<UsageTotals>,
@@ -142,6 +146,7 @@ impl TaskRegistry {
             workflow_run_id: Some(workflow_run_id.clone()),
             phase_count: Some(phase_count),
             workflow_progress: None,
+            workflow_phases: Vec::new(),
             workflow_agents: Vec::new(),
             usage: None,
             result: None,
@@ -179,6 +184,7 @@ impl TaskRegistry {
             workflow_run_id: None,
             phase_count: None,
             workflow_progress: None,
+            workflow_phases: Vec::new(),
             workflow_agents: Vec::new(),
             usage: None,
             result: None,
@@ -217,6 +223,7 @@ impl TaskRegistry {
                         workflow_run_id: record.workflow_run_id.clone(),
                         phase_count: record.phase_count,
                         workflow_progress: record.workflow_progress,
+                        workflow_phases: record.workflow_phases.clone(),
                         workflow_agents: record.workflow_agents.clone(),
                         usage: record.usage,
                     })
@@ -262,6 +269,17 @@ impl TaskRegistry {
     ) -> Result<(), String> {
         self.update_task(id, |record| {
             record.workflow_agents = agents;
+            Ok(())
+        })
+    }
+
+    pub fn update_workflow_phases(
+        &self,
+        id: &str,
+        phases: Vec<WorkflowPhaseTaskSummary>,
+    ) -> Result<(), String> {
+        self.update_task(id, |record| {
+            record.workflow_phases = phases;
             Ok(())
         })
     }
@@ -521,6 +539,7 @@ impl PersistedTaskRecord {
             workflow_run_id: self.workflow_run_id,
             phase_count: self.phase_count,
             workflow_progress: self.workflow_progress,
+            workflow_phases: self.workflow_phases,
             workflow_agents: self.workflow_agents,
             usage: self.usage,
             result: self.result,
@@ -551,6 +570,7 @@ impl From<&TaskRecord> for PersistedTaskRecord {
             workflow_run_id: record.workflow_run_id.clone(),
             phase_count: record.phase_count,
             workflow_progress: record.workflow_progress,
+            workflow_phases: record.workflow_phases.clone(),
             workflow_agents: record.workflow_agents.clone(),
             usage: record.usage,
             result: record.result.clone(),
@@ -788,6 +808,31 @@ mod tests {
                 failed_phases: 0,
             })
         );
+    }
+
+    #[test]
+    fn registry_lists_workflow_phase_details() {
+        let registry = TaskRegistry::new("session-1".to_string());
+        let task = registry.create_workflow(
+            "workflow-run-1".to_string(),
+            "audit".to_string(),
+            "Audit code".to_string(),
+            1,
+        );
+        let phase = WorkflowPhaseTaskSummary {
+            name: "scan".to_string(),
+            status: orca_core::workflow_types::WorkflowRunStatus::Failed,
+            agent_count: 1,
+            error: Some("scan failed".to_string()),
+            fallback: Some("value".to_string()),
+        };
+
+        registry
+            .update_workflow_phases(&task.id, vec![phase.clone()])
+            .unwrap();
+
+        let list = registry.list();
+        assert_eq!(list[0].workflow_phases, vec![phase]);
     }
 
     #[test]

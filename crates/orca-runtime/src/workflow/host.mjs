@@ -161,10 +161,14 @@ async function phase(name, body, opts = {}) {
     emit({ type: "phase_completed", name });
     return result;
   } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
     if (opts?.fallback === "continue") {
-      const message = error instanceof Error ? error.message : String(error);
-      emit({ type: "phase_failed", name, error: message });
+      emit({ type: "phase_failed", name, error: message, fallback: "continue" });
       return { fallback: "continue", error: message };
+    }
+    if (opts?.fallback && Object.prototype.hasOwnProperty.call(opts.fallback, "value")) {
+      emit({ type: "phase_failed", name, error: message, fallback: "value" });
+      return opts.fallback.value;
     }
     throw error;
   } finally {

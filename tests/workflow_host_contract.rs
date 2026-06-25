@@ -148,7 +148,7 @@ fn host_phase_fallback_continue_emits_failed_phase_and_continues() {
     assert!(events.iter().any(|event| {
         matches!(
             event,
-            HostEvent::PhaseFailed { name, error }
+            HostEvent::PhaseFailed { name, error, .. }
                 if name == "scan" && error.contains("scan failed")
         )
     }));
@@ -164,6 +164,62 @@ fn host_phase_fallback_continue_emits_failed_phase_and_continues() {
             .iter()
             .any(|event| matches!(event, HostEvent::WorkflowCompleted { .. }))
     );
+}
+
+#[test]
+fn host_phase_fallback_value_returns_value_to_following_phase() {
+    if !WorkflowHost::node_available() {
+        return;
+    }
+
+    let temp = tempdir().unwrap();
+    let script = temp.path().join("workflow.js");
+    fs::write(
+        &script,
+        "export const meta = { name: 'fallback-value-test', description: 'Fallback value test', phases: ['scan', 'review'] };\n\
+         const scan = await phase('scan', async () => agent('fail scan'), { fallback: { value: { recovered: true, source: 'fallback' } } });\n\
+         const review = await phase('review', async () => agent(`review recovered=${scan.recovered}`));\n\
+         export default { scan, review };",
+    )
+    .unwrap();
+
+    let events =
+        WorkflowHost::run_collecting_events_with_agent(&script, serde_json::json!(null), |call| {
+            if call.prompt == "fail scan" {
+                Ok(orca_runtime::workflow::host::HostCommand::AgentError {
+                    call_id: call.call_id.clone(),
+                    error: "scan failed".to_string(),
+                })
+            } else {
+                Ok(orca_runtime::workflow::host::HostCommand::AgentResult {
+                    call_id: call.call_id.clone(),
+                    result: serde_json::json!({ "prompt": call.prompt }),
+                })
+            }
+        })
+        .unwrap();
+
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            HostEvent::PhaseFailed { name, error, fallback }
+                if name == "scan" && error.contains("scan failed") && fallback.as_deref() == Some("value")
+        )
+    }));
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            HostEvent::AgentCall { prompt, phase, .. }
+                if prompt == "review recovered=true" && phase.as_deref() == Some("review")
+        )
+    }));
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            HostEvent::WorkflowCompleted { result }
+                if result["scan"]["recovered"] == true && result["scan"]["source"] == "fallback"
+        )
+    }));
 }
 
 #[test]

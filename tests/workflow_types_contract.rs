@@ -79,6 +79,7 @@ fn background_task_summary_matches_sdk_names() {
             running_phases: 1,
             failed_phases: 0,
         }),
+        workflow_phases: Vec::new(),
         workflow_agents: Vec::new(),
         usage: None,
     };
@@ -92,6 +93,7 @@ fn background_task_summary_matches_sdk_names() {
     assert_eq!(value["workflowProgress"]["totalAgents"], 5);
     assert_eq!(value["workflowProgress"]["completedAgents"], 3);
     assert_eq!(value["workflowProgress"]["failedAgents"], 1);
+    assert!(value.get("workflowPhases").is_none());
     assert!(value.get("usage").is_none());
 }
 
