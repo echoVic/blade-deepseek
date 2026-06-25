@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.35":
+        "Bracketed paste support in TUI input; textarea soft-wrap rendering rewritten with accurate height calculation.",
       "v0.1.34":
         "Add a reusable real API release gate that verifies provider summary costs, CLI JSONL output, and server-mode streaming before tagging.",
       "v0.1.33":
@@ -100,6 +102,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.35":
+        "TUI 输入框支持括号粘贴（Bracketed Paste）；重写文本区域软换行渲染，修复高度计算不准确问题。",
       "v0.1.34":
         "新增可重复执行的真实 API 发布闸门，发版前统一验证 provider summary 成本、CLI JSONL 输出和 server-mode 流式事件。",
       "v0.1.33":
