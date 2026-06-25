@@ -1040,8 +1040,12 @@ fn execute_tool_with_approval(
         tool_types::ToolName::WorkflowSendMessage
             | tool_types::ToolName::WorkflowReadMessages
             | tool_types::ToolName::WorkflowClearMessages
+            | tool_types::ToolName::WorkflowCreateTaskList
+            | tool_types::ToolName::WorkflowClaimTask
+            | tool_types::ToolName::WorkflowCompleteTask
+            | tool_types::ToolName::WorkflowListTasks
     ) {
-        execute_workflow_mailbox_tool(execution_request, workflow_ipc)
+        execute_workflow_ipc_tool(execution_request, workflow_ipc)
     } else {
         orca_tools::execute_with_mcp_external_and_policy(
             execution_request,
@@ -1093,14 +1097,14 @@ fn execute_tool_with_approval(
     Ok((status, result))
 }
 
-fn execute_workflow_mailbox_tool(
+fn execute_workflow_ipc_tool(
     tool_request: &tool_types::ToolRequest,
     workflow_ipc: Option<&WorkflowIpcContext>,
 ) -> tool_types::ToolResult {
     let Some(workflow_ipc) = workflow_ipc else {
         return tool_types::ToolResult::failed(
             tool_request,
-            "workflow mailbox tools are only available inside workflow child agents",
+            "workflow IPC tools are only available inside workflow child agents",
             None,
         );
     };
@@ -1114,18 +1118,12 @@ fn execute_workflow_mailbox_tool(
             );
         }
     };
-    let channel = match args.get("channel").and_then(serde_json::Value::as_str) {
-        Some(channel) => channel,
-        None => {
-            return tool_types::ToolResult::invalid_input(
-                tool_request,
-                "missing required string field: channel",
-            );
-        }
-    };
-
     let result = match tool_request.name {
         tool_types::ToolName::WorkflowSendMessage => {
+            let channel = match required_string_arg(tool_request, &args, "channel") {
+                Ok(channel) => channel,
+                Err(result) => return result,
+            };
             let message = args
                 .get("message")
                 .cloned()
@@ -1133,15 +1131,89 @@ fn execute_workflow_mailbox_tool(
             let from = args.get("from").and_then(serde_json::Value::as_str);
             workflow_ipc.send_message(channel, from, message)
         }
-        tool_types::ToolName::WorkflowReadMessages => workflow_ipc.read_messages(channel),
-        tool_types::ToolName::WorkflowClearMessages => workflow_ipc.clear_messages(channel),
-        _ => unreachable!("workflow mailbox tool dispatch guarded by caller"),
+        tool_types::ToolName::WorkflowReadMessages => {
+            let channel = match required_string_arg(tool_request, &args, "channel") {
+                Ok(channel) => channel,
+                Err(result) => return result,
+            };
+            workflow_ipc.read_messages(channel)
+        }
+        tool_types::ToolName::WorkflowClearMessages => {
+            let channel = match required_string_arg(tool_request, &args, "channel") {
+                Ok(channel) => channel,
+                Err(result) => return result,
+            };
+            workflow_ipc.clear_messages(channel)
+        }
+        tool_types::ToolName::WorkflowCreateTaskList => {
+            let name = match required_string_arg(tool_request, &args, "name") {
+                Ok(name) => name,
+                Err(result) => return result,
+            };
+            let items = match args.get("items").and_then(serde_json::Value::as_array) {
+                Some(items) => items.clone(),
+                None => {
+                    return tool_types::ToolResult::invalid_input(
+                        tool_request,
+                        "missing required array field: items",
+                    );
+                }
+            };
+            workflow_ipc.create_task_list(name, items)
+        }
+        tool_types::ToolName::WorkflowClaimTask => {
+            let name = match required_string_arg(tool_request, &args, "name") {
+                Ok(name) => name,
+                Err(result) => return result,
+            };
+            let by = args.get("by").and_then(serde_json::Value::as_str);
+            workflow_ipc.claim_task(name, by)
+        }
+        tool_types::ToolName::WorkflowCompleteTask => {
+            let name = match required_string_arg(tool_request, &args, "name") {
+                Ok(name) => name,
+                Err(result) => return result,
+            };
+            let task_id = match required_string_arg(tool_request, &args, "task_id") {
+                Ok(task_id) => task_id,
+                Err(result) => return result,
+            };
+            let result = args
+                .get("result")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            let by = args.get("by").and_then(serde_json::Value::as_str);
+            workflow_ipc.complete_task(name, task_id, result, by)
+        }
+        tool_types::ToolName::WorkflowListTasks => {
+            let name = match required_string_arg(tool_request, &args, "name") {
+                Ok(name) => name,
+                Err(result) => return result,
+            };
+            workflow_ipc.list_tasks(name)
+        }
+        _ => unreachable!("workflow IPC tool dispatch guarded by caller"),
     };
 
     match result {
         Ok(value) => tool_types::ToolResult::completed(tool_request, value.to_string(), false),
         Err(error) => tool_types::ToolResult::invalid_input(tool_request, error),
     }
+}
+
+fn required_string_arg<'a>(
+    tool_request: &tool_types::ToolRequest,
+    args: &'a serde_json::Value,
+    field: &str,
+) -> Result<&'a str, tool_types::ToolResult> {
+    args.get(field)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            tool_types::ToolResult::invalid_input(
+                tool_request,
+                format!("missing required string field: {field}"),
+            )
+        })
 }
 
 fn execute_workflow_tool(
@@ -2139,7 +2211,7 @@ mod tests {
     }
 
     #[test]
-    fn workflow_mailbox_tool_requires_workflow_child_context() {
+    fn workflow_ipc_tool_requires_workflow_child_context() {
         let request = tool_types::ToolRequest {
             id: "mailbox".to_string(),
             name: tool_types::ToolName::WorkflowReadMessages,
@@ -2148,7 +2220,7 @@ mod tests {
             raw_arguments: Some(serde_json::json!({ "channel": "findings" }).to_string()),
         };
 
-        let result = execute_workflow_mailbox_tool(&request, None);
+        let result = execute_workflow_ipc_tool(&request, None);
 
         assert_eq!(result.status, tool_types::ToolStatus::Failed);
         assert!(

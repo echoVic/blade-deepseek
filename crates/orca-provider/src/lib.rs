@@ -148,7 +148,10 @@ fn mock_call(conversation: &Conversation) -> ProviderResponse {
         }
     }
 
-    if prompt.trim().starts_with("workflow_read_messages ") && has_tool_results {
+    if (prompt.trim().starts_with("workflow_read_messages ")
+        || prompt.trim().starts_with("workflow_list_tasks "))
+        && has_tool_results
+    {
         let tool_outputs = conversation
             .messages
             .iter()
@@ -158,7 +161,7 @@ fn mock_call(conversation: &Conversation) -> ProviderResponse {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        let msg = format!("Workflow mailbox messages: {tool_outputs}");
+        let msg = format!("Workflow IPC result: {tool_outputs}");
         return ProviderResponse {
             steps: vec![ProviderStep::MessageDelta(msg.clone())],
             assistant_content: Some(msg),
@@ -462,6 +465,84 @@ fn parse_mock_prompt(prompt: &str) -> Option<ToolRequest> {
             action: ActionKind::Agent,
             target: Some(channel.to_string()),
             raw_arguments: Some(serde_json::json!({ "channel": channel }).to_string()),
+        });
+    }
+
+    if let Some(rest) = prompt.strip_prefix("workflow_create_task_list ") {
+        let mut parts = rest.split_whitespace();
+        let name = parts.next()?.trim();
+        let items = parts
+            .map(|item| serde_json::Value::String(item.to_string()))
+            .collect::<Vec<_>>();
+        if name.is_empty() {
+            return None;
+        }
+        return Some(ToolRequest {
+            id: "mock-tool-1".to_string(),
+            name: ToolName::WorkflowCreateTaskList,
+            action: ActionKind::Agent,
+            target: Some(name.to_string()),
+            raw_arguments: Some(serde_json::json!({ "name": name, "items": items }).to_string()),
+        });
+    }
+
+    if let Some(rest) = prompt.strip_prefix("workflow_claim_task ") {
+        let mut parts = rest.splitn(2, ' ');
+        let name = parts.next()?.trim();
+        let by = parts.next().unwrap_or("").trim();
+        if name.is_empty() {
+            return None;
+        }
+        let mut arguments = serde_json::json!({ "name": name });
+        if !by.is_empty() {
+            arguments["by"] = serde_json::Value::String(by.to_string());
+        }
+        return Some(ToolRequest {
+            id: "mock-tool-1".to_string(),
+            name: ToolName::WorkflowClaimTask,
+            action: ActionKind::Agent,
+            target: Some(name.to_string()),
+            raw_arguments: Some(arguments.to_string()),
+        });
+    }
+
+    if let Some(rest) = prompt.strip_prefix("workflow_complete_task ") {
+        let mut parts = rest.splitn(4, ' ');
+        let name = parts.next()?.trim();
+        let task_id = parts.next()?.trim();
+        let by = parts.next()?.trim();
+        let result = parts.next().unwrap_or("").trim();
+        if name.is_empty() || task_id.is_empty() || by.is_empty() {
+            return None;
+        }
+        return Some(ToolRequest {
+            id: "mock-tool-1".to_string(),
+            name: ToolName::WorkflowCompleteTask,
+            action: ActionKind::Agent,
+            target: Some(task_id.to_string()),
+            raw_arguments: Some(
+                serde_json::json!({
+                    "name": name,
+                    "task_id": task_id,
+                    "by": by,
+                    "result": result
+                })
+                .to_string(),
+            ),
+        });
+    }
+
+    if let Some(rest) = prompt.strip_prefix("workflow_list_tasks ") {
+        let name = rest.trim();
+        if name.is_empty() {
+            return None;
+        }
+        return Some(ToolRequest {
+            id: "mock-tool-1".to_string(),
+            name: ToolName::WorkflowListTasks,
+            action: ActionKind::Agent,
+            target: Some(name.to_string()),
+            raw_arguments: Some(serde_json::json!({ "name": name }).to_string()),
         });
     }
 

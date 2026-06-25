@@ -715,6 +715,110 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
     ));
     registry.register(BuiltinTool::new(
         builtin_spec(
+            "workflow_create_task_list",
+            "Create or replace a task list in the current workflow run so workflow child agents can claim shared work.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Task list name"
+                    },
+                    "items": {
+                        "type": "array",
+                        "description": "Task payloads to enqueue",
+                        "items": {}
+                    }
+                },
+                "required": ["name", "items"]
+            }),
+            CapabilitySet::filesystem_write(),
+            ToolExposure::Direct,
+            RendererHint::Agent,
+            false,
+        ),
+        BuiltinExecutor::WorkflowCreateTaskList,
+    ));
+    registry.register(BuiltinTool::new(
+        builtin_spec(
+            "workflow_claim_task",
+            "Claim the next pending task from a task list in the current workflow run.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Task list name"
+                    },
+                    "by": {
+                        "type": "string",
+                        "description": "Optional worker label"
+                    }
+                },
+                "required": ["name"]
+            }),
+            CapabilitySet::filesystem_write(),
+            ToolExposure::Direct,
+            RendererHint::Agent,
+            false,
+        ),
+        BuiltinExecutor::WorkflowClaimTask,
+    ));
+    registry.register(BuiltinTool::new(
+        builtin_spec(
+            "workflow_complete_task",
+            "Mark a claimed workflow task as completed with a JSON-serializable result.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Task list name"
+                    },
+                    "task_id": {
+                        "type": "string",
+                        "description": "Task id returned by workflow_claim_task or workflow_list_tasks"
+                    },
+                    "result": {
+                        "description": "JSON-serializable task result"
+                    },
+                    "by": {
+                        "type": "string",
+                        "description": "Optional worker label"
+                    }
+                },
+                "required": ["name", "task_id"]
+            }),
+            CapabilitySet::filesystem_write(),
+            ToolExposure::Direct,
+            RendererHint::Agent,
+            false,
+        ),
+        BuiltinExecutor::WorkflowCompleteTask,
+    ));
+    registry.register(BuiltinTool::new(
+        builtin_spec(
+            "workflow_list_tasks",
+            "List tasks in a task list from the current workflow run.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Task list name"
+                    }
+                },
+                "required": ["name"]
+            }),
+            CapabilitySet::read_only_fs(),
+            ToolExposure::Direct,
+            RendererHint::Agent,
+            false,
+        ),
+        BuiltinExecutor::WorkflowListTasks,
+    ));
+    registry.register(BuiltinTool::new(
+        builtin_spec(
             "update_plan",
             "Update the current task plan. Use for complex multi-step tasks or when the user asks for a todo/task list. At most one step may be in_progress. Maximum 50 items, each step max 200 chars.",
             json!({
@@ -1002,9 +1106,13 @@ impl Tool for BuiltinTool {
             ),
             BuiltinExecutor::WorkflowSendMessage
             | BuiltinExecutor::WorkflowReadMessages
-            | BuiltinExecutor::WorkflowClearMessages => ToolResult::failed(
+            | BuiltinExecutor::WorkflowClearMessages
+            | BuiltinExecutor::WorkflowCreateTaskList
+            | BuiltinExecutor::WorkflowClaimTask
+            | BuiltinExecutor::WorkflowCompleteTask
+            | BuiltinExecutor::WorkflowListTasks => ToolResult::failed(
                 request,
-                "workflow mailbox tools must be executed by the runtime",
+                "workflow IPC tools must be executed by the runtime",
                 None,
             ),
             BuiltinExecutor::GetGoal => update_goal::execute_get(request),
@@ -1038,6 +1146,10 @@ enum BuiltinExecutor {
     WorkflowSendMessage,
     WorkflowReadMessages,
     WorkflowClearMessages,
+    WorkflowCreateTaskList,
+    WorkflowClaimTask,
+    WorkflowCompleteTask,
+    WorkflowListTasks,
     GetGoal,
     CreateGoal,
     UpdateGoal,
@@ -1234,6 +1346,40 @@ mod tests {
                 .expect("workflow_clear_messages tool")
                 .action_kind(),
             ActionKind::Write
+        );
+    }
+
+    #[test]
+    fn workflow_task_list_tools_have_autoedit_safe_action_kinds() {
+        let registry = default_tool_registry();
+
+        assert_eq!(
+            registry
+                .get("workflow_create_task_list")
+                .expect("workflow_create_task_list tool")
+                .action_kind(),
+            ActionKind::Write
+        );
+        assert_eq!(
+            registry
+                .get("workflow_claim_task")
+                .expect("workflow_claim_task tool")
+                .action_kind(),
+            ActionKind::Write
+        );
+        assert_eq!(
+            registry
+                .get("workflow_complete_task")
+                .expect("workflow_complete_task tool")
+                .action_kind(),
+            ActionKind::Write
+        );
+        assert_eq!(
+            registry
+                .get("workflow_list_tasks")
+                .expect("workflow_list_tasks tool")
+                .action_kind(),
+            ActionKind::Read
         );
     }
 }

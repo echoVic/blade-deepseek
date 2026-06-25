@@ -266,6 +266,47 @@ fn workflow_child_agents_can_exchange_messages_with_mailbox_tools() {
 }
 
 #[test]
+fn workflow_child_agents_can_claim_and_complete_shared_tasks() {
+    if !orca_runtime::workflow::host::WorkflowHost::node_available() {
+        return;
+    }
+
+    let temp = tempdir().unwrap();
+    let script = temp.path().join("workflow.js");
+    fs::write(
+        &script,
+        "export const meta = { name: 'child-tasks', description: 'Child task list test', phases: ['setup', 'work', 'verify'] };\n\
+         await phase('setup', async () => agent('workflow_create_task_list audit api docs'));\n\
+         await phase('work', async () => agent('workflow_claim_task audit worker-a'));\n\
+         await phase('done', async () => agent('workflow_complete_task audit workflow-task-1 worker-a ok'));\n\
+         const tasks = await phase('verify', async () => agent('workflow_list_tasks audit'));\n\
+         export default tasks.result;",
+    )
+    .unwrap();
+
+    let mut config = mock_run_config(temp.path());
+    config.approval_mode = ApprovalMode::Suggest;
+    let tasks = TaskRegistry::new("session-1".to_string());
+    let session_dir = temp.path().join("session");
+    let runner = WorkflowRunner::new(config, tasks.clone(), session_dir);
+
+    let launched = runner
+        .launch(WorkflowLaunchRequest::from_script_path(
+            script.display().to_string(),
+        ))
+        .expect("workflow completes with child task-list tools");
+
+    assert!(launched.summary.contains("workflow-task-1"));
+    assert!(launched.summary.contains("completed"));
+    assert!(launched.summary.contains("worker-a"));
+    assert!(launched.summary.contains("api"));
+    assert!(launched.summary.contains("ok"));
+    let record = tasks.get(&launched.task_id).expect("task record");
+    assert_eq!(record.status, TaskStatus::Completed);
+    assert_eq!(record.workflow_agents.len(), 4);
+}
+
+#[test]
 fn workflow_runner_marks_task_and_run_failed_on_host_error() {
     if !orca_runtime::workflow::host::WorkflowHost::node_available() {
         return;

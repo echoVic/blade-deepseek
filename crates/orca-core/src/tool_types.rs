@@ -21,6 +21,10 @@ pub enum ToolName {
     WorkflowSendMessage,
     WorkflowReadMessages,
     WorkflowClearMessages,
+    WorkflowCreateTaskList,
+    WorkflowClaimTask,
+    WorkflowCompleteTask,
+    WorkflowListTasks,
     WebSearch,
     GetGoal,
     CreateGoal,
@@ -56,6 +60,10 @@ impl ToolName {
             "workflow_send_message" => Self::WorkflowSendMessage,
             "workflow_read_messages" => Self::WorkflowReadMessages,
             "workflow_clear_messages" => Self::WorkflowClearMessages,
+            "workflow_create_task_list" => Self::WorkflowCreateTaskList,
+            "workflow_claim_task" => Self::WorkflowClaimTask,
+            "workflow_complete_task" => Self::WorkflowCompleteTask,
+            "workflow_list_tasks" => Self::WorkflowListTasks,
             "web_search" => Self::WebSearch,
             "get_goal" => Self::GetGoal,
             "create_goal" => Self::CreateGoal,
@@ -103,6 +111,10 @@ impl ToolName {
             Self::WorkflowSendMessage => "workflow_send_message",
             Self::WorkflowReadMessages => "workflow_read_messages",
             Self::WorkflowClearMessages => "workflow_clear_messages",
+            Self::WorkflowCreateTaskList => "workflow_create_task_list",
+            Self::WorkflowClaimTask => "workflow_claim_task",
+            Self::WorkflowCompleteTask => "workflow_complete_task",
+            Self::WorkflowListTasks => "workflow_list_tasks",
             Self::WebSearch => "web_search",
             Self::GetGoal => "get_goal",
             Self::CreateGoal => "create_goal",
@@ -136,6 +148,10 @@ impl ToolName {
             Self::WorkflowSendMessage => "workflow_send_message",
             Self::WorkflowReadMessages => "workflow_read_messages",
             Self::WorkflowClearMessages => "workflow_clear_messages",
+            Self::WorkflowCreateTaskList => "workflow_create_task_list",
+            Self::WorkflowClaimTask => "workflow_claim_task",
+            Self::WorkflowCompleteTask => "workflow_complete_task",
+            Self::WorkflowListTasks => "workflow_list_tasks",
             Self::WebSearch => "web_search",
             Self::GetGoal => "get_goal",
             Self::CreateGoal => "create_goal",
@@ -171,6 +187,10 @@ impl ToolName {
             "workflow_send_message" => Self::WorkflowSendMessage,
             "workflow_read_messages" => Self::WorkflowReadMessages,
             "workflow_clear_messages" => Self::WorkflowClearMessages,
+            "workflow_create_task_list" => Self::WorkflowCreateTaskList,
+            "workflow_claim_task" => Self::WorkflowClaimTask,
+            "workflow_complete_task" => Self::WorkflowCompleteTask,
+            "workflow_list_tasks" => Self::WorkflowListTasks,
             "web_search" => Self::WebSearch,
             "get_goal" => Self::GetGoal,
             "create_goal" => Self::CreateGoal,
@@ -197,6 +217,7 @@ impl ToolName {
                 | Self::GitStatus
                 | Self::SubagentStatus
                 | Self::WorkflowReadMessages
+                | Self::WorkflowListTasks
                 | Self::GetGoal
                 | Self::RequestUserInput
                 | Self::ListSkills
