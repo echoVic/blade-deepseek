@@ -1178,6 +1178,12 @@ fn execute_workflow_for_tui(
     let notify_tx = event_tx.clone();
     let notify_registry = task_registry.clone();
     thread::spawn(move || {
+        while !launch.is_finished() {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let _ = notify_tx.send(TuiEvent::WorkflowTasksUpdated {
+                tasks: notify_registry.list(),
+            });
+        }
         let notification = match launch.join() {
             Ok(Ok(result)) => WorkflowTerminalNotification {
                 task_id: result.task_id,
@@ -1922,6 +1928,20 @@ mod tests {
                 event,
                 TuiEvent::WorkflowTasksUpdated { tasks }
                 if tasks.iter().any(|task| task.workflow_run_id.is_some())
+            )
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                TuiEvent::WorkflowTasksUpdated { tasks }
+                if tasks.iter().any(|task| {
+                    task.workflow_progress
+                        .map(|progress| {
+                            progress.total_agents > 0
+                                && progress.completed_agents + progress.failed_agents > 0
+                        })
+                        .unwrap_or(false)
+                })
             )
         }));
         assert!(events.iter().any(|event| {

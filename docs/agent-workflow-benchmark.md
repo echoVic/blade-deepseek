@@ -188,18 +188,18 @@ All Phase 1 findings above were **cross-validated by the orchestrator** against 
 | **Agent Teams** | ❌ GAP | No team_name or agent grouping concept in types | P2 |
 | **Dynamic Workflows** | ⚠️ PARTIAL | JS DSL supports `Promise.all()` fan-out but agent spawning is fixed at script load | P1 |
 | **Worktrees** | ❌ GAP | `.worktrees/` directory exists but no isolation mode in subagent/workflow | P1 |
-| **Observability: token/elapsed/agent count** | ⚠️ PARTIAL | Workflows have `WorkflowPhaseRecord.agent_count`, `WorkflowWorkerRecord` with timestamps, `CostTracker` per agent; NOT exposed via TUI or subagent tool | P1 |
+| **Observability: token/elapsed/agent count** | ⚠️ PARTIAL | `/workflows` now receives live agent/phase progress counts; token and elapsed detail are still not exposed as a full dashboard | P1 |
 | **Agent Communication** | ❌ GAP | No message passing between agents; `WorkflowHost` routes calls one-way | P2 |
 | **Shared Task List** | ❌ GAP | No work queue; agents are stateless, results collected by `Promise.all()` | P2 |
 | **Reusable Workflow Scripts** | ✅ PRESENT | `.orca/workflows/*.js` + `~/.orca/workflows/*.js` + named workflow resolution | ✓ |
-| **Workflow Progress/Status** | ⚠️ PARTIAL | `WorkflowRunState` tracks phases and agent_count; `state.json` persists it; TUI shows `/workflows` list but not real-time progress | P2 |
+| **Workflow Progress/Status** | ⚠️ PARTIAL | `WorkflowRunState` tracks phases and agent_count; TUI polls `WorkflowTasksUpdated` and shows real agent/phase counts in `/workflows` | P2 |
 | **Fan-out to 8+ agents** | ✅ PRESENT | Default 16 concurrent, 1000 per run. Confirmed in this audit: 8 agents launched concurrently | ✓ |
 | **Agent Budget/Token Tracking** | ⚠️ PARTIAL | `CostTracker` exists per child agent; not surfaced to user or TUI | P2 |
 | **Resume/Fork Workflows** | ⚠️ PARTIAL | `resumeFromRunId` in `WorkflowInput` exists; state persistence supports it; not tested for complex workflows | P2 |
 | **Error Recovery** | ⚠️ PARTIAL | Agent failures caught (`WorkflowAgentFailed` event); no retry or fallback logic | P1 |
 | **Structured Agent Output** | ⚠️ PARTIAL | Workflow agents return `Value` (JSON); subagent tool returns text; no schema validation | P2 |
 
-**Overall gap**: Orca's **workflow system** is architecturally capable of concurrent agent fan-out (confirmed 8+ agents) with observability (phase tracking, agent statuses, timestamps). The primary gap is the **subagent tool** (model-facing), which lacks async mode, depth > 1, and team coordination. The workflow system's observability exists at the data layer but is under-exposed in the TUI.
+**Overall gap**: Orca's **workflow system** is architecturally capable of concurrent agent fan-out (confirmed 8+ agents) with observability (phase tracking, agent statuses, timestamps). The first TUI exposure now shows live agent/phase counts in `/workflows`; the remaining gaps are a richer agent dashboard, async model-facing subagents, depth > 1, worktree isolation, and team coordination.
 
 ### Reviewer 3: Actionability of Next Steps
 
@@ -225,14 +225,14 @@ All recommended next steps are **implementable within current architecture**:
 | Capability | Orca Status | Implementation Details |
 |-----------|-------------|----------------------|
 | 8+ agent fan-out | ✅ Yes | 16 concurrent default, 1000/run max. Confirmed: 8 launched this audit |
-| Workflow progress observability | ✅ Yes (data) / ⚠️ Partial (UI) | `WorkflowPhaseRecord`, agent_count, worker PID/timestamps |
-| Agent count tracking | ✅ Yes | `total_agent_count` in `WorkflowRunState` |
+| Workflow progress observability | ✅ Yes (data) / ⚠️ Partial (UI) | `/workflows` shows live agent/phase counts; full dashboard still missing |
+| Agent count tracking | ✅ Yes | `WorkflowTaskProgress` exposes total/running/completed/failed agents to TUI task summaries |
 | Token usage tracking | ✅ Yes (internal) | `CostTracker` per child agent; not user-facing |
 | Elapsed time tracking | ✅ Yes | `WorkflowWorkerRecord.started_at_ms/completed_at_ms` |
 | Reusable workflow scripts | ✅ Yes | Named workflows, `.orca/workflows/*.js` |
 | Agent-to-agent communication | ❌ No | One-way: host → agent → result |
 | Shared task list | ❌ No | Agents are independent, stateless |
-| Agent view / team dashboard | ❌ No | `/workflows` lists tasks only |
+| Agent view / team dashboard | ⚠️ Partial | `/workflows` lists tasks with agent/phase progress; no dedicated dashboard or team view |
 | Dynamic agent spawning | ⚠️ Partial | Fixed at script load; no conditional spawn |
 | Worktree isolation | ❌ No | `.worktrees/` dir exists, isolation not wired |
 | Async subagent (model tool) | ⚠️ Partial | Parallel batching up to 6 exists (`SubagentConfig.max_parallel`); async (non-blocking) mode still missing |
@@ -276,13 +276,13 @@ All recommended next steps are **implementable within current architecture**:
 
 1. **Async subagent execution** (`subagent` tool): Allow model to launch non-blocking subagents with `agent_id` return. Already defined in `subagent-enhancement-plan.md` §2.1. Files: `agent_child.rs`, `subagent.rs`, new `tools/subagent_status.rs`.
 
-2. **Subagent status/progress visibility**: Expose `WorkflowAgentStatus` (pending/running/completed/failed) to TUI and JSONL events for individual subagent tool calls. Files: `event_schema.rs` (add events), `tui/ui.rs`.
+2. **Subagent status/progress visibility**: Workflow task progress is now exposed in `/workflows`; individual model-facing async subagent handles/status remain to be implemented. Files: `agent_child.rs`, `subagent.rs`, new `tools/subagent_status.rs`.
 
 3. **Workflow error retry**: When an agent fails, allow phase-level retry. Files: `workflow/runner.rs`, `workflow/host.rs`.
 
 ### P1 — Important enhancements
 
-4. **TUI agent dashboard**: Live view of running agents with status, progress, token usage. Files: `tui/app.rs`, `tui/ui.rs`, new `tui/agent_panel.rs`.
+4. **TUI agent dashboard**: Extend the current `/workflows` agent/phase counts into a dedicated live dashboard with per-agent rows, elapsed time, token usage, and failure details. Files: `tui/app.rs`, `tui/ui.rs`, new `tui/agent_panel.rs`.
 
 5. **Worktree isolation**: Isolate subagent file writes in git worktree with auto-cleanup. Files: `sandbox/mod.rs`, `agent_child.rs`.
 
@@ -307,5 +307,6 @@ All recommended next steps are **implementable within current architecture**:
 - ✅ Git status inspected: 2 pre-existing dirty files, none from this audit
 - ✅ Phase 1 workflow completed: all 8 agents returned source-verified results
 - ✅ Phase 2 reviewer scripts prepared (`.orca/workflows/audit-phase2.js`)
-- ✅ No business logic modified; only docs + workflow scripts added
+- ✅ Workflow task summaries now carry live progress data into the TUI; docs and tests reflect the updated capability
 - ✅ Subagent docs now reflect batch parallel execution; async non-blocking mode is still not implemented
+- ✅ `/workflows` now receives live workflow progress summaries with total/running/completed/failed agent counts and phase counts

@@ -8,7 +8,7 @@ use std::ops::Range;
 use tui_textarea::TextArea;
 use unicode_width::UnicodeWidthStr;
 
-use orca_core::task_types::{TaskStatus, TaskType};
+use orca_core::task_types::{BackgroundTaskSummary, TaskStatus, TaskType};
 
 use crate::shortcuts::{self, ShortcutScope};
 use crate::theme::Theme;
@@ -366,10 +366,7 @@ fn render_workflows_panel(frame: &mut Frame, area: Rect, state: &mut AppState, t
         let status = task_status_label(task.status);
         let status_color = task_status_color(task.status, theme);
         let run_id = task.workflow_run_id.as_deref().unwrap_or("-");
-        let phase_count = task
-            .phase_count
-            .map(|count| count.to_string())
-            .unwrap_or_else(|| "-".to_string());
+        let progress = workflow_progress_label(task);
         let name_style = if selected {
             Style::default()
                 .fg(theme.border)
@@ -387,10 +384,7 @@ fn render_workflows_panel(frame: &mut Frame, area: Rect, state: &mut AppState, t
             Span::styled("  ", Style::default()),
             Span::styled(status.to_string(), Style::default().fg(status_color)),
             Span::styled(format!("  {run_id}"), Style::default().fg(theme.muted)),
-            Span::styled(
-                format!("  {phase_count} phases"),
-                Style::default().fg(theme.muted),
-            ),
+            Span::styled(format!("  {progress}"), Style::default().fg(theme.muted)),
         ]));
         frame.render_widget(label, parts[0]);
 
@@ -445,6 +439,41 @@ fn workflow_gauge_label(status: TaskStatus) -> String {
         TaskStatus::Running => "running…".to_string(),
         TaskStatus::Stopping => "stopping…".to_string(),
     }
+}
+
+fn workflow_progress_label(task: &BackgroundTaskSummary) -> String {
+    let total_phases = task.phase_count.unwrap_or_default();
+    let Some(progress) = task.workflow_progress else {
+        return match task.phase_count {
+            Some(count) => format!("{count} phases"),
+            None => "phases -".to_string(),
+        };
+    };
+
+    let mut parts = vec![format!(
+        "agents {}/{}",
+        progress.completed_agents, progress.total_agents
+    )];
+    if progress.running_agents > 0 {
+        parts.push(format!("running {}", progress.running_agents));
+    }
+    if progress.failed_agents > 0 {
+        parts.push(format!("failed {}", progress.failed_agents));
+    }
+
+    let phase_total = if total_phases == 0 {
+        progress
+            .completed_phases
+            .saturating_add(progress.running_phases)
+            .saturating_add(progress.failed_phases)
+    } else {
+        total_phases
+    };
+    parts.push(format!(
+        "phases {}/{}",
+        progress.completed_phases, phase_total
+    ));
+    parts.join(", ")
 }
 
 fn build_welcome_lines<'a>(state: &AppState, theme: &Theme) -> Vec<Line<'a>> {
@@ -2138,6 +2167,37 @@ mod tests {
         let cell = status_cell(&state, &theme);
         assert_eq!(cell.content.as_ref(), " ● running 1m 05s");
         assert_eq!(cell.style.fg, Some(theme.warning));
+    }
+
+    #[test]
+    fn workflow_progress_label_summarizes_agents_and_phases() {
+        let task = BackgroundTaskSummary {
+            id: "task-1".to_string(),
+            task_type: TaskType::Workflow,
+            status: TaskStatus::Running,
+            description: "Audit".to_string(),
+            command: None,
+            agent_type: None,
+            server: None,
+            tool: None,
+            name: Some("audit".to_string()),
+            workflow_run_id: Some("workflow-run-1".to_string()),
+            phase_count: Some(3),
+            workflow_progress: Some(orca_core::task_types::WorkflowTaskProgress {
+                total_agents: 5,
+                running_agents: 2,
+                completed_agents: 2,
+                failed_agents: 1,
+                completed_phases: 1,
+                running_phases: 1,
+                failed_phases: 0,
+            }),
+        };
+
+        assert_eq!(
+            workflow_progress_label(&task),
+            "agents 2/5, running 2, failed 1, phases 1/3"
+        );
     }
 
     #[test]

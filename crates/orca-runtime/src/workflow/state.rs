@@ -120,6 +120,14 @@ pub struct WorkflowWorkerRecord {
     pub completed_at_ms: Option<i64>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WorkflowAgentStatusCounts {
+    pub completed: u32,
+    pub failed: u32,
+    pub cancelled: u32,
+    pub cached: u32,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct WorkflowStopRequest {
@@ -297,6 +305,26 @@ impl WorkflowStateStore {
                 input_hash: entry.record.input_hash.clone(),
                 output: entry.record.output.clone().unwrap_or(Value::Null),
             }))
+    }
+
+    pub fn agent_status_counts(&self, run_id: &str) -> io::Result<WorkflowAgentStatusCounts> {
+        let path = self.run_dir(run_id).join("agent-cache.json");
+        if !path.exists() {
+            return Ok(WorkflowAgentStatusCounts::default());
+        }
+
+        let cache = read_agent_cache(&path)?;
+        let mut counts = WorkflowAgentStatusCounts::default();
+        for entry in cache.values() {
+            match entry.record.status {
+                WorkflowAgentStatus::Completed => counts.completed += 1,
+                WorkflowAgentStatus::Failed => counts.failed += 1,
+                WorkflowAgentStatus::Cancelled => counts.cancelled += 1,
+                WorkflowAgentStatus::Cached => counts.cached += 1,
+                WorkflowAgentStatus::Pending | WorkflowAgentStatus::Running => {}
+            }
+        }
+        Ok(counts)
     }
 }
 

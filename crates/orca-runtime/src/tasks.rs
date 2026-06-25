@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use orca_core::cancel::CancelToken;
-use orca_core::task_types::{BackgroundTaskSummary, TaskStatus, TaskType};
+use orca_core::task_types::{BackgroundTaskSummary, TaskStatus, TaskType, WorkflowTaskProgress};
 
 #[derive(Clone, Debug)]
 pub struct TaskRegistry {
@@ -27,6 +27,7 @@ pub struct TaskRecord {
     pub name: Option<String>,
     pub workflow_run_id: Option<String>,
     pub phase_count: Option<usize>,
+    pub workflow_progress: Option<WorkflowTaskProgress>,
     pub result: Option<String>,
     pub error: Option<String>,
     pub control: TaskControl,
@@ -70,6 +71,7 @@ impl TaskRegistry {
             name: Some(name),
             workflow_run_id: Some(workflow_run_id.clone()),
             phase_count: Some(phase_count),
+            workflow_progress: None,
             result: None,
             error: None,
             control,
@@ -104,6 +106,7 @@ impl TaskRegistry {
                         name: record.name.clone(),
                         workflow_run_id: record.workflow_run_id.clone(),
                         phase_count: record.phase_count,
+                        workflow_progress: record.workflow_progress,
                     })
                     .collect::<Vec<_>>()
             })
@@ -115,6 +118,17 @@ impl TaskRegistry {
     pub fn get(&self, id: &str) -> Option<TaskRecord> {
         self.with_tasks(|tasks| tasks.get(id).cloned())
             .expect("task registry lock poisoned")
+    }
+
+    pub fn update_workflow_progress(
+        &self,
+        id: &str,
+        progress: WorkflowTaskProgress,
+    ) -> Result<(), String> {
+        self.update_task(id, |record| {
+            record.workflow_progress = Some(progress);
+            Ok(())
+        })
     }
 
     pub fn mark_running(&self, id: &str) -> Result<(), String> {
@@ -256,6 +270,46 @@ mod tests {
         assert_eq!(list[0].name.as_deref(), Some("audit"));
         assert_eq!(list[0].workflow_run_id.as_deref(), Some("workflow-run-1"));
         assert_eq!(list[0].phase_count, Some(2));
+    }
+
+    #[test]
+    fn registry_lists_workflow_progress() {
+        let registry = TaskRegistry::new("session-1".to_string());
+        let task = registry.create_workflow(
+            "workflow-run-1".to_string(),
+            "audit".to_string(),
+            "Audit code".to_string(),
+            3,
+        );
+
+        registry
+            .update_workflow_progress(
+                &task.id,
+                orca_core::task_types::WorkflowTaskProgress {
+                    total_agents: 5,
+                    running_agents: 2,
+                    completed_agents: 2,
+                    failed_agents: 1,
+                    completed_phases: 1,
+                    running_phases: 1,
+                    failed_phases: 0,
+                },
+            )
+            .unwrap();
+
+        let list = registry.list();
+        assert_eq!(
+            list[0].workflow_progress,
+            Some(orca_core::task_types::WorkflowTaskProgress {
+                total_agents: 5,
+                running_agents: 2,
+                completed_agents: 2,
+                failed_agents: 1,
+                completed_phases: 1,
+                running_phases: 1,
+                failed_phases: 0,
+            })
+        );
     }
 
     #[test]

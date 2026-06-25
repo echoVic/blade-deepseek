@@ -1225,6 +1225,7 @@ mod tests {
             name: Some("audit".to_string()),
             workflow_run_id: Some("workflow-run-1".to_string()),
             phase_count: Some(2),
+            workflow_progress: None,
         }];
         state.workflow_panel.selected = 9;
 
@@ -1252,6 +1253,7 @@ mod tests {
                 name: Some("audit".to_string()),
                 workflow_run_id: Some("workflow-run-1".to_string()),
                 phase_count: Some(2),
+                workflow_progress: None,
             }],
         });
         state.update(TuiEvent::WorkflowNotification {

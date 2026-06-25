@@ -22,6 +22,18 @@ pub enum TaskType {
     Monitor,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkflowTaskProgress {
+    pub total_agents: u32,
+    pub running_agents: u32,
+    pub completed_agents: u32,
+    pub failed_agents: u32,
+    pub completed_phases: usize,
+    pub running_phases: usize,
+    pub failed_phases: usize,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BackgroundTaskSummary {
@@ -44,4 +56,6 @@ pub struct BackgroundTaskSummary {
     pub workflow_run_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub phase_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workflow_progress: Option<WorkflowTaskProgress>,
 }

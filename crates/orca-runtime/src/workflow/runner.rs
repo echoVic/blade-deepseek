@@ -14,7 +14,7 @@ use orca_core::event_schema::EventFactory;
 use orca_core::event_schema::RunStatus;
 use orca_core::event_sink::EventSink;
 use orca_core::subagent_types::SubagentType;
-use orca_core::task_types::TaskType;
+use orca_core::task_types::{TaskType, WorkflowTaskProgress};
 use orca_core::workflow_types::{
     WorkflowAgentStatus, WorkflowInput, WorkflowOutput, WorkflowPhaseRecord, WorkflowRunState,
     WorkflowRunStatus,
@@ -81,6 +81,10 @@ pub struct WorkflowBackgroundLaunch {
 }
 
 impl WorkflowBackgroundLaunch {
+    pub fn is_finished(&self) -> bool {
+        self.handle.is_finished()
+    }
+
     pub fn join(self) -> thread::Result<io::Result<WorkflowLaunchResult>> {
         self.handle.join()
     }
@@ -327,6 +331,7 @@ impl WorkflowRunner {
             |call| {
                 self.answer_agent_call(
                     &run_id,
+                    &task_id,
                     resume_from.as_deref(),
                     &transcript_dir,
                     call,
@@ -344,7 +349,8 @@ impl WorkflowRunner {
                     &mut completed_result,
                     &mut failed_error,
                 );
-                self.state.write_state(&state)
+                self.state.write_state(&state)?;
+                self.refresh_task_progress(&task_id, &state)
             },
         ) {
             Ok(events) => events,
@@ -440,6 +446,7 @@ impl WorkflowRunner {
     fn answer_agent_call(
         &self,
         run_id: &str,
+        task_id: &str,
         resume_from: Option<&str>,
         transcript_dir: &std::path::Path,
         call: AgentCall,
@@ -489,6 +496,9 @@ impl WorkflowRunner {
                         transcript_path: Some(transcript_path.display().to_string()),
                     },
                 )?;
+                if let Ok(state) = self.state.load_run(run_id) {
+                    let _ = self.refresh_task_progress(task_id, &state);
+                }
                 return Ok(HostCommand::AgentResult {
                     call_id: call.call_id,
                     result: normalized_cached_value,
@@ -516,6 +526,9 @@ impl WorkflowRunner {
                         transcript_path: Some(transcript_path.display().to_string()),
                     },
                 )?;
+                if let Ok(state) = self.state.load_run(run_id) {
+                    let _ = self.refresh_task_progress(task_id, &state);
+                }
 
                 Ok(HostCommand::AgentResult {
                     call_id: call.call_id,
@@ -540,6 +553,9 @@ impl WorkflowRunner {
                         transcript_path: Some(transcript_path.display().to_string()),
                     },
                 )?;
+                if let Ok(state) = self.state.load_run(run_id) {
+                    let _ = self.refresh_task_progress(task_id, &state);
+                }
 
                 Ok(HostCommand::AgentError {
                     call_id: call.call_id,
@@ -644,6 +660,47 @@ impl WorkflowRunner {
             },
             summary: STOPPED_SUMMARY.to_string(),
         })
+    }
+
+    fn refresh_task_progress(&self, task_id: &str, state: &WorkflowRunState) -> io::Result<()> {
+        let counts = self.state.agent_status_counts(&state.run_id)?;
+        let terminal_agents = counts
+            .completed
+            .saturating_add(counts.failed)
+            .saturating_add(counts.cancelled)
+            .saturating_add(counts.cached);
+        let running_agents = state.total_agent_count.saturating_sub(terminal_agents);
+        let progress = WorkflowTaskProgress {
+            total_agents: state.total_agent_count,
+            running_agents,
+            completed_agents: counts.completed.saturating_add(counts.cached),
+            failed_agents: counts.failed.saturating_add(counts.cancelled),
+            completed_phases: state
+                .phases
+                .iter()
+                .filter(|phase| phase.status == WorkflowRunStatus::Completed)
+                .count(),
+            running_phases: state
+                .phases
+                .iter()
+                .filter(|phase| phase.status == WorkflowRunStatus::Running)
+                .count(),
+            failed_phases: state
+                .phases
+                .iter()
+                .filter(|phase| {
+                    matches!(
+                        phase.status,
+                        WorkflowRunStatus::Failed
+                            | WorkflowRunStatus::Cancelled
+                            | WorkflowRunStatus::Stopped
+                    )
+                })
+                .count(),
+        };
+        self.tasks
+            .update_workflow_progress(task_id, progress)
+            .map_err(io::Error::other)
     }
 }
 
