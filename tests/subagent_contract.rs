@@ -184,6 +184,141 @@ fn async_subagent_completes_after_launching_exec_process_exits() {
 }
 
 #[test]
+fn subagent_schema_accepts_matching_output() {
+    let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .args([
+            "exec",
+            "--output-format",
+            "jsonl",
+            "--provider",
+            "mock",
+            "subagent schema_ok",
+        ])
+        .output()
+        .expect("run orca");
+
+    assert_eq!(output.status.code(), Some(0));
+
+    let events = parse_jsonl(&output.stdout);
+    let completed = find_event(&events, "subagent.completed");
+    assert_eq!(completed["payload"]["description"], "schema_ok");
+    assert_eq!(completed["payload"]["status"], "success");
+    assert_eq!(completed["payload"]["error"], Value::Null);
+
+    let tool_completed = find_event(&events, "tool.call.completed");
+    assert_eq!(tool_completed["payload"]["name"], "subagent");
+    assert_eq!(tool_completed["payload"]["status"], "completed");
+    assert_eq!(events.last().unwrap()["payload"]["status"], "success");
+}
+
+#[test]
+fn subagent_schema_failure_fails_parent_run() {
+    let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .args([
+            "exec",
+            "--output-format",
+            "jsonl",
+            "--provider",
+            "mock",
+            "subagent schema_fail",
+        ])
+        .output()
+        .expect("run orca");
+
+    assert_eq!(output.status.code(), Some(1));
+
+    let events = parse_jsonl(&output.stdout);
+    let completed = find_event(&events, "subagent.completed");
+    assert_eq!(completed["payload"]["description"], "schema_fail");
+    assert_eq!(completed["payload"]["status"], "failed");
+    let error = completed["payload"]["error"].as_str().unwrap();
+    assert!(error.contains("subagent output schema validation failed for schema_fail"));
+    assert!(error.contains("$ expected object, got string"));
+
+    let tool_completed = find_event(&events, "tool.call.completed");
+    assert_eq!(tool_completed["payload"]["name"], "subagent");
+    assert_eq!(tool_completed["payload"]["status"], "failed");
+    assert_eq!(events.last().unwrap()["payload"]["status"], "failed");
+}
+
+#[test]
+fn subagent_batch_schema_failure_fails_parent_run() {
+    let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .args([
+            "exec",
+            "--output-format",
+            "jsonl",
+            "--provider",
+            "mock",
+            "subagent batch schema_fail",
+        ])
+        .output()
+        .expect("run orca");
+
+    assert_eq!(output.status.code(), Some(1));
+
+    let events = parse_jsonl(&output.stdout);
+    let completed = events
+        .iter()
+        .filter(|event| event["type"] == "subagent.completed")
+        .collect::<Vec<_>>();
+    assert_eq!(completed.len(), 2);
+    assert_eq!(completed[0]["payload"]["id"], "mock-tool-1");
+    assert_eq!(completed[0]["payload"]["status"], "success");
+    assert_eq!(completed[1]["payload"]["id"], "mock-tool-2");
+    assert_eq!(completed[1]["payload"]["description"], "schema_fail");
+    assert_eq!(completed[1]["payload"]["status"], "failed");
+    let error = completed[1]["payload"]["error"].as_str().unwrap();
+    assert!(error.contains("subagent output schema validation failed for schema_fail"));
+    assert!(error.contains("$ expected object, got string"));
+
+    let failed_tool = events
+        .iter()
+        .filter(|event| event["type"] == "tool.call.completed")
+        .find(|event| event["payload"]["id"] == "mock-tool-2")
+        .expect("failed batch tool completion");
+    assert_eq!(failed_tool["payload"]["name"], "subagent");
+    assert_eq!(failed_tool["payload"]["status"], "failed");
+    assert_eq!(events.last().unwrap()["payload"]["status"], "failed");
+}
+
+#[test]
+fn async_subagent_schema_failure_persists_failed_task() {
+    let cwd = tempdir().expect("temp cwd");
+    let orca_home = tempdir().expect("temp orca home");
+    let launched = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .current_dir(cwd.path())
+        .env("ORCA_HOME", orca_home.path())
+        .args([
+            "exec",
+            "--output-format",
+            "jsonl",
+            "--provider",
+            "mock",
+            "--approval-mode",
+            "full-auto",
+            "subagent async schema_fail",
+        ])
+        .output()
+        .expect("run orca");
+    assert_eq!(launched.status.code(), Some(0));
+    let launch_events = parse_jsonl(&launched.stdout);
+    let launch_completed = find_event(&launch_events, "tool.call.completed");
+    let launch_payload: Value =
+        serde_json::from_str(launch_completed["payload"]["output"].as_str().unwrap()).unwrap();
+    let agent_id = launch_payload["agent_id"].as_str().unwrap().to_string();
+
+    let status_payload = poll_subagent_status_until_failed(cwd.path(), orca_home.path(), &agent_id);
+
+    assert_eq!(status_payload["agent_id"], agent_id);
+    assert_eq!(status_payload["description"], "schema_fail");
+    assert_eq!(status_payload["status"], "failed");
+    let error = status_payload["error"].as_str().unwrap();
+    assert!(error.contains("subagent output schema validation failed for schema_fail"));
+    assert!(error.contains("$ expected object, got string"));
+}
+
+#[test]
 fn nested_subagent_calls_are_rejected() {
     let orca_home = tempdir().expect("temp orca home");
     std::fs::write(
@@ -346,6 +481,52 @@ fn parse_jsonl(stdout: &[u8]) -> Vec<Value> {
         .lines()
         .map(|line| serde_json::from_str(line).expect("valid jsonl line"))
         .collect()
+}
+
+fn poll_subagent_status_until_failed(
+    cwd: &std::path::Path,
+    orca_home: &std::path::Path,
+    agent_id: &str,
+) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut last_payload = None;
+    while Instant::now() < deadline {
+        let status = Command::new(env!("CARGO_BIN_EXE_orca"))
+            .current_dir(cwd)
+            .env("ORCA_HOME", orca_home)
+            .args([
+                "exec",
+                "--output-format",
+                "jsonl",
+                "--provider",
+                "mock",
+                "--approval-mode",
+                "full-auto",
+                &format!("subagent_status {agent_id}"),
+            ])
+            .output()
+            .expect("run orca");
+        assert_eq!(status.status.code(), Some(0));
+        let status_events = parse_jsonl(&status.stdout);
+        let status_completed = find_event(&status_events, "tool.call.completed");
+        let status_payload: Value =
+            serde_json::from_str(status_completed["payload"]["output"].as_str().unwrap()).unwrap();
+        if status_payload["status"] == "failed" {
+            return status_payload;
+        }
+        assert_ne!(
+            status_payload["status"], "completed",
+            "async subagent completed despite schema mismatch: {status_payload}"
+        );
+        last_payload = Some(status_payload);
+        thread::sleep(Duration::from_millis(50));
+    }
+    panic!(
+        "async subagent did not fail before timeout; last status: {}",
+        last_payload
+            .map(|payload| payload.to_string())
+            .unwrap_or_else(|| "<none>".to_string())
+    );
 }
 
 fn poll_subagent_status(

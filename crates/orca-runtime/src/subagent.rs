@@ -1,6 +1,7 @@
 use orca_core::subagent_types::SubagentType;
 use orca_core::tool_types::ToolRequest;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SubagentRequest {
@@ -10,6 +11,7 @@ pub struct SubagentRequest {
     pub model: Option<String>,
     pub mode: SubagentMode,
     pub isolation: SubagentIsolation,
+    pub schema: Option<Value>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -30,6 +32,12 @@ pub fn extract_subagent_field(tool_request: &ToolRequest, field: &str) -> Option
     let raw = tool_request.raw_arguments.as_ref()?;
     let value: serde_json::Value = serde_json::from_str(raw).ok()?;
     value[field].as_str().map(String::from)
+}
+
+pub fn extract_subagent_json_field(tool_request: &ToolRequest, field: &str) -> Option<Value> {
+    let raw = tool_request.raw_arguments.as_ref()?;
+    let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+    value.get(field).cloned()
 }
 
 pub fn create_subagent_request(tool_request: &ToolRequest) -> SubagentRequest {
@@ -53,6 +61,7 @@ pub fn create_subagent_request(tool_request: &ToolRequest) -> SubagentRequest {
         Some("worktree") => SubagentIsolation::Worktree,
         _ => SubagentIsolation::None,
     };
+    let schema = extract_subagent_json_field(tool_request, "schema");
 
     SubagentRequest {
         description,
@@ -61,6 +70,7 @@ pub fn create_subagent_request(tool_request: &ToolRequest) -> SubagentRequest {
         model,
         mode,
         isolation,
+        schema,
     }
 }
 
@@ -83,7 +93,8 @@ mod tests {
                     "prompt": "review src/main.rs for bugs",
                     "subagent_type": "code_reviewer",
                     "model": "deepseek-v4-pro",
-                    "isolation": "worktree"
+                    "isolation": "worktree",
+                    "schema": { "type": "string" }
                 })
                 .to_string(),
             ),
@@ -95,6 +106,7 @@ mod tests {
         assert_eq!(result.model.as_deref(), Some("deepseek-v4-pro"));
         assert_eq!(result.mode, SubagentMode::Sync);
         assert_eq!(result.isolation, SubagentIsolation::Worktree);
+        assert_eq!(result.schema, Some(serde_json::json!({ "type": "string" })));
     }
 
     #[test]

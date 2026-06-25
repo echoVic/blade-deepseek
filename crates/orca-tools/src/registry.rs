@@ -566,6 +566,10 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
                         "type": "string",
                         "enum": ["none", "worktree"],
                         "description": "none uses the current checkout. worktree runs the child in a detached git worktree and preserves it if the child leaves file changes."
+                    },
+                    "schema": {
+                        "type": "object",
+                        "description": "Optional JSON Schema subset for validating the child agent's final output. Supports type, required, and properties."
                     }
                 },
                 "required": ["description", "prompt"]

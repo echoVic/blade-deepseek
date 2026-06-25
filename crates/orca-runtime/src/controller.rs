@@ -25,6 +25,7 @@ use orca_provider::tool_schema::{
 };
 use orca_provider::{self, ProviderConfig};
 use orca_tools;
+use serde_json::Value;
 
 use crate::agent_child::{ChildAgentRequest, ChildAgentResult, ChildAgentRuntime, run_child_agent};
 use crate::agent_common;
@@ -33,6 +34,7 @@ use crate::history::{self, SessionStore, SessionWriter};
 use crate::hooks::{HookContext, HookRunner, conversation_with_hook_context};
 use crate::instructions::{self, ProjectInstructions};
 use crate::memory::{self, MemoryBlock};
+use crate::schema_validation::validate_json_schema_subset;
 use crate::session::new_run_id;
 use crate::subagent::{self, SubagentIsolation, SubagentMode};
 use crate::tasks::TaskRegistry;
@@ -72,6 +74,7 @@ struct AgentLoopResult {
 struct SubagentExecutionResult {
     tool_request: tool_types::ToolRequest,
     description: String,
+    schema: Option<Value>,
     child: ChildAgentResult,
     cost_tracker: CostTracker,
     worktree: Option<WorktreeOutcome>,
@@ -1559,6 +1562,7 @@ fn execute_subagent_batch(
                 SubagentExecutionResult {
                     tool_request: child_tool_request,
                     description: request.description,
+                    schema: request.schema,
                     child,
                     cost_tracker: child_cost_tracker,
                     worktree: None,
@@ -1625,6 +1629,30 @@ fn subagent_execution_to_tool_result(
                 .final_message
                 .clone()
                 .unwrap_or_else(|| "(subagent completed without a final message)".to_string());
+            if let Err(mut error) = validate_subagent_output_schema(
+                &execution.description,
+                execution.schema.as_ref(),
+                &output,
+            ) {
+                append_worktree_outcome(&mut error, execution.worktree.as_ref());
+                if emit_deltas {
+                    sink.emit(&events.subagent_completed(
+                        &execution.tool_request.id,
+                        &execution.description,
+                        RunStatus::Failed,
+                        Some(&output),
+                        Some(&error),
+                    ))?;
+                }
+                return Ok((
+                    RunStatus::Failed,
+                    tool_types::ToolResult::failed(
+                        &execution.tool_request,
+                        format!("Subagent status: Failed\n\n{error}"),
+                        None,
+                    ),
+                ));
+            }
             append_worktree_outcome(&mut output, execution.worktree.as_ref());
             if emit_deltas {
                 sink.emit(&events.subagent_completed(
@@ -1686,6 +1714,24 @@ fn append_worktree_outcome(output: &mut String, outcome: Option<&WorktreeOutcome
     }
 }
 
+fn validate_subagent_output_schema(
+    description: &str,
+    schema: Option<&Value>,
+    output: &str,
+) -> Result<(), String> {
+    let Some(schema) = schema else {
+        return Ok(());
+    };
+    let value = subagent_output_value(output);
+    validate_json_schema_subset(schema, &value, "$").map_err(|error| {
+        format!("subagent output schema validation failed for {description}: {error}")
+    })
+}
+
+fn subagent_output_value(output: &str) -> Value {
+    serde_json::from_str(output).unwrap_or_else(|_| Value::String(output.to_string()))
+}
+
 fn execute_subagent_tool(
     config: &RunConfig,
     cwd: &Path,
@@ -1705,6 +1751,7 @@ fn execute_subagent_tool(
 ) -> io::Result<tool_types::ToolResult> {
     let request = subagent::create_subagent_request(tool_request);
     let description = request.description.clone();
+    let schema = request.schema.clone();
 
     if emit_deltas {
         sink.emit(&events.subagent_started(&tool_request.id, &description))?;
@@ -1792,6 +1839,25 @@ fn execute_subagent_tool(
             let mut output = child
                 .final_message
                 .unwrap_or_else(|| "(subagent completed without a final message)".to_string());
+            if let Err(mut error) =
+                validate_subagent_output_schema(&description, schema.as_ref(), &output)
+            {
+                append_worktree_outcome(&mut error, worktree.as_ref());
+                if emit_deltas {
+                    sink.emit(&events.subagent_completed(
+                        &tool_request.id,
+                        &description,
+                        RunStatus::Failed,
+                        Some(&output),
+                        Some(&error),
+                    ))?;
+                }
+                return Ok(tool_types::ToolResult::failed(
+                    tool_request,
+                    format!("Subagent status: Failed\n\n{error}"),
+                    None,
+                ));
+            }
             append_worktree_outcome(&mut output, worktree.as_ref());
             if emit_deltas {
                 sink.emit(&events.subagent_completed(
@@ -2005,6 +2071,18 @@ pub fn run_async_subagent_worker(
         let mut output = child
             .final_message
             .unwrap_or_else(|| "(subagent completed without a final message)".to_string());
+        if let Err(mut error) =
+            validate_subagent_output_schema(&request.description, request.schema.as_ref(), &output)
+        {
+            append_worktree_outcome(&mut error, worktree.as_ref());
+            if task_registry
+                .fail_with_usage(&agent_id, error, usage)
+                .is_ok()
+            {
+                return 1;
+            }
+            return 1;
+        }
         append_worktree_outcome(&mut output, worktree.as_ref());
         if task_registry
             .complete_with_usage(&agent_id, output, usage)

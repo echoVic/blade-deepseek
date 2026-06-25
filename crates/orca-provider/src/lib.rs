@@ -295,6 +295,36 @@ fn mock_call(conversation: &Conversation) -> ProviderResponse {
         };
     }
 
+    if prompt.trim() == "subagent batch schema_fail" {
+        let mut first = parse_mock_prompt("subagent schema_ok").expect("schema ok request");
+        first.id = "mock-tool-1".to_string();
+        let mut second = parse_mock_prompt("subagent schema_fail").expect("schema fail request");
+        second.id = "mock-tool-2".to_string();
+        let steps = vec![
+            ProviderStep::ToolCall(first.clone()),
+            ProviderStep::ToolCall(second.clone()),
+        ];
+        let tool_calls = vec![
+            RawToolCall {
+                id: first.id,
+                function_name: first.name.as_str().to_string(),
+                arguments: first.raw_arguments.unwrap_or_default(),
+            },
+            RawToolCall {
+                id: second.id,
+                function_name: second.name.as_str().to_string(),
+                arguments: second.raw_arguments.unwrap_or_default(),
+            },
+        ];
+        return ProviderResponse {
+            steps,
+            assistant_content: None,
+            assistant_reasoning: None,
+            tool_calls,
+            usage: None,
+        };
+    }
+
     if let Some(tool_request) = parse_mock_prompt(prompt) {
         let raw_call = RawToolCall {
             id: tool_request.id.clone(),
@@ -365,6 +395,8 @@ fn parse_mock_prompt(prompt: &str) -> Option<ToolRequest> {
         };
         let prompt = if description == "mock_fail" {
             "mock_fail".to_string()
+        } else if description == "schema_ok" || description == "schema_fail" {
+            "mock_usage".to_string()
         } else {
             description.to_string()
         };
@@ -372,6 +404,17 @@ fn parse_mock_prompt(prompt: &str) -> Option<ToolRequest> {
             "description": description,
             "prompt": prompt
         });
+        if description == "schema_ok" {
+            arguments["schema"] = serde_json::json!({ "type": "string" });
+        } else if description == "schema_fail" {
+            arguments["schema"] = serde_json::json!({
+                "type": "object",
+                "required": ["result"],
+                "properties": {
+                    "result": { "type": "string" }
+                }
+            });
+        }
         if let Some(mode) = mode {
             arguments["mode"] = serde_json::Value::String(mode.to_string());
         }
@@ -708,6 +751,26 @@ mod tests {
         assert_eq!(arguments["description"], "inspect repo");
         assert_eq!(arguments["prompt"], "inspect repo");
         assert_eq!(arguments["mode"], "async");
+    }
+
+    #[test]
+    fn mock_prompt_parses_subagent_schema() {
+        let request = parse_mock_prompt("subagent schema_fail").expect("tool request");
+        assert_eq!(request.name, ToolName::Subagent);
+
+        let arguments: serde_json::Value =
+            serde_json::from_str(request.raw_arguments.as_deref().unwrap()).unwrap();
+        assert_eq!(arguments["description"], "schema_fail");
+        assert_eq!(arguments["prompt"], "mock_usage");
+        assert_eq!(arguments["schema"]["type"], "object");
+        assert_eq!(
+            arguments["schema"]["required"],
+            serde_json::json!(["result"])
+        );
+        assert_eq!(
+            arguments["schema"]["properties"]["result"]["type"],
+            "string"
+        );
     }
 
     #[test]

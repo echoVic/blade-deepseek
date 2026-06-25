@@ -10,6 +10,7 @@ pub mod memory;
 pub mod mentions;
 pub mod notify;
 pub mod protocol;
+pub mod schema_validation;
 pub mod server;
 pub mod session;
 pub mod subagent;
