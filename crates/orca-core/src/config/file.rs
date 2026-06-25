@@ -527,6 +527,7 @@ max_parallel = 6
 [tools]
 max_read_parallel = 5
 output_truncation = { mode = "tokens", limit = 512 }
+shell_timeout_secs = 42
 "#;
         let config: FileConfig = toml::from_str(toml).unwrap();
         assert_eq!(config.tools.max_read_parallel, 5);
@@ -534,6 +535,7 @@ output_truncation = { mode = "tokens", limit = 512 }
             config.tools.output_truncation,
             crate::tool_types::ToolOutputTruncation::tokens(512)
         );
+        assert_eq!(config.tools.shell_timeout_secs, 42);
     }
 
     #[test]
@@ -542,6 +544,7 @@ output_truncation = { mode = "tokens", limit = 512 }
 [tools]
 max_read_parallel = 0
 output_truncation = { mode = "bytes", limit = 0 }
+shell_timeout_secs = 0
 "#;
         let config: FileConfig = toml::from_str(toml).unwrap();
         let normalized = config.tools.normalized();
@@ -550,6 +553,7 @@ output_truncation = { mode = "bytes", limit = 0 }
             normalized.output_truncation,
             crate::tool_types::ToolOutputTruncation::bytes(1)
         );
+        assert_eq!(normalized.shell_timeout_secs, 1);
     }
 
     #[test]
@@ -771,6 +775,7 @@ command = "echo user"
 
 [tools]
 max_read_parallel = 4
+shell_timeout_secs = 77
 "#,
         )
         .unwrap();
@@ -808,6 +813,7 @@ decision = "allow"
         assert_eq!(config.hooks[0].command, "echo user");
         assert_eq!(config.permissions.rules.len(), 1);
         assert_eq!(config.tools.max_read_parallel, 4);
+        assert_eq!(config.tools.shell_timeout_secs, 77);
     }
 
     #[test]

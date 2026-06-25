@@ -89,6 +89,8 @@ pub struct ToolConfig {
     pub max_read_parallel: usize,
     #[serde(default)]
     pub output_truncation: ToolOutputTruncation,
+    #[serde(default = "default_shell_timeout_secs")]
+    pub shell_timeout_secs: u64,
 }
 
 impl Default for ToolConfig {
@@ -96,18 +98,25 @@ impl Default for ToolConfig {
         Self {
             max_read_parallel: DEFAULT_MAX_READ_PARALLEL_TOOLS,
             output_truncation: ToolOutputTruncation::default(),
+            shell_timeout_secs: default_shell_timeout_secs(),
         }
     }
 }
 
 impl ToolConfig {
     const MAX_READ_PARALLEL_UPPER: usize = 32;
+    const MAX_SHELL_TIMEOUT_SECS: u64 = 3600;
 
     pub fn normalized(mut self) -> Self {
         if self.max_read_parallel == 0 {
             self.max_read_parallel = 1;
         } else if self.max_read_parallel > Self::MAX_READ_PARALLEL_UPPER {
             self.max_read_parallel = Self::MAX_READ_PARALLEL_UPPER;
+        }
+        if self.shell_timeout_secs == 0 {
+            self.shell_timeout_secs = 1;
+        } else if self.shell_timeout_secs > Self::MAX_SHELL_TIMEOUT_SECS {
+            self.shell_timeout_secs = Self::MAX_SHELL_TIMEOUT_SECS;
         }
         self.output_truncation = self.output_truncation.normalized();
         self
@@ -116,6 +125,10 @@ impl ToolConfig {
 
 fn default_max_read_parallel() -> usize {
     DEFAULT_MAX_READ_PARALLEL_TOOLS
+}
+
+fn default_shell_timeout_secs() -> u64 {
+    120
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -270,6 +283,7 @@ pub fn format_config_show(config: &RunConfig) -> String {
             "[tools]\n",
             "max_read_parallel = {}\n",
             "output_truncation = \"{}\"\n",
+            "shell_timeout_secs = {}\n",
             "\n",
             "[subagents]\n",
             "max_depth = {}\n",
@@ -314,6 +328,7 @@ pub fn format_config_show(config: &RunConfig) -> String {
         runtime.workflow_agents,
         config.tools.max_read_parallel,
         config.tools.output_truncation,
+        config.tools.shell_timeout_secs,
         config.subagents.max_depth,
         config.subagents.max_parallel,
         config.mcp_servers.len(),

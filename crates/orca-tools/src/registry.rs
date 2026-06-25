@@ -61,6 +61,7 @@ pub trait Tool: Send + Sync {
 pub struct ToolContext<'a> {
     pub cwd: &'a Path,
     pub output_truncation: ToolOutputTruncation,
+    pub shell_timeout: Duration,
     pub mcp_registry: Option<&'a McpRegistry>,
 }
 
@@ -69,12 +70,18 @@ impl<'a> ToolContext<'a> {
         Self {
             cwd,
             output_truncation: ToolOutputTruncation::bytes(MAX_TOOL_OUTPUT_BYTES),
+            shell_timeout: Duration::from_secs(120),
             mcp_registry: None,
         }
     }
 
     pub fn with_output_truncation(mut self, output_truncation: ToolOutputTruncation) -> Self {
         self.output_truncation = output_truncation.normalized();
+        self
+    }
+
+    pub fn with_shell_timeout(mut self, shell_timeout: Duration) -> Self {
+        self.shell_timeout = shell_timeout;
         self
     }
 
@@ -898,9 +905,12 @@ impl Tool for BuiltinTool {
             }
             BuiltinExecutor::Glob => glob::execute(request, ctx.cwd, ctx.max_output_bytes()),
             BuiltinExecutor::Grep => grep::execute(request, ctx.cwd, ctx.max_output_bytes()),
-            BuiltinExecutor::Bash => {
-                bash::execute_with_policy(request, ctx.cwd, ctx.output_truncation)
-            }
+            BuiltinExecutor::Bash => bash::execute_with_policy(
+                request,
+                ctx.cwd,
+                ctx.output_truncation,
+                ctx.shell_timeout,
+            ),
             BuiltinExecutor::Edit => edit::execute(request, ctx.cwd),
             BuiltinExecutor::WriteFile => write_file::execute(request, ctx.cwd),
             BuiltinExecutor::GitStatus => git::status(request, ctx.cwd, ctx.max_output_bytes()),
@@ -1067,6 +1077,7 @@ impl Tool for ExternalTool {
             request,
             ctx.cwd,
             ctx.output_truncation,
+            ctx.shell_timeout,
         )
     }
 }

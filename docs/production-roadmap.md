@@ -4,7 +4,7 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-06-26
-Current baseline: v0.1.36 workflow isolation and recovery
+Current baseline: v0.1.37 shell execution timeout hardening
 
 ---
 
@@ -18,7 +18,7 @@ working baseline used to prioritize the next patch releases.
 | Tool registry | Built-ins, MCP tools, and TOML external tools share `ToolSpec` metadata | Codex-style spec/capability registry | Implemented |
 | Tool approval | Action kind is derived from tool capabilities, with TOML allow/deny rules | Capability/policy driven approvals | Implemented |
 | File discovery | `glob` is model-facing; `list_files` remains a compatibility alias | Claude `Glob`, Codex file search | Implemented; fuzzy search still missing |
-| Shell execution | Synchronous `bash` via `sh -c` with approval and macOS Seatbelt path | Codex `exec_command` sessions, PTY, stdin, timeout | Partial |
+| Shell execution | Synchronous `bash` via `sh -c` with approval, macOS Seatbelt path, and configurable timeout | Codex `exec_command` sessions, PTY, stdin, timeout | Partial |
 | Context management | BPE token counting, local compaction, persisted collapse/summary records | Multi-level local/remote compaction | Partial |
 | Tool output control | Fixed byte truncation helper on tool output | Codex truncation policies by bytes/tokens with explicit warnings | Partial |
 | Model metadata | `ModelSelection` plus DeepSeek defaults | Codex `models-manager` with model capability metadata | Partial |
@@ -114,6 +114,26 @@ commands and consume versioned events without owning turn execution details.
 construction, and hook-modified request validation now flow through
 `orca_runtime::tool_invocation` for normal controller execution, readonly
 batches, subagent batches, and TUI approval prompts.
+
+### P3: Shell Timeout Hardening
+
+**Release target:** v0.1.37
+
+**Current status:** synchronous shell and external tool execution now honor the
+configurable `[tools].shell_timeout_secs` setting, default to 120 seconds, and
+normalize values into the 1..3600 second range.
+
+**Goal:** keep shell execution bounded without widening the PTY/session model in
+the same patch.
+
+**Scope:**
+
+1. Add a shared child-process wait helper with timeout handling.
+2. Thread the configured timeout from `RunConfig` into `orca-tools`.
+3. Preserve current `bash` and external tool semantics for non-timeout cases.
+
+**Verification:** covered by the release patch checks and the Rust checks for
+`orca-core`, `orca-tools`, and `orca-runtime`.
 
 **Goal:** reduce the remaining divergence between built-in tools, MCP tools,
 external tools, approvals, and future plugin-provided tools.

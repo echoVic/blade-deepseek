@@ -13,6 +13,7 @@ pub mod git;
 pub mod glob;
 pub mod grep;
 pub mod list_files;
+pub mod process;
 pub mod read_file;
 pub mod registry;
 pub mod sandbox;
@@ -29,7 +30,7 @@ pub fn execute_with_mcp(
     cwd: &Path,
     mcp_registry: &McpRegistry,
 ) -> ToolResult {
-    execute_with_mcp_and_external(request, cwd, mcp_registry, &[])
+    execute_with_mcp_and_external(request, cwd, mcp_registry, &[], 120)
 }
 
 pub fn execute_with_mcp_and_external(
@@ -37,6 +38,7 @@ pub fn execute_with_mcp_and_external(
     cwd: &Path,
     mcp_registry: &McpRegistry,
     external_tools: &[ExternalToolConfig],
+    shell_timeout_secs: u64,
 ) -> ToolResult {
     execute_with_mcp_external_and_policy(
         request,
@@ -44,6 +46,7 @@ pub fn execute_with_mcp_and_external(
         mcp_registry,
         external_tools,
         ToolOutputTruncation::default(),
+        shell_timeout_secs,
     )
 }
 
@@ -53,21 +56,28 @@ pub fn execute_with_mcp_external_and_policy(
     mcp_registry: &McpRegistry,
     external_tools: &[ExternalToolConfig],
     output_truncation: ToolOutputTruncation,
+    shell_timeout_secs: u64,
 ) -> ToolResult {
+    let shell_timeout = std::time::Duration::from_secs(shell_timeout_secs.max(1));
     if !matches!(&request.name, ToolName::Mcp(_)) {
         if external_tools.is_empty() {
             let reg = registry::default_tool_registry();
-            let ctx = registry::ToolContext::new(cwd).with_output_truncation(output_truncation);
+            let ctx = registry::ToolContext::new(cwd)
+                .with_output_truncation(output_truncation)
+                .with_shell_timeout(shell_timeout);
             return reg.execute(request, &ctx);
         }
         let reg = registry::tool_registry_with_mcp_and_external(None, external_tools);
-        let ctx = registry::ToolContext::new(cwd).with_output_truncation(output_truncation);
+        let ctx = registry::ToolContext::new(cwd)
+            .with_output_truncation(output_truncation)
+            .with_shell_timeout(shell_timeout);
         return reg.execute(request, &ctx);
     }
 
     let reg = registry::tool_registry_with_mcp_and_external(Some(mcp_registry), external_tools);
     let ctx = registry::ToolContext::new(cwd)
         .with_output_truncation(output_truncation)
+        .with_shell_timeout(shell_timeout)
         .with_mcp(mcp_registry);
     reg.execute(request, &ctx)
 }
@@ -165,6 +175,7 @@ pub fn run_readonly_batch_parallel_with_policy(
                         &mcp_registry,
                         &[],
                         output_truncation,
+                        120,
                     )
                 }),
             ));

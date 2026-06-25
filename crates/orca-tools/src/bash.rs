@@ -8,16 +8,23 @@ use orca_core::tool_types::{
     ToolOutputTruncation, ToolRequest, ToolResult, truncate_output_with_policy,
 };
 
+use crate::process;
 use crate::sandbox;
 
 pub fn execute(request: &ToolRequest, cwd: &Path, max_bytes: usize) -> ToolResult {
-    execute_with_policy(request, cwd, ToolOutputTruncation::bytes(max_bytes))
+    execute_with_policy(
+        request,
+        cwd,
+        ToolOutputTruncation::bytes(max_bytes),
+        Duration::from_secs(120),
+    )
 }
 
 pub fn execute_with_policy(
     request: &ToolRequest,
     cwd: &Path,
     output_truncation: ToolOutputTruncation,
+    shell_timeout: Duration,
 ) -> ToolResult {
     let Some(command) = request
         .target
@@ -27,43 +34,83 @@ pub fn execute_with_policy(
         return ToolResult::failed(request, "bash command is required", None);
     };
 
-    let output = sandbox::bash_command(command, cwd)
+    let child = match sandbox::bash_command(command, cwd)
         .env_remove("ORCA_API_KEY")
-        .output();
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            return ToolResult::failed(
+                request,
+                format!("failed to run shell command: {error}"),
+                None,
+            );
+        }
+    };
 
-    match output {
-        Ok(output) if output.status.success() => {
-            let stdout = String::from_utf8_lossy(&output.stdout)
-                .trim_end()
-                .to_string();
-            let (stdout, truncated) = truncate_output_with_policy(stdout, output_truncation);
-            ToolResult::completed(request, stdout, truncated)
+    let output = match process::wait_for_child_output_with_timeout(child, shell_timeout) {
+        Ok(output) => output,
+        Err(error) => {
+            return ToolResult::failed(
+                request,
+                format!("failed to wait for shell command: {error}"),
+                None,
+            );
         }
-        Ok(output) => {
-            let stdout = String::from_utf8_lossy(&output.stdout)
-                .trim_end()
-                .to_string();
-            let stderr = String::from_utf8_lossy(&output.stderr)
-                .trim_end()
-                .to_string();
-            let message = if stderr.is_empty() {
-                stdout
-            } else if stdout.is_empty() {
-                stderr
-            } else {
-                format!("{stdout}\n{stderr}")
-            };
-            let (message, truncated) = truncate_output_with_policy(message, output_truncation);
-            let mut result = ToolResult::failed(request, message, output.status.code());
-            result.truncated = truncated;
-            result
-        }
-        Err(error) => ToolResult::failed(
-            request,
-            format!("failed to run shell command: {error}"),
-            None,
-        ),
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout)
+        .trim_end()
+        .to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr)
+        .trim_end()
+        .to_string();
+    let timed_out = output.timed_out;
+    if output.status.success() && !timed_out {
+        let (stdout, truncated) = truncate_output_with_policy(stdout, output_truncation);
+        return ToolResult::completed(request, stdout, truncated);
     }
+
+    let message = if timed_out {
+        if stderr.is_empty() && stdout.is_empty() {
+            format!("shell command timed out after {}s", shell_timeout.as_secs())
+        } else if stderr.is_empty() {
+            format!(
+                "shell command timed out after {}s: {stdout}",
+                shell_timeout.as_secs()
+            )
+        } else if stdout.is_empty() {
+            format!(
+                "shell command timed out after {}s: {stderr}",
+                shell_timeout.as_secs()
+            )
+        } else {
+            format!(
+                "shell command timed out after {}s: {stdout}\n{stderr}",
+                shell_timeout.as_secs()
+            )
+        }
+    } else if stderr.is_empty() {
+        stdout
+    } else if stdout.is_empty() {
+        stderr
+    } else {
+        format!("{stdout}\n{stderr}")
+    };
+    let (message, truncated) = truncate_output_with_policy(message, output_truncation);
+    let mut result = ToolResult::failed(
+        request,
+        message,
+        if timed_out {
+            None
+        } else {
+            output.status.code()
+        },
+    );
+    result.truncated = truncated;
+    result
 }
 
 enum StreamEvent {
@@ -81,6 +128,7 @@ pub fn execute_streaming(
         request,
         cwd,
         ToolOutputTruncation::bytes(max_bytes),
+        Duration::from_secs(120),
         on_output,
     )
 }
@@ -89,6 +137,7 @@ pub fn execute_streaming_with_policy(
     request: &ToolRequest,
     cwd: &Path,
     output_truncation: ToolOutputTruncation,
+    shell_timeout: Duration,
     on_output: &mut dyn FnMut(&str),
 ) -> ToolResult {
     let Some(command) = request
@@ -99,14 +148,12 @@ pub fn execute_streaming_with_policy(
         return ToolResult::failed(request, "bash command is required", None);
     };
 
-    let mut command = sandbox::bash_command(command, cwd);
-    let child = command
+    let mut child = match sandbox::bash_command(command, cwd)
         .env_remove("ORCA_API_KEY")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn();
-
-    let mut child = match child {
+        .spawn()
+    {
         Ok(child) => child,
         Err(error) => {
             return ToolResult::failed(
@@ -116,7 +163,6 @@ pub fn execute_streaming_with_policy(
             );
         }
     };
-
     let (tx, rx) = mpsc::channel();
     let stdout_handle = child.stdout.take().map(|stdout| {
         let tx = tx.clone();
@@ -162,6 +208,7 @@ pub fn execute_streaming_with_policy(
                 }
             },
         }
+        let _ = shell_timeout;
     };
 
     if let Some(handle) = stdout_handle {

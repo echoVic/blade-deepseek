@@ -1033,6 +1033,7 @@ fn execute_tool_with_approval(
             mcp_registry,
             &config.external_tools,
             config.tools.output_truncation,
+            config.tools.shell_timeout_secs,
         )
     };
     let is_failure = matches!(

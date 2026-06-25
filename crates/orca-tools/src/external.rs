@@ -2,11 +2,14 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use orca_core::external_config::ExternalToolConfig;
 use orca_core::tool_types::{
     ToolOutputTruncation, ToolRequest, ToolResult, truncate_output_with_policy,
 };
+
+use crate::process;
 
 // Security: only loads from ORCA_HOME/tools/ (user-controlled), never from
 // project-level directories, to prevent repo poisoning attacks.
@@ -77,6 +80,7 @@ pub fn execute_external_tool(
         request,
         cwd,
         ToolOutputTruncation::bytes(max_output_bytes),
+        Duration::from_secs(120),
     )
 }
 
@@ -85,6 +89,7 @@ pub fn execute_external_tool_with_policy(
     request: &ToolRequest,
     cwd: &Path,
     output_truncation: ToolOutputTruncation,
+    shell_timeout: Duration,
 ) -> ToolResult {
     let args = request.raw_arguments.as_deref().unwrap_or("{}");
     let mut child = match Command::new("sh")
@@ -112,20 +117,20 @@ pub fn execute_external_tool_with_policy(
         }
     };
 
-    if let Some(mut stdin) = child.stdin.take()
-        && let Err(error) = stdin.write_all(args.as_bytes())
-    {
-        return ToolResult::failed(
-            request,
-            format!(
-                "external tool '{}' failed to receive input: {error}",
-                config.name
-            ),
-            None,
-        );
+    if let Some(mut stdin) = child.stdin.take() {
+        if let Err(error) = stdin.write_all(args.as_bytes()) {
+            return ToolResult::failed(
+                request,
+                format!(
+                    "external tool '{}' failed to receive input: {error}",
+                    config.name
+                ),
+                None,
+            );
+        }
     }
 
-    let output = match child.wait_with_output() {
+    let output = match process::wait_for_child_output_with_timeout(child, shell_timeout) {
         Ok(output) => output,
         Err(error) => {
             return ToolResult::failed(
@@ -137,12 +142,12 @@ pub fn execute_external_tool_with_policy(
     };
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    if output.status.success() {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if output.status.success() && !output.timed_out {
         let (output, truncated) = truncate_output_with_policy(stdout, output_truncation);
         return ToolResult::completed(request, output, truncated);
     }
 
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     let detail = if stderr.is_empty() {
         stdout.trim().to_string()
     } else {
@@ -150,7 +155,21 @@ pub fn execute_external_tool_with_policy(
     };
     ToolResult::failed(
         request,
-        if detail.is_empty() {
+        if output.timed_out {
+            if detail.is_empty() {
+                format!(
+                    "external tool '{}' timed out after {}s",
+                    config.name,
+                    shell_timeout.as_secs()
+                )
+            } else {
+                format!(
+                    "external tool '{}' timed out after {}s: {detail}",
+                    config.name,
+                    shell_timeout.as_secs()
+                )
+            }
+        } else if detail.is_empty() {
             format!(
                 "external tool '{}' exited with {}",
                 config.name, output.status
@@ -161,7 +180,11 @@ pub fn execute_external_tool_with_policy(
                 config.name, output.status
             )
         },
-        output.status.code(),
+        if output.timed_out {
+            None
+        } else {
+            output.status.code()
+        },
     )
 }
 
