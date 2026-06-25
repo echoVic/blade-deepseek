@@ -25,11 +25,13 @@ const MODULE_SPECIFIER_CALLEES = new Set(["import", "require", "getBuiltinModule
 
 let callSeq = 0;
 let messageSeq = 0;
+let taskSeq = 0;
 let currentPhase = null;
 let activeMarkerPhase = null;
 let stdinBuffer = "";
 const pendingAgentResolvers = new Map();
 const messageChannels = new Map();
+const taskLists = new Map();
 let stdinClosed = false;
 
 process.stdin.setEncoding("utf8");
@@ -111,6 +113,51 @@ function clearMessages(channel) {
   return count;
 }
 
+function createTaskList(name, items = []) {
+  const listName = normalizeTaskListName(name);
+  if (!Array.isArray(items)) {
+    throw new Error("Workflow task list items must be an array");
+  }
+
+  const tasks = items.map((item) => {
+    taskSeq += 1;
+    return {
+      id: `workflow-task-${taskSeq}`,
+      status: "pending",
+      value: cloneMessageValue(item),
+      claimedBy: null,
+      completedBy: null,
+      result: null,
+    };
+  });
+  taskLists.set(listName, tasks);
+  return listTasks(listName);
+}
+
+function claimTask(name, opts = {}) {
+  const tasks = taskLists.get(normalizeTaskListName(name)) ?? [];
+  const task = tasks.find((item) => item.status === "pending");
+  if (!task) {
+    return null;
+  }
+
+  task.status = "running";
+  task.claimedBy = normalizeTaskWorker(opts?.by ?? opts?.from);
+  return cloneMessageValue(task);
+}
+
+function completeTask(name, taskId, result = null, opts = {}) {
+  const task = findTask(name, taskId);
+  task.status = "completed";
+  task.completedBy = normalizeTaskWorker(opts?.by ?? opts?.from);
+  task.result = cloneMessageValue(result);
+  return cloneMessageValue(task);
+}
+
+function listTasks(name) {
+  return (taskLists.get(normalizeTaskListName(name)) ?? []).map(cloneMessageValue);
+}
+
 function normalizeMessageChannel(channel) {
   const channelName = String(channel ?? "").trim();
   if (channelName.length === 0) {
@@ -122,6 +169,33 @@ function normalizeMessageChannel(channel) {
 function normalizeMessageSender(from) {
   const sender = String(from ?? currentPhase ?? "workflow").trim();
   return sender.length === 0 ? "workflow" : sender;
+}
+
+function normalizeTaskListName(name) {
+  const listName = String(name ?? "").trim();
+  if (listName.length === 0) {
+    throw new Error("Workflow task list name must be a non-empty string");
+  }
+  return listName;
+}
+
+function normalizeTaskWorker(worker) {
+  const workerName = String(worker ?? currentPhase ?? "workflow").trim();
+  return workerName.length === 0 ? "workflow" : workerName;
+}
+
+function findTask(name, taskId) {
+  const listName = normalizeTaskListName(name);
+  const id = String(taskId ?? "").trim();
+  if (id.length === 0) {
+    throw new Error("Workflow task id must be a non-empty string");
+  }
+
+  const task = (taskLists.get(listName) ?? []).find((item) => item.id === id);
+  if (!task) {
+    throw new Error(`Workflow task not found: ${id}`);
+  }
+  return task;
 }
 
 function cloneMessageValue(value) {
@@ -305,6 +379,10 @@ async function loadWorkflowModule() {
       sendMessage,
       readMessages,
       clearMessages,
+      createTaskList,
+      claimTask,
+      completeTask,
+      listTasks,
     }),
     {
       codeGeneration: {

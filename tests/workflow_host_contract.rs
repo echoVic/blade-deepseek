@@ -197,6 +197,60 @@ fn host_message_channel_passes_agent_findings_to_later_agents() {
 }
 
 #[test]
+fn host_task_list_distributes_shared_work_to_parallel_agents() {
+    if !WorkflowHost::node_available() {
+        return;
+    }
+
+    let temp = tempdir().unwrap();
+    let script = temp.path().join("workflow.js");
+    fs::write(
+        &script,
+        "export const meta = { name: 'task-list-test', description: 'Task list test', phases: ['work'] };\n\
+         createTaskList('audit', [{ area: 'api' }, { area: 'docs' }]);\n\
+         const worker = async (name) => {\n\
+           const task = claimTask('audit', { by: name });\n\
+           const result = await agent(`handle ${task.value.area}`);\n\
+           completeTask('audit', task.id, { prompt: result.prompt }, { by: name });\n\
+           return { worker: name, taskId: task.id, area: task.value.area };\n\
+         };\n\
+         const workers = await phase('work', async () => parallel([worker('worker-a'), worker('worker-b')]));\n\
+         export default { workers, tasks: listTasks('audit') };",
+    )
+    .unwrap();
+
+    let events = WorkflowHost::run_collecting_events(&script, serde_json::json!(null)).unwrap();
+
+    let prompts = events
+        .iter()
+        .filter_map(|event| match event {
+            HostEvent::AgentCall { prompt, phase, .. } if phase.as_deref() == Some("work") => {
+                Some(prompt.as_str())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(prompts, vec!["handle api", "handle docs"]);
+
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            HostEvent::WorkflowCompleted { result }
+                if result["workers"].as_array().map(|items| items.len()) == Some(2)
+                    && result["workers"][0]["taskId"] != result["workers"][1]["taskId"]
+                    && result["tasks"].as_array().map(|items| {
+                        items.iter().all(|item| {
+                            item["status"] == "completed"
+                                && item["claimedBy"].as_str().is_some()
+                                && item["completedBy"].as_str().is_some()
+                                && item["result"]["prompt"].as_str().is_some()
+                        })
+                    }) == Some(true)
+        )
+    }));
+}
+
+#[test]
 fn host_phase_fallback_continue_emits_failed_phase_and_continues() {
     if !WorkflowHost::node_available() {
         return;

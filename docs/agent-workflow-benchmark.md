@@ -9,7 +9,7 @@
 
 ## Executive Summary
 
-Orca has a **production-grade workflow runtime** that supports concurrent agent fan-out (up to 16 agents in parallel, 1000 per run by default). The `subagent` tool (model-facing) supports **parallel batching up to 6** (via `SubagentConfig.max_parallel`), default nesting depth **2**, optional git worktree isolation (`isolation: "worktree"`), plus an **async mode** (`mode: "async"` returning an `agent_id` for `subagent_status`). In headless/`exec`, async subagents are worker-backed: the launching process records a durable task under `.orca/task-sessions`, spawns a hidden `subagent-worker` process, and later `subagent_status` calls can resolve prior `agent_id` values across process boundaries. Completed async subagent records include token/cost usage; legacy queued/running records without a worker owner still recover as failed interruption records instead of pretending process-local execution survived. The **workflow system** (`WorkflowRunner` + `WorkflowHost`) achieves true concurrency via `thread::scope().spawn()` for up to 16 concurrent agents, supports opt-in workflow-agent worktree isolation through `{ isolation: "worktree" }`, retries transient child-agent failures once by default, supports opt-in phase fallback via `phase(name, body, { fallback: "continue" })`, supports explicit fallback values via `{ fallback: { value } }`, supports recovery functions via `{ fallback: async ({ error }) => ... }`, and can enforce a per-agent hard token budget with `[workflows] max_agent_tokens = ...`. Remaining gaps include agent teams, agent-to-agent communication, shared task lists, structured typed output, and resume/fork stress coverage. Workflow observability includes phase tracking, per-agent status rows, retry/failure detail, token usage, retry attempt telemetry, failed-but-continued phases, failed phase fallback/error rows, and lifecycle timestamps in `/workflows`.
+Orca has a **production-grade workflow runtime** that supports concurrent agent fan-out (up to 16 agents in parallel, 1000 per run by default). The `subagent` tool (model-facing) supports **parallel batching up to 6** (via `SubagentConfig.max_parallel`), default nesting depth **2**, optional git worktree isolation (`isolation: "worktree"`), plus an **async mode** (`mode: "async"` returning an `agent_id` for `subagent_status`). In headless/`exec`, async subagents are worker-backed: the launching process records a durable task under `.orca/task-sessions`, spawns a hidden `subagent-worker` process, and later `subagent_status` calls can resolve prior `agent_id` values across process boundaries. Completed async subagent records include token/cost usage; legacy queued/running records without a worker owner still recover as failed interruption records instead of pretending process-local execution survived. The **workflow system** (`WorkflowRunner` + `WorkflowHost`) achieves true concurrency via `thread::scope().spawn()` for up to 16 concurrent agents, supports opt-in workflow-agent worktree isolation through `{ isolation: "worktree" }`, retries transient child-agent failures once by default, supports opt-in phase fallback via `phase(name, body, { fallback: "continue" })`, supports explicit fallback values via `{ fallback: { value } }`, supports recovery functions via `{ fallback: async ({ error }) => ... }`, can enforce a per-agent hard token budget with `[workflows] max_agent_tokens = ...`, and now exposes workflow-level message channels and shared task lists. Remaining gaps include role-scoped agent teams, direct child-agent mailbox/tool IPC, durable child-agent task claiming, structured typed output, and resume/fork stress coverage. Workflow observability includes phase tracking, per-agent status rows, retry/failure detail, token usage, retry attempt telemetry, failed-but-continued phases, failed phase fallback/error rows, and lifecycle timestamps in `/workflows`.
 
 ---
 
@@ -191,7 +191,7 @@ All Phase 1 findings above were **cross-validated by the orchestrator** against 
 | **Async model-facing subagents** | ✅ PRESENT | `subagent` accepts `mode: "async"` and returns `agent_id`; in headless/`exec`, a hidden worker process owns execution and writes durable status/result/usage for later `subagent_status` calls. TUI async work remains session-local. | ✓ for headless/exec cross-process execution |
 | **Observability: token/elapsed/agent count** | ⚠️ PARTIAL+ | `/workflows` now receives live agent/phase progress counts, renders elapsed async subagent rows, and shows selected workflow phase fallback/error detail plus agent retry/failure detail and token/cost usage | P1 |
 | **Agent Communication** | ⚠️ PARTIAL | Workflow scripts can use `sendMessage(channel, value)`, `readMessages(channel)`, and `clearMessages(channel)` to pass findings between agent calls through the orchestrator; direct child-agent mailbox/tool IPC remains open | P2 |
-| **Shared Task List** | ❌ GAP | No work queue; agents are stateless, results collected by `Promise.all()` | P2 |
+| **Shared Task List** | ⚠️ PARTIAL | Workflow scripts can use `createTaskList(name, items)`, `claimTask(name, opts)`, `completeTask(name, id, result, opts)`, and `listTasks(name)` to coordinate parallel worker prompts through an orchestrator-owned task list; direct child-agent task claiming remains open | P2 |
 | **Reusable Workflow Scripts** | ✅ PRESENT | `.orca/workflows/*.js` + `~/.orca/workflows/*.js` + named workflow resolution | ✓ |
 | **Workflow Progress/Status** | ⚠️ PARTIAL+ | `WorkflowRunState` tracks phases, agent_count, phase error, and fallback policy; TUI polls `WorkflowTasksUpdated` and shows real agent/phase counts plus failed phase detail in `/workflows` | P2 |
 | **Fan-out to 8+ agents** | ✅ PRESENT | Default 16 concurrent, 1000 per run. Confirmed in this audit: 8 agents launched concurrently | ✓ |
@@ -200,7 +200,7 @@ All Phase 1 findings above were **cross-validated by the orchestrator** against 
 | **Error Recovery** | ✅ PRESENT | Child-agent failures are retried once by default (`max_agent_retries` configurable up to 5), retry telemetry is persisted, phases can opt into `fallback: "continue"`, `{ fallback: { value } }`, or `fallback: async ({ error }) => ...`; failed phase fallback/error detail is visible in `/workflows` | ✓ |
 | **Structured Agent Output** | ⚠️ PARTIAL | Workflow agents return `Value` (JSON); subagent tool returns text; no schema validation | P2 |
 
-**Overall gap**: Orca's **workflow system** is architecturally capable of concurrent agent fan-out (confirmed 8+ agents) with observability (phase tracking, agent statuses, team labels, retry attempts, lifecycle timestamps, per-agent token usage, per-agent hard token budgets, and bounded child-agent retry). The TUI now has `/workflows` for task-oriented progress and `/agents` for a dedicated workflow-agent dashboard across runs, while model-facing subagents have worker-backed async/status handles in headless/`exec` and optional worktree isolation for file-writing tasks. Workflow agents can also opt into worktree isolation, phases can opt into continue-on-failure, explicit fallback-value recovery, or async recovery functions, and workflow scripts can pass messages between agent calls through an orchestrator-owned channel. The remaining gaps are role-scoped agent-team policy, direct child-agent mailbox/tool IPC, shared task lists, structured typed output, and resume/fork stress coverage.
+**Overall gap**: Orca's **workflow system** is architecturally capable of concurrent agent fan-out (confirmed 8+ agents) with observability (phase tracking, agent statuses, team labels, retry attempts, lifecycle timestamps, per-agent token usage, per-agent hard token budgets, and bounded child-agent retry). The TUI now has `/workflows` for task-oriented progress and `/agents` for a dedicated workflow-agent dashboard across runs, while model-facing subagents have worker-backed async/status handles in headless/`exec` and optional worktree isolation for file-writing tasks. Workflow agents can also opt into worktree isolation, phases can opt into continue-on-failure, explicit fallback-value recovery, or async recovery functions, and workflow scripts can pass messages and task-list state between agent calls through orchestrator-owned channels. The remaining gaps are role-scoped agent-team policy, direct child-agent mailbox/tool IPC, durable child-agent task claiming, structured typed output, and resume/fork stress coverage.
 
 ### Reviewer 3: Actionability of Next Steps
 
@@ -214,8 +214,8 @@ All recommended next steps are **implementable within current architecture**:
 | P1: TUI agent dashboard | ✅ Dedicated `/agents` dashboard implemented with workflow name, team label, status, attempts, retry/failure detail, token usage, and cost | `task_types.rs`, `workflow/state.rs`, `workflow/runner.rs`, `tui/app.rs`, `tui/ui.rs`, `tui/types.rs` | No blocker |
 | P1: Worktree isolation | ✅ Implemented | `worktree.rs`, `subagent.rs`, `controller.rs`, `workflow/runner.rs` | Model-facing and workflow agents can opt into isolated git worktrees |
 | P1: Agent error retry | ✅ Implemented (bounded child-agent retry + telemetry + phase continue/value/function fallback) | `workflow/runner.rs`, `workflow/state.rs`, `workflow/host.mjs`, `config/mod.rs`, `ui.rs` | No P1 blocker |
-| P2: Agent communication | 5-7 days | `workflow/host.rs`, new message channel | Moderate — requires new IPC |
-| P2: Shared task list | 3-5 days | New `tasks.rs` module, workflow JS API | Moderate — stateful agent coordination |
+| P2: Agent communication | ⚠️ Partially implemented | `workflow/host.mjs`, `tests/workflow_host_contract.rs` | Remaining: direct child-agent mailbox/tool IPC and durable cross-run channels |
+| P2: Shared task list | ⚠️ Partially implemented | `workflow/host.mjs`, `tests/workflow_host_contract.rs` | Remaining: direct child-agent task claiming and durable cross-run queues |
 
 **Already on roadmap**: Worktree automation, shell sessions, async subagents, plugin-compatible skills (from `production-roadmap.md`).
 
@@ -232,7 +232,7 @@ All recommended next steps are **implementable within current architecture**:
 | Elapsed time tracking | ✅ Yes | `WorkflowWorkerRecord.started_at_ms/completed_at_ms` |
 | Reusable workflow scripts | ✅ Yes | Named workflows, `.orca/workflows/*.js` |
 | Agent-to-agent communication | ⚠️ Partial | Workflow-level message channels let one agent result publish findings for later agents; direct child-agent mailbox/tool IPC remains open |
-| Shared task list | ❌ No | Agents are independent, stateless |
+| Shared task list | ⚠️ Partial | Workflow-level task lists let orchestration scripts create, claim, complete, and inspect shared work items for parallel worker prompts; direct child-agent queue tools remain open |
 | Agent view / team dashboard | ✅ Yes | `/workflows` lists workflow and async subagent tasks and expands the selected workflow into per-agent rows; `/agents` shows a dedicated all-workflow agent dashboard with team labels |
 | Dynamic agent spawning | ✅ Yes | Workflow scripts can conditionally/iteratively call `agent()` at runtime, including args-driven dynamic fan-out |
 | Worktree isolation | ✅ Yes | `subagent` supports `isolation: "worktree"`; workflow agents support `agent(prompt, { isolation: "worktree" })` |
@@ -297,11 +297,13 @@ All recommended next steps are **implementable within current architecture**:
 
 8. **Agent-to-agent communication**: ⚠️ Partially implemented. Workflow scripts can use `sendMessage(channel, value)`, `readMessages(channel)`, and `clearMessages(channel)` to share findings between agent calls through the orchestrator. Remaining work: direct child-agent mailbox/tool IPC and durable cross-run channels. Files: `workflow/host.mjs`, `tests/workflow_host_contract.rs`.
 
-9. **Structured typed output**: Schema-validated agent return types. Files: `workflow_types.rs`, `script.rs`.
+9. **Shared task list**: ⚠️ Partially implemented. Workflow scripts can use `createTaskList(name, items)`, `claimTask(name, opts)`, `completeTask(name, id, result, opts)`, and `listTasks(name)` to coordinate parallel worker prompts through an orchestrator-owned work queue. Remaining work: direct child-agent task-claiming tools and durable cross-run queues. Files: `workflow/host.mjs`, `tests/workflow_host_contract.rs`.
 
-10. **Agent teams**: Named agent groups with role-based tool access and team-level execution policy. Files: `subagent_types.rs`, `config/mod.rs`.
+10. **Structured typed output**: Schema-validated agent return types. Files: `workflow_types.rs`, `script.rs`.
 
-11. **Resume/fork stress coverage**: Exercise complex workflow resume/fork paths across phases, cached agents, failed phases, and fallback recovery. Files: `workflow/state.rs`, `workflow/runner.rs`, `tests/workflow_runtime_contract.rs`.
+11. **Agent teams**: Named agent groups with role-based tool access and team-level execution policy. Files: `subagent_types.rs`, `config/mod.rs`.
+
+12. **Resume/fork stress coverage**: Exercise complex workflow resume/fork paths across phases, cached agents, failed phases, and fallback recovery. Files: `workflow/state.rs`, `workflow/runner.rs`, `tests/workflow_runtime_contract.rs`.
 
 ---
 
@@ -318,6 +320,7 @@ All recommended next steps are **implementable within current architecture**:
 - ✅ `/agents` now opens a dedicated workflow-agent dashboard across runs
 - ✅ Workflow agent summaries and dashboards now preserve and display `agent(..., { team })` labels
 - ✅ Workflow scripts can now pass findings between agent calls with `sendMessage`, `readMessages`, and `clearMessages`
+- ✅ Workflow scripts can now coordinate shared work with `createTaskList`, `claimTask`, `completeTask`, and `listTasks`
 - ✅ `/workflows` now receives live workflow progress summaries with total/running/completed/failed agent counts, phase counts, and background task lifecycle timestamps
 - ✅ `/workflows` now shows failed phase fallback/error rows for selected workflow tasks
 - ✅ `/workflows` now renders async subagent task rows with status, agent type, and elapsed time
