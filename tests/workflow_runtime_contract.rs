@@ -227,6 +227,45 @@ fn workflow_resume_reuses_complex_fallback_agents_as_cached_rows() {
 }
 
 #[test]
+fn workflow_child_agents_can_exchange_messages_with_mailbox_tools() {
+    if !orca_runtime::workflow::host::WorkflowHost::node_available() {
+        return;
+    }
+
+    let temp = tempdir().unwrap();
+    let script = temp.path().join("workflow.js");
+    fs::write(
+        &script,
+         "export const meta = { name: 'child-mailbox', description: 'Child mailbox test', phases: ['scan', 'review'] };\n\
+         await phase('scan', async () => agent('workflow_send_message findings scanner high'));\n\
+         const review = await phase('review', async () => agent('workflow_read_messages findings'));\n\
+         await phase('cleanup', async () => agent('workflow_clear_messages findings'));\n\
+         const after = await phase('verify', async () => agent('workflow_read_messages findings'));\n\
+         export default { before: review.result, after: after.result };",
+    )
+    .unwrap();
+
+    let mut config = mock_run_config(temp.path());
+    config.approval_mode = ApprovalMode::Suggest;
+    let tasks = TaskRegistry::new("session-1".to_string());
+    let session_dir = temp.path().join("session");
+    let runner = WorkflowRunner::new(config, tasks.clone(), session_dir);
+
+    let launched = runner
+        .launch(WorkflowLaunchRequest::from_script_path(
+            script.display().to_string(),
+        ))
+        .expect("workflow completes with child mailbox tools");
+
+    assert!(launched.summary.contains("scanner"));
+    assert!(launched.summary.contains("high"));
+    assert!(launched.summary.contains("[]"));
+    let record = tasks.get(&launched.task_id).expect("task record");
+    assert_eq!(record.status, TaskStatus::Completed);
+    assert_eq!(record.workflow_agents.len(), 4);
+}
+
+#[test]
 fn workflow_runner_marks_task_and_run_failed_on_host_error() {
     if !orca_runtime::workflow::host::WorkflowHost::node_available() {
         return;

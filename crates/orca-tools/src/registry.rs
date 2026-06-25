@@ -645,6 +645,76 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
     ));
     registry.register(BuiltinTool::new(
         builtin_spec(
+            "workflow_send_message",
+            "Send a message to the current workflow run mailbox so later workflow child agents can read it.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "channel": {
+                        "type": "string",
+                        "description": "Mailbox channel name"
+                    },
+                    "message": {
+                        "description": "JSON-serializable message payload"
+                    },
+                    "from": {
+                        "type": "string",
+                        "description": "Optional sender label"
+                    }
+                },
+                "required": ["channel", "message"]
+            }),
+            CapabilitySet::filesystem_write(),
+            ToolExposure::Direct,
+            RendererHint::Agent,
+            false,
+        ),
+        BuiltinExecutor::WorkflowSendMessage,
+    ));
+    registry.register(BuiltinTool::new(
+        builtin_spec(
+            "workflow_read_messages",
+            "Read messages from a channel in the current workflow run mailbox.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "channel": {
+                        "type": "string",
+                        "description": "Mailbox channel name"
+                    }
+                },
+                "required": ["channel"]
+            }),
+            CapabilitySet::read_only_fs(),
+            ToolExposure::Direct,
+            RendererHint::Agent,
+            false,
+        ),
+        BuiltinExecutor::WorkflowReadMessages,
+    ));
+    registry.register(BuiltinTool::new(
+        builtin_spec(
+            "workflow_clear_messages",
+            "Clear messages from a channel in the current workflow run mailbox.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "channel": {
+                        "type": "string",
+                        "description": "Mailbox channel name"
+                    }
+                },
+                "required": ["channel"]
+            }),
+            CapabilitySet::filesystem_write(),
+            ToolExposure::Direct,
+            RendererHint::Agent,
+            false,
+        ),
+        BuiltinExecutor::WorkflowClearMessages,
+    ));
+    registry.register(BuiltinTool::new(
+        builtin_spec(
             "update_plan",
             "Update the current task plan. Use for complex multi-step tasks or when the user asks for a todo/task list. At most one step may be in_progress. Maximum 50 items, each step max 200 chars.",
             json!({
@@ -930,6 +1000,13 @@ impl Tool for BuiltinTool {
                 "Workflow must be executed by the runtime controller",
                 None,
             ),
+            BuiltinExecutor::WorkflowSendMessage
+            | BuiltinExecutor::WorkflowReadMessages
+            | BuiltinExecutor::WorkflowClearMessages => ToolResult::failed(
+                request,
+                "workflow mailbox tools must be executed by the runtime",
+                None,
+            ),
             BuiltinExecutor::GetGoal => update_goal::execute_get(request),
             BuiltinExecutor::CreateGoal => update_goal::execute_create(request),
             BuiltinExecutor::UpdateGoal => update_goal::execute_update(request),
@@ -958,6 +1035,9 @@ enum BuiltinExecutor {
     Subagent,
     SubagentStatus,
     Workflow,
+    WorkflowSendMessage,
+    WorkflowReadMessages,
+    WorkflowClearMessages,
     GetGoal,
     CreateGoal,
     UpdateGoal,
@@ -1120,6 +1200,40 @@ mod tests {
                 .contains("tool arguments failed schema validation"),
             "error={:?}",
             result.error
+        );
+    }
+
+    #[test]
+    fn workflow_mailbox_tools_have_autoedit_safe_action_kinds() {
+        let registry = default_tool_registry();
+
+        assert_eq!(
+            registry
+                .get("Workflow")
+                .expect("workflow tool")
+                .action_kind(),
+            ActionKind::Agent
+        );
+        assert_eq!(
+            registry
+                .get("workflow_send_message")
+                .expect("workflow_send_message tool")
+                .action_kind(),
+            ActionKind::Write
+        );
+        assert_eq!(
+            registry
+                .get("workflow_read_messages")
+                .expect("workflow_read_messages tool")
+                .action_kind(),
+            ActionKind::Read
+        );
+        assert_eq!(
+            registry
+                .get("workflow_clear_messages")
+                .expect("workflow_clear_messages tool")
+                .action_kind(),
+            ActionKind::Write
         );
     }
 }

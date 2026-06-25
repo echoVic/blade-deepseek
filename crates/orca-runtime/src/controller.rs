@@ -41,6 +41,7 @@ use crate::tool_invocation::{
     prepare_tool_invocation, prepare_tool_invocation_with_external, validate_tool_invocation,
     validate_tool_invocation_with_external,
 };
+use crate::workflow::ipc::WorkflowIpcContext;
 use crate::workflow::{WorkflowBackgroundLaunch, WorkflowLaunchRequest, WorkflowRunner};
 use crate::worktree::{WorktreeGuard, WorktreeOutcome};
 use orca_core::hook_types::HookEvent;
@@ -249,6 +250,7 @@ fn run_inner<W: io::Write>(
         &cancel,
         &task_registry,
         &mut background_workflows,
+        None,
     )?;
     let status = result.status;
 
@@ -302,6 +304,7 @@ fn run_agent_loop(
     cancel: &CancelToken,
     task_registry: &TaskRegistry,
     background_workflows: &mut Vec<BackgroundWorkflowRun>,
+    workflow_ipc: Option<&WorkflowIpcContext>,
 ) -> io::Result<AgentLoopResult> {
     let max_turns = DEFAULT_MAX_TURNS;
     let budget_model = config.model.as_option();
@@ -699,6 +702,7 @@ fn run_agent_loop(
                     hooks,
                     cost_tracker,
                     cancel,
+                    workflow_ipc,
                 )?;
 
                 for (status, result) in results {
@@ -781,6 +785,7 @@ fn run_agent_loop(
                 cancel,
                 task_registry,
                 background_workflows,
+                workflow_ipc,
             )?;
 
             if tool_request.name == tool_types::ToolName::UpdatePlan
@@ -850,6 +855,7 @@ pub(crate) fn execute_child_agent_loop<W: io::Write>(
         runtime.cancel,
         &task_registry,
         &mut background_workflows,
+        request.workflow_ipc.as_ref(),
     )?;
     observe_background_workflows(
         ControllerRunOptions::for_run_config(config),
@@ -894,6 +900,7 @@ fn execute_tool_with_approval(
     cancel: &CancelToken,
     task_registry: &TaskRegistry,
     background_workflows: &mut Vec<BackgroundWorkflowRun>,
+    workflow_ipc: Option<&WorkflowIpcContext>,
 ) -> io::Result<(RunStatus, tool_types::ToolResult)> {
     let invocation = prepare_tool_invocation(tool_request, subagent_depth, mcp_registry, config);
     if let Err(error) = validate_tool_invocation(&invocation, mcp_registry, config) {
@@ -1023,9 +1030,17 @@ fn execute_tool_with_approval(
             cost_tracker,
             cancel,
             task_registry,
+            workflow_ipc,
         )?
     } else if execution_request.name == tool_types::ToolName::SubagentStatus {
         execute_subagent_status_tool(execution_request, task_registry)
+    } else if matches!(
+        execution_request.name,
+        tool_types::ToolName::WorkflowSendMessage
+            | tool_types::ToolName::WorkflowReadMessages
+            | tool_types::ToolName::WorkflowClearMessages
+    ) {
+        execute_workflow_mailbox_tool(execution_request, workflow_ipc)
     } else {
         orca_tools::execute_with_mcp_external_and_policy(
             execution_request,
@@ -1075,6 +1090,57 @@ fn execute_tool_with_approval(
     };
 
     Ok((status, result))
+}
+
+fn execute_workflow_mailbox_tool(
+    tool_request: &tool_types::ToolRequest,
+    workflow_ipc: Option<&WorkflowIpcContext>,
+) -> tool_types::ToolResult {
+    let Some(workflow_ipc) = workflow_ipc else {
+        return tool_types::ToolResult::failed(
+            tool_request,
+            "workflow mailbox tools are only available inside workflow child agents",
+            None,
+        );
+    };
+    let raw = tool_request.raw_arguments.as_deref().unwrap_or("{}");
+    let args: serde_json::Value = match serde_json::from_str(raw) {
+        Ok(value) => value,
+        Err(error) => {
+            return tool_types::ToolResult::invalid_input(
+                tool_request,
+                format!("arguments are not valid JSON: {error}"),
+            );
+        }
+    };
+    let channel = match args.get("channel").and_then(serde_json::Value::as_str) {
+        Some(channel) => channel,
+        None => {
+            return tool_types::ToolResult::invalid_input(
+                tool_request,
+                "missing required string field: channel",
+            );
+        }
+    };
+
+    let result = match tool_request.name {
+        tool_types::ToolName::WorkflowSendMessage => {
+            let message = args
+                .get("message")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            let from = args.get("from").and_then(serde_json::Value::as_str);
+            workflow_ipc.send_message(channel, from, message)
+        }
+        tool_types::ToolName::WorkflowReadMessages => workflow_ipc.read_messages(channel),
+        tool_types::ToolName::WorkflowClearMessages => workflow_ipc.clear_messages(channel),
+        _ => unreachable!("workflow mailbox tool dispatch guarded by caller"),
+    };
+
+    match result {
+        Ok(value) => tool_types::ToolResult::completed(tool_request, value.to_string(), false),
+        Err(error) => tool_types::ToolResult::invalid_input(tool_request, error),
+    }
 }
 
 fn execute_workflow_tool(
@@ -1308,6 +1374,7 @@ fn execute_subagent_batch(
     hooks: &HookRunner,
     cost_tracker: &mut CostTracker,
     cancel: &CancelToken,
+    workflow_ipc: Option<&WorkflowIpcContext>,
 ) -> io::Result<Vec<(RunStatus, tool_types::ToolResult)>> {
     let mut handles = Vec::new();
     let mut results: Vec<Option<(RunStatus, tool_types::ToolResult)>> =
@@ -1386,6 +1453,7 @@ fn execute_subagent_batch(
             model: request.model.clone(),
             depth: subagent_depth + 1,
             emit_deltas: false,
+            workflow_ipc: workflow_ipc.cloned(),
         };
         let child_tool_request = invocation.effective;
         let child_config = config.clone();
@@ -1560,6 +1628,7 @@ fn execute_subagent_tool(
     cost_tracker: &mut CostTracker,
     cancel: &CancelToken,
     task_registry: &TaskRegistry,
+    workflow_ipc: Option<&WorkflowIpcContext>,
 ) -> io::Result<tool_types::ToolResult> {
     let request = subagent::create_subagent_request(tool_request);
     let description = request.description.clone();
@@ -1623,6 +1692,7 @@ fn execute_subagent_tool(
         model: request.model,
         depth: subagent_depth + 1,
         emit_deltas: false,
+        workflow_ipc: workflow_ipc.cloned(),
     };
     let mut runtime = ChildAgentRuntime::new(
         child_cwd,
@@ -1837,6 +1907,7 @@ pub fn run_async_subagent_worker(
         model: request.model,
         depth: child_depth,
         emit_deltas: false,
+        workflow_ipc: None,
     };
     let mut child_events = EventFactory::new(format!("subagent-{agent_id}"));
     let mut child_sink = EventSink::new(io::sink(), config.output_format);
@@ -2064,6 +2135,28 @@ mod tests {
             target: Some("target".to_string()),
             raw_arguments: None,
         }
+    }
+
+    #[test]
+    fn workflow_mailbox_tool_requires_workflow_child_context() {
+        let request = tool_types::ToolRequest {
+            id: "mailbox".to_string(),
+            name: tool_types::ToolName::WorkflowReadMessages,
+            action: ActionKind::Agent,
+            target: Some("findings".to_string()),
+            raw_arguments: Some(serde_json::json!({ "channel": "findings" }).to_string()),
+        };
+
+        let result = execute_workflow_mailbox_tool(&request, None);
+
+        assert_eq!(result.status, tool_types::ToolStatus::Failed);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("only available inside workflow child agents")
+        );
     }
 
     #[test]

@@ -32,6 +32,7 @@ use crate::tasks::TaskRegistry;
 use crate::worktree::{WorktreeGuard, WorktreeOutcome};
 
 use super::host::{AgentCall, HostCommand, HostEvent, WorkflowHost};
+use super::ipc::WorkflowIpcContext;
 use super::script::{ResolvedWorkflowScript, resolve_workflow_script_to_path};
 use super::state::{
     WorkflowAgentRecord, WorkflowAgentStatusCounts, WorkflowStateStore, WorkflowWorkerRecord,
@@ -344,6 +345,7 @@ impl WorkflowRunner {
         let mut failed_error = None;
         let mut completed_result = None;
         let gate = Arc::new(WorkflowExecutionGate::new());
+        let workflow_ipc = WorkflowIpcContext::new();
         let workflow_limits = self.config.workflows.clone();
 
         if self.state.stop_requested(&run_id)? {
@@ -372,6 +374,7 @@ impl WorkflowRunner {
                     call,
                     Arc::clone(&cached_agents),
                     &gate,
+                    &workflow_ipc,
                     &workflow_limits,
                 )
             },
@@ -496,6 +499,7 @@ impl WorkflowRunner {
         call: AgentCall,
         cached_agents: Arc<AtomicU32>,
         gate: &Arc<WorkflowExecutionGate>,
+        workflow_ipc: &WorkflowIpcContext,
         workflow_limits: &orca_core::config::WorkflowConfig,
     ) -> io::Result<HostCommand> {
         if self.state.stop_requested(run_id)? {
@@ -598,7 +602,8 @@ impl WorkflowRunner {
                 }
             };
 
-            match self.run_child_agent_call(&call, execution_policy.max_agent_tokens) {
+            match self.run_child_agent_call(&call, workflow_ipc, execution_policy.max_agent_tokens)
+            {
                 Ok(child_output) => {
                     let mut output = child_agent_output(&call.prompt, &child_output.message);
                     append_worktree_outcome(&mut output, child_output.worktree.as_ref());
@@ -716,6 +721,7 @@ impl WorkflowRunner {
     fn run_child_agent_call(
         &self,
         call: &AgentCall,
+        workflow_ipc: &WorkflowIpcContext,
         max_agent_tokens: Option<u64>,
     ) -> Result<WorkflowChildAgentCallOutput, WorkflowChildAgentCallError> {
         let cwd = self
@@ -746,6 +752,7 @@ impl WorkflowRunner {
             model: None,
             depth: 1,
             emit_deltas: false,
+            workflow_ipc: Some(workflow_ipc.for_sender(call.call_path.clone())),
         };
         let mut runtime = ChildAgentRuntime::new(
             child_cwd,

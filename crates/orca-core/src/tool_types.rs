@@ -18,6 +18,9 @@ pub enum ToolName {
     Subagent,
     SubagentStatus,
     Workflow,
+    WorkflowSendMessage,
+    WorkflowReadMessages,
+    WorkflowClearMessages,
     WebSearch,
     GetGoal,
     CreateGoal,
@@ -50,6 +53,9 @@ impl ToolName {
             "subagent" => Self::Subagent,
             "subagent_status" => Self::SubagentStatus,
             "Workflow" | "workflow" => Self::Workflow,
+            "workflow_send_message" => Self::WorkflowSendMessage,
+            "workflow_read_messages" => Self::WorkflowReadMessages,
+            "workflow_clear_messages" => Self::WorkflowClearMessages,
             "web_search" => Self::WebSearch,
             "get_goal" => Self::GetGoal,
             "create_goal" => Self::CreateGoal,
@@ -94,6 +100,9 @@ impl ToolName {
             Self::Subagent => "subagent",
             Self::SubagentStatus => "subagent_status",
             Self::Workflow => "Workflow",
+            Self::WorkflowSendMessage => "workflow_send_message",
+            Self::WorkflowReadMessages => "workflow_read_messages",
+            Self::WorkflowClearMessages => "workflow_clear_messages",
             Self::WebSearch => "web_search",
             Self::GetGoal => "get_goal",
             Self::CreateGoal => "create_goal",
@@ -124,6 +133,9 @@ impl ToolName {
             Self::Subagent => "subagent",
             Self::SubagentStatus => "subagent_status",
             Self::Workflow => "Workflow",
+            Self::WorkflowSendMessage => "workflow_send_message",
+            Self::WorkflowReadMessages => "workflow_read_messages",
+            Self::WorkflowClearMessages => "workflow_clear_messages",
             Self::WebSearch => "web_search",
             Self::GetGoal => "get_goal",
             Self::CreateGoal => "create_goal",
@@ -156,6 +168,9 @@ impl ToolName {
             "subagent" => Self::Subagent,
             "subagent_status" => Self::SubagentStatus,
             "Workflow" | "workflow" => Self::Workflow,
+            "workflow_send_message" => Self::WorkflowSendMessage,
+            "workflow_read_messages" => Self::WorkflowReadMessages,
+            "workflow_clear_messages" => Self::WorkflowClearMessages,
             "web_search" => Self::WebSearch,
             "get_goal" => Self::GetGoal,
             "create_goal" => Self::CreateGoal,
@@ -181,6 +196,7 @@ impl ToolName {
                 | Self::Grep
                 | Self::GitStatus
                 | Self::SubagentStatus
+                | Self::WorkflowReadMessages
                 | Self::GetGoal
                 | Self::RequestUserInput
                 | Self::ListSkills

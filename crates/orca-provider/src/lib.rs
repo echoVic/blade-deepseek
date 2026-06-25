@@ -148,6 +148,26 @@ fn mock_call(conversation: &Conversation) -> ProviderResponse {
         }
     }
 
+    if prompt.trim().starts_with("workflow_read_messages ") && has_tool_results {
+        let tool_outputs = conversation
+            .messages
+            .iter()
+            .filter_map(|message| match message {
+                Message::Tool { content, .. } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let msg = format!("Workflow mailbox messages: {tool_outputs}");
+        return ProviderResponse {
+            steps: vec![ProviderStep::MessageDelta(msg.clone())],
+            assistant_content: Some(msg),
+            assistant_reasoning: None,
+            tool_calls: Vec::new(),
+            usage: None,
+        };
+    }
+
     if has_tool_results {
         let msg = "Mock completed after tool execution.".to_string();
         return ProviderResponse {
@@ -390,6 +410,58 @@ fn parse_mock_prompt(prompt: &str) -> Option<ToolRequest> {
                 })
                 .to_string(),
             ),
+        });
+    }
+
+    if let Some(rest) = prompt.strip_prefix("workflow_send_message ") {
+        let mut parts = rest.splitn(3, ' ');
+        let channel = parts.next()?.trim();
+        let from = parts.next()?.trim();
+        let message = parts.next()?.trim();
+        if channel.is_empty() || from.is_empty() || message.is_empty() {
+            return None;
+        }
+        return Some(ToolRequest {
+            id: "mock-tool-1".to_string(),
+            name: ToolName::WorkflowSendMessage,
+            action: ActionKind::Agent,
+            target: Some(channel.to_string()),
+            raw_arguments: Some(
+                serde_json::json!({
+                    "channel": channel,
+                    "from": from,
+                    "message": message
+                })
+                .to_string(),
+            ),
+        });
+    }
+
+    if let Some(rest) = prompt.strip_prefix("workflow_read_messages ") {
+        let channel = rest.trim();
+        if channel.is_empty() {
+            return None;
+        }
+        return Some(ToolRequest {
+            id: "mock-tool-1".to_string(),
+            name: ToolName::WorkflowReadMessages,
+            action: ActionKind::Agent,
+            target: Some(channel.to_string()),
+            raw_arguments: Some(serde_json::json!({ "channel": channel }).to_string()),
+        });
+    }
+
+    if let Some(rest) = prompt.strip_prefix("workflow_clear_messages ") {
+        let channel = rest.trim();
+        if channel.is_empty() {
+            return None;
+        }
+        return Some(ToolRequest {
+            id: "mock-tool-1".to_string(),
+            name: ToolName::WorkflowClearMessages,
+            action: ActionKind::Agent,
+            target: Some(channel.to_string()),
+            raw_arguments: Some(serde_json::json!({ "channel": channel }).to_string()),
         });
     }
 

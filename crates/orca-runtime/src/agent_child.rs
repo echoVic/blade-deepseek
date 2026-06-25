@@ -12,6 +12,7 @@ use crate::cost::CostTracker;
 use crate::hooks::HookRunner;
 use crate::instructions::ProjectInstructions;
 use crate::memory::MemoryBlock;
+use crate::workflow::ipc::WorkflowIpcContext;
 
 #[derive(Clone, Debug)]
 pub struct ChildAgentRequest {
@@ -20,6 +21,7 @@ pub struct ChildAgentRequest {
     pub model: Option<String>,
     pub depth: u32,
     pub emit_deltas: bool,
+    pub(crate) workflow_ipc: Option<WorkflowIpcContext>,
 }
 
 #[derive(Clone, Debug)]
@@ -189,6 +191,7 @@ mod tests {
             model: Some(FLASH_MODEL.to_string()),
             depth: 1,
             emit_deltas: false,
+            workflow_ipc: None,
         };
         let cancel = CancelToken::new();
         let mut events = EventFactory::new("test-run".to_string());
@@ -215,6 +218,7 @@ mod tests {
             model: Some(AUTO_MODEL.to_string()),
             depth: 1,
             emit_deltas: false,
+            workflow_ipc: None,
         };
         let cancel = CancelToken::new();
         let mut events = EventFactory::new("test-run".to_string());
@@ -239,6 +243,7 @@ mod tests {
             model: None,
             depth: 1,
             emit_deltas: false,
+            workflow_ipc: None,
         };
         let cancel = CancelToken::new();
         let mut events = EventFactory::new("test-run".to_string());
