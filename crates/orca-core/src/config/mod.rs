@@ -137,6 +137,8 @@ pub struct WorkflowTeamConfig {
     pub max_agent_retries: Option<u32>,
     #[serde(default)]
     pub max_agent_tokens: Option<u64>,
+    #[serde(default)]
+    pub allowed_tools: Option<Vec<String>>,
 }
 
 impl WorkflowTeamConfig {
@@ -146,6 +148,20 @@ impl WorkflowTeamConfig {
         }
         if let Some(max_agent_tokens) = self.max_agent_tokens {
             self.max_agent_tokens = Some(max_agent_tokens.max(1));
+        }
+        self.allowed_tools = self.allowed_tools.map(|tools| {
+            tools
+                .into_iter()
+                .map(|tool| tool.trim().to_string())
+                .filter(|tool| !tool.is_empty())
+                .collect::<Vec<_>>()
+        });
+        if self
+            .allowed_tools
+            .as_ref()
+            .is_some_and(|tools| tools.is_empty())
+        {
+            self.allowed_tools = Some(Vec::new());
         }
         self
     }

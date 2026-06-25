@@ -21,6 +21,8 @@ pub struct ChildAgentRequest {
     pub model: Option<String>,
     pub depth: u32,
     pub emit_deltas: bool,
+    pub allowed_tools: Option<Vec<String>>,
+    pub tool_policy_label: Option<String>,
     pub(crate) workflow_ipc: Option<WorkflowIpcContext>,
 }
 
@@ -191,6 +193,8 @@ mod tests {
             model: Some(FLASH_MODEL.to_string()),
             depth: 1,
             emit_deltas: false,
+            allowed_tools: None,
+            tool_policy_label: None,
             workflow_ipc: None,
         };
         let cancel = CancelToken::new();
@@ -218,6 +222,8 @@ mod tests {
             model: Some(AUTO_MODEL.to_string()),
             depth: 1,
             emit_deltas: false,
+            allowed_tools: None,
+            tool_policy_label: None,
             workflow_ipc: None,
         };
         let cancel = CancelToken::new();
@@ -243,6 +249,8 @@ mod tests {
             model: None,
             depth: 1,
             emit_deltas: false,
+            allowed_tools: None,
+            tool_policy_label: None,
             workflow_ipc: None,
         };
         let cancel = CancelToken::new();

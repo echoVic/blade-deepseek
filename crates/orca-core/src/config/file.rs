@@ -595,6 +595,7 @@ workflowKeywordTriggerEnabled = false
 [workflows.teams.backend]
 max_agent_retries = 0
 max_agent_tokens = 100
+allowed_tools = ["read_file", "grep"]
 
 [workflows.teams.frontend]
 max_agent_retries = 2
@@ -604,10 +605,15 @@ max_agent_retries = 2
         let backend = workflows.teams.get("backend").expect("backend policy");
         assert_eq!(backend.max_agent_retries, Some(0));
         assert_eq!(backend.max_agent_tokens, Some(100));
+        assert_eq!(
+            backend.allowed_tools.as_deref(),
+            Some(["read_file".to_string(), "grep".to_string()].as_slice())
+        );
 
         let frontend = workflows.teams.get("frontend").expect("frontend policy");
         assert_eq!(frontend.max_agent_retries, Some(2));
         assert_eq!(frontend.max_agent_tokens, None);
+        assert_eq!(frontend.allowed_tools, None);
     }
 
     #[test]

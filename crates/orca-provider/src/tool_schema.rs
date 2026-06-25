@@ -100,6 +100,28 @@ pub fn deepseek_tools_schema_for_type_with_mcp_and_external(
         .collect()
 }
 
+pub fn deepseek_tools_schema_for_allowed_names_with_mcp_and_external<S: AsRef<str>>(
+    allowed: &[S],
+    mcp_registry: Option<&McpRegistry>,
+    external_tools: &[ExternalToolConfig],
+) -> Vec<Value> {
+    let registry = registry::tool_registry_with_mcp_and_external(mcp_registry, external_tools);
+    let allowed_canonical_names = allowed
+        .iter()
+        .filter_map(|name| {
+            registry
+                .resolve(name.as_ref())
+                .map(|resolved| resolved.tool.name().to_string())
+        })
+        .collect::<HashSet<_>>();
+
+    registry
+        .model_visible_tools()
+        .filter(|tool| allowed_canonical_names.contains(tool.name()))
+        .map(|tool| tool.schema())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,6 +213,23 @@ mod tests {
 
         assert!(names.contains(&"glob"));
         assert!(!names.contains(&"list_files"));
+        assert!(!names.contains(&"subagent"));
+    }
+
+    #[test]
+    fn explicit_allowed_schema_exposes_only_allowed_tools() {
+        let tools = deepseek_tools_schema_for_allowed_names_with_mcp_and_external(
+            &["read_file".to_string(), "list_files".to_string()],
+            None,
+            &[],
+        );
+        let names = tools
+            .iter()
+            .filter_map(|tool| tool["function"]["name"].as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, vec!["read_file", "glob"]);
+        assert!(!names.contains(&"bash"));
         assert!(!names.contains(&"subagent"));
     }
 

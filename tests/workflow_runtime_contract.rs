@@ -570,6 +570,7 @@ fn workflow_team_policy_enforces_team_token_budget() {
         WorkflowTeamConfig {
             max_agent_retries: Some(0),
             max_agent_tokens: Some(100),
+            allowed_tools: None,
         },
     );
     let tasks = TaskRegistry::new("session-1".to_string());
@@ -606,6 +607,58 @@ fn workflow_team_policy_enforces_team_token_budget() {
             .expect("usage should be preserved")
             .total_tokens(),
         150
+    );
+}
+
+#[test]
+fn workflow_team_policy_blocks_disallowed_tools() {
+    if !orca_runtime::workflow::host::WorkflowHost::node_available() {
+        return;
+    }
+
+    let temp = tempdir().unwrap();
+    let script = temp.path().join("workflow.js");
+    fs::write(
+        &script,
+        "export const meta = { name: 'team-tools', description: 'Team tool policy test', phases: [] };\n\
+         export default await agent('bash printf hi', { team: 'backend' });",
+    )
+    .unwrap();
+
+    let mut config = mock_run_config(temp.path());
+    config.workflows.teams.insert(
+        "backend".to_string(),
+        WorkflowTeamConfig {
+            max_agent_retries: Some(0),
+            max_agent_tokens: None,
+            allowed_tools: Some(vec!["read_file".to_string()]),
+        },
+    );
+    let tasks = TaskRegistry::new("session-1".to_string());
+    let session_dir = temp.path().join("session");
+    let runner = WorkflowRunner::new(config, tasks.clone(), session_dir.clone());
+    let error = runner
+        .launch(WorkflowLaunchRequest::from_script_path(
+            script.display().to_string(),
+        ))
+        .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("workflow team 'backend' disallows tool 'bash'"),
+        "team tool policy should fail backend agent: {error}"
+    );
+
+    let task = tasks.list().into_iter().next().expect("workflow task");
+    let record = tasks.get(&task.id).expect("task record");
+    assert_eq!(record.status, TaskStatus::Failed);
+    assert_eq!(record.workflow_agents.len(), 1);
+    let agent = &record.workflow_agents[0];
+    assert_eq!(agent.team.as_deref(), Some("backend"));
+    assert_eq!(
+        agent.status,
+        orca_core::workflow_types::WorkflowAgentStatus::Failed
     );
 }
 

@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::io;
 use std::path::Path;
 use std::path::PathBuf;
@@ -20,6 +21,7 @@ use orca_core::workflow_types::WorkflowInput;
 use orca_mcp::McpRegistry;
 use orca_provider::context;
 use orca_provider::tool_schema::{
+    deepseek_tools_schema_for_allowed_names_with_mcp_and_external,
     deepseek_tools_schema_for_type_with_mcp_and_external,
     deepseek_tools_schema_with_mcp_and_external,
 };
@@ -246,6 +248,8 @@ fn run_inner<W: io::Write>(
         0,
         true,
         &SubagentType::General,
+        None,
+        None,
         &instructions,
         &memory,
         &mcp_registry,
@@ -300,6 +304,8 @@ fn run_agent_loop(
     subagent_depth: u32,
     emit_deltas: bool,
     subagent_type: &SubagentType,
+    allowed_tools: Option<&[String]>,
+    tool_policy_label: Option<&str>,
     instructions: &ProjectInstructions,
     memory: &MemoryBlock,
     mcp_registry: &McpRegistry,
@@ -319,11 +325,21 @@ fn run_agent_loop(
     let policy = ApprovalPolicy::new(config.approval_mode)
         .with_permission_rules(config.permission_rules.clone());
     let tools_override = if subagent_depth > 0 {
-        Some(deepseek_tools_schema_for_type_with_mcp_and_external(
-            subagent_type,
-            Some(mcp_registry),
-            &config.external_tools,
-        ))
+        if let Some(allowed_tools) = allowed_tools {
+            Some(
+                deepseek_tools_schema_for_allowed_names_with_mcp_and_external(
+                    allowed_tools,
+                    Some(mcp_registry),
+                    &config.external_tools,
+                ),
+            )
+        } else {
+            Some(deepseek_tools_schema_for_type_with_mcp_and_external(
+                subagent_type,
+                Some(mcp_registry),
+                &config.external_tools,
+            ))
+        }
     } else {
         Some(deepseek_tools_schema_with_mcp_and_external(
             Some(mcp_registry),
@@ -690,6 +706,23 @@ fn run_agent_loop(
             .collect();
         let mut index = 0;
         while index < tool_requests.len() {
+            if let Some(result) = child_tool_policy_failure(
+                &tool_requests[index],
+                allowed_tools,
+                tool_policy_label,
+                mcp_registry,
+                &config.external_tools,
+            ) {
+                if emit_deltas {
+                    sink.emit(&events.tool_call_requested(&tool_requests[index]))?;
+                    sink.emit(&events.tool_call_completed(&result))?;
+                }
+                return Ok(AgentLoopResult::failure(
+                    RunStatus::Failed,
+                    result.error.clone().unwrap_or_default(),
+                ));
+            }
+
             if should_run_subagent_batch(config, &tool_requests[index], subagent_depth) {
                 let batch_end = collect_subagent_batch(config, &tool_requests, index);
                 let results = execute_subagent_batch(
@@ -851,6 +884,8 @@ pub(crate) fn execute_child_agent_loop<W: io::Write>(
         request.depth,
         request.emit_deltas,
         &request.subagent_type,
+        request.allowed_tools.as_deref(),
+        request.tool_policy_label.as_deref(),
         runtime.instructions,
         runtime.memory,
         runtime.mcp_registry,
@@ -872,6 +907,43 @@ pub(crate) fn execute_child_agent_loop<W: io::Write>(
         final_message: child.final_message,
         error: child.error,
     })
+}
+
+fn child_tool_policy_failure(
+    tool_request: &tool_types::ToolRequest,
+    allowed_tools: Option<&[String]>,
+    policy_label: Option<&str>,
+    mcp_registry: &McpRegistry,
+    external_tools: &[orca_core::external_config::ExternalToolConfig],
+) -> Option<tool_types::ToolResult> {
+    let allowed_tools = allowed_tools?;
+    let registry = orca_tools::registry::tool_registry_with_mcp_and_external(
+        Some(mcp_registry),
+        external_tools,
+    );
+    let allowed_canonical_names = allowed_tools
+        .iter()
+        .filter_map(|tool| {
+            registry
+                .resolve(tool)
+                .map(|resolved| resolved.tool.name().to_string())
+        })
+        .collect::<HashSet<_>>();
+    let requested_name = tool_request.name.as_str();
+    let requested_canonical_name = registry
+        .resolve(requested_name)
+        .map(|resolved| resolved.tool.name().to_string())
+        .unwrap_or_else(|| requested_name.to_string());
+
+    if allowed_canonical_names.contains(&requested_canonical_name) {
+        return None;
+    }
+
+    let label = policy_label.unwrap_or("child agent tool policy");
+    Some(tool_types::ToolResult::invalid_input(
+        tool_request,
+        format!("{label} disallows tool '{requested_name}'"),
+    ))
 }
 
 #[cfg(test)]
@@ -1529,6 +1601,8 @@ fn execute_subagent_batch(
             model: request.model.clone(),
             depth: subagent_depth + 1,
             emit_deltas: false,
+            allowed_tools: None,
+            tool_policy_label: None,
             workflow_ipc: workflow_ipc.cloned(),
         };
         let child_tool_request = invocation.effective;
@@ -1812,6 +1886,8 @@ fn execute_subagent_tool(
         model: request.model,
         depth: subagent_depth + 1,
         emit_deltas: false,
+        allowed_tools: None,
+        tool_policy_label: None,
         workflow_ipc: workflow_ipc.cloned(),
     };
     let mut runtime = ChildAgentRuntime::new(
@@ -2046,6 +2122,8 @@ pub fn run_async_subagent_worker(
         model: request.model,
         depth: child_depth,
         emit_deltas: false,
+        allowed_tools: None,
+        tool_policy_label: None,
         workflow_ipc: None,
     };
     let mut child_events = EventFactory::new(format!("subagent-{agent_id}"));

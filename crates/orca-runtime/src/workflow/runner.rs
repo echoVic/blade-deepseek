@@ -134,10 +134,12 @@ struct WorkflowChildAgentCallError {
     retryable: bool,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct WorkflowAgentExecutionPolicy {
     max_agent_retries: u32,
     max_agent_tokens: Option<u64>,
+    allowed_tools: Option<Vec<String>>,
+    tool_policy_label: Option<String>,
 }
 
 impl From<io::Error> for WorkflowChildAgentCallError {
@@ -603,8 +605,7 @@ impl WorkflowRunner {
                 }
             };
 
-            match self.run_child_agent_call(&call, workflow_ipc, execution_policy.max_agent_tokens)
-            {
+            match self.run_child_agent_call(&call, workflow_ipc, &execution_policy) {
                 Ok(child_output) => {
                     let mut output = child_agent_output(&call.prompt, &child_output.message);
                     append_worktree_outcome(&mut output, child_output.worktree.as_ref());
@@ -723,7 +724,7 @@ impl WorkflowRunner {
         &self,
         call: &AgentCall,
         workflow_ipc: &WorkflowIpcContext,
-        max_agent_tokens: Option<u64>,
+        execution_policy: &WorkflowAgentExecutionPolicy,
     ) -> Result<WorkflowChildAgentCallOutput, WorkflowChildAgentCallError> {
         let cwd = self
             .config
@@ -753,6 +754,8 @@ impl WorkflowRunner {
             model: None,
             depth: 1,
             emit_deltas: false,
+            allowed_tools: execution_policy.allowed_tools.clone(),
+            tool_policy_label: execution_policy.tool_policy_label.clone(),
             workflow_ipc: Some(workflow_ipc.for_sender(call.call_path.clone())),
         };
         let mut runtime = ChildAgentRuntime::new(
@@ -774,7 +777,7 @@ impl WorkflowRunner {
 
         match result.status {
             RunStatus::Success => {
-                if let Some(max_agent_tokens) = max_agent_tokens {
+                if let Some(max_agent_tokens) = execution_policy.max_agent_tokens {
                     let total_tokens = usage.total_tokens();
                     if total_tokens > max_agent_tokens {
                         let mut error = format!(
@@ -945,16 +948,22 @@ fn workflow_agent_execution_policy(
     let mut policy = WorkflowAgentExecutionPolicy {
         max_agent_retries: workflow_limits.max_agent_retries,
         max_agent_tokens: workflow_limits.max_agent_tokens,
+        allowed_tools: None,
+        tool_policy_label: None,
     };
 
     if let Some(team) = workflow_agent_team(&call.opts)
         && let Some(team_policy) = workflow_limits.teams.get(&team)
     {
+        policy.tool_policy_label = Some(format!("workflow team '{team}'"));
         if let Some(max_agent_retries) = team_policy.max_agent_retries {
             policy.max_agent_retries = max_agent_retries;
         }
         if let Some(max_agent_tokens) = team_policy.max_agent_tokens {
             policy.max_agent_tokens = Some(max_agent_tokens);
+        }
+        if let Some(allowed_tools) = &team_policy.allowed_tools {
+            policy.allowed_tools = Some(allowed_tools.clone());
         }
     }
 
