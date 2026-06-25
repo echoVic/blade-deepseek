@@ -66,6 +66,9 @@ pub struct SessionWriter {
     path: PathBuf,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct SessionStore;
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct CompactionRecord {
     pub collapsed_at: DateTime<Utc>,
@@ -297,6 +300,95 @@ impl SessionWriter {
         plan: Vec<PlanItem>,
     ) -> io::Result<()> {
         write_record(&self.path, &SessionRecord::PlanState { explanation, plan })
+    }
+}
+
+impl SessionStore {
+    pub fn new() -> Self {
+        Self
+    }
+
+    pub fn list_sessions(&self, limit: usize) -> io::Result<Vec<SessionSummary>> {
+        list_sessions(limit)
+    }
+
+    pub fn list_sessions_with_archived(
+        &self,
+        limit: usize,
+        include_archived: bool,
+    ) -> io::Result<Vec<SessionSummary>> {
+        list_sessions_with_archived(limit, include_archived)
+    }
+
+    pub fn load_session(&self, selector: &str) -> io::Result<SessionTranscript> {
+        load_session(selector)
+    }
+
+    pub fn delete_session(&self, selector: &str) -> io::Result<PathBuf> {
+        delete_session(selector)
+    }
+
+    pub fn archive_session(&self, selector: &str) -> io::Result<PathBuf> {
+        archive_session(selector)
+    }
+
+    pub fn rename_session(&self, selector: &str, title: &str) -> io::Result<PathBuf> {
+        rename_session(selector, title)
+    }
+
+    pub fn compress_session(&self, selector: &str) -> io::Result<PathBuf> {
+        compress_session(selector)
+    }
+
+    pub fn search_sessions(
+        &self,
+        query: &str,
+        include_archived: bool,
+    ) -> io::Result<Vec<SearchHit>> {
+        search_sessions(query, include_archived)
+    }
+
+    pub fn create_meta(
+        &self,
+        cwd: &Path,
+        provider: &str,
+        model: Option<String>,
+        prompt: &str,
+    ) -> SessionMeta {
+        create_meta(cwd, provider, model, prompt)
+    }
+
+    pub fn create_fork_meta(
+        &self,
+        cwd: &Path,
+        provider: &str,
+        model: Option<String>,
+        prompt: &str,
+        parent_id: String,
+    ) -> SessionMeta {
+        create_fork_meta(cwd, provider, model, prompt, parent_id)
+    }
+
+    pub fn start_writer(
+        &self,
+        cwd: &Path,
+        provider: &str,
+        model: Option<String>,
+        prompt: &str,
+    ) -> io::Result<SessionWriter> {
+        SessionWriter::start(cwd, provider, model, prompt)
+    }
+
+    pub fn start_writer_from_meta(&self, meta: SessionMeta) -> io::Result<SessionWriter> {
+        SessionWriter::start_from_meta(meta)
+    }
+
+    pub fn resume_conversation(
+        &self,
+        transcript: &SessionTranscript,
+        system_prompt: String,
+    ) -> Conversation {
+        resume_conversation(transcript, system_prompt)
     }
 }
 

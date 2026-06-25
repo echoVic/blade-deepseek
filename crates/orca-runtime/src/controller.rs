@@ -29,7 +29,7 @@ use orca_tools;
 use crate::agent_child::{ChildAgentRequest, ChildAgentResult, ChildAgentRuntime, run_child_agent};
 use crate::agent_common;
 use crate::cost::CostTracker;
-use crate::history::{self, SessionWriter};
+use crate::history::{self, SessionStore, SessionWriter};
 use crate::hooks::{HookContext, HookRunner, conversation_with_hook_context};
 use crate::instructions::{self, ProjectInstructions};
 use crate::memory::{self, MemoryBlock};
@@ -157,6 +157,7 @@ fn run_inner<W: io::Write>(
     let task_registry = TaskRegistry::new_for_cwd(events.run_id().to_string(), &cwd_path);
     let mut background_workflows = Vec::new();
     let mut sink = EventSink::new(writer, config.output_format);
+    let store = SessionStore::new();
     let instructions = load_project_instructions(&cwd_path);
     let memory = memory::load_for_cwd(&cwd_path);
     let hooks = HookRunner::new(config.hooks.clone());
@@ -167,14 +168,14 @@ fn run_inner<W: io::Write>(
 
     let resumed = match &config.history_mode {
         HistoryMode::Resume(selector) | HistoryMode::Fork(selector) => {
-            Some(history::load_session(selector)?)
+            Some(store.load_session(selector)?)
         }
         HistoryMode::Record | HistoryMode::Disabled => None,
     };
 
     let mut history_writer = match &config.history_mode {
         HistoryMode::Disabled => None,
-        HistoryMode::Record | HistoryMode::Resume(_) => match SessionWriter::start(
+        HistoryMode::Record | HistoryMode::Resume(_) => match store.start_writer(
             &cwd_path,
             config.provider.as_str(),
             config.model.as_history_value(),
@@ -191,14 +192,14 @@ fn run_inner<W: io::Write>(
                 .as_ref()
                 .map(|transcript| transcript.meta.session_id.clone())
                 .unwrap_or_default();
-            let meta = history::create_fork_meta(
+            let meta = store.create_fork_meta(
                 &cwd_path,
                 config.provider.as_str(),
                 config.model.as_history_value(),
                 &prompt,
                 parent_id,
             );
-            match SessionWriter::start_from_meta(meta) {
+            match store.start_writer_from_meta(meta) {
                 Ok(writer) => Some(writer),
                 Err(error) => {
                     eprintln!("orca: warning: failed to initialize history: {error}");

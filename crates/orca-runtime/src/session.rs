@@ -14,7 +14,7 @@ use orca_provider::ProviderConfig;
 
 use crate::agent_common;
 use crate::cost::CostTracker;
-use crate::history::{self, SessionWriter};
+use crate::history::{self, SessionStore, SessionWriter};
 use crate::hooks::{HookContext, HookRunner, conversation_with_hook_context};
 use crate::instructions::{self, ProjectInstructions};
 use crate::memory::{self, MemoryBlock};
@@ -29,6 +29,7 @@ pub fn new_run_id() -> String {
 }
 
 pub struct InteractiveSession {
+    store: SessionStore,
     conversation: Conversation,
     writer: Option<SessionWriter>,
     session_id: Option<String>,
@@ -50,6 +51,7 @@ impl InteractiveSession {
             .cwd
             .clone()
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        let store = SessionStore::new();
         let instructions = instructions::load_for_cwd_or_default(&cwd);
         let memory = memory::load_for_cwd(&cwd);
         let mcp_registry = orca_mcp::initialize_registry(&config.mcp_servers);
@@ -66,9 +68,9 @@ impl InteractiveSession {
             HistoryMode::Resume(selector) | HistoryMode::Fork(selector) => {
                 let transcript = match preloaded {
                     Some(t) => t,
-                    None => history::load_session(selector)?,
+                    None => store.load_session(selector)?,
                 };
-                let mut conv = history::resume_conversation(&transcript, system_prompt);
+                let mut conv = store.resume_conversation(&transcript, system_prompt);
                 conv.strip_legacy_pinned_volatile();
                 conv.strip_legacy_summary_messages();
                 (conv, Some(transcript))
@@ -84,20 +86,20 @@ impl InteractiveSession {
         let writer = match &config.history_mode {
             HistoryMode::Disabled => None,
             HistoryMode::Record | HistoryMode::Resume(_) => {
-                let meta = history::create_meta(
+                let meta = store.create_meta(
                     &cwd,
                     config.provider.as_str(),
                     config.model.as_history_value(),
                     prompt_for_title,
                 );
                 session_id = Some(meta.session_id.clone());
-                start_writer_with_messages(meta, &conversation)
+                start_writer_with_messages(&store, meta, &conversation)
             }
             HistoryMode::Fork(_) => {
                 let parent_id = loaded_transcript
                     .map(|transcript| transcript.meta.session_id)
                     .unwrap_or_default();
-                let meta = history::create_fork_meta(
+                let meta = store.create_fork_meta(
                     &cwd,
                     config.provider.as_str(),
                     config.model.as_history_value(),
@@ -105,13 +107,14 @@ impl InteractiveSession {
                     parent_id,
                 );
                 session_id = Some(meta.session_id.clone());
-                start_writer_with_messages(meta, &conversation)
+                start_writer_with_messages(&store, meta, &conversation)
             }
         };
 
         let task_session_id = session_id.clone().unwrap_or_else(new_run_id);
 
         Ok(Self {
+            store,
             conversation,
             writer,
             session_id,
@@ -138,6 +141,10 @@ impl InteractiveSession {
 
     pub fn session_id(&self) -> Option<&str> {
         self.session_id.as_deref()
+    }
+
+    pub fn store(&self) -> &SessionStore {
+        &self.store
     }
 
     pub fn instructions(&self) -> &ProjectInstructions {
@@ -301,10 +308,11 @@ impl InteractiveSession {
 }
 
 fn start_writer_with_messages(
+    store: &SessionStore,
     meta: history::SessionMeta,
     conversation: &Conversation,
 ) -> Option<SessionWriter> {
-    match SessionWriter::start_from_meta(meta) {
+    match store.start_writer_from_meta(meta) {
         Ok(mut writer) => {
             for message in &conversation.messages {
                 if let Err(error) = writer.append_message(message) {
@@ -479,6 +487,7 @@ mod tests {
                 InteractiveSession::new_with_preloaded(&cfg, "workflow", None).expect("session");
 
             assert!(!session.has_active_workflows());
+            assert!(session.store().list_sessions(10).is_ok());
             let handle = session.task_registry().create_workflow(
                 "run-1".to_string(),
                 "demo".to_string(),

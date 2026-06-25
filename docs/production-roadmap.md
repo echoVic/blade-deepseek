@@ -4,7 +4,7 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-06-26
-Current baseline: v0.1.37 shell execution timeout hardening
+Current baseline: v0.1.38 history/session store boundary
 
 ---
 
@@ -29,7 +29,7 @@ working baseline used to prioritize the next patch releases.
 | Persistent goals | `/goal` with persisted state plus goal-scoped `get_goal`, `create_goal`, and narrow `update_goal` | Codex goal extension | Implemented |
 | Workflows | JavaScript workflow DSL, multi-stage runner, task state, notifications, runtime status events, and worktree-isolated/recoverable agent runs | Codex automations/tasks concepts | Implemented; packaging/docs can improve |
 | TUI | Markdown-ish rendering, themes, Vim mode, diff preview, slash commands, workflow panel, elapsed timers, and clearer approval dialogs | Codex/Claude richer terminal UX | Partial |
-| History | JSONL transcripts, resume/fork/search/archive/compress | Codex thread store with queryable metadata | Partial |
+| History | JSONL transcripts, resume/fork/search/archive/compress with a dedicated `SessionStore` boundary | Codex thread store with queryable metadata | Partial |
 | Release | GitHub release + npm alias distribution scripts, retrying post-publish GitHub/npm/npm-exec verification, and a reusable real API e2e release gate | Codex npm/native release model | Implemented |
 | Skills | Markdown skill discovery, `list_skills`/`read_skill`, and explicit `$skill` prompt injection | Codex skills and plugin-provided skill bundles | Partial |
 
@@ -146,6 +146,29 @@ external tools, approvals, and future plugin-provided tools.
    runtime path. Done in v0.1.33.
 3. Prepare for long-running shell sessions, worktree automation, and async
    subagents without adding them in the same patch. Still open after v0.1.33.
+
+### P4: History Store Boundary
+
+**Release target:** v0.1.38
+
+**Current status:** history/session persistence now flows through a dedicated
+`SessionStore` boundary, with runtime session/controller call sites aligned to
+the same entry point.
+
+**Goal:** separate session history persistence from orchestration so the
+runtime can evolve toward a Codex-style thread store without keeping
+everything in one history module.
+
+**Scope:**
+
+1. Add a dedicated history store object that owns session list/load/archive/
+   delete/search/compress helpers.
+2. Route runtime session/controller code through the store instead of direct
+   helper calls.
+3. Keep the existing JSONL format and user-facing history commands stable.
+
+**Verification:** Rust tests for `orca-runtime`, plus release staging and
+public publish verification.
 
 ### Skills And Plugins
 
