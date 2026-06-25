@@ -5,9 +5,9 @@ use std::time::{Duration, Instant};
 
 use crossterm::ExecutableCommand;
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind,
-    KeyboardEnhancementFlags, MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEventKind, KeyboardEnhancementFlags, MouseEvent, MouseEventKind,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::Terminal;
@@ -53,6 +53,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
     let mut stdout = io::stdout();
     stdout.execute(EnterAlternateScreen)?;
     stdout.execute(EnableMouseCapture)?;
+    let bracketed_paste = stdout.execute(EnableBracketedPaste).is_ok();
     // Kitty keyboard protocol: push enhancement AFTER entering alternate screen,
     // otherwise the terminal may reset the keyboard state stack on screen switch.
     let kbd_enhanced = stdout
@@ -197,6 +198,23 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                         MouseWheelScroll::Up => state.scroll_up(1),
                         MouseWheelScroll::Down => state.scroll_down(1),
                     }
+                }
+                continue;
+            }
+
+            if let Event::Paste(pasted) = &ev {
+                match state.status {
+                    AppStatus::Setup if state.setup_step == 1 => {
+                        insert_pasted_text(&mut textarea, pasted);
+                    }
+                    AppStatus::Idle | AppStatus::WaitingUserInput => {
+                        if insert_pasted_text(&mut textarea, pasted) {
+                            state.reset_history_navigation();
+                            update_slash_menu(&textarea, &mut state);
+                            update_mention_candidates(&textarea, &mut state, &config);
+                        }
+                    }
+                    _ => {}
                 }
                 continue;
             }
@@ -658,6 +676,9 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
     // Restore order: pop keyboard enhancement first, then leave alternate screen
     if kbd_enhanced {
         let _ = io::stdout().execute(PopKeyboardEnhancementFlags);
+    }
+    if bracketed_paste {
+        let _ = io::stdout().execute(DisableBracketedPaste);
     }
     let _ = io::stdout().execute(DisableMouseCapture);
     io::stdout().execute(LeaveAlternateScreen)?;
@@ -1297,6 +1318,29 @@ mod tests {
     }
 
     #[test]
+    fn bracketed_paste_inserts_multiline_text_without_submitting() {
+        let (_state, _rx) = test_state();
+        let (_action_tx, action_rx) = mpsc::channel::<UserAction>();
+        let theme = Theme::named(ThemeName::Dark);
+        let mut textarea = make_textarea(&VimState::new(false), &theme);
+
+        assert!(insert_pasted_text(&mut textarea, "alpha\nbravo\ncharlie"));
+
+        assert_eq!(textarea_text(&textarea), "alpha\nbravo\ncharlie");
+        assert!(action_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn bracketed_paste_can_insert_newline_after_existing_text() {
+        let theme = Theme::named(ThemeName::Dark);
+        let mut textarea = make_textarea_with_text("prefix", &VimState::new(false), &theme);
+
+        assert!(insert_pasted_text(&mut textarea, "\nnext"));
+
+        assert_eq!(textarea_text(&textarea), "prefix\nnext");
+    }
+
+    #[test]
     fn wheel_over_composer_scrolls_content() {
         let layout = ui::AppLayout {
             content: Rect::new(0, 3, 80, 18),
@@ -1740,6 +1784,13 @@ fn configure_textarea(textarea: &mut TextArea, vim_state: &VimState, theme: &The
 
 fn textarea_text(textarea: &TextArea) -> String {
     textarea.lines().join("\n")
+}
+
+fn insert_pasted_text(textarea: &mut TextArea, pasted: &str) -> bool {
+    if pasted.is_empty() {
+        return false;
+    }
+    textarea.insert_str(pasted)
 }
 
 fn make_setup_textarea<'a>(theme: &Theme) -> TextArea<'a> {

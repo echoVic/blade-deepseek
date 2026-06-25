@@ -4,6 +4,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Gauge, Paragraph, Wrap};
+use std::ops::Range;
 use tui_textarea::TextArea;
 use unicode_width::UnicodeWidthStr;
 
@@ -25,8 +26,7 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
         return;
     }
 
-    let input_lines = textarea.lines().len().max(1) as u16;
-    let input_height = input_lines + 2;
+    let input_height = composer_input_height(frame.area().width, textarea);
 
     let plan_height = plan_panel_height(state);
     let goal_height: u16 = if state.current_goal.is_some() { 3 } else { 0 };
@@ -77,8 +77,7 @@ pub(crate) struct AppLayout {
 }
 
 pub(crate) fn app_layout(area: Rect, state: &AppState, textarea: &TextArea) -> AppLayout {
-    let input_lines = textarea.lines().len().max(1) as u16;
-    let input_height = input_lines + 2;
+    let input_height = composer_input_height(area.width, textarea);
     let plan_height = plan_panel_height(state);
     let goal_height: u16 = if state.current_goal.is_some() { 3 } else { 0 };
     let chunks = main_layout(area, goal_height, plan_height, input_height);
@@ -854,7 +853,266 @@ fn task_status_color(status: TaskStatus, theme: &Theme) -> Color {
 }
 
 fn render_input(frame: &mut Frame, area: Rect, textarea: &TextArea) {
-    frame.render_widget(textarea, area);
+    let inner = if let Some(block) = textarea.block() {
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        inner
+    } else {
+        area
+    };
+
+    if inner.is_empty() {
+        return;
+    }
+
+    let (lines, cursor_line) = composer_visual_lines(textarea, inner.width as usize);
+    let visible_height = inner.height as usize;
+    let start = if lines.len() <= visible_height {
+        0
+    } else if cursor_line >= visible_height {
+        cursor_line + 1 - visible_height
+    } else {
+        0
+    };
+    let end = (start + visible_height).min(lines.len());
+    let visible = lines[start..end].to_vec();
+    let paragraph = Paragraph::new(visible)
+        .style(textarea.style())
+        .alignment(textarea.alignment());
+    frame.render_widget(paragraph, inner);
+}
+
+fn composer_input_height(area_width: u16, textarea: &TextArea) -> u16 {
+    let input_lines = composer_visual_line_count(area_width, textarea).max(1) as u16;
+    let block_extra = textarea
+        .block()
+        .map(|block| {
+            let outer = Rect::new(0, 0, area_width, u16::MAX);
+            u16::MAX.saturating_sub(block.inner(outer).height)
+        })
+        .unwrap_or(0);
+    input_lines.saturating_add(block_extra)
+}
+
+fn composer_visual_line_count(area_width: u16, textarea: &TextArea) -> usize {
+    let inner_width = textarea_inner_width(area_width, textarea) as usize;
+    if textarea.is_empty() {
+        return 1;
+    }
+    textarea
+        .lines()
+        .iter()
+        .map(|line| textarea_wrap_ranges(line, inner_width).len())
+        .sum::<usize>()
+        .max(1)
+}
+
+fn textarea_inner_width(area_width: u16, textarea: &TextArea) -> u16 {
+    textarea
+        .block()
+        .map(|block| block.inner(Rect::new(0, 0, area_width, 1)).width)
+        .unwrap_or(area_width)
+}
+
+fn composer_visual_lines(textarea: &TextArea, width: usize) -> (Vec<Line<'static>>, usize) {
+    if textarea.is_empty() {
+        let mut spans = vec![Span::styled(" ", textarea.cursor_style())];
+        if let Some(style) = textarea.placeholder_style() {
+            spans.push(Span::styled(textarea.placeholder_text().to_string(), style));
+        }
+        return (vec![Line::from(spans)], 0);
+    }
+
+    let (cursor_row, cursor_col) = textarea.cursor();
+    let selection = textarea.selection_range();
+    let mut visual_lines = Vec::new();
+    let mut cursor_visual_line = 0usize;
+
+    for (row, logical_line) in textarea.lines().iter().enumerate() {
+        let ranges = textarea_wrap_ranges(logical_line, width);
+        for range in ranges {
+            let visual_index = visual_lines.len();
+            if row == cursor_row && cursor_in_visual_range(cursor_col, &range, logical_line) {
+                cursor_visual_line = visual_index;
+            }
+            visual_lines.push(render_textarea_visual_line(
+                logical_line,
+                row,
+                range,
+                textarea,
+                selection,
+            ));
+        }
+    }
+
+    if visual_lines.is_empty() {
+        visual_lines.push(Line::from(Span::styled(" ", textarea.cursor_style())));
+    }
+
+    (visual_lines, cursor_visual_line)
+}
+
+fn cursor_in_visual_range(cursor_col: usize, range: &Range<usize>, logical_line: &str) -> bool {
+    let line_len = logical_line.chars().count();
+    (range.start <= cursor_col && cursor_col < range.end)
+        || (cursor_col == line_len && range.end == line_len)
+        || (range.is_empty() && cursor_col == range.start)
+}
+
+fn render_textarea_visual_line(
+    logical_line: &str,
+    row: usize,
+    range: Range<usize>,
+    textarea: &TextArea,
+    selection: Option<((usize, usize), (usize, usize))>,
+) -> Line<'static> {
+    let (cursor_row, cursor_col) = textarea.cursor();
+    let base_style = textarea.style();
+    let cursor_style = textarea.cursor_style();
+    let cursor_line_style = textarea.cursor_line_style();
+    let selection_style = Style::default().bg(Color::LightBlue);
+    let mut spans = Vec::new();
+    let mut pending = String::new();
+    let mut pending_style = base_style;
+
+    for (col, ch) in logical_line
+        .chars()
+        .enumerate()
+        .skip(range.start)
+        .take(range.end.saturating_sub(range.start))
+    {
+        let style = if row == cursor_row && col == cursor_col {
+            cursor_style
+        } else if selection_contains(selection, row, col) {
+            selection_style
+        } else if row == cursor_row {
+            cursor_line_style
+        } else {
+            base_style
+        };
+        push_styled_char(&mut spans, &mut pending, &mut pending_style, ch, style);
+    }
+
+    flush_pending_span(&mut spans, &mut pending, pending_style);
+
+    if row == cursor_row && cursor_col == range.end && cursor_col == logical_line.chars().count() {
+        spans.push(Span::styled(" ", cursor_style));
+    } else if selection_contains(selection, row, range.end)
+        && range.end == logical_line.chars().count()
+    {
+        spans.push(Span::styled(" ", selection_style));
+    }
+
+    Line::from(spans)
+}
+
+fn selection_contains(
+    selection: Option<((usize, usize), (usize, usize))>,
+    row: usize,
+    col: usize,
+) -> bool {
+    let Some(((start_row, start_col), (end_row, end_col))) = selection else {
+        return false;
+    };
+    (row > start_row || (row == start_row && col >= start_col))
+        && (row < end_row || (row == end_row && col < end_col))
+}
+
+fn push_styled_char(
+    spans: &mut Vec<Span<'static>>,
+    pending: &mut String,
+    pending_style: &mut Style,
+    ch: char,
+    style: Style,
+) {
+    if pending.is_empty() {
+        *pending_style = style;
+    } else if *pending_style != style {
+        flush_pending_span(spans, pending, *pending_style);
+        *pending_style = style;
+    }
+    pending.push(ch);
+}
+
+fn flush_pending_span(spans: &mut Vec<Span<'static>>, pending: &mut String, pending_style: Style) {
+    if !pending.is_empty() {
+        spans.push(Span::styled(std::mem::take(pending), pending_style));
+    }
+}
+
+fn textarea_wrap_ranges(line: &str, width: usize) -> Vec<Range<usize>> {
+    if line.is_empty() || width == 0 {
+        return vec![0..line.chars().count()];
+    }
+
+    let mut ranges = Vec::new();
+    let mut current_start = 0usize;
+    let mut current_end = 0usize;
+    let mut current_width = 0usize;
+    let mut segment_start = 0usize;
+
+    for segment in line.split_inclusive(|c: char| c.is_whitespace() || c == '/' || c == '-') {
+        let segment_cols = segment.chars().count();
+        let segment_width = UnicodeWidthStr::width(segment);
+        if segment_width == 0 {
+            segment_start += segment_cols;
+            continue;
+        }
+
+        if segment_width > width {
+            if current_width > 0 {
+                ranges.push(current_start..current_end);
+            }
+            let (start, end, display_width) =
+                push_hard_wrapped_segment(&mut ranges, segment, segment_start, width);
+            current_start = start;
+            current_end = end;
+            current_width = display_width;
+        } else if current_width == 0 {
+            current_start = segment_start;
+            current_end = segment_start + segment_cols;
+            current_width = segment_width;
+        } else if current_width + segment_width <= width {
+            current_end = segment_start + segment_cols;
+            current_width += segment_width;
+        } else {
+            ranges.push(current_start..current_end);
+            current_start = segment_start;
+            current_end = segment_start + segment_cols;
+            current_width = segment_width;
+        }
+
+        segment_start += segment_cols;
+    }
+
+    if current_width > 0 || ranges.is_empty() {
+        ranges.push(current_start..current_end);
+    }
+    ranges
+}
+
+fn push_hard_wrapped_segment(
+    ranges: &mut Vec<Range<usize>>,
+    segment: &str,
+    segment_start: usize,
+    width: usize,
+) -> (usize, usize, usize) {
+    let mut chunk_start = segment_start;
+    let mut current_col = segment_start;
+    let mut current_width = 0usize;
+
+    for ch in segment.chars() {
+        let ch_width = UnicodeWidthStr::width(ch.to_string().as_str()).max(1);
+        if current_width > 0 && current_width + ch_width > width {
+            ranges.push(chunk_start..current_col);
+            chunk_start = current_col;
+            current_width = 0;
+        }
+        current_col += 1;
+        current_width += ch_width;
+    }
+
+    (chunk_start, current_col, current_width)
 }
 
 fn render_status(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
@@ -1880,6 +2138,49 @@ mod tests {
         let cell = status_cell(&state, &theme);
         assert_eq!(cell.content.as_ref(), " ● running 1m 05s");
         assert_eq!(cell.style.fg, Some(theme.warning));
+    }
+
+    #[test]
+    fn composer_layout_counts_soft_wrapped_visual_lines() {
+        let state = test_state();
+        let mut textarea = TextArea::from(vec!["alpha bravo charlie".to_string()]);
+        textarea.set_block(Block::default().borders(Borders::ALL));
+        let layout = app_layout(Rect::new(0, 0, 12, 24), &state, &textarea);
+
+        assert_eq!(layout.input.height, 5);
+    }
+
+    #[test]
+    fn composer_render_soft_wraps_long_pasted_lines() {
+        let mut state = test_state();
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let textarea = TextArea::from(vec!["alpha bravo charlie".to_string()]);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(12, 8))
+            .expect("test backend");
+
+        terminal
+            .draw(|frame| render(frame, &mut state, &textarea, &theme))
+            .expect("draw");
+        let rendered = format!("{:?}", terminal.backend().buffer());
+
+        assert!(rendered.contains("alpha"));
+        assert!(rendered.contains("bravo"));
+        assert!(rendered.contains("charlie"));
+    }
+
+    #[test]
+    fn composer_cursor_at_wrap_boundary_belongs_to_next_visual_line() {
+        let mut textarea = TextArea::default();
+        for ch in "alpha bravo".chars() {
+            textarea.insert_char(ch);
+        }
+        for _ in 0.."bravo".chars().count() {
+            textarea.move_cursor(tui_textarea::CursorMove::Back);
+        }
+
+        let (_lines, cursor_line) = composer_visual_lines(&textarea, 6);
+
+        assert_eq!(cursor_line, 1);
     }
 
     #[test]
