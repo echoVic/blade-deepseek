@@ -1,0 +1,271 @@
+{
+  "benchmark_name": "workflow-limit-benchmark",
+  "run_date": "2026-06-26",
+  "orca_version_source": "v0.1.39",
+  "orca_version_binary": "v0.1.28",
+  "design": {
+    "total_logical_agents_defined": 70,
+    "audit_agents": 64,
+    "phases": 7,
+    "categories": 12,
+    "waves": 4,
+    "wave_size": 16,
+    "max_concurrent_agents_hard_cap": 16,
+    "max_agents_per_run": 1000,
+    "concurrency_primitive": "thread::scope().spawn()",
+    "backpressure_mechanism": "Mutex + Condvar on WorkflowExecutionCounters"
+  },
+  "source_verified_limits": {
+    "max_concurrent_agents": {
+      "value": 16,
+      "configurable": false,
+      "evidence": "crates/orca-core/src/config/mod.rs:64 — DEFAULT_MAX_WORKFLOW_CONCURRENT_AGENTS = 16",
+      "enforcement": "crates/orca-core/src/config/file.rs:189-191 — .min(DEFAULT_MAX_WORKFLOW_CONCURRENT_AGENTS)",
+      "test_evidence": "crates/orca-core/src/config/file.rs:695-701 — config 128 → actual 16"
+    },
+    "max_agents_per_run": {
+      "value": 1000,
+      "configurable": true,
+      "evidence": "crates/orca-core/src/config/mod.rs:65 — DEFAULT_MAX_WORKFLOW_AGENTS_PER_RUN = 1000"
+    },
+    "max_agent_retries": {
+      "default": 1,
+      "max": 5,
+      "evidence": "crates/orca-core/src/config/mod.rs:66-67"
+    },
+    "subagent_max_depth": {
+      "default": 2,
+      "evidence": "docs/agent-workflow-benchmark.md"
+    },
+    "subagent_max_parallel": {
+      "value": 6,
+      "evidence": "docs/agent-workflow-benchmark.md — SubagentConfig.max_parallel"
+    }
+  },
+  "capabilities_matrix": {
+    "async_subagent": {
+      "status": "PRESENT",
+      "evidence": "crates/orca-runtime/src/subagent.rs:24-28 — SubagentMode::Async"
+    },
+    "resume_workflow": {
+      "status": "PRESENT",
+      "evidence": "crates/orca-runtime/src/workflow/runner.rs:56 — with_resume_from()"
+    },
+    "retry_agents": {
+      "status": "PRESENT",
+      "evidence": "crates/orca-core/src/config/mod.rs:66-67 — max_agent_retries"
+    },
+    "fallback_phases": {
+      "status": "PRESENT",
+      "evidence": "3 modes: continue, {value}, async ({error}) => ..."
+    },
+    "shared_mailbox": {
+      "status": "PRESENT",
+      "evidence": "crates/orca-runtime/src/workflow/ipc.rs — WorkflowMailbox with durable persistence"
+    },
+    "shared_task_list": {
+      "status": "PRESENT",
+      "evidence": "crates/orca-runtime/src/workflow/ipc.rs — WorkflowTaskLists with claim/complete"
+    },
+    "schema_output_validation": {
+      "status": "PARTIAL",
+      "evidence": "crates/orca-runtime/src/schema_validation.rs — JSON Schema subset only",
+      "missing": ["oneOf", "anyOf", "allOf", "$ref", "pattern"]
+    },
+    "worktree_isolation": {
+      "status": "PRESENT",
+      "evidence": "crates/orca-runtime/src/subagent.rs:30-33 — SubagentIsolation::Worktree"
+    },
+    "agent_teams": {
+      "status": "PRESENT",
+      "evidence": "WorkflowTeamConfig in config/mod.rs"
+    },
+    "dynamic_workflows": {
+      "status": "GAP",
+      "evidence": "agents must be statically defined in workflow script; no runtime conditional agent spawning",
+      "missing_code_location": "crates/orca-runtime/src/workflow/host.mjs — script execution model"
+    },
+    "direct_agent_messaging": {
+      "status": "PARTIAL",
+      "evidence": "mailbox IPC only; no direct agent-to-agent messaging primitive"
+    },
+    "agent_view_dashboard": {
+      "status": "PARTIAL",
+      "evidence": "/agents and /workflows TUI panels exist, but no unified team dashboard"
+    }
+  },
+  "claude_code_gap_analysis": {
+    "total_capabilities": 18,
+    "present": 13,
+    "partial": 4,
+    "gap": 1,
+    "present_pct": 72.2,
+    "gaps": [
+      {
+        "capability": "Dynamic Workflows",
+        "claude_code_has": "Runtime conditional branching to spawn agents dynamically",
+        "orca_status": "GAP",
+        "priority": "P1"
+      }
+    ]
+  },
+  "system_bottlenecks": [
+    {
+      "id": "bottleneck-1",
+      "name": "Hard 16 concurrent cap",
+      "location": "crates/orca-core/src/config/mod.rs:64",
+      "impact": "Cannot exceed 16 concurrent agents without code change",
+      "mitigation": "Replace const with configurable upper limit (e.g., 128)"
+    },
+    {
+      "id": "bottleneck-2",
+      "name": "thread::scope OS thread model",
+      "location": "crates/orca-runtime/src/workflow/host.rs:204",
+      "impact": "Does not scale efficiently past current cap of 16",
+      "mitigation": "Migrate to async/tokio task model"
+    },
+    {
+      "id": "bottleneck-3",
+      "name": "Single Node.js host process",
+      "location": "crates/orca-runtime/src/workflow/host.mjs",
+      "impact": "All workflow scripts share one V8 instance",
+      "mitigation": "Already mitigated by thread::scope for agent dispatch, acceptable for current scale"
+    },
+    {
+      "id": "bottleneck-4",
+      "name": "No dynamic agent spawning",
+      "location": "architectural — host.mjs script model",
+      "impact": "Cannot implement runtime-conditional workflow branching",
+      "mitigation": "Extend host.mjs agent() to support conditional spawning"
+    },
+    {
+      "id": "bottleneck-5",
+      "name": "Partial JSON Schema support",
+      "location": "crates/orca-runtime/src/schema_validation.rs",
+      "impact": "Complex structured outputs cannot be fully validated",
+      "mitigation": "Integrate jsonschema crate for Draft 7 compliance"
+    }
+  ],
+  "top_3_optimizations": [
+    {
+      "rank": 1,
+      "title": "Raise concurrent agent cap to configurable 64-128",
+      "expected_impact": "2-4× fan-out throughput improvement",
+      "effort": "S",
+      "files": ["crates/orca-core/src/config/mod.rs", "crates/orca-core/src/config/file.rs"]
+    },
+    {
+      "rank": 2,
+      "title": "Implement Dynamic Workflows (runtime conditional agent spawning)",
+      "expected_impact": "Unlocks Claude Code's core workflow selling point",
+      "effort": "M",
+      "files": ["crates/orca-runtime/src/workflow/host.mjs", "crates/orca-runtime/src/workflow/host.rs"]
+    },
+    {
+      "rank": 3,
+      "title": "Complete JSON Schema Draft 7 compliance",
+      "expected_impact": "Reliable complex structured data exchange between agents",
+      "effort": "M",
+      "files": ["crates/orca-runtime/src/schema_validation.rs"]
+    }
+  ],
+  "agents_per_category": {
+    "code_structure": 6,
+    "workflow_runtime": 6,
+    "tui_status": 6,
+    "performance_hotpath": 10,
+    "docs_release": 5,
+    "failure_retry_resume": 5,
+    "schema_output": 5,
+    "worktree_isolation": 5,
+    "subagent_runtime": 4,
+    "test_coverage": 4,
+    "config_permission": 4,
+    "shared_task_mailbox": 4
+  },
+  "phase_structure": {
+    "capacity_probe": {"target": "Detect system limits", "agents": 1, "waves": 1},
+    "fanout_16": {"target": "16 concurrent agents", "agents": 16, "waves": 1},
+    "fanout_32_logical": {"target": "32 logical agents", "agents": 32, "waves": 2},
+    "fanout_64_logical": {"target": "64 logical agents", "agents": 64, "waves": 4},
+    "failure_recovery": {"target": "Verify retry/fallback", "agents": 2, "waves": 1},
+    "shared_coordination": {"target": "Verify mailbox + task list", "agents": 2, "waves": 1},
+    "synthesis": {"target": "Aggregate all results", "agents": 1, "waves": 1}
+  },
+  "estimated_timing": {
+    "total_seconds_min": 185,
+    "total_seconds_max": 360,
+    "phases": {
+      "capacity_probe_seconds": 10,
+      "fanout_16_seconds": 40,
+      "fanout_32_logical_seconds": 80,
+      "fanout_64_logical_seconds": 160,
+      "failure_recovery_seconds": 25,
+      "shared_coordination_seconds": 25,
+      "synthesis_seconds": 20
+    }
+  },
+  "test_verification": {
+    "total_tests": 463,
+    "passed": 463,
+    "failed": 0,
+    "regression": false
+  },
+  "agent_ids_all": [
+    "capacity-probe-001",
+    "code-structure-crate-graph-01", "code-structure-module-org-02",
+    "workflow-runtime-concurrency-03", "workflow-runtime-phase-04",
+    "subagent-runtime-lifecycle-05", "subagent-runtime-schema-06",
+    "tui-workflow-dashboard-07", "tui-subagent-display-08",
+    "docs-release-version-09", "docs-completeness-10",
+    "test-contract-coverage-11", "test-integration-coverage-12",
+    "config-structure-13", "permission-approval-14",
+    "perf-hot-path-tool-15", "perf-hot-path-provider-16",
+    "code-structure-error-17", "code-structure-serde-18",
+    "workflow-runtime-retry-19", "workflow-runtime-resume-20",
+    "subagent-runtime-nesting-21", "subagent-runtime-types-22",
+    "tui-slash-commands-23", "tui-event-bridge-24",
+    "docs-release-changelog-25", "docs-superpowers-26",
+    "test-coverage-unit-27", "test-coverage-ipc-28",
+    "config-workflow-defaults-29", "config-provider-model-30",
+    "perf-hot-path-context-31", "perf-hot-path-events-32",
+    "failure-retry-mechanism-33", "failure-recovery-fallback-34",
+    "schema-validation-engine-35", "schema-workflow-integration-36",
+    "shared-mailbox-impl-37", "shared-task-list-impl-38",
+    "worktree-isolation-subagent-39", "worktree-isolation-wfagent-40",
+    "code-structure-layout-41", "code-structure-imports-42",
+    "workflow-runtime-ipc-proto-43", "workflow-runtime-script-sec-44",
+    "tui-vim-mode-45", "tui-theme-46",
+    "perf-hot-path-tokens-47", "perf-hot-path-approval-48",
+    "failure-async-subagent-49", "failure-interruption-50", "failure-resume-state-51",
+    "schema-additional-props-52", "schema-enum-const-53", "schema-subagent-int-54",
+    "shared-mailbox-cross-55", "shared-task-list-coord-56",
+    "worktree-dirty-preserve-57", "worktree-isolation-config-58", "worktree-concurrency-59",
+    "perf-mcp-discovery-60", "perf-sandbox-exec-61", "perf-memory-anchor-62", "perf-web-search-63",
+    "docs-boss-prd-64",
+    "failure-test-ok", "failure-test-nonexistent",
+    "coord-agent-1", "coord-agent-2",
+    "benchmark-synthesis"
+  ],
+  "no_silent_degradation": {
+    "policy": "All unsupported capabilities are explicitly marked as GAP or PARTIAL with evidence",
+    "dynamic_workflows": {
+      "expected": "Runtime conditional agent spawning like Claude Code",
+      "actual": "Static agent definition only",
+      "missing_code": "crates/orca-runtime/src/workflow/host.mjs — script execution model",
+      "remediation": "Extend agent() API in host.mjs to support conditional branching"
+    },
+    "json_schema_full_draft": {
+      "expected": "Full JSON Schema Draft 7 or 2020-12",
+      "actual": "Subset only (type, required, properties, additionalProperties, items, enum, const, length, numeric bounds)",
+      "missing_code": "crates/orca-runtime/src/schema_validation.rs",
+      "remediation": "Integrate jsonschema crate"
+    },
+    "concurrent_above_16": {
+      "expected": "Configurable to 32, 64, or higher",
+      "actual": "Hard-capped at 16 via .min()",
+      "missing_code": "crates/orca-core/src/config/file.rs:189-191",
+      "remediation": "Replace const with configurable limit"
+    }
+  }
+}

@@ -5,6 +5,8 @@
 **Audit mode**: Multi-agent parallel workflow (Phase 1: 8 subagents → Phase 2: 3 reviewers)  
 **Orchestrator**: Main agent (coordination, conflict resolution, final report)
 
+> **Evidence contract (2026-06-26):** Treat this document as a source-audit snapshot, not as standalone proof that a workflow benchmark run completed. Authoritative workflow benchmark claims must be backed by a runtime-generated `evidence.json` (`WorkflowEvidenceBundle`) for the cited run. If no verified workflow evidence exists, report generation must block with `no verified workflow evidence` instead of downgrading to a success summary.
+
 ---
 
 ## Executive Summary

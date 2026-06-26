@@ -17,8 +17,8 @@ use orca_core::event_sink::EventSink;
 use orca_core::subagent_types::SubagentType;
 use orca_core::task_types::{TaskType, WorkflowPhaseTaskSummary, WorkflowTaskProgress};
 use orca_core::workflow_types::{
-    WorkflowAgentStatus, WorkflowInput, WorkflowOutput, WorkflowPhaseRecord, WorkflowRunState,
-    WorkflowRunStatus,
+    WorkflowAgentStatus, WorkflowEvidenceIdentity, WorkflowInput, WorkflowOutput,
+    WorkflowPhaseRecord, WorkflowRunState, WorkflowRunStatus,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -414,6 +414,7 @@ impl WorkflowRunner {
                     state.status = WorkflowRunStatus::Failed;
                     state.error = Some(message.clone());
                     self.state.write_state(&state)?;
+                    self.write_evidence_for_state(&state)?;
                     self.tasks
                         .fail(&task_id, message.clone())
                         .map_err(io::Error::other)?;
@@ -444,6 +445,7 @@ impl WorkflowRunner {
             state.status = WorkflowRunStatus::Failed;
             state.error = Some(error.clone());
             self.state.write_state(&state)?;
+            self.write_evidence_for_state(&state)?;
             self.tasks
                 .fail(&task_id, error.clone())
                 .map_err(io::Error::other)?;
@@ -479,6 +481,7 @@ impl WorkflowRunner {
         state.status = WorkflowRunStatus::Completed;
         state.final_summary = Some(summary.clone());
         self.state.write_state(&state)?;
+        self.write_evidence_for_state(&state)?;
         self.refresh_task_progress(&task_id, &state)?;
         self.tasks
             .complete(&task_id, result.clone())
@@ -888,6 +891,7 @@ impl WorkflowRunner {
         state.final_summary = Some(STOPPED_SUMMARY.to_string());
         state.error = None;
         self.state.write_state(&state)?;
+        self.write_evidence_for_state(&state)?;
         self.tasks
             .stop(&task_id, STOPPED_SUMMARY.to_string())
             .map_err(io::Error::other)?;
@@ -951,6 +955,18 @@ impl WorkflowRunner {
         self.tasks
             .update_workflow_agents(task_id, self.state.agent_summaries(&state.run_id)?)
             .map_err(io::Error::other)
+    }
+
+    fn write_evidence_for_state(&self, state: &WorkflowRunState) -> io::Result<()> {
+        let identity = WorkflowEvidenceIdentity {
+            app_version: self.config.app_version.clone(),
+            binary_path: std::env::current_exe()
+                .ok()
+                .map(|path| path.display().to_string()),
+            generated_at_ms: now_ms(),
+        };
+        let bundle = self.state.build_evidence_bundle(state, identity)?;
+        self.state.write_evidence_bundle(&bundle)
     }
 }
 

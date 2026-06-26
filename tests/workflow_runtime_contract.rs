@@ -33,7 +33,8 @@ fn workflow_runner_executes_agent_and_writes_state() {
 
     let config = mock_run_config(temp.path());
     let tasks = TaskRegistry::new("session-1".to_string());
-    let runner = WorkflowRunner::new(config, tasks.clone(), temp.path().join("session"));
+    let session_dir = temp.path().join("session");
+    let runner = WorkflowRunner::new(config, tasks.clone(), session_dir.clone());
 
     let launched = runner
         .launch(WorkflowLaunchRequest::from_script_path(
@@ -55,6 +56,25 @@ fn workflow_runner_executes_agent_and_writes_state() {
             .output
             .transcript_dir
             .unwrap()
+            .contains("transcripts")
+    );
+
+    let run_id = launched.output.run_id.as_deref().expect("run id");
+    let store = WorkflowStateStore::new(session_dir.join("workflow-runs"));
+    let evidence = store.load_evidence_bundle(run_id).unwrap();
+    assert_eq!(evidence.run_id, run_id);
+    assert_eq!(evidence.task_id, launched.task_id);
+    assert_eq!(evidence.workflow_name, "audit");
+    assert_eq!(evidence.status, WorkflowRunStatus::Completed);
+    assert_eq!(evidence.total_agent_count, 1);
+    assert_eq!(evidence.identity.app_version, "0.0.0-test");
+    assert_eq!(evidence.agents.len(), 1);
+    assert_eq!(evidence.agents[0].status, WorkflowAgentStatus::Completed);
+    assert!(
+        evidence.agents[0]
+            .transcript_path
+            .as_deref()
+            .unwrap_or_default()
             .contains("transcripts")
     );
 }

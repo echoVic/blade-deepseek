@@ -1,8 +1,11 @@
 use std::fs;
 
+use orca_core::cost_types::UsageTotals;
 use orca_core::workflow_types::{
-    WorkflowAgentStatus, WorkflowInput, WorkflowMeta, WorkflowRunState, WorkflowRunStatus,
+    WorkflowAgentStatus, WorkflowEvidenceIdentity, WorkflowInput, WorkflowMeta,
+    WorkflowPhaseRecord, WorkflowRunState, WorkflowRunStatus,
 };
+use orca_runtime::workflow::report::{render_evidence_markdown, render_report_for_run};
 use orca_runtime::workflow::script::{
     resolve_workflow_script, resolve_workflow_script_to_path, resolve_workflow_script_with_user_dir,
 };
@@ -202,6 +205,256 @@ fn state_store_round_trips_run_state_and_agent_cache() {
         .cached_agent_result(&updated_state.run_id, "phases.scan", "1234")
         .unwrap();
     assert_eq!(cached, Some(record));
+}
+
+#[test]
+fn workflow_evidence_bundle_round_trips_state_and_agent_rows() {
+    let temp = tempdir().unwrap();
+    let store = WorkflowStateStore::new(temp.path().join("runs"));
+    let state = WorkflowRunState {
+        run_id: "workflow-run-evidence".to_string(),
+        task_id: "task-evidence".to_string(),
+        session_id: "session-evidence".to_string(),
+        cwd: "/tmp/project".to_string(),
+        workflow_name: "audit".to_string(),
+        meta: WorkflowMeta {
+            name: "audit".to_string(),
+            description: "Audit code".to_string(),
+            phases: vec!["scan".to_string(), "review".to_string()],
+        },
+        script_digest: "abcd".repeat(16),
+        args_digest: "ef01".repeat(16),
+        status: WorkflowRunStatus::Completed,
+        phases: vec![
+            WorkflowPhaseRecord {
+                name: "scan".to_string(),
+                status: WorkflowRunStatus::Completed,
+                started_at_ms: Some(100),
+                completed_at_ms: Some(200),
+                agent_count: 1,
+                error: None,
+                fallback: None,
+            },
+            WorkflowPhaseRecord {
+                name: "review".to_string(),
+                status: WorkflowRunStatus::Failed,
+                started_at_ms: Some(210),
+                completed_at_ms: Some(260),
+                agent_count: 1,
+                error: Some("review failed".to_string()),
+                fallback: Some("continue".to_string()),
+            },
+        ],
+        total_agent_count: 2,
+        final_summary: Some("done with review fallback".to_string()),
+        error: None,
+    };
+    store.create_run(&state).unwrap();
+
+    store
+        .record_agent_completed(
+            &state.run_id,
+            WorkflowAgentRecord {
+                call_id: "call-scan".to_string(),
+                call_path: "phases.scan:1".to_string(),
+                prompt: "inspect repo".to_string(),
+                opts: json!({ "team": "research" }),
+                team: Some("research".to_string()),
+                input_hash: "hash-scan".to_string(),
+                status: WorkflowAgentStatus::Completed,
+                attempt: 1,
+                max_attempts: 2,
+                previous_errors: Vec::new(),
+                output: Some(json!({ "summary": "ok" })),
+                error: None,
+                transcript_path: Some("/tmp/project/.orca/transcripts/call-scan.json".to_string()),
+                started_at_ms: Some(110),
+                completed_at_ms: Some(180),
+                usage: Some(UsageTotals {
+                    input_tokens: 10,
+                    output_tokens: 20,
+                    cache_tokens: 3,
+                    estimated_cost_usd: 0.001,
+                }),
+            },
+        )
+        .unwrap();
+    store
+        .record_agent_completed(
+            &state.run_id,
+            WorkflowAgentRecord {
+                call_id: "call-review".to_string(),
+                call_path: "phases.review:1".to_string(),
+                prompt: "review repo".to_string(),
+                opts: json!({ "team": "review" }),
+                team: Some("review".to_string()),
+                input_hash: "hash-review".to_string(),
+                status: WorkflowAgentStatus::Failed,
+                attempt: 2,
+                max_attempts: 2,
+                previous_errors: vec!["transient timeout".to_string()],
+                output: None,
+                error: Some("review failed".to_string()),
+                transcript_path: Some(
+                    "/tmp/project/.orca/transcripts/call-review.json".to_string(),
+                ),
+                started_at_ms: Some(220),
+                completed_at_ms: Some(255),
+                usage: None,
+            },
+        )
+        .unwrap();
+
+    let bundle = store
+        .build_evidence_bundle(
+            &state,
+            WorkflowEvidenceIdentity {
+                app_version: "0.0.0-test".to_string(),
+                binary_path: Some("/tmp/orca".to_string()),
+                generated_at_ms: 300,
+            },
+        )
+        .unwrap();
+    store.write_evidence_bundle(&bundle).unwrap();
+
+    assert!(store.evidence_path(&state.run_id).exists());
+    let loaded = store.load_evidence_bundle(&state.run_id).unwrap();
+    assert_eq!(loaded.evidence_version, 1);
+    assert_eq!(loaded.run_id, state.run_id);
+    assert_eq!(loaded.task_id, state.task_id);
+    assert_eq!(loaded.session_id, state.session_id);
+    assert_eq!(loaded.cwd, state.cwd);
+    assert_eq!(loaded.workflow_name, state.workflow_name);
+    assert_eq!(loaded.script_digest, state.script_digest);
+    assert_eq!(loaded.args_digest, state.args_digest);
+    assert_eq!(loaded.status, WorkflowRunStatus::Completed);
+    assert_eq!(loaded.total_agent_count, 2);
+    assert_eq!(loaded.phases.len(), 2);
+    assert_eq!(loaded.phases[1].error.as_deref(), Some("review failed"));
+    assert_eq!(loaded.phases[1].fallback.as_deref(), Some("continue"));
+    assert_eq!(loaded.agents.len(), 2);
+    let scan = loaded
+        .agents
+        .iter()
+        .find(|agent| agent.call_id == "call-scan")
+        .expect("scan agent evidence");
+    assert_eq!(scan.call_path, "phases.scan:1");
+    assert_eq!(scan.team.as_deref(), Some("research"));
+    assert_eq!(scan.status, WorkflowAgentStatus::Completed);
+    assert_eq!(scan.attempt, 1);
+    assert_eq!(scan.max_attempts, 2);
+    assert_eq!(scan.input_hash, "hash-scan");
+    assert_eq!(scan.usage.unwrap().total_tokens(), 30);
+    let review = loaded
+        .agents
+        .iter()
+        .find(|agent| agent.call_id == "call-review")
+        .expect("review agent evidence");
+    assert_eq!(review.previous_errors, vec!["transient timeout"]);
+    assert_eq!(review.error.as_deref(), Some("review failed"));
+}
+
+#[test]
+fn workflow_report_is_bound_to_evidence() {
+    let temp = tempdir().unwrap();
+    let store = WorkflowStateStore::new(temp.path().join("runs"));
+    let state = WorkflowRunState {
+        run_id: "workflow-run-report".to_string(),
+        task_id: "task-report".to_string(),
+        session_id: "session-report".to_string(),
+        cwd: "/tmp/project".to_string(),
+        workflow_name: "audit".to_string(),
+        meta: WorkflowMeta {
+            name: "audit".to_string(),
+            description: "Audit code".to_string(),
+            phases: vec!["scan".to_string()],
+        },
+        script_digest: "abcd".repeat(16),
+        args_digest: "ef01".repeat(16),
+        status: WorkflowRunStatus::Completed,
+        phases: Vec::new(),
+        total_agent_count: 3,
+        final_summary: Some("evidence says three agents".to_string()),
+        error: None,
+    };
+    store.create_run(&state).unwrap();
+    for index in 0..3 {
+        store
+            .record_agent_completed(
+                &state.run_id,
+                WorkflowAgentRecord {
+                    call_id: format!("call-{index}"),
+                    call_path: format!("root:{index}"),
+                    prompt: format!("agent {index}"),
+                    opts: json!({}),
+                    team: None,
+                    input_hash: format!("hash-{index}"),
+                    status: WorkflowAgentStatus::Completed,
+                    attempt: 1,
+                    max_attempts: 1,
+                    previous_errors: Vec::new(),
+                    output: Some(json!({ "index": index })),
+                    error: None,
+                    transcript_path: Some(format!("/tmp/transcript-{index}.json")),
+                    started_at_ms: Some(100 + index),
+                    completed_at_ms: Some(200 + index),
+                    usage: None,
+                },
+            )
+            .unwrap();
+    }
+    let bundle = store
+        .build_evidence_bundle(
+            &state,
+            WorkflowEvidenceIdentity {
+                app_version: "0.0.0-test".to_string(),
+                binary_path: None,
+                generated_at_ms: 300,
+            },
+        )
+        .unwrap();
+    store.write_evidence_bundle(&bundle).unwrap();
+
+    let markdown = render_evidence_markdown(&bundle);
+    assert!(markdown.contains("workflow-run-report"));
+    assert!(markdown.contains("| Total agents | 3 |"));
+    assert!(!markdown.contains("| Total agents | 11 |"));
+
+    let report = render_report_for_run(&store, &state.run_id).unwrap();
+    assert!(report.markdown.contains("| Total agents | 3 |"));
+    assert_eq!(report.json["totalAgentCount"], 3);
+}
+
+#[test]
+fn workflow_report_blocks_without_verified_evidence() {
+    let temp = tempdir().unwrap();
+    let store = WorkflowStateStore::new(temp.path().join("runs"));
+    let state = WorkflowRunState {
+        run_id: "workflow-run-missing-evidence".to_string(),
+        task_id: "task-missing-evidence".to_string(),
+        session_id: "session-missing-evidence".to_string(),
+        cwd: "/tmp/project".to_string(),
+        workflow_name: "audit".to_string(),
+        meta: WorkflowMeta {
+            name: "audit".to_string(),
+            description: "Audit code".to_string(),
+            phases: vec!["scan".to_string()],
+        },
+        script_digest: "abcd".repeat(16),
+        args_digest: "ef01".repeat(16),
+        status: WorkflowRunStatus::Completed,
+        phases: Vec::new(),
+        total_agent_count: 11,
+        final_summary: Some("should not be enough".to_string()),
+        error: None,
+    };
+    store.create_run(&state).unwrap();
+
+    let error = render_report_for_run(&store, &state.run_id).unwrap_err();
+    assert!(
+        error.to_string().contains("no verified workflow evidence"),
+        "unexpected error: {error}"
+    );
 }
 
 #[test]

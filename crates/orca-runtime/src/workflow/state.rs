@@ -6,7 +6,10 @@ use std::sync::{Arc, Mutex};
 
 use orca_core::cost_types::UsageTotals;
 use orca_core::task_types::WorkflowAgentTaskSummary;
-use orca_core::workflow_types::{WorkflowAgentStatus, WorkflowInput, WorkflowRunState};
+use orca_core::workflow_types::{
+    WorkflowAgentStatus, WorkflowEvidenceAgent, WorkflowEvidenceBundle, WorkflowEvidenceIdentity,
+    WorkflowEvidencePhase, WorkflowInput, WorkflowRunState,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -216,6 +219,10 @@ impl WorkflowStateStore {
         self.run_dir(run_id).join("task-lists.json")
     }
 
+    pub fn evidence_path(&self, run_id: &str) -> PathBuf {
+        self.run_dir(run_id).join("evidence.json")
+    }
+
     pub fn create_run(&self, state: &WorkflowRunState) -> io::Result<()> {
         fs::create_dir_all(self.transcript_dir(&state.run_id))?;
         self.write_state(state)
@@ -233,6 +240,83 @@ impl WorkflowStateStore {
 
     pub fn load_state(&self, run_id: &str) -> io::Result<WorkflowRunState> {
         read_json(&self.state_path(run_id))
+    }
+
+    pub fn write_evidence_bundle(&self, bundle: &WorkflowEvidenceBundle) -> io::Result<()> {
+        write_json_pretty(&self.evidence_path(&bundle.run_id), bundle)
+    }
+
+    pub fn load_evidence_bundle(&self, run_id: &str) -> io::Result<WorkflowEvidenceBundle> {
+        read_json(&self.evidence_path(run_id))
+    }
+
+    pub fn build_evidence_bundle(
+        &self,
+        state: &WorkflowRunState,
+        identity: WorkflowEvidenceIdentity,
+    ) -> io::Result<WorkflowEvidenceBundle> {
+        let cache_path = self.run_dir(&state.run_id).join("agent-cache.json");
+        let mut agents = if cache_path.exists() {
+            read_agent_cache(&cache_path)?
+                .into_values()
+                .map(|entry| WorkflowEvidenceAgent {
+                    call_id: entry.record.call_id,
+                    call_path: entry.record.call_path,
+                    team: entry
+                        .record
+                        .team
+                        .or_else(|| workflow_agent_team(&entry.record.opts)),
+                    input_hash: entry.record.input_hash,
+                    status: entry.record.status,
+                    attempt: entry.record.attempt,
+                    max_attempts: entry.record.max_attempts,
+                    previous_errors: entry.record.previous_errors,
+                    error: entry.record.error,
+                    transcript_path: entry.record.transcript_path,
+                    started_at_ms: entry.record.started_at_ms,
+                    completed_at_ms: entry.record.completed_at_ms,
+                    usage: entry.record.usage,
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        agents.sort_by(|left, right| {
+            left.call_path
+                .cmp(&right.call_path)
+                .then_with(|| left.call_id.cmp(&right.call_id))
+        });
+
+        Ok(WorkflowEvidenceBundle {
+            evidence_version: 1,
+            identity,
+            run_id: state.run_id.clone(),
+            task_id: state.task_id.clone(),
+            session_id: state.session_id.clone(),
+            cwd: state.cwd.clone(),
+            workflow_name: state.workflow_name.clone(),
+            meta: state.meta.clone(),
+            script_digest: state.script_digest.clone(),
+            args_digest: state.args_digest.clone(),
+            status: state.status,
+            phases: state
+                .phases
+                .iter()
+                .map(|phase| WorkflowEvidencePhase {
+                    name: phase.name.clone(),
+                    status: phase.status,
+                    started_at_ms: phase.started_at_ms,
+                    completed_at_ms: phase.completed_at_ms,
+                    agent_count: phase.agent_count,
+                    error: phase.error.clone(),
+                    fallback: phase.fallback.clone(),
+                })
+                .collect(),
+            total_agent_count: state.total_agent_count,
+            final_summary: state.final_summary.clone(),
+            error: state.error.clone(),
+            agents,
+        })
     }
 
     pub fn write_launch_input(&self, run_id: &str, input: &WorkflowInput) -> io::Result<()> {
