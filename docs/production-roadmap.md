@@ -115,6 +115,18 @@ construction, and hook-modified request validation now flow through
 `orca_runtime::tool_invocation` for normal controller execution, readonly
 batches, subagent batches, and TUI approval prompts.
 
+**Goal:** reduce the remaining divergence between built-in tools, MCP tools,
+external tools, approvals, and future plugin-provided tools.
+
+**Scope:**
+
+1. Normalize tool invocation records across all tool sources. Done in v0.1.33
+   for built-in, MCP, and TOML external tools.
+2. Move approval classification and validation result shaping into a shared
+   runtime path. Done in v0.1.33.
+3. Prepare for long-running shell sessions, worktree automation, and async
+   subagents without adding them in the same patch. Still open after v0.1.33.
+
 ### P3: Shell Timeout Hardening
 
 **Release target:** v0.1.37
@@ -134,18 +146,6 @@ the same patch.
 
 **Verification:** covered by the release patch checks and the Rust checks for
 `orca-core`, `orca-tools`, and `orca-runtime`.
-
-**Goal:** reduce the remaining divergence between built-in tools, MCP tools,
-external tools, approvals, and future plugin-provided tools.
-
-**Scope:**
-
-1. Normalize tool invocation records across all tool sources. Done in v0.1.33
-   for built-in, MCP, and TOML external tools.
-2. Move approval classification and validation result shaping into a shared
-   runtime path. Done in v0.1.33.
-3. Prepare for long-running shell sessions, worktree automation, and async
-   subagents without adding them in the same patch. Still open after v0.1.33.
 
 ### P4: History Store Boundary
 
