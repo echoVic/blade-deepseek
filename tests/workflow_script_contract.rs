@@ -7,11 +7,13 @@ use orca_core::workflow_types::{
 };
 use orca_runtime::workflow::report::{render_evidence_markdown, render_report_for_run};
 use orca_runtime::workflow::script::{
-    resolve_workflow_script, resolve_workflow_script_to_path, resolve_workflow_script_with_user_dir,
+    parse_workflow_args_schema, resolve_workflow_script, resolve_workflow_script_to_path,
+    resolve_workflow_script_with_user_dir, validate_workflow_args,
 };
 use orca_runtime::workflow::state::{
     WorkflowAgentCacheRecord, WorkflowAgentRecord, WorkflowStateStore,
 };
+use orca_runtime::workflow::verifier::{WorkflowVerificationStatus, verify_workflow_run};
 use serde_json::json;
 use tempfile::tempdir;
 
@@ -54,6 +56,24 @@ fn inline_script_accepts_top_level_phase_objects() {
     assert_eq!(resolved.meta.name, "audit");
     assert_eq!(resolved.meta.description, "Audit code");
     assert_eq!(resolved.meta.phases, vec!["scan", "review"]);
+}
+
+#[test]
+fn workflow_meta_parses_optional_tags_and_version() {
+    let temp = tempdir().unwrap();
+    let session_dir = temp.path().join("session");
+    let input = WorkflowInput {
+        script: Some(
+            "export const meta = { name: 'audit', description: 'Audit code', phases: [], tags: ['security', 'audit'], version: '1' };\nexport default 'ok';"
+                .to_string(),
+        ),
+        ..Default::default()
+    };
+
+    let resolved = resolve_workflow_script(&input, temp.path(), &session_dir).unwrap();
+
+    assert_eq!(resolved.meta.tags, vec!["security", "audit"]);
+    assert_eq!(resolved.meta.version.as_deref(), Some("1"));
 }
 
 #[test]
@@ -137,6 +157,85 @@ fn nearest_project_workflow_wins_over_user_workflow() {
 }
 
 #[test]
+fn workflow_args_schema_is_extracted_from_script() {
+    let schema = parse_workflow_args_schema(
+        "export const meta = { name: 'audit', description: 'Audit code', phases: [] };\n\
+         export const args = {\n\
+           target: { type: 'string', required: true },\n\
+           maxAgents: { type: 'number', required: false, default: 8 },\n\
+           dryRun: { type: 'boolean', default: true }\n\
+         };\n\
+         export default args;",
+    )
+    .unwrap()
+    .expect("args schema");
+
+    assert_eq!(schema.len(), 3);
+    assert!(schema["target"].required);
+    assert_eq!(schema["target"].arg_type.as_str(), "string");
+    assert_eq!(schema["maxAgents"].default, Some(json!(8)));
+    assert_eq!(schema["dryRun"].arg_type.as_str(), "boolean");
+}
+
+#[test]
+fn workflow_args_validation_applies_defaults_and_rejects_bad_inputs() {
+    let schema = parse_workflow_args_schema(
+        "export const args = {\n\
+           target: { type: 'string', required: true },\n\
+           maxAgents: { type: 'number', default: 8 },\n\
+           dryRun: { type: 'boolean', default: false }\n\
+         };",
+    )
+    .unwrap()
+    .expect("args schema");
+
+    let normalized = validate_workflow_args(Some(json!({ "target": "src" })), &schema).unwrap();
+    assert_eq!(
+        normalized,
+        json!({ "target": "src", "maxAgents": 8, "dryRun": false })
+    );
+
+    let missing = validate_workflow_args(Some(json!({})), &schema).unwrap_err();
+    assert_eq!(missing.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(missing.to_string().contains("missing required workflow arg `target`"));
+
+    let wrong_type =
+        validate_workflow_args(Some(json!({ "target": "src", "maxAgents": "many" })), &schema)
+            .unwrap_err();
+    assert_eq!(wrong_type.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(wrong_type
+        .to_string()
+        .contains("workflow arg `maxAgents` must be number"));
+}
+
+#[test]
+fn saved_workflow_args_schema_is_validated_before_launch_persistence() {
+    let temp = tempdir().unwrap();
+    let workflow_dir = temp.path().join(".orca/workflows");
+    fs::create_dir_all(&workflow_dir).unwrap();
+    fs::write(
+        workflow_dir.join("audit.js"),
+        "export const meta = { name: 'audit', description: 'Audit code', phases: [] };\n\
+         export const args = { target: { type: 'string', required: true }, maxAgents: { type: 'number', default: 8 } };\n\
+         export default args;",
+    )
+    .unwrap();
+
+    let input = WorkflowInput {
+        name: Some("audit".to_string()),
+        args: Some(json!({ "target": "src" })),
+        ..Default::default()
+    };
+
+    let resolved = resolve_workflow_script(&input, temp.path(), &temp.path().join("session"))
+        .expect("saved workflow resolves");
+    let normalized = validate_workflow_args(input.args.clone(), &resolved.args_schema).unwrap();
+
+    assert_eq!(resolved.args_schema.len(), 2);
+    assert_eq!(normalized, json!({ "target": "src", "maxAgents": 8 }));
+}
+
+#[test]
 fn missing_meta_fields_return_invalid_data_error() {
     let temp = tempdir().unwrap();
     let session_dir = temp.path().join("session");
@@ -166,6 +265,8 @@ fn state_store_round_trips_run_state_and_agent_cache() {
             name: "audit".to_string(),
             description: "Audit code".to_string(),
             phases: vec!["scan".to_string()],
+            tags: Vec::new(),
+            version: None,
         },
         script_digest: "abcd".repeat(16),
         args_digest: "ef01".repeat(16),
@@ -221,6 +322,8 @@ fn workflow_evidence_bundle_round_trips_state_and_agent_rows() {
             name: "audit".to_string(),
             description: "Audit code".to_string(),
             phases: vec!["scan".to_string(), "review".to_string()],
+            tags: Vec::new(),
+            version: None,
         },
         script_digest: "abcd".repeat(16),
         args_digest: "ef01".repeat(16),
@@ -355,6 +458,111 @@ fn workflow_evidence_bundle_round_trips_state_and_agent_rows() {
 }
 
 #[test]
+fn workflow_verifier_reports_proven_and_completed_with_failures_from_artifacts() {
+    let temp = tempdir().unwrap();
+    let store = WorkflowStateStore::new(temp.path().join("runs"));
+    let mut state = WorkflowRunState {
+        run_id: "workflow-run-verified".to_string(),
+        task_id: "task-verified".to_string(),
+        session_id: "session-verified".to_string(),
+        cwd: "/tmp/project".to_string(),
+        workflow_name: "audit".to_string(),
+        meta: WorkflowMeta {
+            name: "audit".to_string(),
+            description: "Audit code".to_string(),
+            phases: vec!["scan".to_string()],
+            tags: Vec::new(),
+            version: None,
+        },
+        script_digest: "abcd".repeat(16),
+        args_digest: "ef01".repeat(16),
+        status: WorkflowRunStatus::Completed,
+        phases: vec![WorkflowPhaseRecord {
+            name: "scan".to_string(),
+            status: WorkflowRunStatus::Completed,
+            started_at_ms: Some(100),
+            completed_at_ms: Some(200),
+            agent_count: 1,
+            error: None,
+            fallback: None,
+        }],
+        total_agent_count: 1,
+        final_summary: Some("done".to_string()),
+        error: None,
+    };
+    store.create_run(&state).unwrap();
+    let transcript = store.transcript_dir(&state.run_id).join("agent-1.txt");
+    fs::write(&transcript, "agent transcript").unwrap();
+    fs::write(store.mailbox_path(&state.run_id), "{\"channels\":{}}").unwrap();
+    fs::write(store.task_lists_path(&state.run_id), "{\"lists\":{}}").unwrap();
+    store
+        .record_agent_completed(
+            &state.run_id,
+            WorkflowAgentRecord {
+                call_id: "agent-1".to_string(),
+                call_path: "scan:1".to_string(),
+                prompt: "inspect repo".to_string(),
+                opts: json!({}),
+                team: None,
+                input_hash: "hash".to_string(),
+                status: WorkflowAgentStatus::Completed,
+                attempt: 1,
+                max_attempts: 1,
+                previous_errors: Vec::new(),
+                output: Some(json!("done")),
+                error: None,
+                transcript_path: Some(transcript.display().to_string()),
+                started_at_ms: Some(100),
+                completed_at_ms: Some(200),
+                usage: None,
+            },
+        )
+        .unwrap();
+    let evidence = store
+        .build_evidence_bundle(
+            &state,
+            WorkflowEvidenceIdentity {
+                app_version: "test".to_string(),
+                binary_path: None,
+                generated_at_ms: 300,
+            },
+        )
+        .unwrap();
+    store.write_evidence_bundle(&evidence).unwrap();
+
+    let verified = verify_workflow_run(&store, &state.run_id).unwrap();
+    assert_eq!(verified.status, WorkflowVerificationStatus::Proven);
+    assert!(verified.mailbox_present);
+    assert!(verified.task_lists_present);
+    assert_eq!(verified.transcript_count, 1);
+
+    state.run_id = "workflow-run-with-failures".to_string();
+    state.task_id = "task-with-failures".to_string();
+    state.phases[0].status = WorkflowRunStatus::Failed;
+    state.phases[0].fallback = Some("continued".to_string());
+    state.phases[0].error = Some("scan failed".to_string());
+    store.create_run(&state).unwrap();
+    let failed_evidence = store
+        .build_evidence_bundle(
+            &state,
+            WorkflowEvidenceIdentity {
+                app_version: "test".to_string(),
+                binary_path: None,
+                generated_at_ms: 400,
+            },
+        )
+        .unwrap();
+    store.write_evidence_bundle(&failed_evidence).unwrap();
+
+    let verified_with_failures = verify_workflow_run(&store, &state.run_id).unwrap();
+    assert_eq!(
+        verified_with_failures.status,
+        WorkflowVerificationStatus::CompletedWithFailures
+    );
+    assert!(verified_with_failures.failure_count > 0);
+}
+
+#[test]
 fn workflow_report_is_bound_to_evidence() {
     let temp = tempdir().unwrap();
     let store = WorkflowStateStore::new(temp.path().join("runs"));
@@ -368,6 +576,8 @@ fn workflow_report_is_bound_to_evidence() {
             name: "audit".to_string(),
             description: "Audit code".to_string(),
             phases: vec!["scan".to_string()],
+            tags: Vec::new(),
+            version: None,
         },
         script_digest: "abcd".repeat(16),
         args_digest: "ef01".repeat(16),
@@ -439,6 +649,8 @@ fn workflow_report_blocks_without_verified_evidence() {
             name: "audit".to_string(),
             description: "Audit code".to_string(),
             phases: vec!["scan".to_string()],
+            tags: Vec::new(),
+            version: None,
         },
         script_digest: "abcd".repeat(16),
         args_digest: "ef01".repeat(16),
@@ -471,6 +683,8 @@ fn state_store_reads_legacy_agent_cache_shape() {
             name: "audit".to_string(),
             description: "Audit code".to_string(),
             phases: vec!["scan".to_string()],
+            tags: Vec::new(),
+            version: None,
         },
         script_digest: "abcd".repeat(16),
         args_digest: "ef01".repeat(16),
@@ -537,6 +751,8 @@ fn state_store_reads_legacy_string_agent_cache_without_json_quoting() {
             name: "audit".to_string(),
             description: "Audit code".to_string(),
             phases: vec!["scan".to_string()],
+            tags: Vec::new(),
+            version: None,
         },
         script_digest: "abcd".repeat(16),
         args_digest: "ef01".repeat(16),
@@ -579,6 +795,8 @@ fn state_store_preserves_legacy_json_looking_string_cache_values() {
             name: "audit".to_string(),
             description: "Audit code".to_string(),
             phases: vec!["scan".to_string()],
+            tags: Vec::new(),
+            version: None,
         },
         script_digest: "abcd".repeat(16),
         args_digest: "ef01".repeat(16),
@@ -629,6 +847,8 @@ fn state_store_reads_legacy_null_agent_cache_as_null_value() {
             name: "audit".to_string(),
             description: "Audit code".to_string(),
             phases: vec!["scan".to_string()],
+            tags: Vec::new(),
+            version: None,
         },
         script_digest: "abcd".repeat(16),
         args_digest: "ef01".repeat(16),
@@ -671,6 +891,8 @@ fn state_store_returns_legacy_object_cache_as_object_value() {
             name: "audit".to_string(),
             description: "Audit code".to_string(),
             phases: vec!["scan".to_string()],
+            tags: Vec::new(),
+            version: None,
         },
         script_digest: "abcd".repeat(16),
         args_digest: "ef01".repeat(16),
@@ -715,6 +937,8 @@ fn state_store_reads_current_null_output_as_null_value() {
             name: "audit".to_string(),
             description: "Audit code".to_string(),
             phases: vec!["scan".to_string()],
+            tags: Vec::new(),
+            version: None,
         },
         script_digest: "abcd".repeat(16),
         args_digest: "ef01".repeat(16),
@@ -775,6 +999,8 @@ fn state_store_reads_current_string_agent_output_as_string_value() {
             name: "audit".to_string(),
             description: "Audit code".to_string(),
             phases: vec!["scan".to_string()],
+            tags: Vec::new(),
+            version: None,
         },
         script_digest: "abcd".repeat(16),
         args_digest: "ef01".repeat(16),
@@ -832,6 +1058,8 @@ fn state_store_preserves_current_json_looking_string_outputs() {
             name: "audit".to_string(),
             description: "Audit code".to_string(),
             phases: vec!["scan".to_string()],
+            tags: Vec::new(),
+            version: None,
         },
         script_digest: "abcd".repeat(16),
         args_digest: "ef01".repeat(16),
@@ -906,6 +1134,8 @@ fn state_store_preserves_missing_output_field_when_appending_completed_record() 
             name: "audit".to_string(),
             description: "Audit code".to_string(),
             phases: vec!["scan".to_string()],
+            tags: Vec::new(),
+            version: None,
         },
         script_digest: "abcd".repeat(16),
         args_digest: "ef01".repeat(16),
@@ -998,6 +1228,8 @@ fn state_store_cached_agent_result_ignores_incomplete_or_outputless_current_reco
             name: "audit".to_string(),
             description: "Audit code".to_string(),
             phases: vec!["scan".to_string()],
+            tags: Vec::new(),
+            version: None,
         },
         script_digest: "abcd".repeat(16),
         args_digest: "ef01".repeat(16),

@@ -5,6 +5,7 @@ pub mod report;
 pub mod runner;
 pub mod script;
 pub mod state;
+pub mod verifier;
 
 pub use draft::WorkflowDraftStore;
 pub use runner::{

@@ -328,6 +328,11 @@ pub const SHORTCUT_HINTS: &[ShortcutHint] = &[
         action: "clear screen",
     },
     ShortcutHint {
+        scope: ShortcutScope::Global,
+        keys: "shift+tab",
+        action: "cycle approval mode",
+    },
+    ShortcutHint {
         scope: ShortcutScope::Idle,
         keys: "enter",
         action: "send message",

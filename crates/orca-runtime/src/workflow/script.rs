@@ -3,7 +3,10 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use orca_core::config::WorkflowConfig;
-use orca_core::workflow_types::{WorkflowInput, WorkflowMeta};
+use orca_core::workflow_types::{
+    WorkflowArgSpec, WorkflowArgType, WorkflowArgsSchema, WorkflowInput, WorkflowMeta,
+};
+use serde_json::{Map, Number, Value};
 use sha2::{Digest, Sha256};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -19,6 +22,7 @@ pub struct ResolvedWorkflowScript {
     pub original_path: Option<PathBuf>,
     pub persisted_path: PathBuf,
     pub meta: WorkflowMeta,
+    pub args_schema: WorkflowArgsSchema,
     pub script: String,
     pub script_digest: String,
 }
@@ -91,6 +95,7 @@ pub fn resolve_workflow_script_with_user_dir_to_path(
     };
 
     let meta = parse_workflow_meta(&script)?;
+    let args_schema = parse_workflow_args_schema(&script)?.unwrap_or_default();
     if let Some(parent) = persisted_path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -102,6 +107,7 @@ pub fn resolve_workflow_script_with_user_dir_to_path(
         persisted_path: persisted_path.to_path_buf(),
         script_digest: sha256_hex(script.as_bytes()),
         meta,
+        args_schema,
         script,
     })
 }
@@ -156,6 +162,8 @@ pub fn parse_workflow_meta(script: &str) -> io::Result<WorkflowMeta> {
     let mut name = None;
     let mut description = None;
     let mut phases = None;
+    let mut tags = Vec::new();
+    let mut version = None;
 
     for field in split_top_level(body, ',') {
         let trimmed = field.trim();
@@ -170,6 +178,8 @@ pub fn parse_workflow_meta(script: &str) -> io::Result<WorkflowMeta> {
             "name" => name = Some(parse_quoted_string(value)?),
             "description" => description = Some(parse_quoted_string(value)?),
             "phases" => phases = Some(parse_phases(value)?),
+            "tags" => tags = parse_string_array(value)?,
+            "version" => version = Some(parse_quoted_string(value)?),
             _ => {}
         }
     }
@@ -182,7 +192,200 @@ pub fn parse_workflow_meta(script: &str) -> io::Result<WorkflowMeta> {
         name: name.ok_or_else(|| missing_meta_field("name"))?,
         description: description.ok_or_else(|| missing_meta_field("description"))?,
         phases: phases.ok_or_else(|| missing_meta_field("phases"))?,
+        tags,
+        version,
     })
+}
+
+pub fn parse_workflow_args_schema(script: &str) -> io::Result<Option<WorkflowArgsSchema>> {
+    let Some(export_index) = script.find("export const args") else {
+        return Ok(None);
+    };
+    let object_start = script[export_index..]
+        .find('{')
+        .map(|offset| export_index + offset)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing args object"))?;
+    let object_end = find_matching_brace(script, object_start)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "unterminated args object"))?;
+    let body = &script[object_start + 1..object_end];
+
+    let mut schema = WorkflowArgsSchema::new();
+    for field in split_top_level(body, ',') {
+        let trimmed = field.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Some((key, value)) = split_key_value(trimmed) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "workflow args field must use key: { ... }",
+            ));
+        };
+        let key = parse_object_key(key)?;
+        let spec = parse_workflow_arg_spec(value)?;
+        schema.insert(key, spec);
+    }
+
+    Ok(Some(schema))
+}
+
+pub fn validate_workflow_args(
+    args: Option<Value>,
+    schema: &WorkflowArgsSchema,
+) -> io::Result<Value> {
+    if schema.is_empty() {
+        return Ok(args.unwrap_or(Value::Null));
+    }
+
+    let mut object = match args.unwrap_or_else(|| Value::Object(Map::new())) {
+        Value::Object(object) => object,
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "workflow args must be an object when the script exports an args schema",
+            ));
+        }
+    };
+
+    for (name, spec) in schema {
+        match object.get(name) {
+            Some(value) if !arg_value_matches_type(value, spec.arg_type) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "workflow arg `{name}` must be {}",
+                        spec.arg_type.as_str()
+                    ),
+                ));
+            }
+            Some(_) => {}
+            None => {
+                if let Some(default) = spec.default.clone() {
+                    object.insert(name.clone(), default);
+                } else if spec.required {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("missing required workflow arg `{name}`"),
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok(Value::Object(object))
+}
+
+fn parse_workflow_arg_spec(input: &str) -> io::Result<WorkflowArgSpec> {
+    let trimmed = input.trim();
+    if !trimmed.starts_with('{') || !trimmed.ends_with('}') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "workflow args spec must be an object",
+        ));
+    }
+    let body = &trimmed[1..trimmed.len() - 1];
+    let mut arg_type = None;
+    let mut required = false;
+    let mut default = None;
+
+    for field in split_top_level(body, ',') {
+        let trimmed = field.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Some((key, value)) = split_key_value(trimmed) else {
+            continue;
+        };
+        match parse_object_key(key)?.as_str() {
+            "type" => arg_type = Some(parse_arg_type(value)?),
+            "required" => required = parse_bool_literal(value)?,
+            "default" => default = Some(parse_jsonish_literal(value)?),
+            _ => {}
+        }
+    }
+
+    Ok(WorkflowArgSpec {
+        arg_type: arg_type.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "workflow args spec missing `type`",
+            )
+        })?,
+        required,
+        default,
+    })
+}
+
+fn parse_object_key(input: &str) -> io::Result<String> {
+    let trimmed = input.trim();
+    if trimmed.starts_with('\'') || trimmed.starts_with('"') {
+        return parse_quoted_string(trimmed);
+    }
+    if trimmed
+        .chars()
+        .all(|ch| ch == '_' || ch == '-' || ch.is_ascii_alphanumeric())
+    {
+        return Ok(trimmed.to_string());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("invalid workflow object key `{trimmed}`"),
+    ))
+}
+
+fn parse_arg_type(input: &str) -> io::Result<WorkflowArgType> {
+    match parse_quoted_string(input)?.as_str() {
+        "string" => Ok(WorkflowArgType::String),
+        "number" => Ok(WorkflowArgType::Number),
+        "boolean" => Ok(WorkflowArgType::Boolean),
+        "json" => Ok(WorkflowArgType::Json),
+        value => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unsupported workflow arg type `{value}`"),
+        )),
+    }
+}
+
+fn parse_bool_literal(input: &str) -> io::Result<bool> {
+    match input.trim() {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "expected boolean literal",
+        )),
+    }
+}
+
+fn parse_jsonish_literal(input: &str) -> io::Result<Value> {
+    let trimmed = input.trim();
+    if trimmed.starts_with('\'') || trimmed.starts_with('"') {
+        return parse_quoted_string(trimmed).map(Value::String);
+    }
+    match trimmed {
+        "true" => return Ok(Value::Bool(true)),
+        "false" => return Ok(Value::Bool(false)),
+        "null" => return Ok(Value::Null),
+        _ => {}
+    }
+    if let Ok(number) = trimmed.parse::<i64>() {
+        return Ok(Value::Number(Number::from(number)));
+    }
+    if let Ok(number) = trimmed.parse::<f64>() {
+        if let Some(number) = Number::from_f64(number) {
+            return Ok(Value::Number(number));
+        }
+    }
+    serde_json::from_str(trimmed).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+fn arg_value_matches_type(value: &Value, arg_type: WorkflowArgType) -> bool {
+    match arg_type {
+        WorkflowArgType::String => value.is_string(),
+        WorkflowArgType::Number => value.is_number(),
+        WorkflowArgType::Boolean => value.is_boolean(),
+        WorkflowArgType::Json => true,
+    }
 }
 
 fn parse_exported_phases(script: &str) -> io::Result<Option<Vec<String>>> {
@@ -386,6 +589,26 @@ fn parse_quoted_string(input: &str) -> io::Result<String> {
 
 fn parse_phases(input: &str) -> io::Result<Vec<String>> {
     parse_phase_names(input)
+}
+
+fn parse_string_array(input: &str) -> io::Result<Vec<String>> {
+    let trimmed = input.trim();
+    if !trimmed.starts_with('[') || !trimmed.ends_with(']') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "expected string array",
+        ));
+    }
+
+    let body = &trimmed[1..trimmed.len() - 1];
+    if body.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+
+    split_top_level(body, ',')
+        .into_iter()
+        .map(parse_quoted_string)
+        .collect()
 }
 
 fn parse_phase_names(input: &str) -> io::Result<Vec<String>> {

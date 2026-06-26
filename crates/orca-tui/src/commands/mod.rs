@@ -25,6 +25,33 @@ pub enum GoalSlashCommand {
 }
 
 pub fn parse(input: &str) -> Option<SlashCommand> {
+    parse_static(input)
+}
+
+pub fn parse_with_cwd(input: &str, cwd: &Path) -> Option<SlashCommand> {
+    if let Some(command) = parse_static(input) {
+        return Some(command);
+    }
+
+    let trimmed = input.trim();
+    let rest = trimmed.strip_prefix('/')?;
+    let mut parts = rest.split_whitespace();
+    let command = parts.next()?;
+    if builtin_command_names().contains(command) {
+        return None;
+    }
+    let saved_workflow = discover_saved_workflows(cwd)
+        .into_iter()
+        .map(|(name, _)| name)
+        .find(|name| name == command)?;
+    let args = parts.collect::<Vec<_>>().join(" ");
+    Some(SlashCommand::WorkflowRun {
+        name: saved_workflow,
+        args: if args.is_empty() { None } else { Some(args) },
+    })
+}
+
+fn parse_static(input: &str) -> Option<SlashCommand> {
     let trimmed = input.trim();
     let rest = trimmed.strip_prefix('/')?;
     let mut parts = rest.split_whitespace();
@@ -95,8 +122,22 @@ pub fn available_commands(cwd: &Path) -> Vec<(String, String)> {
             format!("/workflow:{name}"),
             format!("Run saved {scope} workflow"),
         ));
+        if !builtin_command_names().contains(name.as_str()) {
+            commands.push((format!("/{name}"), format!("Run saved {scope} workflow")));
+        }
     }
     commands
+}
+
+fn builtin_command_names() -> std::collections::BTreeSet<&'static str> {
+    all_commands()
+        .iter()
+        .filter_map(|(command, _)| {
+            command
+                .strip_prefix('/')
+                .and_then(|name| name.split([' ', ':']).next())
+        })
+        .collect()
 }
 
 fn discover_saved_workflows(cwd: &Path) -> Vec<(String, &'static str)> {
@@ -278,6 +319,52 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(command_names.contains(&"/workflow:<name>".to_string()));
         assert!(command_names.contains(&"/workflow:security-audit".to_string()));
+    }
+
+    #[test]
+    fn saved_workflow_aliases_are_available_only_without_builtin_collision() {
+        let temp = tempfile::tempdir().unwrap();
+        let workflow_dir = temp.path().join(".orca").join("workflows");
+        std::fs::create_dir_all(&workflow_dir).unwrap();
+        std::fs::write(workflow_dir.join("security-audit.js"), "export default 'ok';").unwrap();
+        std::fs::write(workflow_dir.join("model.js"), "export default 'ok';").unwrap();
+
+        let command_names = available_commands(temp.path())
+            .into_iter()
+            .map(|(command, _)| command)
+            .collect::<Vec<_>>();
+
+        assert!(command_names.contains(&"/security-audit".to_string()));
+        assert!(command_names.contains(&"/workflow:security-audit".to_string()));
+        assert!(command_names.contains(&"/workflow:model".to_string()));
+        assert_eq!(
+            command_names
+                .iter()
+                .filter(|command| command.as_str() == "/model")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn parse_with_cwd_accepts_saved_workflow_aliases() {
+        let temp = tempfile::tempdir().unwrap();
+        let workflow_dir = temp.path().join(".orca").join("workflows");
+        std::fs::create_dir_all(&workflow_dir).unwrap();
+        std::fs::write(workflow_dir.join("security-audit.js"), "export default 'ok';").unwrap();
+        std::fs::write(workflow_dir.join("model.js"), "export default 'ok';").unwrap();
+
+        assert_eq!(
+            parse_with_cwd("/security-audit target=src", temp.path()),
+            Some(SlashCommand::WorkflowRun {
+                name: "security-audit".to_string(),
+                args: Some("target=src".to_string()),
+            })
+        );
+        assert_eq!(
+            parse_with_cwd("/model", temp.path()),
+            Some(SlashCommand::Model(None))
+        );
     }
 
     #[test]

@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 use std::sync::mpsc;
 use std::time::Instant;
 
+use orca_core::approval_types::ApprovalMode;
 use orca_core::cost_types::UsageTotals;
 use orca_core::goal_types::ThreadGoal;
 use orca_core::plan_types::PlanItem;
@@ -275,6 +276,7 @@ pub struct AppState {
     pub visible_height: u16,
     pub app_version: String,
     pub model_name: String,
+    pub approval_mode: ApprovalMode,
     pub cwd: String,
     #[allow(dead_code)]
     pub event_tx: mpsc::Sender<UserAction>,
@@ -322,6 +324,7 @@ impl AppState {
             visible_height: 0,
             app_version,
             model_name,
+            approval_mode: ApprovalMode::default(),
             cwd,
             event_tx,
             approval_dialog: None,
@@ -673,13 +676,14 @@ impl AppState {
                 }
             }
             TuiEvent::PlanUpdated { explanation, plan } => {
+                // The live plan is shown in the bottom panel during the turn. It is archived
+                // inline (and the panel cleared) when the turn completes, so we avoid pushing a
+                // message on every update to keep the scrollback clean.
                 self.current_plan = if plan.is_empty() {
                     None
                 } else {
-                    Some((explanation.clone(), plan.clone()))
+                    Some((explanation, plan))
                 };
-                self.messages
-                    .push(ChatMessage::PlanUpdate { explanation, plan });
             }
             TuiEvent::SubagentStarted { id, description } => {
                 self.messages.push(ChatMessage::Subagent {
@@ -787,6 +791,7 @@ impl AppState {
             }
             TuiEvent::SessionCompleted { .. } => {
                 self.promote_trailing_reasoning();
+                self.archive_current_plan();
                 self.set_status(AppStatus::Idle);
             }
             TuiEvent::Compacted {
@@ -852,6 +857,17 @@ impl AppState {
             let text = text.clone();
             self.messages.pop();
             self.messages.push(ChatMessage::Assistant(text));
+        }
+    }
+
+    /// Move the live plan out of the bottom panel and into the scrollback as an archived
+    /// checklist when a turn ends, so the panel stops occluding content once work is done.
+    fn archive_current_plan(&mut self) {
+        if let Some((explanation, plan)) = self.current_plan.take()
+            && !plan.is_empty()
+        {
+            self.messages
+                .push(ChatMessage::PlanUpdate { explanation, plan });
         }
     }
 
@@ -1095,7 +1111,7 @@ mod tests {
     }
 
     #[test]
-    fn update_plan_events_create_plan_message_without_tool_rows() {
+    fn plan_lives_in_panel_during_turn_and_archives_inline_on_completion() {
         let mut state = state();
 
         state.update(TuiEvent::ToolRequested {
@@ -1125,6 +1141,15 @@ mod tests {
             ],
         });
 
+        // During the turn the plan only lives in the bottom panel, not the scrollback.
+        assert!(state.messages.is_empty());
+        assert!(state.current_plan.is_some());
+
+        // When the turn completes the panel clears and the plan is archived inline.
+        state.update(TuiEvent::SessionCompleted {
+            status: "success".to_string(),
+        });
+        assert!(state.current_plan.is_none());
         assert_eq!(state.messages.len(), 1);
         match &state.messages[0] {
             ChatMessage::PlanUpdate { explanation, plan } => {
@@ -1240,6 +1265,10 @@ mod tests {
             workflow_progress: None,
             workflow_phases: Vec::new(),
             workflow_agents: Vec::new(),
+            workflow_script_path: None,
+            workflow_launch_input: None,
+            workflow_final_summary: None,
+            workflow_failure_count: 0,
             usage: None,
         }];
         state.workflow_panel.selected = 9;
@@ -1285,6 +1314,10 @@ mod tests {
                 workflow_progress: None,
                 workflow_phases: Vec::new(),
                 workflow_agents: Vec::new(),
+                workflow_script_path: None,
+                workflow_launch_input: None,
+                workflow_final_summary: None,
+                workflow_failure_count: 0,
                 usage: None,
             }],
         });

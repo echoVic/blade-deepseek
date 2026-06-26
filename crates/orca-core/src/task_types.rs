@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::cost_types::UsageTotals;
-use crate::workflow_types::{WorkflowAgentStatus, WorkflowRunStatus};
+use crate::workflow_types::{WorkflowAgentStatus, WorkflowInput, WorkflowRunStatus};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -106,6 +106,14 @@ pub struct BackgroundTaskSummary {
     pub workflow_phases: Vec<WorkflowPhaseTaskSummary>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workflow_agents: Vec<WorkflowAgentTaskSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workflow_script_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workflow_launch_input: Option<WorkflowInput>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workflow_final_summary: Option<String>,
+    #[serde(default)]
+    pub workflow_failure_count: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<UsageTotals>,
 }

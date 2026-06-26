@@ -21,6 +21,16 @@ impl ApprovalMode {
             Self::Plan => "plan",
         }
     }
+
+    /// Next mode in the Shift+Tab cycle: suggest -> auto-edit -> full-auto -> plan -> suggest.
+    pub fn next(self) -> Self {
+        match self {
+            Self::Suggest => Self::AutoEdit,
+            Self::AutoEdit => Self::FullAuto,
+            Self::FullAuto => Self::Plan,
+            Self::Plan => Self::Suggest,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

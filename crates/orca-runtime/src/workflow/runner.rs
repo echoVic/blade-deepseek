@@ -34,7 +34,7 @@ use crate::worktree::{WorktreeGuard, WorktreeOutcome};
 
 use super::host::{AgentCall, HostCommand, HostEvent, WorkflowHost, WorkflowHostIpcPaths};
 use super::ipc::WorkflowIpcContext;
-use super::script::{ResolvedWorkflowScript, resolve_workflow_script_to_path};
+use super::script::{ResolvedWorkflowScript, resolve_workflow_script_to_path, validate_workflow_args};
 use super::state::{
     WorkflowAgentRecord, WorkflowAgentStatusCounts, WorkflowStateStore, WorkflowWorkerRecord,
     input_hash, workflow_agent_team,
@@ -299,6 +299,7 @@ impl WorkflowRunner {
     }
 
     fn prepare_launch(&self, request: WorkflowLaunchRequest) -> io::Result<PreparedWorkflowRun> {
+        let mut request = request;
         let cwd = self.config.cwd.clone().unwrap_or(std::env::current_dir()?);
         fs::create_dir_all(&self.session_dir)?;
 
@@ -307,6 +308,9 @@ impl WorkflowRunner {
         let resolved_input = self.resolve_launch_input(&request.input)?;
         let resolved =
             resolve_workflow_script_to_path(&resolved_input, &cwd, &persisted_script_path)?;
+        let normalized_args =
+            validate_workflow_args(resolved_input.args.clone(), &resolved.args_schema)?;
+        request.input.args = Some(normalized_args);
         let task = self.tasks.create_workflow(
             run_id.clone(),
             resolved.meta.name.clone(),
@@ -330,6 +334,13 @@ impl WorkflowRunner {
         };
         self.state.create_run(&state)?;
         self.state.write_launch_input(&run_id, &request.input)?;
+        self.tasks
+            .update_workflow_artifacts(
+                &task.id,
+                resolved.persisted_path.display().to_string(),
+                request.input.clone(),
+            )
+            .map_err(io::Error::other)?;
 
         self.tasks
             .mark_running(&task.id)
@@ -1022,6 +1033,13 @@ impl WorkflowRunner {
             .map_err(io::Error::other)?;
         self.tasks
             .update_workflow_agents(task_id, self.state.agent_summaries(&state.run_id)?)
+            .map_err(io::Error::other)?;
+        self.tasks
+            .update_workflow_result_summary(
+                task_id,
+                state.final_summary.clone(),
+                workflow_failure_count(state, &self.state.agent_status_counts(&state.run_id)?),
+            )
             .map_err(io::Error::other)
     }
 
@@ -1053,6 +1071,20 @@ fn terminal_agent_count(counts: &WorkflowAgentStatusCounts) -> u32 {
         .saturating_add(counts.failed)
         .saturating_add(counts.cancelled)
         .saturating_add(counts.cached)
+}
+
+fn workflow_failure_count(state: &WorkflowRunState, counts: &WorkflowAgentStatusCounts) -> u32 {
+    let phase_failures = state
+        .phases
+        .iter()
+        .filter(|phase| phase.status == WorkflowRunStatus::Failed)
+        .count() as u32;
+    let workflow_failure = u32::from(state.status == WorkflowRunStatus::Failed);
+    counts
+        .failed
+        .saturating_add(counts.cancelled)
+        .saturating_add(phase_failures)
+        .saturating_add(workflow_failure)
 }
 
 fn workflow_status_line(

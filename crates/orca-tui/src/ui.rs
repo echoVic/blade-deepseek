@@ -348,7 +348,9 @@ fn render_workflows_panel(frame: &mut Frame, area: Rect, state: &mut AppState, t
     let mut constraints = vec![Constraint::Length(header_h)];
     constraints.extend(tasks.iter().enumerate().map(|(index, task)| {
         let detail_rows = if index == state.workflow_panel.selected {
-            workflow_phase_detail_rows(task).len() as u16 + task.workflow_agents.len() as u16
+            workflow_metadata_row_count(task)
+                + workflow_phase_detail_rows(task).len() as u16
+                + task.workflow_agents.len() as u16
         } else {
             0
         };
@@ -384,7 +386,13 @@ fn render_workflows_panel(frame: &mut Frame, area: Rect, state: &mut AppState, t
 
         // Split the row into a label line, a gauge line, and optional agent rows.
         let mut row_constraints = vec![Constraint::Length(1), Constraint::Length(1)];
+        let metadata_rows = if selected {
+            workflow_metadata_rows(task, theme)
+        } else {
+            Vec::new()
+        };
         if selected {
+            row_constraints.extend(metadata_rows.iter().map(|_| Constraint::Length(1)));
             row_constraints.extend(
                 workflow_phase_detail_rows(task)
                     .iter()
@@ -420,13 +428,17 @@ fn render_workflows_panel(frame: &mut Frame, area: Rect, state: &mut AppState, t
 
         if selected {
             let phase_rows = workflow_phase_detail_rows(task);
+            for (metadata_index, line) in metadata_rows.iter().enumerate() {
+                frame.render_widget(Paragraph::new(line.clone()), parts[metadata_index + 2]);
+            }
+            let detail_offset = metadata_rows.len() + 2;
             for (phase_index, phase) in phase_rows.iter().enumerate() {
                 let line = Paragraph::new(workflow_phase_row_label(phase, theme));
-                frame.render_widget(line, parts[phase_index + 2]);
+                frame.render_widget(line, parts[detail_offset + phase_index]);
             }
             for (agent_index, agent) in task.workflow_agents.iter().enumerate() {
                 let line = Paragraph::new(agent_row_label(agent, theme));
-                frame.render_widget(line, parts[phase_rows.len() + agent_index + 2]);
+                frame.render_widget(line, parts[detail_offset + phase_rows.len() + agent_index]);
             }
         }
     }
@@ -501,6 +513,73 @@ fn workflow_phase_detail_rows(
                 )
         })
         .collect()
+}
+
+fn workflow_metadata_row_count(task: &BackgroundTaskSummary) -> u16 {
+    u16::from(task.workflow_run_id.is_some())
+        + u16::from(task.workflow_script_path.is_some())
+        + u16::from(task.workflow_launch_input.is_some())
+        + u16::from(task.workflow_failure_count > 0)
+        + u16::from(task.workflow_final_summary.is_some())
+}
+
+fn workflow_metadata_rows<'a>(task: &BackgroundTaskSummary, theme: &Theme) -> Vec<Line<'a>> {
+    let mut rows = Vec::new();
+    if let Some(run_id) = &task.workflow_run_id {
+        rows.push(Line::from(vec![
+            Span::styled("    run ", Style::default().fg(theme.muted)),
+            Span::styled(run_id.clone(), Style::default().fg(theme.text)),
+        ]));
+    }
+    if let Some(script_path) = &task.workflow_script_path {
+        rows.push(Line::from(vec![
+            Span::styled("    script ", Style::default().fg(theme.muted)),
+            Span::styled(script_path.clone(), Style::default().fg(theme.text)),
+        ]));
+    }
+    if let Some(launch_input) = &task.workflow_launch_input {
+        rows.push(Line::from(vec![
+            Span::styled("    launch ", Style::default().fg(theme.muted)),
+            Span::styled(workflow_launch_input_label(launch_input), Style::default().fg(theme.text)),
+        ]));
+    }
+    if task.workflow_failure_count > 0 {
+        rows.push(Line::from(vec![
+            Span::styled("    failures ", Style::default().fg(theme.muted)),
+            Span::styled(task.workflow_failure_count.to_string(), Style::default().fg(theme.error)),
+        ]));
+    }
+    if let Some(summary) = &task.workflow_final_summary {
+        rows.push(Line::from(vec![
+            Span::styled("    final ", Style::default().fg(theme.muted)),
+            Span::styled(summary.clone(), Style::default().fg(theme.text)),
+        ]));
+    }
+    rows
+}
+
+fn workflow_launch_input_label(input: &orca_core::workflow_types::WorkflowInput) -> String {
+    let mut parts = Vec::new();
+    if let Some(draft_id) = input.draft_id.as_deref() {
+        parts.push(format!("draftId={draft_id}"));
+    }
+    if let Some(name) = input.name.as_deref() {
+        parts.push(format!("name={name}"));
+    }
+    if let Some(script_path) = input.script_path.as_deref() {
+        parts.push(format!("scriptPath={script_path}"));
+    }
+    if let Some(resume_from) = input.resume_from_run_id.as_deref() {
+        parts.push(format!("resumeFrom={resume_from}"));
+    }
+    if let Some(args) = &input.args {
+        parts.push(format!("args={args}"));
+    }
+    if parts.is_empty() {
+        "inline script".to_string()
+    } else {
+        parts.join(" ")
+    }
 }
 
 /// Truthful gauge fill for a workflow lifecycle state.
@@ -1013,8 +1092,7 @@ fn build_message_lines(
                 }
             }
             ChatMessage::PlanUpdate { explanation, plan } => {
-                let _ = (explanation, plan);
-                // Plan is rendered in the fixed bottom panel; skip inline rendering.
+                append_archived_plan_lines(&mut lines, explanation.as_deref(), plan, theme);
             }
             ChatMessage::Subagent {
                 description,
@@ -1087,6 +1165,56 @@ fn render_plan_panel(frame: &mut Frame, area: Rect, state: &AppState, theme: &Th
 
     let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
     frame.render_widget(paragraph, inner);
+}
+
+/// Render a finished plan as an inline checklist in the scrollback. Completed steps are dimmed and
+/// struck through; the in-progress/pending steps keep their live-panel styling so the archived view
+/// matches what the user saw in the bottom panel.
+fn append_archived_plan_lines(
+    lines: &mut Vec<Line<'static>>,
+    explanation: Option<&str>,
+    plan: &[orca_core::plan_types::PlanItem],
+    theme: &Theme,
+) {
+    use orca_core::plan_types::PlanStatus;
+
+    lines.push(Line::from(Span::styled(
+        "  Task Plan",
+        Style::default().fg(theme.muted).add_modifier(Modifier::BOLD),
+    )));
+
+    if let Some(note) = explanation.map(str::trim).filter(|n| !n.is_empty()) {
+        lines.push(Line::from(Span::styled(
+            format!("  {note}"),
+            Style::default()
+                .fg(theme.muted)
+                .add_modifier(Modifier::ITALIC),
+        )));
+    }
+
+    for item in plan {
+        let (icon, text_style) = match item.status {
+            PlanStatus::Completed => (
+                "✓",
+                Style::default()
+                    .fg(theme.muted)
+                    .add_modifier(Modifier::CROSSED_OUT),
+            ),
+            PlanStatus::InProgress => ("→", Style::default().fg(theme.warning)),
+            PlanStatus::Pending => ("•", Style::default().fg(theme.muted)),
+        };
+        let icon_style = match item.status {
+            PlanStatus::Completed => Style::default().fg(theme.success),
+            PlanStatus::InProgress => Style::default().fg(theme.warning),
+            PlanStatus::Pending => Style::default().fg(theme.muted),
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {icon} "), icon_style),
+            Span::styled(item.step.clone(), text_style),
+        ]));
+    }
+
+    lines.push(Line::from(""));
 }
 
 fn append_subagent_lines(
@@ -1503,6 +1631,10 @@ fn render_status(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
         Span::styled(scroll_hint, Style::default().fg(theme.muted)),
         Span::styled(
             format!(" | model: {}", state.model_name),
+            Style::default().fg(theme.muted),
+        ),
+        Span::styled(
+            format!(" | mode: {}", state.approval_mode.as_str()),
             Style::default().fg(theme.muted),
         ),
         Span::styled(
@@ -2540,6 +2672,10 @@ mod tests {
             }),
             workflow_phases: Vec::new(),
             workflow_agents: Vec::new(),
+            workflow_script_path: None,
+            workflow_launch_input: None,
+            workflow_final_summary: None,
+            workflow_failure_count: 0,
             usage: None,
         };
 
@@ -2568,6 +2704,16 @@ mod tests {
             workflow_progress: None,
             workflow_phases: Vec::new(),
             workflow_agents: Vec::new(),
+            workflow_script_path: Some(
+                "/repo/.orca/workflow-sessions/s1/workflow-runs/run-1/script.js".to_string(),
+            ),
+            workflow_launch_input: Some(orca_core::workflow_types::WorkflowInput {
+                name: Some("audit".to_string()),
+                args: Some(serde_json::json!({ "target": "src" })),
+                ..Default::default()
+            }),
+            workflow_final_summary: Some("completed with fallback review".to_string()),
+            workflow_failure_count: 1,
             usage: Some(orca_core::cost_types::UsageTotals {
                 input_tokens: 120,
                 output_tokens: 30,
@@ -2636,6 +2782,16 @@ mod tests {
                     estimated_cost_usd: 0.0000252,
                 }),
             }],
+            workflow_script_path: Some(
+                "/repo/.orca/workflow-sessions/s1/workflow-runs/run-1/script.js".to_string(),
+            ),
+            workflow_launch_input: Some(orca_core::workflow_types::WorkflowInput {
+                name: Some("audit".to_string()),
+                args: Some(serde_json::json!({ "target": "src" })),
+                ..Default::default()
+            }),
+            workflow_final_summary: Some("completed with fallback review".to_string()),
+            workflow_failure_count: 1,
             usage: None,
             created_at_ms: 1_000,
             started_at_ms: Some(1_000),
@@ -2643,7 +2799,7 @@ mod tests {
         }];
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         let textarea = TextArea::default();
-        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 16))
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(180, 30))
             .expect("test backend");
 
         terminal
@@ -2662,6 +2818,13 @@ mod tests {
         assert!(rendered.contains("elapsed 2s"));
         assert!(rendered.contains("150 tok"));
         assert!(rendered.contains("$0.000025"));
+        assert!(rendered.contains("run workflow-run-1"));
+        assert!(rendered.contains(
+            "script /repo/.orca/workflow-sessions/s1/workflow-runs/run-1/script.js"
+        ));
+        assert!(rendered.contains("launch name=audit args={\"target\":\"src\"}"));
+        assert!(rendered.contains("failures 1"));
+        assert!(rendered.contains("final completed with fallback review"));
     }
 
     #[test]
@@ -2741,6 +2904,10 @@ mod tests {
                     estimated_cost_usd: 0.0000252,
                 }),
             }],
+            workflow_script_path: None,
+            workflow_launch_input: None,
+            workflow_final_summary: None,
+            workflow_failure_count: 0,
             usage: None,
             created_at_ms: 1_000,
             started_at_ms: Some(1_000),

@@ -104,6 +104,10 @@ fn background_task_summary_matches_sdk_names() {
         }),
         workflow_phases: Vec::new(),
         workflow_agents: Vec::new(),
+        workflow_script_path: None,
+        workflow_launch_input: None,
+        workflow_final_summary: None,
+        workflow_failure_count: 0,
         usage: None,
     };
 

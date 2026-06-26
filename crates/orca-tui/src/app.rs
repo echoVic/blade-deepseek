@@ -101,6 +101,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
         model_name,
         cwd_display,
     );
+    state.approval_mode = config.approval_mode;
     let theme = Theme::named(config.theme);
     if should_show_picker && !picker_sessions.is_empty() {
         state.status = AppStatus::SessionPicker;
@@ -271,6 +272,28 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
 
                 if state.show_shortcuts && key.code == KeyCode::Esc {
                     state.show_shortcuts = false;
+                    continue;
+                }
+
+                // Shift+Tab cycles the approval mode. Skipped while an approval dialog is open,
+                // where BackTab moves the dialog selection instead.
+                if key.code == KeyCode::BackTab
+                    && matches!(
+                        state.status,
+                        AppStatus::Idle | AppStatus::Running | AppStatus::WaitingUserInput
+                    )
+                {
+                    let next = config.approval_mode.next();
+                    config.approval_mode = next;
+                    if let Ok(mut cfg) = shared_config.lock() {
+                        cfg.approval_mode = next;
+                    }
+                    state.approval_mode = next;
+                    state.messages.push(ChatMessage::System(format!(
+                        "Approval mode switched to {}.",
+                        next.as_str()
+                    )));
+                    state.scroll_to_bottom();
                     continue;
                 }
 
@@ -1614,6 +1637,7 @@ fn handle_slash_menu_key(
                         if let Ok(mut cfg) = shared_config.lock() {
                             cfg.approval_mode = mode;
                         }
+                        state.approval_mode = mode;
                         state.messages.push(ChatMessage::System(format!(
                             "Approval mode switched to {chosen}."
                         )));
@@ -1731,6 +1755,7 @@ fn select_slash_menu_command(
                 "suggest".to_string(),
                 "auto-edit".to_string(),
                 "full-auto".to_string(),
+                "plan".to_string(),
             ];
             state.slash_menu = Some(SlashMenu {
                 items: menu_items,
@@ -2498,7 +2523,12 @@ fn handle_slash_command(
     state: &mut AppState,
     action_tx: &mpsc::Sender<UserAction>,
 ) -> Option<SlashOutcome> {
-    let command = commands::parse(text)?;
+    let cwd = config
+        .cwd
+        .as_deref()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let command = commands::parse_with_cwd(text, &cwd)?;
     match command {
         SlashCommand::Model(Some(model)) => match commands::validate_model(&model) {
             Ok(()) => {
@@ -2542,12 +2572,13 @@ fn handle_slash_command(
                 if let Ok(mut cfg) = shared_config.lock() {
                     cfg.approval_mode = approval_mode;
                 }
+                state.approval_mode = approval_mode;
                 state.messages.push(ChatMessage::System(format!(
                     "Approval mode switched to {mode}."
                 )));
             }
             None => state.messages.push(ChatMessage::Error(
-                "unsupported mode. Use suggest, auto-edit, or full-auto.".to_string(),
+                "unsupported mode. Use suggest, auto-edit, full-auto, or plan.".to_string(),
             )),
         },
         SlashCommand::Mode(None) => {
@@ -2562,6 +2593,7 @@ fn handle_slash_command(
                 if let Ok(mut cfg) = shared_config.lock() {
                     cfg.approval_mode = ApprovalMode::Suggest;
                 }
+                state.approval_mode = ApprovalMode::Suggest;
                 state
                     .messages
                     .push(ChatMessage::System("Plan mode disabled.".to_string()));
@@ -2571,6 +2603,7 @@ fn handle_slash_command(
                 if let Ok(mut cfg) = shared_config.lock() {
                     cfg.approval_mode = ApprovalMode::Plan;
                 }
+                state.approval_mode = ApprovalMode::Plan;
                 state
                     .messages
                     .push(ChatMessage::System("Plan mode enabled.".to_string()));

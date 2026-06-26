@@ -1,6 +1,6 @@
 use std::fs;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use orca_core::approval_types::ApprovalMode;
 use orca_core::config::{
@@ -233,6 +233,58 @@ fn workflow_draft_store_saves_reusable_workflow_and_cancels_draft() {
 }
 
 #[test]
+fn workflow_runner_applies_exported_args_schema_defaults_to_runtime_args() {
+    if !orca_runtime::workflow::host::WorkflowHost::node_available() {
+        return;
+    }
+
+    let temp = tempdir().unwrap();
+    let script = temp.path().join("workflow.js");
+    fs::write(
+        &script,
+        "export const meta = { name: 'args-defaults', description: 'Args defaults', phases: [] };\n\
+         export const args = { target: { type: 'string', required: true }, maxAgents: { type: 'number', default: 8 } };\n\
+         export default args;",
+    )
+    .unwrap();
+
+    let config = mock_run_config(temp.path());
+    let tasks = TaskRegistry::new("session-1".to_string());
+    let session_dir = temp.path().join("session");
+    let runner = WorkflowRunner::new(config, tasks.clone(), session_dir.clone());
+    let launched = runner
+        .launch(WorkflowLaunchRequest::from(orca_core::workflow_types::WorkflowInput {
+            script_path: Some(script.display().to_string()),
+            args: Some(json!({ "target": "src" })),
+            ..Default::default()
+        }))
+        .expect("workflow launches with schema defaults");
+
+    assert!(launched.summary.contains("\"target\":\"src\""));
+    assert!(launched.summary.contains("\"maxAgents\":8"));
+    let run_id = launched.output.run_id.as_deref().expect("run id");
+    let store = WorkflowStateStore::new(session_dir.join("workflow-runs"));
+    let launch_input = store.load_launch_input(run_id).expect("launch input");
+    assert_eq!(
+        launch_input.args,
+        Some(json!({ "target": "src", "maxAgents": 8 }))
+    );
+
+    let summary = tasks
+        .list()
+        .into_iter()
+        .find(|task| task.workflow_run_id.as_deref() == Some(run_id))
+        .expect("workflow task summary");
+    assert_eq!(
+        summary.workflow_script_path.as_deref(),
+        launched.output.script_path.as_deref()
+    );
+    assert_eq!(summary.workflow_launch_input, Some(launch_input));
+    assert_eq!(summary.workflow_final_summary, launched.output.summary);
+    assert_eq!(summary.workflow_failure_count, 0);
+}
+
+#[test]
 fn workflow_resume_uses_completed_agent_cache() {
     if !orca_runtime::workflow::host::WorkflowHost::node_available() {
         return;
@@ -305,6 +357,63 @@ fn workflow_respects_configured_concurrency_in_evidence() {
             .agents
             .iter()
             .all(|agent| agent.status == WorkflowAgentStatus::Completed)
+    );
+}
+
+#[test]
+fn workflow_barrier_min_hold_makes_max_concurrency_observable() {
+    if !orca_runtime::workflow::host::WorkflowHost::node_available() {
+        return;
+    }
+
+    let temp = tempdir().unwrap();
+    let script = temp.path().join("barrier.js");
+    fs::write(
+        &script,
+        "export const meta = { name: 'barrier', description: 'Barrier concurrency', phases: ['fanout'] };\n\
+         export default await phase('fanout', async () => parallel([\n\
+           agent('hold-1', { barrier: 'concurrency-4', minHoldMs: 150 }),\n\
+           agent('hold-2', { barrier: 'concurrency-4', minHoldMs: 150 }),\n\
+           agent('hold-3', { barrier: 'concurrency-4', minHoldMs: 150 }),\n\
+           agent('hold-4', { barrier: 'concurrency-4', minHoldMs: 150 })\n\
+         ]));",
+    )
+    .unwrap();
+
+    let mut config = mock_run_config(temp.path());
+    config.workflows.max_concurrent_agents = 4;
+    let tasks = TaskRegistry::new("session-1".to_string());
+    let session_dir = temp.path().join("session");
+    let runner = WorkflowRunner::new(config, tasks, session_dir.clone());
+
+    let started = Instant::now();
+    let launched = runner
+        .launch(WorkflowLaunchRequest::from_script_path(
+            script.display().to_string(),
+        ))
+        .expect("barrier workflow runs");
+    assert!(
+        started.elapsed() >= Duration::from_millis(100),
+        "minHoldMs should hold barrier agents long enough to make concurrency observable"
+    );
+    let run_id = launched.output.run_id.as_deref().expect("run id");
+    let store = WorkflowStateStore::new(session_dir.join("workflow-runs"));
+    let evidence = store.load_evidence_bundle(run_id).expect("evidence");
+
+    assert_eq!(evidence.status, WorkflowRunStatus::Completed);
+    assert_eq!(evidence.max_configured_concurrent_agents, 4);
+    assert_eq!(evidence.max_observed_concurrent_agents, 4);
+    assert!(
+        evidence
+            .agents
+            .iter()
+            .all(|agent| agent.barrier.as_deref() == Some("concurrency-4"))
+    );
+    assert!(
+        evidence
+            .agents
+            .iter()
+            .all(|agent| agent.min_hold_ms == Some(150))
     );
 }
 

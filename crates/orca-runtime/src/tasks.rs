@@ -12,6 +12,7 @@ use orca_core::task_types::{
     BackgroundTaskSummary, TaskStatus, TaskType, WorkflowAgentTaskSummary,
     WorkflowPhaseTaskSummary, WorkflowTaskProgress,
 };
+use orca_core::workflow_types::WorkflowInput;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug)]
@@ -44,6 +45,10 @@ pub struct TaskRecord {
     pub workflow_progress: Option<WorkflowTaskProgress>,
     pub workflow_phases: Vec<WorkflowPhaseTaskSummary>,
     pub workflow_agents: Vec<WorkflowAgentTaskSummary>,
+    pub workflow_script_path: Option<String>,
+    pub workflow_launch_input: Option<WorkflowInput>,
+    pub workflow_final_summary: Option<String>,
+    pub workflow_failure_count: u32,
     pub usage: Option<UsageTotals>,
     pub result: Option<String>,
     pub error: Option<String>,
@@ -81,6 +86,14 @@ struct PersistedTaskRecord {
     workflow_phases: Vec<WorkflowPhaseTaskSummary>,
     #[serde(default)]
     workflow_agents: Vec<WorkflowAgentTaskSummary>,
+    #[serde(default)]
+    workflow_script_path: Option<String>,
+    #[serde(default)]
+    workflow_launch_input: Option<WorkflowInput>,
+    #[serde(default)]
+    workflow_final_summary: Option<String>,
+    #[serde(default)]
+    workflow_failure_count: u32,
     usage: Option<UsageTotals>,
     result: Option<String>,
     error: Option<String>,
@@ -151,6 +164,10 @@ impl TaskRegistry {
             workflow_progress: None,
             workflow_phases: Vec::new(),
             workflow_agents: Vec::new(),
+            workflow_script_path: None,
+            workflow_launch_input: None,
+            workflow_final_summary: None,
+            workflow_failure_count: 0,
             usage: None,
             result: None,
             error: None,
@@ -190,6 +207,10 @@ impl TaskRegistry {
             workflow_progress: None,
             workflow_phases: Vec::new(),
             workflow_agents: Vec::new(),
+            workflow_script_path: None,
+            workflow_launch_input: None,
+            workflow_final_summary: None,
+            workflow_failure_count: 0,
             usage: None,
             result: None,
             error: None,
@@ -230,6 +251,10 @@ impl TaskRegistry {
                         workflow_progress: record.workflow_progress,
                         workflow_phases: record.workflow_phases.clone(),
                         workflow_agents: record.workflow_agents.clone(),
+                        workflow_script_path: record.workflow_script_path.clone(),
+                        workflow_launch_input: record.workflow_launch_input.clone(),
+                        workflow_final_summary: record.workflow_final_summary.clone(),
+                        workflow_failure_count: record.workflow_failure_count,
                         usage: record.usage,
                     })
                     .collect::<Vec<_>>()
@@ -285,6 +310,32 @@ impl TaskRegistry {
     ) -> Result<(), String> {
         self.update_task(id, |record| {
             record.workflow_phases = phases;
+            Ok(())
+        })
+    }
+
+    pub fn update_workflow_artifacts(
+        &self,
+        id: &str,
+        script_path: String,
+        launch_input: WorkflowInput,
+    ) -> Result<(), String> {
+        self.update_task(id, |record| {
+            record.workflow_script_path = Some(script_path);
+            record.workflow_launch_input = Some(launch_input);
+            Ok(())
+        })
+    }
+
+    pub fn update_workflow_result_summary(
+        &self,
+        id: &str,
+        final_summary: Option<String>,
+        failure_count: u32,
+    ) -> Result<(), String> {
+        self.update_task(id, |record| {
+            record.workflow_final_summary = final_summary;
+            record.workflow_failure_count = failure_count;
             Ok(())
         })
     }
@@ -559,6 +610,10 @@ impl PersistedTaskRecord {
             workflow_progress: self.workflow_progress,
             workflow_phases: self.workflow_phases,
             workflow_agents: self.workflow_agents,
+            workflow_script_path: self.workflow_script_path,
+            workflow_launch_input: self.workflow_launch_input,
+            workflow_final_summary: self.workflow_final_summary,
+            workflow_failure_count: self.workflow_failure_count,
             usage: self.usage,
             result: self.result,
             error: self.error,
@@ -591,6 +646,10 @@ impl From<&TaskRecord> for PersistedTaskRecord {
             workflow_progress: record.workflow_progress,
             workflow_phases: record.workflow_phases.clone(),
             workflow_agents: record.workflow_agents.clone(),
+            workflow_script_path: record.workflow_script_path.clone(),
+            workflow_launch_input: record.workflow_launch_input.clone(),
+            workflow_final_summary: record.workflow_final_summary.clone(),
+            workflow_failure_count: record.workflow_failure_count,
             usage: record.usage,
             result: record.result.clone(),
             error: record.error.clone(),
