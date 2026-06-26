@@ -2,7 +2,8 @@ use std::fs;
 
 use orca_core::cost_types::UsageTotals;
 use orca_core::workflow_types::{
-    WorkflowAgentStatus, WorkflowEvidenceIdentity, WorkflowInput, WorkflowMeta,
+    WorkflowAgentStatus, WorkflowEvidenceContract, WorkflowEvidenceIdentity,
+    WorkflowEvidenceToolEvent, WorkflowInput, WorkflowMeta, WorkflowMutationPolicy,
     WorkflowPhaseRecord, WorkflowRunState, WorkflowRunStatus,
 };
 use orca_runtime::workflow::report::{render_evidence_markdown, render_report_for_run};
@@ -197,15 +198,23 @@ fn workflow_args_validation_applies_defaults_and_rejects_bad_inputs() {
 
     let missing = validate_workflow_args(Some(json!({})), &schema).unwrap_err();
     assert_eq!(missing.kind(), std::io::ErrorKind::InvalidInput);
-    assert!(missing.to_string().contains("missing required workflow arg `target`"));
+    assert!(
+        missing
+            .to_string()
+            .contains("missing required workflow arg `target`")
+    );
 
-    let wrong_type =
-        validate_workflow_args(Some(json!({ "target": "src", "maxAgents": "many" })), &schema)
-            .unwrap_err();
+    let wrong_type = validate_workflow_args(
+        Some(json!({ "target": "src", "maxAgents": "many" })),
+        &schema,
+    )
+    .unwrap_err();
     assert_eq!(wrong_type.kind(), std::io::ErrorKind::InvalidInput);
-    assert!(wrong_type
-        .to_string()
-        .contains("workflow arg `maxAgents` must be number"));
+    assert!(
+        wrong_type
+            .to_string()
+            .contains("workflow arg `maxAgents` must be number")
+    );
 }
 
 #[test]
@@ -379,6 +388,7 @@ fn workflow_evidence_bundle_round_trips_state_and_agent_rows() {
                     cache_tokens: 3,
                     estimated_cost_usd: 0.001,
                 }),
+                tool_events: Vec::new(),
             },
         )
         .unwrap();
@@ -404,6 +414,7 @@ fn workflow_evidence_bundle_round_trips_state_and_agent_rows() {
                 started_at_ms: Some(220),
                 completed_at_ms: Some(255),
                 usage: None,
+                tool_events: Vec::new(),
             },
         )
         .unwrap();
@@ -515,6 +526,7 @@ fn workflow_verifier_reports_proven_and_completed_with_failures_from_artifacts()
                 started_at_ms: Some(100),
                 completed_at_ms: Some(200),
                 usage: None,
+                tool_events: Vec::new(),
             },
         )
         .unwrap();
@@ -560,6 +572,255 @@ fn workflow_verifier_reports_proven_and_completed_with_failures_from_artifacts()
         WorkflowVerificationStatus::CompletedWithFailures
     );
     assert!(verified_with_failures.failure_count > 0);
+}
+
+#[test]
+fn workflow_verifier_rejects_missing_declared_evidence_contract() {
+    let temp = tempdir().unwrap();
+    let store = WorkflowStateStore::new(temp.path().join("runs"));
+    let mut state = WorkflowRunState {
+        run_id: "workflow-run-contract".to_string(),
+        task_id: "task-contract".to_string(),
+        session_id: "session-contract".to_string(),
+        cwd: temp.path().display().to_string(),
+        workflow_name: "contract".to_string(),
+        meta: WorkflowMeta {
+            name: "contract".to_string(),
+            description: "Contract test".to_string(),
+            phases: vec!["scan".to_string()],
+            tags: Vec::new(),
+            version: None,
+        },
+        script_digest: "abcd".repeat(16),
+        args_digest: "ef01".repeat(16),
+        status: WorkflowRunStatus::Completed,
+        phases: vec![WorkflowPhaseRecord {
+            name: "scan".to_string(),
+            status: WorkflowRunStatus::Completed,
+            started_at_ms: Some(100),
+            completed_at_ms: Some(200),
+            agent_count: 1,
+            error: None,
+            fallback: None,
+        }],
+        total_agent_count: 1,
+        final_summary: Some("done".to_string()),
+        error: None,
+    };
+    store.create_run(&state).unwrap();
+    let transcript = store.transcript_dir(&state.run_id).join("agent.txt");
+    fs::write(&transcript, "agent transcript").unwrap();
+    store
+        .record_agent_completed(
+            &state.run_id,
+            WorkflowAgentRecord {
+                call_id: "agent-1".to_string(),
+                call_path: "scan:1".to_string(),
+                prompt: "scan".to_string(),
+                opts: json!({}),
+                team: None,
+                input_hash: "hash".to_string(),
+                status: WorkflowAgentStatus::Completed,
+                attempt: 1,
+                max_attempts: 1,
+                previous_errors: Vec::new(),
+                output: Some(json!("done")),
+                error: None,
+                transcript_path: Some(transcript.display().to_string()),
+                started_at_ms: Some(100),
+                completed_at_ms: Some(200),
+                usage: None,
+                tool_events: Vec::new(),
+            },
+        )
+        .unwrap();
+    let mut evidence = store
+        .build_evidence_bundle(
+            &state,
+            WorkflowEvidenceIdentity {
+                app_version: "test".to_string(),
+                binary_path: None,
+                generated_at_ms: 300,
+            },
+        )
+        .unwrap();
+    evidence.contract = Some(WorkflowEvidenceContract {
+        required_tool_calls: vec!["read_file".to_string()],
+        expected_tool_failures: Vec::new(),
+        expected_mcp_failures: Vec::new(),
+        mutation_policy: Some(WorkflowMutationPolicy::ReadOnly),
+        min_observed_concurrency: Some(2),
+    });
+    store.write_evidence_bundle(&evidence).unwrap();
+
+    let verified = verify_workflow_run(&store, &state.run_id).unwrap();
+    assert_eq!(verified.status, WorkflowVerificationStatus::NotProven);
+    assert!(
+        verified
+            .contract_failures
+            .iter()
+            .any(|failure| failure.contains("required tool call `read_file` was not observed"))
+    );
+    assert!(
+        verified
+            .contract_failures
+            .iter()
+            .any(|failure| failure.contains("observed concurrency 0 is below required 2"))
+    );
+
+    state.run_id = "workflow-run-contract-proven".to_string();
+    state.task_id = "task-contract-proven".to_string();
+    store.create_run(&state).unwrap();
+    let transcript = store.transcript_dir(&state.run_id).join("agent.txt");
+    fs::write(&transcript, "agent transcript").unwrap();
+    store
+        .record_agent_completed(
+            &state.run_id,
+            WorkflowAgentRecord {
+                call_id: "agent-1".to_string(),
+                call_path: "scan:1".to_string(),
+                prompt: "scan".to_string(),
+                opts: json!({}),
+                team: None,
+                input_hash: "hash".to_string(),
+                status: WorkflowAgentStatus::Completed,
+                attempt: 1,
+                max_attempts: 1,
+                previous_errors: Vec::new(),
+                output: Some(json!("done")),
+                error: None,
+                transcript_path: Some(transcript.display().to_string()),
+                started_at_ms: Some(100),
+                completed_at_ms: Some(200),
+                usage: None,
+                tool_events: vec![WorkflowEvidenceToolEvent {
+                    id: Some("tool-1".to_string()),
+                    name: "read_file".to_string(),
+                    status: Some("completed".to_string()),
+                    target: Some("README.md".to_string()),
+                    error: None,
+                    is_mcp: false,
+                }],
+            },
+        )
+        .unwrap();
+    let mut evidence = store
+        .build_evidence_bundle(
+            &state,
+            WorkflowEvidenceIdentity {
+                app_version: "test".to_string(),
+                binary_path: None,
+                generated_at_ms: 400,
+            },
+        )
+        .unwrap();
+    evidence.contract = Some(WorkflowEvidenceContract {
+        required_tool_calls: vec!["read_file".to_string()],
+        expected_tool_failures: Vec::new(),
+        expected_mcp_failures: Vec::new(),
+        mutation_policy: Some(WorkflowMutationPolicy::ReadOnly),
+        min_observed_concurrency: Some(1),
+    });
+    evidence.max_observed_concurrent_agents = 1;
+    store.write_evidence_bundle(&evidence).unwrap();
+
+    let verified = verify_workflow_run(&store, &state.run_id).unwrap();
+    assert_eq!(verified.status, WorkflowVerificationStatus::Proven);
+    assert!(verified.contract_failures.is_empty());
+}
+
+#[test]
+fn workflow_verifier_rejects_read_only_contract_when_mutation_tool_completes() {
+    let temp = tempdir().unwrap();
+    let store = WorkflowStateStore::new(temp.path().join("runs"));
+    let state = WorkflowRunState {
+        run_id: "workflow-run-readonly-contract".to_string(),
+        task_id: "task-readonly-contract".to_string(),
+        session_id: "session-readonly-contract".to_string(),
+        cwd: temp.path().display().to_string(),
+        workflow_name: "readonly-contract".to_string(),
+        meta: WorkflowMeta {
+            name: "readonly-contract".to_string(),
+            description: "Read-only contract test".to_string(),
+            phases: vec!["scan".to_string()],
+            tags: Vec::new(),
+            version: None,
+        },
+        script_digest: "abcd".repeat(16),
+        args_digest: "ef01".repeat(16),
+        status: WorkflowRunStatus::Completed,
+        phases: vec![WorkflowPhaseRecord {
+            name: "scan".to_string(),
+            status: WorkflowRunStatus::Completed,
+            started_at_ms: Some(100),
+            completed_at_ms: Some(200),
+            agent_count: 1,
+            error: None,
+            fallback: None,
+        }],
+        total_agent_count: 1,
+        final_summary: Some("done".to_string()),
+        error: None,
+    };
+    store.create_run(&state).unwrap();
+    let transcript = store.transcript_dir(&state.run_id).join("agent.txt");
+    fs::write(&transcript, "agent transcript").unwrap();
+    store
+        .record_agent_completed(
+            &state.run_id,
+            WorkflowAgentRecord {
+                call_id: "agent-1".to_string(),
+                call_path: "scan:1".to_string(),
+                prompt: "scan".to_string(),
+                opts: json!({}),
+                team: None,
+                input_hash: "hash".to_string(),
+                status: WorkflowAgentStatus::Completed,
+                attempt: 1,
+                max_attempts: 1,
+                previous_errors: Vec::new(),
+                output: Some(json!("done")),
+                error: None,
+                transcript_path: Some(transcript.display().to_string()),
+                started_at_ms: Some(100),
+                completed_at_ms: Some(200),
+                usage: None,
+                tool_events: vec![WorkflowEvidenceToolEvent {
+                    id: Some("tool-1".to_string()),
+                    name: "edit".to_string(),
+                    status: Some("completed".to_string()),
+                    target: Some("src/lib.rs".to_string()),
+                    error: None,
+                    is_mcp: false,
+                }],
+            },
+        )
+        .unwrap();
+    let mut evidence = store
+        .build_evidence_bundle(
+            &state,
+            WorkflowEvidenceIdentity {
+                app_version: "test".to_string(),
+                binary_path: None,
+                generated_at_ms: 400,
+            },
+        )
+        .unwrap();
+    evidence.contract = Some(WorkflowEvidenceContract {
+        required_tool_calls: Vec::new(),
+        expected_tool_failures: Vec::new(),
+        expected_mcp_failures: Vec::new(),
+        mutation_policy: Some(WorkflowMutationPolicy::ReadOnly),
+        min_observed_concurrency: None,
+    });
+    store.write_evidence_bundle(&evidence).unwrap();
+
+    let verified = verify_workflow_run(&store, &state.run_id).unwrap();
+
+    assert_eq!(verified.status, WorkflowVerificationStatus::NotProven);
+    assert!(verified.contract_failures.iter().any(|failure| {
+        failure.contains("read-only mutation policy") && failure.contains("edit")
+    }));
 }
 
 #[test]
@@ -609,6 +870,7 @@ fn workflow_report_is_bound_to_evidence() {
                     started_at_ms: Some(100 + index),
                     completed_at_ms: Some(200 + index),
                     usage: None,
+                    tool_events: Vec::new(),
                 },
             )
             .unwrap();
@@ -1098,6 +1360,7 @@ fn state_store_preserves_current_json_looking_string_outputs() {
                     started_at_ms: Some(1_000 + index as i64),
                     completed_at_ms: Some(2_000 + index as i64),
                     usage: None,
+                    tool_events: Vec::new(),
                 },
             )
             .unwrap();
@@ -1186,6 +1449,7 @@ fn state_store_preserves_missing_output_field_when_appending_completed_record() 
                 started_at_ms: Some(1_000),
                 completed_at_ms: Some(2_000),
                 usage: None,
+                tool_events: Vec::new(),
             },
         )
         .unwrap();

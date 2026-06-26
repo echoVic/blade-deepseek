@@ -1456,6 +1456,34 @@ fn execute_workflow_draft_action_for_tui(
                 script_path: Some(draft.script_path),
             }
         }
+        "edit" => {
+            let Some(script) = input.script.as_deref() else {
+                return tool_types::ToolResult::invalid_input(
+                    request,
+                    "workflow draft action edit requires script",
+                );
+            };
+            let edited = match draft_store.edit_script(
+                &input.draft_id,
+                script,
+                config.workflows.max_concurrent_agents,
+            ) {
+                Ok(edited) => edited,
+                Err(error) => {
+                    return tool_types::ToolResult::failed(request, error.to_string(), None);
+                }
+            };
+            WorkflowDraftActionOutput {
+                status: "edited".to_string(),
+                action: "edit".to_string(),
+                draft_id: input.draft_id.clone(),
+                workflow_name: edited.name,
+                saved_path: None,
+                task_id: None,
+                run_id: None,
+                script_path: Some(edited.script_path),
+            }
+        }
         "cancel" => {
             if let Err(error) = draft_store.cancel(&input.draft_id) {
                 return tool_types::ToolResult::failed(request, error.to_string(), None);
@@ -1621,6 +1649,8 @@ fn parse_workflow_draft_input(
 struct WorkflowDraftActionInput {
     draft_id: String,
     action: String,
+    #[serde(default)]
+    script: Option<String>,
     #[serde(default)]
     save_as: Option<String>,
     #[serde(default)]
@@ -2447,11 +2477,7 @@ mod tests {
 
         let mut events: Vec<TuiEvent> = event_rx.try_iter().collect();
         let deadline = Instant::now() + Duration::from_secs(3);
-        while Instant::now() < deadline
-            && !events
-                .iter()
-                .any(|event| matches!(event, TuiEvent::WorkflowNotification { .. }))
-        {
+        while Instant::now() < deadline && !workflow_runtime_events_complete(&events) {
             if let Ok(event) = event_rx.recv_timeout(Duration::from_millis(50)) {
                 events.push(event);
             }
@@ -2512,6 +2538,27 @@ mod tests {
                     && summary.contains("mock-workflow")
             )
         }));
+    }
+
+    fn workflow_runtime_events_complete(events: &[TuiEvent]) -> bool {
+        let has_notification = events
+            .iter()
+            .any(|event| matches!(event, TuiEvent::WorkflowNotification { .. }));
+        let has_terminal_progress = events.iter().any(|event| {
+            matches!(
+                event,
+                TuiEvent::WorkflowTasksUpdated { tasks }
+                if tasks.iter().any(|task| {
+                    task.workflow_progress
+                        .map(|progress| {
+                            progress.total_agents > 0
+                                && progress.completed_agents + progress.failed_agents > 0
+                        })
+                        .unwrap_or(false)
+                })
+            )
+        });
+        has_notification && has_terminal_progress
     }
 
     #[test]

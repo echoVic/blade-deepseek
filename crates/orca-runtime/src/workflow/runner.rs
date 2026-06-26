@@ -1,6 +1,6 @@
 use std::fs;
 use std::io;
-use std::io::sink;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -17,8 +17,8 @@ use orca_core::event_sink::EventSink;
 use orca_core::subagent_types::SubagentType;
 use orca_core::task_types::{TaskType, WorkflowPhaseTaskSummary, WorkflowTaskProgress};
 use orca_core::workflow_types::{
-    WorkflowAgentStatus, WorkflowEvidenceIdentity, WorkflowInput, WorkflowOutput,
-    WorkflowPhaseRecord, WorkflowRunState, WorkflowRunStatus,
+    WorkflowAgentStatus, WorkflowEvidenceIdentity, WorkflowEvidenceToolEvent, WorkflowInput,
+    WorkflowOutput, WorkflowPhaseRecord, WorkflowRunState, WorkflowRunStatus,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -34,10 +34,12 @@ use crate::worktree::{WorktreeGuard, WorktreeOutcome};
 
 use super::host::{AgentCall, HostCommand, HostEvent, WorkflowHost, WorkflowHostIpcPaths};
 use super::ipc::WorkflowIpcContext;
-use super::script::{ResolvedWorkflowScript, resolve_workflow_script_to_path, validate_workflow_args};
+use super::script::{
+    ResolvedWorkflowScript, resolve_workflow_script_to_path, validate_workflow_args,
+};
 use super::state::{
     WorkflowAgentRecord, WorkflowAgentStatusCounts, WorkflowStateStore, WorkflowWorkerRecord,
-    input_hash, workflow_agent_team,
+    input_hash, workflow_agent_min_hold_ms, workflow_agent_team,
 };
 
 const STOP_REQUESTED_ERROR: &str = "__orca_workflow_stop_requested__";
@@ -136,6 +138,7 @@ struct WorkflowChildAgentCallOutput {
     message: String,
     usage: UsageTotals,
     worktree: Option<WorktreeOutcome>,
+    tool_events: Vec<WorkflowEvidenceToolEvent>,
 }
 
 #[derive(Clone, Debug)]
@@ -143,6 +146,7 @@ struct WorkflowChildAgentCallError {
     message: String,
     usage: Option<UsageTotals>,
     retryable: bool,
+    tool_events: Vec<WorkflowEvidenceToolEvent>,
 }
 
 #[derive(Clone, Debug)]
@@ -159,7 +163,37 @@ impl From<io::Error> for WorkflowChildAgentCallError {
             message: error.to_string(),
             usage: None,
             retryable: true,
+            tool_events: Vec::new(),
         }
+    }
+}
+
+#[derive(Clone, Default)]
+struct SharedEventBuffer {
+    bytes: Arc<Mutex<Vec<u8>>>,
+}
+
+impl SharedEventBuffer {
+    fn content(&self) -> Vec<u8> {
+        self.bytes
+            .lock()
+            .map(|bytes| bytes.clone())
+            .unwrap_or_default()
+    }
+}
+
+impl Write for SharedEventBuffer {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let mut bytes = self
+            .bytes
+            .lock()
+            .map_err(|_| io::Error::other("workflow child event buffer poisoned"))?;
+        bytes.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }
 
@@ -392,6 +426,7 @@ impl WorkflowRunner {
             script_path: Some(script_path.display().to_string()),
             args: input.args.clone(),
             resume_from_run_id: input.resume_from_run_id.clone(),
+            restart_phase: input.restart_phase.clone(),
             ..Default::default()
         })
     }
@@ -407,6 +442,7 @@ impl WorkflowRunner {
         let mut state = self.state.load_run(&run_id)?;
         let args = request.input.args.clone().unwrap_or(Value::Null);
         let resume_from = request.input.resume_from_run_id.clone();
+        let restart_phase = request.input.restart_phase.clone();
         let cached_agents = Arc::new(AtomicU32::new(0));
         let mut failed_error = None;
         let mut completed_result = None;
@@ -445,6 +481,7 @@ impl WorkflowRunner {
                         &run_id,
                         &task_id,
                         resume_from.as_deref(),
+                        restart_phase.as_deref(),
                         &transcript_dir,
                         call,
                         Arc::clone(&cached_agents),
@@ -581,6 +618,7 @@ impl WorkflowRunner {
         run_id: &str,
         task_id: &str,
         resume_from: Option<&str>,
+        restart_phase: Option<&str>,
         transcript_dir: &std::path::Path,
         call: AgentCall,
         cached_agents: Arc<AtomicU32>,
@@ -594,8 +632,16 @@ impl WorkflowRunner {
                 error: STOP_REQUESTED_ERROR.to_string(),
             });
         }
+        if self.wait_while_paused(run_id, task_id)? {
+            return Ok(HostCommand::AgentError {
+                call_id: call.call_id,
+                error: STOP_REQUESTED_ERROR.to_string(),
+            });
+        }
         let hash = input_hash(&call.prompt, &call.opts);
-        if let Some(resume_run_id) = resume_from {
+        if let Some(resume_run_id) = resume_from
+            && !call_path_matches_phase(&call.call_path, restart_phase)
+        {
             if let Some(cached_value) =
                 self.state
                     .find_cached_agent_value(resume_run_id, &call.call_path, &hash)
@@ -626,6 +672,7 @@ impl WorkflowRunner {
                             started_at_ms: Some(now_ms()),
                             completed_at_ms: Some(now_ms()),
                             usage: None,
+                            tool_events: Vec::new(),
                         },
                     )?;
                     if let Ok(state) = self.state.load_run(run_id) {
@@ -657,6 +704,7 @@ impl WorkflowRunner {
                         started_at_ms: Some(now_ms()),
                         completed_at_ms: Some(now_ms()),
                         usage: None,
+                        tool_events: Vec::new(),
                     },
                 )?;
                 if let Ok(state) = self.state.load_run(run_id) {
@@ -711,10 +759,14 @@ impl WorkflowRunner {
                     started_at_ms: Some(started_at_ms),
                     completed_at_ms: None,
                     usage: None,
+                    tool_events: Vec::new(),
                 },
             )?;
             if let Ok(state) = self.state.load_run(run_id) {
                 let _ = self.refresh_task_progress(task_id, &state);
+            }
+            if let Some(min_hold_ms) = workflow_agent_min_hold_ms(&call.opts) {
+                thread::sleep(std::time::Duration::from_millis(min_hold_ms));
             }
 
             match self.run_child_agent_call(&call, workflow_ipc, &execution_policy) {
@@ -745,6 +797,7 @@ impl WorkflowRunner {
                                 started_at_ms: Some(started_at_ms),
                                 completed_at_ms: Some(completed_at_ms),
                                 usage: Some(child_output.usage),
+                                tool_events: child_output.tool_events,
                             },
                         )?;
                         if let Ok(state) = self.state.load_run(run_id) {
@@ -775,6 +828,7 @@ impl WorkflowRunner {
                             started_at_ms: Some(started_at_ms),
                             completed_at_ms: Some(completed_at_ms),
                             usage: Some(child_output.usage),
+                            tool_events: child_output.tool_events,
                         },
                     )?;
                     if let Ok(state) = self.state.load_run(run_id) {
@@ -793,6 +847,7 @@ impl WorkflowRunner {
                         message: error_message,
                         usage,
                         retryable,
+                        tool_events,
                     } = error;
                     let transcript_path =
                         write_agent_transcript(transcript_dir, &call, &error_message, false)?;
@@ -815,6 +870,7 @@ impl WorkflowRunner {
                             started_at_ms: Some(started_at_ms),
                             completed_at_ms: Some(completed_at_ms),
                             usage,
+                            tool_events,
                         },
                     )?;
                     if let Ok(state) = self.state.load_run(run_id) {
@@ -840,6 +896,35 @@ impl WorkflowRunner {
         })
     }
 
+    fn wait_while_paused(&self, run_id: &str, task_id: &str) -> io::Result<bool> {
+        let mut paused = false;
+        while self.state.pause_requested(run_id)? {
+            if self.state.stop_requested(run_id)? {
+                return Ok(true);
+            }
+            let mut state = self.state.load_run(run_id)?;
+            if state.status != WorkflowRunStatus::Paused {
+                state.status = WorkflowRunStatus::Paused;
+                self.state.write_state(&state)?;
+                self.refresh_task_progress(task_id, &state)?;
+            }
+            let _ = self.tasks.request_pause(task_id);
+            paused = true;
+            thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        if paused {
+            let mut state = self.state.load_run(run_id)?;
+            if state.status == WorkflowRunStatus::Paused {
+                state.status = WorkflowRunStatus::Running;
+                self.state.write_state(&state)?;
+                self.refresh_task_progress(task_id, &state)?;
+            }
+            let _ = self.tasks.request_resume(task_id);
+        }
+        Ok(false)
+    }
+
     fn run_child_agent_call(
         &self,
         call: &AgentCall,
@@ -861,7 +946,8 @@ impl WorkflowRunner {
             .map(|guard| guard.path())
             .unwrap_or(cwd);
         let mut events = EventFactory::new(format!("workflow-child-{}", call.call_id));
-        let mut sink = EventSink::new(sink(), self.config.output_format);
+        let event_buffer = SharedEventBuffer::default();
+        let mut sink = EventSink::new(event_buffer.clone(), OutputFormat::Jsonl);
         let instructions = instructions::load_for_cwd_or_default(cwd);
         let memory = memory::load_for_cwd(cwd);
         let (workflow_child_config, mcp_registry) =
@@ -873,7 +959,7 @@ impl WorkflowRunner {
             subagent_type: SubagentType::General,
             model: None,
             depth: 1,
-            emit_deltas: false,
+            emit_deltas: true,
             allowed_tools: execution_policy.allowed_tools.clone(),
             tool_policy_label: execution_policy.tool_policy_label.clone(),
             workflow_ipc: Some(workflow_ipc.for_sender(call.call_path.clone())),
@@ -893,6 +979,7 @@ impl WorkflowRunner {
             run_child_agent(&workflow_child_config, &child_request, &mut runtime);
         drop(runtime);
         let usage = child_cost_tracker.totals();
+        let tool_events = parse_child_tool_events(&event_buffer.content());
         let worktree = worktree_guard.map(WorktreeGuard::finish).transpose()?;
 
         match result.status {
@@ -908,6 +995,7 @@ impl WorkflowRunner {
                             message: error,
                             usage: Some(usage),
                             retryable: false,
+                            tool_events,
                         });
                     }
                 }
@@ -915,6 +1003,7 @@ impl WorkflowRunner {
                     message: result.final_message.unwrap_or_default(),
                     usage,
                     worktree,
+                    tool_events,
                 })
             }
             _ => {
@@ -928,6 +1017,7 @@ impl WorkflowRunner {
                     message: error,
                     usage: Some(usage),
                     retryable,
+                    tool_events,
                 })
             }
         }
@@ -1147,6 +1237,85 @@ fn workflow_run_status_label(status: WorkflowRunStatus) -> &'static str {
         WorkflowRunStatus::Cancelled => "cancelled",
         WorkflowRunStatus::AsyncLaunched => "async_launched",
     }
+}
+
+fn call_path_matches_phase(call_path: &str, restart_phase: Option<&str>) -> bool {
+    let Some(restart_phase) = restart_phase
+        .map(str::trim)
+        .filter(|phase| !phase.is_empty())
+    else {
+        return false;
+    };
+    let Some((phase, _)) = call_path.split_once(':') else {
+        return call_path == restart_phase;
+    };
+    phase == restart_phase || phase.strip_prefix("phases.") == Some(restart_phase)
+}
+
+fn parse_child_tool_events(bytes: &[u8]) -> Vec<WorkflowEvidenceToolEvent> {
+    let content = String::from_utf8_lossy(bytes);
+    let mut events_by_id = std::collections::BTreeMap::<String, WorkflowEvidenceToolEvent>::new();
+    let mut anonymous_events = Vec::new();
+    for line in content.lines() {
+        let Ok(event) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let Some(event_type) = event.get("type").and_then(Value::as_str) else {
+            continue;
+        };
+        if event_type != "tool.call.requested" && event_type != "tool.call.completed" {
+            continue;
+        }
+        let payload = event.get("payload").unwrap_or(&Value::Null);
+        let name = payload
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("tool")
+            .to_string();
+        let id = payload
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let tool_event = WorkflowEvidenceToolEvent {
+            id: id.clone(),
+            name: name.clone(),
+            status: payload
+                .get("status")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            target: payload
+                .get("target")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            error: payload
+                .get("error")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            is_mcp: name.starts_with("mcp__"),
+        };
+        if let Some(id) = id {
+            events_by_id
+                .entry(id)
+                .and_modify(|existing| merge_tool_event(existing, &tool_event))
+                .or_insert(tool_event);
+        } else {
+            anonymous_events.push(tool_event);
+        }
+    }
+    events_by_id.into_values().chain(anonymous_events).collect()
+}
+
+fn merge_tool_event(existing: &mut WorkflowEvidenceToolEvent, update: &WorkflowEvidenceToolEvent) {
+    if existing.status.is_none() {
+        existing.status = update.status.clone();
+    }
+    if existing.target.is_none() {
+        existing.target = update.target.clone();
+    }
+    if existing.error.is_none() {
+        existing.error = update.error.clone();
+    }
+    existing.is_mcp |= update.is_mcp;
 }
 
 fn workflow_phase_summaries(state: &WorkflowRunState) -> Vec<WorkflowPhaseTaskSummary> {

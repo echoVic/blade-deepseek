@@ -626,7 +626,7 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
     registry.register(BuiltinTool::new(
         builtin_spec(
             "WorkflowDraftAction",
-            "Apply a preview decision to a workflow draft. Use run to launch an approved draft, save to persist it as a reusable workflow command, or cancel to discard it.",
+            "Apply a preview decision to a workflow draft. Use run to launch an approved draft, edit to replace the draft script and re-render metadata, save to persist it as a reusable workflow command, or cancel to discard it.",
             json!({
                 "type": "object",
                 "properties": {
@@ -636,8 +636,12 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
                     },
                     "action": {
                         "type": "string",
-                        "enum": ["run", "save", "cancel"],
+                        "enum": ["run", "edit", "save", "cancel"],
                         "description": "Decision to apply to the draft preview."
+                    },
+                    "script": {
+                        "type": "string",
+                        "description": "Replacement JavaScript workflow script for action=edit."
                     },
                     "saveAs": {
                         "type": "string",

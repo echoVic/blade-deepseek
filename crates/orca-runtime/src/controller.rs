@@ -1451,6 +1451,29 @@ fn execute_workflow_draft_action_tool(
             });
             action_output
         }
+        "edit" => {
+            let script = input.script.as_deref().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "workflow draft action edit requires script",
+                )
+            })?;
+            let edited = draft_store.edit_script(
+                &input.draft_id,
+                script,
+                config.workflows.max_concurrent_agents,
+            )?;
+            WorkflowDraftActionOutput {
+                status: "edited".to_string(),
+                action: "edit".to_string(),
+                draft_id: input.draft_id.clone(),
+                workflow_name: edited.name,
+                saved_path: None,
+                task_id: None,
+                run_id: None,
+                script_path: Some(edited.script_path),
+            }
+        }
         "save" => {
             let workflow_dir = match input.scope.as_deref().unwrap_or("project") {
                 "project" => cwd.join(".orca").join("workflows"),
@@ -1530,6 +1553,8 @@ fn parse_workflow_draft_input(
 struct WorkflowDraftActionInput {
     draft_id: String,
     action: String,
+    #[serde(default)]
+    script: Option<String>,
     #[serde(default)]
     save_as: Option<String>,
     #[serde(default)]

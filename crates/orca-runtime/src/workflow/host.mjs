@@ -620,13 +620,21 @@ function matchWorkflowExport(source, startIndex) {
 
     const secondTokenEnd = readIdentifierEnd(source, secondTokenStart + 1);
     const secondToken = source.slice(secondTokenStart, secondTokenEnd);
-    if (secondToken !== "meta" && secondToken !== "phases") {
+    if (secondToken !== "meta" && secondToken !== "phases" && secondToken !== "args") {
       return null;
     }
 
     const equalsIndex = skipIgnorable(source, secondTokenEnd);
     if (source[equalsIndex] !== "=") {
       return null;
+    }
+
+    if (secondToken === "args") {
+      return {
+        start: startIndex,
+        end: secondTokenEnd,
+        text: "const __workflow_args_schema__",
+      };
     }
 
     return {

@@ -6,6 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use orca_core::workflow_types::{WorkflowDraft, WorkflowSourceMutationRisk};
 
 use super::script::parse_workflow_meta;
+use super::state::WorkflowStateStore;
 
 #[derive(Clone, Debug)]
 pub struct WorkflowDraftStore {
@@ -53,6 +54,7 @@ impl WorkflowDraftStore {
             phases: meta.phases,
             script: script.to_string(),
             script_path: script_path.display().to_string(),
+            args: None,
             estimated_agent_count: estimate_agent_count(script),
             max_configured_concurrent_agents: max_configured_concurrent_agents as u32,
             source_mutation_risk: classify_source_mutation_risk(script),
@@ -78,6 +80,39 @@ impl WorkflowDraftStore {
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
     }
 
+    pub fn edit_script(
+        &self,
+        draft_id: &str,
+        script: &str,
+        max_configured_concurrent_agents: usize,
+    ) -> io::Result<WorkflowDraft> {
+        let existing = self.load(draft_id)?;
+        let meta = parse_workflow_meta(script)?;
+        let script_path = self.script_path(draft_id);
+        if let Some(parent) = script_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&script_path, script)?;
+
+        let draft = WorkflowDraft {
+            draft_id: existing.draft_id,
+            session_id: existing.session_id,
+            cwd: existing.cwd,
+            name: meta.name,
+            description: meta.description,
+            phases: meta.phases,
+            script: script.to_string(),
+            script_path: script_path.display().to_string(),
+            args: existing.args,
+            estimated_agent_count: estimate_agent_count(script),
+            max_configured_concurrent_agents: max_configured_concurrent_agents as u32,
+            source_mutation_risk: classify_source_mutation_risk(script),
+            created_at_ms: existing.created_at_ms,
+        };
+        self.write(&draft)?;
+        Ok(draft)
+    }
+
     pub fn cancel(&self, draft_id: &str) -> io::Result<()> {
         let dir = self.draft_dir(draft_id);
         if dir.exists() {
@@ -98,6 +133,26 @@ impl WorkflowDraftStore {
         let path = workflow_dir.join(format!("{name}.js"));
         fs::write(&path, draft.script)?;
         Ok(path)
+    }
+
+    pub fn clone_from_run(
+        &self,
+        state_store: &WorkflowStateStore,
+        run_id: &str,
+        max_configured_concurrent_agents: usize,
+    ) -> io::Result<WorkflowDraft> {
+        let state = state_store.load_run(run_id)?;
+        let script = fs::read_to_string(state_store.run_dir(run_id).join("script.js"))?;
+        let launch_input = state_store.load_launch_input(run_id)?;
+        let mut draft = self.create_from_script(
+            &state.session_id,
+            Path::new(&state.cwd),
+            &script,
+            max_configured_concurrent_agents,
+        )?;
+        draft.args = launch_input.args;
+        self.write(&draft)?;
+        Ok(draft)
     }
 }
 

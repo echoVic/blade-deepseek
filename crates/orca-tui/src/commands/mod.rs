@@ -326,7 +326,11 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let workflow_dir = temp.path().join(".orca").join("workflows");
         std::fs::create_dir_all(&workflow_dir).unwrap();
-        std::fs::write(workflow_dir.join("security-audit.js"), "export default 'ok';").unwrap();
+        std::fs::write(
+            workflow_dir.join("security-audit.js"),
+            "export default 'ok';",
+        )
+        .unwrap();
         std::fs::write(workflow_dir.join("model.js"), "export default 'ok';").unwrap();
 
         let command_names = available_commands(temp.path())
@@ -351,7 +355,11 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let workflow_dir = temp.path().join(".orca").join("workflows");
         std::fs::create_dir_all(&workflow_dir).unwrap();
-        std::fs::write(workflow_dir.join("security-audit.js"), "export default 'ok';").unwrap();
+        std::fs::write(
+            workflow_dir.join("security-audit.js"),
+            "export default 'ok';",
+        )
+        .unwrap();
         std::fs::write(workflow_dir.join("model.js"), "export default 'ok';").unwrap();
 
         assert_eq!(

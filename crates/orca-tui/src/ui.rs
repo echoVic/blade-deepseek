@@ -540,13 +540,19 @@ fn workflow_metadata_rows<'a>(task: &BackgroundTaskSummary, theme: &Theme) -> Ve
     if let Some(launch_input) = &task.workflow_launch_input {
         rows.push(Line::from(vec![
             Span::styled("    launch ", Style::default().fg(theme.muted)),
-            Span::styled(workflow_launch_input_label(launch_input), Style::default().fg(theme.text)),
+            Span::styled(
+                workflow_launch_input_label(launch_input),
+                Style::default().fg(theme.text),
+            ),
         ]));
     }
     if task.workflow_failure_count > 0 {
         rows.push(Line::from(vec![
             Span::styled("    failures ", Style::default().fg(theme.muted)),
-            Span::styled(task.workflow_failure_count.to_string(), Style::default().fg(theme.error)),
+            Span::styled(
+                task.workflow_failure_count.to_string(),
+                Style::default().fg(theme.error),
+            ),
         ]));
     }
     if let Some(summary) = &task.workflow_final_summary {
@@ -1180,7 +1186,9 @@ fn append_archived_plan_lines(
 
     lines.push(Line::from(Span::styled(
         "  Task Plan",
-        Style::default().fg(theme.muted).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(theme.muted)
+            .add_modifier(Modifier::BOLD),
     )));
 
     if let Some(note) = explanation.map(str::trim).filter(|n| !n.is_empty()) {
@@ -2819,9 +2827,10 @@ mod tests {
         assert!(rendered.contains("150 tok"));
         assert!(rendered.contains("$0.000025"));
         assert!(rendered.contains("run workflow-run-1"));
-        assert!(rendered.contains(
-            "script /repo/.orca/workflow-sessions/s1/workflow-runs/run-1/script.js"
-        ));
+        assert!(
+            rendered
+                .contains("script /repo/.orca/workflow-sessions/s1/workflow-runs/run-1/script.js")
+        );
         assert!(rendered.contains("launch name=audit args={\"target\":\"src\"}"));
         assert!(rendered.contains("failures 1"));
         assert!(rendered.contains("final completed with fallback review"));

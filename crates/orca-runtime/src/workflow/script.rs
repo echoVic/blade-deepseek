@@ -126,6 +126,14 @@ fn resolve_path(cwd: &Path, raw_path: &str) -> PathBuf {
 }
 
 fn find_named_workflow(cwd: &Path, name: &str, user_workflow_dir: &Path) -> io::Result<PathBuf> {
+    find_saved_workflow(cwd, name, user_workflow_dir)
+}
+
+pub fn find_saved_workflow(
+    cwd: &Path,
+    name: &str,
+    user_workflow_dir: &Path,
+) -> io::Result<PathBuf> {
     for ancestor in cwd.ancestors() {
         let candidate = ancestor
             .join(".orca")
@@ -252,10 +260,7 @@ pub fn validate_workflow_args(
             Some(value) if !arg_value_matches_type(value, spec.arg_type) => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    format!(
-                        "workflow arg `{name}` must be {}",
-                        spec.arg_type.as_str()
-                    ),
+                    format!("workflow arg `{name}` must be {}", spec.arg_type.as_str()),
                 ));
             }
             Some(_) => {}

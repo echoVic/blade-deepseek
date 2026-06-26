@@ -9,7 +9,8 @@ use orca_core::task_types::WorkflowAgentTaskSummary;
 use orca_core::workflow_types::{
     WorkflowAgentFailureKind, WorkflowAgentStatus, WorkflowEvidenceAgent, WorkflowEvidenceBundle,
     WorkflowEvidenceFailure, WorkflowEvidenceFailureKind, WorkflowEvidenceIdentity,
-    WorkflowEvidencePhase, WorkflowInput, WorkflowRunState, WorkflowRunStatus,
+    WorkflowEvidencePhase, WorkflowEvidenceToolEvent, WorkflowInput, WorkflowRunState,
+    WorkflowRunStatus,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -49,6 +50,8 @@ pub struct WorkflowAgentRecord {
     pub completed_at_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<UsageTotals>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_events: Vec<WorkflowEvidenceToolEvent>,
 }
 
 #[derive(Clone, Debug)]
@@ -94,6 +97,8 @@ struct WorkflowAgentRecordOnDisk {
     completed_at_ms: Option<i64>,
     #[serde(default)]
     usage: Option<UsageTotals>,
+    #[serde(default)]
+    tool_events: Vec<WorkflowEvidenceToolEvent>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -120,6 +125,8 @@ struct WorkflowAgentRecordOnDiskWritable {
     completed_at_ms: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     usage: Option<UsageTotals>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tool_events: Vec<WorkflowEvidenceToolEvent>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -173,11 +180,15 @@ pub struct WorkflowAgentStatusCounts {
     pub cached: u32,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct WorkflowStopRequest {
+struct WorkflowControlRequest {
+    #[serde(default)]
     stop_requested: bool,
-    requested_at_ms: i64,
+    #[serde(default)]
+    pause_requested: bool,
+    #[serde(default)]
+    updated_at_ms: i64,
 }
 
 impl WorkflowStateStore {
@@ -272,6 +283,8 @@ impl WorkflowStateStore {
                             .record
                             .team
                             .or_else(|| workflow_agent_team(&entry.record.opts)),
+                        barrier: workflow_agent_barrier(&entry.record.opts),
+                        min_hold_ms: workflow_agent_min_hold_ms(&entry.record.opts),
                         input_hash: entry.record.input_hash,
                         status: entry.record.status,
                         attempt: entry.record.attempt,
@@ -282,6 +295,7 @@ impl WorkflowStateStore {
                         started_at_ms: entry.record.started_at_ms,
                         completed_at_ms: entry.record.completed_at_ms,
                         usage: entry.record.usage,
+                        tool_events: entry.record.tool_events,
                         failure_kind,
                         retryable,
                         retry_attempted,
@@ -327,6 +341,7 @@ impl WorkflowStateStore {
             total_agent_count: state.total_agent_count,
             max_configured_concurrent_agents: 0,
             max_observed_concurrent_agents: 0,
+            contract: None,
             final_summary: state.final_summary.clone(),
             error: state.error.clone(),
             agents,
@@ -362,22 +377,46 @@ impl WorkflowStateStore {
     }
 
     pub fn request_stop(&self, run_id: &str) -> io::Result<()> {
-        write_json_pretty(
-            &self.stop_request_path(run_id),
-            &WorkflowStopRequest {
-                stop_requested: true,
-                requested_at_ms: now_ms(),
-            },
-        )
+        let mut control = self.load_control_request(run_id)?;
+        control.stop_requested = true;
+        control.updated_at_ms = now_ms();
+        write_json_pretty(&self.stop_request_path(run_id), &control)
     }
 
     pub fn stop_requested(&self, run_id: &str) -> io::Result<bool> {
+        Ok(self.load_control_request(run_id)?.stop_requested)
+    }
+
+    pub fn request_pause(&self, run_id: &str) -> io::Result<()> {
+        let mut control = self.load_control_request(run_id)?;
+        control.pause_requested = true;
+        control.updated_at_ms = now_ms();
+        write_json_pretty(&self.stop_request_path(run_id), &control)
+    }
+
+    pub fn request_resume(&self, run_id: &str) -> io::Result<()> {
+        let mut control = self.load_control_request(run_id)?;
+        control.pause_requested = false;
+        control.updated_at_ms = now_ms();
+        write_json_pretty(&self.stop_request_path(run_id), &control)?;
+        let mut state = self.load_run(run_id)?;
+        if state.status == WorkflowRunStatus::Paused {
+            state.status = WorkflowRunStatus::Running;
+            self.write_state(&state)?;
+        }
+        Ok(())
+    }
+
+    pub fn pause_requested(&self, run_id: &str) -> io::Result<bool> {
+        Ok(self.load_control_request(run_id)?.pause_requested)
+    }
+
+    fn load_control_request(&self, run_id: &str) -> io::Result<WorkflowControlRequest> {
         let path = self.stop_request_path(run_id);
         if !path.exists() {
-            return Ok(false);
+            return Ok(WorkflowControlRequest::default());
         }
-        let request: WorkflowStopRequest = read_json(&path)?;
-        Ok(request.stop_requested)
+        read_json(&path)
     }
 
     pub fn record_agent_completed(
@@ -667,6 +706,7 @@ impl IntoWorkflowAgentRecord for WorkflowAgentCacheRecord {
             started_at_ms: None,
             completed_at_ms: None,
             usage: None,
+            tool_events: Vec::new(),
         }
     }
 }
@@ -762,6 +802,7 @@ fn read_agent_cache(path: &Path) -> io::Result<HashMap<String, CachedWorkflowAge
                             started_at_ms: record.started_at_ms,
                             completed_at_ms: record.completed_at_ms,
                             usage: record.usage,
+                            tool_events: record.tool_events,
                         },
                         output_present: record.output.present,
                     },
@@ -816,6 +857,7 @@ fn write_agent_cache(
                     started_at_ms: entry.record.started_at_ms,
                     completed_at_ms: entry.record.completed_at_ms,
                     usage: entry.record.usage,
+                    tool_events: entry.record.tool_events.clone(),
                 },
             )
         })
@@ -829,6 +871,20 @@ pub fn workflow_agent_team(opts: &Value) -> Option<String> {
         .map(str::trim)
         .filter(|team| !team.is_empty())
         .map(str::to_string)
+}
+
+pub fn workflow_agent_barrier(opts: &Value) -> Option<String> {
+    opts.get("barrier")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|barrier| !barrier.is_empty())
+        .map(str::to_string)
+}
+
+pub fn workflow_agent_min_hold_ms(opts: &Value) -> Option<u64> {
+    opts.get("minHoldMs")
+        .and_then(Value::as_u64)
+        .filter(|value| *value > 0)
 }
 
 fn write_json_pretty<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {

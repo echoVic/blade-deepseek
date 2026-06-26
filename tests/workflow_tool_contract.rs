@@ -60,6 +60,14 @@ fn workflow_draft_action_schema_is_registered_for_preview_decisions() {
     assert!(properties.get("action").is_some());
     assert!(properties.get("saveAs").is_some());
     assert!(properties.get("scope").is_some());
+    assert!(properties.get("script").is_some());
+    assert!(
+        properties["action"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value == "edit")
+    );
 }
 
 #[test]

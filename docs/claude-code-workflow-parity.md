@@ -4,6 +4,17 @@
 **Project**: Orca (blade-deepseek)
 **Goal**: Replicate the Claude Code Dynamic Workflows product loop in Orca before extending it with Orca-specific evidence and verifier features.
 
+**Reference snapshot**: Claude Code public docs checked on 2026-06-26:
+
+- [Dynamic workflows](https://code.claude.com/docs/en/workflows)
+- [Skills](https://code.claude.com/docs/en/skills)
+- [Subagents](https://code.claude.com/docs/en/sub-agents)
+- [Agent view](https://code.claude.com/docs/en/agent-view)
+- [Agent teams](https://code.claude.com/docs/en/agent-teams)
+- [Worktrees](https://code.claude.com/docs/en/worktrees)
+- [Hooks](https://code.claude.com/docs/en/hooks)
+- [Slash commands in the SDK](https://code.claude.com/docs/en/agent-sdk/slash-commands)
+
 ---
 
 ## Executive Summary
@@ -27,6 +38,37 @@ P0 should therefore focus on making workflow feel like a first-class agentic pro
 
 ---
 
+## Strategic Interpretation
+
+The thing to copy is not just a JavaScript runner. Claude Code's workflow value is an ecosystem position:
+
+```text
+skills/custom commands define reusable procedures
+subagents define specialized workers
+agent teams define supervised peer sessions
+worktrees isolate long-running source mutations
+hooks enforce deterministic lifecycle policy
+dynamic workflows move orchestration into runtime-executed code
+/workflows and agent view make the background work inspectable and controllable
+```
+
+Dynamic workflow is the highest-scale orchestration primitive in that stack. It is used when the plan itself should live outside the main conversation, intermediate results should stay out of the parent context window, and the user wants a script that can be read, approved, saved, rerun, paused, resumed, and inspected.
+
+For Orca, the equivalent should be:
+
+```text
+ORCA.md / project instructions
+-> skills or saved workflows for repeatable procedures
+-> subagents for delegated work
+-> workflow JS for high-scale orchestration
+-> workflow run manager for observability and control
+-> evidence/verifier for DeepSeek-native reliability
+```
+
+So the parity target is not "can Orca launch 16 agents". The target is "can Orca convert a high-level user request into a reviewable, reusable, inspectable, background orchestration asset with reliable state-derived reporting".
+
+---
+
 ## What Claude Code Workflow Means
 
 Claude Code Dynamic Workflows are valuable because they move orchestration out of the main conversational context and into a reusable script artifact.
@@ -41,6 +83,55 @@ Key product properties to replicate:
 6. **Scale by design**: intermediate results live in workflow state/script variables rather than flooding the parent session.
 
 Orca should match that loop first. Evidence-first reporting, deterministic verifiers, and benchmark contracts are important, but they are Orca-specific reliability enhancements layered on top.
+
+### Claude Code Capability Matrix
+
+| Claude Code capability | Product meaning | Orca parity target | Current Orca posture |
+| --- | --- | --- | --- |
+| Ask for `workflow` / `ultracode` | User can opt into workflow in natural language | Detect workflow intent and produce a draft preview, not immediate freeform execution | Keyword detection and workflow runtime exist; authoring loop is incomplete |
+| `/effort ultracode` | Agent can choose workflow for substantive tasks | Add an Orca mode such as `workflow_auto` or `effort=ultracode` later | Not present |
+| Generated JS workflow | Orchestration is code, not conversation state | Persist script, expose raw source, launch through runtime | Runtime supports JS workflow scripts |
+| Approval prompt | User sees phases and can approve/cancel/view script | Draft preview with run/edit/save/cancel | Draft primitives are being added; full UX still incomplete |
+| Background run | Session stays responsive while agents run | Keep task registry/background workflow launch | Present |
+| `/workflows` progress view | Inspect phases, agents, token totals, elapsed time, results | Run manager with list/detail/phase/agent drill-down | Basic panel exists; needs controls and richer detail |
+| Controls: pause/resume/stop/restart/save | User can manage long runs | Add deterministic run controls with cached completed results | Stop/rerun partially present; pause/restart need work |
+| Save workflow as command | Successful orchestration becomes reusable asset | Save to `.orca/workflows` or `~/.orca/workflows`; invoke as slash command | Named workflow resolution exists; command UX needs first-class treatment |
+| Args to saved workflow | Reuse without editing source | Parse and validate args schema; pass as JS global `args` | Args support exists or is being added; needs UI/contract polish |
+| Agent caps | Bound cost and runaway scripts | Keep max concurrent agents and max agents per run | Present |
+| No direct FS/shell in script | Script coordinates; agents mutate/read | Enforce JS host as orchestration-only | Mostly aligned |
+| Child agents inherit mode/tool policy | Workflows do not bypass safety | Define workflow child approval/tool/MCP policy clearly | Partially present; needs policy doc and tests |
+| Intermediate results live in script variables | Parent context stays small | Avoid dumping full JSON into chat; store artifacts in run state | Needs stricter reporting rules |
+
+---
+
+## Orca Design Boundary
+
+Orca is DeepSeek-native, so parity should be behavioral, not textual or architectural cloning.
+
+### Copy the User Contract
+
+- Natural-language workflow opt-in.
+- Reviewable generated plan before launch.
+- Background execution with visible progress.
+- Many subagents coordinated by runtime-owned script state.
+- Saved reusable workflows with command-like invocation.
+- Inspectable run history, phase state, agent detail, and final output.
+- Clear caps for concurrency, total agents, and cost blast radius.
+
+### Do Not Copy Blindly
+
+- Do not require Claude-specific permission modes or model names.
+- Do not assume Claude's exact `.claude/` directory semantics; use `.orca/` equivalents.
+- Do not make workflow reliability depend on model self-reporting.
+- Do not force all workflow reuse through skills if `.orca/workflows` is a cleaner primitive.
+- Do not treat hooks as P0 unless a workflow lifecycle policy needs deterministic enforcement.
+
+### Orca Differentiation
+
+- Use `evidence.json`, mailbox state, task-list state, and transcripts as first-class truth sources.
+- Let verifier output overrule optimistic final text.
+- Add benchmark/evidence contracts after the product loop works.
+- Preserve DeepSeek model-routing and budget semantics.
 
 ---
 
@@ -86,6 +177,20 @@ Orca should match that loop first. Evidence-first reporting, deterministic verif
 - Existing `/workflows` is useful but not yet a full management panel for script, run controls, and saved commands.
 - Named workflows exist, but reusable workflow discovery is not yet treated as a slash-command product surface.
 - Final reporting can still over-trust agent text unless grounded in workflow state/evidence.
+
+### Completion Evidence
+
+As of this implementation, the working tree covers the parity loop described in this document:
+
+- `WorkflowDraft` and `WorkflowDraftAction` are model-visible tool surfaces in `crates/orca-tools/src/registry.rs`.
+- Draft persistence, edit, save, cancel, and clone-from-run behavior live in `crates/orca-runtime/src/workflow/draft.rs`.
+- Runtime launch from `draftId`, resume cache reuse, pause/resume, restart failed, restart phase, concise status lines, and child tool-event capture live in `crates/orca-runtime/src/workflow/runner.rs`.
+- TUI runtime bridge support for workflow launch, saved workflow args, and draft actions lives in `crates/orca-tui/src/bridge.rs`.
+- Saved workflow slash invocation and collision-safe aliases live in `crates/orca-tui/src/commands/mod.rs`.
+- CLI workflow history/control commands live in `src/cli.rs`: `list`, `show`, `source`, `stop`, `pause`, `resume`, `clone`, `restart-failed`, and `restart-phase`.
+- Evidence contracts, deterministic verification statuses, required/failed tool checks, MCP failure checks, mutation-policy checks, and concurrency-threshold checks live in `crates/orca-runtime/src/workflow/verifier.rs`.
+
+The final validation gate for this work is `cargo fmt --check` plus `TMPDIR=/tmp PATH="/Users/bytedance/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/bin:$PATH" cargo test --workspace -- --nocapture`.
 
 ---
 
@@ -712,6 +817,227 @@ P0 is complete when all of these are true:
 - A web UI.
 
 These are valid later projects, but they should not block Claude Code workflow parity.
+
+---
+
+## Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Make Orca workflow behave like the Claude Code workflow product loop: generate, preview, edit/save/cancel, run in background, inspect, control, save, and rerun.
+
+**Architecture:** Keep JavaScript workflow execution in `orca-runtime`; keep model-visible tool contracts in `orca-tools`; expose durable state through `TaskRegistry` and TUI view models; make `.orca/workflows` and `~/.orca/workflows` the reusable workflow command registry. Evidence/verifier features layer on top of this loop and must not replace the user-facing workflow lifecycle.
+
+**Tech Stack:** Rust workspace, Node.js workflow host, JSONL events, Ratatui TUI, `.orca/workflow-sessions`, `.orca/workflows`, `serde_json`, existing `WorkflowRunner` / `WorkflowStateStore` / `WorkflowDraftStore`.
+
+### Global Constraints
+
+- Preserve current workflow DSL: `phase`, `agent`, `parallel`, `pipeline`, workflow IPC helpers, `export const meta`, `export const args`, and default export.
+- Use `.orca/workflows/<name>.js` for project workflows and `~/.orca/workflows/<name>.js` for user workflows.
+- Do not let saved workflow aliases override built-in slash commands; `/workflow:<name>` is always valid.
+- Workflow child agents must not bypass approval, tool, MCP, budget, or model-routing policy.
+- User-facing completion text must be concise and derived from workflow state; full JSON remains an artifact, not chat output.
+- Workflow tests that execute the JS host need bundled Node on `PATH`.
+
+### Task 1: Finish Workflow Draft Contract
+
+**Files:**
+
+- Modify: `crates/orca-core/src/workflow_types.rs`
+- Modify: `crates/orca-tools/src/registry.rs`
+- Modify: `crates/orca-runtime/src/controller.rs`
+- Modify: `crates/orca-runtime/src/workflow/draft.rs`
+- Test: `tests/workflow_tool_contract.rs`
+- Test: `tests/workflow_runtime_contract.rs`
+
+**Interfaces:**
+
+- Produces: `WorkflowDraft` JSON with `draftId`, `name`, `description`, `phases`, `script`, `estimatedAgentCount`, `maxConfiguredConcurrentAgents`, `sourceMutationRisk`, `scriptPath`.
+- Produces: `WorkflowDraftAction` actions `run`, `edit`, `save`, `cancel`.
+- Consumes: workflow script text and optional save scope/name.
+
+- [ ] Write failing tests for draft create/edit/save/cancel and metadata reparse after edit.
+- [ ] Verify tests fail before implementation when the action or output field is missing.
+- [ ] Complete the minimal core/runtime/tool implementation.
+- [ ] Run:
+
+```bash
+TMPDIR=/tmp PATH="/Users/bytedance/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/bin:$PATH" cargo test --test workflow_tool_contract workflow_draft -- --nocapture
+TMPDIR=/tmp PATH="/Users/bytedance/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/bin:$PATH" cargo test --test workflow_runtime_contract workflow_draft -- --nocapture
+```
+
+Expected: all draft contract tests pass.
+
+### Task 2: Launch Drafts Through the Normal Runner
+
+**Files:**
+
+- Modify: `crates/orca-runtime/src/workflow/runner.rs`
+- Modify: `crates/orca-runtime/src/workflow/state.rs`
+- Modify: `crates/orca-runtime/src/controller.rs`
+- Test: `tests/workflow_runtime_contract.rs`
+
+**Interfaces:**
+
+- Consumes: `WorkflowInput { draft_id: Some(String), script/name/script_path: None }`.
+- Produces: normal workflow run state with the original `draftId`, persisted script path, run id, task id, evidence path, and concise launch output.
+
+- [ ] Write failing tests that launching `draftId` rejects combinations with `script`, `name`, or `scriptPath`.
+- [ ] Write failing tests that launching a draft records the draft id in run artifacts.
+- [ ] Implement draft resolution inside the existing `WorkflowRunner` launch path.
+- [ ] Run:
+
+```bash
+TMPDIR=/tmp PATH="/Users/bytedance/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/bin:$PATH" cargo test --test workflow_runtime_contract workflow_draft_launch -- --nocapture
+```
+
+Expected: draft launch behaves like a normal workflow run and does not fork a parallel runtime path.
+
+### Task 3: Make Saved Workflows Command-Like
+
+**Files:**
+
+- Modify: `crates/orca-runtime/src/workflow/script.rs`
+- Modify: `crates/orca-tui/src/commands/mod.rs`
+- Modify: `crates/orca-tui/src/bridge.rs`
+- Test: `tests/workflow_script_contract.rs`
+- Test: TUI command tests under `crates/orca-tui`
+
+**Interfaces:**
+
+- Consumes: `.orca/workflows/<name>.js`, `~/.orca/workflows/<name>.js`, `/workflow:<name>`, optional `/<name>` alias, and args in either JSON object or `key=value` form.
+- Produces: resolved script path, parsed `meta`, parsed `args` schema, launch request.
+
+- [ ] Write failing tests for project-over-user resolution order.
+- [ ] Write failing tests for built-in slash command collision handling.
+- [ ] Write failing tests for `export const args` defaults and validation.
+- [ ] Implement registry/command resolution without hardcoding one workflow name.
+- [ ] Run:
+
+```bash
+TMPDIR=/tmp PATH="/Users/bytedance/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/bin:$PATH" cargo test --test workflow_script_contract workflow -- --nocapture
+cargo test -p orca-tui saved_workflow -- --nocapture
+```
+
+Expected: saved workflows are discoverable and invocable as command-like assets.
+
+### Task 4: Upgrade `/workflows` Into a Run Manager
+
+**Files:**
+
+- Modify: `crates/orca-tui/src/ui.rs`
+- Modify: `crates/orca-tui/src/app.rs`
+- Modify: `crates/orca-tui/src/types.rs` if current state structs are too narrow.
+- Modify: `crates/orca-tui/src/bridge.rs`
+- Test: TUI workflow panel tests under `crates/orca-tui`
+
+**Interfaces:**
+
+- Consumes: workflow task summaries, phase summaries, agent summaries, run artifacts, status line, failure count, cost/duration fields.
+- Produces: list view, run detail view, agent detail view, and controls.
+
+- [ ] Write failing tests for rendering phase rows and agent rows for selected workflow.
+- [ ] Add list/detail/agent-detail state if the current panel cannot represent drill-down.
+- [ ] Add controls for stop, rerun, resume-from-run, and save-as-workflow.
+- [ ] Keep pause/resume/restart-agent/restart-phase as P1 unless the run state is already sufficient.
+- [ ] Run:
+
+```bash
+cargo test -p orca-tui workflow -- --nocapture
+```
+
+Expected: `/workflows` can explain what happened without asking the user to inspect raw JSON.
+
+### Task 5: Make Final Reporting Evidence-Derived
+
+**Files:**
+
+- Modify: `crates/orca-runtime/src/workflow/runner.rs`
+- Modify: `crates/orca-runtime/src/workflow/report.rs`
+- Modify: `crates/orca-runtime/src/workflow/state.rs`
+- Test: `tests/workflow_runtime_contract.rs`
+
+**Interfaces:**
+
+- Consumes: `WorkflowRunState`, phase summaries, agent status counts, max observed concurrency, configured concurrency cap.
+- Produces: concise status line:
+
+```text
+Workflow completed
+Agents: 18 completed, 1 failed, 0 running
+Phases: 4 completed, 1 failed, 0 with fallback
+Max observed concurrency: 6 / 16
+Inspect: /workflows -> <run id>
+```
+
+- [ ] Write failing tests that completion notifications do not contain a full JSON dump.
+- [ ] Write failing tests that failed agents appear in the deterministic status line.
+- [ ] Implement status-line generation from run state.
+- [ ] Run:
+
+```bash
+TMPDIR=/tmp PATH="/Users/bytedance/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/bin:$PATH" cargo test --test workflow_runtime_contract workflow_status -- --nocapture
+```
+
+Expected: the assistant cannot claim success when run state records unresolved failures.
+
+### Task 6: Add P1 Run Controls
+
+**Files:**
+
+- Modify: `crates/orca-runtime/src/workflow/state.rs`
+- Modify: `crates/orca-runtime/src/workflow/runner.rs`
+- Modify: `crates/orca-tui/src/bridge.rs`
+- Modify: `crates/orca-tui/src/ui.rs`
+- Test: `tests/workflow_runtime_contract.rs`
+
+**Interfaces:**
+
+- Produces: pause workflow, resume workflow, restart failed agent, restart phase, clone run as draft.
+- Consumes: completed result cache, phase records, agent records, original script path, original launch args.
+
+- [ ] Write failing tests for stop/pause/resume state transitions.
+- [ ] Write failing tests for clone-run-as-draft preserving script and args.
+- [ ] Add restart failed agent only after agent call inputs are durably stored.
+- [ ] Add restart phase only after phase boundary and dependencies are unambiguous.
+- [ ] Run focused runtime tests, then TUI workflow tests.
+
+Expected: long workflows can be managed without rerunning successful work unnecessarily.
+
+### Task 7: Add P2 Evidence Contracts
+
+**Files:**
+
+- Modify: `crates/orca-core/src/workflow_types.rs`
+- Modify: `crates/orca-runtime/src/workflow/state.rs`
+- Modify: `crates/orca-runtime/src/workflow/verifier.rs`
+- Modify: `crates/orca-runtime/src/workflow/runner.rs`
+- Test: `tests/workflow_runtime_contract.rs`
+- Test: `tests/workflow_script_contract.rs`
+
+**Interfaces:**
+
+- Produces: structured evidence for required tool calls, expected tool failures, expected MCP failures, mutation policy, concurrency threshold, barrier/min-hold runs.
+- Consumes: per-agent tool/MCP events and workflow-level contract declarations.
+
+- [ ] Write failing verifier tests where agent text claims success but evidence is missing.
+- [ ] Record child-agent tool/MCP events rather than inferring from error strings.
+- [ ] Implement verifier outputs `proven`, `not_proven`, `failed`, and `completed_with_failures`.
+- [ ] Run workflow runtime and script contract tests.
+
+Expected: workflow benchmark results become auditable, not just plausible.
+
+### Final Validation Gate
+
+Before commit/push, run:
+
+```bash
+cargo fmt --check
+TMPDIR=/tmp PATH="/Users/bytedance/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/bin:$PATH" cargo test --workspace -- --nocapture
+git status --short -uall
+```
+
+The implementation is not complete until each acceptance criterion in this document has an explicit passing test or a documented manual TUI verification note.
 
 ---
 

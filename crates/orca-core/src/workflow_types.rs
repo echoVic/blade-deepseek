@@ -23,6 +23,8 @@ pub struct WorkflowInput {
     pub script_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resume_from_run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restart_phase: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -43,6 +45,8 @@ pub struct WorkflowDraft {
     pub phases: Vec<String>,
     pub script: String,
     pub script_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub args: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimated_agent_count: Option<u32>,
     pub max_configured_concurrent_agents: u32,
@@ -170,6 +174,44 @@ pub enum WorkflowAgentFailureKind {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
+pub enum WorkflowMutationPolicy {
+    ReadOnly,
+    AllowSourceMutation,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkflowEvidenceContract {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_tool_calls: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expected_tool_failures: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expected_mcp_failures: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mutation_policy: Option<WorkflowMutationPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_observed_concurrency: Option<u32>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkflowEvidenceToolEvent {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub is_mcp: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum WorkflowEvidenceFailureKind {
     AgentFailed,
     PhaseFailedContinue,
@@ -240,6 +282,10 @@ pub struct WorkflowEvidenceAgent {
     pub call_path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub team: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub barrier: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_hold_ms: Option<u64>,
     pub input_hash: String,
     pub status: WorkflowAgentStatus,
     pub attempt: u32,
@@ -256,6 +302,8 @@ pub struct WorkflowEvidenceAgent {
     pub completed_at_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<UsageTotals>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_events: Vec<WorkflowEvidenceToolEvent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_kind: Option<WorkflowAgentFailureKind>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -304,6 +352,8 @@ pub struct WorkflowEvidenceBundle {
     pub max_configured_concurrent_agents: u32,
     #[serde(default)]
     pub max_observed_concurrent_agents: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contract: Option<WorkflowEvidenceContract>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub final_summary: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

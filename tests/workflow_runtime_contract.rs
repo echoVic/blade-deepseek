@@ -233,6 +233,38 @@ fn workflow_draft_store_saves_reusable_workflow_and_cancels_draft() {
 }
 
 #[test]
+fn workflow_draft_store_edits_script_and_reparses_preview_metadata() {
+    let temp = tempdir().unwrap();
+    let draft_store = WorkflowDraftStore::new(temp.path().join("session").join("workflow-drafts"));
+    let draft = draft_store
+        .create_from_script(
+            "session-1",
+            temp.path(),
+            "export const meta = { name: 'audit', description: 'Audit', phases: ['scan'] };\nexport default 'old';",
+            8,
+        )
+        .expect("draft is created");
+
+    let edited = draft_store
+        .edit_script(
+            &draft.draft_id,
+            "export const meta = { name: 'audit-v2', description: 'Edited audit', phases: ['scan', 'report'] };\nexport default 'new';",
+            8,
+        )
+        .expect("draft is edited");
+
+    assert_eq!(edited.draft_id, draft.draft_id);
+    assert_eq!(edited.name, "audit-v2");
+    assert_eq!(edited.description, "Edited audit");
+    assert_eq!(edited.phases, vec!["scan", "report"]);
+    assert_eq!(edited.estimated_agent_count, None);
+    assert_eq!(
+        fs::read_to_string(draft_store.script_path(&draft.draft_id)).unwrap(),
+        edited.script
+    );
+}
+
+#[test]
 fn workflow_runner_applies_exported_args_schema_defaults_to_runtime_args() {
     if !orca_runtime::workflow::host::WorkflowHost::node_available() {
         return;
@@ -253,11 +285,13 @@ fn workflow_runner_applies_exported_args_schema_defaults_to_runtime_args() {
     let session_dir = temp.path().join("session");
     let runner = WorkflowRunner::new(config, tasks.clone(), session_dir.clone());
     let launched = runner
-        .launch(WorkflowLaunchRequest::from(orca_core::workflow_types::WorkflowInput {
-            script_path: Some(script.display().to_string()),
-            args: Some(json!({ "target": "src" })),
-            ..Default::default()
-        }))
+        .launch(WorkflowLaunchRequest::from(
+            orca_core::workflow_types::WorkflowInput {
+                script_path: Some(script.display().to_string()),
+                args: Some(json!({ "target": "src" })),
+                ..Default::default()
+            },
+        ))
         .expect("workflow launches with schema defaults");
 
     assert!(launched.summary.contains("\"target\":\"src\""));
@@ -1909,6 +1943,144 @@ fn workflow_runner_stops_when_control_file_is_requested() {
 }
 
 #[test]
+fn workflow_runner_pauses_and_resumes_from_control_file() {
+    if !orca_runtime::workflow::host::WorkflowHost::node_available() {
+        return;
+    }
+
+    let temp = tempdir().unwrap();
+    let script = temp.path().join("workflow.js");
+    fs::write(
+        &script,
+        "export const meta = { name: 'pause-control', description: 'Pause control test', phases: [] };\nawait agent('first');\nexport default await agent('second');",
+    )
+    .unwrap();
+
+    let mut config = mock_run_config(temp.path());
+    config.hooks = vec![HookConfig {
+        event: HookEvent::PreModelCall,
+        command: "sleep 0.7".to_string(),
+        tool: None,
+    }];
+    let tasks = TaskRegistry::new("session-1".to_string());
+    let session_dir = temp.path().join("session");
+    let runner = WorkflowRunner::new(config, tasks.clone(), session_dir.clone());
+
+    let launch = runner
+        .launch_background(WorkflowLaunchRequest::from_script_path(
+            script.display().to_string(),
+        ))
+        .unwrap();
+    let task_id = launch.task_id.clone();
+    let run_id = launch.output.run_id.as_deref().unwrap().to_string();
+    let store = WorkflowStateStore::new(session_dir.join("workflow-runs"));
+
+    thread::sleep(Duration::from_millis(150));
+    store.request_pause(&run_id).expect("request pause");
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        let state = store.load_run(&run_id).expect("run state");
+        if state.status == WorkflowRunStatus::Paused {
+            let task = tasks.get(&task_id).expect("task record");
+            assert_eq!(task.status, TaskStatus::Paused);
+            store.request_resume(&run_id).expect("request resume");
+            let result = launch.join().unwrap().unwrap();
+            assert_eq!(result.output.status, "completed");
+            let completed_state = store.load_run(&run_id).expect("completed state");
+            assert_eq!(completed_state.status, WorkflowRunStatus::Completed);
+            return;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+
+    panic!("workflow did not enter paused state");
+}
+
+#[test]
+fn workflow_draft_store_clones_run_script_and_args_as_draft() {
+    if !orca_runtime::workflow::host::WorkflowHost::node_available() {
+        return;
+    }
+
+    let temp = tempdir().unwrap();
+    let script = temp.path().join("workflow.js");
+    fs::write(
+        &script,
+        "export const meta = { name: 'clone-me', description: 'Clone run', phases: [] };\nexport const args = { target: { type: 'string', required: true } };\nexport default args.target;",
+    )
+    .unwrap();
+
+    let config = mock_run_config(temp.path());
+    let tasks = TaskRegistry::new("session-1".to_string());
+    let session_dir = temp.path().join("session");
+    let runner = WorkflowRunner::new(config, tasks, session_dir.clone());
+    let launched = runner
+        .launch(WorkflowLaunchRequest::from(
+            orca_core::workflow_types::WorkflowInput {
+                script_path: Some(script.display().to_string()),
+                args: Some(json!({ "target": "crates" })),
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+
+    let run_id = launched.output.run_id.as_deref().expect("run id");
+    let state_store = WorkflowStateStore::new(session_dir.join("workflow-runs"));
+    let draft_store = WorkflowDraftStore::new(session_dir.join("workflow-drafts"));
+    let draft = draft_store
+        .clone_from_run(&state_store, run_id, 8)
+        .expect("clone run as draft");
+
+    assert_eq!(draft.name, "clone-me");
+    assert_eq!(draft.args, Some(json!({ "target": "crates" })));
+    assert!(
+        fs::read_to_string(draft_store.script_path(&draft.draft_id))
+            .unwrap()
+            .contains("export const args")
+    );
+}
+
+#[test]
+fn workflow_evidence_records_child_tool_events_from_jsonl() {
+    if !orca_runtime::workflow::host::WorkflowHost::node_available() {
+        return;
+    }
+
+    let temp = tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "hello workflow").unwrap();
+    let script = temp.path().join("workflow.js");
+    fs::write(
+        &script,
+        "export const meta = { name: 'tool-events', description: 'Tool event evidence', phases: [] };\nexport default await agent('read README.md');",
+    )
+    .unwrap();
+
+    let config = mock_run_config(temp.path());
+    let tasks = TaskRegistry::new("session-1".to_string());
+    let session_dir = temp.path().join("session");
+    let runner = WorkflowRunner::new(config, tasks, session_dir.clone());
+    let launched = runner
+        .launch(WorkflowLaunchRequest::from_script_path(
+            script.display().to_string(),
+        ))
+        .unwrap();
+
+    let run_id = launched.output.run_id.as_deref().expect("run id");
+    let store = WorkflowStateStore::new(session_dir.join("workflow-runs"));
+    let evidence = store.load_evidence_bundle(run_id).expect("evidence");
+    let agent = evidence.agents.first().expect("agent evidence");
+    assert!(
+        agent
+            .tool_events
+            .iter()
+            .any(|event| event.name == "read_file" && event.status.as_deref() == Some("completed")),
+        "expected child read_file tool event in evidence: {:?}",
+        agent.tool_events
+    );
+}
+
+#[test]
 fn agent_cap_failure_is_recorded() {
     if !orca_runtime::workflow::host::WorkflowHost::node_available() {
         return;
@@ -1918,11 +2090,12 @@ fn agent_cap_failure_is_recorded() {
     let script = temp.path().join("workflow.js");
     fs::write(
         &script,
-        "export const meta = { name: 'cap', description: 'Cap test', phases: [] };\nfor (let i = 0; i < 1001; i++) await agent(`agent ${i}`);\nexport default 'unreachable';",
+        "export const meta = { name: 'cap', description: 'Cap test', phases: [] };\nfor (let i = 0; i < 4; i++) await agent(`agent ${i}`);\nexport default 'unreachable';",
     )
     .unwrap();
 
-    let config = mock_run_config(temp.path());
+    let mut config = mock_run_config(temp.path());
+    config.workflows.max_agents_per_run = 3;
     let tasks = TaskRegistry::new("session-1".to_string());
     let session_dir = temp.path().join("session");
     let runner = WorkflowRunner::new(config, tasks.clone(), session_dir.clone());
@@ -1934,7 +2107,7 @@ fn agent_cap_failure_is_recorded() {
 
     assert!(
         err.to_string()
-            .contains("maximum workflow agent count 1000 exceeded")
+            .contains("maximum workflow agent count 3 exceeded")
     );
 
     let task = tasks.list().into_iter().next().expect("workflow task");
@@ -1943,13 +2116,13 @@ fn agent_cap_failure_is_recorded() {
     let store = WorkflowStateStore::new(session_dir.join("workflow-runs"));
     let state = store.load_run(run_id).expect("run state");
     assert_eq!(state.status, WorkflowRunStatus::Failed);
-    assert_eq!(state.total_agent_count, 1000);
+    assert_eq!(state.total_agent_count, 3);
     assert!(
         state
             .error
             .as_deref()
             .unwrap_or_default()
-            .contains("maximum workflow agent count 1000 exceeded")
+            .contains("maximum workflow agent count 3 exceeded")
     );
 }
 
