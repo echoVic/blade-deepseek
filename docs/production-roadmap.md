@@ -3,8 +3,8 @@
 > Goal: evolve Orca into a production-grade DeepSeek-native agent runtime.
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
-Last updated: 2026-06-26
-Current baseline: v0.1.38 history/session store boundary
+Last updated: 2026-06-27
+Current baseline: v0.1.42 workflow parity loop and process timeout hardening
 
 ---
 
@@ -27,7 +27,7 @@ working baseline used to prioritize the next patch releases.
 | Project instructions | User/project/rules files with includes | `AGENTS.md` style layered instructions | Implemented |
 | Memory | Manual `/remember` plus optional project extraction | Codex memories extension | Partial |
 | Persistent goals | `/goal` with persisted state plus goal-scoped `get_goal`, `create_goal`, and narrow `update_goal` | Codex goal extension | Implemented |
-| Workflows | JavaScript workflow DSL, multi-stage runner, task state, notifications, runtime status events, and worktree-isolated/recoverable agent runs | Codex automations/tasks concepts | Implemented; packaging/docs can improve |
+| Workflows | JavaScript workflow DSL, generated drafts, edit/save/run controls, reusable workflow commands, task state, notifications, runtime status events, evidence-bound reports, and worktree-isolated/recoverable agent runs | Codex/Claude workflow orchestration concepts | Implemented |
 | TUI | Markdown-ish rendering, themes, Vim mode, diff preview, slash commands, workflow panel, elapsed timers, and clearer approval dialogs | Codex/Claude richer terminal UX | Partial |
 | History | JSONL transcripts, resume/fork/search/archive/compress with a dedicated `SessionStore` boundary | Codex thread store with queryable metadata | Partial |
 | Release | GitHub release + npm alias distribution scripts, retrying post-publish GitHub/npm/npm-exec verification, and a reusable real API e2e release gate | Codex npm/native release model | Implemented |
@@ -169,6 +169,48 @@ everything in one history module.
 
 **Verification:** Rust tests for `orca-runtime`, plus release staging and
 public publish verification.
+
+### P5: Claude Code Workflow Parity
+
+**Release target:** v0.1.42
+
+**Current status:** generated workflow drafts, draft edit/save/cancel actions,
+launch from draft, saved workflow slash invocation, argument schema validation,
+pause/resume/clone/restart controls, and evidence-bound final reporting are
+implemented.
+
+**Goal:** make workflow a first-class reviewable artifact rather than only a
+JavaScript runner.
+
+**Scope:**
+
+1. Generate workflow drafts from model tool calls and expose preview metadata.
+2. Let users edit, save, cancel, run, clone, pause, resume, and restart
+   workflow runs through durable state.
+3. Treat saved project/user workflows as reusable command-like assets.
+4. Ground final workflow status and reports in evidence, verifier contracts,
+   and child tool events.
+
+**Verification:** workflow CLI/runtime/script/tool/host/event contract tests,
+release staging, site build/SEO checks, and public publish verification.
+
+### P6: Process Timeout Cleanup
+
+**Release target:** v0.1.42
+
+**Current status:** shell, external tools, hook commands, sandbox helpers, and
+verifier commands now share non-interactive child process setup and timeout
+cleanup behavior.
+
+**Goal:** prevent timed-out commands from leaving descendant processes behind
+while keeping existing command surfaces stable.
+
+**Scope:**
+
+1. Add shared non-interactive process preparation.
+2. Terminate the full child process tree on timeout.
+3. Apply the timeout behavior consistently across bash, external tools, hooks,
+   sandboxed commands, and verifier execution.
 
 ### Skills And Plugins
 
