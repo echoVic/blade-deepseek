@@ -10,6 +10,7 @@ fn workflow_input_accepts_official_fields() {
         "description": "ignored",
         "title": "ignored",
         "args": { "paths": ["src"] },
+        "draftId": "workflow-draft-1",
         "scriptPath": "/tmp/workflow.js",
         "resumeFromRunId": "workflow-run-1"
     }))
@@ -18,6 +19,7 @@ fn workflow_input_accepts_official_fields() {
     assert!(input.script.unwrap().contains("export const meta"));
     assert_eq!(input.name.as_deref(), Some("audit"));
     assert_eq!(input.args.unwrap()["paths"][0], "src");
+    assert_eq!(input.draft_id.as_deref(), Some("workflow-draft-1"));
     assert_eq!(input.script_path.as_deref(), Some("/tmp/workflow.js"));
     assert_eq!(input.resume_from_run_id.as_deref(), Some("workflow-run-1"));
 }
@@ -51,6 +53,27 @@ fn workflow_tool_name_round_trips() {
     assert_eq!(ToolName::Workflow.as_str(), "Workflow");
     assert_eq!(ToolName::from_str("Workflow"), Some(ToolName::Workflow));
     assert_eq!(ToolName::from_str("workflow"), Some(ToolName::Workflow));
+    assert_eq!(ToolName::WorkflowDraft.as_str(), "WorkflowDraft");
+    assert_eq!(
+        ToolName::from_str("WorkflowDraft"),
+        Some(ToolName::WorkflowDraft)
+    );
+    assert_eq!(
+        ToolName::from_str("workflow_draft"),
+        Some(ToolName::WorkflowDraft)
+    );
+    assert_eq!(
+        ToolName::WorkflowDraftAction.as_str(),
+        "WorkflowDraftAction"
+    );
+    assert_eq!(
+        ToolName::from_str("WorkflowDraftAction"),
+        Some(ToolName::WorkflowDraftAction)
+    );
+    assert_eq!(
+        ToolName::from_str("workflow_draft_action"),
+        Some(ToolName::WorkflowDraftAction)
+    );
 }
 
 #[test]

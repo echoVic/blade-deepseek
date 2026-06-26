@@ -7,6 +7,8 @@ use crate::cost_types::UsageTotals;
 #[serde(rename_all = "camelCase")]
 pub struct WorkflowInput {
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub draft_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub script: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
@@ -20,6 +22,48 @@ pub struct WorkflowInput {
     pub script_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resume_from_run_id: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowSourceMutationRisk {
+    ReadOnlyLikely,
+    SourceMutationPossible,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkflowDraft {
+    pub draft_id: String,
+    pub session_id: String,
+    pub cwd: String,
+    pub name: String,
+    pub description: String,
+    pub phases: Vec<String>,
+    pub script: String,
+    pub script_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_agent_count: Option<u32>,
+    pub max_configured_concurrent_agents: u32,
+    pub source_mutation_risk: WorkflowSourceMutationRisk,
+    pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkflowDraftActionOutput {
+    pub status: String,
+    pub action: String,
+    pub draft_id: String,
+    pub workflow_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saved_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub script_path: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

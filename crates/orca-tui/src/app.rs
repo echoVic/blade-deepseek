@@ -210,7 +210,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                     AppStatus::Idle | AppStatus::WaitingUserInput => {
                         if insert_pasted_text(&mut textarea, pasted) {
                             state.reset_history_navigation();
-                            update_slash_menu(&textarea, &mut state);
+                            update_slash_menu(&textarea, &mut state, &config);
                             update_mention_candidates(&textarea, &mut state, &config);
                         }
                     }
@@ -580,7 +580,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                                 };
                                 if changed {
                                     state.reset_history_navigation();
-                                    update_slash_menu(&textarea, &mut state);
+                                    update_slash_menu(&textarea, &mut state, &config);
                                     update_mention_candidates(&textarea, &mut state, &config);
                                 }
                             }
@@ -608,7 +608,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                             };
                             if changed {
                                 state.reset_history_navigation();
-                                update_slash_menu(&textarea, &mut state);
+                                update_slash_menu(&textarea, &mut state, &config);
                                 update_mention_candidates(&textarea, &mut state, &config);
                             }
                         }
@@ -1171,8 +1171,8 @@ mod tests {
                 items: commands::all_commands()
                     .iter()
                     .map(|(command, description)| SlashMenuItem {
-                        command,
-                        description,
+                        command: (*command).to_string(),
+                        description: (*description).to_string(),
                     })
                     .collect(),
                 selected: commands::all_commands()
@@ -1222,8 +1222,8 @@ mod tests {
             items: commands::all_commands()
                 .iter()
                 .map(|(command, description)| SlashMenuItem {
-                    command,
-                    description,
+                    command: (*command).to_string(),
+                    description: (*description).to_string(),
                 })
                 .collect(),
             selected: commands::all_commands()
@@ -1315,6 +1315,28 @@ mod tests {
             Ok(UserAction::SetModel(model)) if model == "deepseek-v4-pro"
         ));
         assert!(state.slash_menu.is_none());
+    }
+
+    #[test]
+    fn workflow_slash_command_dispatches_structured_run_action() {
+        let (mut state, _rx) = test_state();
+        let mut config = test_config(HistoryMode::Record);
+        let shared_config = Arc::new(Mutex::new(config.clone()));
+        let (action_tx, action_rx) = mpsc::channel();
+
+        handle_slash_command(
+            "/workflow:security-audit target=src maxAgents=8",
+            &mut config,
+            &shared_config,
+            &mut state,
+            &action_tx,
+        );
+
+        assert!(matches!(
+            action_rx.try_recv(),
+            Ok(UserAction::RunWorkflow { name, args })
+                if name == "security-audit" && args.as_deref() == Some("target=src maxAgents=8")
+        ));
     }
 
     #[test]
@@ -1419,12 +1441,17 @@ mod tests {
 
 // --- Slash menu helpers ---
 
-fn update_slash_menu(textarea: &TextArea, state: &mut AppState) {
+fn update_slash_menu(textarea: &TextArea, state: &mut AppState, config: &RunConfig) {
     let text = textarea_text(textarea);
     if textarea.lines().len() == 1 && text.starts_with('/') {
         let filter = &text;
-        let items: Vec<SlashMenuItem> = commands::all_commands()
-            .iter()
+        let cwd = config
+            .cwd
+            .as_deref()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        let items: Vec<SlashMenuItem> = commands::available_commands(&cwd)
+            .into_iter()
             .filter(|(cmd, _)| cmd.starts_with(filter))
             .map(|(cmd, desc)| SlashMenuItem {
                 command: cmd,
@@ -1618,7 +1645,7 @@ fn handle_slash_menu_key(
             true
         }
         KeyCode::Tab => {
-            let selected_cmd = menu.items[menu.selected].command;
+            let selected_cmd = menu.items[menu.selected].command.clone();
             if selected_cmd == "/goal" {
                 *textarea = make_textarea_with_text("/goal ", vim_state, theme);
                 state.slash_menu = None;
@@ -1639,7 +1666,7 @@ fn handle_slash_menu_key(
             true
         }
         KeyCode::Enter => {
-            let selected_cmd = menu.items[menu.selected].command;
+            let selected_cmd = menu.items[menu.selected].command.clone();
             select_slash_menu_command(
                 selected_cmd,
                 menu.items.clone(),
@@ -1661,7 +1688,7 @@ fn handle_slash_menu_key(
         _ => {
             // Pass key to textarea for filtering
             textarea.input(Input::from(ev.clone()));
-            update_slash_menu(textarea, state);
+            update_slash_menu(textarea, state, config);
             true
         }
     }
@@ -1669,7 +1696,7 @@ fn handle_slash_menu_key(
 
 #[allow(clippy::too_many_arguments)]
 fn select_slash_menu_command(
-    selected_cmd: &'static str,
+    selected_cmd: String,
     menu_items: Vec<SlashMenuItem>,
     selected: usize,
     state: &mut AppState,
@@ -1680,7 +1707,7 @@ fn select_slash_menu_command(
     vim_state: &VimState,
     theme: &Theme,
 ) {
-    match selected_cmd {
+    match selected_cmd.as_str() {
         "/model" => {
             let models: Vec<String> = commands::available_models()
                 .iter()
@@ -1741,10 +1768,10 @@ fn select_slash_menu_command(
             }
         }
         _ => {
-            *textarea = make_textarea_with_text(selected_cmd, vim_state, theme);
+            *textarea = make_textarea_with_text(&selected_cmd, vim_state, theme);
             state.slash_menu = None;
             if let Some(outcome) =
-                handle_slash_command(selected_cmd, config, shared_config, state, action_tx)
+                handle_slash_command(&selected_cmd, config, shared_config, state, action_tx)
             {
                 match outcome {
                     SlashOutcome::Continue => {
@@ -2223,6 +2250,37 @@ fn agent_loop_thread(
                     let _ = orca_runtime::notify::notify("Orca", "Task completed");
                 }
             }
+            Ok(UserAction::RunWorkflow { name, args }) => {
+                cancel.reset();
+                let cfg = config.lock().unwrap().clone();
+                if session.is_none() {
+                    let prompt = format!("Run saved workflow `{name}`");
+                    let transcript = preloaded.lock().unwrap().take();
+                    session = match bridge::TuiConversationSession::new_with_preloaded(
+                        &cfg, &prompt, transcript,
+                    ) {
+                        Ok(session) => Some(session),
+                        Err(error) => {
+                            let _ = event_tx.send(TuiEvent::Error(format!(
+                                "failed to initialize conversation history: {error}"
+                            )));
+                            continue;
+                        }
+                    };
+                }
+                if let Some(session) = session.as_ref() {
+                    bridge::launch_saved_workflow_for_tui(
+                        &cfg,
+                        session,
+                        &name,
+                        args.as_deref(),
+                        &event_tx,
+                    );
+                }
+                if cfg.desktop_notifications {
+                    let _ = orca_runtime::notify::notify("Orca", "Workflow launched");
+                }
+            }
             Ok(UserAction::Interrupt) => {
                 // Cancel already set by TUI thread; just continue waiting for next Submit
             }
@@ -2535,6 +2593,10 @@ fn handle_slash_command(
         }
         SlashCommand::WorkflowList => {
             state.show_workflows();
+        }
+        SlashCommand::WorkflowRun { name, args } => {
+            state.enter_running();
+            let _ = action_tx.send(UserAction::RunWorkflow { name, args });
         }
         SlashCommand::AgentDashboard => {
             state.show_agents();

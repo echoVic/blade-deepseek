@@ -2,6 +2,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender};
 use std::thread;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use orca_approval::ApprovalPolicy;
 use orca_core::approval_types::ApprovalDecision;
@@ -14,7 +15,7 @@ use orca_core::model::ModelRouteContext;
 use orca_core::provider_types::ProviderStep;
 use orca_core::subagent_types::SubagentType;
 use orca_core::tool_types;
-use orca_core::workflow_types::WorkflowInput;
+use orca_core::workflow_types::{WorkflowDraftActionOutput, WorkflowInput};
 use orca_mcp::McpRegistry;
 use orca_provider::ProviderConfig;
 use orca_provider::tool_schema::{
@@ -34,7 +35,7 @@ use orca_runtime::session::InteractiveSession;
 use orca_runtime::subagent::{self, SubagentMode};
 use orca_runtime::tasks::TaskRegistry;
 use orca_runtime::tool_invocation::{approval_request_for_invocation, prepare_tool_invocation};
-use orca_runtime::workflow::{WorkflowLaunchRequest, WorkflowRunner};
+use orca_runtime::workflow::{WorkflowDraftStore, WorkflowLaunchRequest, WorkflowRunner};
 use serde::Deserialize;
 
 use crate::diff;
@@ -167,6 +168,96 @@ impl TuiConversationSession {
     pub fn compact(&mut self, config: &RunConfig, cwd: &Path) -> (usize, usize) {
         self.runtime.compact(config, cwd)
     }
+}
+
+pub fn launch_saved_workflow_for_tui(
+    config: &RunConfig,
+    session: &TuiConversationSession,
+    name: &str,
+    raw_args: Option<&str>,
+    event_tx: &Sender<TuiEvent>,
+) {
+    let cwd = config
+        .cwd
+        .clone()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let args = match raw_args.map(parse_saved_workflow_args).transpose() {
+        Ok(args) => args,
+        Err(error) => {
+            let _ = event_tx.send(TuiEvent::Error(error));
+            return;
+        }
+    };
+    let input = WorkflowInput {
+        name: Some(name.to_string()),
+        args,
+        ..Default::default()
+    };
+    let raw_arguments = match serde_json::to_string(&input) {
+        Ok(raw_arguments) => raw_arguments,
+        Err(error) => {
+            let _ = event_tx.send(TuiEvent::Error(error.to_string()));
+            return;
+        }
+    };
+    let request = tool_types::ToolRequest {
+        id: format!("tui-workflow-{}", now_ms()),
+        name: tool_types::ToolName::Workflow,
+        action: orca_core::approval_types::ActionKind::Agent,
+        target: Some(name.to_string()),
+        raw_arguments: Some(raw_arguments),
+    };
+    let _ = event_tx.send(TuiEvent::ToolRequested {
+        id: request.id.clone(),
+        name: request.name.as_str().to_string(),
+        target: request.target.clone(),
+    });
+    let result =
+        execute_workflow_for_tui(config, &cwd, &request, event_tx, session.task_registry());
+    let _ = event_tx.send(TuiEvent::ToolCompleted {
+        id: request.id,
+        name: request.name.as_str().to_string(),
+        status: result.status.as_str().to_string(),
+        output: result.output.or(result.error).unwrap_or_default(),
+        diff: None,
+        kind: Some(tool_result_kind_label(result.kind).to_string()),
+    });
+}
+
+fn parse_saved_workflow_args(raw: &str) -> Result<serde_json::Value, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(serde_json::Value::Object(serde_json::Map::new()));
+    }
+    if trimmed.starts_with('{') {
+        let value: serde_json::Value =
+            serde_json::from_str(trimmed).map_err(|error| error.to_string())?;
+        if value.is_object() {
+            return Ok(value);
+        }
+        return Err("workflow args JSON must be an object".to_string());
+    }
+
+    let mut object = serde_json::Map::new();
+    for part in trimmed.split_whitespace() {
+        let Some((key, value)) = part.split_once('=') else {
+            return Err(format!("workflow arg `{part}` must use key=value"));
+        };
+        if key.trim().is_empty() {
+            return Err("workflow arg key cannot be empty".to_string());
+        }
+        let parsed_value = serde_json::from_str(value)
+            .unwrap_or_else(|_| serde_json::Value::String(value.to_string()));
+        object.insert(key.to_string(), parsed_value);
+    }
+    Ok(serde_json::Value::Object(object))
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or_default()
 }
 
 fn tui_tools_schema(
@@ -1000,6 +1091,38 @@ fn execute_tool_for_tui(
             )
         } else if execution_request.name == tool_types::ToolName::RequestUserInput {
             execute_user_input_request_for_tui(execution_request, event_tx, action_rx)
+        } else if execution_request.name == tool_types::ToolName::WorkflowDraft {
+            let Some(task_registry) = task_registry else {
+                return (
+                    true,
+                    tool_types::ToolResult::failed(
+                        execution_request,
+                        "workflow draft tools require a main TUI session",
+                        None,
+                    ),
+                    None,
+                );
+            };
+            execute_workflow_draft_for_tui(config, cwd, execution_request, task_registry)
+        } else if execution_request.name == tool_types::ToolName::WorkflowDraftAction {
+            let Some(task_registry) = task_registry else {
+                return (
+                    true,
+                    tool_types::ToolResult::failed(
+                        execution_request,
+                        "workflow draft action tools require a main TUI session",
+                        None,
+                    ),
+                    None,
+                );
+            };
+            execute_workflow_draft_action_for_tui(
+                config,
+                cwd,
+                execution_request,
+                event_tx,
+                task_registry,
+            )
         } else if execution_request.name == tool_types::ToolName::Workflow {
             let Some(task_registry) = task_registry else {
                 return (
@@ -1159,6 +1282,209 @@ fn should_stop_after_tui_tool_result(
             && result.status == tool_types::ToolStatus::Failed)
 }
 
+fn execute_workflow_draft_for_tui(
+    config: &RunConfig,
+    cwd: &Path,
+    request: &tool_types::ToolRequest,
+    task_registry: &TaskRegistry,
+) -> tool_types::ToolResult {
+    if !config.workflows.enabled {
+        return tool_types::ToolResult::failed(request, "workflows are disabled", None);
+    }
+    let input = match parse_workflow_draft_input(request) {
+        Ok(input) => input,
+        Err(error) => return tool_types::ToolResult::invalid_input(request, error.to_string()),
+    };
+    let session_dir = cwd
+        .join(".orca")
+        .join("workflow-sessions")
+        .join(task_registry.session_id());
+    let draft_store = WorkflowDraftStore::new(session_dir.join("workflow-drafts"));
+    let draft = match draft_store.create_from_script(
+        task_registry.session_id(),
+        cwd,
+        &input.script,
+        config.workflows.max_concurrent_agents,
+    ) {
+        Ok(draft) => draft,
+        Err(error) => return tool_types::ToolResult::failed(request, error.to_string(), None),
+    };
+    match serde_json::to_string(&draft) {
+        Ok(output) => tool_types::ToolResult::completed(request, output, false),
+        Err(error) => tool_types::ToolResult::failed(request, error.to_string(), None),
+    }
+}
+
+fn execute_workflow_draft_action_for_tui(
+    config: &RunConfig,
+    cwd: &Path,
+    request: &tool_types::ToolRequest,
+    event_tx: &Sender<TuiEvent>,
+    task_registry: &TaskRegistry,
+) -> tool_types::ToolResult {
+    if !config.workflows.enabled {
+        return tool_types::ToolResult::failed(request, "workflows are disabled", None);
+    }
+    let input = match parse_workflow_draft_action_input(request) {
+        Ok(input) => input,
+        Err(error) => return tool_types::ToolResult::invalid_input(request, error.to_string()),
+    };
+    let session_dir = cwd
+        .join(".orca")
+        .join("workflow-sessions")
+        .join(task_registry.session_id());
+    let draft_store = WorkflowDraftStore::new(session_dir.join("workflow-drafts"));
+    let draft = match draft_store.load(&input.draft_id) {
+        Ok(draft) => draft,
+        Err(error) => return tool_types::ToolResult::failed(request, error.to_string(), None),
+    };
+
+    let output = match input.action.as_str() {
+        "run" => {
+            let runner = WorkflowRunner::new(config.clone(), task_registry.clone(), session_dir);
+            let launch =
+                match runner.launch_background(WorkflowLaunchRequest::from(WorkflowInput {
+                    draft_id: Some(input.draft_id.clone()),
+                    args: input.args.clone(),
+                    ..Default::default()
+                })) {
+                    Ok(launch) => launch,
+                    Err(error) => {
+                        return tool_types::ToolResult::failed(request, error.to_string(), None);
+                    }
+                };
+            let task_id = launch.task_id.clone();
+            let run_id = launch.run_id.clone();
+            let workflow_name = launch.workflow_name.clone();
+            let tool_use_id = request.id.clone();
+            let task_id_for_notification = task_id.clone();
+            let run_id_for_notification = run_id.clone();
+            let tool_use_id_for_notification = tool_use_id.clone();
+            let workflow_name_for_notification = workflow_name.clone();
+            let _ = event_tx.send(TuiEvent::WorkflowTasksUpdated {
+                tasks: task_registry.list(),
+            });
+            let notify_tx = event_tx.clone();
+            let notify_registry = task_registry.clone();
+            thread::spawn(move || {
+                while !launch.is_finished() {
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                    let _ = notify_tx.send(TuiEvent::WorkflowTasksUpdated {
+                        tasks: notify_registry.list(),
+                    });
+                }
+                let notification = match launch.join() {
+                    Ok(Ok(result)) => WorkflowTerminalNotification {
+                        task_id: result.task_id,
+                        run_id: run_id_for_notification,
+                        tool_use_id: tool_use_id_for_notification,
+                        status: "completed".to_string(),
+                        summary: result.status_line,
+                    },
+                    Ok(Err(error)) => WorkflowTerminalNotification {
+                        task_id: task_id_for_notification,
+                        run_id: run_id_for_notification,
+                        tool_use_id: tool_use_id_for_notification,
+                        status: "failed".to_string(),
+                        summary: error.to_string(),
+                    },
+                    Err(_) => WorkflowTerminalNotification {
+                        task_id: task_id_for_notification,
+                        run_id: run_id_for_notification,
+                        tool_use_id: tool_use_id_for_notification,
+                        status: "failed".to_string(),
+                        summary: "workflow thread panicked".to_string(),
+                    },
+                };
+                let _ = notify_tx.send(TuiEvent::WorkflowTasksUpdated {
+                    tasks: notify_registry.list(),
+                });
+                let prompt = notification.to_prompt();
+                let _ = notify_tx.send(TuiEvent::WorkflowNotification {
+                    prompt,
+                    status: notification.status,
+                    summary: format!(
+                        "{}: {}",
+                        workflow_name_for_notification, notification.summary
+                    ),
+                });
+            });
+            WorkflowDraftActionOutput {
+                status: "async_launched".to_string(),
+                action: "run".to_string(),
+                draft_id: input.draft_id.clone(),
+                workflow_name,
+                saved_path: None,
+                task_id: Some(task_id),
+                run_id: Some(run_id),
+                script_path: Some(draft.script_path),
+            }
+        }
+        "save" => {
+            let workflow_dir = match input.scope.as_deref().unwrap_or("project") {
+                "project" => cwd.join(".orca").join("workflows"),
+                "user" => std::env::var_os("HOME")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| cwd.to_path_buf())
+                    .join(".orca")
+                    .join("workflows"),
+                other => {
+                    return tool_types::ToolResult::invalid_input(
+                        request,
+                        format!("unsupported workflow draft save scope: {other}"),
+                    );
+                }
+            };
+            let saved_path = match draft_store.save_reusable(
+                &input.draft_id,
+                &workflow_dir,
+                input.save_as.as_deref(),
+            ) {
+                Ok(path) => path,
+                Err(error) => {
+                    return tool_types::ToolResult::failed(request, error.to_string(), None);
+                }
+            };
+            WorkflowDraftActionOutput {
+                status: "saved".to_string(),
+                action: "save".to_string(),
+                draft_id: input.draft_id.clone(),
+                workflow_name: draft.name,
+                saved_path: Some(saved_path.display().to_string()),
+                task_id: None,
+                run_id: None,
+                script_path: Some(draft.script_path),
+            }
+        }
+        "cancel" => {
+            if let Err(error) = draft_store.cancel(&input.draft_id) {
+                return tool_types::ToolResult::failed(request, error.to_string(), None);
+            }
+            WorkflowDraftActionOutput {
+                status: "cancelled".to_string(),
+                action: "cancel".to_string(),
+                draft_id: input.draft_id,
+                workflow_name: draft.name,
+                saved_path: None,
+                task_id: None,
+                run_id: None,
+                script_path: None,
+            }
+        }
+        other => {
+            return tool_types::ToolResult::invalid_input(
+                request,
+                format!("unsupported workflow draft action: {other}"),
+            );
+        }
+    };
+
+    match serde_json::to_string(&output) {
+        Ok(output) => tool_types::ToolResult::completed(request, output, false),
+        Err(error) => tool_types::ToolResult::failed(request, error.to_string(), None),
+    }
+}
+
 fn execute_workflow_for_tui(
     config: &RunConfig,
     cwd: &Path,
@@ -1211,7 +1537,7 @@ fn execute_workflow_for_tui(
                 run_id,
                 tool_use_id,
                 status: "completed".to_string(),
-                summary: result.summary,
+                summary: result.status_line,
             },
             Ok(Err(error)) => WorkflowTerminalNotification {
                 task_id,
@@ -1271,6 +1597,41 @@ fn xml_escape(value: &str) -> String {
 }
 
 fn parse_workflow_input(request: &tool_types::ToolRequest) -> std::io::Result<WorkflowInput> {
+    let raw_arguments = request.raw_arguments.as_deref().unwrap_or("{}");
+    serde_json::from_str(raw_arguments)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkflowDraftInput {
+    script: String,
+}
+
+fn parse_workflow_draft_input(
+    request: &tool_types::ToolRequest,
+) -> std::io::Result<WorkflowDraftInput> {
+    let raw_arguments = request.raw_arguments.as_deref().unwrap_or("{}");
+    serde_json::from_str(raw_arguments)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkflowDraftActionInput {
+    draft_id: String,
+    action: String,
+    #[serde(default)]
+    save_as: Option<String>,
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    args: Option<serde_json::Value>,
+}
+
+fn parse_workflow_draft_action_input(
+    request: &tool_types::ToolRequest,
+) -> std::io::Result<WorkflowDraftActionInput> {
     let raw_arguments = request.raw_arguments.as_deref().unwrap_or("{}");
     serde_json::from_str(raw_arguments)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))
@@ -1940,6 +2301,18 @@ mod tests {
     }
 
     #[test]
+    fn saved_workflow_args_parse_key_value_and_json_objects() {
+        let value = parse_saved_workflow_args("target=src maxAgents=8 dryRun=true").unwrap();
+        assert_eq!(value["target"], "src");
+        assert_eq!(value["maxAgents"], 8);
+        assert_eq!(value["dryRun"], true);
+
+        let value = parse_saved_workflow_args(r#"{"target":"crates","maxAgents":4}"#).unwrap();
+        assert_eq!(value["target"], "crates");
+        assert_eq!(value["maxAgents"], 4);
+    }
+
+    #[test]
     fn tui_session_reuses_conversation_across_submits() {
         let config = config();
         let (event_tx, event_rx) = mpsc::channel();
@@ -2139,6 +2512,48 @@ mod tests {
                     && summary.contains("mock-workflow")
             )
         }));
+    }
+
+    #[test]
+    fn tui_workflow_draft_tool_uses_runtime_draft_store() {
+        let mut config = full_auto_config();
+        config.output_format = OutputFormat::Jsonl;
+        let temp = tempfile::tempdir().unwrap();
+        config.cwd = Some(temp.path().to_path_buf());
+        let (event_tx, event_rx) = mpsc::channel();
+        let (_action_tx, action_rx) = mpsc::channel();
+        let cancel = CancelToken::new();
+        let mut session =
+            TuiConversationSession::new_with_preloaded(&config, "workflow draft", None)
+                .expect("session");
+
+        run_agent_for_tui(
+            &config,
+            &mut session,
+            "workflow draft",
+            &event_tx,
+            &action_rx,
+            &cancel,
+            false,
+        );
+
+        let events: Vec<TuiEvent> = event_rx.try_iter().collect();
+        let draft_tool = events.iter().find_map(|event| match event {
+            TuiEvent::ToolCompleted {
+                name,
+                status,
+                output,
+                ..
+            } if name == "WorkflowDraft" => Some((status.as_str(), output.as_str())),
+            _ => None,
+        });
+        let (status, output) = draft_tool.expect("workflow draft tool completed");
+        assert_eq!(status, "completed");
+        assert!(output.contains("\"draftId\""));
+        assert!(
+            !output.contains("WorkflowDraft must be executed by the runtime controller"),
+            "TUI must not route WorkflowDraft through the placeholder executor"
+        );
     }
 
     #[test]

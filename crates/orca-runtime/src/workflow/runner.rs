@@ -49,6 +49,15 @@ pub struct WorkflowLaunchRequest {
 }
 
 impl WorkflowLaunchRequest {
+    pub fn from_draft_id(draft_id: String) -> Self {
+        Self {
+            input: WorkflowInput {
+                draft_id: Some(draft_id),
+                ..Default::default()
+            },
+        }
+    }
+
     pub fn from_script_path(script_path: String) -> Self {
         Self {
             input: WorkflowInput {
@@ -75,6 +84,7 @@ pub struct WorkflowLaunchResult {
     pub task_id: String,
     pub output: WorkflowOutput,
     pub summary: String,
+    pub status_line: String,
 }
 
 #[derive(Debug)]
@@ -294,8 +304,9 @@ impl WorkflowRunner {
 
         let run_id = format!("workflow-run-{}", uuid::Uuid::new_v4());
         let persisted_script_path = self.state.run_dir(&run_id).join("script.js");
+        let resolved_input = self.resolve_launch_input(&request.input)?;
         let resolved =
-            resolve_workflow_script_to_path(&request.input, &cwd, &persisted_script_path)?;
+            resolve_workflow_script_to_path(&resolved_input, &cwd, &persisted_script_path)?;
         let task = self.tasks.create_workflow(
             run_id.clone(),
             resolved.meta.name.clone(),
@@ -334,6 +345,43 @@ impl WorkflowRunner {
             task_id: task.id,
             run_id,
             transcript_dir,
+        })
+    }
+
+    fn resolve_launch_input(&self, input: &WorkflowInput) -> io::Result<WorkflowInput> {
+        let Some(draft_id) = input
+            .draft_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        else {
+            return Ok(input.clone());
+        };
+
+        if input.script.is_some() || input.script_path.is_some() || input.name.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "workflow draftId cannot be combined with script, scriptPath, or name",
+            ));
+        }
+
+        let script_path = self
+            .session_dir
+            .join("workflow-drafts")
+            .join(draft_id)
+            .join("script.js");
+        if !script_path.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("workflow draft `{draft_id}` not found"),
+            ));
+        }
+
+        Ok(WorkflowInput {
+            draft_id: None,
+            script_path: Some(script_path.display().to_string()),
+            args: input.args.clone(),
+            resume_from_run_id: input.resume_from_run_id.clone(),
+            ..Default::default()
         })
     }
 
@@ -487,6 +535,12 @@ impl WorkflowRunner {
         self.state.write_state(&state)?;
         let counters = gate.snapshot()?;
         self.write_evidence_for_state(&state, Some(&counters))?;
+        let status_line = workflow_status_line(
+            &state,
+            &counts,
+            &counters,
+            self.config.workflows.max_concurrent_agents,
+        );
         self.refresh_task_progress(&task_id, &state)?;
         self.tasks
             .complete(&task_id, result.clone())
@@ -507,6 +561,7 @@ impl WorkflowRunner {
                 session_url: None,
             },
             summary,
+            status_line,
         })
     }
 
@@ -902,6 +957,7 @@ impl WorkflowRunner {
             .stop(&task_id, STOPPED_SUMMARY.to_string())
             .map_err(io::Error::other)?;
         let _ = self.state.mark_worker_exited(&run_id);
+        let counts = self.state.agent_status_counts(&run_id)?;
 
         Ok(WorkflowLaunchResult {
             task_id: task_id.clone(),
@@ -917,6 +973,12 @@ impl WorkflowRunner {
                 session_url: None,
             },
             summary: STOPPED_SUMMARY.to_string(),
+            status_line: workflow_status_line(
+                &state,
+                &counts,
+                &counters,
+                self.config.workflows.max_concurrent_agents,
+            ),
         })
     }
 
@@ -991,6 +1053,68 @@ fn terminal_agent_count(counts: &WorkflowAgentStatusCounts) -> u32 {
         .saturating_add(counts.failed)
         .saturating_add(counts.cancelled)
         .saturating_add(counts.cached)
+}
+
+fn workflow_status_line(
+    state: &WorkflowRunState,
+    counts: &WorkflowAgentStatusCounts,
+    counters: &WorkflowExecutionCounters,
+    max_configured_concurrent_agents: usize,
+) -> String {
+    let completed_agents = counts.completed.saturating_add(counts.cached);
+    let failed_agents = counts.failed.saturating_add(counts.cancelled);
+    let running_agents = state
+        .total_agent_count
+        .saturating_sub(terminal_agent_count(counts));
+    let completed_phases = state
+        .phases
+        .iter()
+        .filter(|phase| phase.status == WorkflowRunStatus::Completed)
+        .count();
+    let failed_phases = state
+        .phases
+        .iter()
+        .filter(|phase| {
+            matches!(
+                phase.status,
+                WorkflowRunStatus::Failed
+                    | WorkflowRunStatus::Cancelled
+                    | WorkflowRunStatus::Stopped
+            )
+        })
+        .count();
+    let fallback_phases = state
+        .phases
+        .iter()
+        .filter(|phase| phase.fallback.is_some())
+        .count();
+    format!(
+        "Workflow {}\nAgents: {} completed, {} failed, {} running\nPhases: {} completed, {} failed, {} with fallback\nMax observed concurrency: {} / {}\nInspect: /workflows -> {}",
+        workflow_run_status_label(state.status),
+        completed_agents,
+        failed_agents,
+        running_agents,
+        completed_phases,
+        failed_phases,
+        fallback_phases,
+        counters.max_observed_concurrent_agents,
+        max_configured_concurrent_agents,
+        state.run_id
+    )
+}
+
+fn workflow_run_status_label(status: WorkflowRunStatus) -> &'static str {
+    match status {
+        WorkflowRunStatus::Queued => "queued",
+        WorkflowRunStatus::Running => "running",
+        WorkflowRunStatus::Paused => "paused",
+        WorkflowRunStatus::Stopping => "stopping",
+        WorkflowRunStatus::Stopped => "stopped",
+        WorkflowRunStatus::Completed => "completed",
+        WorkflowRunStatus::Failed => "failed",
+        WorkflowRunStatus::Cancelled => "cancelled",
+        WorkflowRunStatus::AsyncLaunched => "async_launched",
+    }
 }
 
 fn workflow_phase_summaries(state: &WorkflowRunState) -> Vec<WorkflowPhaseTaskSummary> {

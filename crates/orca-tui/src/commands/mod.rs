@@ -9,6 +9,7 @@ pub enum SlashCommand {
     Plan(Option<String>),
     Goal(GoalSlashCommand),
     WorkflowList,
+    WorkflowRun { name: String, args: Option<String> },
     AgentDashboard,
     Remember(String),
 }
@@ -41,6 +42,18 @@ pub fn parse(input: &str) -> Option<SlashCommand> {
         )),
         "plan" => Some(SlashCommand::Plan(parts.next().map(str::to_string))),
         "goal" => parse_goal(parts.collect::<Vec<_>>().join(" ")).map(SlashCommand::Goal),
+        command if command.starts_with("workflow:") => {
+            let name = command.trim_start_matches("workflow:").trim();
+            if name.is_empty() {
+                None
+            } else {
+                let args = parts.collect::<Vec<_>>().join(" ");
+                Some(SlashCommand::WorkflowRun {
+                    name: name.to_string(),
+                    args: if args.is_empty() { None } else { Some(args) },
+                })
+            }
+        }
         "workflows" => Some(SlashCommand::WorkflowList),
         "agents" => Some(SlashCommand::AgentDashboard),
         "remember" => {
@@ -64,11 +77,77 @@ pub fn all_commands() -> &'static [(&'static str, &'static str)] {
         ("/mode", "Switch approval mode"),
         ("/plan", "Toggle plan mode"),
         ("/goal", "Manage a persistent goal"),
+        ("/workflow:<name>", "Run a saved workflow"),
         ("/workflows", "Show workflow tasks"),
         ("/agents", "Show workflow agent dashboard"),
         ("/remember", "Save a note to memory"),
         ("/history", "Browse session history"),
     ]
+}
+
+pub fn available_commands(cwd: &Path) -> Vec<(String, String)> {
+    let mut commands = all_commands()
+        .iter()
+        .map(|(command, description)| ((*command).to_string(), (*description).to_string()))
+        .collect::<Vec<_>>();
+    for (name, scope) in discover_saved_workflows(cwd) {
+        commands.push((
+            format!("/workflow:{name}"),
+            format!("Run saved {scope} workflow"),
+        ));
+    }
+    commands
+}
+
+fn discover_saved_workflows(cwd: &Path) -> Vec<(String, &'static str)> {
+    let mut workflows = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for ancestor in cwd.ancestors() {
+        collect_workflow_dir(
+            &ancestor.join(".orca").join("workflows"),
+            "project",
+            &mut seen,
+            &mut workflows,
+        );
+    }
+    if let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) {
+        collect_workflow_dir(
+            &home.join(".orca").join("workflows"),
+            "user",
+            &mut seen,
+            &mut workflows,
+        );
+    }
+    workflows
+}
+
+fn collect_workflow_dir(
+    dir: &Path,
+    scope: &'static str,
+    seen: &mut std::collections::BTreeSet<String>,
+    workflows: &mut Vec<(String, &'static str)>,
+) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut names = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("js") {
+                return None;
+            }
+            path.file_stem()
+                .and_then(|stem| stem.to_str())
+                .map(str::to_string)
+        })
+        .collect::<Vec<_>>();
+    names.sort();
+    for name in names {
+        if seen.insert(name.clone()) {
+            workflows.push((name, scope));
+        }
+    }
 }
 
 fn parse_goal(args: String) -> Option<GoalSlashCommand> {
@@ -165,6 +244,43 @@ mod tests {
     }
 
     #[test]
+    fn parses_saved_workflow_command() {
+        assert_eq!(
+            parse("/workflow:security-audit target=src maxAgents=8"),
+            Some(SlashCommand::WorkflowRun {
+                name: "security-audit".to_string(),
+                args: Some("target=src maxAgents=8".to_string()),
+            })
+        );
+        assert_eq!(parse("/workflow:"), None);
+
+        let command_names = all_commands()
+            .iter()
+            .map(|(command, _)| *command)
+            .collect::<Vec<_>>();
+        assert!(command_names.contains(&"/workflow:<name>"));
+    }
+
+    #[test]
+    fn available_commands_include_project_saved_workflows() {
+        let temp = tempfile::tempdir().unwrap();
+        let workflow_dir = temp.path().join(".orca").join("workflows");
+        std::fs::create_dir_all(&workflow_dir).unwrap();
+        std::fs::write(
+            workflow_dir.join("security-audit.js"),
+            "export const meta = {};",
+        )
+        .unwrap();
+
+        let command_names = available_commands(temp.path())
+            .into_iter()
+            .map(|(command, _)| command)
+            .collect::<Vec<_>>();
+        assert!(command_names.contains(&"/workflow:<name>".to_string()));
+        assert!(command_names.contains(&"/workflow:security-audit".to_string()));
+    }
+
+    #[test]
     fn parses_agents_command() {
         assert_eq!(parse("/agents"), Some(SlashCommand::AgentDashboard));
     }
@@ -211,3 +327,4 @@ mod tests {
         assert!(validate_model("bogus-model").is_err());
     }
 }
+use std::path::Path;

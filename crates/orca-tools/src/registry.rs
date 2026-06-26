@@ -604,6 +604,66 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
     ));
     registry.register(BuiltinTool::new(
         builtin_spec(
+            "WorkflowDraft",
+            "Create a previewable dynamic workflow draft from a JavaScript workflow script without launching it. Use this before Workflow when the user should review phases and raw script first.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "script": {
+                        "type": "string",
+                        "description": "Self-contained workflow script to store as a preview draft. The draft is not executed until launched through Workflow with draftId."
+                    }
+                },
+                "required": ["script"]
+            }),
+            CapabilitySet::filesystem_write(),
+            ToolExposure::Direct,
+            RendererHint::Agent,
+            false,
+        ),
+        BuiltinExecutor::WorkflowDraft,
+    ));
+    registry.register(BuiltinTool::new(
+        builtin_spec(
+            "WorkflowDraftAction",
+            "Apply a preview decision to a workflow draft. Use run to launch an approved draft, save to persist it as a reusable workflow command, or cancel to discard it.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "draftId": {
+                        "type": "string",
+                        "description": "Identifier returned by WorkflowDraft."
+                    },
+                    "action": {
+                        "type": "string",
+                        "enum": ["run", "save", "cancel"],
+                        "description": "Decision to apply to the draft preview."
+                    },
+                    "saveAs": {
+                        "type": "string",
+                        "description": "Reusable workflow name for action=save. Defaults to the draft meta name."
+                    },
+                    "scope": {
+                        "type": "string",
+                        "enum": ["project", "user"],
+                        "description": "Where to save reusable workflows. Project writes .orca/workflows; user writes ~/.orca/workflows."
+                    },
+                    "args": {
+                        "type": "object",
+                        "description": "Structured args passed when action=run."
+                    }
+                },
+                "required": ["draftId", "action"]
+            }),
+            CapabilitySet::filesystem_write(),
+            ToolExposure::Direct,
+            RendererHint::Agent,
+            false,
+        ),
+        BuiltinExecutor::WorkflowDraftAction,
+    ));
+    registry.register(BuiltinTool::new(
+        builtin_spec(
             "Workflow",
             "Launch a dynamic workflow: a JavaScript script that orchestrates many subagents in the background. The tool returns task metadata immediately; the final report is delivered later as a task notification.",
             json!({
@@ -628,6 +688,10 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
                     "args": {
                         "type": "object",
                         "description": "Structured input exposed to the workflow script as the global args value."
+                    },
+                    "draftId": {
+                        "type": "string",
+                        "description": "Identifier of a previewed workflow draft to launch."
                     },
                     "scriptPath": {
                         "type": "string",
@@ -1103,6 +1167,16 @@ impl Tool for BuiltinTool {
                 "subagent_status tool must be executed by the runtime",
                 None,
             ),
+            BuiltinExecutor::WorkflowDraft => ToolResult::failed(
+                request,
+                "WorkflowDraft must be executed by the runtime controller",
+                None,
+            ),
+            BuiltinExecutor::WorkflowDraftAction => ToolResult::failed(
+                request,
+                "WorkflowDraftAction must be executed by the runtime controller",
+                None,
+            ),
             BuiltinExecutor::Workflow => ToolResult::failed(
                 request,
                 "Workflow must be executed by the runtime controller",
@@ -1146,6 +1220,8 @@ enum BuiltinExecutor {
     WebSearch,
     Subagent,
     SubagentStatus,
+    WorkflowDraft,
+    WorkflowDraftAction,
     Workflow,
     WorkflowSendMessage,
     WorkflowReadMessages,

@@ -1397,6 +1397,7 @@ fn workflow_input_for_launch(
 ) -> WorkflowInput {
     let script_path = PathBuf::from(script_or_name);
     WorkflowInput {
+        draft_id: None,
         script_path: if script_path.is_absolute() || cwd.join(script_or_name).exists() {
             Some(script_or_name.to_string())
         } else {

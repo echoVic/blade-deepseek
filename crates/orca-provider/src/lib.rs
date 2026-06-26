@@ -171,6 +171,83 @@ fn mock_call(conversation: &Conversation) -> ProviderResponse {
         };
     }
 
+    if prompt == "workflow draft action save" && has_tool_results {
+        let action_completed = conversation.messages.iter().any(|message| match message {
+            Message::Tool { content, .. } => serde_json::from_str::<serde_json::Value>(content)
+                .ok()
+                .is_some_and(|value| {
+                    value.get("status").and_then(serde_json::Value::as_str) == Some("saved")
+                        && value.get("action").and_then(serde_json::Value::as_str) == Some("save")
+                }),
+            _ => false,
+        });
+        if action_completed {
+            let msg = "Mock saved workflow draft.".to_string();
+            return ProviderResponse {
+                steps: vec![ProviderStep::MessageDelta(msg.clone())],
+                assistant_content: Some(msg),
+                assistant_reasoning: None,
+                tool_calls: Vec::new(),
+                usage: None,
+            };
+        }
+
+        let draft_id = conversation
+            .messages
+            .iter()
+            .find_map(|message| match message {
+                Message::Tool { content, .. } => serde_json::from_str::<serde_json::Value>(content)
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .get("draftId")
+                            .and_then(serde_json::Value::as_str)
+                            .map(ToString::to_string)
+                    }),
+                _ => None,
+            });
+        if let Some(draft_id) = draft_id {
+            let tool_request = ToolRequest {
+                id: "mock-tool-2".to_string(),
+                name: ToolName::WorkflowDraftAction,
+                action: ActionKind::Write,
+                target: Some(draft_id.clone()),
+                raw_arguments: Some(
+                    serde_json::json!({
+                        "draftId": draft_id,
+                        "action": "save",
+                        "scope": "project"
+                    })
+                    .to_string(),
+                ),
+            };
+            let raw_call = RawToolCall {
+                id: tool_request.id.clone(),
+                function_name: tool_request.name.as_str().to_string(),
+                arguments: tool_request.raw_arguments.clone().unwrap_or_default(),
+            };
+            return ProviderResponse {
+                steps: vec![ProviderStep::ToolCall(tool_request)],
+                assistant_content: None,
+                assistant_reasoning: None,
+                tool_calls: vec![raw_call],
+                usage: None,
+            };
+        }
+    }
+
+    if prompt == "mcp__broken__tool" && has_tool_results {
+        return ProviderResponse {
+            steps: vec![ProviderStep::Error(
+                "mcp__broken__tool failed in mock provider".to_string(),
+            )],
+            assistant_content: None,
+            assistant_reasoning: None,
+            tool_calls: Vec::new(),
+            usage: None,
+        };
+    }
+
     if has_tool_results {
         let msg = "Mock completed after tool execution.".to_string();
         return ProviderResponse {
@@ -448,6 +525,28 @@ fn parse_mock_prompt(prompt: &str) -> Option<ToolRequest> {
             action: ActionKind::Agent,
             target: Some("mcp__broken__tool".to_string()),
             raw_arguments: Some(serde_json::json!({}).to_string()),
+        });
+    }
+
+    if prompt == "workflow draft" {
+        let script = "export const meta = { name: 'mock-workflow', description: 'Mock workflow', phases: ['main'] };\nconst result = await phase('main', async () => agent('inspect repo'));\nexport default result;";
+        return Some(ToolRequest {
+            id: "mock-tool-1".to_string(),
+            name: ToolName::WorkflowDraft,
+            action: ActionKind::Write,
+            target: Some("mock-workflow".to_string()),
+            raw_arguments: Some(serde_json::json!({ "script": script }).to_string()),
+        });
+    }
+
+    if prompt == "workflow draft action save" {
+        let script = "export const meta = { name: 'mock-workflow', description: 'Mock workflow', phases: ['main'] };\nconst result = await phase('main', async () => agent('inspect repo'));\nexport default result;";
+        return Some(ToolRequest {
+            id: "mock-tool-1".to_string(),
+            name: ToolName::WorkflowDraft,
+            action: ActionKind::Write,
+            target: Some("mock-workflow".to_string()),
+            raw_arguments: Some(serde_json::json!({ "script": script }).to_string()),
         });
     }
 

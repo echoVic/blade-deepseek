@@ -92,6 +92,7 @@ pub enum TuiEvent {
 #[derive(Debug, Clone)]
 pub enum UserAction {
     Submit(String),
+    RunWorkflow { name: String, args: Option<String> },
     SetModel(String),
     Remember(String),
     Compact,
@@ -246,8 +247,8 @@ pub struct WorkflowPanelState {
 
 #[derive(Debug, Clone)]
 pub struct SlashMenuItem {
-    pub command: &'static str,
-    pub description: &'static str,
+    pub command: String,
+    pub description: String,
 }
 
 #[derive(Debug, Clone)]

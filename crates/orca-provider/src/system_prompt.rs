@@ -88,6 +88,10 @@ Use `bash` for tests, builds, project scripts, and complex shell-only tasks. For
 
 When using `web_search` for requests about latest news, recent updates, current status, today, this week, this month, or "最新/最近/今天", include a `fresh_days` value that matches the requested recency instead of relying on the query text alone. Examples: use `fresh_days: 1` for today/current breakage, `fresh_days: 7` for this week/recent updates, and `fresh_days: 30` for latest news or recent releases unless the user asks for a broader range.
 
+## Dynamic workflows
+
+For natural-language workflow requests, including requests that mention workflow, workflows, ultracode, multi-agent orchestration, parallel agents, or large multi-phase audits, call WorkflowDraft first unless the user already provided an explicit script, scriptPath, name, or draftId. The draft script must include export const meta with name, description, and phases, and should keep intermediate data inside workflow state/script variables instead of flooding the main conversation. Show the generated preview to the user. Then launch the approved draft with Workflow using draftId, or use Workflow directly for explicit script/scriptPath/name/draftId launches. Saved workflows can be launched with Workflow using name and args.
+
 ## Safety Rules
 1. NEVER execute destructive commands (rm -rf /, rm -rf ~, mkfs, dd if=/dev/zero, etc.).
 2. NEVER expose, log, or transmit secrets, API keys, passwords, or credentials.
@@ -152,6 +156,15 @@ mod tests {
         assert!(prompt.contains("include a `fresh_days` value"));
         assert!(prompt.contains("fresh_days: 30"));
         assert!(prompt.contains("最新/最近/今天"));
+    }
+
+    #[test]
+    fn prompt_routes_dynamic_workflows_through_preview_drafts() {
+        let prompt = build_system_prompt(std::path::Path::new("/repo"));
+
+        assert!(prompt.contains("For natural-language workflow requests"));
+        assert!(prompt.contains("call WorkflowDraft first"));
+        assert!(prompt.contains("Then launch the approved draft with Workflow using draftId"));
     }
 
     #[test]

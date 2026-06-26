@@ -141,7 +141,7 @@ fn find_named_workflow(cwd: &Path, name: &str, user_workflow_dir: &Path) -> io::
     ))
 }
 
-fn parse_workflow_meta(script: &str) -> io::Result<WorkflowMeta> {
+pub fn parse_workflow_meta(script: &str) -> io::Result<WorkflowMeta> {
     let export_index = script
         .find("export const meta")
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing `export const meta`"))?;

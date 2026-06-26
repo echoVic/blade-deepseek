@@ -1628,7 +1628,7 @@ fn render_slash_menu(frame: &mut Frame, input_area: Rect, state: &AppState, them
             let items: Vec<(&str, &str)> = menu
                 .items
                 .iter()
-                .map(|i| (i.command, i.description))
+                .map(|i| (i.command.as_str(), i.description.as_str()))
                 .collect();
             (items, menu.selected, " Commands ")
         };

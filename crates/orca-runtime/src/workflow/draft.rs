@@ -1,0 +1,156 @@
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use orca_core::workflow_types::{WorkflowDraft, WorkflowSourceMutationRisk};
+
+use super::script::parse_workflow_meta;
+
+#[derive(Clone, Debug)]
+pub struct WorkflowDraftStore {
+    root: PathBuf,
+}
+
+impl WorkflowDraftStore {
+    pub fn new(root: PathBuf) -> Self {
+        Self { root }
+    }
+
+    pub fn draft_dir(&self, draft_id: &str) -> PathBuf {
+        self.root.join(draft_id)
+    }
+
+    pub fn draft_path(&self, draft_id: &str) -> PathBuf {
+        self.draft_dir(draft_id).join("draft.json")
+    }
+
+    pub fn script_path(&self, draft_id: &str) -> PathBuf {
+        self.draft_dir(draft_id).join("script.js")
+    }
+
+    pub fn create_from_script(
+        &self,
+        session_id: &str,
+        cwd: &Path,
+        script: &str,
+        max_configured_concurrent_agents: usize,
+    ) -> io::Result<WorkflowDraft> {
+        let meta = parse_workflow_meta(script)?;
+        let draft_id = format!("workflow-draft-{}", uuid::Uuid::new_v4());
+        let script_path = self.script_path(&draft_id);
+        if let Some(parent) = script_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&script_path, script)?;
+
+        let draft = WorkflowDraft {
+            draft_id: draft_id.clone(),
+            session_id: session_id.to_string(),
+            cwd: cwd.display().to_string(),
+            name: meta.name,
+            description: meta.description,
+            phases: meta.phases,
+            script: script.to_string(),
+            script_path: script_path.display().to_string(),
+            estimated_agent_count: estimate_agent_count(script),
+            max_configured_concurrent_agents: max_configured_concurrent_agents as u32,
+            source_mutation_risk: classify_source_mutation_risk(script),
+            created_at_ms: now_ms(),
+        };
+        self.write(&draft)?;
+        Ok(draft)
+    }
+
+    pub fn write(&self, draft: &WorkflowDraft) -> io::Result<()> {
+        let path = self.draft_path(&draft.draft_id);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let value = serde_json::to_vec_pretty(draft)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        fs::write(path, value)
+    }
+
+    pub fn load(&self, draft_id: &str) -> io::Result<WorkflowDraft> {
+        let raw = fs::read_to_string(self.draft_path(draft_id))?;
+        serde_json::from_str(&raw)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    }
+
+    pub fn cancel(&self, draft_id: &str) -> io::Result<()> {
+        let dir = self.draft_dir(draft_id);
+        if dir.exists() {
+            fs::remove_dir_all(dir)?;
+        }
+        Ok(())
+    }
+
+    pub fn save_reusable(
+        &self,
+        draft_id: &str,
+        workflow_dir: &Path,
+        save_as: Option<&str>,
+    ) -> io::Result<PathBuf> {
+        let draft = self.load(draft_id)?;
+        let name = sanitize_workflow_name(save_as.unwrap_or(&draft.name))?;
+        fs::create_dir_all(workflow_dir)?;
+        let path = workflow_dir.join(format!("{name}.js"));
+        fs::write(&path, draft.script)?;
+        Ok(path)
+    }
+}
+
+fn estimate_agent_count(script: &str) -> Option<u32> {
+    let count = script.match_indices("agent(").count() as u32;
+    if count == 0 { None } else { Some(count) }
+}
+
+fn classify_source_mutation_risk(script: &str) -> WorkflowSourceMutationRisk {
+    let lower = script.to_ascii_lowercase();
+    let source_mutation_markers = [
+        "edit(",
+        "write_file",
+        "writefile",
+        "apply_patch",
+        "modify",
+        "implement",
+        "fix ",
+        "refactor",
+        "commit",
+        "isolation: \"worktree\"",
+        "isolation: 'worktree'",
+    ];
+    if source_mutation_markers
+        .iter()
+        .any(|marker| lower.contains(marker))
+    {
+        WorkflowSourceMutationRisk::SourceMutationPossible
+    } else {
+        WorkflowSourceMutationRisk::ReadOnlyLikely
+    }
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or_default()
+}
+
+fn sanitize_workflow_name(raw: &str) -> io::Result<String> {
+    let name = raw.trim();
+    if name.is_empty()
+        || name.contains('/')
+        || name.contains('\\')
+        || name == "."
+        || name == ".."
+        || name.contains("..")
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "workflow save name must be a simple file stem",
+        ));
+    }
+    Ok(name.to_string())
+}

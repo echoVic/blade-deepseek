@@ -69,8 +69,6 @@ fn profile(cwd: &Path) -> String {
 (allow file-read*)
 (allow file-read* file-write* (literal "/dev/null"))
 (allow file-write* (subpath "{cwd_escaped}"))
-(allow file-write* (subpath "/tmp"))
-(allow file-write* (subpath "/private/tmp"))
 {ssh_deny}
 {orca_deny}
 (allow network-outbound)

@@ -12,11 +12,12 @@ use orca_core::model::ModelSelection;
 use orca_core::task_types::TaskStatus;
 use orca_core::workflow_types::{
     WorkflowAgentFailureKind, WorkflowAgentStatus, WorkflowEvidenceFailureKind, WorkflowRunStatus,
+    WorkflowSourceMutationRisk,
 };
 use orca_runtime::tasks::TaskRegistry;
 use orca_runtime::workflow::report::render_report_for_run;
 use orca_runtime::workflow::state::{WorkflowStateStore, input_hash};
-use orca_runtime::workflow::{WorkflowLaunchRequest, WorkflowRunner};
+use orca_runtime::workflow::{WorkflowDraftStore, WorkflowLaunchRequest, WorkflowRunner};
 use serde_json::json;
 use tempfile::tempdir;
 
@@ -80,6 +81,155 @@ fn workflow_runner_executes_agent_and_writes_state() {
             .unwrap_or_default()
             .contains("transcripts")
     );
+}
+
+#[test]
+fn workflow_launch_result_includes_evidence_derived_status_line() {
+    if !orca_runtime::workflow::host::WorkflowHost::node_available() {
+        return;
+    }
+
+    let temp = tempdir().unwrap();
+    let script = temp.path().join("workflow.js");
+    fs::write(
+        &script,
+        "export const meta = { name: 'status-line', description: 'Status line', phases: ['scan'] };\nexport default await phase('scan', async () => agent('inspect repo'));",
+    )
+    .unwrap();
+
+    let mut config = mock_run_config(temp.path());
+    config.workflows.max_concurrent_agents = 4;
+    let tasks = TaskRegistry::new("session-1".to_string());
+    let runner = WorkflowRunner::new(config, tasks.clone(), temp.path().join("session"));
+    let launched = runner
+        .launch(WorkflowLaunchRequest::from_script_path(
+            script.display().to_string(),
+        ))
+        .unwrap();
+
+    assert!(launched.summary.contains("inspect repo"));
+    assert!(launched.status_line.contains("Workflow completed"));
+    assert!(
+        launched
+            .status_line
+            .contains("Agents: 1 completed, 0 failed, 0 running")
+    );
+    assert!(
+        launched
+            .status_line
+            .contains("Phases: 1 completed, 0 failed")
+    );
+    assert!(
+        launched
+            .status_line
+            .contains("Max observed concurrency: 1 / 4")
+    );
+    assert!(
+        launched
+            .status_line
+            .contains("Inspect: /workflows -> workflow-run-")
+    );
+}
+
+#[test]
+fn workflow_draft_persists_preview_and_launches_from_draft() {
+    if !orca_runtime::workflow::host::WorkflowHost::node_available() {
+        return;
+    }
+
+    let temp = tempdir().unwrap();
+    let session_dir = temp.path().join("session");
+    let script = "export const meta = { name: 'draft-audit', description: 'Draft audit', phases: ['scan', 'report'] };\n\
+const scan = await phase('scan', async () => parallel([\n\
+  agent('inspect auth', { team: 'scanner' }),\n\
+  agent('inspect permissions', { team: 'scanner' })\n\
+]));\n\
+export default await phase('report', async () => agent(`report ${JSON.stringify(scan)}`, { team: 'reporter' }));";
+
+    let config = mock_run_config(temp.path());
+    let draft_store = WorkflowDraftStore::new(session_dir.join("workflow-drafts"));
+    let draft = draft_store
+        .create_from_script(
+            "session-1",
+            temp.path(),
+            script,
+            config.workflows.max_concurrent_agents,
+        )
+        .expect("draft is created");
+
+    assert!(draft.draft_id.starts_with("workflow-draft-"));
+    assert_eq!(draft.session_id, "session-1");
+    assert_eq!(draft.name, "draft-audit");
+    assert_eq!(draft.description, "Draft audit");
+    assert_eq!(draft.phases, vec!["scan", "report"]);
+    assert_eq!(draft.estimated_agent_count, Some(3));
+    assert_eq!(
+        draft.max_configured_concurrent_agents,
+        config.workflows.max_concurrent_agents as u32
+    );
+    assert_eq!(
+        draft.source_mutation_risk,
+        WorkflowSourceMutationRisk::ReadOnlyLikely
+    );
+    assert!(draft.script_path.ends_with("script.js"));
+
+    let reloaded = draft_store
+        .load(&draft.draft_id)
+        .expect("draft reloads from disk");
+    assert_eq!(reloaded, draft);
+    assert_eq!(
+        fs::read_to_string(draft_store.script_path(&draft.draft_id)).unwrap(),
+        script
+    );
+
+    let tasks = TaskRegistry::new("session-1".to_string());
+    let runner = WorkflowRunner::new(config, tasks.clone(), session_dir.clone());
+    let launched = runner
+        .launch(WorkflowLaunchRequest::from_draft_id(draft.draft_id.clone()))
+        .expect("draft launches");
+
+    assert_eq!(
+        launched.output.workflow_name.as_deref(),
+        Some("draft-audit")
+    );
+    let run_id = launched.output.run_id.as_deref().expect("run id");
+    let store = WorkflowStateStore::new(session_dir.join("workflow-runs"));
+    let launch_input = store.load_launch_input(run_id).expect("launch input");
+    assert_eq!(
+        launch_input.draft_id.as_deref(),
+        Some(draft.draft_id.as_str())
+    );
+    assert_eq!(launch_input.script_path, None);
+    assert_eq!(launch_input.script, None);
+    assert_eq!(
+        store.load_run(run_id).unwrap().status,
+        WorkflowRunStatus::Completed
+    );
+}
+
+#[test]
+fn workflow_draft_store_saves_reusable_workflow_and_cancels_draft() {
+    let temp = tempdir().unwrap();
+    let draft_store = WorkflowDraftStore::new(temp.path().join("session").join("workflow-drafts"));
+    let script = "export const meta = { name: 'security-audit', description: 'Audit', phases: ['scan'] };\nexport default await phase('scan', async () => agent('scan repo'));";
+    let draft = draft_store
+        .create_from_script("session-1", temp.path(), script, 8)
+        .expect("draft is created");
+
+    let saved_path = draft_store
+        .save_reusable(
+            &draft.draft_id,
+            &temp.path().join(".orca").join("workflows"),
+            None,
+        )
+        .expect("workflow is saved");
+    assert_eq!(saved_path.file_name().unwrap(), "security-audit.js");
+    assert_eq!(fs::read_to_string(saved_path).unwrap(), script);
+
+    draft_store
+        .cancel(&draft.draft_id)
+        .expect("draft is cancelled");
+    assert!(!draft_store.draft_dir(&draft.draft_id).exists());
 }
 
 #[test]
