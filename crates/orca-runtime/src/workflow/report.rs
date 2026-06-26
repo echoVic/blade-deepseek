@@ -1,6 +1,9 @@
 use std::io;
 
-use orca_core::workflow_types::{WorkflowAgentStatus, WorkflowEvidenceBundle, WorkflowRunStatus};
+use orca_core::workflow_types::{
+    WorkflowAgentFailureKind, WorkflowAgentStatus, WorkflowEvidenceBundle,
+    WorkflowEvidenceFailureKind, WorkflowRunStatus,
+};
 use serde_json::{Value, json};
 
 use super::state::WorkflowStateStore;
@@ -57,6 +60,14 @@ pub fn render_evidence_markdown(bundle: &WorkflowEvidenceBundle) -> String {
         "| Total agents | {} |\n",
         bundle.total_agent_count
     ));
+    markdown.push_str(&format!(
+        "| Max configured concurrent agents | {} |\n",
+        bundle.max_configured_concurrent_agents
+    ));
+    markdown.push_str(&format!(
+        "| Max observed concurrent agents | {} |\n",
+        bundle.max_observed_concurrent_agents
+    ));
     markdown.push_str(&format!("| Evidence agents | {} |\n", bundle.agents.len()));
     markdown.push_str(&format!("| Completed agents | {} |\n", counts.completed));
     markdown.push_str(&format!("| Cached agents | {} |\n", counts.cached));
@@ -102,17 +113,63 @@ pub fn render_evidence_markdown(bundle: &WorkflowEvidenceBundle) -> String {
         }
     }
 
+    if !bundle.failures.is_empty() {
+        markdown.push_str("\n## Failures\n\n");
+        markdown.push_str(
+            "| Kind | Scope | Phase | Call id | Retryable | Retry attempted | Message |\n",
+        );
+        markdown.push_str("| --- | --- | --- | --- | --- | --- | --- |\n");
+        for failure in &bundle.failures {
+            markdown.push_str(&format!(
+                "| {} | {} | {} | {} | {} | {} | {} |\n",
+                evidence_failure_kind_label(failure.kind),
+                escape_table(&failure.scope),
+                failure
+                    .phase_name
+                    .as_deref()
+                    .map(escape_table)
+                    .unwrap_or_default(),
+                failure
+                    .call_id
+                    .as_deref()
+                    .map(escape_table)
+                    .unwrap_or_default(),
+                failure
+                    .retryable
+                    .map(|retryable| retryable.to_string())
+                    .unwrap_or_default(),
+                failure.retry_attempted,
+                failure
+                    .message
+                    .as_deref()
+                    .map(escape_table)
+                    .unwrap_or_default(),
+            ));
+        }
+    }
+
     if !bundle.agents.is_empty() {
         markdown.push_str("\n## Agents\n\n");
-        markdown.push_str("| Call id | Path | Team | Status | Attempt | Transcript |\n");
-        markdown.push_str("| --- | --- | --- | --- | ---: | --- |\n");
+        markdown.push_str(
+            "| Call id | Path | Team | Status | Failure kind | Retryable | Retry attempted | Attempt | Transcript |\n",
+        );
+        markdown.push_str("| --- | --- | --- | --- | --- | --- | --- | ---: | --- |\n");
         for agent in &bundle.agents {
             markdown.push_str(&format!(
-                "| {} | {} | {} | {} | {}/{} | {} |\n",
+                "| {} | {} | {} | {} | {} | {} | {} | {}/{} | {} |\n",
                 escape_table(&agent.call_id),
                 escape_table(&agent.call_path),
                 agent.team.as_deref().map(escape_table).unwrap_or_default(),
                 agent_status_label(agent.status),
+                agent
+                    .failure_kind
+                    .map(agent_failure_kind_label)
+                    .unwrap_or_default(),
+                agent
+                    .retryable
+                    .map(|retryable| retryable.to_string())
+                    .unwrap_or_default(),
+                agent.retry_attempted,
                 agent.attempt,
                 agent.max_attempts,
                 agent
@@ -182,6 +239,25 @@ fn agent_status_label(status: WorkflowAgentStatus) -> &'static str {
         WorkflowAgentStatus::Completed => "completed",
         WorkflowAgentStatus::Failed => "failed",
         WorkflowAgentStatus::Cancelled => "cancelled",
+    }
+}
+
+fn evidence_failure_kind_label(kind: WorkflowEvidenceFailureKind) -> &'static str {
+    match kind {
+        WorkflowEvidenceFailureKind::AgentFailed => "agent_failed",
+        WorkflowEvidenceFailureKind::PhaseFailedContinue => "phase_failed_continue",
+        WorkflowEvidenceFailureKind::PhaseFailedBlocked => "phase_failed_blocked",
+        WorkflowEvidenceFailureKind::WorkflowFailed => "workflow_failed",
+    }
+}
+
+fn agent_failure_kind_label(kind: WorkflowAgentFailureKind) -> &'static str {
+    match kind {
+        WorkflowAgentFailureKind::AgentFailed => "agent_failed",
+        WorkflowAgentFailureKind::ToolFailure => "tool_failure",
+        WorkflowAgentFailureKind::McpFailure => "mcp_failure",
+        WorkflowAgentFailureKind::TokenBudget => "token_budget",
+        WorkflowAgentFailureKind::SchemaValidation => "schema_validation",
     }
 }
 

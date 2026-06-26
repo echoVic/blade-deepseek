@@ -109,6 +109,7 @@ pub struct WorkflowRunner {
 struct WorkflowExecutionCounters {
     total_agents: u32,
     active_agents: usize,
+    max_observed_concurrent_agents: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -188,6 +189,9 @@ impl WorkflowExecutionGate {
         }
         counters.total_agents += 1;
         counters.active_agents += 1;
+        counters.max_observed_concurrent_agents = counters
+            .max_observed_concurrent_agents
+            .max(counters.active_agents);
         Ok(WorkflowAgentPermit {
             gate: Arc::clone(self),
         })
@@ -366,7 +370,7 @@ impl WorkflowRunner {
                 transcript_dir,
                 task_id,
                 run_id,
-                gate.snapshot()?.total_agents,
+                gate.snapshot()?,
             );
         }
 
@@ -407,14 +411,13 @@ impl WorkflowRunner {
                 Err(error) => {
                     let message = error.to_string();
                     let counts = self.state.agent_status_counts(&run_id)?;
-                    state.total_agent_count = gate
-                        .snapshot()?
-                        .total_agents
-                        .max(terminal_agent_count(&counts));
+                    let counters = gate.snapshot()?;
+                    state.total_agent_count =
+                        counters.total_agents.max(terminal_agent_count(&counts));
                     state.status = WorkflowRunStatus::Failed;
                     state.error = Some(message.clone());
                     self.state.write_state(&state)?;
-                    self.write_evidence_for_state(&state)?;
+                    self.write_evidence_for_state(&state, Some(&counters))?;
                     self.tasks
                         .fail(&task_id, message.clone())
                         .map_err(io::Error::other)?;
@@ -439,13 +442,14 @@ impl WorkflowRunner {
                     transcript_dir,
                     task_id,
                     run_id,
-                    gate.snapshot()?.total_agents,
+                    gate.snapshot()?,
                 );
             }
             state.status = WorkflowRunStatus::Failed;
             state.error = Some(error.clone());
             self.state.write_state(&state)?;
-            self.write_evidence_for_state(&state)?;
+            let counters = gate.snapshot()?;
+            self.write_evidence_for_state(&state, Some(&counters))?;
             self.tasks
                 .fail(&task_id, error.clone())
                 .map_err(io::Error::other)?;
@@ -461,7 +465,7 @@ impl WorkflowRunner {
                 transcript_dir,
                 task_id,
                 run_id,
-                gate.snapshot()?.total_agents,
+                gate.snapshot()?,
             );
         }
 
@@ -481,7 +485,8 @@ impl WorkflowRunner {
         state.status = WorkflowRunStatus::Completed;
         state.final_summary = Some(summary.clone());
         self.state.write_state(&state)?;
-        self.write_evidence_for_state(&state)?;
+        let counters = gate.snapshot()?;
+        self.write_evidence_for_state(&state, Some(&counters))?;
         self.refresh_task_progress(&task_id, &state)?;
         self.tasks
             .complete(&task_id, result.clone())
@@ -852,10 +857,11 @@ impl WorkflowRunner {
                     .or(result.final_message)
                     .unwrap_or_else(|| "workflow child agent failed".to_string());
                 append_worktree_outcome(&mut error, worktree.as_ref());
+                let retryable = is_retryable_child_agent_error(&error);
                 Err(WorkflowChildAgentCallError {
                     message: error,
                     usage: Some(usage),
-                    retryable: true,
+                    retryable,
                 })
             }
         }
@@ -884,14 +890,14 @@ impl WorkflowRunner {
         transcript_dir: PathBuf,
         task_id: String,
         run_id: String,
-        total_agent_count: u32,
+        counters: WorkflowExecutionCounters,
     ) -> io::Result<WorkflowLaunchResult> {
         state.status = WorkflowRunStatus::Stopped;
-        state.total_agent_count = total_agent_count;
+        state.total_agent_count = counters.total_agents;
         state.final_summary = Some(STOPPED_SUMMARY.to_string());
         state.error = None;
         self.state.write_state(&state)?;
-        self.write_evidence_for_state(&state)?;
+        self.write_evidence_for_state(&state, Some(&counters))?;
         self.tasks
             .stop(&task_id, STOPPED_SUMMARY.to_string())
             .map_err(io::Error::other)?;
@@ -957,7 +963,11 @@ impl WorkflowRunner {
             .map_err(io::Error::other)
     }
 
-    fn write_evidence_for_state(&self, state: &WorkflowRunState) -> io::Result<()> {
+    fn write_evidence_for_state(
+        &self,
+        state: &WorkflowRunState,
+        counters: Option<&WorkflowExecutionCounters>,
+    ) -> io::Result<()> {
         let identity = WorkflowEvidenceIdentity {
             app_version: self.config.app_version.clone(),
             binary_path: std::env::current_exe()
@@ -965,7 +975,12 @@ impl WorkflowRunner {
                 .map(|path| path.display().to_string()),
             generated_at_ms: now_ms(),
         };
-        let bundle = self.state.build_evidence_bundle(state, identity)?;
+        let mut bundle = self.state.build_evidence_bundle(state, identity)?;
+        bundle.max_configured_concurrent_agents =
+            self.config.workflows.max_concurrent_agents as u32;
+        bundle.max_observed_concurrent_agents = counters
+            .map(|counters| counters.max_observed_concurrent_agents as u32)
+            .unwrap_or_default();
         self.state.write_evidence_bundle(&bundle)
     }
 }
@@ -1042,6 +1057,18 @@ fn validate_workflow_agent_schema(call: &AgentCall, result: &Value) -> Result<()
             call.call_id
         )
     })
+}
+
+fn is_retryable_child_agent_error(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    !(error.contains("disallows tool")
+        || error.contains("tool")
+        || error.contains("command")
+        || error.contains("mcp__")
+        || error.contains("mcp")
+        || error.contains("token budget")
+        || error.contains("tokens exceeded")
+        || error.contains("schema validation"))
 }
 
 fn append_worktree_outcome(output: &mut String, outcome: Option<&WorktreeOutcome>) {
@@ -1173,7 +1200,8 @@ fn write_agent_transcript(
 fn result_to_summary(result: &Value) -> String {
     match result {
         Value::String(value) => value.clone(),
-        Value::Object(map) => summary_from_dsl_phases(map.get("phases"))
+        Value::Object(map) => summary_from_object_phases(map.get("phases"))
+            .or_else(|| summary_from_dsl_phases(map.get("phases")))
             .or_else(|| {
                 map.get("result").and_then(|value| match value {
                     Value::String(text) => Some(text.clone()),
@@ -1189,6 +1217,22 @@ fn result_to_summary(result: &Value) -> String {
         Value::Null => String::new(),
         value => value.to_string(),
     }
+}
+
+fn summary_from_object_phases(phases: Option<&Value>) -> Option<String> {
+    let phases = phases?.as_object()?;
+    let mut parts = Vec::new();
+    for (name, phase_value) in phases {
+        if let Some(obj) = phase_value.as_object() {
+            if let Some(error) = obj.get("error").and_then(Value::as_str) {
+                parts.push(format!("{name}: {error}"));
+            }
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(parts.join("; "))
 }
 
 fn summary_from_dsl_phases(phases: Option<&Value>) -> Option<String> {

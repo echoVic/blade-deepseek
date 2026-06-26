@@ -7,8 +7,9 @@ use std::sync::{Arc, Mutex};
 use orca_core::cost_types::UsageTotals;
 use orca_core::task_types::WorkflowAgentTaskSummary;
 use orca_core::workflow_types::{
-    WorkflowAgentStatus, WorkflowEvidenceAgent, WorkflowEvidenceBundle, WorkflowEvidenceIdentity,
-    WorkflowEvidencePhase, WorkflowInput, WorkflowRunState,
+    WorkflowAgentFailureKind, WorkflowAgentStatus, WorkflowEvidenceAgent, WorkflowEvidenceBundle,
+    WorkflowEvidenceFailure, WorkflowEvidenceFailureKind, WorkflowEvidenceIdentity,
+    WorkflowEvidencePhase, WorkflowInput, WorkflowRunState, WorkflowRunStatus,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -259,23 +260,32 @@ impl WorkflowStateStore {
         let mut agents = if cache_path.exists() {
             read_agent_cache(&cache_path)?
                 .into_values()
-                .map(|entry| WorkflowEvidenceAgent {
-                    call_id: entry.record.call_id,
-                    call_path: entry.record.call_path,
-                    team: entry
-                        .record
-                        .team
-                        .or_else(|| workflow_agent_team(&entry.record.opts)),
-                    input_hash: entry.record.input_hash,
-                    status: entry.record.status,
-                    attempt: entry.record.attempt,
-                    max_attempts: entry.record.max_attempts,
-                    previous_errors: entry.record.previous_errors,
-                    error: entry.record.error,
-                    transcript_path: entry.record.transcript_path,
-                    started_at_ms: entry.record.started_at_ms,
-                    completed_at_ms: entry.record.completed_at_ms,
-                    usage: entry.record.usage,
+                .map(|entry| {
+                    let failure_kind = agent_failure_kind(&entry.record);
+                    let retry_attempted =
+                        !entry.record.previous_errors.is_empty() || entry.record.attempt > 1;
+                    let retryable = failure_kind.map(|kind| agent_failure_retryable(kind));
+                    WorkflowEvidenceAgent {
+                        call_id: entry.record.call_id,
+                        call_path: entry.record.call_path,
+                        team: entry
+                            .record
+                            .team
+                            .or_else(|| workflow_agent_team(&entry.record.opts)),
+                        input_hash: entry.record.input_hash,
+                        status: entry.record.status,
+                        attempt: entry.record.attempt,
+                        max_attempts: entry.record.max_attempts,
+                        previous_errors: entry.record.previous_errors,
+                        error: entry.record.error,
+                        transcript_path: entry.record.transcript_path,
+                        started_at_ms: entry.record.started_at_ms,
+                        completed_at_ms: entry.record.completed_at_ms,
+                        usage: entry.record.usage,
+                        failure_kind,
+                        retryable,
+                        retry_attempted,
+                    }
                 })
                 .collect::<Vec<_>>()
         } else {
@@ -286,6 +296,20 @@ impl WorkflowStateStore {
                 .cmp(&right.call_path)
                 .then_with(|| left.call_id.cmp(&right.call_id))
         });
+        let phases = state
+            .phases
+            .iter()
+            .map(|phase| WorkflowEvidencePhase {
+                name: phase.name.clone(),
+                status: phase.status,
+                started_at_ms: phase.started_at_ms,
+                completed_at_ms: phase.completed_at_ms,
+                agent_count: phase.agent_count,
+                error: phase.error.clone(),
+                fallback: phase.fallback.clone(),
+            })
+            .collect::<Vec<_>>();
+        let failures = workflow_evidence_failures(state, &phases, &agents);
 
         Ok(WorkflowEvidenceBundle {
             evidence_version: 1,
@@ -299,23 +323,14 @@ impl WorkflowStateStore {
             script_digest: state.script_digest.clone(),
             args_digest: state.args_digest.clone(),
             status: state.status,
-            phases: state
-                .phases
-                .iter()
-                .map(|phase| WorkflowEvidencePhase {
-                    name: phase.name.clone(),
-                    status: phase.status,
-                    started_at_ms: phase.started_at_ms,
-                    completed_at_ms: phase.completed_at_ms,
-                    agent_count: phase.agent_count,
-                    error: phase.error.clone(),
-                    fallback: phase.fallback.clone(),
-                })
-                .collect(),
+            phases,
             total_agent_count: state.total_agent_count,
+            max_configured_concurrent_agents: 0,
+            max_observed_concurrent_agents: 0,
             final_summary: state.final_summary.clone(),
             error: state.error.clone(),
             agents,
+            failures,
         })
     }
 
@@ -507,6 +522,109 @@ fn is_reusable_cached_status(status: WorkflowAgentStatus) -> bool {
         status,
         WorkflowAgentStatus::Completed | WorkflowAgentStatus::Cached
     )
+}
+
+fn workflow_evidence_failures(
+    state: &WorkflowRunState,
+    phases: &[WorkflowEvidencePhase],
+    agents: &[WorkflowEvidenceAgent],
+) -> Vec<WorkflowEvidenceFailure> {
+    let mut failures = Vec::new();
+    for agent in agents {
+        if let Some(failure_kind) = agent.failure_kind {
+            failures.push(WorkflowEvidenceFailure {
+                kind: WorkflowEvidenceFailureKind::AgentFailed,
+                scope: agent_failure_scope(failure_kind).to_string(),
+                phase_name: phase_name_from_call_path(&agent.call_path),
+                call_id: Some(agent.call_id.clone()),
+                call_path: Some(agent.call_path.clone()),
+                message: agent
+                    .error
+                    .clone()
+                    .or_else(|| agent.previous_errors.last().cloned()),
+                retryable: agent.retryable,
+                retry_attempted: agent.retry_attempted,
+            });
+        }
+    }
+    for phase in phases {
+        if phase.status == WorkflowRunStatus::Failed {
+            failures.push(WorkflowEvidenceFailure {
+                kind: if phase.fallback.is_some() {
+                    WorkflowEvidenceFailureKind::PhaseFailedContinue
+                } else {
+                    WorkflowEvidenceFailureKind::PhaseFailedBlocked
+                },
+                scope: "phase".to_string(),
+                phase_name: Some(phase.name.clone()),
+                call_id: None,
+                call_path: None,
+                message: phase.error.clone(),
+                retryable: None,
+                retry_attempted: false,
+            });
+        }
+    }
+    if state.status == WorkflowRunStatus::Failed {
+        failures.push(WorkflowEvidenceFailure {
+            kind: WorkflowEvidenceFailureKind::WorkflowFailed,
+            scope: "workflow".to_string(),
+            phase_name: None,
+            call_id: None,
+            call_path: None,
+            message: state.error.clone(),
+            retryable: None,
+            retry_attempted: false,
+        });
+    }
+    failures
+}
+
+fn agent_failure_kind(record: &WorkflowAgentRecord) -> Option<WorkflowAgentFailureKind> {
+    if record.status != WorkflowAgentStatus::Failed && record.previous_errors.is_empty() {
+        return None;
+    }
+    let message = record
+        .error
+        .as_deref()
+        .or_else(|| record.previous_errors.last().map(String::as_str))
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if message.contains("mcp__") || message.contains("mcp") {
+        Some(WorkflowAgentFailureKind::McpFailure)
+    } else if message.contains("disallows tool")
+        || message.contains("tool")
+        || message.contains("command")
+    {
+        Some(WorkflowAgentFailureKind::ToolFailure)
+    } else if message.contains("token budget") || message.contains("tokens exceeded") {
+        Some(WorkflowAgentFailureKind::TokenBudget)
+    } else if message.contains("schema validation") {
+        Some(WorkflowAgentFailureKind::SchemaValidation)
+    } else {
+        Some(WorkflowAgentFailureKind::AgentFailed)
+    }
+}
+
+fn agent_failure_retryable(kind: WorkflowAgentFailureKind) -> bool {
+    matches!(kind, WorkflowAgentFailureKind::AgentFailed)
+}
+
+fn agent_failure_scope(kind: WorkflowAgentFailureKind) -> &'static str {
+    match kind {
+        WorkflowAgentFailureKind::AgentFailed => "agent",
+        WorkflowAgentFailureKind::ToolFailure => "tool",
+        WorkflowAgentFailureKind::McpFailure => "mcp",
+        WorkflowAgentFailureKind::TokenBudget => "token_budget",
+        WorkflowAgentFailureKind::SchemaValidation => "schema_validation",
+    }
+}
+
+fn phase_name_from_call_path(call_path: &str) -> Option<String> {
+    call_path
+        .strip_prefix("phases.")
+        .and_then(|rest| rest.split(':').next())
+        .map(str::to_string)
 }
 
 fn now_ms() -> i64 {

@@ -76,6 +76,25 @@ pub enum WorkflowAgentStatus {
     Cancelled,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowAgentFailureKind {
+    AgentFailed,
+    ToolFailure,
+    McpFailure,
+    TokenBudget,
+    SchemaValidation,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowEvidenceFailureKind {
+    AgentFailed,
+    PhaseFailedContinue,
+    PhaseFailedBlocked,
+    WorkflowFailed,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkflowPhaseRecord {
@@ -155,6 +174,31 @@ pub struct WorkflowEvidenceAgent {
     pub completed_at_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<UsageTotals>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_kind: Option<WorkflowAgentFailureKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retryable: Option<bool>,
+    #[serde(default)]
+    pub retry_attempted: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkflowEvidenceFailure {
+    pub kind: WorkflowEvidenceFailureKind,
+    pub scope: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retryable: Option<bool>,
+    #[serde(default)]
+    pub retry_attempted: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -174,10 +218,16 @@ pub struct WorkflowEvidenceBundle {
     #[serde(default)]
     pub phases: Vec<WorkflowEvidencePhase>,
     pub total_agent_count: u32,
+    #[serde(default)]
+    pub max_configured_concurrent_agents: u32,
+    #[serde(default)]
+    pub max_observed_concurrent_agents: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub final_summary: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(default)]
     pub agents: Vec<WorkflowEvidenceAgent>,
+    #[serde(default)]
+    pub failures: Vec<WorkflowEvidenceFailure>,
 }

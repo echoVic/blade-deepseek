@@ -80,7 +80,12 @@ async function agent(prompt, opts = {}) {
 }
 
 async function parallel(items) {
-  return Promise.all(items);
+  const results = await Promise.allSettled(items);
+  const firstError = results.find((r) => r.status === "rejected");
+  if (firstError) {
+    throw firstError.reason;
+  }
+  return results.map((r) => r.value);
 }
 
 async function pipeline(items) {

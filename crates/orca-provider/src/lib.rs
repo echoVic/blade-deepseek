@@ -441,6 +441,16 @@ fn parse_mock_prompt(prompt: &str) -> Option<ToolRequest> {
         });
     }
 
+    if prompt == "mcp__broken__tool" {
+        return Some(ToolRequest {
+            id: "mock-tool-1".to_string(),
+            name: ToolName::Mcp("mcp__broken__tool".to_string()),
+            action: ActionKind::Agent,
+            target: Some("mcp__broken__tool".to_string()),
+            raw_arguments: Some(serde_json::json!({}).to_string()),
+        });
+    }
+
     if let Some(rest) = prompt.strip_prefix("workflow ") {
         let mode = rest.trim();
         let script = "export const meta = { name: 'mock-workflow', description: 'Mock workflow', phases: ['main'] };\nconst result = await phase('main', async () => agent('inspect repo'));\nexport default result;";

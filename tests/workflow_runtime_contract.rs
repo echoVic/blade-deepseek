@@ -10,8 +10,11 @@ use orca_core::config::{
 use orca_core::hook_types::{HookConfig, HookEvent};
 use orca_core::model::ModelSelection;
 use orca_core::task_types::TaskStatus;
-use orca_core::workflow_types::{WorkflowAgentStatus, WorkflowRunStatus};
+use orca_core::workflow_types::{
+    WorkflowAgentFailureKind, WorkflowAgentStatus, WorkflowEvidenceFailureKind, WorkflowRunStatus,
+};
 use orca_runtime::tasks::TaskRegistry;
+use orca_runtime::workflow::report::render_report_for_run;
 use orca_runtime::workflow::state::{WorkflowStateStore, input_hash};
 use orca_runtime::workflow::{WorkflowLaunchRequest, WorkflowRunner};
 use serde_json::json;
@@ -110,6 +113,95 @@ fn workflow_resume_uses_completed_agent_cache() {
         .unwrap();
 
     assert!(second.summary.contains("cached 1 agent"));
+}
+
+#[test]
+fn workflow_respects_configured_concurrency_in_evidence() {
+    if !orca_runtime::workflow::host::WorkflowHost::node_available() {
+        return;
+    }
+
+    let repo = std::env::current_dir().expect("repo cwd");
+    let script = repo.join("tests/fixtures/workflows/stress-evidence.js");
+    assert!(script.exists(), "stress workflow fixture should exist");
+
+    let temp = tempdir().unwrap();
+    let mut config = mock_run_config(temp.path());
+    config.workflows.max_concurrent_agents = 4;
+    let tasks = TaskRegistry::new("session-1".to_string());
+    let session_dir = temp.path().join("session");
+    let runner = WorkflowRunner::new(config, tasks.clone(), session_dir.clone());
+
+    let launched = runner
+        .launch(WorkflowLaunchRequest::from_script_path(
+            script.display().to_string(),
+        ))
+        .expect("stress workflow runs");
+    let run_id = launched.output.run_id.as_deref().expect("run id");
+    let store = WorkflowStateStore::new(session_dir.join("workflow-runs"));
+    let evidence = store.load_evidence_bundle(run_id).expect("evidence");
+
+    assert_eq!(evidence.status, WorkflowRunStatus::Completed);
+    assert_eq!(evidence.total_agent_count, 16);
+    assert_eq!(evidence.agents.len(), 16);
+    assert_eq!(evidence.max_configured_concurrent_agents, 4);
+    assert!(
+        evidence.max_observed_concurrent_agents <= 4,
+        "observed {} should stay within configured cap",
+        evidence.max_observed_concurrent_agents
+    );
+    assert!(
+        evidence
+            .agents
+            .iter()
+            .all(|agent| agent.status == WorkflowAgentStatus::Completed)
+    );
+}
+
+#[test]
+fn workflow_resume_reuses_evidence_bound_cached_agents() {
+    if !orca_runtime::workflow::host::WorkflowHost::node_available() {
+        return;
+    }
+
+    let repo = std::env::current_dir().expect("repo cwd");
+    let script = repo.join("tests/fixtures/workflows/stress-evidence.js");
+    assert!(script.exists(), "stress workflow fixture should exist");
+
+    let temp = tempdir().unwrap();
+    let mut config = mock_run_config(temp.path());
+    config.workflows.max_concurrent_agents = 4;
+    let tasks = TaskRegistry::new("session-1".to_string());
+    let session_dir = temp.path().join("session");
+    let runner = WorkflowRunner::new(config, tasks.clone(), session_dir.clone());
+
+    let first = runner
+        .launch(WorkflowLaunchRequest::from_script_path(
+            script.display().to_string(),
+        ))
+        .expect("first stress workflow runs");
+    let first_run_id = first.output.run_id.clone().expect("first run id");
+    let second = runner
+        .launch(
+            WorkflowLaunchRequest::from_script_path(script.display().to_string())
+                .with_resume_from(first_run_id),
+        )
+        .expect("resumed stress workflow runs from cache");
+
+    assert!(second.summary.contains("cached 16 agents"));
+    let run_id = second.output.run_id.as_deref().expect("second run id");
+    let store = WorkflowStateStore::new(session_dir.join("workflow-runs"));
+    let evidence = store.load_evidence_bundle(run_id).expect("evidence");
+    assert_eq!(evidence.total_agent_count, 16);
+    assert_eq!(evidence.agents.len(), 16);
+    assert!(
+        evidence
+            .agents
+            .iter()
+            .all(|agent| agent.status == WorkflowAgentStatus::Cached)
+    );
+    assert_eq!(evidence.max_configured_concurrent_agents, 4);
+    assert_eq!(evidence.max_observed_concurrent_agents, 0);
 }
 
 #[test]
@@ -472,6 +564,18 @@ fn workflow_runner_retries_transient_child_agent_failure() {
     let state = store.load_run(run_id).expect("run state");
     assert_eq!(state.status, WorkflowRunStatus::Completed);
     assert_eq!(state.total_agent_count, 2);
+    let evidence = store.load_evidence_bundle(run_id).expect("evidence");
+    assert_eq!(evidence.total_agent_count, 2);
+    assert_eq!(evidence.agents.len(), 1);
+    assert_eq!(evidence.agents[0].attempt, 2);
+    assert_eq!(evidence.agents[0].max_attempts, 2);
+    assert_eq!(evidence.agents[0].previous_errors.len(), 1);
+    assert_eq!(evidence.agents[0].retryable, Some(true));
+    assert!(evidence.agents[0].retry_attempted);
+    assert_eq!(
+        evidence.agents[0].failure_kind,
+        Some(WorkflowAgentFailureKind::AgentFailed)
+    );
     assert!(
         store
             .cached_agent_result(run_id, "root:1", &input_hash(&flaky_prompt, &json!({})))
@@ -680,6 +784,146 @@ fn workflow_team_policy_blocks_disallowed_tools() {
         agent.status,
         orca_core::workflow_types::WorkflowAgentStatus::Failed
     );
+
+    let run_id = record.workflow_run_id.as_deref().expect("run id");
+    let store = WorkflowStateStore::new(session_dir.join("workflow-runs"));
+    let evidence = store.load_evidence_bundle(run_id).expect("evidence");
+    assert_eq!(evidence.agents.len(), 1);
+    assert_eq!(
+        evidence.agents[0].failure_kind,
+        Some(WorkflowAgentFailureKind::ToolFailure)
+    );
+    assert_eq!(evidence.agents[0].retryable, Some(false));
+    assert!(!evidence.agents[0].retry_attempted);
+    assert!(evidence.failures.iter().any(|failure| failure.kind
+        == WorkflowEvidenceFailureKind::AgentFailed
+        && failure.call_id.as_deref() == Some(evidence.agents[0].call_id.as_str())));
+}
+
+#[test]
+fn workflow_evidence_classifies_mcp_tool_failures_without_stopping_independent_branches() {
+    if !orca_runtime::workflow::host::WorkflowHost::node_available() {
+        return;
+    }
+
+    let temp = tempdir().unwrap();
+    let script = temp.path().join("workflow.js");
+    fs::write(
+        &script,
+        "export const meta = { name: 'mcp-diagnostics', description: 'MCP diagnostics test', phases: ['fanout'] };\n\
+         const results = await phase('fanout', async () => parallel([\n\
+           agent('mcp__broken__tool', { team: 'mcp' }),\n\
+           agent('inspect still runs', { team: 'control' })\n\
+         ]), { fallback: 'continue' });\n\
+         export default 'continued after mcp failure';",
+    )
+    .unwrap();
+
+    let mut config = mock_run_config(temp.path());
+    config.workflows.max_agent_retries = 0;
+    let tasks = TaskRegistry::new("session-1".to_string());
+    let session_dir = temp.path().join("session");
+    let runner = WorkflowRunner::new(config, tasks.clone(), session_dir.clone());
+    let launched = runner
+        .launch(WorkflowLaunchRequest::from_script_path(
+            script.display().to_string(),
+        ))
+        .expect("fallback keeps workflow running after mcp branch fails");
+
+    assert!(launched.summary.contains("continued after mcp failure"));
+    let run_id = launched.output.run_id.as_deref().expect("run id");
+    let store = WorkflowStateStore::new(session_dir.join("workflow-runs"));
+    let evidence = store.load_evidence_bundle(run_id).expect("evidence");
+    assert_eq!(evidence.status, WorkflowRunStatus::Completed);
+    assert_eq!(evidence.agents.len(), 2);
+    let mcp_agent = evidence
+        .agents
+        .iter()
+        .find(|agent| agent.team.as_deref() == Some("mcp"))
+        .expect("mcp agent evidence");
+    assert_eq!(mcp_agent.status, WorkflowAgentStatus::Failed);
+    assert_eq!(
+        mcp_agent.failure_kind,
+        Some(WorkflowAgentFailureKind::McpFailure)
+    );
+    assert_eq!(mcp_agent.retryable, Some(false));
+    assert!(!mcp_agent.retry_attempted);
+    let control_agent = evidence
+        .agents
+        .iter()
+        .find(|agent| agent.team.as_deref() == Some("control"))
+        .expect("control agent evidence");
+    assert_eq!(control_agent.status, WorkflowAgentStatus::Completed);
+    assert!(evidence.failures.iter().any(|failure| failure.kind
+        == WorkflowEvidenceFailureKind::PhaseFailedContinue
+        && failure.phase_name.as_deref() == Some("fanout")));
+}
+
+#[test]
+fn workflow_evidence_classifies_tool_policy_failures_without_stopping_independent_branches() {
+    if !orca_runtime::workflow::host::WorkflowHost::node_available() {
+        return;
+    }
+
+    let temp = tempdir().unwrap();
+    let script = temp.path().join("workflow.js");
+    fs::write(
+        &script,
+        "export const meta = { name: 'tool-diagnostics', description: 'Tool diagnostics test', phases: ['fanout'] };\n\
+         await phase('fanout', async () => parallel([\n\
+           agent('bash printf hi', { team: 'blocked' }),\n\
+           agent('inspect still runs', { team: 'control' })\n\
+         ]), { fallback: 'continue' });\n\
+         export default 'continued after tool failure';",
+    )
+    .unwrap();
+
+    let mut config = mock_run_config(temp.path());
+    config.workflows.max_agent_retries = 0;
+    config.workflows.teams.insert(
+        "blocked".to_string(),
+        WorkflowTeamConfig {
+            max_agent_retries: Some(0),
+            max_agent_tokens: None,
+            allowed_tools: Some(vec!["read_file".to_string()]),
+        },
+    );
+    let tasks = TaskRegistry::new("session-1".to_string());
+    let session_dir = temp.path().join("session");
+    let runner = WorkflowRunner::new(config, tasks.clone(), session_dir.clone());
+    let launched = runner
+        .launch(WorkflowLaunchRequest::from_script_path(
+            script.display().to_string(),
+        ))
+        .expect("fallback keeps workflow running after tool branch fails");
+
+    assert!(launched.summary.contains("continued after tool failure"));
+    let run_id = launched.output.run_id.as_deref().expect("run id");
+    let store = WorkflowStateStore::new(session_dir.join("workflow-runs"));
+    let evidence = store.load_evidence_bundle(run_id).expect("evidence");
+    assert_eq!(evidence.status, WorkflowRunStatus::Completed);
+    assert_eq!(evidence.agents.len(), 2);
+    let blocked_agent = evidence
+        .agents
+        .iter()
+        .find(|agent| agent.team.as_deref() == Some("blocked"))
+        .expect("blocked agent evidence");
+    assert_eq!(blocked_agent.status, WorkflowAgentStatus::Failed);
+    assert_eq!(
+        blocked_agent.failure_kind,
+        Some(WorkflowAgentFailureKind::ToolFailure)
+    );
+    assert_eq!(blocked_agent.retryable, Some(false));
+    assert!(!blocked_agent.retry_attempted);
+    let control_agent = evidence
+        .agents
+        .iter()
+        .find(|agent| agent.team.as_deref() == Some("control"))
+        .expect("control agent evidence");
+    assert_eq!(control_agent.status, WorkflowAgentStatus::Completed);
+    assert!(evidence.failures.iter().any(|failure| failure.kind
+        == WorkflowEvidenceFailureKind::PhaseFailedContinue
+        && failure.phase_name.as_deref() == Some("fanout")));
 }
 
 #[test]
@@ -1034,6 +1278,14 @@ fn failing_phase_is_persisted_as_failed_and_completed() {
     assert_eq!(phase.agent_count, 1);
     assert!(phase.started_at_ms.is_some());
     assert!(phase.completed_at_ms.is_some());
+    let evidence = store.load_evidence_bundle(run_id).expect("evidence");
+    let failure_kinds = evidence
+        .failures
+        .iter()
+        .map(|failure| failure.kind)
+        .collect::<Vec<_>>();
+    assert!(failure_kinds.contains(&WorkflowEvidenceFailureKind::PhaseFailedBlocked));
+    assert!(failure_kinds.contains(&WorkflowEvidenceFailureKind::WorkflowFailed));
 }
 
 #[test]
@@ -1081,6 +1333,21 @@ fn phase_fallback_continue_records_failed_phase_and_runs_next_phase() {
     assert_eq!(state.phases[0].agent_count, 1);
     assert_eq!(state.phases[1].name, "review");
     assert_eq!(state.phases[1].status, WorkflowRunStatus::Completed);
+    let evidence = store.load_evidence_bundle(run_id).expect("evidence");
+    assert_eq!(evidence.status, WorkflowRunStatus::Completed);
+    assert!(evidence.failures.iter().any(|failure| failure.kind
+        == WorkflowEvidenceFailureKind::PhaseFailedContinue
+        && failure.phase_name.as_deref() == Some("scan")));
+    assert!(
+        evidence
+            .failures
+            .iter()
+            .any(|failure| failure.kind == WorkflowEvidenceFailureKind::AgentFailed)
+    );
+    let report = render_report_for_run(&store, run_id).expect("evidence report");
+    assert!(report.markdown.contains("| Status | completed |"));
+    assert!(report.markdown.contains("phase_failed_continue"));
+    assert!(report.markdown.contains("agent_failed"));
 }
 
 #[test]
