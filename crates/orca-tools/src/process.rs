@@ -1,8 +1,11 @@
 use std::io::{self, Read};
-use std::process::{Child, ExitStatus};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 pub struct CommandOutput {
     pub stdout: Vec<u8>,
@@ -40,7 +43,7 @@ pub fn wait_for_child_output_with_timeout(
             None => {
                 if Instant::now() >= deadline {
                     timed_out = true;
-                    let _ = child.kill();
+                    kill_child_tree(&mut child);
                     break child.wait()?;
                 }
                 thread::sleep(Duration::from_millis(50));
@@ -57,6 +60,14 @@ pub fn wait_for_child_output_with_timeout(
         status,
         timed_out,
     })
+}
+
+pub fn prepare_non_interactive_command(command: &mut Command) {
+    command.stdin(Stdio::null());
+    #[cfg(unix)]
+    {
+        command.process_group(0);
+    }
 }
 
 fn spawn_reader<R: Read + Send + 'static>(
@@ -80,5 +91,31 @@ fn take_buffer(buffer: Arc<Mutex<Option<Vec<u8>>>>) -> Vec<u8> {
             .ok()
             .and_then(|slot| slot.clone())
             .unwrap_or_default(),
+    }
+}
+
+pub fn kill_child_tree(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        kill_process_group(child.id());
+    }
+    let _ = child.kill();
+}
+
+#[cfg(unix)]
+fn kill_process_group(pid: u32) {
+    unsafe extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+
+    const SIGTERM: i32 = 15;
+    const SIGKILL: i32 = 9;
+    let pgid = -(pid as i32);
+    unsafe {
+        let _ = kill(pgid, SIGTERM);
+    }
+    thread::sleep(Duration::from_millis(50));
+    unsafe {
+        let _ = kill(pgid, SIGKILL);
     }
 }

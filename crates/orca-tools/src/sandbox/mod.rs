@@ -5,7 +5,9 @@ use std::process::Command;
 pub mod seatbelt;
 
 pub fn bash_command(command: &str, cwd: &Path) -> Command {
-    platform::bash_command(command, cwd)
+    let mut command = platform::bash_command(command, cwd);
+    crate::process::prepare_non_interactive_command(&mut command);
+    command
 }
 
 #[cfg(target_os = "macos")]

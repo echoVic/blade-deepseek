@@ -1,4 +1,5 @@
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use orca_core::conversation::Conversation;
 use orca_core::hook_types::{HookConfig, HookEvent};
@@ -33,9 +34,19 @@ impl HookRunner {
     }
 
     pub fn run(&self, event: HookEvent, context: HookContext<'_>) -> Result<HookOutcome, String> {
+        self.run_with_timeout(event, context, Duration::from_secs(30))
+    }
+
+    fn run_with_timeout(
+        &self,
+        event: HookEvent,
+        context: HookContext<'_>,
+        timeout: Duration,
+    ) -> Result<HookOutcome, String> {
         let mut outcome = HookOutcome::default();
         for hook in self.matching_hooks(event, context.tool_request) {
-            let output = Command::new("sh")
+            let mut command = Command::new("sh");
+            command
                 .arg("-c")
                 .arg(&hook.command)
                 .env("ORCA_HOOK_EVENT", event.as_str())
@@ -102,8 +113,39 @@ impl HookRunner {
                         .map(|usage| usage.cache_tokens.to_string())
                         .unwrap_or_default(),
                 )
-                .output()
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            orca_tools::process::prepare_non_interactive_command(&mut command);
+            let child = command
+                .spawn()
                 .map_err(|error| format!("hook '{}' failed to start: {error}", hook.command))?;
+            let output = orca_tools::process::wait_for_child_output_with_timeout(child, timeout)
+                .map_err(|error| format!("hook '{}' failed: {error}", hook.command))?;
+
+            if output.timed_out {
+                let stderr =
+                    String::from_utf8_lossy(&output.stderr[..output.stderr.len().min(65536)])
+                        .trim()
+                        .to_string();
+                let stdout =
+                    String::from_utf8_lossy(&output.stdout[..output.stdout.len().min(65536)])
+                        .trim()
+                        .to_string();
+                let detail = if stderr.is_empty() { stdout } else { stderr };
+                return Err(if detail.is_empty() {
+                    format!(
+                        "hook '{}' timed out after {}s",
+                        hook.command,
+                        timeout.as_secs()
+                    )
+                } else {
+                    format!(
+                        "hook '{}' timed out after {}s: {detail}",
+                        hook.command,
+                        timeout.as_secs()
+                    )
+                });
+            }
 
             if !output.status.success() {
                 let stderr =
@@ -243,6 +285,7 @@ mod tests {
     use orca_core::approval_types::ActionKind;
     use orca_core::provider_types::Usage;
     use orca_core::tool_types::{ToolName, ToolRequest};
+    use std::time::Instant;
 
     #[test]
     fn pre_tool_hook_can_block() {
@@ -273,6 +316,41 @@ mod tests {
             )
             .unwrap_err();
         assert!(err.contains("blocked"));
+    }
+
+    #[test]
+    fn hook_timeout_kills_descendant_processes() {
+        let runner = HookRunner::new(vec![HookConfig {
+            event: HookEvent::PreModelCall,
+            command: "printf before; sleep 5; printf after".to_string(),
+            tool: None,
+        }]);
+        let start = Instant::now();
+
+        let err = runner
+            .run_with_timeout(
+                HookEvent::PreModelCall,
+                HookContext {
+                    cwd: ".",
+                    session_status: None,
+                    tool_request: None,
+                    tool_result: None,
+                    before_messages: None,
+                    after_messages: None,
+                    usage: None,
+                },
+                Duration::from_millis(200),
+            )
+            .unwrap_err();
+
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "hook should not wait for descendant processes"
+        );
+        assert!(
+            err.contains("timed out after 0s: before"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{io::BufRead, io::BufReader};
 
 use orca_core::tool_types::{
@@ -186,6 +186,10 @@ pub fn execute_streaming_with_policy(
 
     let mut stdout = String::new();
     let mut stderr = String::new();
+    let deadline = Instant::now()
+        .checked_add(shell_timeout)
+        .unwrap_or_else(Instant::now);
+    let mut timed_out = false;
     let status = loop {
         match rx.recv_timeout(Duration::from_millis(50)) {
             Ok(StreamEvent::Stdout(chunk)) => {
@@ -208,7 +212,20 @@ pub fn execute_streaming_with_policy(
                 }
             },
         }
-        let _ = shell_timeout;
+        if Instant::now() >= deadline {
+            timed_out = true;
+            process::kill_child_tree(&mut child);
+            match child.wait() {
+                Ok(status) => break status,
+                Err(error) => {
+                    return ToolResult::failed(
+                        request,
+                        format!("failed to wait for shell command: {error}"),
+                        None,
+                    );
+                }
+            }
+        }
     };
 
     if let Some(handle) = stdout_handle {
@@ -232,11 +249,13 @@ pub fn execute_streaming_with_policy(
 
     let stdout = stdout.trim_end().to_string();
     let stderr = stderr.trim_end().to_string();
-    if status.success() {
+    if status.success() && !timed_out {
         let (stdout, truncated) = truncate_output_with_policy(stdout, output_truncation);
         ToolResult::completed(request, stdout, truncated)
     } else {
-        let message = if stderr.is_empty() {
+        let message = if timed_out {
+            timeout_message(shell_timeout, &stdout, &stderr)
+        } else if stderr.is_empty() {
             stdout
         } else if stdout.is_empty() {
             stderr
@@ -250,22 +269,48 @@ pub fn execute_streaming_with_policy(
     }
 }
 
+fn timeout_message(shell_timeout: Duration, stdout: &str, stderr: &str) -> String {
+    if stderr.is_empty() && stdout.is_empty() {
+        format!("shell command timed out after {}s", shell_timeout.as_secs())
+    } else if stderr.is_empty() {
+        format!(
+            "shell command timed out after {}s: {stdout}",
+            shell_timeout.as_secs()
+        )
+    } else if stdout.is_empty() {
+        format!(
+            "shell command timed out after {}s: {stderr}",
+            shell_timeout.as_secs()
+        )
+    } else {
+        format!(
+            "shell command timed out after {}s: {stdout}\n{stderr}",
+            shell_timeout.as_secs()
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use orca_core::approval_types::ActionKind;
     use orca_core::tool_types::{ToolName, ToolStatus};
+    use std::time::Instant;
+
+    fn bash_request(command: &str) -> ToolRequest {
+        ToolRequest {
+            id: "bash-1".to_string(),
+            name: ToolName::Bash,
+            action: ActionKind::Shell,
+            target: Some(command.to_string()),
+            raw_arguments: None,
+        }
+    }
 
     #[test]
     fn streaming_reports_output_chunks_and_final_result() {
         let dir = tempfile::TempDir::new().unwrap();
-        let request = ToolRequest {
-            id: "bash-1".to_string(),
-            name: ToolName::Bash,
-            action: ActionKind::Shell,
-            target: Some("printf 'one\\ntwo\\n'".to_string()),
-            raw_arguments: None,
-        };
+        let request = bash_request("printf 'one\\ntwo\\n'");
         let mut chunks = Vec::new();
 
         let result = execute_streaming(&request, dir.path(), 1024, &mut |chunk| {
@@ -277,5 +322,61 @@ mod tests {
         let joined = chunks.join("");
         assert!(joined.contains("one\n"), "expected stdout in chunks");
         assert!(joined.contains("two\n"), "expected stdout in chunks");
+    }
+
+    #[test]
+    fn bash_commands_receive_eof_on_stdin_instead_of_inheriting_terminal() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let request = bash_request("read line; printf done");
+        let start = Instant::now();
+
+        let result = execute_with_policy(
+            &request,
+            dir.path(),
+            ToolOutputTruncation::bytes(1024),
+            Duration::from_secs(2),
+        );
+
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "stdin should be closed without waiting for timeout"
+        );
+        assert_eq!(result.status, ToolStatus::Completed);
+        assert_eq!(result.output.as_deref(), Some("done"));
+    }
+
+    #[test]
+    fn streaming_respects_shell_timeout_and_returns_partial_output() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let request = bash_request("printf before; sleep 5; printf after");
+        let mut chunks = Vec::new();
+        let start = Instant::now();
+
+        let result = execute_streaming_with_policy(
+            &request,
+            dir.path(),
+            ToolOutputTruncation::bytes(1024),
+            Duration::from_millis(200),
+            &mut |chunk| chunks.push(chunk.to_string()),
+        );
+
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "streaming command should not wait for the child to finish"
+        );
+        assert_eq!(result.status, ToolStatus::Failed);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("shell command timed out after 0s"),
+            "unexpected error: {:?}",
+            result.error
+        );
+        assert!(
+            chunks.join("").contains("before"),
+            "partial output should be streamed before timeout"
+        );
     }
 }

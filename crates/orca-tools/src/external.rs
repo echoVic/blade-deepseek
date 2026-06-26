@@ -92,7 +92,8 @@ pub fn execute_external_tool_with_policy(
     shell_timeout: Duration,
 ) -> ToolResult {
     let args = request.raw_arguments.as_deref().unwrap_or("{}");
-    let mut child = match Command::new("sh")
+    let mut command = Command::new("sh");
+    command
         .arg("-c")
         .arg(&config.command)
         .current_dir(cwd)
@@ -102,11 +103,12 @@ pub fn execute_external_tool_with_policy(
             "ORCA_TOOL_TARGET",
             request.target.as_deref().unwrap_or_default(),
         )
-        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
+        .stderr(Stdio::piped());
+    process::prepare_non_interactive_command(&mut command);
+    command.stdin(Stdio::piped());
+
+    let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
             return ToolResult::failed(
@@ -192,4 +194,55 @@ fn is_valid_tool_name(name: &str) -> bool {
     let mut chars = name.chars();
     matches!(chars.next(), Some(first) if first.is_ascii_alphabetic() || first == '_')
         && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use orca_core::approval_types::ActionKind;
+    use orca_core::tool_types::{ToolName, ToolStatus};
+    use std::time::Instant;
+
+    #[test]
+    fn external_tool_timeout_kills_descendant_processes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = ExternalToolConfig {
+            name: "slow_tool".to_string(),
+            description: "slow tool".to_string(),
+            action_kind: ActionKind::Shell,
+            command: "printf before; sleep 5; printf after".to_string(),
+            schema: serde_json::json!({}),
+        };
+        let request = ToolRequest {
+            id: "external-1".to_string(),
+            name: ToolName::External("slow_tool".to_string()),
+            action: ActionKind::Shell,
+            target: None,
+            raw_arguments: Some("{}".to_string()),
+        };
+        let start = Instant::now();
+
+        let result = execute_external_tool_with_policy(
+            &config,
+            &request,
+            dir.path(),
+            ToolOutputTruncation::bytes(1024),
+            Duration::from_millis(200),
+        );
+
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "external tool should not wait for descendant processes"
+        );
+        assert_eq!(result.status, ToolStatus::Failed);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("external tool 'slow_tool' timed out after 0s: before"),
+            "unexpected error: {:?}",
+            result.error
+        );
+    }
 }
