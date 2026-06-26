@@ -1,14 +1,14 @@
 import { useEffect, useState } from "react";
 import {
-  type Locale,
-  type SeoEntry,
-  applySeoHead,
-  canonicalOrigin,
-  detectInitialLocale,
-  links,
-  localeStorageKey,
-  releaseVersion,
-  releases,
+    type Locale,
+    type SeoEntry,
+    applySeoHead,
+    canonicalOrigin,
+    detectInitialLocale,
+    links,
+    localeStorageKey,
+    releaseVersion,
+    releases,
 } from "../shared";
 
 const canonicalUrl = `${canonicalOrigin}/changelog/`;
@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.40":
+        "Workflow evidence bundles with standardized reporting (Markdown + JSON), automatic evidence capture at lifecycle checkpoints, and contract validation tests.",
       "v0.1.39":
         "Workflow child task list tools, typed output schemas for subagents, team tool allowlists, durable IPC state, and agent lifecycle observability.",
       "v0.1.38":
@@ -110,6 +112,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.40":
+        "新增工作流证据包（Evidence Bundle）与标准化报告生成（Markdown + JSON），生命周期各节点自动写入证据，配套合约校验测试。",
       "v0.1.39":
         "工作流子任务列表工具、subagent 强类型输出 schema、团队工具白名单、持久化 IPC 状态及 agent 生命周期可观测性。",
       "v0.1.38":
