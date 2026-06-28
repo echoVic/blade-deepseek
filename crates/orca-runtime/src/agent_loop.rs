@@ -303,22 +303,13 @@ pub(crate) fn run_agent_loop(
                 emit_deltas,
             )?;
             if emit_deltas && config.auto_memory {
-                let provider_config = ProviderConfig {
-                    api_key: config.api_key.clone(),
-                    base_url: config.base_url.clone(),
-                    model: Some(orca_core::model::auxiliary_model().to_string()),
-                    tools_override: Some(Vec::new()),
-                    mcp_registry: None,
-                    external_tools: Vec::new(),
-                };
-                if let Err(error) = memory::extract_project_memory(
-                    config.provider,
-                    &provider_config,
+                memory::extract_project_memory_after_final_response(
+                    config,
                     cwd,
                     &conversation.messages,
-                ) {
-                    sink.emit(&events.error(&format!("memory extraction failed: {error}")))?;
-                }
+                    events,
+                    sink,
+                )?;
             }
             return Ok(AgentLoopResult::success(final_message));
         }

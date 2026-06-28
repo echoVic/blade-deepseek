@@ -2,8 +2,11 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use orca_core::config::ProviderKind;
+use orca_core::config::{ProviderKind, RunConfig};
 use orca_core::conversation::{Conversation, Message};
+use orca_core::event_schema::EventFactory;
+use orca_core::event_sink::EventSink;
+use orca_core::model;
 use orca_core::provider_types::ProviderStep;
 use orca_provider::{self, ProviderConfig};
 
@@ -125,6 +128,31 @@ pub fn extract_project_memory(
     remember_project(cwd, &note).map(Some)
 }
 
+pub(crate) fn extract_project_memory_after_final_response(
+    config: &RunConfig,
+    cwd: &Path,
+    messages: &[Message],
+    events: &mut EventFactory,
+    sink: &mut EventSink<impl std::io::Write>,
+) -> Result<(), std::io::Error> {
+    let provider_config = auto_memory_provider_config(config);
+    if let Err(error) = extract_project_memory(config.provider, &provider_config, cwd, messages) {
+        sink.emit(&events.error(&format!("memory extraction failed: {error}")))?;
+    }
+    Ok(())
+}
+
+fn auto_memory_provider_config(config: &RunConfig) -> ProviderConfig {
+    ProviderConfig {
+        api_key: config.api_key.clone(),
+        base_url: config.base_url.clone(),
+        model: Some(model::auxiliary_model().to_string()),
+        tools_override: Some(Vec::new()),
+        mcp_registry: None,
+        external_tools: Vec::new(),
+    }
+}
+
 fn memory_root() -> Option<PathBuf> {
     std::env::var_os("ORCA_HOME")
         .map(PathBuf::from)
@@ -214,7 +242,49 @@ fn format_messages_for_memory(messages: &[Message]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use orca_core::approval_rules::PermissionRules;
+    use orca_core::approval_types::ApprovalMode;
+    use orca_core::config::{
+        HistoryMode, ModelRuntimeConfig, OutputFormat, ThemeName, ToolConfig, WorkflowConfig,
+    };
+    use orca_core::model::ModelSelection;
+    use orca_core::subagent_config::SubagentConfig;
     use tempfile::TempDir;
+
+    fn config() -> RunConfig {
+        RunConfig {
+            app_version: "test".to_string(),
+            prompt: String::new(),
+            cwd: None,
+            output_format: OutputFormat::Text,
+            approval_mode: ApprovalMode::Suggest,
+            provider: ProviderKind::Mock,
+            verifier: None,
+            model: ModelSelection::parse(None).expect("model"),
+            model_runtime: ModelRuntimeConfig::default(),
+            api_key: None,
+            base_url: None,
+            mcp_servers: Vec::new(),
+            hooks: Vec::new(),
+            external_tools: Vec::new(),
+            history_mode: HistoryMode::Disabled,
+            show_session_picker: false,
+            active_permission_profile: None,
+            permission_profiles: Default::default(),
+            runtime_workspace_roots: None,
+            permission_rules: PermissionRules::default(),
+            additional_working_directories: Vec::new(),
+            max_budget_usd: None,
+            subagents: SubagentConfig::default(),
+            tools: ToolConfig::default(),
+            workflows: WorkflowConfig::default(),
+            theme: ThemeName::Dark,
+            vim_mode: false,
+            update_check: false,
+            desktop_notifications: false,
+            auto_memory: false,
+        }
+    }
 
     #[test]
     fn memory_block_formats_prompt() {
@@ -245,5 +315,27 @@ mod tests {
         let formatted = format_messages_for_memory(&messages);
         assert!(!formatted.contains("system"));
         assert!(formatted.contains("remember cargo test"));
+    }
+
+    #[test]
+    fn auto_memory_provider_config_uses_auxiliary_model_without_tools() {
+        let mut config = config();
+        config.api_key = Some("key".to_string());
+        config.base_url = Some("https://example.test".to_string());
+
+        let provider_config = auto_memory_provider_config(&config);
+
+        assert_eq!(provider_config.api_key.as_deref(), Some("key"));
+        assert_eq!(
+            provider_config.base_url.as_deref(),
+            Some("https://example.test")
+        );
+        assert_eq!(
+            provider_config.model.as_deref(),
+            Some(model::auxiliary_model())
+        );
+        assert!(matches!(provider_config.tools_override, Some(ref tools) if tools.is_empty()));
+        assert!(provider_config.mcp_registry.is_none());
+        assert!(provider_config.external_tools.is_empty());
     }
 }

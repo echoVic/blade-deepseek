@@ -424,6 +424,35 @@ mod tests {
     }
 
     #[test]
+    fn final_memory_extraction_is_owned_by_memory_module() {
+        let agent_loop_source = include_str!("agent_loop.rs");
+        let memory_source = include_str!("memory.rs");
+
+        for marker in [
+            "model::auxiliary_model",
+            "memory::extract_project_memory(",
+            "memory extraction failed:",
+        ] {
+            assert!(
+                !agent_loop_source.contains(marker),
+                "agent_loop must not own final memory extraction detail {marker}"
+            );
+        }
+        assert!(
+            agent_loop_source.contains("memory::extract_project_memory_after_final_response("),
+            "agent_loop must delegate final memory extraction"
+        );
+        assert!(
+            memory_source.contains("pub(crate) fn extract_project_memory_after_final_response"),
+            "memory module must expose final memory extraction helper"
+        );
+        assert!(
+            memory_source.contains("model::auxiliary_model"),
+            "memory module must own auxiliary model selection for memory extraction"
+        );
+    }
+
+    #[test]
     fn agent_initial_history_recording_is_owned_by_session_module() {
         let agent_loop_source = include_str!("agent_loop.rs");
         let session_source = include_str!("session.rs");
