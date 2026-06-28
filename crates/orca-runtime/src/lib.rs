@@ -165,6 +165,43 @@ mod tests {
     }
 
     #[test]
+    fn runtime_compaction_step_is_owned_by_lifecycle_module() {
+        let agent_loop_source = include_str!("agent_loop.rs");
+        let lifecycle_source = include_str!("lifecycle.rs");
+
+        assert!(
+            !agent_loop_source.contains("struct RuntimeCompactionStep"),
+            "agent_loop must not own runtime compaction step state"
+        );
+        assert!(
+            !agent_loop_source.contains("impl<'a> RuntimeCompactionStep"),
+            "agent_loop must not own runtime compaction step behavior"
+        );
+        assert!(
+            lifecycle_source.contains("struct RuntimeCompactionStep"),
+            "lifecycle must own runtime compaction step state"
+        );
+        assert!(
+            lifecycle_source.contains("impl<'a")
+                && lifecycle_source.contains("RuntimeCompactionStep<'a"),
+            "lifecycle must own runtime compaction step behavior"
+        );
+
+        for marker in [
+            "HookEvent::OnBudgetWarning",
+            "HookEvent::PreCompact",
+            "HookEvent::PostCompact",
+            "compact_with_summary(",
+            "append_compaction(",
+        ] {
+            assert!(
+                !agent_loop_source.contains(marker),
+                "agent_loop must not own runtime compaction detail {marker}"
+            );
+        }
+    }
+
+    #[test]
     fn thread_store_trait_is_owned_by_thread_store_module() {
         let history_source = include_str!("history.rs");
         let thread_store_source = include_str!("thread_store.rs");

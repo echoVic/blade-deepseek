@@ -28,8 +28,9 @@ use crate::cost::CostTracker;
 use crate::hooks::{HookContext, HookRunner, conversation_with_hook_context};
 use crate::instructions::ProjectInstructions;
 use crate::lifecycle::{
-    AgentLoopContext, RuntimeSessionLifecycle, RuntimeTaskActor, RuntimeTurnConfig,
-    RuntimeTurnDeps, RuntimeTurnExecution, RuntimeTurnState, TurnPermissionOverlay,
+    AgentLoopContext, RuntimeCompactionStep, RuntimeSessionLifecycle, RuntimeTaskActor,
+    RuntimeTurnConfig, RuntimeTurnDeps, RuntimeTurnExecution, RuntimeTurnState,
+    TurnPermissionOverlay,
 };
 use crate::memory::{self, MemoryBlock};
 use crate::session::AgentConversationContext;
@@ -224,80 +225,18 @@ pub(crate) fn run_agent_loop(
     let mut reactive_compacted = false;
 
     loop {
-        if context::needs_compaction_wire(&conversation, &ctx_config, &provider_config) {
-            let before_messages = conversation.messages.len();
-            match hooks.run(
-                HookEvent::OnBudgetWarning,
-                HookContext {
-                    cwd: &cwd.display().to_string(),
-                    session_status: None,
-                    tool_request: None,
-                    tool_result: None,
-                    before_messages: Some(before_messages),
-                    after_messages: None,
-                    usage: None,
-                },
-            ) {
-                Ok(outcome) if !outcome.injected_context.is_empty() => {
-                    *conversation = conversation_with_hook_context(conversation, &outcome);
-                }
-                Err(error) if emit_deltas => {
-                    sink.emit(&events.error(&format!("on_budget_warning hook failed: {error}")))?;
-                }
-                _ => {}
-            }
-            if emit_deltas
-                && let Err(error) = hooks.run(
-                    HookEvent::PreCompact,
-                    HookContext {
-                        cwd: &cwd.display().to_string(),
-                        session_status: None,
-                        tool_request: None,
-                        tool_result: None,
-                        before_messages: Some(before_messages),
-                        after_messages: None,
-                        usage: None,
-                    },
-                )
-            {
-                sink.emit(&events.error(&format!("pre_compact hook failed: {error}")))?;
-            }
-            let compaction = context::compact_with_summary(
-                config.provider,
-                &conversation,
-                &ctx_config,
-                &provider_config,
-            );
-            *conversation = compaction.conversation;
-            let after_messages = conversation.messages.len();
-            if emit_deltas && let Some(writer) = history_writer.as_deref_mut() {
-                writer.append_compaction(before_messages, after_messages)?;
-                if let context::CompactionKind::RemoteSummary(summary) = compaction.kind {
-                    writer.append_summary_state(
-                        before_messages,
-                        after_messages,
-                        summary,
-                        &conversation.summary,
-                    )?;
-                }
-            }
-            if emit_deltas
-                && let Err(error) = hooks.run(
-                    HookEvent::PostCompact,
-                    HookContext {
-                        cwd: &cwd.display().to_string(),
-                        session_status: None,
-                        tool_request: None,
-                        tool_result: None,
-                        before_messages: Some(before_messages),
-                        after_messages: Some(after_messages),
-                        usage: None,
-                    },
-                )
-            {
-                sink.emit(&events.error(&format!("post_compact hook failed: {error}")))?;
-            }
-        }
+        RuntimeCompactionStep::new(
+            config.provider,
+            &ctx_config,
+            &provider_config,
+            cwd,
+            emit_deltas,
+            hooks,
+            events,
+            sink,
+            history_writer.as_deref_mut(),
+        )
+        .compact_if_needed(conversation)?;
 
         let turn_prompt = if actor
             .active_task()
@@ -443,26 +382,18 @@ pub(crate) fn run_agent_loop(
 
         if let Some(error) = provider_error {
             if context::is_prompt_too_long_error(&error) && !reactive_compacted {
-                let before_messages = conversation.messages.len();
-                let compaction = context::compact_with_summary(
+                RuntimeCompactionStep::new(
                     config.provider,
-                    &conversation,
                     &ctx_config,
                     &provider_config,
-                );
-                *conversation = compaction.conversation;
-                let after_messages = conversation.messages.len();
-                if emit_deltas && let Some(writer) = history_writer.as_deref_mut() {
-                    writer.append_compaction(before_messages, after_messages)?;
-                    if let context::CompactionKind::RemoteSummary(summary) = compaction.kind {
-                        writer.append_summary_state(
-                            before_messages,
-                            after_messages,
-                            summary,
-                            &conversation.summary,
-                        )?;
-                    }
-                }
+                    cwd,
+                    emit_deltas,
+                    hooks,
+                    events,
+                    sink,
+                    history_writer.as_deref_mut(),
+                )
+                .compact_after_prompt_too_long(conversation)?;
                 reactive_compacted = true;
                 continue;
             }
