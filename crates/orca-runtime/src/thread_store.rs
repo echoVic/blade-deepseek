@@ -1,4 +1,4 @@
-pub use crate::history::{SessionSummary, SessionTranscript, SessionWriter};
+pub use crate::history::{SessionTranscript, SessionWriter};
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -37,6 +37,26 @@ pub struct SessionMeta {
     #[serde(default)]
     pub permission_rules: PermissionRules,
     #[serde(default)]
+    pub additional_working_directories: Vec<AdditionalWorkingDirectory>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SessionSummary {
+    pub session_id: String,
+    pub title: String,
+    pub cwd: String,
+    pub provider: String,
+    pub model: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub path: PathBuf,
+    pub archived: bool,
+    pub parent_id: Option<String>,
+    pub forked: bool,
+    pub approval_mode: Option<ApprovalMode>,
+    pub active_permission_profile: Option<ActivePermissionProfile>,
+    pub runtime_workspace_roots: Vec<PathBuf>,
+    pub permission_rule_count: usize,
     pub additional_working_directories: Vec<AdditionalWorkingDirectory>,
 }
 

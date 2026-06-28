@@ -19,11 +19,11 @@ use orca_core::tool_types::{ToolResult, ToolStatus};
 use orca_core::{approval_rules::PermissionRules, approval_types::ApprovalMode};
 
 pub use crate::thread_store::{
-    JsonlThreadStore, LiveThread, SessionMeta, SessionStore, SortDirection, StoredThreadItem,
-    StoredThreadItemPage, StoredThreadProjection, StoredThreadSearchHit, StoredThreadSearchPage,
-    StoredThreadSummary, StoredThreadSummaryPage, StoredThreadTurn, StoredThreadTurnPage,
-    ThreadListFilters, ThreadMetadataPatch, ThreadRelationFilter, ThreadSortKey, ThreadStore,
-    TurnItemsView,
+    JsonlThreadStore, LiveThread, SessionMeta, SessionStore, SessionSummary, SortDirection,
+    StoredThreadItem, StoredThreadItemPage, StoredThreadProjection, StoredThreadSearchHit,
+    StoredThreadSearchPage, StoredThreadSummary, StoredThreadSummaryPage, StoredThreadTurn,
+    StoredThreadTurnPage, ThreadListFilters, ThreadMetadataPatch, ThreadRelationFilter,
+    ThreadSortKey, ThreadStore, TurnItemsView,
 };
 
 const ORCA_HOME_ENV: &str = "ORCA_HOME";
@@ -31,26 +31,6 @@ const SESSION_SCHEMA_VERSION: u32 = 1;
 
 #[cfg(test)]
 pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct SessionSummary {
-    pub session_id: String,
-    pub title: String,
-    pub cwd: String,
-    pub provider: String,
-    pub model: Option<String>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-    pub path: PathBuf,
-    pub archived: bool,
-    pub parent_id: Option<String>,
-    pub forked: bool,
-    pub approval_mode: Option<ApprovalMode>,
-    pub active_permission_profile: Option<ActivePermissionProfile>,
-    pub runtime_workspace_roots: Vec<PathBuf>,
-    pub permission_rule_count: usize,
-    pub additional_working_directories: Vec<AdditionalWorkingDirectory>,
-}
 
 #[derive(Clone, Debug)]
 pub struct SessionTranscript {
