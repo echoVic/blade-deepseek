@@ -94,6 +94,15 @@ pub struct ThreadSteerHandle {
     pending: Arc<Mutex<Vec<String>>>,
 }
 
+pub(crate) struct AgentLoopContext<'a> {
+    pub(crate) turn_config: RuntimeTurnConfig<'a>,
+    pub(crate) turn_deps: Option<RuntimeTurnDeps<'a>>,
+    pub(crate) turn_state: Option<RuntimeTurnState<'a>>,
+    pub(crate) turn_execution: Option<RuntimeTurnExecution<'a>>,
+    pub(crate) steer_handle: Option<&'a ThreadSteerHandle>,
+    pub(crate) permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct RuntimeTurnConfig<'a> {
     pub(crate) cwd: &'a Path,
@@ -901,6 +910,156 @@ impl ThreadSteerHandle {
             .expect("thread steer handle lock")
             .drain(..)
             .collect()
+    }
+}
+
+impl<'a> AgentLoopContext<'a> {
+    pub fn new(
+        cwd: &'a Path,
+        prompt: &'a str,
+        subagent_depth: u32,
+        emit_deltas: bool,
+        subagent_type: &'a SubagentType,
+    ) -> Self {
+        Self {
+            turn_config: RuntimeTurnConfig::new(
+                cwd,
+                prompt,
+                subagent_depth,
+                emit_deltas,
+                subagent_type,
+            ),
+            turn_deps: None,
+            turn_state: None,
+            turn_execution: None,
+            steer_handle: None,
+            permission_handler: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn turn_config(&self) -> RuntimeTurnConfig<'a> {
+        self.turn_config
+    }
+
+    pub fn with_services(
+        mut self,
+        instructions: &'a ProjectInstructions,
+        memory: &'a MemoryBlock,
+        mcp_registry: &'a McpRegistry,
+        hooks: &'a HookRunner,
+    ) -> Self {
+        self.turn_deps = Some(RuntimeTurnDeps::new(
+            instructions,
+            memory,
+            mcp_registry,
+            hooks,
+        ));
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn turn_deps(&self) -> RuntimeTurnDeps<'a> {
+        self.turn_deps.expect("agent loop turn deps")
+    }
+
+    #[cfg(test)]
+    pub fn instructions(&self) -> &'a ProjectInstructions {
+        self.turn_deps().instructions()
+    }
+
+    #[cfg(test)]
+    pub fn memory(&self) -> &'a MemoryBlock {
+        self.turn_deps().memory()
+    }
+
+    #[cfg(test)]
+    pub fn mcp_registry(&self) -> &'a McpRegistry {
+        self.turn_deps().mcp_registry()
+    }
+
+    #[cfg(test)]
+    pub fn hooks(&self) -> &'a HookRunner {
+        self.turn_deps().hooks()
+    }
+
+    pub fn with_runtime(
+        mut self,
+        cost_tracker: &'a mut CostTracker,
+        cancel: &'a CancelToken,
+        task_registry: &'a TaskRegistry,
+    ) -> Self {
+        self.turn_state = Some(RuntimeTurnState::new(cost_tracker, cancel, task_registry));
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn turn_state(&self) -> &RuntimeTurnState<'a> {
+        self.turn_state.as_ref().expect("agent loop turn state")
+    }
+
+    #[cfg(test)]
+    pub fn cost_tracker(&self) -> &CostTracker {
+        self.turn_state().cost_tracker()
+    }
+
+    #[cfg(test)]
+    pub fn cancel(&self) -> &'a CancelToken {
+        self.turn_state().cancel()
+    }
+
+    #[cfg(test)]
+    pub fn task_registry(&self) -> &'a TaskRegistry {
+        self.turn_state().task_registry()
+    }
+
+    pub(crate) fn with_execution(
+        mut self,
+        background_workflows: &'a mut Vec<BackgroundWorkflowRun>,
+        workflow_ipc: Option<&'a WorkflowIpcContext>,
+        lifecycle: Option<&'a mut RuntimeSessionLifecycle>,
+    ) -> Self {
+        self.turn_execution = Some(RuntimeTurnExecution::new(
+            background_workflows,
+            workflow_ipc,
+            lifecycle,
+        ));
+        self
+    }
+
+    pub(crate) fn with_steer_handle(mut self, steer_handle: Option<&'a ThreadSteerHandle>) -> Self {
+        self.steer_handle = steer_handle;
+        self
+    }
+
+    pub(crate) fn with_permission_handler(
+        mut self,
+        permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
+    ) -> Self {
+        self.permission_handler = permission_handler;
+        self
+    }
+
+    #[cfg(test)]
+    pub fn background_workflow_count(&self) -> usize {
+        self.turn_execution().background_workflow_count()
+    }
+
+    #[cfg(test)]
+    pub fn workflow_ipc(&self) -> Option<&'a WorkflowIpcContext> {
+        self.turn_execution().workflow_ipc()
+    }
+
+    #[cfg(test)]
+    pub fn lifecycle(&self) -> Option<&RuntimeSessionLifecycle> {
+        self.turn_execution().lifecycle()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn turn_execution(&self) -> &RuntimeTurnExecution<'a> {
+        self.turn_execution
+            .as_ref()
+            .expect("agent loop turn execution")
     }
 }
 
