@@ -22,6 +22,24 @@ pub struct JsonlThreadStore;
 
 pub type SessionStore = JsonlThreadStore;
 
+impl JsonlThreadStore {
+    pub fn list_sessions(&self, limit: usize) -> io::Result<Vec<SessionSummary>> {
+        list_sessions(limit)
+    }
+
+    pub fn list_sessions_with_archived(
+        &self,
+        limit: usize,
+        include_archived: bool,
+    ) -> io::Result<Vec<SessionSummary>> {
+        list_sessions_with_archived(limit, include_archived)
+    }
+
+    pub fn load_session(&self, selector: &str) -> io::Result<SessionTranscript> {
+        load_session(selector)
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SessionMeta {
     pub schema_version: u32,
@@ -405,6 +423,94 @@ pub(crate) fn load_thread_records(
     Ok((meta, messages))
 }
 
+pub fn list_sessions(limit: usize) -> io::Result<Vec<SessionSummary>> {
+    list_sessions_with_archived(limit, false)
+}
+
+pub fn list_sessions_with_archived(
+    limit: usize,
+    include_archived: bool,
+) -> io::Result<Vec<SessionSummary>> {
+    let mut summaries = Vec::new();
+    collect_summaries_from_root(&sessions_dir(), false, &mut summaries)?;
+    if include_archived {
+        collect_summaries_from_root(&archive_dir(), true, &mut summaries)?;
+    }
+
+    summaries.sort_by(|a, b| {
+        b.updated_at
+            .cmp(&a.updated_at)
+            .then_with(|| b.created_at.cmp(&a.created_at))
+    });
+    summaries.truncate(limit);
+    Ok(summaries)
+}
+
+pub fn load_session(selector: &str) -> io::Result<SessionTranscript> {
+    let path = if is_latest_selector(selector) {
+        list_sessions(1)?
+            .into_iter()
+            .next()
+            .map(|s| s.path)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no saved sessions"))?
+    } else {
+        find_session_path(selector, true)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("no saved session matches '{selector}'"),
+            )
+        })?
+    };
+
+    read_transcript(&path)
+}
+
+pub(crate) fn summarize_session_with_archive_flag(
+    path: &Path,
+    archived: bool,
+) -> io::Result<SessionSummary> {
+    let meta = read_session_meta(path)?;
+    let updated_at = fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .map(DateTime::<Utc>::from)
+        .unwrap_or(meta.created_at);
+
+    Ok(SessionSummary {
+        session_id: meta.session_id,
+        title: meta.title,
+        cwd: meta.cwd,
+        provider: meta.provider,
+        model: meta.model,
+        created_at: meta.created_at,
+        updated_at,
+        path: path.to_path_buf(),
+        archived,
+        parent_id: meta.parent_id,
+        forked: meta.forked,
+        approval_mode: meta.approval_mode,
+        active_permission_profile: meta.active_permission_profile,
+        permission_rule_count: meta.permission_rules.rules.len(),
+        runtime_workspace_roots: meta.runtime_workspace_roots,
+        additional_working_directories: meta.additional_working_directories,
+    })
+}
+
+fn collect_summaries_from_root(
+    root: &Path,
+    archived: bool,
+    summaries: &mut Vec<SessionSummary>,
+) -> io::Result<()> {
+    if !root.exists() {
+        return Ok(());
+    }
+    collect_session_files(root, &mut |path| {
+        if let Ok(summary) = summarize_session_with_archive_flag(path, archived) {
+            summaries.push(summary);
+        }
+    })
+}
+
 pub(crate) fn find_session_path(
     selector: &str,
     include_archived: bool,
@@ -428,7 +534,7 @@ pub(crate) fn resolve_session_path(
     include_archived: bool,
 ) -> io::Result<Option<PathBuf>> {
     if is_latest_selector(selector) {
-        return Ok(history::list_sessions_with_archived(1, include_archived)?
+        return Ok(list_sessions_with_archived(1, include_archived)?
             .into_iter()
             .next()
             .map(|session| session.path));

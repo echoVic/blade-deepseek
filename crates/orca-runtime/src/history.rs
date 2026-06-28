@@ -12,8 +12,8 @@ use uuid::Uuid;
 use crate::thread_store::{
     SessionRecord, StoredMessage, archive_dir, collect_session_files, find_session_path,
     is_latest_selector, load_thread_records, lock_file, read_history_lines, read_records,
-    read_session_meta, read_transcript, resolve_session_path, rewrite_records, sessions_dir,
-    unlock_file,
+    read_session_meta, resolve_session_path, rewrite_records, sessions_dir,
+    summarize_session_with_archive_flag, unlock_file,
 };
 use orca_core::config::{ActivePermissionProfile, AdditionalWorkingDirectory};
 use orca_core::conversation::{
@@ -27,7 +27,8 @@ pub use crate::thread_store::{
     SessionWriter, SortDirection, StoredThreadItem, StoredThreadItemPage, StoredThreadProjection,
     StoredThreadSearchHit, StoredThreadSearchPage, StoredThreadSummary, StoredThreadSummaryPage,
     StoredThreadTurn, StoredThreadTurnPage, ThreadListFilters, ThreadMetadataPatch,
-    ThreadRelationFilter, ThreadSortKey, ThreadStore, TurnItemsView,
+    ThreadRelationFilter, ThreadSortKey, ThreadStore, TurnItemsView, list_sessions,
+    list_sessions_with_archived, load_session,
 };
 
 const SESSION_SCHEMA_VERSION: u32 = 1;
@@ -55,22 +56,6 @@ pub struct ContextSummaryRecord {
 impl JsonlThreadStore {
     pub fn new() -> Self {
         Self
-    }
-
-    pub fn list_sessions(&self, limit: usize) -> io::Result<Vec<SessionSummary>> {
-        list_sessions(limit)
-    }
-
-    pub fn list_sessions_with_archived(
-        &self,
-        limit: usize,
-        include_archived: bool,
-    ) -> io::Result<Vec<SessionSummary>> {
-        list_sessions_with_archived(limit, include_archived)
-    }
-
-    pub fn load_session(&self, selector: &str) -> io::Result<SessionTranscript> {
-        load_session(selector)
     }
 
     pub fn delete_session(&self, selector: &str) -> io::Result<PathBuf> {
@@ -1094,48 +1079,6 @@ impl From<SessionSummary> for StoredThreadSummary {
     }
 }
 
-pub fn list_sessions(limit: usize) -> io::Result<Vec<SessionSummary>> {
-    list_sessions_with_archived(limit, false)
-}
-
-pub fn list_sessions_with_archived(
-    limit: usize,
-    include_archived: bool,
-) -> io::Result<Vec<SessionSummary>> {
-    let mut summaries = Vec::new();
-    collect_summaries_from_root(&sessions_dir(), false, &mut summaries)?;
-    if include_archived {
-        collect_summaries_from_root(&archive_dir(), true, &mut summaries)?;
-    }
-
-    summaries.sort_by(|a, b| {
-        b.updated_at
-            .cmp(&a.updated_at)
-            .then_with(|| b.created_at.cmp(&a.created_at))
-    });
-    summaries.truncate(limit);
-    Ok(summaries)
-}
-
-pub fn load_session(selector: &str) -> io::Result<SessionTranscript> {
-    let path = if is_latest_selector(selector) {
-        list_sessions(1)?
-            .into_iter()
-            .next()
-            .map(|s| s.path)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no saved sessions"))?
-    } else {
-        find_session_path(selector, true)?.ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("no saved session matches '{selector}'"),
-            )
-        })?
-    };
-
-    read_transcript(&path)
-}
-
 pub fn delete_session(selector: &str) -> io::Result<PathBuf> {
     let path = if is_latest_selector(selector) {
         list_sessions_with_archived(1, true)?
@@ -1338,49 +1281,6 @@ pub fn create_fork_meta(
     meta.parent_id = Some(parent_id);
     meta.forked = true;
     meta
-}
-
-fn summarize_session_with_archive_flag(path: &Path, archived: bool) -> io::Result<SessionSummary> {
-    let meta = read_session_meta(path)?;
-    let updated_at = fs::metadata(path)
-        .and_then(|metadata| metadata.modified())
-        .ok()
-        .map(DateTime::<Utc>::from)
-        .unwrap_or(meta.created_at);
-
-    Ok(SessionSummary {
-        session_id: meta.session_id,
-        title: meta.title,
-        cwd: meta.cwd,
-        provider: meta.provider,
-        model: meta.model,
-        created_at: meta.created_at,
-        updated_at,
-        path: path.to_path_buf(),
-        archived,
-        parent_id: meta.parent_id,
-        forked: meta.forked,
-        approval_mode: meta.approval_mode,
-        active_permission_profile: meta.active_permission_profile,
-        permission_rule_count: meta.permission_rules.rules.len(),
-        runtime_workspace_roots: meta.runtime_workspace_roots,
-        additional_working_directories: meta.additional_working_directories,
-    })
-}
-
-fn collect_summaries_from_root(
-    root: &Path,
-    archived: bool,
-    summaries: &mut Vec<SessionSummary>,
-) -> io::Result<()> {
-    if !root.exists() {
-        return Ok(());
-    }
-    collect_session_files(root, &mut |path| {
-        if let Ok(summary) = summarize_session_with_archive_flag(path, archived) {
-            summaries.push(summary);
-        }
-    })
 }
 
 pub fn compress_session(selector: &str) -> io::Result<PathBuf> {
