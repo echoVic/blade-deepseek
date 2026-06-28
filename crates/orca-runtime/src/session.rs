@@ -54,6 +54,55 @@ pub(crate) struct InteractiveSessionRuntimeParts<'a> {
     pub task_registry: &'a TaskRegistry,
 }
 
+pub(crate) struct AgentConversationContext<'a> {
+    pub(crate) resumed: Option<&'a SessionTranscript>,
+    pub(crate) history_writer: Option<&'a mut SessionWriter>,
+    pub(crate) conversation: Option<&'a mut Conversation>,
+}
+
+impl<'a> AgentConversationContext<'a> {
+    pub(crate) fn new() -> Self {
+        Self {
+            resumed: None,
+            history_writer: None,
+            conversation: None,
+        }
+    }
+
+    pub(crate) fn with_resumed(mut self, resumed: Option<&'a SessionTranscript>) -> Self {
+        self.resumed = resumed;
+        self
+    }
+
+    pub(crate) fn with_history_writer(
+        mut self,
+        history_writer: Option<&'a mut SessionWriter>,
+    ) -> Self {
+        self.history_writer = history_writer;
+        self
+    }
+
+    pub(crate) fn with_conversation(mut self, conversation: Option<&'a mut Conversation>) -> Self {
+        self.conversation = conversation;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn resumed(&self) -> Option<&SessionTranscript> {
+        self.resumed
+    }
+
+    #[cfg(test)]
+    pub(crate) fn history_writer(&self) -> Option<&SessionWriter> {
+        self.history_writer.as_deref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn conversation(&self) -> Option<&Conversation> {
+        self.conversation.as_deref()
+    }
+}
+
 impl InteractiveSession {
     pub fn new_with_preloaded(
         config: &RunConfig,

@@ -142,6 +142,29 @@ mod tests {
     }
 
     #[test]
+    fn agent_conversation_context_is_owned_by_session_module() {
+        let agent_loop_source = include_str!("agent_loop.rs");
+        let session_source = include_str!("session.rs");
+
+        assert!(
+            !agent_loop_source.contains("struct AgentConversationContext"),
+            "agent_loop must not own agent conversation context"
+        );
+        assert!(
+            !agent_loop_source.contains("impl<'a> AgentConversationContext"),
+            "agent_loop must not own agent conversation context behavior"
+        );
+        assert!(
+            session_source.contains("struct AgentConversationContext"),
+            "session must own agent conversation context"
+        );
+        assert!(
+            session_source.contains("impl<'a> AgentConversationContext"),
+            "session must own agent conversation context behavior"
+        );
+    }
+
+    #[test]
     fn thread_store_trait_is_owned_by_thread_store_module() {
         let history_source = include_str!("history.rs");
         let thread_store_source = include_str!("thread_store.rs");
