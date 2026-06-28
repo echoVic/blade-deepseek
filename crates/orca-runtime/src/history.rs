@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -10,14 +10,13 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::thread_store::{
-    SessionRecord, StoredMessage, lock_file, open_history_reader, read_history_lines, read_records,
-    rewrite_records, unlock_file,
+    SessionRecord, StoredMessage, lock_file, read_history_lines, read_records, read_session_meta,
+    read_transcript, rewrite_records, unlock_file,
 };
 use orca_core::config::{ActivePermissionProfile, AdditionalWorkingDirectory};
 use orca_core::conversation::{
     Conversation, Message, RawToolCall, SummaryState, normalize_tool_boundaries,
 };
-use orca_core::plan_types::{PlanItem, PlanStatus};
 use orca_core::tool_types::ToolStatus;
 use orca_core::{approval_rules::PermissionRules, approval_types::ApprovalMode};
 
@@ -1394,71 +1393,6 @@ fn summarize_session_with_archive_flag(path: &Path, archived: bool) -> io::Resul
     })
 }
 
-fn read_session_meta(path: &Path) -> io::Result<SessionMeta> {
-    let reader = open_history_reader(path)?;
-    for line in reader.lines() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        if let Ok(SessionRecord::Meta(meta)) = serde_json::from_str::<SessionRecord>(&line) {
-            return Ok(meta);
-        }
-        break;
-    }
-    Err(io::Error::new(
-        io::ErrorKind::InvalidData,
-        format!("missing session metadata in {}", path.display()),
-    ))
-}
-
-fn read_transcript(path: &Path) -> io::Result<SessionTranscript> {
-    let records = read_records(path)?;
-    let mut meta = None;
-    let mut messages = Vec::new();
-    let mut compactions = Vec::new();
-    let mut summaries = Vec::new();
-    let mut usage = None;
-    let mut last_plan: Option<(Option<String>, Vec<PlanItem>)> = None;
-
-    for record in records {
-        match record {
-            SessionRecord::Meta(m) => meta = Some(m),
-            SessionRecord::Message { message } => messages.push(message.into()),
-            SessionRecord::Completed { .. } => {}
-            SessionRecord::ContextCollapsed(record) => compactions.push(record),
-            SessionRecord::ContextSummary(record) => summaries.push(record),
-            SessionRecord::Usage(record) => usage = Some(record),
-            SessionRecord::PlanState { explanation, plan } => {
-                let all_done = !plan.is_empty()
-                    && plan.iter().all(|item| item.status == PlanStatus::Completed);
-                if plan.is_empty() || all_done {
-                    last_plan = None;
-                } else {
-                    last_plan = Some((explanation, plan));
-                }
-            }
-        }
-    }
-
-    let meta = meta.ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("missing session metadata in {}", path.display()),
-        )
-    })?;
-
-    Ok(SessionTranscript {
-        meta,
-        messages,
-        compactions,
-        summaries,
-        usage,
-        plan: last_plan,
-        path: path.to_path_buf(),
-    })
-}
-
 fn find_session_path(selector: &str, include_archived: bool) -> io::Result<Option<PathBuf>> {
     let mut candidates: Vec<PathBuf> = Vec::new();
     collect_matching_paths(&sessions_dir(), selector, &mut candidates)?;
@@ -1788,6 +1722,7 @@ fn title_from_prompt(prompt: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use orca_core::plan_types::{PlanItem, PlanStatus};
 
     #[test]
     fn title_from_prompt_normalizes_whitespace_and_truncates() {

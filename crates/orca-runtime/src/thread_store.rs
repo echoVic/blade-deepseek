@@ -9,7 +9,7 @@ use orca_core::approval_types::ApprovalMode;
 use orca_core::config::{ActivePermissionProfile, AdditionalWorkingDirectory};
 use orca_core::conversation::{Conversation, Message, RawToolCall, SummaryState};
 use orca_core::cost_types::UsageTotals;
-use orca_core::plan_types::PlanItem;
+use orca_core::plan_types::{PlanItem, PlanStatus};
 use orca_core::tool_types::{ToolResult, ToolStatus};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -308,6 +308,71 @@ pub(crate) fn open_history_reader(path: &Path) -> io::Result<Box<dyn BufRead>> {
         return Ok(Box::new(BufReader::new(decoder)));
     }
     Ok(Box::new(BufReader::new(file)))
+}
+
+pub(crate) fn read_session_meta(path: &Path) -> io::Result<SessionMeta> {
+    let reader = open_history_reader(path)?;
+    for line in reader.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(SessionRecord::Meta(meta)) = serde_json::from_str::<SessionRecord>(&line) {
+            return Ok(meta);
+        }
+        break;
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("missing session metadata in {}", path.display()),
+    ))
+}
+
+pub(crate) fn read_transcript(path: &Path) -> io::Result<SessionTranscript> {
+    let records = read_records(path)?;
+    let mut meta = None;
+    let mut messages = Vec::new();
+    let mut compactions = Vec::new();
+    let mut summaries = Vec::new();
+    let mut usage = None;
+    let mut last_plan: Option<(Option<String>, Vec<PlanItem>)> = None;
+
+    for record in records {
+        match record {
+            SessionRecord::Meta(m) => meta = Some(m),
+            SessionRecord::Message { message } => messages.push(message.into()),
+            SessionRecord::Completed { .. } => {}
+            SessionRecord::ContextCollapsed(record) => compactions.push(record),
+            SessionRecord::ContextSummary(record) => summaries.push(record),
+            SessionRecord::Usage(record) => usage = Some(record),
+            SessionRecord::PlanState { explanation, plan } => {
+                let all_done = !plan.is_empty()
+                    && plan.iter().all(|item| item.status == PlanStatus::Completed);
+                if plan.is_empty() || all_done {
+                    last_plan = None;
+                } else {
+                    last_plan = Some((explanation, plan));
+                }
+            }
+        }
+    }
+
+    let meta = meta.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("missing session metadata in {}", path.display()),
+        )
+    })?;
+
+    Ok(SessionTranscript {
+        meta,
+        messages,
+        compactions,
+        summaries,
+        usage,
+        plan: last_plan,
+        path: path.to_path_buf(),
+    })
 }
 
 fn redact_session_record(record: &SessionRecord) -> SessionRecord {

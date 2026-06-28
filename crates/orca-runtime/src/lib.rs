@@ -251,6 +251,23 @@ mod tests {
     }
 
     #[test]
+    fn session_read_models_are_owned_by_thread_store_module() {
+        let history_source = include_str!("history.rs");
+        let thread_store_source = include_str!("thread_store.rs");
+
+        for function_name in ["read_session_meta(", "read_transcript("] {
+            assert!(
+                !history_source.contains(&format!("fn {function_name}")),
+                "history must not own ThreadStore session reader {function_name}"
+            );
+            assert!(
+                thread_store_source.contains(&format!("fn {function_name}")),
+                "thread_store must own ThreadStore session reader {function_name}"
+            );
+        }
+    }
+
+    #[test]
     fn protocol_imports_thread_types_from_thread_store_boundary() {
         let protocol_source = include_str!("protocol.rs");
 
