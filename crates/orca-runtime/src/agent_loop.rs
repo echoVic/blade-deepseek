@@ -22,9 +22,9 @@ use crate::tasks::TaskRegistry;
 use crate::tool_execution::policy_for_tool_execution;
 use crate::tool_invocation::{
     AgentToolPolicyContext, ToolRequestCursor, ToolTurnOutcome, collect_readonly_batch,
-    execute_readonly_batch, provider_config_for_agent_loop, record_readonly_batch_results,
-    reject_disallowed_child_tool, run_normal_tool_turn, should_run_readonly_batch,
-    terminal_tool_turn, tool_requests_from_provider_steps,
+    provider_config_for_agent_loop, reject_disallowed_child_tool, run_normal_tool_turn,
+    run_readonly_tool_turn, should_run_readonly_batch, terminal_tool_turn,
+    tool_requests_from_provider_steps,
 };
 use crate::workflow_execution::observe_background_workflows;
 use orca_core::cancel::CancelToken;
@@ -362,23 +362,23 @@ pub(crate) fn run_agent_loop(
                     &tool_requests,
                     cursor.position(),
                 );
-                let results = execute_readonly_batch(
+                match run_readonly_tool_turn(
                     cwd,
                     events,
                     sink,
+                    conversation,
+                    history_writer.as_deref_mut(),
                     &tool_requests[cursor.position()..batch_end],
                     emit_deltas,
                     mcp_registry,
                     hooks,
                     config.tools.output_truncation,
-                )?;
-
-                record_readonly_batch_results(
-                    conversation,
-                    history_writer.as_deref_mut(),
-                    results,
-                    emit_deltas,
-                )?;
+                )? {
+                    ToolTurnOutcome::Continue => {}
+                    ToolTurnOutcome::Return { status, error } => {
+                        return Ok(AgentLoopResult::terminal(status, error));
+                    }
+                }
                 cursor.advance_to(batch_end);
                 continue;
             }

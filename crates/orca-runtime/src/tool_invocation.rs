@@ -362,6 +362,33 @@ pub(crate) fn record_readonly_batch_results(
     Ok(())
 }
 
+pub(crate) fn run_readonly_tool_turn(
+    cwd: &Path,
+    events: &mut EventFactory,
+    sink: &mut EventSink<impl io::Write>,
+    conversation: &mut Conversation,
+    history_writer: Option<&mut SessionWriter>,
+    tool_requests: &[ToolRequest],
+    emit_deltas: bool,
+    mcp_registry: &McpRegistry,
+    hooks: &HookRunner,
+    output_truncation: ToolOutputTruncation,
+) -> io::Result<ToolTurnOutcome> {
+    let results = execute_readonly_batch(
+        cwd,
+        events,
+        sink,
+        tool_requests,
+        emit_deltas,
+        mcp_registry,
+        hooks,
+        output_truncation,
+    )?;
+
+    record_readonly_batch_results(conversation, history_writer, results, emit_deltas)?;
+    Ok(ToolTurnOutcome::Continue)
+}
+
 pub(crate) fn record_normal_tool_result(
     conversation: &mut Conversation,
     mut history_writer: Option<&mut SessionWriter>,
@@ -618,8 +645,8 @@ mod tests {
         AgentToolPolicyContext, ToolRequestCursor, ToolTurnOutcome, apply_pre_tool_outcome,
         approval_request_for_invocation, prepare_tool_invocation, provider_config_for_agent_loop,
         provider_tool_schema_override, record_normal_tool_result, record_readonly_batch_results,
-        run_normal_tool_turn, terminal_tool_turn, tool_requests_from_provider_steps,
-        validate_tool_invocation,
+        run_normal_tool_turn, run_readonly_tool_turn, terminal_tool_turn,
+        tool_requests_from_provider_steps, validate_tool_invocation,
     };
 
     fn config_with_external(external_tools: Vec<ExternalToolConfig>) -> RunConfig {
@@ -936,6 +963,7 @@ mod tests {
     fn run_normal_tool_turn_executes_and_records_tool_result() {
         let cwd = tempfile::tempdir().expect("cwd");
         std::fs::write(cwd.path().join("tracked.txt"), "hello\n").expect("write file");
+        std::fs::write(cwd.path().join("other.txt"), "world\n").expect("write file");
         let mut config = config_with_external(Vec::new());
         config.approval_mode = ApprovalMode::FullAuto;
         let mut events = EventFactory::new("normal-tool-turn".to_string());
@@ -991,6 +1019,67 @@ mod tests {
             matches!(&conversation.messages[0], Message::Tool { tool_call_id, content, .. }
                 if tool_call_id == "tool-1" && content.contains("hello"))
         );
+    }
+
+    #[test]
+    fn run_readonly_tool_turn_executes_and_records_batch_results() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        std::fs::write(cwd.path().join("tracked.txt"), "hello\n").expect("write file");
+        let mut events = EventFactory::new("readonly-tool-turn".to_string());
+        let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+        let mut conversation = Conversation::new();
+        let requests = vec![
+            request(
+                ToolName::ReadFile,
+                ActionKind::Read,
+                Some("tracked.txt"),
+                Some(json!({ "path": "tracked.txt" }).to_string().as_str()),
+            ),
+            ToolRequest {
+                id: "tool-2".to_string(),
+                name: ToolName::ReadFile,
+                action: ActionKind::Read,
+                target: Some("other.txt".to_string()),
+                raw_arguments: Some(json!({ "path": "other.txt" }).to_string()),
+            },
+        ];
+        let registry = McpRegistry::default();
+        let hooks = crate::hooks::HookRunner::default();
+
+        let outcome = run_readonly_tool_turn(
+            cwd.path(),
+            &mut events,
+            &mut sink,
+            &mut conversation,
+            None,
+            &requests,
+            false,
+            &registry,
+            &hooks,
+            ToolConfig::default().output_truncation,
+        )
+        .expect("run readonly tool turn");
+
+        assert!(matches!(outcome, ToolTurnOutcome::Continue));
+        assert_eq!(conversation.messages.len(), 2);
+        let combined_tool_content = conversation
+            .messages
+            .iter()
+            .filter_map(|message| match message {
+                Message::Tool { content, .. } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            matches!(&conversation.messages[0], Message::Tool { tool_call_id, .. }
+                if tool_call_id == "tool-1")
+        );
+        assert!(
+            matches!(&conversation.messages[1], Message::Tool { tool_call_id, .. }
+                if tool_call_id == "tool-2")
+        );
+        assert!(combined_tool_content.contains("hello"));
     }
 
     #[test]

@@ -329,6 +329,35 @@ mod tests {
     }
 
     #[test]
+    fn readonly_tool_turn_runner_is_owned_by_tool_invocation_module() {
+        let agent_loop_source = include_str!("agent_loop.rs");
+        let tool_invocation_source = include_str!("tool_invocation.rs");
+
+        for marker in ["execute_readonly_batch(", "record_readonly_batch_results("] {
+            assert!(
+                !agent_loop_source.contains(marker),
+                "agent_loop must not own readonly tool-turn runner detail {marker}"
+            );
+        }
+        assert!(
+            agent_loop_source.contains("run_readonly_tool_turn("),
+            "agent_loop must delegate readonly tool-turn execution"
+        );
+        assert!(
+            tool_invocation_source.contains("pub(crate) fn run_readonly_tool_turn"),
+            "tool_invocation must expose readonly tool-turn runner"
+        );
+        assert!(
+            tool_invocation_source.contains("execute_readonly_batch"),
+            "tool_invocation must compose readonly batch execution"
+        );
+        assert!(
+            tool_invocation_source.contains("record_readonly_batch_results"),
+            "tool_invocation must compose readonly batch result recording"
+        );
+    }
+
+    #[test]
     fn child_tool_policy_gate_is_owned_by_tool_invocation_module() {
         let agent_loop_source = include_str!("agent_loop.rs");
         let tool_invocation_source = include_str!("tool_invocation.rs");
@@ -429,8 +458,12 @@ mod tests {
             "agent_loop must not own readonly batch result recording"
         );
         assert!(
-            agent_loop_source.contains("record_readonly_batch_results("),
-            "agent_loop must delegate readonly batch result recording"
+            !agent_loop_source.contains("record_readonly_batch_results("),
+            "agent_loop must delegate readonly batch result recording through readonly tool-turn runner"
+        );
+        assert!(
+            agent_loop_source.contains("run_readonly_tool_turn("),
+            "agent_loop must delegate readonly tool turn recording"
         );
         assert!(
             tool_invocation_source.contains("pub(crate) fn record_readonly_batch_results"),
