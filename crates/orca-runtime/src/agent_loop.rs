@@ -20,7 +20,7 @@ use crate::subagent_execution::{
     record_subagent_batch_results, should_run_subagent_batch,
 };
 use crate::tasks::TaskRegistry;
-use crate::tool_execution::{ToolExecutionActor, ToolExecutionContext};
+use crate::tool_execution::{ToolExecutionContext, execute_tool_with_approval};
 use crate::tool_invocation::{
     AgentToolPolicyContext, NormalToolRecordOutcome, collect_readonly_batch,
     execute_readonly_batch, record_normal_tool_result, record_readonly_batch_results,
@@ -439,6 +439,8 @@ pub(crate) fn run_agent_loop(
                     )
                     .with_permission_overlay(&mut permission_overlay)
                     .with_permission_handler(permission_handler),
+                execute_child_agent_loop,
+                execute_child_agent_loop,
             )?;
 
             match record_normal_tool_result(
@@ -511,25 +513,6 @@ pub(crate) fn execute_child_agent_loop<W: io::Write>(
         final_message: child.final_message,
         error: child.error,
     })
-}
-
-fn execute_tool_with_approval(
-    config: &RunConfig,
-    events: &mut EventFactory,
-    sink: &mut EventSink<impl io::Write>,
-    tool_request: &tool_types::ToolRequest,
-    context: ToolExecutionContext<'_>,
-) -> io::Result<(RunStatus, tool_types::ToolResult)> {
-    let mut actor = ToolExecutionActor::new(events.run_id().to_string(), DEFAULT_MAX_TURNS);
-    actor.execute(
-        config,
-        events,
-        sink,
-        tool_request,
-        context,
-        execute_child_agent_loop,
-        execute_child_agent_loop,
-    )
 }
 
 #[cfg(test)]

@@ -33,6 +33,8 @@ use crate::workflow_execution::{
     BackgroundWorkflowRun, execute_workflow_draft_action_tool, execute_workflow_tool,
 };
 
+const DEFAULT_TOOL_MAX_TURNS: u32 = 128;
+
 pub(crate) struct ToolExecutionContext<'a> {
     cwd: &'a Path,
     subagent_depth: u32,
@@ -196,6 +198,27 @@ impl<'a> ToolExecutionContext<'a> {
     pub(crate) fn workflow_ipc(&self) -> Option<&'a WorkflowIpcContext> {
         self.workflow_ipc
     }
+}
+
+pub(crate) fn execute_tool_with_approval<W: io::Write>(
+    config: &RunConfig,
+    events: &mut EventFactory,
+    sink: &mut EventSink<W>,
+    tool_request: &tool_types::ToolRequest,
+    context: ToolExecutionContext<'_>,
+    child_executor: ChildAgentExecutor<W>,
+    workflow_child_executor: ChildAgentExecutor<SharedEventBuffer>,
+) -> io::Result<(RunStatus, tool_types::ToolResult)> {
+    let mut actor = ToolExecutionActor::new(events.run_id().to_string(), DEFAULT_TOOL_MAX_TURNS);
+    actor.execute(
+        config,
+        events,
+        sink,
+        tool_request,
+        context,
+        child_executor,
+        workflow_child_executor,
+    )
 }
 
 impl ToolExecutionActor {

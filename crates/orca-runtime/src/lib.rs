@@ -169,6 +169,29 @@ mod tests {
     }
 
     #[test]
+    fn normal_tool_execution_entrypoint_is_owned_by_tool_execution_module() {
+        let agent_loop_source = include_str!("agent_loop.rs");
+        let tool_execution_source = include_str!("tool_execution.rs");
+
+        assert!(
+            !agent_loop_source.contains("fn execute_tool_with_approval"),
+            "agent_loop must not own normal tool execution entrypoint"
+        );
+        assert!(
+            agent_loop_source.contains("execute_tool_with_approval("),
+            "agent_loop must delegate normal tool execution"
+        );
+        assert!(
+            tool_execution_source.contains("pub(crate) fn execute_tool_with_approval"),
+            "tool_execution must expose normal tool execution entrypoint"
+        );
+        assert!(
+            tool_execution_source.contains("ToolExecutionActor::new"),
+            "tool_execution must own tool actor construction"
+        );
+    }
+
+    #[test]
     fn child_tool_policy_gate_is_owned_by_tool_invocation_module() {
         let agent_loop_source = include_str!("agent_loop.rs");
         let tool_invocation_source = include_str!("tool_invocation.rs");
