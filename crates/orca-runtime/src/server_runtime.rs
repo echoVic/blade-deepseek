@@ -363,7 +363,7 @@ impl ServerThread {
             Vec::new()
         };
         let turns = if include_turns {
-            crate::history::messages_to_thread_turns(
+            crate::thread_store::messages_to_thread_turns(
                 &self.thread_id,
                 &self.session.conversation().messages,
                 usize::MAX,
@@ -392,8 +392,8 @@ impl ServerThread {
         sort_direction: crate::thread_store::SortDirection,
         items_view: TurnItemsView,
     ) -> crate::thread_store::StoredThreadTurnPage {
-        crate::history::page_thread_turns(
-            crate::history::messages_to_thread_turns(
+        crate::thread_store::page_thread_turns(
+            crate::thread_store::messages_to_thread_turns(
                 &self.thread_id,
                 &self.session.conversation().messages,
                 usize::MAX,
@@ -412,8 +412,8 @@ impl ServerThread {
         limit: usize,
         sort_direction: crate::thread_store::SortDirection,
     ) -> crate::thread_store::StoredThreadItemPage {
-        crate::history::page_thread_items(
-            crate::history::messages_to_thread_items(
+        crate::thread_store::page_thread_items(
+            crate::thread_store::messages_to_thread_items(
                 &self.thread_id,
                 &self.session.conversation().messages,
                 turn_id,
