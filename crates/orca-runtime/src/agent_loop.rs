@@ -26,7 +26,6 @@ use orca_tools;
 use crate::agent_child::{ChildAgentRequest, ChildAgentResult, ChildAgentRuntime};
 use crate::agent_common;
 use crate::cost::CostTracker;
-use crate::history::{self, SessionWriter};
 use crate::hooks::{HookContext, HookRunner, conversation_with_hook_context};
 use crate::instructions::ProjectInstructions;
 use crate::lifecycle::{
@@ -38,6 +37,7 @@ use crate::subagent_execution::{
     collect_subagent_batch, execute_subagent_batch, should_run_subagent_batch,
 };
 use crate::tasks::TaskRegistry;
+use crate::thread_store::{self, SessionTranscript, SessionWriter};
 use crate::tool_execution::{ToolExecutionActor, ToolExecutionContext};
 use crate::tool_invocation::{
     apply_pre_tool_outcome_with_external, prepare_tool_invocation_with_external,
@@ -93,7 +93,7 @@ pub(crate) struct AgentLoopContext<'a> {
 }
 
 pub(crate) struct AgentConversationContext<'a> {
-    resumed: Option<&'a history::SessionTranscript>,
+    resumed: Option<&'a SessionTranscript>,
     history_writer: Option<&'a mut SessionWriter>,
     conversation: Option<&'a mut Conversation>,
 }
@@ -440,7 +440,7 @@ impl<'a> AgentConversationContext<'a> {
         }
     }
 
-    pub(crate) fn with_resumed(mut self, resumed: Option<&'a history::SessionTranscript>) -> Self {
+    pub(crate) fn with_resumed(mut self, resumed: Option<&'a SessionTranscript>) -> Self {
         self.resumed = resumed;
         self
     }
@@ -459,7 +459,7 @@ impl<'a> AgentConversationContext<'a> {
     }
 
     #[cfg(test)]
-    pub(crate) fn resumed(&self) -> Option<&history::SessionTranscript> {
+    pub(crate) fn resumed(&self) -> Option<&SessionTranscript> {
         self.resumed
     }
 
@@ -591,7 +591,7 @@ pub(crate) fn run_agent_loop(
         conversation
     } else {
         owned_conversation = if let Some(resumed) = resumed {
-            let mut conv = history::resume_conversation(resumed, system_prompt);
+            let mut conv = thread_store::resume_conversation(resumed, system_prompt);
             conv.strip_legacy_pinned_volatile();
             conv.strip_legacy_summary_messages();
             conv

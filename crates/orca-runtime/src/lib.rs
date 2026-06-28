@@ -51,4 +51,14 @@ mod tests {
             "protocol must import thread protocol types through thread_store"
         );
     }
+
+    #[test]
+    fn agent_loop_imports_session_types_from_thread_store_boundary() {
+        let agent_loop_source = include_str!("agent_loop.rs");
+
+        assert!(
+            !agent_loop_source.contains("use crate::history"),
+            "agent loop must import session transcript/writer types through thread_store"
+        );
+    }
 }

@@ -1,11 +1,11 @@
 pub use crate::history::{
-    JsonlThreadStore, LiveThread, SessionStore, SortDirection, StoredThreadItem,
-    StoredThreadItemPage, StoredThreadProjection, StoredThreadSearchHit, StoredThreadSearchPage,
-    StoredThreadSummary, StoredThreadSummaryPage, StoredThreadTurn, StoredThreadTurnPage,
-    ThreadListFilters, ThreadMetadataPatch, ThreadRelationFilter, ThreadSortKey, ThreadStore,
-    TurnItemsView,
+    JsonlThreadStore, LiveThread, SessionStore, SessionTranscript, SessionWriter, SortDirection,
+    StoredThreadItem, StoredThreadItemPage, StoredThreadProjection, StoredThreadSearchHit,
+    StoredThreadSearchPage, StoredThreadSummary, StoredThreadSummaryPage, StoredThreadTurn,
+    StoredThreadTurnPage, ThreadListFilters, ThreadMetadataPatch, ThreadRelationFilter,
+    ThreadSortKey, ThreadStore, TurnItemsView,
 };
-use orca_core::conversation::Message;
+use orca_core::conversation::{Conversation, Message};
 
 pub(crate) fn messages_to_thread_turns(
     thread_id: &str,
@@ -31,6 +31,13 @@ pub(crate) fn messages_to_thread_items(
 
 pub(crate) fn next_turn_id_for_messages(thread_id: &str, messages: &[Message]) -> String {
     crate::history::next_turn_id_for_messages(thread_id, messages)
+}
+
+pub(crate) fn resume_conversation(
+    transcript: &SessionTranscript,
+    system_prompt: String,
+) -> Conversation {
+    crate::history::resume_conversation(transcript, system_prompt)
 }
 
 pub(crate) fn page_thread_turns(
