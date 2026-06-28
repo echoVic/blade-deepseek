@@ -54,12 +54,17 @@ pub(crate) struct AgentLoopResult {
     pub(crate) error: Option<String>,
 }
 
-pub(crate) struct AgentLoopContext<'a> {
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RuntimeTurnConfig<'a> {
     cwd: &'a Path,
     prompt: &'a str,
     subagent_depth: u32,
     emit_deltas: bool,
     subagent_type: &'a SubagentType,
+}
+
+pub(crate) struct AgentLoopContext<'a> {
+    turn_config: RuntimeTurnConfig<'a>,
     instructions: Option<&'a ProjectInstructions>,
     memory: Option<&'a MemoryBlock>,
     mcp_registry: Option<&'a McpRegistry>,
@@ -126,8 +131,8 @@ impl AgentLoopResult {
     }
 }
 
-impl<'a> AgentLoopContext<'a> {
-    pub fn new(
+impl<'a> RuntimeTurnConfig<'a> {
+    pub(crate) fn new(
         cwd: &'a Path,
         prompt: &'a str,
         subagent_depth: u32,
@@ -140,6 +145,51 @@ impl<'a> AgentLoopContext<'a> {
             subagent_depth,
             emit_deltas,
             subagent_type,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cwd(&self) -> &'a Path {
+        self.cwd
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prompt(&self) -> &'a str {
+        self.prompt
+    }
+
+    #[cfg(test)]
+    pub(crate) fn subagent_depth(&self) -> u32 {
+        self.subagent_depth
+    }
+
+    #[cfg(test)]
+    pub(crate) fn emit_deltas(&self) -> bool {
+        self.emit_deltas
+    }
+
+    #[cfg(test)]
+    pub(crate) fn subagent_type(&self) -> &'a SubagentType {
+        self.subagent_type
+    }
+}
+
+impl<'a> AgentLoopContext<'a> {
+    pub fn new(
+        cwd: &'a Path,
+        prompt: &'a str,
+        subagent_depth: u32,
+        emit_deltas: bool,
+        subagent_type: &'a SubagentType,
+    ) -> Self {
+        Self {
+            turn_config: RuntimeTurnConfig::new(
+                cwd,
+                prompt,
+                subagent_depth,
+                emit_deltas,
+                subagent_type,
+            ),
             instructions: None,
             memory: None,
             mcp_registry: None,
@@ -156,28 +206,8 @@ impl<'a> AgentLoopContext<'a> {
     }
 
     #[cfg(test)]
-    pub fn cwd(&self) -> &'a Path {
-        self.cwd
-    }
-
-    #[cfg(test)]
-    pub fn prompt(&self) -> &'a str {
-        self.prompt
-    }
-
-    #[cfg(test)]
-    pub fn subagent_depth(&self) -> u32 {
-        self.subagent_depth
-    }
-
-    #[cfg(test)]
-    pub fn emit_deltas(&self) -> bool {
-        self.emit_deltas
-    }
-
-    #[cfg(test)]
-    pub fn subagent_type(&self) -> &'a SubagentType {
-        self.subagent_type
+    pub(crate) fn turn_config(&self) -> RuntimeTurnConfig<'a> {
+        self.turn_config
     }
 
     pub fn with_services(
@@ -365,11 +395,14 @@ pub(crate) fn run_agent_loop(
         conversation,
     } = conversation_context;
     let AgentLoopContext {
-        cwd,
-        prompt,
-        subagent_depth,
-        emit_deltas,
-        subagent_type,
+        turn_config:
+            RuntimeTurnConfig {
+                cwd,
+                prompt,
+                subagent_depth,
+                emit_deltas,
+                subagent_type,
+            },
         instructions,
         memory,
         mcp_registry,
@@ -1155,4 +1188,93 @@ fn execute_readonly_batch(
     }
 
     Ok(results)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lifecycle::RuntimeTaskKind;
+    use std::path::PathBuf;
+
+    #[test]
+    fn runtime_turn_config_snapshots_agent_loop_entry_values() {
+        let cwd = PathBuf::from("/tmp/orca-runtime-turn-config");
+        let subagent_type = SubagentType::General;
+
+        let config = RuntimeTurnConfig::new(&cwd, "inspect repo", 2, false, &subagent_type);
+
+        assert_eq!(config.cwd(), cwd.as_path());
+        assert_eq!(config.prompt(), "inspect repo");
+        assert_eq!(config.subagent_depth(), 2);
+        assert!(!config.emit_deltas());
+        assert_eq!(config.subagent_type(), &SubagentType::General);
+    }
+
+    #[test]
+    fn agent_loop_context_exposes_runtime_turn_config() {
+        let cwd = PathBuf::from("/tmp/orca-agent-loop-config");
+        let subagent_type = SubagentType::General;
+
+        let context = AgentLoopContext::new(&cwd, "inspect repo", 1, true, &subagent_type);
+
+        let config = context.turn_config();
+        assert_eq!(config.cwd(), cwd.as_path());
+        assert_eq!(config.prompt(), "inspect repo");
+        assert_eq!(config.subagent_depth(), 1);
+        assert!(config.emit_deltas());
+        assert_eq!(config.subagent_type(), &SubagentType::General);
+    }
+
+    #[test]
+    fn agent_loop_context_carries_readonly_services() {
+        let cwd = PathBuf::from("/tmp/orca-agent-loop-services");
+        let subagent_type = SubagentType::General;
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let registry = McpRegistry::default();
+        let hooks = HookRunner::default();
+
+        let context = AgentLoopContext::new(&cwd, "inspect repo", 0, true, &subagent_type)
+            .with_services(&instructions, &memory, &registry, &hooks);
+
+        assert!(std::ptr::eq(context.instructions(), &instructions));
+        assert!(std::ptr::eq(context.memory(), &memory));
+        assert!(std::ptr::eq(context.mcp_registry(), &registry));
+        assert!(std::ptr::eq(context.hooks(), &hooks));
+    }
+
+    #[test]
+    fn agent_loop_context_carries_runtime_refs() {
+        let cwd = PathBuf::from("/tmp/orca-agent-loop-runtime");
+        let subagent_type = SubagentType::General;
+        let mut cost_tracker = CostTracker::new(None);
+        let cancel = CancelToken::new();
+        let task_registry = TaskRegistry::new("agent-loop-runtime".to_string());
+
+        let context = AgentLoopContext::new(&cwd, "inspect repo", 0, true, &subagent_type)
+            .with_runtime(&mut cost_tracker, &cancel, &task_registry);
+
+        assert_eq!(context.cost_tracker().totals().total_tokens(), 0);
+        assert!(std::ptr::eq(context.cancel(), &cancel));
+        assert!(std::ptr::eq(context.task_registry(), &task_registry));
+    }
+
+    #[test]
+    fn agent_loop_context_carries_execution_refs() {
+        let cwd = PathBuf::from("/tmp/orca-agent-loop-execution");
+        let subagent_type = SubagentType::General;
+        let mut background_workflows = Vec::new();
+        let mut lifecycle = RuntimeSessionLifecycle::new("agent-loop-execution");
+        lifecycle.start_task(RuntimeTaskKind::Agent);
+
+        let context = AgentLoopContext::new(&cwd, "inspect repo", 0, true, &subagent_type)
+            .with_execution(&mut background_workflows, None, Some(&mut lifecycle));
+
+        assert_eq!(context.background_workflow_count(), 0);
+        assert!(context.workflow_ipc().is_none());
+        assert_eq!(
+            context.lifecycle().unwrap().run_id(),
+            "agent-loop-execution"
+        );
+    }
 }
