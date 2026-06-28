@@ -15,7 +15,7 @@ use orca_mcp::McpRegistry;
 use orca_tools;
 
 use crate::agent_common;
-use crate::agent_loop::{AgentConversationContext, AgentToolPolicyContext, run_agent_loop};
+use crate::agent_loop::{AgentConversationContext, run_agent_loop};
 use crate::cost::CostTracker;
 use crate::hooks::{HookContext, HookRunner};
 use crate::instructions;
@@ -28,6 +28,7 @@ use crate::memory;
 use crate::session::{InteractiveSession, InteractiveSessionRuntimeParts, new_run_id};
 use crate::tasks::TaskRegistry;
 use crate::thread_store::SessionStore;
+use crate::tool_invocation::AgentToolPolicyContext;
 #[cfg(test)]
 use crate::tool_invocation::{
     apply_pre_tool_outcome_with_external, prepare_tool_invocation_with_external,

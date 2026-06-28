@@ -13,10 +13,37 @@ pub struct ToolInvocation {
     pub action: Option<ActionKind>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct AgentToolPolicyContext<'a> {
+    allowed_tools: Option<&'a [String]>,
+    label: Option<&'a str>,
+}
+
 #[derive(Clone, Debug)]
 pub struct ToolExecutionFailure {
     pub request: ToolRequest,
     pub message: String,
+}
+
+impl<'a> AgentToolPolicyContext<'a> {
+    pub(crate) fn new(allowed_tools: Option<&'a [String]>, label: Option<&'a str>) -> Self {
+        Self {
+            allowed_tools,
+            label,
+        }
+    }
+
+    pub(crate) fn unrestricted() -> Self {
+        Self::new(None, None)
+    }
+
+    pub(crate) fn allowed_tools(&self) -> Option<&'a [String]> {
+        self.allowed_tools
+    }
+
+    pub(crate) fn label(&self) -> Option<&'a str> {
+        self.label
+    }
 }
 
 impl ToolExecutionFailure {

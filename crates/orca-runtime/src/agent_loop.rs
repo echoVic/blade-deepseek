@@ -39,7 +39,8 @@ use crate::tasks::TaskRegistry;
 use crate::thread_store::{self, SessionTranscript, SessionWriter};
 use crate::tool_execution::{ToolExecutionActor, ToolExecutionContext};
 use crate::tool_invocation::{
-    apply_pre_tool_outcome_with_external, prepare_tool_invocation_with_external,
+    AgentToolPolicyContext, apply_pre_tool_outcome_with_external,
+    prepare_tool_invocation_with_external,
 };
 use crate::workflow_execution::observe_background_workflows;
 
@@ -56,12 +57,6 @@ pub(crate) struct AgentConversationContext<'a> {
     resumed: Option<&'a SessionTranscript>,
     history_writer: Option<&'a mut SessionWriter>,
     conversation: Option<&'a mut Conversation>,
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct AgentToolPolicyContext<'a> {
-    allowed_tools: Option<&'a [String]>,
-    label: Option<&'a str>,
 }
 
 impl AgentLoopResult {
@@ -122,27 +117,6 @@ impl<'a> AgentConversationContext<'a> {
     #[cfg(test)]
     pub(crate) fn conversation(&self) -> Option<&Conversation> {
         self.conversation.as_deref()
-    }
-}
-
-impl<'a> AgentToolPolicyContext<'a> {
-    pub(crate) fn new(allowed_tools: Option<&'a [String]>, label: Option<&'a str>) -> Self {
-        Self {
-            allowed_tools,
-            label,
-        }
-    }
-
-    pub(crate) fn unrestricted() -> Self {
-        Self::new(None, None)
-    }
-
-    pub(crate) fn allowed_tools(&self) -> Option<&'a [String]> {
-        self.allowed_tools
-    }
-
-    pub(crate) fn label(&self) -> Option<&'a str> {
-        self.label
     }
 }
 

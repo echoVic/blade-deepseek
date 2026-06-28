@@ -119,6 +119,29 @@ mod tests {
     }
 
     #[test]
+    fn agent_tool_policy_context_is_owned_by_tool_invocation_module() {
+        let agent_loop_source = include_str!("agent_loop.rs");
+        let tool_invocation_source = include_str!("tool_invocation.rs");
+
+        assert!(
+            !agent_loop_source.contains("struct AgentToolPolicyContext"),
+            "agent_loop must not own agent tool policy context"
+        );
+        assert!(
+            !agent_loop_source.contains("impl<'a> AgentToolPolicyContext"),
+            "agent_loop must not own agent tool policy behavior"
+        );
+        assert!(
+            tool_invocation_source.contains("struct AgentToolPolicyContext"),
+            "tool_invocation must own agent tool policy context"
+        );
+        assert!(
+            tool_invocation_source.contains("impl<'a> AgentToolPolicyContext"),
+            "tool_invocation must own agent tool policy behavior"
+        );
+    }
+
+    #[test]
     fn thread_store_trait_is_owned_by_thread_store_module() {
         let history_source = include_str!("history.rs");
         let thread_store_source = include_str!("thread_store.rs");
