@@ -24,9 +24,9 @@ use crate::cost::CostTracker;
 use crate::hooks::HookRunner;
 use crate::instructions::ProjectInstructions;
 use crate::lifecycle::{
-    AgentLoopContext, RuntimeCompactionStep, RuntimeProviderTurnStep, RuntimeSessionLifecycle,
-    RuntimeSteerStep, RuntimeTaskActor, RuntimeTurnConfig, RuntimeTurnDeps, RuntimeTurnExecution,
-    RuntimeTurnState, TurnPermissionOverlay,
+    AgentLoopContext, RuntimeCompactionStep, RuntimeProviderErrorOutcome, RuntimeProviderTurnStep,
+    RuntimeSessionLifecycle, RuntimeSteerStep, RuntimeTaskActor, RuntimeTurnConfig,
+    RuntimeTurnDeps, RuntimeTurnExecution, RuntimeTurnState, TurnPermissionOverlay,
 };
 use crate::memory::{self, MemoryBlock};
 use crate::session::{
@@ -262,32 +262,31 @@ pub(crate) fn run_agent_loop(
             }
         };
 
-        let provider_error = response.steps.iter().find_map(|step| match step {
-            ProviderStep::Error(message) => Some(message.clone()),
-            _ => None,
-        });
-
-        if let Some(error) = provider_error {
-            if context::is_prompt_too_long_error(&error) && !reactive_compacted {
-                RuntimeCompactionStep::new(
-                    config.provider,
-                    &ctx_config,
-                    &provider_config,
-                    cwd,
-                    emit_deltas,
-                    hooks,
-                    events,
-                    sink,
-                    history_writer.as_deref_mut(),
-                )
-                .compact_after_prompt_too_long(conversation)?;
+        let mut provider_turn_step = RuntimeProviderTurnStep::new();
+        match provider_turn_step.handle_provider_error(
+            &response,
+            &mut RuntimeCompactionStep::new(
+                config.provider,
+                &ctx_config,
+                &provider_config,
+                cwd,
+                emit_deltas,
+                hooks,
+                events,
+                sink,
+                history_writer.as_deref_mut(),
+            ),
+            conversation,
+            reactive_compacted,
+        )? {
+            RuntimeProviderErrorOutcome::ContinueAfterCompaction => {
                 reactive_compacted = true;
                 continue;
             }
-            if emit_deltas {
-                sink.emit(&events.error(&error))?;
+            RuntimeProviderErrorOutcome::Failed(error) => {
+                return Ok(AgentLoopResult::failure(RunStatus::Failed, error));
             }
-            return Ok(AgentLoopResult::failure(RunStatus::Failed, error));
+            RuntimeProviderErrorOutcome::NoError => {}
         }
 
         reactive_compacted = false;

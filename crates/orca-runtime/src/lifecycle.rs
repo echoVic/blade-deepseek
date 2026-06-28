@@ -100,6 +100,12 @@ pub(crate) struct RuntimeProviderTurnOutput {
     pub(crate) terminal_error: Option<RuntimeTurnStartError>,
 }
 
+pub(crate) enum RuntimeProviderErrorOutcome {
+    ContinueAfterCompaction,
+    Failed(String),
+    NoError,
+}
+
 pub(crate) struct RuntimeCompactionStep<'a, W: io::Write> {
     provider: ProviderKind,
     context_config: &'a context::ContextConfig,
@@ -2277,6 +2283,33 @@ impl RuntimeProviderTurnStep {
 
         Ok(RuntimeProviderTurnOutput::response(response))
     }
+
+    pub(crate) fn handle_provider_error<W: io::Write>(
+        &mut self,
+        response: &ProviderResponse,
+        compaction: &mut RuntimeCompactionStep<'_, W>,
+        conversation: &mut Conversation,
+        reactive_compacted: bool,
+    ) -> io::Result<RuntimeProviderErrorOutcome> {
+        let provider_error = response.steps.iter().find_map(|step| match step {
+            ProviderStep::Error(message) => Some(message.clone()),
+            _ => None,
+        });
+
+        let Some(error) = provider_error else {
+            return Ok(RuntimeProviderErrorOutcome::NoError);
+        };
+
+        if context::is_prompt_too_long_error(&error) && !reactive_compacted {
+            compaction.compact_after_prompt_too_long(conversation)?;
+            return Ok(RuntimeProviderErrorOutcome::ContinueAfterCompaction);
+        }
+
+        if compaction.emit_deltas {
+            compaction.sink.emit(&compaction.events.error(&error))?;
+        }
+        Ok(RuntimeProviderErrorOutcome::Failed(error))
+    }
 }
 
 fn cancelled_provider_turn<W: io::Write>(
@@ -2410,5 +2443,67 @@ impl RuntimeTurnLifecycle {
         let mut event = events.turn_started(self.number, prompt);
         event.payload["task"] = task.payload();
         event
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use orca_core::config::{ModelRuntimeConfig, OutputFormat};
+
+    #[test]
+    fn provider_turn_error_handler_emits_failure_event_for_non_compaction_errors() {
+        let response = ProviderResponse {
+            steps: vec![ProviderStep::Error(
+                "DeepSeek provider error: quota".to_string(),
+            )],
+            assistant_content: None,
+            assistant_reasoning: None,
+            tool_calls: Vec::new(),
+            usage: None,
+        };
+        let runtime = ModelRuntimeConfig::default();
+        let context_config =
+            context::ContextConfig::for_model_with_runtime(Some("deepseek-chat"), &runtime);
+        let provider_config = ProviderConfig {
+            api_key: None,
+            base_url: None,
+            model: None,
+            tools_override: Some(Vec::new()),
+            mcp_registry: None,
+            external_tools: Vec::new(),
+        };
+        let hooks = HookRunner::default();
+        let mut events = EventFactory::new("provider-error-test".to_string());
+        let mut output = Vec::new();
+        let mut sink = EventSink::new(&mut output, OutputFormat::Jsonl);
+        let cwd = Path::new(".");
+        let mut compaction = RuntimeCompactionStep::new(
+            ProviderKind::DeepSeek,
+            &context_config,
+            &provider_config,
+            cwd,
+            true,
+            &hooks,
+            &mut events,
+            &mut sink,
+            None,
+        );
+        let mut conversation = Conversation::new();
+
+        let outcome = RuntimeProviderTurnStep::new()
+            .handle_provider_error(&response, &mut compaction, &mut conversation, false)
+            .expect("provider error handling succeeds");
+
+        match outcome {
+            RuntimeProviderErrorOutcome::Failed(error) => {
+                assert_eq!(error, "DeepSeek provider error: quota");
+            }
+            _ => panic!("expected non-compaction provider error to fail"),
+        }
+        let output = String::from_utf8(output).expect("jsonl is utf8");
+        assert!(output.contains("\"type\":\"error\""));
+        assert!(output.contains("DeepSeek provider error: quota"));
     }
 }

@@ -424,6 +424,9 @@ mod tests {
             "usage_updated",
             "provider_replay_updated",
             "ProviderStep::ReplayState",
+            "ProviderStep::Error",
+            "is_prompt_too_long_error",
+            "events.error(&error)",
             "append_usage(",
         ] {
             assert!(
