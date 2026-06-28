@@ -17,6 +17,8 @@ pub enum ToolName {
     GitStatus,
     Subagent,
     SubagentStatus,
+    TaskList,
+    TaskStop,
     WorkflowDraft,
     WorkflowDraftAction,
     Workflow,
@@ -33,6 +35,7 @@ pub enum ToolName {
     UpdateGoal,
     UpdatePlan,
     RequestUserInput,
+    RequestPermissions,
     ListSkills,
     ReadSkill,
     Namespaced {
@@ -58,6 +61,8 @@ impl ToolName {
             "git_status" => Self::GitStatus,
             "subagent" => Self::Subagent,
             "subagent_status" => Self::SubagentStatus,
+            "task_list" => Self::TaskList,
+            "task_stop" => Self::TaskStop,
             "WorkflowDraft" | "workflow_draft" => Self::WorkflowDraft,
             "WorkflowDraftAction" | "workflow_draft_action" => Self::WorkflowDraftAction,
             "Workflow" | "workflow" => Self::Workflow,
@@ -74,6 +79,7 @@ impl ToolName {
             "update_goal" => Self::UpdateGoal,
             "update_plan" => Self::UpdatePlan,
             "request_user_input" => Self::RequestUserInput,
+            "request_permissions" => Self::RequestPermissions,
             "list_skills" => Self::ListSkills,
             "read_skill" => Self::ReadSkill,
             other => Self::External(other.to_string()),
@@ -111,6 +117,8 @@ impl ToolName {
             Self::GitStatus => "git_status",
             Self::Subagent => "subagent",
             Self::SubagentStatus => "subagent_status",
+            Self::TaskList => "task_list",
+            Self::TaskStop => "task_stop",
             Self::WorkflowDraft => "WorkflowDraft",
             Self::WorkflowDraftAction => "WorkflowDraftAction",
             Self::Workflow => "Workflow",
@@ -127,6 +135,7 @@ impl ToolName {
             Self::UpdateGoal => "update_goal",
             Self::UpdatePlan => "update_plan",
             Self::RequestUserInput => "request_user_input",
+            Self::RequestPermissions => "request_permissions",
             Self::ListSkills => "list_skills",
             Self::ReadSkill => "read_skill",
             Self::Namespaced { name, .. } => name,
@@ -150,6 +159,8 @@ impl ToolName {
             Self::GitStatus => "git_status",
             Self::Subagent => "subagent",
             Self::SubagentStatus => "subagent_status",
+            Self::TaskList => "task_list",
+            Self::TaskStop => "task_stop",
             Self::WorkflowDraft => "WorkflowDraft",
             Self::WorkflowDraftAction => "WorkflowDraftAction",
             Self::Workflow => "Workflow",
@@ -166,6 +177,7 @@ impl ToolName {
             Self::UpdateGoal => "update_goal",
             Self::UpdatePlan => "update_plan",
             Self::RequestUserInput => "request_user_input",
+            Self::RequestPermissions => "request_permissions",
             Self::ListSkills => "list_skills",
             Self::ReadSkill => "read_skill",
             Self::Namespaced { serialized, .. } => serialized,
@@ -191,6 +203,8 @@ impl ToolName {
             "git_status" => Self::GitStatus,
             "subagent" => Self::Subagent,
             "subagent_status" => Self::SubagentStatus,
+            "task_list" => Self::TaskList,
+            "task_stop" => Self::TaskStop,
             "WorkflowDraft" | "workflow_draft" => Self::WorkflowDraft,
             "WorkflowDraftAction" | "workflow_draft_action" => Self::WorkflowDraftAction,
             "Workflow" | "workflow" => Self::Workflow,
@@ -207,6 +221,7 @@ impl ToolName {
             "update_goal" => Self::UpdateGoal,
             "update_plan" => Self::UpdatePlan,
             "request_user_input" => Self::RequestUserInput,
+            "request_permissions" => Self::RequestPermissions,
             "list_skills" => Self::ListSkills,
             "read_skill" => Self::ReadSkill,
             other => Self::External(other.to_string()),
@@ -226,6 +241,7 @@ impl ToolName {
                 | Self::Grep
                 | Self::GitStatus
                 | Self::SubagentStatus
+                | Self::TaskList
                 | Self::WorkflowReadMessages
                 | Self::WorkflowListTasks
                 | Self::GetGoal
@@ -276,9 +292,12 @@ pub enum ToolCapability {
     NetworkSearch,
     AgentDelegate,
     WorkflowRun,
+    TaskRead,
+    TaskControl,
     PlanUpdate,
     GoalUpdate,
     UserInputRequest,
+    PermissionRequest,
     SkillRead,
 }
 
@@ -325,6 +344,7 @@ impl CapabilitySet {
                         | ToolCapability::FsList
                         | ToolCapability::FsSearch
                         | ToolCapability::GitInspect
+                        | ToolCapability::TaskRead
                         | ToolCapability::PlanUpdate
                         | ToolCapability::GoalUpdate
                         | ToolCapability::UserInputRequest
@@ -337,6 +357,10 @@ impl CapabilitySet {
         if self.contains(ToolCapability::ShellExecute) {
             ActionKind::Shell
         } else if self.contains(ToolCapability::FsWrite) {
+            ActionKind::Write
+        } else if self.contains(ToolCapability::TaskControl) {
+            ActionKind::Write
+        } else if self.contains(ToolCapability::PermissionRequest) {
             ActionKind::Write
         } else if self.contains(ToolCapability::NetworkSearch) {
             ActionKind::Network

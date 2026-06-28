@@ -388,6 +388,7 @@ fn workflow_evidence_bundle_round_trips_state_and_agent_rows() {
                     cache_tokens: 3,
                     estimated_cost_usd: 0.001,
                 }),
+                task: None,
                 tool_events: Vec::new(),
             },
         )
@@ -414,6 +415,7 @@ fn workflow_evidence_bundle_round_trips_state_and_agent_rows() {
                 started_at_ms: Some(220),
                 completed_at_ms: Some(255),
                 usage: None,
+                task: None,
                 tool_events: Vec::new(),
             },
         )
@@ -526,6 +528,7 @@ fn workflow_verifier_reports_proven_and_completed_with_failures_from_artifacts()
                 started_at_ms: Some(100),
                 completed_at_ms: Some(200),
                 usage: None,
+                task: None,
                 tool_events: Vec::new(),
             },
         )
@@ -630,6 +633,7 @@ fn workflow_verifier_rejects_missing_declared_evidence_contract() {
                 started_at_ms: Some(100),
                 completed_at_ms: Some(200),
                 usage: None,
+                task: None,
                 tool_events: Vec::new(),
             },
         )
@@ -693,6 +697,7 @@ fn workflow_verifier_rejects_missing_declared_evidence_contract() {
                 started_at_ms: Some(100),
                 completed_at_ms: Some(200),
                 usage: None,
+                task: None,
                 tool_events: vec![WorkflowEvidenceToolEvent {
                     id: Some("tool-1".to_string()),
                     name: "read_file".to_string(),
@@ -785,6 +790,7 @@ fn workflow_verifier_rejects_read_only_contract_when_mutation_tool_completes() {
                 started_at_ms: Some(100),
                 completed_at_ms: Some(200),
                 usage: None,
+                task: None,
                 tool_events: vec![WorkflowEvidenceToolEvent {
                     id: Some("tool-1".to_string()),
                     name: "edit".to_string(),
@@ -870,6 +876,7 @@ fn workflow_report_is_bound_to_evidence() {
                     started_at_ms: Some(100 + index),
                     completed_at_ms: Some(200 + index),
                     usage: None,
+                    task: None,
                     tool_events: Vec::new(),
                 },
             )
@@ -1360,6 +1367,7 @@ fn state_store_preserves_current_json_looking_string_outputs() {
                     started_at_ms: Some(1_000 + index as i64),
                     completed_at_ms: Some(2_000 + index as i64),
                     usage: None,
+                    task: None,
                     tool_events: Vec::new(),
                 },
             )
@@ -1449,6 +1457,7 @@ fn state_store_preserves_missing_output_field_when_appending_completed_record() 
                 started_at_ms: Some(1_000),
                 completed_at_ms: Some(2_000),
                 usage: None,
+                task: None,
                 tool_events: Vec::new(),
             },
         )

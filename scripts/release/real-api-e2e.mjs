@@ -1,11 +1,15 @@
 #!/usr/bin/env node
 
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
+import readline from "node:readline";
 import path from "node:path";
 
 const repoRoot = path.resolve(import.meta.dirname, "..", "..");
 const cliSentinel = "ORCA_REAL_E2E_OK";
 const serverSentinel = "ORCA_SERVER_REAL_OK";
+const serverThreadSentinel = `ORCA_SERVER_THREAD_MEMORY_OK_${Date.now()}_${process.pid}`;
+const serverThreadReadySentinel = "READY";
+const serverThreadTitle = `ORCA server thread metadata e2e ${serverThreadSentinel}`;
 
 function parseArgs(argv) {
   const args = {
@@ -159,7 +163,7 @@ function runCli(args) {
   console.log(`CLI real API e2e verified: ${cliSentinel}`);
 }
 
-function runServer(args) {
+function runServerSubmit(args) {
   if (args.skipServer) {
     console.log("Server real API e2e skipped");
     return;
@@ -188,16 +192,783 @@ function runServer(args) {
   console.log(`Server real API e2e verified: ${serverSentinel}`);
 }
 
-function main() {
+async function runServerThread(args) {
+  const child = spawn(args.orcaBin, ["--mode", "server"], {
+    cwd: repoRoot,
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+
+  let stderr = "";
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk) => {
+    stderr += chunk;
+  });
+
+  let timedOut = false;
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    child.kill("SIGKILL");
+  }, args.timeoutMs);
+
+  const closed = new Promise((resolve, reject) => {
+    child.on("error", reject);
+    child.on("close", (code, signal) => resolve({ code, signal }));
+  });
+
+  const stdout = readline.createInterface({ input: child.stdout });
+  const iterator = stdout[Symbol.asyncIterator]();
+  const events = [];
+
+  const send = (request) => {
+    child.stdin.write(`${JSON.stringify(request)}\n`);
+  };
+
+  const readNext = async (label) => {
+    const result = await iterator.next();
+    if (result.done) {
+      throw new Error(`${label} ended before expected server event${stderr ? `\nstderr:\n${stderr}` : ""}`);
+    }
+    try {
+      const event = JSON.parse(result.value);
+      events.push(event);
+      return event;
+    } catch (error) {
+      throw new Error(`Unable to parse server thread JSONL line: ${error.message}\n${result.value}`);
+    }
+  };
+
+  const readUntil = async (label, predicate) => {
+    for (;;) {
+      const event = await readNext(label);
+      if (predicate(event)) {
+        return event;
+      }
+    }
+  };
+
+  try {
+    send({
+      id: "server-thread",
+      method: "thread/start",
+      params: {},
+    });
+    const threadStarted = await readUntil(
+      "server thread/start",
+      (event) => event.id === "server-thread" && (event.event === "thread_started" || event.event === "error"),
+    );
+    if (threadStarted.event === "error") {
+      throw new Error(`Server thread/start failed: ${JSON.stringify(threadStarted)}`);
+    }
+    const threadId = threadStarted.threadId;
+    if (typeof threadId !== "string" || threadId.length === 0) {
+      throw new Error(`Server thread/start did not return a threadId: ${JSON.stringify(threadStarted)}`);
+    }
+
+    send({
+      id: "server-thread-turn-1",
+      method: "turn/start",
+      params: {
+        threadId,
+        input: [
+          {
+            type: "text",
+            text: `Remember this exact token for the next turn: ${serverThreadSentinel}. Reply with exactly: ${serverThreadReadySentinel}.`,
+          },
+        ],
+      },
+    });
+    let turnOneText = "";
+    await readUntil("server thread turn 1", (event) => {
+      if (event.id !== "server-thread-turn-1") {
+        return false;
+      }
+      if (event.event === "message_delta") {
+        turnOneText += event.text ?? "";
+      }
+      if (event.event === "error") {
+        throw new Error(`Server thread turn 1 failed: ${JSON.stringify(event)}`);
+      }
+      return event.event === "turn_completed";
+    });
+    if (!turnOneText.includes(serverThreadReadySentinel)) {
+      throw new Error(`Server thread turn 1 missing sentinel ${serverThreadReadySentinel}:\n${JSON.stringify(events)}`);
+    }
+
+    send({
+      id: "server-thread-turn-2",
+      method: "turn/start",
+      params: {
+        threadId,
+        input: [
+          {
+            type: "text",
+            text: "Reply with exactly the token I asked you to remember.",
+          },
+        ],
+      },
+    });
+    let turnTwoText = "";
+    const turnTwoCompleted = await readUntil("server thread turn 2", (event) => {
+      if (event.id !== "server-thread-turn-2") {
+        return false;
+      }
+      if (event.event === "message_delta") {
+        turnTwoText += event.text ?? "";
+      }
+      if (event.event === "error") {
+        throw new Error(`Server thread turn 2 failed: ${JSON.stringify(event)}`);
+      }
+      return event.event === "turn_completed";
+    });
+    if (turnTwoCompleted.status !== "success") {
+      throw new Error(`Server thread turn 2 completed with unexpected status: ${JSON.stringify(turnTwoCompleted)}`);
+    }
+    if (!turnTwoText.includes(serverThreadSentinel)) {
+      throw new Error(`Server thread e2e missing sentinel ${serverThreadSentinel}:\n${JSON.stringify(events)}`);
+    }
+
+    send({
+      id: "server-turn-interrupt",
+      method: "turn/interrupt",
+      params: {
+        turnId: "turn-idle-real-api",
+      },
+    });
+    const turnInterrupt = await readUntil("server turn/interrupt", (event) => {
+      if (event.id !== "server-turn-interrupt") {
+        return false;
+      }
+      if (event.event === "error") {
+        throw new Error(`Server turn/interrupt failed: ${JSON.stringify(event)}`);
+      }
+      return event.event === "turn_controlled";
+    });
+    if (
+      turnInterrupt.action !== "interrupt" ||
+      turnInterrupt.turnId !== "turn-idle-real-api" ||
+      turnInterrupt.status !== "idle"
+    ) {
+      throw new Error(`Server turn/interrupt returned malformed control event: ${JSON.stringify(turnInterrupt)}`);
+    }
+
+    send({
+      id: "server-turn-resume",
+      method: "turn/resume",
+      params: {
+        turnId: "turn-idle-real-api",
+      },
+    });
+    const turnResume = await readUntil("server turn/resume", (event) => {
+      if (event.id !== "server-turn-resume") {
+        return false;
+      }
+      if (event.event === "error") {
+        throw new Error(`Server turn/resume failed: ${JSON.stringify(event)}`);
+      }
+      return event.event === "turn_controlled";
+    });
+    if (
+      turnResume.action !== "resume" ||
+      turnResume.turnId !== "turn-idle-real-api" ||
+      turnResume.status !== "idle"
+    ) {
+      throw new Error(`Server turn/resume returned malformed control event: ${JSON.stringify(turnResume)}`);
+    }
+
+    send({
+      id: "server-turn-steer",
+      method: "turn/steer",
+      params: {
+        turnId: "turn-idle-real-api",
+        input: [
+          {
+            type: "text",
+            text: "steer this idle turn",
+          },
+        ],
+      },
+    });
+    const turnSteer = await readUntil("server turn/steer", (event) => {
+      if (event.id !== "server-turn-steer") {
+        return false;
+      }
+      if (event.event === "error") {
+        throw new Error(`Server turn/steer failed: ${JSON.stringify(event)}`);
+      }
+      return event.event === "turn_controlled";
+    });
+    if (
+      turnSteer.action !== "steer" ||
+      turnSteer.turnId !== "turn-idle-real-api" ||
+      turnSteer.status !== "idle" ||
+      turnSteer.input !== "steer this idle turn"
+    ) {
+      throw new Error(`Server turn/steer returned malformed control event: ${JSON.stringify(turnSteer)}`);
+    }
+
+    send({
+      id: "server-thread-metadata",
+      method: "thread/metadata/update",
+      params: {
+        threadId,
+        title: serverThreadTitle,
+      },
+    });
+    const metadataUpdated = await readUntil("server thread/metadata/update", (event) => {
+      if (event.id !== "server-thread-metadata") {
+        return false;
+      }
+      if (event.event === "error") {
+        throw new Error(`Server thread/metadata/update failed: ${JSON.stringify(event)}`);
+      }
+      return event.event === "thread_metadata_updated";
+    });
+    if (metadataUpdated.threadId !== threadId || metadataUpdated.title !== serverThreadTitle) {
+      throw new Error(`Server thread/metadata/update returned malformed projection: ${JSON.stringify(metadataUpdated)}`);
+    }
+
+    send({
+      id: "server-thread-extra",
+      method: "thread/start",
+      params: {},
+    });
+    const extraThreadStarted = await readUntil(
+      "server extra thread/start",
+      (event) => event.id === "server-thread-extra" && (event.event === "thread_started" || event.event === "error"),
+    );
+    if (extraThreadStarted.event === "error") {
+      throw new Error(`Server extra thread/start failed: ${JSON.stringify(extraThreadStarted)}`);
+    }
+    const extraThreadId = extraThreadStarted.threadId;
+    if (typeof extraThreadId !== "string" || extraThreadId.length === 0 || extraThreadId === threadId) {
+      throw new Error(`Server extra thread/start returned malformed threadId: ${JSON.stringify(extraThreadStarted)}`);
+    }
+
+    send({
+      id: "server-thread-extra-turn",
+      method: "turn/start",
+      params: {
+        threadId: extraThreadId,
+        input: [
+          {
+            type: "text",
+            text: `Reply with exactly this token for list pagination coverage: ${serverThreadSentinel}.`,
+          },
+        ],
+      },
+    });
+    let extraTurnText = "";
+    const extraTurnCompleted = await readUntil("server extra thread turn", (event) => {
+      if (event.id !== "server-thread-extra-turn") {
+        return false;
+      }
+      if (event.event === "message_delta") {
+        extraTurnText += event.text ?? "";
+      }
+      if (event.event === "error") {
+        throw new Error(`Server extra thread turn failed: ${JSON.stringify(event)}`);
+      }
+      return event.event === "turn_completed";
+    });
+    if (extraTurnCompleted.status !== "success" || !extraTurnText.includes(serverThreadSentinel)) {
+      throw new Error(`Server extra thread turn returned unexpected output: ${JSON.stringify({ extraTurnCompleted, extraTurnText })}`);
+    }
+
+    const extraThreadTitle = `ORCA server extra thread ${serverThreadSentinel}`;
+    send({
+      id: "server-thread-extra-metadata",
+      method: "thread/metadata/update",
+      params: {
+        threadId: extraThreadId,
+        title: extraThreadTitle,
+      },
+    });
+    const extraMetadataUpdated = await readUntil("server extra thread/metadata/update", (event) => {
+      if (event.id !== "server-thread-extra-metadata") {
+        return false;
+      }
+      if (event.event === "error") {
+        throw new Error(`Server extra thread/metadata/update failed: ${JSON.stringify(event)}`);
+      }
+      return event.event === "thread_metadata_updated";
+    });
+    if (extraMetadataUpdated.threadId !== extraThreadId || extraMetadataUpdated.title !== extraThreadTitle) {
+      throw new Error(`Server extra thread/metadata/update returned malformed projection: ${JSON.stringify(extraMetadataUpdated)}`);
+    }
+
+    send({
+      id: "server-thread-list",
+      method: "thread/list",
+      params: {
+        searchTerm: serverThreadSentinel,
+        sortKey: "updatedAt",
+        limit: 1,
+      },
+    });
+    const threadList = await readUntil("server thread/list", (event) => {
+      if (event.id !== "server-thread-list") {
+        return false;
+      }
+      if (event.event === "error") {
+        throw new Error(`Server thread/list failed: ${JSON.stringify(event)}`);
+      }
+      return event.event === "thread_list";
+    });
+    const listedThreads = Array.isArray(threadList.data) ? threadList.data : [];
+    if (listedThreads.length !== 1 || typeof threadList.nextCursor !== "string") {
+      throw new Error(`Server thread/list first page did not paginate: ${JSON.stringify(threadList)}`);
+    }
+    send({
+      id: "server-thread-list-page-2",
+      method: "thread/list",
+      params: {
+        cursor: threadList.nextCursor,
+        searchTerm: serverThreadSentinel,
+        sortKey: "updatedAt",
+        limit: 10,
+      },
+    });
+    const threadListPage2 = await readUntil("server thread/list page 2", (event) => {
+      if (event.id !== "server-thread-list-page-2") {
+        return false;
+      }
+      if (event.event === "error") {
+        throw new Error(`Server thread/list page 2 failed: ${JSON.stringify(event)}`);
+      }
+      return event.event === "thread_list";
+    });
+    const allListedThreads = listedThreads.concat(Array.isArray(threadListPage2.data) ? threadListPage2.data : []);
+    if (
+      !allListedThreads.some((thread) => thread.threadId === threadId && thread.title === serverThreadTitle) ||
+      !allListedThreads.some((thread) => thread.threadId === extraThreadId)
+    ) {
+      throw new Error(`Server thread/list did not include both created threads: ${JSON.stringify({ threadList, threadListPage2 })}`);
+    }
+    const firstListedThread = allListedThreads.find((thread) => thread.threadId === threadId);
+    if (!firstListedThread?.cwd || !firstListedThread?.provider || !firstListedThread?.model) {
+      throw new Error(`Server thread/list missing metadata for filter coverage: ${JSON.stringify(allListedThreads)}`);
+    }
+
+    send({
+      id: "server-thread-list-metadata-filter",
+      method: "thread/list",
+      params: {
+        searchTerm: serverThreadSentinel,
+        cwd: firstListedThread.cwd,
+        modelProviders: [firstListedThread.provider],
+        model: firstListedThread.model,
+        sortKey: "updatedAt",
+        limit: 10,
+      },
+    });
+    const threadListMetadataFilter = await readUntil("server thread/list metadata filter", (event) => {
+      if (event.id !== "server-thread-list-metadata-filter") {
+        return false;
+      }
+      if (event.event === "error") {
+        throw new Error(`Server thread/list metadata filter failed: ${JSON.stringify(event)}`);
+      }
+      return event.event === "thread_list";
+    });
+    const metadataFilteredThreads = Array.isArray(threadListMetadataFilter.data) ? threadListMetadataFilter.data : [];
+    if (
+      metadataFilteredThreads.length !== 2 ||
+      metadataFilteredThreads.some(
+        (thread) =>
+          thread.cwd !== firstListedThread.cwd ||
+          thread.provider !== firstListedThread.provider ||
+          thread.model !== firstListedThread.model,
+      )
+    ) {
+      throw new Error(`Server thread/list metadata filter returned unexpected threads: ${JSON.stringify(threadListMetadataFilter)}`);
+    }
+
+    send({
+      id: "server-thread-list-metadata-filter-miss",
+      method: "thread/list",
+      params: {
+        searchTerm: serverThreadSentinel,
+        cwd: `${firstListedThread.cwd}/missing`,
+        modelProviders: [firstListedThread.provider],
+        model: firstListedThread.model,
+        sortKey: "updatedAt",
+        limit: 10,
+      },
+    });
+    const threadListMetadataFilterMiss = await readUntil("server thread/list metadata filter miss", (event) => {
+      if (event.id !== "server-thread-list-metadata-filter-miss") {
+        return false;
+      }
+      if (event.event === "error") {
+        throw new Error(`Server thread/list metadata filter miss failed: ${JSON.stringify(event)}`);
+      }
+      return event.event === "thread_list";
+    });
+    if ((Array.isArray(threadListMetadataFilterMiss.data) ? threadListMetadataFilterMiss.data : []).length !== 0) {
+      throw new Error(
+        `Server thread/list metadata filter miss should be empty: ${JSON.stringify(threadListMetadataFilterMiss)}`,
+      );
+    }
+
+    send({
+      id: "server-thread-search",
+      method: "thread/search",
+      params: {
+        searchTerm: serverThreadSentinel,
+        sortKey: "updatedAt",
+        limit: 1,
+      },
+    });
+    const threadSearch = await readUntil("server thread/search", (event) => {
+      if (event.id !== "server-thread-search") {
+        return false;
+      }
+      if (event.event === "error") {
+        throw new Error(`Server thread/search failed: ${JSON.stringify(event)}`);
+      }
+      return event.event === "thread_search";
+    });
+    const searchHits = Array.isArray(threadSearch.data) ? threadSearch.data : [];
+    if (searchHits.length !== 1 || typeof threadSearch.nextCursor !== "string") {
+      throw new Error(`Server thread/search first page did not paginate: ${JSON.stringify(threadSearch)}`);
+    }
+    send({
+      id: "server-thread-search-page-2",
+      method: "thread/search",
+      params: {
+        searchTerm: serverThreadSentinel,
+        cursor: threadSearch.nextCursor,
+        sortKey: "updatedAt",
+        limit: 10,
+      },
+    });
+    const threadSearchPage2 = await readUntil("server thread/search page 2", (event) => {
+      if (event.id !== "server-thread-search-page-2") {
+        return false;
+      }
+      if (event.event === "error") {
+        throw new Error(`Server thread/search page 2 failed: ${JSON.stringify(event)}`);
+      }
+      return event.event === "thread_search";
+    });
+    const allSearchHits = searchHits.concat(Array.isArray(threadSearchPage2.data) ? threadSearchPage2.data : []);
+    if (
+      !allSearchHits.some((hit) => hit.thread?.threadId === threadId && String(hit.snippet ?? "").includes(serverThreadSentinel)) ||
+      !allSearchHits.some((hit) => hit.thread?.threadId === extraThreadId && String(hit.snippet ?? "").includes(serverThreadSentinel))
+    ) {
+      throw new Error(`Server thread/search did not include both created threads: ${JSON.stringify({ threadSearch, threadSearchPage2 })}`);
+    }
+
+    send({
+      id: "server-thread-turns-list",
+      method: "thread/turns/list",
+      params: {
+        threadId,
+        limit: 1,
+      },
+    });
+    const threadTurns = await readUntil("server thread/turns/list", (event) => {
+      if (event.id !== "server-thread-turns-list") {
+        return false;
+      }
+      if (event.event === "error") {
+        throw new Error(`Server thread/turns/list failed: ${JSON.stringify(event)}`);
+      }
+      return event.event === "thread_turns_list";
+    });
+    const turns = Array.isArray(threadTurns.data) ? threadTurns.data : [];
+    if (typeof threadTurns.nextCursor !== "string") {
+      throw new Error(`Server thread/turns/list did not return a next cursor: ${JSON.stringify(threadTurns)}`);
+    }
+
+    send({
+      id: "server-thread-turns-list-page-2",
+      method: "thread/turns/list",
+      params: {
+        threadId,
+        cursor: threadTurns.nextCursor,
+        limit: 10,
+      },
+    });
+    const threadTurnsPage2 = await readUntil("server thread/turns/list page 2", (event) => {
+      if (event.id !== "server-thread-turns-list-page-2") {
+        return false;
+      }
+      if (event.event === "error") {
+        throw new Error(`Server thread/turns/list page 2 failed: ${JSON.stringify(event)}`);
+      }
+      return event.event === "thread_turns_list";
+    });
+    const turnsPage2 = Array.isArray(threadTurnsPage2.data) ? threadTurnsPage2.data : [];
+    const allTurns = [...turns, ...turnsPage2];
+    const turnText = turns
+      .concat(turnsPage2)
+      .flatMap((turn) => (Array.isArray(turn.items) ? turn.items : []))
+      .map((item) => item.content ?? "")
+      .join("\n");
+    const turnWithRecallAndAssistant = allTurns.find((turn) => {
+      const items = Array.isArray(turn.items) ? turn.items : [];
+      return (
+        turn.threadId === threadId &&
+        items.some(
+          (item) =>
+            item.role === "user" &&
+            String(item.content ?? "").includes("Reply with exactly the token I asked you to remember."),
+        ) &&
+        items.some((item) => item.role === "assistant" && String(item.content ?? "").includes(serverThreadSentinel))
+      );
+    });
+    if (
+      !allTurns.some((turn) => turn.threadId === threadId && typeof turn.turnId === "string") ||
+      !turnText.includes(`Remember this exact token for the next turn: ${serverThreadSentinel}`) ||
+      !turnWithRecallAndAssistant
+    ) {
+      throw new Error(
+        `Server thread/turns/list missing expected projection: ${JSON.stringify({ threadTurns, threadTurnsPage2 })}`,
+      );
+    }
+
+    send({
+      id: "server-thread-turns-list-desc",
+      method: "thread/turns/list",
+      params: {
+        threadId,
+        limit: 1,
+        sortDirection: "desc",
+      },
+    });
+    const threadTurnsDesc = await readUntil("server thread/turns/list desc", (event) => {
+      if (event.id !== "server-thread-turns-list-desc") {
+        return false;
+      }
+      if (event.event === "error") {
+        throw new Error(`Server thread/turns/list desc failed: ${JSON.stringify(event)}`);
+      }
+      return event.event === "thread_turns_list";
+    });
+    const descTurns = Array.isArray(threadTurnsDesc.data) ? threadTurnsDesc.data : [];
+    const firstDescTurnItems = Array.isArray(descTurns[0]?.items) ? descTurns[0].items : [];
+    if (
+      descTurns.length !== 1 ||
+      !firstDescTurnItems.some((item) => item.role === "assistant" && String(item.content ?? "").includes(serverThreadSentinel))
+    ) {
+      throw new Error(`Server thread/turns/list desc did not return latest turn first: ${JSON.stringify(threadTurnsDesc)}`);
+    }
+
+    send({
+      id: "server-thread-turns-list-not-loaded",
+      method: "thread/turns/list",
+      params: {
+        threadId,
+        limit: 1,
+        itemsView: "notLoaded",
+      },
+    });
+    const threadTurnsNotLoaded = await readUntil("server thread/turns/list notLoaded", (event) => {
+      if (event.id !== "server-thread-turns-list-not-loaded") {
+        return false;
+      }
+      if (event.event === "error") {
+        throw new Error(`Server thread/turns/list notLoaded failed: ${JSON.stringify(event)}`);
+      }
+      return event.event === "thread_turns_list";
+    });
+    const notLoadedTurns = Array.isArray(threadTurnsNotLoaded.data) ? threadTurnsNotLoaded.data : [];
+    if (
+      notLoadedTurns.length !== 1 ||
+      notLoadedTurns[0]?.itemsView !== "notLoaded" ||
+      !Array.isArray(notLoadedTurns[0]?.items) ||
+      notLoadedTurns[0].items.length !== 0
+    ) {
+      throw new Error(`Server thread/turns/list notLoaded returned unexpected items: ${JSON.stringify(threadTurnsNotLoaded)}`);
+    }
+
+    send({
+      id: "server-thread-items-list",
+      method: "thread/items/list",
+      params: {
+        threadId,
+        limit: 2,
+      },
+    });
+    const threadItems = await readUntil("server thread/items/list", (event) => {
+      if (event.id !== "server-thread-items-list") {
+        return false;
+      }
+      if (event.event === "error") {
+        throw new Error(`Server thread/items/list failed: ${JSON.stringify(event)}`);
+      }
+      return event.event === "thread_items_list";
+    });
+    const items = Array.isArray(threadItems.data) ? threadItems.data : [];
+    if (typeof threadItems.nextCursor !== "string") {
+      throw new Error(`Server thread/items/list did not return a next cursor: ${JSON.stringify(threadItems)}`);
+    }
+    send({
+      id: "server-thread-items-list-page-2",
+      method: "thread/items/list",
+      params: {
+        threadId,
+        cursor: threadItems.nextCursor,
+        limit: 10,
+      },
+    });
+    const threadItemsPage2 = await readUntil("server thread/items/list page 2", (event) => {
+      if (event.id !== "server-thread-items-list-page-2") {
+        return false;
+      }
+      if (event.event === "error") {
+        throw new Error(`Server thread/items/list page 2 failed: ${JSON.stringify(event)}`);
+      }
+      return event.event === "thread_items_list";
+    });
+    const itemsPage2 = Array.isArray(threadItemsPage2.data) ? threadItemsPage2.data : [];
+    const allItems = [...items, ...itemsPage2];
+    const itemText = allItems.map((entry) => entry.item?.content ?? "").join("\n");
+    if (
+      !allItems.some((entry) => entry.threadId === threadId && typeof entry.itemId === "string") ||
+      !itemText.includes(`Remember this exact token for the next turn: ${serverThreadSentinel}`) ||
+      !itemText.includes(serverThreadSentinel)
+    ) {
+      throw new Error(
+        `Server thread/items/list missing expected projection: ${JSON.stringify({ threadItems, threadItemsPage2 })}`,
+      );
+    }
+
+    send({
+      id: "server-thread-items-list-desc",
+      method: "thread/items/list",
+      params: {
+        threadId,
+        limit: 1,
+        sortDirection: "desc",
+      },
+    });
+    const threadItemsDesc = await readUntil("server thread/items/list desc", (event) => {
+      if (event.id !== "server-thread-items-list-desc") {
+        return false;
+      }
+      if (event.event === "error") {
+        throw new Error(`Server thread/items/list desc failed: ${JSON.stringify(event)}`);
+      }
+      return event.event === "thread_items_list";
+    });
+    const descItems = Array.isArray(threadItemsDesc.data) ? threadItemsDesc.data : [];
+    if (
+      descItems.length !== 1 ||
+      descItems[0]?.item?.role !== "assistant" ||
+      !String(descItems[0]?.item?.content ?? "").includes(serverThreadSentinel)
+    ) {
+      throw new Error(`Server thread/items/list desc did not return latest item first: ${JSON.stringify(threadItemsDesc)}`);
+    }
+
+    send({
+      id: "server-thread-read",
+      method: "thread/read",
+      params: {
+        threadId,
+        includeMessages: true,
+        includeTurns: true,
+      },
+    });
+    const threadRead = await readUntil("server thread/read", (event) => {
+      if (event.id !== "server-thread-read") {
+        return false;
+      }
+      if (event.event === "error") {
+        throw new Error(`Server thread/read failed: ${JSON.stringify(event)}`);
+      }
+      return event.event === "thread_read";
+    });
+    const messages = Array.isArray(threadRead.messages) ? threadRead.messages : [];
+    const readTurns = Array.isArray(threadRead.turns) ? threadRead.turns : [];
+    const userText = messages
+      .filter((message) => message.role === "user")
+      .map((message) => message.content ?? "")
+      .join("\n");
+    const assistantText = messages
+      .filter((message) => message.role === "assistant")
+      .map((message) => message.content ?? "")
+      .join("\n");
+    if (threadRead.threadId !== threadId || !Number.isInteger(threadRead.messageCount)) {
+      throw new Error(`Server thread/read returned malformed projection: ${JSON.stringify(threadRead)}`);
+    }
+    if (threadRead.title !== serverThreadTitle) {
+      throw new Error(`Server thread/read did not reflect metadata update: ${JSON.stringify(threadRead)}`);
+    }
+    if (
+      !userText.includes(`Remember this exact token for the next turn: ${serverThreadSentinel}`) ||
+      !userText.includes("Reply with exactly the token I asked you to remember.")
+    ) {
+      throw new Error(`Server thread/read missing expected user history: ${JSON.stringify(threadRead)}`);
+    }
+    if (!assistantText.includes(serverThreadSentinel)) {
+      throw new Error(`Server thread/read missing expected assistant history: ${JSON.stringify(threadRead)}`);
+    }
+    const readTurnWithRecallAndAssistant = readTurns.find((turn) => {
+      const items = Array.isArray(turn.items) ? turn.items : [];
+      return (
+        turn.threadId === threadId &&
+        items.some(
+          (item) =>
+            item.role === "user" &&
+            String(item.content ?? "").includes("Reply with exactly the token I asked you to remember."),
+        ) &&
+        items.some((item) => item.role === "assistant" && String(item.content ?? "").includes(serverThreadSentinel))
+      );
+    });
+    if (!readTurnWithRecallAndAssistant) {
+      throw new Error(`Server thread/read includeTurns missing expected projection: ${JSON.stringify(threadRead)}`);
+    }
+  } finally {
+    child.stdin.end();
+    stdout.close();
+    clearTimeout(timeout);
+  }
+
+  const result = await closed;
+  if (timedOut) {
+    throw new Error(`Server thread real API e2e timed out after ${args.timeoutMs}ms${stderr ? `\nstderr:\n${stderr}` : ""}`);
+  }
+  if (result.code !== 0) {
+    throw new Error(
+      `Server thread real API e2e exited with code ${result.code}${result.signal ? ` signal ${result.signal}` : ""}${
+        stderr ? `\nstderr:\n${stderr}` : ""
+      }`,
+    );
+  }
+
+  console.log(`Server thread real API e2e verified: ${serverThreadSentinel}`);
+  console.log("Server thread/read e2e verified");
+  console.log("Server thread/metadata/update e2e verified");
+  console.log("Server turn controls e2e verified");
+  console.log("Server thread/list e2e verified");
+  console.log("Server thread/list metadata filters e2e verified");
+  console.log("Server thread/search e2e verified");
+  console.log("Server thread/turns/list e2e verified");
+  console.log("Server thread/items/list e2e verified");
+}
+
+async function runServer(args) {
+  if (args.skipServer) {
+    console.log("Server real API e2e skipped");
+    return;
+  }
+
+  runServerSubmit(args);
+  await runServerThread(args);
+}
+
+async function main() {
   const args = parseArgs(process.argv.slice(2));
   runBuild(args);
   runProviderSummary(args);
   runCli(args);
-  runServer(args);
+  await runServer(args);
 }
 
 try {
-  main();
+  await main();
 } catch (error) {
   console.error(error.message);
   process.exit(1);

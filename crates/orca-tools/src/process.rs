@@ -15,8 +15,16 @@ pub struct CommandOutput {
 }
 
 pub fn wait_for_child_output_with_timeout(
+    child: Child,
+    timeout: Duration,
+) -> io::Result<CommandOutput> {
+    wait_for_child_output_with_timeout_or_cancel(child, timeout, || false)
+}
+
+pub fn wait_for_child_output_with_timeout_or_cancel(
     mut child: Child,
     timeout: Duration,
+    should_cancel: impl Fn() -> bool,
 ) -> io::Result<CommandOutput> {
     let stdout = child
         .stdout
@@ -41,6 +49,10 @@ pub fn wait_for_child_output_with_timeout(
         match child.try_wait()? {
             Some(status) => break status,
             None => {
+                if should_cancel() {
+                    kill_child_tree(&mut child);
+                    break child.wait()?;
+                }
                 if Instant::now() >= deadline {
                     timed_out = true;
                     kill_child_tree(&mut child);

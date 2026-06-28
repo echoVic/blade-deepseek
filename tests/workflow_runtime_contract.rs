@@ -74,6 +74,18 @@ fn workflow_runner_executes_agent_and_writes_state() {
     assert_eq!(evidence.identity.app_version, "0.0.0-test");
     assert_eq!(evidence.agents.len(), 1);
     assert_eq!(evidence.agents[0].status, WorkflowAgentStatus::Completed);
+    let task = evidence.agents[0]
+        .task
+        .as_ref()
+        .expect("workflow child task lifecycle");
+    assert_eq!(task.kind, "subagent");
+    assert_eq!(task.status, "succeeded");
+    assert_eq!(task.turn, 1);
+    assert!(
+        task.task_id.starts_with("workflow-child-"),
+        "task id should use the workflow child run id: {}",
+        task.task_id
+    );
     assert!(
         evidence.agents[0]
             .transcript_path
@@ -2144,7 +2156,11 @@ fn mock_run_config(cwd: &std::path::Path) -> RunConfig {
         external_tools: Vec::new(),
         history_mode: HistoryMode::Disabled,
         show_session_picker: false,
+        active_permission_profile: None,
+        permission_profiles: Default::default(),
+        runtime_workspace_roots: None,
         permission_rules: Default::default(),
+        additional_working_directories: Vec::new(),
         max_budget_usd: None,
         subagents: Default::default(),
         tools: ToolConfig::default(),

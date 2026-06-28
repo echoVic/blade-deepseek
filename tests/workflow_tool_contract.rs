@@ -194,15 +194,25 @@ fn workflow_tool_launches_background_task_and_returns_output() {
             .starts_with("workflow-run-")
     );
 
-    assert!(
-        events
-            .iter()
-            .any(|event| event["type"] == "workflow.started")
-    );
-    assert!(
-        events
-            .iter()
-            .any(|event| event["type"] == "workflow.result.available")
+    let workflow_started = events
+        .iter()
+        .find(|event| event["type"] == "workflow.started")
+        .expect("workflow started event");
+    assert_eq!(workflow_started["payload"]["task"]["kind"], "workflow");
+    assert_eq!(workflow_started["payload"]["task"]["status"], "running");
+    let workflow_completed = events
+        .iter()
+        .find(|event| event["type"] == "workflow.completed")
+        .expect("workflow completed event");
+    assert_eq!(workflow_completed["payload"]["task"]["kind"], "workflow");
+    assert_eq!(workflow_completed["payload"]["task"]["status"], "succeeded");
+    let workflow_result_available = events
+        .iter()
+        .find(|event| event["type"] == "workflow.result.available")
+        .expect("workflow result available event");
+    assert_eq!(
+        workflow_result_available["payload"]["task"]["status"],
+        "succeeded"
     );
     let result_available_index = events
         .iter()

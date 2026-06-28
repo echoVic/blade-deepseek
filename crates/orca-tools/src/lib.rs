@@ -58,19 +58,67 @@ pub fn execute_with_mcp_external_and_policy(
     output_truncation: ToolOutputTruncation,
     shell_timeout_secs: u64,
 ) -> ToolResult {
+    execute_with_mcp_external_policy_or_cancel(
+        request,
+        cwd,
+        mcp_registry,
+        external_tools,
+        output_truncation,
+        shell_timeout_secs,
+        || false,
+    )
+}
+
+pub fn execute_with_mcp_external_policy_or_cancel(
+    request: &ToolRequest,
+    cwd: &Path,
+    mcp_registry: &McpRegistry,
+    external_tools: &[ExternalToolConfig],
+    output_truncation: ToolOutputTruncation,
+    shell_timeout_secs: u64,
+    should_cancel: impl Fn() -> bool,
+) -> ToolResult {
+    execute_with_mcp_external_roots_policy_or_cancel(
+        request,
+        cwd,
+        &[],
+        mcp_registry,
+        external_tools,
+        output_truncation,
+        shell_timeout_secs,
+        should_cancel,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn execute_with_mcp_external_roots_policy_or_cancel(
+    request: &ToolRequest,
+    cwd: &Path,
+    additional_roots: &[PathBuf],
+    mcp_registry: &McpRegistry,
+    external_tools: &[ExternalToolConfig],
+    output_truncation: ToolOutputTruncation,
+    shell_timeout_secs: u64,
+    should_cancel: impl Fn() -> bool,
+) -> ToolResult {
     let shell_timeout = std::time::Duration::from_secs(shell_timeout_secs.max(1));
+    let should_cancel = &should_cancel as &dyn Fn() -> bool;
     if !matches!(&request.name, ToolName::Mcp(_)) {
         if external_tools.is_empty() {
             let reg = registry::default_tool_registry();
             let ctx = registry::ToolContext::new(cwd)
                 .with_output_truncation(output_truncation)
-                .with_shell_timeout(shell_timeout);
+                .with_shell_timeout(shell_timeout)
+                .with_additional_working_directories(additional_roots.iter().cloned())
+                .with_cancel(should_cancel);
             return reg.execute(request, &ctx);
         }
         let reg = registry::tool_registry_with_mcp_and_external(None, external_tools);
         let ctx = registry::ToolContext::new(cwd)
             .with_output_truncation(output_truncation)
-            .with_shell_timeout(shell_timeout);
+            .with_shell_timeout(shell_timeout)
+            .with_additional_working_directories(additional_roots.iter().cloned())
+            .with_cancel(should_cancel);
         return reg.execute(request, &ctx);
     }
 
@@ -78,7 +126,9 @@ pub fn execute_with_mcp_external_and_policy(
     let ctx = registry::ToolContext::new(cwd)
         .with_output_truncation(output_truncation)
         .with_shell_timeout(shell_timeout)
-        .with_mcp(mcp_registry);
+        .with_additional_working_directories(additional_roots.iter().cloned())
+        .with_mcp(mcp_registry)
+        .with_cancel(should_cancel);
     reg.execute(request, &ctx)
 }
 
@@ -240,8 +290,11 @@ pub fn resolve_workspace_path(cwd: &Path, target: Option<&str>) -> Result<PathBu
 mod tests {
     use super::*;
     use orca_core::approval_types::ActionKind;
+    use orca_core::mcp_types::{McpServerConfig, McpTransportKind};
     use orca_core::tool_types::{ToolStatus, truncate_output};
     use std::fs;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
 
     #[test]
     fn micro_compact_preserves_head_and_tail() {
@@ -352,6 +405,91 @@ mod tests {
             assert!(tool.is_read_only(&request));
             assert!(tool.is_concurrent_safe(&request));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mcp_tool_execution_observes_cancel_callback() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let server = temp_dir.path().join("slow_mcp_server.sh");
+        fs::write(
+            &server,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"slow","version":"1"}}}\n'
+      ;;
+    *'"method":"notifications/initialized"'*)
+      ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"wait","description":"waits","inputSchema":{"type":"object","properties":{},"required":[]}}]}}\n'
+      ;;
+    *'"method":"tools/call"'*)
+      sleep 5
+      printf '{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"too late"}],"isError":false}}\n'
+      ;;
+  esac
+done
+"#,
+        )
+        .expect("write MCP fixture");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&server).expect("metadata").permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&server, permissions).expect("chmod MCP fixture");
+        }
+
+        let registry = orca_mcp::initialize_registry(&[McpServerConfig {
+            name: "slow".to_string(),
+            transport: McpTransportKind::Stdio,
+            command: Some(server.to_string_lossy().into_owned()),
+            args: Vec::new(),
+            url: None,
+            env: Default::default(),
+            headers: Default::default(),
+            disabled: false,
+            startup_timeout_ms: None,
+            tool_timeout_ms: None,
+        }]);
+        assert!(
+            registry.errors().is_empty(),
+            "registry errors: {:?}",
+            registry.errors()
+        );
+        let request = ToolRequest {
+            id: "mcp-call".to_string(),
+            name: ToolName::Mcp("mcp__slow__wait".to_string()),
+            action: ActionKind::Write,
+            target: None,
+            raw_arguments: Some("{}".to_string()),
+        };
+        let cancelled = AtomicBool::new(false);
+        let started = Instant::now();
+
+        let result = execute_with_mcp_external_policy_or_cancel(
+            &request,
+            temp_dir.path(),
+            &registry,
+            &[],
+            ToolOutputTruncation::default(),
+            30,
+            || {
+                if started.elapsed() >= Duration::from_millis(100) {
+                    cancelled.store(true, Ordering::SeqCst);
+                }
+                cancelled.load(Ordering::SeqCst)
+            },
+        );
+
+        assert!(
+            started.elapsed() < Duration::from_millis(750),
+            "cancelled MCP call took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(result.status, ToolStatus::Failed);
+        assert_eq!(result.error.as_deref(), Some("MCP tool call cancelled"));
     }
 
     #[test]

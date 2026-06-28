@@ -1,12 +1,16 @@
 use std::process::Command;
+use std::sync::{Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use tempfile::tempdir;
 
+static SUBAGENT_CLI_TEST_LOCK: Mutex<()> = Mutex::new(());
+
 #[test]
 fn subagent_tool_runs_child_agent_and_emits_events() {
+    let _guard = subagent_cli_test_guard();
     let output = Command::new(env!("CARGO_BIN_EXE_orca"))
         .args([
             "exec",
@@ -30,10 +34,23 @@ fn subagent_tool_runs_child_agent_and_emits_events() {
     let started = find_event(&events, "subagent.started");
     assert_eq!(started["payload"]["id"], "mock-tool-1");
     assert_eq!(started["payload"]["description"], "inspect repo");
+    assert_eq!(started["payload"]["task"]["kind"], "subagent");
+    assert_eq!(started["payload"]["task"]["status"], "running");
+    assert_eq!(
+        started["payload"]["task"]["task_id"],
+        "subagent-mock-tool-1:task-1"
+    );
 
     let completed = find_event(&events, "subagent.completed");
     assert_eq!(completed["payload"]["id"], "mock-tool-1");
     assert_eq!(completed["payload"]["description"], "inspect repo");
+    assert_eq!(completed["payload"]["task"]["kind"], "subagent");
+    assert_eq!(completed["payload"]["task"]["status"], "succeeded");
+    assert_eq!(completed["payload"]["task"]["turn"], 1);
+    assert_eq!(
+        completed["payload"]["task"]["task_id"],
+        "subagent-mock-tool-1:task-1"
+    );
     assert_eq!(completed["payload"]["status"], "success");
     assert!(
         completed["payload"]["output"]
@@ -57,6 +74,7 @@ fn subagent_tool_runs_child_agent_and_emits_events() {
 
 #[test]
 fn async_subagent_launches_without_blocking_parent_tool() {
+    let _guard = subagent_cli_test_guard();
     let cwd = tempdir().expect("temp cwd");
     let output = Command::new(env!("CARGO_BIN_EXE_orca"))
         .current_dir(cwd.path())
@@ -95,6 +113,7 @@ fn async_subagent_launches_without_blocking_parent_tool() {
 
 #[test]
 fn subagent_status_can_read_persisted_async_handle() {
+    let _guard = subagent_cli_test_guard();
     let cwd = tempdir().expect("temp cwd");
     let launched = Command::new(env!("CARGO_BIN_EXE_orca"))
         .current_dir(cwd.path())
@@ -144,6 +163,7 @@ fn subagent_status_can_read_persisted_async_handle() {
 
 #[test]
 fn async_subagent_completes_after_launching_exec_process_exits() {
+    let _guard = subagent_cli_test_guard();
     let cwd = tempdir().expect("temp cwd");
     let orca_home = tempdir().expect("temp orca home");
     write_sleep_hook_config(orca_home.path(), 0.4);
@@ -174,6 +194,13 @@ fn async_subagent_completes_after_launching_exec_process_exits() {
     assert_eq!(status_payload["agent_id"], agent_id);
     assert_eq!(status_payload["description"], "mock_usage");
     assert_eq!(status_payload["status"], "completed");
+    assert_eq!(status_payload["task"]["kind"], "subagent");
+    assert_eq!(status_payload["task"]["status"], "succeeded");
+    assert_eq!(status_payload["task"]["turn"], 1);
+    assert_eq!(
+        status_payload["task"]["task_id"],
+        format!("subagent-{agent_id}:task-1")
+    );
     assert!(
         status_payload["output"]
             .as_str()
@@ -185,6 +212,7 @@ fn async_subagent_completes_after_launching_exec_process_exits() {
 
 #[test]
 fn subagent_schema_accepts_matching_output() {
+    let _guard = subagent_cli_test_guard();
     let output = Command::new(env!("CARGO_BIN_EXE_orca"))
         .args([
             "exec",
@@ -213,6 +241,7 @@ fn subagent_schema_accepts_matching_output() {
 
 #[test]
 fn subagent_schema_failure_fails_parent_run() {
+    let _guard = subagent_cli_test_guard();
     let output = Command::new(env!("CARGO_BIN_EXE_orca"))
         .args([
             "exec",
@@ -243,6 +272,7 @@ fn subagent_schema_failure_fails_parent_run() {
 
 #[test]
 fn subagent_batch_schema_failure_fails_parent_run() {
+    let _guard = subagent_cli_test_guard();
     let output = Command::new(env!("CARGO_BIN_EXE_orca"))
         .args([
             "exec",
@@ -284,6 +314,7 @@ fn subagent_batch_schema_failure_fails_parent_run() {
 
 #[test]
 fn async_subagent_schema_failure_persists_failed_task() {
+    let _guard = subagent_cli_test_guard();
     let cwd = tempdir().expect("temp cwd");
     let orca_home = tempdir().expect("temp orca home");
     let launched = Command::new(env!("CARGO_BIN_EXE_orca"))
@@ -313,6 +344,9 @@ fn async_subagent_schema_failure_persists_failed_task() {
     assert_eq!(status_payload["agent_id"], agent_id);
     assert_eq!(status_payload["description"], "schema_fail");
     assert_eq!(status_payload["status"], "failed");
+    assert_eq!(status_payload["task"]["kind"], "subagent");
+    assert_eq!(status_payload["task"]["status"], "failed");
+    assert_eq!(status_payload["task"]["turn"], 1);
     let error = status_payload["error"].as_str().unwrap();
     assert!(error.contains("subagent output schema validation failed for schema_fail"));
     assert!(error.contains("$ expected object, got string"));
@@ -320,6 +354,7 @@ fn async_subagent_schema_failure_persists_failed_task() {
 
 #[test]
 fn nested_subagent_calls_are_rejected() {
+    let _guard = subagent_cli_test_guard();
     let orca_home = tempdir().expect("temp orca home");
     std::fs::write(
         orca_home.path().join("config.toml"),
@@ -360,6 +395,7 @@ fn nested_subagent_calls_are_rejected() {
 
 #[test]
 fn default_subagent_depth_allows_one_nested_child() {
+    let _guard = subagent_cli_test_guard();
     let output = Command::new(env!("CARGO_BIN_EXE_orca"))
         .args([
             "exec",
@@ -381,6 +417,7 @@ fn default_subagent_depth_allows_one_nested_child() {
 
 #[test]
 fn worktree_isolated_subagent_writes_outside_parent_worktree() {
+    let _guard = subagent_cli_test_guard();
     let repo = tempdir().expect("temp repo");
     run_git(repo.path(), &["init"]);
     run_git(repo.path(), &["config", "user.email", "orca@example.test"]);
@@ -424,6 +461,7 @@ fn worktree_isolated_subagent_writes_outside_parent_worktree() {
 
 #[test]
 fn subagent_child_failure_fails_parent_run() {
+    let _guard = subagent_cli_test_guard();
     let output = Command::new(env!("CARGO_BIN_EXE_orca"))
         .args([
             "exec",
@@ -459,6 +497,12 @@ fn find_event<'a>(events: &'a [Value], event_type: &str) -> &'a Value {
         .iter()
         .find(|event| event["type"] == event_type)
         .unwrap_or_else(|| panic!("missing {event_type}"))
+}
+
+fn subagent_cli_test_guard() -> MutexGuard<'static, ()> {
+    SUBAGENT_CLI_TEST_LOCK
+        .lock()
+        .expect("subagent CLI test lock")
 }
 
 fn run_git(cwd: &std::path::Path, args: &[&str]) {

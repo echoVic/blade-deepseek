@@ -248,6 +248,28 @@ fn mock_call(conversation: &Conversation) -> ProviderResponse {
         };
     }
 
+    if let Some(command) = prompt.trim().strip_prefix("force_bash ") {
+        let bash = ToolRequest {
+            id: "mock-tool-1".to_string(),
+            name: ToolName::Bash,
+            action: ActionKind::Shell,
+            target: Some(command.to_string()),
+            raw_arguments: Some(serde_json::json!({ "command": command }).to_string()),
+        };
+        let raw_call = RawToolCall {
+            id: bash.id.clone(),
+            function_name: bash.name.as_str().to_string(),
+            arguments: bash.raw_arguments.clone().unwrap_or_default(),
+        };
+        return ProviderResponse {
+            steps: vec![ProviderStep::ToolCall(bash)],
+            assistant_content: None,
+            assistant_reasoning: None,
+            tool_calls: vec![raw_call],
+            usage: None,
+        };
+    }
+
     if has_tool_results {
         let msg = "Mock completed after tool execution.".to_string();
         return ProviderResponse {
@@ -322,7 +344,21 @@ fn mock_call(conversation: &Conversation) -> ProviderResponse {
         };
     }
 
-    if prompt.trim() == "mock_history_echo" {
+    if prompt.trim() == "mock_proposed_plan" {
+        let message = "Preface\n<proposed_plan>\n# Final plan\n- first\n- second\n</proposed_plan>\nPostscript";
+        return ProviderResponse {
+            steps: vec![ProviderStep::MessageDelta(message.to_string())],
+            assistant_content: Some(message.to_string()),
+            assistant_reasoning: None,
+            tool_calls: Vec::new(),
+            usage: None,
+        };
+    }
+
+    if prompt
+        .lines()
+        .any(|line| line.trim() == "mock_history_echo")
+    {
         let users = conversation
             .messages
             .iter()
@@ -395,6 +431,62 @@ fn mock_call(conversation: &Conversation) -> ProviderResponse {
         ];
         return ProviderResponse {
             steps,
+            assistant_content: None,
+            assistant_reasoning: None,
+            tool_calls,
+            usage: None,
+        };
+    }
+
+    if let Some(rest) = prompt.trim().strip_prefix("request_permissions_then_bash ")
+        && let Some((root, command)) = rest.split_once(" :: ")
+    {
+        let request_permissions = ToolRequest {
+            id: "mock-tool-1".to_string(),
+            name: ToolName::RequestPermissions,
+            action: ActionKind::Write,
+            target: Some(root.to_string()),
+            raw_arguments: Some(
+                serde_json::json!({
+                    "reason": "mock provider needs a temporary write root",
+                    "permissions": {
+                        "fileSystem": {
+                            "read": null,
+                            "write": [root]
+                        },
+                        "network": null
+                    }
+                })
+                .to_string(),
+            ),
+        };
+        let bash = ToolRequest {
+            id: "mock-tool-2".to_string(),
+            name: ToolName::Bash,
+            action: ActionKind::Shell,
+            target: Some(command.to_string()),
+            raw_arguments: Some(serde_json::json!({ "command": command }).to_string()),
+        };
+        let tool_calls = vec![
+            RawToolCall {
+                id: request_permissions.id.clone(),
+                function_name: request_permissions.name.as_str().to_string(),
+                arguments: request_permissions
+                    .raw_arguments
+                    .clone()
+                    .unwrap_or_default(),
+            },
+            RawToolCall {
+                id: bash.id.clone(),
+                function_name: bash.name.as_str().to_string(),
+                arguments: bash.raw_arguments.clone().unwrap_or_default(),
+            },
+        ];
+        return ProviderResponse {
+            steps: vec![
+                ProviderStep::ToolCall(request_permissions),
+                ProviderStep::ToolCall(bash),
+            ],
             assistant_content: None,
             assistant_reasoning: None,
             tool_calls,
@@ -518,12 +610,36 @@ fn parse_mock_prompt(prompt: &str) -> Option<ToolRequest> {
         });
     }
 
+    if let Some(rest) = prompt.strip_prefix("task_stop ") {
+        let task_id = rest.trim();
+        if task_id.is_empty() {
+            return None;
+        }
+        return Some(ToolRequest {
+            id: "mock-tool-1".to_string(),
+            name: ToolName::TaskStop,
+            action: ActionKind::Write,
+            target: Some(task_id.to_string()),
+            raw_arguments: Some(serde_json::json!({ "task_id": task_id }).to_string()),
+        });
+    }
+
     if prompt == "mcp__broken__tool" {
         return Some(ToolRequest {
             id: "mock-tool-1".to_string(),
             name: ToolName::Mcp("mcp__broken__tool".to_string()),
             action: ActionKind::Agent,
             target: Some("mcp__broken__tool".to_string()),
+            raw_arguments: Some(serde_json::json!({}).to_string()),
+        });
+    }
+
+    if prompt == "mcp__slow__wait" {
+        return Some(ToolRequest {
+            id: "mock-tool-1".to_string(),
+            name: ToolName::Mcp("mcp__slow__wait".to_string()),
+            action: ActionKind::Agent,
+            target: Some("mcp__slow__wait".to_string()),
             raw_arguments: Some(serde_json::json!({}).to_string()),
         });
     }
@@ -880,6 +996,57 @@ mod tests {
             arguments["schema"]["properties"]["result"]["type"],
             "string"
         );
+    }
+
+    #[test]
+    fn mock_proposed_plan_returns_tagged_plan_block() {
+        let mut conversation = Conversation::new();
+        conversation.add_user("mock_proposed_plan".to_string());
+
+        let response = mock_call(&conversation);
+
+        assert_eq!(
+            response.assistant_content.as_deref(),
+            Some(
+                "Preface\n<proposed_plan>\n# Final plan\n- first\n- second\n</proposed_plan>\nPostscript"
+            )
+        );
+        assert!(matches!(
+            response.steps.first(),
+            Some(ProviderStep::MessageDelta(text)) if text.contains("<proposed_plan>")
+        ));
+    }
+
+    #[test]
+    fn mock_provider_can_request_permissions_then_bash() {
+        let mut conversation = Conversation::new();
+        conversation.add_user(
+            "request_permissions_then_bash /tmp/orca-extra :: printf hi > /tmp/orca-extra/out"
+                .to_string(),
+        );
+
+        let response = mock_call(&conversation);
+
+        assert_eq!(response.tool_calls.len(), 2);
+        assert!(matches!(
+            response.steps.as_slice(),
+            [
+                ProviderStep::ToolCall(first),
+                ProviderStep::ToolCall(second)
+            ] if first.name == ToolName::RequestPermissions && second.name == ToolName::Bash
+        ));
+    }
+
+    #[test]
+    fn mock_prompt_parses_task_stop() {
+        let request = parse_mock_prompt("task_stop task-shell-1").expect("tool request");
+
+        assert_eq!(request.name, ToolName::TaskStop);
+        assert_eq!(request.action, ActionKind::Write);
+        assert_eq!(request.target.as_deref(), Some("task-shell-1"));
+        let arguments: serde_json::Value =
+            serde_json::from_str(request.raw_arguments.as_deref().unwrap()).unwrap();
+        assert_eq!(arguments["task_id"], "task-shell-1");
     }
 
     #[test]

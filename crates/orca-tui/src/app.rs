@@ -5,11 +5,11 @@ use std::time::{Duration, Instant};
 
 use crossterm::ExecutableCommand;
 use crossterm::event::{
-    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event, KeyCode, KeyEventKind, KeyboardEnhancementFlags, MouseEvent, MouseEventKind,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind,
+    KeyboardEnhancementFlags, MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
-use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::terminal;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
@@ -51,8 +51,9 @@ pub fn run_tui(config: RunConfig) -> i32 {
 fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
     terminal::enable_raw_mode()?;
     let mut stdout = io::stdout();
-    stdout.execute(EnterAlternateScreen)?;
-    stdout.execute(EnableMouseCapture)?;
+    // Codex-style: no alt-screen, no mouse capture → native terminal selection works
+    // stdout.execute(EnterAlternateScreen)?;
+    // stdout.execute(EnableMouseCapture)?;
     let bracketed_paste = stdout.execute(EnableBracketedPaste).is_ok();
     // Kitty keyboard protocol: push enhancement AFTER entering alternate screen,
     // otherwise the terminal may reset the keyboard state stack on screen switch.
@@ -696,15 +697,16 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
         }
     }
 
-    // Restore order: pop keyboard enhancement first, then leave alternate screen
+    // Cleanup: pop keyboard enhancement, disable bracketed paste
     if kbd_enhanced {
         let _ = io::stdout().execute(PopKeyboardEnhancementFlags);
     }
     if bracketed_paste {
         let _ = io::stdout().execute(DisableBracketedPaste);
     }
-    let _ = io::stdout().execute(DisableMouseCapture);
-    io::stdout().execute(LeaveAlternateScreen)?;
+    // Codex-style: no mouse capture or alt-screen to clean up
+    // let _ = io::stdout().execute(DisableMouseCapture);
+    // io::stdout().execute(LeaveAlternateScreen)?;
     terminal::disable_raw_mode()?;
 
     Ok(exit_code)
@@ -803,7 +805,11 @@ mod tests {
             external_tools: Vec::new(),
             history_mode,
             show_session_picker: false,
+            active_permission_profile: None,
+            permission_profiles: Default::default(),
+            runtime_workspace_roots: None,
             permission_rules: Default::default(),
+            additional_working_directories: Vec::new(),
             max_budget_usd: None,
             subagents: Default::default(),
             tools: ToolConfig::default(),
@@ -841,6 +847,11 @@ mod tests {
                 created_at: chrono::Utc::now(),
                 parent_id: None,
                 forked: false,
+                approval_mode: None,
+                active_permission_profile: None,
+                runtime_workspace_roots: Vec::new(),
+                permission_rules: Default::default(),
+                additional_working_directories: Vec::new(),
             },
             messages: Vec::new(),
             compactions: Vec::new(),

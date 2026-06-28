@@ -8,6 +8,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::lifecycle::RuntimeWorkflowIpc;
+
 #[derive(Clone, Debug)]
 pub(crate) struct WorkflowIpcContext {
     mailbox: Arc<WorkflowMailbox>,
@@ -103,6 +105,47 @@ impl WorkflowIpcContext {
 
     pub(crate) fn list_tasks(&self, name: &str) -> Result<Value, String> {
         self.task_lists.list_tasks(name)
+    }
+}
+
+impl RuntimeWorkflowIpc for WorkflowIpcContext {
+    fn send_message(
+        &self,
+        channel: &str,
+        from: Option<&str>,
+        message: Value,
+    ) -> Result<Value, String> {
+        self.send_message(channel, from, message)
+    }
+
+    fn read_messages(&self, channel: &str) -> Result<Value, String> {
+        self.read_messages(channel)
+    }
+
+    fn clear_messages(&self, channel: &str) -> Result<Value, String> {
+        self.clear_messages(channel)
+    }
+
+    fn create_task_list(&self, name: &str, items: Vec<Value>) -> Result<Value, String> {
+        self.create_task_list(name, items)
+    }
+
+    fn claim_task(&self, name: &str, by: Option<&str>) -> Result<Value, String> {
+        self.claim_task(name, by)
+    }
+
+    fn complete_task(
+        &self,
+        name: &str,
+        task_id: &str,
+        result: Value,
+        by: Option<&str>,
+    ) -> Result<Value, String> {
+        self.complete_task(name, task_id, result, by)
+    }
+
+    fn list_tasks(&self, name: &str) -> Result<Value, String> {
+        self.list_tasks(name)
     }
 }
 

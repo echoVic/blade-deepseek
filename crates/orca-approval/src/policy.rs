@@ -109,6 +109,9 @@ mod tests {
             id: "test-1".to_string(),
             action,
             description: "test".to_string(),
+            tool: None,
+            target: None,
+            preview: None,
         }
     }
 
@@ -195,6 +198,9 @@ mod tests {
             id: "custom-id-42".to_string(),
             action: ActionKind::Read,
             description: "test".to_string(),
+            tool: None,
+            target: None,
+            preview: None,
         };
         let res = policy.resolve(&req);
         assert_eq!(res.id, "custom-id-42");
@@ -212,6 +218,9 @@ mod tests {
             id: "danger".to_string(),
             action: ActionKind::Shell,
             description: "bash requested rm -rf target".to_string(),
+            tool: Some("bash".to_string()),
+            target: Some("rm -rf target".to_string()),
+            preview: None,
         };
 
         let res = policy.resolve_for_tool(&req, "bash", Some("rm -rf target"));
@@ -232,6 +241,9 @@ mod tests {
             id: "cargo".to_string(),
             action: ActionKind::Shell,
             description: "bash requested cargo test".to_string(),
+            tool: Some("bash".to_string()),
+            target: Some("cargo test".to_string()),
+            preview: None,
         };
 
         let res = policy.resolve_for_tool(&req, "bash", Some("cargo test"));
@@ -252,6 +264,9 @@ mod tests {
             id: "other".to_string(),
             action: ActionKind::Shell,
             description: "bash requested npm test".to_string(),
+            tool: Some("bash".to_string()),
+            target: Some("npm test".to_string()),
+            preview: None,
         };
 
         let res = policy.resolve_for_tool(&req, "bash", Some("npm test"));
@@ -271,6 +286,9 @@ mod tests {
             id: "curl".to_string(),
             action: ActionKind::Shell,
             description: "bash requested curl example.com".to_string(),
+            tool: Some("bash".to_string()),
+            target: Some("curl example.com".to_string()),
+            preview: None,
         };
 
         let res = policy.resolve_for_tool(&req, "bash", Some("curl example.com"));
@@ -290,6 +308,9 @@ mod tests {
             id: "publish".to_string(),
             action: ActionKind::Shell,
             description: "bash requested cargo publish secret-crate".to_string(),
+            tool: Some("bash".to_string()),
+            target: Some("cargo publish secret-crate".to_string()),
+            preview: None,
         };
 
         let res = policy.resolve_for_tool(&req, "bash", Some("cargo publish secret-crate"));

@@ -114,6 +114,7 @@ impl<W: Write> EventSink<W> {
             EventType::WorkflowResultAvailable => {
                 writeln!(self.writer, "workflow result available")
             }
+            EventType::WorkflowTasksUpdated => writeln!(self.writer, "workflow tasks updated"),
             EventType::VerificationStarted => writeln!(self.writer, "verification started"),
             EventType::VerificationCompleted => writeln!(self.writer, "verification completed"),
             EventType::Error => writeln!(

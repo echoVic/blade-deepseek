@@ -5,6 +5,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Gauge, Paragraph, Wrap};
 use std::ops::Range;
+use std::path::{Path, PathBuf};
 use tui_textarea::TextArea;
 use unicode_width::UnicodeWidthStr;
 
@@ -12,6 +13,7 @@ use orca_core::task_types::{
     BackgroundTaskSummary, TaskStatus, TaskType, WorkflowAgentTaskSummary,
 };
 use orca_core::workflow_types::{WorkflowAgentStatus, WorkflowRunStatus};
+use orca_runtime::history::SessionSummary;
 
 use crate::shortcuts::{self, ShortcutScope};
 use crate::theme::Theme;
@@ -241,10 +243,73 @@ fn render_session_picker(frame: &mut Frame, state: &mut AppState, theme: &Theme)
             Style::default().fg(theme.muted),
         ));
         lines.push(Line::from(spans));
+
+        if let Some(metadata) = session_permission_metadata_label(session) {
+            lines.push(Line::from(vec![
+                Span::styled("    ", Style::default()),
+                Span::styled(metadata, Style::default().fg(theme.muted)),
+            ]));
+        }
     }
 
     let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
     frame.render_widget(paragraph, inner);
+}
+
+fn session_permission_metadata_label(session: &SessionSummary) -> Option<String> {
+    let mut parts = Vec::new();
+
+    if let Some(profile) = &session.active_permission_profile {
+        parts.push(format!("profile {}", profile.id));
+    }
+    if session.permission_rule_count > 0 {
+        parts.push(format!(
+            "{} rule{}",
+            session.permission_rule_count,
+            if session.permission_rule_count == 1 {
+                ""
+            } else {
+                "s"
+            }
+        ));
+    }
+    if !session.additional_working_directories.is_empty() {
+        let labels = session
+            .additional_working_directories
+            .iter()
+            .map(|entry| {
+                format!(
+                    "{} {}",
+                    entry.source,
+                    workspace_relative_path_label(&entry.path, &session.runtime_workspace_roots)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        parts.push(format!("dirs {labels}"));
+    }
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("  "))
+    }
+}
+
+fn workspace_relative_path_label(path: &Path, runtime_workspace_roots: &[PathBuf]) -> String {
+    let Some(root) = runtime_workspace_roots
+        .iter()
+        .filter(|root| path == root.as_path() || path.starts_with(root))
+        .max_by_key(|root| root.components().count())
+    else {
+        return path.display().to_string();
+    };
+
+    match path.strip_prefix(root) {
+        Ok(relative) if relative.as_os_str().is_empty() => ":workspace_roots".to_string(),
+        Ok(relative) => format!(":workspace_roots/{}", relative.display()),
+        Err(_) => path.display().to_string(),
+    }
 }
 
 /// Split `text` into styled spans, highlighting the first case-insensitive
@@ -2568,6 +2633,9 @@ fn truncate_lines(text: &str, max_lines: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
+    use orca_core::config::AdditionalWorkingDirectory;
+    use orca_runtime::history::SessionSummary;
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
@@ -2604,6 +2672,71 @@ mod tests {
             "deepseek".to_string(),
             "/tmp".to_string(),
         )
+    }
+
+    fn session_summary(id: &str, title: &str) -> SessionSummary {
+        SessionSummary {
+            session_id: id.to_string(),
+            title: title.to_string(),
+            cwd: "/workspace/project".to_string(),
+            provider: "deepseek".to_string(),
+            model: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            path: "/tmp/session.jsonl".into(),
+            archived: false,
+            parent_id: None,
+            forked: false,
+            approval_mode: None,
+            active_permission_profile: None,
+            runtime_workspace_roots: Vec::new(),
+            permission_rule_count: 0,
+            additional_working_directories: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn session_picker_labels_additional_directories_under_runtime_workspace_roots() {
+        let mut state = test_state();
+        state.status = AppStatus::SessionPicker;
+        let mut session = session_summary("session-1", "workspace permissions");
+        session.runtime_workspace_roots = vec!["/workspace/project".into()];
+        session.additional_working_directories = vec![AdditionalWorkingDirectory::new(
+            "/workspace/project/docs",
+            "session",
+        )];
+        state.session_picker_sessions = vec![session];
+
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let textarea = TextArea::default();
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 12))
+            .expect("test backend");
+
+        terminal
+            .draw(|frame| render(frame, &mut state, &textarea, &theme))
+            .expect("draw");
+        let rendered = format!("{:?}", terminal.backend().buffer());
+
+        assert!(rendered.contains(":workspace_roots/docs"));
+        assert!(rendered.contains("session"));
+    }
+
+    #[test]
+    fn workspace_relative_path_label_prefers_longest_matching_runtime_root() {
+        let roots = vec!["/workspace".into(), "/workspace/project".into()];
+
+        assert_eq!(
+            workspace_relative_path_label(Path::new("/workspace/project"), &roots),
+            ":workspace_roots"
+        );
+        assert_eq!(
+            workspace_relative_path_label(Path::new("/workspace/project/docs"), &roots),
+            ":workspace_roots/docs"
+        );
+        assert_eq!(
+            workspace_relative_path_label(Path::new("/var/tmp/cache"), &roots),
+            "/var/tmp/cache"
+        );
     }
 
     #[test]

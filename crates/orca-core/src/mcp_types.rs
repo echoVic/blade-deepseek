@@ -31,6 +31,10 @@ pub struct McpServerConfig {
     pub headers: HashMap<String, String>,
     #[serde(default)]
     pub disabled: bool,
+    #[serde(default)]
+    pub startup_timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub tool_timeout_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

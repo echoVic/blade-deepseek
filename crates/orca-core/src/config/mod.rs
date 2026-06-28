@@ -237,7 +237,11 @@ pub struct RunConfig {
     pub external_tools: Vec<ExternalToolConfig>,
     pub history_mode: HistoryMode,
     pub show_session_picker: bool,
+    pub active_permission_profile: Option<ActivePermissionProfile>,
+    pub permission_profiles: HashMap<String, PermissionProfileConfig>,
+    pub runtime_workspace_roots: Option<Vec<PathBuf>>,
     pub permission_rules: PermissionRules,
+    pub additional_working_directories: Vec<AdditionalWorkingDirectory>,
     pub max_budget_usd: Option<f64>,
     pub subagents: SubagentConfig,
     pub tools: ToolConfig,
@@ -247,6 +251,122 @@ pub struct RunConfig {
     pub update_check: bool,
     pub desktop_notifications: bool,
     pub auto_memory: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AdditionalWorkingDirectory {
+    pub path: PathBuf,
+    pub source: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ActivePermissionProfile {
+    pub id: String,
+    pub extends: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PermissionProfileConfig {
+    #[serde(default)]
+    pub extends: Option<String>,
+    #[serde(default)]
+    pub filesystem: PermissionProfileFilesystemConfig,
+    #[serde(default)]
+    pub network: PermissionProfileNetworkConfig,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct PermissionProfileFilesystemConfig {
+    entries: HashMap<PathBuf, PermissionProfileFileAccess>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+enum PermissionProfileFilesystemEntry {
+    Access(PermissionProfileFileAccess),
+    Scoped(HashMap<PathBuf, PermissionProfileFileAccess>),
+}
+
+impl<'de> Deserialize<'de> for PermissionProfileFilesystemConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = HashMap::<PathBuf, PermissionProfileFilesystemEntry>::deserialize(deserializer)?;
+        let mut entries = HashMap::new();
+        for (path, entry) in raw {
+            match entry {
+                PermissionProfileFilesystemEntry::Access(access) => {
+                    entries.insert(path, access);
+                }
+                PermissionProfileFilesystemEntry::Scoped(scoped) => {
+                    for (subpath, access) in scoped {
+                        entries.insert(path.join(subpath), access);
+                    }
+                }
+            }
+        }
+        Ok(Self { entries })
+    }
+}
+
+impl PermissionProfileFilesystemConfig {
+    pub fn get(&self, path: &std::path::Path) -> Option<&PermissionProfileFileAccess> {
+        self.entries.get(path)
+    }
+
+    pub fn entries(&self) -> impl Iterator<Item = (&PathBuf, &PermissionProfileFileAccess)> {
+        self.entries.iter()
+    }
+}
+
+impl From<HashMap<PathBuf, PermissionProfileFileAccess>> for PermissionProfileFilesystemConfig {
+    fn from(entries: HashMap<PathBuf, PermissionProfileFileAccess>) -> Self {
+        Self { entries }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PermissionProfileNetworkConfig {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PermissionProfileFileAccess {
+    Read,
+    Write,
+    ReadWrite,
+    Deny,
+}
+
+impl PermissionProfileFileAccess {
+    pub fn allows_write(self) -> bool {
+        matches!(self, Self::Write | Self::ReadWrite)
+    }
+
+    pub fn denies_write(self) -> bool {
+        matches!(self, Self::Deny)
+    }
+}
+
+impl ActivePermissionProfile {
+    pub fn new(id: impl Into<String>, extends: Option<impl Into<String>>) -> Self {
+        Self {
+            id: id.into(),
+            extends: extends.map(Into::into),
+        }
+    }
+}
+
+impl AdditionalWorkingDirectory {
+    pub fn new(path: impl Into<PathBuf>, source: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            source: source.into(),
+        }
+    }
 }
 
 pub fn format_config_show(config: &RunConfig) -> String {
@@ -309,7 +429,8 @@ pub fn format_config_show(config: &RunConfig) -> String {
             "mcp_servers = {}\n",
             "external_tools = {}\n",
             "hooks = {}\n",
-            "permission_rules = {}"
+            "permission_rules = {}\n",
+            "additional_working_directories = {}"
         ),
         config.model.display_name(),
         config.approval_mode.as_str(),
@@ -350,7 +471,8 @@ pub fn format_config_show(config: &RunConfig) -> String {
         config.mcp_servers.len(),
         config.external_tools.len(),
         config.hooks.len(),
-        config.permission_rules.rules.len()
+        config.permission_rules.rules.len(),
+        config.additional_working_directories.len()
     )
 }
 
@@ -448,7 +570,11 @@ mod tests {
             external_tools: Vec::new(),
             history_mode: HistoryMode::Disabled,
             show_session_picker: false,
+            active_permission_profile: None,
+            permission_profiles: Default::default(),
+            runtime_workspace_roots: None,
             permission_rules: PermissionRules::default(),
+            additional_working_directories: Vec::new(),
             max_budget_usd: Some(1.25),
             subagents: SubagentConfig::default(),
             tools: ToolConfig::default(),

@@ -1,62 +1,54 @@
-use std::collections::HashSet;
 use std::io;
-use std::path::Path;
-use std::path::PathBuf;
-use std::process::{Command as ProcessCommand, Stdio};
-use std::thread;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use orca_approval::{ApprovalPolicy, prompt_user};
-use orca_core::approval_types::{ApprovalDecision, ApprovalRequest, ApprovalResolution};
 use orca_core::cancel::CancelToken;
 use orca_core::config::{HistoryMode, OutputFormat, RunConfig};
-use orca_core::conversation::Conversation;
-use orca_core::cost_types::UsageTotals;
 use orca_core::event_schema::{EventFactory, RunStatus};
 use orca_core::event_sink::EventSink;
-use orca_core::model::ModelRouteContext;
-use orca_core::provider_types::ProviderStep;
 use orca_core::subagent_types::SubagentType;
+#[cfg(test)]
 use orca_core::tool_types;
-use orca_core::workflow_types::{WorkflowDraftActionOutput, WorkflowInput};
+#[cfg(test)]
 use orca_mcp::McpRegistry;
-use orca_provider::context;
-use orca_provider::tool_schema::{
-    deepseek_tools_schema_for_allowed_names_with_mcp_and_external,
-    deepseek_tools_schema_for_type_with_mcp_and_external,
-    deepseek_tools_schema_with_mcp_and_external,
-};
-use orca_provider::{self, ProviderConfig};
+#[cfg(test)]
 use orca_tools;
-use serde_json::Value;
 
-use crate::agent_child::{ChildAgentRequest, ChildAgentResult, ChildAgentRuntime, run_child_agent};
 use crate::agent_common;
+use crate::agent_loop::{
+    AgentConversationContext, AgentLoopContext, AgentToolPolicyContext, ThreadSteerHandle,
+    run_agent_loop,
+};
 use crate::cost::CostTracker;
-use crate::history::{self, SessionStore, SessionWriter};
-use crate::hooks::{HookContext, HookRunner, conversation_with_hook_context};
-use crate::instructions::{self, ProjectInstructions};
-use crate::memory::{self, MemoryBlock};
-use crate::schema_validation::validate_json_schema_subset;
-use crate::session::new_run_id;
-use crate::subagent::{self, SubagentIsolation, SubagentMode};
+use crate::history::SessionStore;
+use crate::hooks::{HookContext, HookRunner};
+use crate::instructions;
+use crate::instructions::ProjectInstructions;
+use crate::lifecycle::{RuntimePermissionRequestHandler, RuntimeSessionLifecycle, RuntimeTaskKind};
+use crate::memory;
+use crate::session::{InteractiveSession, InteractiveSessionRuntimeParts, new_run_id};
 use crate::tasks::TaskRegistry;
+#[cfg(test)]
 use crate::tool_invocation::{
-    apply_pre_tool_outcome, apply_pre_tool_outcome_with_external, approval_request_for_invocation,
-    prepare_tool_invocation, prepare_tool_invocation_with_external, validate_tool_invocation,
-    validate_tool_invocation_with_external,
+    apply_pre_tool_outcome_with_external, prepare_tool_invocation_with_external,
 };
-use crate::workflow::ipc::WorkflowIpcContext;
-use crate::workflow::{
-    WorkflowBackgroundLaunch, WorkflowDraftStore, WorkflowLaunchRequest, WorkflowRunner,
-};
-use crate::worktree::{WorktreeGuard, WorktreeOutcome};
+use crate::workflow_execution::{BackgroundWorkflowRun, observe_background_workflows};
 use orca_core::hook_types::HookEvent;
 
+#[cfg(test)]
 const DEFAULT_MAX_TURNS: u32 = 128;
 
 #[derive(Clone, Copy, Debug)]
 pub struct ControllerRunOptions {
     pub wait_for_background_workflows: bool,
+}
+
+impl Default for ControllerRunOptions {
+    fn default() -> Self {
+        Self {
+            wait_for_background_workflows: true,
+        }
+    }
 }
 
 impl ControllerRunOptions {
@@ -67,52 +59,187 @@ impl ControllerRunOptions {
     }
 }
 
-#[derive(Clone, Debug)]
-struct AgentLoopResult {
-    status: RunStatus,
-    final_message: Option<String>,
-    error: Option<String>,
+pub struct ThreadTurnExecutor<'a> {
+    config: &'a RunConfig,
+    session: &'a mut InteractiveSession,
+    lifecycle: &'a mut RuntimeSessionLifecycle,
 }
 
-#[derive(Clone, Debug)]
-struct SubagentExecutionResult {
-    tool_request: tool_types::ToolRequest,
-    description: String,
-    schema: Option<Value>,
-    child: ChildAgentResult,
-    cost_tracker: CostTracker,
-    worktree: Option<WorktreeOutcome>,
+pub struct ThreadTurnContext<'a> {
+    cwd: PathBuf,
+    prompt: String,
+    parts: InteractiveSessionRuntimeParts<'a>,
 }
 
-#[derive(Debug)]
-struct BackgroundWorkflowRun {
-    task_id: String,
-    run_id: String,
-    workflow_name: String,
-    handle: WorkflowBackgroundLaunch,
+pub struct ThreadTurnExecution<W: io::Write> {
+    events: EventFactory,
+    sink: EventSink<W>,
+    cancel: CancelToken,
+    background_workflows: Vec<BackgroundWorkflowRun>,
 }
 
-#[derive(Clone, Debug)]
-pub struct AsyncSubagentWorktree {
-    pub repo_root: PathBuf,
-    pub path: PathBuf,
+#[derive(Clone)]
+pub struct ThreadTurnRequest {
+    prompt: String,
+    options: ControllerRunOptions,
+    steer_handle: Option<ThreadSteerHandle>,
+    permission_handler: Option<Arc<dyn RuntimePermissionRequestHandler + Send + Sync>>,
 }
 
-impl AgentLoopResult {
-    fn success(final_message: Option<String>) -> Self {
+impl<'a> ThreadTurnExecutor<'a> {
+    pub fn new(
+        config: &'a RunConfig,
+        session: &'a mut InteractiveSession,
+        lifecycle: &'a mut RuntimeSessionLifecycle,
+    ) -> Self {
         Self {
-            status: RunStatus::Success,
-            final_message,
-            error: None,
+            config,
+            session,
+            lifecycle,
         }
     }
 
-    fn failure(status: RunStatus, error: impl Into<String>) -> Self {
-        Self {
-            status,
-            final_message: None,
-            error: Some(error.into()),
+    pub fn run<W: io::Write>(&mut self, prompt: &str, writer: W) -> io::Result<RunStatus> {
+        self.run_request(&ThreadTurnRequest::new(prompt), writer)
+    }
+
+    pub fn run_request<W: io::Write>(
+        &mut self,
+        request: &ThreadTurnRequest,
+        writer: W,
+    ) -> io::Result<RunStatus> {
+        self.run_request_with_cancel(request, writer, CancelToken::new())
+    }
+
+    pub fn run_request_with_cancel<W: io::Write>(
+        &mut self,
+        request: &ThreadTurnRequest,
+        writer: W,
+        cancel: CancelToken,
+    ) -> io::Result<RunStatus> {
+        run_thread_turn_inner(
+            self.config,
+            self.session,
+            self.lifecycle,
+            request,
+            writer,
+            cancel,
+        )
+    }
+}
+
+impl<'a> ThreadTurnContext<'a> {
+    pub fn prepare(
+        config: &RunConfig,
+        session: &'a mut InteractiveSession,
+        request: &ThreadTurnRequest,
+    ) -> io::Result<Self> {
+        let cwd = config.cwd.clone().unwrap_or(std::env::current_dir()?);
+        let prompt = request.prompt().to_string();
+        let mut parts = session.runtime_parts();
+        parts
+            .conversation
+            .replace_skill_context(agent_common::explicit_skill_context(&cwd, &prompt));
+        parts.conversation.add_user(prompt.clone());
+        if let Some(writer) = parts.writer.as_deref_mut()
+            && let Some(message) = parts.conversation.messages.last()
+        {
+            writer.append_message(message)?;
         }
+
+        Ok(Self { cwd, prompt, parts })
+    }
+
+    pub fn cwd(&self) -> &Path {
+        &self.cwd
+    }
+
+    pub fn prompt(&self) -> &str {
+        &self.prompt
+    }
+}
+
+impl<W: io::Write> ThreadTurnExecution<W> {
+    pub fn new(
+        lifecycle: &RuntimeSessionLifecycle,
+        writer: W,
+        output_format: OutputFormat,
+    ) -> Self {
+        Self::new_with_cancel(lifecycle, writer, output_format, CancelToken::new())
+    }
+
+    pub fn new_with_cancel(
+        lifecycle: &RuntimeSessionLifecycle,
+        writer: W,
+        output_format: OutputFormat,
+        cancel: CancelToken,
+    ) -> Self {
+        Self {
+            events: EventFactory::new(lifecycle.run_id().to_string()),
+            sink: EventSink::new(writer, output_format),
+            cancel,
+            background_workflows: Vec::new(),
+        }
+    }
+
+    pub fn run_id(&self) -> &str {
+        self.events.run_id()
+    }
+
+    pub fn background_workflow_count(&self) -> usize {
+        self.background_workflows.len()
+    }
+}
+
+impl ThreadTurnRequest {
+    pub fn new(prompt: impl Into<String>) -> Self {
+        Self {
+            prompt: prompt.into(),
+            options: ControllerRunOptions::default(),
+            steer_handle: None,
+            permission_handler: None,
+        }
+    }
+
+    pub fn prompt(&self) -> &str {
+        &self.prompt
+    }
+
+    pub fn options(&self) -> ControllerRunOptions {
+        self.options
+    }
+
+    pub fn with_options(mut self, options: ControllerRunOptions) -> Self {
+        self.options = options;
+        self
+    }
+
+    pub fn with_wait_for_background_workflows(mut self, wait: bool) -> Self {
+        self.options.wait_for_background_workflows = wait;
+        self
+    }
+
+    pub fn with_steer_handle(mut self, handle: ThreadSteerHandle) -> Self {
+        self.steer_handle = Some(handle);
+        self
+    }
+
+    pub fn with_permission_handler(
+        mut self,
+        handler: Arc<dyn RuntimePermissionRequestHandler + Send + Sync>,
+    ) -> Self {
+        self.permission_handler = Some(handler);
+        self
+    }
+
+    pub fn steer_handle(&self) -> Option<&ThreadSteerHandle> {
+        self.steer_handle.as_ref()
+    }
+
+    pub fn permission_handler(
+        &self,
+    ) -> Option<&(dyn RuntimePermissionRequestHandler + Send + Sync)> {
+        self.permission_handler.as_deref()
     }
 }
 
@@ -160,8 +287,10 @@ fn run_inner<W: io::Write>(
         config.prompt.trim().to_string()
     };
 
-    let mut events = EventFactory::new(new_run_id());
-    let task_registry = TaskRegistry::new_for_cwd(events.run_id().to_string(), &cwd_path);
+    let mut lifecycle = RuntimeSessionLifecycle::new(new_run_id());
+    lifecycle.start_task(RuntimeTaskKind::Agent);
+    let mut events = EventFactory::new(lifecycle.run_id().to_string());
+    let task_registry = TaskRegistry::new_for_cwd(lifecycle.run_id().to_string(), &cwd_path);
     let mut background_workflows = Vec::new();
     let mut sink = EventSink::new(writer, config.output_format);
     let store = SessionStore::new();
@@ -241,30 +370,26 @@ fn run_inner<W: io::Write>(
     let mut cost_tracker = CostTracker::new(config.model.as_deref());
     let result = run_agent_loop(
         &config,
-        &cwd_path,
+        AgentLoopContext::new(&cwd_path, &prompt, 0, true, &SubagentType::General)
+            .with_services(&instructions, &memory, &mcp_registry, &hooks)
+            .with_runtime(&mut cost_tracker, &cancel, &task_registry)
+            .with_execution(&mut background_workflows, None, Some(&mut lifecycle)),
         &mut events,
         &mut sink,
-        &prompt,
-        resumed.as_ref(),
-        history_writer.as_mut(),
-        0,
-        true,
-        &SubagentType::General,
-        None,
-        None,
-        &instructions,
-        &memory,
-        &mcp_registry,
-        &hooks,
-        &mut cost_tracker,
-        &cancel,
-        &task_registry,
-        &mut background_workflows,
-        None,
+        AgentConversationContext::new()
+            .with_resumed(resumed.as_ref())
+            .with_history_writer(history_writer.as_mut()),
+        AgentToolPolicyContext::unrestricted(),
     )?;
     let status = result.status;
+    lifecycle.finish_task(status);
 
-    observe_background_workflows(options, &mut events, &mut sink, &mut background_workflows)?;
+    observe_background_workflows(
+        options.wait_for_background_workflows,
+        &mut events,
+        &mut sink,
+        &mut background_workflows,
+    )?;
 
     let status =
         run_verifier_if_needed(status, config.verifier.as_deref(), &mut events, &mut sink)?;
@@ -294,658 +419,91 @@ fn run_inner<W: io::Write>(
     Ok(status)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn run_agent_loop(
+pub fn run_thread_turn_to_writer<W: io::Write>(
     config: &RunConfig,
-    cwd: &Path,
-    events: &mut EventFactory,
-    sink: &mut EventSink<impl io::Write>,
+    session: &mut InteractiveSession,
+    lifecycle: &mut RuntimeSessionLifecycle,
     prompt: &str,
-    resumed: Option<&history::SessionTranscript>,
-    history_writer: Option<&mut SessionWriter>,
-    subagent_depth: u32,
-    emit_deltas: bool,
-    subagent_type: &SubagentType,
-    allowed_tools: Option<&[String]>,
-    tool_policy_label: Option<&str>,
-    instructions: &ProjectInstructions,
-    memory: &MemoryBlock,
-    mcp_registry: &McpRegistry,
-    hooks: &HookRunner,
-    cost_tracker: &mut CostTracker,
-    cancel: &CancelToken,
-    task_registry: &TaskRegistry,
-    background_workflows: &mut Vec<BackgroundWorkflowRun>,
-    workflow_ipc: Option<&WorkflowIpcContext>,
-) -> io::Result<AgentLoopResult> {
-    let max_turns = DEFAULT_MAX_TURNS;
-    let budget_model = config.model.as_option();
-    let ctx_config = context::ContextConfig::for_model_with_runtime(
-        budget_model.as_deref(),
-        &config.model_runtime,
-    );
-    let policy = ApprovalPolicy::new(config.approval_mode)
-        .with_permission_rules(config.permission_rules.clone());
-    let tools_override = if subagent_depth > 0 {
-        if let Some(allowed_tools) = allowed_tools {
-            Some(
-                deepseek_tools_schema_for_allowed_names_with_mcp_and_external(
-                    allowed_tools,
-                    Some(mcp_registry),
-                    &config.external_tools,
-                ),
-            )
-        } else {
-            Some(deepseek_tools_schema_for_type_with_mcp_and_external(
-                subagent_type,
-                Some(mcp_registry),
-                &config.external_tools,
-            ))
-        }
-    } else {
-        Some(deepseek_tools_schema_with_mcp_and_external(
-            Some(mcp_registry),
-            &config.external_tools,
-        ))
-    };
-    let provider_config = ProviderConfig {
-        api_key: config.api_key.clone(),
-        base_url: config.base_url.clone(),
-        model: config.model.as_option(),
-        tools_override,
-        mcp_registry: Some(mcp_registry.clone()),
-        external_tools: config.external_tools.clone(),
-    };
-
-    let system_prompt = agent_common::build_agent_system_prompt(
-        cwd,
-        subagent_depth,
-        subagent_type,
-        Some(instructions),
-        config.approval_mode,
-        Some(memory),
-    );
-    let mut conversation = if let Some(resumed) = resumed {
-        let mut conv = history::resume_conversation(resumed, system_prompt);
-        conv.strip_legacy_pinned_volatile();
-        conv.strip_legacy_summary_messages();
-        conv
-    } else {
-        let mut conversation = Conversation::new();
-        conversation.add_system(system_prompt);
-        conversation
-    };
-    conversation.replace_skill_context(agent_common::explicit_skill_context(cwd, prompt));
-    conversation.add_user(prompt.to_string());
-
-    let mut history_writer = history_writer;
-    if emit_deltas && let Some(writer) = history_writer.as_deref_mut() {
-        if resumed.is_some() {
-            for message in &conversation.messages {
-                writer.append_message(message)?;
-            }
-            // Persist the inherited summary_state into the new transcript.
-            // Without this, multi-process `--continue` resumes (e.g. pipe-eval)
-            // load summary_state into memory but never write it back, so the
-            // next process that resumes from this new transcript loses the
-            // shape of the summary state — re-triggering compaction storms
-            // and shifting the wire prefix.
-            if !conversation.summary.is_empty() {
-                let inherited_marker = conversation
-                    .summary
-                    .latest_rolling()
-                    .map(|text| text.to_string())
-                    .unwrap_or_default();
-                let count = conversation.messages.len();
-                writer.append_summary_state(
-                    count,
-                    count,
-                    inherited_marker,
-                    &conversation.summary,
-                )?;
-            }
-        } else {
-            if let Some(system) = conversation.messages.first() {
-                writer.append_message(system)?;
-            }
-            if let Some(user) = conversation.messages.last() {
-                writer.append_message(user)?;
-            }
-        }
-    }
-
-    let mut turn: u32 = 0;
-    let mut reactive_compacted = false;
-
-    loop {
-        turn += 1;
-
-        if turn > max_turns {
-            let error = "max turns exhausted";
-            if emit_deltas {
-                sink.emit(&events.error(error))?;
-            }
-            return Ok(AgentLoopResult::failure(RunStatus::BudgetExhausted, error));
-        }
-
-        if context::needs_compaction_wire(&conversation, &ctx_config, &provider_config) {
-            let before_messages = conversation.messages.len();
-            match hooks.run(
-                HookEvent::OnBudgetWarning,
-                HookContext {
-                    cwd: &cwd.display().to_string(),
-                    session_status: None,
-                    tool_request: None,
-                    tool_result: None,
-                    before_messages: Some(before_messages),
-                    after_messages: None,
-                    usage: None,
-                },
-            ) {
-                Ok(outcome) if !outcome.injected_context.is_empty() => {
-                    conversation = conversation_with_hook_context(&conversation, &outcome);
-                }
-                Err(error) if emit_deltas => {
-                    sink.emit(&events.error(&format!("on_budget_warning hook failed: {error}")))?;
-                }
-                _ => {}
-            }
-            if emit_deltas
-                && let Err(error) = hooks.run(
-                    HookEvent::PreCompact,
-                    HookContext {
-                        cwd: &cwd.display().to_string(),
-                        session_status: None,
-                        tool_request: None,
-                        tool_result: None,
-                        before_messages: Some(before_messages),
-                        after_messages: None,
-                        usage: None,
-                    },
-                )
-            {
-                sink.emit(&events.error(&format!("pre_compact hook failed: {error}")))?;
-            }
-            let compaction = context::compact_with_summary(
-                config.provider,
-                &conversation,
-                &ctx_config,
-                &provider_config,
-            );
-            conversation = compaction.conversation;
-            let after_messages = conversation.messages.len();
-            if emit_deltas && let Some(writer) = history_writer.as_deref_mut() {
-                writer.append_compaction(before_messages, after_messages)?;
-                if let context::CompactionKind::RemoteSummary(summary) = compaction.kind {
-                    writer.append_summary_state(
-                        before_messages,
-                        after_messages,
-                        summary,
-                        &conversation.summary,
-                    )?;
-                }
-            }
-            if emit_deltas
-                && let Err(error) = hooks.run(
-                    HookEvent::PostCompact,
-                    HookContext {
-                        cwd: &cwd.display().to_string(),
-                        session_status: None,
-                        tool_request: None,
-                        tool_result: None,
-                        before_messages: Some(before_messages),
-                        after_messages: Some(after_messages),
-                        usage: None,
-                    },
-                )
-            {
-                sink.emit(&events.error(&format!("post_compact hook failed: {error}")))?;
-            }
-        }
-
-        let turn_prompt = if turn == 1 { Some(prompt) } else { None };
-        if emit_deltas {
-            sink.emit(&events.turn_started(turn, turn_prompt))?;
-        }
-
-        let route_decision = config.model.route(ModelRouteContext {
-            subagent_type,
-            subagent_model: None,
-        });
-        cost_tracker.set_model(Some(&route_decision.actual_model));
-        if emit_deltas {
-            sink.emit(&events.model_routed(&route_decision))?;
-        }
-        let mut turn_provider_config = provider_config.clone();
-        turn_provider_config.model = Some(route_decision.actual_model.clone());
-
-        let pre_model_outcome = match hooks.run(
-            HookEvent::PreModelCall,
-            HookContext {
-                cwd: &cwd.display().to_string(),
-                session_status: None,
-                tool_request: None,
-                tool_result: None,
-                before_messages: None,
-                after_messages: None,
-                usage: None,
-            },
-        ) {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                let error = format!("pre_model_call hook failed: {error}");
-                if emit_deltas {
-                    sink.emit(&events.error(&error))?;
-                }
-                return Ok(AgentLoopResult::failure(RunStatus::Failed, error));
-            }
-        };
-        let model_conversation = conversation_with_hook_context(&conversation, &pre_model_outcome);
-
-        let response = orca_provider::call_streaming(
-            config.provider,
-            &model_conversation,
-            &turn_provider_config,
-            cancel,
-            &mut |step| {
-                if !emit_deltas {
-                    return;
-                }
-                match step {
-                    ProviderStep::ReasoningDelta(text) => {
-                        let _ = sink.emit(&events.assistant_reasoning_delta(text));
-                    }
-                    ProviderStep::MessageDelta(text) => {
-                        let _ = sink.emit(&events.assistant_message_delta(text));
-                    }
-                    _ => {}
-                }
-            },
-        );
-
-        if let Err(error) = hooks.run(
-            HookEvent::PostModelCall,
-            HookContext {
-                cwd: &cwd.display().to_string(),
-                session_status: None,
-                tool_request: None,
-                tool_result: None,
-                before_messages: None,
-                after_messages: None,
-                usage: response.usage.as_ref(),
-            },
-        ) && emit_deltas
-        {
-            sink.emit(&events.error(&format!("post_model_call hook failed: {error}")))?;
-        }
-
-        if let Some(usage) = response.usage
-            && !usage.is_empty()
-        {
-            let totals = cost_tracker.add_usage(usage);
-            if emit_deltas {
-                sink.emit(&events.usage_updated(totals))?;
-                if let Some(writer) = history_writer.as_deref_mut() {
-                    writer.append_usage(totals)?;
-                }
-            }
-            if let Some(max_budget) = config.max_budget_usd
-                && totals.estimated_cost_usd > max_budget
-            {
-                let error = format!(
-                    "budget exhausted: estimated cost ${:.6} exceeded limit ${:.6}",
-                    totals.estimated_cost_usd, max_budget
-                );
-                if emit_deltas {
-                    sink.emit(&events.error(&error))?;
-                }
-                return Ok(AgentLoopResult::failure(RunStatus::BudgetExhausted, error));
-            }
-        }
-
-        let provider_error = response.steps.iter().find_map(|step| match step {
-            ProviderStep::Error(message) => Some(message.clone()),
-            _ => None,
-        });
-
-        if let Some(error) = provider_error {
-            if context::is_prompt_too_long_error(&error) && !reactive_compacted {
-                let before_messages = conversation.messages.len();
-                let compaction = context::compact_with_summary(
-                    config.provider,
-                    &conversation,
-                    &ctx_config,
-                    &provider_config,
-                );
-                conversation = compaction.conversation;
-                let after_messages = conversation.messages.len();
-                if emit_deltas && let Some(writer) = history_writer.as_deref_mut() {
-                    writer.append_compaction(before_messages, after_messages)?;
-                    if let context::CompactionKind::RemoteSummary(summary) = compaction.kind {
-                        writer.append_summary_state(
-                            before_messages,
-                            after_messages,
-                            summary,
-                            &conversation.summary,
-                        )?;
-                    }
-                }
-                reactive_compacted = true;
-                continue;
-            }
-            if emit_deltas {
-                sink.emit(&events.error(&error))?;
-            }
-            return Ok(AgentLoopResult::failure(RunStatus::Failed, error));
-        }
-
-        reactive_compacted = false;
-
-        for step in &response.steps {
-            match step {
-                ProviderStep::ReplayState(replay) => {
-                    if emit_deltas {
-                        sink.emit(&events.provider_replay_updated(replay))?;
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        if response.tool_calls.is_empty() {
-            let final_message = response.assistant_content.clone();
-            conversation.add_assistant(
-                response.assistant_content,
-                response.assistant_reasoning,
-                vec![],
-            );
-            if emit_deltas
-                && let Some(writer) = history_writer.as_deref_mut()
-                && let Some(message) = conversation.messages.last()
-            {
-                writer.append_message(message)?;
-            }
-            if emit_deltas && config.auto_memory {
-                let provider_config = ProviderConfig {
-                    api_key: config.api_key.clone(),
-                    base_url: config.base_url.clone(),
-                    model: Some(orca_core::model::auxiliary_model().to_string()),
-                    tools_override: Some(Vec::new()),
-                    mcp_registry: None,
-                    external_tools: Vec::new(),
-                };
-                if let Err(error) = memory::extract_project_memory(
-                    config.provider,
-                    &provider_config,
-                    cwd,
-                    &conversation.messages,
-                ) {
-                    sink.emit(&events.error(&format!("memory extraction failed: {error}")))?;
-                }
-            }
-            return Ok(AgentLoopResult::success(final_message));
-        }
-
-        conversation.add_assistant(
-            response.assistant_content,
-            response.assistant_reasoning,
-            response.tool_calls.clone(),
-        );
-        if emit_deltas
-            && let Some(writer) = history_writer.as_deref_mut()
-            && let Some(message) = conversation.messages.last()
-        {
-            writer.append_message(message)?;
-        }
-
-        let tool_requests: Vec<tool_types::ToolRequest> = response
-            .steps
-            .iter()
-            .filter_map(|step| match step {
-                ProviderStep::ToolCall(tool_request) => Some(tool_request.clone()),
-                _ => None,
-            })
-            .collect();
-        let mut index = 0;
-        while index < tool_requests.len() {
-            if let Some(result) = child_tool_policy_failure(
-                &tool_requests[index],
-                allowed_tools,
-                tool_policy_label,
-                mcp_registry,
-                &config.external_tools,
-            ) {
-                if emit_deltas {
-                    sink.emit(&events.tool_call_requested(&tool_requests[index]))?;
-                    sink.emit(&events.tool_call_completed(&result))?;
-                }
-                return Ok(AgentLoopResult::failure(
-                    RunStatus::Failed,
-                    result.error.clone().unwrap_or_default(),
-                ));
-            }
-
-            if should_run_subagent_batch(config, &tool_requests[index], subagent_depth) {
-                let batch_end = collect_subagent_batch(config, &tool_requests, index);
-                let results = execute_subagent_batch(
-                    config,
-                    cwd,
-                    events,
-                    sink,
-                    &tool_requests[index..batch_end],
-                    subagent_depth,
-                    emit_deltas,
-                    instructions,
-                    memory,
-                    mcp_registry,
-                    hooks,
-                    cost_tracker,
-                    cancel,
-                    workflow_ipc,
-                )?;
-
-                for (status, result) in results {
-                    let result_content = agent_common::format_tool_result_for_model(&result);
-                    conversation.add_tool_result(result.id.clone(), result_content);
-                    if emit_deltas
-                        && let Some(writer) = history_writer.as_deref_mut()
-                        && let Some(message) = conversation.messages.last()
-                    {
-                        writer.append_message(message)?;
-                    }
-
-                    if status == RunStatus::ApprovalRequired {
-                        return Ok(AgentLoopResult {
-                            status,
-                            final_message: None,
-                            error: result.error.clone(),
-                        });
-                    }
-                    if status == RunStatus::Failed {
-                        return Ok(AgentLoopResult::failure(
-                            RunStatus::Failed,
-                            result.error.clone().unwrap_or_default(),
-                        ));
-                    }
-                }
-                index = batch_end;
-                continue;
-            }
-
-            if orca_tools::should_run_readonly_batch(
-                config.tools.max_read_parallel,
-                &tool_requests[index],
-            ) {
-                let batch_end = orca_tools::collect_readonly_batch(
-                    config.tools.max_read_parallel,
-                    &tool_requests,
-                    index,
-                );
-                let results = execute_readonly_batch(
-                    cwd,
-                    events,
-                    sink,
-                    &tool_requests[index..batch_end],
-                    emit_deltas,
-                    mcp_registry,
-                    hooks,
-                    config.tools.output_truncation,
-                )?;
-
-                for result in results {
-                    let result_content = agent_common::format_tool_result_for_model(&result);
-                    conversation.add_tool_result(result.id.clone(), result_content);
-                    if emit_deltas
-                        && let Some(writer) = history_writer.as_deref_mut()
-                        && let Some(message) = conversation.messages.last()
-                    {
-                        writer.append_message(message)?;
-                    }
-                }
-                index = batch_end;
-                continue;
-            }
-
-            let tool_request = &tool_requests[index];
-            let (status, result) = execute_tool_with_approval(
-                config,
-                cwd,
-                events,
-                sink,
-                tool_request,
-                subagent_depth,
-                emit_deltas,
-                &policy,
-                instructions,
-                memory,
-                mcp_registry,
-                hooks,
-                cost_tracker,
-                cancel,
-                task_registry,
-                background_workflows,
-                workflow_ipc,
-            )?;
-
-            if tool_request.name == tool_types::ToolName::UpdatePlan
-                && result.status == tool_types::ToolStatus::Completed
-            {
-                if let Ok(update) = orca_tools::update_plan::parse_args(tool_request) {
-                    conversation.replace_plan_state(
-                        orca_tools::update_plan::format_context_message(&update),
-                    );
-                    if let Some(writer) = history_writer.as_deref_mut() {
-                        let _ = writer.append_plan_state(update.explanation, update.plan);
-                    }
-                }
-            }
-
-            let result_content = agent_common::format_tool_result_for_model(&result);
-            conversation.add_tool_result(tool_request.id.clone(), result_content);
-            if emit_deltas
-                && let Some(writer) = history_writer.as_deref_mut()
-                && let Some(message) = conversation.messages.last()
-            {
-                writer.append_message(message)?;
-            }
-
-            if status == RunStatus::ApprovalRequired {
-                return Ok(AgentLoopResult {
-                    status,
-                    final_message: None,
-                    error: result.error.clone(),
-                });
-            }
-            if status == RunStatus::Failed && tool_request.name == tool_types::ToolName::Subagent {
-                return Ok(AgentLoopResult::failure(
-                    RunStatus::Failed,
-                    result.error.clone().unwrap_or_default(),
-                ));
-            }
-            index += 1;
-        }
-    }
+    writer: W,
+    options: ControllerRunOptions,
+) -> io::Result<RunStatus> {
+    ThreadTurnExecutor::new(config, session, lifecycle).run_request(
+        &ThreadTurnRequest::new(prompt).with_options(options),
+        writer,
+    )
 }
 
-pub(crate) fn execute_child_agent_loop<W: io::Write>(
+pub fn run_thread_turn_to_writer_with_cancel<W: io::Write>(
     config: &RunConfig,
-    request: &ChildAgentRequest,
-    runtime: &mut ChildAgentRuntime<'_, W>,
-    child_cost_tracker: &mut CostTracker,
-) -> io::Result<ChildAgentResult> {
-    let task_registry = TaskRegistry::new_for_cwd(runtime.events.run_id().to_string(), runtime.cwd);
-    let mut background_workflows = Vec::new();
-    let child = run_agent_loop(
+    session: &mut InteractiveSession,
+    lifecycle: &mut RuntimeSessionLifecycle,
+    prompt: &str,
+    writer: W,
+    options: ControllerRunOptions,
+    cancel: CancelToken,
+) -> io::Result<RunStatus> {
+    run_thread_turn_inner(
         config,
-        runtime.cwd,
-        runtime.events,
-        runtime.sink,
-        &request.prompt,
-        None,
-        None,
-        request.depth,
-        request.emit_deltas,
-        &request.subagent_type,
-        request.allowed_tools.as_deref(),
-        request.tool_policy_label.as_deref(),
-        runtime.instructions,
-        runtime.memory,
-        runtime.mcp_registry,
-        runtime.hooks,
-        child_cost_tracker,
-        runtime.cancel,
-        &task_registry,
-        &mut background_workflows,
-        request.workflow_ipc.as_ref(),
-    )?;
-    observe_background_workflows(
-        ControllerRunOptions::for_run_config(config),
-        runtime.events,
-        runtime.sink,
-        &mut background_workflows,
-    )?;
-    Ok(ChildAgentResult {
-        status: child.status,
-        final_message: child.final_message,
-        error: child.error,
-    })
+        session,
+        lifecycle,
+        &ThreadTurnRequest::new(prompt).with_options(options),
+        writer,
+        cancel,
+    )
 }
 
-fn child_tool_policy_failure(
-    tool_request: &tool_types::ToolRequest,
-    allowed_tools: Option<&[String]>,
-    policy_label: Option<&str>,
-    mcp_registry: &McpRegistry,
-    external_tools: &[orca_core::external_config::ExternalToolConfig],
-) -> Option<tool_types::ToolResult> {
-    let allowed_tools = allowed_tools?;
-    let registry = orca_tools::registry::tool_registry_with_mcp_and_external(
-        Some(mcp_registry),
-        external_tools,
-    );
-    let allowed_canonical_names = allowed_tools
-        .iter()
-        .filter_map(|tool| {
-            registry
-                .resolve(tool)
-                .map(|resolved| resolved.tool.name().to_string())
-        })
-        .collect::<HashSet<_>>();
-    let requested_name = tool_request.name.as_str();
-    let requested_canonical_name = registry
-        .resolve(requested_name)
-        .map(|resolved| resolved.tool.name().to_string())
-        .unwrap_or_else(|| requested_name.to_string());
+fn run_thread_turn_inner<W: io::Write>(
+    config: &RunConfig,
+    session: &mut InteractiveSession,
+    lifecycle: &mut RuntimeSessionLifecycle,
+    request: &ThreadTurnRequest,
+    writer: W,
+    cancel: CancelToken,
+) -> io::Result<RunStatus> {
+    let context = ThreadTurnContext::prepare(config, session, request)?;
+    let mut execution =
+        ThreadTurnExecution::new_with_cancel(lifecycle, writer, config.output_format, cancel);
+    let ThreadTurnContext { cwd, prompt, parts } = context;
 
-    if allowed_canonical_names.contains(&requested_canonical_name) {
-        return None;
-    }
-
-    let label = policy_label.unwrap_or("child agent tool policy");
-    Some(tool_types::ToolResult::invalid_input(
-        tool_request,
-        format!("{label} disallows tool '{requested_name}'"),
-    ))
+    let result = run_agent_loop(
+        config,
+        AgentLoopContext::new(&cwd, &prompt, 0, true, &SubagentType::General)
+            .with_services(
+                parts.instructions,
+                parts.memory,
+                parts.mcp_registry,
+                parts.hooks,
+            )
+            .with_runtime(parts.cost_tracker, &execution.cancel, parts.task_registry)
+            .with_execution(&mut execution.background_workflows, None, Some(lifecycle))
+            .with_steer_handle(request.steer_handle())
+            .with_permission_handler(request.permission_handler()),
+        &mut execution.events,
+        &mut execution.sink,
+        AgentConversationContext::new()
+            .with_history_writer(parts.writer)
+            .with_conversation(Some(parts.conversation)),
+        AgentToolPolicyContext::unrestricted(),
+    )?;
+    let status = result.status;
+    lifecycle.finish_task(status);
+    observe_background_workflows(
+        request.options().wait_for_background_workflows,
+        &mut execution.events,
+        &mut execution.sink,
+        &mut execution.background_workflows,
+    )?;
+    let status = run_verifier_if_needed(
+        status,
+        config.verifier.as_deref(),
+        &mut execution.events,
+        &mut execution.sink,
+    )?;
+    session.complete(status.as_str());
+    execution
+        .sink
+        .emit(&execution.events.session_completed(status))?;
+    Ok(status)
 }
 
 #[cfg(test)]
@@ -961,698 +519,7 @@ fn canonical_action_for_tool(
     )
 }
 
-fn execute_tool_with_approval(
-    config: &RunConfig,
-    cwd: &Path,
-    events: &mut EventFactory,
-    sink: &mut EventSink<impl io::Write>,
-    tool_request: &tool_types::ToolRequest,
-    subagent_depth: u32,
-    emit_deltas: bool,
-    policy: &ApprovalPolicy,
-    instructions: &ProjectInstructions,
-    memory: &MemoryBlock,
-    mcp_registry: &McpRegistry,
-    hooks: &HookRunner,
-    cost_tracker: &mut CostTracker,
-    cancel: &CancelToken,
-    task_registry: &TaskRegistry,
-    background_workflows: &mut Vec<BackgroundWorkflowRun>,
-    workflow_ipc: Option<&WorkflowIpcContext>,
-) -> io::Result<(RunStatus, tool_types::ToolResult)> {
-    let invocation = prepare_tool_invocation(tool_request, subagent_depth, mcp_registry, config);
-    if let Err(error) = validate_tool_invocation(&invocation, mcp_registry, config) {
-        if emit_deltas {
-            sink.emit(&events.tool_call_requested(tool_request))?;
-        }
-        let result = error.into_result();
-        if emit_deltas {
-            sink.emit(&events.tool_call_completed(&result))?;
-        }
-        return Ok((RunStatus::Failed, result));
-    }
-
-    if let Some(approval) = approval_request_for_invocation(&invocation)
-        && agent_common::requires_approval(approval.action)
-    {
-        let resolution = policy.resolve_for_tool(
-            &approval,
-            tool_request.name.as_str(),
-            tool_request.target.as_deref(),
-        );
-        if emit_deltas {
-            sink.emit(&events.approval_requested(&approval))?;
-        }
-
-        match resolution.decision {
-            ApprovalDecision::Allow => {
-                if emit_deltas {
-                    sink.emit(&events.approval_resolved(&resolution))?;
-                }
-            }
-            ApprovalDecision::Ask => {
-                let final_resolution = resolve_interactive(config, &approval, tool_request)?;
-                if emit_deltas {
-                    sink.emit(&events.approval_resolved(&final_resolution))?;
-                }
-                if final_resolution.decision == ApprovalDecision::Deny {
-                    if emit_deltas {
-                        sink.emit(&events.tool_call_requested(tool_request))?;
-                    }
-                    let result =
-                        tool_types::ToolResult::denied(tool_request, final_resolution.reason);
-                    if emit_deltas {
-                        sink.emit(&events.tool_call_completed(&result))?;
-                    }
-                    return Ok((RunStatus::ApprovalRequired, result));
-                }
-            }
-            ApprovalDecision::Deny => {
-                if emit_deltas {
-                    sink.emit(&events.approval_resolved(&resolution))?;
-                    sink.emit(&events.tool_call_requested(tool_request))?;
-                }
-                let result = tool_types::ToolResult::denied(tool_request, resolution.reason);
-                if emit_deltas {
-                    sink.emit(&events.tool_call_completed(&result))?;
-                }
-                return Ok((RunStatus::ApprovalRequired, result));
-            }
-        }
-    }
-
-    if emit_deltas {
-        sink.emit(&events.tool_call_requested(tool_request))?;
-    }
-    let pre_tool_outcome = match hooks.run(
-        HookEvent::PreToolUse,
-        HookContext {
-            cwd: &cwd.display().to_string(),
-            session_status: None,
-            tool_request: Some(tool_request),
-            tool_result: None,
-            before_messages: None,
-            after_messages: None,
-            usage: None,
-        },
-    ) {
-        Ok(outcome) => outcome,
-        Err(error) => {
-            let result = tool_types::ToolResult::failed(
-                tool_request,
-                format!("pre_tool_use hook blocked tool: {error}"),
-                None,
-            );
-            if emit_deltas {
-                sink.emit(&events.tool_call_completed(&result))?;
-            }
-            return Ok((RunStatus::Failed, result));
-        }
-    };
-    let invocation =
-        match apply_pre_tool_outcome(invocation, &pre_tool_outcome, mcp_registry, config) {
-            Ok(invocation) => invocation,
-            Err(error) => {
-                let result = error.into_result();
-                if emit_deltas {
-                    sink.emit(&events.tool_call_completed(&result))?;
-                }
-                return Ok((RunStatus::Failed, result));
-            }
-        };
-    let execution_request = &invocation.effective;
-    let result = if execution_request.name == tool_types::ToolName::WorkflowDraft {
-        execute_workflow_draft_tool(config, cwd, execution_request, task_registry)?
-    } else if execution_request.name == tool_types::ToolName::WorkflowDraftAction {
-        execute_workflow_draft_action_tool(
-            config,
-            cwd,
-            events,
-            sink,
-            execution_request,
-            emit_deltas,
-            task_registry,
-            background_workflows,
-        )?
-    } else if execution_request.name == tool_types::ToolName::Workflow {
-        execute_workflow_tool(
-            config,
-            cwd,
-            events,
-            sink,
-            execution_request,
-            emit_deltas,
-            task_registry,
-            background_workflows,
-        )?
-    } else if execution_request.name == tool_types::ToolName::Subagent {
-        execute_subagent_tool(
-            config,
-            cwd,
-            events,
-            sink,
-            execution_request,
-            subagent_depth,
-            instructions,
-            memory,
-            mcp_registry,
-            hooks,
-            emit_deltas,
-            cost_tracker,
-            cancel,
-            task_registry,
-            workflow_ipc,
-        )?
-    } else if execution_request.name == tool_types::ToolName::SubagentStatus {
-        execute_subagent_status_tool(execution_request, task_registry)
-    } else if matches!(
-        execution_request.name,
-        tool_types::ToolName::WorkflowSendMessage
-            | tool_types::ToolName::WorkflowReadMessages
-            | tool_types::ToolName::WorkflowClearMessages
-            | tool_types::ToolName::WorkflowCreateTaskList
-            | tool_types::ToolName::WorkflowClaimTask
-            | tool_types::ToolName::WorkflowCompleteTask
-            | tool_types::ToolName::WorkflowListTasks
-    ) {
-        execute_workflow_ipc_tool(execution_request, workflow_ipc)
-    } else {
-        orca_tools::execute_with_mcp_external_and_policy(
-            execution_request,
-            cwd,
-            mcp_registry,
-            &config.external_tools,
-            config.tools.output_truncation,
-            config.tools.shell_timeout_secs,
-        )
-    };
-    let is_failure = matches!(
-        result.status,
-        tool_types::ToolStatus::Failed | tool_types::ToolStatus::Denied
-    );
-    if emit_deltas {
-        sink.emit(&events.tool_call_completed(&result))?;
-        if execution_request.name == tool_types::ToolName::UpdatePlan
-            && result.status == tool_types::ToolStatus::Completed
-        {
-            match orca_tools::update_plan::parse_args(execution_request) {
-                Ok(update) => sink.emit(&events.plan_updated(&update))?,
-                Err(error) => {
-                    sink.emit(&events.error(&format!("failed to render plan update: {error}")))?
-                }
-            }
-        }
-        if let Err(error) = hooks.run(
-            HookEvent::PostToolUse,
-            HookContext {
-                cwd: &cwd.display().to_string(),
-                session_status: None,
-                tool_request: Some(execution_request),
-                tool_result: Some(&result),
-                before_messages: None,
-                after_messages: None,
-                usage: None,
-            },
-        ) {
-            sink.emit(&events.error(&format!("post_tool_use hook failed: {error}")))?;
-        }
-    }
-
-    let status = if is_failure {
-        RunStatus::Failed
-    } else {
-        RunStatus::Success
-    };
-
-    Ok((status, result))
-}
-
-fn execute_workflow_ipc_tool(
-    tool_request: &tool_types::ToolRequest,
-    workflow_ipc: Option<&WorkflowIpcContext>,
-) -> tool_types::ToolResult {
-    let Some(workflow_ipc) = workflow_ipc else {
-        return tool_types::ToolResult::failed(
-            tool_request,
-            "workflow IPC tools are only available inside workflow child agents",
-            None,
-        );
-    };
-    let raw = tool_request.raw_arguments.as_deref().unwrap_or("{}");
-    let args: serde_json::Value = match serde_json::from_str(raw) {
-        Ok(value) => value,
-        Err(error) => {
-            return tool_types::ToolResult::invalid_input(
-                tool_request,
-                format!("arguments are not valid JSON: {error}"),
-            );
-        }
-    };
-    let result = match tool_request.name {
-        tool_types::ToolName::WorkflowSendMessage => {
-            let channel = match required_string_arg(tool_request, &args, "channel") {
-                Ok(channel) => channel,
-                Err(result) => return result,
-            };
-            let message = args
-                .get("message")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null);
-            let from = args.get("from").and_then(serde_json::Value::as_str);
-            workflow_ipc.send_message(channel, from, message)
-        }
-        tool_types::ToolName::WorkflowReadMessages => {
-            let channel = match required_string_arg(tool_request, &args, "channel") {
-                Ok(channel) => channel,
-                Err(result) => return result,
-            };
-            workflow_ipc.read_messages(channel)
-        }
-        tool_types::ToolName::WorkflowClearMessages => {
-            let channel = match required_string_arg(tool_request, &args, "channel") {
-                Ok(channel) => channel,
-                Err(result) => return result,
-            };
-            workflow_ipc.clear_messages(channel)
-        }
-        tool_types::ToolName::WorkflowCreateTaskList => {
-            let name = match required_string_arg(tool_request, &args, "name") {
-                Ok(name) => name,
-                Err(result) => return result,
-            };
-            let items = match args.get("items").and_then(serde_json::Value::as_array) {
-                Some(items) => items.clone(),
-                None => {
-                    return tool_types::ToolResult::invalid_input(
-                        tool_request,
-                        "missing required array field: items",
-                    );
-                }
-            };
-            workflow_ipc.create_task_list(name, items)
-        }
-        tool_types::ToolName::WorkflowClaimTask => {
-            let name = match required_string_arg(tool_request, &args, "name") {
-                Ok(name) => name,
-                Err(result) => return result,
-            };
-            let by = args.get("by").and_then(serde_json::Value::as_str);
-            workflow_ipc.claim_task(name, by)
-        }
-        tool_types::ToolName::WorkflowCompleteTask => {
-            let name = match required_string_arg(tool_request, &args, "name") {
-                Ok(name) => name,
-                Err(result) => return result,
-            };
-            let task_id = match required_string_arg(tool_request, &args, "task_id") {
-                Ok(task_id) => task_id,
-                Err(result) => return result,
-            };
-            let result = args
-                .get("result")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null);
-            let by = args.get("by").and_then(serde_json::Value::as_str);
-            workflow_ipc.complete_task(name, task_id, result, by)
-        }
-        tool_types::ToolName::WorkflowListTasks => {
-            let name = match required_string_arg(tool_request, &args, "name") {
-                Ok(name) => name,
-                Err(result) => return result,
-            };
-            workflow_ipc.list_tasks(name)
-        }
-        _ => unreachable!("workflow IPC tool dispatch guarded by caller"),
-    };
-
-    match result {
-        Ok(value) => tool_types::ToolResult::completed(tool_request, value.to_string(), false),
-        Err(error) => tool_types::ToolResult::invalid_input(tool_request, error),
-    }
-}
-
-fn required_string_arg<'a>(
-    tool_request: &tool_types::ToolRequest,
-    args: &'a serde_json::Value,
-    field: &str,
-) -> Result<&'a str, tool_types::ToolResult> {
-    args.get(field)
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| {
-            tool_types::ToolResult::invalid_input(
-                tool_request,
-                format!("missing required string field: {field}"),
-            )
-        })
-}
-
-fn execute_workflow_tool(
-    config: &RunConfig,
-    cwd: &Path,
-    events: &mut EventFactory,
-    sink: &mut EventSink<impl io::Write>,
-    tool_request: &tool_types::ToolRequest,
-    emit_deltas: bool,
-    task_registry: &TaskRegistry,
-    background_workflows: &mut Vec<BackgroundWorkflowRun>,
-) -> io::Result<tool_types::ToolResult> {
-    if !config.workflows.enabled {
-        return Ok(tool_types::ToolResult::failed(
-            tool_request,
-            "workflows are disabled",
-            None,
-        ));
-    }
-
-    let input = parse_workflow_input(tool_request)?;
-    let session_dir = cwd
-        .join(".orca")
-        .join("workflow-sessions")
-        .join(task_registry.session_id());
-    let runner = WorkflowRunner::new(config.clone(), task_registry.clone(), session_dir);
-    let launch = runner.launch_background(WorkflowLaunchRequest::from(input))?;
-    if emit_deltas {
-        sink.emit(&events.workflow_started(
-            &launch.task_id,
-            &launch.run_id,
-            &launch.workflow_name,
-            &launch.phases,
-        ))?;
-    }
-    let output = serde_json::to_string(&launch.output)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    background_workflows.push(BackgroundWorkflowRun {
-        task_id: launch.task_id.clone(),
-        run_id: launch.run_id.clone(),
-        workflow_name: launch.workflow_name.clone(),
-        handle: launch,
-    });
-
-    Ok(tool_types::ToolResult::completed(
-        tool_request,
-        output,
-        false,
-    ))
-}
-
-fn execute_workflow_draft_tool(
-    config: &RunConfig,
-    cwd: &Path,
-    tool_request: &tool_types::ToolRequest,
-    task_registry: &TaskRegistry,
-) -> io::Result<tool_types::ToolResult> {
-    if !config.workflows.enabled {
-        return Ok(tool_types::ToolResult::failed(
-            tool_request,
-            "workflows are disabled",
-            None,
-        ));
-    }
-
-    let input = parse_workflow_draft_input(tool_request)?;
-    let session_dir = cwd
-        .join(".orca")
-        .join("workflow-sessions")
-        .join(task_registry.session_id());
-    let draft_store = WorkflowDraftStore::new(session_dir.join("workflow-drafts"));
-    let draft = draft_store.create_from_script(
-        task_registry.session_id(),
-        cwd,
-        &input.script,
-        config.workflows.max_concurrent_agents,
-    )?;
-    let output = serde_json::to_string(&draft)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-
-    Ok(tool_types::ToolResult::completed(
-        tool_request,
-        output,
-        false,
-    ))
-}
-
-fn execute_workflow_draft_action_tool(
-    config: &RunConfig,
-    cwd: &Path,
-    events: &mut EventFactory,
-    sink: &mut EventSink<impl io::Write>,
-    tool_request: &tool_types::ToolRequest,
-    emit_deltas: bool,
-    task_registry: &TaskRegistry,
-    background_workflows: &mut Vec<BackgroundWorkflowRun>,
-) -> io::Result<tool_types::ToolResult> {
-    if !config.workflows.enabled {
-        return Ok(tool_types::ToolResult::failed(
-            tool_request,
-            "workflows are disabled",
-            None,
-        ));
-    }
-
-    let input = parse_workflow_draft_action_input(tool_request)?;
-    let session_dir = cwd
-        .join(".orca")
-        .join("workflow-sessions")
-        .join(task_registry.session_id());
-    let draft_store = WorkflowDraftStore::new(session_dir.join("workflow-drafts"));
-    let draft = draft_store.load(&input.draft_id)?;
-
-    let output = match input.action.as_str() {
-        "run" => {
-            let runner = WorkflowRunner::new(config.clone(), task_registry.clone(), session_dir);
-            let launch = runner.launch_background(WorkflowLaunchRequest::from(WorkflowInput {
-                draft_id: Some(input.draft_id.clone()),
-                args: input.args.clone(),
-                ..Default::default()
-            }))?;
-            if emit_deltas {
-                sink.emit(&events.workflow_started(
-                    &launch.task_id,
-                    &launch.run_id,
-                    &launch.workflow_name,
-                    &launch.phases,
-                ))?;
-            }
-            let action_output = WorkflowDraftActionOutput {
-                status: "async_launched".to_string(),
-                action: "run".to_string(),
-                draft_id: input.draft_id.clone(),
-                workflow_name: launch.workflow_name.clone(),
-                saved_path: None,
-                task_id: Some(launch.task_id.clone()),
-                run_id: Some(launch.run_id.clone()),
-                script_path: launch.output.script_path.clone(),
-            };
-            background_workflows.push(BackgroundWorkflowRun {
-                task_id: launch.task_id.clone(),
-                run_id: launch.run_id.clone(),
-                workflow_name: launch.workflow_name.clone(),
-                handle: launch,
-            });
-            action_output
-        }
-        "edit" => {
-            let script = input.script.as_deref().ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "workflow draft action edit requires script",
-                )
-            })?;
-            let edited = draft_store.edit_script(
-                &input.draft_id,
-                script,
-                config.workflows.max_concurrent_agents,
-            )?;
-            WorkflowDraftActionOutput {
-                status: "edited".to_string(),
-                action: "edit".to_string(),
-                draft_id: input.draft_id.clone(),
-                workflow_name: edited.name,
-                saved_path: None,
-                task_id: None,
-                run_id: None,
-                script_path: Some(edited.script_path),
-            }
-        }
-        "save" => {
-            let workflow_dir = match input.scope.as_deref().unwrap_or("project") {
-                "project" => cwd.join(".orca").join("workflows"),
-                "user" => dirs::home_dir()
-                    .unwrap_or_else(|| cwd.to_path_buf())
-                    .join(".orca")
-                    .join("workflows"),
-                other => {
-                    return Ok(tool_types::ToolResult::invalid_input(
-                        tool_request,
-                        format!("unsupported workflow draft save scope: {other}"),
-                    ));
-                }
-            };
-            let saved_path = draft_store.save_reusable(
-                &input.draft_id,
-                &workflow_dir,
-                input.save_as.as_deref(),
-            )?;
-            WorkflowDraftActionOutput {
-                status: "saved".to_string(),
-                action: "save".to_string(),
-                draft_id: input.draft_id.clone(),
-                workflow_name: draft.name,
-                saved_path: Some(saved_path.display().to_string()),
-                task_id: None,
-                run_id: None,
-                script_path: Some(draft.script_path),
-            }
-        }
-        "cancel" => {
-            draft_store.cancel(&input.draft_id)?;
-            WorkflowDraftActionOutput {
-                status: "cancelled".to_string(),
-                action: "cancel".to_string(),
-                draft_id: input.draft_id,
-                workflow_name: draft.name,
-                saved_path: None,
-                task_id: None,
-                run_id: None,
-                script_path: None,
-            }
-        }
-        other => {
-            return Ok(tool_types::ToolResult::invalid_input(
-                tool_request,
-                format!("unsupported workflow draft action: {other}"),
-            ));
-        }
-    };
-
-    let output = serde_json::to_string(&output)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    Ok(tool_types::ToolResult::completed(
-        tool_request,
-        output,
-        false,
-    ))
-}
-
-#[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct WorkflowDraftInput {
-    script: String,
-}
-
-fn parse_workflow_draft_input(
-    tool_request: &tool_types::ToolRequest,
-) -> io::Result<WorkflowDraftInput> {
-    let raw_arguments = tool_request.raw_arguments.as_deref().unwrap_or("{}");
-    serde_json::from_str(raw_arguments)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
-}
-
-#[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct WorkflowDraftActionInput {
-    draft_id: String,
-    action: String,
-    #[serde(default)]
-    script: Option<String>,
-    #[serde(default)]
-    save_as: Option<String>,
-    #[serde(default)]
-    scope: Option<String>,
-    #[serde(default)]
-    args: Option<serde_json::Value>,
-}
-
-fn parse_workflow_draft_action_input(
-    tool_request: &tool_types::ToolRequest,
-) -> io::Result<WorkflowDraftActionInput> {
-    let raw_arguments = tool_request.raw_arguments.as_deref().unwrap_or("{}");
-    serde_json::from_str(raw_arguments)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
-}
-
-fn parse_workflow_input(tool_request: &tool_types::ToolRequest) -> io::Result<WorkflowInput> {
-    let raw_arguments = tool_request.raw_arguments.as_deref().unwrap_or("{}");
-    serde_json::from_str(raw_arguments)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
-}
-
-fn observe_background_workflows(
-    options: ControllerRunOptions,
-    events: &mut EventFactory,
-    sink: &mut EventSink<impl io::Write>,
-    background_workflows: &mut Vec<BackgroundWorkflowRun>,
-) -> io::Result<()> {
-    if !options.wait_for_background_workflows {
-        return Ok(());
-    }
-
-    for workflow in background_workflows.drain(..) {
-        match workflow.handle.join() {
-            Ok(Ok(result)) => {
-                sink.emit(&events.workflow_completed(
-                    &workflow.task_id,
-                    &workflow.run_id,
-                    &workflow.workflow_name,
-                ))?;
-                sink.emit(&events.workflow_result_available(
-                    &workflow.task_id,
-                    &workflow.run_id,
-                    &result.status_line,
-                ))?;
-            }
-            Ok(Err(error)) => {
-                sink.emit(&events.workflow_failed(
-                    &workflow.task_id,
-                    &workflow.run_id,
-                    &error.to_string(),
-                ))?;
-            }
-            Err(_) => {
-                sink.emit(&events.workflow_failed(
-                    &workflow.task_id,
-                    &workflow.run_id,
-                    "workflow thread panicked",
-                ))?;
-            }
-        }
-    }
-
-    Ok(())
-}
-
-fn should_run_subagent_batch(
-    config: &RunConfig,
-    tool_request: &tool_types::ToolRequest,
-    subagent_depth: u32,
-) -> bool {
-    tool_request.name == tool_types::ToolName::Subagent
-        && subagent_depth < config.subagents.max_depth
-        && config.subagents.max_parallel > 1
-        && is_batchable_subagent_request(tool_request)
-}
-
-fn collect_subagent_batch(
-    config: &RunConfig,
-    tool_requests: &[tool_types::ToolRequest],
-    start: usize,
-) -> usize {
-    let max_end = (start + config.subagents.max_parallel).min(tool_requests.len());
-    let mut end = start;
-    while end < max_end && is_batchable_subagent_request(&tool_requests[end]) {
-        end += 1;
-    }
-    end
-}
-
-fn is_batchable_subagent_request(tool_request: &tool_types::ToolRequest) -> bool {
-    if tool_request.name != tool_types::ToolName::Subagent {
-        return false;
-    }
-    let request = subagent::create_subagent_request(tool_request);
-    request.mode == SubagentMode::Sync && request.isolation == SubagentIsolation::None
-}
-
+#[cfg(test)]
 fn execute_readonly_batch(
     cwd: &Path,
     events: &mut EventFactory,
@@ -1738,771 +605,6 @@ fn execute_readonly_batch(
     Ok(results)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn execute_subagent_batch(
-    config: &RunConfig,
-    cwd: &Path,
-    events: &mut EventFactory,
-    sink: &mut EventSink<impl io::Write>,
-    tool_requests: &[tool_types::ToolRequest],
-    subagent_depth: u32,
-    emit_deltas: bool,
-    instructions: &ProjectInstructions,
-    memory: &MemoryBlock,
-    mcp_registry: &McpRegistry,
-    hooks: &HookRunner,
-    cost_tracker: &mut CostTracker,
-    cancel: &CancelToken,
-    workflow_ipc: Option<&WorkflowIpcContext>,
-) -> io::Result<Vec<(RunStatus, tool_types::ToolResult)>> {
-    let mut handles = Vec::new();
-    let mut results: Vec<Option<(RunStatus, tool_types::ToolResult)>> =
-        vec![None; tool_requests.len()];
-
-    for (idx, tool_request) in tool_requests.iter().enumerate() {
-        let invocation = prepare_tool_invocation_with_external(
-            tool_request,
-            subagent_depth,
-            config.subagents.max_depth,
-            mcp_registry,
-            &[],
-        );
-        if emit_deltas {
-            sink.emit(&events.tool_call_requested(tool_request))?;
-        }
-        if let Err(error) = validate_tool_invocation_with_external(&invocation, mcp_registry, &[]) {
-            let result = error.into_result();
-            if emit_deltas {
-                sink.emit(&events.tool_call_completed(&result))?;
-            }
-            results[idx] = Some((RunStatus::Failed, result));
-            continue;
-        }
-        let pre_tool_outcome = match hooks.run(
-            HookEvent::PreToolUse,
-            HookContext {
-                cwd: &cwd.display().to_string(),
-                session_status: None,
-                tool_request: Some(tool_request),
-                tool_result: None,
-                before_messages: None,
-                after_messages: None,
-                usage: None,
-            },
-        ) {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                let result = tool_types::ToolResult::failed(
-                    tool_request,
-                    format!("pre_tool_use hook blocked tool: {error}"),
-                    None,
-                );
-                if emit_deltas {
-                    sink.emit(&events.tool_call_completed(&result))?;
-                }
-                results[idx] = Some((RunStatus::Failed, result));
-                continue;
-            }
-        };
-        let invocation = match apply_pre_tool_outcome_with_external(
-            invocation,
-            &pre_tool_outcome,
-            mcp_registry,
-            &[],
-        ) {
-            Ok(invocation) => invocation,
-            Err(error) => {
-                let result = error.into_result();
-                if emit_deltas {
-                    sink.emit(&events.tool_call_completed(&result))?;
-                }
-                results[idx] = Some((RunStatus::Failed, result));
-                continue;
-            }
-        };
-
-        let request = subagent::create_subagent_request(&invocation.effective);
-        if emit_deltas {
-            sink.emit(&events.subagent_started(&tool_request.id, &request.description))?;
-        }
-
-        let child_request = ChildAgentRequest {
-            prompt: request.prompt.clone(),
-            subagent_type: request.subagent_type,
-            model: request.model.clone(),
-            depth: subagent_depth + 1,
-            emit_deltas: false,
-            allowed_tools: None,
-            tool_policy_label: None,
-            workflow_ipc: workflow_ipc.cloned(),
-        };
-        let child_tool_request = invocation.effective;
-        let child_config = config.clone();
-        let child_cwd = cwd.to_path_buf();
-        let child_instructions = instructions.clone();
-        let child_memory = memory.clone();
-        let child_mcp_registry = mcp_registry.clone();
-        let child_hooks = hooks.clone();
-        let child_cancel = cancel.clone();
-        handles.push((
-            idx,
-            thread::spawn(move || {
-                let mut child_events =
-                    EventFactory::new(format!("subagent-{}", child_tool_request.id));
-                let mut child_sink = EventSink::new(io::sink(), child_config.output_format);
-                let mut child_runtime = ChildAgentRuntime::new(
-                    &child_cwd,
-                    &mut child_events,
-                    &mut child_sink,
-                    &child_instructions,
-                    &child_memory,
-                    &child_mcp_registry,
-                    &child_hooks,
-                    &child_cancel,
-                    execute_child_agent_loop,
-                );
-                let (child, child_cost_tracker) =
-                    run_child_agent(&child_config, &child_request, &mut child_runtime);
-
-                SubagentExecutionResult {
-                    tool_request: child_tool_request,
-                    description: request.description,
-                    schema: request.schema,
-                    child,
-                    cost_tracker: child_cost_tracker,
-                    worktree: None,
-                }
-            }),
-        ));
-    }
-
-    for (idx, handle) in handles {
-        let execution = match handle.join() {
-            Ok(execution) => execution,
-            Err(_) => {
-                let tool_request = &tool_requests[idx];
-                let result =
-                    tool_types::ToolResult::failed(tool_request, "subagent thread panicked", None);
-                if emit_deltas {
-                    sink.emit(&events.tool_call_completed(&result))?;
-                }
-                results[idx] = Some((RunStatus::Failed, result));
-                continue;
-            }
-        };
-
-        cost_tracker.merge(&execution.cost_tracker);
-
-        let (status, result) =
-            subagent_execution_to_tool_result(events, sink, &execution, emit_deltas)?;
-        if emit_deltas {
-            sink.emit(&events.tool_call_completed(&result))?;
-            if let Err(error) = hooks.run(
-                HookEvent::PostToolUse,
-                HookContext {
-                    cwd: &cwd.display().to_string(),
-                    session_status: None,
-                    tool_request: Some(&execution.tool_request),
-                    tool_result: Some(&result),
-                    before_messages: None,
-                    after_messages: None,
-                    usage: None,
-                },
-            ) {
-                sink.emit(&events.error(&format!("post_tool_use hook failed: {error}")))?;
-            }
-        }
-        results[idx] = Some((status, result));
-    }
-
-    Ok(results
-        .into_iter()
-        .map(|result| result.expect("each subagent batch item has a result"))
-        .collect())
-}
-
-fn subagent_execution_to_tool_result(
-    events: &mut EventFactory,
-    sink: &mut EventSink<impl io::Write>,
-    execution: &SubagentExecutionResult,
-    emit_deltas: bool,
-) -> io::Result<(RunStatus, tool_types::ToolResult)> {
-    match execution.child.status {
-        RunStatus::Success => {
-            let mut output = execution
-                .child
-                .final_message
-                .clone()
-                .unwrap_or_else(|| "(subagent completed without a final message)".to_string());
-            if let Err(mut error) = validate_subagent_output_schema(
-                &execution.description,
-                execution.schema.as_ref(),
-                &output,
-            ) {
-                append_worktree_outcome(&mut error, execution.worktree.as_ref());
-                if emit_deltas {
-                    sink.emit(&events.subagent_completed(
-                        &execution.tool_request.id,
-                        &execution.description,
-                        RunStatus::Failed,
-                        Some(&output),
-                        Some(&error),
-                    ))?;
-                }
-                return Ok((
-                    RunStatus::Failed,
-                    tool_types::ToolResult::failed(
-                        &execution.tool_request,
-                        format!("Subagent status: Failed\n\n{error}"),
-                        None,
-                    ),
-                ));
-            }
-            append_worktree_outcome(&mut output, execution.worktree.as_ref());
-            if emit_deltas {
-                sink.emit(&events.subagent_completed(
-                    &execution.tool_request.id,
-                    &execution.description,
-                    execution.child.status,
-                    Some(&output),
-                    None,
-                ))?;
-            }
-            Ok((
-                RunStatus::Success,
-                tool_types::ToolResult::completed(
-                    &execution.tool_request,
-                    format!("Subagent status: success\n\n{output}"),
-                    false,
-                ),
-            ))
-        }
-        status => {
-            let mut error = execution
-                .child
-                .error
-                .clone()
-                .unwrap_or_else(|| format!("subagent ended with status {status:?}"));
-            append_worktree_outcome(&mut error, execution.worktree.as_ref());
-            if emit_deltas {
-                sink.emit(&events.subagent_completed(
-                    &execution.tool_request.id,
-                    &execution.description,
-                    status,
-                    execution.child.final_message.as_deref(),
-                    Some(&error),
-                ))?;
-            }
-            Ok((
-                RunStatus::Failed,
-                tool_types::ToolResult::failed(
-                    &execution.tool_request,
-                    format!("Subagent status: {status:?}\n\n{error}"),
-                    None,
-                ),
-            ))
-        }
-    }
-}
-
-fn append_worktree_outcome(output: &mut String, outcome: Option<&WorktreeOutcome>) {
-    if let Some(outcome) = outcome {
-        let status = if outcome.preserved {
-            "preserved"
-        } else {
-            "cleaned"
-        };
-        output.push_str(&format!(
-            "\n\nWorktree {status}: {}",
-            outcome.path.display()
-        ));
-    }
-}
-
-fn validate_subagent_output_schema(
-    description: &str,
-    schema: Option<&Value>,
-    output: &str,
-) -> Result<(), String> {
-    let Some(schema) = schema else {
-        return Ok(());
-    };
-    let value = subagent_output_value(output);
-    validate_json_schema_subset(schema, &value, "$").map_err(|error| {
-        format!("subagent output schema validation failed for {description}: {error}")
-    })
-}
-
-fn subagent_output_value(output: &str) -> Value {
-    serde_json::from_str(output).unwrap_or_else(|_| Value::String(output.to_string()))
-}
-
-fn execute_subagent_tool(
-    config: &RunConfig,
-    cwd: &Path,
-    events: &mut EventFactory,
-    sink: &mut EventSink<impl io::Write>,
-    tool_request: &tool_types::ToolRequest,
-    subagent_depth: u32,
-    instructions: &ProjectInstructions,
-    memory: &MemoryBlock,
-    mcp_registry: &McpRegistry,
-    hooks: &HookRunner,
-    emit_deltas: bool,
-    cost_tracker: &mut CostTracker,
-    cancel: &CancelToken,
-    task_registry: &TaskRegistry,
-    workflow_ipc: Option<&WorkflowIpcContext>,
-) -> io::Result<tool_types::ToolResult> {
-    let request = subagent::create_subagent_request(tool_request);
-    let description = request.description.clone();
-    let schema = request.schema.clone();
-
-    if emit_deltas {
-        sink.emit(&events.subagent_started(&tool_request.id, &description))?;
-    }
-
-    if subagent_depth >= config.subagents.max_depth {
-        let error = format!("subagent max depth {} reached", config.subagents.max_depth);
-        if emit_deltas {
-            sink.emit(&events.subagent_completed(
-                &tool_request.id,
-                &description,
-                RunStatus::Failed,
-                None,
-                Some(&error),
-            ))?;
-        }
-        return Ok(tool_types::ToolResult::failed(tool_request, error, None));
-    }
-
-    if request.mode == SubagentMode::Async {
-        return Ok(launch_async_subagent(
-            config,
-            cwd,
-            tool_request,
-            request,
-            subagent_depth,
-            task_registry,
-        ));
-    }
-
-    let worktree_guard = if request.isolation == SubagentIsolation::Worktree {
-        match WorktreeGuard::create(cwd) {
-            Ok(guard) => Some(guard),
-            Err(error) => {
-                let error = format!("failed to create subagent worktree: {error}");
-                if emit_deltas {
-                    sink.emit(&events.subagent_completed(
-                        &tool_request.id,
-                        &description,
-                        RunStatus::Failed,
-                        None,
-                        Some(&error),
-                    ))?;
-                }
-                return Ok(tool_types::ToolResult::failed(tool_request, error, None));
-            }
-        }
-    } else {
-        None
-    };
-    let child_cwd = worktree_guard
-        .as_ref()
-        .map(|guard| guard.path())
-        .unwrap_or(cwd);
-    let child_request = ChildAgentRequest {
-        prompt: request.prompt,
-        subagent_type: request.subagent_type,
-        model: request.model,
-        depth: subagent_depth + 1,
-        emit_deltas: false,
-        allowed_tools: None,
-        tool_policy_label: None,
-        workflow_ipc: workflow_ipc.cloned(),
-    };
-    let mut runtime = ChildAgentRuntime::new(
-        child_cwd,
-        events,
-        sink,
-        instructions,
-        memory,
-        mcp_registry,
-        hooks,
-        cancel,
-        execute_child_agent_loop,
-    );
-    let (child, child_cost_tracker) = run_child_agent(config, &child_request, &mut runtime);
-    drop(runtime);
-    let worktree = worktree_guard
-        .map(WorktreeGuard::finish)
-        .transpose()
-        .map_err(io::Error::other)?;
-
-    cost_tracker.merge(&child_cost_tracker);
-
-    match child.status {
-        RunStatus::Success => {
-            let mut output = child
-                .final_message
-                .unwrap_or_else(|| "(subagent completed without a final message)".to_string());
-            if let Err(mut error) =
-                validate_subagent_output_schema(&description, schema.as_ref(), &output)
-            {
-                append_worktree_outcome(&mut error, worktree.as_ref());
-                if emit_deltas {
-                    sink.emit(&events.subagent_completed(
-                        &tool_request.id,
-                        &description,
-                        RunStatus::Failed,
-                        Some(&output),
-                        Some(&error),
-                    ))?;
-                }
-                return Ok(tool_types::ToolResult::failed(
-                    tool_request,
-                    format!("Subagent status: Failed\n\n{error}"),
-                    None,
-                ));
-            }
-            append_worktree_outcome(&mut output, worktree.as_ref());
-            if emit_deltas {
-                sink.emit(&events.subagent_completed(
-                    &tool_request.id,
-                    &description,
-                    child.status,
-                    Some(&output),
-                    None,
-                ))?;
-            }
-            Ok(tool_types::ToolResult::completed(
-                tool_request,
-                format!("Subagent status: success\n\n{output}"),
-                false,
-            ))
-        }
-        status => {
-            let mut error = child
-                .error
-                .unwrap_or_else(|| format!("subagent ended with status {status:?}"));
-            append_worktree_outcome(&mut error, worktree.as_ref());
-            if emit_deltas {
-                sink.emit(&events.subagent_completed(
-                    &tool_request.id,
-                    &description,
-                    status,
-                    child.final_message.as_deref(),
-                    Some(&error),
-                ))?;
-            }
-            Ok(tool_types::ToolResult::failed(
-                tool_request,
-                format!("Subagent status: {status:?}\n\n{error}"),
-                None,
-            ))
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn launch_async_subagent(
-    config: &RunConfig,
-    cwd: &Path,
-    tool_request: &tool_types::ToolRequest,
-    request: subagent::SubagentRequest,
-    subagent_depth: u32,
-    task_registry: &TaskRegistry,
-) -> tool_types::ToolResult {
-    let agent_type = serde_json::to_value(&request.subagent_type)
-        .ok()
-        .and_then(|value| value.as_str().map(str::to_string));
-    let task = task_registry.create_subagent(request.description.clone(), agent_type);
-    let agent_id = task.id.clone();
-    let worktree_guard = if request.isolation == SubagentIsolation::Worktree {
-        match WorktreeGuard::create(cwd) {
-            Ok(guard) => Some(guard),
-            Err(error) => {
-                let error = format!("failed to create subagent worktree: {error}");
-                let _ = task_registry.fail(&agent_id, error.clone());
-                return tool_types::ToolResult::failed(tool_request, error, None);
-            }
-        }
-    } else {
-        None
-    };
-    let child_cwd = worktree_guard
-        .as_ref()
-        .map(|guard| guard.path().to_path_buf())
-        .unwrap_or_else(|| cwd.to_path_buf());
-    let worktree = worktree_guard.as_ref().map(|guard| AsyncSubagentWorktree {
-        repo_root: guard.repo_root().to_path_buf(),
-        path: guard.path().to_path_buf(),
-    });
-    if let Err(error) = task_registry.mark_worker_spawned(&agent_id, 0) {
-        let _ = task_registry.fail(&agent_id, error.clone());
-        return tool_types::ToolResult::failed(tool_request, error, None);
-    }
-    match spawn_async_subagent_worker(
-        config,
-        cwd,
-        &child_cwd,
-        task_registry.session_id(),
-        &agent_id,
-        &request,
-        subagent_depth + 1,
-        worktree.as_ref(),
-    ) {
-        Ok(pid) => {
-            let _ = task_registry.mark_worker_spawned(&agent_id, pid);
-            std::mem::forget(worktree_guard);
-        }
-        Err(error) => {
-            let worktree = worktree_guard.and_then(|guard| guard.finish().ok());
-            let mut error = format!("failed to start async subagent worker: {error}");
-            append_worktree_outcome(&mut error, worktree.as_ref());
-            let _ = task_registry.fail(&agent_id, error.clone());
-            return tool_types::ToolResult::failed(tool_request, error, None);
-        }
-    }
-
-    let output = serde_json::json!({
-        "status": "async_launched",
-        "agent_id": agent_id,
-        "description": request.description,
-    })
-    .to_string();
-    tool_types::ToolResult::completed(tool_request, output, false)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn spawn_async_subagent_worker(
-    config: &RunConfig,
-    cwd: &Path,
-    child_cwd: &Path,
-    task_session_id: &str,
-    agent_id: &str,
-    request: &subagent::SubagentRequest,
-    child_depth: u32,
-    worktree: Option<&AsyncSubagentWorktree>,
-) -> Result<u32, String> {
-    let current_exe = std::env::current_exe().map_err(|error| error.to_string())?;
-    let request_json = serde_json::to_string(request).map_err(|error| error.to_string())?;
-    let mut command = ProcessCommand::new(current_exe);
-    command
-        .current_dir(cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .arg("subagent-worker")
-        .arg("--cwd")
-        .arg(cwd)
-        .arg("--child-cwd")
-        .arg(child_cwd)
-        .arg("--provider")
-        .arg(config.provider.as_str())
-        .arg("--session-id")
-        .arg(task_session_id)
-        .arg("--agent-id")
-        .arg(agent_id)
-        .arg("--subagent-depth")
-        .arg(child_depth.to_string())
-        .arg("--request-json")
-        .arg(request_json);
-    if let Some(model) = config.model.as_history_value() {
-        command.arg("--model").arg(model);
-    }
-    if let Some(api_key) = config.api_key.as_deref() {
-        command.arg("--api-key").arg(api_key);
-    }
-    if let Some(base_url) = config.base_url.as_deref() {
-        command.arg("--base-url").arg(base_url);
-    }
-    if let Some(worktree) = worktree {
-        command
-            .arg("--worktree-repo-root")
-            .arg(&worktree.repo_root)
-            .arg("--worktree-path")
-            .arg(&worktree.path);
-    }
-    command
-        .spawn()
-        .map(|child| child.id())
-        .map_err(|error| error.to_string())
-}
-
-pub fn run_async_subagent_worker(
-    config: RunConfig,
-    cwd: PathBuf,
-    child_cwd: PathBuf,
-    task_session_id: String,
-    agent_id: String,
-    request: subagent::SubagentRequest,
-    child_depth: u32,
-    worktree: Option<AsyncSubagentWorktree>,
-) -> i32 {
-    let task_registry = TaskRegistry::new_for_cwd(task_session_id, &cwd);
-    let _ = task_registry.mark_running(&agent_id);
-    let instructions = load_project_instructions(&cwd);
-    let memory = memory::load_for_cwd(&cwd);
-    let hooks = HookRunner::new(config.hooks.clone());
-    let mcp_registry = orca_mcp::initialize_registry(&config.mcp_servers);
-    let cancel = CancelToken::new();
-    let child_request = ChildAgentRequest {
-        prompt: request.prompt,
-        subagent_type: request.subagent_type,
-        model: request.model,
-        depth: child_depth,
-        emit_deltas: false,
-        allowed_tools: None,
-        tool_policy_label: None,
-        workflow_ipc: None,
-    };
-    let mut child_events = EventFactory::new(format!("subagent-{agent_id}"));
-    let mut child_sink = EventSink::new(io::sink(), config.output_format);
-    let mut child_runtime = ChildAgentRuntime::new(
-        &child_cwd,
-        &mut child_events,
-        &mut child_sink,
-        &instructions,
-        &memory,
-        &mcp_registry,
-        &hooks,
-        &cancel,
-        execute_child_agent_loop,
-    );
-    let (child, child_cost_tracker) = run_child_agent(&config, &child_request, &mut child_runtime);
-    drop(child_runtime);
-    let worktree = worktree.and_then(|worktree| {
-        WorktreeGuard::finish_existing(worktree.repo_root, worktree.path).ok()
-    });
-    let usage = usage_totals_if_non_empty(child_cost_tracker.totals());
-    if child.status == RunStatus::Success {
-        let mut output = child
-            .final_message
-            .unwrap_or_else(|| "(subagent completed without a final message)".to_string());
-        if let Err(mut error) =
-            validate_subagent_output_schema(&request.description, request.schema.as_ref(), &output)
-        {
-            append_worktree_outcome(&mut error, worktree.as_ref());
-            if task_registry
-                .fail_with_usage(&agent_id, error, usage)
-                .is_ok()
-            {
-                return 1;
-            }
-            return 1;
-        }
-        append_worktree_outcome(&mut output, worktree.as_ref());
-        if task_registry
-            .complete_with_usage(&agent_id, output, usage)
-            .is_ok()
-        {
-            return 0;
-        }
-    } else {
-        let mut error = child
-            .error
-            .or(child.final_message)
-            .unwrap_or_else(|| format!("subagent ended with status {:?}", child.status));
-        append_worktree_outcome(&mut error, worktree.as_ref());
-        if task_registry
-            .fail_with_usage(&agent_id, error, usage)
-            .is_ok()
-        {
-            return 1;
-        }
-    }
-    1
-}
-
-fn execute_subagent_status_tool(
-    tool_request: &tool_types::ToolRequest,
-    task_registry: &TaskRegistry,
-) -> tool_types::ToolResult {
-    let agent_id = subagent::extract_subagent_field(tool_request, "agent_id")
-        .or_else(|| tool_request.target.clone());
-    let Some(agent_id) = agent_id else {
-        return tool_types::ToolResult::invalid_input(tool_request, "missing agent_id");
-    };
-    let Some(record) = task_registry.get(&agent_id) else {
-        return tool_types::ToolResult::failed(
-            tool_request,
-            format!("subagent '{agent_id}' not found"),
-            None,
-        );
-    };
-    if record.task_type != orca_core::task_types::TaskType::Subagent {
-        return tool_types::ToolResult::failed(
-            tool_request,
-            format!("task '{agent_id}' is not a subagent"),
-            None,
-        );
-    }
-
-    let output = serde_json::json!({
-        "agent_id": agent_id,
-        "status": record.status,
-        "description": record.description,
-        "agent_type": record.agent_type,
-        "created_at_ms": record.created_at_ms,
-        "started_at_ms": record.started_at_ms,
-        "completed_at_ms": record.completed_at_ms,
-        "output": record.result,
-        "error": record.error,
-        "usage": record.usage.map(usage_totals_json),
-    })
-    .to_string();
-    tool_types::ToolResult::completed(tool_request, output, false)
-}
-
-fn usage_totals_if_non_empty(usage: UsageTotals) -> Option<UsageTotals> {
-    if usage.total_tokens() == 0 && usage.cache_tokens == 0 && usage.estimated_cost_usd == 0.0 {
-        None
-    } else {
-        Some(usage)
-    }
-}
-
-fn usage_totals_json(usage: UsageTotals) -> serde_json::Value {
-    serde_json::json!({
-        "input_tokens": usage.input_tokens,
-        "output_tokens": usage.output_tokens,
-        "cache_tokens": usage.cache_tokens,
-        "total_tokens": usage.total_tokens(),
-        "estimated_cost_usd": usage.estimated_cost_usd,
-    })
-}
-
-fn resolve_interactive(
-    config: &RunConfig,
-    approval: &ApprovalRequest,
-    tool_request: &tool_types::ToolRequest,
-) -> io::Result<ApprovalResolution> {
-    if config.output_format == OutputFormat::Jsonl {
-        return Ok(ApprovalResolution {
-            id: approval.id.clone(),
-            decision: ApprovalDecision::Deny,
-            reason: "interactive confirmation unavailable in jsonl mode".to_string(),
-        });
-    }
-
-    let allowed = prompt_user(tool_request.name.as_str(), tool_request.target.as_deref())?;
-
-    Ok(ApprovalResolution {
-        id: approval.id.clone(),
-        decision: if allowed {
-            ApprovalDecision::Allow
-        } else {
-            ApprovalDecision::Deny
-        },
-        reason: if allowed {
-            "user approved".to_string()
-        } else {
-            "user denied".to_string()
-        },
-    })
-}
-
 fn run_verifier_if_needed(
     status: RunStatus,
     verifier: Option<&str>,
@@ -2536,9 +638,18 @@ fn load_project_instructions(cwd: &Path) -> ProjectInstructions {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent_loop::execute_child_agent_loop;
     use crate::hooks::HookOutcome;
+    use crate::hooks::conversation_with_hook_context;
+    use crate::lifecycle::{RuntimeTaskStatus, RuntimeToolActorContext};
+    use crate::memory::MemoryBlock;
+    use crate::subagent_execution::{collect_subagent_batch, should_run_subagent_batch};
+    use crate::tool_execution::{ToolExecutionActor, ToolExecutionContext};
+    use crate::tool_invocation::prepare_tool_invocation;
+    use orca_approval::ApprovalPolicy;
     use orca_core::approval_types::{ActionKind, ApprovalMode};
     use orca_core::config::{HistoryMode, OutputFormat, ProviderKind};
+    use orca_core::conversation::Conversation;
     use orca_core::model::ModelSelection;
     use orca_core::subagent_config::SubagentConfig;
 
@@ -2557,7 +668,11 @@ mod tests {
             base_url: None,
             history_mode: HistoryMode::Disabled,
             show_session_picker: false,
+            active_permission_profile: None,
+            permission_profiles: Default::default(),
+            runtime_workspace_roots: None,
             permission_rules: Default::default(),
+            additional_working_directories: Vec::new(),
             max_budget_usd: None,
             mcp_servers: Vec::new(),
             hooks: Vec::new(),
@@ -2599,6 +714,7 @@ mod tests {
 
     #[test]
     fn workflow_ipc_tool_requires_workflow_child_context() {
+        let mut context = RuntimeToolActorContext::new("test-run", DEFAULT_MAX_TURNS);
         let request = tool_types::ToolRequest {
             id: "mailbox".to_string(),
             name: tool_types::ToolName::WorkflowReadMessages,
@@ -2607,7 +723,7 @@ mod tests {
             raw_arguments: Some(serde_json::json!({ "channel": "findings" }).to_string()),
         };
 
-        let result = execute_workflow_ipc_tool(&request, None);
+        let result = context.execute_workflow_ipc_tool(&request, None);
 
         assert_eq!(result.status, tool_types::ToolStatus::Failed);
         assert!(
@@ -2711,6 +827,7 @@ mod tests {
 
     #[test]
     fn subagent_status_returns_session_local_task_result() {
+        let mut context = RuntimeToolActorContext::new("test-run", DEFAULT_MAX_TURNS);
         let registry = TaskRegistry::new("session-status".to_string());
         let task =
             registry.create_subagent("inspect auth".to_string(), Some("general".to_string()));
@@ -2725,7 +842,7 @@ mod tests {
             raw_arguments: Some(serde_json::json!({ "agent_id": task.id }).to_string()),
         };
 
-        let result = execute_subagent_status_tool(&request, &registry);
+        let result = context.execute_subagent_status_tool(&request, &registry);
 
         assert_eq!(result.status, tool_types::ToolStatus::Completed);
         let payload: serde_json::Value =
@@ -2888,5 +1005,301 @@ mod tests {
             Some(orca_core::conversation::Message::System { content, pinned: true })
                 if content.contains("policy hint") && content.contains("repo hint")
         ));
+    }
+
+    #[test]
+    fn agent_loop_context_carries_turn_metadata() {
+        let cwd = PathBuf::from("/tmp/orca-agent-loop");
+        let subagent_type = SubagentType::General;
+
+        let context = AgentLoopContext::new(&cwd, "inspect repo", 2, false, &subagent_type);
+
+        assert_eq!(context.cwd(), cwd.as_path());
+        assert_eq!(context.prompt(), "inspect repo");
+        assert_eq!(context.subagent_depth(), 2);
+        assert!(!context.emit_deltas());
+        assert_eq!(context.subagent_type(), &SubagentType::General);
+    }
+
+    #[test]
+    fn agent_loop_context_carries_readonly_services() {
+        let cwd = PathBuf::from("/tmp/orca-agent-loop-services");
+        let subagent_type = SubagentType::General;
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let registry = McpRegistry::default();
+        let hooks = HookRunner::default();
+
+        let context = AgentLoopContext::new(&cwd, "inspect repo", 0, true, &subagent_type)
+            .with_services(&instructions, &memory, &registry, &hooks);
+
+        assert!(std::ptr::eq(context.instructions(), &instructions));
+        assert!(std::ptr::eq(context.memory(), &memory));
+        assert!(std::ptr::eq(context.mcp_registry(), &registry));
+        assert!(std::ptr::eq(context.hooks(), &hooks));
+    }
+
+    #[test]
+    fn agent_loop_context_carries_runtime_refs() {
+        let cwd = PathBuf::from("/tmp/orca-agent-loop-runtime");
+        let subagent_type = SubagentType::General;
+        let mut cost_tracker = CostTracker::new(None);
+        let cancel = CancelToken::new();
+        let task_registry = TaskRegistry::new("agent-loop-runtime".to_string());
+
+        let context = AgentLoopContext::new(&cwd, "inspect repo", 0, true, &subagent_type)
+            .with_runtime(&mut cost_tracker, &cancel, &task_registry);
+
+        assert_eq!(context.cost_tracker().totals().total_tokens(), 0);
+        assert!(std::ptr::eq(context.cancel(), &cancel));
+        assert!(std::ptr::eq(context.task_registry(), &task_registry));
+    }
+
+    #[test]
+    fn agent_loop_context_carries_execution_refs() {
+        let cwd = PathBuf::from("/tmp/orca-agent-loop-execution");
+        let subagent_type = SubagentType::General;
+        let mut background_workflows = Vec::new();
+        let mut lifecycle = RuntimeSessionLifecycle::new("agent-loop-execution");
+        lifecycle.start_task(RuntimeTaskKind::Agent);
+
+        let context = AgentLoopContext::new(&cwd, "inspect repo", 0, true, &subagent_type)
+            .with_execution(&mut background_workflows, None, Some(&mut lifecycle));
+
+        assert_eq!(context.background_workflow_count(), 0);
+        assert!(context.workflow_ipc().is_none());
+        assert_eq!(
+            context.lifecycle().unwrap().run_id(),
+            "agent-loop-execution"
+        );
+    }
+
+    #[test]
+    fn agent_conversation_context_groups_history_inputs() {
+        let cwd = tempfile::tempdir().unwrap();
+        let mut writer = SessionStore::new()
+            .start_writer(
+                cwd.path(),
+                "test-provider",
+                Some("test-model".to_string()),
+                "agent-conversation-context",
+            )
+            .unwrap();
+        let mut conversation = Conversation::new();
+        conversation.add_system("system".to_string());
+
+        let context = AgentConversationContext::new()
+            .with_history_writer(Some(&mut writer))
+            .with_conversation(Some(&mut conversation));
+
+        assert!(context.resumed().is_none());
+        assert!(context.history_writer().is_some());
+        assert!(context.conversation().is_some());
+    }
+
+    #[test]
+    fn agent_tool_policy_context_groups_child_tool_policy() {
+        let allowed_tools = vec!["read".to_string(), "edit".to_string()];
+        let context =
+            AgentToolPolicyContext::new(Some(allowed_tools.as_slice()), Some("review-only"));
+
+        assert_eq!(context.allowed_tools().unwrap(), allowed_tools.as_slice());
+        assert_eq!(context.label(), Some("review-only"));
+    }
+
+    #[test]
+    fn tool_execution_context_groups_tool_services() {
+        let cwd = PathBuf::from("/tmp/orca-tool-execution-services");
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let registry = McpRegistry::default();
+        let hooks = HookRunner::default();
+        let policy = ApprovalPolicy::new(ApprovalMode::FullAuto);
+
+        let context = ToolExecutionContext::new(&cwd, 1, true, &policy).with_services(
+            &instructions,
+            &memory,
+            &registry,
+            &hooks,
+        );
+
+        assert_eq!(context.cwd(), cwd.as_path());
+        assert_eq!(context.subagent_depth(), 1);
+        assert!(context.emit_deltas());
+        assert!(std::ptr::eq(context.policy(), &policy));
+        assert!(std::ptr::eq(context.instructions(), &instructions));
+        assert!(std::ptr::eq(context.memory(), &memory));
+        assert!(std::ptr::eq(context.mcp_registry(), &registry));
+        assert!(std::ptr::eq(context.hooks(), &hooks));
+    }
+
+    #[test]
+    fn tool_execution_context_groups_runtime_state() {
+        let cwd = PathBuf::from("/tmp/orca-tool-execution-runtime");
+        let policy = ApprovalPolicy::new(ApprovalMode::FullAuto);
+        let mut cost_tracker = CostTracker::new(None);
+        let cancel = CancelToken::new();
+        let task_registry = TaskRegistry::new("tool-execution-runtime".to_string());
+        let mut background_workflows = Vec::new();
+
+        let context = ToolExecutionContext::new(&cwd, 0, false, &policy).with_runtime(
+            &mut cost_tracker,
+            &cancel,
+            &task_registry,
+            &mut background_workflows,
+            None,
+        );
+
+        assert_eq!(context.cost_tracker().totals().total_tokens(), 0);
+        assert!(std::ptr::eq(context.cancel(), &cancel));
+        assert!(std::ptr::eq(context.task_registry(), &task_registry));
+        assert_eq!(context.background_workflow_count(), 0);
+        assert!(context.workflow_ipc().is_none());
+    }
+
+    #[test]
+    fn tool_execution_actor_owns_runtime_tool_actor_state() {
+        let actor = ToolExecutionActor::new("tool-actor-run", DEFAULT_MAX_TURNS);
+        let task = actor.active_task().expect("active task");
+
+        assert_eq!(task.kind(), RuntimeTaskKind::Agent);
+        assert_eq!(task.status(), RuntimeTaskStatus::Running);
+    }
+
+    #[test]
+    fn tool_execution_actor_executes_normal_tool_from_context() {
+        let cwd = tempfile::tempdir().unwrap();
+        std::fs::write(cwd.path().join("tracked.txt"), "hello\n").unwrap();
+        let config = config(SubagentConfig::default());
+        let mut events = EventFactory::new("tool-actor-execute".to_string());
+        let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+        let request = tool_types::ToolRequest {
+            id: "read-file".to_string(),
+            name: tool_types::ToolName::ReadFile,
+            action: ActionKind::Read,
+            target: Some("tracked.txt".to_string()),
+            raw_arguments: Some(serde_json::json!({ "path": "tracked.txt" }).to_string()),
+        };
+        let policy = ApprovalPolicy::new(ApprovalMode::FullAuto);
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let registry = McpRegistry::default();
+        let hooks = HookRunner::default();
+        let mut cost_tracker = CostTracker::new(None);
+        let cancel = CancelToken::new();
+        let task_registry = TaskRegistry::new("tool-actor-execute".to_string());
+        let mut background_workflows = Vec::new();
+        let context = ToolExecutionContext::new(cwd.path(), 0, true, &policy)
+            .with_services(&instructions, &memory, &registry, &hooks)
+            .with_runtime(
+                &mut cost_tracker,
+                &cancel,
+                &task_registry,
+                &mut background_workflows,
+                None,
+            );
+
+        let mut actor = ToolExecutionActor::new(events.run_id().to_string(), DEFAULT_MAX_TURNS);
+        let (status, result) = actor
+            .execute(
+                &config,
+                &mut events,
+                &mut sink,
+                &request,
+                context,
+                execute_child_agent_loop,
+                execute_child_agent_loop,
+            )
+            .unwrap();
+
+        assert_eq!(status, RunStatus::Success);
+        assert_eq!(result.status, tool_types::ToolStatus::Completed);
+        assert_eq!(result.id, "read-file");
+    }
+
+    #[test]
+    fn tool_execution_actor_approval_allows_read_tool_to_continue() {
+        let config = config(SubagentConfig::default());
+        let mut events = EventFactory::new("tool-actor-approval".to_string());
+        let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+        let request = tool_types::ToolRequest {
+            id: "read-file".to_string(),
+            name: tool_types::ToolName::ReadFile,
+            action: ActionKind::Read,
+            target: Some("tracked.txt".to_string()),
+            raw_arguments: Some(serde_json::json!({ "path": "tracked.txt" }).to_string()),
+        };
+        let registry = McpRegistry::default();
+        let invocation = prepare_tool_invocation(&request, 0, &registry, &config);
+        let policy = ApprovalPolicy::new(ApprovalMode::FullAuto);
+
+        let mut actor = ToolExecutionActor::new(events.run_id().to_string(), DEFAULT_MAX_TURNS);
+        let result = actor
+            .handle_approval(
+                &config,
+                &mut events,
+                &mut sink,
+                &request,
+                &invocation,
+                &policy,
+                false,
+                true,
+            )
+            .unwrap();
+
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn tool_execution_actor_dispatches_normal_tool() {
+        let cwd = tempfile::tempdir().unwrap();
+        std::fs::write(cwd.path().join("tracked.txt"), "hello\n").unwrap();
+        let config = config(SubagentConfig::default());
+        let mut events = EventFactory::new("tool-actor-dispatch".to_string());
+        let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+        let request = tool_types::ToolRequest {
+            id: "read-file".to_string(),
+            name: tool_types::ToolName::ReadFile,
+            action: ActionKind::Read,
+            target: Some("tracked.txt".to_string()),
+            raw_arguments: Some(serde_json::json!({ "path": "tracked.txt" }).to_string()),
+        };
+        let registry = McpRegistry::default();
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let hooks = HookRunner::default();
+        let mut cost_tracker = CostTracker::new(None);
+        let cancel = CancelToken::new();
+        let task_registry = TaskRegistry::new("tool-actor-dispatch".to_string());
+        let mut background_workflows = Vec::new();
+        let mut permission_overlay = crate::lifecycle::TurnPermissionOverlay::default();
+
+        let mut actor = ToolExecutionActor::new(events.run_id().to_string(), DEFAULT_MAX_TURNS);
+        let result = actor
+            .dispatch_tool(
+                &config,
+                cwd.path(),
+                &mut events,
+                &mut sink,
+                &request,
+                0,
+                &instructions,
+                &memory,
+                &registry,
+                &hooks,
+                true,
+                &mut cost_tracker,
+                &cancel,
+                &task_registry,
+                &mut background_workflows,
+                None,
+                &mut permission_overlay,
+                None,
+                execute_child_agent_loop,
+                execute_child_agent_loop,
+            )
+            .unwrap();
+
+        assert_eq!(result.status, tool_types::ToolStatus::Completed);
     }
 }

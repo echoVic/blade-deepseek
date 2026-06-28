@@ -8,6 +8,7 @@ use crate::cost_types::UsageTotals;
 use crate::model::ModelRouteDecision;
 use crate::plan_types::UpdatePlanArgs;
 use crate::provider_types::ProviderReplayState;
+use crate::task_types::BackgroundTaskSummary;
 use crate::tool_types::{ToolRequest, ToolResult};
 use crate::verification::VerificationResult;
 
@@ -80,6 +81,8 @@ pub enum EventType {
     WorkflowFailed,
     #[serde(rename = "workflow.result.available")]
     WorkflowResultAvailable,
+    #[serde(rename = "workflow.tasks.updated")]
+    WorkflowTasksUpdated,
     #[serde(rename = "verification.started")]
     VerificationStarted,
     #[serde(rename = "verification.completed")]
@@ -224,7 +227,10 @@ impl EventFactory {
             json!({
                 "id": request.id,
                 "action": request.action,
-                "description": request.description
+                "description": request.description,
+                "tool": request.tool,
+                "target": request.target,
+                "preview": request.preview
             }),
         )
     }
@@ -247,7 +253,8 @@ impl EventFactory {
                 "id": request.id,
                 "name": request.name,
                 "action": request.action,
-                "target": request.target
+                "target": request.target,
+                "raw_arguments": request.raw_arguments
             }),
         )
     }
@@ -262,7 +269,8 @@ impl EventFactory {
                 "output": result.output,
                 "error": result.error,
                 "exit_code": result.exit_code,
-                "truncated": result.truncated
+                "truncated": result.truncated,
+                "kind": result.kind
             }),
         )
     }
@@ -359,6 +367,9 @@ impl EventFactory {
         &mut self,
         task_id: &str,
         run_id: &str,
+        workflow_name: &str,
+        tool_use_id: Option<&str>,
+        status: &str,
         result: &str,
     ) -> EventEnvelope {
         self.make(
@@ -366,18 +377,40 @@ impl EventFactory {
             json!({
                 "taskId": task_id,
                 "runId": run_id,
+                "workflowName": workflow_name,
+                "toolUseId": tool_use_id,
+                "status": status,
                 "result": result
             }),
         )
     }
 
-    pub fn workflow_failed(&mut self, task_id: &str, run_id: &str, error: &str) -> EventEnvelope {
+    pub fn workflow_failed(
+        &mut self,
+        task_id: &str,
+        run_id: &str,
+        workflow_name: &str,
+        tool_use_id: Option<&str>,
+        error: &str,
+    ) -> EventEnvelope {
         self.make(
             EventType::WorkflowFailed,
             json!({
                 "taskId": task_id,
                 "runId": run_id,
+                "workflowName": workflow_name,
+                "toolUseId": tool_use_id,
+                "status": "failed",
                 "error": error
+            }),
+        )
+    }
+
+    pub fn workflow_tasks_updated(&mut self, tasks: &[BackgroundTaskSummary]) -> EventEnvelope {
+        self.make(
+            EventType::WorkflowTasksUpdated,
+            json!({
+                "tasks": tasks
             }),
         )
     }
@@ -446,6 +479,7 @@ fn timestamp_ms() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::task_types::{BackgroundTaskSummary, TaskStatus, TaskType, WorkflowTaskProgress};
 
     #[test]
     fn factory_increments_seq() {
@@ -509,6 +543,100 @@ mod tests {
         let e = f.turn_started(2, None);
         assert_eq!(e.payload["turn"], 2);
         assert!(e.payload.get("prompt").is_none());
+    }
+
+    #[test]
+    fn approval_requested_payload_includes_display_metadata() {
+        let mut f = EventFactory::new("run-1".to_string());
+        let request = ApprovalRequest {
+            id: "approval-1".to_string(),
+            action: crate::approval_types::ActionKind::Shell,
+            description: "bash requested shell".to_string(),
+            tool: Some("bash".to_string()),
+            target: Some("echo hi".to_string()),
+            preview: Some("$ echo hi".to_string()),
+        };
+
+        let event = f.approval_requested(&request);
+
+        assert_eq!(event.event_type, EventType::ApprovalRequested);
+        assert_eq!(event.payload["id"], "approval-1");
+        assert_eq!(event.payload["action"], "shell");
+        assert_eq!(event.payload["description"], "bash requested shell");
+        assert_eq!(event.payload["tool"], "bash");
+        assert_eq!(event.payload["target"], "echo hi");
+        assert_eq!(event.payload["preview"], "$ echo hi");
+    }
+
+    #[test]
+    fn workflow_result_payload_includes_tui_notification_metadata() {
+        let mut f = EventFactory::new("run-1".to_string());
+
+        let event = f.workflow_result_available(
+            "task-1",
+            "workflow-run-1",
+            "mock-workflow",
+            Some("tool-use-1"),
+            "completed",
+            "all phases passed",
+        );
+
+        assert_eq!(event.event_type, EventType::WorkflowResultAvailable);
+        assert_eq!(event.payload["taskId"], "task-1");
+        assert_eq!(event.payload["runId"], "workflow-run-1");
+        assert_eq!(event.payload["workflowName"], "mock-workflow");
+        assert_eq!(event.payload["toolUseId"], "tool-use-1");
+        assert_eq!(event.payload["status"], "completed");
+        assert_eq!(event.payload["result"], "all phases passed");
+    }
+
+    #[test]
+    fn workflow_tasks_updated_payload_includes_task_summaries() {
+        let mut f = EventFactory::new("run-1".to_string());
+        let task = BackgroundTaskSummary {
+            id: "task-1".to_string(),
+            task_type: TaskType::Workflow,
+            status: TaskStatus::Running,
+            description: "demo workflow".to_string(),
+            created_at_ms: 10,
+            started_at_ms: Some(20),
+            completed_at_ms: None,
+            command: None,
+            agent_type: None,
+            server: None,
+            tool: Some("workflow".to_string()),
+            name: Some("demo".to_string()),
+            workflow_run_id: Some("workflow-run-1".to_string()),
+            phase_count: Some(2),
+            workflow_progress: Some(WorkflowTaskProgress {
+                total_agents: 3,
+                running_agents: 1,
+                completed_agents: 2,
+                failed_agents: 0,
+                completed_phases: 1,
+                running_phases: 1,
+                failed_phases: 0,
+            }),
+            workflow_phases: Vec::new(),
+            workflow_agents: Vec::new(),
+            workflow_script_path: Some("workflow.md".to_string()),
+            workflow_launch_input: None,
+            workflow_final_summary: None,
+            workflow_failure_count: 0,
+            usage: None,
+        };
+
+        let event = f.workflow_tasks_updated(&[task]);
+
+        assert_eq!(event.event_type, EventType::WorkflowTasksUpdated);
+        assert_eq!(event.payload["tasks"][0]["id"], "task-1");
+        assert_eq!(event.payload["tasks"][0]["type"], "workflow");
+        assert_eq!(event.payload["tasks"][0]["status"], "running");
+        assert_eq!(event.payload["tasks"][0]["workflowRunId"], "workflow-run-1");
+        assert_eq!(
+            event.payload["tasks"][0]["workflowProgress"]["completedAgents"],
+            2
+        );
     }
 
     #[test]

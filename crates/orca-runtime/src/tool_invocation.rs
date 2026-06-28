@@ -147,6 +147,9 @@ pub fn approval_request_for_invocation(invocation: &ToolInvocation) -> Option<Ap
             invocation.requested.name.as_str(),
             action.as_str()
         ),
+        tool: Some(invocation.requested.name.as_str().to_string()),
+        target: invocation.requested.target.clone(),
+        preview: None,
     })
 }
 
@@ -188,9 +191,13 @@ mod tests {
             verifier: None,
             history_mode: HistoryMode::Disabled,
             show_session_picker: false,
+            active_permission_profile: None,
+            permission_profiles: Default::default(),
+            runtime_workspace_roots: None,
             theme: ThemeName::Dark,
             mcp_servers: Vec::new(),
             permission_rules: PermissionRules::default(),
+            additional_working_directories: Vec::new(),
             hooks: Vec::new(),
             workflows: WorkflowConfig::default(),
             subagents: SubagentConfig {
@@ -235,6 +242,9 @@ mod tests {
         assert_eq!(approval.action, ActionKind::Shell);
         assert_eq!(approval.id, "approval-tool-1");
         assert_eq!(approval.description, "bash requested shell");
+        assert_eq!(approval.tool, Some("bash".to_string()));
+        assert_eq!(approval.target, Some("echo hi".to_string()));
+        assert_eq!(approval.preview, None);
     }
 
     #[test]

@@ -19,14 +19,20 @@ use orca_core::task_types::{TaskType, WorkflowPhaseTaskSummary, WorkflowTaskProg
 use orca_core::workflow_types::{
     WorkflowAgentStatus, WorkflowEvidenceIdentity, WorkflowEvidenceToolEvent, WorkflowInput,
     WorkflowOutput, WorkflowPhaseRecord, WorkflowRunState, WorkflowRunStatus,
+    WorkflowTaskLifecycleEvidence,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::agent_child::{ChildAgentRequest, ChildAgentRuntime, run_child_agent};
-use crate::controller::execute_child_agent_loop;
+use crate::agent_child::{
+    ChildAgentExecutor, ChildAgentRequest, ChildAgentRuntime, run_child_agent,
+};
+use crate::agent_loop::execute_child_agent_loop;
 use crate::hooks::HookRunner;
 use crate::instructions;
+use crate::lifecycle::{
+    RuntimeSessionLifecycle, RuntimeTaskKind, RuntimeTaskLifecycle, RuntimeTaskStatus,
+};
 use crate::memory;
 use crate::schema_validation::validate_json_schema_subset;
 use crate::tasks::TaskRegistry;
@@ -115,6 +121,7 @@ pub struct WorkflowRunner {
     tasks: TaskRegistry,
     session_dir: PathBuf,
     state: WorkflowStateStore,
+    child_executor: ChildAgentExecutor<SharedEventBuffer>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -139,6 +146,7 @@ struct WorkflowChildAgentCallOutput {
     usage: UsageTotals,
     worktree: Option<WorktreeOutcome>,
     tool_events: Vec<WorkflowEvidenceToolEvent>,
+    task: Option<WorkflowTaskLifecycleEvidence>,
 }
 
 #[derive(Clone, Debug)]
@@ -147,6 +155,7 @@ struct WorkflowChildAgentCallError {
     usage: Option<UsageTotals>,
     retryable: bool,
     tool_events: Vec<WorkflowEvidenceToolEvent>,
+    task: Option<WorkflowTaskLifecycleEvidence>,
 }
 
 #[derive(Clone, Debug)]
@@ -164,12 +173,13 @@ impl From<io::Error> for WorkflowChildAgentCallError {
             usage: None,
             retryable: true,
             tool_events: Vec::new(),
+            task: None,
         }
     }
 }
 
 #[derive(Clone, Default)]
-struct SharedEventBuffer {
+pub(crate) struct SharedEventBuffer {
     bytes: Arc<Mutex<Vec<u8>>>,
 }
 
@@ -277,7 +287,16 @@ impl WorkflowRunner {
             tasks,
             session_dir,
             state,
+            child_executor: execute_child_agent_loop,
         }
+    }
+
+    pub(crate) fn with_child_executor(
+        mut self,
+        child_executor: ChildAgentExecutor<SharedEventBuffer>,
+    ) -> Self {
+        self.child_executor = child_executor;
+        self
     }
 
     pub fn launch(&self, request: WorkflowLaunchRequest) -> io::Result<WorkflowLaunchResult> {
@@ -672,6 +691,7 @@ impl WorkflowRunner {
                             started_at_ms: Some(now_ms()),
                             completed_at_ms: Some(now_ms()),
                             usage: None,
+                            task: None,
                             tool_events: Vec::new(),
                         },
                     )?;
@@ -704,6 +724,7 @@ impl WorkflowRunner {
                         started_at_ms: Some(now_ms()),
                         completed_at_ms: Some(now_ms()),
                         usage: None,
+                        task: None,
                         tool_events: Vec::new(),
                     },
                 )?;
@@ -759,6 +780,7 @@ impl WorkflowRunner {
                     started_at_ms: Some(started_at_ms),
                     completed_at_ms: None,
                     usage: None,
+                    task: None,
                     tool_events: Vec::new(),
                 },
             )?;
@@ -772,6 +794,7 @@ impl WorkflowRunner {
             match self.run_child_agent_call(&call, workflow_ipc, &execution_policy) {
                 Ok(child_output) => {
                     let completed_at_ms = now_ms();
+                    let child_task = child_output.task.clone();
                     let mut output = child_agent_output(&call.prompt, &child_output.message);
                     append_worktree_outcome(&mut output, child_output.worktree.as_ref());
                     let transcript_path =
@@ -797,6 +820,7 @@ impl WorkflowRunner {
                                 started_at_ms: Some(started_at_ms),
                                 completed_at_ms: Some(completed_at_ms),
                                 usage: Some(child_output.usage),
+                                task: child_task,
                                 tool_events: child_output.tool_events,
                             },
                         )?;
@@ -828,6 +852,7 @@ impl WorkflowRunner {
                             started_at_ms: Some(started_at_ms),
                             completed_at_ms: Some(completed_at_ms),
                             usage: Some(child_output.usage),
+                            task: child_task,
                             tool_events: child_output.tool_events,
                         },
                     )?;
@@ -848,6 +873,7 @@ impl WorkflowRunner {
                         usage,
                         retryable,
                         tool_events,
+                        task,
                     } = error;
                     let transcript_path =
                         write_agent_transcript(transcript_dir, &call, &error_message, false)?;
@@ -870,6 +896,7 @@ impl WorkflowRunner {
                             started_at_ms: Some(started_at_ms),
                             completed_at_ms: Some(completed_at_ms),
                             usage,
+                            task,
                             tool_events,
                         },
                     )?;
@@ -964,6 +991,9 @@ impl WorkflowRunner {
             tool_policy_label: execution_policy.tool_policy_label.clone(),
             workflow_ipc: Some(workflow_ipc.for_sender(call.call_path.clone())),
         };
+        let mut lifecycle =
+            RuntimeSessionLifecycle::new(format!("workflow-child-{}", call.call_id));
+        lifecycle.start_task(RuntimeTaskKind::Subagent);
         let mut runtime = ChildAgentRuntime::new(
             child_cwd,
             &mut events,
@@ -973,11 +1003,20 @@ impl WorkflowRunner {
             &mcp_registry,
             &hooks,
             &cancel,
-            execute_child_agent_loop,
+            Some(&mut lifecycle),
+            self.child_executor,
         );
         let (result, child_cost_tracker) =
             run_child_agent(&workflow_child_config, &child_request, &mut runtime);
         drop(runtime);
+        let task = lifecycle
+            .finish_task(result.status)
+            .map(workflow_task_lifecycle_evidence)
+            .or_else(|| {
+                lifecycle
+                    .active_task()
+                    .map(workflow_task_lifecycle_evidence)
+            });
         let usage = child_cost_tracker.totals();
         let tool_events = parse_child_tool_events(&event_buffer.content());
         let worktree = worktree_guard.map(WorktreeGuard::finish).transpose()?;
@@ -996,6 +1035,7 @@ impl WorkflowRunner {
                             usage: Some(usage),
                             retryable: false,
                             tool_events,
+                            task,
                         });
                     }
                 }
@@ -1004,6 +1044,7 @@ impl WorkflowRunner {
                     usage,
                     worktree,
                     tool_events,
+                    task,
                 })
             }
             _ => {
@@ -1018,6 +1059,7 @@ impl WorkflowRunner {
                     usage: Some(usage),
                     retryable,
                     tool_events,
+                    task,
                 })
             }
         }
@@ -1250,6 +1292,29 @@ fn call_path_matches_phase(call_path: &str, restart_phase: Option<&str>) -> bool
         return call_path == restart_phase;
     };
     phase == restart_phase || phase.strip_prefix("phases.") == Some(restart_phase)
+}
+
+fn workflow_task_lifecycle_evidence(task: &RuntimeTaskLifecycle) -> WorkflowTaskLifecycleEvidence {
+    WorkflowTaskLifecycleEvidence {
+        task_id: task.id().to_string(),
+        kind: match task.kind() {
+            RuntimeTaskKind::Agent => "agent",
+            RuntimeTaskKind::Workflow => "workflow",
+            RuntimeTaskKind::Subagent => "subagent",
+            RuntimeTaskKind::Shell => "shell",
+        }
+        .to_string(),
+        status: match task.status() {
+            RuntimeTaskStatus::Running => "running",
+            RuntimeTaskStatus::Succeeded => "succeeded",
+            RuntimeTaskStatus::Failed => "failed",
+            RuntimeTaskStatus::Cancelled => "cancelled",
+            RuntimeTaskStatus::ApprovalRequired => "approval_required",
+            RuntimeTaskStatus::BudgetExhausted => "budget_exhausted",
+        }
+        .to_string(),
+        turn: task.current_turn(),
+    }
 }
 
 fn parse_child_tool_events(bytes: &[u8]) -> Vec<WorkflowEvidenceToolEvent> {
@@ -1652,9 +1717,12 @@ fn child_agent_output(prompt: &str, final_message: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent_child::ChildAgentResult;
+    use crate::cost::CostTracker;
     use orca_core::config::{HistoryMode, OutputFormat, ProviderKind, ToolConfig, WorkflowConfig};
     use orca_core::mcp_types::McpServerConfig;
     use orca_core::model::ModelSelection;
+    use tempfile::tempdir;
 
     #[test]
     fn workflow_child_config_defaults_to_autoedit_approval_mode() {
@@ -1718,6 +1786,59 @@ mod tests {
         );
     }
 
+    #[test]
+    fn workflow_child_agent_call_uses_injected_child_executor() {
+        let temp = tempdir().unwrap();
+        let mut config = test_run_config();
+        config.cwd = Some(temp.path().to_path_buf());
+        let runner = WorkflowRunner::new(
+            config,
+            TaskRegistry::new("workflow-injected-child".to_string()),
+            temp.path().join("session"),
+        )
+        .with_child_executor(fake_workflow_child_executor);
+        let workflow_ipc = WorkflowIpcContext::new();
+        let policy = WorkflowAgentExecutionPolicy {
+            max_agent_retries: 1,
+            max_agent_tokens: None,
+            allowed_tools: Some(vec!["shell".to_string()]),
+            tool_policy_label: Some("test-policy".to_string()),
+        };
+        let call = AgentCall {
+            call_id: "call-1".to_string(),
+            call_path: "agent-a".to_string(),
+            phase: Some("phase-a".to_string()),
+            prompt: "inspect injected runner".to_string(),
+            opts: serde_json::json!({}),
+        };
+
+        let output = runner
+            .run_child_agent_call(&call, &workflow_ipc, &policy)
+            .expect("injected child executor should satisfy workflow agent call");
+
+        assert_eq!(output.message, "injected workflow child result");
+    }
+
+    fn fake_workflow_child_executor(
+        _config: &RunConfig,
+        request: &ChildAgentRequest,
+        _runtime: &mut ChildAgentRuntime<'_, SharedEventBuffer>,
+        _cost_tracker: &mut CostTracker,
+    ) -> io::Result<ChildAgentResult> {
+        assert_eq!(request.prompt, "inspect injected runner");
+        assert_eq!(
+            request.allowed_tools.as_ref().map(|tools| tools.as_slice()),
+            Some(vec!["shell".to_string()].as_slice())
+        );
+        assert_eq!(request.tool_policy_label.as_deref(), Some("test-policy"));
+        assert!(request.workflow_ipc.is_some());
+        Ok(ChildAgentResult {
+            status: RunStatus::Success,
+            final_message: Some("injected workflow child result".to_string()),
+            error: None,
+        })
+    }
+
     fn test_run_config() -> RunConfig {
         RunConfig {
             app_version: "0.0.0-test".to_string(),
@@ -1736,7 +1857,11 @@ mod tests {
             external_tools: Vec::new(),
             history_mode: HistoryMode::Disabled,
             show_session_picker: false,
+            active_permission_profile: None,
+            permission_profiles: Default::default(),
+            runtime_workspace_roots: None,
             permission_rules: Default::default(),
+            additional_working_directories: Vec::new(),
             max_budget_usd: None,
             subagents: Default::default(),
             tools: ToolConfig::default(),

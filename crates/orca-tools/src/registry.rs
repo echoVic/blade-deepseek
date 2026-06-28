@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::time::Duration;
 
@@ -62,7 +62,9 @@ pub struct ToolContext<'a> {
     pub cwd: &'a Path,
     pub output_truncation: ToolOutputTruncation,
     pub shell_timeout: Duration,
+    pub additional_working_directories: Vec<PathBuf>,
     pub mcp_registry: Option<&'a McpRegistry>,
+    pub should_cancel: Option<&'a dyn Fn() -> bool>,
 }
 
 impl<'a> ToolContext<'a> {
@@ -71,7 +73,9 @@ impl<'a> ToolContext<'a> {
             cwd,
             output_truncation: ToolOutputTruncation::bytes(MAX_TOOL_OUTPUT_BYTES),
             shell_timeout: Duration::from_secs(120),
+            additional_working_directories: Vec::new(),
             mcp_registry: None,
+            should_cancel: None,
         }
     }
 
@@ -85,6 +89,14 @@ impl<'a> ToolContext<'a> {
         self
     }
 
+    pub fn with_additional_working_directories(
+        mut self,
+        directories: impl IntoIterator<Item = PathBuf>,
+    ) -> Self {
+        self.additional_working_directories = directories.into_iter().collect();
+        self
+    }
+
     pub fn max_output_bytes(&self) -> usize {
         match self.output_truncation {
             ToolOutputTruncation::Bytes { limit } => limit,
@@ -95,6 +107,16 @@ impl<'a> ToolContext<'a> {
     pub fn with_mcp(mut self, mcp_registry: &'a McpRegistry) -> Self {
         self.mcp_registry = Some(mcp_registry);
         self
+    }
+
+    pub fn with_cancel(mut self, should_cancel: &'a dyn Fn() -> bool) -> Self {
+        self.should_cancel = Some(should_cancel);
+        self
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.should_cancel
+            .is_some_and(|should_cancel| should_cancel())
     }
 }
 
@@ -604,6 +626,49 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
     ));
     registry.register(BuiltinTool::new(
         builtin_spec(
+            "task_list",
+            "List background tasks in the current session, including shell, workflow, and subagent work.",
+            json!({
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "additionalProperties": false
+            }),
+            CapabilitySet::new(vec![ToolCapability::TaskRead]),
+            ToolExposure::Direct,
+            RendererHint::Agent,
+            true,
+        ),
+        BuiltinExecutor::TaskList,
+    ));
+    registry.register(BuiltinTool::new(
+        builtin_spec(
+            "task_stop",
+            "Request that a running background task stop. Prefer task_id; shell_id is accepted as a deprecated compatibility alias.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "task_id": {
+                        "type": "string",
+                        "description": "Task id returned by task_list or shell/start"
+                    },
+                    "shell_id": {
+                        "type": "string",
+                        "description": "Deprecated alias accepted for package 3 compatibility"
+                    }
+                },
+                "required": [],
+                "additionalProperties": false
+            }),
+            CapabilitySet::new(vec![ToolCapability::TaskControl]),
+            ToolExposure::Direct,
+            RendererHint::Agent,
+            false,
+        ),
+        BuiltinExecutor::TaskStop,
+    ));
+    registry.register(BuiltinTool::new(
+        builtin_spec(
             "WorkflowDraft",
             "Create a previewable dynamic workflow draft from a JavaScript workflow script without launching it. Use this before Workflow when the user should review phases and raw script first.",
             json!({
@@ -1041,6 +1106,73 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
     ));
     registry.register(BuiltinTool::new(
         builtin_spec(
+            "request_permissions",
+            "Request additional permissions for the current turn. Compatible with Codex permission profiles; granted fileSystem.write roots are temporary and do not persist to thread metadata.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "reason": {
+                        "type": "string",
+                        "description": "Why the additional permission is required"
+                    },
+                    "permissions": {
+                        "type": "object",
+                        "properties": {
+                            "fileSystem": {
+                                "type": ["object", "null"],
+                                "properties": {
+                                    "read": {
+                                        "type": ["array", "null"],
+                                        "items": { "type": "string" }
+                                    },
+                                    "write": {
+                                        "type": ["array", "null"],
+                                        "items": { "type": "string" }
+                                    },
+                                    "globScanMaxDepth": {
+                                        "type": "integer"
+                                    },
+                                    "entries": {
+                                        "type": "array",
+                                        "items": {
+                                            "type": "object",
+                                            "properties": {
+                                                "path": { "type": "string" },
+                                                "access": {
+                                                    "type": "string",
+                                                    "enum": ["read", "write", "readWrite"]
+                                                }
+                                            },
+                                            "required": ["path", "access"],
+                                            "additionalProperties": false
+                                        }
+                                    }
+                                },
+                                "additionalProperties": false
+                            },
+                            "network": {
+                                "type": ["object", "null"],
+                                "properties": {
+                                    "enabled": { "type": ["boolean", "null"] }
+                                },
+                                "additionalProperties": false
+                            }
+                        },
+                        "additionalProperties": false
+                    }
+                },
+                "required": ["reason", "permissions"],
+                "additionalProperties": false
+            }),
+            CapabilitySet::new(vec![ToolCapability::PermissionRequest]),
+            ToolExposure::Direct,
+            RendererHint::State,
+            false,
+        ),
+        BuiltinExecutor::RequestPermissions,
+    ));
+    registry.register(BuiltinTool::new(
+        builtin_spec(
             "request_user_input",
             "Ask the user a structured clarification question. Use only when progress requires user input; headless runs return a deterministic failure instead of blocking.",
             json!({
@@ -1151,11 +1283,13 @@ impl Tool for BuiltinTool {
             }
             BuiltinExecutor::Glob => glob::execute(request, ctx.cwd, ctx.max_output_bytes()),
             BuiltinExecutor::Grep => grep::execute(request, ctx.cwd, ctx.max_output_bytes()),
-            BuiltinExecutor::Bash => bash::execute_with_policy(
+            BuiltinExecutor::Bash => bash::execute_with_policy_roots_or_cancel(
                 request,
                 ctx.cwd,
+                &ctx.additional_working_directories,
                 ctx.output_truncation,
                 ctx.shell_timeout,
+                || ctx.is_cancelled(),
             ),
             BuiltinExecutor::Edit => edit::execute(request, ctx.cwd),
             BuiltinExecutor::WriteFile => write_file::execute(request, ctx.cwd),
@@ -1169,6 +1303,16 @@ impl Tool for BuiltinTool {
             BuiltinExecutor::SubagentStatus => ToolResult::failed(
                 request,
                 "subagent_status tool must be executed by the runtime",
+                None,
+            ),
+            BuiltinExecutor::TaskList => ToolResult::failed(
+                request,
+                "task_list tool must be executed by the runtime",
+                None,
+            ),
+            BuiltinExecutor::TaskStop => ToolResult::failed(
+                request,
+                "task_stop tool must be executed by the runtime",
                 None,
             ),
             BuiltinExecutor::WorkflowDraft => ToolResult::failed(
@@ -1203,6 +1347,11 @@ impl Tool for BuiltinTool {
             BuiltinExecutor::UpdatePlan => update_plan::execute(request),
             BuiltinExecutor::ListSkills => skills::execute_list(request, ctx.cwd),
             BuiltinExecutor::ReadSkill => skills::execute_read(request, ctx.cwd),
+            BuiltinExecutor::RequestPermissions => ToolResult::failed(
+                request,
+                "request_permissions must be executed by the runtime",
+                None,
+            ),
             BuiltinExecutor::RequestUserInput => ToolResult::failed(
                 request,
                 "request_user_input requires an interactive TUI session",
@@ -1224,6 +1373,8 @@ enum BuiltinExecutor {
     WebSearch,
     Subagent,
     SubagentStatus,
+    TaskList,
+    TaskStop,
     WorkflowDraft,
     WorkflowDraftAction,
     Workflow,
@@ -1240,6 +1391,7 @@ enum BuiltinExecutor {
     UpdatePlan,
     ListSkills,
     ReadSkill,
+    RequestPermissions,
     RequestUserInput,
 }
 
@@ -1307,7 +1459,13 @@ impl Tool for McpProxyTool {
             }
         };
 
-        match registry.call_tool(&tool_ref, arguments) {
+        let call_result = if ctx.should_cancel.is_some() {
+            registry.call_tool_or_cancel(&tool_ref, arguments, &|| ctx.is_cancelled())
+        } else {
+            registry.call_tool(&tool_ref, arguments)
+        };
+
+        match call_result {
             Ok(result) if result.is_error => ToolResult::failed(request, result.output, None),
             Ok(result) => ToolResult::completed(request, result.output, false),
             Err(error) => ToolResult::failed(request, error, None),
@@ -1348,12 +1506,13 @@ impl Tool for ExternalTool {
     }
 
     fn execute(&self, request: &ToolRequest, ctx: &ToolContext<'_>) -> ToolResult {
-        external::execute_external_tool_with_policy(
+        external::execute_external_tool_with_policy_or_cancel(
             &self.tool,
             request,
             ctx.cwd,
             ctx.output_truncation,
             ctx.shell_timeout,
+            || ctx.is_cancelled(),
         )
     }
 }
@@ -1464,6 +1623,87 @@ mod tests {
                 .expect("workflow_list_tasks tool")
                 .action_kind(),
             ActionKind::Read
+        );
+    }
+
+    #[test]
+    fn package3_task_tools_are_model_visible_with_safe_action_kinds() {
+        let registry = default_tool_registry();
+
+        let task_list = registry.get("task_list").expect("task_list tool");
+        assert_eq!(task_list.action_kind(), ActionKind::Read);
+        assert!(task_list.spec().exposure.is_model_visible());
+        assert!(task_list.is_concurrent_safe(&request(ToolName::TaskList, "{}")));
+
+        let task_stop = registry.get("task_stop").expect("task_stop tool");
+        assert_eq!(task_stop.action_kind(), ActionKind::Write);
+        assert!(task_stop.spec().exposure.is_model_visible());
+        assert!(
+            !task_stop.is_concurrent_safe(&request(ToolName::TaskStop, r#"{"task_id":"task-1"}"#))
+        );
+        assert!(
+            task_stop
+                .spec()
+                .input_schema
+                .get("properties")
+                .and_then(Value::as_object)
+                .expect("properties")
+                .contains_key("shell_id"),
+            "task_stop should accept package 3's deprecated shell_id alias"
+        );
+    }
+
+    #[test]
+    fn request_permissions_tool_is_model_visible_runtime_special() {
+        let registry = default_tool_registry();
+
+        let tool = registry
+            .get("request_permissions")
+            .expect("request_permissions tool");
+        assert_eq!(tool.action_kind(), ActionKind::Write);
+        assert!(tool.spec().exposure.is_model_visible());
+        assert!(!tool.is_concurrent_safe(&request(
+            ToolName::RequestPermissions,
+            r#"{"reason":"write generated files","permissions":{"fileSystem":{"write":["/tmp/orca-extra"]}}}"#
+        )));
+        assert!(
+            tool.spec()
+                .input_schema
+                .pointer("/properties/permissions/properties/fileSystem/properties/write")
+                .is_some(),
+            "schema should expose Codex-style fileSystem.write permission requests"
+        );
+        assert_eq!(
+            tool.spec()
+                .input_schema
+                .pointer("/properties/permissions/properties/fileSystem/properties/entries/items/properties/access/enum")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+            vec![json!("read"), json!("write"), json!("readWrite")],
+            "schema should expose Codex-style fileSystem.entries access modes"
+        );
+    }
+
+    #[test]
+    fn request_permissions_schema_accepts_null_overlay_sections() {
+        let registry = default_tool_registry();
+        let result = registry.execute(
+            &request(
+                ToolName::RequestPermissions,
+                r#"{"reason":"temporary write","permissions":{"fileSystem":{"read":null,"write":["/tmp/orca-extra"]},"network":null}}"#,
+            ),
+            &ToolContext::new(Path::new(".")),
+        );
+
+        assert!(
+            !result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("tool arguments failed schema validation"),
+            "schema should accept Codex-style null overlay sections: {:?}",
+            result.error
         );
     }
 }

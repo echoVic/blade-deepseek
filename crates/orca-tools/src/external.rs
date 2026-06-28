@@ -91,6 +91,24 @@ pub fn execute_external_tool_with_policy(
     output_truncation: ToolOutputTruncation,
     shell_timeout: Duration,
 ) -> ToolResult {
+    execute_external_tool_with_policy_or_cancel(
+        config,
+        request,
+        cwd,
+        output_truncation,
+        shell_timeout,
+        || false,
+    )
+}
+
+pub fn execute_external_tool_with_policy_or_cancel(
+    config: &ExternalToolConfig,
+    request: &ToolRequest,
+    cwd: &Path,
+    output_truncation: ToolOutputTruncation,
+    shell_timeout: Duration,
+    should_cancel: impl Fn() -> bool,
+) -> ToolResult {
     let args = request.raw_arguments.as_deref().unwrap_or("{}");
     let mut command = Command::new("sh");
     command
@@ -132,7 +150,11 @@ pub fn execute_external_tool_with_policy(
         }
     }
 
-    let output = match process::wait_for_child_output_with_timeout(child, shell_timeout) {
+    let output = match process::wait_for_child_output_with_timeout_or_cancel(
+        child,
+        shell_timeout,
+        &should_cancel,
+    ) {
         Ok(output) => output,
         Err(error) => {
             return ToolResult::failed(
@@ -145,6 +167,22 @@ pub fn execute_external_tool_with_policy(
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if should_cancel() {
+        let detail = if stderr.is_empty() {
+            stdout.trim().to_string()
+        } else {
+            stderr
+        };
+        return ToolResult::failed(
+            request,
+            if detail.is_empty() {
+                format!("external tool '{}' cancelled", config.name)
+            } else {
+                format!("external tool '{}' cancelled: {detail}", config.name)
+            },
+            output.status.code(),
+        );
+    }
     if output.status.success() && !output.timed_out {
         let (output, truncated) = truncate_output_with_policy(stdout, output_truncation);
         return ToolResult::completed(request, output, truncated);
@@ -241,6 +279,50 @@ mod tests {
                 .as_deref()
                 .unwrap_or_default()
                 .contains("external tool 'slow_tool' timed out after 0s: before"),
+            "unexpected error: {:?}",
+            result.error
+        );
+    }
+
+    #[test]
+    fn external_tool_wait_observes_cancel_callback() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = ExternalToolConfig {
+            name: "slow_tool".to_string(),
+            description: "slow tool".to_string(),
+            action_kind: ActionKind::Shell,
+            command: "printf before; sleep 5; printf after".to_string(),
+            schema: serde_json::json!({}),
+        };
+        let request = ToolRequest {
+            id: "external-1".to_string(),
+            name: ToolName::External("slow_tool".to_string()),
+            action: ActionKind::Shell,
+            target: None,
+            raw_arguments: Some("{}".to_string()),
+        };
+        let start = Instant::now();
+
+        let result = execute_external_tool_with_policy_or_cancel(
+            &config,
+            &request,
+            dir.path(),
+            ToolOutputTruncation::bytes(1024),
+            Duration::from_secs(30),
+            || start.elapsed() >= Duration::from_millis(100),
+        );
+
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "cancelled external tool should not wait for the shell timeout"
+        );
+        assert_eq!(result.status, ToolStatus::Failed);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("external tool 'slow_tool' cancelled"),
             "unexpected error: {:?}",
             result.error
         );

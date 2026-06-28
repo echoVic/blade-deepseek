@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::Mutex;
+use std::sync::mpsc;
+use std::time::Duration;
 
 use serde_json::{Value, json};
 
@@ -22,12 +24,14 @@ pub fn connect(config: &McpServerConfig) -> Result<Box<dyn McpTransport>, String
 
 struct StdioTransport {
     state: Mutex<StdioState>,
+    startup_timeout: Duration,
+    tool_timeout: Duration,
 }
 
 struct StdioState {
     _child: Child,
     stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    responses: mpsc::Receiver<Result<Value, String>>,
     next_id: u64,
 }
 
@@ -62,21 +66,40 @@ impl StdioTransport {
             .stdout
             .take()
             .ok_or_else(|| format!("failed to open stdout for MCP server '{}'", config.name))?;
+        let (response_tx, responses) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut stdout = BufReader::new(stdout);
+            loop {
+                match read_json_line(&mut stdout) {
+                    Ok(value) => {
+                        if response_tx.send(Ok(value)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = response_tx.send(Err(error));
+                        break;
+                    }
+                }
+            }
+        });
 
         Ok(Self {
             state: Mutex::new(StdioState {
                 _child: child,
                 stdin,
-                stdout: BufReader::new(stdout),
+                responses,
                 next_id: 1,
             }),
+            startup_timeout: timeout_from_ms(config.startup_timeout_ms),
+            tool_timeout: timeout_from_ms(config.tool_timeout_ms),
         })
     }
 }
 
 impl McpTransport for StdioTransport {
     fn initialize(&self) -> Result<(), String> {
-        let _ = self.request(
+        let _ = self.request_with_timeout(
             "initialize",
             json!({
                 "protocolVersion": "2024-11-05",
@@ -86,27 +109,34 @@ impl McpTransport for StdioTransport {
                     "version": env!("CARGO_PKG_VERSION")
                 }
             }),
+            self.startup_timeout,
         )?;
         self.notify("notifications/initialized", json!({}))
     }
 
     fn list_tools(&self) -> Result<Value, String> {
-        self.request("tools/list", json!({}))
+        self.request_with_timeout("tools/list", json!({}), self.startup_timeout)
     }
 
     fn call_tool(&self, name: &str, arguments: Value) -> Result<Value, String> {
-        self.request(
+        self.request_with_timeout(
             "tools/call",
             json!({
                 "name": name,
                 "arguments": arguments
             }),
+            self.tool_timeout,
         )
     }
 }
 
 impl StdioTransport {
-    fn request(&self, method: &str, params: Value) -> Result<Value, String> {
+    fn request_with_timeout(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value, String> {
         let mut state = self
             .state
             .lock()
@@ -122,7 +152,7 @@ impl StdioTransport {
         });
         write_json_line(&mut state.stdin, &message)?;
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let deadline = std::time::Instant::now() + timeout;
         let mut iterations = 0u32;
         loop {
             if iterations >= 1000 {
@@ -131,11 +161,29 @@ impl StdioTransport {
                 ));
             }
             if std::time::Instant::now() >= deadline {
-                return Err(format!("MCP request '{method}' timed out after 30s"));
+                let _ = state._child.kill();
+                return Err(format!(
+                    "MCP request '{method}' timed out after {}",
+                    format_duration(timeout)
+                ));
             }
             iterations += 1;
 
-            let response = read_json_line(&mut state.stdout)?;
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let response = match state.responses.recv_timeout(remaining) {
+                Ok(Ok(response)) => response,
+                Ok(Err(error)) => return Err(error),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    let _ = state._child.kill();
+                    return Err(format!(
+                        "MCP request '{method}' timed out after {}",
+                        format_duration(timeout)
+                    ));
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err("MCP stdio reader stopped before returning".to_string());
+                }
+            };
             if response.get("id").and_then(Value::as_u64) != Some(id) {
                 continue;
             }
@@ -190,6 +238,8 @@ struct SseTransport {
     headers: HashMap<String, String>,
     next_id: Mutex<u64>,
     client: reqwest::blocking::Client,
+    startup_timeout: Duration,
+    tool_timeout: Duration,
 }
 
 impl SseTransport {
@@ -204,13 +254,15 @@ impl SseTransport {
             headers: config.headers.clone(),
             next_id: Mutex::new(1),
             client,
+            startup_timeout: timeout_from_ms(config.startup_timeout_ms),
+            tool_timeout: timeout_from_ms(config.tool_timeout_ms),
         })
     }
 }
 
 impl McpTransport for SseTransport {
     fn initialize(&self) -> Result<(), String> {
-        let _ = self.request(
+        let _ = self.request_with_timeout(
             "initialize",
             json!({
                 "protocolVersion": "2024-11-05",
@@ -220,21 +272,23 @@ impl McpTransport for SseTransport {
                     "version": env!("CARGO_PKG_VERSION")
                 }
             }),
+            self.startup_timeout,
         )?;
         self.notify("notifications/initialized", json!({}))
     }
 
     fn list_tools(&self) -> Result<Value, String> {
-        self.request("tools/list", json!({}))
+        self.request_with_timeout("tools/list", json!({}), self.startup_timeout)
     }
 
     fn call_tool(&self, name: &str, arguments: Value) -> Result<Value, String> {
-        self.request(
+        self.request_with_timeout(
             "tools/call",
             json!({
                 "name": name,
                 "arguments": arguments
             }),
+            self.tool_timeout,
         )
     }
 }
@@ -252,7 +306,12 @@ impl SseTransport {
         Ok(())
     }
 
-    fn request(&self, method: &str, params: Value) -> Result<Value, String> {
+    fn request_with_timeout(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value, String> {
         let id = {
             let mut next_id = self
                 .next_id
@@ -268,6 +327,7 @@ impl SseTransport {
             builder = builder.header(key, value);
         }
         let response = builder
+            .timeout(timeout)
             .json(&json!({
                 "jsonrpc": "2.0",
                 "id": id,
@@ -275,7 +335,16 @@ impl SseTransport {
                 "params": params
             }))
             .send()
-            .map_err(|error| format!("MCP SSE request '{method}' failed: {error}"))?;
+            .map_err(|error| {
+                if error.is_timeout() {
+                    format!(
+                        "MCP SSE request '{method}' timed out after {}",
+                        format_duration(timeout)
+                    )
+                } else {
+                    format!("MCP SSE request '{method}' failed: {error}")
+                }
+            })?;
 
         let status = response.status();
         if !status.is_success() {
@@ -311,4 +380,219 @@ fn parse_sse_or_json_response(text: &str) -> Result<Value, String> {
         return Err("response was neither JSON nor SSE data".to_string());
     }
     serde_json::from_str(&data).map_err(|error| error.to_string())
+}
+
+fn timeout_from_ms(timeout_ms: Option<u64>) -> Duration {
+    Duration::from_millis(timeout_ms.unwrap_or(30_000).max(1))
+}
+
+fn format_duration(duration: Duration) -> String {
+    if duration.as_millis().is_multiple_of(1000) {
+        format!("{}s", duration.as_secs())
+    } else {
+        format!("{}ms", duration.as_millis())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    #[cfg(unix)]
+    #[test]
+    fn stdio_tool_call_uses_configured_tool_timeout() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let server = temp_dir.path().join("slow_mcp_server.sh");
+        fs::write(
+            &server,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"slow","version":"1"}}}\n'
+      ;;
+    *'"method":"notifications/initialized"'*)
+      ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"wait","description":"waits","inputSchema":{"type":"object","properties":{},"required":[]}}]}}\n'
+      ;;
+    *'"method":"tools/call"'*)
+      sleep 5
+      printf '{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"too late"}],"isError":false}}\n'
+      ;;
+  esac
+done
+"#,
+        )
+        .expect("write MCP fixture");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&server).expect("metadata").permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&server, permissions).expect("chmod MCP fixture");
+        }
+        let transport = connect(&McpServerConfig {
+            name: "slow".to_string(),
+            transport: McpTransportKind::Stdio,
+            command: Some(server.to_string_lossy().into_owned()),
+            args: Vec::new(),
+            url: None,
+            env: Default::default(),
+            headers: Default::default(),
+            disabled: false,
+            startup_timeout_ms: Some(5000),
+            tool_timeout_ms: Some(100),
+        })
+        .expect("connect stdio MCP");
+        transport.initialize().expect("initialize MCP");
+        transport.list_tools().expect("list tools");
+
+        let started = Instant::now();
+        let result = transport.call_tool("wait", Value::Object(Default::default()));
+
+        assert!(
+            started.elapsed() < Duration::from_millis(750),
+            "tool call took {:?}",
+            started.elapsed()
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .contains("MCP request 'tools/call' timed out after 100ms")
+        );
+    }
+
+    #[test]
+    fn sse_tool_call_uses_configured_tool_timeout() {
+        let server = SlowSseServer::start();
+        let transport = connect(&McpServerConfig {
+            name: "slow_sse".to_string(),
+            transport: McpTransportKind::Sse,
+            command: None,
+            args: Vec::new(),
+            url: Some(server.url()),
+            env: Default::default(),
+            headers: Default::default(),
+            disabled: false,
+            startup_timeout_ms: Some(5000),
+            tool_timeout_ms: Some(100),
+        })
+        .expect("connect SSE MCP");
+        transport.initialize().expect("initialize SSE MCP");
+        transport.list_tools().expect("list SSE tools");
+
+        let started = Instant::now();
+        let result = transport.call_tool("wait", Value::Object(Default::default()));
+
+        assert!(
+            started.elapsed() < Duration::from_millis(750),
+            "tool call took {:?}",
+            started.elapsed()
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .contains("MCP SSE request 'tools/call' timed out after 100ms")
+        );
+    }
+
+    struct SlowSseServer {
+        addr: std::net::SocketAddr,
+    }
+
+    impl SlowSseServer {
+        fn start() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind SSE fixture");
+            let addr = listener.local_addr().expect("SSE fixture addr");
+            let listener = Arc::new(listener);
+            let acceptor = Arc::clone(&listener);
+            std::thread::spawn(move || {
+                for stream in acceptor.incoming() {
+                    match stream {
+                        Ok(mut stream) => handle_sse_fixture_request(&mut stream),
+                        Err(_) => break,
+                    }
+                }
+            });
+            Self { addr }
+        }
+
+        fn url(&self) -> String {
+            format!("http://{}", self.addr)
+        }
+    }
+
+    fn handle_sse_fixture_request(stream: &mut TcpStream) {
+        let request = read_http_request(stream);
+        if request.contains(r#""method":"tools/call""#) {
+            std::thread::sleep(Duration::from_secs(5));
+            write_json_response(
+                stream,
+                r#"{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"too late"}],"isError":false}}"#,
+            );
+            return;
+        }
+        if request.contains(r#""method":"tools/list""#) {
+            write_json_response(
+                stream,
+                r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"wait","description":"waits","inputSchema":{"type":"object","properties":{},"required":[]}}]}}"#,
+            );
+            return;
+        }
+        if request.contains(r#""method":"initialize""#) {
+            write_json_response(
+                stream,
+                r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"slow_sse","version":"1"}}}"#,
+            );
+            return;
+        }
+        write_json_response(stream, r#"{"jsonrpc":"2.0","result":{}}"#);
+    }
+
+    fn read_http_request(stream: &mut TcpStream) -> String {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set read timeout");
+        let mut buffer = Vec::new();
+        let mut chunk = [0u8; 512];
+        loop {
+            let read = stream.read(&mut chunk).expect("read request");
+            if read == 0 {
+                break;
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+            let request = String::from_utf8_lossy(&buffer);
+            if let Some(header_end) = request.find("\r\n\r\n") {
+                let content_length = request
+                    .lines()
+                    .find_map(|line| {
+                        let (key, value) = line.split_once(':')?;
+                        key.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                if buffer.len() >= header_end + 4 + content_length {
+                    return request.into_owned();
+                }
+            }
+        }
+        String::from_utf8_lossy(&buffer).into_owned()
+    }
+
+    fn write_json_response(stream: &mut TcpStream, body: &str) {
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream
+            .write_all(response.as_bytes())
+            .expect("write response");
+    }
 }

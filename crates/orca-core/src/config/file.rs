@@ -9,8 +9,8 @@ use crate::approval_rules::PermissionRules;
 use crate::approval_types::ApprovalMode;
 use crate::config::{
     DEFAULT_MAX_WORKFLOW_AGENTS_PER_RUN, DEFAULT_MAX_WORKFLOW_CONCURRENT_AGENTS,
-    MAX_WORKFLOW_AGENT_RETRIES, ModelRuntimeConfig, ThemeName, ToolConfig, WorkflowConfig,
-    WorkflowTeamConfig,
+    MAX_WORKFLOW_AGENT_RETRIES, ModelRuntimeConfig, PermissionProfileConfig, ThemeName, ToolConfig,
+    WorkflowConfig, WorkflowTeamConfig,
 };
 use crate::subagent_config::SubagentConfig;
 
@@ -31,6 +31,8 @@ pub struct FileConfig {
     pub hooks: Vec<crate::hook_types::HookConfig>,
     #[serde(default)]
     pub permissions: PermissionRules,
+    #[serde(default)]
+    pub permission_profiles: HashMap<String, PermissionProfileConfig>,
     #[serde(default)]
     pub subagents: SubagentConfig,
     #[serde(default)]
@@ -70,6 +72,8 @@ struct RawFileConfig {
     #[serde(default)]
     pub permissions: PermissionRules,
     #[serde(default)]
+    pub permission_profiles: HashMap<String, PermissionProfileConfig>,
+    #[serde(default)]
     pub subagents: SubagentConfig,
     #[serde(default)]
     pub tools: ToolConfig,
@@ -98,6 +102,7 @@ impl Default for FileConfig {
             mcp_servers: Vec::new(),
             hooks: Vec::new(),
             permissions: PermissionRules::default(),
+            permission_profiles: HashMap::new(),
             subagents: SubagentConfig::default(),
             tools: ToolConfig::default(),
             workflows: WorkflowFileConfig::default(),
@@ -128,6 +133,7 @@ impl From<RawFileConfig> for FileConfig {
             mcp_servers: raw.mcp_servers,
             hooks: raw.hooks,
             permissions: raw.permissions,
+            permission_profiles: raw.permission_profiles,
             subagents: raw.subagents,
             tools: raw.tools,
             workflows,
@@ -467,6 +473,87 @@ decision = "deny"
     }
 
     #[test]
+    fn parse_permission_profiles() {
+        let toml = r#"
+[permission_profiles.locked-down]
+extends = ":read-only"
+"#;
+        let config: FileConfig = toml::from_str(toml).unwrap();
+        assert_eq!(
+            config
+                .permission_profiles
+                .get("locked-down")
+                .unwrap()
+                .extends,
+            Some(":read-only".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_permission_profile_filesystem_entries() {
+        let toml = r#"
+[permission_profiles.extra-write]
+extends = ":read-only"
+
+[permission_profiles.extra-write.filesystem]
+"/tmp/orca-extra" = "write"
+"/tmp/orca-read" = "read"
+"#;
+        let config: FileConfig = toml::from_str(toml).unwrap();
+        let profile = config.permission_profiles.get("extra-write").unwrap();
+
+        assert_eq!(profile.extends.as_deref(), Some(":read-only"));
+        assert_eq!(
+            profile.filesystem.get(Path::new("/tmp/orca-extra")),
+            Some(&crate::config::PermissionProfileFileAccess::Write)
+        );
+        assert_eq!(
+            profile.filesystem.get(Path::new("/tmp/orca-read")),
+            Some(&crate::config::PermissionProfileFileAccess::Read)
+        );
+    }
+
+    #[test]
+    fn parse_permission_profile_scoped_filesystem_entries() {
+        let toml = r#"
+[permission_profiles.docs]
+extends = ":read-only"
+
+[permission_profiles.docs.filesystem.":workspace_roots"]
+docs = "write"
+secrets = "deny"
+"#;
+        let config: FileConfig = toml::from_str(toml).unwrap();
+        let profile = config.permission_profiles.get("docs").unwrap();
+
+        assert_eq!(
+            profile.filesystem.get(Path::new(":workspace_roots/docs")),
+            Some(&crate::config::PermissionProfileFileAccess::Write)
+        );
+        assert_eq!(
+            profile
+                .filesystem
+                .get(Path::new(":workspace_roots/secrets")),
+            Some(&crate::config::PermissionProfileFileAccess::Deny)
+        );
+    }
+
+    #[test]
+    fn parse_permission_profile_network_enabled() {
+        let toml = r#"
+[permission_profiles.net-on]
+extends = ":read-only"
+
+[permission_profiles.net-on.network]
+enabled = true
+"#;
+        let config: FileConfig = toml::from_str(toml).unwrap();
+        let profile = config.permission_profiles.get("net-on").unwrap();
+
+        assert_eq!(profile.network.enabled, Some(true));
+    }
+
+    #[test]
     fn parse_partial_config() {
         let toml = r#"model = "deepseek-v4-flash""#;
         let config: FileConfig = toml::from_str(toml).unwrap();
@@ -490,10 +577,14 @@ name = "demo"
 transport = "stdio"
 command = "node"
 args = ["server.js"]
+startup_timeout_ms = 1000
+tool_timeout_ms = 2000
 "#;
         let config: FileConfig = toml::from_str(toml).unwrap();
         assert_eq!(config.mcp_servers.len(), 1);
         assert_eq!(config.mcp_servers[0].name, "demo");
+        assert_eq!(config.mcp_servers[0].startup_timeout_ms, Some(1000));
+        assert_eq!(config.mcp_servers[0].tool_timeout_ms, Some(2000));
     }
 
     #[test]

@@ -6,13 +6,17 @@ use std::process::Command;
 
 use chrono::{DateTime, Datelike, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use uuid::Uuid;
 
+use orca_core::config::{ActivePermissionProfile, AdditionalWorkingDirectory};
 use orca_core::conversation::{
     Conversation, Message, RawToolCall, SummaryState, normalize_tool_boundaries,
 };
 use orca_core::cost_types::UsageTotals;
 use orca_core::plan_types::{PlanItem, PlanStatus};
+use orca_core::tool_types::{ToolResult, ToolStatus};
+use orca_core::{approval_rules::PermissionRules, approval_types::ApprovalMode};
 
 const ORCA_HOME_ENV: &str = "ORCA_HOME";
 const SESSION_SCHEMA_VERSION: u32 = 1;
@@ -33,6 +37,16 @@ pub struct SessionMeta {
     pub parent_id: Option<String>,
     #[serde(default)]
     pub forked: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_mode: Option<ApprovalMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_permission_profile: Option<ActivePermissionProfile>,
+    #[serde(default)]
+    pub runtime_workspace_roots: Vec<PathBuf>,
+    #[serde(default)]
+    pub permission_rules: PermissionRules,
+    #[serde(default)]
+    pub additional_working_directories: Vec<AdditionalWorkingDirectory>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -48,6 +62,11 @@ pub struct SessionSummary {
     pub archived: bool,
     pub parent_id: Option<String>,
     pub forked: bool,
+    pub approval_mode: Option<ApprovalMode>,
+    pub active_permission_profile: Option<ActivePermissionProfile>,
+    pub runtime_workspace_roots: Vec<PathBuf>,
+    pub permission_rule_count: usize,
+    pub additional_working_directories: Vec<AdditionalWorkingDirectory>,
 }
 
 #[derive(Clone, Debug)]
@@ -66,8 +85,230 @@ pub struct SessionWriter {
     path: PathBuf,
 }
 
+#[derive(Clone, Debug)]
+pub struct LiveThread {
+    thread_id: String,
+    writer: SessionWriter,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ThreadMetadataPatch {
+    pub title: Option<String>,
+    pub active_permission_profile: Option<ActivePermissionProfile>,
+    pub approval_mode: Option<ApprovalMode>,
+    pub runtime_workspace_roots: Option<Vec<PathBuf>>,
+    pub permission_rules: Option<PermissionRules>,
+    pub additional_working_directories: Option<Vec<AdditionalWorkingDirectory>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct StoredThreadProjection {
+    pub thread_id: String,
+    pub title: String,
+    pub cwd: String,
+    pub runtime_workspace_roots: Vec<PathBuf>,
+    pub active_permission_profile: Option<ActivePermissionProfile>,
+    pub additional_working_directories: Vec<AdditionalWorkingDirectory>,
+    pub message_count: usize,
+    pub messages: Vec<Value>,
+    pub turns: Vec<StoredThreadTurn>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct StoredThreadSearchHit {
+    pub thread: StoredThreadSummary,
+    pub snippet: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct StoredThreadTurn {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub index: usize,
+    pub role: String,
+    pub items_view: TurnItemsView,
+    pub items: Vec<Value>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct StoredThreadItem {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub item_id: String,
+    pub index: usize,
+    pub item: Value,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct StoredThreadTurnPage {
+    pub data: Vec<StoredThreadTurn>,
+    pub next_cursor: Option<String>,
+    pub backwards_cursor: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct StoredThreadItemPage {
+    pub data: Vec<StoredThreadItem>,
+    pub next_cursor: Option<String>,
+    pub backwards_cursor: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct StoredThreadSummaryPage {
+    pub data: Vec<StoredThreadSummary>,
+    pub next_cursor: Option<String>,
+    pub backwards_cursor: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct StoredThreadSearchPage {
+    pub data: Vec<StoredThreadSearchHit>,
+    pub next_cursor: Option<String>,
+    pub backwards_cursor: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SortDirection {
+    Asc,
+    Desc,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ThreadSortKey {
+    CreatedAt,
+    UpdatedAt,
+    RecencyAt,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ThreadListFilters {
+    pub archived: bool,
+    pub model_providers: Option<Vec<String>>,
+    pub model_names: Option<Vec<String>>,
+    pub cwd_filters: Vec<String>,
+    pub relation: Option<ThreadRelationFilter>,
+}
+
+impl ThreadListFilters {
+    pub fn active() -> Self {
+        Self::default()
+    }
+
+    pub fn archived() -> Self {
+        Self {
+            archived: true,
+            ..Self::default()
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ThreadRelationFilter {
+    DirectChildrenOf(String),
+    DescendantsOf(String),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TurnItemsView {
+    NotLoaded,
+    Summary,
+    Full,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct StoredThreadSummary {
+    pub thread_id: String,
+    pub title: String,
+    pub cwd: String,
+    pub provider: String,
+    pub model: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub archived: bool,
+    pub parent_id: Option<String>,
+    pub forked: bool,
+    pub approval_mode: Option<ApprovalMode>,
+    pub active_permission_profile: Option<ActivePermissionProfile>,
+    pub permission_rule_count: usize,
+    pub runtime_workspace_roots: Vec<PathBuf>,
+    pub additional_working_directories: Vec<AdditionalWorkingDirectory>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct SessionStore;
+
+pub trait ThreadStore {
+    fn create_live_thread(
+        &self,
+        cwd: &Path,
+        provider: &str,
+        model: Option<String>,
+        prompt: &str,
+    ) -> io::Result<LiveThread>;
+
+    fn create_live_thread_with_permissions(
+        &self,
+        cwd: &Path,
+        provider: &str,
+        model: Option<String>,
+        prompt: &str,
+        active_permission_profile: Option<ActivePermissionProfile>,
+        approval_mode: ApprovalMode,
+        permission_rules: PermissionRules,
+        additional_working_directories: Vec<AdditionalWorkingDirectory>,
+    ) -> io::Result<LiveThread>;
+
+    fn update_thread_metadata(
+        &self,
+        thread_id: &str,
+        patch: ThreadMetadataPatch,
+    ) -> io::Result<SessionSummary>;
+
+    fn read_thread(
+        &self,
+        thread_id: &str,
+        include_messages: bool,
+        include_turns: bool,
+    ) -> io::Result<StoredThreadProjection>;
+
+    fn list_threads(
+        &self,
+        cursor: Option<&str>,
+        limit: usize,
+        filters: ThreadListFilters,
+        sort_key: ThreadSortKey,
+        sort_direction: SortDirection,
+        search_term: Option<&str>,
+    ) -> io::Result<StoredThreadSummaryPage>;
+
+    fn search_threads(
+        &self,
+        query: &str,
+        cursor: Option<&str>,
+        limit: usize,
+        include_archived: bool,
+        sort_key: ThreadSortKey,
+        sort_direction: SortDirection,
+    ) -> io::Result<StoredThreadSearchPage>;
+
+    fn list_thread_turns(
+        &self,
+        thread_id: &str,
+        cursor: Option<&str>,
+        limit: usize,
+        sort_direction: SortDirection,
+        items_view: TurnItemsView,
+    ) -> io::Result<StoredThreadTurnPage>;
+
+    fn list_thread_items(
+        &self,
+        thread_id: &str,
+        turn_id: Option<&str>,
+        cursor: Option<&str>,
+        limit: usize,
+        sort_direction: SortDirection,
+    ) -> io::Result<StoredThreadItemPage>;
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct CompactionRecord {
@@ -134,6 +375,14 @@ enum StoredMessage {
     Tool {
         tool_call_id: String,
         content: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<ToolStatus>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit_code: Option<i32>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        truncated: bool,
         #[serde(default)]
         pinned: bool,
     },
@@ -168,6 +417,10 @@ impl From<&Message> for StoredMessage {
             } => Self::Tool {
                 tool_call_id: tool_call_id.clone(),
                 content: content.clone(),
+                status: None,
+                error: None,
+                exit_code: None,
+                truncated: false,
                 pinned: *pinned,
             },
         }
@@ -193,6 +446,10 @@ impl From<StoredMessage> for Message {
             StoredMessage::Tool {
                 tool_call_id,
                 content,
+                status: _,
+                error: _,
+                exit_code: _,
+                truncated: _,
                 pinned,
             } => Self::Tool {
                 tool_call_id,
@@ -219,11 +476,43 @@ impl SessionWriter {
         Ok(Self { path })
     }
 
+    pub fn append_to_existing(path: PathBuf) -> io::Result<Self> {
+        if !path.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("history file not found: {}", path.display()),
+            ));
+        }
+        Ok(Self { path })
+    }
+
     pub fn append_message(&mut self, message: &Message) -> io::Result<()> {
         write_record(
             &self.path,
             &SessionRecord::Message {
                 message: StoredMessage::from(message),
+            },
+        )
+    }
+
+    pub fn append_tool_result_message(
+        &mut self,
+        result: &ToolResult,
+        content: String,
+        pinned: bool,
+    ) -> io::Result<()> {
+        write_record(
+            &self.path,
+            &SessionRecord::Message {
+                message: StoredMessage::Tool {
+                    tool_call_id: result.id.clone(),
+                    content,
+                    status: Some(result.status),
+                    error: result.error.clone(),
+                    exit_code: result.exit_code,
+                    truncated: result.truncated,
+                    pinned,
+                },
             },
         )
     }
@@ -303,6 +592,35 @@ impl SessionWriter {
     }
 }
 
+impl LiveThread {
+    pub fn thread_id(&self) -> &str {
+        &self.thread_id
+    }
+
+    pub fn append_items(&mut self, messages: &[Message]) -> io::Result<()> {
+        for message in messages {
+            self.writer.append_message(message)?;
+        }
+        Ok(())
+    }
+
+    pub fn complete(&mut self, status: &str) -> io::Result<()> {
+        self.writer.complete(status)
+    }
+
+    pub fn writer_mut(&mut self) -> &mut SessionWriter {
+        &mut self.writer
+    }
+
+    pub fn into_writer(self) -> SessionWriter {
+        self.writer
+    }
+
+    pub fn into_thread_id_and_writer(self) -> (String, SessionWriter) {
+        (self.thread_id, self.writer)
+    }
+}
+
 impl SessionStore {
     pub fn new() -> Self {
         Self
@@ -358,6 +676,26 @@ impl SessionStore {
         create_meta(cwd, provider, model, prompt)
     }
 
+    pub fn create_meta_with_permissions(
+        &self,
+        cwd: &Path,
+        provider: &str,
+        model: Option<String>,
+        prompt: &str,
+        active_permission_profile: Option<ActivePermissionProfile>,
+        approval_mode: ApprovalMode,
+        permission_rules: PermissionRules,
+        additional_working_directories: Vec<AdditionalWorkingDirectory>,
+    ) -> SessionMeta {
+        let mut meta = create_meta(cwd, provider, model, prompt);
+        meta.active_permission_profile = active_permission_profile;
+        meta.approval_mode = Some(approval_mode);
+        meta.runtime_workspace_roots = vec![cwd.to_path_buf()];
+        meta.permission_rules = permission_rules;
+        meta.additional_working_directories = additional_working_directories;
+        meta
+    }
+
     pub fn create_fork_meta(
         &self,
         cwd: &Path,
@@ -389,6 +727,969 @@ impl SessionStore {
         system_prompt: String,
     ) -> Conversation {
         resume_conversation(transcript, system_prompt)
+    }
+}
+
+impl ThreadStore for SessionStore {
+    fn create_live_thread(
+        &self,
+        cwd: &Path,
+        provider: &str,
+        model: Option<String>,
+        prompt: &str,
+    ) -> io::Result<LiveThread> {
+        let meta = self.create_meta(cwd, provider, model, prompt);
+        let thread_id = meta.session_id.clone();
+        let writer = self.start_writer_from_meta(meta)?;
+        Ok(LiveThread { thread_id, writer })
+    }
+
+    fn create_live_thread_with_permissions(
+        &self,
+        cwd: &Path,
+        provider: &str,
+        model: Option<String>,
+        prompt: &str,
+        active_permission_profile: Option<ActivePermissionProfile>,
+        approval_mode: ApprovalMode,
+        permission_rules: PermissionRules,
+        additional_working_directories: Vec<AdditionalWorkingDirectory>,
+    ) -> io::Result<LiveThread> {
+        let meta = self.create_meta_with_permissions(
+            cwd,
+            provider,
+            model,
+            prompt,
+            active_permission_profile,
+            approval_mode,
+            permission_rules,
+            additional_working_directories,
+        );
+        let thread_id = meta.session_id.clone();
+        let writer = self.start_writer_from_meta(meta)?;
+        Ok(LiveThread { thread_id, writer })
+    }
+
+    fn update_thread_metadata(
+        &self,
+        thread_id: &str,
+        patch: ThreadMetadataPatch,
+    ) -> io::Result<SessionSummary> {
+        let path = find_session_path(thread_id, true)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("no saved session matches '{thread_id}'"),
+            )
+        })?;
+        let mut records = read_records(&path)?;
+        let mut patched = false;
+        for record in &mut records {
+            if let SessionRecord::Meta(meta) = record {
+                if let Some(title) = patch.title {
+                    meta.title = title;
+                    patched = true;
+                }
+                if let Some(approval_mode) = patch.approval_mode {
+                    meta.approval_mode = Some(approval_mode);
+                    patched = true;
+                }
+                if let Some(active_permission_profile) = patch.active_permission_profile {
+                    meta.active_permission_profile = Some(active_permission_profile);
+                    patched = true;
+                }
+                if let Some(runtime_workspace_roots) = patch.runtime_workspace_roots {
+                    meta.runtime_workspace_roots = runtime_workspace_roots;
+                    patched = true;
+                }
+                if let Some(permission_rules) = patch.permission_rules {
+                    meta.permission_rules = permission_rules;
+                    patched = true;
+                }
+                if let Some(additional_working_directories) = patch.additional_working_directories {
+                    meta.additional_working_directories = additional_working_directories;
+                    patched = true;
+                }
+                break;
+            }
+        }
+        if !patched {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "thread metadata patch did not include any supported fields",
+            ));
+        }
+        rewrite_records(&path, &records)?;
+        summarize_session_with_archive_flag(&path, path.starts_with(archive_dir()))
+    }
+
+    fn read_thread(
+        &self,
+        thread_id: &str,
+        include_messages: bool,
+        include_turns: bool,
+    ) -> io::Result<StoredThreadProjection> {
+        let (meta, stored_messages) = load_thread_records(thread_id)?;
+        let projected_messages = if include_messages {
+            stored_messages
+                .iter()
+                .map(stored_message_to_thread_json)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let turns = if include_turns {
+            stored_messages_to_thread_turns(
+                &meta.session_id,
+                &stored_messages,
+                usize::MAX,
+                TurnItemsView::Full,
+            )
+        } else {
+            Vec::new()
+        };
+        Ok(StoredThreadProjection {
+            thread_id: meta.session_id,
+            title: meta.title,
+            cwd: meta.cwd,
+            runtime_workspace_roots: meta.runtime_workspace_roots,
+            active_permission_profile: meta.active_permission_profile,
+            additional_working_directories: meta.additional_working_directories,
+            message_count: stored_messages.len(),
+            messages: projected_messages,
+            turns,
+        })
+    }
+
+    fn list_threads(
+        &self,
+        cursor: Option<&str>,
+        limit: usize,
+        filters: ThreadListFilters,
+        sort_key: ThreadSortKey,
+        sort_direction: SortDirection,
+        search_term: Option<&str>,
+    ) -> io::Result<StoredThreadSummaryPage> {
+        let mut summaries = self
+            .list_sessions_with_archived(usize::MAX, filters.archived)?
+            .into_iter()
+            .map(StoredThreadSummary::from)
+            .collect::<Vec<_>>();
+        let all_summaries = summaries.clone();
+        summaries
+            .retain(|summary| thread_summary_matches_filters(summary, &filters, &all_summaries));
+        if let Some(search_term) = search_term.filter(|term| !term.is_empty()) {
+            summaries.retain(|summary| thread_summary_matches(summary, search_term));
+        }
+        sort_thread_summaries(&mut summaries, sort_key);
+        if sort_direction == SortDirection::Asc {
+            summaries.reverse();
+        }
+        let (data, next_cursor, backwards_cursor) = page_vec(summaries, cursor, limit);
+        Ok(StoredThreadSummaryPage {
+            data,
+            next_cursor,
+            backwards_cursor,
+        })
+    }
+
+    fn search_threads(
+        &self,
+        query: &str,
+        cursor: Option<&str>,
+        limit: usize,
+        include_archived: bool,
+        sort_key: ThreadSortKey,
+        sort_direction: SortDirection,
+    ) -> io::Result<StoredThreadSearchPage> {
+        let mut hits = self
+            .search_sessions(query, include_archived)?
+            .into_iter()
+            .map(|hit| {
+                let archived = hit.archived;
+                let snippet = hit.line.clone();
+                summarize_session_with_archive_flag(&hit.path, archived).map(|summary| {
+                    StoredThreadSearchHit {
+                        thread: StoredThreadSummary::from(summary),
+                        snippet,
+                    }
+                })
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        sort_thread_search_hits(&mut hits, sort_key);
+        if sort_direction == SortDirection::Asc {
+            hits.reverse();
+        }
+        let (data, next_cursor, backwards_cursor) = page_vec(hits, cursor, limit);
+        Ok(StoredThreadSearchPage {
+            data,
+            next_cursor,
+            backwards_cursor,
+        })
+    }
+
+    fn list_thread_turns(
+        &self,
+        thread_id: &str,
+        cursor: Option<&str>,
+        limit: usize,
+        sort_direction: SortDirection,
+        items_view: TurnItemsView,
+    ) -> io::Result<StoredThreadTurnPage> {
+        let (meta, messages) = load_thread_records(thread_id)?;
+        Ok(page_thread_turns(
+            stored_messages_to_thread_turns(&meta.session_id, &messages, usize::MAX, items_view),
+            cursor,
+            limit,
+            sort_direction,
+        ))
+    }
+
+    fn list_thread_items(
+        &self,
+        thread_id: &str,
+        turn_id: Option<&str>,
+        cursor: Option<&str>,
+        limit: usize,
+        sort_direction: SortDirection,
+    ) -> io::Result<StoredThreadItemPage> {
+        let (meta, messages) = load_thread_records(thread_id)?;
+        Ok(page_thread_items(
+            stored_messages_to_thread_items(&meta.session_id, &messages, turn_id, usize::MAX),
+            cursor,
+            limit,
+            sort_direction,
+        ))
+    }
+}
+
+fn thread_summary_matches(summary: &StoredThreadSummary, search_term: &str) -> bool {
+    summary.title.contains(search_term)
+        || summary.cwd.contains(search_term)
+        || summary.provider.contains(search_term)
+        || summary
+            .model
+            .as_deref()
+            .is_some_and(|model| model.contains(search_term))
+}
+
+fn load_thread_records(thread_id: &str) -> io::Result<(SessionMeta, Vec<StoredMessage>)> {
+    let path = find_session_path(thread_id, true)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("no saved session matches '{thread_id}'"),
+        )
+    })?;
+    let records = read_records(&path)?;
+    let mut meta = None;
+    let mut messages = Vec::new();
+    for record in records {
+        match record {
+            SessionRecord::Meta(record_meta) => meta = Some(record_meta),
+            SessionRecord::Message { message } => messages.push(message),
+            _ => {}
+        }
+    }
+    let meta = meta.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("session '{thread_id}' is missing metadata"),
+        )
+    })?;
+    Ok((meta, messages))
+}
+
+fn thread_summary_matches_filters(
+    summary: &StoredThreadSummary,
+    filters: &ThreadListFilters,
+    all_summaries: &[StoredThreadSummary],
+) -> bool {
+    if summary.archived != filters.archived {
+        return false;
+    }
+    if let Some(model_providers) = &filters.model_providers {
+        if !model_providers.is_empty()
+            && !model_providers
+                .iter()
+                .any(|provider| provider == &summary.provider)
+        {
+            return false;
+        }
+    }
+    if let Some(model_names) = &filters.model_names {
+        if !model_names.is_empty()
+            && !summary
+                .model
+                .as_ref()
+                .is_some_and(|model| model_names.iter().any(|expected| expected == model))
+        {
+            return false;
+        }
+    }
+    if !filters.cwd_filters.is_empty() && !filters.cwd_filters.iter().any(|cwd| cwd == &summary.cwd)
+    {
+        return false;
+    }
+    match &filters.relation {
+        Some(ThreadRelationFilter::DirectChildrenOf(parent_id)) => {
+            summary.parent_id.as_deref() == Some(parent_id.as_str())
+        }
+        Some(ThreadRelationFilter::DescendantsOf(ancestor_id)) => {
+            thread_descends_from(summary, ancestor_id, all_summaries)
+        }
+        None => true,
+    }
+}
+
+fn thread_descends_from(
+    summary: &StoredThreadSummary,
+    ancestor_id: &str,
+    all_summaries: &[StoredThreadSummary],
+) -> bool {
+    let mut next_parent = summary.parent_id.as_deref();
+    while let Some(parent_id) = next_parent {
+        if parent_id == ancestor_id {
+            return true;
+        }
+        next_parent = all_summaries
+            .iter()
+            .find(|candidate| candidate.thread_id == parent_id)
+            .and_then(|candidate| candidate.parent_id.as_deref());
+    }
+    false
+}
+
+fn sort_thread_summaries(summaries: &mut [StoredThreadSummary], sort_key: ThreadSortKey) {
+    summaries.sort_by(|a, b| match sort_key {
+        ThreadSortKey::CreatedAt => b
+            .created_at
+            .cmp(&a.created_at)
+            .then_with(|| b.updated_at.cmp(&a.updated_at)),
+        ThreadSortKey::UpdatedAt | ThreadSortKey::RecencyAt => b
+            .updated_at
+            .cmp(&a.updated_at)
+            .then_with(|| b.created_at.cmp(&a.created_at)),
+    });
+}
+
+fn sort_thread_search_hits(hits: &mut [StoredThreadSearchHit], sort_key: ThreadSortKey) {
+    hits.sort_by(|a, b| match sort_key {
+        ThreadSortKey::CreatedAt => b
+            .thread
+            .created_at
+            .cmp(&a.thread.created_at)
+            .then_with(|| b.thread.updated_at.cmp(&a.thread.updated_at)),
+        ThreadSortKey::UpdatedAt | ThreadSortKey::RecencyAt => b
+            .thread
+            .updated_at
+            .cmp(&a.thread.updated_at)
+            .then_with(|| b.thread.created_at.cmp(&a.thread.created_at)),
+    });
+}
+
+pub(crate) fn message_to_thread_json(message: &Message) -> Value {
+    match message {
+        Message::System { content, .. } => json!({
+            "role": "system",
+            "content": content,
+        }),
+        Message::User { content, .. } => json!({
+            "role": "user",
+            "content": content,
+        }),
+        Message::Assistant {
+            content,
+            reasoning_content,
+            tool_calls,
+            ..
+        } => json!({
+            "role": "assistant",
+            "content": content,
+            "reasoningContent": reasoning_content,
+            "toolCalls": tool_calls,
+        }),
+        Message::Tool {
+            tool_call_id,
+            content,
+            ..
+        } => json!({
+            "role": "tool",
+            "toolCallId": tool_call_id,
+            "content": content,
+        }),
+    }
+}
+
+fn stored_message_to_thread_json(message: &StoredMessage) -> Value {
+    match message {
+        StoredMessage::System { content, .. } => json!({
+            "role": "system",
+            "content": content,
+        }),
+        StoredMessage::User { content, .. } => json!({
+            "role": "user",
+            "content": content,
+        }),
+        StoredMessage::Assistant {
+            content,
+            reasoning_content,
+            tool_calls,
+            ..
+        } => json!({
+            "role": "assistant",
+            "content": content,
+            "reasoningContent": reasoning_content,
+            "toolCalls": tool_calls,
+        }),
+        StoredMessage::Tool {
+            tool_call_id,
+            content,
+            ..
+        } => json!({
+            "role": "tool",
+            "toolCallId": tool_call_id,
+            "content": content,
+        }),
+    }
+}
+
+pub(crate) fn messages_to_thread_turns(
+    thread_id: &str,
+    messages: &[Message],
+    limit: usize,
+    items_view: TurnItemsView,
+) -> Vec<StoredThreadTurn> {
+    group_messages_into_thread_turns(thread_id, messages, items_view)
+        .into_iter()
+        .take(limit)
+        .collect()
+}
+
+pub(crate) fn messages_to_thread_items(
+    thread_id: &str,
+    messages: &[Message],
+    turn_id: Option<&str>,
+    limit: usize,
+) -> Vec<StoredThreadItem> {
+    group_messages_into_thread_turns(thread_id, messages, TurnItemsView::Full)
+        .into_iter()
+        .flat_map(|turn| {
+            turn.items
+                .into_iter()
+                .map(move |item| (turn.turn_id.clone(), item))
+        })
+        .enumerate()
+        .map(|(item_index, (item_turn_id, item))| StoredThreadItem {
+            thread_id: thread_id.to_string(),
+            turn_id: item_turn_id,
+            item_id: item_id_for_index(item_index),
+            index: item_index,
+            item,
+        })
+        .filter(|item| turn_id.is_none_or(|requested| requested == item.turn_id))
+        .take(limit)
+        .collect()
+}
+
+fn stored_messages_to_thread_turns(
+    thread_id: &str,
+    messages: &[StoredMessage],
+    limit: usize,
+    items_view: TurnItemsView,
+) -> Vec<StoredThreadTurn> {
+    group_stored_messages_into_thread_turns(thread_id, messages, items_view)
+        .into_iter()
+        .take(limit)
+        .collect()
+}
+
+fn stored_messages_to_thread_items(
+    thread_id: &str,
+    messages: &[StoredMessage],
+    turn_id: Option<&str>,
+    limit: usize,
+) -> Vec<StoredThreadItem> {
+    group_stored_messages_into_thread_turns(thread_id, messages, TurnItemsView::Full)
+        .into_iter()
+        .flat_map(|turn| {
+            turn.items
+                .into_iter()
+                .map(move |item| (turn.turn_id.clone(), item))
+        })
+        .enumerate()
+        .map(|(item_index, (item_turn_id, item))| StoredThreadItem {
+            thread_id: thread_id.to_string(),
+            turn_id: item_turn_id,
+            item_id: item_id_for_index(item_index),
+            index: item_index,
+            item,
+        })
+        .filter(|item| turn_id.is_none_or(|requested| requested == item.turn_id))
+        .take(limit)
+        .collect()
+}
+
+pub(crate) fn page_thread_turns(
+    mut turns: Vec<StoredThreadTurn>,
+    cursor: Option<&str>,
+    limit: usize,
+    sort_direction: SortDirection,
+) -> StoredThreadTurnPage {
+    if sort_direction == SortDirection::Desc {
+        turns.reverse();
+    }
+    let (data, next_cursor, backwards_cursor) = page_vec(turns, cursor, limit);
+    StoredThreadTurnPage {
+        data,
+        next_cursor,
+        backwards_cursor,
+    }
+}
+
+pub(crate) fn page_thread_items(
+    mut items: Vec<StoredThreadItem>,
+    cursor: Option<&str>,
+    limit: usize,
+    sort_direction: SortDirection,
+) -> StoredThreadItemPage {
+    if sort_direction == SortDirection::Desc {
+        items.reverse();
+    }
+    let (data, next_cursor, backwards_cursor) = page_vec(items, cursor, limit);
+    StoredThreadItemPage {
+        data,
+        next_cursor,
+        backwards_cursor,
+    }
+}
+
+fn page_vec<T>(
+    items: Vec<T>,
+    cursor: Option<&str>,
+    limit: usize,
+) -> (Vec<T>, Option<String>, Option<String>) {
+    let start = cursor
+        .and_then(|cursor| cursor.parse::<usize>().ok())
+        .unwrap_or(0)
+        .min(items.len());
+    let page_size = limit.max(1);
+    let end = start.saturating_add(page_size).min(items.len());
+    let next_cursor = (end < items.len()).then(|| end.to_string());
+    let backwards_cursor = (!items.is_empty()).then(|| start.to_string());
+    let data = items.into_iter().skip(start).take(end - start).collect();
+    (data, next_cursor, backwards_cursor)
+}
+
+fn group_messages_into_thread_turns(
+    thread_id: &str,
+    messages: &[Message],
+    items_view: TurnItemsView,
+) -> Vec<StoredThreadTurn> {
+    let mut turns = Vec::new();
+    for message in messages {
+        if matches!(message, Message::System { .. }) {
+            continue;
+        }
+        let items = message_to_thread_items_for_projection(message);
+        let role = message_role(message).to_string();
+        let starts_turn = turns.is_empty() || matches!(message, Message::User { .. });
+
+        if starts_turn {
+            let index = turns.len();
+            turns.push(StoredThreadTurn {
+                thread_id: thread_id.to_string(),
+                turn_id: turn_id_for_index(index),
+                index,
+                role,
+                items_view,
+                items: items_for_view(items_view, items),
+            });
+        } else if let Some(turn) = turns.last_mut() {
+            if turn.items_view != TurnItemsView::NotLoaded {
+                merge_projected_items(&mut turn.items, items);
+            }
+        }
+    }
+    turns
+}
+
+fn group_stored_messages_into_thread_turns(
+    thread_id: &str,
+    messages: &[StoredMessage],
+    items_view: TurnItemsView,
+) -> Vec<StoredThreadTurn> {
+    let mut turns = Vec::new();
+    for message in messages {
+        if matches!(message, StoredMessage::System { .. }) {
+            continue;
+        }
+        let items = stored_message_to_thread_items_for_projection(message);
+        let role = stored_message_role(message).to_string();
+        let starts_turn = turns.is_empty() || matches!(message, StoredMessage::User { .. });
+
+        if starts_turn {
+            let index = turns.len();
+            turns.push(StoredThreadTurn {
+                thread_id: thread_id.to_string(),
+                turn_id: turn_id_for_index(index),
+                index,
+                role,
+                items_view,
+                items: items_for_view(items_view, items),
+            });
+        } else if let Some(turn) = turns.last_mut()
+            && turn.items_view != TurnItemsView::NotLoaded
+        {
+            merge_projected_items(&mut turn.items, items);
+        }
+    }
+    turns
+}
+
+fn message_role(message: &Message) -> &'static str {
+    match message {
+        Message::System { .. } => "system",
+        Message::User { .. } => "user",
+        Message::Assistant { .. } => "assistant",
+        Message::Tool { .. } => "tool",
+    }
+}
+
+fn stored_message_role(message: &StoredMessage) -> &'static str {
+    match message {
+        StoredMessage::System { .. } => "system",
+        StoredMessage::User { .. } => "user",
+        StoredMessage::Assistant { .. } => "assistant",
+        StoredMessage::Tool { .. } => "tool",
+    }
+}
+
+fn message_to_thread_items_for_projection(message: &Message) -> Vec<Value> {
+    match message {
+        Message::Assistant {
+            content,
+            reasoning_content,
+            tool_calls,
+            ..
+        } => {
+            let mut items = Vec::new();
+            if content.is_some() || reasoning_content.is_some() || tool_calls.is_empty() {
+                items.push(message_to_thread_json(message));
+            }
+            items.extend(tool_calls.iter().map(tool_call_to_thread_item));
+            items
+        }
+        Message::Tool {
+            tool_call_id,
+            content,
+            ..
+        } => vec![tool_result_to_thread_item(tool_call_id, content)],
+        _ => vec![message_to_thread_json(message)],
+    }
+}
+
+fn stored_message_to_thread_items_for_projection(message: &StoredMessage) -> Vec<Value> {
+    match message {
+        StoredMessage::Assistant {
+            content,
+            reasoning_content,
+            tool_calls,
+            ..
+        } => {
+            let mut items = Vec::new();
+            if content.is_some() || reasoning_content.is_some() || tool_calls.is_empty() {
+                items.push(stored_message_to_thread_json(message));
+            }
+            items.extend(tool_calls.iter().map(tool_call_to_thread_item));
+            items
+        }
+        StoredMessage::Tool {
+            tool_call_id,
+            content,
+            status,
+            error,
+            exit_code,
+            truncated,
+            ..
+        } => vec![tool_result_to_thread_item_with_metadata(
+            tool_call_id,
+            content,
+            *status,
+            error.as_deref(),
+            *exit_code,
+            *truncated,
+        )],
+        _ => vec![stored_message_to_thread_json(message)],
+    }
+}
+
+fn merge_projected_items(turn_items: &mut Vec<Value>, items: Vec<Value>) {
+    for item in items {
+        if item["type"] == "tool_result"
+            && let Some(tool_call_id) = item["toolCallId"].as_str()
+            && let Some(existing) = turn_items
+                .iter_mut()
+                .rev()
+                .find(|candidate| candidate["id"].as_str() == Some(tool_call_id))
+        {
+            complete_tool_item(existing, &item);
+            continue;
+        }
+        turn_items.push(item);
+    }
+}
+
+fn tool_call_to_thread_item(tool_call: &RawToolCall) -> Value {
+    if let Some((server, tool)) = mcp_tool_parts(&tool_call.function_name) {
+        json!({
+            "id": tool_call.id,
+            "type": "mcpToolCall",
+            "server": server,
+            "tool": tool,
+            "status": "in_progress",
+            "arguments": parse_json_or_null(&tool_call.arguments),
+            "result": Value::Null,
+            "error": Value::Null,
+        })
+    } else {
+        if tool_call.function_name == "bash" {
+            return command_execution_thread_item(tool_call);
+        }
+        json!({
+            "id": tool_call.id,
+            "type": "dynamicToolCall",
+            "namespace": Value::Null,
+            "tool": tool_call.function_name,
+            "status": "in_progress",
+            "arguments": parse_json_or_null(&tool_call.arguments),
+            "contentItems": Value::Null,
+            "success": Value::Null,
+            "error": Value::Null,
+        })
+    }
+}
+
+fn command_execution_thread_item(tool_call: &RawToolCall) -> Value {
+    json!({
+        "id": tool_call.id,
+        "type": "commandExecution",
+        "tool": tool_call.function_name,
+        "command": command_from_tool_arguments(&tool_call.arguments),
+        "cwd": Value::Null,
+        "processId": Value::Null,
+        "source": Value::Null,
+        "status": "in_progress",
+        "commandActions": [],
+        "aggregatedOutput": Value::Null,
+        "error": Value::Null,
+        "exitCode": Value::Null,
+        "durationMs": Value::Null,
+    })
+}
+
+fn tool_result_to_thread_item(tool_call_id: &str, content: &str) -> Value {
+    json!({
+        "type": "tool_result",
+        "toolCallId": tool_call_id,
+        "content": content,
+    })
+}
+
+fn tool_result_to_thread_item_with_metadata(
+    tool_call_id: &str,
+    content: &str,
+    status: Option<ToolStatus>,
+    error: Option<&str>,
+    exit_code: Option<i32>,
+    truncated: bool,
+) -> Value {
+    let mut item = tool_result_to_thread_item(tool_call_id, content);
+    if let Some(status) = status {
+        item["status"] = Value::from(status.as_str());
+    }
+    if let Some(error) = error {
+        item["error"] = Value::from(error.to_string());
+    }
+    if let Some(exit_code) = exit_code {
+        item["exitCode"] = Value::from(exit_code);
+    }
+    if truncated {
+        item["truncated"] = Value::from(true);
+    }
+    item
+}
+
+fn complete_tool_item(item: &mut Value, result: &Value) {
+    let content = result["content"].as_str().unwrap_or_default();
+    if let Some((status, failure)) = tool_failure_from_result(result)
+        .or_else(|| parse_tool_failure_content(content).map(|failure| ("failed", failure)))
+    {
+        item["status"] = Value::from(status);
+        copy_truncated_metadata(item, result);
+        if item["type"] == "mcpToolCall" {
+            item["result"] = Value::Null;
+        } else if item["type"] == "dynamicToolCall" {
+            item["contentItems"] = Value::Null;
+            item["success"] = Value::from(false);
+        } else {
+            item["result"] = Value::Null;
+        }
+        item["error"] = failure;
+        return;
+    }
+
+    item["status"] = Value::from("completed");
+    copy_truncated_metadata(item, result);
+    if item["type"] == "mcpToolCall" {
+        item["result"] = mcp_result_from_content(content);
+        item["error"] = Value::Null;
+    } else if item["type"] == "dynamicToolCall" {
+        item["contentItems"] = json!([{
+            "type": "text",
+            "text": content,
+        }]);
+        item["success"] = Value::from(true);
+        item["error"] = Value::Null;
+    } else if item["type"] == "commandExecution" {
+        item["aggregatedOutput"] = Value::from(content.to_string());
+        item["error"] = Value::Null;
+    } else {
+        item["result"] = Value::from(content.to_string());
+        item["error"] = Value::Null;
+    }
+}
+
+fn copy_truncated_metadata(item: &mut Value, result: &Value) {
+    if result["truncated"].as_bool() == Some(true) {
+        item["truncated"] = Value::from(true);
+    }
+}
+
+fn tool_failure_from_result(result: &Value) -> Option<(&'static str, Value)> {
+    let status = match result["status"].as_str()? {
+        "completed" => return None,
+        "failed" => "failed",
+        "denied" => "denied",
+        "not_implemented" => "not_implemented",
+        _ => "failed",
+    };
+    let message = result["error"]
+        .as_str()
+        .filter(|message| !message.is_empty())
+        .or_else(|| {
+            result["content"]
+                .as_str()
+                .filter(|message| !message.is_empty())
+        })
+        .unwrap_or("tool call failed");
+    let mut error = json!({ "message": message });
+    if let Some(exit_code) = result["exitCode"].as_i64() {
+        error["exitCode"] = Value::from(exit_code);
+    }
+    Some((status, error))
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+fn parse_tool_failure_content(content: &str) -> Option<Value> {
+    if let Some(message) = content.strip_prefix("ERROR: ") {
+        return Some(json!({ "message": message }));
+    }
+
+    let value = serde_json::from_str::<Value>(content).ok()?;
+    if value.get("status").and_then(Value::as_str) != Some("failed") {
+        return None;
+    }
+    let message = value
+        .get("error")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("message").and_then(Value::as_str))
+        .unwrap_or("tool call failed");
+    let mut error = json!({ "message": message });
+    if let Some(exit_code) = value.get("exit_code").and_then(Value::as_i64) {
+        error["exitCode"] = Value::from(exit_code);
+    } else if let Some(exit_code) = value.get("exitCode").and_then(Value::as_i64) {
+        error["exitCode"] = Value::from(exit_code);
+    }
+    Some(error)
+}
+
+fn mcp_tool_parts(tool: &str) -> Option<(String, String)> {
+    let rest = tool.strip_prefix("mcp__")?;
+    let (server, local_tool) = rest.rsplit_once("__")?;
+    Some((server.to_string(), local_tool.to_string()))
+}
+
+fn parse_json_or_null(raw: &str) -> Value {
+    serde_json::from_str(raw).unwrap_or(Value::Null)
+}
+
+fn command_from_tool_arguments(raw: &str) -> Value {
+    parse_json_or_null(raw)
+        .get("command")
+        .and_then(Value::as_str)
+        .map(|command| Value::from(command.to_string()))
+        .unwrap_or(Value::Null)
+}
+
+fn mcp_result_from_content(content: &str) -> Value {
+    match serde_json::from_str::<Value>(content) {
+        Ok(value) if value.is_object() => json!({
+            "content": value.get("content").cloned().unwrap_or_else(|| {
+                json!([{ "type": "text", "text": content }])
+            }),
+            "structuredContent": value.get("structuredContent").cloned().unwrap_or(Value::Null),
+            "_meta": value.get("_meta").cloned().unwrap_or(Value::Null),
+        }),
+        _ => json!({
+            "content": [{ "type": "text", "text": content }],
+            "structuredContent": Value::Null,
+            "_meta": Value::Null,
+        }),
+    }
+}
+
+fn items_for_view(items_view: TurnItemsView, items: Vec<Value>) -> Vec<Value> {
+    match items_view {
+        TurnItemsView::NotLoaded => Vec::new(),
+        TurnItemsView::Summary | TurnItemsView::Full => items,
+    }
+}
+
+fn turn_id_for_index(index: usize) -> String {
+    format!("turn-{}", index + 1)
+}
+
+pub(crate) fn next_turn_id_for_messages(thread_id: &str, messages: &[Message]) -> String {
+    let turn_count =
+        group_messages_into_thread_turns(thread_id, messages, TurnItemsView::NotLoaded).len();
+    turn_id_for_index(turn_count)
+}
+
+fn item_id_for_index(index: usize) -> String {
+    format!("item-{}", index + 1)
+}
+
+impl From<SessionSummary> for StoredThreadSummary {
+    fn from(summary: SessionSummary) -> Self {
+        Self {
+            thread_id: summary.session_id,
+            title: summary.title,
+            cwd: summary.cwd,
+            provider: summary.provider,
+            model: summary.model,
+            created_at: summary.created_at,
+            updated_at: summary.updated_at,
+            archived: summary.archived,
+            parent_id: summary.parent_id,
+            forked: summary.forked,
+            approval_mode: summary.approval_mode,
+            active_permission_profile: summary.active_permission_profile,
+            permission_rule_count: summary.permission_rule_count,
+            runtime_workspace_roots: summary.runtime_workspace_roots,
+            additional_working_directories: summary.additional_working_directories,
+        }
     }
 }
 
@@ -484,22 +1785,14 @@ pub fn rename_session(selector: &str, title: &str) -> io::Result<PathBuf> {
             format!("no saved session matches '{selector}'"),
         )
     })?;
-    let mut records = read_records(&path)?;
-    let mut renamed = false;
-    for record in &mut records {
-        if let SessionRecord::Meta(meta) = record {
-            meta.title = title.to_string();
-            renamed = true;
-            break;
-        }
-    }
-    if !renamed {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("missing session metadata in {}", path.display()),
-        ));
-    }
-    rewrite_records(&path, &records)?;
+    let meta = read_session_meta(&path)?;
+    SessionStore::new().update_thread_metadata(
+        &meta.session_id,
+        ThreadMetadataPatch {
+            title: Some(title.to_string()),
+            ..ThreadMetadataPatch::default()
+        },
+    )?;
     Ok(path)
 }
 
@@ -625,6 +1918,11 @@ pub fn create_meta(cwd: &Path, provider: &str, model: Option<String>, prompt: &s
         created_at: now,
         parent_id: None,
         forked: false,
+        approval_mode: None,
+        active_permission_profile: None,
+        runtime_workspace_roots: vec![cwd.to_path_buf()],
+        permission_rules: PermissionRules::default(),
+        additional_working_directories: Vec::new(),
     }
 }
 
@@ -661,6 +1959,11 @@ fn summarize_session_with_archive_flag(path: &Path, archived: bool) -> io::Resul
         archived,
         parent_id: meta.parent_id,
         forked: meta.forked,
+        approval_mode: meta.approval_mode,
+        active_permission_profile: meta.active_permission_profile,
+        permission_rule_count: meta.permission_rules.rules.len(),
+        runtime_workspace_roots: meta.runtime_workspace_roots,
+        additional_working_directories: meta.additional_working_directories,
     })
 }
 

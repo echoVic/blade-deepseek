@@ -1,9 +1,30 @@
+use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread;
+use std::time::Duration;
 
-use serde_json::Value;
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use orca_core::cancel::CancelToken;
+use serde_json::{Value, json};
 
-use crate::controller;
+use crate::agent_loop::ThreadSteerHandle;
+use crate::history::{
+    SessionStore, SortDirection, StoredThreadSummary, ThreadListFilters, ThreadMetadataPatch,
+    ThreadSortKey, ThreadStore, TurnItemsView,
+};
+use crate::lifecycle::{
+    RuntimePermissionRequest, RuntimePermissionRequestHandler, RuntimePermissionResponse,
+};
 use crate::protocol::{self, ClientOp, ServerEvent, Submission};
+use crate::server_runtime::{
+    PermissionProfileOverride, ServerRequestWriter, ServerThread, ServerThreadRuntime,
+    thread_item_to_json, thread_run_config, thread_turn_to_json,
+};
+use crate::shell_session::{RuntimeShellSessionManager, ShellSandboxMode, ShellSessionCommand};
+use crate::tasks::TaskRegistry;
 use orca_core::config::{HistoryMode, OutputFormat, RunConfig};
 
 #[derive(Clone, Debug)]
@@ -12,7 +33,7 @@ pub struct ServerConfig {
 }
 
 pub fn run(config: ServerConfig) -> i32 {
-    match run_with_io(config, io::stdin().lock(), io::stdout().lock()) {
+    match run_with_io(config, io::stdin().lock(), io::stdout()) {
         Ok(()) => 0,
         Err(error) => {
             eprintln!("orca: server error: {error}");
@@ -21,43 +42,2807 @@ pub fn run(config: ServerConfig) -> i32 {
     }
 }
 
-fn run_with_io<R: BufRead, W: Write>(
+fn run_with_io<R: BufRead, W: Write + Send + 'static>(
     config: ServerConfig,
     mut reader: R,
-    mut writer: W,
+    writer: W,
 ) -> io::Result<()> {
     let mut line = String::new();
+    let mut state = ServerState::default();
+    let writer = Arc::new(Mutex::new(writer));
     while reader.read_line(&mut line)? != 0 {
         let trimmed = line.trim();
         if !trimmed.is_empty() {
-            handle_line(&config, trimmed, &mut writer)?;
+            handle_line(&config, &mut state, trimmed, Arc::clone(&writer))?;
         }
         line.clear();
+    }
+    state.terminate_active_command_exec_processes();
+    state.join_active_turns();
+    Ok(())
+}
+
+#[derive(Default)]
+struct ServerState {
+    threads: ServerThreadRuntime,
+    shell_sessions: Option<RuntimeShellSessionManager>,
+    command_exec: CommandExecManager,
+    active_turns: HashMap<String, ActiveTurnControl>,
+    running_turns: Vec<ActiveTurnHandle>,
+    pending_permissions: Arc<Mutex<HashMap<String, PendingPermissionRequest>>>,
+}
+
+impl ServerState {
+    fn terminate_active_command_exec_processes(&mut self) {
+        self.command_exec
+            .terminate_all(self.shell_sessions.as_mut());
+    }
+}
+
+#[derive(Clone)]
+struct CommandExecProcess {
+    shell_id: Option<String>,
+    command_event_id: Value,
+    stream_output: bool,
+    output_bytes_cap: Option<usize>,
+    stdout_len: usize,
+    stderr_len: usize,
+    stdout_cap_reached: bool,
+    stderr_cap_reached: bool,
+}
+
+#[derive(Default)]
+struct CommandExecManager {
+    processes: HashMap<String, CommandExecProcess>,
+}
+
+impl CommandExecManager {
+    fn insert(&mut self, process_id: String, process: CommandExecProcess) -> Result<(), String> {
+        if self.processes.contains_key(&process_id) {
+            return Err(format!(
+                "duplicate active command/exec process id: {:?}",
+                process_id
+            ));
+        }
+        self.processes.insert(process_id, process);
+        Ok(())
+    }
+
+    fn activate(&mut self, process_id: &str, shell_id: String) -> bool {
+        let Some(process) = self.processes.get_mut(process_id) else {
+            return false;
+        };
+        process.shell_id = Some(shell_id);
+        true
+    }
+
+    fn get(&self, process_id: &str) -> Option<&CommandExecProcess> {
+        self.processes.get(process_id)
+    }
+
+    fn get_mut(&mut self, process_id: &str) -> Option<&mut CommandExecProcess> {
+        self.processes.get_mut(process_id)
+    }
+
+    fn remove(&mut self, process_id: &str) -> Option<CommandExecProcess> {
+        self.processes.remove(process_id)
+    }
+
+    fn process_ids(&self) -> Vec<String> {
+        self.processes.keys().cloned().collect()
+    }
+
+    fn write_to_process<W: Write>(
+        &mut self,
+        shell_sessions: Option<&mut RuntimeShellSessionManager>,
+        process_id: &str,
+        delta_base64: Option<&str>,
+        close_stdin: bool,
+        id: &Value,
+        writer: &mut W,
+    ) -> io::Result<()> {
+        let Some(process) = self.get(process_id).cloned() else {
+            return protocol::write_server_event(
+                writer,
+                id,
+                ServerEvent::error(format!("unknown command process: {process_id}")),
+            );
+        };
+        let Some(shell_id) = process.shell_id.as_deref() else {
+            return protocol::write_server_event(
+                writer,
+                id,
+                ServerEvent::error(format!("command process is still starting: {process_id}")),
+            );
+        };
+        let Some(manager) = shell_sessions else {
+            return protocol::write_server_event(
+                writer,
+                id,
+                ServerEvent::error(format!("unknown command process: {process_id}")),
+            );
+        };
+        if let Some(delta_base64) = delta_base64 {
+            let bytes = match BASE64_STANDARD.decode(delta_base64) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    return protocol::write_server_event(
+                        writer,
+                        id,
+                        ServerEvent::error(format!(
+                            "invalid command/exec write deltaBase64: {error}"
+                        )),
+                    );
+                }
+            };
+            let input = String::from_utf8_lossy(&bytes);
+            if let Err(error) = manager.write_stdin(shell_id, &input) {
+                return protocol::write_server_event(
+                    writer,
+                    id,
+                    ServerEvent::error(error.to_string()),
+                );
+            }
+        }
+        if close_stdin && let Err(error) = manager.close_stdin(shell_id) {
+            return protocol::write_server_event(writer, id, ServerEvent::error(error.to_string()));
+        }
+        protocol::write_server_event(
+            writer,
+            id,
+            ServerEvent::CommandExecWritten {
+                process_id: Value::from(process_id.to_string()),
+            },
+        )?;
+        self.drain_with_timeout(Some(manager), writer, Duration::from_secs(5))
+    }
+
+    fn resize_process<W: Write>(
+        &mut self,
+        shell_sessions: Option<&mut RuntimeShellSessionManager>,
+        process_id: &str,
+        cols: u16,
+        rows: u16,
+        id: &Value,
+        writer: &mut W,
+    ) -> io::Result<()> {
+        let Some(process) = self.get(process_id).cloned() else {
+            return protocol::write_server_event(
+                writer,
+                id,
+                ServerEvent::error(format!("unknown command process: {process_id}")),
+            );
+        };
+        let Some(shell_id) = process.shell_id.as_deref() else {
+            return protocol::write_server_event(
+                writer,
+                id,
+                ServerEvent::error(format!("command process is still starting: {process_id}")),
+            );
+        };
+        let Some(manager) = shell_sessions else {
+            return protocol::write_server_event(
+                writer,
+                id,
+                ServerEvent::error(format!("unknown command process: {process_id}")),
+            );
+        };
+        if let Err(error) = manager.resize(shell_id, cols, rows) {
+            return protocol::write_server_event(writer, id, ServerEvent::error(error.to_string()));
+        }
+        protocol::write_server_event(
+            writer,
+            id,
+            ServerEvent::CommandExecResized {
+                process_id: Value::from(process_id.to_string()),
+                cols: Value::from(cols),
+                rows: Value::from(rows),
+            },
+        )
+    }
+
+    fn drain<W: Write>(
+        &mut self,
+        shell_sessions: Option<&mut RuntimeShellSessionManager>,
+        writer: &mut W,
+    ) -> io::Result<()> {
+        self.drain_with_timeout(shell_sessions, writer, Duration::from_millis(1))
+    }
+
+    fn drain_with_timeout<W: Write>(
+        &mut self,
+        shell_sessions: Option<&mut RuntimeShellSessionManager>,
+        writer: &mut W,
+        timeout: Duration,
+    ) -> io::Result<()> {
+        let Some(manager) = shell_sessions else {
+            return Ok(());
+        };
+        let deadline = std::time::Instant::now()
+            .checked_add(timeout)
+            .unwrap_or_else(std::time::Instant::now);
+        loop {
+            let process_ids = self.process_ids();
+            if process_ids.is_empty() {
+                return Ok(());
+            }
+            let mut observed_output = false;
+            for process_id in process_ids {
+                let Some(process) = self.get(&process_id).cloned() else {
+                    continue;
+                };
+                let Some(shell_id) = process.shell_id.as_deref() else {
+                    continue;
+                };
+                let output = match manager.read(shell_id, Duration::from_millis(1)) {
+                    Ok(output) => output,
+                    Err(_) => continue,
+                };
+                if process.stream_output {
+                    let stdout_observed_len = output.stdout.len();
+                    let stderr_observed_len = output.stderr.len();
+                    let stdout_delta =
+                        capped_delta(&output.stdout, process.stdout_len, process.output_bytes_cap);
+                    let stderr_delta =
+                        capped_delta(&output.stderr, process.stderr_len, process.output_bytes_cap);
+                    let stdout_cap_reached = process
+                        .output_bytes_cap
+                        .is_some_and(|cap| output.stdout.len() >= cap)
+                        && !process.stdout_cap_reached;
+                    let stderr_cap_reached = process
+                        .output_bytes_cap
+                        .is_some_and(|cap| output.stderr.len() >= cap)
+                        && !process.stderr_cap_reached;
+                    observed_output |= !stdout_delta.is_empty() || !stderr_delta.is_empty();
+                    write_command_exec_output_deltas(
+                        writer,
+                        &process_id,
+                        &stdout_delta,
+                        &stderr_delta,
+                        stdout_cap_reached,
+                        stderr_cap_reached,
+                        output.status != orca_core::task_types::TaskStatus::Running,
+                    )?;
+                    if let Some(process) = self.get_mut(&process_id) {
+                        process.stdout_len = match process.output_bytes_cap {
+                            Some(cap) => capped_utf8_len(&output.stdout, cap),
+                            None => stdout_observed_len,
+                        };
+                        process.stderr_len = match process.output_bytes_cap {
+                            Some(cap) => capped_utf8_len(&output.stderr, cap),
+                            None => stderr_observed_len,
+                        };
+                        process.stdout_cap_reached |= stdout_cap_reached;
+                        process.stderr_cap_reached |= stderr_cap_reached;
+                    }
+                }
+                if output.status != orca_core::task_types::TaskStatus::Running {
+                    self.remove(&process_id);
+                    protocol::write_server_event(
+                        writer,
+                        &process.command_event_id,
+                        ServerEvent::CommandExecCompleted {
+                            process_id: Value::from(process_id),
+                            exit_code: output.exit_code.map(Value::from).unwrap_or(Value::Null),
+                            stdout: if process.stream_output {
+                                Value::from("")
+                            } else {
+                                Value::from(cap_text(&output.stdout, process.output_bytes_cap))
+                            },
+                            stderr: if process.stream_output {
+                                Value::from("")
+                            } else {
+                                Value::from(cap_text(&output.stderr, process.output_bytes_cap))
+                            },
+                        },
+                    )?;
+                }
+            }
+            if std::time::Instant::now() >= deadline
+                || (observed_output && timeout <= Duration::from_millis(1))
+            {
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn terminate_process<W: Write>(
+        &mut self,
+        shell_sessions: Option<&mut RuntimeShellSessionManager>,
+        process_id: &str,
+        id: &Value,
+        writer: &mut W,
+    ) -> io::Result<()> {
+        let Some(process) = self.get(process_id).cloned() else {
+            return protocol::write_server_event(
+                writer,
+                id,
+                ServerEvent::error(format!("unknown command process: {process_id}")),
+            );
+        };
+        let Some(shell_id) = process.shell_id.as_deref() else {
+            return protocol::write_server_event(
+                writer,
+                id,
+                ServerEvent::error(format!("command process is still starting: {process_id}")),
+            );
+        };
+        let Some(manager) = shell_sessions else {
+            return protocol::write_server_event(
+                writer,
+                id,
+                ServerEvent::error(format!("unknown command process: {process_id}")),
+            );
+        };
+        match manager.kill(shell_id) {
+            Ok(output) => {
+                self.remove(process_id);
+                protocol::write_server_event(
+                    writer,
+                    id,
+                    ServerEvent::CommandExecTerminated {
+                        process_id: Value::from(process_id.to_string()),
+                    },
+                )?;
+                protocol::write_server_event(
+                    writer,
+                    &process.command_event_id,
+                    ServerEvent::CommandExecCompleted {
+                        process_id: Value::from(process_id.to_string()),
+                        exit_code: output.exit_code.map(Value::from).unwrap_or(Value::Null),
+                        stdout: if process.stream_output {
+                            Value::from("")
+                        } else {
+                            Value::from(cap_text(&output.stdout, process.output_bytes_cap))
+                        },
+                        stderr: if process.stream_output {
+                            Value::from("")
+                        } else {
+                            Value::from(cap_text(&output.stderr, process.output_bytes_cap))
+                        },
+                    },
+                )
+            }
+            Err(error) => {
+                protocol::write_server_event(writer, id, ServerEvent::error(error.to_string()))
+            }
+        }
+    }
+
+    fn terminate_all(&mut self, shell_sessions: Option<&mut RuntimeShellSessionManager>) {
+        let Some(manager) = shell_sessions else {
+            self.processes.clear();
+            return;
+        };
+        for process_id in self.process_ids() {
+            let Some(process) = self.remove(&process_id) else {
+                continue;
+            };
+            let Some(shell_id) = process.shell_id else {
+                continue;
+            };
+            let _ = manager.kill(&shell_id);
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ActiveTurnControl {
+    thread_id: String,
+    cancel: CancelToken,
+    steer_handle: ThreadSteerHandle,
+    session_permission_directories: Vec<orca_core::config::AdditionalWorkingDirectory>,
+}
+
+struct ActiveTurnHandle {
+    handle: thread::JoinHandle<(String, String, ServerThread)>,
+}
+
+struct PendingPermissionRequest {
+    sender: mpsc::Sender<RuntimePermissionResponse>,
+    thread_id: String,
+    runtime_workspace_roots: Vec<PathBuf>,
+}
+
+struct ServerPermissionRequestHandler<W: Write + Send + 'static> {
+    writer: Arc<Mutex<W>>,
+    pending: Arc<Mutex<HashMap<String, PendingPermissionRequest>>>,
+    event_id: Value,
+    thread_id: String,
+    turn_id: String,
+    runtime_workspace_roots: Vec<PathBuf>,
+}
+
+impl<W: Write + Send + 'static> RuntimePermissionRequestHandler
+    for ServerPermissionRequestHandler<W>
+{
+    fn request_permissions(
+        &self,
+        request: &RuntimePermissionRequest,
+    ) -> io::Result<RuntimePermissionResponse> {
+        let request_id = format!("permission-{}-{}", self.turn_id, request.id);
+        let (sender, receiver) = mpsc::channel();
+        {
+            let mut pending = self.pending.lock().map_err(lock_error)?;
+            pending.insert(
+                request_id.clone(),
+                PendingPermissionRequest {
+                    sender,
+                    thread_id: self.thread_id.clone(),
+                    runtime_workspace_roots: self.runtime_workspace_roots.clone(),
+                },
+            );
+        }
+        if let Err(error) = write_locked_event(
+            &self.writer,
+            &self.event_id,
+            ServerEvent::PermissionRequest {
+                request_id: json!(request_id.clone()),
+                thread_id: json!(self.thread_id),
+                turn_id: json!(self.turn_id),
+                reason: request
+                    .reason
+                    .as_ref()
+                    .map(|reason| json!(reason))
+                    .unwrap_or(Value::Null),
+                permissions: serde_json::to_value(&request.permissions).unwrap_or(Value::Null),
+            },
+        ) {
+            let mut pending = self.pending.lock().map_err(lock_error)?;
+            pending.remove(&request_id);
+            return Err(error);
+        }
+        receiver
+            .recv()
+            .map_err(|_| io::Error::other("permission response channel closed"))
+    }
+}
+
+impl ServerState {
+    fn shell_manager(&mut self, cwd: &std::path::Path) -> &mut RuntimeShellSessionManager {
+        self.shell_sessions.get_or_insert_with(|| {
+            RuntimeShellSessionManager::new(TaskRegistry::new_for_cwd(
+                "server-shell".to_string(),
+                cwd,
+            ))
+        })
+    }
+
+    fn join_active_turns(&mut self) {
+        for active in self.running_turns.drain(..) {
+            if let Ok((turn_id, _thread_id, thread)) = active.handle.join() {
+                let control = self.active_turns.remove(&turn_id);
+                let thread = merge_completed_turn_metadata(thread, control);
+                self.threads.put_thread(thread);
+            }
+        }
+    }
+
+    fn reclaim_finished_threads(&mut self) {
+        let mut pending = Vec::new();
+        for active in self.running_turns.drain(..) {
+            if active.handle.is_finished() {
+                if let Ok((turn_id, _thread_id, thread)) = active.handle.join() {
+                    let control = self.active_turns.remove(&turn_id);
+                    let thread = merge_completed_turn_metadata(thread, control);
+                    self.threads.put_thread(thread);
+                }
+            } else {
+                pending.push(active);
+            }
+        }
+        self.running_turns = pending;
+    }
+
+    fn reclaim_finished_thread(&mut self, thread_id: &str) {
+        const MAX_WAIT: Duration = Duration::from_millis(100);
+        const POLL: Duration = Duration::from_millis(5);
+        let deadline = std::time::Instant::now() + MAX_WAIT;
+        loop {
+            self.reclaim_finished_threads();
+            if self.threads.has_thread(thread_id)
+                || !self
+                    .active_turns
+                    .values()
+                    .any(|turn| turn.thread_id == thread_id)
+                || std::time::Instant::now() >= deadline
+            {
+                break;
+            }
+            thread::sleep(POLL);
+        }
+        self.reclaim_finished_threads();
+    }
+}
+
+fn merge_completed_turn_metadata(
+    mut thread: ServerThread,
+    control: Option<ActiveTurnControl>,
+) -> ServerThread {
+    if let Some(control) = control
+        && !control.session_permission_directories.is_empty()
+    {
+        thread.update_metadata(ThreadMetadataPatch {
+            title: None,
+            active_permission_profile: None,
+            approval_mode: None,
+            runtime_workspace_roots: None,
+            permission_rules: None,
+            additional_working_directories: Some(control.session_permission_directories),
+        });
+    }
+    thread
+}
+
+fn handle_line<W: Write + Send + 'static>(
+    config: &ServerConfig,
+    state: &mut ServerState,
+    line: &str,
+    writer: Arc<Mutex<W>>,
+) -> io::Result<()> {
+    state.reclaim_finished_threads();
+    let submission = match Submission::decode(line) {
+        Ok(submission) => submission,
+        Err(error) => {
+            write_locked_event(&writer, &error.id, ServerEvent::error(error.message))?;
+            return Ok(());
+        }
+    };
+    {
+        let mut writer = writer.lock().map_err(lock_error)?;
+        drain_command_exec_processes(state, &mut *writer)?;
+    }
+
+    let result = match &submission.op {
+        ClientOp::Submit { thread_id, .. } => {
+            if let Some(thread_id) = thread_id {
+                if !state.threads.has_thread(thread_id)
+                    && !state
+                        .active_turns
+                        .values()
+                        .any(|turn| turn.thread_id == *thread_id)
+                {
+                    protocol::write_server_event(
+                        &mut *writer.lock().map_err(lock_error)?,
+                        &submission.id,
+                        ServerEvent::error(format!("unknown thread: {thread_id}")),
+                    )?;
+                    return Ok(());
+                }
+                run_thread_submit_async(config, state, submission.id, submission.op, writer)
+            } else {
+                let mut writer = writer.lock().map_err(lock_error)?;
+                run_submit(config, submission.id, submission.op, &mut *writer)
+            }
+        }
+        ClientOp::ThreadStart {
+            runtime_workspace_roots,
+        } => {
+            let mut writer = writer.lock().map_err(lock_error)?;
+            run_thread_start(
+                config,
+                state,
+                runtime_workspace_roots.clone(),
+                submission.id,
+                &mut *writer,
+            )
+        }
+        ClientOp::ThreadResume {
+            thread_id,
+            permissions,
+        } => {
+            let mut writer = writer.lock().map_err(lock_error)?;
+            run_thread_resume(
+                config,
+                state,
+                thread_id,
+                permissions.clone(),
+                submission.id.clone(),
+                &mut *writer,
+            )
+        }
+        ClientOp::ThreadFork {
+            thread_id,
+            permissions,
+        } => {
+            let mut writer = writer.lock().map_err(lock_error)?;
+            run_thread_fork(
+                config,
+                state,
+                thread_id,
+                permissions.clone(),
+                submission.id.clone(),
+                &mut *writer,
+            )
+        }
+        ClientOp::ThreadRead {
+            thread_id,
+            include_messages,
+            include_turns,
+        } => {
+            state.reclaim_finished_thread(thread_id);
+            let mut writer = writer.lock().map_err(lock_error)?;
+            run_thread_read(
+                state,
+                thread_id,
+                *include_messages,
+                *include_turns,
+                submission.id.clone(),
+                &mut *writer,
+            )
+        }
+        ClientOp::ThreadList {
+            cursor,
+            sort_key,
+            sort_direction,
+            search_term,
+            limit,
+            filters,
+        } => {
+            let mut writer = writer.lock().map_err(lock_error)?;
+            run_thread_list(
+                cursor.as_deref(),
+                *limit,
+                filters.clone(),
+                *sort_key,
+                *sort_direction,
+                search_term.as_deref(),
+                submission.id.clone(),
+                &mut *writer,
+            )
+        }
+        ClientOp::ThreadSearch {
+            query,
+            cursor,
+            sort_key,
+            sort_direction,
+            include_archived,
+            limit,
+        } => {
+            let mut writer = writer.lock().map_err(lock_error)?;
+            run_thread_search(
+                query,
+                cursor.as_deref(),
+                *limit,
+                *include_archived,
+                *sort_key,
+                *sort_direction,
+                submission.id.clone(),
+                &mut *writer,
+            )
+        }
+        ClientOp::ThreadTurnsList {
+            thread_id,
+            cursor,
+            sort_direction,
+            items_view,
+            limit,
+        } => {
+            state.reclaim_finished_thread(thread_id);
+            let mut writer = writer.lock().map_err(lock_error)?;
+            run_thread_turns_list(
+                state,
+                thread_id,
+                cursor.as_deref(),
+                *limit,
+                *sort_direction,
+                *items_view,
+                submission.id.clone(),
+                &mut *writer,
+            )
+        }
+        ClientOp::ThreadItemsList {
+            thread_id,
+            turn_id,
+            cursor,
+            sort_direction,
+            limit,
+        } => {
+            state.reclaim_finished_thread(thread_id);
+            let mut writer = writer.lock().map_err(lock_error)?;
+            run_thread_items_list(
+                state,
+                thread_id,
+                turn_id.as_deref(),
+                cursor.as_deref(),
+                *limit,
+                *sort_direction,
+                submission.id.clone(),
+                &mut *writer,
+            )
+        }
+        ClientOp::ThreadMetadataUpdate { thread_id, title } => {
+            let mut writer = writer.lock().map_err(lock_error)?;
+            run_thread_metadata_update(
+                state,
+                thread_id,
+                title.clone(),
+                submission.id.clone(),
+                &mut *writer,
+            )
+        }
+        ClientOp::TurnInterrupt { thread_id, turn_id } => run_turn_control(
+            state,
+            "interrupt",
+            thread_id.as_deref(),
+            turn_id,
+            None,
+            submission.id.clone(),
+            writer,
+        ),
+        ClientOp::TurnResume { thread_id, turn_id } => run_turn_control(
+            state,
+            "resume",
+            thread_id.as_deref(),
+            turn_id,
+            None,
+            submission.id.clone(),
+            writer,
+        ),
+        ClientOp::TurnSteer {
+            thread_id,
+            turn_id,
+            input,
+        } => run_turn_control(
+            state,
+            "steer",
+            thread_id.as_deref(),
+            turn_id,
+            Some(input),
+            submission.id.clone(),
+            writer,
+        ),
+        ClientOp::PermissionRespond {
+            request_id,
+            decision,
+            scope,
+            permissions,
+            strict_auto_review,
+        } => {
+            let mut writer = writer.lock().map_err(lock_error)?;
+            run_permission_respond(
+                state,
+                request_id,
+                *decision,
+                *scope,
+                permissions.clone(),
+                *strict_auto_review,
+                submission.id.clone(),
+                &mut *writer,
+            )
+        }
+        ClientOp::ShellStart {
+            thread_id,
+            command,
+            description,
+            terminal,
+        } => {
+            let mut writer = writer.lock().map_err(lock_error)?;
+            run_shell_start(
+                config,
+                state,
+                thread_id.as_deref(),
+                command,
+                description.clone(),
+                *terminal,
+                submission.id.clone(),
+                &mut *writer,
+            )
+        }
+        ClientOp::ShellWrite { shell_id, input } => {
+            let mut writer = writer.lock().map_err(lock_error)?;
+            run_shell_write(state, shell_id, input, submission.id.clone(), &mut *writer)
+        }
+        ClientOp::ShellUpdate {
+            shell_id,
+            description,
+        } => {
+            let mut writer = writer.lock().map_err(lock_error)?;
+            run_shell_update(
+                state,
+                shell_id,
+                description.as_deref(),
+                submission.id.clone(),
+                &mut *writer,
+            )
+        }
+        ClientOp::ShellClose { shell_id } => {
+            let mut writer = writer.lock().map_err(lock_error)?;
+            run_shell_close(state, shell_id, submission.id.clone(), &mut *writer)
+        }
+        ClientOp::ShellResize {
+            shell_id,
+            cols,
+            rows,
+        } => {
+            let mut writer = writer.lock().map_err(lock_error)?;
+            run_shell_resize(
+                state,
+                shell_id,
+                *cols,
+                *rows,
+                submission.id.clone(),
+                &mut *writer,
+            )
+        }
+        ClientOp::ShellList => {
+            let mut writer = writer.lock().map_err(lock_error)?;
+            run_shell_list(state, submission.id.clone(), &mut *writer)
+        }
+        ClientOp::ShellRead {
+            shell_id,
+            timeout_ms,
+        } => {
+            let mut writer = writer.lock().map_err(lock_error)?;
+            run_shell_read(
+                state,
+                shell_id,
+                *timeout_ms,
+                submission.id.clone(),
+                &mut *writer,
+            )
+        }
+        ClientOp::ShellKill { shell_id } => {
+            let mut writer = writer.lock().map_err(lock_error)?;
+            run_shell_kill(state, shell_id, submission.id.clone(), &mut *writer)
+        }
+        ClientOp::CommandExec {
+            thread_id,
+            command,
+            process_id,
+            cwd,
+            env,
+            options,
+            terminal,
+        } => {
+            let mut writer = writer.lock().map_err(lock_error)?;
+            run_command_exec(
+                config,
+                state,
+                thread_id.as_deref(),
+                command,
+                process_id.as_deref(),
+                cwd.as_ref(),
+                env,
+                options,
+                *terminal,
+                submission.id.clone(),
+                &mut *writer,
+            )
+        }
+        ClientOp::CommandExecWrite {
+            process_id,
+            delta_base64,
+            close_stdin,
+        } => {
+            let mut writer = writer.lock().map_err(lock_error)?;
+            run_command_exec_write(
+                state,
+                process_id,
+                delta_base64.as_deref(),
+                *close_stdin,
+                submission.id.clone(),
+                &mut *writer,
+            )
+        }
+        ClientOp::CommandExecResize {
+            process_id,
+            cols,
+            rows,
+        } => {
+            let mut writer = writer.lock().map_err(lock_error)?;
+            run_command_exec_resize(
+                state,
+                process_id,
+                *cols,
+                *rows,
+                submission.id.clone(),
+                &mut *writer,
+            )
+        }
+        ClientOp::CommandExecTerminate { process_id } => {
+            let mut writer = writer.lock().map_err(lock_error)?;
+            run_command_exec_terminate(state, process_id, submission.id.clone(), &mut *writer)
+        }
+    };
+    result?;
+    state.reclaim_finished_threads();
+    Ok(())
+}
+
+#[cfg(test)]
+fn handle_line_for_test(
+    config: &ServerConfig,
+    state: &mut ServerState,
+    line: &str,
+    output: &mut Vec<u8>,
+) -> io::Result<()> {
+    let writer = Arc::new(Mutex::new(Vec::new()));
+    handle_line(config, state, line, Arc::clone(&writer))?;
+    state.join_active_turns();
+    let mut writer = writer.lock().map_err(lock_error)?;
+    output.extend_from_slice(&writer);
+    writer.clear();
+    Ok(())
+}
+
+fn write_locked_event<W: Write>(
+    writer: &Arc<Mutex<W>>,
+    id: &Value,
+    event: ServerEvent,
+) -> io::Result<()> {
+    let mut writer = writer.lock().map_err(lock_error)?;
+    protocol::write_server_event(&mut *writer, id, event)
+}
+
+fn lock_error<T>(_: std::sync::PoisonError<T>) -> io::Error {
+    io::Error::other("server writer lock poisoned")
+}
+
+struct SharedServerRequestWriter<W: Write> {
+    inner: Arc<Mutex<W>>,
+    writer: ServerRequestWriter<LockedServerWriter<W>>,
+}
+
+impl<W: Write> SharedServerRequestWriter<W> {
+    fn new(id: Value, inner: Arc<Mutex<W>>) -> Self {
+        let locked = LockedServerWriter {
+            inner: Arc::clone(&inner),
+        };
+        Self {
+            inner,
+            writer: ServerRequestWriter::new(id, locked),
+        }
+    }
+
+    fn flush_remaining(&mut self) -> io::Result<()> {
+        self.writer.flush_remaining()
+    }
+}
+
+impl<W: Write> Write for SharedServerRequestWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.writer.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.lock().map_err(lock_error)?.flush()
+    }
+}
+
+struct LockedServerWriter<W: Write> {
+    inner: Arc<Mutex<W>>,
+}
+
+impl<W: Write> Write for LockedServerWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.inner.lock().map_err(lock_error)?.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.lock().map_err(lock_error)?.flush()
+    }
+}
+
+fn run_turn_control<W: Write + Send + 'static>(
+    state: &mut ServerState,
+    action: &str,
+    thread_id: Option<&str>,
+    turn_id: &str,
+    input: Option<&String>,
+    id: Value,
+    writer: Arc<Mutex<W>>,
+) -> io::Result<()> {
+    let mut steered_item = None;
+    let status = if let Some(control) = state.active_turns.get_mut(turn_id) {
+        if let Some(expected_thread_id) = thread_id {
+            if expected_thread_id != control.thread_id {
+                return write_locked_event(
+                    &writer,
+                    &id,
+                    ServerEvent::error(format!(
+                        "turn {turn_id} does not belong to thread {expected_thread_id}"
+                    )),
+                );
+            }
+        }
+        match action {
+            "interrupt" => {
+                control.cancel.cancel();
+                "interrupted"
+            }
+            "resume" => {
+                control.cancel.reset();
+                "resumed"
+            }
+            "steer" => {
+                if let Some(input) = input {
+                    control.steer_handle.push(input.clone());
+                    steered_item = Some((control.thread_id.clone(), input.clone()));
+                }
+                "steered"
+            }
+            _ => "running",
+        }
+    } else if let Some(actual_thread_id) = state.threads.completed_turn_thread_id(turn_id) {
+        if let Some(expected_thread_id) = thread_id {
+            if expected_thread_id != actual_thread_id {
+                return write_locked_event(
+                    &writer,
+                    &id,
+                    ServerEvent::error(format!(
+                        "turn {turn_id} does not belong to thread {expected_thread_id}"
+                    )),
+                );
+            }
+        }
+        return write_locked_event(
+            &writer,
+            &id,
+            ServerEvent::error(format!("turn is not active: {turn_id}")),
+        );
+    } else {
+        "idle"
+    };
+    write_locked_event(
+        &writer,
+        &id,
+        ServerEvent::TurnControlled {
+            action: Value::from(action.to_string()),
+            turn_id: Value::from(turn_id.to_string()),
+            status: Value::from(status),
+            input: input
+                .map(|input| Value::from(input.clone()))
+                .unwrap_or(Value::Null),
+        },
+    )?;
+    if let Some((thread_id, input)) = steered_item {
+        write_locked_event(
+            &writer,
+            &id,
+            ServerEvent::ItemStarted {
+                thread_id: Value::from(thread_id),
+                turn_id: Value::from(turn_id.to_string()),
+                item: json!({
+                    "type": "user_message",
+                    "role": "user",
+                    "content": input,
+                }),
+            },
+        )?;
     }
     Ok(())
 }
 
-fn handle_line<W: Write>(config: &ServerConfig, line: &str, writer: &mut W) -> io::Result<()> {
-    let submission = match Submission::decode(line) {
-        Ok(submission) => submission,
+fn run_permission_respond<W: Write>(
+    state: &mut ServerState,
+    request_id: &str,
+    decision: protocol::PermissionResponseDecision,
+    scope: protocol::PermissionGrantScope,
+    permissions: protocol::RequestPermissionProfile,
+    strict_auto_review: bool,
+    id: Value,
+    writer: &mut W,
+) -> io::Result<()> {
+    let pending = {
+        let mut pending = state.pending_permissions.lock().map_err(lock_error)?;
+        pending.remove(request_id)
+    };
+    let Some(pending) = pending else {
+        return protocol::write_server_event(
+            writer,
+            &id,
+            ServerEvent::error(format!("unknown permission request: {request_id}")),
+        );
+    };
+    if decision == protocol::PermissionResponseDecision::Allow
+        && scope == protocol::PermissionGrantScope::Session
+    {
+        let directories = persist_session_permission_grant(
+            &pending.thread_id,
+            &pending.runtime_workspace_roots,
+            &permissions,
+        )?;
+        for control in state.active_turns.values_mut() {
+            if control.thread_id == pending.thread_id {
+                control.session_permission_directories = directories.clone();
+            }
+        }
+    }
+    if pending
+        .sender
+        .send(RuntimePermissionResponse {
+            decision,
+            scope,
+            permissions,
+            strict_auto_review,
+        })
+        .is_err()
+    {
+        return protocol::write_server_event(
+            writer,
+            &id,
+            ServerEvent::error(format!(
+                "permission request is no longer active: {request_id}"
+            )),
+        );
+    }
+    protocol::write_server_event(
+        writer,
+        &id,
+        ServerEvent::PermissionResolved {
+            request_id: json!(request_id),
+            decision: json!(decision),
+            scope: json!(scope),
+            strict_auto_review: json!(strict_auto_review),
+        },
+    )
+}
+
+fn persist_session_permission_grant(
+    thread_id: &str,
+    runtime_workspace_roots: &[PathBuf],
+    permissions: &protocol::RequestPermissionProfile,
+) -> io::Result<Vec<orca_core::config::AdditionalWorkingDirectory>> {
+    let file_system = permissions.file_system.as_ref();
+    let roots = file_system
+        .into_iter()
+        .flat_map(|file_system| {
+            file_system
+                .write
+                .iter()
+                .flatten()
+                .chain(file_system.read.iter().flatten())
+        })
+        .filter(|path| !path.as_os_str().is_empty());
+    let store = SessionStore::new();
+    let mut transcript = store.load_session(thread_id)?;
+    for root in roots {
+        for root in
+            materialize_workspace_roots_paths(&transcript.meta.cwd, runtime_workspace_roots, root)
+        {
+            if !transcript
+                .meta
+                .additional_working_directories
+                .iter()
+                .any(|directory| directory.path == root)
+            {
+                transcript.meta.additional_working_directories.push(
+                    orca_core::config::AdditionalWorkingDirectory::new(root, "session"),
+                );
+            }
+        }
+    }
+    store.update_thread_metadata(
+        thread_id,
+        ThreadMetadataPatch {
+            title: None,
+            active_permission_profile: None,
+            approval_mode: transcript.meta.approval_mode,
+            runtime_workspace_roots: None,
+            permission_rules: Some(transcript.meta.permission_rules),
+            additional_working_directories: Some(transcript.meta.additional_working_directories),
+        },
+    )?;
+    let updated = store.load_session(thread_id)?;
+    Ok(updated.meta.additional_working_directories)
+}
+
+fn materialize_workspace_roots_paths(
+    cwd: &str,
+    runtime_workspace_roots: &[PathBuf],
+    path: &std::path::Path,
+) -> Vec<PathBuf> {
+    let Some(rest) = path
+        .to_str()
+        .and_then(|path| path.strip_prefix(":workspace_roots"))
+    else {
+        return vec![path.to_path_buf()];
+    };
+    let roots = if runtime_workspace_roots.is_empty() {
+        vec![PathBuf::from(cwd)]
+    } else {
+        runtime_workspace_roots.to_vec()
+    };
+    let subpath = rest
+        .trim_start_matches(std::path::MAIN_SEPARATOR)
+        .trim_start_matches('/');
+    roots
+        .into_iter()
+        .map(|root| {
+            if subpath.is_empty() {
+                return root;
+            }
+            let mut materialized = root;
+            for component in PathBuf::from(subpath).components() {
+                if let std::path::Component::Normal(part) = component {
+                    materialized.push(part);
+                }
+            }
+            materialized
+        })
+        .collect()
+}
+
+fn materialize_profile_special_path(
+    path: PathBuf,
+    tmpdir: Option<&std::path::Path>,
+) -> Vec<PathBuf> {
+    match path.to_str() {
+        Some(":slash_tmp") => vec![PathBuf::from("/tmp")],
+        Some(":tmpdir") => tmpdir
+            .map(|path| vec![path.to_path_buf()])
+            .unwrap_or_default(),
+        _ => vec![path],
+    }
+}
+
+fn run_shell_start<W: Write>(
+    config: &ServerConfig,
+    state: &mut ServerState,
+    thread_id: Option<&str>,
+    command: &str,
+    description: Option<String>,
+    terminal: crate::shell_session::ShellTerminalMode,
+    id: Value,
+    writer: &mut W,
+) -> io::Result<()> {
+    if command.trim().is_empty() {
+        return protocol::write_server_event(
+            writer,
+            &id,
+            ServerEvent::error("shell command must not be empty"),
+        );
+    }
+    let cwd = server_cwd(&config.run_config)?;
+    let task_registry = match thread_id {
+        Some(thread_id) => match state.threads.task_registry(thread_id) {
+            Some(registry) => Some(registry),
+            None => {
+                return protocol::write_server_event(
+                    writer,
+                    &id,
+                    ServerEvent::error(format!("unknown thread: {thread_id}")),
+                );
+            }
+        },
+        None => None,
+    };
+    let manager = state.shell_manager(&cwd);
+    let command_text = command.to_string();
+    let command = ShellSessionCommand {
+        command: command_text.clone(),
+        cwd,
+        additional_working_directories: Vec::new(),
+        denied_working_directories: Vec::new(),
+        env: Default::default(),
+        description: description.unwrap_or_else(|| command_text.clone()),
+        terminal,
+        sandbox: ShellSandboxMode::WorkspaceWrite {
+            network_access: true,
+            exclude_tmpdir_env_var: false,
+            exclude_slash_tmp: false,
+        },
+    };
+    let spawn_result = match task_registry {
+        Some(task_registry) => manager.spawn_with_task_registry(command, task_registry),
+        None => manager.spawn(command),
+    };
+    let handle = match spawn_result {
+        Ok(handle) => handle,
         Err(error) => {
-            protocol::write_server_event(writer, &error.id, ServerEvent::error(error.message))?;
-            return Ok(());
+            return protocol::write_server_event(
+                writer,
+                &id,
+                ServerEvent::error(format!("failed to start shell: {error}")),
+            );
         }
     };
+    protocol::write_server_event(
+        writer,
+        &id,
+        ServerEvent::ShellStarted {
+            shell_id: Value::from(handle.id),
+            task_id: Value::from(handle.task_id),
+            command: Value::from(command_text),
+            status: Value::from("running"),
+            requested_terminal_mode: Value::from(handle.requested_terminal.as_str()),
+            effective_terminal_mode: Value::from(handle.effective_terminal.as_str()),
+        },
+    )
+}
 
-    match &submission.op {
-        ClientOp::Submit { .. } => run_submit(config, submission, writer),
+fn run_shell_write<W: Write>(
+    state: &mut ServerState,
+    shell_id: &str,
+    input: &str,
+    id: Value,
+    writer: &mut W,
+) -> io::Result<()> {
+    let Some(manager) = state.shell_sessions.as_mut() else {
+        return unknown_shell(writer, &id, shell_id);
+    };
+    if let Err(error) = manager.write_stdin(shell_id, input) {
+        return protocol::write_server_event(writer, &id, ServerEvent::error(error.to_string()));
+    }
+    protocol::write_server_event(
+        writer,
+        &id,
+        ServerEvent::ShellUpdated {
+            shell_id: Value::from(shell_id.to_string()),
+            status: Value::from("running"),
+            cols: Value::Null,
+            rows: Value::Null,
+            stdout: Value::Null,
+            stderr: Value::Null,
+            exit_code: Value::Null,
+            description: Value::Null,
+        },
+    )
+}
+
+fn run_shell_update<W: Write>(
+    state: &mut ServerState,
+    shell_id: &str,
+    description: Option<&str>,
+    id: Value,
+    writer: &mut W,
+) -> io::Result<()> {
+    let Some(manager) = state.shell_sessions.as_mut() else {
+        return unknown_shell(writer, &id, shell_id);
+    };
+    let Some(description) = description else {
+        return protocol::write_server_event(
+            writer,
+            &id,
+            ServerEvent::error("shell update did not include any supported fields"),
+        );
+    };
+    if let Err(error) = manager.update_description(shell_id, description) {
+        return protocol::write_server_event(writer, &id, ServerEvent::error(error.to_string()));
+    }
+    protocol::write_server_event(
+        writer,
+        &id,
+        ServerEvent::ShellUpdated {
+            shell_id: Value::from(shell_id.to_string()),
+            status: Value::from("updated"),
+            cols: Value::Null,
+            rows: Value::Null,
+            stdout: Value::Null,
+            stderr: Value::Null,
+            exit_code: Value::Null,
+            description: Value::from(description.trim().to_string()),
+        },
+    )
+}
+
+fn run_shell_close<W: Write>(
+    state: &mut ServerState,
+    shell_id: &str,
+    id: Value,
+    writer: &mut W,
+) -> io::Result<()> {
+    let Some(manager) = state.shell_sessions.as_mut() else {
+        return unknown_shell(writer, &id, shell_id);
+    };
+    if let Err(error) = manager.close_stdin(shell_id) {
+        return protocol::write_server_event(writer, &id, ServerEvent::error(error.to_string()));
+    }
+    protocol::write_server_event(
+        writer,
+        &id,
+        ServerEvent::ShellUpdated {
+            shell_id: Value::from(shell_id.to_string()),
+            status: Value::from("stdin_closed"),
+            cols: Value::Null,
+            rows: Value::Null,
+            stdout: Value::Null,
+            stderr: Value::Null,
+            exit_code: Value::Null,
+            description: Value::Null,
+        },
+    )
+}
+
+fn run_shell_resize<W: Write>(
+    state: &mut ServerState,
+    shell_id: &str,
+    cols: u16,
+    rows: u16,
+    id: Value,
+    writer: &mut W,
+) -> io::Result<()> {
+    let Some(manager) = state.shell_sessions.as_mut() else {
+        return unknown_shell(writer, &id, shell_id);
+    };
+    if cols == 0 || rows == 0 {
+        return protocol::write_server_event(
+            writer,
+            &id,
+            ServerEvent::error("shell resize cols and rows must be greater than zero"),
+        );
+    }
+    if let Err(error) = manager.resize(shell_id, cols, rows) {
+        return protocol::write_server_event(writer, &id, ServerEvent::error(error.to_string()));
+    }
+    protocol::write_server_event(
+        writer,
+        &id,
+        ServerEvent::ShellUpdated {
+            shell_id: Value::from(shell_id.to_string()),
+            status: Value::from("resized"),
+            cols: Value::from(cols),
+            rows: Value::from(rows),
+            stdout: Value::Null,
+            stderr: Value::Null,
+            exit_code: Value::Null,
+            description: Value::Null,
+        },
+    )
+}
+
+fn run_shell_list<W: Write>(state: &mut ServerState, id: Value, writer: &mut W) -> io::Result<()> {
+    if let Some(manager) = state.shell_sessions.as_mut() {
+        for output in manager.reap_requested_stops()? {
+            write_shell_completed(writer, &id, output)?;
+        }
+    }
+    let shells = state
+        .shell_sessions
+        .as_mut()
+        .map(|manager| manager.list())
+        .unwrap_or_default()
+        .into_iter()
+        .map(shell_snapshot_to_json)
+        .collect::<Vec<_>>();
+    protocol::write_server_event(
+        writer,
+        &id,
+        ServerEvent::ShellListed {
+            shells: Value::from(shells),
+        },
+    )
+}
+
+fn run_shell_read<W: Write>(
+    state: &mut ServerState,
+    shell_id: &str,
+    timeout_ms: u64,
+    id: Value,
+    writer: &mut W,
+) -> io::Result<()> {
+    let Some(manager) = state.shell_sessions.as_mut() else {
+        return unknown_shell(writer, &id, shell_id);
+    };
+    for output in manager.reap_requested_stops()? {
+        if output.id == shell_id {
+            return write_shell_completed(writer, &id, output);
+        }
+        write_shell_completed(writer, &id, output)?;
+    }
+    let output = match manager.read(shell_id, Duration::from_millis(timeout_ms.max(1))) {
+        Ok(output) => output,
+        Err(error) => {
+            return protocol::write_server_event(
+                writer,
+                &id,
+                ServerEvent::error(error.to_string()),
+            );
+        }
+    };
+    if output.status == orca_core::task_types::TaskStatus::Running {
+        write_shell_output_deltas(writer, &id, &output, false)?;
+        protocol::write_server_event(
+            writer,
+            &id,
+            ServerEvent::ShellUpdated {
+                shell_id: Value::from(output.id),
+                status: Value::from("running"),
+                cols: Value::Null,
+                rows: Value::Null,
+                stdout: Value::from(output.stdout),
+                stderr: Value::from(output.stderr),
+                exit_code: Value::Null,
+                description: Value::Null,
+            },
+        )
+    } else {
+        write_shell_completed(writer, &id, output)
+    }
+}
+
+fn run_shell_kill<W: Write>(
+    state: &mut ServerState,
+    shell_id: &str,
+    id: Value,
+    writer: &mut W,
+) -> io::Result<()> {
+    let Some(manager) = state.shell_sessions.as_mut() else {
+        return unknown_shell(writer, &id, shell_id);
+    };
+    let output = match manager.kill(shell_id) {
+        Ok(output) => output,
+        Err(error) => {
+            return protocol::write_server_event(
+                writer,
+                &id,
+                ServerEvent::error(error.to_string()),
+            );
+        }
+    };
+    write_shell_completed(writer, &id, output)
+}
+
+fn run_command_exec<W: Write>(
+    config: &ServerConfig,
+    state: &mut ServerState,
+    thread_id: Option<&str>,
+    command: &[String],
+    process_id: Option<&str>,
+    cwd: Option<&PathBuf>,
+    env: &protocol::CommandEnvOverrides,
+    options: &protocol::CommandExecOptions,
+    terminal: crate::shell_session::ShellTerminalMode,
+    id: Value,
+    writer: &mut W,
+) -> io::Result<()> {
+    if command.is_empty() {
+        return protocol::write_server_event(
+            writer,
+            &id,
+            ServerEvent::error("command/exec command must not be empty"),
+        );
+    }
+    if options.sandbox_policy != protocol::CommandSandboxPolicy::Default
+        && options.permission_profile.is_some()
+    {
+        return protocol::write_server_event(
+            writer,
+            &id,
+            ServerEvent::error("`permissionProfile` cannot be combined with `sandboxPolicy`"),
+        );
+    }
+    if options.disable_timeout && options.timeout_ms.is_some() {
+        return protocol::write_server_event(
+            writer,
+            &id,
+            ServerEvent::error("command/exec cannot set both timeoutMs and disableTimeout"),
+        );
+    }
+    if options.disable_output_cap && options.output_bytes_cap.is_some() {
+        return protocol::write_server_event(
+            writer,
+            &id,
+            ServerEvent::error("command/exec cannot set both outputBytesCap and disableOutputCap"),
+        );
+    }
+    if options.has_size && !terminal.is_pty() {
+        return protocol::write_server_event(
+            writer,
+            &id,
+            ServerEvent::error("command/exec size requires tty: true"),
+        );
+    }
+    let (terminal_cols, terminal_rows) = terminal.size();
+    if terminal_cols == Some(0) || terminal_rows == Some(0) {
+        return protocol::write_server_event(
+            writer,
+            &id,
+            ServerEvent::error("command/exec size rows and cols must be greater than 0"),
+        );
+    }
+    let timeout_ms = match options.timeout_ms {
+        Some(timeout_ms) => match u64::try_from(timeout_ms) {
+            Ok(timeout_ms) => timeout_ms,
+            Err(_) => {
+                return protocol::write_server_event(
+                    writer,
+                    &id,
+                    ServerEvent::error(format!(
+                        "command/exec timeoutMs must be non-negative, got {timeout_ms}"
+                    )),
+                );
+            }
+        },
+        None => 120_000,
+    };
+    if process_id.is_none()
+        && (terminal.is_pty() || options.stream_stdin || options.stream_stdout_stderr)
+    {
+        return protocol::write_server_event(
+            writer,
+            &id,
+            ServerEvent::error(
+                "command/exec tty or streaming requires a client-supplied processId",
+            ),
+        );
+    }
+    let command_text = protocol::shell_join(command);
+    let cwd = cwd.cloned().unwrap_or(server_cwd(&config.run_config)?);
+    let (mut additional_working_directories, thread_permission_profile, runtime_workspace_roots) =
+        match thread_id {
+            Some(thread_id) => {
+                state.reclaim_finished_thread(thread_id);
+                match state.threads.thread(thread_id) {
+                    Some(thread) => (
+                        thread
+                            .additional_working_directories()
+                            .iter()
+                            .map(|directory| directory.path.clone())
+                            .collect(),
+                        thread.active_permission_profile().cloned(),
+                        thread.runtime_workspace_roots().to_vec(),
+                    ),
+                    None => {
+                        return protocol::write_server_event(
+                            writer,
+                            &id,
+                            ServerEvent::error(format!("unknown thread: {thread_id}")),
+                        );
+                    }
+                }
+            }
+            None => (
+                Vec::new(),
+                None,
+                config
+                    .run_config
+                    .runtime_workspace_roots
+                    .clone()
+                    .unwrap_or_default(),
+            ),
+        };
+    let effective_sandbox = match command_exec_sandbox_mode(
+        &config.run_config,
+        options,
+        thread_permission_profile.as_ref(),
+        &cwd,
+        &runtime_workspace_roots,
+        std::env::var_os("TMPDIR").map(PathBuf::from).as_deref(),
+    ) {
+        Ok(sandbox) => sandbox,
+        Err(error) => {
+            return protocol::write_server_event(writer, &id, ServerEvent::error(error));
+        }
+    };
+    additional_working_directories.extend(effective_sandbox.additional_writable_roots.clone());
+    let denied_writable_directories = effective_sandbox.denied_writable_roots.clone();
+    if let protocol::CommandSandboxPolicy::WorkspaceWrite { writable_roots, .. } =
+        &options.sandbox_policy
+    {
+        additional_working_directories.extend(writable_roots.iter().cloned());
+    }
+    if let Some(process_id) = process_id {
+        if let Err(error) = state.command_exec.insert(
+            process_id.to_string(),
+            CommandExecProcess {
+                shell_id: None,
+                command_event_id: id.clone(),
+                stream_output: terminal.is_pty() || options.stream_stdout_stderr,
+                output_bytes_cap: options
+                    .output_bytes_cap
+                    .and_then(|cap| usize::try_from(cap).ok()),
+                stdout_len: 0,
+                stderr_len: 0,
+                stdout_cap_reached: false,
+                stderr_cap_reached: false,
+            },
+        ) {
+            return protocol::write_server_event(writer, &id, ServerEvent::error(error));
+        }
+    }
+    let manager = state.shell_manager(&cwd);
+    let handle = match manager.spawn(ShellSessionCommand {
+        command: command_text.clone(),
+        cwd,
+        additional_working_directories,
+        denied_working_directories: denied_writable_directories,
+        env: env.clone(),
+        description: command_text,
+        terminal,
+        sandbox: effective_sandbox.mode,
+    }) {
+        Ok(handle) => handle,
+        Err(error) => {
+            if let Some(process_id) = process_id {
+                state.command_exec.remove(process_id);
+            }
+            return protocol::write_server_event(
+                writer,
+                &id,
+                ServerEvent::error(format!("failed to start command: {error}")),
+            );
+        }
+    };
+    if let Some(process_id) = process_id {
+        state.command_exec.activate(process_id, handle.id);
+        protocol::write_server_event(
+            writer,
+            &id,
+            ServerEvent::CommandExecStarted {
+                process_id: Value::from(process_id.to_string()),
+            },
+        )?;
+        drain_command_exec_processes_with_timeout(state, writer, Duration::from_millis(250))?;
+        return Ok(());
+    }
+
+    let output = match state
+        .shell_sessions
+        .as_mut()
+        .expect("command exec shell manager")
+        .wait(&handle.id, Duration::from_millis(timeout_ms.max(1)))
+    {
+        Ok(output) => output,
+        Err(error) => {
+            return protocol::write_server_event(
+                writer,
+                &id,
+                ServerEvent::error(error.to_string()),
+            );
+        }
+    };
+    protocol::write_server_event(
+        writer,
+        &id,
+        ServerEvent::CommandExecCompleted {
+            process_id: Value::Null,
+            exit_code: output.exit_code.map(Value::from).unwrap_or(Value::Null),
+            stdout: Value::from(cap_text(
+                &output.stdout,
+                options
+                    .output_bytes_cap
+                    .and_then(|cap| usize::try_from(cap).ok()),
+            )),
+            stderr: Value::from(cap_text(
+                &output.stderr,
+                options
+                    .output_bytes_cap
+                    .and_then(|cap| usize::try_from(cap).ok()),
+            )),
+        },
+    )
+}
+
+fn shell_sandbox_mode_from_command_policy(
+    policy: &protocol::CommandSandboxPolicy,
+) -> ShellSandboxMode {
+    match policy {
+        protocol::CommandSandboxPolicy::DangerFullAccess
+        | protocol::CommandSandboxPolicy::ExternalSandbox { .. } => {
+            ShellSandboxMode::DangerFullAccess
+        }
+        protocol::CommandSandboxPolicy::ReadOnly { network_access } => ShellSandboxMode::ReadOnly {
+            network_access: *network_access,
+        },
+        protocol::CommandSandboxPolicy::WorkspaceWrite {
+            network_access,
+            exclude_tmpdir_env_var,
+            exclude_slash_tmp,
+            ..
+        } => ShellSandboxMode::WorkspaceWrite {
+            network_access: *network_access,
+            exclude_tmpdir_env_var: *exclude_tmpdir_env_var,
+            exclude_slash_tmp: *exclude_slash_tmp,
+        },
+        protocol::CommandSandboxPolicy::Default | protocol::CommandSandboxPolicy::Other => {
+            ShellSandboxMode::WorkspaceWrite {
+                network_access: true,
+                exclude_tmpdir_env_var: false,
+                exclude_slash_tmp: false,
+            }
+        }
+    }
+}
+
+fn command_exec_sandbox_mode(
+    config: &RunConfig,
+    options: &protocol::CommandExecOptions,
+    thread_permission_profile: Option<&crate::server_runtime::ActivePermissionProfile>,
+    cwd: &std::path::Path,
+    runtime_workspace_roots: &[PathBuf],
+    tmpdir: Option<&std::path::Path>,
+) -> Result<CommandExecSandbox, String> {
+    if let Some(profile) = options.permission_profile.as_deref() {
+        return shell_sandbox_mode_from_permission_profile(
+            config,
+            profile,
+            cwd,
+            runtime_workspace_roots,
+            tmpdir,
+        );
+    }
+    if options.sandbox_policy != protocol::CommandSandboxPolicy::Default {
+        return Ok(CommandExecSandbox::new(
+            shell_sandbox_mode_from_command_policy(&options.sandbox_policy),
+        ));
+    }
+    if let Some(profile) = thread_permission_profile {
+        let inherited_profile = profile.extends.as_deref().unwrap_or(&profile.id);
+        return shell_sandbox_mode_from_permission_profile(
+            config,
+            inherited_profile,
+            cwd,
+            runtime_workspace_roots,
+            tmpdir,
+        );
+    }
+    Ok(CommandExecSandbox::new(
+        shell_sandbox_mode_from_command_policy(&options.sandbox_policy),
+    ))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CommandExecSandbox {
+    mode: ShellSandboxMode,
+    additional_writable_roots: Vec<PathBuf>,
+    denied_writable_roots: Vec<PathBuf>,
+}
+
+impl CommandExecSandbox {
+    fn new(mode: ShellSandboxMode) -> Self {
+        Self {
+            mode,
+            additional_writable_roots: Vec::new(),
+            denied_writable_roots: Vec::new(),
+        }
+    }
+}
+
+fn shell_sandbox_mode_from_permission_profile(
+    config: &RunConfig,
+    profile: &str,
+    cwd: &std::path::Path,
+    runtime_workspace_roots: &[PathBuf],
+    tmpdir: Option<&std::path::Path>,
+) -> Result<CommandExecSandbox, String> {
+    let resolved =
+        resolve_permission_profile(config, profile, cwd, runtime_workspace_roots, tmpdir)?;
+    let mut mode = match resolved.builtin.as_deref() {
+        Some("read-only") => ShellSandboxMode::ReadOnly {
+            network_access: false,
+        },
+        Some("workspace") => ShellSandboxMode::WorkspaceWrite {
+            network_access: true,
+            exclude_tmpdir_env_var: false,
+            exclude_slash_tmp: false,
+        },
+        Some("danger-full-access") => ShellSandboxMode::DangerFullAccess,
+        Some(_) | None => return Err(format!("unknown command/exec permissionProfile: {profile}")),
+    };
+    if let Some(network_access) = resolved.network_access {
+        mode = match mode {
+            ShellSandboxMode::WorkspaceWrite {
+                exclude_tmpdir_env_var,
+                exclude_slash_tmp,
+                ..
+            } => ShellSandboxMode::WorkspaceWrite {
+                network_access,
+                exclude_tmpdir_env_var,
+                exclude_slash_tmp,
+            },
+            ShellSandboxMode::ReadOnly { .. } => ShellSandboxMode::ReadOnly { network_access },
+            ShellSandboxMode::DangerFullAccess => ShellSandboxMode::DangerFullAccess,
+        };
+    }
+    Ok(CommandExecSandbox {
+        mode,
+        additional_writable_roots: resolved.additional_writable_roots,
+        denied_writable_roots: resolved.denied_writable_roots,
+    })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ResolvedPermissionProfile {
+    builtin: Option<String>,
+    additional_writable_roots: Vec<PathBuf>,
+    denied_writable_roots: Vec<PathBuf>,
+    network_access: Option<bool>,
+}
+
+fn resolve_permission_profile(
+    config: &RunConfig,
+    profile: &str,
+    cwd: &std::path::Path,
+    runtime_workspace_roots: &[PathBuf],
+    tmpdir: Option<&std::path::Path>,
+) -> Result<ResolvedPermissionProfile, String> {
+    let mut current = normalize_permission_profile_name(profile).map(str::to_string);
+    let mut seen = Vec::new();
+    let mut additional_writable_roots = Vec::new();
+    let mut denied_writable_roots = Vec::new();
+    let mut network_access = None;
+    while let Some(name) = current {
+        if is_builtin_permission_profile_name(&name) {
+            return Ok(ResolvedPermissionProfile {
+                builtin: Some(name),
+                additional_writable_roots,
+                denied_writable_roots,
+                network_access,
+            });
+        }
+        if seen.iter().any(|seen_name| seen_name == &name) {
+            seen.push(name);
+            return Err(format!(
+                "command/exec permissionProfile cycle: {}",
+                seen.join(" -> ")
+            ));
+        }
+        seen.push(name.clone());
+        let Some(profile) = config.permission_profiles.get(&name) else {
+            return Err(format!("unknown command/exec permissionProfile: {name}"));
+        };
+        for (path, access) in profile.filesystem.entries() {
+            let roots = materialize_workspace_roots_paths(
+                &cwd.display().to_string(),
+                runtime_workspace_roots,
+                path,
+            )
+            .into_iter()
+            .flat_map(|root| materialize_profile_special_path(root, tmpdir))
+            .collect::<Vec<_>>();
+            for root in roots {
+                if access.allows_write() && !additional_writable_roots.contains(&root) {
+                    additional_writable_roots.push(root.clone());
+                }
+                if access.denies_write() && !denied_writable_roots.contains(&root) {
+                    denied_writable_roots.push(root);
+                }
+            }
+        }
+        if network_access.is_none() {
+            network_access = profile.network.enabled;
+        }
+        current = profile
+            .extends
+            .as_deref()
+            .and_then(normalize_permission_profile_name)
+            .map(str::to_string);
+    }
+    Ok(ResolvedPermissionProfile {
+        builtin: None,
+        additional_writable_roots,
+        denied_writable_roots,
+        network_access,
+    })
+}
+
+fn is_builtin_permission_profile_name(profile: &str) -> bool {
+    matches!(profile, "read-only" | "workspace" | "danger-full-access")
+}
+
+fn normalize_permission_profile_name(profile: &str) -> Option<&str> {
+    profile
+        .strip_prefix(':')
+        .or(Some(profile))
+        .filter(|profile| !profile.is_empty())
+}
+
+fn run_command_exec_write<W: Write>(
+    state: &mut ServerState,
+    process_id: &str,
+    delta_base64: Option<&str>,
+    close_stdin: bool,
+    id: Value,
+    writer: &mut W,
+) -> io::Result<()> {
+    if delta_base64.is_none() && !close_stdin {
+        return protocol::write_server_event(
+            writer,
+            &id,
+            ServerEvent::error("command/exec/write requires deltaBase64 or closeStdin"),
+        );
+    }
+    state.command_exec.write_to_process(
+        state.shell_sessions.as_mut(),
+        process_id,
+        delta_base64,
+        close_stdin,
+        &id,
+        writer,
+    )
+}
+
+fn run_command_exec_resize<W: Write>(
+    state: &mut ServerState,
+    process_id: &str,
+    cols: u16,
+    rows: u16,
+    id: Value,
+    writer: &mut W,
+) -> io::Result<()> {
+    if cols == 0 || rows == 0 {
+        return protocol::write_server_event(
+            writer,
+            &id,
+            ServerEvent::error("command/exec size rows and cols must be greater than 0"),
+        );
+    }
+    state.command_exec.resize_process(
+        state.shell_sessions.as_mut(),
+        process_id,
+        cols,
+        rows,
+        &id,
+        writer,
+    )
+}
+
+fn drain_command_exec_processes<W: Write>(
+    state: &mut ServerState,
+    writer: &mut W,
+) -> io::Result<()> {
+    state
+        .command_exec
+        .drain(state.shell_sessions.as_mut(), writer)
+}
+
+fn drain_command_exec_processes_with_timeout<W: Write>(
+    state: &mut ServerState,
+    writer: &mut W,
+    timeout: Duration,
+) -> io::Result<()> {
+    state
+        .command_exec
+        .drain_with_timeout(state.shell_sessions.as_mut(), writer, timeout)
+}
+
+fn cap_text(text: &str, cap: Option<usize>) -> String {
+    let Some(cap) = cap else {
+        return text.to_string();
+    };
+    let visible_len = capped_utf8_len(text, cap);
+    text[..visible_len].to_string()
+}
+
+fn capped_delta(text: &str, sent_len: usize, cap: Option<usize>) -> String {
+    let visible_len = cap
+        .map(|cap| capped_utf8_len(text, cap))
+        .unwrap_or_else(|| text.len());
+    let sent_len = sent_len.min(visible_len);
+    text.get(sent_len..visible_len)
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn capped_utf8_len(text: &str, cap: usize) -> usize {
+    if cap >= text.len() {
+        return text.len();
+    }
+    let mut len = cap;
+    while len > 0 && !text.is_char_boundary(len) {
+        len -= 1;
+    }
+    len
+}
+
+fn write_command_exec_output_deltas<W: Write>(
+    writer: &mut W,
+    process_id: &str,
+    stdout_delta: &str,
+    stderr_delta: &str,
+    stdout_cap_reached: bool,
+    stderr_cap_reached: bool,
+    final_chunk: bool,
+) -> io::Result<()> {
+    if !stdout_delta.is_empty() {
+        protocol::write_server_event(
+            writer,
+            &Value::Null,
+            ServerEvent::CommandExecOutputDelta {
+                process_id: Value::from(process_id.to_string()),
+                stream: Value::from("stdout"),
+                delta: Value::from(stdout_delta.to_string()),
+                delta_base64: Value::from(BASE64_STANDARD.encode(stdout_delta.as_bytes())),
+                cap_reached: Value::from(stdout_cap_reached),
+                final_chunk: Value::from(final_chunk),
+            },
+        )?;
+    }
+    if !stderr_delta.is_empty() {
+        protocol::write_server_event(
+            writer,
+            &Value::Null,
+            ServerEvent::CommandExecOutputDelta {
+                process_id: Value::from(process_id.to_string()),
+                stream: Value::from("stderr"),
+                delta: Value::from(stderr_delta.to_string()),
+                delta_base64: Value::from(BASE64_STANDARD.encode(stderr_delta.as_bytes())),
+                cap_reached: Value::from(stderr_cap_reached),
+                final_chunk: Value::from(final_chunk),
+            },
+        )?;
+    }
+    Ok(())
+}
+
+fn run_command_exec_terminate<W: Write>(
+    state: &mut ServerState,
+    process_id: &str,
+    id: Value,
+    writer: &mut W,
+) -> io::Result<()> {
+    state
+        .command_exec
+        .terminate_process(state.shell_sessions.as_mut(), process_id, &id, writer)
+}
+
+fn write_shell_completed<W: Write>(
+    writer: &mut W,
+    id: &Value,
+    output: crate::shell_session::ShellSessionOutput,
+) -> io::Result<()> {
+    write_shell_output_deltas(writer, id, &output, true)?;
+    protocol::write_server_event(
+        writer,
+        id,
+        ServerEvent::ShellExited {
+            shell_id: Value::from(output.id.clone()),
+            task_id: Value::from(output.task_id.clone()),
+            status: Value::from(shell_status_label(output.status)),
+            exit_code: output.exit_code.map(Value::from).unwrap_or(Value::Null),
+        },
+    )?;
+    protocol::write_server_event(
+        writer,
+        id,
+        ServerEvent::ShellCompleted {
+            shell_id: Value::from(output.id),
+            task_id: Value::from(output.task_id),
+            status: Value::from(shell_status_label(output.status)),
+            stdout: Value::from(output.stdout),
+            stderr: Value::from(output.stderr),
+            exit_code: output.exit_code.map(Value::from).unwrap_or(Value::Null),
+        },
+    )
+}
+
+fn write_shell_output_deltas<W: Write>(
+    writer: &mut W,
+    id: &Value,
+    output: &crate::shell_session::ShellSessionOutput,
+    final_chunk: bool,
+) -> io::Result<()> {
+    if !output.stdout.is_empty() {
+        protocol::write_server_event(
+            writer,
+            id,
+            ServerEvent::ShellOutputDelta {
+                shell_id: Value::from(output.id.clone()),
+                stream: Value::from("stdout"),
+                delta: Value::from(output.stdout.clone()),
+                final_chunk: Value::from(final_chunk),
+            },
+        )?;
+    }
+    if !output.stderr.is_empty() {
+        protocol::write_server_event(
+            writer,
+            id,
+            ServerEvent::ShellOutputDelta {
+                shell_id: Value::from(output.id.clone()),
+                stream: Value::from("stderr"),
+                delta: Value::from(output.stderr.clone()),
+                final_chunk: Value::from(final_chunk),
+            },
+        )?;
+    }
+    Ok(())
+}
+
+fn shell_snapshot_to_json(snapshot: crate::shell_session::ShellSessionSnapshot) -> Value {
+    json!({
+        "shellId": snapshot.id,
+        "taskId": snapshot.task_id,
+        "command": snapshot.command,
+        "description": snapshot.description,
+        "status": shell_status_label(snapshot.status),
+        "requestedTerminalMode": snapshot.requested_terminal.as_str(),
+        "effectiveTerminalMode": snapshot.effective_terminal.as_str(),
+    })
+}
+
+fn unknown_shell<W: Write>(writer: &mut W, id: &Value, shell_id: &str) -> io::Result<()> {
+    protocol::write_server_event(
+        writer,
+        id,
+        ServerEvent::error(format!("unknown shell session: {shell_id}")),
+    )
+}
+
+fn shell_status_label(status: orca_core::task_types::TaskStatus) -> &'static str {
+    match status {
+        orca_core::task_types::TaskStatus::Completed => "completed",
+        orca_core::task_types::TaskStatus::Stopped => "stopped",
+        orca_core::task_types::TaskStatus::Failed => "failed",
+        orca_core::task_types::TaskStatus::Cancelled => "cancelled",
+        orca_core::task_types::TaskStatus::Running => "running",
+        orca_core::task_types::TaskStatus::Queued => "queued",
+        orca_core::task_types::TaskStatus::Paused => "paused",
+        orca_core::task_types::TaskStatus::Stopping => "stopping",
+    }
+}
+
+fn server_cwd(config: &RunConfig) -> io::Result<PathBuf> {
+    config
+        .cwd
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(std::env::current_dir)
+}
+
+fn run_thread_list<W: Write>(
+    cursor: Option<&str>,
+    limit: usize,
+    filters: ThreadListFilters,
+    sort_key: ThreadSortKey,
+    sort_direction: SortDirection,
+    search_term: Option<&str>,
+    id: Value,
+    writer: &mut W,
+) -> io::Result<()> {
+    let store = SessionStore::new();
+    let page = store.list_threads(
+        cursor,
+        limit,
+        filters,
+        sort_key,
+        sort_direction,
+        search_term,
+    )?;
+    let data = page
+        .data
+        .into_iter()
+        .map(thread_summary_to_json)
+        .collect::<Vec<_>>();
+    protocol::write_server_event(
+        writer,
+        &id,
+        ServerEvent::ThreadList {
+            data: Value::from(data),
+            next_cursor: optional_string_to_json(page.next_cursor),
+            backwards_cursor: optional_string_to_json(page.backwards_cursor),
+        },
+    )
+}
+
+fn run_thread_search<W: Write>(
+    query: &str,
+    cursor: Option<&str>,
+    limit: usize,
+    include_archived: bool,
+    sort_key: ThreadSortKey,
+    sort_direction: SortDirection,
+    id: Value,
+    writer: &mut W,
+) -> io::Result<()> {
+    if query.is_empty() {
+        return protocol::write_server_event(
+            writer,
+            &id,
+            ServerEvent::error("thread search term must not be empty"),
+        );
+    }
+    let store = SessionStore::new();
+    let page = store.search_threads(
+        query,
+        cursor,
+        limit,
+        include_archived,
+        sort_key,
+        sort_direction,
+    )?;
+    let data = page
+        .data
+        .into_iter()
+        .map(|hit| {
+            serde_json::json!({
+                "thread": thread_summary_to_json(hit.thread),
+                "snippet": hit.snippet,
+            })
+        })
+        .collect::<Vec<_>>();
+    protocol::write_server_event(
+        writer,
+        &id,
+        ServerEvent::ThreadSearch {
+            data: Value::from(data),
+            next_cursor: optional_string_to_json(page.next_cursor),
+            backwards_cursor: optional_string_to_json(page.backwards_cursor),
+        },
+    )
+}
+
+fn thread_summary_to_json(summary: StoredThreadSummary) -> Value {
+    serde_json::json!({
+        "threadId": summary.thread_id,
+        "title": summary.title,
+        "cwd": summary.cwd,
+        "provider": summary.provider,
+        "model": summary.model,
+        "createdAt": summary.created_at.to_rfc3339(),
+        "updatedAt": summary.updated_at.to_rfc3339(),
+        "archived": summary.archived,
+        "parentId": summary.parent_id,
+        "forked": summary.forked,
+        "approvalMode": summary.approval_mode.map(|mode| mode.as_str()),
+        "runtimeWorkspaceRoots": runtime_workspace_roots_to_json(summary.runtime_workspace_roots),
+        "activePermissionProfile": active_permission_profile_to_json(summary.active_permission_profile),
+        "permissionRuleCount": summary.permission_rule_count,
+        "additionalWorkingDirectoryCount": summary.additional_working_directories.len(),
+        "additionalWorkingDirectories": additional_working_directories_to_json(summary.additional_working_directories),
+    })
+}
+
+fn additional_working_directories_to_json(
+    directories: Vec<orca_core::config::AdditionalWorkingDirectory>,
+) -> Value {
+    Value::from(
+        directories
+            .into_iter()
+            .map(|directory| {
+                serde_json::json!({
+                    "path": directory.path,
+                    "source": directory.source,
+                })
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn runtime_workspace_roots_to_json(roots: Vec<PathBuf>) -> Value {
+    Value::from(
+        roots
+            .into_iter()
+            .map(|root| Value::from(root.display().to_string()))
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn active_permission_profile_to_json(
+    profile: Option<orca_core::config::ActivePermissionProfile>,
+) -> Value {
+    profile
+        .map(|profile| {
+            serde_json::json!({
+                "id": profile.id,
+                "extends": profile.extends,
+            })
+        })
+        .unwrap_or(Value::Null)
+}
+
+fn run_thread_turns_list<W: Write>(
+    state: &ServerState,
+    thread_id: &str,
+    cursor: Option<&str>,
+    limit: usize,
+    sort_direction: SortDirection,
+    items_view: TurnItemsView,
+    id: Value,
+    writer: &mut W,
+) -> io::Result<()> {
+    let store = SessionStore::new();
+    let page = match store.list_thread_turns(thread_id, cursor, limit, sort_direction, items_view) {
+        Ok(page) => page,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            match state.threads.list_thread_turns(
+                thread_id,
+                cursor,
+                limit,
+                sort_direction,
+                items_view,
+            ) {
+                Some(page) => page,
+                None => {
+                    return protocol::write_server_event(
+                        writer,
+                        &id,
+                        ServerEvent::error(format!("unknown thread: {thread_id}")),
+                    );
+                }
+            }
+        }
+        Err(error) => return Err(error),
+    };
+
+    protocol::write_server_event(
+        writer,
+        &id,
+        ServerEvent::ThreadTurnsList {
+            data: Value::from(
+                page.data
+                    .into_iter()
+                    .map(thread_turn_to_json)
+                    .collect::<Vec<_>>(),
+            ),
+            next_cursor: optional_string_to_json(page.next_cursor),
+            backwards_cursor: optional_string_to_json(page.backwards_cursor),
+        },
+    )
+}
+
+fn run_thread_items_list<W: Write>(
+    state: &ServerState,
+    thread_id: &str,
+    turn_id: Option<&str>,
+    cursor: Option<&str>,
+    limit: usize,
+    sort_direction: SortDirection,
+    id: Value,
+    writer: &mut W,
+) -> io::Result<()> {
+    let store = SessionStore::new();
+    let page = match store.list_thread_items(thread_id, turn_id, cursor, limit, sort_direction) {
+        Ok(page) => page,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            match state
+                .threads
+                .list_thread_items(thread_id, turn_id, cursor, limit, sort_direction)
+            {
+                Some(page) => page,
+                None => {
+                    return protocol::write_server_event(
+                        writer,
+                        &id,
+                        ServerEvent::error(format!("unknown thread: {thread_id}")),
+                    );
+                }
+            }
+        }
+        Err(error) => return Err(error),
+    };
+
+    protocol::write_server_event(
+        writer,
+        &id,
+        ServerEvent::ThreadItemsList {
+            data: Value::from(
+                page.data
+                    .into_iter()
+                    .map(thread_item_to_json)
+                    .collect::<Vec<_>>(),
+            ),
+            next_cursor: optional_string_to_json(page.next_cursor),
+            backwards_cursor: optional_string_to_json(page.backwards_cursor),
+        },
+    )
+}
+
+fn optional_string_to_json(value: Option<String>) -> Value {
+    value.map(Value::from).unwrap_or(Value::Null)
+}
+
+fn run_thread_start<W: Write>(
+    config: &ServerConfig,
+    state: &mut ServerState,
+    runtime_workspace_roots: Option<Vec<PathBuf>>,
+    id: Value,
+    writer: &mut W,
+) -> io::Result<()> {
+    let mut run_config = thread_run_config(&config.run_config);
+    if let Some(runtime_workspace_roots) = runtime_workspace_roots {
+        run_config.runtime_workspace_roots = Some(runtime_workspace_roots);
+    }
+    let thread_id = state.threads.start_thread(&run_config)?;
+    protocol::write_server_event(
+        writer,
+        &id,
+        ServerEvent::ThreadStarted {
+            thread_id: Value::from(thread_id),
+        },
+    )
+}
+
+fn run_thread_resume<W: Write>(
+    config: &ServerConfig,
+    state: &mut ServerState,
+    thread_id: &str,
+    permissions: PermissionProfileOverride,
+    id: Value,
+    writer: &mut W,
+) -> io::Result<()> {
+    match state
+        .threads
+        .resume_thread_with_permissions(&config.run_config, thread_id, permissions)
+    {
+        Ok(thread_id) => protocol::write_server_event(
+            writer,
+            &id,
+            ServerEvent::ThreadStarted {
+                thread_id: Value::from(thread_id),
+            },
+        ),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => protocol::write_server_event(
+            writer,
+            &id,
+            ServerEvent::error(format!("unknown thread: {thread_id}")),
+        ),
+        Err(error) => Err(error),
+    }
+}
+
+fn run_thread_fork<W: Write>(
+    config: &ServerConfig,
+    state: &mut ServerState,
+    thread_id: &str,
+    permissions: PermissionProfileOverride,
+    id: Value,
+    writer: &mut W,
+) -> io::Result<()> {
+    match state
+        .threads
+        .fork_thread_with_permissions(&config.run_config, thread_id, permissions)
+    {
+        Ok(thread_id) => protocol::write_server_event(
+            writer,
+            &id,
+            ServerEvent::ThreadStarted {
+                thread_id: Value::from(thread_id),
+            },
+        ),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => protocol::write_server_event(
+            writer,
+            &id,
+            ServerEvent::error(format!("unknown thread: {thread_id}")),
+        ),
+        Err(error) => Err(error),
+    }
+}
+
+fn run_thread_submit_async<W: Write + Send + 'static>(
+    config: &ServerConfig,
+    state: &mut ServerState,
+    id: Value,
+    op: ClientOp,
+    writer: Arc<Mutex<W>>,
+) -> io::Result<()> {
+    let run_config = thread_run_config(&config.run_config);
+    let ClientOp::Submit {
+        thread_id: Some(thread_id),
+        prompt,
+        permissions,
+    } = op
+    else {
+        return Ok(());
+    };
+
+    state.reclaim_finished_thread(&thread_id);
+    let Some(mut thread_state) = state.threads.take_thread(&thread_id) else {
+        if state
+            .active_turns
+            .values()
+            .any(|turn| turn.thread_id == thread_id)
+        {
+            return write_locked_event(
+                &writer,
+                &id,
+                ServerEvent::error(format!("thread has an active turn: {thread_id}")),
+            );
+        }
+        return write_locked_event(
+            &writer,
+            &id,
+            ServerEvent::error(format!("unknown thread: {thread_id}")),
+        );
+    };
+    let cancel = CancelToken::new();
+    let steer_handle = ThreadSteerHandle::default();
+    let active_turn_id = thread_state.next_persisted_turn_id();
+    let runtime_workspace_roots = permissions
+        .runtime_workspace_roots
+        .clone()
+        .unwrap_or_else(|| thread_state.runtime_workspace_roots().to_vec());
+    state.active_turns.insert(
+        active_turn_id.clone(),
+        ActiveTurnControl {
+            thread_id: thread_id.clone(),
+            cancel: cancel.clone(),
+            steer_handle: steer_handle.clone(),
+            session_permission_directories: Vec::new(),
+        },
+    );
+
+    let writer_for_thread = Arc::clone(&writer);
+    let thread_id_for_return = thread_id.clone();
+    let active_turn_id_for_return = active_turn_id.clone();
+    let permission_handler = Arc::new(ServerPermissionRequestHandler {
+        writer: Arc::clone(&writer),
+        pending: Arc::clone(&state.pending_permissions),
+        event_id: id.clone(),
+        thread_id: thread_id.clone(),
+        turn_id: active_turn_id.clone(),
+        runtime_workspace_roots,
+    });
+    let handle = thread::spawn(move || {
+        let mut writer = SharedServerRequestWriter::new(id.clone(), Arc::clone(&writer_for_thread));
+        let status = thread_state.run_turn_with_permissions_cancel_and_permission_handler(
+            &run_config,
+            &prompt,
+            permissions,
+            &mut writer,
+            cancel,
+            steer_handle,
+            permission_handler,
+        );
+        let _ = writer.flush_remaining();
+        if let Err(error) = status {
+            let _ = write_locked_event(
+                &writer_for_thread,
+                &id,
+                ServerEvent::error(error.to_string()),
+            );
+        }
+        (
+            active_turn_id_for_return,
+            thread_id_for_return,
+            thread_state,
+        )
+    });
+    state.running_turns.push(ActiveTurnHandle { handle });
+    state.reclaim_finished_threads();
+    Ok(())
+}
+
+fn run_thread_read<W: Write>(
+    state: &ServerState,
+    thread_id: &str,
+    include_messages: bool,
+    include_turns: bool,
+    id: Value,
+    writer: &mut W,
+) -> io::Result<()> {
+    let store = SessionStore::new();
+    if let Ok(thread) = store.read_thread(thread_id, include_messages, include_turns) {
+        return protocol::write_server_event(
+            writer,
+            &id,
+            ServerEvent::ThreadRead {
+                thread_id: Value::from(thread.thread_id),
+                title: Value::from(thread.title),
+                cwd: Value::from(thread.cwd),
+                runtime_workspace_roots: runtime_workspace_roots_to_json(
+                    thread.runtime_workspace_roots,
+                ),
+                active_permission_profile: active_permission_profile_to_json(
+                    thread.active_permission_profile,
+                ),
+                additional_working_directory_count: Value::from(
+                    thread.additional_working_directories.len() as u64,
+                ),
+                additional_working_directories: additional_working_directories_to_json(
+                    thread.additional_working_directories,
+                ),
+                message_count: Value::from(thread.message_count as u64),
+                messages: Value::from(thread.messages),
+                turns: Value::from(
+                    thread
+                        .turns
+                        .into_iter()
+                        .map(thread_turn_to_json)
+                        .collect::<Vec<_>>(),
+                ),
+            },
+        );
+    }
+
+    match state
+        .threads
+        .read_thread(thread_id, include_messages, include_turns)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "unknown thread"))
+    {
+        Ok(thread) => protocol::write_server_event(
+            writer,
+            &id,
+            ServerEvent::ThreadRead {
+                thread_id: Value::from(thread.thread_id),
+                title: Value::from(thread.title),
+                cwd: Value::from(thread.cwd),
+                runtime_workspace_roots: runtime_workspace_roots_to_json(
+                    thread.runtime_workspace_roots,
+                ),
+                active_permission_profile: active_permission_profile_to_json(
+                    thread.active_permission_profile,
+                ),
+                additional_working_directory_count: Value::from(
+                    thread.additional_working_directories.len() as u64,
+                ),
+                additional_working_directories: additional_working_directories_to_json(
+                    thread.additional_working_directories,
+                ),
+                message_count: Value::from(thread.message_count as u64),
+                messages: Value::from(thread.messages),
+                turns: Value::from(
+                    thread
+                        .turns
+                        .into_iter()
+                        .map(thread_turn_to_json)
+                        .collect::<Vec<_>>(),
+                ),
+            },
+        ),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => protocol::write_server_event(
+            writer,
+            &id,
+            ServerEvent::error(format!("unknown thread: {thread_id}")),
+        ),
+        Err(error) => Err(error),
+    }
+}
+
+fn run_thread_metadata_update<W: Write>(
+    state: &mut ServerState,
+    thread_id: &str,
+    title: Option<String>,
+    id: Value,
+    writer: &mut W,
+) -> io::Result<()> {
+    let Some(title) = title else {
+        return protocol::write_server_event(
+            writer,
+            &id,
+            ServerEvent::error("thread metadata patch did not include any supported fields"),
+        );
+    };
+
+    let live_thread_updated = state.threads.update_thread_metadata(
+        thread_id,
+        ThreadMetadataPatch {
+            title: Some(title.clone()),
+            ..ThreadMetadataPatch::default()
+        },
+    );
+
+    let store = SessionStore::new();
+    match store.update_thread_metadata(
+        thread_id,
+        ThreadMetadataPatch {
+            title: Some(title.clone()),
+            ..ThreadMetadataPatch::default()
+        },
+    ) {
+        Ok(_) => protocol::write_server_event(
+            writer,
+            &id,
+            ServerEvent::ThreadMetadataUpdated {
+                thread_id: Value::from(thread_id.to_string()),
+                title: Value::from(title),
+            },
+        ),
+        Err(error) if error.kind() == io::ErrorKind::NotFound && live_thread_updated => {
+            protocol::write_server_event(
+                writer,
+                &id,
+                ServerEvent::ThreadMetadataUpdated {
+                    thread_id: Value::from(thread_id.to_string()),
+                    title: Value::from(title),
+                },
+            )
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => protocol::write_server_event(
+            writer,
+            &id,
+            ServerEvent::error(format!("unknown thread: {thread_id}")),
+        ),
+        Err(error) if error.kind() == io::ErrorKind::InvalidInput => {
+            protocol::write_server_event(writer, &id, ServerEvent::error(error.to_string()))
+        }
+        Err(error) => Err(error),
     }
 }
 
 fn run_submit<W: Write>(
     config: &ServerConfig,
-    submission: Submission,
+    id: Value,
+    op: ClientOp,
     writer: &mut W,
 ) -> io::Result<()> {
     let mut run_config = config.run_config.clone();
-    let ClientOp::Submit { prompt } = submission.op;
+    let ClientOp::Submit { prompt, .. } = op else {
+        return Ok(());
+    };
     run_config.prompt = prompt;
     // Defensive: force JSONL output and disable history regardless of config file settings.
     run_config.output_format = OutputFormat::Jsonl;
@@ -65,64 +2850,15 @@ fn run_submit<W: Write>(
     run_config.show_session_picker = false;
     run_config.desktop_notifications = false;
 
-    let mut streaming_writer = ServerWriter::new(submission.id, writer);
-    let _exit_code = controller::run_to_writer_with_options(
+    let mut streaming_writer = ServerRequestWriter::new(id, writer);
+    let _exit_code = crate::controller::run_to_writer_with_options(
         run_config,
         &mut streaming_writer,
-        controller::ControllerRunOptions {
-            wait_for_background_workflows: false,
+        crate::controller::ControllerRunOptions {
+            wait_for_background_workflows: true,
         },
     );
     streaming_writer.flush_remaining()
-}
-
-struct ServerWriter<'a, W: Write> {
-    id: Value,
-    inner: &'a mut W,
-    buffer: Vec<u8>,
-}
-
-impl<'a, W: Write> ServerWriter<'a, W> {
-    fn new(id: Value, inner: &'a mut W) -> Self {
-        Self {
-            id,
-            inner,
-            buffer: Vec::new(),
-        }
-    }
-
-    fn flush_remaining(&mut self) -> io::Result<()> {
-        if !self.buffer.is_empty() {
-            let line = String::from_utf8_lossy(&self.buffer).to_string();
-            self.buffer.clear();
-            if let Some(event) = map_runtime_event(&line) {
-                protocol::write_server_event(self.inner, &self.id, event)?;
-            }
-        }
-        Ok(())
-    }
-}
-
-impl<W: Write> Write for ServerWriter<'_, W> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.buffer.extend_from_slice(buf);
-        while let Some(pos) = self.buffer.iter().position(|&b| b == b'\n') {
-            let line = String::from_utf8_lossy(&self.buffer[..pos]).to_string();
-            self.buffer.drain(..=pos);
-            if let Some(event) = map_runtime_event(&line) {
-                protocol::write_server_event(self.inner, &self.id, event)?;
-            }
-        }
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.inner.flush()
-    }
-}
-
-fn map_runtime_event(line: &str) -> Option<ServerEvent> {
-    protocol::map_runtime_event_line(line)
 }
 
 #[cfg(test)]
@@ -133,13 +2869,35 @@ mod tests {
     use orca_core::config::{
         HistoryMode, OutputFormat, ProviderKind, RunConfig, ThemeName, ToolConfig, WorkflowConfig,
     };
+    use orca_core::conversation::Message;
     use orca_core::model::ModelSelection;
     use orca_core::subagent_config::SubagentConfig;
     use std::io::Cursor;
+    use tempfile::tempdir;
+
+    #[derive(Clone, Default)]
+    struct SharedVecWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl SharedVecWriter {
+        fn bytes(&self) -> Vec<u8> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    impl Write for SharedVecWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn maps_runtime_tool_events_to_protocol_shape() {
-        let mapped = map_runtime_event(
+        let mapped = protocol::map_runtime_event_line(
             r#"{"type":"tool.call.requested","payload":{"name":"read_file","target":"src/main.rs"}}"#,
         )
         .expect("mapped event");
@@ -152,8 +2910,26 @@ mod tests {
     }
 
     #[test]
+    fn maps_runtime_plan_updated_event_to_protocol_shape() {
+        let mapped = protocol::map_runtime_event_line(
+            r#"{"type":"plan.updated","payload":{"explanation":"ship it","plan":[{"step":"Inspect","status":"completed"},{"step":"Implement","status":"in_progress"}]}}"#,
+        )
+        .expect("mapped event");
+        let mapped = protocol::legacy_json_event(Value::from(7), mapped);
+
+        assert_eq!(mapped["event"], "turn_plan_updated");
+        assert!(mapped["threadId"].is_null());
+        assert!(mapped["turnId"].is_null());
+        assert_eq!(mapped["explanation"], "ship it");
+        assert_eq!(mapped["plan"][0]["step"], "Inspect");
+        assert_eq!(mapped["plan"][0]["status"], "completed");
+        assert_eq!(mapped["plan"][1]["step"], "Implement");
+        assert_eq!(mapped["plan"][1]["status"], "in_progress");
+    }
+
+    #[test]
     fn maps_runtime_workflow_events_to_protocol_shape() {
-        let mapped = map_runtime_event(
+        let mapped = protocol::map_runtime_event_line(
             r#"{"type":"workflow.started","payload":{"taskId":"task-1","runId":"workflow-run-1","workflowName":"audit"}}"#,
         )
         .expect("mapped event");
@@ -167,7 +2943,7 @@ mod tests {
 
     #[test]
     fn maps_runtime_workflow_result_available_event_to_protocol_shape() {
-        let mapped = map_runtime_event(
+        let mapped = protocol::map_runtime_event_line(
             r#"{"type":"workflow.result.available","payload":{"taskId":"task-1","runId":"workflow-run-1","result":"done"}}"#,
         )
         .expect("mapped event");
@@ -181,7 +2957,7 @@ mod tests {
 
     #[test]
     fn maps_runtime_workflow_completed_event_to_protocol_shape() {
-        let mapped = map_runtime_event(
+        let mapped = protocol::map_runtime_event_line(
             r#"{"type":"workflow.completed","payload":{"taskId":"task-1","runId":"workflow-run-1","workflowName":"audit"}}"#,
         )
         .expect("mapped event");
@@ -195,7 +2971,7 @@ mod tests {
 
     #[test]
     fn maps_runtime_workflow_failed_event_to_protocol_shape() {
-        let mapped = map_runtime_event(
+        let mapped = protocol::map_runtime_event_line(
             r#"{"type":"workflow.failed","payload":{"taskId":"task-1","runId":"workflow-run-1","error":"boom"}}"#,
         )
         .expect("mapped event");
@@ -212,35 +2988,1019 @@ mod tests {
         let mut output = Vec::new();
         let id = Value::from(42);
         {
-            let mut writer = ServerWriter::new(id, &mut output);
+            let mut writer = ServerRequestWriter::new(id, &mut output);
             writer
                 .write_all(
                     b"{\"type\":\"assistant.message.delta\",\"payload\":{\"text\":\"hi\"}}\n",
                 )
                 .unwrap();
         }
-        let line = String::from_utf8(output).unwrap();
-        let event: Value = serde_json::from_str(line.trim()).unwrap();
-        assert_eq!(event["id"], 42);
-        assert_eq!(event["event"], "message_delta");
-        assert_eq!(event["text"], "hi");
+        let events = parse_jsonl(&output);
+        assert!(events.iter().all(|event| event["id"] == 42));
+        assert!(events.iter().any(|event| {
+            event["event"] == "item_started" && event["item"]["type"] == "agent_message"
+        }));
+        assert!(events.iter().any(|event| {
+            event["event"] == "item_message_delta"
+                && event["itemId"] == "item-agent-message-1"
+                && event["delta"] == "hi"
+        }));
+        assert!(
+            events
+                .iter()
+                .any(|event| event["event"] == "message_delta" && event["text"] == "hi")
+        );
     }
 
     #[test]
-    fn workflow_submit_does_not_wait_for_background_result() {
-        let input = Cursor::new(br#"{"id":7,"op":"submit","prompt":"workflow inline"}"#.to_vec());
+    fn server_writer_streams_tool_call_item_lifecycle() {
         let mut output = Vec::new();
+        {
+            let mut writer = ServerRequestWriter::new(Value::from("turn"), &mut output);
+            writer
+                .write_all(
+                    br#"{"type":"tool.call.requested","payload":{"id":"tool-1","name":"bash","target":"cargo test"}}"#,
+                )
+                .unwrap();
+            writer.write_all(b"\n").unwrap();
+            writer
+                .write_all(
+                    br#"{"type":"tool.call.completed","payload":{"id":"tool-1","name":"bash","status":"completed","output":"ok","exit_code":0}}"#,
+                )
+                .unwrap();
+            writer.write_all(b"\n").unwrap();
+        }
+
+        let events = parse_jsonl(&output);
+        let started = events
+            .iter()
+            .find(|event| {
+                event["event"] == "item_started"
+                    && event["item"]["type"] == "commandExecution"
+                    && event["item"]["id"] == "tool-1"
+            })
+            .expect("tool item_started");
+        assert_eq!(started["item"]["tool"], "bash");
+        assert_eq!(started["item"]["command"], "cargo test");
+        assert_eq!(started["item"]["status"], "in_progress");
+
+        assert!(
+            events
+                .iter()
+                .any(|event| event["event"] == "tool_requested" && event["tool"] == "bash")
+        );
+
+        let completed = events
+            .iter()
+            .find(|event| {
+                event["event"] == "item_completed"
+                    && event["item"]["type"] == "commandExecution"
+                    && event["item"]["id"] == "tool-1"
+            })
+            .expect("tool item_completed");
+        assert_eq!(completed["item"]["status"], "completed");
+        assert_eq!(completed["item"]["aggregatedOutput"], "ok");
+        assert!(completed["item"].get("output").is_none());
+        assert_eq!(completed["item"]["exitCode"], 0);
+
+        assert!(
+            events
+                .iter()
+                .any(|event| event["event"] == "tool_completed" && event["status"] == "completed")
+        );
+        let legacy_completed = events
+            .iter()
+            .find(|event| event["event"] == "tool_completed" && event["tool"] == "bash")
+            .expect("legacy tool_completed");
+        assert_eq!(legacy_completed["exitCode"], 0);
+    }
+
+    #[test]
+    fn server_writer_preserves_failed_command_execution_output_for_diagnostics() {
+        let mut output = Vec::new();
+        {
+            let mut writer = ServerRequestWriter::new(Value::from("turn"), &mut output);
+            writer
+                .write_all(
+                    br#"{"type":"tool.call.requested","payload":{"id":"tool-1","name":"bash","target":"cargo test"}}"#,
+                )
+                .unwrap();
+            writer.write_all(b"\n").unwrap();
+            writer
+                .write_all(
+                    br#"{"type":"tool.call.completed","payload":{"id":"tool-1","name":"bash","status":"failed","output":"test failure details","error":"command failed","exit_code":101}}"#,
+                )
+                .unwrap();
+            writer.write_all(b"\n").unwrap();
+        }
+
+        let events = parse_jsonl(&output);
+        let completed = events
+            .iter()
+            .find(|event| {
+                event["event"] == "item_completed"
+                    && event["item"]["type"] == "commandExecution"
+                    && event["item"]["id"] == "tool-1"
+            })
+            .expect("tool item_completed");
+        assert_eq!(completed["item"]["status"], "failed");
+        assert_eq!(
+            completed["item"]["aggregatedOutput"],
+            "test failure details"
+        );
+        assert!(completed["item"].get("output").is_none());
+        assert_eq!(completed["item"]["error"], "command failed");
+        assert_eq!(completed["item"]["exitCode"], 101);
+    }
+
+    #[test]
+    fn command_exec_manager_rejects_duplicate_active_process_id_until_removed() {
+        let mut manager = CommandExecManager::default();
+        let first = command_exec_process("shell-1");
+        let duplicate = command_exec_process("shell-2");
+
+        assert!(manager.insert("proc-1".to_string(), first).is_ok());
+        let duplicate_error = manager
+            .insert("proc-1".to_string(), duplicate)
+            .expect_err("duplicate process id should be rejected");
+        assert_eq!(
+            duplicate_error,
+            "duplicate active command/exec process id: \"proc-1\""
+        );
+
+        assert_eq!(
+            manager
+                .get("proc-1")
+                .expect("registered process")
+                .shell_id
+                .as_deref(),
+            Some("shell-1")
+        );
+        manager.remove("proc-1");
+        assert!(
+            manager
+                .insert("proc-1".to_string(), command_exec_process("shell-3"))
+                .is_ok()
+        );
+        assert_eq!(
+            manager
+                .get("proc-1")
+                .expect("re-registered process")
+                .shell_id
+                .as_deref(),
+            Some("shell-3")
+        );
+    }
+
+    #[test]
+    fn command_exec_sandbox_resolves_custom_permission_profile_chain() {
+        let mut config = test_run_config();
+        config.permission_profiles.insert(
+            "locked-down".to_string(),
+            orca_core::config::PermissionProfileConfig {
+                extends: Some("read-base".to_string()),
+                ..Default::default()
+            },
+        );
+        config.permission_profiles.insert(
+            "read-base".to_string(),
+            orca_core::config::PermissionProfileConfig {
+                extends: Some(":read-only".to_string()),
+                ..Default::default()
+            },
+        );
+        let options = protocol::CommandExecOptions {
+            permission_profile: Some("locked-down".to_string()),
+            ..Default::default()
+        };
+
+        let sandbox =
+            test_profile_sandbox(&config, &options).expect("custom permission profile sandbox");
+
+        assert_eq!(
+            sandbox.mode,
+            ShellSandboxMode::ReadOnly {
+                network_access: false
+            }
+        );
+    }
+
+    #[test]
+    fn command_exec_sandbox_applies_custom_permission_profile_network_override() {
+        let mut config = test_run_config();
+        config.permission_profiles.insert(
+            "read-network".to_string(),
+            orca_core::config::PermissionProfileConfig {
+                extends: Some(":read-only".to_string()),
+                network: orca_core::config::PermissionProfileNetworkConfig {
+                    enabled: Some(true),
+                },
+                ..Default::default()
+            },
+        );
+        config.permission_profiles.insert(
+            "workspace-offline".to_string(),
+            orca_core::config::PermissionProfileConfig {
+                extends: Some(":workspace".to_string()),
+                network: orca_core::config::PermissionProfileNetworkConfig {
+                    enabled: Some(false),
+                },
+                ..Default::default()
+            },
+        );
+
+        let read_options = protocol::CommandExecOptions {
+            permission_profile: Some("read-network".to_string()),
+            ..Default::default()
+        };
+        let workspace_options = protocol::CommandExecOptions {
+            permission_profile: Some("workspace-offline".to_string()),
+            ..Default::default()
+        };
+
+        let read_sandbox =
+            test_profile_sandbox(&config, &read_options).expect("read-only network profile");
+        let workspace_sandbox =
+            test_profile_sandbox(&config, &workspace_options).expect("workspace network profile");
+
+        assert_eq!(
+            read_sandbox.mode,
+            ShellSandboxMode::ReadOnly {
+                network_access: true
+            }
+        );
+        assert_eq!(
+            workspace_sandbox.mode,
+            ShellSandboxMode::WorkspaceWrite {
+                network_access: false,
+                exclude_tmpdir_env_var: false,
+                exclude_slash_tmp: false
+            }
+        );
+    }
+
+    #[test]
+    fn command_exec_sandbox_materializes_custom_permission_profile_workspace_roots() {
+        let mut config = test_run_config();
+        let runtime_root = std::env::current_dir().unwrap().join("runtime-root");
+        let docs = runtime_root.join("docs");
+        config.permission_profiles.insert(
+            "docs".to_string(),
+            orca_core::config::PermissionProfileConfig {
+                extends: Some(":read-only".to_string()),
+                filesystem: std::collections::HashMap::from([(
+                    PathBuf::from(":workspace_roots/docs"),
+                    orca_core::config::PermissionProfileFileAccess::Write,
+                )])
+                .into(),
+                ..Default::default()
+            },
+        );
+        let options = protocol::CommandExecOptions {
+            permission_profile: Some("docs".to_string()),
+            ..Default::default()
+        };
+
+        let sandbox = command_exec_sandbox_mode(
+            &config,
+            &options,
+            None,
+            std::path::Path::new("/workspace"),
+            std::slice::from_ref(&runtime_root),
+            None,
+        )
+        .expect("workspace roots profile");
+
+        assert_eq!(sandbox.additional_writable_roots, vec![docs]);
+    }
+
+    #[test]
+    fn command_exec_sandbox_materializes_custom_permission_profile_special_tmp_roots() {
+        let mut config = test_run_config();
+        config.permission_profiles.insert(
+            "tmp".to_string(),
+            orca_core::config::PermissionProfileConfig {
+                extends: Some(":read-only".to_string()),
+                filesystem: std::collections::HashMap::from([
+                    (
+                        PathBuf::from(":slash_tmp"),
+                        orca_core::config::PermissionProfileFileAccess::Write,
+                    ),
+                    (
+                        PathBuf::from(":tmpdir"),
+                        orca_core::config::PermissionProfileFileAccess::Deny,
+                    ),
+                ])
+                .into(),
+                ..Default::default()
+            },
+        );
+        let tmpdir = std::env::temp_dir().join("orca-special-tmpdir");
+        let options = protocol::CommandExecOptions {
+            permission_profile: Some("tmp".to_string()),
+            ..Default::default()
+        };
+
+        let sandbox = command_exec_sandbox_mode(
+            &config,
+            &options,
+            None,
+            std::path::Path::new("/workspace"),
+            &[],
+            Some(&tmpdir),
+        )
+        .expect("special tmp profile");
+
+        assert_eq!(
+            sandbox.additional_writable_roots,
+            vec![PathBuf::from("/tmp")]
+        );
+        assert_eq!(sandbox.denied_writable_roots, vec![tmpdir]);
+    }
+
+    #[test]
+    fn command_exec_sandbox_rejects_custom_permission_profile_cycle() {
+        let mut config = test_run_config();
+        config.permission_profiles.insert(
+            "a".to_string(),
+            orca_core::config::PermissionProfileConfig {
+                extends: Some("b".to_string()),
+                ..Default::default()
+            },
+        );
+        config.permission_profiles.insert(
+            "b".to_string(),
+            orca_core::config::PermissionProfileConfig {
+                extends: Some("a".to_string()),
+                ..Default::default()
+            },
+        );
+        let options = protocol::CommandExecOptions {
+            permission_profile: Some("a".to_string()),
+            ..Default::default()
+        };
+
+        let error = test_profile_sandbox(&config, &options).expect_err("cycle error");
+
+        assert_eq!(error, "command/exec permissionProfile cycle: a -> b -> a");
+    }
+
+    fn test_profile_sandbox(
+        config: &RunConfig,
+        options: &protocol::CommandExecOptions,
+    ) -> Result<CommandExecSandbox, String> {
+        command_exec_sandbox_mode(
+            config,
+            options,
+            None,
+            std::path::Path::new("/workspace"),
+            &[],
+            None,
+        )
+    }
+
+    fn command_exec_process(shell_id: &str) -> CommandExecProcess {
+        CommandExecProcess {
+            shell_id: Some(shell_id.to_string()),
+            command_event_id: Value::from("cmd"),
+            stream_output: false,
+            output_bytes_cap: None,
+            stdout_len: 0,
+            stderr_len: 0,
+            stdout_cap_reached: false,
+            stderr_cap_reached: false,
+        }
+    }
+
+    #[test]
+    fn server_writer_streams_mcp_tool_call_item_lifecycle() {
+        let mut output = Vec::new();
+        {
+            let mut writer = ServerRequestWriter::new(Value::from("turn"), &mut output);
+            writer
+                .write_all(
+                    br#"{"type":"tool.call.requested","payload":{"id":"mcp-1","name":"mcp__local__search","target":"{\"query\":\"orca\"}","raw_arguments":"{\"query\":\"orca\"}"}}"#,
+                )
+                .unwrap();
+            writer.write_all(b"\n").unwrap();
+            writer
+                .write_all(
+                    br#"{"type":"tool.call.completed","payload":{"id":"mcp-1","name":"mcp__local__search","status":"completed","output":"{\"content\":[{\"type\":\"text\",\"text\":\"found\"}],\"structuredContent\":{\"count\":1},\"_meta\":{\"source\":\"test\"}}","exit_code":0}}"#,
+                )
+                .unwrap();
+            writer.write_all(b"\n").unwrap();
+        }
+
+        let events = parse_jsonl(&output);
+        let started = events
+            .iter()
+            .find(|event| {
+                event["event"] == "item_started"
+                    && event["item"]["type"] == "mcpToolCall"
+                    && event["item"]["id"] == "mcp-1"
+            })
+            .expect("mcp item_started");
+        assert_eq!(started["item"]["server"], "local");
+        assert_eq!(started["item"]["tool"], "search");
+        assert_eq!(started["item"]["status"], "in_progress");
+        assert_eq!(started["item"]["arguments"]["query"], "orca");
+
+        let completed = events
+            .iter()
+            .find(|event| {
+                event["event"] == "item_completed"
+                    && event["item"]["type"] == "mcpToolCall"
+                    && event["item"]["id"] == "mcp-1"
+            })
+            .expect("mcp item_completed");
+        assert_eq!(completed["item"]["status"], "completed");
+        assert_eq!(completed["item"]["server"], "local");
+        assert_eq!(completed["item"]["tool"], "search");
+        assert_eq!(completed["item"]["result"]["content"][0]["text"], "found");
+        assert_eq!(completed["item"]["result"]["structuredContent"]["count"], 1);
+        assert_eq!(completed["item"]["result"]["_meta"]["source"], "test");
+        assert!(completed["item"]["error"].is_null());
+    }
+
+    #[test]
+    fn server_writer_streams_external_tool_as_dynamic_tool_call_item() {
+        let mut output = Vec::new();
+        {
+            let mut writer = ServerRequestWriter::new(Value::from("turn"), &mut output);
+            writer
+                .write_all(
+                    br#"{"type":"tool.call.requested","payload":{"id":"external-1","name":"deploy","target":"{\"env\":\"staging\"}","raw_arguments":"{\"env\":\"staging\"}"}}"#,
+                )
+                .unwrap();
+            writer.write_all(b"\n").unwrap();
+            writer
+                .write_all(
+                    br#"{"type":"tool.call.completed","payload":{"id":"external-1","name":"deploy","status":"completed","output":"deployed staging","exit_code":0}}"#,
+                )
+                .unwrap();
+            writer.write_all(b"\n").unwrap();
+        }
+
+        let events = parse_jsonl(&output);
+        let started = events
+            .iter()
+            .find(|event| {
+                event["event"] == "item_started"
+                    && event["item"]["type"] == "dynamicToolCall"
+                    && event["item"]["id"] == "external-1"
+            })
+            .expect("external item_started");
+        assert!(started["item"]["namespace"].is_null());
+        assert_eq!(started["item"]["tool"], "deploy");
+        assert_eq!(started["item"]["status"], "in_progress");
+        assert_eq!(started["item"]["arguments"]["env"], "staging");
+
+        let completed = events
+            .iter()
+            .find(|event| {
+                event["event"] == "item_completed"
+                    && event["item"]["type"] == "dynamicToolCall"
+                    && event["item"]["id"] == "external-1"
+            })
+            .expect("external item_completed");
+        assert_eq!(completed["item"]["status"], "completed");
+        assert_eq!(completed["item"]["success"], true);
+        assert_eq!(completed["item"]["contentItems"][0]["type"], "text");
+        assert_eq!(
+            completed["item"]["contentItems"][0]["text"],
+            "deployed staging"
+        );
+        assert!(completed["item"]["error"].is_null());
+    }
+
+    #[test]
+    fn server_writer_streams_denied_external_tool_as_failed_dynamic_item() {
+        let mut output = Vec::new();
+        {
+            let mut writer = ServerRequestWriter::new(Value::from("turn"), &mut output);
+            writer
+                .write_all(
+                    br#"{"type":"tool.call.requested","payload":{"id":"external-denied-1","name":"deploy","target":"{\"env\":\"production\"}","raw_arguments":"{\"env\":\"production\"}"}}"#,
+                )
+                .unwrap();
+            writer.write_all(b"\n").unwrap();
+            writer
+                .write_all(
+                    br#"{"type":"tool.call.completed","payload":{"id":"external-denied-1","name":"deploy","status":"denied","output":"policy denied deploy"}}"#,
+                )
+                .unwrap();
+            writer.write_all(b"\n").unwrap();
+        }
+
+        let events = parse_jsonl(&output);
+        let completed = events
+            .iter()
+            .find(|event| {
+                event["event"] == "item_completed"
+                    && event["item"]["type"] == "dynamicToolCall"
+                    && event["item"]["id"] == "external-denied-1"
+            })
+            .expect("external item_completed");
+        assert_eq!(completed["item"]["status"], "denied");
+        assert_eq!(completed["item"]["success"], false);
+        assert!(completed["item"]["contentItems"].is_null());
+        assert_eq!(
+            completed["item"]["error"]["message"],
+            "policy denied deploy"
+        );
+    }
+
+    #[test]
+    fn server_writer_streams_file_change_item_lifecycle_for_edit() {
+        let mut output = Vec::new();
+        {
+            let mut writer = ServerRequestWriter::new(Value::from("turn"), &mut output);
+            writer
+                .write_all(
+                    br#"{"type":"tool.call.requested","payload":{"id":"edit-1","name":"edit","target":"note.txt :: hello => hi"}}"#,
+                )
+                .unwrap();
+            writer.write_all(b"\n").unwrap();
+            writer
+                .write_all(
+                    br#"{"type":"tool.call.completed","payload":{"id":"edit-1","name":"edit","status":"completed","output":"edited note.txt","exit_code":0}}"#,
+                )
+                .unwrap();
+            writer.write_all(b"\n").unwrap();
+        }
+
+        let events = parse_jsonl(&output);
+        let started = events
+            .iter()
+            .find(|event| {
+                event["event"] == "item_started"
+                    && event["item"]["type"] == "fileChange"
+                    && event["item"]["id"] == "edit-1:file-change"
+            })
+            .expect("file_change item_started");
+        assert_eq!(started["item"]["status"], "inProgress");
+        assert!(started["item"].get("tool").is_none());
+        assert_eq!(started["item"]["changes"][0]["path"], "note.txt");
+        assert_eq!(started["item"]["changes"][0]["kind"], "edit");
+        assert!(started["item"]["changes"][0]["diff"].as_str().is_some());
+
+        let completed = events
+            .iter()
+            .find(|event| {
+                event["event"] == "item_completed"
+                    && event["item"]["type"] == "fileChange"
+                    && event["item"]["id"] == "edit-1:file-change"
+            })
+            .expect("file_change item_completed");
+        assert_eq!(completed["item"]["status"], "completed");
+        assert!(completed["item"].get("output").is_none());
+        assert!(completed["item"].get("error").is_none());
+        assert!(completed["item"].get("tool").is_none());
+        assert_eq!(completed["item"]["changes"][0]["path"], "note.txt");
+        assert!(completed["item"]["changes"][0]["diff"].as_str().is_some());
+        assert!(
+            events
+                .iter()
+                .any(|event| event["event"] == "tool_completed" && event["tool"] == "edit")
+        );
+    }
+
+    #[test]
+    fn server_writer_streams_failed_file_change_item_lifecycle_for_edit() {
+        let mut output = Vec::new();
+        {
+            let mut writer = ServerRequestWriter::new(Value::from("turn"), &mut output);
+            writer
+                .write_all(
+                    br#"{"type":"tool.call.requested","payload":{"id":"edit-1","name":"edit","target":"note.txt :: hello => hi"}}"#,
+                )
+                .unwrap();
+            writer.write_all(b"\n").unwrap();
+            writer
+                .write_all(
+                    br#"{"type":"tool.call.completed","payload":{"id":"edit-1","name":"edit","status":"failed","error":"edit old text was not found","exit_code":1}}"#,
+                )
+                .unwrap();
+            writer.write_all(b"\n").unwrap();
+        }
+
+        let events = parse_jsonl(&output);
+        let completed = events
+            .iter()
+            .find(|event| {
+                event["event"] == "item_completed"
+                    && event["item"]["type"] == "fileChange"
+                    && event["item"]["id"] == "edit-1:file-change"
+            })
+            .expect("file_change item_completed");
+        assert_eq!(completed["item"]["status"], "failed");
+        assert!(completed["item"].get("output").is_none());
+        assert!(completed["item"].get("error").is_none());
+        assert!(completed["item"].get("tool").is_none());
+        assert_eq!(completed["item"]["changes"][0]["path"], "note.txt");
+        assert_eq!(completed["item"]["changes"][0]["kind"], "edit");
+        assert!(completed["item"]["changes"][0]["diff"].as_str().is_some());
+        assert!(
+            events
+                .iter()
+                .any(|event| event["event"] == "tool_completed" && event["tool"] == "edit")
+        );
+    }
+
+    #[test]
+    fn server_writer_streams_failed_file_change_output_as_error_detail() {
+        let mut output = Vec::new();
+        {
+            let mut writer = ServerRequestWriter::new(Value::from("turn"), &mut output);
+            writer
+                .write_all(
+                    br#"{"type":"tool.call.requested","payload":{"id":"edit-1","name":"edit","target":"note.txt :: hello => hi"}}"#,
+                )
+                .unwrap();
+            writer.write_all(b"\n").unwrap();
+            writer
+                .write_all(
+                    br#"{"type":"tool.call.completed","payload":{"id":"edit-1","name":"edit","status":"failed","output":"edit old text was not found","exit_code":1}}"#,
+                )
+                .unwrap();
+            writer.write_all(b"\n").unwrap();
+        }
+
+        let events = parse_jsonl(&output);
+        let completed = events
+            .iter()
+            .find(|event| {
+                event["event"] == "item_completed"
+                    && event["item"]["type"] == "fileChange"
+                    && event["item"]["id"] == "edit-1:file-change"
+            })
+            .expect("file_change item_completed");
+        assert_eq!(completed["item"]["status"], "failed");
+        assert!(completed["item"].get("output").is_none());
+        assert!(completed["item"].get("error").is_none());
+        assert!(completed["item"].get("tool").is_none());
+        assert_eq!(completed["item"]["changes"][0]["path"], "note.txt");
+        assert_eq!(completed["item"]["changes"][0]["kind"], "edit");
+        assert!(completed["item"]["changes"][0]["diff"].as_str().is_some());
+    }
+
+    #[test]
+    fn server_writer_streams_file_change_item_lifecycle_for_write_file() {
+        let mut output = Vec::new();
+        {
+            let mut writer = ServerRequestWriter::new(Value::from("turn"), &mut output);
+            writer
+                .write_all(
+                    br#"{"type":"tool.call.requested","payload":{"id":"write-1","name":"write_file","target":"new.txt"}}"#,
+                )
+                .unwrap();
+            writer.write_all(b"\n").unwrap();
+            writer
+                .write_all(
+                    br#"{"type":"tool.call.completed","payload":{"id":"write-1","name":"write_file","status":"completed","output":"wrote 3 bytes to new.txt","exit_code":0}}"#,
+                )
+                .unwrap();
+            writer.write_all(b"\n").unwrap();
+        }
+
+        let events = parse_jsonl(&output);
+        let started = events
+            .iter()
+            .find(|event| {
+                event["event"] == "item_started"
+                    && event["item"]["type"] == "fileChange"
+                    && event["item"]["id"] == "write-1:file-change"
+            })
+            .expect("file_change item_started");
+        assert!(started["item"].get("tool").is_none());
+        assert_eq!(started["item"]["status"], "inProgress");
+        assert_eq!(started["item"]["changes"][0]["path"], "new.txt");
+        assert_eq!(started["item"]["changes"][0]["kind"], "write");
+        assert!(started["item"]["changes"][0]["diff"].as_str().is_some());
+
+        let completed = events
+            .iter()
+            .find(|event| {
+                event["event"] == "item_completed"
+                    && event["item"]["type"] == "fileChange"
+                    && event["item"]["id"] == "write-1:file-change"
+            })
+            .expect("file_change item_completed");
+        assert_eq!(completed["item"]["status"], "completed");
+        assert!(completed["item"].get("output").is_none());
+        assert!(completed["item"].get("error").is_none());
+        assert!(completed["item"].get("tool").is_none());
+        assert_eq!(completed["item"]["changes"][0]["path"], "new.txt");
+        assert_eq!(completed["item"]["changes"][0]["kind"], "write");
+        assert!(completed["item"]["changes"][0]["diff"].as_str().is_some());
+    }
+
+    #[test]
+    fn server_writer_streams_workflow_item_lifecycle() {
+        let mut output = Vec::new();
+        {
+            let mut writer = ServerRequestWriter::new(Value::from("turn"), &mut output);
+            writer
+                .write_all(
+                    br#"{"type":"workflow.started","payload":{"taskId":"task-1","runId":"workflow-run-1","workflowName":"audit","task":{"kind":"workflow","status":"running"}}}"#,
+                )
+                .unwrap();
+            writer.write_all(b"\n").unwrap();
+            writer
+                .write_all(
+                    br#"{"type":"workflow.result.available","payload":{"taskId":"task-1","runId":"workflow-run-1","result":"done","task":{"kind":"workflow","status":"running"}}}"#,
+                )
+                .unwrap();
+            writer.write_all(b"\n").unwrap();
+            writer
+                .write_all(
+                    br#"{"type":"workflow.completed","payload":{"taskId":"task-1","runId":"workflow-run-1","workflowName":"audit","task":{"kind":"workflow","status":"completed"}}}"#,
+                )
+                .unwrap();
+            writer.write_all(b"\n").unwrap();
+        }
+
+        let events = parse_jsonl(&output);
+        let started = events
+            .iter()
+            .find(|event| {
+                event["event"] == "item_started"
+                    && event["item"]["type"] == "workflow"
+                    && event["item"]["id"] == "workflow-run-1"
+            })
+            .expect("workflow item_started");
+        assert_eq!(started["item"]["workflowName"], "audit");
+        assert_eq!(started["item"]["taskId"], "task-1");
+        assert_eq!(started["item"]["status"], "running");
+
+        assert!(
+            events
+                .iter()
+                .any(|event| event["event"] == "workflow_started")
+        );
+        assert!(events.iter().any(|event| {
+            event["event"] == "workflow_result_available" && event["result"] == "done"
+        }));
+
+        let completed = events
+            .iter()
+            .find(|event| {
+                event["event"] == "item_completed"
+                    && event["item"]["type"] == "workflow"
+                    && event["item"]["id"] == "workflow-run-1"
+            })
+            .expect("workflow item_completed");
+        assert_eq!(completed["item"]["workflowName"], "audit");
+        assert_eq!(completed["item"]["taskId"], "task-1");
+        assert_eq!(completed["item"]["status"], "completed");
+        assert_eq!(completed["item"]["result"], "done");
+    }
+
+    #[test]
+    fn server_writer_streams_failed_workflow_item_lifecycle() {
+        let mut output = Vec::new();
+        {
+            let mut writer = ServerRequestWriter::new(Value::from("turn"), &mut output);
+            writer
+                .write_all(
+                    br#"{"type":"workflow.started","payload":{"taskId":"task-1","runId":"workflow-run-1","workflowName":"audit","task":{"kind":"workflow","status":"running"}}}"#,
+                )
+                .unwrap();
+            writer.write_all(b"\n").unwrap();
+            writer
+                .write_all(
+                    br#"{"type":"workflow.failed","payload":{"taskId":"task-1","runId":"workflow-run-1","error":"boom","task":{"kind":"workflow","status":"failed"}}}"#,
+                )
+                .unwrap();
+            writer.write_all(b"\n").unwrap();
+        }
+
+        let events = parse_jsonl(&output);
+        let completed = events
+            .iter()
+            .find(|event| {
+                event["event"] == "item_completed"
+                    && event["item"]["type"] == "workflow"
+                    && event["item"]["id"] == "workflow-run-1"
+            })
+            .expect("workflow item_completed");
+        assert_eq!(completed["item"]["workflowName"], "audit");
+        assert_eq!(completed["item"]["status"], "failed");
+        assert_eq!(completed["item"]["error"], "boom");
+        assert!(completed["item"]["result"].is_null());
+        assert!(
+            events
+                .iter()
+                .any(|event| event["event"] == "workflow_failed" && event["error"] == "boom")
+        );
+    }
+
+    #[test]
+    fn server_writer_streams_reasoning_item_lifecycle() {
+        let mut output = Vec::new();
+        {
+            let mut writer = ServerRequestWriter::new(Value::from("turn"), &mut output);
+            writer
+                .write_all(br#"{"type":"assistant.reasoning.delta","payload":{"text":"thinking"}}"#)
+                .unwrap();
+            writer.write_all(b"\n").unwrap();
+            writer
+                .write_all(br#"{"type":"session.completed","payload":{"status":"completed"}}"#)
+                .unwrap();
+            writer.write_all(b"\n").unwrap();
+        }
+
+        let events = parse_jsonl(&output);
+        let started = events
+            .iter()
+            .find(|event| {
+                event["event"] == "item_started"
+                    && event["item"]["type"] == "reasoning"
+                    && event["item"]["id"] == "item-reasoning-1"
+            })
+            .expect("reasoning item_started");
+        assert_eq!(started["item"]["summary"], "");
+        assert_eq!(started["item"]["content"], "");
+
+        assert!(events.iter().any(|event| {
+            event["event"] == "item_reasoning_delta"
+                && event["itemId"] == "item-reasoning-1"
+                && event["delta"] == "thinking"
+        }));
+        assert!(
+            events
+                .iter()
+                .any(|event| event["event"] == "reasoning_delta" && event["text"] == "thinking")
+        );
+
+        let completed = events
+            .iter()
+            .find(|event| {
+                event["event"] == "item_completed"
+                    && event["item"]["type"] == "reasoning"
+                    && event["item"]["id"] == "item-reasoning-1"
+            })
+            .expect("reasoning item_completed");
+        assert_eq!(completed["item"]["summary"], "thinking");
+        assert_eq!(completed["item"]["content"], "");
+    }
+
+    #[test]
+    fn server_writer_streams_proposed_plan_item_lifecycle() {
+        let mut output = Vec::new();
+        {
+            let mut writer = ServerRequestWriter::new(Value::from("turn"), &mut output);
+            writer
+                .write_all(
+                    br#"{"type":"assistant.message.delta","payload":{"text":"Preface\n<proposed_plan>\n# Final plan\n- first\n- second\n</proposed_plan>\nPostscript"}}"#,
+                )
+                .unwrap();
+            writer.write_all(b"\n").unwrap();
+            writer
+                .write_all(br#"{"type":"session.completed","payload":{"status":"completed"}}"#)
+                .unwrap();
+            writer.write_all(b"\n").unwrap();
+        }
+
+        let events = parse_jsonl(&output);
+        let plan_started = events
+            .iter()
+            .find(|event| {
+                event["event"] == "item_started"
+                    && event["item"]["type"] == "plan"
+                    && event["item"]["id"] == "item-plan-1"
+            })
+            .expect("plan item_started");
+        assert_eq!(plan_started["item"]["text"], "");
+
+        let plan_delta = events
+            .iter()
+            .find(|event| event["event"] == "item_plan_delta")
+            .expect("plan delta");
+        assert_eq!(plan_delta["itemId"], "item-plan-1");
+        assert_eq!(plan_delta["delta"], "# Final plan\n- first\n- second\n");
+
+        let plan_completed = events
+            .iter()
+            .find(|event| {
+                event["event"] == "item_completed"
+                    && event["item"]["type"] == "plan"
+                    && event["item"]["id"] == "item-plan-1"
+            })
+            .expect("plan item_completed");
+        assert_eq!(
+            plan_completed["item"]["text"],
+            "# Final plan\n- first\n- second\n"
+        );
+
+        let message_delta_text = events
+            .iter()
+            .filter(|event| event["event"] == "item_message_delta")
+            .filter_map(|event| event["delta"].as_str())
+            .collect::<String>();
+        assert_eq!(message_delta_text, "Preface\n\nPostscript");
+
+        let agent_completed = events
+            .iter()
+            .find(|event| {
+                event["event"] == "item_completed" && event["item"]["type"] == "agent_message"
+            })
+            .expect("agent message item_completed");
+        assert_eq!(agent_completed["item"]["text"], "Preface\n\nPostscript");
+    }
+
+    #[test]
+    fn server_writer_parses_proposed_plan_tag_split_across_deltas() {
+        let mut output = Vec::new();
+        {
+            let mut writer = ServerRequestWriter::new(Value::from("turn"), &mut output);
+            writer
+                .write_all(
+                    br#"{"type":"assistant.message.delta","payload":{"text":"Intro\n<proposed"}}"#,
+                )
+                .unwrap();
+            writer.write_all(b"\n").unwrap();
+            writer
+                .write_all(br#"{"type":"assistant.message.delta","payload":{"text":"_plan>\n- Step 1\n</proposed_plan>\nOutro"}}"#)
+                .unwrap();
+            writer.write_all(b"\n").unwrap();
+            writer
+                .write_all(br#"{"type":"session.completed","payload":{"status":"completed"}}"#)
+                .unwrap();
+            writer.write_all(b"\n").unwrap();
+        }
+
+        let events = parse_jsonl(&output);
+        let plan_delta = events
+            .iter()
+            .find(|event| event["event"] == "item_plan_delta")
+            .expect("plan delta");
+        assert_eq!(plan_delta["delta"], "- Step 1\n");
+
+        let message_delta_text = events
+            .iter()
+            .filter(|event| event["event"] == "item_message_delta")
+            .filter_map(|event| event["delta"].as_str())
+            .collect::<String>();
+        assert_eq!(message_delta_text, "Intro\n\nOutro");
+
+        let agent_completed = events
+            .iter()
+            .find(|event| {
+                event["event"] == "item_completed" && event["item"]["type"] == "agent_message"
+            })
+            .expect("agent message item_completed");
+        assert_eq!(agent_completed["item"]["text"], "Intro\n\nOutro");
+    }
+
+    #[test]
+    fn server_writer_leaves_incomplete_proposed_plan_tag_as_agent_message() {
+        let mut output = Vec::new();
+        {
+            let mut writer = ServerRequestWriter::new(Value::from("turn"), &mut output);
+            writer
+                .write_all(br#"{"type":"assistant.message.delta","payload":{"text":"Intro\n<proposed_plan> not a complete block"}}"#)
+                .unwrap();
+            writer.write_all(b"\n").unwrap();
+            writer
+                .write_all(br#"{"type":"session.completed","payload":{"status":"completed"}}"#)
+                .unwrap();
+            writer.write_all(b"\n").unwrap();
+        }
+
+        let events = parse_jsonl(&output);
+        assert!(
+            !events
+                .iter()
+                .any(|event| event["event"] == "item_started" && event["item"]["type"] == "plan")
+        );
+        let agent_completed = events
+            .iter()
+            .find(|event| {
+                event["event"] == "item_completed" && event["item"]["type"] == "agent_message"
+            })
+            .expect("agent message item_completed");
+        assert_eq!(
+            agent_completed["item"]["text"],
+            "Intro\n<proposed_plan> not a complete block"
+        );
+    }
+
+    #[test]
+    fn workflow_submit_streams_background_result() {
+        let input = Cursor::new(br#"{"id":7,"op":"submit","prompt":"workflow inline"}"#.to_vec());
+        let output = SharedVecWriter::default();
 
         run_with_io(
             ServerConfig {
                 run_config: test_run_config(),
             },
             input,
-            &mut output,
+            output.clone(),
         )
         .expect("server run");
 
-        let events = parse_jsonl(&output);
+        let events = parse_jsonl(&output.bytes());
         assert!(events.iter().all(|event| event["id"] == 7));
         assert!(events.iter().any(|event| {
             event["event"] == "tool_completed"
@@ -252,21 +4012,768 @@ mod tests {
                 .iter()
                 .any(|event| event["event"] == "workflow_started")
         );
+        let workflow_started = events
+            .iter()
+            .find(|event| event["event"] == "workflow_started")
+            .expect("workflow started event");
+        assert_eq!(workflow_started["task"]["kind"], "workflow");
+        assert_eq!(workflow_started["task"]["status"], "running");
         assert!(
             events
                 .iter()
                 .any(|event| event["event"] == "turn_completed")
         );
         assert!(
-            !events
+            events
                 .iter()
                 .any(|event| event["event"] == "workflow_result_available")
         );
         assert!(
-            !events
+            events
                 .iter()
                 .any(|event| event["event"] == "workflow_completed")
         );
+        assert!(events.iter().any(|event| {
+            event["event"] == "item_completed" && event["item"]["type"] == "workflow"
+        }));
+    }
+
+    #[test]
+    fn submit_turn_started_event_preserves_task_lifecycle_metadata() {
+        let input = Cursor::new(br#"{"id":7,"op":"submit","prompt":"reply once"}"#.to_vec());
+        let output = SharedVecWriter::default();
+
+        run_with_io(
+            ServerConfig {
+                run_config: test_run_config(),
+            },
+            input,
+            output.clone(),
+        )
+        .expect("server run");
+
+        let events = parse_jsonl(&output.bytes());
+        let turn_started = events
+            .iter()
+            .find(|event| event["event"] == "turn_started")
+            .expect("turn started event");
+
+        assert_eq!(turn_started["turn"], 1);
+        assert_eq!(turn_started["task"]["kind"], "agent");
+        assert_eq!(turn_started["task"]["status"], "running");
+        assert_eq!(turn_started["task"]["turn"], 1);
+        assert!(
+            turn_started["task"]["task_id"]
+                .as_str()
+                .unwrap()
+                .contains(":task-1")
+        );
+    }
+
+    #[test]
+    fn thread_start_materializes_recorded_history_when_enabled() {
+        with_orca_home(|home| {
+            let mut config = test_run_config();
+            config.cwd = Some(home.to_path_buf());
+            config.history_mode = HistoryMode::Record;
+            let server_config = ServerConfig { run_config: config };
+            let mut state = ServerState::default();
+            let mut output = Vec::new();
+
+            handle_line_for_test(
+                &server_config,
+                &mut state,
+                r#"{"id":"thread","method":"thread/start","params":{}}"#,
+                &mut output,
+            )
+            .expect("thread start");
+
+            let events = parse_jsonl(&output);
+            let thread_id = events
+                .iter()
+                .find(|event| event["event"] == "thread_started")
+                .and_then(|event| event["threadId"].as_str())
+                .expect("thread id")
+                .to_string();
+
+            handle_line_for_test(
+                &server_config,
+                &mut state,
+                &format!(
+                    r#"{{"id":"turn","method":"turn/start","params":{{"threadId":"{thread_id}","input":[{{"type":"text","text":"persist this server thread"}}]}}}}"#
+                ),
+                &mut output,
+            )
+            .expect("thread turn");
+
+            let store = crate::history::SessionStore::new();
+            let transcript = store.load_session("latest").expect("latest transcript");
+            assert_eq!(transcript.meta.session_id, thread_id);
+            assert!(transcript.messages.iter().any(|message| {
+                matches!(message, Message::User { content, .. } if content == "persist this server thread")
+            }));
+            assert!(transcript.messages.iter().any(|message| {
+                matches!(message, Message::Assistant { content: Some(content), .. } if content == "Mock runtime completed the headless harness contract.")
+            }));
+        });
+    }
+
+    #[test]
+    fn thread_read_returns_persisted_thread_projection() {
+        with_orca_home(|home| {
+            let mut config = test_run_config();
+            config.cwd = Some(home.to_path_buf());
+            config.history_mode = HistoryMode::Record;
+            let server_config = ServerConfig { run_config: config };
+            let mut state = ServerState::default();
+            let mut output = Vec::new();
+
+            handle_line_for_test(
+                &server_config,
+                &mut state,
+                r#"{"id":"thread","method":"thread/start","params":{}}"#,
+                &mut output,
+            )
+            .expect("thread start");
+            let thread_id = parse_jsonl(&output)
+                .into_iter()
+                .find(|event| event["event"] == "thread_started")
+                .and_then(|event| event["threadId"].as_str().map(ToString::to_string))
+                .expect("thread id");
+
+            handle_line_for_test(
+                &server_config,
+                &mut state,
+                &format!(
+                    r#"{{"id":"turn","method":"turn/start","params":{{"threadId":"{thread_id}","input":[{{"type":"text","text":"readable server thread"}}]}}}}"#
+                ),
+                &mut output,
+            )
+            .expect("thread turn");
+
+            let mut read_output = Vec::new();
+            handle_line_for_test(
+                &server_config,
+                &mut state,
+                &format!(
+                    r#"{{"id":"read","method":"thread/read","params":{{"threadId":"{thread_id}","includeMessages":true}}}}"#
+                ),
+                &mut read_output,
+            )
+            .expect("thread read");
+
+            let events = parse_jsonl(&read_output);
+            assert_eq!(events.len(), 1);
+            let read = &events[0];
+            assert_eq!(read["id"], "read");
+            assert_eq!(read["event"], "thread_read");
+            assert_eq!(read["threadId"], thread_id);
+            let messages = read["messages"].as_array().expect("messages");
+            assert_eq!(read["messageCount"], messages.len());
+            assert!(messages.iter().any(|message| {
+                message["role"] == "user" && message["content"] == "readable server thread"
+            }));
+            assert!(
+                messages
+                    .iter()
+                    .any(|message| message["role"] == "assistant")
+            );
+
+            let mut turns_output = Vec::new();
+            handle_line_for_test(
+                &server_config,
+                &mut state,
+                &format!(
+                    r#"{{"id":"read-turns","method":"thread/read","params":{{"threadId":"{thread_id}","includeTurns":true}}}}"#
+                ),
+                &mut turns_output,
+            )
+            .expect("thread read with turns");
+
+            let turn_events = parse_jsonl(&turns_output);
+            assert_eq!(turn_events.len(), 1);
+            assert_eq!(turn_events[0]["event"], "thread_read");
+            let turns = turn_events[0]["turns"].as_array().expect("turns");
+            assert!(turns.iter().any(|turn| {
+                turn["items"].as_array().is_some_and(|items| {
+                    items.iter().any(|item| {
+                        item["role"] == "user" && item["content"] == "readable server thread"
+                    }) && items.iter().any(|item| item["role"] == "assistant")
+                })
+            }));
+        });
+    }
+
+    #[test]
+    fn thread_read_returns_in_memory_thread_projection() {
+        with_orca_home(|home| {
+            let mut config = test_run_config();
+            config.cwd = Some(home.to_path_buf());
+            config.history_mode = HistoryMode::Disabled;
+            let server_config = ServerConfig { run_config: config };
+            let mut state = ServerState::default();
+            let mut output = Vec::new();
+
+            handle_line_for_test(
+                &server_config,
+                &mut state,
+                r#"{"id":"thread","method":"thread/start","params":{}}"#,
+                &mut output,
+            )
+            .expect("thread start");
+            let thread_id = parse_jsonl(&output)
+                .into_iter()
+                .find(|event| event["event"] == "thread_started")
+                .and_then(|event| event["threadId"].as_str().map(ToString::to_string))
+                .expect("thread id");
+
+            handle_line_for_test(
+                &server_config,
+                &mut state,
+                &format!(
+                    r#"{{"id":"turn","method":"turn/start","params":{{"threadId":"{thread_id}","input":[{{"type":"text","text":"readable memory thread"}}]}}}}"#
+                ),
+                &mut output,
+            )
+            .expect("thread turn");
+
+            let mut read_output = Vec::new();
+            handle_line_for_test(
+                &server_config,
+                &mut state,
+                &format!(
+                    r#"{{"id":"read","method":"thread/read","params":{{"threadId":"{thread_id}","includeMessages":true}}}}"#
+                ),
+                &mut read_output,
+            )
+            .expect("thread read");
+
+            let events = parse_jsonl(&read_output);
+            assert_eq!(events.len(), 1);
+            let read = &events[0];
+            assert_eq!(read["event"], "thread_read");
+            assert_eq!(read["threadId"], thread_id);
+            let messages = read["messages"].as_array().expect("messages");
+            assert!(messages.iter().any(|message| {
+                message["role"] == "user" && message["content"] == "readable memory thread"
+            }));
+        });
+    }
+
+    #[test]
+    fn completed_background_turn_is_reclaimed_before_next_thread_turn() {
+        with_orca_home(|home| {
+            let mut config = test_run_config();
+            config.cwd = Some(home.to_path_buf());
+            config.history_mode = HistoryMode::Disabled;
+            let server_config = ServerConfig { run_config: config };
+            let mut state = ServerState::default();
+            let mut output = Vec::new();
+
+            handle_line_for_test(
+                &server_config,
+                &mut state,
+                r#"{"id":"thread","method":"thread/start","params":{}}"#,
+                &mut output,
+            )
+            .expect("thread start");
+            let thread_id = parse_jsonl(&output)
+                .into_iter()
+                .find(|event| event["event"] == "thread_started")
+                .and_then(|event| event["threadId"].as_str().map(ToString::to_string))
+                .expect("thread id");
+
+            let writer = Arc::new(Mutex::new(Vec::new()));
+            let first = format!(
+                r#"{{"id":"turn-1","method":"turn/start","params":{{"threadId":"{thread_id}","input":[{{"type":"text","text":"first prompt"}}]}}}}"#
+            );
+            handle_line(&server_config, &mut state, &first, Arc::clone(&writer))
+                .expect("first turn");
+            loop {
+                let events = parse_jsonl(&writer.lock().expect("writer").clone());
+                if events
+                    .iter()
+                    .any(|event| event["id"] == "turn-1" && event["event"] == "turn_completed")
+                {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+
+            let second = format!(
+                r#"{{"id":"turn-2","method":"turn/start","params":{{"threadId":"{thread_id}","input":[{{"type":"text","text":"mock_history_echo"}}]}}}}"#
+            );
+            handle_line(&server_config, &mut state, &second, Arc::clone(&writer))
+                .expect("second turn");
+            state.join_active_turns();
+            let events = parse_jsonl(&writer.lock().expect("writer").clone());
+            let echoed = events
+                .iter()
+                .filter(|event| event["id"] == "turn-2" && event["event"] == "message_delta")
+                .filter_map(|event| event["text"].as_str())
+                .collect::<String>();
+
+            assert!(
+                echoed.contains("first prompt | mock_history_echo"),
+                "expected second turn to see prior thread history, got: {echoed}"
+            );
+            assert!(
+                !events.iter().any(|event| {
+                    event["id"] == "turn-2"
+                        && event["event"] == "error"
+                        && event["message"]
+                            .as_str()
+                            .is_some_and(|message| message.contains("unknown thread"))
+                }),
+                "second turn must not race with thread reclamation"
+            );
+        });
+    }
+
+    #[test]
+    fn thread_metadata_update_changes_read_title() {
+        with_orca_home(|home| {
+            let mut config = test_run_config();
+            config.cwd = Some(home.to_path_buf());
+            config.history_mode = HistoryMode::Record;
+            let server_config = ServerConfig { run_config: config };
+            let mut state = ServerState::default();
+            let mut output = Vec::new();
+
+            handle_line_for_test(
+                &server_config,
+                &mut state,
+                r#"{"id":"thread","method":"thread/start","params":{}}"#,
+                &mut output,
+            )
+            .expect("thread start");
+            let thread_id = parse_jsonl(&output)
+                .into_iter()
+                .find(|event| event["event"] == "thread_started")
+                .and_then(|event| event["threadId"].as_str().map(ToString::to_string))
+                .expect("thread id");
+
+            let mut metadata_output = Vec::new();
+            handle_line_for_test(
+                &server_config,
+                &mut state,
+                &format!(
+                    r#"{{"id":"rename","method":"thread/metadata/update","params":{{"threadId":"{thread_id}","title":"renamed from server"}}}}"#
+                ),
+                &mut metadata_output,
+            )
+            .expect("metadata update");
+            let metadata_events = parse_jsonl(&metadata_output);
+            assert_eq!(metadata_events.len(), 1);
+            assert_eq!(metadata_events[0]["event"], "thread_metadata_updated");
+            assert_eq!(metadata_events[0]["threadId"], thread_id);
+            assert_eq!(metadata_events[0]["title"], "renamed from server");
+
+            let mut read_output = Vec::new();
+            handle_line_for_test(
+                &server_config,
+                &mut state,
+                &format!(
+                    r#"{{"id":"read","method":"thread/read","params":{{"threadId":"{thread_id}"}}}}"#
+                ),
+                &mut read_output,
+            )
+            .expect("thread read");
+
+            let read_events = parse_jsonl(&read_output);
+            assert_eq!(read_events.len(), 1);
+            assert_eq!(read_events[0]["event"], "thread_read");
+            assert_eq!(read_events[0]["title"], "renamed from server");
+        });
+    }
+
+    #[test]
+    fn thread_list_returns_persisted_thread_summaries() {
+        with_orca_home(|home| {
+            let store = SessionStore::new();
+            let mut first = store
+                .create_live_thread(home, "mock", None, "first listed thread")
+                .expect("create first thread");
+            first.complete("success").expect("complete first");
+            let mut second = store
+                .create_live_thread(home, "mock", None, "second listed thread")
+                .expect("create second thread");
+            second.complete("success").expect("complete second");
+
+            let server_config = ServerConfig {
+                run_config: test_run_config(),
+            };
+            let mut state = ServerState::default();
+            let mut output = Vec::new();
+
+            handle_line_for_test(
+                &server_config,
+                &mut state,
+                r#"{"id":"list","method":"thread/list","params":{"limit":1}}"#,
+                &mut output,
+            )
+            .expect("thread list");
+
+            let events = parse_jsonl(&output);
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0]["event"], "thread_list");
+            let data = events[0]["data"].as_array().expect("thread list data");
+            assert_eq!(data.len(), 1);
+            let first_page_title = data[0]["title"].as_str().expect("thread title");
+            assert!(matches!(
+                first_page_title,
+                "first listed thread" | "second listed thread"
+            ));
+            assert_eq!(data[0]["cwd"], home.display().to_string());
+            assert_eq!(events[0]["nextCursor"], "1");
+            assert_eq!(events[0]["backwardsCursor"], "0");
+
+            let mut page_output = Vec::new();
+            handle_line_for_test(
+                &server_config,
+                &mut state,
+                r#"{"id":"list-page","method":"thread/list","params":{"cursor":"1","limit":1}}"#,
+                &mut page_output,
+            )
+            .expect("thread list page");
+
+            let page_events = parse_jsonl(&page_output);
+            assert_eq!(page_events.len(), 1);
+            assert_eq!(page_events[0]["event"], "thread_list");
+            let page_data = page_events[0]["data"]
+                .as_array()
+                .expect("thread list page data");
+            assert_eq!(page_data.len(), 1);
+            let second_page_title = page_data[0]["title"].as_str().expect("thread title");
+            assert!(matches!(
+                second_page_title,
+                "first listed thread" | "second listed thread"
+            ));
+            assert_ne!(first_page_title, second_page_title);
+            assert_eq!(page_events[0]["nextCursor"], Value::Null);
+            assert_eq!(page_events[0]["backwardsCursor"], "1");
+
+            let mut filtered_output = Vec::new();
+            handle_line_for_test(
+                &server_config,
+                &mut state,
+                r#"{"id":"list-filtered","method":"thread/list","params":{"searchTerm":"second listed","limit":10}}"#,
+                &mut filtered_output,
+            )
+            .expect("filtered thread list");
+
+            let filtered_events = parse_jsonl(&filtered_output);
+            assert_eq!(filtered_events.len(), 1);
+            assert_eq!(filtered_events[0]["event"], "thread_list");
+            let filtered_data = filtered_events[0]["data"]
+                .as_array()
+                .expect("filtered thread list data");
+            assert_eq!(filtered_data.len(), 1);
+            assert_eq!(filtered_data[0]["title"], "second listed thread");
+            assert_eq!(filtered_events[0]["nextCursor"], Value::Null);
+        });
+    }
+
+    #[test]
+    fn thread_search_returns_persisted_hits() {
+        with_orca_home(|home| {
+            let store = SessionStore::new();
+            let mut thread = store
+                .create_live_thread(home, "mock", None, "searchable thread")
+                .expect("create thread");
+            let thread_id = thread.thread_id().to_string();
+            thread
+                .append_items(&[Message::User {
+                    content: "needle appears in this transcript".to_string(),
+                    pinned: false,
+                }])
+                .expect("append search message");
+            thread.complete("success").expect("complete thread");
+            let mut second = store
+                .create_live_thread(home, "mock", None, "searchable thread second")
+                .expect("create second thread");
+            let second_id = second.thread_id().to_string();
+            second
+                .append_items(&[Message::User {
+                    content: "needle appears again".to_string(),
+                    pinned: false,
+                }])
+                .expect("append second search message");
+            second.complete("success").expect("complete second thread");
+
+            let server_config = ServerConfig {
+                run_config: test_run_config(),
+            };
+            let mut state = ServerState::default();
+            let mut output = Vec::new();
+
+            handle_line_for_test(
+                &server_config,
+                &mut state,
+                r#"{"id":"search","method":"thread/search","params":{"searchTerm":"needle","limit":1}}"#,
+                &mut output,
+            )
+            .expect("thread search");
+
+            let events = parse_jsonl(&output);
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0]["event"], "thread_search");
+            let data = events[0]["data"].as_array().expect("thread search data");
+            assert_eq!(data.len(), 1);
+            let first_hit_id = data[0]["thread"]["threadId"]
+                .as_str()
+                .expect("thread id")
+                .to_string();
+            assert!(first_hit_id == thread_id || first_hit_id == second_id);
+            assert!(
+                data[0]["snippet"]
+                    .as_str()
+                    .is_some_and(|snippet| snippet.contains("needle"))
+            );
+            assert_eq!(events[0]["nextCursor"], "1");
+
+            let mut page_output = Vec::new();
+            handle_line_for_test(
+                &server_config,
+                &mut state,
+                r#"{"id":"search-page","method":"thread/search","params":{"searchTerm":"needle","cursor":"1","limit":1}}"#,
+                &mut page_output,
+            )
+            .expect("thread search page");
+
+            let page_events = parse_jsonl(&page_output);
+            assert_eq!(page_events.len(), 1);
+            assert_eq!(page_events[0]["event"], "thread_search");
+            let page_data = page_events[0]["data"]
+                .as_array()
+                .expect("thread search page data");
+            assert_eq!(page_data.len(), 1);
+            let second_hit_id = page_data[0]["thread"]["threadId"]
+                .as_str()
+                .expect("thread id")
+                .to_string();
+            assert!(second_hit_id == thread_id || second_hit_id == second_id);
+            assert_ne!(first_hit_id, second_hit_id);
+            assert_eq!(page_events[0]["nextCursor"], Value::Null);
+            assert_eq!(page_events[0]["backwardsCursor"], "1");
+        });
+    }
+
+    #[test]
+    fn thread_turns_and_items_list_return_persisted_projection() {
+        with_orca_home(|home| {
+            let store = SessionStore::new();
+            let mut thread = store
+                .create_live_thread(home, "mock", None, "projected server thread")
+                .expect("create thread");
+            let thread_id = thread.thread_id().to_string();
+            thread
+                .append_items(&[
+                    Message::User {
+                        content: "server projected user".to_string(),
+                        pinned: false,
+                    },
+                    Message::Assistant {
+                        content: Some("server projected assistant".to_string()),
+                        reasoning_content: None,
+                        tool_calls: Vec::new(),
+                        pinned: false,
+                    },
+                    Message::User {
+                        content: "server projected second user".to_string(),
+                        pinned: false,
+                    },
+                    Message::Assistant {
+                        content: Some("server projected second assistant".to_string()),
+                        reasoning_content: None,
+                        tool_calls: Vec::new(),
+                        pinned: false,
+                    },
+                ])
+                .expect("append projection messages");
+            thread.complete("success").expect("complete thread");
+
+            let server_config = ServerConfig {
+                run_config: test_run_config(),
+            };
+            let mut state = ServerState::default();
+            let mut turns_output = Vec::new();
+            handle_line_for_test(
+                &server_config,
+                &mut state,
+                &format!(
+                    r#"{{"id":"turns","method":"thread/turns/list","params":{{"threadId":"{thread_id}","limit":10}}}}"#
+                ),
+                &mut turns_output,
+            )
+            .expect("thread turns list");
+
+            let turn_events = parse_jsonl(&turns_output);
+            assert_eq!(turn_events.len(), 1);
+            assert_eq!(turn_events[0]["event"], "thread_turns_list");
+            let turns = turn_events[0]["data"].as_array().expect("turn data");
+            assert_eq!(turns.len(), 2);
+            assert_eq!(turns[0]["turnId"], "turn-1");
+            assert_eq!(turns[0]["role"], "user");
+            assert_eq!(turns[0]["itemsView"], "full");
+            assert_eq!(turns[0]["items"][0]["content"], "server projected user");
+            assert_eq!(
+                turns[0]["items"][1]["content"],
+                "server projected assistant"
+            );
+            assert_eq!(turn_events[0]["nextCursor"], Value::Null);
+            assert_eq!(turn_events[0]["backwardsCursor"], "0");
+
+            let mut second_turn_page_output = Vec::new();
+            handle_line_for_test(
+                &server_config,
+                &mut state,
+                &format!(
+                    r#"{{"id":"turn-page","method":"thread/turns/list","params":{{"threadId":"{thread_id}","cursor":"1","limit":1}}}}"#
+                ),
+                &mut second_turn_page_output,
+            )
+            .expect("second thread turns page");
+
+            let second_turn_page_events = parse_jsonl(&second_turn_page_output);
+            assert_eq!(second_turn_page_events.len(), 1);
+            assert_eq!(second_turn_page_events[0]["event"], "thread_turns_list");
+            let page_turns = second_turn_page_events[0]["data"]
+                .as_array()
+                .expect("paged turn data");
+            assert_eq!(page_turns.len(), 1);
+            assert_eq!(page_turns[0]["turnId"], "turn-2");
+            assert_eq!(
+                page_turns[0]["items"][0]["content"],
+                "server projected second user"
+            );
+            assert_eq!(second_turn_page_events[0]["nextCursor"], Value::Null);
+            assert_eq!(second_turn_page_events[0]["backwardsCursor"], "1");
+
+            let mut latest_turn_output = Vec::new();
+            handle_line_for_test(
+                &server_config,
+                &mut state,
+                &format!(
+                    r#"{{"id":"turn-desc","method":"thread/turns/list","params":{{"threadId":"{thread_id}","limit":1,"sortDirection":"desc"}}}}"#
+                ),
+                &mut latest_turn_output,
+            )
+            .expect("latest thread turns page");
+
+            let latest_turn_events = parse_jsonl(&latest_turn_output);
+            assert_eq!(latest_turn_events.len(), 1);
+            assert_eq!(latest_turn_events[0]["event"], "thread_turns_list");
+            let latest_turns = latest_turn_events[0]["data"]
+                .as_array()
+                .expect("latest turn data");
+            assert_eq!(latest_turns.len(), 1);
+            assert_eq!(latest_turns[0]["turnId"], "turn-2");
+            assert_eq!(
+                latest_turns[0]["items"][1]["content"],
+                "server projected second assistant"
+            );
+            assert_eq!(latest_turn_events[0]["nextCursor"], "1");
+
+            let mut unloaded_turn_output = Vec::new();
+            handle_line_for_test(
+                &server_config,
+                &mut state,
+                &format!(
+                    r#"{{"id":"turn-unloaded","method":"thread/turns/list","params":{{"threadId":"{thread_id}","limit":1,"itemsView":"notLoaded"}}}}"#
+                ),
+                &mut unloaded_turn_output,
+            )
+            .expect("unloaded thread turns page");
+
+            let unloaded_turn_events = parse_jsonl(&unloaded_turn_output);
+            assert_eq!(unloaded_turn_events.len(), 1);
+            assert_eq!(unloaded_turn_events[0]["event"], "thread_turns_list");
+            let unloaded_turns = unloaded_turn_events[0]["data"]
+                .as_array()
+                .expect("unloaded turn data");
+            assert_eq!(unloaded_turns.len(), 1);
+            assert_eq!(unloaded_turns[0]["turnId"], "turn-1");
+            assert_eq!(unloaded_turns[0]["itemsView"], "notLoaded");
+            assert_eq!(
+                unloaded_turns[0]["items"].as_array().expect("items").len(),
+                0
+            );
+
+            let mut items_output = Vec::new();
+            handle_line_for_test(
+                &server_config,
+                &mut state,
+                &format!(
+                    r#"{{"id":"items","method":"thread/items/list","params":{{"threadId":"{thread_id}","turnId":"turn-1","limit":10}}}}"#
+                ),
+                &mut items_output,
+            )
+            .expect("thread items list");
+
+            let item_events = parse_jsonl(&items_output);
+            assert_eq!(item_events.len(), 1);
+            assert_eq!(item_events[0]["event"], "thread_items_list");
+            let items = item_events[0]["data"].as_array().expect("item data");
+            assert_eq!(items.len(), 2);
+            assert_eq!(items[1]["itemId"], "item-2");
+            assert_eq!(items[1]["turnId"], "turn-1");
+            assert_eq!(items[1]["item"]["content"], "server projected assistant");
+            assert_eq!(item_events[0]["nextCursor"], Value::Null);
+            assert_eq!(item_events[0]["backwardsCursor"], "0");
+
+            let mut second_items_page_output = Vec::new();
+            handle_line_for_test(
+                &server_config,
+                &mut state,
+                &format!(
+                    r#"{{"id":"items-page","method":"thread/items/list","params":{{"threadId":"{thread_id}","cursor":"2","limit":2}}}}"#
+                ),
+                &mut second_items_page_output,
+            )
+            .expect("second thread items page");
+
+            let second_items_page_events = parse_jsonl(&second_items_page_output);
+            assert_eq!(second_items_page_events.len(), 1);
+            assert_eq!(second_items_page_events[0]["event"], "thread_items_list");
+            let page_items = second_items_page_events[0]["data"]
+                .as_array()
+                .expect("paged item data");
+            assert_eq!(page_items.len(), 2);
+            assert_eq!(page_items[0]["itemId"], "item-3");
+            assert_eq!(page_items[0]["turnId"], "turn-2");
+            assert_eq!(
+                page_items[0]["item"]["content"],
+                "server projected second user"
+            );
+            assert_eq!(second_items_page_events[0]["nextCursor"], Value::Null);
+            assert_eq!(second_items_page_events[0]["backwardsCursor"], "2");
+
+            let mut latest_item_output = Vec::new();
+            handle_line_for_test(
+                &server_config,
+                &mut state,
+                &format!(
+                    r#"{{"id":"item-desc","method":"thread/items/list","params":{{"threadId":"{thread_id}","limit":1,"sortDirection":"desc"}}}}"#
+                ),
+                &mut latest_item_output,
+            )
+            .expect("latest thread items page");
+
+            let latest_item_events = parse_jsonl(&latest_item_output);
+            assert_eq!(latest_item_events.len(), 1);
+            assert_eq!(latest_item_events[0]["event"], "thread_items_list");
+            let latest_items = latest_item_events[0]["data"]
+                .as_array()
+                .expect("latest item data");
+            assert_eq!(latest_items.len(), 1);
+            assert_eq!(latest_items[0]["itemId"], "item-4");
+            assert_eq!(
+                latest_items[0]["item"]["content"],
+                "server projected second assistant"
+            );
+            assert_eq!(latest_item_events[0]["nextCursor"], "1");
+        });
     }
 
     fn test_run_config() -> RunConfig {
@@ -287,7 +4794,11 @@ mod tests {
             external_tools: Vec::new(),
             history_mode: HistoryMode::Disabled,
             show_session_picker: false,
+            active_permission_profile: None,
+            permission_profiles: Default::default(),
+            runtime_workspace_roots: None,
             permission_rules: PermissionRules::default(),
+            additional_working_directories: Vec::new(),
             max_budget_usd: None,
             subagents: SubagentConfig::default(),
             tools: ToolConfig::default(),
@@ -305,5 +4816,23 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str(line).expect("valid jsonl line"))
             .collect()
+    }
+
+    fn with_orca_home<T>(f: impl FnOnce(&std::path::Path) -> T) -> T {
+        let _guard = crate::history::TEST_ENV_LOCK.lock().expect("env lock");
+        let home = tempdir().expect("temp home");
+        let previous = std::env::var_os("ORCA_HOME");
+        unsafe {
+            std::env::set_var("ORCA_HOME", home.path());
+        }
+        let result = f(home.path());
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var("ORCA_HOME", previous);
+            } else {
+                std::env::remove_var("ORCA_HOME");
+            }
+        }
+        result
     }
 }

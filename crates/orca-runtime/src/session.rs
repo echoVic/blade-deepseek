@@ -14,7 +14,7 @@ use orca_provider::ProviderConfig;
 
 use crate::agent_common;
 use crate::cost::CostTracker;
-use crate::history::{self, SessionStore, SessionWriter};
+use crate::history::{self, SessionStore, SessionWriter, ThreadStore};
 use crate::hooks::{HookContext, HookRunner, conversation_with_hook_context};
 use crate::instructions::{self, ProjectInstructions};
 use crate::memory::{self, MemoryBlock};
@@ -39,6 +39,17 @@ pub struct InteractiveSession {
     hooks: HookRunner,
     memory: MemoryBlock,
     task_registry: TaskRegistry,
+}
+
+pub(crate) struct InteractiveSessionRuntimeParts<'a> {
+    pub conversation: &'a mut Conversation,
+    pub writer: Option<&'a mut SessionWriter>,
+    pub instructions: &'a ProjectInstructions,
+    pub cost_tracker: &'a mut CostTracker,
+    pub mcp_registry: &'a McpRegistry,
+    pub hooks: &'a HookRunner,
+    pub memory: &'a MemoryBlock,
+    pub task_registry: &'a TaskRegistry,
 }
 
 impl InteractiveSession {
@@ -86,14 +97,31 @@ impl InteractiveSession {
         let writer = match &config.history_mode {
             HistoryMode::Disabled => None,
             HistoryMode::Record | HistoryMode::Resume(_) => {
-                let meta = store.create_meta(
+                match store.create_live_thread_with_permissions(
                     &cwd,
                     config.provider.as_str(),
                     config.model.as_history_value(),
                     prompt_for_title,
-                );
-                session_id = Some(meta.session_id.clone());
-                start_writer_with_messages(&store, meta, &conversation)
+                    config.active_permission_profile.clone(),
+                    config.approval_mode,
+                    config.permission_rules.clone(),
+                    config.additional_working_directories.clone(),
+                ) {
+                    Ok(mut thread) => {
+                        if let Err(error) = thread.append_items(&conversation.messages) {
+                            eprintln!("orca: warning: history write failed: {error}");
+                            None
+                        } else {
+                            let (thread_id, writer) = thread.into_thread_id_and_writer();
+                            session_id = Some(thread_id);
+                            Some(writer)
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("orca: warning: failed to initialize history: {error}");
+                        None
+                    }
+                }
             }
             HistoryMode::Fork(_) => {
                 let parent_id = loaded_transcript
@@ -106,6 +134,11 @@ impl InteractiveSession {
                     prompt_for_title,
                     parent_id,
                 );
+                let mut meta = meta;
+                meta.active_permission_profile = config.active_permission_profile.clone();
+                meta.approval_mode = Some(config.approval_mode);
+                meta.permission_rules = config.permission_rules.clone();
+                meta.additional_working_directories = config.additional_working_directories.clone();
                 session_id = Some(meta.session_id.clone());
                 start_writer_with_messages(&store, meta, &conversation)
             }
@@ -124,6 +157,47 @@ impl InteractiveSession {
             hooks,
             memory,
             task_registry: TaskRegistry::new_for_cwd(task_session_id, &cwd),
+        })
+    }
+
+    pub(crate) fn resume_same_thread(
+        config: &RunConfig,
+        transcript: history::SessionTranscript,
+    ) -> io::Result<Self> {
+        let cwd = config
+            .cwd
+            .clone()
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        let store = SessionStore::new();
+        let instructions = instructions::load_for_cwd_or_default(&cwd);
+        let memory = memory::load_for_cwd(&cwd);
+        let mcp_registry = orca_mcp::initialize_registry(&config.mcp_servers);
+        let hooks = HookRunner::new(config.hooks.clone());
+        let system_prompt = agent_common::build_agent_system_prompt(
+            &cwd,
+            0,
+            &SubagentType::General,
+            Some(&instructions),
+            config.approval_mode,
+            Some(&memory),
+        );
+        let mut conversation = store.resume_conversation(&transcript, system_prompt);
+        conversation.strip_legacy_pinned_volatile();
+        conversation.strip_legacy_summary_messages();
+        let session_id = transcript.meta.session_id.clone();
+        let writer = Some(history::SessionWriter::append_to_existing(transcript.path)?);
+
+        Ok(Self {
+            store,
+            conversation,
+            writer,
+            session_id: Some(session_id.clone()),
+            instructions,
+            cost_tracker: CostTracker::new(None),
+            mcp_registry,
+            hooks,
+            memory,
+            task_registry: TaskRegistry::new_for_cwd(session_id, &cwd),
         })
     }
 
@@ -177,6 +251,19 @@ impl InteractiveSession {
 
     pub fn task_registry(&self) -> &TaskRegistry {
         &self.task_registry
+    }
+
+    pub(crate) fn runtime_parts(&mut self) -> InteractiveSessionRuntimeParts<'_> {
+        InteractiveSessionRuntimeParts {
+            conversation: &mut self.conversation,
+            writer: self.writer.as_mut(),
+            instructions: &self.instructions,
+            cost_tracker: &mut self.cost_tracker,
+            mcp_registry: &self.mcp_registry,
+            hooks: &self.hooks,
+            memory: &self.memory,
+            task_registry: &self.task_registry,
+        }
     }
 
     pub fn has_active_workflows(&self) -> bool {
@@ -382,7 +469,11 @@ mod tests {
             external_tools: Vec::new(),
             history_mode,
             show_session_picker: false,
+            active_permission_profile: None,
+            permission_profiles: Default::default(),
+            runtime_workspace_roots: None,
             permission_rules: PermissionRules::default(),
+            additional_working_directories: Vec::new(),
             max_budget_usd: None,
             subagents: SubagentConfig::default(),
             tools: ToolConfig::default(),

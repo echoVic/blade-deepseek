@@ -86,6 +86,9 @@ pub struct ApprovalRequest {
     pub id: String,
     pub action: ActionKind,
     pub description: String,
+    pub tool: Option<String>,
+    pub target: Option<String>,
+    pub preview: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

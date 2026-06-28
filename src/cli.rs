@@ -22,7 +22,10 @@ use orca_runtime::tasks::TaskRegistry;
 use orca_runtime::workflow::script::{find_saved_workflow, parse_workflow_meta};
 use orca_runtime::workflow::state::WorkflowStateStore;
 use orca_runtime::workflow::{WorkflowDraftStore, WorkflowLaunchRequest, WorkflowRunner};
-use orca_runtime::{controller::AsyncSubagentWorktree, subagent::SubagentRequest};
+use orca_runtime::{
+    subagent::SubagentRequest,
+    subagent_execution::{self, AsyncSubagentWorktree},
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -191,6 +194,10 @@ pub struct Cli {
     /// API base URL (overrides config file and ORCA_BASE_URL env).
     #[arg(long)]
     base_url: Option<String>,
+
+    /// Workspace directory.
+    #[arg(long)]
+    cwd: Option<PathBuf>,
 
     /// Provider implementation (internal, for testing).
     #[arg(long, value_enum, default_value_t = ProviderKind::DeepSeek, hide = true)]
@@ -767,7 +774,11 @@ fn run_exec(args: ExecArgs) -> i32 {
         base_url,
         history_mode,
         show_session_picker: false,
+        active_permission_profile: None,
+        permission_profiles: file_config.permission_profiles,
+        runtime_workspace_roots: None,
         permission_rules: file_config.permissions,
+        additional_working_directories: Vec::new(),
         max_budget_usd: args.max_budget,
         mcp_servers: file_config.mcp_servers,
         hooks: file_config.hooks,
@@ -986,7 +997,7 @@ fn run_subagent_worker(args: SubagentWorkerArgs) -> i32 {
         }
     };
 
-    controller::run_async_subagent_worker(
+    subagent_execution::run_async_subagent_worker(
         config,
         args.cwd,
         args.child_cwd,
@@ -1473,7 +1484,11 @@ fn build_workflow_run_config(
         base_url: file_config.base_url,
         history_mode: HistoryMode::Disabled,
         show_session_picker: false,
+        active_permission_profile: None,
+        permission_profiles: file_config.permission_profiles,
+        runtime_workspace_roots: None,
         permission_rules: file_config.permissions,
+        additional_working_directories: Vec::new(),
         max_budget_usd: None,
         mcp_servers: file_config.mcp_servers,
         hooks: file_config.hooks,
@@ -1521,7 +1536,11 @@ fn build_worker_run_config(
         base_url: file_config.base_url,
         history_mode: HistoryMode::Disabled,
         show_session_picker: false,
+        active_permission_profile: None,
+        permission_profiles: file_config.permission_profiles,
+        runtime_workspace_roots: None,
         permission_rules: file_config.permissions,
+        additional_working_directories: Vec::new(),
         max_budget_usd: None,
         mcp_servers: file_config.mcp_servers,
         hooks: file_config.hooks,
@@ -1923,7 +1942,11 @@ fn run_placeholder(cli: Cli) -> i32 {
         base_url,
         history_mode,
         show_session_picker: cli.session_picker,
+        active_permission_profile: None,
+        permission_profiles: file_config.permission_profiles,
+        runtime_workspace_roots: None,
         permission_rules: file_config.permissions,
+        additional_working_directories: Vec::new(),
         max_budget_usd: None,
         mcp_servers: file_config.mcp_servers,
         hooks: file_config.hooks,
@@ -2124,7 +2147,9 @@ fn run_server(cli: Cli) -> i32 {
         return 1;
     }
 
-    let cwd = std::env::current_dir().unwrap_or_default();
+    let cwd = cli
+        .cwd
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
     let file_config = match load_effective_file_config(
         &cwd,
         ConfigOverrides {
@@ -2152,7 +2177,7 @@ fn run_server(cli: Cli) -> i32 {
     let config = RunConfig {
         app_version: env!("CARGO_PKG_VERSION").to_string(),
         prompt: String::new(),
-        cwd: None,
+        cwd: Some(cwd),
         output_format: OutputFormat::Jsonl,
         approval_mode: file_config.mode.unwrap_or_default(),
         provider: cli.provider,
@@ -2161,9 +2186,13 @@ fn run_server(cli: Cli) -> i32 {
         model_runtime: file_config.model_runtime,
         api_key: file_config.api_key,
         base_url: file_config.base_url,
-        history_mode: HistoryMode::Disabled,
+        history_mode: HistoryMode::Record,
         show_session_picker: false,
+        active_permission_profile: None,
+        permission_profiles: file_config.permission_profiles,
+        runtime_workspace_roots: None,
         permission_rules: file_config.permissions,
+        additional_working_directories: Vec::new(),
         max_budget_usd: None,
         mcp_servers: file_config.mcp_servers,
         hooks: file_config.hooks,

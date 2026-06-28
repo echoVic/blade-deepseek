@@ -26,6 +26,34 @@ pub fn execute_with_policy(
     output_truncation: ToolOutputTruncation,
     shell_timeout: Duration,
 ) -> ToolResult {
+    execute_with_policy_or_cancel(request, cwd, output_truncation, shell_timeout, || false)
+}
+
+pub fn execute_with_policy_or_cancel(
+    request: &ToolRequest,
+    cwd: &Path,
+    output_truncation: ToolOutputTruncation,
+    shell_timeout: Duration,
+    should_cancel: impl Fn() -> bool,
+) -> ToolResult {
+    execute_with_policy_roots_or_cancel(
+        request,
+        cwd,
+        &[],
+        output_truncation,
+        shell_timeout,
+        should_cancel,
+    )
+}
+
+pub fn execute_with_policy_roots_or_cancel(
+    request: &ToolRequest,
+    cwd: &Path,
+    additional_roots: &[std::path::PathBuf],
+    output_truncation: ToolOutputTruncation,
+    shell_timeout: Duration,
+    should_cancel: impl Fn() -> bool,
+) -> ToolResult {
     let Some(command) = request
         .target
         .as_deref()
@@ -34,7 +62,7 @@ pub fn execute_with_policy(
         return ToolResult::failed(request, "bash command is required", None);
     };
 
-    let child = match sandbox::bash_command(command, cwd)
+    let child = match sandbox::bash_command_with_additional_roots(command, cwd, additional_roots)
         .env_remove("ORCA_API_KEY")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -50,7 +78,11 @@ pub fn execute_with_policy(
         }
     };
 
-    let output = match process::wait_for_child_output_with_timeout(child, shell_timeout) {
+    let output = match process::wait_for_child_output_with_timeout_or_cancel(
+        child,
+        shell_timeout,
+        &should_cancel,
+    ) {
         Ok(output) => output,
         Err(error) => {
             return ToolResult::failed(
@@ -67,6 +99,21 @@ pub fn execute_with_policy(
     let stderr = String::from_utf8_lossy(&output.stderr)
         .trim_end()
         .to_string();
+    if should_cancel() {
+        let message = if stderr.is_empty() && stdout.is_empty() {
+            "shell command cancelled".to_string()
+        } else if stderr.is_empty() {
+            format!("shell command cancelled: {stdout}")
+        } else if stdout.is_empty() {
+            format!("shell command cancelled: {stderr}")
+        } else {
+            format!("shell command cancelled: {stdout}\n{stderr}")
+        };
+        let (message, truncated) = truncate_output_with_policy(message, output_truncation);
+        let mut result = ToolResult::failed(request, message, output.status.code());
+        result.truncated = truncated;
+        return result;
+    }
     let timed_out = output.timed_out;
     if output.status.success() && !timed_out {
         let (stdout, truncated) = truncate_output_with_policy(stdout, output_truncation);
@@ -140,6 +187,44 @@ pub fn execute_streaming_with_policy(
     shell_timeout: Duration,
     on_output: &mut dyn FnMut(&str),
 ) -> ToolResult {
+    execute_streaming_with_policy_or_cancel(
+        request,
+        cwd,
+        output_truncation,
+        shell_timeout,
+        on_output,
+        || false,
+    )
+}
+
+pub fn execute_streaming_with_policy_or_cancel(
+    request: &ToolRequest,
+    cwd: &Path,
+    output_truncation: ToolOutputTruncation,
+    shell_timeout: Duration,
+    on_output: &mut dyn FnMut(&str),
+    should_cancel: impl Fn() -> bool,
+) -> ToolResult {
+    execute_streaming_with_policy_roots_or_cancel(
+        request,
+        cwd,
+        &[],
+        output_truncation,
+        shell_timeout,
+        on_output,
+        should_cancel,
+    )
+}
+
+pub fn execute_streaming_with_policy_roots_or_cancel(
+    request: &ToolRequest,
+    cwd: &Path,
+    additional_roots: &[std::path::PathBuf],
+    output_truncation: ToolOutputTruncation,
+    shell_timeout: Duration,
+    on_output: &mut dyn FnMut(&str),
+    should_cancel: impl Fn() -> bool,
+) -> ToolResult {
     let Some(command) = request
         .target
         .as_deref()
@@ -148,21 +233,22 @@ pub fn execute_streaming_with_policy(
         return ToolResult::failed(request, "bash command is required", None);
     };
 
-    let mut child = match sandbox::bash_command(command, cwd)
-        .env_remove("ORCA_API_KEY")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(error) => {
-            return ToolResult::failed(
-                request,
-                format!("failed to run shell command: {error}"),
-                None,
-            );
-        }
-    };
+    let mut child =
+        match sandbox::bash_command_with_additional_roots(command, cwd, additional_roots)
+            .env_remove("ORCA_API_KEY")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) => {
+                return ToolResult::failed(
+                    request,
+                    format!("failed to run shell command: {error}"),
+                    None,
+                );
+            }
+        };
     let (tx, rx) = mpsc::channel();
     let stdout_handle = child.stdout.take().map(|stdout| {
         let tx = tx.clone();
@@ -190,6 +276,7 @@ pub fn execute_streaming_with_policy(
         .checked_add(shell_timeout)
         .unwrap_or_else(Instant::now);
     let mut timed_out = false;
+    let mut cancelled = false;
     let status = loop {
         match rx.recv_timeout(Duration::from_millis(50)) {
             Ok(StreamEvent::Stdout(chunk)) => {
@@ -211,6 +298,20 @@ pub fn execute_streaming_with_policy(
                     );
                 }
             },
+        }
+        if should_cancel() {
+            cancelled = true;
+            process::kill_child_tree(&mut child);
+            match child.wait() {
+                Ok(status) => break status,
+                Err(error) => {
+                    return ToolResult::failed(
+                        request,
+                        format!("failed to wait for shell command: {error}"),
+                        None,
+                    );
+                }
+            }
         }
         if Instant::now() >= deadline {
             timed_out = true;
@@ -249,11 +350,13 @@ pub fn execute_streaming_with_policy(
 
     let stdout = stdout.trim_end().to_string();
     let stderr = stderr.trim_end().to_string();
-    if status.success() && !timed_out {
+    if status.success() && !timed_out && !cancelled {
         let (stdout, truncated) = truncate_output_with_policy(stdout, output_truncation);
         ToolResult::completed(request, stdout, truncated)
     } else {
-        let message = if timed_out {
+        let message = if cancelled {
+            cancelled_message(&stdout, &stderr)
+        } else if timed_out {
             timeout_message(shell_timeout, &stdout, &stderr)
         } else if stderr.is_empty() {
             stdout
@@ -266,6 +369,18 @@ pub fn execute_streaming_with_policy(
         let mut result = ToolResult::failed(request, message, status.code());
         result.truncated = truncated;
         result
+    }
+}
+
+fn cancelled_message(stdout: &str, stderr: &str) -> String {
+    if stderr.is_empty() && stdout.is_empty() {
+        "shell command cancelled".to_string()
+    } else if stderr.is_empty() {
+        format!("shell command cancelled: {stdout}")
+    } else if stdout.is_empty() {
+        format!("shell command cancelled: {stderr}")
+    } else {
+        format!("shell command cancelled: {stdout}\n{stderr}")
     }
 }
 
@@ -378,5 +493,102 @@ mod tests {
             chunks.join("").contains("before"),
             "partial output should be streamed before timeout"
         );
+    }
+
+    #[test]
+    fn bash_wait_observes_cancel_callback() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let request = bash_request("printf before; sleep 5; printf after");
+        let start = Instant::now();
+
+        let result = execute_with_policy_or_cancel(
+            &request,
+            dir.path(),
+            ToolOutputTruncation::bytes(1024),
+            Duration::from_secs(30),
+            || start.elapsed() >= Duration::from_millis(100),
+        );
+
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "cancelled command should not wait for the shell timeout"
+        );
+        assert_eq!(result.status, ToolStatus::Failed);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("shell command cancelled"),
+            "unexpected error: {:?}",
+            result.error
+        );
+    }
+
+    #[test]
+    fn streaming_bash_wait_observes_cancel_callback() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let request = bash_request("printf before; sleep 5; printf after");
+        let mut chunks = Vec::new();
+        let start = Instant::now();
+
+        let result = execute_streaming_with_policy_or_cancel(
+            &request,
+            dir.path(),
+            ToolOutputTruncation::bytes(1024),
+            Duration::from_secs(30),
+            &mut |chunk| chunks.push(chunk.to_string()),
+            || start.elapsed() >= Duration::from_millis(100),
+        );
+
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "cancelled streaming command should not wait for the shell timeout"
+        );
+        assert_eq!(result.status, ToolStatus::Failed);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("shell command cancelled"),
+            "unexpected error: {:?}",
+            result.error
+        );
+        assert!(
+            chunks.join("").contains("before"),
+            "partial output should still stream before cancellation"
+        );
+    }
+
+    #[test]
+    fn bash_command_allows_additional_working_directory_writes() {
+        if !crate::sandbox::seatbelt_available() {
+            return;
+        }
+
+        let workspace = tempfile::TempDir::new().unwrap();
+        let extra = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let extra_file = extra.path().join("allowed.txt");
+        let outside_file = outside.path().join("blocked.txt");
+        let request = bash_request(&format!(
+            "printf allowed > {} && printf blocked > {}",
+            extra_file.display(),
+            outside_file.display()
+        ));
+
+        let result = execute_with_policy_roots_or_cancel(
+            &request,
+            workspace.path(),
+            &[extra.path().to_path_buf()],
+            ToolOutputTruncation::bytes(1024),
+            Duration::from_secs(5),
+            || false,
+        );
+
+        assert_eq!(result.status, ToolStatus::Failed);
+        assert_eq!(std::fs::read_to_string(extra_file).unwrap(), "allowed");
+        assert!(!outside_file.exists());
     }
 }

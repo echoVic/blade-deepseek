@@ -9,11 +9,20 @@ use orca_core::plan_types::PlanItem;
 use orca_core::task_types::BackgroundTaskSummary;
 use orca_runtime::history::SessionSummary;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TuiTaskLifecycle {
+    pub id: String,
+    pub kind: String,
+    pub status: String,
+    pub turn: u32,
+}
+
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub enum TuiEvent {
     TurnStarted {
         turn: u32,
+        task: Option<TuiTaskLifecycle>,
     },
     ReasoningDelta(String),
     MessageDelta(String),
@@ -913,6 +922,11 @@ mod tests {
             archived: false,
             parent_id: None,
             forked: false,
+            approval_mode: None,
+            active_permission_profile: None,
+            runtime_workspace_roots: Vec::new(),
+            permission_rule_count: 0,
+            additional_working_directories: Vec::new(),
         }
     }
 
@@ -1366,7 +1380,10 @@ mod tests {
         let mut state = state();
         assert!(state.running_started_at.is_none());
 
-        state.update(TuiEvent::TurnStarted { turn: 1 });
+        state.update(TuiEvent::TurnStarted {
+            turn: 1,
+            task: None,
+        });
         assert!(state.running_started_at.is_some());
 
         state.update(TuiEvent::SessionCompleted {
@@ -1379,7 +1396,10 @@ mod tests {
     #[test]
     fn approval_round_trip_preserves_running_timer() {
         let mut state = state();
-        state.update(TuiEvent::TurnStarted { turn: 1 });
+        state.update(TuiEvent::TurnStarted {
+            turn: 1,
+            task: None,
+        });
         let started_at = Instant::now() - std::time::Duration::from_secs(65);
         state.running_started_at = Some(started_at);
 

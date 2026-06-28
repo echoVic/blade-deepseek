@@ -277,6 +277,15 @@ pub struct WorkflowEvidencePhase {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct WorkflowTaskLifecycleEvidence {
+    pub task_id: String,
+    pub kind: String,
+    pub status: String,
+    pub turn: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct WorkflowEvidenceAgent {
     pub call_id: String,
     pub call_path: String,
@@ -302,6 +311,8 @@ pub struct WorkflowEvidenceAgent {
     pub completed_at_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<UsageTotals>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<WorkflowTaskLifecycleEvidence>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_events: Vec<WorkflowEvidenceToolEvent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

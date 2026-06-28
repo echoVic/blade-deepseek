@@ -5,15 +5,17 @@ use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use orca_approval::ApprovalPolicy;
-use orca_core::approval_types::ApprovalDecision;
+use orca_core::approval_types::{ApprovalDecision, ApprovalRequest, ApprovalResolution};
 use orca_core::cancel::CancelToken;
 use orca_core::config::RunConfig;
 use orca_core::conversation::Conversation;
 use orca_core::cost_types::UsageTotals;
+use orca_core::event_schema::{EventEnvelope, EventFactory, EventType, RunStatus};
 use orca_core::hook_types::HookEvent;
 use orca_core::model::ModelRouteContext;
 use orca_core::provider_types::ProviderStep;
 use orca_core::subagent_types::SubagentType;
+use orca_core::task_types::BackgroundTaskSummary;
 use orca_core::tool_types;
 use orca_core::workflow_types::{WorkflowDraftActionOutput, WorkflowInput};
 use orca_mcp::McpRegistry;
@@ -30,6 +32,10 @@ use orca_runtime::hooks::{
     HookContext, HookRunner, conversation_with_hook_context, tool_request_with_hook_outcome,
 };
 use orca_runtime::instructions::ProjectInstructions;
+use orca_runtime::lifecycle::{
+    RuntimeApprovalDecision, RuntimeApprovalHandler, RuntimeSessionLifecycle, RuntimeTaskKind,
+    RuntimeToolActorContext, RuntimeTurnRunner, RuntimeUserInputHandler, RuntimeUserInputRequest,
+};
 use orca_runtime::memory::{self, MemoryBlock};
 use orca_runtime::session::InteractiveSession;
 use orca_runtime::subagent::{self, SubagentMode};
@@ -39,7 +45,7 @@ use orca_runtime::workflow::{WorkflowDraftStore, WorkflowLaunchRequest, Workflow
 use serde::Deserialize;
 
 use crate::diff;
-use crate::types::{TuiEvent, UserAction};
+use crate::types::{TuiEvent, TuiTaskLifecycle, UserAction};
 
 const DEFAULT_MAX_TURNS: u32 = 128;
 
@@ -51,27 +57,367 @@ struct TuiAgentResult {
     cost_tracker: CostTracker,
 }
 
-#[derive(Debug, Deserialize)]
-struct UserInputRequestArgs {
-    question: String,
-    #[serde(default)]
-    choices: Vec<String>,
+struct TuiApprovalHandler<'a> {
+    action_rx: &'a Receiver<UserAction>,
 }
 
-fn tool_result_kind_label(kind: tool_types::ToolResultKind) -> &'static str {
-    match kind {
-        tool_types::ToolResultKind::Success => "success",
-        tool_types::ToolResultKind::Empty => "empty",
-        tool_types::ToolResultKind::NoMatches => "no_matches",
-        tool_types::ToolResultKind::Truncated => "truncated",
-        tool_types::ToolResultKind::PermissionDenied => "permission_denied",
-        tool_types::ToolResultKind::InvalidInput => "invalid_input",
-        tool_types::ToolResultKind::RuntimeError => "runtime_error",
+impl<'a> TuiApprovalHandler<'a> {
+    fn new(action_rx: &'a Receiver<UserAction>) -> Self {
+        Self { action_rx }
     }
+}
+
+impl RuntimeApprovalHandler for TuiApprovalHandler<'_> {
+    fn resolve_interactive(
+        &self,
+        approval: &ApprovalRequest,
+        _request: &tool_types::ToolRequest,
+    ) -> std::io::Result<ApprovalResolution> {
+        let allowed = loop {
+            match self.action_rx.recv() {
+                Ok(UserAction::Approve(value)) => break value,
+                Ok(UserAction::Interrupt) | Ok(UserAction::Cancel) | Err(_) => break false,
+                _ => continue,
+            }
+        };
+        Ok(ApprovalResolution {
+            id: approval.id.clone(),
+            decision: if allowed {
+                ApprovalDecision::Allow
+            } else {
+                ApprovalDecision::Deny
+            },
+            reason: if allowed {
+                "user approved".to_string()
+            } else {
+                "user denied".to_string()
+            },
+        })
+    }
+}
+
+struct TuiUserInputHandler<'a> {
+    event_tx: &'a Sender<TuiEvent>,
+    action_rx: &'a Receiver<UserAction>,
+}
+
+impl<'a> TuiUserInputHandler<'a> {
+    fn new(event_tx: &'a Sender<TuiEvent>, action_rx: &'a Receiver<UserAction>) -> Self {
+        Self {
+            event_tx,
+            action_rx,
+        }
+    }
+}
+
+impl RuntimeUserInputHandler for TuiUserInputHandler<'_> {
+    fn request_user_input(
+        &self,
+        request: &RuntimeUserInputRequest,
+    ) -> std::io::Result<Option<String>> {
+        let _ = self.event_tx.send(TuiEvent::UserInputRequested {
+            id: request.id.clone(),
+            question: request.question.clone(),
+            choices: request.choices.clone(),
+        });
+
+        loop {
+            match self.action_rx.recv() {
+                Ok(UserAction::RespondToUserInput(answer)) => return Ok(Some(answer)),
+                Ok(UserAction::Interrupt) | Ok(UserAction::Cancel) | Err(_) => return Ok(None),
+                _ => continue,
+            }
+        }
+    }
+}
+
+fn tui_event_from_runtime_event(event: &EventEnvelope) -> Option<TuiEvent> {
+    match event.event_type {
+        EventType::AssistantReasoningDelta => Some(TuiEvent::ReasoningDelta(
+            event.payload["text"].as_str()?.to_string(),
+        )),
+        EventType::AssistantMessageDelta => Some(TuiEvent::MessageDelta(
+            event.payload["text"].as_str()?.to_string(),
+        )),
+        EventType::UsageUpdated => Some(TuiEvent::UsageUpdated(UsageTotals {
+            input_tokens: event.payload["input_tokens"].as_u64()?,
+            output_tokens: event.payload["output_tokens"].as_u64()?,
+            cache_tokens: event.payload["cache_tokens"].as_u64().unwrap_or_default(),
+            estimated_cost_usd: event.payload["estimated_cost_usd"].as_f64()?,
+        })),
+        EventType::ToolCallRequested => Some(TuiEvent::ToolRequested {
+            id: event.payload["id"].as_str()?.to_string(),
+            name: event.payload["name"].as_str()?.to_string(),
+            target: event
+                .payload
+                .get("target")
+                .and_then(|value| value.as_str())
+                .map(str::to_string),
+        }),
+        EventType::ToolCallCompleted => {
+            let output = event
+                .payload
+                .get("output")
+                .and_then(|value| value.as_str())
+                .or_else(|| event.payload.get("error").and_then(|value| value.as_str()))
+                .unwrap_or_default()
+                .to_string();
+            Some(TuiEvent::ToolCompleted {
+                id: event.payload["id"].as_str()?.to_string(),
+                name: event.payload["name"].as_str()?.to_string(),
+                status: event.payload["status"].as_str()?.to_string(),
+                output,
+                diff: None,
+                kind: event
+                    .payload
+                    .get("kind")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string),
+            })
+        }
+        EventType::PlanUpdated => Some(TuiEvent::PlanUpdated {
+            explanation: serde_json::from_value(event.payload["explanation"].clone()).ok()?,
+            plan: serde_json::from_value(event.payload["plan"].clone()).ok()?,
+        }),
+        EventType::ApprovalRequested => Some(TuiEvent::ApprovalNeeded {
+            id: event.payload["id"].as_str()?.to_string(),
+            tool: event
+                .payload
+                .get("tool")
+                .and_then(|value| value.as_str())
+                .or_else(|| event.payload["action"].as_str())?
+                .to_string(),
+            target: event
+                .payload
+                .get("target")
+                .and_then(|value| value.as_str())
+                .or_else(|| {
+                    event
+                        .payload
+                        .get("description")
+                        .and_then(|value| value.as_str())
+                })
+                .map(str::to_string),
+            preview: event
+                .payload
+                .get("preview")
+                .and_then(|value| value.as_str())
+                .map(str::to_string),
+        }),
+        EventType::SubagentStarted => Some(TuiEvent::SubagentStarted {
+            id: event.payload["id"].as_str()?.to_string(),
+            description: event.payload["description"].as_str()?.to_string(),
+        }),
+        EventType::SubagentCompleted => Some(TuiEvent::SubagentCompleted {
+            id: event.payload["id"].as_str()?.to_string(),
+            description: event.payload["description"].as_str()?.to_string(),
+            status: match event.payload["status"].as_str()? {
+                "success" => "completed",
+                status => status,
+            }
+            .to_string(),
+            output: event
+                .payload
+                .get("output")
+                .and_then(|value| value.as_str())
+                .map(str::to_string),
+            error: event
+                .payload
+                .get("error")
+                .and_then(|value| value.as_str())
+                .map(str::to_string),
+        }),
+        EventType::WorkflowResultAvailable | EventType::WorkflowFailed => {
+            let status = event.payload["status"]
+                .as_str()
+                .unwrap_or(if event.event_type == EventType::WorkflowFailed {
+                    "failed"
+                } else {
+                    "completed"
+                })
+                .to_string();
+            let summary = event
+                .payload
+                .get("result")
+                .and_then(|value| value.as_str())
+                .or_else(|| event.payload.get("error").and_then(|value| value.as_str()))
+                .unwrap_or_default()
+                .to_string();
+            let notification = WorkflowTerminalNotification {
+                task_id: event.payload["taskId"].as_str()?.to_string(),
+                run_id: event.payload["runId"].as_str()?.to_string(),
+                tool_use_id: event
+                    .payload
+                    .get("toolUseId")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                status: status.clone(),
+                summary: summary.clone(),
+            };
+            let workflow_name = event
+                .payload
+                .get("workflowName")
+                .and_then(|value| value.as_str())
+                .unwrap_or("workflow");
+            Some(TuiEvent::WorkflowNotification {
+                prompt: notification.to_prompt(),
+                status,
+                summary: format!("{workflow_name}: {summary}"),
+            })
+        }
+        EventType::WorkflowTasksUpdated => Some(TuiEvent::WorkflowTasksUpdated {
+            tasks: serde_json::from_value(event.payload["tasks"].clone()).ok()?,
+        }),
+        EventType::Error => Some(TuiEvent::Error(
+            event.payload["message"].as_str()?.to_string(),
+        )),
+        EventType::SessionCompleted => Some(TuiEvent::SessionCompleted {
+            status: event.payload["status"].as_str()?.to_string(),
+        }),
+        _ => None,
+    }
+}
+
+fn send_error_for_tui(event_tx: &Sender<TuiEvent>, events: &mut EventFactory, message: &str) {
+    send_runtime_event_as_tui(event_tx, events.error(message));
+}
+
+fn send_session_completed_for_tui(
+    event_tx: &Sender<TuiEvent>,
+    events: &mut EventFactory,
+    status: orca_core::event_schema::RunStatus,
+) {
+    send_runtime_event_as_tui(event_tx, events.session_completed(status));
+}
+
+fn send_session_completed_status_for_tui(
+    event_tx: &Sender<TuiEvent>,
+    events: &mut EventFactory,
+    status: &str,
+) {
+    let status = match status {
+        "success" => orca_core::event_schema::RunStatus::Success,
+        "failed" => orca_core::event_schema::RunStatus::Failed,
+        "interrupted" | "cancelled" => orca_core::event_schema::RunStatus::Cancelled,
+        "approval_required" => orca_core::event_schema::RunStatus::ApprovalRequired,
+        "verification_failed" => orca_core::event_schema::RunStatus::VerificationFailed,
+        "budget_exhausted" => orca_core::event_schema::RunStatus::BudgetExhausted,
+        _ => orca_core::event_schema::RunStatus::Failed,
+    };
+    send_session_completed_for_tui(event_tx, events, status);
+}
+
+fn send_runtime_event_as_tui(event_tx: &Sender<TuiEvent>, event: EventEnvelope) {
+    if let Some(event) = tui_event_from_runtime_event(&event) {
+        let _ = event_tx.send(event);
+    }
+}
+
+fn send_workflow_tasks_updated_for_tui(
+    event_tx: &Sender<TuiEvent>,
+    events: &mut EventFactory,
+    tasks: &[BackgroundTaskSummary],
+) {
+    send_runtime_event_as_tui(event_tx, events.workflow_tasks_updated(tasks));
+}
+
+fn send_tool_requested_for_tui(
+    event_tx: &Sender<TuiEvent>,
+    events: &mut EventFactory,
+    request: &tool_types::ToolRequest,
+) {
+    send_runtime_event_as_tui(event_tx, events.tool_call_requested(request));
+}
+
+fn send_tool_completed_for_tui(
+    event_tx: &Sender<TuiEvent>,
+    events: &mut EventFactory,
+    result: &tool_types::ToolResult,
+    diff: Option<String>,
+) {
+    if let Some(TuiEvent::ToolCompleted {
+        id,
+        name,
+        status,
+        output,
+        kind,
+        ..
+    }) = tui_event_from_runtime_event(&events.tool_call_completed(result))
+    {
+        let _ = event_tx.send(TuiEvent::ToolCompleted {
+            id,
+            name,
+            status,
+            output,
+            diff,
+            kind,
+        });
+    }
+}
+
+fn send_subagent_started_for_tui(
+    event_tx: &Sender<TuiEvent>,
+    events: &mut EventFactory,
+    id: &str,
+    description: &str,
+) {
+    send_runtime_event_as_tui(event_tx, events.subagent_started(id, description));
+}
+
+fn send_subagent_completed_for_tui(
+    event_tx: &Sender<TuiEvent>,
+    events: &mut EventFactory,
+    id: &str,
+    description: &str,
+    status: orca_core::event_schema::RunStatus,
+    output: Option<&str>,
+    error: Option<&str>,
+) {
+    send_runtime_event_as_tui(
+        event_tx,
+        events.subagent_completed(id, description, status, output, error),
+    );
+}
+
+struct WorkflowNotificationPayload<'a> {
+    task_id: &'a str,
+    run_id: &'a str,
+    tool_use_id: &'a str,
+    workflow_name: &'a str,
+    status: &'a str,
+    summary: &'a str,
+}
+
+fn send_workflow_notification_for_tui(
+    event_tx: &Sender<TuiEvent>,
+    events: &mut EventFactory,
+    payload: WorkflowNotificationPayload<'_>,
+) {
+    let event = if payload.status == "completed" {
+        events.workflow_result_available(
+            payload.task_id,
+            payload.run_id,
+            payload.workflow_name,
+            Some(payload.tool_use_id),
+            payload.status,
+            payload.summary,
+        )
+    } else {
+        events.workflow_failed(
+            payload.task_id,
+            payload.run_id,
+            payload.workflow_name,
+            Some(payload.tool_use_id),
+            payload.summary,
+        )
+    };
+    send_runtime_event_as_tui(event_tx, event);
 }
 
 pub struct TuiConversationSession {
     runtime: InteractiveSession,
+    lifecycle: RuntimeSessionLifecycle,
 }
 
 impl TuiConversationSession {
@@ -80,8 +426,14 @@ impl TuiConversationSession {
         prompt_for_title: &str,
         preloaded: Option<history::SessionTranscript>,
     ) -> std::io::Result<Self> {
+        let runtime = InteractiveSession::new_with_preloaded(config, prompt_for_title, preloaded)?;
+        let run_id = runtime
+            .session_id()
+            .unwrap_or_else(|| "tui-session")
+            .to_string();
         Ok(Self {
-            runtime: InteractiveSession::new_with_preloaded(config, prompt_for_title, preloaded)?,
+            runtime,
+            lifecycle: RuntimeSessionLifecycle::new(run_id),
         })
     }
 
@@ -168,6 +520,40 @@ impl TuiConversationSession {
     pub fn compact(&mut self, config: &RunConfig, cwd: &Path) -> (usize, usize) {
         self.runtime.compact(config, cwd)
     }
+
+    fn next_turn_lifecycle(&mut self) -> (u32, Option<TuiTaskLifecycle>) {
+        if self.lifecycle.active_task().is_none() {
+            self.lifecycle.start_task(RuntimeTaskKind::Agent);
+        }
+        let started = RuntimeTurnRunner::new(&mut self.lifecycle).advance_turn();
+        let task = started.task().map(|task| TuiTaskLifecycle {
+            id: task.id().to_string(),
+            kind: lifecycle_kind_label(task.kind()).to_string(),
+            status: lifecycle_status_label(task.status()).to_string(),
+            turn: task.current_turn(),
+        });
+        (started.turn(), task)
+    }
+}
+
+fn lifecycle_kind_label(kind: orca_runtime::lifecycle::RuntimeTaskKind) -> &'static str {
+    match kind {
+        orca_runtime::lifecycle::RuntimeTaskKind::Agent => "agent",
+        orca_runtime::lifecycle::RuntimeTaskKind::Workflow => "workflow",
+        orca_runtime::lifecycle::RuntimeTaskKind::Subagent => "subagent",
+        orca_runtime::lifecycle::RuntimeTaskKind::Shell => "shell",
+    }
+}
+
+fn lifecycle_status_label(status: orca_runtime::lifecycle::RuntimeTaskStatus) -> &'static str {
+    match status {
+        orca_runtime::lifecycle::RuntimeTaskStatus::Running => "running",
+        orca_runtime::lifecycle::RuntimeTaskStatus::Succeeded => "succeeded",
+        orca_runtime::lifecycle::RuntimeTaskStatus::Failed => "failed",
+        orca_runtime::lifecycle::RuntimeTaskStatus::Cancelled => "cancelled",
+        orca_runtime::lifecycle::RuntimeTaskStatus::ApprovalRequired => "approval_required",
+        orca_runtime::lifecycle::RuntimeTaskStatus::BudgetExhausted => "budget_exhausted",
+    }
 }
 
 pub fn launch_saved_workflow_for_tui(
@@ -207,21 +593,16 @@ pub fn launch_saved_workflow_for_tui(
         target: Some(name.to_string()),
         raw_arguments: Some(raw_arguments),
     };
-    let _ = event_tx.send(TuiEvent::ToolRequested {
-        id: request.id.clone(),
-        name: request.name.as_str().to_string(),
-        target: request.target.clone(),
-    });
+    let mut events = EventFactory::new(
+        session
+            .session_id()
+            .unwrap_or("tui-workflow-session")
+            .to_string(),
+    );
+    send_tool_requested_for_tui(event_tx, &mut events, &request);
     let result =
         execute_workflow_for_tui(config, &cwd, &request, event_tx, session.task_registry());
-    let _ = event_tx.send(TuiEvent::ToolCompleted {
-        id: request.id,
-        name: request.name.as_str().to_string(),
-        status: result.status.as_str().to_string(),
-        output: result.output.or(result.error).unwrap_or_default(),
-        diff: None,
-        kind: Some(tool_result_kind_label(result.kind).to_string()),
-    });
+    send_tool_completed_for_tui(event_tx, &mut events, &result, None);
 }
 
 fn parse_saved_workflow_args(raw: &str) -> Result<serde_json::Value, String> {
@@ -315,15 +696,23 @@ pub fn run_agent_for_tui(
 
     let mut turn: u32 = 0;
     let mut reactive_compacted = false;
+    let mut runtime_events = EventFactory::new(
+        session
+            .session_id()
+            .unwrap_or("tui-agent-session")
+            .to_string(),
+    );
 
     loop {
         turn += 1;
 
         if turn > DEFAULT_MAX_TURNS {
-            let _ = event_tx.send(TuiEvent::Error("max turns exhausted".to_string()));
-            let _ = event_tx.send(TuiEvent::SessionCompleted {
-                status: "budget_exhausted".to_string(),
-            });
+            send_error_for_tui(event_tx, &mut runtime_events, "max turns exhausted");
+            send_session_completed_for_tui(
+                event_tx,
+                &mut runtime_events,
+                orca_core::event_schema::RunStatus::BudgetExhausted,
+            );
             session.complete("budget_exhausted");
             return "budget_exhausted".to_string();
         }
@@ -341,7 +730,8 @@ pub fn run_agent_for_tui(
             limit_tokens: ctx_config.effective_limit(),
         });
 
-        let _ = event_tx.send(TuiEvent::TurnStarted { turn });
+        let (turn, task) = session.next_turn_lifecycle();
+        let _ = event_tx.send(TuiEvent::TurnStarted { turn, task });
 
         let route_decision = config.model.route(ModelRouteContext {
             subagent_type: &SubagentType::General,
@@ -367,12 +757,16 @@ pub fn run_agent_for_tui(
         ) {
             Ok(outcome) => outcome,
             Err(error) => {
-                let _ = event_tx.send(TuiEvent::Error(format!(
-                    "pre_model_call hook failed: {error}"
-                )));
-                let _ = event_tx.send(TuiEvent::SessionCompleted {
-                    status: "failed".to_string(),
-                });
+                send_error_for_tui(
+                    event_tx,
+                    &mut runtime_events,
+                    &format!("pre_model_call hook failed: {error}"),
+                );
+                send_session_completed_for_tui(
+                    event_tx,
+                    &mut runtime_events,
+                    orca_core::event_schema::RunStatus::Failed,
+                );
                 session.complete("failed");
                 return "failed".to_string();
             }
@@ -382,6 +776,7 @@ pub fn run_agent_for_tui(
 
         let tx = event_tx.clone();
         let mut emitted_message_delta = false;
+        let mut stream_events = EventFactory::new(runtime_events.run_id().to_string());
         let response = orca_provider::call_streaming(
             config.provider,
             &model_conversation,
@@ -389,11 +784,11 @@ pub fn run_agent_for_tui(
             cancel,
             &mut |step| match step {
                 ProviderStep::ReasoningDelta(text) => {
-                    let _ = tx.send(TuiEvent::ReasoningDelta(text.to_string()));
+                    send_runtime_event_as_tui(&tx, stream_events.assistant_reasoning_delta(text));
                 }
                 ProviderStep::MessageDelta(text) => {
                     emitted_message_delta = true;
-                    let _ = tx.send(TuiEvent::MessageDelta(text.to_string()));
+                    send_runtime_event_as_tui(&tx, stream_events.assistant_message_delta(text));
                 }
                 _ => {}
             },
@@ -411,38 +806,48 @@ pub fn run_agent_for_tui(
                 usage: response.usage.as_ref(),
             },
         ) {
-            let _ = event_tx.send(TuiEvent::Error(format!(
-                "post_model_call hook failed: {error}"
-            )));
+            send_error_for_tui(
+                event_tx,
+                &mut runtime_events,
+                &format!("post_model_call hook failed: {error}"),
+            );
         }
 
         if let Some(usage) = response.usage
             && !usage.is_empty()
         {
             let totals = session.cost_tracker_mut().add_usage(usage);
-            let _ = event_tx.send(TuiEvent::UsageUpdated(totals));
+            send_runtime_event_as_tui(event_tx, runtime_events.usage_updated(totals));
             if let Some(writer) = session.writer_mut() {
                 let _ = writer.append_usage(totals);
             }
             if let Some(max_budget) = config.max_budget_usd
                 && totals.estimated_cost_usd > max_budget
             {
-                let _ = event_tx.send(TuiEvent::Error(format!(
-                    "budget exhausted: estimated cost ${:.6} exceeded limit ${:.6}",
-                    totals.estimated_cost_usd, max_budget
-                )));
-                let _ = event_tx.send(TuiEvent::SessionCompleted {
-                    status: "budget_exhausted".to_string(),
-                });
+                send_error_for_tui(
+                    event_tx,
+                    &mut runtime_events,
+                    &format!(
+                        "budget exhausted: estimated cost ${:.6} exceeded limit ${:.6}",
+                        totals.estimated_cost_usd, max_budget
+                    ),
+                );
+                send_session_completed_for_tui(
+                    event_tx,
+                    &mut runtime_events,
+                    orca_core::event_schema::RunStatus::BudgetExhausted,
+                );
                 session.complete("budget_exhausted");
                 return "budget_exhausted".to_string();
             }
         }
 
         if cancel.is_cancelled() {
-            let _ = event_tx.send(TuiEvent::SessionCompleted {
-                status: "interrupted".to_string(),
-            });
+            send_session_completed_for_tui(
+                event_tx,
+                &mut runtime_events,
+                orca_core::event_schema::RunStatus::Cancelled,
+            );
             session.complete("interrupted");
             return "interrupted".to_string();
         }
@@ -478,10 +883,12 @@ pub fn run_agent_for_tui(
                 reactive_compacted = true;
                 continue;
             }
-            let _ = event_tx.send(TuiEvent::Error(error));
-            let _ = event_tx.send(TuiEvent::SessionCompleted {
-                status: "failed".to_string(),
-            });
+            send_error_for_tui(event_tx, &mut runtime_events, &error);
+            send_session_completed_for_tui(
+                event_tx,
+                &mut runtime_events,
+                orca_core::event_schema::RunStatus::Failed,
+            );
             session.complete("failed");
             return "failed".to_string();
         }
@@ -493,7 +900,10 @@ pub fn run_agent_for_tui(
                 && let Some(content) = response.assistant_content.as_deref()
                 && !content.is_empty()
             {
-                let _ = event_tx.send(TuiEvent::MessageDelta(content.to_string()));
+                send_runtime_event_as_tui(
+                    event_tx,
+                    runtime_events.assistant_message_delta(content),
+                );
             }
             session.conversation_mut().add_assistant(
                 response.assistant_content,
@@ -518,14 +928,18 @@ pub fn run_agent_for_tui(
                     &cwd,
                     &session.conversation().messages,
                 ) {
-                    let _ = event_tx.send(TuiEvent::Error(format!(
-                        "memory extraction failed: {error}"
-                    )));
+                    send_error_for_tui(
+                        event_tx,
+                        &mut runtime_events,
+                        &format!("memory extraction failed: {error}"),
+                    );
                 }
             }
-            let _ = event_tx.send(TuiEvent::SessionCompleted {
-                status: "success".to_string(),
-            });
+            send_session_completed_for_tui(
+                event_tx,
+                &mut runtime_events,
+                orca_core::event_schema::RunStatus::Success,
+            );
             session.complete("success");
             return "success".to_string();
         }
@@ -571,9 +985,11 @@ pub fn run_agent_for_tui(
                         session.append_message(&message);
                     }
                     if should_stop {
-                        let _ = event_tx.send(TuiEvent::SessionCompleted {
-                            status: "approval_required".to_string(),
-                        });
+                        send_session_completed_for_tui(
+                            event_tx,
+                            &mut runtime_events,
+                            orca_core::event_schema::RunStatus::ApprovalRequired,
+                        );
                         session.complete("approval_required");
                         return "approval_required".to_string();
                     }
@@ -627,6 +1043,7 @@ pub fn run_agent_for_tui(
                 session.mcp_registry(),
                 session.hooks(),
                 Some(session.task_registry()),
+                cancel,
             );
 
             if let Some(c) = child_cost {
@@ -660,9 +1077,7 @@ pub fn run_agent_for_tui(
                 } else {
                     "failed"
                 };
-                let _ = event_tx.send(TuiEvent::SessionCompleted {
-                    status: status.to_string(),
-                });
+                send_session_completed_status_for_tui(event_tx, &mut runtime_events, status);
                 session.complete(status);
                 return status.to_string();
             }
@@ -708,13 +1123,10 @@ fn execute_readonly_batch_for_tui(
 ) -> Vec<tool_types::ToolResult> {
     let mut hook_failed: Vec<Option<tool_types::ToolResult>> = vec![None; tool_requests.len()];
     let mut runnable = Vec::new();
+    let mut events = EventFactory::new("tui-readonly-batch".to_string());
 
     for (idx, tool_request) in tool_requests.iter().enumerate() {
-        let _ = event_tx.send(TuiEvent::ToolRequested {
-            id: tool_request.id.clone(),
-            name: tool_request.name.as_str().to_string(),
-            target: tool_request.target.clone(),
-        });
+        send_tool_requested_for_tui(event_tx, &mut events, tool_request);
         match hooks.run(
             HookEvent::PreToolUse,
             HookContext {
@@ -755,18 +1167,7 @@ fn execute_readonly_batch_for_tui(
     }
 
     for (tool_request, result) in tool_requests.iter().zip(results.iter()) {
-        let _ = event_tx.send(TuiEvent::ToolCompleted {
-            id: result.id.clone(),
-            name: result.name.as_str().to_string(),
-            status: result.status.as_str().to_string(),
-            output: result
-                .output
-                .clone()
-                .or_else(|| result.error.clone())
-                .unwrap_or_default(),
-            diff: None,
-            kind: Some(tool_result_kind_label(result.kind).to_string()),
-        });
+        send_tool_completed_for_tui(event_tx, &mut events, result, None);
         if let Err(error) = hooks.run(
             HookEvent::PostToolUse,
             HookContext {
@@ -802,25 +1203,25 @@ fn execute_subagent_batch_for_tui(
     let mut handles = Vec::new();
     let mut results: Vec<Option<(bool, tool_types::ToolResult, CostTracker)>> =
         vec![None; tool_requests.len()];
+    let mut events = EventFactory::new("tui-subagent-batch".to_string());
 
     for (idx, tool_request) in tool_requests.iter().enumerate() {
         let request = subagent::create_subagent_request(tool_request);
         let description = request.description.clone();
         let subagent_type = request.subagent_type;
-        let _ = event_tx.send(TuiEvent::SubagentStarted {
-            id: tool_request.id.clone(),
-            description: description.clone(),
-        });
+        send_subagent_started_for_tui(event_tx, &mut events, &tool_request.id, &description);
 
         if subagent_depth >= config.subagents.max_depth {
             let error = format!("subagent max depth {} reached", config.subagents.max_depth);
-            let _ = event_tx.send(TuiEvent::SubagentCompleted {
-                id: tool_request.id.clone(),
-                description,
-                status: "failed".to_string(),
-                output: None,
-                error: Some(error.clone()),
-            });
+            send_subagent_completed_for_tui(
+                event_tx,
+                &mut events,
+                &tool_request.id,
+                &description,
+                RunStatus::Failed,
+                None,
+                Some(&error),
+            );
             results[idx] = Some((
                 false,
                 tool_types::ToolResult::failed(tool_request, error, None),
@@ -865,13 +1266,15 @@ fn execute_subagent_batch_for_tui(
                 let tool_request = &tool_requests[idx];
                 let result =
                     tool_types::ToolResult::failed(tool_request, "subagent thread panicked", None);
-                let _ = event_tx.send(TuiEvent::SubagentCompleted {
-                    id: tool_request.id.clone(),
-                    description,
-                    status: "failed".to_string(),
-                    output: None,
-                    error: result.error.clone(),
-                });
+                send_subagent_completed_for_tui(
+                    event_tx,
+                    &mut events,
+                    &tool_request.id,
+                    &description,
+                    RunStatus::Failed,
+                    None,
+                    result.error.as_deref(),
+                );
                 results[idx] = Some((false, result, CostTracker::new(None)));
                 continue;
             }
@@ -950,73 +1353,51 @@ fn execute_tool_for_tui(
     mcp_registry: &McpRegistry,
     hooks: &HookRunner,
     task_registry: Option<&TaskRegistry>,
+    cancel: &CancelToken,
 ) -> (bool, tool_types::ToolResult, Option<CostTracker>) {
     let invocation = prepare_tool_invocation(tool_request, subagent_depth, mcp_registry, config);
+    let mut events = EventFactory::new(
+        session_id
+            .map(str::to_string)
+            .unwrap_or_else(|| "tui-tool-session".to_string()),
+    );
     if let Some(approval) = approval_request_for_invocation(&invocation)
         && agent_common::requires_approval(approval.action)
     {
-        let resolution = policy.resolve_for_tool(
-            &approval,
-            tool_request.name.as_str(),
-            tool_request.target.as_deref(),
-        );
+        let mut runtime_context =
+            RuntimeToolActorContext::new(events.run_id().to_string(), DEFAULT_MAX_TURNS);
+        let approval_decision =
+            runtime_context.resolve_tool_approval(policy, Some(approval.clone()), tool_request);
 
-        match resolution.decision {
-            ApprovalDecision::Allow => {}
-            ApprovalDecision::Ask => {
-                let _ = event_tx.send(TuiEvent::ApprovalNeeded {
-                    id: approval.id.clone(),
-                    tool: tool_request.name.as_str().to_string(),
-                    target: tool_request.target.clone(),
-                    preview: build_approval_preview(tool_request),
-                });
+        match approval_decision {
+            RuntimeApprovalDecision::Allowed(_) => {}
+            RuntimeApprovalDecision::Ask(approval) => {
+                let mut approval = approval.clone();
+                approval.preview = build_approval_preview(tool_request);
+                send_runtime_event_as_tui(event_tx, events.approval_requested(&approval));
 
-                let allowed = loop {
-                    match action_rx.recv() {
-                        Ok(UserAction::Approve(v)) => break v,
-                        Ok(UserAction::Interrupt) => break false,
-                        Ok(UserAction::Cancel) => break false,
-                        Err(_) => break false,
-                        _ => continue,
-                    }
-                };
-
-                if !allowed {
-                    let result = tool_types::ToolResult::denied(tool_request, "user denied");
-                    let _ = event_tx.send(TuiEvent::ToolRequested {
-                        id: tool_request.id.clone(),
-                        name: tool_request.name.as_str().to_string(),
-                        target: tool_request.target.clone(),
+                let handler = TuiApprovalHandler::new(action_rx);
+                let resolution = runtime_context
+                    .resolve_interactive_tool_approval(&handler, &approval, tool_request)
+                    .unwrap_or_else(|error| ApprovalResolution {
+                        id: approval.id.clone(),
+                        decision: ApprovalDecision::Deny,
+                        reason: format!("interactive approval failed: {error}"),
                     });
-                    let _ = event_tx.send(TuiEvent::ToolCompleted {
-                        id: tool_request.id.clone(),
-                        name: tool_request.name.as_str().to_string(),
-                        status: "denied".to_string(),
-                        output: String::new(),
-                        diff: None,
-                        kind: Some(tool_result_kind_label(result.kind).to_string()),
-                    });
+
+                if resolution.decision == ApprovalDecision::Deny {
+                    let result = tool_types::ToolResult::denied(tool_request, resolution.reason);
+                    send_tool_requested_for_tui(event_tx, &mut events, tool_request);
+                    send_tool_completed_for_tui(event_tx, &mut events, &result, None);
                     return (true, result, None);
                 }
             }
-            ApprovalDecision::Deny => {
-                let result =
-                    tool_types::ToolResult::denied(tool_request, resolution.reason.clone());
-                let _ = event_tx.send(TuiEvent::ToolRequested {
-                    id: tool_request.id.clone(),
-                    name: tool_request.name.as_str().to_string(),
-                    target: tool_request.target.clone(),
-                });
-                let _ = event_tx.send(TuiEvent::ToolCompleted {
-                    id: tool_request.id.clone(),
-                    name: tool_request.name.as_str().to_string(),
-                    status: "denied".to_string(),
-                    output: String::new(),
-                    diff: None,
-                    kind: Some(tool_result_kind_label(result.kind).to_string()),
-                });
+            RuntimeApprovalDecision::Denied { result, .. } => {
+                send_tool_requested_for_tui(event_tx, &mut events, tool_request);
+                send_tool_completed_for_tui(event_tx, &mut events, &result, None);
                 return (true, result, None);
             }
+            RuntimeApprovalDecision::NotRequired => {}
         }
     }
 
@@ -1036,11 +1417,7 @@ fn execute_tool_for_tui(
         );
         (r, Some(c))
     } else {
-        let _ = event_tx.send(TuiEvent::ToolRequested {
-            id: tool_request.id.clone(),
-            name: tool_request.name.as_str().to_string(),
-            target: tool_request.target.clone(),
-        });
+        send_tool_requested_for_tui(event_tx, &mut events, tool_request);
         let pre_tool_outcome = match hooks.run(
             HookEvent::PreToolUse,
             HookContext {
@@ -1060,14 +1437,7 @@ fn execute_tool_for_tui(
                     format!("pre_tool_use hook blocked tool: {error}"),
                     None,
                 );
-                let _ = event_tx.send(TuiEvent::ToolCompleted {
-                    id: tool_request.id.clone(),
-                    name: tool_request.name.as_str().to_string(),
-                    status: "failed".to_string(),
-                    output: result.error.clone().unwrap_or_default(),
-                    diff: None,
-                    kind: Some(tool_result_kind_label(result.kind).to_string()),
-                });
+                send_tool_completed_for_tui(event_tx, &mut events, &result, None);
                 return (true, result, None);
             }
         };
@@ -1082,12 +1452,13 @@ fn execute_tool_for_tui(
                     chunk: chunk.to_string(),
                 });
             };
-            orca_tools::bash::execute_streaming_with_policy(
+            orca_tools::bash::execute_streaming_with_policy_or_cancel(
                 execution_request,
                 cwd,
                 config.tools.output_truncation,
                 std::time::Duration::from_secs(config.tools.shell_timeout_secs.max(1)),
                 &mut on_output,
+                || cancel.is_cancelled(),
             )
         } else if execution_request.name == tool_types::ToolName::RequestUserInput {
             execute_user_input_request_for_tui(execution_request, event_tx, action_rx)
@@ -1222,27 +1593,13 @@ fn execute_tool_for_tui(
     };
 
     if tool_request.name != tool_types::ToolName::Subagent {
-        let _ = event_tx.send(TuiEvent::ToolCompleted {
-            id: tool_request.id.clone(),
-            name: tool_request.name.as_str().to_string(),
-            status: result.status.as_str().to_string(),
-            output: result
-                .output
-                .clone()
-                .or_else(|| result.error.clone())
-                .unwrap_or_default(),
-            diff: rendered_diff,
-            kind: Some(tool_result_kind_label(result.kind).to_string()),
-        });
+        send_tool_completed_for_tui(event_tx, &mut events, &result, rendered_diff);
         if tool_request.name == tool_types::ToolName::UpdatePlan
             && result.status == tool_types::ToolStatus::Completed
         {
             match orca_tools::update_plan::parse_args(tool_request) {
                 Ok(update) => {
-                    let _ = event_tx.send(TuiEvent::PlanUpdated {
-                        explanation: update.explanation,
-                        plan: update.plan,
-                    });
+                    send_runtime_event_as_tui(event_tx, events.plan_updated(&update));
                 }
                 Err(error) => {
                     let _ = event_tx.send(TuiEvent::Error(format!(
@@ -1361,53 +1718,50 @@ fn execute_workflow_draft_action_for_tui(
             let run_id_for_notification = run_id.clone();
             let tool_use_id_for_notification = tool_use_id.clone();
             let workflow_name_for_notification = workflow_name.clone();
-            let _ = event_tx.send(TuiEvent::WorkflowTasksUpdated {
-                tasks: task_registry.list(),
-            });
+            let mut task_events = EventFactory::new(run_id.clone());
+            send_workflow_tasks_updated_for_tui(event_tx, &mut task_events, &task_registry.list());
             let notify_tx = event_tx.clone();
             let notify_registry = task_registry.clone();
             thread::spawn(move || {
+                let mut events = EventFactory::new(run_id_for_notification.clone());
                 while !launch.is_finished() {
                     std::thread::sleep(std::time::Duration::from_millis(300));
-                    let _ = notify_tx.send(TuiEvent::WorkflowTasksUpdated {
-                        tasks: notify_registry.list(),
-                    });
+                    send_workflow_tasks_updated_for_tui(
+                        &notify_tx,
+                        &mut events,
+                        &notify_registry.list(),
+                    );
                 }
-                let notification = match launch.join() {
-                    Ok(Ok(result)) => WorkflowTerminalNotification {
-                        task_id: result.task_id,
-                        run_id: run_id_for_notification,
-                        tool_use_id: tool_use_id_for_notification,
-                        status: "completed".to_string(),
-                        summary: result.status_line,
-                    },
-                    Ok(Err(error)) => WorkflowTerminalNotification {
-                        task_id: task_id_for_notification,
-                        run_id: run_id_for_notification,
-                        tool_use_id: tool_use_id_for_notification,
-                        status: "failed".to_string(),
-                        summary: error.to_string(),
-                    },
-                    Err(_) => WorkflowTerminalNotification {
-                        task_id: task_id_for_notification,
-                        run_id: run_id_for_notification,
-                        tool_use_id: tool_use_id_for_notification,
-                        status: "failed".to_string(),
-                        summary: "workflow thread panicked".to_string(),
-                    },
-                };
-                let _ = notify_tx.send(TuiEvent::WorkflowTasksUpdated {
-                    tasks: notify_registry.list(),
-                });
-                let prompt = notification.to_prompt();
-                let _ = notify_tx.send(TuiEvent::WorkflowNotification {
-                    prompt,
-                    status: notification.status,
-                    summary: format!(
-                        "{}: {}",
-                        workflow_name_for_notification, notification.summary
+                let (task_id, status, summary) = match launch.join() {
+                    Ok(Ok(result)) => (result.task_id, "completed".to_string(), result.status_line),
+                    Ok(Err(error)) => (
+                        task_id_for_notification.clone(),
+                        "failed".to_string(),
+                        error.to_string(),
                     ),
-                });
+                    Err(_) => (
+                        task_id_for_notification,
+                        "failed".to_string(),
+                        "workflow thread panicked".to_string(),
+                    ),
+                };
+                send_workflow_tasks_updated_for_tui(
+                    &notify_tx,
+                    &mut events,
+                    &notify_registry.list(),
+                );
+                send_workflow_notification_for_tui(
+                    &notify_tx,
+                    &mut events,
+                    WorkflowNotificationPayload {
+                        task_id: &task_id,
+                        run_id: &run_id_for_notification,
+                        tool_use_id: &tool_use_id_for_notification,
+                        workflow_name: &workflow_name_for_notification,
+                        status: &status,
+                        summary: &summary,
+                    },
+                );
             });
             WorkflowDraftActionOutput {
                 status: "async_launched".to_string(),
@@ -1546,51 +1900,39 @@ fn execute_workflow_for_tui(
         Ok(output) => output,
         Err(error) => return tool_types::ToolResult::failed(request, error.to_string(), None),
     };
-    let _ = event_tx.send(TuiEvent::WorkflowTasksUpdated {
-        tasks: task_registry.list(),
-    });
+    let mut task_events = EventFactory::new(run_id.clone());
+    send_workflow_tasks_updated_for_tui(event_tx, &mut task_events, &task_registry.list());
 
     let notify_tx = event_tx.clone();
     let notify_registry = task_registry.clone();
     thread::spawn(move || {
+        let mut events = EventFactory::new(run_id.clone());
         while !launch.is_finished() {
             std::thread::sleep(std::time::Duration::from_millis(300));
-            let _ = notify_tx.send(TuiEvent::WorkflowTasksUpdated {
-                tasks: notify_registry.list(),
-            });
+            send_workflow_tasks_updated_for_tui(&notify_tx, &mut events, &notify_registry.list());
         }
-        let notification = match launch.join() {
-            Ok(Ok(result)) => WorkflowTerminalNotification {
-                task_id: result.task_id,
-                run_id,
-                tool_use_id,
-                status: "completed".to_string(),
-                summary: result.status_line,
-            },
-            Ok(Err(error)) => WorkflowTerminalNotification {
+        let (task_id, status, summary) = match launch.join() {
+            Ok(Ok(result)) => (result.task_id, "completed".to_string(), result.status_line),
+            Ok(Err(error)) => (task_id, "failed".to_string(), error.to_string()),
+            Err(_) => (
                 task_id,
-                run_id,
-                tool_use_id,
-                status: "failed".to_string(),
-                summary: error.to_string(),
-            },
-            Err(_) => WorkflowTerminalNotification {
-                task_id,
-                run_id,
-                tool_use_id,
-                status: "failed".to_string(),
-                summary: "workflow thread panicked".to_string(),
-            },
+                "failed".to_string(),
+                "workflow thread panicked".to_string(),
+            ),
         };
-        let _ = notify_tx.send(TuiEvent::WorkflowTasksUpdated {
-            tasks: notify_registry.list(),
-        });
-        let prompt = notification.to_prompt();
-        let _ = notify_tx.send(TuiEvent::WorkflowNotification {
-            prompt,
-            status: notification.status,
-            summary: format!("{}: {}", workflow_name, notification.summary),
-        });
+        send_workflow_tasks_updated_for_tui(&notify_tx, &mut events, &notify_registry.list());
+        send_workflow_notification_for_tui(
+            &notify_tx,
+            &mut events,
+            WorkflowNotificationPayload {
+                task_id: &task_id,
+                run_id: &run_id,
+                tool_use_id: &tool_use_id,
+                workflow_name: &workflow_name,
+                status: &status,
+                summary: &summary,
+            },
+        );
     });
 
     tool_types::ToolResult::completed(request, output, false)
@@ -1672,46 +2014,12 @@ fn execute_user_input_request_for_tui(
     event_tx: &Sender<TuiEvent>,
     action_rx: &Receiver<UserAction>,
 ) -> tool_types::ToolResult {
-    let args = match parse_user_input_request_args(request) {
-        Ok(args) => args,
-        Err(error) => return tool_types::ToolResult::failed(request, error, None),
-    };
-    let _ = event_tx.send(TuiEvent::UserInputRequested {
-        id: request.id.clone(),
-        question: args.question,
-        choices: args.choices,
-    });
-
-    loop {
-        match action_rx.recv() {
-            Ok(UserAction::RespondToUserInput(answer)) => {
-                return tool_types::ToolResult::completed(request, answer, false);
-            }
-            Ok(UserAction::Interrupt) | Ok(UserAction::Cancel) | Err(_) => {
-                return tool_types::ToolResult::failed(
-                    request,
-                    "user input request cancelled",
-                    None,
-                );
-            }
-            _ => {}
-        }
+    let handler = TuiUserInputHandler::new(event_tx, action_rx);
+    let mut runtime_context = RuntimeToolActorContext::new("tui-user-input", DEFAULT_MAX_TURNS);
+    match runtime_context.execute_user_input_tool(request, &handler) {
+        Ok(result) => result,
+        Err(error) => tool_types::ToolResult::failed(request, error.to_string(), None),
     }
-}
-
-fn parse_user_input_request_args(
-    request: &tool_types::ToolRequest,
-) -> Result<UserInputRequestArgs, String> {
-    let raw = request
-        .raw_arguments
-        .as_deref()
-        .ok_or_else(|| "missing request_user_input arguments JSON".to_string())?;
-    let args: UserInputRequestArgs = serde_json::from_str(raw)
-        .map_err(|error| format!("invalid request_user_input arguments JSON: {error}"))?;
-    if args.question.trim().is_empty() {
-        return Err("missing required request_user_input argument: question".to_string());
-    }
-    Ok(args)
 }
 
 #[cfg(test)]
@@ -1742,21 +2050,21 @@ fn execute_subagent_for_tui(
     let request = subagent::create_subagent_request(tool_request);
     let description = request.description.clone();
     let subagent_type = request.subagent_type.clone();
+    let mut events = EventFactory::new("tui-subagent".to_string());
 
-    let _ = event_tx.send(TuiEvent::SubagentStarted {
-        id: tool_request.id.clone(),
-        description: description.clone(),
-    });
+    send_subagent_started_for_tui(event_tx, &mut events, &tool_request.id, &description);
 
     if subagent_depth >= config.subagents.max_depth {
         let error = format!("subagent max depth {} reached", config.subagents.max_depth);
-        let _ = event_tx.send(TuiEvent::SubagentCompleted {
-            id: tool_request.id.clone(),
-            description,
-            status: "failed".to_string(),
-            output: None,
-            error: Some(error.clone()),
-        });
+        send_subagent_completed_for_tui(
+            event_tx,
+            &mut events,
+            &tool_request.id,
+            &description,
+            RunStatus::Failed,
+            None,
+            Some(&error),
+        );
         return (
             tool_types::ToolResult::failed(tool_request, error, None),
             CostTracker::new(None),
@@ -1810,13 +2118,15 @@ fn execute_subagent_for_tui(
         let output = child
             .final_message
             .unwrap_or_else(|| "(subagent completed without a final message)".to_string());
-        let _ = event_tx.send(TuiEvent::SubagentCompleted {
-            id: tool_request.id.clone(),
-            description,
-            status: "completed".to_string(),
-            output: Some(output.clone()),
-            error: None,
-        });
+        send_subagent_completed_for_tui(
+            event_tx,
+            &mut events,
+            &tool_request.id,
+            &description,
+            RunStatus::Success,
+            Some(&output),
+            None,
+        );
         (
             tool_types::ToolResult::completed(
                 tool_request,
@@ -1829,13 +2139,15 @@ fn execute_subagent_for_tui(
         let error = child
             .error
             .unwrap_or_else(|| format!("subagent ended with status {}", child.status));
-        let _ = event_tx.send(TuiEvent::SubagentCompleted {
-            id: tool_request.id.clone(),
-            description,
-            status: "failed".to_string(),
-            output: child.final_message,
-            error: Some(error.clone()),
-        });
+        send_subagent_completed_for_tui(
+            event_tx,
+            &mut events,
+            &tool_request.id,
+            &description,
+            RunStatus::Failed,
+            child.final_message.as_deref(),
+            Some(&error),
+        );
         (
             tool_types::ToolResult::failed(tool_request, error, None),
             child.cost_tracker,
@@ -1876,6 +2188,7 @@ fn launch_async_subagent_for_tui(
     let thread_agent_id = agent_id.clone();
 
     thread::spawn(move || {
+        let mut events = EventFactory::new(thread_agent_id.clone());
         let _ = child_registry.mark_running(&thread_agent_id);
         let child = run_child_agent_for_tui_silent(
             &child_config,
@@ -1900,14 +2213,11 @@ fn launch_async_subagent_for_tui(
                 .unwrap_or_else(|| format!("subagent ended with status {}", child.status));
             let _ = child_registry.fail_with_usage(&thread_agent_id, error, usage);
         }
-        let _ = child_event_tx.send(TuiEvent::WorkflowTasksUpdated {
-            tasks: child_registry.list(),
-        });
+        send_workflow_tasks_updated_for_tui(&child_event_tx, &mut events, &child_registry.list());
     });
 
-    let _ = event_tx.send(TuiEvent::WorkflowTasksUpdated {
-        tasks: task_registry.list(),
-    });
+    let mut events = EventFactory::new(agent_id.clone());
+    send_workflow_tasks_updated_for_tui(event_tx, &mut events, &task_registry.list());
     tool_types::ToolResult::completed(
         tool_request,
         serde_json::json!({
@@ -1987,17 +2297,20 @@ fn child_result_to_tui_tool_result(
     event_tx: &Sender<TuiEvent>,
 ) -> (bool, tool_types::ToolResult, CostTracker) {
     let cost_tracker = child.cost_tracker.clone();
+    let mut events = EventFactory::new("tui-subagent-child".to_string());
     if child.status == "success" {
         let output = child
             .final_message
             .unwrap_or_else(|| "(subagent completed without a final message)".to_string());
-        let _ = event_tx.send(TuiEvent::SubagentCompleted {
-            id: tool_request.id.clone(),
-            description: description.to_string(),
-            status: "completed".to_string(),
-            output: Some(output.clone()),
-            error: None,
-        });
+        send_subagent_completed_for_tui(
+            event_tx,
+            &mut events,
+            &tool_request.id,
+            description,
+            RunStatus::Success,
+            Some(&output),
+            None,
+        );
         (
             false,
             tool_types::ToolResult::completed(
@@ -2011,13 +2324,15 @@ fn child_result_to_tui_tool_result(
         let error = child
             .error
             .unwrap_or_else(|| format!("subagent ended with status {}", child.status));
-        let _ = event_tx.send(TuiEvent::SubagentCompleted {
-            id: tool_request.id.clone(),
-            description: description.to_string(),
-            status: "failed".to_string(),
-            output: child.final_message,
-            error: Some(error.clone()),
-        });
+        send_subagent_completed_for_tui(
+            event_tx,
+            &mut events,
+            &tool_request.id,
+            description,
+            RunStatus::Failed,
+            child.final_message.as_deref(),
+            Some(&error),
+        );
         (
             false,
             tool_types::ToolResult::failed(tool_request, error, None),
@@ -2232,6 +2547,7 @@ fn run_child_agent_for_tui(
                     &mcp_registry,
                     hooks,
                     None,
+                    &child_cancel,
                 );
 
                 if let Some(c) = child_cost {
@@ -2290,6 +2606,9 @@ mod tests {
 
     use orca_core::approval_types::ApprovalMode;
     use orca_core::config::{HistoryMode, OutputFormat, ProviderKind, RunConfig};
+    use orca_core::cost_types::UsageTotals;
+    use orca_core::event_schema::EventFactory;
+    use orca_core::event_schema::RunStatus;
     use orca_core::model::ModelSelection;
 
     fn config() -> RunConfig {
@@ -2307,7 +2626,11 @@ mod tests {
             base_url: None,
             history_mode: HistoryMode::Disabled,
             show_session_picker: false,
+            active_permission_profile: None,
+            permission_profiles: Default::default(),
+            runtime_workspace_roots: None,
             permission_rules: Default::default(),
+            additional_working_directories: Vec::new(),
             max_budget_usd: None,
             mcp_servers: Vec::new(),
             hooks: Vec::new(),
@@ -2414,6 +2737,40 @@ mod tests {
     }
 
     #[test]
+    fn tui_turn_started_events_include_agent_task_lifecycle() {
+        let config = config();
+        let (event_tx, event_rx) = mpsc::channel();
+        let (_action_tx, action_rx) = mpsc::channel();
+        let cancel = CancelToken::new();
+        let mut session =
+            TuiConversationSession::new_with_preloaded(&config, "task lifecycle", None)
+                .expect("session");
+
+        let status = run_agent_for_tui(
+            &config,
+            &mut session,
+            "mock_silent_final",
+            &event_tx,
+            &action_rx,
+            &cancel,
+            false,
+        );
+
+        assert_eq!(status, "success");
+        let turn = event_rx
+            .try_iter()
+            .find_map(|event| match event {
+                TuiEvent::TurnStarted { turn, task } => task.map(|task| (turn, task)),
+                _ => None,
+            })
+            .expect("turn started with task lifecycle");
+        assert_eq!(turn.0, 1);
+        assert_eq!(turn.1.kind, "agent");
+        assert_eq!(turn.1.status, "running");
+        assert_eq!(turn.1.turn, 1);
+    }
+
+    #[test]
     fn tui_tool_schema_exposes_goal_tool_only_for_goal_turns() {
         let config = config();
         let mut session =
@@ -2431,6 +2788,265 @@ mod tests {
 
         assert!(!base_names.contains(&"update_goal".to_string()));
         assert!(goal_names.contains(&"update_goal".to_string()));
+    }
+
+    #[test]
+    fn runtime_tool_requested_event_maps_to_tui_tool_requested() {
+        let mut events = EventFactory::new("tui-runtime-adapter".to_string());
+        let request = tool_types::ToolRequest {
+            id: "tool-call-1".to_string(),
+            name: tool_types::ToolName::Bash,
+            action: orca_core::approval_types::ActionKind::Shell,
+            target: Some("echo hi".to_string()),
+            raw_arguments: Some(serde_json::json!({ "command": "echo hi" }).to_string()),
+        };
+
+        let tui_event =
+            tui_event_from_runtime_event(&events.tool_call_requested(&request)).expect("tui event");
+
+        match tui_event {
+            TuiEvent::ToolRequested { id, name, target } => {
+                assert_eq!(id, "tool-call-1");
+                assert_eq!(name, "bash");
+                assert_eq!(target, Some("echo hi".to_string()));
+            }
+            other => panic!("expected tool requested event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn runtime_failed_tool_completed_event_maps_error_to_tui_output() {
+        let mut events = EventFactory::new("tui-runtime-adapter".to_string());
+        let request = tool_types::ToolRequest {
+            id: "tool-call-2".to_string(),
+            name: tool_types::ToolName::External("deploy_preview".to_string()),
+            action: orca_core::approval_types::ActionKind::Agent,
+            target: Some("preview".to_string()),
+            raw_arguments: None,
+        };
+        let result = tool_types::ToolResult::failed(&request, "preview failed", Some(42));
+
+        let tui_event =
+            tui_event_from_runtime_event(&events.tool_call_completed(&result)).expect("tui event");
+
+        match tui_event {
+            TuiEvent::ToolCompleted {
+                id,
+                name,
+                status,
+                output,
+                diff,
+                kind,
+            } => {
+                assert_eq!(id, "tool-call-2");
+                assert_eq!(name, "deploy_preview");
+                assert_eq!(status, "failed");
+                assert_eq!(output, "preview failed");
+                assert_eq!(diff, None);
+                assert_eq!(kind, Some("runtime_error".to_string()));
+            }
+            other => panic!("expected tool completed event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn runtime_assistant_delta_events_map_to_tui_streaming_events() {
+        let mut events = EventFactory::new("tui-runtime-adapter".to_string());
+
+        let reasoning = tui_event_from_runtime_event(&events.assistant_reasoning_delta("thinking"))
+            .expect("reasoning event");
+        let message = tui_event_from_runtime_event(&events.assistant_message_delta("hello"))
+            .expect("message event");
+
+        assert!(matches!(reasoning, TuiEvent::ReasoningDelta(text) if text == "thinking"));
+        assert!(matches!(message, TuiEvent::MessageDelta(text) if text == "hello"));
+    }
+
+    #[test]
+    fn runtime_usage_error_and_completion_events_map_to_tui_events() {
+        let mut events = EventFactory::new("tui-runtime-adapter".to_string());
+
+        let usage = tui_event_from_runtime_event(&events.usage_updated(UsageTotals {
+            input_tokens: 10,
+            output_tokens: 5,
+            cache_tokens: 2,
+            estimated_cost_usd: 0.001,
+        }))
+        .expect("usage event");
+        let error = tui_event_from_runtime_event(&events.error("boom")).expect("error event");
+        let completed =
+            tui_event_from_runtime_event(&events.session_completed(RunStatus::BudgetExhausted))
+                .expect("completion event");
+
+        match usage {
+            TuiEvent::UsageUpdated(totals) => {
+                assert_eq!(totals.input_tokens, 10);
+                assert_eq!(totals.output_tokens, 5);
+                assert_eq!(totals.cache_tokens, 2);
+                assert_eq!(totals.estimated_cost_usd, 0.001);
+            }
+            other => panic!("expected usage event, got {other:?}"),
+        }
+        assert!(matches!(error, TuiEvent::Error(message) if message == "boom"));
+        assert!(
+            matches!(completed, TuiEvent::SessionCompleted { status } if status == "budget_exhausted")
+        );
+    }
+
+    #[test]
+    fn runtime_plan_approval_and_subagent_events_map_to_tui_events() {
+        let mut events = EventFactory::new("tui-runtime-adapter".to_string());
+        let plan_update = orca_core::plan_types::UpdatePlanArgs {
+            explanation: Some("next steps".to_string()),
+            plan: vec![orca_core::plan_types::PlanItem {
+                step: "wire adapter".to_string(),
+                status: orca_core::plan_types::PlanStatus::InProgress,
+            }],
+        };
+        let approval = orca_core::approval_types::ApprovalRequest {
+            id: "approval-1".to_string(),
+            action: orca_core::approval_types::ActionKind::Shell,
+            description: "run cargo test".to_string(),
+            tool: Some("bash".to_string()),
+            target: Some("cargo test".to_string()),
+            preview: Some("$ cargo test".to_string()),
+        };
+
+        let plan =
+            tui_event_from_runtime_event(&events.plan_updated(&plan_update)).expect("plan event");
+        let approval =
+            tui_event_from_runtime_event(&events.approval_requested(&approval)).expect("approval");
+        let subagent_started =
+            tui_event_from_runtime_event(&events.subagent_started("agent-1", "review code"))
+                .expect("subagent started");
+        let subagent_completed = tui_event_from_runtime_event(&events.subagent_completed(
+            "agent-1",
+            "review code",
+            RunStatus::Success,
+            Some("looks good"),
+            None,
+        ))
+        .expect("subagent completed");
+
+        match plan {
+            TuiEvent::PlanUpdated { explanation, plan } => {
+                assert_eq!(explanation, Some("next steps".to_string()));
+                assert_eq!(plan.len(), 1);
+                assert_eq!(plan[0].step, "wire adapter");
+                assert_eq!(
+                    plan[0].status,
+                    orca_core::plan_types::PlanStatus::InProgress
+                );
+            }
+            other => panic!("expected plan event, got {other:?}"),
+        }
+        assert!(
+            matches!(approval, TuiEvent::ApprovalNeeded { id, tool, target, preview }
+                if id == "approval-1"
+                    && tool == "bash"
+                    && target == Some("cargo test".to_string())
+                    && preview == Some("$ cargo test".to_string()))
+        );
+        assert!(
+            matches!(subagent_started, TuiEvent::SubagentStarted { id, description }
+                if id == "agent-1" && description == "review code")
+        );
+        assert!(
+            matches!(subagent_completed, TuiEvent::SubagentCompleted { id, description, status, output, error }
+                if id == "agent-1"
+                    && description == "review code"
+                    && status == "completed"
+                    && output == Some("looks good".to_string())
+                    && error.is_none())
+        );
+    }
+
+    #[test]
+    fn runtime_workflow_result_event_maps_to_tui_notification() {
+        let mut events = EventFactory::new("tui-runtime-adapter".to_string());
+
+        let notification = tui_event_from_runtime_event(&events.workflow_result_available(
+            "task-1",
+            "workflow-run-1",
+            "mock-workflow",
+            Some("workflow-tool-1"),
+            "completed",
+            "all phases passed",
+        ))
+        .expect("workflow notification");
+
+        match notification {
+            TuiEvent::WorkflowNotification {
+                prompt,
+                status,
+                summary,
+            } => {
+                assert_eq!(status, "completed");
+                assert_eq!(summary, "mock-workflow: all phases passed");
+                assert!(prompt.contains("<task-id>task-1</task-id>"));
+                assert!(prompt.contains("<tool-use-id>workflow-tool-1</tool-use-id>"));
+                assert!(prompt.contains("<run-id>workflow-run-1</run-id>"));
+                assert!(prompt.contains("<status>completed</status>"));
+                assert!(prompt.contains("<summary>all phases passed</summary>"));
+            }
+            other => panic!("expected workflow notification, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn runtime_workflow_tasks_event_maps_to_tui_tasks_updated() {
+        let mut events = EventFactory::new("tui-runtime-adapter".to_string());
+        let task = orca_core::task_types::BackgroundTaskSummary {
+            id: "task-1".to_string(),
+            task_type: orca_core::task_types::TaskType::Workflow,
+            status: orca_core::task_types::TaskStatus::Running,
+            description: "demo workflow".to_string(),
+            created_at_ms: 10,
+            started_at_ms: Some(20),
+            completed_at_ms: None,
+            command: None,
+            agent_type: None,
+            server: None,
+            tool: Some("workflow".to_string()),
+            name: Some("demo".to_string()),
+            workflow_run_id: Some("workflow-run-1".to_string()),
+            phase_count: Some(2),
+            workflow_progress: Some(orca_core::task_types::WorkflowTaskProgress {
+                total_agents: 3,
+                running_agents: 1,
+                completed_agents: 2,
+                failed_agents: 0,
+                completed_phases: 1,
+                running_phases: 1,
+                failed_phases: 0,
+            }),
+            workflow_phases: Vec::new(),
+            workflow_agents: Vec::new(),
+            workflow_script_path: Some("workflow.md".to_string()),
+            workflow_launch_input: None,
+            workflow_final_summary: None,
+            workflow_failure_count: 0,
+            usage: None,
+        };
+
+        let tui_event = tui_event_from_runtime_event(&events.workflow_tasks_updated(&[task]))
+            .expect("workflow tasks updated event");
+
+        match tui_event {
+            TuiEvent::WorkflowTasksUpdated { tasks } => {
+                assert_eq!(tasks.len(), 1);
+                assert_eq!(tasks[0].id, "task-1");
+                assert_eq!(tasks[0].workflow_run_id, Some("workflow-run-1".to_string()));
+                assert_eq!(
+                    tasks[0]
+                        .workflow_progress
+                        .as_ref()
+                        .map(|progress| progress.completed_agents),
+                    Some(2)
+                );
+            }
+            other => panic!("expected workflow tasks updated event, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2604,6 +3220,53 @@ mod tests {
     }
 
     #[test]
+    fn tui_streaming_bash_observes_turn_cancel() {
+        let config = full_auto_config();
+        let (event_tx, event_rx) = mpsc::channel();
+        let (_action_tx, action_rx) = mpsc::channel();
+        let cancel = CancelToken::new();
+        let turn_cancel = cancel.clone();
+        let mut session =
+            TuiConversationSession::new_with_preloaded(&config, "bash", None).expect("session");
+
+        let handle = std::thread::spawn(move || {
+            run_agent_for_tui(
+                &config,
+                &mut session,
+                "bash printf 'before\\n'; sleep 5; printf after",
+                &event_tx,
+                &action_rx,
+                &turn_cancel,
+                false,
+            )
+        });
+
+        let start = Instant::now();
+        loop {
+            match event_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("TUI event before timeout")
+            {
+                TuiEvent::ToolOutputDelta { chunk, .. } if chunk.contains("before") => {
+                    cancel.cancel();
+                    break;
+                }
+                TuiEvent::SessionCompleted { status } => {
+                    panic!("session completed before streaming output: {status}");
+                }
+                _ => {}
+            }
+        }
+
+        let status = handle.join().expect("turn thread joined");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "cancelled TUI streaming bash should not wait for shell timeout"
+        );
+        assert_eq!(status, "interrupted");
+    }
+
+    #[test]
     fn tui_approval_action_rejects_caller_supplied_read_for_shell() {
         let request = tool_types::ToolRequest {
             id: "bash".to_string(),
@@ -2617,6 +3280,242 @@ mod tests {
         assert_eq!(
             canonical_action_for_tool(&request, &registry, &[]),
             orca_core::approval_types::ActionKind::Shell
+        );
+    }
+
+    #[test]
+    fn tui_approval_handler_resolves_approve_action_through_runtime_context() {
+        let (action_tx, action_rx) = mpsc::channel();
+        action_tx
+            .send(UserAction::Approve(true))
+            .expect("send approval");
+        let handler = TuiApprovalHandler::new(&action_rx);
+        let mut context = orca_runtime::lifecycle::RuntimeToolActorContext::new("tui-approval", 2);
+        let approval = orca_core::approval_types::ApprovalRequest {
+            id: "approval-1".to_string(),
+            action: orca_core::approval_types::ActionKind::Shell,
+            description: "bash requested shell".to_string(),
+            tool: Some("bash".to_string()),
+            target: Some("echo hi".to_string()),
+            preview: Some("$ echo hi".to_string()),
+        };
+        let request = tool_types::ToolRequest {
+            id: "bash".to_string(),
+            name: tool_types::ToolName::Bash,
+            action: orca_core::approval_types::ActionKind::Shell,
+            target: Some("echo hi".to_string()),
+            raw_arguments: Some(serde_json::json!({ "command": "echo hi" }).to_string()),
+        };
+
+        let resolution = context
+            .resolve_interactive_tool_approval(&handler, &approval, &request)
+            .expect("approval resolution");
+
+        assert_eq!(resolution.id, "approval-1");
+        assert_eq!(
+            resolution.decision,
+            orca_core::approval_types::ApprovalDecision::Allow
+        );
+        assert_eq!(resolution.reason, "user approved");
+    }
+
+    #[test]
+    fn tui_approval_handler_maps_cancel_to_runtime_denial() {
+        let (action_tx, action_rx) = mpsc::channel();
+        action_tx.send(UserAction::Cancel).expect("send cancel");
+        let handler = TuiApprovalHandler::new(&action_rx);
+        let mut context = orca_runtime::lifecycle::RuntimeToolActorContext::new("tui-approval", 2);
+        let approval = orca_core::approval_types::ApprovalRequest {
+            id: "approval-1".to_string(),
+            action: orca_core::approval_types::ActionKind::Shell,
+            description: "bash requested shell".to_string(),
+            tool: Some("bash".to_string()),
+            target: Some("echo hi".to_string()),
+            preview: Some("$ echo hi".to_string()),
+        };
+        let request = tool_types::ToolRequest {
+            id: "bash".to_string(),
+            name: tool_types::ToolName::Bash,
+            action: orca_core::approval_types::ActionKind::Shell,
+            target: Some("echo hi".to_string()),
+            raw_arguments: Some(serde_json::json!({ "command": "echo hi" }).to_string()),
+        };
+
+        let resolution = context
+            .resolve_interactive_tool_approval(&handler, &approval, &request)
+            .expect("approval resolution");
+
+        assert_eq!(resolution.id, "approval-1");
+        assert_eq!(
+            resolution.decision,
+            orca_core::approval_types::ApprovalDecision::Deny
+        );
+        assert_eq!(resolution.reason, "user denied");
+    }
+
+    #[test]
+    fn tui_tool_approval_uses_runtime_handler_before_execution() {
+        let config = config();
+        let (event_tx, event_rx) = mpsc::channel();
+        let (action_tx, action_rx) = mpsc::channel();
+        action_tx
+            .send(UserAction::Approve(true))
+            .expect("send approval");
+        let request = tool_types::ToolRequest {
+            id: "bash".to_string(),
+            name: tool_types::ToolName::Bash,
+            action: orca_core::approval_types::ActionKind::Shell,
+            target: Some("printf approved".to_string()),
+            raw_arguments: Some(serde_json::json!({ "command": "printf approved" }).to_string()),
+        };
+
+        let (should_stop, result, _) = execute_tool_for_tui(
+            &config,
+            config.cwd.as_deref().unwrap_or_else(|| Path::new(".")),
+            &request,
+            &event_tx,
+            &action_rx,
+            0,
+            Some("approval-session"),
+            &ApprovalPolicy::new(config.approval_mode),
+            &ProjectInstructions::default(),
+            &MemoryBlock::default(),
+            &McpRegistry::default(),
+            &HookRunner::default(),
+            None,
+            &CancelToken::new(),
+        );
+
+        let events: Vec<TuiEvent> = event_rx.try_iter().collect();
+        assert!(!should_stop);
+        assert_eq!(result.status, tool_types::ToolStatus::Completed);
+        assert_eq!(result.output.as_deref(), Some("approved"));
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                TuiEvent::ApprovalNeeded { tool, target, preview, .. }
+                if tool == "bash"
+                    && target == &Some("printf approved".to_string())
+                    && preview == &Some("$ printf approved".to_string())
+            )
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                TuiEvent::ToolCompleted { name, status, output, .. }
+                if name == "bash" && status == "completed" && output == "approved"
+            )
+        }));
+    }
+
+    #[test]
+    fn tui_tool_approval_cancel_returns_denied_result() {
+        let config = config();
+        let (event_tx, event_rx) = mpsc::channel();
+        let (action_tx, action_rx) = mpsc::channel();
+        action_tx.send(UserAction::Cancel).expect("send cancel");
+        let request = tool_types::ToolRequest {
+            id: "bash".to_string(),
+            name: tool_types::ToolName::Bash,
+            action: orca_core::approval_types::ActionKind::Shell,
+            target: Some("printf denied".to_string()),
+            raw_arguments: Some(serde_json::json!({ "command": "printf denied" }).to_string()),
+        };
+
+        let (should_stop, result, _) = execute_tool_for_tui(
+            &config,
+            config.cwd.as_deref().unwrap_or_else(|| Path::new(".")),
+            &request,
+            &event_tx,
+            &action_rx,
+            0,
+            Some("approval-session"),
+            &ApprovalPolicy::new(config.approval_mode),
+            &ProjectInstructions::default(),
+            &MemoryBlock::default(),
+            &McpRegistry::default(),
+            &HookRunner::default(),
+            None,
+            &CancelToken::new(),
+        );
+
+        let events: Vec<TuiEvent> = event_rx.try_iter().collect();
+        assert!(should_stop);
+        assert_eq!(result.status, tool_types::ToolStatus::Denied);
+        assert_eq!(result.error.as_deref(), Some("user denied"));
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                TuiEvent::ToolCompleted { name, status, output, .. }
+                if name == "bash" && status == "denied" && output == "user denied"
+            )
+        }));
+    }
+
+    #[test]
+    fn tui_user_input_handler_routes_answer_through_runtime_context() {
+        let (event_tx, event_rx) = mpsc::channel();
+        let (action_tx, action_rx) = mpsc::channel();
+        action_tx
+            .send(UserAction::RespondToUserInput("yes".to_string()))
+            .expect("send answer");
+        let handler = TuiUserInputHandler::new(&event_tx, &action_rx);
+        let mut context = RuntimeToolActorContext::new("tui-user-input", 2);
+        let request = tool_types::ToolRequest {
+            id: "ask".to_string(),
+            name: tool_types::ToolName::RequestUserInput,
+            action: orca_core::approval_types::ActionKind::Read,
+            target: None,
+            raw_arguments: Some(
+                serde_json::json!({
+                    "question": "Continue?",
+                    "choices": ["yes", "no"]
+                })
+                .to_string(),
+            ),
+        };
+
+        let result = context
+            .execute_user_input_tool(&request, &handler)
+            .expect("user input result");
+        let events: Vec<TuiEvent> = event_rx.try_iter().collect();
+
+        assert_eq!(result.status, tool_types::ToolStatus::Completed);
+        assert_eq!(result.output.as_deref(), Some("yes"));
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                TuiEvent::UserInputRequested { id, question, choices }
+                if id == "ask"
+                    && question == "Continue?"
+                    && choices == &vec!["yes".to_string(), "no".to_string()]
+            )
+        }));
+    }
+
+    #[test]
+    fn tui_user_input_handler_maps_cancel_to_runtime_failure() {
+        let (event_tx, _event_rx) = mpsc::channel();
+        let (action_tx, action_rx) = mpsc::channel();
+        action_tx.send(UserAction::Cancel).expect("send cancel");
+        let handler = TuiUserInputHandler::new(&event_tx, &action_rx);
+        let mut context = RuntimeToolActorContext::new("tui-user-input", 2);
+        let request = tool_types::ToolRequest {
+            id: "ask".to_string(),
+            name: tool_types::ToolName::RequestUserInput,
+            action: orca_core::approval_types::ActionKind::Read,
+            target: None,
+            raw_arguments: Some(serde_json::json!({ "question": "Continue?" }).to_string()),
+        };
+
+        let result = context
+            .execute_user_input_tool(&request, &handler)
+            .expect("user input result");
+
+        assert_eq!(result.status, tool_types::ToolStatus::Failed);
+        assert_eq!(
+            result.error.as_deref(),
+            Some("user input request cancelled")
         );
     }
 

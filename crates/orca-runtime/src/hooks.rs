@@ -1,6 +1,7 @@
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
+use orca_core::cancel::CancelToken;
 use orca_core::conversation::Conversation;
 use orca_core::hook_types::{HookConfig, HookEvent};
 use orca_core::provider_types::Usage;
@@ -37,11 +38,32 @@ impl HookRunner {
         self.run_with_timeout(event, context, Duration::from_secs(30))
     }
 
+    pub fn run_with_cancel(
+        &self,
+        event: HookEvent,
+        context: HookContext<'_>,
+        cancel: &CancelToken,
+    ) -> Result<HookOutcome, String> {
+        self.run_with_timeout_or_cancel(event, context, Duration::from_secs(30), || {
+            cancel.is_cancelled()
+        })
+    }
+
     fn run_with_timeout(
         &self,
         event: HookEvent,
         context: HookContext<'_>,
         timeout: Duration,
+    ) -> Result<HookOutcome, String> {
+        self.run_with_timeout_or_cancel(event, context, timeout, || false)
+    }
+
+    fn run_with_timeout_or_cancel(
+        &self,
+        event: HookEvent,
+        context: HookContext<'_>,
+        timeout: Duration,
+        should_cancel: impl Fn() -> bool,
     ) -> Result<HookOutcome, String> {
         let mut outcome = HookOutcome::default();
         for hook in self.matching_hooks(event, context.tool_request) {
@@ -119,8 +141,15 @@ impl HookRunner {
             let child = command
                 .spawn()
                 .map_err(|error| format!("hook '{}' failed to start: {error}", hook.command))?;
-            let output = orca_tools::process::wait_for_child_output_with_timeout(child, timeout)
-                .map_err(|error| format!("hook '{}' failed: {error}", hook.command))?;
+            let output = orca_tools::process::wait_for_child_output_with_timeout_or_cancel(
+                child,
+                timeout,
+                &should_cancel,
+            )
+            .map_err(|error| format!("hook '{}' failed: {error}", hook.command))?;
+            if should_cancel() {
+                return Err(format!("hook '{}' cancelled", hook.command));
+            }
 
             if output.timed_out {
                 let stderr =

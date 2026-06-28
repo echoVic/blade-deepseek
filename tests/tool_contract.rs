@@ -1,12 +1,16 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
+use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
+static TOOL_CLI_TEST_LOCK: Mutex<()> = Mutex::new(());
+
 #[test]
 fn read_file_emits_tool_request_and_completed_events() {
+    let _guard = tool_cli_test_guard();
     let temp_dir = make_temp_workspace("read-file");
     fs::write(temp_dir.join("note.txt"), "orca read fixture\n").expect("write fixture");
 
@@ -46,6 +50,7 @@ fn read_file_emits_tool_request_and_completed_events() {
 
 #[test]
 fn git_status_emits_completed_tool_event() {
+    let _guard = tool_cli_test_guard();
     let output = Command::new(env!("CARGO_BIN_EXE_orca"))
         .args([
             "exec",
@@ -73,6 +78,7 @@ fn git_status_emits_completed_tool_event() {
 
 #[test]
 fn grep_emits_completed_tool_event_with_matches() {
+    let _guard = tool_cli_test_guard();
     let temp_dir = make_temp_workspace("grep");
     fs::write(
         temp_dir.join("fixture.txt"),
@@ -115,6 +121,7 @@ fn grep_emits_completed_tool_event_with_matches() {
 
 #[test]
 fn suggest_denies_bash_in_jsonl_mode() {
+    let _guard = tool_cli_test_guard();
     let output = Command::new(env!("CARGO_BIN_EXE_orca"))
         .args([
             "exec",
@@ -136,10 +143,13 @@ fn suggest_denies_bash_in_jsonl_mode() {
     let completed = find_event(&events, "tool.call.completed");
     assert_eq!(completed["payload"]["name"], "bash");
     assert_eq!(completed["payload"]["status"], "denied");
+    assert_eq!(completed["payload"]["task"]["kind"], "shell");
+    assert_eq!(completed["payload"]["task"]["status"], "approval_required");
 }
 
 #[test]
 fn full_auto_allows_bash_tool() {
+    let _guard = tool_cli_test_guard();
     let output = Command::new(env!("CARGO_BIN_EXE_orca"))
         .args([
             "exec",
@@ -164,7 +174,87 @@ fn full_auto_allows_bash_tool() {
 }
 
 #[test]
+fn full_auto_bash_tool_events_include_shell_task_lifecycle() {
+    let _guard = tool_cli_test_guard();
+    let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .args([
+            "exec",
+            "--output-format",
+            "jsonl",
+            "--provider",
+            "mock",
+            "--approval-mode",
+            "full-auto",
+            "bash printf hi",
+        ])
+        .output()
+        .expect("run orca");
+
+    assert_eq!(output.status.code(), Some(0));
+
+    let events = parse_jsonl(&output.stdout);
+    let requested = find_event(&events, "tool.call.requested");
+    let completed = find_event(&events, "tool.call.completed");
+    assert_eq!(requested["payload"]["task"]["kind"], "shell");
+    assert_eq!(requested["payload"]["task"]["status"], "running");
+    assert_eq!(requested["payload"]["task"]["turn"], 1);
+    assert_eq!(completed["payload"]["task"]["kind"], "shell");
+    assert_eq!(completed["payload"]["task"]["status"], "succeeded");
+    assert_eq!(completed["payload"]["task"]["turn"], 1);
+    assert_eq!(
+        requested["payload"]["task"]["task_id"],
+        completed["payload"]["task"]["task_id"]
+    );
+}
+
+#[test]
+fn full_auto_bash_persists_runtime_shell_task_record() {
+    let _guard = tool_cli_test_guard();
+    let workspace = make_temp_workspace("bash-shell-task");
+    let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .args([
+            "exec",
+            "--output-format",
+            "jsonl",
+            "--provider",
+            "mock",
+            "--approval-mode",
+            "full-auto",
+            "--cwd",
+            workspace.to_str().unwrap(),
+            "bash printf persisted-shell-task",
+        ])
+        .output()
+        .expect("run orca");
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+
+    let events = parse_jsonl(&output.stdout);
+    let completed = find_event(&events, "tool.call.completed");
+    assert_eq!(completed["payload"]["status"], "completed");
+    assert_eq!(completed["payload"]["output"], "persisted-shell-task");
+
+    let sessions_root = workspace.join(".orca").join("task-sessions");
+    let task_files = find_task_files(&sessions_root);
+    assert_eq!(task_files.len(), 1, "task files: {task_files:?}");
+    let tasks: Value = serde_json::from_str(
+        &fs::read_to_string(&task_files[0]).expect("read persisted shell tasks"),
+    )
+    .expect("persisted tasks json");
+    let shell_task = tasks
+        .as_object()
+        .and_then(|tasks| tasks.values().next())
+        .expect("one shell task");
+    assert_eq!(shell_task["task_type"], "shell");
+    assert_eq!(shell_task["status"], "completed");
+    assert_eq!(shell_task["command"], "printf persisted-shell-task");
+    assert_eq!(shell_task["result"], "persisted-shell-task");
+}
+
+#[test]
 fn tool_output_truncation_policy_from_config_applies_to_bash() {
+    let _guard = tool_cli_test_guard();
     let home = make_temp_workspace("tool-truncation-home");
     fs::write(
         home.join("config.toml"),
@@ -205,6 +295,7 @@ output_truncation = { mode = "tokens", limit = 12 }
 
 #[test]
 fn pre_tool_hook_can_modify_tool_target_before_execution() {
+    let _guard = tool_cli_test_guard();
     let home = make_temp_workspace("hook-modify-home");
     fs::write(
         home.join("config.toml"),
@@ -244,6 +335,7 @@ command = "printf '%s' '{\"action\":\"modify\",\"modified_target\":\"printf sani
 
 #[test]
 fn pre_tool_hook_json_deny_blocks_tool_even_when_exit_succeeds() {
+    let _guard = tool_cli_test_guard();
     let home = make_temp_workspace("hook-deny-home");
     fs::write(
         home.join("config.toml"),
@@ -285,6 +377,7 @@ command = "printf '%s' '{\"action\":\"deny\",\"reason\":\"blocked by hook\"}'"
 
 #[test]
 fn full_auto_bash_cannot_write_outside_workspace() {
+    let _guard = tool_cli_test_guard();
     if !sandbox_seatbelt_available() {
         return;
     }
@@ -323,6 +416,56 @@ fn full_auto_bash_cannot_write_outside_workspace() {
     assert_eq!(completed["payload"]["status"], "failed");
 }
 
+#[test]
+fn request_permissions_grants_bash_write_root_for_current_turn() {
+    let _guard = tool_cli_test_guard();
+    if !sandbox_seatbelt_available() {
+        return;
+    }
+
+    let workspace = make_temp_workspace("request-permissions-workspace");
+    let extra = make_temp_workspace("request-permissions-extra");
+    let output_file = extra.join("generated.txt");
+    let prompt = format!(
+        "request_permissions_then_bash {} :: printf granted > {}",
+        extra.display(),
+        output_file.display()
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .args([
+            "exec",
+            "--output-format",
+            "jsonl",
+            "--provider",
+            "mock",
+            "--approval-mode",
+            "full-auto",
+            "--cwd",
+            workspace.to_str().unwrap(),
+            &prompt,
+        ])
+        .output()
+        .expect("run orca");
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(fs::read_to_string(&output_file).unwrap(), "granted");
+
+    let events = parse_jsonl(&output.stdout);
+    let requested = events
+        .iter()
+        .filter(|event| event["type"] == "tool.call.requested")
+        .map(|event| event["payload"]["name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(requested, vec!["request_permissions", "bash"]);
+    let completed = events
+        .iter()
+        .filter(|event| event["type"] == "tool.call.completed")
+        .collect::<Vec<_>>();
+    assert_eq!(completed[0]["payload"]["status"], "completed");
+    assert_eq!(completed[1]["payload"]["status"], "completed");
+}
+
 fn sandbox_seatbelt_available() -> bool {
     Command::new("sandbox-exec")
         .arg("-p")
@@ -335,6 +478,7 @@ fn sandbox_seatbelt_available() -> bool {
 
 #[test]
 fn auto_edit_allows_edit_tool() {
+    let _guard = tool_cli_test_guard();
     let temp_dir = make_temp_workspace("edit-success");
     let file_path = temp_dir.join("note.txt");
     fs::write(&file_path, "hello orca\n").expect("write fixture");
@@ -369,6 +513,7 @@ fn auto_edit_allows_edit_tool() {
 
 #[test]
 fn suggest_denies_edit_in_jsonl_mode() {
+    let _guard = tool_cli_test_guard();
     let temp_dir = make_temp_workspace("edit-denied");
     let file_path = temp_dir.join("note.txt");
     fs::write(&file_path, "hello orca\n").expect("write fixture");
@@ -398,6 +543,7 @@ fn suggest_denies_edit_in_jsonl_mode() {
 
 #[test]
 fn update_plan_emits_plan_updated_event() {
+    let _guard = tool_cli_test_guard();
     let output = Command::new(env!("CARGO_BIN_EXE_orca"))
         .args([
             "exec",
@@ -441,6 +587,7 @@ fn update_plan_emits_plan_updated_event() {
 
 #[test]
 fn malformed_update_plan_is_schema_failed_and_can_be_retried() {
+    let _guard = tool_cli_test_guard();
     let temp = tempfile::tempdir().unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_orca"))
         .current_dir(temp.path())
@@ -488,6 +635,7 @@ fn malformed_update_plan_is_schema_failed_and_can_be_retried() {
 
 #[test]
 fn external_tool_descriptor_runs_from_orca_tools_dir() {
+    let _guard = tool_cli_test_guard();
     let home = make_temp_workspace("external-home");
     let tools_dir = home.join("tools");
     fs::create_dir_all(&tools_dir).expect("tools dir");
@@ -561,6 +709,10 @@ fn find_event<'a>(events: &'a [Value], event_type: &str) -> &'a Value {
         .unwrap_or_else(|| panic!("missing {event_type}"))
 }
 
+fn tool_cli_test_guard() -> MutexGuard<'static, ()> {
+    TOOL_CLI_TEST_LOCK.lock().expect("tool CLI test lock")
+}
+
 fn parse_jsonl(stdout: &[u8]) -> Vec<Value> {
     String::from_utf8_lossy(stdout)
         .lines()
@@ -576,6 +728,26 @@ fn make_temp_workspace(name: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("orca-{name}-{nanos}"));
     fs::create_dir_all(&dir).expect("create temp workspace");
     dir
+}
+
+fn find_task_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut files = Vec::new();
+    if !root.exists() {
+        return files;
+    }
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir).expect("read task dir") {
+            let path = entry.expect("task dir entry").path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.file_name().and_then(|name| name.to_str()) == Some("tasks.json") {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    files
 }
 
 fn shell_escape(path: &std::path::Path) -> String {

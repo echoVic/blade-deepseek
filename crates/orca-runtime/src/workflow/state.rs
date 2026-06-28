@@ -10,7 +10,7 @@ use orca_core::workflow_types::{
     WorkflowAgentFailureKind, WorkflowAgentStatus, WorkflowEvidenceAgent, WorkflowEvidenceBundle,
     WorkflowEvidenceFailure, WorkflowEvidenceFailureKind, WorkflowEvidenceIdentity,
     WorkflowEvidencePhase, WorkflowEvidenceToolEvent, WorkflowInput, WorkflowRunState,
-    WorkflowRunStatus,
+    WorkflowRunStatus, WorkflowTaskLifecycleEvidence,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -50,6 +50,8 @@ pub struct WorkflowAgentRecord {
     pub completed_at_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<UsageTotals>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<WorkflowTaskLifecycleEvidence>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_events: Vec<WorkflowEvidenceToolEvent>,
 }
@@ -98,6 +100,8 @@ struct WorkflowAgentRecordOnDisk {
     #[serde(default)]
     usage: Option<UsageTotals>,
     #[serde(default)]
+    task: Option<WorkflowTaskLifecycleEvidence>,
+    #[serde(default)]
     tool_events: Vec<WorkflowEvidenceToolEvent>,
 }
 
@@ -125,6 +129,8 @@ struct WorkflowAgentRecordOnDiskWritable {
     completed_at_ms: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     usage: Option<UsageTotals>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    task: Option<WorkflowTaskLifecycleEvidence>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tool_events: Vec<WorkflowEvidenceToolEvent>,
 }
@@ -295,6 +301,7 @@ impl WorkflowStateStore {
                         started_at_ms: entry.record.started_at_ms,
                         completed_at_ms: entry.record.completed_at_ms,
                         usage: entry.record.usage,
+                        task: entry.record.task,
                         tool_events: entry.record.tool_events,
                         failure_kind,
                         retryable,
@@ -706,6 +713,7 @@ impl IntoWorkflowAgentRecord for WorkflowAgentCacheRecord {
             started_at_ms: None,
             completed_at_ms: None,
             usage: None,
+            task: None,
             tool_events: Vec::new(),
         }
     }
@@ -802,6 +810,7 @@ fn read_agent_cache(path: &Path) -> io::Result<HashMap<String, CachedWorkflowAge
                             started_at_ms: record.started_at_ms,
                             completed_at_ms: record.completed_at_ms,
                             usage: record.usage,
+                            task: record.task,
                             tool_events: record.tool_events,
                         },
                         output_present: record.output.present,
@@ -857,6 +866,7 @@ fn write_agent_cache(
                     started_at_ms: entry.record.started_at_ms,
                     completed_at_ms: entry.record.completed_at_ms,
                     usage: entry.record.usage,
+                    task: entry.record.task.clone(),
                     tool_events: entry.record.tool_events.clone(),
                 },
             )

@@ -15,6 +15,10 @@ use orca_core::task_types::{
 use orca_core::workflow_types::WorkflowInput;
 use serde::{Deserialize, Serialize};
 
+use crate::lifecycle::{
+    RuntimeSubagentStatusLookup, RuntimeSubagentStatusRecord, RuntimeUsageTotals,
+};
+
 #[derive(Clone, Debug)]
 pub struct TaskRegistry {
     session_id: String,
@@ -53,6 +57,7 @@ pub struct TaskRecord {
     pub result: Option<String>,
     pub error: Option<String>,
     pub worker_pid: Option<u32>,
+    pub command: Option<String>,
     pub control: TaskControl,
 }
 
@@ -99,6 +104,8 @@ struct PersistedTaskRecord {
     error: Option<String>,
     #[serde(default)]
     worker_pid: Option<u32>,
+    #[serde(default)]
+    command: Option<String>,
 }
 
 impl TaskRegistry {
@@ -172,6 +179,7 @@ impl TaskRegistry {
             result: None,
             error: None,
             worker_pid: None,
+            command: None,
             control,
         };
 
@@ -215,6 +223,7 @@ impl TaskRegistry {
             result: None,
             error: None,
             worker_pid: None,
+            command: None,
             control,
         };
 
@@ -224,6 +233,50 @@ impl TaskRegistry {
         TaskHandle {
             id,
             task_type: TaskType::Subagent,
+            workflow_run_id: None,
+        }
+    }
+
+    pub fn create_shell(&self, description: String, command: String) -> TaskHandle {
+        let id = new_task_id();
+        let created_at_ms = now_ms();
+        let control = TaskControl {
+            cancel: CancelToken::new(),
+            pause: Arc::new(AtomicBool::new(false)),
+        };
+        let record = TaskRecord {
+            id: id.clone(),
+            task_type: TaskType::Shell,
+            status: TaskStatus::Queued,
+            description,
+            created_at_ms,
+            started_at_ms: None,
+            completed_at_ms: None,
+            name: None,
+            agent_type: None,
+            workflow_run_id: None,
+            phase_count: None,
+            workflow_progress: None,
+            workflow_phases: Vec::new(),
+            workflow_agents: Vec::new(),
+            workflow_script_path: None,
+            workflow_launch_input: None,
+            workflow_final_summary: None,
+            workflow_failure_count: 0,
+            usage: None,
+            result: None,
+            error: None,
+            worker_pid: None,
+            command: Some(command),
+            control,
+        };
+
+        self.insert_task(id.clone(), record)
+            .expect("task registry insert failed");
+
+        TaskHandle {
+            id,
+            task_type: TaskType::Shell,
             workflow_run_id: None,
         }
     }
@@ -241,7 +294,7 @@ impl TaskRegistry {
                         created_at_ms: record.created_at_ms,
                         started_at_ms: record.started_at_ms,
                         completed_at_ms: record.completed_at_ms,
-                        command: None,
+                        command: record.command.clone(),
                         agent_type: record.agent_type.clone(),
                         server: None,
                         tool: None,
@@ -477,6 +530,15 @@ impl TaskRegistry {
         })
     }
 
+    pub fn is_cancelled(&self, id: &str) -> bool {
+        self.with_tasks(|tasks| {
+            tasks
+                .get(id)
+                .is_some_and(|record| record.control.cancel.is_cancelled())
+        })
+        .unwrap_or(false)
+    }
+
     fn update_task<F>(&self, id: &str, update: F) -> Result<(), String>
     where
         F: FnOnce(&mut TaskRecord) -> Result<(), String>,
@@ -593,6 +655,35 @@ impl TaskPersistence {
     }
 }
 
+impl RuntimeSubagentStatusLookup for TaskRegistry {
+    fn subagent_status_record(&self, agent_id: &str) -> Option<RuntimeSubagentStatusRecord> {
+        let record = self.get(agent_id)?;
+        if record.task_type != TaskType::Subagent {
+            return None;
+        }
+        Some(RuntimeSubagentStatusRecord {
+            id: record.id,
+            status: serde_json::to_value(record.status)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_string))
+                .unwrap_or_else(|| format!("{:?}", record.status)),
+            description: record.description,
+            agent_type: record.agent_type,
+            created_at_ms: record.created_at_ms,
+            started_at_ms: record.started_at_ms,
+            completed_at_ms: record.completed_at_ms,
+            output: record.result,
+            error: record.error,
+            usage: record.usage.map(|usage| RuntimeUsageTotals {
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
+                cache_tokens: usage.cache_tokens,
+                estimated_cost_usd: usage.estimated_cost_usd,
+            }),
+        })
+    }
+}
+
 impl PersistedTaskRecord {
     fn into_task_record(self) -> TaskRecord {
         TaskRecord {
@@ -618,6 +709,7 @@ impl PersistedTaskRecord {
             result: self.result,
             error: self.error,
             worker_pid: self.worker_pid,
+            command: self.command,
             control: new_task_control(),
         }
     }
@@ -654,6 +746,7 @@ impl From<&TaskRecord> for PersistedTaskRecord {
             result: record.result.clone(),
             error: record.error.clone(),
             worker_pid: record.worker_pid,
+            command: record.command.clone(),
         }
     }
 }

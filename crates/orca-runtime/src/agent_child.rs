@@ -11,6 +11,7 @@ use orca_mcp::McpRegistry;
 use crate::cost::CostTracker;
 use crate::hooks::HookRunner;
 use crate::instructions::ProjectInstructions;
+use crate::lifecycle::RuntimeSessionLifecycle;
 use crate::memory::MemoryBlock;
 use crate::workflow::ipc::WorkflowIpcContext;
 
@@ -33,7 +34,7 @@ pub struct ChildAgentResult {
     pub error: Option<String>,
 }
 
-type ChildAgentExecutor<W> = fn(
+pub(crate) type ChildAgentExecutor<W> = fn(
     &RunConfig,
     &ChildAgentRequest,
     &mut ChildAgentRuntime<'_, W>,
@@ -49,6 +50,7 @@ pub(crate) struct ChildAgentRuntime<'a, W: io::Write> {
     pub mcp_registry: &'a McpRegistry,
     pub hooks: &'a HookRunner,
     pub cancel: &'a CancelToken,
+    pub lifecycle: Option<&'a mut RuntimeSessionLifecycle>,
     executor: ChildAgentExecutor<W>,
 }
 
@@ -62,6 +64,7 @@ impl<'a, W: io::Write> ChildAgentRuntime<'a, W> {
         mcp_registry: &'a McpRegistry,
         hooks: &'a HookRunner,
         cancel: &'a CancelToken,
+        lifecycle: Option<&'a mut RuntimeSessionLifecycle>,
         executor: ChildAgentExecutor<W>,
     ) -> Self {
         Self {
@@ -73,6 +76,7 @@ impl<'a, W: io::Write> ChildAgentRuntime<'a, W> {
             mcp_registry,
             hooks,
             cancel,
+            lifecycle,
             executor,
         }
     }
@@ -148,7 +152,11 @@ mod tests {
             external_tools: Vec::<ExternalToolConfig>::new(),
             history_mode: HistoryMode::Disabled,
             show_session_picker: false,
+            active_permission_profile: None,
+            permission_profiles: Default::default(),
+            runtime_workspace_roots: None,
             permission_rules: PermissionRules::default(),
+            additional_working_directories: Vec::new(),
             max_budget_usd: None,
             subagents: SubagentConfig::default(),
             tools: ToolConfig::default(),
@@ -181,6 +189,7 @@ mod tests {
             mcp_registry,
             hooks,
             cancel,
+            None,
             executor,
         )
     }
