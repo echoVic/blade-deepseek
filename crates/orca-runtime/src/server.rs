@@ -1270,6 +1270,7 @@ fn materialize_profile_special_path(
     tmpdir: Option<&std::path::Path>,
 ) -> Vec<PathBuf> {
     match path.to_str() {
+        Some(":root") => vec![PathBuf::from("/")],
         Some(":slash_tmp") => vec![PathBuf::from("/tmp")],
         Some(":tmpdir") => tmpdir
             .map(|path| vec![path.to_path_buf()])
@@ -3316,6 +3317,39 @@ mod tests {
             vec![PathBuf::from("/tmp")]
         );
         assert_eq!(sandbox.denied_writable_roots, vec![tmpdir]);
+    }
+
+    #[test]
+    fn command_exec_sandbox_materializes_custom_permission_profile_root_path() {
+        let mut config = test_run_config();
+        config.permission_profiles.insert(
+            "root".to_string(),
+            orca_core::config::PermissionProfileConfig {
+                extends: Some(":read-only".to_string()),
+                filesystem: std::collections::HashMap::from([(
+                    PathBuf::from(":root"),
+                    orca_core::config::PermissionProfileFileAccess::Write,
+                )])
+                .into(),
+                ..Default::default()
+            },
+        );
+        let options = protocol::CommandExecOptions {
+            permission_profile: Some("root".to_string()),
+            ..Default::default()
+        };
+
+        let sandbox = command_exec_sandbox_mode(
+            &config,
+            &options,
+            None,
+            std::path::Path::new("/workspace"),
+            &[],
+            None,
+        )
+        .expect("root profile");
+
+        assert_eq!(sandbox.additional_writable_roots, vec![PathBuf::from("/")]);
     }
 
     #[test]
