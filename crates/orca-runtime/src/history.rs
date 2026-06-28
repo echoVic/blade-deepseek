@@ -19,11 +19,11 @@ use orca_core::tool_types::{ToolResult, ToolStatus};
 use orca_core::{approval_rules::PermissionRules, approval_types::ApprovalMode};
 
 pub use crate::thread_store::{
-    JsonlThreadStore, LiveThread, SessionMeta, SessionStore, SessionSummary, SortDirection,
-    StoredThreadItem, StoredThreadItemPage, StoredThreadProjection, StoredThreadSearchHit,
-    StoredThreadSearchPage, StoredThreadSummary, StoredThreadSummaryPage, StoredThreadTurn,
-    StoredThreadTurnPage, ThreadListFilters, ThreadMetadataPatch, ThreadRelationFilter,
-    ThreadSortKey, ThreadStore, TurnItemsView,
+    JsonlThreadStore, LiveThread, SessionMeta, SessionStore, SessionSummary, SessionTranscript,
+    SortDirection, StoredThreadItem, StoredThreadItemPage, StoredThreadProjection,
+    StoredThreadSearchHit, StoredThreadSearchPage, StoredThreadSummary, StoredThreadSummaryPage,
+    StoredThreadTurn, StoredThreadTurnPage, ThreadListFilters, ThreadMetadataPatch,
+    ThreadRelationFilter, ThreadSortKey, ThreadStore, TurnItemsView,
 };
 
 const ORCA_HOME_ENV: &str = "ORCA_HOME";
@@ -31,17 +31,6 @@ const SESSION_SCHEMA_VERSION: u32 = 1;
 
 #[cfg(test)]
 pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-#[derive(Clone, Debug)]
-pub struct SessionTranscript {
-    pub meta: SessionMeta,
-    pub messages: Vec<Message>,
-    pub compactions: Vec<CompactionRecord>,
-    pub summaries: Vec<ContextSummaryRecord>,
-    pub usage: Option<UsageTotals>,
-    pub plan: Option<(Option<String>, Vec<PlanItem>)>,
-    pub path: PathBuf,
-}
 
 #[derive(Clone, Debug)]
 pub struct SessionWriter {

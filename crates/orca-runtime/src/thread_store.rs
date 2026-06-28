@@ -1,12 +1,15 @@
-pub use crate::history::{SessionTranscript, SessionWriter};
+pub use crate::history::SessionWriter;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::history::{CompactionRecord, ContextSummaryRecord};
 use chrono::{DateTime, Utc};
 use orca_core::approval_rules::PermissionRules;
 use orca_core::approval_types::ApprovalMode;
 use orca_core::config::{ActivePermissionProfile, AdditionalWorkingDirectory};
 use orca_core::conversation::{Conversation, Message};
+use orca_core::cost_types::UsageTotals;
+use orca_core::plan_types::PlanItem;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -58,6 +61,17 @@ pub struct SessionSummary {
     pub runtime_workspace_roots: Vec<PathBuf>,
     pub permission_rule_count: usize,
     pub additional_working_directories: Vec<AdditionalWorkingDirectory>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SessionTranscript {
+    pub meta: SessionMeta,
+    pub messages: Vec<Message>,
+    pub compactions: Vec<CompactionRecord>,
+    pub summaries: Vec<ContextSummaryRecord>,
+    pub usage: Option<UsageTotals>,
+    pub plan: Option<(Option<String>, Vec<PlanItem>)>,
+    pub path: PathBuf,
 }
 
 #[derive(Clone, Debug)]
