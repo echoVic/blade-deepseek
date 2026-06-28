@@ -10,9 +10,10 @@ use orca_core::{
 };
 use serde_json::{Value, json};
 
-use crate::agent_loop::ThreadSteerHandle;
 use crate::controller::{ThreadTurnExecutor, ThreadTurnRequest};
-use crate::lifecycle::{RuntimePermissionRequestHandler, RuntimeSessionLifecycle, RuntimeTaskKind};
+use crate::lifecycle::{
+    RuntimePermissionRequestHandler, RuntimeSessionLifecycle, RuntimeTaskKind, ThreadSteerHandle,
+};
 use crate::protocol;
 use crate::session::{InteractiveSession, new_run_id};
 use crate::thread_store::{

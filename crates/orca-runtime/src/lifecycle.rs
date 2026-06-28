@@ -1,5 +1,6 @@
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use orca_approval::ApprovalPolicy;
 use orca_core::approval_types::{ApprovalDecision, ApprovalRequest, ApprovalResolution};
@@ -86,6 +87,11 @@ pub struct RuntimeToolActorContext {
     lifecycle: RuntimeSessionLifecycle,
     max_turns: u32,
     permission_overlay: TurnPermissionOverlay,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ThreadSteerHandle {
+    pending: Arc<Mutex<Vec<String>>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -878,6 +884,23 @@ impl<'a> RuntimeTaskActor<'a> {
             });
         }
         Ok(totals)
+    }
+}
+
+impl ThreadSteerHandle {
+    pub fn push(&self, input: impl Into<String>) {
+        self.pending
+            .lock()
+            .expect("thread steer handle lock")
+            .push(input.into());
+    }
+
+    pub fn drain(&self) -> Vec<String> {
+        self.pending
+            .lock()
+            .expect("thread steer handle lock")
+            .drain(..)
+            .collect()
     }
 }
 

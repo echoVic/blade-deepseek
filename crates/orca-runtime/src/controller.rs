@@ -16,14 +16,15 @@ use orca_tools;
 
 use crate::agent_common;
 use crate::agent_loop::{
-    AgentConversationContext, AgentLoopContext, AgentToolPolicyContext, ThreadSteerHandle,
-    run_agent_loop,
+    AgentConversationContext, AgentLoopContext, AgentToolPolicyContext, run_agent_loop,
 };
 use crate::cost::CostTracker;
 use crate::hooks::{HookContext, HookRunner};
 use crate::instructions;
 use crate::instructions::ProjectInstructions;
-use crate::lifecycle::{RuntimePermissionRequestHandler, RuntimeSessionLifecycle, RuntimeTaskKind};
+use crate::lifecycle::{
+    RuntimePermissionRequestHandler, RuntimeSessionLifecycle, RuntimeTaskKind, ThreadSteerHandle,
+};
 use crate::memory;
 use crate::session::{InteractiveSession, InteractiveSessionRuntimeParts, new_run_id};
 use crate::tasks::TaskRegistry;

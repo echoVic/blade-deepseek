@@ -1,7 +1,6 @@
 use std::collections::HashSet;
 use std::io;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
 
 use orca_approval::ApprovalPolicy;
 use orca_core::cancel::CancelToken;
@@ -30,7 +29,8 @@ use crate::hooks::{HookContext, HookRunner, conversation_with_hook_context};
 use crate::instructions::ProjectInstructions;
 use crate::lifecycle::{
     RuntimePermissionRequestHandler, RuntimeSessionLifecycle, RuntimeTaskActor, RuntimeTurnConfig,
-    RuntimeTurnDeps, RuntimeTurnExecution, RuntimeTurnState, TurnPermissionOverlay,
+    RuntimeTurnDeps, RuntimeTurnExecution, RuntimeTurnState, ThreadSteerHandle,
+    TurnPermissionOverlay,
 };
 use crate::memory::{self, MemoryBlock};
 use crate::subagent_execution::{
@@ -69,32 +69,10 @@ pub(crate) struct AgentConversationContext<'a> {
     conversation: Option<&'a mut Conversation>,
 }
 
-#[derive(Clone, Debug, Default)]
-pub struct ThreadSteerHandle {
-    pending: Arc<Mutex<Vec<String>>>,
-}
-
 #[derive(Clone, Copy)]
 pub(crate) struct AgentToolPolicyContext<'a> {
     allowed_tools: Option<&'a [String]>,
     label: Option<&'a str>,
-}
-
-impl ThreadSteerHandle {
-    pub fn push(&self, input: impl Into<String>) {
-        self.pending
-            .lock()
-            .expect("thread steer handle lock")
-            .push(input.into());
-    }
-
-    pub fn drain(&self) -> Vec<String> {
-        self.pending
-            .lock()
-            .expect("thread steer handle lock")
-            .drain(..)
-            .collect()
-    }
 }
 
 impl AgentLoopResult {

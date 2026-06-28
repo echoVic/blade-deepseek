@@ -12,9 +12,9 @@ use orca_core::cancel::CancelToken;
 use serde_json::{Value, json};
 use walkdir::WalkDir;
 
-use crate::agent_loop::ThreadSteerHandle;
 use crate::lifecycle::{
     RuntimePermissionRequest, RuntimePermissionRequestHandler, RuntimePermissionResponse,
+    ThreadSteerHandle,
 };
 use crate::protocol::{self, ClientOp, ServerEvent, Submission};
 use crate::server_runtime::{

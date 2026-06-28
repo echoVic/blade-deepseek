@@ -73,6 +73,29 @@ mod tests {
     }
 
     #[test]
+    fn thread_steer_handle_is_owned_by_lifecycle_module() {
+        let agent_loop_source = include_str!("agent_loop.rs");
+        let lifecycle_source = include_str!("lifecycle.rs");
+
+        assert!(
+            !agent_loop_source.contains("struct ThreadSteerHandle"),
+            "agent_loop must not own the thread turn steer handle"
+        );
+        assert!(
+            !agent_loop_source.contains("impl ThreadSteerHandle"),
+            "agent_loop must not own thread turn steer handle behavior"
+        );
+        assert!(
+            lifecycle_source.contains("struct ThreadSteerHandle"),
+            "lifecycle must own the thread turn steer handle"
+        );
+        assert!(
+            lifecycle_source.contains("impl ThreadSteerHandle"),
+            "lifecycle must own thread turn steer handle behavior"
+        );
+    }
+
+    #[test]
     fn thread_store_trait_is_owned_by_thread_store_module() {
         let history_source = include_str!("history.rs");
         let thread_store_source = include_str!("thread_store.rs");
