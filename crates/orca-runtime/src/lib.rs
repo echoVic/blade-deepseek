@@ -289,6 +289,29 @@ mod tests {
     }
 
     #[test]
+    fn agent_assistant_response_recording_is_owned_by_session_module() {
+        let agent_loop_source = include_str!("agent_loop.rs");
+        let session_source = include_str!("session.rs");
+
+        assert!(
+            !agent_loop_source.contains("conversation.add_assistant"),
+            "agent_loop must not own assistant response conversation recording"
+        );
+        assert!(
+            session_source.contains("pub(crate) fn record_assistant_response_for_agent"),
+            "session must expose agent assistant response recording"
+        );
+        assert!(
+            session_source.contains("add_assistant"),
+            "session must own assistant response conversation recording"
+        );
+        assert!(
+            session_source.contains("append_message(message)"),
+            "session must own assistant response history writing"
+        );
+    }
+
+    #[test]
     fn runtime_compaction_step_is_owned_by_lifecycle_module() {
         let agent_loop_source = include_str!("agent_loop.rs");
         let lifecycle_source = include_str!("lifecycle.rs");

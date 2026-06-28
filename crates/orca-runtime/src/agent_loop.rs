@@ -31,7 +31,8 @@ use crate::lifecycle::{
 };
 use crate::memory::{self, MemoryBlock};
 use crate::session::{
-    AgentConversationContext, record_plan_state_for_agent, record_tool_result_for_agent,
+    AgentConversationContext, record_assistant_response_for_agent, record_plan_state_for_agent,
+    record_tool_result_for_agent,
 };
 use crate::subagent_execution::{
     collect_subagent_batch, execute_subagent_batch, should_run_subagent_batch,
@@ -345,17 +346,14 @@ pub(crate) fn run_agent_loop(
 
         if response.tool_calls.is_empty() {
             let final_message = response.assistant_content.clone();
-            conversation.add_assistant(
+            record_assistant_response_for_agent(
+                conversation,
+                history_writer.as_deref_mut(),
                 response.assistant_content,
                 response.assistant_reasoning,
                 vec![],
-            );
-            if emit_deltas
-                && let Some(writer) = history_writer.as_deref_mut()
-                && let Some(message) = conversation.messages.last()
-            {
-                writer.append_message(message)?;
-            }
+                emit_deltas,
+            )?;
             if emit_deltas && config.auto_memory {
                 let provider_config = ProviderConfig {
                     api_key: config.api_key.clone(),
@@ -377,17 +375,14 @@ pub(crate) fn run_agent_loop(
             return Ok(AgentLoopResult::success(final_message));
         }
 
-        conversation.add_assistant(
+        record_assistant_response_for_agent(
+            conversation,
+            history_writer.as_deref_mut(),
             response.assistant_content,
             response.assistant_reasoning,
             response.tool_calls.clone(),
-        );
-        if emit_deltas
-            && let Some(writer) = history_writer.as_deref_mut()
-            && let Some(message) = conversation.messages.last()
-        {
-            writer.append_message(message)?;
-        }
+            emit_deltas,
+        )?;
 
         let tool_requests: Vec<tool_types::ToolRequest> = response
             .steps
