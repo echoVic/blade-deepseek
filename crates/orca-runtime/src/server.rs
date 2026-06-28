@@ -1822,6 +1822,7 @@ fn shell_sandbox_mode_from_command_policy(
         }
         protocol::CommandSandboxPolicy::ReadOnly { network_access } => ShellSandboxMode::ReadOnly {
             network_access: *network_access,
+            allow_global_read: true,
         },
         protocol::CommandSandboxPolicy::WorkspaceWrite {
             network_access,
@@ -1911,6 +1912,7 @@ fn shell_sandbox_mode_from_permission_profile(
     let mut mode = match resolved.builtin.as_deref() {
         Some("read-only") => ShellSandboxMode::ReadOnly {
             network_access: false,
+            allow_global_read: false,
         },
         Some("workspace") => ShellSandboxMode::WorkspaceWrite {
             network_access: true,
@@ -1931,13 +1933,30 @@ fn shell_sandbox_mode_from_permission_profile(
                 exclude_tmpdir_env_var,
                 exclude_slash_tmp,
             },
-            ShellSandboxMode::ReadOnly { .. } => ShellSandboxMode::ReadOnly { network_access },
+            ShellSandboxMode::ReadOnly {
+                allow_global_read, ..
+            } => ShellSandboxMode::ReadOnly {
+                network_access,
+                allow_global_read,
+            },
             ShellSandboxMode::DangerFullAccess => ShellSandboxMode::DangerFullAccess,
         };
     }
+    let mut additional_readable_roots = resolved.additional_readable_roots;
+    if matches!(
+        mode,
+        ShellSandboxMode::ReadOnly {
+            allow_global_read: false,
+            ..
+        }
+    ) {
+        for root in orca_tools::sandbox::platform_default_read_roots() {
+            push_unique_path(&mut additional_readable_roots, root);
+        }
+    }
     Ok(CommandExecSandbox {
         mode,
-        additional_readable_roots: resolved.additional_readable_roots,
+        additional_readable_roots,
         additional_writable_roots: resolved.additional_writable_roots,
         denied_writable_roots: resolved.denied_writable_roots,
     })
@@ -3318,7 +3337,8 @@ mod tests {
         assert_eq!(
             sandbox.mode,
             ShellSandboxMode::ReadOnly {
-                network_access: false
+                network_access: false,
+                allow_global_read: false
             }
         );
     }
@@ -3366,7 +3386,8 @@ mod tests {
         assert_eq!(
             read_sandbox.mode,
             ShellSandboxMode::ReadOnly {
-                network_access: true
+                network_access: true,
+                allow_global_read: false
             }
         );
         assert_eq!(
@@ -3437,8 +3458,63 @@ mod tests {
 
         let sandbox = test_profile_sandbox(&config, &options).expect("read roots profile");
 
-        assert_eq!(sandbox.additional_readable_roots, vec![readable]);
+        assert!(sandbox.additional_readable_roots.contains(&readable));
+        assert!(
+            sandbox
+                .additional_readable_roots
+                .contains(&PathBuf::from("/bin"))
+        );
+        assert!(
+            sandbox
+                .additional_readable_roots
+                .contains(&PathBuf::from("/usr"))
+        );
         assert!(sandbox.additional_writable_roots.is_empty());
+    }
+
+    #[test]
+    fn command_exec_custom_read_profile_uses_strict_read_roots() {
+        let mut config = test_run_config();
+        let readable = std::env::current_dir()
+            .unwrap()
+            .join("strict-readable-root");
+        config.permission_profiles.insert(
+            "strict-docs".to_string(),
+            orca_core::config::PermissionProfileConfig {
+                extends: Some(":read-only".to_string()),
+                filesystem: std::collections::HashMap::from([(
+                    readable.clone(),
+                    orca_core::config::PermissionProfileFileAccess::Read,
+                )])
+                .into(),
+                ..Default::default()
+            },
+        );
+        let options = protocol::CommandExecOptions {
+            permission_profile: Some("strict-docs".to_string()),
+            ..Default::default()
+        };
+
+        let sandbox = test_profile_sandbox(&config, &options).expect("strict read profile");
+
+        assert_eq!(
+            sandbox.mode,
+            ShellSandboxMode::ReadOnly {
+                network_access: false,
+                allow_global_read: false,
+            }
+        );
+        assert!(sandbox.additional_readable_roots.contains(&readable));
+        assert!(
+            sandbox
+                .additional_readable_roots
+                .contains(&PathBuf::from("/bin"))
+        );
+        assert!(
+            sandbox
+                .additional_readable_roots
+                .contains(&PathBuf::from("/usr"))
+        );
     }
 
     #[test]
@@ -3464,7 +3540,17 @@ mod tests {
 
         let sandbox = test_profile_sandbox(&config, &options).expect("read-write roots profile");
 
-        assert_eq!(sandbox.additional_readable_roots, vec![root.clone()]);
+        assert!(sandbox.additional_readable_roots.contains(&root));
+        assert!(
+            sandbox
+                .additional_readable_roots
+                .contains(&PathBuf::from("/bin"))
+        );
+        assert!(
+            sandbox
+                .additional_readable_roots
+                .contains(&PathBuf::from("/usr"))
+        );
         assert_eq!(sandbox.additional_writable_roots, vec![root]);
     }
 

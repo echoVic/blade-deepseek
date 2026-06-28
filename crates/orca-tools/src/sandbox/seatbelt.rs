@@ -68,6 +68,7 @@ pub fn read_only_bash_command(
     additional_roots: &[PathBuf],
     denied_roots: &[PathBuf],
     network_access: bool,
+    allow_global_read: bool,
 ) -> Command {
     if !available() {
         return plain_bash_command(command, cwd);
@@ -92,6 +93,7 @@ pub fn read_only_bash_command(
             &canonical_additional_roots,
             &canonical_denied_roots,
             network_access,
+            allow_global_read,
         ))
         .arg("sh")
         .arg("-c")
@@ -217,6 +219,7 @@ fn read_only_profile(
     additional_roots: &[PathBuf],
     denied_roots: &[PathBuf],
     network_access: bool,
+    allow_global_read: bool,
 ) -> String {
     let additional_read_rules = read_allow_rules(readable_roots);
     let additional_write_rules = additional_roots
@@ -235,13 +238,18 @@ fn read_only_profile(
     } else {
         ""
     };
+    let global_read_rule = if allow_global_read {
+        "(allow file-read*)"
+    } else {
+        ""
+    };
     format!(
         r#"(version 1)
 (deny default)
 (allow process*)
 (allow sysctl-read)
 (allow signal (target self))
-(allow file-read*)
+{global_read_rule}
 (allow file-read* file-write* (literal "/dev/null"))
 {additional_read_rules}
 {additional_write_rules}
@@ -326,7 +334,7 @@ mod tests {
     #[test]
     fn read_only_profile_does_not_allow_workspace_writes() {
         let workspace = TempDir::new().unwrap();
-        let profile = read_only_profile(&[], &[], &[], false);
+        let profile = read_only_profile(&[], &[], &[], false, true);
 
         assert!(!profile.contains(&workspace.path().display().to_string()));
         assert!(!profile.contains("file-write* (subpath"));
@@ -337,7 +345,7 @@ mod tests {
     fn read_only_profile_allows_additional_write_roots() {
         let workspace = TempDir::new().unwrap();
         let extra = TempDir::new().unwrap();
-        let profile = read_only_profile(&[], &[extra.path().to_path_buf()], &[], false);
+        let profile = read_only_profile(&[], &[extra.path().to_path_buf()], &[], false, true);
 
         assert!(!profile.contains(&workspace.path().display().to_string()));
         assert!(profile.contains(&format!(
@@ -350,7 +358,7 @@ mod tests {
     #[test]
     fn read_only_profile_allows_additional_read_roots_without_writes() {
         let readable = TempDir::new().unwrap();
-        let profile = read_only_profile(&[readable.path().to_path_buf()], &[], &[], false);
+        let profile = read_only_profile(&[readable.path().to_path_buf()], &[], &[], false, true);
 
         assert!(profile.contains(&format!(
             r#"(allow file-read* (subpath "{}"))"#,
@@ -371,6 +379,7 @@ mod tests {
             &[extra.path().to_path_buf()],
             &[blocked.clone()],
             false,
+            true,
         );
 
         let allow = format!(
@@ -400,12 +409,63 @@ mod tests {
             &[extra.path().to_path_buf()],
             &[denied_file.clone()],
             false,
+            true,
         );
 
         assert!(profile.contains(&format!(
             r#"(deny file-read* file-write* (literal "{}"))"#,
             denied_file.display()
         )));
+    }
+
+    #[test]
+    fn read_only_profile_can_disable_global_reads() {
+        let readable = TempDir::new().unwrap();
+        let profile = read_only_profile(&[readable.path().to_path_buf()], &[], &[], false, false);
+
+        assert!(!profile.contains("\n(allow file-read*)\n"));
+        assert!(profile.contains(&format!(
+            r#"(allow file-read* (subpath "{}"))"#,
+            readable.path().display()
+        )));
+    }
+
+    #[test]
+    fn strict_read_only_sandbox_blocks_reads_outside_allowed_roots() {
+        if !available() {
+            return;
+        }
+
+        let parent = TempDir::new_in(std::env::current_dir().unwrap()).unwrap();
+        let workspace_path = parent.path().join("workspace");
+        let readable_path = parent.path().join("readable");
+        std::fs::create_dir(&workspace_path).unwrap();
+        std::fs::create_dir(&readable_path).unwrap();
+        let allowed = readable_path.join("allowed.txt");
+        let blocked = parent.path().join("blocked.txt");
+        std::fs::write(&allowed, "allowed").unwrap();
+        std::fs::write(&blocked, "blocked").unwrap();
+
+        let output: Output = read_only_bash_command(
+            &format!(
+                "cat {} >/dev/null && cat {} >/dev/null",
+                allowed.display(),
+                blocked.display()
+            ),
+            &workspace_path,
+            &[readable_path],
+            &[],
+            &[],
+            false,
+            false,
+        )
+        .output()
+        .unwrap();
+
+        assert!(
+            !output.status.success(),
+            "strict read-only sandbox should reject unlisted reads"
+        );
     }
 
     #[test]

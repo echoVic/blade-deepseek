@@ -53,6 +53,7 @@ pub fn read_only_bash_command(
     additional_roots: &[PathBuf],
     denied_roots: &[PathBuf],
     network_access: bool,
+    allow_global_read: bool,
 ) -> Command {
     let mut command = platform::read_only_bash_command(
         command,
@@ -61,6 +62,7 @@ pub fn read_only_bash_command(
         additional_roots,
         denied_roots,
         network_access,
+        allow_global_read,
     );
     crate::process::prepare_non_interactive_command(&mut command);
     command
@@ -108,6 +110,7 @@ mod platform {
         additional_roots: &[PathBuf],
         denied_roots: &[PathBuf],
         network_access: bool,
+        allow_global_read: bool,
     ) -> Command {
         crate::sandbox::seatbelt::read_only_bash_command(
             command,
@@ -116,6 +119,7 @@ mod platform {
             additional_roots,
             denied_roots,
             network_access,
+            allow_global_read,
         )
     }
 
@@ -190,6 +194,7 @@ mod platform {
         _additional_roots: &[PathBuf],
         _denied_roots: &[PathBuf],
         _network_access: bool,
+        _allow_global_read: bool,
     ) -> Command {
         let mut cmd = Command::new("sh");
         cmd.arg("-c").arg(command).current_dir(cwd);

@@ -52,6 +52,7 @@ pub enum ShellSandboxMode {
     },
     ReadOnly {
         network_access: bool,
+        allow_global_read: bool,
     },
     DangerFullAccess,
 }
@@ -189,16 +190,18 @@ impl RuntimeShellSessionManager {
                 exclude_tmpdir_env_var,
                 exclude_slash_tmp,
             ),
-            ShellSandboxMode::ReadOnly { network_access } => {
-                orca_tools::sandbox::read_only_bash_command(
-                    &command.command,
-                    &command.cwd,
-                    &command.additional_readable_directories,
-                    &command.additional_working_directories,
-                    &command.denied_working_directories,
-                    network_access,
-                )
-            }
+            ShellSandboxMode::ReadOnly {
+                network_access,
+                allow_global_read,
+            } => orca_tools::sandbox::read_only_bash_command(
+                &command.command,
+                &command.cwd,
+                &command.additional_readable_directories,
+                &command.additional_working_directories,
+                &command.denied_working_directories,
+                network_access,
+                allow_global_read,
+            ),
             ShellSandboxMode::DangerFullAccess => {
                 orca_tools::sandbox::plain_bash_command(&command.command, &command.cwd)
             }
