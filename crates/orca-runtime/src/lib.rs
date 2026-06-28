@@ -422,6 +422,8 @@ mod tests {
             "assistant_reasoning_delta",
             "assistant_message_delta",
             "usage_updated",
+            "provider_replay_updated",
+            "ProviderStep::ReplayState",
             "append_usage(",
         ] {
             assert!(

@@ -292,17 +292,6 @@ pub(crate) fn run_agent_loop(
 
         reactive_compacted = false;
 
-        for step in &response.steps {
-            match step {
-                ProviderStep::ReplayState(replay) => {
-                    if emit_deltas {
-                        sink.emit(&events.provider_replay_updated(replay))?;
-                    }
-                }
-                _ => {}
-            }
-        }
-
         if response.tool_calls.is_empty() {
             let final_message = response.assistant_content.clone();
             record_assistant_response_for_agent(

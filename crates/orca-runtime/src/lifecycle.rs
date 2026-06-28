@@ -2309,6 +2309,9 @@ fn emit_provider_delta<W: io::Write>(
         ProviderStep::MessageDelta(text) => {
             let _ = sink.emit(&events.assistant_message_delta(text));
         }
+        ProviderStep::ReplayState(replay) => {
+            let _ = sink.emit(&events.provider_replay_updated(replay));
+        }
         _ => {}
     }
 }
