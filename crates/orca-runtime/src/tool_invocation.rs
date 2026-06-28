@@ -31,6 +31,9 @@ use crate::instructions::ProjectInstructions;
 use crate::lifecycle::{RuntimePermissionRequestHandler, TurnPermissionOverlay};
 use crate::memory::MemoryBlock;
 use crate::session::{record_plan_state_for_agent, record_tool_result_for_agent};
+use crate::subagent_execution::{
+    collect_subagent_batch, run_subagent_batch_tool_turn, should_run_subagent_batch,
+};
 use crate::tasks::TaskRegistry;
 use crate::thread_store::SessionWriter;
 use crate::tool_execution::{ToolExecutionContext, execute_tool_with_approval};
@@ -389,6 +392,145 @@ pub(crate) fn run_readonly_tool_turn(
     Ok(ToolTurnOutcome::Continue)
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_tool_turns<W: io::Write>(
+    config: &RunConfig,
+    cwd: &Path,
+    events: &mut EventFactory,
+    sink: &mut EventSink<W>,
+    conversation: &mut Conversation,
+    mut history_writer: Option<&mut SessionWriter>,
+    tool_requests: &[ToolRequest],
+    tool_policy: AgentToolPolicyContext<'_>,
+    subagent_depth: u32,
+    emit_deltas: bool,
+    policy: &ApprovalPolicy,
+    instructions: &ProjectInstructions,
+    memory: &MemoryBlock,
+    mcp_registry: &McpRegistry,
+    hooks: &HookRunner,
+    cost_tracker: &mut CostTracker,
+    cancel: &CancelToken,
+    task_registry: &TaskRegistry,
+    background_workflows: &mut Vec<BackgroundWorkflowRun>,
+    workflow_ipc: Option<&WorkflowIpcContext>,
+    permission_handler: Option<&(dyn RuntimePermissionRequestHandler + Send + Sync)>,
+    child_executor: ChildAgentExecutor<W>,
+    workflow_child_executor: ChildAgentExecutor<SharedEventBuffer>,
+    batch_child_executor: ChildAgentExecutor<io::Sink>,
+) -> io::Result<ToolTurnOutcome> {
+    let mut cursor = ToolRequestCursor::new(tool_requests);
+    let mut permission_overlay = TurnPermissionOverlay::default();
+    while let Some(tool_request) = cursor.current() {
+        if let Some(result) = reject_disallowed_child_tool(
+            tool_request,
+            tool_policy,
+            mcp_registry,
+            &config.external_tools,
+        ) {
+            if emit_deltas {
+                sink.emit(&events.tool_call_requested(tool_request))?;
+                sink.emit(&events.tool_call_completed(&result))?;
+            }
+            return Ok(ToolTurnOutcome::Return {
+                status: RunStatus::Failed,
+                error: Some(result.error.clone().unwrap_or_default()),
+            });
+        }
+
+        if should_run_subagent_batch(config, tool_request, subagent_depth) {
+            let batch_end = collect_subagent_batch(config, tool_requests, cursor.position());
+            match run_subagent_batch_tool_turn(
+                config,
+                cwd,
+                events,
+                sink,
+                conversation,
+                history_writer.as_deref_mut(),
+                &tool_requests[cursor.position()..batch_end],
+                subagent_depth,
+                emit_deltas,
+                instructions,
+                memory,
+                mcp_registry,
+                hooks,
+                cost_tracker,
+                cancel,
+                workflow_ipc,
+                batch_child_executor,
+            )? {
+                ToolTurnOutcome::Continue => {}
+                ToolTurnOutcome::Return { status, error } => {
+                    return Ok(ToolTurnOutcome::Return { status, error });
+                }
+            }
+            cursor.advance_to(batch_end);
+            continue;
+        }
+
+        if should_run_readonly_batch(config.tools.max_read_parallel, tool_request) {
+            let batch_end = collect_readonly_batch(
+                config.tools.max_read_parallel,
+                tool_requests,
+                cursor.position(),
+            );
+            match run_readonly_tool_turn(
+                cwd,
+                events,
+                sink,
+                conversation,
+                history_writer.as_deref_mut(),
+                &tool_requests[cursor.position()..batch_end],
+                emit_deltas,
+                mcp_registry,
+                hooks,
+                config.tools.output_truncation,
+            )? {
+                ToolTurnOutcome::Continue => {}
+                ToolTurnOutcome::Return { status, error } => {
+                    return Ok(ToolTurnOutcome::Return { status, error });
+                }
+            }
+            cursor.advance_to(batch_end);
+            continue;
+        }
+
+        match run_normal_tool_turn(
+            config,
+            cwd,
+            events,
+            sink,
+            conversation,
+            history_writer.as_deref_mut(),
+            tool_request,
+            subagent_depth,
+            emit_deltas,
+            policy,
+            instructions,
+            memory,
+            mcp_registry,
+            hooks,
+            cost_tracker,
+            cancel,
+            task_registry,
+            background_workflows,
+            workflow_ipc,
+            &mut permission_overlay,
+            permission_handler,
+            child_executor,
+            workflow_child_executor,
+        )? {
+            ToolTurnOutcome::Continue => {}
+            ToolTurnOutcome::Return { status, error } => {
+                return Ok(ToolTurnOutcome::Return { status, error });
+            }
+        }
+        cursor.advance_one();
+    }
+
+    Ok(ToolTurnOutcome::Continue)
+}
+
 pub(crate) fn record_normal_tool_result(
     conversation: &mut Conversation,
     mut history_writer: Option<&mut SessionWriter>,
@@ -645,7 +787,7 @@ mod tests {
         AgentToolPolicyContext, ToolRequestCursor, ToolTurnOutcome, apply_pre_tool_outcome,
         approval_request_for_invocation, prepare_tool_invocation, provider_config_for_agent_loop,
         provider_tool_schema_override, record_normal_tool_result, record_readonly_batch_results,
-        run_normal_tool_turn, run_readonly_tool_turn, terminal_tool_turn,
+        run_normal_tool_turn, run_readonly_tool_turn, run_tool_turns, terminal_tool_turn,
         tool_requests_from_provider_steps, validate_tool_invocation,
     };
 
@@ -1080,6 +1222,66 @@ mod tests {
                 if tool_call_id == "tool-2")
         );
         assert!(combined_tool_content.contains("hello"));
+    }
+
+    #[test]
+    fn run_tool_turns_returns_failed_for_disallowed_child_tool() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let config = config_with_external(Vec::new());
+        let mut events = EventFactory::new("tool-turns-disallowed".to_string());
+        let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+        let mut conversation = Conversation::new();
+        let allowed = vec!["read_file".to_string()];
+        let request = request(ToolName::Subagent, ActionKind::Agent, Some("audit"), None);
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let mcp_registry = McpRegistry::default();
+        let hooks = crate::hooks::HookRunner::default();
+        let mut cost_tracker = CostTracker::new(None);
+        let cancel = CancelToken::new();
+        let task_registry = TaskRegistry::new("tool-turns-disallowed".to_string());
+        let mut background_workflows = Vec::new();
+        let policy = policy_for_tool_execution(&config);
+
+        let outcome = run_tool_turns(
+            &config,
+            cwd.path(),
+            &mut events,
+            &mut sink,
+            &mut conversation,
+            None,
+            &[request],
+            AgentToolPolicyContext::new(Some(&allowed), Some("test child")),
+            1,
+            true,
+            &policy,
+            &instructions,
+            &memory,
+            &mcp_registry,
+            &hooks,
+            &mut cost_tracker,
+            &cancel,
+            &task_registry,
+            &mut background_workflows,
+            None,
+            None,
+            unused_child_executor::<Vec<u8>>,
+            unused_child_executor::<crate::workflow::runner::SharedEventBuffer>,
+            unused_child_executor::<io::Sink>,
+        )
+        .expect("run tool turns");
+
+        match outcome {
+            ToolTurnOutcome::Return { status, error } => {
+                assert_eq!(status, RunStatus::Failed);
+                assert_eq!(
+                    error.as_deref(),
+                    Some("test child disallows tool 'subagent'")
+                );
+            }
+            ToolTurnOutcome::Continue => panic!("disallowed child tool should end the turn"),
+        }
+        assert!(conversation.messages.is_empty());
     }
 
     #[test]

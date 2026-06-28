@@ -231,11 +231,11 @@ mod tests {
         );
         assert!(
             !agent_loop_source.contains("execute_tool_with_approval("),
-            "agent_loop must delegate normal tool execution through normal tool-turn runner"
+            "agent_loop must delegate normal tool execution through tool-turn dispatch runner"
         );
         assert!(
-            agent_loop_source.contains("run_normal_tool_turn("),
-            "agent_loop must delegate normal tool turn execution"
+            agent_loop_source.contains("run_tool_turns("),
+            "agent_loop must delegate normal tool turn execution through tool-turn dispatch"
         );
         assert!(
             tool_execution_source.contains("pub(crate) fn execute_tool_with_approval"),
@@ -259,8 +259,12 @@ mod tests {
             );
         }
         assert!(
-            agent_loop_source.contains("ToolRequestCursor"),
-            "agent_loop must delegate tool request cursor state"
+            !agent_loop_source.contains("ToolRequestCursor"),
+            "agent_loop must delegate tool request cursor state through tool-turn dispatch"
+        );
+        assert!(
+            agent_loop_source.contains("run_tool_turns("),
+            "agent_loop must delegate tool request cursor use"
         );
         assert!(
             tool_invocation_source.contains("pub(crate) struct ToolRequestCursor"),
@@ -311,7 +315,11 @@ mod tests {
             );
         }
         assert!(
-            agent_loop_source.contains("run_normal_tool_turn("),
+            !agent_loop_source.contains("run_normal_tool_turn("),
+            "agent_loop must delegate normal tool-turn execution through tool-turn dispatch"
+        );
+        assert!(
+            agent_loop_source.contains("run_tool_turns("),
             "agent_loop must delegate normal tool-turn execution"
         );
         assert!(
@@ -340,7 +348,11 @@ mod tests {
             );
         }
         assert!(
-            agent_loop_source.contains("run_readonly_tool_turn("),
+            !agent_loop_source.contains("run_readonly_tool_turn("),
+            "agent_loop must delegate readonly tool-turn execution through tool-turn dispatch"
+        );
+        assert!(
+            agent_loop_source.contains("run_tool_turns("),
             "agent_loop must delegate readonly tool-turn execution"
         );
         assert!(
@@ -393,11 +405,11 @@ mod tests {
         }
         assert!(
             !agent_loop_source.contains("record_normal_tool_result("),
-            "agent_loop must delegate normal tool result recording through normal tool-turn runner"
+            "agent_loop must delegate normal tool result recording through tool-turn dispatch"
         );
         assert!(
-            agent_loop_source.contains("run_normal_tool_turn("),
-            "agent_loop must delegate normal tool turn recording"
+            agent_loop_source.contains("run_tool_turns("),
+            "agent_loop must delegate normal tool turn recording through tool-turn dispatch"
         );
         assert!(
             tool_invocation_source.contains("pub(crate) fn record_normal_tool_result"),
@@ -459,11 +471,11 @@ mod tests {
         );
         assert!(
             !agent_loop_source.contains("record_readonly_batch_results("),
-            "agent_loop must delegate readonly batch result recording through readonly tool-turn runner"
+            "agent_loop must delegate readonly batch result recording through tool-turn dispatch"
         );
         assert!(
-            agent_loop_source.contains("run_readonly_tool_turn("),
-            "agent_loop must delegate readonly tool turn recording"
+            agent_loop_source.contains("run_tool_turns("),
+            "agent_loop must delegate readonly tool turn recording through tool-turn dispatch"
         );
         assert!(
             tool_invocation_source.contains("pub(crate) fn record_readonly_batch_results"),
@@ -514,7 +526,11 @@ mod tests {
             );
         }
         assert!(
-            agent_loop_source.contains("run_subagent_batch_tool_turn("),
+            !agent_loop_source.contains("run_subagent_batch_tool_turn("),
+            "agent_loop must delegate subagent batch tool turns through tool-turn dispatch"
+        );
+        assert!(
+            agent_loop_source.contains("run_tool_turns("),
             "agent_loop must delegate subagent batch tool turns"
         );
         assert!(
@@ -528,6 +544,52 @@ mod tests {
         assert!(
             subagent_execution_source.contains("record_subagent_batch_results"),
             "subagent_execution must compose subagent batch result recording"
+        );
+    }
+
+    #[test]
+    fn tool_turn_dispatch_loop_is_owned_by_tool_invocation_module() {
+        let agent_loop_source = include_str!("agent_loop.rs");
+        let tool_invocation_source = include_str!("tool_invocation.rs");
+
+        for marker in [
+            "let mut cursor = ToolRequestCursor::new",
+            "while let Some(tool_request)",
+            "collect_subagent_batch(",
+            "collect_readonly_batch(",
+            "run_normal_tool_turn(",
+            "run_readonly_tool_turn(",
+            "run_subagent_batch_tool_turn(",
+            "reject_disallowed_child_tool(",
+        ] {
+            assert!(
+                !agent_loop_source.contains(marker),
+                "agent_loop must not own tool-turn dispatch loop detail {marker}"
+            );
+        }
+        assert!(
+            agent_loop_source.contains("run_tool_turns("),
+            "agent_loop must delegate tool-turn dispatch"
+        );
+        assert!(
+            tool_invocation_source.contains("pub(crate) fn run_tool_turns"),
+            "tool_invocation must expose the tool-turn dispatch runner"
+        );
+        assert!(
+            tool_invocation_source.contains("ToolRequestCursor::new"),
+            "tool_invocation must own dispatch cursor state"
+        );
+        assert!(
+            tool_invocation_source.contains("run_normal_tool_turn"),
+            "tool_invocation must compose normal tool turns"
+        );
+        assert!(
+            tool_invocation_source.contains("run_readonly_tool_turn"),
+            "tool_invocation must compose readonly tool turns"
+        );
+        assert!(
+            tool_invocation_source.contains("run_subagent_batch_tool_turn"),
+            "tool_invocation must compose subagent batch tool turns"
         );
     }
 

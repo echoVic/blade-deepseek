@@ -7,22 +7,18 @@ use crate::instructions::ProjectInstructions;
 use crate::lifecycle::{
     AgentLoopContext, RuntimeCompactionStep, RuntimeProviderErrorOutcome, RuntimeProviderTurnStep,
     RuntimeSessionLifecycle, RuntimeSteerStep, RuntimeTaskActor, RuntimeTurnConfig,
-    RuntimeTurnDeps, RuntimeTurnExecution, RuntimeTurnState, TurnPermissionOverlay,
+    RuntimeTurnDeps, RuntimeTurnExecution, RuntimeTurnState,
 };
 use crate::memory::{self, MemoryBlock};
 use crate::session::{
     AgentConversationContext, bootstrap_agent_conversation_for_loop,
     record_assistant_response_for_agent, record_initial_history_for_agent,
 };
-use crate::subagent_execution::{
-    collect_subagent_batch, run_subagent_batch_tool_turn, should_run_subagent_batch,
-};
 use crate::tasks::TaskRegistry;
 use crate::tool_execution::policy_for_tool_execution;
 use crate::tool_invocation::{
-    AgentToolPolicyContext, ToolRequestCursor, ToolTurnOutcome, collect_readonly_batch,
-    provider_config_for_agent_loop, reject_disallowed_child_tool, run_normal_tool_turn,
-    run_readonly_tool_turn, should_run_readonly_batch, tool_requests_from_provider_steps,
+    AgentToolPolicyContext, ToolTurnOutcome, provider_config_for_agent_loop, run_tool_turns,
+    tool_requests_from_provider_steps,
 };
 use crate::workflow_execution::observe_background_workflows;
 use orca_core::cancel::CancelToken;
@@ -295,113 +291,36 @@ pub(crate) fn run_agent_loop(
         )?;
 
         let tool_requests = tool_requests_from_provider_steps(&response.steps);
-        let mut cursor = ToolRequestCursor::new(&tool_requests);
-        let mut permission_overlay = TurnPermissionOverlay::default();
-        while let Some(tool_request) = cursor.current() {
-            if let Some(result) = reject_disallowed_child_tool(
-                tool_request,
-                tool_policy,
-                mcp_registry,
-                &config.external_tools,
-            ) {
-                if emit_deltas {
-                    sink.emit(&events.tool_call_requested(tool_request))?;
-                    sink.emit(&events.tool_call_completed(&result))?;
-                }
-                return Ok(AgentLoopResult::failure(
-                    RunStatus::Failed,
-                    result.error.clone().unwrap_or_default(),
-                ));
+        match run_tool_turns(
+            config,
+            cwd,
+            events,
+            sink,
+            conversation,
+            history_writer.as_deref_mut(),
+            &tool_requests,
+            tool_policy,
+            subagent_depth,
+            emit_deltas,
+            &policy,
+            instructions,
+            memory,
+            mcp_registry,
+            hooks,
+            cost_tracker,
+            cancel,
+            task_registry,
+            background_workflows,
+            workflow_ipc,
+            permission_handler,
+            execute_child_agent_loop,
+            execute_child_agent_loop,
+            execute_child_agent_loop,
+        )? {
+            ToolTurnOutcome::Continue => {}
+            ToolTurnOutcome::Return { status, error } => {
+                return Ok(AgentLoopResult::terminal(status, error));
             }
-
-            if should_run_subagent_batch(config, tool_request, subagent_depth) {
-                let batch_end = collect_subagent_batch(config, &tool_requests, cursor.position());
-                match run_subagent_batch_tool_turn(
-                    config,
-                    cwd,
-                    events,
-                    sink,
-                    conversation,
-                    history_writer.as_deref_mut(),
-                    &tool_requests[cursor.position()..batch_end],
-                    subagent_depth,
-                    emit_deltas,
-                    instructions,
-                    memory,
-                    mcp_registry,
-                    hooks,
-                    cost_tracker,
-                    cancel,
-                    workflow_ipc,
-                    execute_child_agent_loop,
-                )? {
-                    ToolTurnOutcome::Continue => {}
-                    ToolTurnOutcome::Return { status, error } => {
-                        return Ok(AgentLoopResult::terminal(status, error));
-                    }
-                }
-                cursor.advance_to(batch_end);
-                continue;
-            }
-
-            if should_run_readonly_batch(config.tools.max_read_parallel, tool_request) {
-                let batch_end = collect_readonly_batch(
-                    config.tools.max_read_parallel,
-                    &tool_requests,
-                    cursor.position(),
-                );
-                match run_readonly_tool_turn(
-                    cwd,
-                    events,
-                    sink,
-                    conversation,
-                    history_writer.as_deref_mut(),
-                    &tool_requests[cursor.position()..batch_end],
-                    emit_deltas,
-                    mcp_registry,
-                    hooks,
-                    config.tools.output_truncation,
-                )? {
-                    ToolTurnOutcome::Continue => {}
-                    ToolTurnOutcome::Return { status, error } => {
-                        return Ok(AgentLoopResult::terminal(status, error));
-                    }
-                }
-                cursor.advance_to(batch_end);
-                continue;
-            }
-
-            match run_normal_tool_turn(
-                config,
-                cwd,
-                events,
-                sink,
-                conversation,
-                history_writer.as_deref_mut(),
-                tool_request,
-                subagent_depth,
-                emit_deltas,
-                &policy,
-                instructions,
-                memory,
-                mcp_registry,
-                hooks,
-                cost_tracker,
-                cancel,
-                task_registry,
-                background_workflows,
-                workflow_ipc,
-                &mut permission_overlay,
-                permission_handler,
-                execute_child_agent_loop,
-                execute_child_agent_loop,
-            )? {
-                ToolTurnOutcome::Continue => {}
-                ToolTurnOutcome::Return { status, error } => {
-                    return Ok(AgentLoopResult::terminal(status, error));
-                }
-            }
-            cursor.advance_one();
         }
     }
 }
