@@ -8,7 +8,8 @@ use crate::lifecycle::{
     AgentLoopContext, RuntimeCompactionStep, RuntimeProviderErrorOutcome,
     RuntimeProviderResponseOutcome, RuntimeProviderResponseStep, RuntimeProviderTurnStep,
     RuntimeSessionLifecycle, RuntimeSteerStep, RuntimeTaskActor, RuntimeTurnConfig,
-    RuntimeTurnDeps, RuntimeTurnExecution, RuntimeTurnState, provider_response_or_terminal,
+    RuntimeTurnDeps, RuntimeTurnExecution, RuntimeTurnStartStep, RuntimeTurnState,
+    provider_response_or_terminal,
 };
 use crate::memory::MemoryBlock;
 use crate::session::{
@@ -162,27 +163,11 @@ pub(crate) fn run_agent_loop(
         )
         .compact_if_needed(conversation)?;
 
-        let turn_prompt = if actor
-            .active_task()
-            .map(|task| task.current_turn())
-            .unwrap_or(0)
-            == 0
+        if let Some(error) = RuntimeTurnStartStep::new()
+            .start(&mut actor, events, sink, prompt, emit_deltas)?
+            .error
         {
-            Some(prompt)
-        } else {
-            None
-        };
-        let started_turn = match actor.start_turn(events, turn_prompt, emit_deltas) {
-            Ok(started_turn) => started_turn,
-            Err(error) => {
-                if emit_deltas {
-                    sink.emit(&events.error(&error.message))?;
-                }
-                return Ok(AgentLoopResult::failure(error.status, error.message));
-            }
-        };
-        if let Some(event) = started_turn.into_event() {
-            sink.emit(&event)?;
+            return Ok(AgentLoopResult::failure(error.status, error.message));
         }
 
         let routed_model = actor.route_model_turn(

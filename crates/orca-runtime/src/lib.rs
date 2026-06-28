@@ -1289,6 +1289,39 @@ mod tests {
     }
 
     #[test]
+    fn runtime_turn_start_step_is_owned_by_lifecycle_module() {
+        let agent_loop_source = include_str!("agent_loop.rs");
+        let lifecycle_source = include_str!("lifecycle.rs");
+
+        for marker in [
+            ".active_task()",
+            "actor.start_turn(",
+            "started_turn.into_event()",
+        ] {
+            assert!(
+                !agent_loop_source.contains(marker),
+                "agent_loop must not own runtime turn-start detail {marker}"
+            );
+        }
+        assert!(
+            agent_loop_source.contains("RuntimeTurnStartStep"),
+            "agent_loop must delegate runtime turn start"
+        );
+        assert!(
+            lifecycle_source.contains("struct RuntimeTurnStartStep"),
+            "lifecycle must own runtime turn-start step state"
+        );
+        assert!(
+            lifecycle_source.contains("impl RuntimeTurnStartStep"),
+            "lifecycle must own runtime turn-start step behavior"
+        );
+        assert!(
+            lifecycle_source.contains("actor.start_turn("),
+            "lifecycle must own runtime actor start_turn call"
+        );
+    }
+
+    #[test]
     fn session_list_load_operations_are_owned_by_thread_store_module() {
         let history_source = include_str!("history.rs");
         let thread_store_source = include_str!("thread_store.rs");

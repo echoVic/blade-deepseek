@@ -98,6 +98,7 @@ pub struct RuntimeToolActorContext {
 }
 
 pub(crate) struct RuntimeSteerStep;
+pub(crate) struct RuntimeTurnStartStep;
 
 pub(crate) struct RuntimeProviderTurnStep;
 pub(crate) struct RuntimeProviderResponseStep;
@@ -122,6 +123,10 @@ pub(crate) enum RuntimeProviderResponseOutcome {
         status: RunStatus,
         error: Option<String>,
     },
+}
+
+pub(crate) struct RuntimeTurnStartStepOutput {
+    pub(crate) error: Option<RuntimeTurnStartError>,
 }
 
 pub(crate) struct RuntimeCompactionStep<'a, W: io::Write> {
@@ -2086,6 +2091,45 @@ impl RuntimeAdvancedTurn {
     }
 }
 
+impl RuntimeTurnStartStep {
+    pub(crate) fn new() -> Self {
+        Self
+    }
+
+    pub(crate) fn start<W: io::Write>(
+        &mut self,
+        actor: &mut RuntimeTaskActor<'_>,
+        events: &mut EventFactory,
+        sink: &mut EventSink<W>,
+        prompt: &str,
+        emit_deltas: bool,
+    ) -> io::Result<RuntimeTurnStartStepOutput> {
+        let turn_prompt = if actor
+            .active_task()
+            .map(|task| task.current_turn())
+            .unwrap_or(0)
+            == 0
+        {
+            Some(prompt)
+        } else {
+            None
+        };
+        let started_turn = match actor.start_turn(events, turn_prompt, emit_deltas) {
+            Ok(started_turn) => started_turn,
+            Err(error) => {
+                if emit_deltas {
+                    sink.emit(&events.error(&error.message))?;
+                }
+                return Ok(RuntimeTurnStartStepOutput { error: Some(error) });
+            }
+        };
+        if let Some(event) = started_turn.into_event() {
+            sink.emit(&event)?;
+        }
+        Ok(RuntimeTurnStartStepOutput { error: None })
+    }
+}
+
 impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
     pub(crate) fn new(
         provider: ProviderKind,
@@ -2773,5 +2817,23 @@ mod tests {
 
         assert_eq!(error.status, RunStatus::Cancelled);
         assert_eq!(error.message, "turn cancelled");
+    }
+
+    #[test]
+    fn turn_start_step_emits_started_event() {
+        let mut lifecycle = RuntimeSessionLifecycle::new("turn-start-step".to_string());
+        let mut actor = RuntimeTaskActor::new(&mut lifecycle, 3);
+        let mut events = EventFactory::new("turn-start-step".to_string());
+        let mut output = Vec::new();
+        let mut sink = EventSink::new(&mut output, OutputFormat::Jsonl);
+
+        let result = RuntimeTurnStartStep::new()
+            .start(&mut actor, &mut events, &mut sink, "hello", true)
+            .expect("start turn");
+
+        assert!(result.error.is_none());
+        let output = String::from_utf8(output).expect("jsonl is utf8");
+        assert!(output.contains("\"type\":\"turn.started\""));
+        assert!(output.contains("hello"));
     }
 }
