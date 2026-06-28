@@ -236,6 +236,33 @@ mod tests {
     }
 
     #[test]
+    fn agent_tool_result_recording_is_owned_by_session_module() {
+        let agent_loop_source = include_str!("agent_loop.rs");
+        let session_source = include_str!("session.rs");
+
+        assert!(
+            !agent_loop_source.contains("format_tool_result_for_model"),
+            "agent_loop must not own tool result model-content formatting"
+        );
+        assert!(
+            !agent_loop_source.contains("append_tool_result_message"),
+            "agent_loop must not own tool result history writing"
+        );
+        assert!(
+            session_source.contains("pub(crate) fn record_tool_result_for_agent"),
+            "session must expose agent tool result recording"
+        );
+        assert!(
+            session_source.contains("format_tool_result_for_model"),
+            "session must own tool result model-content formatting"
+        );
+        assert!(
+            session_source.contains("append_tool_result_message"),
+            "session must own tool result history writing"
+        );
+    }
+
+    #[test]
     fn runtime_compaction_step_is_owned_by_lifecycle_module() {
         let agent_loop_source = include_str!("agent_loop.rs");
         let lifecycle_source = include_str!("lifecycle.rs");

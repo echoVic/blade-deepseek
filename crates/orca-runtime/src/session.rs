@@ -9,6 +9,7 @@ use orca_core::cost_types::UsageTotals;
 use orca_core::hook_types::HookEvent;
 use orca_core::subagent_types::SubagentType;
 use orca_core::task_types::TaskStatus;
+use orca_core::tool_types::ToolResult;
 use orca_mcp::McpRegistry;
 use orca_provider::ProviderConfig;
 
@@ -101,6 +102,20 @@ impl<'a> AgentConversationContext<'a> {
     pub(crate) fn conversation(&self) -> Option<&Conversation> {
         self.conversation.as_deref()
     }
+}
+
+pub(crate) fn record_tool_result_for_agent(
+    conversation: &mut Conversation,
+    history_writer: Option<&mut SessionWriter>,
+    result: &ToolResult,
+    emit_deltas: bool,
+) -> io::Result<String> {
+    let result_content = agent_common::format_tool_result_for_model(result);
+    conversation.add_tool_result(result.id.clone(), result_content.clone());
+    if emit_deltas && let Some(writer) = history_writer {
+        writer.append_tool_result_message(result, result_content.clone(), false)?;
+    }
+    Ok(result_content)
 }
 
 impl InteractiveSession {

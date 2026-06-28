@@ -30,7 +30,7 @@ use crate::lifecycle::{
     RuntimeTurnState, TurnPermissionOverlay,
 };
 use crate::memory::{self, MemoryBlock};
-use crate::session::AgentConversationContext;
+use crate::session::{AgentConversationContext, record_tool_result_for_agent};
 use crate::subagent_execution::{
     collect_subagent_batch, execute_subagent_batch, should_run_subagent_batch,
 };
@@ -435,11 +435,12 @@ pub(crate) fn run_agent_loop(
                 )?;
 
                 for (status, result) in results {
-                    let result_content = agent_common::format_tool_result_for_model(&result);
-                    conversation.add_tool_result(result.id.clone(), result_content.clone());
-                    if emit_deltas && let Some(writer) = history_writer.as_deref_mut() {
-                        writer.append_tool_result_message(&result, result_content, false)?;
-                    }
+                    record_tool_result_for_agent(
+                        conversation,
+                        history_writer.as_deref_mut(),
+                        &result,
+                        emit_deltas,
+                    )?;
 
                     if status == RunStatus::ApprovalRequired {
                         return Ok(AgentLoopResult {
@@ -480,11 +481,12 @@ pub(crate) fn run_agent_loop(
                 )?;
 
                 for result in results {
-                    let result_content = agent_common::format_tool_result_for_model(&result);
-                    conversation.add_tool_result(result.id.clone(), result_content.clone());
-                    if emit_deltas && let Some(writer) = history_writer.as_deref_mut() {
-                        writer.append_tool_result_message(&result, result_content, false)?;
-                    }
+                    record_tool_result_for_agent(
+                        conversation,
+                        history_writer.as_deref_mut(),
+                        &result,
+                        emit_deltas,
+                    )?;
                 }
                 index = batch_end;
                 continue;
@@ -522,11 +524,12 @@ pub(crate) fn run_agent_loop(
                 }
             }
 
-            let result_content = agent_common::format_tool_result_for_model(&result);
-            conversation.add_tool_result(tool_request.id.clone(), result_content.clone());
-            if emit_deltas && let Some(writer) = history_writer.as_deref_mut() {
-                writer.append_tool_result_message(&result, result_content, false)?;
-            }
+            record_tool_result_for_agent(
+                conversation,
+                history_writer.as_deref_mut(),
+                &result,
+                emit_deltas,
+            )?;
 
             if status == RunStatus::ApprovalRequired {
                 return Ok(AgentLoopResult {
