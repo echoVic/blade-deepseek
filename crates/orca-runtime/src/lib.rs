@@ -196,6 +196,23 @@ mod tests {
     }
 
     #[test]
+    fn jsonl_record_types_are_owned_by_thread_store_module() {
+        let history_source = include_str!("history.rs");
+        let thread_store_source = include_str!("thread_store.rs");
+
+        for type_name in ["SessionRecord", "StoredMessage"] {
+            assert!(
+                !history_source.contains(&format!("enum {type_name}")),
+                "history must not own JSONL ThreadStore record type {type_name}"
+            );
+            assert!(
+                thread_store_source.contains(&format!("enum {type_name}")),
+                "thread_store must own JSONL ThreadStore record type {type_name}"
+            );
+        }
+    }
+
+    #[test]
     fn protocol_imports_thread_types_from_thread_store_boundary() {
         let protocol_source = include_str!("protocol.rs");
 

@@ -1,17 +1,15 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::history::{
-    self, CompactionRecord, ContextSummaryRecord, SessionRecord, StoredMessage, write_record,
-};
+use crate::history::{self, CompactionRecord, ContextSummaryRecord, write_record};
 use chrono::{DateTime, Utc};
 use orca_core::approval_rules::PermissionRules;
 use orca_core::approval_types::ApprovalMode;
 use orca_core::config::{ActivePermissionProfile, AdditionalWorkingDirectory};
-use orca_core::conversation::{Conversation, Message, SummaryState};
+use orca_core::conversation::{Conversation, Message, RawToolCall, SummaryState};
 use orca_core::cost_types::UsageTotals;
 use orca_core::plan_types::PlanItem;
-use orca_core::tool_types::ToolResult;
+use orca_core::tool_types::{ToolResult, ToolStatus};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -74,6 +72,143 @@ pub struct SessionTranscript {
     pub usage: Option<UsageTotals>,
     pub plan: Option<(Option<String>, Vec<PlanItem>)>,
     pub path: PathBuf,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "type")]
+pub(crate) enum SessionRecord {
+    #[serde(rename = "session.meta")]
+    Meta(SessionMeta),
+    #[serde(rename = "conversation.message")]
+    Message { message: StoredMessage },
+    #[serde(rename = "session.completed")]
+    Completed {
+        status: String,
+        completed_at: DateTime<Utc>,
+    },
+    #[serde(rename = "context.collapsed")]
+    ContextCollapsed(CompactionRecord),
+    #[serde(rename = "context.summary")]
+    ContextSummary(ContextSummaryRecord),
+    #[serde(rename = "session.usage")]
+    Usage(UsageTotals),
+    #[serde(rename = "plan.state")]
+    PlanState {
+        explanation: Option<String>,
+        plan: Vec<PlanItem>,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case", tag = "role")]
+pub(crate) enum StoredMessage {
+    System {
+        content: String,
+        #[serde(default)]
+        pinned: bool,
+    },
+    User {
+        content: String,
+        #[serde(default)]
+        pinned: bool,
+    },
+    Assistant {
+        content: Option<String>,
+        reasoning_content: Option<String>,
+        tool_calls: Vec<RawToolCall>,
+        #[serde(default)]
+        pinned: bool,
+    },
+    Tool {
+        tool_call_id: String,
+        content: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<ToolStatus>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit_code: Option<i32>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        truncated: bool,
+        #[serde(default)]
+        pinned: bool,
+    },
+}
+
+impl From<&Message> for StoredMessage {
+    fn from(message: &Message) -> Self {
+        match message {
+            Message::System { content, pinned } => Self::System {
+                content: content.clone(),
+                pinned: *pinned,
+            },
+            Message::User { content, pinned } => Self::User {
+                content: content.clone(),
+                pinned: *pinned,
+            },
+            Message::Assistant {
+                content,
+                reasoning_content,
+                tool_calls,
+                pinned,
+            } => Self::Assistant {
+                content: content.clone(),
+                reasoning_content: reasoning_content.clone(),
+                tool_calls: tool_calls.clone(),
+                pinned: *pinned,
+            },
+            Message::Tool {
+                tool_call_id,
+                content,
+                pinned,
+            } => Self::Tool {
+                tool_call_id: tool_call_id.clone(),
+                content: content.clone(),
+                status: None,
+                error: None,
+                exit_code: None,
+                truncated: false,
+                pinned: *pinned,
+            },
+        }
+    }
+}
+
+impl From<StoredMessage> for Message {
+    fn from(message: StoredMessage) -> Self {
+        match message {
+            StoredMessage::System { content, pinned } => Self::System { content, pinned },
+            StoredMessage::User { content, pinned } => Self::User { content, pinned },
+            StoredMessage::Assistant {
+                content,
+                reasoning_content,
+                tool_calls,
+                pinned,
+            } => Self::Assistant {
+                content,
+                reasoning_content,
+                tool_calls,
+                pinned,
+            },
+            StoredMessage::Tool {
+                tool_call_id,
+                content,
+                status: _,
+                error: _,
+                exit_code: _,
+                truncated: _,
+                pinned,
+            } => Self::Tool {
+                tool_call_id,
+                content,
+                pinned,
+            },
+        }
+    }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Clone, Debug)]
