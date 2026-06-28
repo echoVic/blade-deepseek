@@ -29,8 +29,8 @@ use crate::cost::CostTracker;
 use crate::hooks::{HookContext, HookRunner, conversation_with_hook_context};
 use crate::instructions::ProjectInstructions;
 use crate::lifecycle::{
-    RuntimePermissionRequestHandler, RuntimeSessionLifecycle, RuntimeTaskActor,
-    TurnPermissionOverlay,
+    RuntimePermissionRequestHandler, RuntimeSessionLifecycle, RuntimeTaskActor, RuntimeTurnConfig,
+    RuntimeTurnDeps, RuntimeTurnExecution, RuntimeTurnState, TurnPermissionOverlay,
 };
 use crate::memory::{self, MemoryBlock};
 use crate::subagent_execution::{
@@ -52,35 +52,6 @@ pub(crate) struct AgentLoopResult {
     pub(crate) status: RunStatus,
     pub(crate) final_message: Option<String>,
     pub(crate) error: Option<String>,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct RuntimeTurnConfig<'a> {
-    cwd: &'a Path,
-    prompt: &'a str,
-    subagent_depth: u32,
-    emit_deltas: bool,
-    subagent_type: &'a SubagentType,
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct RuntimeTurnDeps<'a> {
-    instructions: &'a ProjectInstructions,
-    memory: &'a MemoryBlock,
-    mcp_registry: &'a McpRegistry,
-    hooks: &'a HookRunner,
-}
-
-pub(crate) struct RuntimeTurnState<'a> {
-    cost_tracker: &'a mut CostTracker,
-    cancel: &'a CancelToken,
-    task_registry: &'a TaskRegistry,
-}
-
-pub(crate) struct RuntimeTurnExecution<'a> {
-    background_workflows: &'a mut Vec<BackgroundWorkflowRun>,
-    workflow_ipc: Option<&'a WorkflowIpcContext>,
-    lifecycle: Option<&'a mut RuntimeSessionLifecycle>,
 }
 
 pub(crate) struct AgentLoopContext<'a> {
@@ -141,143 +112,6 @@ impl AgentLoopResult {
             final_message: None,
             error: Some(error.into()),
         }
-    }
-}
-
-impl<'a> RuntimeTurnConfig<'a> {
-    pub(crate) fn new(
-        cwd: &'a Path,
-        prompt: &'a str,
-        subagent_depth: u32,
-        emit_deltas: bool,
-        subagent_type: &'a SubagentType,
-    ) -> Self {
-        Self {
-            cwd,
-            prompt,
-            subagent_depth,
-            emit_deltas,
-            subagent_type,
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn cwd(&self) -> &'a Path {
-        self.cwd
-    }
-
-    #[cfg(test)]
-    pub(crate) fn prompt(&self) -> &'a str {
-        self.prompt
-    }
-
-    #[cfg(test)]
-    pub(crate) fn subagent_depth(&self) -> u32 {
-        self.subagent_depth
-    }
-
-    #[cfg(test)]
-    pub(crate) fn emit_deltas(&self) -> bool {
-        self.emit_deltas
-    }
-
-    #[cfg(test)]
-    pub(crate) fn subagent_type(&self) -> &'a SubagentType {
-        self.subagent_type
-    }
-}
-
-impl<'a> RuntimeTurnDeps<'a> {
-    pub(crate) fn new(
-        instructions: &'a ProjectInstructions,
-        memory: &'a MemoryBlock,
-        mcp_registry: &'a McpRegistry,
-        hooks: &'a HookRunner,
-    ) -> Self {
-        Self {
-            instructions,
-            memory,
-            mcp_registry,
-            hooks,
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn instructions(&self) -> &'a ProjectInstructions {
-        self.instructions
-    }
-
-    #[cfg(test)]
-    pub(crate) fn memory(&self) -> &'a MemoryBlock {
-        self.memory
-    }
-
-    #[cfg(test)]
-    pub(crate) fn mcp_registry(&self) -> &'a McpRegistry {
-        self.mcp_registry
-    }
-
-    #[cfg(test)]
-    pub(crate) fn hooks(&self) -> &'a HookRunner {
-        self.hooks
-    }
-}
-
-impl<'a> RuntimeTurnState<'a> {
-    pub(crate) fn new(
-        cost_tracker: &'a mut CostTracker,
-        cancel: &'a CancelToken,
-        task_registry: &'a TaskRegistry,
-    ) -> Self {
-        Self {
-            cost_tracker,
-            cancel,
-            task_registry,
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn cost_tracker(&self) -> &CostTracker {
-        self.cost_tracker
-    }
-
-    #[cfg(test)]
-    pub(crate) fn cancel(&self) -> &'a CancelToken {
-        self.cancel
-    }
-
-    #[cfg(test)]
-    pub(crate) fn task_registry(&self) -> &'a TaskRegistry {
-        self.task_registry
-    }
-}
-
-impl<'a> RuntimeTurnExecution<'a> {
-    pub(crate) fn new(
-        background_workflows: &'a mut Vec<BackgroundWorkflowRun>,
-        workflow_ipc: Option<&'a WorkflowIpcContext>,
-        lifecycle: Option<&'a mut RuntimeSessionLifecycle>,
-    ) -> Self {
-        Self {
-            background_workflows,
-            workflow_ipc,
-            lifecycle,
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn background_workflow_count(&self) -> usize {
-        self.background_workflows.len()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn workflow_ipc(&self) -> Option<&'a WorkflowIpcContext> {
-        self.workflow_ipc
-    }
-
-    #[cfg(test)]
-    pub(crate) fn lifecycle(&self) -> Option<&RuntimeSessionLifecycle> {
-        self.lifecycle.as_deref()
     }
 }
 

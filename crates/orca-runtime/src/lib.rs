@@ -43,6 +43,36 @@ mod tests {
     }
 
     #[test]
+    fn runtime_turn_context_types_are_owned_by_lifecycle_module() {
+        let agent_loop_source = include_str!("agent_loop.rs");
+        let lifecycle_source = include_str!("lifecycle.rs");
+
+        for type_name in [
+            "RuntimeTurnConfig",
+            "RuntimeTurnDeps",
+            "RuntimeTurnState",
+            "RuntimeTurnExecution",
+        ] {
+            assert!(
+                !agent_loop_source.contains(&format!("struct {type_name}")),
+                "agent_loop must not own runtime turn context type {type_name}"
+            );
+            assert!(
+                !agent_loop_source.contains(&format!("impl<'a> {type_name}")),
+                "agent_loop must not own runtime turn context behavior {type_name}"
+            );
+            assert!(
+                lifecycle_source.contains(&format!("struct {type_name}")),
+                "lifecycle must own runtime turn context type {type_name}"
+            );
+            assert!(
+                lifecycle_source.contains(&format!("impl<'a> {type_name}")),
+                "lifecycle must own runtime turn context behavior {type_name}"
+            );
+        }
+    }
+
+    #[test]
     fn thread_store_trait_is_owned_by_thread_store_module() {
         let history_source = include_str!("history.rs");
         let thread_store_source = include_str!("thread_store.rs");
