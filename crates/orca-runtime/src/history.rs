@@ -19,10 +19,11 @@ use orca_core::tool_types::{ToolResult, ToolStatus};
 use orca_core::{approval_rules::PermissionRules, approval_types::ApprovalMode};
 
 pub use crate::thread_store::{
-    JsonlThreadStore, SessionStore, SortDirection, StoredThreadItem, StoredThreadItemPage,
-    StoredThreadProjection, StoredThreadSearchHit, StoredThreadSearchPage, StoredThreadSummary,
-    StoredThreadSummaryPage, StoredThreadTurn, StoredThreadTurnPage, ThreadListFilters,
-    ThreadMetadataPatch, ThreadRelationFilter, ThreadSortKey, ThreadStore, TurnItemsView,
+    JsonlThreadStore, LiveThread, SessionStore, SortDirection, StoredThreadItem,
+    StoredThreadItemPage, StoredThreadProjection, StoredThreadSearchHit, StoredThreadSearchPage,
+    StoredThreadSummary, StoredThreadSummaryPage, StoredThreadTurn, StoredThreadTurnPage,
+    ThreadListFilters, ThreadMetadataPatch, ThreadRelationFilter, ThreadSortKey, ThreadStore,
+    TurnItemsView,
 };
 
 const ORCA_HOME_ENV: &str = "ORCA_HOME";
@@ -90,12 +91,6 @@ pub struct SessionTranscript {
 #[derive(Clone, Debug)]
 pub struct SessionWriter {
     path: PathBuf,
-}
-
-#[derive(Clone, Debug)]
-pub struct LiveThread {
-    thread_id: String,
-    writer: SessionWriter,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -377,35 +372,6 @@ impl SessionWriter {
         plan: Vec<PlanItem>,
     ) -> io::Result<()> {
         write_record(&self.path, &SessionRecord::PlanState { explanation, plan })
-    }
-}
-
-impl LiveThread {
-    pub fn thread_id(&self) -> &str {
-        &self.thread_id
-    }
-
-    pub fn append_items(&mut self, messages: &[Message]) -> io::Result<()> {
-        for message in messages {
-            self.writer.append_message(message)?;
-        }
-        Ok(())
-    }
-
-    pub fn complete(&mut self, status: &str) -> io::Result<()> {
-        self.writer.complete(status)
-    }
-
-    pub fn writer_mut(&mut self) -> &mut SessionWriter {
-        &mut self.writer
-    }
-
-    pub fn into_writer(self) -> SessionWriter {
-        self.writer
-    }
-
-    pub fn into_thread_id_and_writer(self) -> (String, SessionWriter) {
-        (self.thread_id, self.writer)
     }
 }
 
