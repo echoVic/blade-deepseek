@@ -5,7 +5,7 @@ use std::sync::OnceLock;
 static SEATBELT_AVAILABLE: OnceLock<bool> = OnceLock::new();
 
 pub fn bash_command(command: &str, cwd: &Path) -> Command {
-    workspace_write_bash_command(command, cwd, &[], &[], true, false, false)
+    workspace_write_bash_command(command, cwd, &[], &[], &[], true, false, false)
 }
 
 pub fn bash_command_with_additional_roots(
@@ -13,12 +13,13 @@ pub fn bash_command_with_additional_roots(
     cwd: &Path,
     additional_roots: &[PathBuf],
 ) -> Command {
-    workspace_write_bash_command(command, cwd, additional_roots, &[], true, false, false)
+    workspace_write_bash_command(command, cwd, &[], additional_roots, &[], true, false, false)
 }
 
 pub fn workspace_write_bash_command(
     command: &str,
     cwd: &Path,
+    readable_roots: &[PathBuf],
     additional_roots: &[PathBuf],
     denied_roots: &[PathBuf],
     network_access: bool,
@@ -30,6 +31,10 @@ pub fn workspace_write_bash_command(
     }
 
     let canonical_cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    let canonical_readable_roots = readable_roots
+        .iter()
+        .map(|root| root.canonicalize().unwrap_or_else(|_| root.clone()))
+        .collect::<Vec<_>>();
     let canonical_additional_roots = additional_roots
         .iter()
         .map(|root| root.canonicalize().unwrap_or_else(|_| root.clone()))
@@ -42,6 +47,7 @@ pub fn workspace_write_bash_command(
     cmd.arg("-p")
         .arg(workspace_write_profile(
             &canonical_cwd,
+            &canonical_readable_roots,
             &canonical_additional_roots,
             &canonical_denied_roots,
             network_access,
@@ -58,6 +64,7 @@ pub fn workspace_write_bash_command(
 pub fn read_only_bash_command(
     command: &str,
     cwd: &Path,
+    readable_roots: &[PathBuf],
     additional_roots: &[PathBuf],
     denied_roots: &[PathBuf],
     network_access: bool,
@@ -66,6 +73,10 @@ pub fn read_only_bash_command(
         return plain_bash_command(command, cwd);
     }
 
+    let canonical_readable_roots = readable_roots
+        .iter()
+        .map(|root| root.canonicalize().unwrap_or_else(|_| root.clone()))
+        .collect::<Vec<_>>();
     let canonical_additional_roots = additional_roots
         .iter()
         .map(|root| root.canonicalize().unwrap_or_else(|_| root.clone()))
@@ -77,6 +88,7 @@ pub fn read_only_bash_command(
     let mut cmd = Command::new("sandbox-exec");
     cmd.arg("-p")
         .arg(read_only_profile(
+            &canonical_readable_roots,
             &canonical_additional_roots,
             &canonical_denied_roots,
             network_access,
@@ -108,6 +120,7 @@ fn plain_bash_command(command: &str, cwd: &Path) -> Command {
 
 fn workspace_write_profile(
     cwd: &Path,
+    readable_roots: &[PathBuf],
     additional_roots: &[PathBuf],
     denied_roots: &[PathBuf],
     network_access: bool,
@@ -115,6 +128,7 @@ fn workspace_write_profile(
     exclude_slash_tmp: bool,
 ) -> String {
     let cwd_escaped = seatbelt_escape(&cwd.display().to_string());
+    let additional_read_rules = read_allow_rules(readable_roots);
     let additional_write_rules = additional_roots
         .iter()
         .map(|root| {
@@ -179,6 +193,7 @@ fn workspace_write_profile(
 (allow file-read*)
 (allow file-read* file-write* (literal "/dev/null"))
 (allow file-write* (subpath "{cwd_escaped}"))
+{additional_read_rules}
 {tmpdir_write}
 {slash_tmp_write}
 {additional_write_rules}
@@ -191,10 +206,12 @@ fn workspace_write_profile(
 }
 
 fn read_only_profile(
+    readable_roots: &[PathBuf],
     additional_roots: &[PathBuf],
     denied_roots: &[PathBuf],
     network_access: bool,
 ) -> String {
+    let additional_read_rules = read_allow_rules(readable_roots);
     let additional_write_rules = additional_roots
         .iter()
         .map(|root| {
@@ -219,11 +236,25 @@ fn read_only_profile(
 (allow signal (target self))
 (allow file-read*)
 (allow file-read* file-write* (literal "/dev/null"))
+{additional_read_rules}
 {additional_write_rules}
 {denied_access_rules}
 {network_rule}
 "#
     )
+}
+
+fn read_allow_rules(readable_roots: &[PathBuf]) -> String {
+    readable_roots
+        .iter()
+        .map(|root| {
+            format!(
+                r#"(allow file-read* (subpath "{}"))"#,
+                seatbelt_escape(&root.display().to_string())
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn access_deny_rules(denied_roots: &[PathBuf]) -> String {
@@ -252,7 +283,7 @@ mod tests {
     #[test]
     fn sandbox_profile_allows_workspace_and_null_device() {
         let workspace = TempDir::new().unwrap();
-        let content = workspace_write_profile(workspace.path(), &[], &[], true, false, false);
+        let content = workspace_write_profile(workspace.path(), &[], &[], &[], true, false, false);
         assert!(content.contains("(version 1)"));
         assert!(content.contains(&workspace.path().display().to_string()));
         assert!(content.contains(r#"(allow file-read* file-write* (literal "/dev/null"))"#));
@@ -261,7 +292,7 @@ mod tests {
     #[test]
     fn profile_denies_sensitive_orca_and_ssh_paths() {
         let workspace = TempDir::new().unwrap();
-        let profile = workspace_write_profile(workspace.path(), &[], &[], true, false, false);
+        let profile = workspace_write_profile(workspace.path(), &[], &[], &[], true, false, false);
 
         assert!(profile.contains("(deny file-read* file-write*"));
         assert!(profile.contains("/.ssh"));
@@ -278,7 +309,7 @@ mod tests {
     #[test]
     fn read_only_profile_does_not_allow_workspace_writes() {
         let workspace = TempDir::new().unwrap();
-        let profile = read_only_profile(&[], &[], false);
+        let profile = read_only_profile(&[], &[], &[], false);
 
         assert!(!profile.contains(&workspace.path().display().to_string()));
         assert!(!profile.contains("file-write* (subpath"));
@@ -289,7 +320,7 @@ mod tests {
     fn read_only_profile_allows_additional_write_roots() {
         let workspace = TempDir::new().unwrap();
         let extra = TempDir::new().unwrap();
-        let profile = read_only_profile(&[extra.path().to_path_buf()], &[], false);
+        let profile = read_only_profile(&[], &[extra.path().to_path_buf()], &[], false);
 
         assert!(!profile.contains(&workspace.path().display().to_string()));
         assert!(profile.contains(&format!(
@@ -300,10 +331,30 @@ mod tests {
     }
 
     #[test]
+    fn read_only_profile_allows_additional_read_roots_without_writes() {
+        let readable = TempDir::new().unwrap();
+        let profile = read_only_profile(&[readable.path().to_path_buf()], &[], &[], false);
+
+        assert!(profile.contains(&format!(
+            r#"(allow file-read* (subpath "{}"))"#,
+            readable.path().display()
+        )));
+        assert!(!profile.contains(&format!(
+            r#"(allow file-write* (subpath "{}"))"#,
+            readable.path().display()
+        )));
+    }
+
+    #[test]
     fn read_only_profile_denies_additional_root_descendant_access() {
         let extra = TempDir::new().unwrap();
         let blocked = extra.path().join("blocked");
-        let profile = read_only_profile(&[extra.path().to_path_buf()], &[blocked.clone()], false);
+        let profile = read_only_profile(
+            &[],
+            &[extra.path().to_path_buf()],
+            &[blocked.clone()],
+            false,
+        );
 
         let allow = format!(
             r#"(allow file-write* (subpath "{}"))"#,
@@ -325,7 +376,7 @@ mod tests {
     #[test]
     fn workspace_write_profile_can_exclude_tmp_writes_and_network() {
         let workspace = TempDir::new().unwrap();
-        let profile = workspace_write_profile(workspace.path(), &[], &[], false, true, true);
+        let profile = workspace_write_profile(workspace.path(), &[], &[], &[], false, true, true);
 
         assert!(!profile.contains(r#"(subpath "/tmp")"#));
         assert!(!profile.contains("network-outbound"));

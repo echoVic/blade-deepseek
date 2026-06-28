@@ -1315,6 +1315,7 @@ fn run_shell_start<W: Write>(
     let command = ShellSessionCommand {
         command: command_text.clone(),
         cwd,
+        additional_readable_directories: Vec::new(),
         additional_working_directories: Vec::new(),
         denied_working_directories: Vec::new(),
         env: Default::default(),
@@ -1738,6 +1739,7 @@ fn run_command_exec<W: Write>(
     let handle = match manager.spawn(ShellSessionCommand {
         command: command_text.clone(),
         cwd,
+        additional_readable_directories: effective_sandbox.additional_readable_roots,
         additional_working_directories,
         denied_working_directories: denied_writable_directories,
         env: env.clone(),
@@ -1878,6 +1880,7 @@ fn command_exec_sandbox_mode(
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct CommandExecSandbox {
     mode: ShellSandboxMode,
+    additional_readable_roots: Vec<PathBuf>,
     additional_writable_roots: Vec<PathBuf>,
     denied_writable_roots: Vec<PathBuf>,
 }
@@ -1886,6 +1889,7 @@ impl CommandExecSandbox {
     fn new(mode: ShellSandboxMode) -> Self {
         Self {
             mode,
+            additional_readable_roots: Vec::new(),
             additional_writable_roots: Vec::new(),
             denied_writable_roots: Vec::new(),
         }
@@ -1930,6 +1934,7 @@ fn shell_sandbox_mode_from_permission_profile(
     }
     Ok(CommandExecSandbox {
         mode,
+        additional_readable_roots: resolved.additional_readable_roots,
         additional_writable_roots: resolved.additional_writable_roots,
         denied_writable_roots: resolved.denied_writable_roots,
     })
@@ -1938,6 +1943,7 @@ fn shell_sandbox_mode_from_permission_profile(
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ResolvedPermissionProfile {
     builtin: Option<String>,
+    additional_readable_roots: Vec<PathBuf>,
     additional_writable_roots: Vec<PathBuf>,
     denied_writable_roots: Vec<PathBuf>,
     network_access: Option<bool>,
@@ -1952,6 +1958,7 @@ fn resolve_permission_profile(
 ) -> Result<ResolvedPermissionProfile, String> {
     let mut current = normalize_permission_profile_name(profile).map(str::to_string);
     let mut seen = Vec::new();
+    let mut additional_readable_roots = Vec::new();
     let mut additional_writable_roots = Vec::new();
     let mut denied_writable_roots = Vec::new();
     let mut network_access = None;
@@ -1959,6 +1966,7 @@ fn resolve_permission_profile(
         if is_builtin_permission_profile_name(&name) {
             return Ok(ResolvedPermissionProfile {
                 builtin: Some(name),
+                additional_readable_roots,
                 additional_writable_roots,
                 denied_writable_roots,
                 network_access,
@@ -1991,6 +1999,9 @@ fn resolve_permission_profile(
             .flat_map(|root| materialize_profile_special_path(root, tmpdir))
             .collect::<Vec<_>>();
             for root in roots {
+                if access.allows_read() && !additional_readable_roots.contains(&root) {
+                    additional_readable_roots.push(root.clone());
+                }
                 if access.allows_write() && !additional_writable_roots.contains(&root) {
                     additional_writable_roots.push(root.clone());
                 }
@@ -2010,6 +2021,7 @@ fn resolve_permission_profile(
     }
     Ok(ResolvedPermissionProfile {
         builtin: None,
+        additional_readable_roots,
         additional_writable_roots,
         denied_writable_roots,
         network_access,
@@ -3285,6 +3297,60 @@ mod tests {
         .expect("workspace roots profile");
 
         assert_eq!(sandbox.additional_writable_roots, vec![docs]);
+    }
+
+    #[test]
+    fn command_exec_sandbox_collects_custom_permission_profile_read_roots() {
+        let mut config = test_run_config();
+        let readable = std::env::current_dir().unwrap().join("readable-root");
+        config.permission_profiles.insert(
+            "docs".to_string(),
+            orca_core::config::PermissionProfileConfig {
+                extends: Some(":read-only".to_string()),
+                filesystem: std::collections::HashMap::from([(
+                    readable.clone(),
+                    orca_core::config::PermissionProfileFileAccess::Read,
+                )])
+                .into(),
+                ..Default::default()
+            },
+        );
+        let options = protocol::CommandExecOptions {
+            permission_profile: Some("docs".to_string()),
+            ..Default::default()
+        };
+
+        let sandbox = test_profile_sandbox(&config, &options).expect("read roots profile");
+
+        assert_eq!(sandbox.additional_readable_roots, vec![readable]);
+        assert!(sandbox.additional_writable_roots.is_empty());
+    }
+
+    #[test]
+    fn command_exec_sandbox_collects_custom_permission_profile_read_write_roots() {
+        let mut config = test_run_config();
+        let root = std::env::current_dir().unwrap().join("read-write-root");
+        config.permission_profiles.insert(
+            "docs".to_string(),
+            orca_core::config::PermissionProfileConfig {
+                extends: Some(":read-only".to_string()),
+                filesystem: std::collections::HashMap::from([(
+                    root.clone(),
+                    orca_core::config::PermissionProfileFileAccess::ReadWrite,
+                )])
+                .into(),
+                ..Default::default()
+            },
+        );
+        let options = protocol::CommandExecOptions {
+            permission_profile: Some("docs".to_string()),
+            ..Default::default()
+        };
+
+        let sandbox = test_profile_sandbox(&config, &options).expect("read-write roots profile");
+
+        assert_eq!(sandbox.additional_readable_roots, vec![root.clone()]);
+        assert_eq!(sandbox.additional_writable_roots, vec![root]);
     }
 
     #[test]

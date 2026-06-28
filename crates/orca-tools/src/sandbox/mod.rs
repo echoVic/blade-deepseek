@@ -5,7 +5,7 @@ use std::process::Command;
 pub mod seatbelt;
 
 pub fn bash_command(command: &str, cwd: &Path) -> Command {
-    workspace_write_bash_command(command, cwd, &[], &[], true, false, false)
+    workspace_write_bash_command(command, cwd, &[], &[], &[], true, false, false)
 }
 
 pub fn plain_bash_command(command: &str, cwd: &Path) -> Command {
@@ -19,12 +19,13 @@ pub fn bash_command_with_additional_roots(
     cwd: &Path,
     additional_roots: &[PathBuf],
 ) -> Command {
-    workspace_write_bash_command(command, cwd, additional_roots, &[], true, false, false)
+    workspace_write_bash_command(command, cwd, &[], additional_roots, &[], true, false, false)
 }
 
 pub fn workspace_write_bash_command(
     command: &str,
     cwd: &Path,
+    readable_roots: &[PathBuf],
     additional_roots: &[PathBuf],
     denied_roots: &[PathBuf],
     network_access: bool,
@@ -34,6 +35,7 @@ pub fn workspace_write_bash_command(
     let mut command = platform::workspace_write_bash_command(
         command,
         cwd,
+        readable_roots,
         additional_roots,
         denied_roots,
         network_access,
@@ -47,6 +49,7 @@ pub fn workspace_write_bash_command(
 pub fn read_only_bash_command(
     command: &str,
     cwd: &Path,
+    readable_roots: &[PathBuf],
     additional_roots: &[PathBuf],
     denied_roots: &[PathBuf],
     network_access: bool,
@@ -54,6 +57,7 @@ pub fn read_only_bash_command(
     let mut command = platform::read_only_bash_command(
         command,
         cwd,
+        readable_roots,
         additional_roots,
         denied_roots,
         network_access,
@@ -74,6 +78,7 @@ mod platform {
     pub fn workspace_write_bash_command(
         command: &str,
         cwd: &Path,
+        readable_roots: &[PathBuf],
         additional_roots: &[PathBuf],
         denied_roots: &[PathBuf],
         network_access: bool,
@@ -83,6 +88,7 @@ mod platform {
         crate::sandbox::seatbelt::workspace_write_bash_command(
             command,
             cwd,
+            readable_roots,
             additional_roots,
             denied_roots,
             network_access,
@@ -94,6 +100,7 @@ mod platform {
     pub fn read_only_bash_command(
         command: &str,
         cwd: &Path,
+        readable_roots: &[PathBuf],
         additional_roots: &[PathBuf],
         denied_roots: &[PathBuf],
         network_access: bool,
@@ -101,6 +108,7 @@ mod platform {
         crate::sandbox::seatbelt::read_only_bash_command(
             command,
             cwd,
+            readable_roots,
             additional_roots,
             denied_roots,
             network_access,
@@ -155,6 +163,7 @@ mod platform {
     pub fn workspace_write_bash_command(
         command: &str,
         cwd: &Path,
+        _readable_roots: &[PathBuf],
         _additional_roots: &[PathBuf],
         _denied_roots: &[PathBuf],
         _network_access: bool,
@@ -169,6 +178,7 @@ mod platform {
     pub fn read_only_bash_command(
         command: &str,
         cwd: &Path,
+        _readable_roots: &[PathBuf],
         _additional_roots: &[PathBuf],
         _denied_roots: &[PathBuf],
         _network_access: bool,

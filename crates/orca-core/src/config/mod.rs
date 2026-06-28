@@ -343,6 +343,10 @@ pub enum PermissionProfileFileAccess {
 }
 
 impl PermissionProfileFileAccess {
+    pub fn allows_read(self) -> bool {
+        matches!(self, Self::Read | Self::ReadWrite)
+    }
+
     pub fn allows_write(self) -> bool {
         matches!(self, Self::Write | Self::ReadWrite)
     }

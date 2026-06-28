@@ -25,6 +25,7 @@ use std::os::unix::process::ExitStatusExt;
 pub struct ShellSessionCommand {
     pub command: String,
     pub cwd: PathBuf,
+    pub additional_readable_directories: Vec<PathBuf>,
     pub additional_working_directories: Vec<PathBuf>,
     pub denied_working_directories: Vec<PathBuf>,
     pub env: BTreeMap<String, Option<String>>,
@@ -181,6 +182,7 @@ impl RuntimeShellSessionManager {
             } => orca_tools::sandbox::workspace_write_bash_command(
                 &command.command,
                 &command.cwd,
+                &command.additional_readable_directories,
                 &command.additional_working_directories,
                 &command.denied_working_directories,
                 network_access,
@@ -191,6 +193,7 @@ impl RuntimeShellSessionManager {
                 orca_tools::sandbox::read_only_bash_command(
                     &command.command,
                     &command.cwd,
+                    &command.additional_readable_directories,
                     &command.additional_working_directories,
                     &command.denied_working_directories,
                     network_access,

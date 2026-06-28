@@ -16,6 +16,7 @@ fn shell_session_runs_interactive_stdin_and_records_task_result() {
         .spawn(ShellSessionCommand {
             command: "read line; printf 'reply:%s\\n' \"$line\"".to_string(),
             cwd: temp.path().to_path_buf(),
+            additional_readable_directories: Vec::new(),
             additional_working_directories: Vec::new(),
             denied_working_directories: Vec::new(),
             env: Default::default(),
@@ -60,6 +61,7 @@ fn shell_session_applies_environment_overrides_and_unsets() {
             command: "printf '%s|%s' \"$ORCA_SHELL_ENV_ADDED\" \"${ORCA_SHELL_ENV_REMOVED-unset}\""
                 .to_string(),
             cwd: temp.path().to_path_buf(),
+            additional_readable_directories: Vec::new(),
             additional_working_directories: Vec::new(),
             denied_working_directories: Vec::new(),
             env: std::collections::BTreeMap::from([
@@ -94,6 +96,7 @@ fn shell_session_kill_stops_running_task_and_collects_partial_output() {
         .spawn(ShellSessionCommand {
             command: "printf started; sleep 30; printf done".to_string(),
             cwd: temp.path().to_path_buf(),
+            additional_readable_directories: Vec::new(),
             additional_working_directories: Vec::new(),
             denied_working_directories: Vec::new(),
             env: Default::default(),
@@ -123,6 +126,7 @@ fn shell_session_reaps_task_stop_requests() {
         .spawn(ShellSessionCommand {
             command: "printf started; sleep 30; printf done".to_string(),
             cwd: temp.path().to_path_buf(),
+            additional_readable_directories: Vec::new(),
             additional_working_directories: Vec::new(),
             denied_working_directories: Vec::new(),
             env: Default::default(),
@@ -164,6 +168,7 @@ fn shell_session_read_returns_incremental_output_without_waiting_for_exit() {
         .spawn(ShellSessionCommand {
             command: "printf ready; sleep 30; printf done".to_string(),
             cwd: temp.path().to_path_buf(),
+            additional_readable_directories: Vec::new(),
             additional_working_directories: Vec::new(),
             denied_working_directories: Vec::new(),
             env: Default::default(),
@@ -201,6 +206,7 @@ fn shell_session_list_returns_running_shell_snapshots() {
         .spawn(ShellSessionCommand {
             command: "printf ready; sleep 30".to_string(),
             cwd: temp.path().to_path_buf(),
+            additional_readable_directories: Vec::new(),
             additional_working_directories: Vec::new(),
             denied_working_directories: Vec::new(),
             env: Default::default(),
@@ -234,6 +240,7 @@ fn shell_session_updates_description_for_list_snapshots() {
         .spawn(ShellSessionCommand {
             command: "sleep 30".to_string(),
             cwd: temp.path().to_path_buf(),
+            additional_readable_directories: Vec::new(),
             additional_working_directories: Vec::new(),
             denied_working_directories: Vec::new(),
             env: Default::default(),
@@ -266,6 +273,7 @@ fn shell_session_pty_exposes_terminal_to_child_process() {
         .spawn(ShellSessionCommand {
             command: "if test -t 0 && test -t 1; then printf tty; else printf pipe; fi".to_string(),
             cwd: temp.path().to_path_buf(),
+            additional_readable_directories: Vec::new(),
             additional_working_directories: Vec::new(),
             denied_working_directories: Vec::new(),
             env: Default::default(),
@@ -302,6 +310,7 @@ fn shell_session_pty_starts_with_configured_window_size() {
         .spawn(ShellSessionCommand {
             command: "python3 -c 'import fcntl,termios,struct,sys; data=fcntl.ioctl(sys.stdin.fileno(), termios.TIOCGWINSZ, struct.pack(\"HHHH\",0,0,0,0)); rows,cols,_,_=struct.unpack(\"HHHH\", data); print(f\"{rows} {cols}\")'".to_string(),
             cwd: temp.path().to_path_buf(),
+            additional_readable_directories: Vec::new(),
             additional_working_directories: Vec::new(),
             denied_working_directories: Vec::new(),
             env: Default::default(),

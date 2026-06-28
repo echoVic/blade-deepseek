@@ -1489,6 +1489,7 @@ fn execute_bash_with_shell_session(
     let handle = match manager.spawn(ShellSessionCommand {
         command: command.to_string(),
         cwd: cwd.to_path_buf(),
+        additional_readable_directories: Vec::new(),
         additional_working_directories: additional_roots.to_vec(),
         denied_working_directories: Vec::new(),
         env: Default::default(),
