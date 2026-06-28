@@ -91,6 +91,13 @@ pub struct RuntimeToolActorContext {
     permission_overlay: TurnPermissionOverlay,
 }
 
+pub(crate) struct RuntimeProviderTurnStep;
+
+pub(crate) struct RuntimeProviderTurnOutput {
+    pub(crate) response: Option<ProviderResponse>,
+    pub(crate) terminal_error: Option<RuntimeTurnStartError>,
+}
+
 pub(crate) struct RuntimeCompactionStep<'a, W: io::Write> {
     provider: ProviderKind,
     context_config: &'a context::ContextConfig,
@@ -2165,6 +2172,129 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
             )?;
         }
         Ok(())
+    }
+}
+
+impl RuntimeProviderTurnStep {
+    pub(crate) fn new() -> Self {
+        Self
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn run<W: io::Write>(
+        &mut self,
+        actor: &mut RuntimeTaskActor<'_>,
+        provider: ProviderKind,
+        conversation: &Conversation,
+        provider_config: &ProviderConfig,
+        cwd: &str,
+        emit_deltas: bool,
+        hooks: &HookRunner,
+        cancel: &CancelToken,
+        cost_tracker: &mut CostTracker,
+        max_budget_usd: Option<f64>,
+        events: &mut EventFactory,
+        sink: &mut EventSink<W>,
+        mut history_writer: Option<&mut SessionWriter>,
+    ) -> io::Result<RuntimeProviderTurnOutput> {
+        let pre_model_outcome = match actor.run_pre_model_hook_with_cancel(hooks, cwd, Some(cancel))
+        {
+            Ok(outcome) => outcome,
+            Err(error) => return Ok(RuntimeProviderTurnOutput::terminal(error)),
+        };
+        if cancel.is_cancelled() {
+            return cancelled_provider_turn(emit_deltas, events, sink);
+        }
+
+        let model_conversation = conversation_with_hook_context(conversation, &pre_model_outcome);
+        let response = actor.call_streaming_provider(
+            provider,
+            &model_conversation,
+            provider_config,
+            cancel,
+            &mut |step| emit_provider_delta(step, emit_deltas, events, sink),
+        );
+        if cancel.is_cancelled() {
+            return cancelled_provider_turn(emit_deltas, events, sink);
+        }
+
+        if let Some(warning) =
+            actor.run_post_model_hook_with_cancel(hooks, cwd, response.usage.as_ref(), Some(cancel))
+            && emit_deltas
+        {
+            sink.emit(&events.error(&warning))?;
+        }
+        if cancel.is_cancelled() {
+            return cancelled_provider_turn(emit_deltas, events, sink);
+        }
+
+        if let Some(usage) = response.usage
+            && !usage.is_empty()
+        {
+            match actor.record_usage(usage, cost_tracker, max_budget_usd) {
+                Ok(totals) => {
+                    if emit_deltas {
+                        sink.emit(&events.usage_updated(totals))?;
+                        if let Some(writer) = history_writer.as_deref_mut() {
+                            writer.append_usage(totals)?;
+                        }
+                    }
+                }
+                Err(error) => return Ok(RuntimeProviderTurnOutput::terminal(error)),
+            }
+        }
+
+        Ok(RuntimeProviderTurnOutput::response(response))
+    }
+}
+
+fn cancelled_provider_turn<W: io::Write>(
+    emit_deltas: bool,
+    events: &mut EventFactory,
+    sink: &mut EventSink<W>,
+) -> io::Result<RuntimeProviderTurnOutput> {
+    if emit_deltas {
+        sink.emit(&events.error("turn cancelled"))?;
+    }
+    Ok(RuntimeProviderTurnOutput::terminal(RuntimeTurnStartError {
+        status: RunStatus::Cancelled,
+        message: "turn cancelled".to_string(),
+    }))
+}
+
+fn emit_provider_delta<W: io::Write>(
+    step: &ProviderStep,
+    emit_deltas: bool,
+    events: &mut EventFactory,
+    sink: &mut EventSink<W>,
+) {
+    if !emit_deltas {
+        return;
+    }
+    match step {
+        ProviderStep::ReasoningDelta(text) => {
+            let _ = sink.emit(&events.assistant_reasoning_delta(text));
+        }
+        ProviderStep::MessageDelta(text) => {
+            let _ = sink.emit(&events.assistant_message_delta(text));
+        }
+        _ => {}
+    }
+}
+
+impl RuntimeProviderTurnOutput {
+    fn response(response: ProviderResponse) -> Self {
+        Self {
+            response: Some(response),
+            terminal_error: None,
+        }
+    }
+
+    fn terminal(error: RuntimeTurnStartError) -> Self {
+        Self {
+            response: None,
+            terminal_error: Some(error),
+        }
     }
 }
 

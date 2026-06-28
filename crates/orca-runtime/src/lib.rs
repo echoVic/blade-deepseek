@@ -202,6 +202,41 @@ mod tests {
     }
 
     #[test]
+    fn runtime_provider_turn_step_is_owned_by_lifecycle_module() {
+        let agent_loop_source = include_str!("agent_loop.rs");
+        let lifecycle_source = include_str!("lifecycle.rs");
+
+        assert!(
+            !agent_loop_source.contains("struct RuntimeProviderTurnStep"),
+            "agent_loop must not own runtime provider turn step state"
+        );
+        assert!(
+            !agent_loop_source.contains("impl<'a> RuntimeProviderTurnStep"),
+            "agent_loop must not own runtime provider turn step behavior"
+        );
+        assert!(
+            lifecycle_source.contains("struct RuntimeProviderTurnStep"),
+            "lifecycle must own runtime provider turn step state"
+        );
+        assert!(
+            lifecycle_source.contains("impl RuntimeProviderTurnStep"),
+            "lifecycle must own runtime provider turn step behavior"
+        );
+
+        for marker in [
+            "assistant_reasoning_delta",
+            "assistant_message_delta",
+            "usage_updated",
+            "append_usage(",
+        ] {
+            assert!(
+                !agent_loop_source.contains(marker),
+                "agent_loop must not own provider turn detail {marker}"
+            );
+        }
+    }
+
+    #[test]
     fn thread_store_trait_is_owned_by_thread_store_module() {
         let history_source = include_str!("history.rs");
         let thread_store_source = include_str!("thread_store.rs");

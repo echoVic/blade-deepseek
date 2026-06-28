@@ -25,11 +25,11 @@ use orca_tools;
 use crate::agent_child::{ChildAgentRequest, ChildAgentResult, ChildAgentRuntime};
 use crate::agent_common;
 use crate::cost::CostTracker;
-use crate::hooks::{HookContext, HookRunner, conversation_with_hook_context};
+use crate::hooks::{HookContext, HookRunner};
 use crate::instructions::ProjectInstructions;
 use crate::lifecycle::{
-    AgentLoopContext, RuntimeCompactionStep, RuntimeSessionLifecycle, RuntimeTaskActor,
-    RuntimeTurnConfig, RuntimeTurnDeps, RuntimeTurnExecution, RuntimeTurnState,
+    AgentLoopContext, RuntimeCompactionStep, RuntimeProviderTurnStep, RuntimeSessionLifecycle,
+    RuntimeTaskActor, RuntimeTurnConfig, RuntimeTurnDeps, RuntimeTurnExecution, RuntimeTurnState,
     TurnPermissionOverlay,
 };
 use crate::memory::{self, MemoryBlock};
@@ -273,26 +273,6 @@ pub(crate) fn run_agent_loop(
         }
         let turn_provider_config = routed_model.provider_config;
 
-        let cwd_display = cwd.display().to_string();
-        let pre_model_outcome =
-            match actor.run_pre_model_hook_with_cancel(hooks, &cwd_display, Some(cancel)) {
-                Ok(outcome) => outcome,
-                Err(error) => {
-                    if emit_deltas {
-                        sink.emit(&events.error(&error.message))?;
-                    }
-                    return Ok(AgentLoopResult::failure(error.status, error.message));
-                }
-            };
-        if cancel.is_cancelled() {
-            if emit_deltas {
-                sink.emit(&events.error("turn cancelled"))?;
-            }
-            return Ok(AgentLoopResult::failure(
-                RunStatus::Cancelled,
-                "turn cancelled",
-            ));
-        }
         if let Some(steer_handle) = steer_handle {
             for input in steer_handle.drain() {
                 conversation.add_user(input);
@@ -303,77 +283,35 @@ pub(crate) fn run_agent_loop(
                 }
             }
         }
-        let model_conversation = conversation_with_hook_context(&conversation, &pre_model_outcome);
 
-        let response = actor.call_streaming_provider(
+        let cwd_display = cwd.display().to_string();
+        let provider_turn = RuntimeProviderTurnStep::new().run(
+            &mut actor,
             config.provider,
-            &model_conversation,
+            conversation,
             &turn_provider_config,
-            cancel,
-            &mut |step| {
-                if !emit_deltas {
-                    return;
-                }
-                match step {
-                    ProviderStep::ReasoningDelta(text) => {
-                        let _ = sink.emit(&events.assistant_reasoning_delta(text));
-                    }
-                    ProviderStep::MessageDelta(text) => {
-                        let _ = sink.emit(&events.assistant_message_delta(text));
-                    }
-                    _ => {}
-                }
-            },
-        );
-        if cancel.is_cancelled() {
-            if emit_deltas {
-                sink.emit(&events.error("turn cancelled"))?;
-            }
-            return Ok(AgentLoopResult::failure(
-                RunStatus::Cancelled,
-                "turn cancelled",
-            ));
-        }
-
-        if let Some(warning) = actor.run_post_model_hook_with_cancel(
-            hooks,
             &cwd_display,
-            response.usage.as_ref(),
-            Some(cancel),
-        ) && emit_deltas
-        {
-            sink.emit(&events.error(&warning))?;
-        }
-        if cancel.is_cancelled() {
-            if emit_deltas {
-                sink.emit(&events.error("turn cancelled"))?;
-            }
-            return Ok(AgentLoopResult::failure(
-                RunStatus::Cancelled,
-                "turn cancelled",
-            ));
-        }
-
-        if let Some(usage) = response.usage
-            && !usage.is_empty()
-        {
-            match actor.record_usage(usage, cost_tracker, config.max_budget_usd) {
-                Ok(totals) => {
-                    if emit_deltas {
-                        sink.emit(&events.usage_updated(totals))?;
-                        if let Some(writer) = history_writer.as_deref_mut() {
-                            writer.append_usage(totals)?;
-                        }
-                    }
+            emit_deltas,
+            hooks,
+            cancel,
+            cost_tracker,
+            config.max_budget_usd,
+            events,
+            sink,
+            history_writer.as_deref_mut(),
+        )?;
+        let response = match provider_turn.response {
+            Some(response) => response,
+            None => {
+                let error = provider_turn
+                    .terminal_error
+                    .expect("provider turn terminal");
+                if emit_deltas && error.status != RunStatus::Cancelled {
+                    sink.emit(&events.error(&error.message))?;
                 }
-                Err(error) => {
-                    if emit_deltas {
-                        sink.emit(&events.error(&error.message))?;
-                    }
-                    return Ok(AgentLoopResult::failure(error.status, error.message));
-                }
+                return Ok(AgentLoopResult::failure(error.status, error.message));
             }
-        }
+        };
 
         let provider_error = response.steps.iter().find_map(|step| match step {
             ProviderStep::Error(message) => Some(message.clone()),
