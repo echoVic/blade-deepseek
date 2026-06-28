@@ -136,6 +136,44 @@ pub(crate) fn record_assistant_response_for_agent(
     Ok(())
 }
 
+pub(crate) fn record_initial_history_for_agent(
+    conversation: &Conversation,
+    history_writer: Option<&mut SessionWriter>,
+    resumed: bool,
+    emit_deltas: bool,
+) -> io::Result<()> {
+    if !emit_deltas {
+        return Ok(());
+    }
+    let Some(writer) = history_writer else {
+        return Ok(());
+    };
+
+    if resumed {
+        for message in &conversation.messages {
+            writer.append_message(message)?;
+        }
+        if !conversation.summary.is_empty() {
+            let inherited_marker = conversation
+                .summary
+                .latest_rolling()
+                .map(|text| text.to_string())
+                .unwrap_or_default();
+            let count = conversation.messages.len();
+            writer.append_summary_state(count, count, inherited_marker, &conversation.summary)?;
+        }
+    } else {
+        if let Some(system) = conversation.messages.first() {
+            writer.append_message(system)?;
+        }
+        if let Some(user) = conversation.messages.last() {
+            writer.append_message(user)?;
+        }
+    }
+
+    Ok(())
+}
+
 pub(crate) fn record_plan_state_for_agent(
     conversation: &mut Conversation,
     history_writer: Option<&mut SessionWriter>,

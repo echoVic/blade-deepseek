@@ -312,6 +312,27 @@ mod tests {
     }
 
     #[test]
+    fn agent_initial_history_recording_is_owned_by_session_module() {
+        let agent_loop_source = include_str!("agent_loop.rs");
+        let session_source = include_str!("session.rs");
+
+        for marker in ["writer.append_message", "append_summary_state"] {
+            assert!(
+                !agent_loop_source.contains(marker),
+                "agent_loop must not own initial history recording detail {marker}"
+            );
+            assert!(
+                session_source.contains(marker),
+                "session must own initial history recording detail {marker}"
+            );
+        }
+        assert!(
+            session_source.contains("pub(crate) fn record_initial_history_for_agent"),
+            "session must expose initial history recording"
+        );
+    }
+
+    #[test]
     fn runtime_compaction_step_is_owned_by_lifecycle_module() {
         let agent_loop_source = include_str!("agent_loop.rs");
         let lifecycle_source = include_str!("lifecycle.rs");

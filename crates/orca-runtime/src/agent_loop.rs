@@ -31,8 +31,8 @@ use crate::lifecycle::{
 };
 use crate::memory::{self, MemoryBlock};
 use crate::session::{
-    AgentConversationContext, record_assistant_response_for_agent, record_plan_state_for_agent,
-    record_tool_result_for_agent,
+    AgentConversationContext, record_assistant_response_for_agent,
+    record_initial_history_for_agent, record_plan_state_for_agent, record_tool_result_for_agent,
 };
 use crate::subagent_execution::{
     collect_subagent_batch, execute_subagent_batch, should_run_subagent_batch,
@@ -183,40 +183,12 @@ pub(crate) fn run_agent_loop(
     };
 
     let mut history_writer = history_writer;
-    if emit_deltas && let Some(writer) = history_writer.as_deref_mut() {
-        if resumed.is_some() {
-            for message in &conversation.messages {
-                writer.append_message(message)?;
-            }
-            // Persist the inherited summary_state into the new transcript.
-            // Without this, multi-process `--continue` resumes (e.g. pipe-eval)
-            // load summary_state into memory but never write it back, so the
-            // next process that resumes from this new transcript loses the
-            // shape of the summary state — re-triggering compaction storms
-            // and shifting the wire prefix.
-            if !conversation.summary.is_empty() {
-                let inherited_marker = conversation
-                    .summary
-                    .latest_rolling()
-                    .map(|text| text.to_string())
-                    .unwrap_or_default();
-                let count = conversation.messages.len();
-                writer.append_summary_state(
-                    count,
-                    count,
-                    inherited_marker,
-                    &conversation.summary,
-                )?;
-            }
-        } else {
-            if let Some(system) = conversation.messages.first() {
-                writer.append_message(system)?;
-            }
-            if let Some(user) = conversation.messages.last() {
-                writer.append_message(user)?;
-            }
-        }
-    }
+    record_initial_history_for_agent(
+        conversation,
+        history_writer.as_deref_mut(),
+        resumed.is_some(),
+        emit_deltas,
+    )?;
 
     let mut legacy_lifecycle = RuntimeSessionLifecycle::new(events.run_id().to_string());
     let lifecycle = lifecycle.unwrap_or(&mut legacy_lifecycle);
