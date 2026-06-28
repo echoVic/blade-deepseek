@@ -8,7 +8,7 @@ use crate::lifecycle::{
     AgentLoopContext, RuntimeCompactionStep, RuntimeProviderErrorOutcome,
     RuntimeProviderResponseOutcome, RuntimeProviderResponseStep, RuntimeProviderTurnStep,
     RuntimeSessionLifecycle, RuntimeSteerStep, RuntimeTaskActor, RuntimeTurnConfig,
-    RuntimeTurnDeps, RuntimeTurnExecution, RuntimeTurnState,
+    RuntimeTurnDeps, RuntimeTurnExecution, RuntimeTurnState, provider_response_or_terminal,
 };
 use crate::memory::MemoryBlock;
 use crate::session::{
@@ -215,12 +215,9 @@ pub(crate) fn run_agent_loop(
             sink,
             history_writer.as_deref_mut(),
         )?;
-        let response = match provider_turn.response {
-            Some(response) => response,
-            None => {
-                let error = provider_turn
-                    .terminal_error
-                    .expect("provider turn terminal");
+        let response = match provider_response_or_terminal(provider_turn) {
+            Ok(response) => response,
+            Err(error) => {
                 if emit_deltas && error.status != RunStatus::Cancelled {
                     sink.emit(&events.error(&error.message))?;
                 }

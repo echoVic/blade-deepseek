@@ -1264,6 +1264,31 @@ mod tests {
     }
 
     #[test]
+    fn runtime_provider_turn_terminal_folding_is_owned_by_lifecycle_module() {
+        let agent_loop_source = include_str!("agent_loop.rs");
+        let lifecycle_source = include_str!("lifecycle.rs");
+
+        for marker in ["provider_turn.response", "provider_turn.terminal_error"] {
+            assert!(
+                !agent_loop_source.contains(marker),
+                "agent_loop must not own provider turn terminal folding detail {marker}"
+            );
+        }
+        assert!(
+            agent_loop_source.contains("provider_response_or_terminal("),
+            "agent_loop must delegate provider turn terminal folding"
+        );
+        assert!(
+            lifecycle_source.contains("pub(crate) fn provider_response_or_terminal"),
+            "lifecycle must expose provider turn terminal folding"
+        );
+        assert!(
+            lifecycle_source.contains("terminal_error"),
+            "lifecycle must own provider turn terminal error extraction"
+        );
+    }
+
+    #[test]
     fn session_list_load_operations_are_owned_by_thread_store_module() {
         let history_source = include_str!("history.rs");
         let thread_store_source = include_str!("thread_store.rs");

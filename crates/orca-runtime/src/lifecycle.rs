@@ -2482,6 +2482,17 @@ impl RuntimeProviderTurnOutput {
     }
 }
 
+pub(crate) fn provider_response_or_terminal(
+    provider_turn: RuntimeProviderTurnOutput,
+) -> Result<ProviderResponse, RuntimeTurnStartError> {
+    match provider_turn.response {
+        Some(response) => Ok(response),
+        None => Err(provider_turn
+            .terminal_error
+            .expect("provider turn terminal")),
+    }
+}
+
 impl RuntimeTaskLifecycle {
     pub fn new_snapshot(
         id: impl Into<String>,
@@ -2746,5 +2757,21 @@ mod tests {
             matches!(&conversation.messages[0], Message::Assistant { content, tool_calls, .. }
                 if content.as_deref() == Some("done") && tool_calls.is_empty())
         );
+    }
+
+    #[test]
+    fn provider_response_or_terminal_returns_terminal_error() {
+        let output = RuntimeProviderTurnOutput::terminal(RuntimeTurnStartError {
+            status: RunStatus::Cancelled,
+            message: "turn cancelled".to_string(),
+        });
+
+        let error = match provider_response_or_terminal(output) {
+            Ok(_) => panic!("expected terminal error"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.status, RunStatus::Cancelled);
+        assert_eq!(error.message, "turn cancelled");
     }
 }
