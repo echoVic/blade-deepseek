@@ -91,6 +91,8 @@ pub struct RuntimeToolActorContext {
     permission_overlay: TurnPermissionOverlay,
 }
 
+pub(crate) struct RuntimeSteerStep;
+
 pub(crate) struct RuntimeProviderTurnStep;
 
 pub(crate) struct RuntimeProviderTurnOutput {
@@ -931,6 +933,35 @@ impl ThreadSteerHandle {
             .expect("thread steer handle lock")
             .drain(..)
             .collect()
+    }
+}
+
+impl RuntimeSteerStep {
+    pub(crate) fn new() -> Self {
+        Self
+    }
+
+    pub(crate) fn apply(
+        &mut self,
+        steer_handle: Option<&ThreadSteerHandle>,
+        conversation: &mut Conversation,
+        mut history_writer: Option<&mut SessionWriter>,
+    ) -> io::Result<usize> {
+        let Some(steer_handle) = steer_handle else {
+            return Ok(0);
+        };
+
+        let mut injected = 0;
+        for input in steer_handle.drain() {
+            conversation.add_user(input);
+            injected += 1;
+            if let Some(writer) = history_writer.as_deref_mut()
+                && let Some(message) = conversation.messages.last()
+            {
+                writer.append_message(message)?;
+            }
+        }
+        Ok(injected)
     }
 }
 

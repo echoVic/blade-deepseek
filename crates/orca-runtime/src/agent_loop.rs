@@ -29,8 +29,8 @@ use crate::hooks::{HookContext, HookRunner};
 use crate::instructions::ProjectInstructions;
 use crate::lifecycle::{
     AgentLoopContext, RuntimeCompactionStep, RuntimeProviderTurnStep, RuntimeSessionLifecycle,
-    RuntimeTaskActor, RuntimeTurnConfig, RuntimeTurnDeps, RuntimeTurnExecution, RuntimeTurnState,
-    TurnPermissionOverlay,
+    RuntimeSteerStep, RuntimeTaskActor, RuntimeTurnConfig, RuntimeTurnDeps, RuntimeTurnExecution,
+    RuntimeTurnState, TurnPermissionOverlay,
 };
 use crate::memory::{self, MemoryBlock};
 use crate::session::AgentConversationContext;
@@ -273,16 +273,7 @@ pub(crate) fn run_agent_loop(
         }
         let turn_provider_config = routed_model.provider_config;
 
-        if let Some(steer_handle) = steer_handle {
-            for input in steer_handle.drain() {
-                conversation.add_user(input);
-                if let Some(writer) = history_writer.as_deref_mut()
-                    && let Some(message) = conversation.messages.last()
-                {
-                    writer.append_message(message)?;
-                }
-            }
-        }
+        RuntimeSteerStep::new().apply(steer_handle, conversation, history_writer.as_deref_mut())?;
 
         let cwd_display = cwd.display().to_string();
         let provider_turn = RuntimeProviderTurnStep::new().run(

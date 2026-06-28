@@ -96,6 +96,33 @@ mod tests {
     }
 
     #[test]
+    fn runtime_steer_step_is_owned_by_lifecycle_module() {
+        let agent_loop_source = include_str!("agent_loop.rs");
+        let lifecycle_source = include_str!("lifecycle.rs");
+
+        assert!(
+            !agent_loop_source.contains("struct RuntimeSteerStep"),
+            "agent_loop must not own runtime steer step state"
+        );
+        assert!(
+            !agent_loop_source.contains("impl RuntimeSteerStep"),
+            "agent_loop must not own runtime steer step behavior"
+        );
+        assert!(
+            lifecycle_source.contains("struct RuntimeSteerStep"),
+            "lifecycle must own runtime steer step state"
+        );
+        assert!(
+            lifecycle_source.contains("impl RuntimeSteerStep"),
+            "lifecycle must own runtime steer step behavior"
+        );
+        assert!(
+            !agent_loop_source.contains("for input in steer_handle.drain()"),
+            "agent_loop must not directly drain steer inputs into conversation"
+        );
+    }
+
+    #[test]
     fn agent_loop_context_is_owned_by_lifecycle_module() {
         let agent_loop_source = include_str!("agent_loop.rs");
         let lifecycle_source = include_str!("lifecycle.rs");
