@@ -1,5 +1,5 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
 use crate::history::{self, CompactionRecord, ContextSummaryRecord};
@@ -13,6 +13,7 @@ use orca_core::plan_types::PlanItem;
 use orca_core::tool_types::{ToolResult, ToolStatus};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use uuid::Uuid;
 
 #[derive(Clone, Debug, Default)]
 pub struct JsonlThreadStore;
@@ -229,6 +230,84 @@ pub(crate) fn write_record_line(mut writer: impl Write, record: &SessionRecord) 
     let mut line = serde_json::to_string(&redacted).map_err(io::Error::other)?;
     line.push('\n');
     writer.write_all(line.as_bytes())
+}
+
+pub(crate) fn read_records(path: &Path) -> io::Result<Vec<SessionRecord>> {
+    let lines = read_history_lines(path)?;
+    let mut records = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str(line) {
+            Ok(record) => records.push(record),
+            Err(_) if i == lines.len() - 1 => break,
+            Err(_) => continue,
+        }
+    }
+    Ok(records)
+}
+
+pub(crate) fn rewrite_records(path: &Path, records: &[SessionRecord]) -> io::Result<()> {
+    let lock = OpenOptions::new().read(true).write(true).open(path)?;
+    lock_file(&lock)?;
+
+    let result = (|| {
+        let temp_path = temp_rewrite_path(path);
+        {
+            let temp = File::create(&temp_path)?;
+            if let Err(error) = write_records_to(temp, path, records) {
+                let _ = fs::remove_file(&temp_path);
+                return Err(error);
+            }
+        }
+        if let Err(error) = fs::rename(&temp_path, path) {
+            let _ = fs::remove_file(&temp_path);
+            return Err(error);
+        }
+        Ok(())
+    })();
+
+    let unlock_result = unlock_file(&lock);
+    result.and(unlock_result)
+}
+
+fn write_records_to(file: File, target_path: &Path, records: &[SessionRecord]) -> io::Result<()> {
+    if target_path.extension().and_then(|ext| ext.to_str()) == Some("zst") {
+        let mut encoder = zstd::stream::write::Encoder::new(file, 3)?;
+        for record in records {
+            write_record_line(&mut encoder, record)?;
+        }
+        encoder.finish()?;
+    } else {
+        let mut writer = io::BufWriter::new(file);
+        for record in records {
+            write_record_line(&mut writer, record)?;
+        }
+        writer.flush()?;
+    }
+    Ok(())
+}
+
+fn temp_rewrite_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("session.jsonl");
+    path.with_file_name(format!("{file_name}.tmp-{}", Uuid::new_v4()))
+}
+
+pub(crate) fn read_history_lines(path: &Path) -> io::Result<Vec<String>> {
+    open_history_reader(path)?.lines().collect()
+}
+
+pub(crate) fn open_history_reader(path: &Path) -> io::Result<Box<dyn BufRead>> {
+    let file = File::open(path)?;
+    if path.extension().and_then(|ext| ext.to_str()) == Some("zst") {
+        let decoder = zstd::stream::read::Decoder::new(file)?;
+        return Ok(Box::new(BufReader::new(decoder)));
+    }
+    Ok(Box::new(BufReader::new(file)))
 }
 
 fn redact_session_record(record: &SessionRecord) -> SessionRecord {
