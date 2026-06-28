@@ -310,9 +310,11 @@ commands and consume versioned events without owning turn execution details.
    `[permission_profiles.docs.filesystem.":workspace_roots"]` normalize into
    the same command sandbox roots. Configured `:tmpdir` / `:slash_tmp` entries
    now materialize to the current command environment's temp directory and
-   `/tmp`, and configured `:root` materializes to `/`. Full Codex read
-   allow-list semantics, `:minimal`, glob handling, and network proxy/domain
-   policy compilation remain later expansions.
+   `/tmp`, and configured `:root` materializes to `/`. Glob filesystem entries
+   are now rejected with an explicit `command/exec` error instead of being
+   silently treated as literal paths. Full Codex read allow-list semantics,
+   `:minimal`, glob expansion/enforcement, and network proxy/domain policy
+   compilation remain later expansions.
 5. **Protocol item stream:** Codex SDK emits `thread.started`, `turn.started`,
    `item.started/updated/completed`, and terminal turn events. Orca now keeps
    legacy JSONL names stable while the server adapter emits user steer

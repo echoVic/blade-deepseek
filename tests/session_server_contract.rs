@@ -2904,6 +2904,60 @@ fn server_mode_command_exec_configured_permission_profile_deny_blocks_reads() {
 }
 
 #[test]
+fn server_mode_command_exec_configured_permission_profile_rejects_glob_entries() {
+    with_orca_home(|home| {
+        let workspace = tempdir().expect("workspace");
+        std::fs::write(
+            home.join("config.toml"),
+            "[permission_profiles.globbed]\nextends = \":read-only\"\n\n[permission_profiles.globbed.filesystem]\n\"/tmp/*.env\" = \"deny\"\n",
+        )
+        .expect("write permission profile config");
+
+        let mut child = orca_command()
+            .args([
+                "--mode",
+                "server",
+                "--provider",
+                "mock",
+                "--cwd",
+                workspace.path().to_str().unwrap(),
+            ])
+            .env("ORCA_HOME", home)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn orca server");
+
+        {
+            let stdin = child.stdin.as_mut().expect("server stdin");
+            writeln!(
+                stdin,
+                r#"{{"id":"cmd","method":"command/exec","params":{{"command":["sh","-lc","true"],"permissionProfile":"globbed"}}}}"#
+            )
+            .expect("write glob permissionProfile command/exec");
+            stdin
+                .flush()
+                .expect("flush glob permissionProfile command/exec");
+        }
+        drop(child.stdin.take());
+
+        let output = child.wait_with_output().expect("wait for server");
+        assert_eq!(output.status.code(), Some(0));
+        assert!(output.stderr.is_empty());
+
+        let events = parse_jsonl(&output.stdout);
+        assert_eq!(events.len(), 1, "expected one error event: {events:?}");
+        assert_eq!(events[0]["id"], "cmd");
+        assert_eq!(events[0]["event"], "error");
+        assert_eq!(
+            events[0]["message"],
+            "command/exec permissionProfile glob filesystem entries are not supported yet: /tmp/*.env"
+        );
+    });
+}
+
+#[test]
 fn server_mode_command_exec_configured_permission_profile_materializes_tmpdir() {
     if !sandbox_seatbelt_available() {
         return;

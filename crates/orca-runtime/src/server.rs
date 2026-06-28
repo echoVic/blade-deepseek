@@ -1976,6 +1976,12 @@ fn resolve_permission_profile(
             return Err(format!("unknown command/exec permissionProfile: {name}"));
         };
         for (path, access) in profile.filesystem.entries() {
+            if contains_glob_chars(path) {
+                return Err(format!(
+                    "command/exec permissionProfile glob filesystem entries are not supported yet: {}",
+                    path.display()
+                ));
+            }
             let roots = materialize_workspace_roots_paths(
                 &cwd.display().to_string(),
                 runtime_workspace_roots,
@@ -2008,6 +2014,12 @@ fn resolve_permission_profile(
         denied_writable_roots,
         network_access,
     })
+}
+
+fn contains_glob_chars(path: &std::path::Path) -> bool {
+    path.to_string_lossy()
+        .chars()
+        .any(|ch| matches!(ch, '*' | '?' | '[' | ']'))
 }
 
 fn is_builtin_permission_profile_name(profile: &str) -> bool {
