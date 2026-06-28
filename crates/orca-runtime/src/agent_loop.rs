@@ -15,16 +15,14 @@ use crate::session::{
     record_assistant_response_for_agent, record_initial_history_for_agent,
 };
 use crate::subagent_execution::{
-    SubagentBatchRecordOutcome, collect_subagent_batch, execute_subagent_batch,
-    record_subagent_batch_results, should_run_subagent_batch,
+    collect_subagent_batch, run_subagent_batch_tool_turn, should_run_subagent_batch,
 };
 use crate::tasks::TaskRegistry;
 use crate::tool_execution::policy_for_tool_execution;
 use crate::tool_invocation::{
     AgentToolPolicyContext, ToolRequestCursor, ToolTurnOutcome, collect_readonly_batch,
     provider_config_for_agent_loop, reject_disallowed_child_tool, run_normal_tool_turn,
-    run_readonly_tool_turn, should_run_readonly_batch, terminal_tool_turn,
-    tool_requests_from_provider_steps,
+    run_readonly_tool_turn, should_run_readonly_batch, tool_requests_from_provider_steps,
 };
 use crate::workflow_execution::observe_background_workflows;
 use orca_core::cancel::CancelToken;
@@ -318,11 +316,13 @@ pub(crate) fn run_agent_loop(
 
             if should_run_subagent_batch(config, tool_request, subagent_depth) {
                 let batch_end = collect_subagent_batch(config, &tool_requests, cursor.position());
-                let results = execute_subagent_batch(
+                match run_subagent_batch_tool_turn(
                     config,
                     cwd,
                     events,
                     sink,
+                    conversation,
+                    history_writer.as_deref_mut(),
                     &tool_requests[cursor.position()..batch_end],
                     subagent_depth,
                     emit_deltas,
@@ -334,22 +334,10 @@ pub(crate) fn run_agent_loop(
                     cancel,
                     workflow_ipc,
                     execute_child_agent_loop,
-                )?;
-
-                match record_subagent_batch_results(
-                    conversation,
-                    history_writer.as_deref_mut(),
-                    results,
-                    emit_deltas,
                 )? {
-                    SubagentBatchRecordOutcome::Continue => {}
-                    SubagentBatchRecordOutcome::Return { status, error } => {
-                        match terminal_tool_turn(status, error) {
-                            ToolTurnOutcome::Continue => {}
-                            ToolTurnOutcome::Return { status, error } => {
-                                return Ok(AgentLoopResult::terminal(status, error));
-                            }
-                        }
+                    ToolTurnOutcome::Continue => {}
+                    ToolTurnOutcome::Return { status, error } => {
+                        return Ok(AgentLoopResult::terminal(status, error));
                     }
                 }
                 cursor.advance_to(batch_end);

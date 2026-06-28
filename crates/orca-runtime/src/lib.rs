@@ -499,6 +499,39 @@ mod tests {
     }
 
     #[test]
+    fn subagent_batch_tool_turn_runner_is_owned_by_subagent_execution_module() {
+        let agent_loop_source = include_str!("agent_loop.rs");
+        let subagent_execution_source = include_str!("subagent_execution.rs");
+
+        for marker in [
+            "execute_subagent_batch(",
+            "record_subagent_batch_results(",
+            "SubagentBatchRecordOutcome",
+        ] {
+            assert!(
+                !agent_loop_source.contains(marker),
+                "agent_loop must not own subagent batch tool-turn detail {marker}"
+            );
+        }
+        assert!(
+            agent_loop_source.contains("run_subagent_batch_tool_turn("),
+            "agent_loop must delegate subagent batch tool turns"
+        );
+        assert!(
+            subagent_execution_source.contains("pub(crate) fn run_subagent_batch_tool_turn"),
+            "subagent_execution must expose subagent batch tool-turn runner"
+        );
+        assert!(
+            subagent_execution_source.contains("execute_subagent_batch"),
+            "subagent_execution must compose subagent batch execution"
+        );
+        assert!(
+            subagent_execution_source.contains("record_subagent_batch_results"),
+            "subagent_execution must compose subagent batch result recording"
+        );
+    }
+
+    #[test]
     fn agent_conversation_context_is_owned_by_session_module() {
         let agent_loop_source = include_str!("agent_loop.rs");
         let session_source = include_str!("session.rs");

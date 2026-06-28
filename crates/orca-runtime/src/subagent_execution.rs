@@ -29,7 +29,7 @@ use crate::subagent::{self, SubagentIsolation, SubagentMode};
 use crate::tasks::TaskRegistry;
 use crate::thread_store::SessionWriter;
 use crate::tool_invocation::{
-    apply_pre_tool_outcome_with_external, prepare_tool_invocation_with_external,
+    ToolTurnOutcome, apply_pre_tool_outcome_with_external, prepare_tool_invocation_with_external,
     validate_tool_invocation_with_external,
 };
 use crate::workflow::ipc::WorkflowIpcContext;
@@ -113,6 +113,52 @@ pub(crate) fn record_subagent_batch_results(
     }
 
     Ok(SubagentBatchRecordOutcome::Continue)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_subagent_batch_tool_turn(
+    config: &RunConfig,
+    cwd: &Path,
+    events: &mut EventFactory,
+    sink: &mut EventSink<impl io::Write>,
+    conversation: &mut Conversation,
+    history_writer: Option<&mut SessionWriter>,
+    tool_requests: &[tool_types::ToolRequest],
+    subagent_depth: u32,
+    emit_deltas: bool,
+    instructions: &ProjectInstructions,
+    memory: &MemoryBlock,
+    mcp_registry: &McpRegistry,
+    hooks: &HookRunner,
+    cost_tracker: &mut CostTracker,
+    cancel: &CancelToken,
+    workflow_ipc: Option<&WorkflowIpcContext>,
+    child_executor: ChildAgentExecutor<io::Sink>,
+) -> io::Result<ToolTurnOutcome> {
+    let results = execute_subagent_batch(
+        config,
+        cwd,
+        events,
+        sink,
+        tool_requests,
+        subagent_depth,
+        emit_deltas,
+        instructions,
+        memory,
+        mcp_registry,
+        hooks,
+        cost_tracker,
+        cancel,
+        workflow_ipc,
+        child_executor,
+    )?;
+
+    match record_subagent_batch_results(conversation, history_writer, results, emit_deltas)? {
+        SubagentBatchRecordOutcome::Continue => Ok(ToolTurnOutcome::Continue),
+        SubagentBatchRecordOutcome::Return { status, error } => {
+            Ok(ToolTurnOutcome::Return { status, error })
+        }
+    }
 }
 
 fn is_batchable_subagent_request(tool_request: &tool_types::ToolRequest) -> bool {
@@ -926,6 +972,8 @@ mod tests {
     use orca_core::tool_types;
     use orca_mcp::McpRegistry;
 
+    use crate::tool_invocation::ToolTurnOutcome;
+
     fn config(subagents: SubagentConfig) -> RunConfig {
         RunConfig {
             app_version: "0.0.0-test".to_string(),
@@ -1023,6 +1071,56 @@ mod tests {
             }
         }
         assert_eq!(conversation.messages.len(), 1);
+    }
+
+    #[test]
+    fn run_subagent_batch_tool_turn_executes_and_records_results() {
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let mut subagents = SubagentConfig::default();
+        subagents.max_parallel = 2;
+        let config = config(subagents);
+        let mut events = EventFactory::new("subagent-batch-turn".to_string());
+        let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+        let requests = vec![subagent_request("injected"), subagent_request("injected")];
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let mcp_registry = McpRegistry::default();
+        let hooks = HookRunner::default();
+        let mut cost_tracker = CostTracker::new(None);
+        let cancel = CancelToken::new();
+        let mut conversation = orca_core::conversation::Conversation::new();
+
+        let outcome = super::run_subagent_batch_tool_turn(
+            &config,
+            cwd.path(),
+            &mut events,
+            &mut sink,
+            &mut conversation,
+            None,
+            &requests,
+            0,
+            true,
+            &instructions,
+            &memory,
+            &mcp_registry,
+            &hooks,
+            &mut cost_tracker,
+            &cancel,
+            None,
+            fake_child_executor::<std::io::Sink>,
+        )
+        .expect("run subagent batch tool turn");
+
+        assert!(matches!(outcome, ToolTurnOutcome::Continue));
+        assert_eq!(conversation.messages.len(), 2);
+        assert!(
+            matches!(&conversation.messages[0], orca_core::conversation::Message::Tool { tool_call_id, content, .. }
+                if tool_call_id == "injected" && content.contains("injected child result"))
+        );
+        assert!(
+            matches!(&conversation.messages[1], orca_core::conversation::Message::Tool { tool_call_id, content, .. }
+                if tool_call_id == "injected" && content.contains("injected child result"))
+        );
     }
 
     fn fake_child_executor<W: io::Write>(
