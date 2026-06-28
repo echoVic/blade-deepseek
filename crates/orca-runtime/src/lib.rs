@@ -263,6 +263,32 @@ mod tests {
     }
 
     #[test]
+    fn agent_plan_state_recording_is_owned_by_session_module() {
+        let agent_loop_source = include_str!("agent_loop.rs");
+        let session_source = include_str!("session.rs");
+
+        for marker in [
+            "orca_tools::update_plan::parse_args",
+            "replace_plan_state",
+            "append_plan_state",
+            "format_context_message",
+        ] {
+            assert!(
+                !agent_loop_source.contains(marker),
+                "agent_loop must not own plan-state recording detail {marker}"
+            );
+            assert!(
+                session_source.contains(marker),
+                "session must own plan-state recording detail {marker}"
+            );
+        }
+        assert!(
+            session_source.contains("pub(crate) fn record_plan_state_for_agent"),
+            "session must expose agent plan-state recording"
+        );
+    }
+
+    #[test]
     fn runtime_compaction_step_is_owned_by_lifecycle_module() {
         let agent_loop_source = include_str!("agent_loop.rs");
         let lifecycle_source = include_str!("lifecycle.rs");

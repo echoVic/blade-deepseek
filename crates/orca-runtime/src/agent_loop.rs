@@ -30,7 +30,9 @@ use crate::lifecycle::{
     RuntimeTurnState, TurnPermissionOverlay,
 };
 use crate::memory::{self, MemoryBlock};
-use crate::session::{AgentConversationContext, record_tool_result_for_agent};
+use crate::session::{
+    AgentConversationContext, record_plan_state_for_agent, record_tool_result_for_agent,
+};
 use crate::subagent_execution::{
     collect_subagent_batch, execute_subagent_batch, should_run_subagent_batch,
 };
@@ -511,18 +513,12 @@ pub(crate) fn run_agent_loop(
                     .with_permission_handler(permission_handler),
             )?;
 
-            if tool_request.name == tool_types::ToolName::UpdatePlan
-                && result.status == tool_types::ToolStatus::Completed
-            {
-                if let Ok(update) = orca_tools::update_plan::parse_args(tool_request) {
-                    conversation.replace_plan_state(
-                        orca_tools::update_plan::format_context_message(&update),
-                    );
-                    if let Some(writer) = history_writer.as_deref_mut() {
-                        let _ = writer.append_plan_state(update.explanation, update.plan);
-                    }
-                }
-            }
+            record_plan_state_for_agent(
+                conversation,
+                history_writer.as_deref_mut(),
+                tool_request,
+                &result,
+            );
 
             record_tool_result_for_agent(
                 conversation,

@@ -9,7 +9,7 @@ use orca_core::cost_types::UsageTotals;
 use orca_core::hook_types::HookEvent;
 use orca_core::subagent_types::SubagentType;
 use orca_core::task_types::TaskStatus;
-use orca_core::tool_types::ToolResult;
+use orca_core::tool_types::{ToolName, ToolRequest, ToolResult, ToolStatus};
 use orca_mcp::McpRegistry;
 use orca_provider::ProviderConfig;
 
@@ -116,6 +116,24 @@ pub(crate) fn record_tool_result_for_agent(
         writer.append_tool_result_message(result, result_content.clone(), false)?;
     }
     Ok(result_content)
+}
+
+pub(crate) fn record_plan_state_for_agent(
+    conversation: &mut Conversation,
+    history_writer: Option<&mut SessionWriter>,
+    tool_request: &ToolRequest,
+    result: &ToolResult,
+) {
+    if tool_request.name != ToolName::UpdatePlan || result.status != ToolStatus::Completed {
+        return;
+    }
+
+    if let Ok(update) = orca_tools::update_plan::parse_args(tool_request) {
+        conversation.replace_plan_state(orca_tools::update_plan::format_context_message(&update));
+        if let Some(writer) = history_writer {
+            let _ = writer.append_plan_state(update.explanation, update.plan);
+        }
+    }
 }
 
 impl InteractiveSession {
