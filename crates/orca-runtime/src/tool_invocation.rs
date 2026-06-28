@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use orca_core::approval_types::{ActionKind, ApprovalRequest};
 use orca_core::config::RunConfig;
 use orca_core::external_config::ExternalToolConfig;
@@ -50,6 +52,58 @@ impl ToolExecutionFailure {
     pub fn into_result(self) -> ToolResult {
         ToolResult::invalid_input(&self.request, self.message)
     }
+}
+
+pub(crate) fn reject_disallowed_child_tool(
+    tool_request: &ToolRequest,
+    policy: AgentToolPolicyContext<'_>,
+    mcp_registry: &McpRegistry,
+    external_tools: &[ExternalToolConfig],
+) -> Option<ToolResult> {
+    child_tool_policy_failure(
+        tool_request,
+        policy.allowed_tools(),
+        policy.label(),
+        mcp_registry,
+        external_tools,
+    )
+}
+
+fn child_tool_policy_failure(
+    tool_request: &ToolRequest,
+    allowed_tools: Option<&[String]>,
+    policy_label: Option<&str>,
+    mcp_registry: &McpRegistry,
+    external_tools: &[ExternalToolConfig],
+) -> Option<ToolResult> {
+    let allowed_tools = allowed_tools?;
+    let registry = orca_tools::registry::tool_registry_with_mcp_and_external(
+        Some(mcp_registry),
+        external_tools,
+    );
+    let allowed_canonical_names = allowed_tools
+        .iter()
+        .filter_map(|tool| {
+            registry
+                .resolve(tool)
+                .map(|resolved| resolved.tool.name().to_string())
+        })
+        .collect::<HashSet<_>>();
+    let requested_name = tool_request.name.as_str();
+    let requested_canonical_name = registry
+        .resolve(requested_name)
+        .map(|resolved| resolved.tool.name().to_string())
+        .unwrap_or_else(|| requested_name.to_string());
+
+    if allowed_canonical_names.contains(&requested_canonical_name) {
+        return None;
+    }
+
+    let label = policy_label.unwrap_or("child agent tool policy");
+    Some(ToolResult::invalid_input(
+        tool_request,
+        format!("{label} disallows tool '{requested_name}'"),
+    ))
 }
 
 pub fn prepare_tool_invocation(

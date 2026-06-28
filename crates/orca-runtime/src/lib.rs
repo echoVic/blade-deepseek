@@ -169,6 +169,25 @@ mod tests {
     }
 
     #[test]
+    fn child_tool_policy_gate_is_owned_by_tool_invocation_module() {
+        let agent_loop_source = include_str!("agent_loop.rs");
+        let tool_invocation_source = include_str!("tool_invocation.rs");
+
+        assert!(
+            !agent_loop_source.contains("fn child_tool_policy_failure"),
+            "agent_loop must not own child tool policy gate behavior"
+        );
+        assert!(
+            tool_invocation_source.contains("fn child_tool_policy_failure"),
+            "tool_invocation must own child tool policy gate behavior"
+        );
+        assert!(
+            tool_invocation_source.contains("pub(crate) fn reject_disallowed_child_tool"),
+            "tool_invocation must expose child tool policy gate to the agent loop"
+        );
+    }
+
+    #[test]
     fn agent_conversation_context_is_owned_by_session_module() {
         let agent_loop_source = include_str!("agent_loop.rs");
         let session_source = include_str!("session.rs");

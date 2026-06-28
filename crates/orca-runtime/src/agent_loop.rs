@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::io;
 use std::path::Path;
 
@@ -42,7 +41,7 @@ use crate::thread_store;
 use crate::tool_execution::{ToolExecutionActor, ToolExecutionContext};
 use crate::tool_invocation::{
     AgentToolPolicyContext, apply_pre_tool_outcome_with_external,
-    prepare_tool_invocation_with_external,
+    prepare_tool_invocation_with_external, reject_disallowed_child_tool,
 };
 use crate::workflow_execution::observe_background_workflows;
 
@@ -402,10 +401,9 @@ pub(crate) fn run_agent_loop(
         let mut index = 0;
         let mut permission_overlay = TurnPermissionOverlay::default();
         while index < tool_requests.len() {
-            if let Some(result) = child_tool_policy_failure(
+            if let Some(result) = reject_disallowed_child_tool(
                 &tool_requests[index],
-                tool_policy.allowed_tools(),
-                tool_policy.label(),
+                tool_policy,
                 mcp_registry,
                 &config.external_tools,
             ) {
@@ -599,43 +597,6 @@ pub(crate) fn execute_child_agent_loop<W: io::Write>(
         final_message: child.final_message,
         error: child.error,
     })
-}
-
-fn child_tool_policy_failure(
-    tool_request: &tool_types::ToolRequest,
-    allowed_tools: Option<&[String]>,
-    policy_label: Option<&str>,
-    mcp_registry: &McpRegistry,
-    external_tools: &[orca_core::external_config::ExternalToolConfig],
-) -> Option<tool_types::ToolResult> {
-    let allowed_tools = allowed_tools?;
-    let registry = orca_tools::registry::tool_registry_with_mcp_and_external(
-        Some(mcp_registry),
-        external_tools,
-    );
-    let allowed_canonical_names = allowed_tools
-        .iter()
-        .filter_map(|tool| {
-            registry
-                .resolve(tool)
-                .map(|resolved| resolved.tool.name().to_string())
-        })
-        .collect::<HashSet<_>>();
-    let requested_name = tool_request.name.as_str();
-    let requested_canonical_name = registry
-        .resolve(requested_name)
-        .map(|resolved| resolved.tool.name().to_string())
-        .unwrap_or_else(|| requested_name.to_string());
-
-    if allowed_canonical_names.contains(&requested_canonical_name) {
-        return None;
-    }
-
-    let label = policy_label.unwrap_or("child agent tool policy");
-    Some(tool_types::ToolResult::invalid_input(
-        tool_request,
-        format!("{label} disallows tool '{requested_name}'"),
-    ))
 }
 
 fn execute_tool_with_approval(
