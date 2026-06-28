@@ -18,7 +18,7 @@ use orca_core::plan_types::{PlanItem, PlanStatus};
 use orca_core::tool_types::{ToolResult, ToolStatus};
 use orca_core::{approval_rules::PermissionRules, approval_types::ApprovalMode};
 
-pub use crate::thread_store::ThreadStore;
+pub use crate::thread_store::{JsonlThreadStore, SessionStore, ThreadStore};
 
 const ORCA_HOME_ENV: &str = "ORCA_HOME";
 const SESSION_SCHEMA_VERSION: u32 = 1;
@@ -235,11 +235,6 @@ pub struct StoredThreadSummary {
     pub runtime_workspace_roots: Vec<PathBuf>,
     pub additional_working_directories: Vec<AdditionalWorkingDirectory>,
 }
-
-#[derive(Clone, Debug, Default)]
-pub struct JsonlThreadStore;
-
-pub type SessionStore = JsonlThreadStore;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct CompactionRecord {

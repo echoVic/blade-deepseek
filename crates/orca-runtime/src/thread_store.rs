@@ -1,9 +1,9 @@
 pub use crate::history::{
-    JsonlThreadStore, LiveThread, SessionMeta, SessionStore, SessionSummary, SessionTranscript,
-    SessionWriter, SortDirection, StoredThreadItem, StoredThreadItemPage, StoredThreadProjection,
-    StoredThreadSearchHit, StoredThreadSearchPage, StoredThreadSummary, StoredThreadSummaryPage,
-    StoredThreadTurn, StoredThreadTurnPage, ThreadListFilters, ThreadMetadataPatch,
-    ThreadRelationFilter, ThreadSortKey, TurnItemsView,
+    LiveThread, SessionMeta, SessionSummary, SessionTranscript, SessionWriter, SortDirection,
+    StoredThreadItem, StoredThreadItemPage, StoredThreadProjection, StoredThreadSearchHit,
+    StoredThreadSearchPage, StoredThreadSummary, StoredThreadSummaryPage, StoredThreadTurn,
+    StoredThreadTurnPage, ThreadListFilters, ThreadMetadataPatch, ThreadRelationFilter,
+    ThreadSortKey, TurnItemsView,
 };
 use std::io;
 use std::path::Path;
@@ -12,6 +12,11 @@ use orca_core::approval_rules::PermissionRules;
 use orca_core::approval_types::ApprovalMode;
 use orca_core::config::{ActivePermissionProfile, AdditionalWorkingDirectory};
 use orca_core::conversation::{Conversation, Message};
+
+#[derive(Clone, Debug, Default)]
+pub struct JsonlThreadStore;
+
+pub type SessionStore = JsonlThreadStore;
 
 pub trait ThreadStore {
     fn create_live_thread(

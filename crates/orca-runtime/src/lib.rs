@@ -58,6 +58,29 @@ mod tests {
     }
 
     #[test]
+    fn jsonl_thread_store_type_is_owned_by_thread_store_module() {
+        let history_source = include_str!("history.rs");
+        let thread_store_source = include_str!("thread_store.rs");
+
+        assert!(
+            !history_source.contains("pub struct JsonlThreadStore"),
+            "history must not own the JSONL ThreadStore backend type"
+        );
+        assert!(
+            !history_source.contains("pub type SessionStore"),
+            "history must not own the SessionStore compatibility alias"
+        );
+        assert!(
+            thread_store_source.contains("pub struct JsonlThreadStore"),
+            "thread_store must own the JSONL ThreadStore backend type"
+        );
+        assert!(
+            thread_store_source.contains("pub type SessionStore"),
+            "thread_store must own the SessionStore compatibility alias"
+        );
+    }
+
+    #[test]
     fn protocol_imports_thread_types_from_thread_store_boundary() {
         let protocol_source = include_str!("protocol.rs");
 
