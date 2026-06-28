@@ -268,8 +268,9 @@ fn access_deny_rules(denied_roots: &[PathBuf]) -> String {
     denied_roots
         .iter()
         .map(|root| {
+            let path_matcher = if root.is_file() { "literal" } else { "subpath" };
             format!(
-                r#"(deny file-read* file-write* (subpath "{}"))"#,
+                r#"(deny file-read* file-write* ({path_matcher} "{}"))"#,
                 seatbelt_escape(&root.display().to_string())
             )
         })
@@ -387,6 +388,24 @@ mod tests {
             profile.find(&deny).unwrap() > profile.find(&allow).unwrap(),
             "deny access rules must come after allow rules"
         );
+    }
+
+    #[test]
+    fn read_only_profile_uses_literal_deny_rules_for_files() {
+        let extra = TempDir::new().unwrap();
+        let denied_file = extra.path().join("secret.env");
+        std::fs::write(&denied_file, "secret").unwrap();
+        let profile = read_only_profile(
+            &[],
+            &[extra.path().to_path_buf()],
+            &[denied_file.clone()],
+            false,
+        );
+
+        assert!(profile.contains(&format!(
+            r#"(deny file-read* file-write* (literal "{}"))"#,
+            denied_file.display()
+        )));
     }
 
     #[test]

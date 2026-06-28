@@ -2976,14 +2976,34 @@ fn server_mode_command_exec_configured_permission_profile_deny_blocks_reads() {
 }
 
 #[test]
-fn server_mode_command_exec_configured_permission_profile_rejects_glob_entries() {
+fn server_mode_command_exec_configured_permission_profile_enforces_deny_glob_entries() {
+    if !sandbox_seatbelt_available() {
+        return;
+    }
+
     with_orca_home(|home| {
         let workspace = tempdir().expect("workspace");
+        let allowed = tempdir().expect("allowed");
+        let denied_file = allowed.path().join("secret.env");
+        let ordinary_file = allowed.path().join("ordinary.txt");
+        let output_file = allowed.path().join("ordinary.out");
+        std::fs::write(&denied_file, "secret").expect("write denied file");
+        std::fs::write(&ordinary_file, "ordinary").expect("write ordinary file");
         std::fs::write(
             home.join("config.toml"),
-            "[permission_profiles.globbed]\nextends = \":read-only\"\n\n[permission_profiles.globbed.filesystem]\n\"/tmp/*.env\" = \"deny\"\n",
+            format!(
+                "[permission_profiles.globbed]\nextends = \":read-only\"\n\n[permission_profiles.globbed.filesystem]\n\"{}\" = \"write\"\n\"{}/*.env\" = \"deny\"\n",
+                allowed.path().display(),
+                allowed.path().display()
+            ),
         )
         .expect("write permission profile config");
+        let command = format!(
+            "set -e; cat {} > {}; cat {}",
+            shell_escape(&ordinary_file),
+            shell_escape(&output_file),
+            shell_escape(&denied_file)
+        );
 
         let mut child = orca_command()
             .args([
@@ -3000,12 +3020,14 @@ fn server_mode_command_exec_configured_permission_profile_rejects_glob_entries()
             .stderr(Stdio::piped())
             .spawn()
             .expect("spawn orca server");
+        let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
 
         {
             let stdin = child.stdin.as_mut().expect("server stdin");
             writeln!(
                 stdin,
-                r#"{{"id":"cmd","method":"command/exec","params":{{"command":["sh","-lc","true"],"permissionProfile":"globbed"}}}}"#
+                r#"{{"id":"cmd","method":"command/exec","params":{{"command":["sh","-lc",{}],"permissionProfile":"globbed"}}}}"#,
+                serde_json::to_string(&command).expect("command json")
             )
             .expect("write glob permissionProfile command/exec");
             stdin
@@ -3014,18 +3036,16 @@ fn server_mode_command_exec_configured_permission_profile_rejects_glob_entries()
         }
         drop(child.stdin.take());
 
+        let completed = read_until_event(&mut stdout, "cmd", "command_exec_completed");
+        assert_ne!(completed["exitCode"], 0);
+        assert_eq!(
+            std::fs::read_to_string(&output_file).expect("ordinary output"),
+            "ordinary"
+        );
+
         let output = child.wait_with_output().expect("wait for server");
         assert_eq!(output.status.code(), Some(0));
         assert!(output.stderr.is_empty());
-
-        let events = parse_jsonl(&output.stdout);
-        assert_eq!(events.len(), 1, "expected one error event: {events:?}");
-        assert_eq!(events[0]["id"], "cmd");
-        assert_eq!(events[0]["event"], "error");
-        assert_eq!(
-            events[0]["message"],
-            "command/exec permissionProfile glob filesystem entries are not supported yet: /tmp/*.env"
-        );
     });
 }
 

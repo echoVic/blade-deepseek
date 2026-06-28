@@ -1115,6 +1115,7 @@ dependencies = [
  "base64",
  "chrono",
  "dirs",
+ "globset",
  "orca-approval",
  "orca-core",
  "orca-mcp",
@@ -1128,6 +1129,7 @@ dependencies = [
  "tokio",
  "toml",
  "uuid",
+ "walkdir",
  "zstd",
 ]
 
