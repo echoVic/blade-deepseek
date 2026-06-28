@@ -32,8 +32,10 @@ use crate::shell_session::{
 };
 use crate::tasks::TaskRegistry;
 use crate::thread_store::SessionWriter;
+use crate::tool_execution::policy_for_tool_execution;
 use crate::tool_invocation::{
-    AgentToolPolicyContext, ToolTurnOutcome, run_tool_turns, tool_requests_from_provider_steps,
+    AgentToolPolicyContext, ToolTurnOutcome, provider_config_for_agent_loop, run_tool_turns,
+    tool_requests_from_provider_steps,
 };
 use crate::workflow::WorkflowDraftStore;
 use crate::workflow::ipc::WorkflowIpcContext;
@@ -98,6 +100,7 @@ pub struct RuntimeToolActorContext {
 }
 
 pub(crate) struct RuntimeSteerStep;
+pub(crate) struct RuntimeTurnSetupStep;
 pub(crate) struct RuntimeTurnStartStep;
 pub(crate) struct RuntimeModelRouteStep;
 pub(crate) struct RuntimeProviderErrorStep {
@@ -143,6 +146,12 @@ pub(crate) enum RuntimeProviderErrorStepOutcome {
 pub(crate) enum RuntimeProviderTurnResultOutcome {
     Response(ProviderResponse),
     Failed(RuntimeTurnStartError),
+}
+
+pub(crate) struct RuntimeTurnSetup {
+    pub(crate) context_config: context::ContextConfig,
+    pub(crate) policy: ApprovalPolicy,
+    pub(crate) provider_config: ProviderConfig,
 }
 
 pub(crate) struct RuntimeCompactionStep<'a, W: io::Write> {
@@ -1007,6 +1016,41 @@ impl RuntimeSteerStep {
             }
         }
         Ok(injected)
+    }
+}
+
+impl RuntimeTurnSetupStep {
+    pub(crate) fn new() -> Self {
+        Self
+    }
+
+    pub(crate) fn prepare(
+        &mut self,
+        config: &RunConfig,
+        subagent_depth: u32,
+        subagent_type: &SubagentType,
+        tool_policy: AgentToolPolicyContext<'_>,
+        mcp_registry: &McpRegistry,
+    ) -> RuntimeTurnSetup {
+        let budget_model = config.model.as_option();
+        let context_config = context::ContextConfig::for_model_with_runtime(
+            budget_model.as_deref(),
+            &config.model_runtime,
+        );
+        let policy = policy_for_tool_execution(config);
+        let provider_config = provider_config_for_agent_loop(
+            config,
+            subagent_depth,
+            subagent_type,
+            tool_policy,
+            mcp_registry,
+        );
+
+        RuntimeTurnSetup {
+            context_config,
+            policy,
+            provider_config,
+        }
     }
 }
 
@@ -3077,5 +3121,35 @@ mod tests {
         let output = String::from_utf8(output).expect("jsonl is utf8");
         assert!(output.contains("\"type\":\"model.routed\""));
         assert!(output.contains(orca_core::model::PRO_MODEL));
+    }
+
+    #[test]
+    fn turn_setup_step_builds_runtime_context_policy_and_provider_config() {
+        let mut config = config();
+        config.api_key = Some("test-key".to_string());
+        config.model =
+            ModelSelection::parse(Some(orca_core::model::FLASH_MODEL.to_string())).expect("model");
+        config.model_runtime = ModelRuntimeConfig {
+            context_window: Some(128_000),
+            auto_compact_token_limit: Some(96_000),
+        };
+        let mcp_registry = McpRegistry::default();
+
+        let setup = RuntimeTurnSetupStep::new().prepare(
+            &config,
+            0,
+            &SubagentType::General,
+            AgentToolPolicyContext::unrestricted(),
+            &mcp_registry,
+        );
+
+        assert_eq!(setup.context_config.max_tokens, 128_000);
+        assert_eq!(setup.context_config.effective_limit(), 96_000);
+        assert_eq!(setup.provider_config.api_key.as_deref(), Some("test-key"));
+        assert_eq!(
+            setup.provider_config.model.as_deref(),
+            Some(orca_core::model::FLASH_MODEL)
+        );
+        assert!(setup.provider_config.mcp_registry.is_some());
     }
 }

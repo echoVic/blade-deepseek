@@ -188,8 +188,12 @@ mod tests {
             );
         }
         assert!(
-            agent_loop_source.contains("provider_config_for_agent_loop"),
-            "agent_loop must delegate provider tool schema override through provider config construction"
+            agent_loop_source.contains("RuntimeTurnSetupStep"),
+            "agent_loop must delegate provider tool schema override through runtime turn setup"
+        );
+        assert!(
+            include_str!("lifecycle.rs").contains("provider_config_for_agent_loop"),
+            "lifecycle setup must delegate provider tool schema override through provider config construction"
         );
         assert!(
             tool_invocation_source.contains("pub(crate) fn provider_tool_schema_override"),
@@ -804,8 +808,8 @@ mod tests {
             "agent_loop must not own provider config construction"
         );
         assert!(
-            agent_loop_source.contains("provider_config_for_agent_loop"),
-            "agent_loop must delegate provider config construction"
+            agent_loop_source.contains("RuntimeTurnSetupStep"),
+            "agent_loop must delegate runtime turn setup"
         );
         assert!(
             tool_invocation_source.contains("pub(crate) fn provider_config_for_agent_loop"),
@@ -827,8 +831,8 @@ mod tests {
             "agent_loop must not own tool approval policy construction"
         );
         assert!(
-            agent_loop_source.contains("policy_for_tool_execution"),
-            "agent_loop must delegate tool approval policy construction"
+            agent_loop_source.contains("RuntimeTurnSetupStep"),
+            "agent_loop must delegate runtime turn setup"
         );
         assert!(
             tool_execution_source.contains("pub(crate) fn policy_for_tool_execution"),
@@ -1261,6 +1265,48 @@ mod tests {
                 "lifecycle must compose provider response handling detail {marker}"
             );
         }
+    }
+
+    #[test]
+    fn runtime_turn_setup_step_is_owned_by_lifecycle_module() {
+        let agent_loop_source = include_str!("agent_loop.rs");
+        let lifecycle_source = include_str!("lifecycle.rs");
+
+        for marker in [
+            "ContextConfig::for_model_with_runtime",
+            "policy_for_tool_execution(",
+            "provider_config_for_agent_loop(",
+            "let budget_model = config.model.as_option()",
+        ] {
+            assert!(
+                !agent_loop_source.contains(marker),
+                "agent_loop must not own runtime turn setup detail {marker}"
+            );
+        }
+        assert!(
+            agent_loop_source.contains("RuntimeTurnSetupStep"),
+            "agent_loop must delegate runtime turn setup"
+        );
+        assert!(
+            lifecycle_source.contains("struct RuntimeTurnSetupStep"),
+            "lifecycle must own runtime turn setup step state"
+        );
+        assert!(
+            lifecycle_source.contains("impl RuntimeTurnSetupStep"),
+            "lifecycle must own runtime turn setup step behavior"
+        );
+        assert!(
+            lifecycle_source.contains("context::ContextConfig::for_model_with_runtime"),
+            "lifecycle must own context config setup"
+        );
+        assert!(
+            lifecycle_source.contains("policy_for_tool_execution("),
+            "lifecycle must compose tool-execution-owned policy construction"
+        );
+        assert!(
+            lifecycle_source.contains("provider_config_for_agent_loop("),
+            "lifecycle must compose tool-invocation-owned provider config construction"
+        );
     }
 
     #[test]

@@ -9,7 +9,8 @@ use crate::lifecycle::{
     RuntimeProviderErrorStepOutcome, RuntimeProviderResponseOutcome, RuntimeProviderResponseStep,
     RuntimeProviderTurnResultOutcome, RuntimeProviderTurnResultStep, RuntimeProviderTurnStep,
     RuntimeSessionLifecycle, RuntimeSteerStep, RuntimeTaskActor, RuntimeTurnConfig,
-    RuntimeTurnDeps, RuntimeTurnExecution, RuntimeTurnStartStep, RuntimeTurnState,
+    RuntimeTurnDeps, RuntimeTurnExecution, RuntimeTurnSetupStep, RuntimeTurnStartStep,
+    RuntimeTurnState,
 };
 use crate::memory::MemoryBlock;
 use crate::session::{
@@ -17,8 +18,7 @@ use crate::session::{
     record_initial_history_for_agent,
 };
 use crate::tasks::TaskRegistry;
-use crate::tool_execution::policy_for_tool_execution;
-use crate::tool_invocation::{AgentToolPolicyContext, provider_config_for_agent_loop};
+use crate::tool_invocation::AgentToolPolicyContext;
 use crate::workflow_execution::observe_background_workflows;
 use orca_core::cancel::CancelToken;
 use orca_core::config::{OutputFormat, RunConfig};
@@ -26,8 +26,6 @@ use orca_core::event_schema::{EventFactory, RunStatus};
 use orca_core::event_sink::EventSink;
 use orca_core::subagent_types::SubagentType;
 use orca_mcp::McpRegistry;
-use orca_provider;
-use orca_provider::context;
 
 const DEFAULT_MAX_TURNS: u32 = 128;
 
@@ -105,19 +103,16 @@ pub(crate) fn run_agent_loop(
         lifecycle,
     } = turn_execution.expect("agent loop turn execution");
     let max_turns = DEFAULT_MAX_TURNS;
-    let budget_model = config.model.as_option();
-    let ctx_config = context::ContextConfig::for_model_with_runtime(
-        budget_model.as_deref(),
-        &config.model_runtime,
-    );
-    let policy = policy_for_tool_execution(config);
-    let provider_config = provider_config_for_agent_loop(
+    let setup = RuntimeTurnSetupStep::new().prepare(
         config,
         subagent_depth,
         subagent_type,
         tool_policy,
         mcp_registry,
     );
+    let ctx_config = setup.context_config;
+    let policy = setup.policy;
+    let provider_config = setup.provider_config;
 
     let mut owned_conversation;
     let conversation = if let Some(conversation) = conversation {
