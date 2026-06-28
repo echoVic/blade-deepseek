@@ -148,6 +148,35 @@ pub(crate) enum RuntimeProviderTurnResultOutcome {
     Failed(RuntimeTurnStartError),
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct AgentLoopResult {
+    pub(crate) status: RunStatus,
+    pub(crate) final_message: Option<String>,
+    pub(crate) error: Option<String>,
+}
+
+impl AgentLoopResult {
+    pub(crate) fn success(final_message: Option<String>) -> Self {
+        Self {
+            status: RunStatus::Success,
+            final_message,
+            error: None,
+        }
+    }
+
+    pub(crate) fn failure(status: RunStatus, error: impl Into<String>) -> Self {
+        Self::terminal(status, Some(error.into()))
+    }
+
+    pub(crate) fn terminal(status: RunStatus, error: Option<String>) -> Self {
+        Self {
+            status,
+            final_message: None,
+            error,
+        }
+    }
+}
+
 pub(crate) struct RuntimeTurnSetup {
     pub(crate) context_config: context::ContextConfig,
     pub(crate) policy: ApprovalPolicy,
@@ -3060,6 +3089,24 @@ mod tests {
         }
         drop(sink);
         assert!(emitted.is_empty());
+    }
+
+    #[test]
+    fn agent_loop_result_constructors_preserve_terminal_shape() {
+        let success = AgentLoopResult::success(Some("done".to_string()));
+        assert_eq!(success.status, RunStatus::Success);
+        assert_eq!(success.final_message.as_deref(), Some("done"));
+        assert_eq!(success.error, None);
+
+        let failure = AgentLoopResult::failure(RunStatus::Failed, "provider failed");
+        assert_eq!(failure.status, RunStatus::Failed);
+        assert_eq!(failure.final_message, None);
+        assert_eq!(failure.error.as_deref(), Some("provider failed"));
+
+        let terminal = AgentLoopResult::terminal(RunStatus::Cancelled, None);
+        assert_eq!(terminal.status, RunStatus::Cancelled);
+        assert_eq!(terminal.final_message, None);
+        assert_eq!(terminal.error, None);
     }
 
     #[test]

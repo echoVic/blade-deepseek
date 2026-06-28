@@ -1310,6 +1310,35 @@ mod tests {
     }
 
     #[test]
+    fn agent_loop_result_is_owned_by_lifecycle_module() {
+        let agent_loop_source = include_str!("agent_loop.rs");
+        let lifecycle_source = include_str!("lifecycle.rs");
+
+        for marker in [
+            "struct AgentLoopResult",
+            "impl AgentLoopResult",
+            "status: RunStatus::Success",
+        ] {
+            assert!(
+                !agent_loop_source.contains(marker),
+                "agent_loop must not own agent-loop result detail {marker}"
+            );
+        }
+        assert!(
+            agent_loop_source.contains("AgentLoopResult"),
+            "agent_loop must use the lifecycle-owned agent-loop result"
+        );
+        assert!(
+            lifecycle_source.contains("struct AgentLoopResult"),
+            "lifecycle must own agent-loop result shape"
+        );
+        assert!(
+            lifecycle_source.contains("impl AgentLoopResult"),
+            "lifecycle must own agent-loop result constructors"
+        );
+    }
+
+    #[test]
     fn runtime_provider_turn_terminal_folding_is_owned_by_lifecycle_module() {
         let agent_loop_source = include_str!("agent_loop.rs");
         let lifecycle_source = include_str!("lifecycle.rs");

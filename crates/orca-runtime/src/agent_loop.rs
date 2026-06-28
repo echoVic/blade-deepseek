@@ -5,12 +5,12 @@ use crate::cost::CostTracker;
 use crate::hooks::HookRunner;
 use crate::instructions::ProjectInstructions;
 use crate::lifecycle::{
-    AgentLoopContext, RuntimeCompactionStep, RuntimeModelRouteStep, RuntimeProviderErrorStep,
-    RuntimeProviderErrorStepOutcome, RuntimeProviderResponseOutcome, RuntimeProviderResponseStep,
-    RuntimeProviderTurnResultOutcome, RuntimeProviderTurnResultStep, RuntimeProviderTurnStep,
-    RuntimeSessionLifecycle, RuntimeSteerStep, RuntimeTaskActor, RuntimeTurnConfig,
-    RuntimeTurnDeps, RuntimeTurnExecution, RuntimeTurnSetupStep, RuntimeTurnStartStep,
-    RuntimeTurnState,
+    AgentLoopContext, AgentLoopResult, RuntimeCompactionStep, RuntimeModelRouteStep,
+    RuntimeProviderErrorStep, RuntimeProviderErrorStepOutcome, RuntimeProviderResponseOutcome,
+    RuntimeProviderResponseStep, RuntimeProviderTurnResultOutcome, RuntimeProviderTurnResultStep,
+    RuntimeProviderTurnStep, RuntimeSessionLifecycle, RuntimeSteerStep, RuntimeTaskActor,
+    RuntimeTurnConfig, RuntimeTurnDeps, RuntimeTurnExecution, RuntimeTurnSetupStep,
+    RuntimeTurnStartStep, RuntimeTurnState,
 };
 use crate::memory::MemoryBlock;
 use crate::session::{
@@ -22,41 +22,12 @@ use crate::tool_invocation::AgentToolPolicyContext;
 use crate::workflow_execution::observe_background_workflows;
 use orca_core::cancel::CancelToken;
 use orca_core::config::{OutputFormat, RunConfig};
-use orca_core::event_schema::{EventFactory, RunStatus};
+use orca_core::event_schema::EventFactory;
 use orca_core::event_sink::EventSink;
 use orca_core::subagent_types::SubagentType;
 use orca_mcp::McpRegistry;
 
 const DEFAULT_MAX_TURNS: u32 = 128;
-
-#[derive(Clone, Debug)]
-pub(crate) struct AgentLoopResult {
-    pub(crate) status: RunStatus,
-    pub(crate) final_message: Option<String>,
-    pub(crate) error: Option<String>,
-}
-
-impl AgentLoopResult {
-    fn success(final_message: Option<String>) -> Self {
-        Self {
-            status: RunStatus::Success,
-            final_message,
-            error: None,
-        }
-    }
-
-    fn failure(status: RunStatus, error: impl Into<String>) -> Self {
-        Self::terminal(status, Some(error.into()))
-    }
-
-    fn terminal(status: RunStatus, error: Option<String>) -> Self {
-        Self {
-            status,
-            final_message: None,
-            error,
-        }
-    }
-}
 
 pub(crate) fn run_agent_loop(
     config: &RunConfig,
