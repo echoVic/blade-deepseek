@@ -327,6 +327,7 @@ impl From<HashMap<PathBuf, PermissionProfileFileAccess>> for PermissionProfileFi
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PermissionProfileNetworkConfig {
     #[serde(default)]
     pub enabled: Option<bool>,

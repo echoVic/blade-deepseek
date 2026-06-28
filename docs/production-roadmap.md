@@ -303,7 +303,9 @@ commands and consume versioned events without owning turn execution details.
    can override broader readable and writable roots.
    `[permission_profiles.<name>.network]`
    `enabled = true|false` now overrides the inherited built-in sandbox network
-   default. Configured `:workspace_roots` / `:workspace_roots/<subpath>`
+   default, while unsupported Codex proxy/domain policy fields are rejected at
+   config parse time instead of being ignored. Configured `:workspace_roots` /
+   `:workspace_roots/<subpath>`
    filesystem entries now materialize against the owning thread's
    `runtimeWorkspaceRoots` before command execution, and TOML scoped
    filesystem tables such as
@@ -313,8 +315,8 @@ commands and consume versioned events without owning turn execution details.
    `/tmp`, and configured `:root` materializes to `/`. Glob filesystem entries
    are now rejected with an explicit `command/exec` error instead of being
    silently treated as literal paths. Full Codex read allow-list semantics,
-   `:minimal`, glob expansion/enforcement, and network proxy/domain policy
-   compilation remain later expansions.
+   `:minimal`, glob expansion/enforcement, and real network proxy/domain
+   policy compilation remain later expansions.
 5. **Protocol item stream:** Codex SDK emits `thread.started`, `turn.started`,
    `item.started/updated/completed`, and terminal turn events. Orca now keeps
    legacy JSONL names stable while the server adapter emits user steer

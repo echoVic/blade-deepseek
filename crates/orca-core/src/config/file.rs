@@ -554,6 +554,26 @@ enabled = true
     }
 
     #[test]
+    fn reject_unsupported_permission_profile_network_domain_policy() {
+        let toml = r#"
+[permission_profiles.limited-network]
+extends = ":read-only"
+
+[permission_profiles.limited-network.network]
+enabled = true
+
+[permission_profiles.limited-network.network.domains]
+"api.example.com" = "allow"
+"#;
+        let error = toml::from_str::<FileConfig>(toml).expect_err("unsupported network domains");
+
+        assert!(
+            error.to_string().contains("unknown field `domains`"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
     fn parse_partial_config() {
         let toml = r#"model = "deepseek-v4-flash""#;
         let config: FileConfig = toml::from_str(toml).unwrap();
