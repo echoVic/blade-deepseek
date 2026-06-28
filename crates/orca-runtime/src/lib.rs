@@ -1268,15 +1268,28 @@ mod tests {
         let agent_loop_source = include_str!("agent_loop.rs");
         let lifecycle_source = include_str!("lifecycle.rs");
 
-        for marker in ["provider_turn.response", "provider_turn.terminal_error"] {
+        for marker in [
+            "provider_turn.response",
+            "provider_turn.terminal_error",
+            "provider_response_or_terminal(",
+            "RunStatus::Cancelled",
+        ] {
             assert!(
                 !agent_loop_source.contains(marker),
                 "agent_loop must not own provider turn terminal folding detail {marker}"
             );
         }
         assert!(
-            agent_loop_source.contains("provider_response_or_terminal("),
+            agent_loop_source.contains("RuntimeProviderTurnResultStep"),
             "agent_loop must delegate provider turn terminal folding"
+        );
+        assert!(
+            lifecycle_source.contains("struct RuntimeProviderTurnResultStep"),
+            "lifecycle must own provider turn result step state"
+        );
+        assert!(
+            lifecycle_source.contains("impl RuntimeProviderTurnResultStep"),
+            "lifecycle must own provider turn result step behavior"
         );
         assert!(
             lifecycle_source.contains("pub(crate) fn provider_response_or_terminal"),

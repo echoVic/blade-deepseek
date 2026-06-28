@@ -103,6 +103,7 @@ pub(crate) struct RuntimeModelRouteStep;
 pub(crate) struct RuntimeProviderErrorStep {
     reactive_compacted: bool,
 }
+pub(crate) struct RuntimeProviderTurnResultStep;
 
 pub(crate) struct RuntimeProviderTurnStep;
 pub(crate) struct RuntimeProviderResponseStep;
@@ -137,6 +138,11 @@ pub(crate) enum RuntimeProviderErrorStepOutcome {
     ContinueAfterCompaction,
     Failed(RuntimeTurnStartError),
     NoError,
+}
+
+pub(crate) enum RuntimeProviderTurnResultOutcome {
+    Response(ProviderResponse),
+    Failed(RuntimeTurnStartError),
 }
 
 pub(crate) struct RuntimeCompactionStep<'a, W: io::Write> {
@@ -2215,6 +2221,30 @@ impl RuntimeProviderErrorStep {
     }
 }
 
+impl RuntimeProviderTurnResultStep {
+    pub(crate) fn new() -> Self {
+        Self
+    }
+
+    pub(crate) fn fold<W: io::Write>(
+        &mut self,
+        provider_turn: RuntimeProviderTurnOutput,
+        events: &mut EventFactory,
+        sink: &mut EventSink<W>,
+        emit_deltas: bool,
+    ) -> io::Result<RuntimeProviderTurnResultOutcome> {
+        match provider_response_or_terminal(provider_turn) {
+            Ok(response) => Ok(RuntimeProviderTurnResultOutcome::Response(response)),
+            Err(error) => {
+                if emit_deltas && error.status != RunStatus::Cancelled {
+                    sink.emit(&events.error(&error.message))?;
+                }
+                Ok(RuntimeProviderTurnResultOutcome::Failed(error))
+            }
+        }
+    }
+}
+
 impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
     pub(crate) fn new(
         provider: ProviderKind,
@@ -2961,6 +2991,31 @@ mod tests {
 
         assert_eq!(error.status, RunStatus::Cancelled);
         assert_eq!(error.message, "turn cancelled");
+    }
+
+    #[test]
+    fn provider_turn_result_step_suppresses_cancelled_error_event() {
+        let output = RuntimeProviderTurnOutput::terminal(RuntimeTurnStartError {
+            status: RunStatus::Cancelled,
+            message: "turn cancelled".to_string(),
+        });
+        let mut events = EventFactory::new("provider-turn-result".to_string());
+        let mut emitted = Vec::new();
+        let mut sink = EventSink::new(&mut emitted, OutputFormat::Jsonl);
+
+        let outcome = RuntimeProviderTurnResultStep::new()
+            .fold(output, &mut events, &mut sink, true)
+            .expect("fold provider turn result");
+
+        match outcome {
+            RuntimeProviderTurnResultOutcome::Failed(error) => {
+                assert_eq!(error.status, RunStatus::Cancelled);
+                assert_eq!(error.message, "turn cancelled");
+            }
+            _ => panic!("expected cancelled provider turn to fail"),
+        }
+        drop(sink);
+        assert!(emitted.is_empty());
     }
 
     #[test]

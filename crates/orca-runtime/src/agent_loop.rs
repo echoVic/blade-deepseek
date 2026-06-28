@@ -7,9 +7,9 @@ use crate::instructions::ProjectInstructions;
 use crate::lifecycle::{
     AgentLoopContext, RuntimeCompactionStep, RuntimeModelRouteStep, RuntimeProviderErrorStep,
     RuntimeProviderErrorStepOutcome, RuntimeProviderResponseOutcome, RuntimeProviderResponseStep,
-    RuntimeProviderTurnStep, RuntimeSessionLifecycle, RuntimeSteerStep, RuntimeTaskActor,
-    RuntimeTurnConfig, RuntimeTurnDeps, RuntimeTurnExecution, RuntimeTurnStartStep,
-    RuntimeTurnState, provider_response_or_terminal,
+    RuntimeProviderTurnResultOutcome, RuntimeProviderTurnResultStep, RuntimeProviderTurnStep,
+    RuntimeSessionLifecycle, RuntimeSteerStep, RuntimeTaskActor, RuntimeTurnConfig,
+    RuntimeTurnDeps, RuntimeTurnExecution, RuntimeTurnStartStep, RuntimeTurnState,
 };
 use crate::memory::MemoryBlock;
 use crate::session::{
@@ -201,12 +201,14 @@ pub(crate) fn run_agent_loop(
             sink,
             history_writer.as_deref_mut(),
         )?;
-        let response = match provider_response_or_terminal(provider_turn) {
-            Ok(response) => response,
-            Err(error) => {
-                if emit_deltas && error.status != RunStatus::Cancelled {
-                    sink.emit(&events.error(&error.message))?;
-                }
+        let response = match RuntimeProviderTurnResultStep::new().fold(
+            provider_turn,
+            events,
+            sink,
+            emit_deltas,
+        )? {
+            RuntimeProviderTurnResultOutcome::Response(response) => response,
+            RuntimeProviderTurnResultOutcome::Failed(error) => {
                 return Ok(AgentLoopResult::failure(error.status, error.message));
             }
         };
