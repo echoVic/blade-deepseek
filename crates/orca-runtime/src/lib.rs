@@ -128,6 +128,21 @@ mod tests {
     }
 
     #[test]
+    fn session_meta_is_owned_by_thread_store_module() {
+        let history_source = include_str!("history.rs");
+        let thread_store_source = include_str!("thread_store.rs");
+
+        assert!(
+            !history_source.contains("pub struct SessionMeta"),
+            "history must not own ThreadStore session metadata"
+        );
+        assert!(
+            thread_store_source.contains("pub struct SessionMeta"),
+            "thread_store must own ThreadStore session metadata"
+        );
+    }
+
+    #[test]
     fn protocol_imports_thread_types_from_thread_store_boundary() {
         let protocol_source = include_str!("protocol.rs");
 

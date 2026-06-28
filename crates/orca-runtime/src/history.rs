@@ -19,7 +19,7 @@ use orca_core::tool_types::{ToolResult, ToolStatus};
 use orca_core::{approval_rules::PermissionRules, approval_types::ApprovalMode};
 
 pub use crate::thread_store::{
-    JsonlThreadStore, LiveThread, SessionStore, SortDirection, StoredThreadItem,
+    JsonlThreadStore, LiveThread, SessionMeta, SessionStore, SortDirection, StoredThreadItem,
     StoredThreadItemPage, StoredThreadProjection, StoredThreadSearchHit, StoredThreadSearchPage,
     StoredThreadSummary, StoredThreadSummaryPage, StoredThreadTurn, StoredThreadTurnPage,
     ThreadListFilters, ThreadMetadataPatch, ThreadRelationFilter, ThreadSortKey, ThreadStore,
@@ -31,31 +31,6 @@ const SESSION_SCHEMA_VERSION: u32 = 1;
 
 #[cfg(test)]
 pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct SessionMeta {
-    pub schema_version: u32,
-    pub session_id: String,
-    pub cwd: String,
-    pub provider: String,
-    pub model: Option<String>,
-    pub title: String,
-    pub created_at: DateTime<Utc>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parent_id: Option<String>,
-    #[serde(default)]
-    pub forked: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub approval_mode: Option<ApprovalMode>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub active_permission_profile: Option<ActivePermissionProfile>,
-    #[serde(default)]
-    pub runtime_workspace_roots: Vec<PathBuf>,
-    #[serde(default)]
-    pub permission_rules: PermissionRules,
-    #[serde(default)]
-    pub additional_working_directories: Vec<AdditionalWorkingDirectory>,
-}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SessionSummary {

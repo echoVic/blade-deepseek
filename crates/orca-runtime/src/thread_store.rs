@@ -1,4 +1,4 @@
-pub use crate::history::{SessionMeta, SessionSummary, SessionTranscript, SessionWriter};
+pub use crate::history::{SessionSummary, SessionTranscript, SessionWriter};
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -7,12 +7,38 @@ use orca_core::approval_rules::PermissionRules;
 use orca_core::approval_types::ApprovalMode;
 use orca_core::config::{ActivePermissionProfile, AdditionalWorkingDirectory};
 use orca_core::conversation::{Conversation, Message};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 #[derive(Clone, Debug, Default)]
 pub struct JsonlThreadStore;
 
 pub type SessionStore = JsonlThreadStore;
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SessionMeta {
+    pub schema_version: u32,
+    pub session_id: String,
+    pub cwd: String,
+    pub provider: String,
+    pub model: Option<String>,
+    pub title: String,
+    pub created_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
+    #[serde(default)]
+    pub forked: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_mode: Option<ApprovalMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_permission_profile: Option<ActivePermissionProfile>,
+    #[serde(default)]
+    pub runtime_workspace_roots: Vec<PathBuf>,
+    #[serde(default)]
+    pub permission_rules: PermissionRules,
+    #[serde(default)]
+    pub additional_working_directories: Vec<AdditionalWorkingDirectory>,
+}
 
 #[derive(Clone, Debug)]
 pub struct LiveThread {
