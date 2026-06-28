@@ -18,7 +18,12 @@ use orca_core::plan_types::{PlanItem, PlanStatus};
 use orca_core::tool_types::{ToolResult, ToolStatus};
 use orca_core::{approval_rules::PermissionRules, approval_types::ApprovalMode};
 
-pub use crate::thread_store::{JsonlThreadStore, SessionStore, ThreadStore};
+pub use crate::thread_store::{
+    JsonlThreadStore, SessionStore, SortDirection, StoredThreadItem, StoredThreadItemPage,
+    StoredThreadProjection, StoredThreadSearchHit, StoredThreadSearchPage, StoredThreadSummary,
+    StoredThreadSummaryPage, StoredThreadTurn, StoredThreadTurnPage, ThreadListFilters,
+    ThreadMetadataPatch, ThreadRelationFilter, ThreadSortKey, ThreadStore, TurnItemsView,
+};
 
 const ORCA_HOME_ENV: &str = "ORCA_HOME";
 const SESSION_SCHEMA_VERSION: u32 = 1;
@@ -91,149 +96,6 @@ pub struct SessionWriter {
 pub struct LiveThread {
     thread_id: String,
     writer: SessionWriter,
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct ThreadMetadataPatch {
-    pub title: Option<String>,
-    pub active_permission_profile: Option<ActivePermissionProfile>,
-    pub approval_mode: Option<ApprovalMode>,
-    pub runtime_workspace_roots: Option<Vec<PathBuf>>,
-    pub permission_rules: Option<PermissionRules>,
-    pub additional_working_directories: Option<Vec<AdditionalWorkingDirectory>>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct StoredThreadProjection {
-    pub thread_id: String,
-    pub title: String,
-    pub cwd: String,
-    pub runtime_workspace_roots: Vec<PathBuf>,
-    pub active_permission_profile: Option<ActivePermissionProfile>,
-    pub additional_working_directories: Vec<AdditionalWorkingDirectory>,
-    pub message_count: usize,
-    pub messages: Vec<Value>,
-    pub turns: Vec<StoredThreadTurn>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct StoredThreadSearchHit {
-    pub thread: StoredThreadSummary,
-    pub snippet: String,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct StoredThreadTurn {
-    pub thread_id: String,
-    pub turn_id: String,
-    pub index: usize,
-    pub role: String,
-    pub items_view: TurnItemsView,
-    pub items: Vec<Value>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct StoredThreadItem {
-    pub thread_id: String,
-    pub turn_id: String,
-    pub item_id: String,
-    pub index: usize,
-    pub item: Value,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct StoredThreadTurnPage {
-    pub data: Vec<StoredThreadTurn>,
-    pub next_cursor: Option<String>,
-    pub backwards_cursor: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct StoredThreadItemPage {
-    pub data: Vec<StoredThreadItem>,
-    pub next_cursor: Option<String>,
-    pub backwards_cursor: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct StoredThreadSummaryPage {
-    pub data: Vec<StoredThreadSummary>,
-    pub next_cursor: Option<String>,
-    pub backwards_cursor: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct StoredThreadSearchPage {
-    pub data: Vec<StoredThreadSearchHit>,
-    pub next_cursor: Option<String>,
-    pub backwards_cursor: Option<String>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SortDirection {
-    Asc,
-    Desc,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ThreadSortKey {
-    CreatedAt,
-    UpdatedAt,
-    RecencyAt,
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct ThreadListFilters {
-    pub archived: bool,
-    pub model_providers: Option<Vec<String>>,
-    pub model_names: Option<Vec<String>>,
-    pub cwd_filters: Vec<String>,
-    pub relation: Option<ThreadRelationFilter>,
-}
-
-impl ThreadListFilters {
-    pub fn active() -> Self {
-        Self::default()
-    }
-
-    pub fn archived() -> Self {
-        Self {
-            archived: true,
-            ..Self::default()
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ThreadRelationFilter {
-    DirectChildrenOf(String),
-    DescendantsOf(String),
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TurnItemsView {
-    NotLoaded,
-    Summary,
-    Full,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct StoredThreadSummary {
-    pub thread_id: String,
-    pub title: String,
-    pub cwd: String,
-    pub provider: String,
-    pub model: Option<String>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-    pub archived: bool,
-    pub parent_id: Option<String>,
-    pub forked: bool,
-    pub approval_mode: Option<ApprovalMode>,
-    pub active_permission_profile: Option<ActivePermissionProfile>,
-    pub permission_rule_count: usize,
-    pub runtime_workspace_roots: Vec<PathBuf>,
-    pub additional_working_directories: Vec<AdditionalWorkingDirectory>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
