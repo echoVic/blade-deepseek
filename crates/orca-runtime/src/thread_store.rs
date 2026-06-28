@@ -1,7 +1,8 @@
-use std::io;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use crate::history::{self, CompactionRecord, ContextSummaryRecord, write_record};
+use crate::history::{self, CompactionRecord, ContextSummaryRecord};
 use chrono::{DateTime, Utc};
 use orca_core::approval_rules::PermissionRules;
 use orca_core::approval_types::ApprovalMode;
@@ -209,6 +210,305 @@ impl From<StoredMessage> for Message {
 
 fn is_false(value: &bool) -> bool {
     !*value
+}
+
+pub(crate) fn write_record(path: &Path, record: &SessionRecord) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    lock_file(&file)?;
+    write_record_line(&mut file, record)?;
+    file.flush()?;
+    unlock_file(&file)
+}
+
+pub(crate) fn write_record_line(mut writer: impl Write, record: &SessionRecord) -> io::Result<()> {
+    let redacted = redact_session_record(record);
+    let mut line = serde_json::to_string(&redacted).map_err(io::Error::other)?;
+    line.push('\n');
+    writer.write_all(line.as_bytes())
+}
+
+fn redact_session_record(record: &SessionRecord) -> SessionRecord {
+    let mut redacted = record.clone();
+    match &mut redacted {
+        SessionRecord::Meta(meta) => {
+            redact_string_in_place(&mut meta.cwd);
+            redact_string_in_place(&mut meta.provider);
+            if let Some(model) = &mut meta.model {
+                redact_string_in_place(model);
+            }
+            redact_string_in_place(&mut meta.title);
+            if let Some(parent_id) = &mut meta.parent_id {
+                redact_string_in_place(parent_id);
+            }
+        }
+        SessionRecord::Message { message } => redact_stored_message(message),
+        SessionRecord::Completed { status, .. } => redact_string_in_place(status),
+        SessionRecord::ContextCollapsed(_) => {}
+        SessionRecord::ContextSummary(record) => {
+            redact_string_in_place(&mut record.summary);
+            if let Some(summary_state) = &mut record.summary_state {
+                if let Some(baseline) = &mut summary_state.baseline {
+                    redact_string_in_place(baseline);
+                }
+                for delta in &mut summary_state.deltas {
+                    redact_string_in_place(delta);
+                }
+            }
+        }
+        SessionRecord::Usage(_) => {}
+        SessionRecord::PlanState { explanation, plan } => {
+            if let Some(explanation) = explanation {
+                redact_string_in_place(explanation);
+            }
+            for item in plan {
+                redact_string_in_place(&mut item.step);
+            }
+        }
+    }
+    redacted
+}
+
+fn redact_stored_message(message: &mut StoredMessage) {
+    match message {
+        StoredMessage::System { content, .. }
+        | StoredMessage::User { content, .. }
+        | StoredMessage::Tool { content, .. } => redact_string_in_place(content),
+        StoredMessage::Assistant {
+            content,
+            reasoning_content,
+            tool_calls,
+            ..
+        } => {
+            if let Some(content) = content {
+                redact_string_in_place(content);
+            }
+            if let Some(reasoning_content) = reasoning_content {
+                redact_string_in_place(reasoning_content);
+            }
+            for tool_call in tool_calls {
+                redact_string_in_place(&mut tool_call.arguments);
+            }
+        }
+    }
+}
+
+fn redact_string_in_place(value: &mut String) {
+    *value = redact_sensitive_text(value);
+}
+
+fn redact_sensitive_text(value: &str) -> String {
+    redact_standalone_secret_tokens(&redact_keyed_secret_values(value))
+}
+
+fn redact_keyed_secret_values(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut output = String::with_capacity(value.len());
+    let mut cursor = 0;
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'=' && bytes[index] != b':' {
+            index += 1;
+            continue;
+        }
+
+        let key_start = key_start_before_delimiter(bytes, index);
+        let key = trim_key_candidate(&value[key_start..index]);
+        if !is_sensitive_key(key) {
+            index += 1;
+            continue;
+        }
+
+        let mut value_start = index + 1;
+        while value_start < bytes.len() && bytes[value_start].is_ascii_whitespace() {
+            value_start += 1;
+        }
+        let quote = (value_start < bytes.len()
+            && (bytes[value_start] == b'"' || bytes[value_start] == b'\''))
+            .then_some(bytes[value_start]);
+        let content_start = if quote.is_some() {
+            value_start + 1
+        } else {
+            value_start
+        };
+        let content_end = if let Some(quote) = quote {
+            quoted_value_end(bytes, content_start, quote)
+        } else {
+            unquoted_value_end(bytes, content_start)
+        };
+        if content_start == content_end {
+            index += 1;
+            continue;
+        }
+
+        output.push_str(&value[cursor..content_start]);
+        output.push_str("<redacted>");
+        if quote.is_some() && content_end < bytes.len() {
+            output.push(bytes[content_end] as char);
+            cursor = content_end + 1;
+            index = cursor;
+        } else {
+            cursor = content_end;
+            index = cursor;
+        }
+    }
+    output.push_str(&value[cursor..]);
+    output
+}
+
+fn key_start_before_delimiter(bytes: &[u8], delimiter_index: usize) -> usize {
+    let mut start = delimiter_index;
+    while start > 0 {
+        let previous = bytes[start - 1];
+        if previous.is_ascii_whitespace() || matches!(previous, b'{' | b'[' | b',' | b';' | b'(') {
+            break;
+        }
+        start -= 1;
+    }
+    start
+}
+
+fn trim_key_candidate(key: &str) -> &str {
+    key.trim_matches(|ch: char| ch.is_whitespace() || matches!(ch, '"' | '\'' | '{' | '[' | ','))
+}
+
+fn is_sensitive_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    key.contains("api_key")
+        || key.contains("apikey")
+        || key.contains("token")
+        || key.contains("password")
+        || key.contains("secret")
+        || key.contains("authorization")
+}
+
+fn quoted_value_end(bytes: &[u8], mut index: usize, quote: u8) -> usize {
+    let mut escaped = false;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if escaped {
+            escaped = false;
+        } else if byte == b'\\' {
+            escaped = true;
+        } else if byte == quote {
+            return index;
+        }
+        index += 1;
+    }
+    index
+}
+
+fn unquoted_value_end(bytes: &[u8], mut index: usize) -> usize {
+    while index < bytes.len()
+        && !bytes[index].is_ascii_whitespace()
+        && !matches!(bytes[index], b',' | b'}' | b']' | b';')
+    {
+        index += 1;
+    }
+    index
+}
+
+fn redact_standalone_secret_tokens(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut token = String::new();
+    for ch in value.chars() {
+        if is_secret_token_boundary(ch) {
+            push_redacted_token(&mut output, &mut token);
+            output.push(ch);
+        } else {
+            token.push(ch);
+        }
+    }
+    push_redacted_token(&mut output, &mut token);
+    output
+}
+
+fn is_secret_token_boundary(ch: char) -> bool {
+    ch.is_whitespace() || matches!(ch, '"' | '\'' | '{' | '}' | '[' | ']' | ',' | ':')
+}
+
+fn push_redacted_token(output: &mut String, token: &mut String) {
+    if token.is_empty() {
+        return;
+    }
+    if looks_like_standalone_secret(token) {
+        output.push_str("<redacted>");
+    } else {
+        output.push_str(token);
+    }
+    token.clear();
+}
+
+fn looks_like_standalone_secret(token: &str) -> bool {
+    let trimmed = token.trim_matches(|ch: char| {
+        matches!(
+            ch,
+            '.' | ';' | ')' | '(' | '<' | '>' | '`' | '"' | '\'' | '='
+        )
+    });
+    let lower = trimmed.to_ascii_lowercase();
+    lower.starts_with("sk-")
+        || (trimmed.len() >= 16
+            && lower.contains("secret")
+            && (lower.contains("token")
+                || lower.contains("password")
+                || lower.contains("key")
+                || lower.contains("test")))
+}
+
+pub(crate) fn lock_file(file: &File) -> io::Result<()> {
+    lock_file_impl(file)
+}
+
+pub(crate) fn unlock_file(file: &File) -> io::Result<()> {
+    unlock_file_impl(file)
+}
+
+#[cfg(unix)]
+fn lock_file_impl(file: &File) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    unsafe {
+        if flock(file.as_raw_fd(), LOCK_EX) == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+}
+
+#[cfg(unix)]
+fn unlock_file_impl(file: &File) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    unsafe {
+        if flock(file.as_raw_fd(), LOCK_UN) == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+}
+
+#[cfg(unix)]
+unsafe extern "C" {
+    fn flock(fd: i32, operation: i32) -> i32;
+}
+
+#[cfg(unix)]
+const LOCK_EX: i32 = 2;
+#[cfg(unix)]
+const LOCK_UN: i32 = 8;
+
+#[cfg(not(unix))]
+fn lock_file_impl(_file: &File) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn unlock_file_impl(_file: &File) -> io::Result<()> {
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
