@@ -1275,10 +1275,7 @@ fn materialize_profile_special_path(
         Some(":tmpdir") => Ok(tmpdir
             .map(|path| vec![path.to_path_buf()])
             .unwrap_or_default()),
-        Some(":minimal") => Err(
-            "command/exec permissionProfile special path is not supported yet: :minimal"
-                .to_string(),
-        ),
+        Some(":minimal") => Ok(orca_tools::sandbox::platform_default_read_roots()),
         _ => Ok(vec![path]),
     }
 }
@@ -3433,6 +3430,48 @@ mod tests {
         .expect("root profile");
 
         assert_eq!(sandbox.additional_writable_roots, vec![PathBuf::from("/")]);
+    }
+
+    #[test]
+    fn command_exec_sandbox_materializes_custom_permission_profile_minimal_path() {
+        let mut config = test_run_config();
+        config.permission_profiles.insert(
+            "minimal".to_string(),
+            orca_core::config::PermissionProfileConfig {
+                extends: Some(":read-only".to_string()),
+                filesystem: std::collections::HashMap::from([(
+                    PathBuf::from(":minimal"),
+                    orca_core::config::PermissionProfileFileAccess::Read,
+                )])
+                .into(),
+                ..Default::default()
+            },
+        );
+        let options = protocol::CommandExecOptions {
+            permission_profile: Some("minimal".to_string()),
+            ..Default::default()
+        };
+
+        let sandbox = command_exec_sandbox_mode(
+            &config,
+            &options,
+            None,
+            std::path::Path::new("/workspace"),
+            &[],
+            None,
+        )
+        .expect("minimal profile");
+
+        assert!(
+            sandbox
+                .additional_readable_roots
+                .contains(&PathBuf::from("/bin"))
+        );
+        assert!(
+            sandbox
+                .additional_readable_roots
+                .contains(&PathBuf::from("/usr"))
+        );
     }
 
     #[test]

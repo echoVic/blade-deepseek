@@ -112,6 +112,13 @@ pub fn available() -> bool {
     })
 }
 
+pub fn platform_default_read_roots() -> Vec<PathBuf> {
+    ["/bin", "/sbin", "/usr", "/System", "/Library"]
+        .into_iter()
+        .map(PathBuf::from)
+        .collect()
+}
+
 fn plain_bash_command(command: &str, cwd: &Path) -> Command {
     let mut cmd = Command::new("sh");
     cmd.arg("-c").arg(command).current_dir(cwd);
@@ -287,6 +294,15 @@ mod tests {
         assert!(content.contains("(version 1)"));
         assert!(content.contains(&workspace.path().display().to_string()));
         assert!(content.contains(r#"(allow file-read* file-write* (literal "/dev/null"))"#));
+    }
+
+    #[test]
+    fn platform_default_read_roots_include_shell_runtime_paths() {
+        let roots = platform_default_read_roots();
+
+        assert!(roots.contains(&PathBuf::from("/bin")));
+        assert!(roots.contains(&PathBuf::from("/usr")));
+        assert!(roots.contains(&PathBuf::from("/System")));
     }
 
     #[test]

@@ -2958,7 +2958,7 @@ fn server_mode_command_exec_configured_permission_profile_rejects_glob_entries()
 }
 
 #[test]
-fn server_mode_command_exec_configured_permission_profile_rejects_minimal_special_path() {
+fn server_mode_command_exec_configured_permission_profile_materializes_minimal_special_path() {
     with_orca_home(|home| {
         let workspace = tempdir().expect("workspace");
         std::fs::write(
@@ -3001,12 +3001,11 @@ fn server_mode_command_exec_configured_permission_profile_rejects_minimal_specia
         assert!(output.stderr.is_empty());
 
         let events = parse_jsonl(&output.stdout);
-        assert_eq!(events.len(), 1, "expected one error event: {events:?}");
-        assert_eq!(events[0]["id"], "cmd");
-        assert_eq!(events[0]["event"], "error");
-        assert_eq!(
-            events[0]["message"],
-            "command/exec permissionProfile special path is not supported yet: :minimal"
+        assert!(
+            events
+                .iter()
+                .any(|event| event["id"] == "cmd" && event["event"] == "command_exec_completed"),
+            "expected command completion for :minimal profile: {events:?}"
         );
     });
 }

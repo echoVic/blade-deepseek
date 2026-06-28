@@ -66,6 +66,10 @@ pub fn read_only_bash_command(
     command
 }
 
+pub fn platform_default_read_roots() -> Vec<PathBuf> {
+    platform::platform_default_read_roots()
+}
+
 #[cfg(test)]
 pub fn seatbelt_available() -> bool {
     platform::seatbelt_available()
@@ -119,6 +123,10 @@ mod platform {
         let mut cmd = Command::new("sh");
         cmd.arg("-c").arg(command).current_dir(cwd);
         cmd
+    }
+
+    pub fn platform_default_read_roots() -> Vec<PathBuf> {
+        crate::sandbox::seatbelt::platform_default_read_roots()
     }
 
     #[cfg(test)]
@@ -192,6 +200,10 @@ mod platform {
         let mut cmd = Command::new("sh");
         cmd.arg("-c").arg(command).current_dir(cwd);
         cmd
+    }
+
+    pub fn platform_default_read_roots() -> Vec<PathBuf> {
+        Vec::new()
     }
 
     #[cfg(test)]
