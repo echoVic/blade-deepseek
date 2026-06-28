@@ -6,14 +6,14 @@ use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::{Value, json};
 
-use crate::history::{
-    SortDirection, ThreadListFilters, ThreadRelationFilter, ThreadSortKey, TurnItemsView,
-};
 use crate::server_runtime::{
     ActivePermissionProfile, AdditionalWorkingDirectory, PermissionProfileOverride,
     PermissionRuleValue, PermissionUpdate,
 };
 use crate::shell_session::ShellTerminalMode;
+use crate::thread_store::{
+    SortDirection, ThreadListFilters, ThreadRelationFilter, ThreadSortKey, TurnItemsView,
+};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Submission {

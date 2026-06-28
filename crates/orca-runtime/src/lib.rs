@@ -41,4 +41,14 @@ mod tests {
 
         assert_thread_store(&SessionStore::new());
     }
+
+    #[test]
+    fn protocol_imports_thread_types_from_thread_store_boundary() {
+        let protocol_source = include_str!("protocol.rs");
+
+        assert!(
+            !protocol_source.contains("use crate::history"),
+            "protocol must import thread protocol types through thread_store"
+        );
+    }
 }
