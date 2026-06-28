@@ -531,6 +531,7 @@ mod tests {
         let session_source = include_str!("session.rs");
 
         for marker in [
+            "agent_common::build_agent_system_prompt",
             "thread_store::resume_conversation",
             "Conversation::new()",
             "add_system(system_prompt)",
@@ -549,6 +550,14 @@ mod tests {
         assert!(
             session_source.contains("pub(crate) fn bootstrap_agent_conversation"),
             "session must expose agent conversation bootstrap"
+        );
+        assert!(
+            agent_loop_source.contains("bootstrap_agent_conversation_for_loop"),
+            "agent_loop must delegate system prompt construction with conversation bootstrap"
+        );
+        assert!(
+            session_source.contains("pub(crate) fn bootstrap_agent_conversation_for_loop"),
+            "session must expose agent-loop conversation bootstrap"
         );
     }
 

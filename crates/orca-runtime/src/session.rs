@@ -195,6 +195,27 @@ pub(crate) fn bootstrap_agent_conversation(
     conversation
 }
 
+pub(crate) fn bootstrap_agent_conversation_for_loop(
+    resumed: Option<&SessionTranscript>,
+    cwd: &Path,
+    prompt: &str,
+    subagent_depth: u32,
+    subagent_type: &SubagentType,
+    instructions: &ProjectInstructions,
+    approval_mode: orca_core::approval_types::ApprovalMode,
+    memory: &MemoryBlock,
+) -> Conversation {
+    let system_prompt = agent_common::build_agent_system_prompt(
+        cwd,
+        subagent_depth,
+        subagent_type,
+        Some(instructions),
+        approval_mode,
+        Some(memory),
+    );
+    bootstrap_agent_conversation(resumed, system_prompt, cwd, prompt)
+}
+
 pub(crate) fn record_plan_state_for_agent(
     conversation: &mut Conversation,
     history_writer: Option<&mut SessionWriter>,
@@ -663,6 +684,37 @@ mod tests {
             }
         }
         result
+    }
+
+    #[test]
+    fn bootstrap_agent_conversation_for_loop_builds_prompt_and_user_turn() {
+        let cwd = tempdir().expect("cwd");
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock {
+            user: Some("prefers concise output".to_string()),
+            project: Some("run cargo test".to_string()),
+        };
+
+        let conversation = bootstrap_agent_conversation_for_loop(
+            None,
+            cwd.path(),
+            "inspect repo",
+            1,
+            &SubagentType::General,
+            &instructions,
+            ApprovalMode::Suggest,
+            &memory,
+        );
+
+        assert_eq!(conversation.messages.len(), 2);
+        assert!(
+            matches!(&conversation.messages[0], orca_core::conversation::Message::System { content, .. }
+                if content.contains("Subagent Role") && content.contains("prefers concise output"))
+        );
+        assert!(
+            matches!(&conversation.messages[1], orca_core::conversation::Message::User { content, .. }
+                if content == "inspect repo")
+        );
     }
 
     #[test]

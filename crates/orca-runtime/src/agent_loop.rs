@@ -1,7 +1,6 @@
 use std::io;
 
 use crate::agent_child::{ChildAgentRequest, ChildAgentResult, ChildAgentRuntime};
-use crate::agent_common;
 use crate::cost::CostTracker;
 use crate::hooks::HookRunner;
 use crate::instructions::ProjectInstructions;
@@ -12,8 +11,8 @@ use crate::lifecycle::{
 };
 use crate::memory::{self, MemoryBlock};
 use crate::session::{
-    AgentConversationContext, bootstrap_agent_conversation, record_assistant_response_for_agent,
-    record_initial_history_for_agent,
+    AgentConversationContext, bootstrap_agent_conversation_for_loop,
+    record_assistant_response_for_agent, record_initial_history_for_agent,
 };
 use crate::subagent_execution::{
     SubagentBatchRecordOutcome, collect_subagent_batch, execute_subagent_batch,
@@ -133,19 +132,20 @@ pub(crate) fn run_agent_loop(
         external_tools: config.external_tools.clone(),
     };
 
-    let system_prompt = agent_common::build_agent_system_prompt(
-        cwd,
-        subagent_depth,
-        subagent_type,
-        Some(instructions),
-        config.approval_mode,
-        Some(memory),
-    );
     let mut owned_conversation;
     let conversation = if let Some(conversation) = conversation {
         conversation
     } else {
-        owned_conversation = bootstrap_agent_conversation(resumed, system_prompt, cwd, prompt);
+        owned_conversation = bootstrap_agent_conversation_for_loop(
+            resumed,
+            cwd,
+            prompt,
+            subagent_depth,
+            subagent_type,
+            instructions,
+            config.approval_mode,
+            memory,
+        );
         &mut owned_conversation
     };
 
