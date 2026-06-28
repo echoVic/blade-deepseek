@@ -15,12 +15,12 @@ use orca_core::conversation::{
 };
 use orca_core::cost_types::UsageTotals;
 use orca_core::plan_types::{PlanItem, PlanStatus};
-use orca_core::tool_types::{ToolResult, ToolStatus};
+use orca_core::tool_types::ToolStatus;
 use orca_core::{approval_rules::PermissionRules, approval_types::ApprovalMode};
 
 pub use crate::thread_store::{
     JsonlThreadStore, LiveThread, SessionMeta, SessionStore, SessionSummary, SessionTranscript,
-    SortDirection, StoredThreadItem, StoredThreadItemPage, StoredThreadProjection,
+    SessionWriter, SortDirection, StoredThreadItem, StoredThreadItemPage, StoredThreadProjection,
     StoredThreadSearchHit, StoredThreadSearchPage, StoredThreadSummary, StoredThreadSummaryPage,
     StoredThreadTurn, StoredThreadTurnPage, ThreadListFilters, ThreadMetadataPatch,
     ThreadRelationFilter, ThreadSortKey, ThreadStore, TurnItemsView,
@@ -31,11 +31,6 @@ const SESSION_SCHEMA_VERSION: u32 = 1;
 
 #[cfg(test)]
 pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-#[derive(Clone, Debug)]
-pub struct SessionWriter {
-    path: PathBuf,
-}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct CompactionRecord {
@@ -56,7 +51,7 @@ pub struct ContextSummaryRecord {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "type")]
-enum SessionRecord {
+pub(crate) enum SessionRecord {
     #[serde(rename = "session.meta")]
     Meta(SessionMeta),
     #[serde(rename = "conversation.message")]
@@ -81,7 +76,7 @@ enum SessionRecord {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case", tag = "role")]
-enum StoredMessage {
+pub(crate) enum StoredMessage {
     System {
         content: String,
         #[serde(default)]
@@ -184,138 +179,6 @@ impl From<StoredMessage> for Message {
                 pinned,
             },
         }
-    }
-}
-
-impl SessionWriter {
-    pub fn start(
-        cwd: &Path,
-        provider: &str,
-        model: Option<String>,
-        prompt: &str,
-    ) -> io::Result<Self> {
-        Self::start_from_meta(create_meta(cwd, provider, model, prompt))
-    }
-
-    pub fn start_from_meta(meta: SessionMeta) -> io::Result<Self> {
-        let path = session_path(&meta.session_id, meta.created_at)?;
-        write_record(&path, &SessionRecord::Meta(meta))?;
-        Ok(Self { path })
-    }
-
-    pub fn append_to_existing(path: PathBuf) -> io::Result<Self> {
-        if !path.exists() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("history file not found: {}", path.display()),
-            ));
-        }
-        Ok(Self { path })
-    }
-
-    pub fn append_message(&mut self, message: &Message) -> io::Result<()> {
-        write_record(
-            &self.path,
-            &SessionRecord::Message {
-                message: StoredMessage::from(message),
-            },
-        )
-    }
-
-    pub fn append_tool_result_message(
-        &mut self,
-        result: &ToolResult,
-        content: String,
-        pinned: bool,
-    ) -> io::Result<()> {
-        write_record(
-            &self.path,
-            &SessionRecord::Message {
-                message: StoredMessage::Tool {
-                    tool_call_id: result.id.clone(),
-                    content,
-                    status: Some(result.status),
-                    error: result.error.clone(),
-                    exit_code: result.exit_code,
-                    truncated: result.truncated,
-                    pinned,
-                },
-            },
-        )
-    }
-
-    pub fn complete(&mut self, status: &str) -> io::Result<()> {
-        write_record(
-            &self.path,
-            &SessionRecord::Completed {
-                status: status.to_string(),
-                completed_at: Utc::now(),
-            },
-        )
-    }
-
-    pub fn append_compaction(
-        &mut self,
-        before_messages: usize,
-        after_messages: usize,
-    ) -> io::Result<()> {
-        write_record(
-            &self.path,
-            &SessionRecord::ContextCollapsed(CompactionRecord {
-                collapsed_at: Utc::now(),
-                before_messages,
-                after_messages,
-            }),
-        )
-    }
-
-    pub fn append_summary(
-        &mut self,
-        before_messages: usize,
-        after_messages: usize,
-        summary: impl Into<String>,
-    ) -> io::Result<()> {
-        write_record(
-            &self.path,
-            &SessionRecord::ContextSummary(ContextSummaryRecord {
-                summarized_at: Utc::now(),
-                before_messages,
-                after_messages,
-                summary: summary.into(),
-                summary_state: None,
-            }),
-        )
-    }
-
-    pub fn append_summary_state(
-        &mut self,
-        before_messages: usize,
-        after_messages: usize,
-        summary: impl Into<String>,
-        summary_state: &SummaryState,
-    ) -> io::Result<()> {
-        write_record(
-            &self.path,
-            &SessionRecord::ContextSummary(ContextSummaryRecord {
-                summarized_at: Utc::now(),
-                before_messages,
-                after_messages,
-                summary: summary.into(),
-                summary_state: Some(summary_state.clone()),
-            }),
-        )
-    }
-
-    pub fn append_usage(&mut self, usage: UsageTotals) -> io::Result<()> {
-        write_record(&self.path, &SessionRecord::Usage(usage))
-    }
-
-    pub fn append_plan_state(
-        &mut self,
-        explanation: Option<String>,
-        plan: Vec<PlanItem>,
-    ) -> io::Result<()> {
-        write_record(&self.path, &SessionRecord::PlanState { explanation, plan })
     }
 }
 
@@ -1808,7 +1671,7 @@ fn collect_session_files(dir: &Path, on_file: &mut dyn FnMut(&Path)) -> io::Resu
     Ok(())
 }
 
-fn write_record(path: &Path, record: &SessionRecord) -> io::Result<()> {
+pub(crate) fn write_record(path: &Path, record: &SessionRecord) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -2385,7 +2248,7 @@ fn unlock_file(_file: &File) -> io::Result<()> {
     Ok(())
 }
 
-fn session_path(session_id: &str, timestamp: DateTime<Utc>) -> io::Result<PathBuf> {
+pub(crate) fn session_path(session_id: &str, timestamp: DateTime<Utc>) -> io::Result<PathBuf> {
     let dir = sessions_dir()
         .join(format!("{:04}", timestamp.year()))
         .join(format!("{:02}", timestamp.month()))
