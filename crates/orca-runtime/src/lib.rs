@@ -188,6 +188,39 @@ mod tests {
     }
 
     #[test]
+    fn normal_tool_result_recording_is_owned_by_tool_invocation_module() {
+        let agent_loop_source = include_str!("agent_loop.rs");
+        let tool_invocation_source = include_str!("tool_invocation.rs");
+
+        for marker in [
+            "record_plan_state_for_agent(",
+            "status == RunStatus::ApprovalRequired",
+            "tool_request.name == tool_types::ToolName::Subagent",
+        ] {
+            assert!(
+                !agent_loop_source.contains(marker),
+                "agent_loop must not own normal tool result detail {marker}"
+            );
+        }
+        assert!(
+            agent_loop_source.contains("record_normal_tool_result("),
+            "agent_loop must delegate normal tool result recording"
+        );
+        assert!(
+            tool_invocation_source.contains("pub(crate) fn record_normal_tool_result"),
+            "tool_invocation must expose normal tool result recording"
+        );
+        assert!(
+            tool_invocation_source.contains("record_plan_state_for_agent"),
+            "tool_invocation must own normal tool plan-state recording"
+        );
+        assert!(
+            tool_invocation_source.contains("record_tool_result_for_agent"),
+            "tool_invocation must own normal tool result recording"
+        );
+    }
+
+    #[test]
     fn readonly_tool_batch_is_owned_by_tool_invocation_module() {
         let agent_loop_source = include_str!("agent_loop.rs");
         let tool_invocation_source = include_str!("tool_invocation.rs");

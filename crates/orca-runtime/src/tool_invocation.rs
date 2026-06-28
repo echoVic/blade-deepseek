@@ -4,7 +4,9 @@ use std::path::Path;
 
 use orca_core::approval_types::{ActionKind, ApprovalRequest};
 use orca_core::config::RunConfig;
+use orca_core::conversation::Conversation;
 use orca_core::event_schema::EventFactory;
+use orca_core::event_schema::RunStatus;
 use orca_core::event_sink::EventSink;
 use orca_core::external_config::ExternalToolConfig;
 use orca_core::hook_types::HookEvent;
@@ -12,6 +14,8 @@ use orca_core::tool_types::{ToolName, ToolOutputTruncation, ToolRequest, ToolRes
 use orca_mcp::McpRegistry;
 
 use crate::hooks::{HookContext, HookOutcome, HookRunner, tool_request_with_hook_outcome};
+use crate::session::{record_plan_state_for_agent, record_tool_result_for_agent};
+use crate::thread_store::SessionWriter;
 
 #[derive(Clone, Debug)]
 pub struct ToolInvocation {
@@ -30,6 +34,14 @@ pub(crate) struct AgentToolPolicyContext<'a> {
 pub struct ToolExecutionFailure {
     pub request: ToolRequest,
     pub message: String,
+}
+
+pub(crate) enum NormalToolRecordOutcome {
+    Continue,
+    Return {
+        status: RunStatus,
+        error: Option<String>,
+    },
 }
 
 impl<'a> AgentToolPolicyContext<'a> {
@@ -211,6 +223,43 @@ pub(crate) fn collect_readonly_batch(
     orca_tools::collect_readonly_batch(max_read_parallel, tool_requests, start)
 }
 
+pub(crate) fn record_normal_tool_result(
+    conversation: &mut Conversation,
+    mut history_writer: Option<&mut SessionWriter>,
+    tool_request: &ToolRequest,
+    result: &ToolResult,
+    status: RunStatus,
+    emit_deltas: bool,
+) -> io::Result<NormalToolRecordOutcome> {
+    record_plan_state_for_agent(
+        conversation,
+        history_writer.as_deref_mut(),
+        tool_request,
+        result,
+    );
+    record_tool_result_for_agent(
+        conversation,
+        history_writer.as_deref_mut(),
+        result,
+        emit_deltas,
+    )?;
+
+    if status == RunStatus::ApprovalRequired {
+        return Ok(NormalToolRecordOutcome::Return {
+            status,
+            error: result.error.clone(),
+        });
+    }
+    if status == RunStatus::Failed && tool_request.name == ToolName::Subagent {
+        return Ok(NormalToolRecordOutcome::Return {
+            status: RunStatus::Failed,
+            error: Some(result.error.clone().unwrap_or_default()),
+        });
+    }
+
+    Ok(NormalToolRecordOutcome::Continue)
+}
+
 pub fn prepare_tool_invocation(
     tool_request: &ToolRequest,
     subagent_depth: u32,
@@ -347,19 +396,21 @@ mod tests {
         HistoryMode, ModelRuntimeConfig, OutputFormat, ProviderKind, RunConfig, ThemeName,
         ToolConfig, WorkflowConfig,
     };
+    use orca_core::conversation::{Conversation, Message};
+    use orca_core::event_schema::RunStatus;
     use orca_core::external_config::ExternalToolConfig;
     use orca_core::mcp_types::McpTool;
     use orca_core::model::ModelSelection;
     use orca_core::subagent_config::SubagentConfig;
-    use orca_core::tool_types::{ToolName, ToolRequest};
+    use orca_core::tool_types::{ToolName, ToolRequest, ToolResult};
     use orca_mcp::McpRegistry;
     use serde_json::json;
 
     use crate::hooks::HookOutcome;
 
     use super::{
-        apply_pre_tool_outcome, approval_request_for_invocation, prepare_tool_invocation,
-        validate_tool_invocation,
+        NormalToolRecordOutcome, apply_pre_tool_outcome, approval_request_for_invocation,
+        prepare_tool_invocation, record_normal_tool_result, validate_tool_invocation,
     };
 
     fn config_with_external(external_tools: Vec<ExternalToolConfig>) -> RunConfig {
@@ -413,6 +464,69 @@ mod tests {
             target: target.map(str::to_string),
             raw_arguments: raw.map(str::to_string),
         }
+    }
+
+    #[test]
+    fn record_normal_tool_result_returns_approval_required_after_recording_tool_message() {
+        let mut conversation = Conversation::new();
+        let request = request(
+            ToolName::RequestPermissions,
+            ActionKind::Read,
+            Some("read"),
+            None,
+        );
+        let result = ToolResult::denied(&request, "needs approval");
+
+        let outcome = record_normal_tool_result(
+            &mut conversation,
+            None,
+            &request,
+            &result,
+            RunStatus::ApprovalRequired,
+            false,
+        )
+        .expect("record approval result");
+
+        match outcome {
+            NormalToolRecordOutcome::Return { status, error } => {
+                assert_eq!(status, RunStatus::ApprovalRequired);
+                assert_eq!(error.as_deref(), Some("needs approval"));
+            }
+            NormalToolRecordOutcome::Continue => panic!("approval-required result must return"),
+        }
+        assert_eq!(conversation.messages.len(), 1);
+        assert!(
+            matches!(&conversation.messages[0], Message::Tool { tool_call_id, .. } if tool_call_id == "tool-1")
+        );
+    }
+
+    #[test]
+    fn record_normal_tool_result_returns_subagent_failure_after_recording_tool_message() {
+        let mut conversation = Conversation::new();
+        let request = request(ToolName::Subagent, ActionKind::Agent, Some("audit"), None);
+        let result = ToolResult::failed(&request, "child failed", None);
+
+        let outcome = record_normal_tool_result(
+            &mut conversation,
+            None,
+            &request,
+            &result,
+            RunStatus::Failed,
+            false,
+        )
+        .expect("record subagent failure");
+
+        match outcome {
+            NormalToolRecordOutcome::Return { status, error } => {
+                assert_eq!(status, RunStatus::Failed);
+                assert_eq!(error.as_deref(), Some("child failed"));
+            }
+            NormalToolRecordOutcome::Continue => panic!("failed subagent result must return"),
+        }
+        assert_eq!(conversation.messages.len(), 1);
+        assert!(
+            matches!(&conversation.messages[0], Message::Tool { tool_call_id, .. } if tool_call_id == "tool-1")
+        );
     }
 
     #[test]

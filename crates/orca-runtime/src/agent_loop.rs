@@ -13,7 +13,7 @@ use crate::lifecycle::{
 use crate::memory::{self, MemoryBlock};
 use crate::session::{
     AgentConversationContext, bootstrap_agent_conversation, record_assistant_response_for_agent,
-    record_initial_history_for_agent, record_plan_state_for_agent, record_tool_result_for_agent,
+    record_initial_history_for_agent, record_tool_result_for_agent,
 };
 use crate::subagent_execution::{
     SubagentBatchRecordOutcome, collect_subagent_batch, execute_subagent_batch,
@@ -22,8 +22,9 @@ use crate::subagent_execution::{
 use crate::tasks::TaskRegistry;
 use crate::tool_execution::{ToolExecutionActor, ToolExecutionContext};
 use crate::tool_invocation::{
-    AgentToolPolicyContext, collect_readonly_batch, execute_readonly_batch,
-    reject_disallowed_child_tool, should_run_readonly_batch,
+    AgentToolPolicyContext, NormalToolRecordOutcome, collect_readonly_batch,
+    execute_readonly_batch, record_normal_tool_result, reject_disallowed_child_tool,
+    should_run_readonly_batch,
 };
 use crate::workflow_execution::observe_background_workflows;
 use orca_approval::ApprovalPolicy;
@@ -442,32 +443,22 @@ pub(crate) fn run_agent_loop(
                     .with_permission_handler(permission_handler),
             )?;
 
-            record_plan_state_for_agent(
+            match record_normal_tool_result(
                 conversation,
                 history_writer.as_deref_mut(),
                 tool_request,
                 &result,
-            );
-
-            record_tool_result_for_agent(
-                conversation,
-                history_writer.as_deref_mut(),
-                &result,
+                status,
                 emit_deltas,
-            )?;
-
-            if status == RunStatus::ApprovalRequired {
-                return Ok(AgentLoopResult {
-                    status,
-                    final_message: None,
-                    error: result.error.clone(),
-                });
-            }
-            if status == RunStatus::Failed && tool_request.name == tool_types::ToolName::Subagent {
-                return Ok(AgentLoopResult::failure(
-                    RunStatus::Failed,
-                    result.error.clone().unwrap_or_default(),
-                ));
+            )? {
+                NormalToolRecordOutcome::Continue => {}
+                NormalToolRecordOutcome::Return { status, error } => {
+                    return Ok(AgentLoopResult {
+                        status,
+                        final_message: None,
+                        error,
+                    });
+                }
             }
             index += 1;
         }
