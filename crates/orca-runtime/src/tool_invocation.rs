@@ -10,8 +10,15 @@ use orca_core::event_schema::RunStatus;
 use orca_core::event_sink::EventSink;
 use orca_core::external_config::ExternalToolConfig;
 use orca_core::hook_types::HookEvent;
+use orca_core::subagent_types::SubagentType;
 use orca_core::tool_types::{ToolName, ToolOutputTruncation, ToolRequest, ToolResult};
 use orca_mcp::McpRegistry;
+use orca_provider::tool_schema::{
+    deepseek_tools_schema_for_allowed_names_with_mcp_and_external,
+    deepseek_tools_schema_for_type_with_mcp_and_external,
+    deepseek_tools_schema_with_mcp_and_external,
+};
+use serde_json::Value;
 
 use crate::hooks::{HookContext, HookOutcome, HookRunner, tool_request_with_hook_outcome};
 use crate::session::{record_plan_state_for_agent, record_tool_result_for_agent};
@@ -68,6 +75,37 @@ impl<'a> AgentToolPolicyContext<'a> {
 impl ToolExecutionFailure {
     pub fn into_result(self) -> ToolResult {
         ToolResult::invalid_input(&self.request, self.message)
+    }
+}
+
+pub(crate) fn provider_tool_schema_override(
+    subagent_depth: u32,
+    subagent_type: &SubagentType,
+    tool_policy: AgentToolPolicyContext<'_>,
+    mcp_registry: &McpRegistry,
+    external_tools: &[ExternalToolConfig],
+) -> Option<Vec<Value>> {
+    if subagent_depth > 0 {
+        if let Some(allowed_tools) = tool_policy.allowed_tools() {
+            Some(
+                deepseek_tools_schema_for_allowed_names_with_mcp_and_external(
+                    allowed_tools,
+                    Some(mcp_registry),
+                    external_tools,
+                ),
+            )
+        } else {
+            Some(deepseek_tools_schema_for_type_with_mcp_and_external(
+                subagent_type,
+                Some(mcp_registry),
+                external_tools,
+            ))
+        }
+    } else {
+        Some(deepseek_tools_schema_with_mcp_and_external(
+            Some(mcp_registry),
+            external_tools,
+        ))
     }
 }
 
@@ -419,6 +457,7 @@ mod tests {
     use orca_core::mcp_types::McpTool;
     use orca_core::model::ModelSelection;
     use orca_core::subagent_config::SubagentConfig;
+    use orca_core::subagent_types::SubagentType;
     use orca_core::tool_types::{ToolName, ToolRequest, ToolResult};
     use orca_mcp::McpRegistry;
     use serde_json::json;
@@ -426,9 +465,9 @@ mod tests {
     use crate::hooks::HookOutcome;
 
     use super::{
-        NormalToolRecordOutcome, apply_pre_tool_outcome, approval_request_for_invocation,
-        prepare_tool_invocation, record_normal_tool_result, record_readonly_batch_results,
-        validate_tool_invocation,
+        AgentToolPolicyContext, NormalToolRecordOutcome, apply_pre_tool_outcome,
+        approval_request_for_invocation, prepare_tool_invocation, provider_tool_schema_override,
+        record_normal_tool_result, record_readonly_batch_results, validate_tool_invocation,
     };
 
     fn config_with_external(external_tools: Vec<ExternalToolConfig>) -> RunConfig {
@@ -482,6 +521,68 @@ mod tests {
             target: target.map(str::to_string),
             raw_arguments: raw.map(str::to_string),
         }
+    }
+
+    fn schema_names(tools: &[serde_json::Value]) -> Vec<&str> {
+        tools
+            .iter()
+            .filter_map(|tool| tool["function"]["name"].as_str())
+            .collect()
+    }
+
+    #[test]
+    fn provider_tool_schema_override_exposes_root_agent_tools() {
+        let registry = McpRegistry::default();
+        let tools = provider_tool_schema_override(
+            0,
+            &SubagentType::General,
+            AgentToolPolicyContext::unrestricted(),
+            &registry,
+            &[],
+        )
+        .expect("root tool schema");
+        let names = schema_names(&tools);
+
+        assert!(names.contains(&"subagent"));
+        assert!(names.contains(&"bash"));
+    }
+
+    #[test]
+    fn provider_tool_schema_override_limits_child_agent_to_allowed_tools() {
+        let registry = McpRegistry::default();
+        let allowed = vec!["read_file".to_string()];
+        let tools = provider_tool_schema_override(
+            1,
+            &SubagentType::General,
+            AgentToolPolicyContext::new(Some(&allowed), Some("test child")),
+            &registry,
+            &[],
+        )
+        .expect("child allowed tool schema");
+        let names = schema_names(&tools);
+
+        assert!(names.contains(&"read_file"));
+        assert!(!names.contains(&"bash"));
+        assert!(!names.contains(&"subagent"));
+    }
+
+    #[test]
+    fn provider_tool_schema_override_uses_child_subagent_type_policy() {
+        let registry = McpRegistry::default();
+        let tools = provider_tool_schema_override(
+            1,
+            &SubagentType::CodeReviewer,
+            AgentToolPolicyContext::unrestricted(),
+            &registry,
+            &[],
+        )
+        .expect("child typed tool schema");
+        let names = schema_names(&tools);
+
+        assert!(names.contains(&"read_file"));
+        assert!(names.contains(&"grep"));
+        assert!(!names.contains(&"bash"));
+        assert!(!names.contains(&"subagent"));
     }
 
     #[test]

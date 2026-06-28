@@ -23,8 +23,8 @@ use crate::tasks::TaskRegistry;
 use crate::tool_execution::{ToolExecutionContext, execute_tool_with_approval};
 use crate::tool_invocation::{
     AgentToolPolicyContext, NormalToolRecordOutcome, collect_readonly_batch,
-    execute_readonly_batch, record_normal_tool_result, record_readonly_batch_results,
-    reject_disallowed_child_tool, should_run_readonly_batch,
+    execute_readonly_batch, provider_tool_schema_override, record_normal_tool_result,
+    record_readonly_batch_results, reject_disallowed_child_tool, should_run_readonly_batch,
 };
 use crate::workflow_execution::observe_background_workflows;
 use orca_approval::ApprovalPolicy;
@@ -37,11 +37,6 @@ use orca_core::subagent_types::SubagentType;
 use orca_core::tool_types;
 use orca_mcp::McpRegistry;
 use orca_provider::context;
-use orca_provider::tool_schema::{
-    deepseek_tools_schema_for_allowed_names_with_mcp_and_external,
-    deepseek_tools_schema_for_type_with_mcp_and_external,
-    deepseek_tools_schema_with_mcp_and_external,
-};
 use orca_provider::{self, ProviderConfig};
 
 const DEFAULT_MAX_TURNS: u32 = 128;
@@ -123,28 +118,13 @@ pub(crate) fn run_agent_loop(
     );
     let policy = ApprovalPolicy::new(config.approval_mode)
         .with_permission_rules(config.permission_rules.clone());
-    let tools_override = if subagent_depth > 0 {
-        if let Some(allowed_tools) = tool_policy.allowed_tools() {
-            Some(
-                deepseek_tools_schema_for_allowed_names_with_mcp_and_external(
-                    allowed_tools,
-                    Some(mcp_registry),
-                    &config.external_tools,
-                ),
-            )
-        } else {
-            Some(deepseek_tools_schema_for_type_with_mcp_and_external(
-                subagent_type,
-                Some(mcp_registry),
-                &config.external_tools,
-            ))
-        }
-    } else {
-        Some(deepseek_tools_schema_with_mcp_and_external(
-            Some(mcp_registry),
-            &config.external_tools,
-        ))
-    };
+    let tools_override = provider_tool_schema_override(
+        subagent_depth,
+        subagent_type,
+        tool_policy,
+        mcp_registry,
+        &config.external_tools,
+    );
     let provider_config = ProviderConfig {
         api_key: config.api_key.clone(),
         base_url: config.base_url.clone(),

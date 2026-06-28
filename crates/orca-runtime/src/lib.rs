@@ -169,6 +169,35 @@ mod tests {
     }
 
     #[test]
+    fn agent_tool_schema_override_is_owned_by_tool_invocation_module() {
+        let agent_loop_source = include_str!("agent_loop.rs");
+        let tool_invocation_source = include_str!("tool_invocation.rs");
+
+        for marker in [
+            "deepseek_tools_schema_for_allowed_names_with_mcp_and_external",
+            "deepseek_tools_schema_for_type_with_mcp_and_external",
+            "deepseek_tools_schema_with_mcp_and_external",
+        ] {
+            assert!(
+                !agent_loop_source.contains(marker),
+                "agent_loop must not own provider tool schema override detail {marker}"
+            );
+            assert!(
+                tool_invocation_source.contains(marker),
+                "tool_invocation must own provider tool schema override detail {marker}"
+            );
+        }
+        assert!(
+            agent_loop_source.contains("provider_tool_schema_override("),
+            "agent_loop must delegate provider tool schema override construction"
+        );
+        assert!(
+            tool_invocation_source.contains("pub(crate) fn provider_tool_schema_override"),
+            "tool_invocation must expose provider tool schema override construction"
+        );
+    }
+
+    #[test]
     fn normal_tool_execution_entrypoint_is_owned_by_tool_execution_module() {
         let agent_loop_source = include_str!("agent_loop.rs");
         let tool_execution_source = include_str!("tool_execution.rs");
