@@ -18,6 +18,8 @@ use orca_core::plan_types::{PlanItem, PlanStatus};
 use orca_core::tool_types::{ToolResult, ToolStatus};
 use orca_core::{approval_rules::PermissionRules, approval_types::ApprovalMode};
 
+pub use crate::thread_store::ThreadStore;
+
 const ORCA_HOME_ENV: &str = "ORCA_HOME";
 const SESSION_SCHEMA_VERSION: u32 = 1;
 
@@ -238,79 +240,6 @@ pub struct StoredThreadSummary {
 pub struct JsonlThreadStore;
 
 pub type SessionStore = JsonlThreadStore;
-
-pub trait ThreadStore {
-    fn create_live_thread(
-        &self,
-        cwd: &Path,
-        provider: &str,
-        model: Option<String>,
-        prompt: &str,
-    ) -> io::Result<LiveThread>;
-
-    fn create_live_thread_with_permissions(
-        &self,
-        cwd: &Path,
-        provider: &str,
-        model: Option<String>,
-        prompt: &str,
-        active_permission_profile: Option<ActivePermissionProfile>,
-        approval_mode: ApprovalMode,
-        permission_rules: PermissionRules,
-        additional_working_directories: Vec<AdditionalWorkingDirectory>,
-    ) -> io::Result<LiveThread>;
-
-    fn update_thread_metadata(
-        &self,
-        thread_id: &str,
-        patch: ThreadMetadataPatch,
-    ) -> io::Result<SessionSummary>;
-
-    fn read_thread(
-        &self,
-        thread_id: &str,
-        include_messages: bool,
-        include_turns: bool,
-    ) -> io::Result<StoredThreadProjection>;
-
-    fn list_threads(
-        &self,
-        cursor: Option<&str>,
-        limit: usize,
-        filters: ThreadListFilters,
-        sort_key: ThreadSortKey,
-        sort_direction: SortDirection,
-        search_term: Option<&str>,
-    ) -> io::Result<StoredThreadSummaryPage>;
-
-    fn search_threads(
-        &self,
-        query: &str,
-        cursor: Option<&str>,
-        limit: usize,
-        include_archived: bool,
-        sort_key: ThreadSortKey,
-        sort_direction: SortDirection,
-    ) -> io::Result<StoredThreadSearchPage>;
-
-    fn list_thread_turns(
-        &self,
-        thread_id: &str,
-        cursor: Option<&str>,
-        limit: usize,
-        sort_direction: SortDirection,
-        items_view: TurnItemsView,
-    ) -> io::Result<StoredThreadTurnPage>;
-
-    fn list_thread_items(
-        &self,
-        thread_id: &str,
-        turn_id: Option<&str>,
-        cursor: Option<&str>,
-        limit: usize,
-        sort_direction: SortDirection,
-    ) -> io::Result<StoredThreadItemPage>;
-}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct CompactionRecord {

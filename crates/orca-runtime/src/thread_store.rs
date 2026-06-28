@@ -1,11 +1,90 @@
 pub use crate::history::{
-    JsonlThreadStore, LiveThread, SessionMeta, SessionStore, SessionTranscript, SessionWriter,
-    SortDirection, StoredThreadItem, StoredThreadItemPage, StoredThreadProjection,
+    JsonlThreadStore, LiveThread, SessionMeta, SessionStore, SessionSummary, SessionTranscript,
+    SessionWriter, SortDirection, StoredThreadItem, StoredThreadItemPage, StoredThreadProjection,
     StoredThreadSearchHit, StoredThreadSearchPage, StoredThreadSummary, StoredThreadSummaryPage,
     StoredThreadTurn, StoredThreadTurnPage, ThreadListFilters, ThreadMetadataPatch,
-    ThreadRelationFilter, ThreadSortKey, ThreadStore, TurnItemsView,
+    ThreadRelationFilter, ThreadSortKey, TurnItemsView,
 };
+use std::io;
+use std::path::Path;
+
+use orca_core::approval_rules::PermissionRules;
+use orca_core::approval_types::ApprovalMode;
+use orca_core::config::{ActivePermissionProfile, AdditionalWorkingDirectory};
 use orca_core::conversation::{Conversation, Message};
+
+pub trait ThreadStore {
+    fn create_live_thread(
+        &self,
+        cwd: &Path,
+        provider: &str,
+        model: Option<String>,
+        prompt: &str,
+    ) -> io::Result<LiveThread>;
+
+    fn create_live_thread_with_permissions(
+        &self,
+        cwd: &Path,
+        provider: &str,
+        model: Option<String>,
+        prompt: &str,
+        active_permission_profile: Option<ActivePermissionProfile>,
+        approval_mode: ApprovalMode,
+        permission_rules: PermissionRules,
+        additional_working_directories: Vec<AdditionalWorkingDirectory>,
+    ) -> io::Result<LiveThread>;
+
+    fn update_thread_metadata(
+        &self,
+        thread_id: &str,
+        patch: ThreadMetadataPatch,
+    ) -> io::Result<SessionSummary>;
+
+    fn read_thread(
+        &self,
+        thread_id: &str,
+        include_messages: bool,
+        include_turns: bool,
+    ) -> io::Result<StoredThreadProjection>;
+
+    fn list_threads(
+        &self,
+        cursor: Option<&str>,
+        limit: usize,
+        filters: ThreadListFilters,
+        sort_key: ThreadSortKey,
+        sort_direction: SortDirection,
+        search_term: Option<&str>,
+    ) -> io::Result<StoredThreadSummaryPage>;
+
+    fn search_threads(
+        &self,
+        query: &str,
+        cursor: Option<&str>,
+        limit: usize,
+        include_archived: bool,
+        sort_key: ThreadSortKey,
+        sort_direction: SortDirection,
+    ) -> io::Result<StoredThreadSearchPage>;
+
+    fn list_thread_turns(
+        &self,
+        thread_id: &str,
+        cursor: Option<&str>,
+        limit: usize,
+        sort_direction: SortDirection,
+        items_view: TurnItemsView,
+    ) -> io::Result<StoredThreadTurnPage>;
+
+    fn list_thread_items(
+        &self,
+        thread_id: &str,
+        turn_id: Option<&str>,
+        cursor: Option<&str>,
+        limit: usize,
+        sort_direction: SortDirection,
+    ) -> io::Result<StoredThreadItemPage>;
+}
 
 pub(crate) fn messages_to_thread_turns(
     thread_id: &str,
