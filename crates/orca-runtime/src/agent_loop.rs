@@ -71,12 +71,16 @@ pub(crate) struct RuntimeTurnDeps<'a> {
     hooks: &'a HookRunner,
 }
 
+pub(crate) struct RuntimeTurnState<'a> {
+    cost_tracker: &'a mut CostTracker,
+    cancel: &'a CancelToken,
+    task_registry: &'a TaskRegistry,
+}
+
 pub(crate) struct AgentLoopContext<'a> {
     turn_config: RuntimeTurnConfig<'a>,
     turn_deps: Option<RuntimeTurnDeps<'a>>,
-    cost_tracker: Option<&'a mut CostTracker>,
-    cancel: Option<&'a CancelToken>,
-    task_registry: Option<&'a TaskRegistry>,
+    turn_state: Option<RuntimeTurnState<'a>>,
     background_workflows: Option<&'a mut Vec<BackgroundWorkflowRun>>,
     workflow_ipc: Option<&'a WorkflowIpcContext>,
     lifecycle: Option<&'a mut RuntimeSessionLifecycle>,
@@ -215,6 +219,35 @@ impl<'a> RuntimeTurnDeps<'a> {
     }
 }
 
+impl<'a> RuntimeTurnState<'a> {
+    pub(crate) fn new(
+        cost_tracker: &'a mut CostTracker,
+        cancel: &'a CancelToken,
+        task_registry: &'a TaskRegistry,
+    ) -> Self {
+        Self {
+            cost_tracker,
+            cancel,
+            task_registry,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cost_tracker(&self) -> &CostTracker {
+        self.cost_tracker
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cancel(&self) -> &'a CancelToken {
+        self.cancel
+    }
+
+    #[cfg(test)]
+    pub(crate) fn task_registry(&self) -> &'a TaskRegistry {
+        self.task_registry
+    }
+}
+
 impl<'a> AgentLoopContext<'a> {
     pub fn new(
         cwd: &'a Path,
@@ -232,9 +265,7 @@ impl<'a> AgentLoopContext<'a> {
                 subagent_type,
             ),
             turn_deps: None,
-            cost_tracker: None,
-            cancel: None,
-            task_registry: None,
+            turn_state: None,
             background_workflows: None,
             workflow_ipc: None,
             lifecycle: None,
@@ -295,27 +326,28 @@ impl<'a> AgentLoopContext<'a> {
         cancel: &'a CancelToken,
         task_registry: &'a TaskRegistry,
     ) -> Self {
-        self.cost_tracker = Some(cost_tracker);
-        self.cancel = Some(cancel);
-        self.task_registry = Some(task_registry);
+        self.turn_state = Some(RuntimeTurnState::new(cost_tracker, cancel, task_registry));
         self
     }
 
     #[cfg(test)]
+    pub(crate) fn turn_state(&self) -> &RuntimeTurnState<'a> {
+        self.turn_state.as_ref().expect("agent loop turn state")
+    }
+
+    #[cfg(test)]
     pub fn cost_tracker(&self) -> &CostTracker {
-        self.cost_tracker
-            .as_deref()
-            .expect("agent loop cost tracker")
+        self.turn_state().cost_tracker()
     }
 
     #[cfg(test)]
     pub fn cancel(&self) -> &'a CancelToken {
-        self.cancel.expect("agent loop cancel token")
+        self.turn_state().cancel()
     }
 
     #[cfg(test)]
     pub fn task_registry(&self) -> &'a TaskRegistry {
-        self.task_registry.expect("agent loop task registry")
+        self.turn_state().task_registry()
     }
 
     pub(crate) fn with_execution(
@@ -449,9 +481,7 @@ pub(crate) fn run_agent_loop(
                 subagent_type,
             },
         turn_deps,
-        cost_tracker,
-        cancel,
-        task_registry,
+        turn_state,
         background_workflows,
         workflow_ipc,
         lifecycle,
@@ -464,9 +494,11 @@ pub(crate) fn run_agent_loop(
         mcp_registry,
         hooks,
     } = turn_deps.expect("agent loop turn deps");
-    let cost_tracker = cost_tracker.expect("agent loop cost tracker");
-    let cancel = cancel.expect("agent loop cancel token");
-    let task_registry = task_registry.expect("agent loop task registry");
+    let RuntimeTurnState {
+        cost_tracker,
+        cancel,
+        task_registry,
+    } = turn_state.expect("agent loop turn state");
     let background_workflows = background_workflows.expect("agent loop background workflows");
     let max_turns = DEFAULT_MAX_TURNS;
     let budget_model = config.model.as_option();
@@ -1335,6 +1367,36 @@ mod tests {
         assert_eq!(context.cost_tracker().totals().total_tokens(), 0);
         assert!(std::ptr::eq(context.cancel(), &cancel));
         assert!(std::ptr::eq(context.task_registry(), &task_registry));
+    }
+
+    #[test]
+    fn runtime_turn_state_groups_mutable_runtime_refs() {
+        let mut cost_tracker = CostTracker::new(None);
+        let cancel = CancelToken::new();
+        let task_registry = TaskRegistry::new("agent-loop-state".to_string());
+
+        let state = RuntimeTurnState::new(&mut cost_tracker, &cancel, &task_registry);
+
+        assert_eq!(state.cost_tracker().totals().total_tokens(), 0);
+        assert!(std::ptr::eq(state.cancel(), &cancel));
+        assert!(std::ptr::eq(state.task_registry(), &task_registry));
+    }
+
+    #[test]
+    fn agent_loop_context_exposes_runtime_turn_state() {
+        let cwd = PathBuf::from("/tmp/orca-agent-loop-state");
+        let subagent_type = SubagentType::General;
+        let mut cost_tracker = CostTracker::new(None);
+        let cancel = CancelToken::new();
+        let task_registry = TaskRegistry::new("agent-loop-state-context".to_string());
+
+        let context = AgentLoopContext::new(&cwd, "inspect repo", 0, true, &subagent_type)
+            .with_runtime(&mut cost_tracker, &cancel, &task_registry);
+
+        let state = context.turn_state();
+        assert_eq!(state.cost_tracker().totals().total_tokens(), 0);
+        assert!(std::ptr::eq(state.cancel(), &cancel));
+        assert!(std::ptr::eq(state.task_registry(), &task_registry));
     }
 
     #[test]
