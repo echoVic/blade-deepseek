@@ -2761,6 +2761,78 @@ fn server_mode_command_exec_configured_permission_profile_uses_scoped_filesystem
 }
 
 #[test]
+fn server_mode_command_exec_configured_permission_profile_uses_trailing_globstar_subtree() {
+    if !sandbox_seatbelt_available() {
+        return;
+    }
+
+    with_orca_home(|home| {
+        let workspace = tempdir().expect("workspace");
+        let allowed = tempdir().expect("allowed");
+        let allowed_file = allowed.path().join("nested").join("allowed.txt");
+        let blocked_file = workspace.path().join("blocked.txt");
+        std::fs::create_dir_all(allowed_file.parent().expect("allowed parent"))
+            .expect("create allowed parent");
+        std::fs::write(
+            home.join("config.toml"),
+            format!(
+                "[permission_profiles.globstar]\nextends = \":read-only\"\n\n[permission_profiles.globstar.filesystem]\n\"{}/**\" = \"write\"\n",
+                allowed.path().display()
+            ),
+        )
+        .expect("write permission profile config");
+        let command = format!(
+            "printf allowed > {}; printf blocked > {}",
+            shell_escape(&allowed_file),
+            shell_escape(&blocked_file)
+        );
+
+        let mut child = orca_command()
+            .args([
+                "--mode",
+                "server",
+                "--provider",
+                "mock",
+                "--cwd",
+                workspace.path().to_str().unwrap(),
+            ])
+            .env("ORCA_HOME", home)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn orca server");
+        let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
+
+        {
+            let stdin = child.stdin.as_mut().expect("server stdin");
+            writeln!(
+                stdin,
+                r#"{{"id":"cmd","method":"command/exec","params":{{"command":["sh","-lc",{}],"permissionProfile":"globstar"}}}}"#,
+                serde_json::to_string(&command).expect("command json")
+            )
+            .expect("write globstar permissionProfile command/exec");
+            stdin
+                .flush()
+                .expect("flush globstar permissionProfile command/exec");
+        }
+        drop(child.stdin.take());
+
+        let completed = read_until_event(&mut stdout, "cmd", "command_exec_completed");
+        assert_ne!(completed["exitCode"], 0);
+        assert_eq!(
+            std::fs::read_to_string(&allowed_file).expect("allowed output"),
+            "allowed"
+        );
+        assert!(!blocked_file.exists());
+
+        let output = child.wait_with_output().expect("wait for server");
+        assert_eq!(output.status.code(), Some(0));
+        assert!(output.stderr.is_empty());
+    });
+}
+
+#[test]
 fn server_mode_command_exec_configured_permission_profile_deny_overrides_write_root() {
     if !sandbox_seatbelt_available() {
         return;

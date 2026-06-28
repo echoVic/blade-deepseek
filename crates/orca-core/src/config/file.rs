@@ -514,6 +514,28 @@ extends = ":read-only"
     }
 
     #[test]
+    fn parse_permission_profile_trailing_globstar_filesystem_entries_as_subtree_roots() {
+        let toml = r#"
+[permission_profiles.extra-write]
+extends = ":read-only"
+
+[permission_profiles.extra-write.filesystem]
+"/tmp/orca-extra/**" = "write"
+"#;
+        let config: FileConfig = toml::from_str(toml).unwrap();
+        let profile = config.permission_profiles.get("extra-write").unwrap();
+
+        assert_eq!(
+            profile.filesystem.get(Path::new("/tmp/orca-extra")),
+            Some(&crate::config::PermissionProfileFileAccess::Write)
+        );
+        assert_eq!(
+            profile.filesystem.get(Path::new("/tmp/orca-extra/**")),
+            None
+        );
+    }
+
+    #[test]
     fn parse_permission_profile_scoped_filesystem_entries() {
         let toml = r#"
 [permission_profiles.docs]

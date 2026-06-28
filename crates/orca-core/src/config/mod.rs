@@ -295,19 +295,36 @@ impl<'de> Deserialize<'de> for PermissionProfileFilesystemConfig {
         let raw = HashMap::<PathBuf, PermissionProfileFilesystemEntry>::deserialize(deserializer)?;
         let mut entries = HashMap::new();
         for (path, entry) in raw {
+            let path = normalize_permission_profile_filesystem_path(path);
             match entry {
                 PermissionProfileFilesystemEntry::Access(access) => {
                     entries.insert(path, access);
                 }
                 PermissionProfileFilesystemEntry::Scoped(scoped) => {
                     for (subpath, access) in scoped {
-                        entries.insert(path.join(subpath), access);
+                        entries.insert(
+                            normalize_permission_profile_filesystem_path(path.join(subpath)),
+                            access,
+                        );
                     }
                 }
             }
         }
         Ok(Self { entries })
     }
+}
+
+fn normalize_permission_profile_filesystem_path(path: PathBuf) -> PathBuf {
+    let Some(path_str) = path.to_str() else {
+        return path;
+    };
+    let Some(stripped) = path_str.strip_suffix("/**") else {
+        return path;
+    };
+    if stripped.is_empty() {
+        return path;
+    }
+    PathBuf::from(stripped)
 }
 
 impl PermissionProfileFilesystemConfig {
