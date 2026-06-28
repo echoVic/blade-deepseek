@@ -1122,6 +1122,7 @@ mod tests {
         let cancel = CancelToken::new();
         let task_registry = TaskRegistry::new("tool-actor-execute".to_string());
         let mut background_workflows = Vec::new();
+        let mut permission_overlay = crate::lifecycle::TurnPermissionOverlay::default();
         let context = ToolExecutionContext::new(cwd.path(), 0, true, &policy)
             .with_services(&instructions, &memory, &registry, &hooks)
             .with_runtime(
@@ -1130,7 +1131,8 @@ mod tests {
                 &task_registry,
                 &mut background_workflows,
                 None,
-            );
+            )
+            .with_permission_overlay(&mut permission_overlay);
 
         let mut actor = ToolExecutionActor::new(events.run_id().to_string(), DEFAULT_MAX_TURNS);
         let (status, result) = actor

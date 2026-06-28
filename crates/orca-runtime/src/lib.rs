@@ -73,6 +73,46 @@ mod tests {
     }
 
     #[test]
+    fn thread_projection_helpers_are_owned_by_thread_store_module() {
+        let history_source = include_str!("history.rs");
+        let thread_store_source = include_str!("thread_store.rs");
+
+        for (function_name, allows_generic) in [
+            ("thread_summary_matches", false),
+            ("thread_summary_matches_filters", false),
+            ("sort_thread_summaries", false),
+            ("sort_thread_search_hits", false),
+            ("message_to_thread_json", false),
+            ("stored_message_to_thread_json", false),
+            ("messages_to_thread_turns", false),
+            ("messages_to_thread_items", false),
+            ("stored_messages_to_thread_turns", false),
+            ("stored_messages_to_thread_items", false),
+            ("page_thread_turns", false),
+            ("page_thread_items", false),
+            ("page_vec", true),
+            ("next_turn_id_for_messages", false),
+        ] {
+            let plain_fn = format!("fn {function_name}(");
+            let generic_fn = format!("fn {function_name}<");
+            assert!(
+                !history_source.contains(&plain_fn) && !history_source.contains(&generic_fn),
+                "history must not own ThreadStore projection helper {function_name}"
+            );
+            let thread_store_owns_helper = thread_store_source.contains(&plain_fn)
+                || (allows_generic && thread_store_source.contains(&generic_fn));
+            assert!(
+                thread_store_owns_helper,
+                "thread_store must own ThreadStore projection helper {function_name}"
+            );
+            assert!(
+                !thread_store_source.contains(&format!("crate::history::{function_name}(")),
+                "thread_store must not bridge projection helper {function_name} through history"
+            );
+        }
+    }
+
+    #[test]
     fn jsonl_thread_store_type_is_owned_by_thread_store_module() {
         let history_source = include_str!("history.rs");
         let thread_store_source = include_str!("thread_store.rs");
