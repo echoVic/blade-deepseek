@@ -100,6 +100,9 @@ pub struct RuntimeToolActorContext {
 pub(crate) struct RuntimeSteerStep;
 pub(crate) struct RuntimeTurnStartStep;
 pub(crate) struct RuntimeModelRouteStep;
+pub(crate) struct RuntimeProviderErrorStep {
+    reactive_compacted: bool,
+}
 
 pub(crate) struct RuntimeProviderTurnStep;
 pub(crate) struct RuntimeProviderResponseStep;
@@ -128,6 +131,12 @@ pub(crate) enum RuntimeProviderResponseOutcome {
 
 pub(crate) struct RuntimeTurnStartStepOutput {
     pub(crate) error: Option<RuntimeTurnStartError>,
+}
+
+pub(crate) enum RuntimeProviderErrorStepOutcome {
+    ContinueAfterCompaction,
+    Failed(RuntimeTurnStartError),
+    NoError,
 }
 
 pub(crate) struct RuntimeCompactionStep<'a, W: io::Write> {
@@ -2156,6 +2165,56 @@ impl RuntimeModelRouteStep {
     }
 }
 
+impl RuntimeProviderErrorStep {
+    pub(crate) fn new() -> Self {
+        Self {
+            reactive_compacted: false,
+        }
+    }
+
+    pub(crate) fn handle<W: io::Write>(
+        &mut self,
+        response: &ProviderResponse,
+        compaction: &mut RuntimeCompactionStep<'_, W>,
+        conversation: &mut Conversation,
+    ) -> io::Result<RuntimeProviderErrorStepOutcome> {
+        match RuntimeProviderTurnStep::new().handle_provider_error(
+            response,
+            compaction,
+            conversation,
+            self.reactive_compacted,
+        )? {
+            RuntimeProviderErrorOutcome::ContinueAfterCompaction => {
+                self.reactive_compacted = true;
+                Ok(RuntimeProviderErrorStepOutcome::ContinueAfterCompaction)
+            }
+            RuntimeProviderErrorOutcome::Failed(message) => {
+                self.reactive_compacted = false;
+                Ok(RuntimeProviderErrorStepOutcome::Failed(
+                    RuntimeTurnStartError {
+                        status: RunStatus::Failed,
+                        message,
+                    },
+                ))
+            }
+            RuntimeProviderErrorOutcome::NoError => {
+                self.reactive_compacted = false;
+                Ok(RuntimeProviderErrorStepOutcome::NoError)
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn mark_reactive_compacted_for_test(&mut self) {
+        self.reactive_compacted = true;
+    }
+
+    #[cfg(test)]
+    fn reactive_compacted_for_test(&self) -> bool {
+        self.reactive_compacted
+    }
+}
+
 impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
     pub(crate) fn new(
         provider: ProviderKind,
@@ -2758,6 +2817,65 @@ mod tests {
             }
             _ => panic!("expected non-compaction provider error to fail"),
         }
+        let output = String::from_utf8(output).expect("jsonl is utf8");
+        assert!(output.contains("\"type\":\"error\""));
+        assert!(output.contains("DeepSeek provider error: quota"));
+    }
+
+    #[test]
+    fn provider_error_step_returns_failure_and_resets_reactive_state() {
+        let response = ProviderResponse {
+            steps: vec![ProviderStep::Error(
+                "DeepSeek provider error: quota".to_string(),
+            )],
+            assistant_content: None,
+            assistant_reasoning: None,
+            tool_calls: Vec::new(),
+            usage: None,
+        };
+        let runtime = ModelRuntimeConfig::default();
+        let context_config =
+            context::ContextConfig::for_model_with_runtime(Some("deepseek-chat"), &runtime);
+        let provider_config = ProviderConfig {
+            api_key: None,
+            base_url: None,
+            model: None,
+            tools_override: Some(Vec::new()),
+            mcp_registry: None,
+            external_tools: Vec::new(),
+        };
+        let hooks = HookRunner::default();
+        let mut events = EventFactory::new("provider-error-step".to_string());
+        let mut output = Vec::new();
+        let mut sink = EventSink::new(&mut output, OutputFormat::Jsonl);
+        let cwd = Path::new(".");
+        let mut compaction = RuntimeCompactionStep::new(
+            ProviderKind::DeepSeek,
+            &context_config,
+            &provider_config,
+            cwd,
+            true,
+            &hooks,
+            &mut events,
+            &mut sink,
+            None,
+        );
+        let mut conversation = Conversation::new();
+        let mut step = RuntimeProviderErrorStep::new();
+        step.mark_reactive_compacted_for_test();
+
+        let outcome = step
+            .handle(&response, &mut compaction, &mut conversation)
+            .expect("provider error step succeeds");
+
+        match outcome {
+            RuntimeProviderErrorStepOutcome::Failed(error) => {
+                assert_eq!(error.status, RunStatus::Failed);
+                assert_eq!(error.message, "DeepSeek provider error: quota");
+            }
+            _ => panic!("expected provider error step failure"),
+        }
+        assert!(!step.reactive_compacted_for_test());
         let output = String::from_utf8(output).expect("jsonl is utf8");
         assert!(output.contains("\"type\":\"error\""));
         assert!(output.contains("DeepSeek provider error: quota"));

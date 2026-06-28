@@ -1359,6 +1359,45 @@ mod tests {
     }
 
     #[test]
+    fn runtime_provider_error_step_is_owned_by_lifecycle_module() {
+        let agent_loop_source = include_str!("agent_loop.rs");
+        let lifecycle_source = include_str!("lifecycle.rs");
+
+        for marker in [
+            "let mut reactive_compacted",
+            "RuntimeProviderErrorOutcome::ContinueAfterCompaction",
+            "RuntimeProviderErrorOutcome::Failed",
+            "RuntimeProviderErrorOutcome::NoError",
+            "handle_provider_error(",
+        ] {
+            assert!(
+                !agent_loop_source.contains(marker),
+                "agent_loop must not own runtime provider-error detail {marker}"
+            );
+        }
+        assert!(
+            agent_loop_source.contains("RuntimeProviderErrorStep"),
+            "agent_loop must delegate runtime provider-error handling"
+        );
+        assert!(
+            lifecycle_source.contains("struct RuntimeProviderErrorStep"),
+            "lifecycle must own runtime provider-error step state"
+        );
+        assert!(
+            lifecycle_source.contains("impl RuntimeProviderErrorStep"),
+            "lifecycle must own runtime provider-error step behavior"
+        );
+        assert!(
+            lifecycle_source.contains("reactive_compacted"),
+            "lifecycle must own reactive compaction loop state"
+        );
+        assert!(
+            lifecycle_source.contains("handle_provider_error("),
+            "lifecycle must keep provider error classification behind the step"
+        );
+    }
+
+    #[test]
     fn session_list_load_operations_are_owned_by_thread_store_module() {
         let history_source = include_str!("history.rs");
         let thread_store_source = include_str!("thread_store.rs");

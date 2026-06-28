@@ -5,11 +5,11 @@ use crate::cost::CostTracker;
 use crate::hooks::HookRunner;
 use crate::instructions::ProjectInstructions;
 use crate::lifecycle::{
-    AgentLoopContext, RuntimeCompactionStep, RuntimeModelRouteStep, RuntimeProviderErrorOutcome,
-    RuntimeProviderResponseOutcome, RuntimeProviderResponseStep, RuntimeProviderTurnStep,
-    RuntimeSessionLifecycle, RuntimeSteerStep, RuntimeTaskActor, RuntimeTurnConfig,
-    RuntimeTurnDeps, RuntimeTurnExecution, RuntimeTurnStartStep, RuntimeTurnState,
-    provider_response_or_terminal,
+    AgentLoopContext, RuntimeCompactionStep, RuntimeModelRouteStep, RuntimeProviderErrorStep,
+    RuntimeProviderErrorStepOutcome, RuntimeProviderResponseOutcome, RuntimeProviderResponseStep,
+    RuntimeProviderTurnStep, RuntimeSessionLifecycle, RuntimeSteerStep, RuntimeTaskActor,
+    RuntimeTurnConfig, RuntimeTurnDeps, RuntimeTurnExecution, RuntimeTurnStartStep,
+    RuntimeTurnState, provider_response_or_terminal,
 };
 use crate::memory::MemoryBlock;
 use crate::session::{
@@ -147,7 +147,7 @@ pub(crate) fn run_agent_loop(
     let mut legacy_lifecycle = RuntimeSessionLifecycle::new(events.run_id().to_string());
     let lifecycle = lifecycle.unwrap_or(&mut legacy_lifecycle);
     let mut actor = RuntimeTaskActor::new(lifecycle, max_turns);
-    let mut reactive_compacted = false;
+    let mut provider_error_step = RuntimeProviderErrorStep::new();
 
     loop {
         RuntimeCompactionStep::new(
@@ -211,8 +211,7 @@ pub(crate) fn run_agent_loop(
             }
         };
 
-        let mut provider_turn_step = RuntimeProviderTurnStep::new();
-        match provider_turn_step.handle_provider_error(
+        match provider_error_step.handle(
             &response,
             &mut RuntimeCompactionStep::new(
                 config.provider,
@@ -226,19 +225,15 @@ pub(crate) fn run_agent_loop(
                 history_writer.as_deref_mut(),
             ),
             conversation,
-            reactive_compacted,
         )? {
-            RuntimeProviderErrorOutcome::ContinueAfterCompaction => {
-                reactive_compacted = true;
+            RuntimeProviderErrorStepOutcome::ContinueAfterCompaction => {
                 continue;
             }
-            RuntimeProviderErrorOutcome::Failed(error) => {
-                return Ok(AgentLoopResult::failure(RunStatus::Failed, error));
+            RuntimeProviderErrorStepOutcome::Failed(error) => {
+                return Ok(AgentLoopResult::failure(error.status, error.message));
             }
-            RuntimeProviderErrorOutcome::NoError => {}
+            RuntimeProviderErrorStepOutcome::NoError => {}
         }
-
-        reactive_compacted = false;
 
         match RuntimeProviderResponseStep::new().handle(
             response,
