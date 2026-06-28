@@ -207,7 +207,11 @@ mod tests {
             "agent_loop must not match provider tool-call steps directly"
         );
         assert!(
-            agent_loop_source.contains("tool_requests_from_provider_steps("),
+            !agent_loop_source.contains("tool_requests_from_provider_steps("),
+            "agent_loop must delegate provider tool request extraction through provider response step"
+        );
+        assert!(
+            agent_loop_source.contains("RuntimeProviderResponseStep"),
             "agent_loop must delegate provider tool request extraction"
         );
         assert!(
@@ -234,8 +238,8 @@ mod tests {
             "agent_loop must delegate normal tool execution through tool-turn dispatch runner"
         );
         assert!(
-            agent_loop_source.contains("run_tool_turns("),
-            "agent_loop must delegate normal tool turn execution through tool-turn dispatch"
+            agent_loop_source.contains("RuntimeProviderResponseStep"),
+            "agent_loop must delegate normal tool turn execution through provider response step"
         );
         assert!(
             tool_execution_source.contains("pub(crate) fn execute_tool_with_approval"),
@@ -263,8 +267,8 @@ mod tests {
             "agent_loop must delegate tool request cursor state through tool-turn dispatch"
         );
         assert!(
-            agent_loop_source.contains("run_tool_turns("),
-            "agent_loop must delegate tool request cursor use"
+            agent_loop_source.contains("RuntimeProviderResponseStep"),
+            "agent_loop must delegate tool request cursor use through provider response step"
         );
         assert!(
             tool_invocation_source.contains("pub(crate) struct ToolRequestCursor"),
@@ -286,8 +290,12 @@ mod tests {
             "agent_loop must not own tool-turn terminal result shape"
         );
         assert!(
-            agent_loop_source.contains("ToolTurnOutcome"),
-            "agent_loop must delegate tool-turn outcome state"
+            !agent_loop_source.contains("ToolTurnOutcome"),
+            "agent_loop must delegate tool-turn outcome state through provider response step"
+        );
+        assert!(
+            agent_loop_source.contains("RuntimeProviderResponseOutcome"),
+            "agent_loop must consume provider response outcome state"
         );
         assert!(
             tool_invocation_source.contains("pub(crate) enum ToolTurnOutcome"),
@@ -319,8 +327,8 @@ mod tests {
             "agent_loop must delegate normal tool-turn execution through tool-turn dispatch"
         );
         assert!(
-            agent_loop_source.contains("run_tool_turns("),
-            "agent_loop must delegate normal tool-turn execution"
+            agent_loop_source.contains("RuntimeProviderResponseStep"),
+            "agent_loop must delegate normal tool-turn execution through provider response step"
         );
         assert!(
             tool_invocation_source.contains("pub(crate) fn run_normal_tool_turn"),
@@ -352,8 +360,8 @@ mod tests {
             "agent_loop must delegate readonly tool-turn execution through tool-turn dispatch"
         );
         assert!(
-            agent_loop_source.contains("run_tool_turns("),
-            "agent_loop must delegate readonly tool-turn execution"
+            agent_loop_source.contains("RuntimeProviderResponseStep"),
+            "agent_loop must delegate readonly tool-turn execution through provider response step"
         );
         assert!(
             tool_invocation_source.contains("pub(crate) fn run_readonly_tool_turn"),
@@ -408,8 +416,8 @@ mod tests {
             "agent_loop must delegate normal tool result recording through tool-turn dispatch"
         );
         assert!(
-            agent_loop_source.contains("run_tool_turns("),
-            "agent_loop must delegate normal tool turn recording through tool-turn dispatch"
+            agent_loop_source.contains("RuntimeProviderResponseStep"),
+            "agent_loop must delegate normal tool turn recording through provider response step"
         );
         assert!(
             tool_invocation_source.contains("pub(crate) fn record_normal_tool_result"),
@@ -474,8 +482,8 @@ mod tests {
             "agent_loop must delegate readonly batch result recording through tool-turn dispatch"
         );
         assert!(
-            agent_loop_source.contains("run_tool_turns("),
-            "agent_loop must delegate readonly tool turn recording through tool-turn dispatch"
+            agent_loop_source.contains("RuntimeProviderResponseStep"),
+            "agent_loop must delegate readonly tool turn recording through provider response step"
         );
         assert!(
             tool_invocation_source.contains("pub(crate) fn record_readonly_batch_results"),
@@ -530,8 +538,8 @@ mod tests {
             "agent_loop must delegate subagent batch tool turns through tool-turn dispatch"
         );
         assert!(
-            agent_loop_source.contains("run_tool_turns("),
-            "agent_loop must delegate subagent batch tool turns"
+            agent_loop_source.contains("RuntimeProviderResponseStep"),
+            "agent_loop must delegate subagent batch tool turns through provider response step"
         );
         assert!(
             subagent_execution_source.contains("pub(crate) fn run_subagent_batch_tool_turn"),
@@ -568,7 +576,11 @@ mod tests {
             );
         }
         assert!(
-            agent_loop_source.contains("run_tool_turns("),
+            !agent_loop_source.contains("run_tool_turns("),
+            "agent_loop must delegate tool-turn dispatch through provider response step"
+        );
+        assert!(
+            agent_loop_source.contains("RuntimeProviderResponseStep"),
             "agent_loop must delegate tool-turn dispatch"
         );
         assert!(
@@ -708,7 +720,11 @@ mod tests {
             );
         }
         assert!(
-            agent_loop_source.contains("memory::extract_project_memory_after_final_response("),
+            !agent_loop_source.contains("extract_project_memory_after_final_response("),
+            "agent_loop must delegate final memory extraction through provider response step"
+        );
+        assert!(
+            agent_loop_source.contains("RuntimeProviderResponseStep"),
             "agent_loop must delegate final memory extraction"
         );
         assert!(
@@ -1202,6 +1218,47 @@ mod tests {
             assert!(
                 thread_store_source.contains(&format!("fn {function_name}")),
                 "thread_store must own ThreadStore lookup helper {function_name}"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_provider_response_step_is_owned_by_lifecycle_module() {
+        let agent_loop_source = include_str!("agent_loop.rs");
+        let lifecycle_source = include_str!("lifecycle.rs");
+
+        for marker in [
+            "record_assistant_response_for_agent(",
+            "extract_project_memory_after_final_response(",
+            "tool_requests_from_provider_steps(",
+            "run_tool_turns(",
+        ] {
+            assert!(
+                !agent_loop_source.contains(marker),
+                "agent_loop must not own provider response handling detail {marker}"
+            );
+        }
+        assert!(
+            agent_loop_source.contains("RuntimeProviderResponseStep"),
+            "agent_loop must delegate provider response handling"
+        );
+        assert!(
+            lifecycle_source.contains("struct RuntimeProviderResponseStep"),
+            "lifecycle must own provider response step state"
+        );
+        assert!(
+            lifecycle_source.contains("impl RuntimeProviderResponseStep"),
+            "lifecycle must own provider response step behavior"
+        );
+        for marker in [
+            "record_assistant_response_for_agent(",
+            "extract_project_memory_after_final_response(",
+            "tool_requests_from_provider_steps(",
+            "run_tool_turns(",
+        ] {
+            assert!(
+                lifecycle_source.contains(marker),
+                "lifecycle must compose provider response handling detail {marker}"
             );
         }
     }

@@ -24,16 +24,22 @@ use serde_json::{Value, json};
 
 use crate::cost::CostTracker;
 use crate::hooks::{HookContext, HookOutcome, HookRunner, conversation_with_hook_context};
+use crate::memory::{self, MemoryBlock};
 use crate::protocol::{PermissionGrantScope, PermissionResponseDecision, RequestPermissionProfile};
+use crate::session::record_assistant_response_for_agent;
 use crate::shell_session::{
     RuntimeShellSessionManager, ShellSandboxMode, ShellSessionCommand, ShellTerminalMode,
 };
 use crate::tasks::TaskRegistry;
 use crate::thread_store::SessionWriter;
+use crate::tool_invocation::{
+    AgentToolPolicyContext, ToolTurnOutcome, run_tool_turns, tool_requests_from_provider_steps,
+};
 use crate::workflow::WorkflowDraftStore;
 use crate::workflow::ipc::WorkflowIpcContext;
+use crate::workflow::runner::SharedEventBuffer;
 use crate::workflow_execution::BackgroundWorkflowRun;
-use crate::{instructions::ProjectInstructions, memory::MemoryBlock};
+use crate::{agent_child::ChildAgentExecutor, instructions::ProjectInstructions};
 use orca_core::event_sink::EventSink;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -94,6 +100,7 @@ pub struct RuntimeToolActorContext {
 pub(crate) struct RuntimeSteerStep;
 
 pub(crate) struct RuntimeProviderTurnStep;
+pub(crate) struct RuntimeProviderResponseStep;
 
 pub(crate) struct RuntimeProviderTurnOutput {
     pub(crate) response: Option<ProviderResponse>,
@@ -104,6 +111,17 @@ pub(crate) enum RuntimeProviderErrorOutcome {
     ContinueAfterCompaction,
     Failed(String),
     NoError,
+}
+
+pub(crate) enum RuntimeProviderResponseOutcome {
+    Continue,
+    Success {
+        final_message: Option<String>,
+    },
+    Return {
+        status: RunStatus,
+        error: Option<String>,
+    },
 }
 
 pub(crate) struct RuntimeCompactionStep<'a, W: io::Write> {
@@ -2312,6 +2330,105 @@ impl RuntimeProviderTurnStep {
     }
 }
 
+impl RuntimeProviderResponseStep {
+    pub(crate) fn new() -> Self {
+        Self
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn handle<W: io::Write>(
+        &mut self,
+        response: ProviderResponse,
+        config: &RunConfig,
+        cwd: &Path,
+        events: &mut EventFactory,
+        sink: &mut EventSink<W>,
+        conversation: &mut Conversation,
+        mut history_writer: Option<&mut SessionWriter>,
+        tool_policy: AgentToolPolicyContext<'_>,
+        subagent_depth: u32,
+        emit_deltas: bool,
+        policy: &ApprovalPolicy,
+        instructions: &ProjectInstructions,
+        memory: &MemoryBlock,
+        mcp_registry: &McpRegistry,
+        hooks: &HookRunner,
+        cost_tracker: &mut CostTracker,
+        cancel: &CancelToken,
+        task_registry: &TaskRegistry,
+        background_workflows: &mut Vec<BackgroundWorkflowRun>,
+        workflow_ipc: Option<&WorkflowIpcContext>,
+        permission_handler: Option<&(dyn RuntimePermissionRequestHandler + Send + Sync)>,
+        child_executor: ChildAgentExecutor<W>,
+        workflow_child_executor: ChildAgentExecutor<SharedEventBuffer>,
+        batch_child_executor: ChildAgentExecutor<io::Sink>,
+    ) -> io::Result<RuntimeProviderResponseOutcome> {
+        if response.tool_calls.is_empty() {
+            let final_message = response.assistant_content.clone();
+            record_assistant_response_for_agent(
+                conversation,
+                history_writer.as_deref_mut(),
+                response.assistant_content,
+                response.assistant_reasoning,
+                vec![],
+                emit_deltas,
+            )?;
+            if emit_deltas && config.auto_memory {
+                memory::extract_project_memory_after_final_response(
+                    config,
+                    cwd,
+                    &conversation.messages,
+                    events,
+                    sink,
+                )?;
+            }
+            return Ok(RuntimeProviderResponseOutcome::Success { final_message });
+        }
+
+        record_assistant_response_for_agent(
+            conversation,
+            history_writer.as_deref_mut(),
+            response.assistant_content,
+            response.assistant_reasoning,
+            response.tool_calls.clone(),
+            emit_deltas,
+        )?;
+
+        let tool_requests = tool_requests_from_provider_steps(&response.steps);
+        match run_tool_turns(
+            config,
+            cwd,
+            events,
+            sink,
+            conversation,
+            history_writer.as_deref_mut(),
+            &tool_requests,
+            tool_policy,
+            subagent_depth,
+            emit_deltas,
+            policy,
+            instructions,
+            memory,
+            mcp_registry,
+            hooks,
+            cost_tracker,
+            cancel,
+            task_registry,
+            background_workflows,
+            workflow_ipc,
+            permission_handler,
+            child_executor,
+            workflow_child_executor,
+            batch_child_executor,
+        )? {
+            ToolTurnOutcome::Continue => Ok(RuntimeProviderResponseOutcome::Continue),
+            ToolTurnOutcome::Return { status, error } => {
+                Ok(RuntimeProviderResponseOutcome::Return { status, error })
+            }
+        }
+    }
+}
+
 fn cancelled_provider_turn<W: io::Write>(
     emit_deltas: bool,
     events: &mut EventFactory,
@@ -2450,7 +2567,65 @@ impl RuntimeTurnLifecycle {
 mod tests {
     use super::*;
 
-    use orca_core::config::{ModelRuntimeConfig, OutputFormat};
+    use orca_core::approval_rules::PermissionRules;
+    use orca_core::approval_types::ApprovalMode;
+    use orca_core::config::{
+        HistoryMode, ModelRuntimeConfig, OutputFormat, ProviderKind, RunConfig, ThemeName,
+        ToolConfig, WorkflowConfig,
+    };
+    use orca_core::conversation::Message;
+    use orca_core::external_config::ExternalToolConfig;
+    use orca_core::hook_types::HookConfig;
+    use orca_core::mcp_types::McpServerConfig;
+    use orca_core::model::ModelSelection;
+    use orca_core::subagent_config::SubagentConfig;
+
+    use crate::agent_child::{ChildAgentRequest, ChildAgentResult, ChildAgentRuntime};
+    use crate::tool_execution::policy_for_tool_execution;
+
+    fn config() -> RunConfig {
+        RunConfig {
+            app_version: "0.0.0-test".to_string(),
+            prompt: String::new(),
+            cwd: None,
+            output_format: OutputFormat::Text,
+            approval_mode: ApprovalMode::Suggest,
+            provider: ProviderKind::Mock,
+            verifier: None,
+            model: ModelSelection::parse(None).unwrap(),
+            model_runtime: Default::default(),
+            api_key: None,
+            base_url: None,
+            history_mode: HistoryMode::Disabled,
+            show_session_picker: false,
+            active_permission_profile: None,
+            permission_profiles: Default::default(),
+            runtime_workspace_roots: None,
+            permission_rules: PermissionRules::default(),
+            additional_working_directories: Vec::new(),
+            max_budget_usd: None,
+            mcp_servers: Vec::<McpServerConfig>::new(),
+            external_tools: Vec::<ExternalToolConfig>::new(),
+            hooks: Vec::<HookConfig>::new(),
+            subagents: SubagentConfig::default(),
+            tools: ToolConfig::default(),
+            workflows: WorkflowConfig::default(),
+            theme: ThemeName::Dark,
+            vim_mode: false,
+            update_check: false,
+            desktop_notifications: false,
+            auto_memory: false,
+        }
+    }
+
+    fn unused_child_executor<W: io::Write>(
+        _config: &RunConfig,
+        _request: &ChildAgentRequest,
+        _runtime: &mut ChildAgentRuntime<'_, W>,
+        _child_cost_tracker: &mut CostTracker,
+    ) -> io::Result<ChildAgentResult> {
+        panic!("final provider response must not execute child agents")
+    }
 
     #[test]
     fn provider_turn_error_handler_emits_failure_event_for_non_compaction_errors() {
@@ -2505,5 +2680,71 @@ mod tests {
         let output = String::from_utf8(output).expect("jsonl is utf8");
         assert!(output.contains("\"type\":\"error\""));
         assert!(output.contains("DeepSeek provider error: quota"));
+    }
+
+    #[test]
+    fn provider_response_step_records_final_assistant_message() {
+        let config = config();
+        let response = ProviderResponse {
+            steps: vec![ProviderStep::MessageDelta("done".to_string())],
+            assistant_content: Some("done".to_string()),
+            assistant_reasoning: None,
+            tool_calls: Vec::new(),
+            usage: None,
+        };
+        let cwd = tempfile::tempdir().expect("cwd");
+        let mut events = EventFactory::new("provider-response-final".to_string());
+        let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+        let mut conversation = Conversation::new();
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let mcp_registry = McpRegistry::default();
+        let hooks = HookRunner::default();
+        let mut cost_tracker = CostTracker::new(None);
+        let cancel = CancelToken::new();
+        let task_registry = TaskRegistry::new("provider-response-final".to_string());
+        let mut background_workflows = Vec::new();
+        let policy = policy_for_tool_execution(&config);
+
+        let outcome = RuntimeProviderResponseStep::new()
+            .handle(
+                response,
+                &config,
+                cwd.path(),
+                &mut events,
+                &mut sink,
+                &mut conversation,
+                None,
+                AgentToolPolicyContext::unrestricted(),
+                0,
+                true,
+                &policy,
+                &instructions,
+                &memory,
+                &mcp_registry,
+                &hooks,
+                &mut cost_tracker,
+                &cancel,
+                &task_registry,
+                &mut background_workflows,
+                None,
+                None,
+                unused_child_executor::<Vec<u8>>,
+                unused_child_executor::<crate::workflow::runner::SharedEventBuffer>,
+                unused_child_executor::<io::Sink>,
+            )
+            .expect("handle provider response");
+
+        match outcome {
+            RuntimeProviderResponseOutcome::Success { final_message } => {
+                assert_eq!(final_message.as_deref(), Some("done"));
+            }
+            _ => panic!("final response should complete the agent loop"),
+        }
+        assert_eq!(conversation.messages.len(), 1);
+        assert!(
+            matches!(&conversation.messages[0], Message::Assistant { content, tool_calls, .. }
+                if content.as_deref() == Some("done") && tool_calls.is_empty())
+        );
     }
 }

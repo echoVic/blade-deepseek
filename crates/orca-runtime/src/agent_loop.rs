@@ -5,21 +5,19 @@ use crate::cost::CostTracker;
 use crate::hooks::HookRunner;
 use crate::instructions::ProjectInstructions;
 use crate::lifecycle::{
-    AgentLoopContext, RuntimeCompactionStep, RuntimeProviderErrorOutcome, RuntimeProviderTurnStep,
+    AgentLoopContext, RuntimeCompactionStep, RuntimeProviderErrorOutcome,
+    RuntimeProviderResponseOutcome, RuntimeProviderResponseStep, RuntimeProviderTurnStep,
     RuntimeSessionLifecycle, RuntimeSteerStep, RuntimeTaskActor, RuntimeTurnConfig,
     RuntimeTurnDeps, RuntimeTurnExecution, RuntimeTurnState,
 };
-use crate::memory::{self, MemoryBlock};
+use crate::memory::MemoryBlock;
 use crate::session::{
     AgentConversationContext, bootstrap_agent_conversation_for_loop,
-    record_assistant_response_for_agent, record_initial_history_for_agent,
+    record_initial_history_for_agent,
 };
 use crate::tasks::TaskRegistry;
 use crate::tool_execution::policy_for_tool_execution;
-use crate::tool_invocation::{
-    AgentToolPolicyContext, ToolTurnOutcome, provider_config_for_agent_loop, run_tool_turns,
-    tool_requests_from_provider_steps,
-};
+use crate::tool_invocation::{AgentToolPolicyContext, provider_config_for_agent_loop};
 use crate::workflow_execution::observe_background_workflows;
 use orca_core::cancel::CancelToken;
 use orca_core::config::{OutputFormat, RunConfig};
@@ -259,46 +257,14 @@ pub(crate) fn run_agent_loop(
 
         reactive_compacted = false;
 
-        if response.tool_calls.is_empty() {
-            let final_message = response.assistant_content.clone();
-            record_assistant_response_for_agent(
-                conversation,
-                history_writer.as_deref_mut(),
-                response.assistant_content,
-                response.assistant_reasoning,
-                vec![],
-                emit_deltas,
-            )?;
-            if emit_deltas && config.auto_memory {
-                memory::extract_project_memory_after_final_response(
-                    config,
-                    cwd,
-                    &conversation.messages,
-                    events,
-                    sink,
-                )?;
-            }
-            return Ok(AgentLoopResult::success(final_message));
-        }
-
-        record_assistant_response_for_agent(
-            conversation,
-            history_writer.as_deref_mut(),
-            response.assistant_content,
-            response.assistant_reasoning,
-            response.tool_calls.clone(),
-            emit_deltas,
-        )?;
-
-        let tool_requests = tool_requests_from_provider_steps(&response.steps);
-        match run_tool_turns(
+        match RuntimeProviderResponseStep::new().handle(
+            response,
             config,
             cwd,
             events,
             sink,
             conversation,
             history_writer.as_deref_mut(),
-            &tool_requests,
             tool_policy,
             subagent_depth,
             emit_deltas,
@@ -317,8 +283,11 @@ pub(crate) fn run_agent_loop(
             execute_child_agent_loop,
             execute_child_agent_loop,
         )? {
-            ToolTurnOutcome::Continue => {}
-            ToolTurnOutcome::Return { status, error } => {
+            RuntimeProviderResponseOutcome::Continue => {}
+            RuntimeProviderResponseOutcome::Success { final_message } => {
+                return Ok(AgentLoopResult::success(final_message));
+            }
+            RuntimeProviderResponseOutcome::Return { status, error } => {
                 return Ok(AgentLoopResult::terminal(status, error));
             }
         }
