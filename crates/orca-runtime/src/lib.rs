@@ -61,4 +61,14 @@ mod tests {
             "agent loop must import session transcript/writer types through thread_store"
         );
     }
+
+    #[test]
+    fn session_imports_session_types_from_thread_store_boundary() {
+        let session_source = include_str!("session.rs");
+
+        assert!(
+            !session_source.contains("use crate::history::{self, SessionWriter};"),
+            "session production code must import session transcript/writer types through thread_store"
+        );
+    }
 }

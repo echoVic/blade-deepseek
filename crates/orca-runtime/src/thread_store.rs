@@ -1,9 +1,9 @@
 pub use crate::history::{
-    JsonlThreadStore, LiveThread, SessionStore, SessionTranscript, SessionWriter, SortDirection,
-    StoredThreadItem, StoredThreadItemPage, StoredThreadProjection, StoredThreadSearchHit,
-    StoredThreadSearchPage, StoredThreadSummary, StoredThreadSummaryPage, StoredThreadTurn,
-    StoredThreadTurnPage, ThreadListFilters, ThreadMetadataPatch, ThreadRelationFilter,
-    ThreadSortKey, ThreadStore, TurnItemsView,
+    JsonlThreadStore, LiveThread, SessionMeta, SessionStore, SessionTranscript, SessionWriter,
+    SortDirection, StoredThreadItem, StoredThreadItemPage, StoredThreadProjection,
+    StoredThreadSearchHit, StoredThreadSearchPage, StoredThreadSummary, StoredThreadSummaryPage,
+    StoredThreadTurn, StoredThreadTurnPage, ThreadListFilters, ThreadMetadataPatch,
+    ThreadRelationFilter, ThreadSortKey, ThreadStore, TurnItemsView,
 };
 use orca_core::conversation::{Conversation, Message};
 

@@ -14,12 +14,13 @@ use orca_provider::ProviderConfig;
 
 use crate::agent_common;
 use crate::cost::CostTracker;
-use crate::history::{self, SessionWriter};
 use crate::hooks::{HookContext, HookRunner, conversation_with_hook_context};
 use crate::instructions::{self, ProjectInstructions};
 use crate::memory::{self, MemoryBlock};
 use crate::tasks::TaskRegistry;
-use crate::thread_store::{SessionStore, ThreadStore};
+use crate::thread_store::{
+    SessionMeta, SessionStore, SessionTranscript, SessionWriter, ThreadStore,
+};
 
 pub fn new_run_id() -> String {
     let nanos = SystemTime::now()
@@ -57,7 +58,7 @@ impl InteractiveSession {
     pub fn new_with_preloaded(
         config: &RunConfig,
         prompt_for_title: &str,
-        preloaded: Option<history::SessionTranscript>,
+        preloaded: Option<SessionTranscript>,
     ) -> io::Result<Self> {
         let cwd = config
             .cwd
@@ -163,7 +164,7 @@ impl InteractiveSession {
 
     pub(crate) fn resume_same_thread(
         config: &RunConfig,
-        transcript: history::SessionTranscript,
+        transcript: SessionTranscript,
     ) -> io::Result<Self> {
         let cwd = config
             .cwd
@@ -186,7 +187,7 @@ impl InteractiveSession {
         conversation.strip_legacy_pinned_volatile();
         conversation.strip_legacy_summary_messages();
         let session_id = transcript.meta.session_id.clone();
-        let writer = Some(history::SessionWriter::append_to_existing(transcript.path)?);
+        let writer = Some(SessionWriter::append_to_existing(transcript.path)?);
 
         Ok(Self {
             store,
@@ -397,7 +398,7 @@ impl InteractiveSession {
 
 fn start_writer_with_messages(
     store: &SessionStore,
-    meta: history::SessionMeta,
+    meta: SessionMeta,
     conversation: &Conversation,
 ) -> Option<SessionWriter> {
     match store.start_writer_from_meta(meta) {
