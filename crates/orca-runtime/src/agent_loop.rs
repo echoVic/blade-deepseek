@@ -1,23 +1,5 @@
 use std::io;
 
-use orca_approval::ApprovalPolicy;
-use orca_core::cancel::CancelToken;
-use orca_core::config::{OutputFormat, RunConfig};
-use orca_core::event_schema::{EventFactory, RunStatus};
-use orca_core::event_sink::EventSink;
-use orca_core::provider_types::ProviderStep;
-use orca_core::subagent_types::SubagentType;
-use orca_core::tool_types;
-use orca_mcp::McpRegistry;
-use orca_provider::context;
-use orca_provider::tool_schema::{
-    deepseek_tools_schema_for_allowed_names_with_mcp_and_external,
-    deepseek_tools_schema_for_type_with_mcp_and_external,
-    deepseek_tools_schema_with_mcp_and_external,
-};
-use orca_provider::{self, ProviderConfig};
-use orca_tools;
-
 use crate::agent_child::{ChildAgentRequest, ChildAgentResult, ChildAgentRuntime};
 use crate::agent_common;
 use crate::cost::CostTracker;
@@ -39,9 +21,26 @@ use crate::subagent_execution::{
 use crate::tasks::TaskRegistry;
 use crate::tool_execution::{ToolExecutionActor, ToolExecutionContext};
 use crate::tool_invocation::{
-    AgentToolPolicyContext, execute_readonly_batch, reject_disallowed_child_tool,
+    AgentToolPolicyContext, collect_readonly_batch, execute_readonly_batch,
+    reject_disallowed_child_tool, should_run_readonly_batch,
 };
 use crate::workflow_execution::observe_background_workflows;
+use orca_approval::ApprovalPolicy;
+use orca_core::cancel::CancelToken;
+use orca_core::config::{OutputFormat, RunConfig};
+use orca_core::event_schema::{EventFactory, RunStatus};
+use orca_core::event_sink::EventSink;
+use orca_core::provider_types::ProviderStep;
+use orca_core::subagent_types::SubagentType;
+use orca_core::tool_types;
+use orca_mcp::McpRegistry;
+use orca_provider::context;
+use orca_provider::tool_schema::{
+    deepseek_tools_schema_for_allowed_names_with_mcp_and_external,
+    deepseek_tools_schema_for_type_with_mcp_and_external,
+    deepseek_tools_schema_with_mcp_and_external,
+};
+use orca_provider::{self, ProviderConfig};
 
 const DEFAULT_MAX_TURNS: u32 = 128;
 
@@ -404,15 +403,9 @@ pub(crate) fn run_agent_loop(
                 continue;
             }
 
-            if orca_tools::should_run_readonly_batch(
-                config.tools.max_read_parallel,
-                &tool_requests[index],
-            ) {
-                let batch_end = orca_tools::collect_readonly_batch(
-                    config.tools.max_read_parallel,
-                    &tool_requests,
-                    index,
-                );
+            if should_run_readonly_batch(config.tools.max_read_parallel, &tool_requests[index]) {
+                let batch_end =
+                    collect_readonly_batch(config.tools.max_read_parallel, &tool_requests, index);
                 let results = execute_readonly_batch(
                     cwd,
                     events,

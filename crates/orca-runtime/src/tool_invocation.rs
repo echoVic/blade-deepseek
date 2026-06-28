@@ -196,6 +196,21 @@ pub(crate) fn execute_readonly_batch(
     Ok(results)
 }
 
+pub(crate) fn should_run_readonly_batch(
+    max_read_parallel: usize,
+    tool_request: &ToolRequest,
+) -> bool {
+    orca_tools::should_run_readonly_batch(max_read_parallel, tool_request)
+}
+
+pub(crate) fn collect_readonly_batch(
+    max_read_parallel: usize,
+    tool_requests: &[ToolRequest],
+    start: usize,
+) -> usize {
+    orca_tools::collect_readonly_batch(max_read_parallel, tool_requests, start)
+}
+
 pub fn prepare_tool_invocation(
     tool_request: &ToolRequest,
     subagent_depth: u32,

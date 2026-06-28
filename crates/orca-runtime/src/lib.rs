@@ -200,7 +200,17 @@ mod tests {
             tool_invocation_source.contains("pub(crate) fn execute_readonly_batch"),
             "tool_invocation must expose readonly tool batch execution"
         );
+        assert!(
+            tool_invocation_source.contains("pub(crate) fn should_run_readonly_batch"),
+            "tool_invocation must expose readonly batch planning"
+        );
+        assert!(
+            tool_invocation_source.contains("pub(crate) fn collect_readonly_batch"),
+            "tool_invocation must expose readonly batch range collection"
+        );
         for marker in [
+            "orca_tools::should_run_readonly_batch",
+            "orca_tools::collect_readonly_batch",
             "run_readonly_batch_parallel_with_policy",
             "HookEvent::PreToolUse",
             "HookEvent::PostToolUse",
