@@ -299,8 +299,9 @@ commands and consume versioned events without owning turn execution details.
    resolves the configured chain before choosing its sandbox. Configured
    `[permission_profiles.<name>.filesystem]` entries with `write` or
    `read-write` access now compile into additional writable roots for
-   `command/exec`, and `deny` entries compile into write-deny rules that can
-   override broader writable roots. `[permission_profiles.<name>.network]`
+   `command/exec`, and `deny` entries compile into read/write deny rules that
+   can override broader readable and writable roots.
+   `[permission_profiles.<name>.network]`
    `enabled = true|false` now overrides the inherited built-in sandbox network
    default. Configured `:workspace_roots` / `:workspace_roots/<subpath>`
    filesystem entries now materialize against the owning thread's

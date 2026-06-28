@@ -2834,6 +2834,76 @@ fn server_mode_command_exec_configured_permission_profile_deny_overrides_write_r
 }
 
 #[test]
+fn server_mode_command_exec_configured_permission_profile_deny_blocks_reads() {
+    if !sandbox_seatbelt_available() {
+        return;
+    }
+
+    with_orca_home(|home| {
+        let workspace = tempdir().expect("workspace");
+        let allowed = tempdir().expect("allowed");
+        let denied = allowed.path().join("denied");
+        std::fs::create_dir(&denied).expect("denied dir");
+        let secret_file = denied.join("secret.txt");
+        let leaked_file = allowed.path().join("leaked.txt");
+        std::fs::write(&secret_file, "secret").expect("write secret");
+        std::fs::write(
+            home.join("config.toml"),
+            format!(
+                "[permission_profiles.mixed]\nextends = \":read-only\"\n\n[permission_profiles.mixed.filesystem]\n\"{}\" = \"write\"\n\"{}\" = \"deny\"\n",
+                allowed.path().display(),
+                denied.display()
+            ),
+        )
+        .expect("write permission profile config");
+        let command = format!(
+            "set -e; secret=$(cat {}); printf %s \"$secret\" > {}",
+            shell_escape(&secret_file),
+            shell_escape(&leaked_file)
+        );
+
+        let mut child = orca_command()
+            .args([
+                "--mode",
+                "server",
+                "--provider",
+                "mock",
+                "--cwd",
+                workspace.path().to_str().unwrap(),
+            ])
+            .env("ORCA_HOME", home)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn orca server");
+        let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
+
+        {
+            let stdin = child.stdin.as_mut().expect("server stdin");
+            writeln!(
+                stdin,
+                r#"{{"id":"cmd","method":"command/exec","params":{{"command":["sh","-lc",{}],"permissionProfile":"mixed"}}}}"#,
+                serde_json::to_string(&command).expect("command json")
+            )
+            .expect("write deny-read permissionProfile command/exec");
+            stdin
+                .flush()
+                .expect("flush deny-read permissionProfile command/exec");
+        }
+        drop(child.stdin.take());
+
+        let completed = read_until_event(&mut stdout, "cmd", "command_exec_completed");
+        assert_ne!(completed["exitCode"], 0);
+        assert!(!leaked_file.exists());
+
+        let output = child.wait_with_output().expect("wait for server");
+        assert_eq!(output.status.code(), Some(0));
+        assert!(output.stderr.is_empty());
+    });
+}
+
+#[test]
 fn server_mode_command_exec_configured_permission_profile_materializes_tmpdir() {
     if !sandbox_seatbelt_available() {
         return;

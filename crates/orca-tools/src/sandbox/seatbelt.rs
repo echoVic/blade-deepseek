@@ -125,7 +125,7 @@ fn workspace_write_profile(
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let denied_write_rules = write_deny_rules(denied_roots);
+    let denied_access_rules = access_deny_rules(denied_roots);
     let home = dirs::home_dir();
     let ssh_deny = home
         .as_ref()
@@ -182,7 +182,7 @@ fn workspace_write_profile(
 {tmpdir_write}
 {slash_tmp_write}
 {additional_write_rules}
-{denied_write_rules}
+{denied_access_rules}
 {ssh_deny}
 {orca_deny}
 {network_rule}
@@ -205,7 +205,7 @@ fn read_only_profile(
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let denied_write_rules = write_deny_rules(denied_roots);
+    let denied_access_rules = access_deny_rules(denied_roots);
     let network_rule = if network_access {
         "(allow network-outbound)"
     } else {
@@ -220,18 +220,18 @@ fn read_only_profile(
 (allow file-read*)
 (allow file-read* file-write* (literal "/dev/null"))
 {additional_write_rules}
-{denied_write_rules}
+{denied_access_rules}
 {network_rule}
 "#
     )
 }
 
-fn write_deny_rules(denied_roots: &[PathBuf]) -> String {
+fn access_deny_rules(denied_roots: &[PathBuf]) -> String {
     denied_roots
         .iter()
         .map(|root| {
             format!(
-                r#"(deny file-write* (subpath "{}"))"#,
+                r#"(deny file-read* file-write* (subpath "{}"))"#,
                 seatbelt_escape(&root.display().to_string())
             )
         })
@@ -300,7 +300,7 @@ mod tests {
     }
 
     #[test]
-    fn read_only_profile_denies_additional_write_root_descendants() {
+    fn read_only_profile_denies_additional_root_descendant_access() {
         let extra = TempDir::new().unwrap();
         let blocked = extra.path().join("blocked");
         let profile = read_only_profile(&[extra.path().to_path_buf()], &[blocked.clone()], false);
@@ -309,13 +309,16 @@ mod tests {
             r#"(allow file-write* (subpath "{}"))"#,
             extra.path().display()
         );
-        let deny = format!(r#"(deny file-write* (subpath "{}"))"#, blocked.display());
+        let deny = format!(
+            r#"(deny file-read* file-write* (subpath "{}"))"#,
+            blocked.display()
+        );
 
         assert!(profile.contains(&allow));
         assert!(profile.contains(&deny));
         assert!(
             profile.find(&deny).unwrap() > profile.find(&allow).unwrap(),
-            "deny write rules must come after allow rules"
+            "deny access rules must come after allow rules"
         );
     }
 
