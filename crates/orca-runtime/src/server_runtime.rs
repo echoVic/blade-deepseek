@@ -213,7 +213,7 @@ impl ServerThread {
     }
 
     pub fn next_persisted_turn_id(&self) -> String {
-        crate::history::next_turn_id_for_messages(
+        crate::thread_store::next_turn_id_for_messages(
             &self.thread_id,
             &self.session.conversation().messages,
         )

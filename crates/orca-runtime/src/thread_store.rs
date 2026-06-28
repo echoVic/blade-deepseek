@@ -29,6 +29,10 @@ pub(crate) fn messages_to_thread_items(
     crate::history::messages_to_thread_items(thread_id, messages, turn_id, limit)
 }
 
+pub(crate) fn next_turn_id_for_messages(thread_id: &str, messages: &[Message]) -> String {
+    crate::history::next_turn_id_for_messages(thread_id, messages)
+}
+
 pub(crate) fn page_thread_turns(
     turns: Vec<StoredThreadTurn>,
     cursor: Option<&str>,
@@ -132,5 +136,23 @@ mod tests {
 
         assert_eq!(item["role"], "user");
         assert_eq!(item["content"], "hello");
+    }
+
+    #[test]
+    fn thread_store_projects_next_turn_id() {
+        let messages = vec![
+            Message::User {
+                content: "hello".to_string(),
+                pinned: false,
+            },
+            Message::Assistant {
+                content: Some("hi".to_string()),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                pinned: false,
+            },
+        ];
+
+        assert_eq!(next_turn_id_for_messages("thread-a", &messages), "turn-2");
     }
 }
