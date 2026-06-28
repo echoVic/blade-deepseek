@@ -16,7 +16,8 @@ use crate::session::{
     record_initial_history_for_agent, record_plan_state_for_agent, record_tool_result_for_agent,
 };
 use crate::subagent_execution::{
-    collect_subagent_batch, execute_subagent_batch, should_run_subagent_batch,
+    SubagentBatchRecordOutcome, collect_subagent_batch, execute_subagent_batch,
+    record_subagent_batch_results, should_run_subagent_batch,
 };
 use crate::tasks::TaskRegistry;
 use crate::tool_execution::{ToolExecutionActor, ToolExecutionContext};
@@ -377,26 +378,19 @@ pub(crate) fn run_agent_loop(
                     execute_child_agent_loop,
                 )?;
 
-                for (status, result) in results {
-                    record_tool_result_for_agent(
-                        conversation,
-                        history_writer.as_deref_mut(),
-                        &result,
-                        emit_deltas,
-                    )?;
-
-                    if status == RunStatus::ApprovalRequired {
+                match record_subagent_batch_results(
+                    conversation,
+                    history_writer.as_deref_mut(),
+                    results,
+                    emit_deltas,
+                )? {
+                    SubagentBatchRecordOutcome::Continue => {}
+                    SubagentBatchRecordOutcome::Return { status, error } => {
                         return Ok(AgentLoopResult {
                             status,
                             final_message: None,
-                            error: result.error.clone(),
+                            error,
                         });
-                    }
-                    if status == RunStatus::Failed {
-                        return Ok(AgentLoopResult::failure(
-                            RunStatus::Failed,
-                            result.error.clone().unwrap_or_default(),
-                        ));
                     }
                 }
                 index = batch_end;

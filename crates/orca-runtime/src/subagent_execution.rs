@@ -5,6 +5,7 @@ use std::thread;
 
 use orca_core::cancel::CancelToken;
 use orca_core::config::RunConfig;
+use orca_core::conversation::Conversation;
 use orca_core::cost_types::UsageTotals;
 use orca_core::event_schema::{EventFactory, RunStatus};
 use orca_core::event_sink::EventSink;
@@ -23,8 +24,10 @@ use crate::instructions::{self, ProjectInstructions};
 use crate::lifecycle::{RuntimeSessionLifecycle, RuntimeTaskKind, RuntimeTaskStatus};
 use crate::memory::{self, MemoryBlock};
 use crate::schema_validation::validate_json_schema_subset;
+use crate::session::record_tool_result_for_agent;
 use crate::subagent::{self, SubagentIsolation, SubagentMode};
 use crate::tasks::TaskRegistry;
+use crate::thread_store::SessionWriter;
 use crate::tool_invocation::{
     apply_pre_tool_outcome_with_external, prepare_tool_invocation_with_external,
     validate_tool_invocation_with_external,
@@ -36,6 +39,14 @@ use crate::worktree::{WorktreeGuard, WorktreeOutcome};
 pub struct AsyncSubagentWorktree {
     pub repo_root: PathBuf,
     pub path: PathBuf,
+}
+
+pub(crate) enum SubagentBatchRecordOutcome {
+    Continue,
+    Return {
+        status: RunStatus,
+        error: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -71,6 +82,37 @@ pub(crate) fn collect_subagent_batch(
         end += 1;
     }
     end
+}
+
+pub(crate) fn record_subagent_batch_results(
+    conversation: &mut Conversation,
+    mut history_writer: Option<&mut SessionWriter>,
+    results: Vec<(RunStatus, tool_types::ToolResult)>,
+    emit_deltas: bool,
+) -> io::Result<SubagentBatchRecordOutcome> {
+    for (status, result) in results {
+        record_tool_result_for_agent(
+            conversation,
+            history_writer.as_deref_mut(),
+            &result,
+            emit_deltas,
+        )?;
+
+        if status == RunStatus::ApprovalRequired {
+            return Ok(SubagentBatchRecordOutcome::Return {
+                status,
+                error: result.error.clone(),
+            });
+        }
+        if status == RunStatus::Failed {
+            return Ok(SubagentBatchRecordOutcome::Return {
+                status: RunStatus::Failed,
+                error: result.error.clone(),
+            });
+        }
+    }
+
+    Ok(SubagentBatchRecordOutcome::Continue)
 }
 
 fn is_batchable_subagent_request(tool_request: &tool_types::ToolRequest) -> bool {
@@ -955,6 +997,32 @@ mod tests {
 
         assert!(super::should_run_subagent_batch(&config, &requests[0], 0));
         assert_eq!(super::collect_subagent_batch(&config, &requests, 0), 1);
+    }
+
+    #[test]
+    fn record_subagent_batch_results_records_tools_and_returns_failure() {
+        let request = subagent_request("failed");
+        let result = tool_types::ToolResult::failed(&request, "child failed", None);
+        let mut conversation = orca_core::conversation::Conversation::new();
+
+        let outcome = super::record_subagent_batch_results(
+            &mut conversation,
+            None,
+            vec![(RunStatus::Failed, result)],
+            true,
+        )
+        .expect("records subagent batch result");
+
+        match outcome {
+            super::SubagentBatchRecordOutcome::Return { status, error } => {
+                assert_eq!(status, RunStatus::Failed);
+                assert_eq!(error.as_deref(), Some("child failed"));
+            }
+            super::SubagentBatchRecordOutcome::Continue => {
+                panic!("failed subagent batch should request early return")
+            }
+        }
+        assert_eq!(conversation.messages.len(), 1);
     }
 
     fn fake_child_executor<W: io::Write>(

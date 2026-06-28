@@ -223,6 +223,29 @@ mod tests {
     }
 
     #[test]
+    fn subagent_batch_result_recording_is_owned_by_subagent_execution_module() {
+        let agent_loop_source = include_str!("agent_loop.rs");
+        let subagent_execution_source = include_str!("subagent_execution.rs");
+
+        assert!(
+            !agent_loop_source.contains("for (status, result) in results"),
+            "agent_loop must not own subagent batch result recording"
+        );
+        assert!(
+            subagent_execution_source.contains("pub(crate) fn record_subagent_batch_results"),
+            "subagent_execution must expose subagent batch result recording"
+        );
+        assert!(
+            subagent_execution_source.contains("record_tool_result_for_agent"),
+            "subagent_execution must record subagent batch tool results"
+        );
+        assert!(
+            subagent_execution_source.contains("RunStatus::ApprovalRequired"),
+            "subagent_execution must own subagent batch approval folding"
+        );
+    }
+
+    #[test]
     fn agent_conversation_context_is_owned_by_session_module() {
         let agent_loop_source = include_str!("agent_loop.rs");
         let session_source = include_str!("session.rs");
