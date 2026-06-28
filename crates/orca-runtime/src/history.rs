@@ -2,7 +2,6 @@ use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use chrono::{DateTime, Datelike, Utc};
 use serde::{Deserialize, Serialize};
@@ -10,10 +9,9 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::thread_store::{
-    SessionRecord, StoredMessage, archive_dir, collect_session_files, find_session_path,
-    is_latest_selector, load_thread_records, lock_file, read_history_lines, read_records,
-    read_session_meta, resolve_session_path, rewrite_records, sessions_dir,
-    summarize_session_with_archive_flag, unlock_file,
+    SessionRecord, StoredMessage, archive_dir, find_session_path, is_latest_selector,
+    load_thread_records, lock_file, read_records, read_session_meta, resolve_session_path,
+    rewrite_records, sessions_dir, summarize_session_with_archive_flag, unlock_file,
 };
 use orca_core::config::{ActivePermissionProfile, AdditionalWorkingDirectory};
 use orca_core::conversation::{
@@ -23,12 +21,12 @@ use orca_core::tool_types::ToolStatus;
 use orca_core::{approval_rules::PermissionRules, approval_types::ApprovalMode};
 
 pub use crate::thread_store::{
-    JsonlThreadStore, LiveThread, SessionMeta, SessionStore, SessionSummary, SessionTranscript,
-    SessionWriter, SortDirection, StoredThreadItem, StoredThreadItemPage, StoredThreadProjection,
-    StoredThreadSearchHit, StoredThreadSearchPage, StoredThreadSummary, StoredThreadSummaryPage,
-    StoredThreadTurn, StoredThreadTurnPage, ThreadListFilters, ThreadMetadataPatch,
-    ThreadRelationFilter, ThreadSortKey, ThreadStore, TurnItemsView, list_sessions,
-    list_sessions_with_archived, load_session,
+    JsonlThreadStore, LiveThread, SearchHit, SessionMeta, SessionStore, SessionSummary,
+    SessionTranscript, SessionWriter, SortDirection, StoredThreadItem, StoredThreadItemPage,
+    StoredThreadProjection, StoredThreadSearchHit, StoredThreadSearchPage, StoredThreadSummary,
+    StoredThreadSummaryPage, StoredThreadTurn, StoredThreadTurnPage, ThreadListFilters,
+    ThreadMetadataPatch, ThreadRelationFilter, ThreadSortKey, ThreadStore, TurnItemsView,
+    list_sessions, list_sessions_with_archived, load_session, search_sessions,
 };
 
 const SESSION_SCHEMA_VERSION: u32 = 1;
@@ -72,14 +70,6 @@ impl JsonlThreadStore {
 
     pub fn compress_session(&self, selector: &str) -> io::Result<PathBuf> {
         compress_session(selector)
-    }
-
-    pub fn search_sessions(
-        &self,
-        query: &str,
-        include_archived: bool,
-    ) -> io::Result<Vec<SearchHit>> {
-        search_sessions(query, include_archived)
     }
 
     pub fn create_meta(
@@ -1311,175 +1301,6 @@ pub fn compress_session(selector: &str) -> io::Result<PathBuf> {
         (Ok(path), Ok(())) => Ok(path),
         (Err(error), _) => Err(error),
         (Ok(_), Err(error)) => Err(error),
-    }
-}
-
-pub fn search_sessions(query: &str, include_archived: bool) -> io::Result<Vec<SearchHit>> {
-    let mut hits = Vec::new();
-    let used_ripgrep = search_roots_with_ripgrep(query, include_archived, &mut hits)?;
-    let mut seen: HashSet<(PathBuf, usize)> = hits
-        .iter()
-        .map(|hit| (hit.path.clone(), hit.line_number))
-        .collect();
-
-    if !used_ripgrep {
-        search_root_in_process(&sessions_dir(), false, query, &mut hits, &mut seen)?;
-    } else {
-        search_compressed_root(&sessions_dir(), false, query, &mut hits, &mut seen)?;
-    }
-    if include_archived {
-        if !used_ripgrep {
-            search_root_in_process(&archive_dir(), true, query, &mut hits, &mut seen)?;
-        } else {
-            search_compressed_root(&archive_dir(), true, query, &mut hits, &mut seen)?;
-        }
-    }
-    Ok(hits)
-}
-
-#[derive(Clone, Debug)]
-pub struct SearchHit {
-    pub session_id: String,
-    pub title: String,
-    pub archived: bool,
-    pub path: PathBuf,
-    pub line_number: usize,
-    pub line: String,
-}
-
-fn search_roots_with_ripgrep(
-    query: &str,
-    include_archived: bool,
-    hits: &mut Vec<SearchHit>,
-) -> io::Result<bool> {
-    let mut roots = Vec::new();
-    if sessions_dir().exists() {
-        roots.push(sessions_dir());
-    }
-    if include_archived && archive_dir().exists() {
-        roots.push(archive_dir());
-    }
-    if roots.is_empty() {
-        return Ok(true);
-    }
-
-    let output = match Command::new("rg")
-        .arg("--json")
-        .arg("--fixed-strings")
-        .arg("--glob")
-        .arg("*.jsonl")
-        .arg(query)
-        .args(&roots)
-        .output()
-    {
-        Ok(output) => output,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(error),
-    };
-
-    if !output.status.success() && output.status.code() != Some(1) {
-        return Ok(false);
-    }
-
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        if value["type"].as_str() != Some("match") {
-            continue;
-        }
-        let Some(path_text) = value["data"]["path"]["text"].as_str() else {
-            continue;
-        };
-        let Some(line_number) = value["data"]["line_number"].as_u64() else {
-            continue;
-        };
-        let Some(line_text) = value["data"]["lines"]["text"].as_str() else {
-            continue;
-        };
-        let path = PathBuf::from(path_text);
-        let archived = path.starts_with(archive_dir());
-        push_search_hit(
-            &path,
-            archived,
-            line_number as usize,
-            line_text.trim_end_matches('\n').to_string(),
-            hits,
-        );
-    }
-
-    Ok(true)
-}
-
-fn search_root_in_process(
-    root: &Path,
-    archived: bool,
-    query: &str,
-    hits: &mut Vec<SearchHit>,
-    seen: &mut HashSet<(PathBuf, usize)>,
-) -> io::Result<()> {
-    if !root.exists() {
-        return Ok(());
-    }
-    collect_session_files(root, &mut |path| {
-        if let Ok(lines) = read_history_lines(path) {
-            push_matching_lines(path, archived, query, &lines, hits, seen);
-        }
-    })
-}
-
-fn search_compressed_root(
-    root: &Path,
-    archived: bool,
-    query: &str,
-    hits: &mut Vec<SearchHit>,
-    seen: &mut HashSet<(PathBuf, usize)>,
-) -> io::Result<()> {
-    if !root.exists() {
-        return Ok(());
-    }
-    collect_session_files(root, &mut |path| {
-        if path.extension().and_then(|ext| ext.to_str()) != Some("zst") {
-            return;
-        }
-        if let Ok(lines) = read_history_lines(path) {
-            push_matching_lines(path, archived, query, &lines, hits, seen);
-        }
-    })
-}
-
-fn push_matching_lines(
-    path: &Path,
-    archived: bool,
-    query: &str,
-    lines: &[String],
-    hits: &mut Vec<SearchHit>,
-    seen: &mut HashSet<(PathBuf, usize)>,
-) {
-    for (index, line) in lines.iter().enumerate() {
-        let line_number = index + 1;
-        if line.contains(query) && seen.insert((path.to_path_buf(), line_number)) {
-            push_search_hit(path, archived, line_number, line.clone(), hits);
-        }
-    }
-}
-
-fn push_search_hit(
-    path: &Path,
-    archived: bool,
-    line_number: usize,
-    line: String,
-    hits: &mut Vec<SearchHit>,
-) {
-    if let Ok(meta) = read_session_meta(path) {
-        hits.push(SearchHit {
-            session_id: meta.session_id,
-            title: meta.title,
-            archived,
-            path: path.to_path_buf(),
-            line_number,
-            line,
-        });
     }
 }
 
