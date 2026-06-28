@@ -333,6 +333,33 @@ mod tests {
     }
 
     #[test]
+    fn agent_conversation_bootstrap_is_owned_by_session_module() {
+        let agent_loop_source = include_str!("agent_loop.rs");
+        let session_source = include_str!("session.rs");
+
+        for marker in [
+            "thread_store::resume_conversation",
+            "Conversation::new()",
+            "add_system(system_prompt)",
+            "replace_skill_context",
+            "add_user(prompt.to_string())",
+        ] {
+            assert!(
+                !agent_loop_source.contains(marker),
+                "agent_loop must not own conversation bootstrap detail {marker}"
+            );
+            assert!(
+                session_source.contains(marker),
+                "session must own conversation bootstrap detail {marker}"
+            );
+        }
+        assert!(
+            session_source.contains("pub(crate) fn bootstrap_agent_conversation"),
+            "session must expose agent conversation bootstrap"
+        );
+    }
+
+    #[test]
     fn runtime_compaction_step_is_owned_by_lifecycle_module() {
         let agent_loop_source = include_str!("agent_loop.rs");
         let lifecycle_source = include_str!("lifecycle.rs");

@@ -3,7 +3,6 @@ use std::io;
 use orca_approval::ApprovalPolicy;
 use orca_core::cancel::CancelToken;
 use orca_core::config::{OutputFormat, RunConfig};
-use orca_core::conversation::Conversation;
 use orca_core::event_schema::{EventFactory, RunStatus};
 use orca_core::event_sink::EventSink;
 use orca_core::provider_types::ProviderStep;
@@ -31,14 +30,13 @@ use crate::lifecycle::{
 };
 use crate::memory::{self, MemoryBlock};
 use crate::session::{
-    AgentConversationContext, record_assistant_response_for_agent,
+    AgentConversationContext, bootstrap_agent_conversation, record_assistant_response_for_agent,
     record_initial_history_for_agent, record_plan_state_for_agent, record_tool_result_for_agent,
 };
 use crate::subagent_execution::{
     collect_subagent_batch, execute_subagent_batch, should_run_subagent_batch,
 };
 use crate::tasks::TaskRegistry;
-use crate::thread_store;
 use crate::tool_execution::{ToolExecutionActor, ToolExecutionContext};
 use crate::tool_invocation::{
     AgentToolPolicyContext, execute_readonly_batch, reject_disallowed_child_tool,
@@ -167,18 +165,7 @@ pub(crate) fn run_agent_loop(
     let conversation = if let Some(conversation) = conversation {
         conversation
     } else {
-        owned_conversation = if let Some(resumed) = resumed {
-            let mut conv = thread_store::resume_conversation(resumed, system_prompt);
-            conv.strip_legacy_pinned_volatile();
-            conv.strip_legacy_summary_messages();
-            conv
-        } else {
-            let mut conversation = Conversation::new();
-            conversation.add_system(system_prompt);
-            conversation
-        };
-        owned_conversation.replace_skill_context(agent_common::explicit_skill_context(cwd, prompt));
-        owned_conversation.add_user(prompt.to_string());
+        owned_conversation = bootstrap_agent_conversation(resumed, system_prompt, cwd, prompt);
         &mut owned_conversation
     };
 

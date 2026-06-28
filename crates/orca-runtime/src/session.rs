@@ -174,6 +174,27 @@ pub(crate) fn record_initial_history_for_agent(
     Ok(())
 }
 
+pub(crate) fn bootstrap_agent_conversation(
+    resumed: Option<&SessionTranscript>,
+    system_prompt: String,
+    cwd: &Path,
+    prompt: &str,
+) -> Conversation {
+    let mut conversation = if let Some(resumed) = resumed {
+        let mut conv = crate::thread_store::resume_conversation(resumed, system_prompt);
+        conv.strip_legacy_pinned_volatile();
+        conv.strip_legacy_summary_messages();
+        conv
+    } else {
+        let mut conversation = Conversation::new();
+        conversation.add_system(system_prompt);
+        conversation
+    };
+    conversation.replace_skill_context(agent_common::explicit_skill_context(cwd, prompt));
+    conversation.add_user(prompt.to_string());
+    conversation
+}
+
 pub(crate) fn record_plan_state_for_agent(
     conversation: &mut Conversation,
     history_writer: Option<&mut SessionWriter>,
