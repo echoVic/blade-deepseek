@@ -77,13 +77,17 @@ pub(crate) struct RuntimeTurnState<'a> {
     task_registry: &'a TaskRegistry,
 }
 
+pub(crate) struct RuntimeTurnExecution<'a> {
+    background_workflows: &'a mut Vec<BackgroundWorkflowRun>,
+    workflow_ipc: Option<&'a WorkflowIpcContext>,
+    lifecycle: Option<&'a mut RuntimeSessionLifecycle>,
+}
+
 pub(crate) struct AgentLoopContext<'a> {
     turn_config: RuntimeTurnConfig<'a>,
     turn_deps: Option<RuntimeTurnDeps<'a>>,
     turn_state: Option<RuntimeTurnState<'a>>,
-    background_workflows: Option<&'a mut Vec<BackgroundWorkflowRun>>,
-    workflow_ipc: Option<&'a WorkflowIpcContext>,
-    lifecycle: Option<&'a mut RuntimeSessionLifecycle>,
+    turn_execution: Option<RuntimeTurnExecution<'a>>,
     steer_handle: Option<&'a ThreadSteerHandle>,
     permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
 }
@@ -248,6 +252,35 @@ impl<'a> RuntimeTurnState<'a> {
     }
 }
 
+impl<'a> RuntimeTurnExecution<'a> {
+    pub(crate) fn new(
+        background_workflows: &'a mut Vec<BackgroundWorkflowRun>,
+        workflow_ipc: Option<&'a WorkflowIpcContext>,
+        lifecycle: Option<&'a mut RuntimeSessionLifecycle>,
+    ) -> Self {
+        Self {
+            background_workflows,
+            workflow_ipc,
+            lifecycle,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn background_workflow_count(&self) -> usize {
+        self.background_workflows.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn workflow_ipc(&self) -> Option<&'a WorkflowIpcContext> {
+        self.workflow_ipc
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lifecycle(&self) -> Option<&RuntimeSessionLifecycle> {
+        self.lifecycle.as_deref()
+    }
+}
+
 impl<'a> AgentLoopContext<'a> {
     pub fn new(
         cwd: &'a Path,
@@ -266,9 +299,7 @@ impl<'a> AgentLoopContext<'a> {
             ),
             turn_deps: None,
             turn_state: None,
-            background_workflows: None,
-            workflow_ipc: None,
-            lifecycle: None,
+            turn_execution: None,
             steer_handle: None,
             permission_handler: None,
         }
@@ -356,9 +387,11 @@ impl<'a> AgentLoopContext<'a> {
         workflow_ipc: Option<&'a WorkflowIpcContext>,
         lifecycle: Option<&'a mut RuntimeSessionLifecycle>,
     ) -> Self {
-        self.background_workflows = Some(background_workflows);
-        self.workflow_ipc = workflow_ipc;
-        self.lifecycle = lifecycle;
+        self.turn_execution = Some(RuntimeTurnExecution::new(
+            background_workflows,
+            workflow_ipc,
+            lifecycle,
+        ));
         self
     }
 
@@ -377,20 +410,24 @@ impl<'a> AgentLoopContext<'a> {
 
     #[cfg(test)]
     pub fn background_workflow_count(&self) -> usize {
-        self.background_workflows
-            .as_deref()
-            .expect("agent loop background workflows")
-            .len()
+        self.turn_execution().background_workflow_count()
     }
 
     #[cfg(test)]
     pub fn workflow_ipc(&self) -> Option<&'a WorkflowIpcContext> {
-        self.workflow_ipc
+        self.turn_execution().workflow_ipc()
     }
 
     #[cfg(test)]
     pub fn lifecycle(&self) -> Option<&RuntimeSessionLifecycle> {
-        self.lifecycle.as_deref()
+        self.turn_execution().lifecycle()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn turn_execution(&self) -> &RuntimeTurnExecution<'a> {
+        self.turn_execution
+            .as_ref()
+            .expect("agent loop turn execution")
     }
 }
 
@@ -482,9 +519,7 @@ pub(crate) fn run_agent_loop(
             },
         turn_deps,
         turn_state,
-        background_workflows,
-        workflow_ipc,
-        lifecycle,
+        turn_execution,
         steer_handle,
         permission_handler,
     } = loop_context;
@@ -499,7 +534,11 @@ pub(crate) fn run_agent_loop(
         cancel,
         task_registry,
     } = turn_state.expect("agent loop turn state");
-    let background_workflows = background_workflows.expect("agent loop background workflows");
+    let RuntimeTurnExecution {
+        background_workflows,
+        workflow_ipc,
+        lifecycle,
+    } = turn_execution.expect("agent loop turn execution");
     let max_turns = DEFAULT_MAX_TURNS;
     let budget_model = config.model.as_option();
     let ctx_config = context::ContextConfig::for_model_with_runtime(
@@ -1415,6 +1454,43 @@ mod tests {
         assert_eq!(
             context.lifecycle().unwrap().run_id(),
             "agent-loop-execution"
+        );
+    }
+
+    #[test]
+    fn runtime_turn_execution_groups_lifecycle_refs() {
+        let mut background_workflows = Vec::new();
+        let mut lifecycle = RuntimeSessionLifecycle::new("agent-loop-execution-group");
+        lifecycle.start_task(RuntimeTaskKind::Agent);
+
+        let execution =
+            RuntimeTurnExecution::new(&mut background_workflows, None, Some(&mut lifecycle));
+
+        assert_eq!(execution.background_workflow_count(), 0);
+        assert!(execution.workflow_ipc().is_none());
+        assert_eq!(
+            execution.lifecycle().unwrap().run_id(),
+            "agent-loop-execution-group"
+        );
+    }
+
+    #[test]
+    fn agent_loop_context_exposes_runtime_turn_execution() {
+        let cwd = PathBuf::from("/tmp/orca-agent-loop-execution-context");
+        let subagent_type = SubagentType::General;
+        let mut background_workflows = Vec::new();
+        let mut lifecycle = RuntimeSessionLifecycle::new("agent-loop-execution-context");
+        lifecycle.start_task(RuntimeTaskKind::Agent);
+
+        let context = AgentLoopContext::new(&cwd, "inspect repo", 0, true, &subagent_type)
+            .with_execution(&mut background_workflows, None, Some(&mut lifecycle));
+
+        let execution = context.turn_execution();
+        assert_eq!(execution.background_workflow_count(), 0);
+        assert!(execution.workflow_ipc().is_none());
+        assert_eq!(
+            execution.lifecycle().unwrap().run_id(),
+            "agent-loop-execution-context"
         );
     }
 }
