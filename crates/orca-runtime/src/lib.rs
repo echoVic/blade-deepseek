@@ -230,8 +230,12 @@ mod tests {
             "agent_loop must not own normal tool execution entrypoint"
         );
         assert!(
-            agent_loop_source.contains("execute_tool_with_approval("),
-            "agent_loop must delegate normal tool execution"
+            !agent_loop_source.contains("execute_tool_with_approval("),
+            "agent_loop must delegate normal tool execution through normal tool-turn runner"
+        );
+        assert!(
+            agent_loop_source.contains("run_normal_tool_turn("),
+            "agent_loop must delegate normal tool turn execution"
         );
         assert!(
             tool_execution_source.contains("pub(crate) fn execute_tool_with_approval"),
@@ -292,6 +296,39 @@ mod tests {
     }
 
     #[test]
+    fn normal_tool_turn_runner_is_owned_by_tool_invocation_module() {
+        let agent_loop_source = include_str!("agent_loop.rs");
+        let tool_invocation_source = include_str!("tool_invocation.rs");
+
+        for marker in [
+            "execute_tool_with_approval(",
+            "ToolExecutionContext::new",
+            "record_normal_tool_result(",
+        ] {
+            assert!(
+                !agent_loop_source.contains(marker),
+                "agent_loop must not own normal tool-turn runner detail {marker}"
+            );
+        }
+        assert!(
+            agent_loop_source.contains("run_normal_tool_turn("),
+            "agent_loop must delegate normal tool-turn execution"
+        );
+        assert!(
+            tool_invocation_source.contains("pub(crate) fn run_normal_tool_turn"),
+            "tool_invocation must expose normal tool-turn runner"
+        );
+        assert!(
+            tool_invocation_source.contains("execute_tool_with_approval"),
+            "tool_invocation must compose normal tool execution"
+        );
+        assert!(
+            tool_invocation_source.contains("record_normal_tool_result"),
+            "tool_invocation must compose normal tool result recording"
+        );
+    }
+
+    #[test]
     fn child_tool_policy_gate_is_owned_by_tool_invocation_module() {
         let agent_loop_source = include_str!("agent_loop.rs");
         let tool_invocation_source = include_str!("tool_invocation.rs");
@@ -326,8 +363,12 @@ mod tests {
             );
         }
         assert!(
-            agent_loop_source.contains("record_normal_tool_result("),
-            "agent_loop must delegate normal tool result recording"
+            !agent_loop_source.contains("record_normal_tool_result("),
+            "agent_loop must delegate normal tool result recording through normal tool-turn runner"
+        );
+        assert!(
+            agent_loop_source.contains("run_normal_tool_turn("),
+            "agent_loop must delegate normal tool turn recording"
         );
         assert!(
             tool_invocation_source.contains("pub(crate) fn record_normal_tool_result"),

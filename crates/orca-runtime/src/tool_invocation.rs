@@ -2,7 +2,9 @@ use std::collections::HashSet;
 use std::io;
 use std::path::Path;
 
+use orca_approval::ApprovalPolicy;
 use orca_core::approval_types::{ActionKind, ApprovalRequest};
+use orca_core::cancel::CancelToken;
 use orca_core::config::RunConfig;
 use orca_core::conversation::Conversation;
 use orca_core::event_schema::EventFactory;
@@ -22,9 +24,19 @@ use orca_provider::tool_schema::{
 };
 use serde_json::Value;
 
+use crate::agent_child::ChildAgentExecutor;
+use crate::cost::CostTracker;
 use crate::hooks::{HookContext, HookOutcome, HookRunner, tool_request_with_hook_outcome};
+use crate::instructions::ProjectInstructions;
+use crate::lifecycle::{RuntimePermissionRequestHandler, TurnPermissionOverlay};
+use crate::memory::MemoryBlock;
 use crate::session::{record_plan_state_for_agent, record_tool_result_for_agent};
+use crate::tasks::TaskRegistry;
 use crate::thread_store::SessionWriter;
+use crate::tool_execution::{ToolExecutionContext, execute_tool_with_approval};
+use crate::workflow::ipc::WorkflowIpcContext;
+use crate::workflow::runner::SharedEventBuffer;
+use crate::workflow_execution::BackgroundWorkflowRun;
 
 #[derive(Clone, Debug)]
 pub struct ToolInvocation {
@@ -384,6 +396,62 @@ pub(crate) fn record_normal_tool_result(
     Ok(ToolTurnOutcome::Continue)
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_normal_tool_turn<W: io::Write>(
+    config: &RunConfig,
+    cwd: &Path,
+    events: &mut EventFactory,
+    sink: &mut EventSink<W>,
+    conversation: &mut Conversation,
+    history_writer: Option<&mut SessionWriter>,
+    tool_request: &ToolRequest,
+    subagent_depth: u32,
+    emit_deltas: bool,
+    policy: &ApprovalPolicy,
+    instructions: &ProjectInstructions,
+    memory: &MemoryBlock,
+    mcp_registry: &McpRegistry,
+    hooks: &HookRunner,
+    cost_tracker: &mut CostTracker,
+    cancel: &CancelToken,
+    task_registry: &TaskRegistry,
+    background_workflows: &mut Vec<BackgroundWorkflowRun>,
+    workflow_ipc: Option<&WorkflowIpcContext>,
+    permission_overlay: &mut TurnPermissionOverlay,
+    permission_handler: Option<&(dyn RuntimePermissionRequestHandler + Send + Sync)>,
+    child_executor: ChildAgentExecutor<W>,
+    workflow_child_executor: ChildAgentExecutor<SharedEventBuffer>,
+) -> io::Result<ToolTurnOutcome> {
+    let (status, result) = execute_tool_with_approval(
+        config,
+        events,
+        sink,
+        tool_request,
+        ToolExecutionContext::new(cwd, subagent_depth, emit_deltas, policy)
+            .with_services(instructions, memory, mcp_registry, hooks)
+            .with_runtime(
+                cost_tracker,
+                cancel,
+                task_registry,
+                background_workflows,
+                workflow_ipc,
+            )
+            .with_permission_overlay(permission_overlay)
+            .with_permission_handler(permission_handler),
+        child_executor,
+        workflow_child_executor,
+    )?;
+
+    record_normal_tool_result(
+        conversation,
+        history_writer,
+        tool_request,
+        &result,
+        status,
+        emit_deltas,
+    )
+}
+
 pub fn prepare_tool_invocation(
     tool_request: &ToolRequest,
     subagent_depth: u32,
@@ -514,14 +582,19 @@ pub fn approval_request_for_invocation(invocation: &ToolInvocation) -> Option<Ap
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+
     use orca_core::approval_rules::PermissionRules;
     use orca_core::approval_types::{ActionKind, ApprovalMode};
+    use orca_core::cancel::CancelToken;
     use orca_core::config::{
         HistoryMode, ModelRuntimeConfig, OutputFormat, ProviderKind, RunConfig, ThemeName,
         ToolConfig, WorkflowConfig,
     };
     use orca_core::conversation::{Conversation, Message};
+    use orca_core::event_schema::EventFactory;
     use orca_core::event_schema::RunStatus;
+    use orca_core::event_sink::EventSink;
     use orca_core::external_config::ExternalToolConfig;
     use orca_core::mcp_types::McpTool;
     use orca_core::model::ModelSelection;
@@ -532,13 +605,21 @@ mod tests {
     use orca_mcp::McpRegistry;
     use serde_json::json;
 
+    use crate::agent_child::{ChildAgentRequest, ChildAgentResult, ChildAgentRuntime};
+    use crate::cost::CostTracker;
     use crate::hooks::HookOutcome;
+    use crate::instructions::ProjectInstructions;
+    use crate::lifecycle::TurnPermissionOverlay;
+    use crate::memory::MemoryBlock;
+    use crate::tasks::TaskRegistry;
+    use crate::tool_execution::policy_for_tool_execution;
 
     use super::{
         AgentToolPolicyContext, ToolRequestCursor, ToolTurnOutcome, apply_pre_tool_outcome,
         approval_request_for_invocation, prepare_tool_invocation, provider_config_for_agent_loop,
         provider_tool_schema_override, record_normal_tool_result, record_readonly_batch_results,
-        terminal_tool_turn, tool_requests_from_provider_steps, validate_tool_invocation,
+        run_normal_tool_turn, terminal_tool_turn, tool_requests_from_provider_steps,
+        validate_tool_invocation,
     };
 
     fn config_with_external(external_tools: Vec<ExternalToolConfig>) -> RunConfig {
@@ -839,6 +920,76 @@ mod tests {
         );
         assert!(
             matches!(&conversation.messages[1], Message::Tool { tool_call_id, .. } if tool_call_id == "tool-2")
+        );
+    }
+
+    fn unused_child_executor<W: io::Write>(
+        _config: &RunConfig,
+        _request: &ChildAgentRequest,
+        _runtime: &mut ChildAgentRuntime<'_, W>,
+        _child_cost_tracker: &mut CostTracker,
+    ) -> io::Result<ChildAgentResult> {
+        panic!("read_file turn must not execute child agents")
+    }
+
+    #[test]
+    fn run_normal_tool_turn_executes_and_records_tool_result() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        std::fs::write(cwd.path().join("tracked.txt"), "hello\n").expect("write file");
+        let mut config = config_with_external(Vec::new());
+        config.approval_mode = ApprovalMode::FullAuto;
+        let mut events = EventFactory::new("normal-tool-turn".to_string());
+        let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+        let mut conversation = Conversation::new();
+        let request = request(
+            ToolName::ReadFile,
+            ActionKind::Read,
+            Some("tracked.txt"),
+            Some(json!({ "path": "tracked.txt" }).to_string().as_str()),
+        );
+        let policy = policy_for_tool_execution(&config);
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let registry = McpRegistry::default();
+        let hooks = crate::hooks::HookRunner::default();
+        let mut cost_tracker = CostTracker::new(None);
+        let cancel = CancelToken::new();
+        let task_registry = TaskRegistry::new("normal-tool-turn".to_string());
+        let mut background_workflows = Vec::new();
+        let mut permission_overlay = TurnPermissionOverlay::default();
+
+        let outcome = run_normal_tool_turn(
+            &config,
+            cwd.path(),
+            &mut events,
+            &mut sink,
+            &mut conversation,
+            None,
+            &request,
+            0,
+            false,
+            &policy,
+            &instructions,
+            &memory,
+            &registry,
+            &hooks,
+            &mut cost_tracker,
+            &cancel,
+            &task_registry,
+            &mut background_workflows,
+            None,
+            &mut permission_overlay,
+            None,
+            unused_child_executor,
+            unused_child_executor,
+        )
+        .expect("run normal tool turn");
+
+        assert!(matches!(outcome, ToolTurnOutcome::Continue));
+        assert_eq!(conversation.messages.len(), 1);
+        assert!(
+            matches!(&conversation.messages[0], Message::Tool { tool_call_id, content, .. }
+                if tool_call_id == "tool-1" && content.contains("hello"))
         );
     }
 

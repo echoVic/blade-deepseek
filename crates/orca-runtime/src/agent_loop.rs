@@ -19,13 +19,11 @@ use crate::subagent_execution::{
     record_subagent_batch_results, should_run_subagent_batch,
 };
 use crate::tasks::TaskRegistry;
-use crate::tool_execution::{
-    ToolExecutionContext, execute_tool_with_approval, policy_for_tool_execution,
-};
+use crate::tool_execution::policy_for_tool_execution;
 use crate::tool_invocation::{
     AgentToolPolicyContext, ToolRequestCursor, ToolTurnOutcome, collect_readonly_batch,
-    execute_readonly_batch, provider_config_for_agent_loop, record_normal_tool_result,
-    record_readonly_batch_results, reject_disallowed_child_tool, should_run_readonly_batch,
+    execute_readonly_batch, provider_config_for_agent_loop, record_readonly_batch_results,
+    reject_disallowed_child_tool, run_normal_tool_turn, should_run_readonly_batch,
     terminal_tool_turn, tool_requests_from_provider_steps,
 };
 use crate::workflow_execution::observe_background_workflows;
@@ -385,33 +383,30 @@ pub(crate) fn run_agent_loop(
                 continue;
             }
 
-            let (status, result) = execute_tool_with_approval(
+            match run_normal_tool_turn(
                 config,
+                cwd,
                 events,
                 sink,
-                tool_request,
-                ToolExecutionContext::new(cwd, subagent_depth, emit_deltas, &policy)
-                    .with_services(instructions, memory, mcp_registry, hooks)
-                    .with_runtime(
-                        cost_tracker,
-                        cancel,
-                        task_registry,
-                        background_workflows,
-                        workflow_ipc,
-                    )
-                    .with_permission_overlay(&mut permission_overlay)
-                    .with_permission_handler(permission_handler),
-                execute_child_agent_loop,
-                execute_child_agent_loop,
-            )?;
-
-            match record_normal_tool_result(
                 conversation,
                 history_writer.as_deref_mut(),
                 tool_request,
-                &result,
-                status,
+                subagent_depth,
                 emit_deltas,
+                &policy,
+                instructions,
+                memory,
+                mcp_registry,
+                hooks,
+                cost_tracker,
+                cancel,
+                task_registry,
+                background_workflows,
+                workflow_ipc,
+                &mut permission_overlay,
+                permission_handler,
+                execute_child_agent_loop,
+                execute_child_agent_loop,
             )? {
                 ToolTurnOutcome::Continue => {}
                 ToolTurnOutcome::Return { status, error } => {
