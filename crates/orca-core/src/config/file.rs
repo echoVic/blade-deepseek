@@ -576,7 +576,7 @@ enabled = true
     }
 
     #[test]
-    fn reject_unsupported_permission_profile_network_domain_policy() {
+    fn parse_permission_profile_network_domain_policy() {
         let toml = r#"
 [permission_profiles.limited-network]
 extends = ":read-only"
@@ -586,12 +586,18 @@ enabled = true
 
 [permission_profiles.limited-network.network.domains]
 "api.example.com" = "allow"
+"blocked.example.com" = "deny"
 "#;
-        let error = toml::from_str::<FileConfig>(toml).expect_err("unsupported network domains");
+        let config: FileConfig = toml::from_str(toml).unwrap();
+        let profile = config.permission_profiles.get("limited-network").unwrap();
 
-        assert!(
-            error.to_string().contains("unknown field `domains`"),
-            "unexpected error: {error}"
+        assert_eq!(
+            profile.network.domains.get("api.example.com"),
+            Some(&crate::config::PermissionProfileNetworkAccess::Allow)
+        );
+        assert_eq!(
+            profile.network.domains.get("blocked.example.com"),
+            Some(&crate::config::PermissionProfileNetworkAccess::Deny)
         );
     }
 

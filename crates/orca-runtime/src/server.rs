@@ -1984,6 +1984,16 @@ fn resolve_permission_profile(
         let Some(profile) = config.permission_profiles.get(&name) else {
             return Err(format!("unknown command/exec permissionProfile: {name}"));
         };
+        if !profile.network.domains.is_empty() {
+            return Err(format!(
+                "command/exec permissionProfile network domain policy is parsed but not enforceable yet: {name}"
+            ));
+        }
+        if !profile.network.unix_sockets.is_empty() {
+            return Err(format!(
+                "command/exec permissionProfile network unix socket policy is parsed but not enforceable yet: {name}"
+            ));
+        }
         for (path, access) in profile.filesystem.entries() {
             if contains_glob_chars(path) {
                 return Err(format!(
@@ -3221,6 +3231,7 @@ mod tests {
                 extends: Some(":read-only".to_string()),
                 network: orca_core::config::PermissionProfileNetworkConfig {
                     enabled: Some(true),
+                    ..Default::default()
                 },
                 ..Default::default()
             },
@@ -3231,6 +3242,7 @@ mod tests {
                 extends: Some(":workspace".to_string()),
                 network: orca_core::config::PermissionProfileNetworkConfig {
                     enabled: Some(false),
+                    ..Default::default()
                 },
                 ..Default::default()
             },

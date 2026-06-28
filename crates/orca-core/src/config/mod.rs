@@ -343,11 +343,49 @@ impl From<HashMap<PathBuf, PermissionProfileFileAccess>> for PermissionProfileFi
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PermissionProfileNetworkConfig {
     #[serde(default)]
     pub enabled: Option<bool>,
+    #[serde(default)]
+    pub domains: PermissionProfileNetworkDomainsConfig,
+    #[serde(default)]
+    pub unix_sockets: PermissionProfileNetworkUnixSocketsConfig,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PermissionProfileNetworkDomainsConfig {
+    #[serde(flatten)]
+    entries: HashMap<String, PermissionProfileNetworkAccess>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PermissionProfileNetworkUnixSocketsConfig {
+    #[serde(flatten)]
+    entries: HashMap<PathBuf, PermissionProfileNetworkAccess>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PermissionProfileNetworkAccess {
+    Allow,
+    Deny,
+}
+
+impl PermissionProfileNetworkDomainsConfig {
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn get(&self, domain: &str) -> Option<&PermissionProfileNetworkAccess> {
+        self.entries.get(domain)
+    }
+}
+
+impl PermissionProfileNetworkUnixSocketsConfig {
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

@@ -3083,6 +3083,60 @@ fn server_mode_command_exec_configured_permission_profile_materializes_minimal_s
 }
 
 #[test]
+fn server_mode_command_exec_configured_permission_profile_rejects_network_domain_policy() {
+    with_orca_home(|home| {
+        let workspace = tempdir().expect("workspace");
+        std::fs::write(
+            home.join("config.toml"),
+            "[permission_profiles.net]\nextends = \":read-only\"\n\n[permission_profiles.net.network]\nenabled = true\n\n[permission_profiles.net.network.domains]\n\"api.example.com\" = \"allow\"\n",
+        )
+        .expect("write permission profile config");
+
+        let mut child = orca_command()
+            .args([
+                "--mode",
+                "server",
+                "--provider",
+                "mock",
+                "--cwd",
+                workspace.path().to_str().unwrap(),
+            ])
+            .env("ORCA_HOME", home)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn orca server");
+
+        {
+            let stdin = child.stdin.as_mut().expect("server stdin");
+            writeln!(
+                stdin,
+                r#"{{"id":"cmd","method":"command/exec","params":{{"command":["sh","-lc","true"],"permissionProfile":"net"}}}}"#
+            )
+            .expect("write network domain permissionProfile command/exec");
+            stdin
+                .flush()
+                .expect("flush network domain permissionProfile command/exec");
+        }
+        drop(child.stdin.take());
+
+        let output = child.wait_with_output().expect("wait for server");
+        assert_eq!(output.status.code(), Some(0));
+        assert!(output.stderr.is_empty());
+
+        let events = parse_jsonl(&output.stdout);
+        assert_eq!(events.len(), 1, "expected one error event: {events:?}");
+        assert_eq!(events[0]["id"], "cmd");
+        assert_eq!(events[0]["event"], "error");
+        assert_eq!(
+            events[0]["message"],
+            "command/exec permissionProfile network domain policy is parsed but not enforceable yet: net"
+        );
+    });
+}
+
+#[test]
 fn server_mode_command_exec_configured_permission_profile_materializes_tmpdir() {
     if !sandbox_seatbelt_available() {
         return;
