@@ -145,6 +145,11 @@ fn tui_event_from_runtime_event(event: &EventEnvelope) -> Option<TuiEvent> {
             cache_tokens: event.payload["cache_tokens"].as_u64().unwrap_or_default(),
             estimated_cost_usd: event.payload["estimated_cost_usd"].as_f64()?,
         })),
+        EventType::ModelRouted => Some(TuiEvent::Notice(format!(
+            "Model routed to {} ({})",
+            event.payload["actual_model"].as_str()?,
+            event.payload["reason"].as_str()?
+        ))),
         EventType::ToolCallRequested => Some(TuiEvent::ToolRequested {
             id: event.payload["id"].as_str()?.to_string(),
             name: event.payload["name"].as_str()?.to_string(),
@@ -204,6 +209,12 @@ fn tui_event_from_runtime_event(event: &EventEnvelope) -> Option<TuiEvent> {
                 .and_then(|value| value.as_str())
                 .map(str::to_string),
         }),
+        EventType::ApprovalResolved => Some(TuiEvent::Notice(format!(
+            "Approval {} resolved: {} ({})",
+            event.payload["id"].as_str()?,
+            event.payload["decision"].as_str()?,
+            event.payload["reason"].as_str()?
+        ))),
         EventType::SubagentStarted => Some(TuiEvent::SubagentStarted {
             id: event.payload["id"].as_str()?.to_string(),
             description: event.payload["description"].as_str()?.to_string(),
@@ -269,6 +280,27 @@ fn tui_event_from_runtime_event(event: &EventEnvelope) -> Option<TuiEvent> {
         EventType::WorkflowTasksUpdated => Some(TuiEvent::WorkflowTasksUpdated {
             tasks: serde_json::from_value(event.payload["tasks"].clone()).ok()?,
         }),
+        EventType::VerificationStarted => Some(TuiEvent::Notice(format!(
+            "Verification started: {}",
+            event.payload["command"].as_str()?
+        ))),
+        EventType::VerificationCompleted => {
+            let status = if event.payload["success"].as_bool()? {
+                "passed"
+            } else {
+                "failed"
+            };
+            let exit = event
+                .payload
+                .get("exit_code")
+                .and_then(|value| value.as_i64())
+                .map(|code| format!(" (exit {code})"))
+                .unwrap_or_default();
+            Some(TuiEvent::Notice(format!(
+                "Verification {status}: {}{exit}",
+                event.payload["command"].as_str()?
+            )))
+        }
         EventType::Error => Some(TuiEvent::Error(
             event.payload["message"].as_str()?.to_string(),
         )),
@@ -2891,6 +2923,48 @@ mod tests {
         assert!(
             matches!(completed, TuiEvent::SessionCompleted { status } if status == "budget_exhausted")
         );
+    }
+
+    #[test]
+    fn runtime_control_events_map_to_tui_notices() {
+        let mut events = EventFactory::new("tui-runtime-adapter".to_string());
+        let route = orca_core::model::ModelRouteDecision {
+            requested_model: Some("auto".to_string()),
+            actual_model: "deepseek-v4-pro".to_string(),
+            reason: orca_core::model::ModelRouteReason::DefaultPro,
+        };
+        let approval = orca_core::approval_types::ApprovalResolution {
+            id: "approval-1".to_string(),
+            decision: orca_core::approval_types::ApprovalDecision::Allow,
+            reason: "user approved".to_string(),
+        };
+        let verifier = orca_core::verification::VerificationResult {
+            command: "cargo test".to_string(),
+            success: false,
+            exit_code: Some(101),
+            stdout: String::new(),
+            stderr: "failed".to_string(),
+        };
+
+        let routed =
+            tui_event_from_runtime_event(&events.model_routed(&route)).expect("model routed");
+        let resolved = tui_event_from_runtime_event(&events.approval_resolved(&approval))
+            .expect("approval resolved");
+        let verification_started =
+            tui_event_from_runtime_event(&events.verification_started("cargo test"))
+                .expect("verification started");
+        let verification_completed =
+            tui_event_from_runtime_event(&events.verification_completed(&verifier))
+                .expect("verification completed");
+
+        assert!(matches!(routed, TuiEvent::Notice(message)
+                if message == "Model routed to deepseek-v4-pro (default_pro)"));
+        assert!(matches!(resolved, TuiEvent::Notice(message)
+                if message == "Approval approval-1 resolved: allow (user approved)"));
+        assert!(matches!(verification_started, TuiEvent::Notice(message)
+                if message == "Verification started: cargo test"));
+        assert!(matches!(verification_completed, TuiEvent::Notice(message)
+                if message == "Verification failed: cargo test (exit 101)"));
     }
 
     #[test]
