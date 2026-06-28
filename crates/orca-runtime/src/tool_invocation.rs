@@ -14,6 +14,7 @@ use orca_core::provider_types::ProviderStep;
 use orca_core::subagent_types::SubagentType;
 use orca_core::tool_types::{ToolName, ToolOutputTruncation, ToolRequest, ToolResult};
 use orca_mcp::McpRegistry;
+use orca_provider::ProviderConfig;
 use orca_provider::tool_schema::{
     deepseek_tools_schema_for_allowed_names_with_mcp_and_external,
     deepseek_tools_schema_for_type_with_mcp_and_external,
@@ -107,6 +108,29 @@ pub(crate) fn provider_tool_schema_override(
             Some(mcp_registry),
             external_tools,
         ))
+    }
+}
+
+pub(crate) fn provider_config_for_agent_loop(
+    config: &RunConfig,
+    subagent_depth: u32,
+    subagent_type: &SubagentType,
+    tool_policy: AgentToolPolicyContext<'_>,
+    mcp_registry: &McpRegistry,
+) -> ProviderConfig {
+    ProviderConfig {
+        api_key: config.api_key.clone(),
+        base_url: config.base_url.clone(),
+        model: config.model.as_option(),
+        tools_override: provider_tool_schema_override(
+            subagent_depth,
+            subagent_type,
+            tool_policy,
+            mcp_registry,
+            &config.external_tools,
+        ),
+        mcp_registry: Some(mcp_registry.clone()),
+        external_tools: config.external_tools.clone(),
     }
 }
 
@@ -478,8 +502,8 @@ mod tests {
 
     use super::{
         AgentToolPolicyContext, NormalToolRecordOutcome, apply_pre_tool_outcome,
-        approval_request_for_invocation, prepare_tool_invocation, provider_tool_schema_override,
-        record_normal_tool_result, record_readonly_batch_results,
+        approval_request_for_invocation, prepare_tool_invocation, provider_config_for_agent_loop,
+        provider_tool_schema_override, record_normal_tool_result, record_readonly_batch_results,
         tool_requests_from_provider_steps, validate_tool_invocation,
     };
 
@@ -594,6 +618,38 @@ mod tests {
 
         assert!(names.contains(&"read_file"));
         assert!(names.contains(&"grep"));
+        assert!(!names.contains(&"bash"));
+        assert!(!names.contains(&"subagent"));
+    }
+
+    #[test]
+    fn provider_config_for_agent_loop_builds_schema_limited_provider_config() {
+        let registry = McpRegistry::default();
+        let allowed = vec!["read_file".to_string()];
+        let mut config = config_with_external(Vec::new());
+        config.api_key = Some("test-key".to_string());
+        config.base_url = Some("https://provider.test".to_string());
+
+        let provider_config = provider_config_for_agent_loop(
+            &config,
+            1,
+            &SubagentType::General,
+            AgentToolPolicyContext::new(Some(&allowed), Some("test child")),
+            &registry,
+        );
+
+        assert_eq!(provider_config.api_key.as_deref(), Some("test-key"));
+        assert_eq!(
+            provider_config.base_url.as_deref(),
+            Some("https://provider.test")
+        );
+        assert_eq!(provider_config.model.as_deref(), Some("mock"));
+        assert!(provider_config.mcp_registry.is_some());
+        assert_eq!(provider_config.external_tools.len(), 0);
+
+        let tools = provider_config.tools_override.expect("tool override");
+        let names = schema_names(&tools);
+        assert!(names.contains(&"read_file"));
         assert!(!names.contains(&"bash"));
         assert!(!names.contains(&"subagent"));
     }

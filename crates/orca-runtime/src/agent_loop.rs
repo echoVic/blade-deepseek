@@ -22,7 +22,7 @@ use crate::tasks::TaskRegistry;
 use crate::tool_execution::{ToolExecutionContext, execute_tool_with_approval};
 use crate::tool_invocation::{
     AgentToolPolicyContext, NormalToolRecordOutcome, collect_readonly_batch,
-    execute_readonly_batch, provider_tool_schema_override, record_normal_tool_result,
+    execute_readonly_batch, provider_config_for_agent_loop, record_normal_tool_result,
     record_readonly_batch_results, reject_disallowed_child_tool, should_run_readonly_batch,
     tool_requests_from_provider_steps,
 };
@@ -34,8 +34,8 @@ use orca_core::event_schema::{EventFactory, RunStatus};
 use orca_core::event_sink::EventSink;
 use orca_core::subagent_types::SubagentType;
 use orca_mcp::McpRegistry;
+use orca_provider;
 use orca_provider::context;
-use orca_provider::{self, ProviderConfig};
 
 const DEFAULT_MAX_TURNS: u32 = 128;
 
@@ -116,21 +116,13 @@ pub(crate) fn run_agent_loop(
     );
     let policy = ApprovalPolicy::new(config.approval_mode)
         .with_permission_rules(config.permission_rules.clone());
-    let tools_override = provider_tool_schema_override(
+    let provider_config = provider_config_for_agent_loop(
+        config,
         subagent_depth,
         subagent_type,
         tool_policy,
         mcp_registry,
-        &config.external_tools,
     );
-    let provider_config = ProviderConfig {
-        api_key: config.api_key.clone(),
-        base_url: config.base_url.clone(),
-        model: config.model.as_option(),
-        tools_override,
-        mcp_registry: Some(mcp_registry.clone()),
-        external_tools: config.external_tools.clone(),
-    };
 
     let mut owned_conversation;
     let conversation = if let Some(conversation) = conversation {

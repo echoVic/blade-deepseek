@@ -188,8 +188,8 @@ mod tests {
             );
         }
         assert!(
-            agent_loop_source.contains("provider_tool_schema_override("),
-            "agent_loop must delegate provider tool schema override construction"
+            agent_loop_source.contains("provider_config_for_agent_loop"),
+            "agent_loop must delegate provider tool schema override through provider config construction"
         );
         assert!(
             tool_invocation_source.contains("pub(crate) fn provider_tool_schema_override"),
@@ -558,6 +558,29 @@ mod tests {
         assert!(
             session_source.contains("pub(crate) fn bootstrap_agent_conversation_for_loop"),
             "session must expose agent-loop conversation bootstrap"
+        );
+    }
+
+    #[test]
+    fn agent_provider_config_construction_is_owned_by_tool_invocation_module() {
+        let agent_loop_source = include_str!("agent_loop.rs");
+        let tool_invocation_source = include_str!("tool_invocation.rs");
+
+        assert!(
+            !agent_loop_source.contains("ProviderConfig {"),
+            "agent_loop must not own provider config construction"
+        );
+        assert!(
+            agent_loop_source.contains("provider_config_for_agent_loop"),
+            "agent_loop must delegate provider config construction"
+        );
+        assert!(
+            tool_invocation_source.contains("pub(crate) fn provider_config_for_agent_loop"),
+            "tool_invocation must expose agent-loop provider config construction"
+        );
+        assert!(
+            tool_invocation_source.contains("provider_tool_schema_override"),
+            "tool_invocation must keep provider config close to tool schema selection"
         );
     }
 
