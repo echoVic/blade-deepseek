@@ -48,6 +48,22 @@ impl JsonlThreadStore {
     ) -> io::Result<Vec<SearchHit>> {
         search_sessions(query, include_archived)
     }
+
+    pub fn delete_session(&self, selector: &str) -> io::Result<PathBuf> {
+        delete_session(selector)
+    }
+
+    pub fn archive_session(&self, selector: &str) -> io::Result<PathBuf> {
+        archive_session(selector)
+    }
+
+    pub fn rename_session(&self, selector: &str, title: &str) -> io::Result<PathBuf> {
+        rename_session(selector, title)
+    }
+
+    pub fn compress_session(&self, selector: &str) -> io::Result<PathBuf> {
+        compress_session(selector)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -236,6 +252,98 @@ impl From<StoredMessage> for Message {
                 pinned,
             },
         }
+    }
+}
+
+pub fn delete_session(selector: &str) -> io::Result<PathBuf> {
+    let path = if is_latest_selector(selector) {
+        list_sessions_with_archived(1, true)?
+            .into_iter()
+            .next()
+            .map(|session| session.path)
+    } else {
+        find_session_path(selector, true)?
+    }
+    .ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("no saved session matches '{selector}'"),
+        )
+    })?;
+    fs::remove_file(&path)?;
+    Ok(path)
+}
+
+pub fn archive_session(selector: &str) -> io::Result<PathBuf> {
+    let path = if is_latest_selector(selector) {
+        list_sessions(1)?
+            .into_iter()
+            .next()
+            .map(|session| session.path)
+    } else {
+        find_session_path(selector, false)?
+    }
+    .ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("no active session matches '{selector}'"),
+        )
+    })?;
+    let relative = path.strip_prefix(sessions_dir()).unwrap_or(&path);
+    let archived_path = archive_dir().join(relative);
+    if let Some(parent) = archived_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::rename(&path, &archived_path)?;
+    Ok(archived_path)
+}
+
+pub fn rename_session(selector: &str, title: &str) -> io::Result<PathBuf> {
+    let path = resolve_session_path(selector, true)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("no saved session matches '{selector}'"),
+        )
+    })?;
+    let meta = read_session_meta(&path)?;
+    JsonlThreadStore::new().update_thread_metadata(
+        &meta.session_id,
+        ThreadMetadataPatch {
+            title: Some(title.to_string()),
+            ..ThreadMetadataPatch::default()
+        },
+    )?;
+    Ok(path)
+}
+
+pub fn compress_session(selector: &str) -> io::Result<PathBuf> {
+    let path = resolve_session_path(selector, true)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("no saved session matches '{selector}'"),
+        )
+    })?;
+    if path.extension().and_then(|ext| ext.to_str()) == Some("zst") {
+        return Ok(path);
+    }
+    let compressed_path = path.with_extension("jsonl.zst");
+    let lock = OpenOptions::new().read(true).write(true).open(&path)?;
+    lock_file(&lock)?;
+    let result = (|| {
+        let input = File::open(&path)?;
+        let output = File::create(&compressed_path)?;
+        if let Err(error) = zstd::stream::copy_encode(input, output, 3) {
+            let _ = fs::remove_file(&compressed_path);
+            return Err(io::Error::other(error));
+        }
+        fs::remove_file(&path)?;
+        Ok(compressed_path)
+    })();
+    let unlock_result = unlock_file(&lock);
+    match (result, unlock_result) {
+        (Ok(path), Ok(())) => Ok(path),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
     }
 }
 
