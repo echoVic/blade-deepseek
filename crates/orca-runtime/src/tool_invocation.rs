@@ -1,12 +1,17 @@
 use std::collections::HashSet;
+use std::io;
+use std::path::Path;
 
 use orca_core::approval_types::{ActionKind, ApprovalRequest};
 use orca_core::config::RunConfig;
+use orca_core::event_schema::EventFactory;
+use orca_core::event_sink::EventSink;
 use orca_core::external_config::ExternalToolConfig;
-use orca_core::tool_types::{ToolName, ToolRequest, ToolResult};
+use orca_core::hook_types::HookEvent;
+use orca_core::tool_types::{ToolName, ToolOutputTruncation, ToolRequest, ToolResult};
 use orca_mcp::McpRegistry;
 
-use crate::hooks::{HookOutcome, tool_request_with_hook_outcome};
+use crate::hooks::{HookContext, HookOutcome, HookRunner, tool_request_with_hook_outcome};
 
 #[derive(Clone, Debug)]
 pub struct ToolInvocation {
@@ -104,6 +109,91 @@ fn child_tool_policy_failure(
         tool_request,
         format!("{label} disallows tool '{requested_name}'"),
     ))
+}
+
+pub(crate) fn execute_readonly_batch(
+    cwd: &Path,
+    events: &mut EventFactory,
+    sink: &mut EventSink<impl io::Write>,
+    tool_requests: &[ToolRequest],
+    emit_deltas: bool,
+    mcp_registry: &McpRegistry,
+    hooks: &HookRunner,
+    output_truncation: ToolOutputTruncation,
+) -> io::Result<Vec<ToolResult>> {
+    let mut hook_failed: Vec<Option<ToolResult>> = vec![None; tool_requests.len()];
+    let mut runnable = Vec::new();
+
+    for (idx, tool_request) in tool_requests.iter().enumerate() {
+        let invocation =
+            prepare_tool_invocation_with_external(tool_request, 0, u32::MAX, mcp_registry, &[]);
+        if emit_deltas {
+            sink.emit(&events.tool_call_requested(tool_request))?;
+        }
+        match hooks.run(
+            HookEvent::PreToolUse,
+            HookContext {
+                cwd: &cwd.display().to_string(),
+                session_status: None,
+                tool_request: Some(tool_request),
+                tool_result: None,
+                before_messages: None,
+                after_messages: None,
+                usage: None,
+            },
+        ) {
+            Ok(outcome) => {
+                match apply_pre_tool_outcome_with_external(invocation, &outcome, mcp_registry, &[])
+                {
+                    Ok(invocation) => runnable.push((idx, invocation.effective)),
+                    Err(error) => hook_failed[idx] = Some(error.into_result()),
+                }
+            }
+            Err(error) => {
+                hook_failed[idx] = Some(ToolResult::failed(
+                    tool_request,
+                    format!("pre_tool_use hook blocked tool: {error}"),
+                    None,
+                ));
+            }
+        }
+    }
+
+    let mut results = orca_tools::run_readonly_batch_parallel_with_policy(
+        tool_requests,
+        runnable,
+        cwd,
+        mcp_registry,
+        output_truncation,
+    );
+
+    for (idx, failed) in hook_failed.into_iter().enumerate() {
+        if let Some(result) = failed {
+            results[idx] = result;
+        }
+    }
+
+    for (tool_request, result) in tool_requests.iter().zip(results.iter()) {
+        if emit_deltas {
+            sink.emit(&events.tool_call_completed(result))?;
+            if let Err(error) = hooks.run(
+                HookEvent::PostToolUse,
+                HookContext {
+                    cwd: &cwd.display().to_string(),
+                    session_status: None,
+                    tool_request: Some(tool_request),
+                    tool_result: Some(result),
+                    before_messages: None,
+                    after_messages: None,
+                    usage: None,
+                },
+            ) {
+                sink.emit(&events.error(&format!("post_tool_use hook failed: {error}")))?;
+            }
+        }
+    }
+
+    Ok(results)
 }
 
 pub fn prepare_tool_invocation(

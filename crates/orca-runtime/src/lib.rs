@@ -188,6 +188,31 @@ mod tests {
     }
 
     #[test]
+    fn readonly_tool_batch_is_owned_by_tool_invocation_module() {
+        let agent_loop_source = include_str!("agent_loop.rs");
+        let tool_invocation_source = include_str!("tool_invocation.rs");
+
+        assert!(
+            !agent_loop_source.contains("fn execute_readonly_batch"),
+            "agent_loop must not own readonly tool batch execution"
+        );
+        assert!(
+            tool_invocation_source.contains("pub(crate) fn execute_readonly_batch"),
+            "tool_invocation must expose readonly tool batch execution"
+        );
+        for marker in [
+            "run_readonly_batch_parallel_with_policy",
+            "HookEvent::PreToolUse",
+            "HookEvent::PostToolUse",
+        ] {
+            assert!(
+                !agent_loop_source.contains(marker),
+                "agent_loop must not own readonly batch detail {marker}"
+            );
+        }
+    }
+
+    #[test]
     fn agent_conversation_context_is_owned_by_session_module() {
         let agent_loop_source = include_str!("agent_loop.rs");
         let session_source = include_str!("session.rs");
