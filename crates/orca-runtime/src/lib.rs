@@ -58,6 +58,21 @@ mod tests {
     }
 
     #[test]
+    fn jsonl_thread_store_impl_is_owned_by_thread_store_module() {
+        let history_source = include_str!("history.rs");
+        let thread_store_source = include_str!("thread_store.rs");
+
+        assert!(
+            !history_source.contains("impl ThreadStore for JsonlThreadStore"),
+            "history must not own the JSONL ThreadStore trait implementation"
+        );
+        assert!(
+            thread_store_source.contains("impl ThreadStore for JsonlThreadStore"),
+            "thread_store must own the JSONL ThreadStore trait implementation"
+        );
+    }
+
+    #[test]
     fn jsonl_thread_store_type_is_owned_by_thread_store_module() {
         let history_source = include_str!("history.rs");
         let thread_store_source = include_str!("thread_store.rs");

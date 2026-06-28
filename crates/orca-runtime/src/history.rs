@@ -8,10 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use crate::thread_store::{
-    SessionRecord, StoredMessage, archive_dir, find_session_path, load_thread_records,
-    read_records, rewrite_records, sessions_dir, summarize_session_with_archive_flag,
-};
+use crate::thread_store::{StoredMessage, sessions_dir};
 use orca_core::config::{ActivePermissionProfile, AdditionalWorkingDirectory};
 use orca_core::conversation::{
     Conversation, Message, RawToolCall, SummaryState, normalize_tool_boundaries,
@@ -120,239 +117,7 @@ impl JsonlThreadStore {
     }
 }
 
-impl ThreadStore for JsonlThreadStore {
-    fn create_live_thread(
-        &self,
-        cwd: &Path,
-        provider: &str,
-        model: Option<String>,
-        prompt: &str,
-    ) -> io::Result<LiveThread> {
-        let meta = self.create_meta(cwd, provider, model, prompt);
-        let thread_id = meta.session_id.clone();
-        let writer = self.start_writer_from_meta(meta)?;
-        Ok(LiveThread { thread_id, writer })
-    }
-
-    fn create_live_thread_with_permissions(
-        &self,
-        cwd: &Path,
-        provider: &str,
-        model: Option<String>,
-        prompt: &str,
-        active_permission_profile: Option<ActivePermissionProfile>,
-        approval_mode: ApprovalMode,
-        permission_rules: PermissionRules,
-        additional_working_directories: Vec<AdditionalWorkingDirectory>,
-    ) -> io::Result<LiveThread> {
-        let meta = self.create_meta_with_permissions(
-            cwd,
-            provider,
-            model,
-            prompt,
-            active_permission_profile,
-            approval_mode,
-            permission_rules,
-            additional_working_directories,
-        );
-        let thread_id = meta.session_id.clone();
-        let writer = self.start_writer_from_meta(meta)?;
-        Ok(LiveThread { thread_id, writer })
-    }
-
-    fn update_thread_metadata(
-        &self,
-        thread_id: &str,
-        patch: ThreadMetadataPatch,
-    ) -> io::Result<SessionSummary> {
-        let path = find_session_path(thread_id, true)?.ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("no saved session matches '{thread_id}'"),
-            )
-        })?;
-        let mut records = read_records(&path)?;
-        let mut patched = false;
-        for record in &mut records {
-            if let SessionRecord::Meta(meta) = record {
-                if let Some(title) = patch.title {
-                    meta.title = title;
-                    patched = true;
-                }
-                if let Some(approval_mode) = patch.approval_mode {
-                    meta.approval_mode = Some(approval_mode);
-                    patched = true;
-                }
-                if let Some(active_permission_profile) = patch.active_permission_profile {
-                    meta.active_permission_profile = Some(active_permission_profile);
-                    patched = true;
-                }
-                if let Some(runtime_workspace_roots) = patch.runtime_workspace_roots {
-                    meta.runtime_workspace_roots = runtime_workspace_roots;
-                    patched = true;
-                }
-                if let Some(permission_rules) = patch.permission_rules {
-                    meta.permission_rules = permission_rules;
-                    patched = true;
-                }
-                if let Some(additional_working_directories) = patch.additional_working_directories {
-                    meta.additional_working_directories = additional_working_directories;
-                    patched = true;
-                }
-                break;
-            }
-        }
-        if !patched {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "thread metadata patch did not include any supported fields",
-            ));
-        }
-        rewrite_records(&path, &records)?;
-        summarize_session_with_archive_flag(&path, path.starts_with(archive_dir()))
-    }
-
-    fn read_thread(
-        &self,
-        thread_id: &str,
-        include_messages: bool,
-        include_turns: bool,
-    ) -> io::Result<StoredThreadProjection> {
-        let (meta, stored_messages) = load_thread_records(thread_id)?;
-        let projected_messages = if include_messages {
-            stored_messages
-                .iter()
-                .map(stored_message_to_thread_json)
-                .collect()
-        } else {
-            Vec::new()
-        };
-        let turns = if include_turns {
-            stored_messages_to_thread_turns(
-                &meta.session_id,
-                &stored_messages,
-                usize::MAX,
-                TurnItemsView::Full,
-            )
-        } else {
-            Vec::new()
-        };
-        Ok(StoredThreadProjection {
-            thread_id: meta.session_id,
-            title: meta.title,
-            cwd: meta.cwd,
-            runtime_workspace_roots: meta.runtime_workspace_roots,
-            active_permission_profile: meta.active_permission_profile,
-            additional_working_directories: meta.additional_working_directories,
-            message_count: stored_messages.len(),
-            messages: projected_messages,
-            turns,
-        })
-    }
-
-    fn list_threads(
-        &self,
-        cursor: Option<&str>,
-        limit: usize,
-        filters: ThreadListFilters,
-        sort_key: ThreadSortKey,
-        sort_direction: SortDirection,
-        search_term: Option<&str>,
-    ) -> io::Result<StoredThreadSummaryPage> {
-        let mut summaries = self
-            .list_sessions_with_archived(usize::MAX, filters.archived)?
-            .into_iter()
-            .map(StoredThreadSummary::from)
-            .collect::<Vec<_>>();
-        let all_summaries = summaries.clone();
-        summaries
-            .retain(|summary| thread_summary_matches_filters(summary, &filters, &all_summaries));
-        if let Some(search_term) = search_term.filter(|term| !term.is_empty()) {
-            summaries.retain(|summary| thread_summary_matches(summary, search_term));
-        }
-        sort_thread_summaries(&mut summaries, sort_key);
-        if sort_direction == SortDirection::Asc {
-            summaries.reverse();
-        }
-        let (data, next_cursor, backwards_cursor) = page_vec(summaries, cursor, limit);
-        Ok(StoredThreadSummaryPage {
-            data,
-            next_cursor,
-            backwards_cursor,
-        })
-    }
-
-    fn search_threads(
-        &self,
-        query: &str,
-        cursor: Option<&str>,
-        limit: usize,
-        include_archived: bool,
-        sort_key: ThreadSortKey,
-        sort_direction: SortDirection,
-    ) -> io::Result<StoredThreadSearchPage> {
-        let mut hits = self
-            .search_sessions(query, include_archived)?
-            .into_iter()
-            .map(|hit| {
-                let archived = hit.archived;
-                let snippet = hit.line.clone();
-                summarize_session_with_archive_flag(&hit.path, archived).map(|summary| {
-                    StoredThreadSearchHit {
-                        thread: StoredThreadSummary::from(summary),
-                        snippet,
-                    }
-                })
-            })
-            .collect::<io::Result<Vec<_>>>()?;
-        sort_thread_search_hits(&mut hits, sort_key);
-        if sort_direction == SortDirection::Asc {
-            hits.reverse();
-        }
-        let (data, next_cursor, backwards_cursor) = page_vec(hits, cursor, limit);
-        Ok(StoredThreadSearchPage {
-            data,
-            next_cursor,
-            backwards_cursor,
-        })
-    }
-
-    fn list_thread_turns(
-        &self,
-        thread_id: &str,
-        cursor: Option<&str>,
-        limit: usize,
-        sort_direction: SortDirection,
-        items_view: TurnItemsView,
-    ) -> io::Result<StoredThreadTurnPage> {
-        let (meta, messages) = load_thread_records(thread_id)?;
-        Ok(page_thread_turns(
-            stored_messages_to_thread_turns(&meta.session_id, &messages, usize::MAX, items_view),
-            cursor,
-            limit,
-            sort_direction,
-        ))
-    }
-
-    fn list_thread_items(
-        &self,
-        thread_id: &str,
-        turn_id: Option<&str>,
-        cursor: Option<&str>,
-        limit: usize,
-        sort_direction: SortDirection,
-    ) -> io::Result<StoredThreadItemPage> {
-        let (meta, messages) = load_thread_records(thread_id)?;
-        Ok(page_thread_items(
-            stored_messages_to_thread_items(&meta.session_id, &messages, turn_id, usize::MAX),
-            cursor,
-            limit,
-            sort_direction,
-        ))
-    }
-}
-
-fn thread_summary_matches(summary: &StoredThreadSummary, search_term: &str) -> bool {
+pub(crate) fn thread_summary_matches(summary: &StoredThreadSummary, search_term: &str) -> bool {
     summary.title.contains(search_term)
         || summary.cwd.contains(search_term)
         || summary.provider.contains(search_term)
@@ -362,7 +127,7 @@ fn thread_summary_matches(summary: &StoredThreadSummary, search_term: &str) -> b
             .is_some_and(|model| model.contains(search_term))
 }
 
-fn thread_summary_matches_filters(
+pub(crate) fn thread_summary_matches_filters(
     summary: &StoredThreadSummary,
     filters: &ThreadListFilters,
     all_summaries: &[StoredThreadSummary],
@@ -422,7 +187,10 @@ fn thread_descends_from(
     false
 }
 
-fn sort_thread_summaries(summaries: &mut [StoredThreadSummary], sort_key: ThreadSortKey) {
+pub(crate) fn sort_thread_summaries(
+    summaries: &mut [StoredThreadSummary],
+    sort_key: ThreadSortKey,
+) {
     summaries.sort_by(|a, b| match sort_key {
         ThreadSortKey::CreatedAt => b
             .created_at
@@ -435,7 +203,7 @@ fn sort_thread_summaries(summaries: &mut [StoredThreadSummary], sort_key: Thread
     });
 }
 
-fn sort_thread_search_hits(hits: &mut [StoredThreadSearchHit], sort_key: ThreadSortKey) {
+pub(crate) fn sort_thread_search_hits(hits: &mut [StoredThreadSearchHit], sort_key: ThreadSortKey) {
     hits.sort_by(|a, b| match sort_key {
         ThreadSortKey::CreatedAt => b
             .thread
@@ -483,7 +251,7 @@ pub(crate) fn message_to_thread_json(message: &Message) -> Value {
     }
 }
 
-fn stored_message_to_thread_json(message: &StoredMessage) -> Value {
+pub(crate) fn stored_message_to_thread_json(message: &StoredMessage) -> Value {
     match message {
         StoredMessage::System { content, .. } => json!({
             "role": "system",
@@ -554,7 +322,7 @@ pub(crate) fn messages_to_thread_items(
         .collect()
 }
 
-fn stored_messages_to_thread_turns(
+pub(crate) fn stored_messages_to_thread_turns(
     thread_id: &str,
     messages: &[StoredMessage],
     limit: usize,
@@ -566,7 +334,7 @@ fn stored_messages_to_thread_turns(
         .collect()
 }
 
-fn stored_messages_to_thread_items(
+pub(crate) fn stored_messages_to_thread_items(
     thread_id: &str,
     messages: &[StoredMessage],
     turn_id: Option<&str>,
@@ -626,7 +394,7 @@ pub(crate) fn page_thread_items(
     }
 }
 
-fn page_vec<T>(
+pub(crate) fn page_vec<T>(
     items: Vec<T>,
     cursor: Option<&str>,
     limit: usize,
