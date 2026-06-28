@@ -1268,14 +1268,18 @@ fn materialize_workspace_roots_paths(
 fn materialize_profile_special_path(
     path: PathBuf,
     tmpdir: Option<&std::path::Path>,
-) -> Vec<PathBuf> {
+) -> Result<Vec<PathBuf>, String> {
     match path.to_str() {
-        Some(":root") => vec![PathBuf::from("/")],
-        Some(":slash_tmp") => vec![PathBuf::from("/tmp")],
-        Some(":tmpdir") => tmpdir
+        Some(":root") => Ok(vec![PathBuf::from("/")]),
+        Some(":slash_tmp") => Ok(vec![PathBuf::from("/tmp")]),
+        Some(":tmpdir") => Ok(tmpdir
             .map(|path| vec![path.to_path_buf()])
-            .unwrap_or_default(),
-        _ => vec![path],
+            .unwrap_or_default()),
+        Some(":minimal") => Err(
+            "command/exec permissionProfile special path is not supported yet: :minimal"
+                .to_string(),
+        ),
+        _ => Ok(vec![path]),
     }
 }
 
@@ -1990,14 +1994,15 @@ fn resolve_permission_profile(
                     path.display()
                 ));
             }
-            let roots = materialize_workspace_roots_paths(
+            let workspace_roots = materialize_workspace_roots_paths(
                 &cwd.display().to_string(),
                 runtime_workspace_roots,
                 path,
-            )
-            .into_iter()
-            .flat_map(|root| materialize_profile_special_path(root, tmpdir))
-            .collect::<Vec<_>>();
+            );
+            let mut roots = Vec::new();
+            for root in workspace_roots {
+                roots.extend(materialize_profile_special_path(root, tmpdir)?);
+            }
             for root in roots {
                 if access.allows_read() && !additional_readable_roots.contains(&root) {
                     additional_readable_roots.push(root.clone());

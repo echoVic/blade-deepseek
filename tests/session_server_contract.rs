@@ -2958,6 +2958,60 @@ fn server_mode_command_exec_configured_permission_profile_rejects_glob_entries()
 }
 
 #[test]
+fn server_mode_command_exec_configured_permission_profile_rejects_minimal_special_path() {
+    with_orca_home(|home| {
+        let workspace = tempdir().expect("workspace");
+        std::fs::write(
+            home.join("config.toml"),
+            "[permission_profiles.minimal]\nextends = \":read-only\"\n\n[permission_profiles.minimal.filesystem]\n\":minimal\" = \"read\"\n",
+        )
+        .expect("write permission profile config");
+
+        let mut child = orca_command()
+            .args([
+                "--mode",
+                "server",
+                "--provider",
+                "mock",
+                "--cwd",
+                workspace.path().to_str().unwrap(),
+            ])
+            .env("ORCA_HOME", home)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn orca server");
+
+        {
+            let stdin = child.stdin.as_mut().expect("server stdin");
+            writeln!(
+                stdin,
+                r#"{{"id":"cmd","method":"command/exec","params":{{"command":["sh","-lc","true"],"permissionProfile":"minimal"}}}}"#
+            )
+            .expect("write minimal permissionProfile command/exec");
+            stdin
+                .flush()
+                .expect("flush minimal permissionProfile command/exec");
+        }
+        drop(child.stdin.take());
+
+        let output = child.wait_with_output().expect("wait for server");
+        assert_eq!(output.status.code(), Some(0));
+        assert!(output.stderr.is_empty());
+
+        let events = parse_jsonl(&output.stdout);
+        assert_eq!(events.len(), 1, "expected one error event: {events:?}");
+        assert_eq!(events[0]["id"], "cmd");
+        assert_eq!(events[0]["event"], "error");
+        assert_eq!(
+            events[0]["message"],
+            "command/exec permissionProfile special path is not supported yet: :minimal"
+        );
+    });
+}
+
+#[test]
 fn server_mode_command_exec_configured_permission_profile_materializes_tmpdir() {
     if !sandbox_seatbelt_available() {
         return;
