@@ -5,7 +5,7 @@ use crate::cost::CostTracker;
 use crate::hooks::HookRunner;
 use crate::instructions::ProjectInstructions;
 use crate::lifecycle::{
-    AgentLoopContext, RuntimeCompactionStep, RuntimeProviderErrorOutcome,
+    AgentLoopContext, RuntimeCompactionStep, RuntimeModelRouteStep, RuntimeProviderErrorOutcome,
     RuntimeProviderResponseOutcome, RuntimeProviderResponseStep, RuntimeProviderTurnStep,
     RuntimeSessionLifecycle, RuntimeSteerStep, RuntimeTaskActor, RuntimeTurnConfig,
     RuntimeTurnDeps, RuntimeTurnExecution, RuntimeTurnStartStep, RuntimeTurnState,
@@ -170,17 +170,18 @@ pub(crate) fn run_agent_loop(
             return Ok(AgentLoopResult::failure(error.status, error.message));
         }
 
-        let routed_model = actor.route_model_turn(
-            &config.model,
-            subagent_type,
-            None,
-            &provider_config,
-            cost_tracker,
-        );
-        if emit_deltas {
-            sink.emit(&events.model_routed(&routed_model.decision))?;
-        }
-        let turn_provider_config = routed_model.provider_config;
+        let turn_provider_config = RuntimeModelRouteStep::new()
+            .route(
+                &mut actor,
+                &config.model,
+                subagent_type,
+                &provider_config,
+                cost_tracker,
+                events,
+                sink,
+                emit_deltas,
+            )?
+            .provider_config;
 
         RuntimeSteerStep::new().apply(steer_handle, conversation, history_writer.as_deref_mut())?;
 

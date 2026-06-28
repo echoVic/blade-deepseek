@@ -99,6 +99,7 @@ pub struct RuntimeToolActorContext {
 
 pub(crate) struct RuntimeSteerStep;
 pub(crate) struct RuntimeTurnStartStep;
+pub(crate) struct RuntimeModelRouteStep;
 
 pub(crate) struct RuntimeProviderTurnStep;
 pub(crate) struct RuntimeProviderResponseStep;
@@ -2130,6 +2131,31 @@ impl RuntimeTurnStartStep {
     }
 }
 
+impl RuntimeModelRouteStep {
+    pub(crate) fn new() -> Self {
+        Self
+    }
+
+    pub(crate) fn route<W: io::Write>(
+        &mut self,
+        actor: &mut RuntimeTaskActor<'_>,
+        model: &ModelSelection,
+        subagent_type: &SubagentType,
+        provider_config: &ProviderConfig,
+        cost_tracker: &mut CostTracker,
+        events: &mut EventFactory,
+        sink: &mut EventSink<W>,
+        emit_deltas: bool,
+    ) -> io::Result<RuntimeModelTurn> {
+        let routed_model =
+            actor.route_model_turn(model, subagent_type, None, provider_config, cost_tracker);
+        if emit_deltas {
+            sink.emit(&events.model_routed(&routed_model.decision))?;
+        }
+        Ok(routed_model)
+    }
+}
+
 impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
     pub(crate) fn new(
         provider: ProviderKind,
@@ -2835,5 +2861,48 @@ mod tests {
         let output = String::from_utf8(output).expect("jsonl is utf8");
         assert!(output.contains("\"type\":\"turn.started\""));
         assert!(output.contains("hello"));
+    }
+
+    #[test]
+    fn model_route_step_returns_provider_config_and_emits_event() {
+        let mut lifecycle = RuntimeSessionLifecycle::new("model-route-step".to_string());
+        let mut actor = RuntimeTaskActor::new(&mut lifecycle, 3);
+        let mut events = EventFactory::new("model-route-step".to_string());
+        let mut output = Vec::new();
+        let mut sink = EventSink::new(&mut output, OutputFormat::Jsonl);
+        let provider_config = ProviderConfig {
+            api_key: Some("test-key".to_string()),
+            base_url: None,
+            model: None,
+            tools_override: Some(Vec::new()),
+            mcp_registry: None,
+            external_tools: Vec::new(),
+        };
+        let mut cost_tracker = CostTracker::new(None);
+        let model = ModelSelection::parse(None).expect("model");
+        let subagent_type = SubagentType::General;
+
+        let result = RuntimeModelRouteStep::new()
+            .route(
+                &mut actor,
+                &model,
+                &subagent_type,
+                &provider_config,
+                &mut cost_tracker,
+                &mut events,
+                &mut sink,
+                true,
+            )
+            .expect("route model");
+
+        assert_eq!(result.provider_config.api_key.as_deref(), Some("test-key"));
+        assert_eq!(
+            result.provider_config.model.as_deref(),
+            Some(orca_core::model::PRO_MODEL)
+        );
+        assert_eq!(result.decision.actual_model, orca_core::model::PRO_MODEL);
+        let output = String::from_utf8(output).expect("jsonl is utf8");
+        assert!(output.contains("\"type\":\"model.routed\""));
+        assert!(output.contains(orca_core::model::PRO_MODEL));
     }
 }

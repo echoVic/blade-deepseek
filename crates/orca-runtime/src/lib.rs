@@ -1322,6 +1322,43 @@ mod tests {
     }
 
     #[test]
+    fn runtime_model_route_step_is_owned_by_lifecycle_module() {
+        let agent_loop_source = include_str!("agent_loop.rs");
+        let lifecycle_source = include_str!("lifecycle.rs");
+
+        for marker in [
+            "actor.route_model_turn(",
+            "events.model_routed(",
+            "let turn_provider_config = routed_model.provider_config",
+        ] {
+            assert!(
+                !agent_loop_source.contains(marker),
+                "agent_loop must not own runtime model routing detail {marker}"
+            );
+        }
+        assert!(
+            agent_loop_source.contains("RuntimeModelRouteStep"),
+            "agent_loop must delegate runtime model routing"
+        );
+        assert!(
+            lifecycle_source.contains("struct RuntimeModelRouteStep"),
+            "lifecycle must own runtime model-route step state"
+        );
+        assert!(
+            lifecycle_source.contains("impl RuntimeModelRouteStep"),
+            "lifecycle must own runtime model-route step behavior"
+        );
+        assert!(
+            lifecycle_source.contains("actor.route_model_turn("),
+            "lifecycle must own runtime actor route_model_turn call"
+        );
+        assert!(
+            lifecycle_source.contains("events.model_routed("),
+            "lifecycle must own runtime model-routed event emission"
+        );
+    }
+
+    #[test]
     fn session_list_load_operations_are_owned_by_thread_store_module() {
         let history_source = include_str!("history.rs");
         let thread_store_source = include_str!("thread_store.rs");
