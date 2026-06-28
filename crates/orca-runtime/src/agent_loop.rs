@@ -25,6 +25,7 @@ use crate::tool_invocation::{
     AgentToolPolicyContext, NormalToolRecordOutcome, collect_readonly_batch,
     execute_readonly_batch, provider_tool_schema_override, record_normal_tool_result,
     record_readonly_batch_results, reject_disallowed_child_tool, should_run_readonly_batch,
+    tool_requests_from_provider_steps,
 };
 use crate::workflow_execution::observe_background_workflows;
 use orca_approval::ApprovalPolicy;
@@ -32,9 +33,7 @@ use orca_core::cancel::CancelToken;
 use orca_core::config::{OutputFormat, RunConfig};
 use orca_core::event_schema::{EventFactory, RunStatus};
 use orca_core::event_sink::EventSink;
-use orca_core::provider_types::ProviderStep;
 use orca_core::subagent_types::SubagentType;
-use orca_core::tool_types;
 use orca_mcp::McpRegistry;
 use orca_provider::context;
 use orca_provider::{self, ProviderConfig};
@@ -303,14 +302,7 @@ pub(crate) fn run_agent_loop(
             emit_deltas,
         )?;
 
-        let tool_requests: Vec<tool_types::ToolRequest> = response
-            .steps
-            .iter()
-            .filter_map(|step| match step {
-                ProviderStep::ToolCall(tool_request) => Some(tool_request.clone()),
-                _ => None,
-            })
-            .collect();
+        let tool_requests = tool_requests_from_provider_steps(&response.steps);
         let mut index = 0;
         let mut permission_overlay = TurnPermissionOverlay::default();
         while index < tool_requests.len() {

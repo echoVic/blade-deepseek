@@ -10,6 +10,7 @@ use orca_core::event_schema::RunStatus;
 use orca_core::event_sink::EventSink;
 use orca_core::external_config::ExternalToolConfig;
 use orca_core::hook_types::HookEvent;
+use orca_core::provider_types::ProviderStep;
 use orca_core::subagent_types::SubagentType;
 use orca_core::tool_types::{ToolName, ToolOutputTruncation, ToolRequest, ToolResult};
 use orca_mcp::McpRegistry;
@@ -107,6 +108,16 @@ pub(crate) fn provider_tool_schema_override(
             external_tools,
         ))
     }
+}
+
+pub(crate) fn tool_requests_from_provider_steps(steps: &[ProviderStep]) -> Vec<ToolRequest> {
+    steps
+        .iter()
+        .filter_map(|step| match step {
+            ProviderStep::ToolCall(tool_request) => Some(tool_request.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 pub(crate) fn reject_disallowed_child_tool(
@@ -456,6 +467,7 @@ mod tests {
     use orca_core::external_config::ExternalToolConfig;
     use orca_core::mcp_types::McpTool;
     use orca_core::model::ModelSelection;
+    use orca_core::provider_types::ProviderStep;
     use orca_core::subagent_config::SubagentConfig;
     use orca_core::subagent_types::SubagentType;
     use orca_core::tool_types::{ToolName, ToolRequest, ToolResult};
@@ -467,7 +479,8 @@ mod tests {
     use super::{
         AgentToolPolicyContext, NormalToolRecordOutcome, apply_pre_tool_outcome,
         approval_request_for_invocation, prepare_tool_invocation, provider_tool_schema_override,
-        record_normal_tool_result, record_readonly_batch_results, validate_tool_invocation,
+        record_normal_tool_result, record_readonly_batch_results,
+        tool_requests_from_provider_steps, validate_tool_invocation,
     };
 
     fn config_with_external(external_tools: Vec<ExternalToolConfig>) -> RunConfig {
@@ -583,6 +596,31 @@ mod tests {
         assert!(names.contains(&"grep"));
         assert!(!names.contains(&"bash"));
         assert!(!names.contains(&"subagent"));
+    }
+
+    #[test]
+    fn tool_requests_from_provider_steps_extracts_tool_calls_in_order() {
+        let first = request(ToolName::ReadFile, ActionKind::Read, Some("one.txt"), None);
+        let second = ToolRequest {
+            id: "tool-2".to_string(),
+            name: ToolName::Bash,
+            action: ActionKind::Shell,
+            target: Some("echo hi".to_string()),
+            raw_arguments: None,
+        };
+        let steps = vec![
+            ProviderStep::MessageDelta("hello".to_string()),
+            ProviderStep::ToolCall(first.clone()),
+            ProviderStep::ReasoningDelta("thinking".to_string()),
+            ProviderStep::ToolCall(second.clone()),
+            ProviderStep::Error("ignored".to_string()),
+        ];
+
+        let requests = tool_requests_from_provider_steps(&steps);
+
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].id, first.id);
+        assert_eq!(requests[1].id, second.id);
     }
 
     #[test]

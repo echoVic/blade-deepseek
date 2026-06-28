@@ -198,6 +198,29 @@ mod tests {
     }
 
     #[test]
+    fn provider_tool_request_extraction_is_owned_by_tool_invocation_module() {
+        let agent_loop_source = include_str!("agent_loop.rs");
+        let tool_invocation_source = include_str!("tool_invocation.rs");
+
+        assert!(
+            !agent_loop_source.contains("ProviderStep::ToolCall"),
+            "agent_loop must not match provider tool-call steps directly"
+        );
+        assert!(
+            agent_loop_source.contains("tool_requests_from_provider_steps("),
+            "agent_loop must delegate provider tool request extraction"
+        );
+        assert!(
+            tool_invocation_source.contains("pub(crate) fn tool_requests_from_provider_steps"),
+            "tool_invocation must expose provider tool request extraction"
+        );
+        assert!(
+            tool_invocation_source.contains("ProviderStep::ToolCall"),
+            "tool_invocation must own provider tool-call step matching"
+        );
+    }
+
+    #[test]
     fn normal_tool_execution_entrypoint_is_owned_by_tool_execution_module() {
         let agent_loop_source = include_str!("agent_loop.rs");
         let tool_execution_source = include_str!("tool_execution.rs");
