@@ -244,6 +244,31 @@ mod tests {
     }
 
     #[test]
+    fn tool_request_cursor_is_owned_by_tool_invocation_module() {
+        let agent_loop_source = include_str!("agent_loop.rs");
+        let tool_invocation_source = include_str!("tool_invocation.rs");
+
+        for marker in ["let mut index = 0", "index += 1", "index = batch_end"] {
+            assert!(
+                !agent_loop_source.contains(marker),
+                "agent_loop must not own tool request cursor detail {marker}"
+            );
+        }
+        assert!(
+            agent_loop_source.contains("ToolRequestCursor"),
+            "agent_loop must delegate tool request cursor state"
+        );
+        assert!(
+            tool_invocation_source.contains("pub(crate) struct ToolRequestCursor"),
+            "tool_invocation must own tool request cursor state"
+        );
+        assert!(
+            tool_invocation_source.contains("fn advance_to"),
+            "tool_invocation must own cursor batch advancement"
+        );
+    }
+
+    #[test]
     fn child_tool_policy_gate_is_owned_by_tool_invocation_module() {
         let agent_loop_source = include_str!("agent_loop.rs");
         let tool_invocation_source = include_str!("tool_invocation.rs");

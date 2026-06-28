@@ -23,7 +23,7 @@ use crate::tool_execution::{
     ToolExecutionContext, execute_tool_with_approval, policy_for_tool_execution,
 };
 use crate::tool_invocation::{
-    AgentToolPolicyContext, NormalToolRecordOutcome, collect_readonly_batch,
+    AgentToolPolicyContext, NormalToolRecordOutcome, ToolRequestCursor, collect_readonly_batch,
     execute_readonly_batch, provider_config_for_agent_loop, record_normal_tool_result,
     record_readonly_batch_results, reject_disallowed_child_tool, should_run_readonly_batch,
     tool_requests_from_provider_steps,
@@ -295,17 +295,17 @@ pub(crate) fn run_agent_loop(
         )?;
 
         let tool_requests = tool_requests_from_provider_steps(&response.steps);
-        let mut index = 0;
+        let mut cursor = ToolRequestCursor::new(&tool_requests);
         let mut permission_overlay = TurnPermissionOverlay::default();
-        while index < tool_requests.len() {
+        while let Some(tool_request) = cursor.current() {
             if let Some(result) = reject_disallowed_child_tool(
-                &tool_requests[index],
+                tool_request,
                 tool_policy,
                 mcp_registry,
                 &config.external_tools,
             ) {
                 if emit_deltas {
-                    sink.emit(&events.tool_call_requested(&tool_requests[index]))?;
+                    sink.emit(&events.tool_call_requested(tool_request))?;
                     sink.emit(&events.tool_call_completed(&result))?;
                 }
                 return Ok(AgentLoopResult::failure(
@@ -314,14 +314,14 @@ pub(crate) fn run_agent_loop(
                 ));
             }
 
-            if should_run_subagent_batch(config, &tool_requests[index], subagent_depth) {
-                let batch_end = collect_subagent_batch(config, &tool_requests, index);
+            if should_run_subagent_batch(config, tool_request, subagent_depth) {
+                let batch_end = collect_subagent_batch(config, &tool_requests, cursor.position());
                 let results = execute_subagent_batch(
                     config,
                     cwd,
                     events,
                     sink,
-                    &tool_requests[index..batch_end],
+                    &tool_requests[cursor.position()..batch_end],
                     subagent_depth,
                     emit_deltas,
                     instructions,
@@ -349,18 +349,21 @@ pub(crate) fn run_agent_loop(
                         });
                     }
                 }
-                index = batch_end;
+                cursor.advance_to(batch_end);
                 continue;
             }
 
-            if should_run_readonly_batch(config.tools.max_read_parallel, &tool_requests[index]) {
-                let batch_end =
-                    collect_readonly_batch(config.tools.max_read_parallel, &tool_requests, index);
+            if should_run_readonly_batch(config.tools.max_read_parallel, tool_request) {
+                let batch_end = collect_readonly_batch(
+                    config.tools.max_read_parallel,
+                    &tool_requests,
+                    cursor.position(),
+                );
                 let results = execute_readonly_batch(
                     cwd,
                     events,
                     sink,
-                    &tool_requests[index..batch_end],
+                    &tool_requests[cursor.position()..batch_end],
                     emit_deltas,
                     mcp_registry,
                     hooks,
@@ -373,11 +376,10 @@ pub(crate) fn run_agent_loop(
                     results,
                     emit_deltas,
                 )?;
-                index = batch_end;
+                cursor.advance_to(batch_end);
                 continue;
             }
 
-            let tool_request = &tool_requests[index];
             let (status, result) = execute_tool_with_approval(
                 config,
                 events,
@@ -415,7 +417,7 @@ pub(crate) fn run_agent_loop(
                     });
                 }
             }
-            index += 1;
+            cursor.advance_one();
         }
     }
 }

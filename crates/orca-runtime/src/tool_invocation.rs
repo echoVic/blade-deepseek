@@ -53,6 +53,11 @@ pub(crate) enum NormalToolRecordOutcome {
     },
 }
 
+pub(crate) struct ToolRequestCursor<'a> {
+    requests: &'a [ToolRequest],
+    index: usize,
+}
+
 impl<'a> AgentToolPolicyContext<'a> {
     pub(crate) fn new(allowed_tools: Option<&'a [String]>, label: Option<&'a str>) -> Self {
         Self {
@@ -71,6 +76,28 @@ impl<'a> AgentToolPolicyContext<'a> {
 
     pub(crate) fn label(&self) -> Option<&'a str> {
         self.label
+    }
+}
+
+impl<'a> ToolRequestCursor<'a> {
+    pub(crate) fn new(requests: &'a [ToolRequest]) -> Self {
+        Self { requests, index: 0 }
+    }
+
+    pub(crate) fn current(&self) -> Option<&'a ToolRequest> {
+        self.requests.get(self.index)
+    }
+
+    pub(crate) fn position(&self) -> usize {
+        self.index
+    }
+
+    pub(crate) fn advance_one(&mut self) {
+        self.advance_to(self.index.saturating_add(1));
+    }
+
+    pub(crate) fn advance_to(&mut self, next_index: usize) {
+        self.index = next_index.min(self.requests.len());
     }
 }
 
@@ -501,7 +528,7 @@ mod tests {
     use crate::hooks::HookOutcome;
 
     use super::{
-        AgentToolPolicyContext, NormalToolRecordOutcome, apply_pre_tool_outcome,
+        AgentToolPolicyContext, NormalToolRecordOutcome, ToolRequestCursor, apply_pre_tool_outcome,
         approval_request_for_invocation, prepare_tool_invocation, provider_config_for_agent_loop,
         provider_tool_schema_override, record_normal_tool_result, record_readonly_batch_results,
         tool_requests_from_provider_steps, validate_tool_invocation,
@@ -677,6 +704,44 @@ mod tests {
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0].id, first.id);
         assert_eq!(requests[1].id, second.id);
+    }
+
+    #[test]
+    fn tool_request_cursor_advances_over_single_and_batch_requests() {
+        let first = request(ToolName::ReadFile, ActionKind::Read, Some("one.txt"), None);
+        let second = ToolRequest {
+            id: "tool-2".to_string(),
+            name: ToolName::ListFiles,
+            action: ActionKind::Read,
+            target: Some("src".to_string()),
+            raw_arguments: None,
+        };
+        let third = ToolRequest {
+            id: "tool-3".to_string(),
+            name: ToolName::Bash,
+            action: ActionKind::Shell,
+            target: Some("echo hi".to_string()),
+            raw_arguments: None,
+        };
+        let requests = vec![first, second, third];
+
+        let mut cursor = ToolRequestCursor::new(&requests);
+
+        assert_eq!(
+            cursor.current().map(|request| request.id.as_str()),
+            Some("tool-1")
+        );
+        cursor.advance_one();
+        assert_eq!(cursor.position(), 1);
+        assert_eq!(
+            cursor.current().map(|request| request.id.as_str()),
+            Some("tool-2")
+        );
+        cursor.advance_to(3);
+        assert_eq!(cursor.position(), 3);
+        assert!(cursor.current().is_none());
+        cursor.advance_to(99);
+        assert_eq!(cursor.position(), 3);
     }
 
     #[test]
