@@ -357,7 +357,7 @@ impl ServerThread {
                 .conversation()
                 .messages
                 .iter()
-                .map(crate::history::message_to_thread_json)
+                .map(crate::thread_store::message_to_thread_json)
                 .collect()
         } else {
             Vec::new()

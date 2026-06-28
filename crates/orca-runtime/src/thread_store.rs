@@ -16,6 +16,10 @@ pub(crate) fn messages_to_thread_turns(
     crate::history::messages_to_thread_turns(thread_id, messages, limit, items_view)
 }
 
+pub(crate) fn message_to_thread_json(message: &Message) -> serde_json::Value {
+    crate::history::message_to_thread_json(message)
+}
+
 pub(crate) fn messages_to_thread_items(
     thread_id: &str,
     messages: &[Message],
@@ -115,5 +119,18 @@ mod tests {
         assert_eq!(turns[0].role, "user");
         assert_eq!(turns[0].items_view, TurnItemsView::Full);
         assert_eq!(turns[0].items.len(), 2);
+    }
+
+    #[test]
+    fn thread_store_projects_messages_to_json_items() {
+        let message = Message::User {
+            content: "hello".to_string(),
+            pinned: false,
+        };
+
+        let item = message_to_thread_json(&message);
+
+        assert_eq!(item["role"], "user");
+        assert_eq!(item["content"], "hello");
     }
 }
