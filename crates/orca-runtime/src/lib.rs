@@ -269,6 +269,29 @@ mod tests {
     }
 
     #[test]
+    fn tool_turn_outcome_is_owned_by_tool_invocation_module() {
+        let agent_loop_source = include_str!("agent_loop.rs");
+        let tool_invocation_source = include_str!("tool_invocation.rs");
+
+        assert!(
+            !agent_loop_source.contains("return Ok(AgentLoopResult {\n                            status,\n                            final_message: None,\n                            error,\n                        });"),
+            "agent_loop must not own tool-turn terminal result shape"
+        );
+        assert!(
+            agent_loop_source.contains("ToolTurnOutcome"),
+            "agent_loop must delegate tool-turn outcome state"
+        );
+        assert!(
+            tool_invocation_source.contains("pub(crate) enum ToolTurnOutcome"),
+            "tool_invocation must own tool-turn outcome state"
+        );
+        assert!(
+            tool_invocation_source.contains("pub(crate) fn terminal_tool_turn"),
+            "tool_invocation must expose terminal tool-turn construction"
+        );
+    }
+
+    #[test]
     fn child_tool_policy_gate_is_owned_by_tool_invocation_module() {
         let agent_loop_source = include_str!("agent_loop.rs");
         let tool_invocation_source = include_str!("tool_invocation.rs");

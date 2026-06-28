@@ -23,10 +23,10 @@ use crate::tool_execution::{
     ToolExecutionContext, execute_tool_with_approval, policy_for_tool_execution,
 };
 use crate::tool_invocation::{
-    AgentToolPolicyContext, NormalToolRecordOutcome, ToolRequestCursor, collect_readonly_batch,
+    AgentToolPolicyContext, ToolRequestCursor, ToolTurnOutcome, collect_readonly_batch,
     execute_readonly_batch, provider_config_for_agent_loop, record_normal_tool_result,
     record_readonly_batch_results, reject_disallowed_child_tool, should_run_readonly_batch,
-    tool_requests_from_provider_steps,
+    terminal_tool_turn, tool_requests_from_provider_steps,
 };
 use crate::workflow_execution::observe_background_workflows;
 use orca_core::cancel::CancelToken;
@@ -57,10 +57,14 @@ impl AgentLoopResult {
     }
 
     fn failure(status: RunStatus, error: impl Into<String>) -> Self {
+        Self::terminal(status, Some(error.into()))
+    }
+
+    fn terminal(status: RunStatus, error: Option<String>) -> Self {
         Self {
             status,
             final_message: None,
-            error: Some(error.into()),
+            error,
         }
     }
 }
@@ -342,11 +346,12 @@ pub(crate) fn run_agent_loop(
                 )? {
                     SubagentBatchRecordOutcome::Continue => {}
                     SubagentBatchRecordOutcome::Return { status, error } => {
-                        return Ok(AgentLoopResult {
-                            status,
-                            final_message: None,
-                            error,
-                        });
+                        match terminal_tool_turn(status, error) {
+                            ToolTurnOutcome::Continue => {}
+                            ToolTurnOutcome::Return { status, error } => {
+                                return Ok(AgentLoopResult::terminal(status, error));
+                            }
+                        }
                     }
                 }
                 cursor.advance_to(batch_end);
@@ -408,13 +413,9 @@ pub(crate) fn run_agent_loop(
                 status,
                 emit_deltas,
             )? {
-                NormalToolRecordOutcome::Continue => {}
-                NormalToolRecordOutcome::Return { status, error } => {
-                    return Ok(AgentLoopResult {
-                        status,
-                        final_message: None,
-                        error,
-                    });
+                ToolTurnOutcome::Continue => {}
+                ToolTurnOutcome::Return { status, error } => {
+                    return Ok(AgentLoopResult::terminal(status, error));
                 }
             }
             cursor.advance_one();

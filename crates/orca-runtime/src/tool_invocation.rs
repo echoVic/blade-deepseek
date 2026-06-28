@@ -45,7 +45,7 @@ pub struct ToolExecutionFailure {
     pub message: String,
 }
 
-pub(crate) enum NormalToolRecordOutcome {
+pub(crate) enum ToolTurnOutcome {
     Continue,
     Return {
         status: RunStatus,
@@ -105,6 +105,16 @@ impl ToolExecutionFailure {
     pub fn into_result(self) -> ToolResult {
         ToolResult::invalid_input(&self.request, self.message)
     }
+}
+
+impl ToolTurnOutcome {
+    pub(crate) fn from_terminal(status: RunStatus, error: Option<String>) -> Self {
+        Self::Return { status, error }
+    }
+}
+
+pub(crate) fn terminal_tool_turn(status: RunStatus, error: Option<String>) -> ToolTurnOutcome {
+    ToolTurnOutcome::from_terminal(status, error)
 }
 
 pub(crate) fn provider_tool_schema_override(
@@ -347,7 +357,7 @@ pub(crate) fn record_normal_tool_result(
     result: &ToolResult,
     status: RunStatus,
     emit_deltas: bool,
-) -> io::Result<NormalToolRecordOutcome> {
+) -> io::Result<ToolTurnOutcome> {
     record_plan_state_for_agent(
         conversation,
         history_writer.as_deref_mut(),
@@ -362,19 +372,16 @@ pub(crate) fn record_normal_tool_result(
     )?;
 
     if status == RunStatus::ApprovalRequired {
-        return Ok(NormalToolRecordOutcome::Return {
-            status,
-            error: result.error.clone(),
-        });
+        return Ok(terminal_tool_turn(status, result.error.clone()));
     }
     if status == RunStatus::Failed && tool_request.name == ToolName::Subagent {
-        return Ok(NormalToolRecordOutcome::Return {
-            status: RunStatus::Failed,
-            error: Some(result.error.clone().unwrap_or_default()),
-        });
+        return Ok(terminal_tool_turn(
+            RunStatus::Failed,
+            Some(result.error.clone().unwrap_or_default()),
+        ));
     }
 
-    Ok(NormalToolRecordOutcome::Continue)
+    Ok(ToolTurnOutcome::Continue)
 }
 
 pub fn prepare_tool_invocation(
@@ -528,10 +535,10 @@ mod tests {
     use crate::hooks::HookOutcome;
 
     use super::{
-        AgentToolPolicyContext, NormalToolRecordOutcome, ToolRequestCursor, apply_pre_tool_outcome,
+        AgentToolPolicyContext, ToolRequestCursor, ToolTurnOutcome, apply_pre_tool_outcome,
         approval_request_for_invocation, prepare_tool_invocation, provider_config_for_agent_loop,
         provider_tool_schema_override, record_normal_tool_result, record_readonly_batch_results,
-        tool_requests_from_provider_steps, validate_tool_invocation,
+        terminal_tool_turn, tool_requests_from_provider_steps, validate_tool_invocation,
     };
 
     fn config_with_external(external_tools: Vec<ExternalToolConfig>) -> RunConfig {
@@ -766,11 +773,11 @@ mod tests {
         .expect("record approval result");
 
         match outcome {
-            NormalToolRecordOutcome::Return { status, error } => {
+            ToolTurnOutcome::Return { status, error } => {
                 assert_eq!(status, RunStatus::ApprovalRequired);
                 assert_eq!(error.as_deref(), Some("needs approval"));
             }
-            NormalToolRecordOutcome::Continue => panic!("approval-required result must return"),
+            ToolTurnOutcome::Continue => panic!("approval-required result must return"),
         }
         assert_eq!(conversation.messages.len(), 1);
         assert!(
@@ -795,11 +802,11 @@ mod tests {
         .expect("record subagent failure");
 
         match outcome {
-            NormalToolRecordOutcome::Return { status, error } => {
+            ToolTurnOutcome::Return { status, error } => {
                 assert_eq!(status, RunStatus::Failed);
                 assert_eq!(error.as_deref(), Some("child failed"));
             }
-            NormalToolRecordOutcome::Continue => panic!("failed subagent result must return"),
+            ToolTurnOutcome::Continue => panic!("failed subagent result must return"),
         }
         assert_eq!(conversation.messages.len(), 1);
         assert!(
@@ -833,6 +840,17 @@ mod tests {
         assert!(
             matches!(&conversation.messages[1], Message::Tool { tool_call_id, .. } if tool_call_id == "tool-2")
         );
+    }
+
+    #[test]
+    fn terminal_tool_turn_carries_status_and_optional_error() {
+        match terminal_tool_turn(RunStatus::Failed, Some("tool failed".to_string())) {
+            ToolTurnOutcome::Return { status, error } => {
+                assert_eq!(status, RunStatus::Failed);
+                assert_eq!(error.as_deref(), Some("tool failed"));
+            }
+            ToolTurnOutcome::Continue => panic!("terminal tool turn must return"),
+        }
     }
 
     #[test]
