@@ -10,8 +10,10 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::thread_store::{
-    SessionRecord, StoredMessage, lock_file, read_history_lines, read_records, read_session_meta,
-    read_transcript, rewrite_records, unlock_file,
+    SessionRecord, StoredMessage, archive_dir, collect_session_files, find_session_path,
+    is_latest_selector, load_thread_records, lock_file, read_history_lines, read_records,
+    read_session_meta, read_transcript, resolve_session_path, rewrite_records, sessions_dir,
+    unlock_file,
 };
 use orca_core::config::{ActivePermissionProfile, AdditionalWorkingDirectory};
 use orca_core::conversation::{
@@ -28,7 +30,6 @@ pub use crate::thread_store::{
     ThreadRelationFilter, ThreadSortKey, ThreadStore, TurnItemsView,
 };
 
-const ORCA_HOME_ENV: &str = "ORCA_HOME";
 const SESSION_SCHEMA_VERSION: u32 = 1;
 
 #[cfg(test)]
@@ -400,32 +401,6 @@ fn thread_summary_matches(summary: &StoredThreadSummary, search_term: &str) -> b
             .model
             .as_deref()
             .is_some_and(|model| model.contains(search_term))
-}
-
-fn load_thread_records(thread_id: &str) -> io::Result<(SessionMeta, Vec<StoredMessage>)> {
-    let path = find_session_path(thread_id, true)?.ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("no saved session matches '{thread_id}'"),
-        )
-    })?;
-    let records = read_records(&path)?;
-    let mut meta = None;
-    let mut messages = Vec::new();
-    for record in records {
-        match record {
-            SessionRecord::Meta(record_meta) => meta = Some(record_meta),
-            SessionRecord::Message { message } => messages.push(message),
-            _ => {}
-        }
-    }
-    let meta = meta.ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("session '{thread_id}' is missing metadata"),
-        )
-    })?;
-    Ok((meta, messages))
 }
 
 fn thread_summary_matches_filters(
@@ -1393,56 +1368,6 @@ fn summarize_session_with_archive_flag(path: &Path, archived: bool) -> io::Resul
     })
 }
 
-fn find_session_path(selector: &str, include_archived: bool) -> io::Result<Option<PathBuf>> {
-    let mut candidates: Vec<PathBuf> = Vec::new();
-    collect_matching_paths(&sessions_dir(), selector, &mut candidates)?;
-    if include_archived {
-        collect_matching_paths(&archive_dir(), selector, &mut candidates)?;
-    }
-
-    if candidates.is_empty() {
-        return Ok(None);
-    }
-
-    candidates.sort_by(|a, b| b.cmp(a));
-    Ok(Some(candidates.into_iter().next().unwrap()))
-}
-
-fn resolve_session_path(selector: &str, include_archived: bool) -> io::Result<Option<PathBuf>> {
-    if is_latest_selector(selector) {
-        return Ok(list_sessions_with_archived(1, include_archived)?
-            .into_iter()
-            .next()
-            .map(|session| session.path));
-    }
-    find_session_path(selector, include_archived)
-}
-
-fn collect_matching_paths(
-    root: &Path,
-    selector: &str,
-    candidates: &mut Vec<PathBuf>,
-) -> io::Result<()> {
-    if is_latest_selector(selector) {
-        return Ok(());
-    }
-    if !root.exists() {
-        return Ok(());
-    }
-    collect_session_files(root, &mut |path| {
-        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
-            return;
-        };
-        if file_name.contains(selector) {
-            candidates.push(path.to_path_buf());
-        }
-    })
-}
-
-fn is_latest_selector(selector: &str) -> bool {
-    matches!(selector, "latest" | "last")
-}
-
 fn collect_summaries_from_root(
     root: &Path,
     archived: bool,
@@ -1456,19 +1381,6 @@ fn collect_summaries_from_root(
             summaries.push(summary);
         }
     })
-}
-
-fn collect_session_files(dir: &Path, on_file: &mut dyn FnMut(&Path)) -> io::Result<()> {
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_dir() {
-            collect_session_files(&path, on_file)?;
-        } else if is_history_file(&path) {
-            on_file(&path);
-        }
-    }
-    Ok(())
 }
 
 pub fn compress_session(selector: &str) -> io::Result<PathBuf> {
@@ -1671,13 +1583,6 @@ fn push_search_hit(
     }
 }
 
-fn is_history_file(path: &Path) -> bool {
-    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-        return false;
-    };
-    name.ends_with(".jsonl") || name.ends_with(".jsonl.zst")
-}
-
 pub(crate) fn session_path(session_id: &str, timestamp: DateTime<Utc>) -> io::Result<PathBuf> {
     let dir = sessions_dir()
         .join(format!("{:04}", timestamp.year()))
@@ -1689,21 +1594,6 @@ pub(crate) fn session_path(session_id: &str, timestamp: DateTime<Utc>) -> io::Re
         timestamp.format("%Y-%m-%dT%H-%M-%S"),
         session_id
     )))
-}
-
-fn sessions_dir() -> PathBuf {
-    orca_home().join("sessions")
-}
-
-fn archive_dir() -> PathBuf {
-    orca_home().join("archive")
-}
-
-fn orca_home() -> PathBuf {
-    std::env::var_os(ORCA_HOME_ENV)
-        .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|home| home.join(".orca")))
-        .unwrap_or_else(|| std::env::temp_dir().join("orca"))
 }
 
 fn title_from_prompt(prompt: &str) -> String {
@@ -1722,6 +1612,7 @@ fn title_from_prompt(prompt: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::thread_store::ORCA_HOME_ENV;
     use orca_core::plan_types::{PlanItem, PlanStatus};
 
     #[test]

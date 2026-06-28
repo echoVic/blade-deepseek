@@ -15,6 +15,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
+pub(crate) const ORCA_HOME_ENV: &str = "ORCA_HOME";
+
 #[derive(Clone, Debug, Default)]
 pub struct JsonlThreadStore;
 
@@ -373,6 +375,125 @@ pub(crate) fn read_transcript(path: &Path) -> io::Result<SessionTranscript> {
         plan: last_plan,
         path: path.to_path_buf(),
     })
+}
+
+pub(crate) fn load_thread_records(
+    thread_id: &str,
+) -> io::Result<(SessionMeta, Vec<StoredMessage>)> {
+    let path = find_session_path(thread_id, true)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("no saved session matches '{thread_id}'"),
+        )
+    })?;
+    let records = read_records(&path)?;
+    let mut meta = None;
+    let mut messages = Vec::new();
+    for record in records {
+        match record {
+            SessionRecord::Meta(record_meta) => meta = Some(record_meta),
+            SessionRecord::Message { message } => messages.push(message),
+            _ => {}
+        }
+    }
+    let meta = meta.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("session '{thread_id}' is missing metadata"),
+        )
+    })?;
+    Ok((meta, messages))
+}
+
+pub(crate) fn find_session_path(
+    selector: &str,
+    include_archived: bool,
+) -> io::Result<Option<PathBuf>> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    collect_matching_paths(&sessions_dir(), selector, &mut candidates)?;
+    if include_archived {
+        collect_matching_paths(&archive_dir(), selector, &mut candidates)?;
+    }
+
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+
+    candidates.sort_by(|a, b| b.cmp(a));
+    Ok(Some(candidates.into_iter().next().unwrap()))
+}
+
+pub(crate) fn resolve_session_path(
+    selector: &str,
+    include_archived: bool,
+) -> io::Result<Option<PathBuf>> {
+    if is_latest_selector(selector) {
+        return Ok(history::list_sessions_with_archived(1, include_archived)?
+            .into_iter()
+            .next()
+            .map(|session| session.path));
+    }
+    find_session_path(selector, include_archived)
+}
+
+fn collect_matching_paths(
+    root: &Path,
+    selector: &str,
+    candidates: &mut Vec<PathBuf>,
+) -> io::Result<()> {
+    if is_latest_selector(selector) {
+        return Ok(());
+    }
+    if !root.exists() {
+        return Ok(());
+    }
+    collect_session_files(root, &mut |path| {
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            return;
+        };
+        if file_name.contains(selector) {
+            candidates.push(path.to_path_buf());
+        }
+    })
+}
+
+pub(crate) fn is_latest_selector(selector: &str) -> bool {
+    matches!(selector, "latest" | "last")
+}
+
+pub(crate) fn collect_session_files(dir: &Path, on_file: &mut dyn FnMut(&Path)) -> io::Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_session_files(&path, on_file)?;
+        } else if is_history_file(&path) {
+            on_file(&path);
+        }
+    }
+    Ok(())
+}
+
+fn is_history_file(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    name.ends_with(".jsonl") || name.ends_with(".jsonl.zst")
+}
+
+pub(crate) fn sessions_dir() -> PathBuf {
+    orca_home().join("sessions")
+}
+
+pub(crate) fn archive_dir() -> PathBuf {
+    orca_home().join("archive")
+}
+
+fn orca_home() -> PathBuf {
+    std::env::var_os(ORCA_HOME_ENV)
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".orca")))
+        .unwrap_or_else(|| std::env::temp_dir().join("orca"))
 }
 
 fn redact_session_record(record: &SessionRecord) -> SessionRecord {
