@@ -1,14 +1,28 @@
 pub use crate::history::{
-    LiveThread, SessionStore, SortDirection, StoredThreadItem, StoredThreadItemPage,
-    StoredThreadProjection, StoredThreadSearchHit, StoredThreadSearchPage, StoredThreadSummary,
-    StoredThreadSummaryPage, StoredThreadTurn, StoredThreadTurnPage, ThreadListFilters,
-    ThreadMetadataPatch, ThreadRelationFilter, ThreadSortKey, ThreadStore, TurnItemsView,
+    JsonlThreadStore, LiveThread, SessionStore, SortDirection, StoredThreadItem,
+    StoredThreadItemPage, StoredThreadProjection, StoredThreadSearchHit, StoredThreadSearchPage,
+    StoredThreadSummary, StoredThreadSummaryPage, StoredThreadTurn, StoredThreadTurnPage,
+    ThreadListFilters, ThreadMetadataPatch, ThreadRelationFilter, ThreadSortKey, ThreadStore,
+    TurnItemsView,
 };
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::history;
+
+    #[test]
+    fn jsonl_thread_store_is_the_named_storage_backend() {
+        fn assert_thread_store<T: ThreadStore>(store: &T) {
+            let _ = store;
+        }
+
+        let store = JsonlThreadStore::new();
+        assert_thread_store(&store);
+
+        let legacy: SessionStore = store;
+        assert_thread_store(&legacy);
+    }
 
     #[test]
     fn session_store_boundary_creates_loadable_jsonl_thread() {

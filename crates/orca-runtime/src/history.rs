@@ -235,7 +235,9 @@ pub struct StoredThreadSummary {
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct SessionStore;
+pub struct JsonlThreadStore;
+
+pub type SessionStore = JsonlThreadStore;
 
 pub trait ThreadStore {
     fn create_live_thread(
@@ -621,7 +623,7 @@ impl LiveThread {
     }
 }
 
-impl SessionStore {
+impl JsonlThreadStore {
     pub fn new() -> Self {
         Self
     }
@@ -730,7 +732,7 @@ impl SessionStore {
     }
 }
 
-impl ThreadStore for SessionStore {
+impl ThreadStore for JsonlThreadStore {
     fn create_live_thread(
         &self,
         cwd: &Path,
