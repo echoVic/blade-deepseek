@@ -14,11 +14,12 @@ use orca_provider::ProviderConfig;
 
 use crate::agent_common;
 use crate::cost::CostTracker;
-use crate::history::{self, SessionStore, SessionWriter, ThreadStore};
+use crate::history::{self, SessionWriter};
 use crate::hooks::{HookContext, HookRunner, conversation_with_hook_context};
 use crate::instructions::{self, ProjectInstructions};
 use crate::memory::{self, MemoryBlock};
 use crate::tasks::TaskRegistry;
+use crate::thread_store::{SessionStore, ThreadStore};
 
 pub fn new_run_id() -> String {
     let nanos = SystemTime::now()

@@ -13,10 +13,6 @@ use serde_json::{Value, json};
 use walkdir::WalkDir;
 
 use crate::agent_loop::ThreadSteerHandle;
-use crate::history::{
-    SessionStore, SortDirection, StoredThreadSummary, ThreadListFilters, ThreadMetadataPatch,
-    ThreadSortKey, ThreadStore, TurnItemsView,
-};
 use crate::lifecycle::{
     RuntimePermissionRequest, RuntimePermissionRequestHandler, RuntimePermissionResponse,
 };
@@ -27,6 +23,10 @@ use crate::server_runtime::{
 };
 use crate::shell_session::{RuntimeShellSessionManager, ShellSandboxMode, ShellSessionCommand};
 use crate::tasks::TaskRegistry;
+use crate::thread_store::{
+    SessionStore, SortDirection, StoredThreadSummary, ThreadListFilters, ThreadMetadataPatch,
+    ThreadSortKey, ThreadStore, TurnItemsView,
+};
 use orca_core::config::{HistoryMode, OutputFormat, RunConfig};
 
 #[derive(Clone, Debug)]
@@ -4474,7 +4474,7 @@ mod tests {
             )
             .expect("thread turn");
 
-            let store = crate::history::SessionStore::new();
+            let store = crate::thread_store::SessionStore::new();
             let transcript = store.load_session("latest").expect("latest transcript");
             assert_eq!(transcript.meta.session_id, thread_id);
             assert!(transcript.messages.iter().any(|message| {

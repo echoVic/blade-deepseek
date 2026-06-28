@@ -20,7 +20,6 @@ use crate::agent_loop::{
     run_agent_loop,
 };
 use crate::cost::CostTracker;
-use crate::history::SessionStore;
 use crate::hooks::{HookContext, HookRunner};
 use crate::instructions;
 use crate::instructions::ProjectInstructions;
@@ -28,6 +27,7 @@ use crate::lifecycle::{RuntimePermissionRequestHandler, RuntimeSessionLifecycle,
 use crate::memory;
 use crate::session::{InteractiveSession, InteractiveSessionRuntimeParts, new_run_id};
 use crate::tasks::TaskRegistry;
+use crate::thread_store::SessionStore;
 #[cfg(test)]
 use crate::tool_invocation::{
     apply_pre_tool_outcome_with_external, prepare_tool_invocation_with_external,

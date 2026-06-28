@@ -12,13 +12,13 @@ use serde_json::{Value, json};
 
 use crate::agent_loop::ThreadSteerHandle;
 use crate::controller::{ThreadTurnExecutor, ThreadTurnRequest};
-use crate::history::{
-    SessionStore, StoredThreadItem, StoredThreadProjection, StoredThreadTurn, ThreadMetadataPatch,
-    ThreadStore, TurnItemsView,
-};
 use crate::lifecycle::{RuntimePermissionRequestHandler, RuntimeSessionLifecycle, RuntimeTaskKind};
 use crate::protocol;
 use crate::session::{InteractiveSession, new_run_id};
+use crate::thread_store::{
+    SessionStore, StoredThreadItem, StoredThreadProjection, StoredThreadTurn, ThreadMetadataPatch,
+    ThreadStore, TurnItemsView,
+};
 pub use orca_core::config::{ActivePermissionProfile, AdditionalWorkingDirectory};
 use orca_core::config::{HistoryMode, OutputFormat, RunConfig};
 
@@ -389,9 +389,9 @@ impl ServerThread {
         &self,
         cursor: Option<&str>,
         limit: usize,
-        sort_direction: crate::history::SortDirection,
+        sort_direction: crate::thread_store::SortDirection,
         items_view: TurnItemsView,
-    ) -> crate::history::StoredThreadTurnPage {
+    ) -> crate::thread_store::StoredThreadTurnPage {
         crate::history::page_thread_turns(
             crate::history::messages_to_thread_turns(
                 &self.thread_id,
@@ -410,8 +410,8 @@ impl ServerThread {
         turn_id: Option<&str>,
         cursor: Option<&str>,
         limit: usize,
-        sort_direction: crate::history::SortDirection,
-    ) -> crate::history::StoredThreadItemPage {
+        sort_direction: crate::thread_store::SortDirection,
+    ) -> crate::thread_store::StoredThreadItemPage {
         crate::history::page_thread_items(
             crate::history::messages_to_thread_items(
                 &self.thread_id,
@@ -605,9 +605,9 @@ impl ServerThreadRuntime {
         thread_id: &str,
         cursor: Option<&str>,
         limit: usize,
-        sort_direction: crate::history::SortDirection,
+        sort_direction: crate::thread_store::SortDirection,
         items_view: TurnItemsView,
-    ) -> Option<crate::history::StoredThreadTurnPage> {
+    ) -> Option<crate::thread_store::StoredThreadTurnPage> {
         let thread = self.threads.get(thread_id)?;
         Some(thread.list_turns(cursor, limit, sort_direction, items_view))
     }
@@ -618,8 +618,8 @@ impl ServerThreadRuntime {
         turn_id: Option<&str>,
         cursor: Option<&str>,
         limit: usize,
-        sort_direction: crate::history::SortDirection,
-    ) -> Option<crate::history::StoredThreadItemPage> {
+        sort_direction: crate::thread_store::SortDirection,
+    ) -> Option<crate::thread_store::StoredThreadItemPage> {
         let thread = self.threads.get(thread_id)?;
         Some(thread.list_items(turn_id, cursor, limit, sort_direction))
     }
@@ -642,7 +642,7 @@ impl ServerThreadRuntime {
                 .list_turns(
                     None,
                     usize::MAX,
-                    crate::history::SortDirection::Asc,
+                    crate::thread_store::SortDirection::Asc,
                     TurnItemsView::Full,
                 )
                 .data
