@@ -63,12 +63,17 @@ pub(crate) struct RuntimeTurnConfig<'a> {
     subagent_type: &'a SubagentType,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct RuntimeTurnDeps<'a> {
+    instructions: &'a ProjectInstructions,
+    memory: &'a MemoryBlock,
+    mcp_registry: &'a McpRegistry,
+    hooks: &'a HookRunner,
+}
+
 pub(crate) struct AgentLoopContext<'a> {
     turn_config: RuntimeTurnConfig<'a>,
-    instructions: Option<&'a ProjectInstructions>,
-    memory: Option<&'a MemoryBlock>,
-    mcp_registry: Option<&'a McpRegistry>,
-    hooks: Option<&'a HookRunner>,
+    turn_deps: Option<RuntimeTurnDeps<'a>>,
     cost_tracker: Option<&'a mut CostTracker>,
     cancel: Option<&'a CancelToken>,
     task_registry: Option<&'a TaskRegistry>,
@@ -174,6 +179,42 @@ impl<'a> RuntimeTurnConfig<'a> {
     }
 }
 
+impl<'a> RuntimeTurnDeps<'a> {
+    pub(crate) fn new(
+        instructions: &'a ProjectInstructions,
+        memory: &'a MemoryBlock,
+        mcp_registry: &'a McpRegistry,
+        hooks: &'a HookRunner,
+    ) -> Self {
+        Self {
+            instructions,
+            memory,
+            mcp_registry,
+            hooks,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn instructions(&self) -> &'a ProjectInstructions {
+        self.instructions
+    }
+
+    #[cfg(test)]
+    pub(crate) fn memory(&self) -> &'a MemoryBlock {
+        self.memory
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mcp_registry(&self) -> &'a McpRegistry {
+        self.mcp_registry
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hooks(&self) -> &'a HookRunner {
+        self.hooks
+    }
+}
+
 impl<'a> AgentLoopContext<'a> {
     pub fn new(
         cwd: &'a Path,
@@ -190,10 +231,7 @@ impl<'a> AgentLoopContext<'a> {
                 emit_deltas,
                 subagent_type,
             ),
-            instructions: None,
-            memory: None,
-            mcp_registry: None,
-            hooks: None,
+            turn_deps: None,
             cost_tracker: None,
             cancel: None,
             task_registry: None,
@@ -217,31 +255,38 @@ impl<'a> AgentLoopContext<'a> {
         mcp_registry: &'a McpRegistry,
         hooks: &'a HookRunner,
     ) -> Self {
-        self.instructions = Some(instructions);
-        self.memory = Some(memory);
-        self.mcp_registry = Some(mcp_registry);
-        self.hooks = Some(hooks);
+        self.turn_deps = Some(RuntimeTurnDeps::new(
+            instructions,
+            memory,
+            mcp_registry,
+            hooks,
+        ));
         self
     }
 
     #[cfg(test)]
+    pub(crate) fn turn_deps(&self) -> RuntimeTurnDeps<'a> {
+        self.turn_deps.expect("agent loop turn deps")
+    }
+
+    #[cfg(test)]
     pub fn instructions(&self) -> &'a ProjectInstructions {
-        self.instructions.expect("agent loop instructions")
+        self.turn_deps().instructions()
     }
 
     #[cfg(test)]
     pub fn memory(&self) -> &'a MemoryBlock {
-        self.memory.expect("agent loop memory")
+        self.turn_deps().memory()
     }
 
     #[cfg(test)]
     pub fn mcp_registry(&self) -> &'a McpRegistry {
-        self.mcp_registry.expect("agent loop mcp registry")
+        self.turn_deps().mcp_registry()
     }
 
     #[cfg(test)]
     pub fn hooks(&self) -> &'a HookRunner {
-        self.hooks.expect("agent loop hooks")
+        self.turn_deps().hooks()
     }
 
     pub fn with_runtime(
@@ -403,10 +448,7 @@ pub(crate) fn run_agent_loop(
                 emit_deltas,
                 subagent_type,
             },
-        instructions,
-        memory,
-        mcp_registry,
-        hooks,
+        turn_deps,
         cost_tracker,
         cancel,
         task_registry,
@@ -416,10 +458,12 @@ pub(crate) fn run_agent_loop(
         steer_handle,
         permission_handler,
     } = loop_context;
-    let instructions = instructions.expect("agent loop instructions");
-    let memory = memory.expect("agent loop memory");
-    let mcp_registry = mcp_registry.expect("agent loop mcp registry");
-    let hooks = hooks.expect("agent loop hooks");
+    let RuntimeTurnDeps {
+        instructions,
+        memory,
+        mcp_registry,
+        hooks,
+    } = turn_deps.expect("agent loop turn deps");
     let cost_tracker = cost_tracker.expect("agent loop cost tracker");
     let cancel = cancel.expect("agent loop cancel token");
     let task_registry = task_registry.expect("agent loop task registry");
@@ -1241,6 +1285,40 @@ mod tests {
         assert!(std::ptr::eq(context.memory(), &memory));
         assert!(std::ptr::eq(context.mcp_registry(), &registry));
         assert!(std::ptr::eq(context.hooks(), &hooks));
+    }
+
+    #[test]
+    fn runtime_turn_deps_group_agent_loop_services() {
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let registry = McpRegistry::default();
+        let hooks = HookRunner::default();
+
+        let deps = RuntimeTurnDeps::new(&instructions, &memory, &registry, &hooks);
+
+        assert!(std::ptr::eq(deps.instructions(), &instructions));
+        assert!(std::ptr::eq(deps.memory(), &memory));
+        assert!(std::ptr::eq(deps.mcp_registry(), &registry));
+        assert!(std::ptr::eq(deps.hooks(), &hooks));
+    }
+
+    #[test]
+    fn agent_loop_context_exposes_runtime_turn_deps() {
+        let cwd = PathBuf::from("/tmp/orca-agent-loop-deps");
+        let subagent_type = SubagentType::General;
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let registry = McpRegistry::default();
+        let hooks = HookRunner::default();
+
+        let context = AgentLoopContext::new(&cwd, "inspect repo", 0, true, &subagent_type)
+            .with_services(&instructions, &memory, &registry, &hooks);
+
+        let deps = context.turn_deps();
+        assert!(std::ptr::eq(deps.instructions(), &instructions));
+        assert!(std::ptr::eq(deps.memory(), &memory));
+        assert!(std::ptr::eq(deps.mcp_registry(), &registry));
+        assert!(std::ptr::eq(deps.hooks(), &hooks));
     }
 
     #[test]
