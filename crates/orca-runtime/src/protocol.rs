@@ -1550,6 +1550,10 @@ impl Serialize for ServerEventEnvelope {
                 }),
             );
         }
+        if let ServerEvent::WorkflowLifecycle { event_name, .. } = &self.event {
+            object.insert("event".to_string(), Value::from(event_name.clone()));
+            object.remove("eventName");
+        }
         let mut map = serializer.serialize_map(Some(object.len()))?;
         for (key, value) in object {
             map.serialize_entry(key, value)?;
@@ -1623,6 +1627,31 @@ pub enum ServerEvent {
         #[serde(rename = "runId")]
         run_id: Value,
         error: Value,
+        task: Value,
+    },
+    WorkflowLifecycle {
+        #[serde(rename = "eventName")]
+        event_name: String,
+        #[serde(rename = "taskId")]
+        task_id: Value,
+        #[serde(rename = "runId")]
+        run_id: Value,
+        #[serde(rename = "workflowName", skip_serializing_if = "Value::is_null")]
+        workflow_name: Value,
+        #[serde(skip_serializing_if = "Value::is_null")]
+        phase: Value,
+        #[serde(rename = "agentId", skip_serializing_if = "Value::is_null")]
+        agent_id: Value,
+        #[serde(skip_serializing_if = "Value::is_null")]
+        status: Value,
+        #[serde(skip_serializing_if = "Value::is_null")]
+        summary: Value,
+        #[serde(skip_serializing_if = "Value::is_null")]
+        output: Value,
+        #[serde(skip_serializing_if = "Value::is_null")]
+        error: Value,
+        #[serde(skip_serializing_if = "Value::is_null")]
+        reason: Value,
         task: Value,
     },
     ThreadRead {
@@ -1906,6 +1935,28 @@ pub fn map_runtime_event_line(line: &str) -> Option<ServerEvent> {
             task_id: payload["taskId"].clone(),
             run_id: payload["runId"].clone(),
             error: payload["error"].clone(),
+            task: payload["task"].clone(),
+        }),
+        "workflow.resumed"
+        | "workflow.phase.started"
+        | "workflow.phase.completed"
+        | "workflow.agent.started"
+        | "workflow.agent.cached"
+        | "workflow.agent.completed"
+        | "workflow.agent.failed"
+        | "workflow.paused"
+        | "workflow.stopped" => Some(ServerEvent::WorkflowLifecycle {
+            event_name: event["type"].as_str().unwrap_or_default().replace('.', "_"),
+            task_id: payload["taskId"].clone(),
+            run_id: payload["runId"].clone(),
+            workflow_name: payload["workflowName"].clone(),
+            phase: payload["phase"].clone(),
+            agent_id: payload["agentId"].clone(),
+            status: payload["status"].clone(),
+            summary: payload["summary"].clone(),
+            output: payload["output"].clone(),
+            error: payload["error"].clone(),
+            reason: payload["reason"].clone(),
             task: payload["task"].clone(),
         }),
         "error" => Some(ServerEvent::Error {
@@ -3160,6 +3211,44 @@ mod tests {
         assert_eq!(value["task"]["task_id"], "workflow-run-1:task-1");
         assert_eq!(value["task"]["kind"], "workflow");
         assert_eq!(value["task"]["status"], "running");
+    }
+
+    #[test]
+    fn maps_runtime_workflow_lifecycle_events_to_protocol_shape() {
+        let cases = [
+            (
+                r#"{"type":"workflow.phase.started","payload":{"taskId":"task-1","runId":"workflow-run-1","phase":"scan"}}"#,
+                "workflow_phase_started",
+                "scan",
+            ),
+            (
+                r#"{"type":"workflow.agent.started","payload":{"taskId":"task-1","runId":"workflow-run-1","phase":"scan","agentId":"agent-1"}}"#,
+                "workflow_agent_started",
+                "agent-1",
+            ),
+            (
+                r#"{"type":"workflow.agent.failed","payload":{"taskId":"task-1","runId":"workflow-run-1","phase":"scan","agentId":"agent-1","error":"boom"}}"#,
+                "workflow_agent_failed",
+                "boom",
+            ),
+            (
+                r#"{"type":"workflow.paused","payload":{"taskId":"task-1","runId":"workflow-run-1","workflowName":"audit","reason":"manual"}}"#,
+                "workflow_paused",
+                "manual",
+            ),
+        ];
+
+        for (raw, event_name, detail) in cases {
+            let event = map_runtime_event_line(raw).expect("mapped event");
+            let value = legacy_json_event(Value::from(7), event);
+            assert_eq!(value["event"], event_name);
+            assert_eq!(value["taskId"], "task-1");
+            assert_eq!(value["runId"], "workflow-run-1");
+            assert!(
+                value.to_string().contains(detail),
+                "mapped event should preserve detail {detail}: {value}"
+            );
+        }
     }
 
     #[test]

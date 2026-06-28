@@ -280,6 +280,53 @@ fn tui_event_from_runtime_event(event: &EventEnvelope) -> Option<TuiEvent> {
         EventType::WorkflowTasksUpdated => Some(TuiEvent::WorkflowTasksUpdated {
             tasks: serde_json::from_value(event.payload["tasks"].clone()).ok()?,
         }),
+        EventType::WorkflowResumed => Some(TuiEvent::Notice(format!(
+            "Workflow resumed: {}",
+            workflow_name_from_payload(&event.payload)
+        ))),
+        EventType::WorkflowPhaseStarted => Some(TuiEvent::Notice(format!(
+            "Workflow phase started: {}",
+            event.payload["phase"].as_str()?
+        ))),
+        EventType::WorkflowPhaseCompleted => Some(TuiEvent::Notice(format!(
+            "Workflow phase completed: {} ({}){}",
+            event.payload["phase"].as_str()?,
+            event.payload["status"].as_str().unwrap_or("completed"),
+            optional_detail_suffix(&event.payload, "summary")
+        ))),
+        EventType::WorkflowAgentStarted => Some(TuiEvent::Notice(format!(
+            "Workflow agent started: {} ({})",
+            event.payload["agentId"].as_str()?,
+            event.payload["phase"].as_str().unwrap_or("workflow")
+        ))),
+        EventType::WorkflowAgentCached => Some(TuiEvent::Notice(format!(
+            "Workflow agent cached: {} ({}){}",
+            event.payload["agentId"].as_str()?,
+            event.payload["phase"].as_str().unwrap_or("workflow"),
+            optional_detail_suffix(&event.payload, "output")
+        ))),
+        EventType::WorkflowAgentCompleted => Some(TuiEvent::Notice(format!(
+            "Workflow agent completed: {} ({}){}",
+            event.payload["agentId"].as_str()?,
+            event.payload["phase"].as_str().unwrap_or("workflow"),
+            optional_detail_suffix(&event.payload, "output")
+        ))),
+        EventType::WorkflowAgentFailed => Some(TuiEvent::Notice(format!(
+            "Workflow agent failed: {} ({}): {}",
+            event.payload["agentId"].as_str()?,
+            event.payload["phase"].as_str().unwrap_or("workflow"),
+            event.payload["error"].as_str().unwrap_or("failed")
+        ))),
+        EventType::WorkflowPaused => Some(TuiEvent::Notice(format!(
+            "Workflow paused: {} ({})",
+            workflow_name_from_payload(&event.payload),
+            event.payload["reason"].as_str().unwrap_or("paused")
+        ))),
+        EventType::WorkflowStopped => Some(TuiEvent::Notice(format!(
+            "Workflow stopped: {} ({})",
+            workflow_name_from_payload(&event.payload),
+            event.payload["reason"].as_str().unwrap_or("stopped")
+        ))),
         EventType::VerificationStarted => Some(TuiEvent::Notice(format!(
             "Verification started: {}",
             event.payload["command"].as_str()?
@@ -309,6 +356,23 @@ fn tui_event_from_runtime_event(event: &EventEnvelope) -> Option<TuiEvent> {
         }),
         _ => None,
     }
+}
+
+fn workflow_name_from_payload(payload: &serde_json::Value) -> String {
+    payload
+        .get("workflowName")
+        .and_then(|value| value.as_str())
+        .unwrap_or("workflow")
+        .to_string()
+}
+
+fn optional_detail_suffix(payload: &serde_json::Value, key: &str) -> String {
+    payload
+        .get(key)
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+        .map(|value| format!(": {value}"))
+        .unwrap_or_default()
 }
 
 fn send_error_for_tui(event_tx: &Sender<TuiEvent>, events: &mut EventFactory, message: &str) {
@@ -3065,6 +3129,40 @@ mod tests {
             }
             other => panic!("expected workflow notification, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn runtime_workflow_lifecycle_events_map_to_tui_notices() {
+        let mut events = EventFactory::new("run-1".to_string());
+
+        let phase_started = tui_event_from_runtime_event(&events.workflow_phase_started(
+            "task-1",
+            "workflow-run-1",
+            "scan",
+        ))
+        .expect("phase started");
+        let agent_failed = tui_event_from_runtime_event(&events.workflow_agent_failed(
+            "task-1",
+            "workflow-run-1",
+            "scan",
+            "agent-1",
+            "boom",
+        ))
+        .expect("agent failed");
+        let paused = tui_event_from_runtime_event(&events.workflow_paused(
+            "task-1",
+            "workflow-run-1",
+            "audit",
+            "manual pause",
+        ))
+        .expect("paused");
+
+        assert!(matches!(phase_started, TuiEvent::Notice(message)
+                if message == "Workflow phase started: scan"));
+        assert!(matches!(agent_failed, TuiEvent::Notice(message)
+                if message == "Workflow agent failed: agent-1 (scan): boom"));
+        assert!(matches!(paused, TuiEvent::Notice(message)
+                if message == "Workflow paused: audit (manual pause)"));
     }
 
     #[test]

@@ -327,6 +327,96 @@ impl EventFactory {
         )
     }
 
+    pub fn workflow_resumed(
+        &mut self,
+        task_id: &str,
+        run_id: &str,
+        workflow_name: &str,
+    ) -> EventEnvelope {
+        self.make(
+            EventType::WorkflowResumed,
+            json!({
+                "taskId": task_id,
+                "runId": run_id,
+                "workflowName": workflow_name
+            }),
+        )
+    }
+
+    pub fn workflow_phase_started(
+        &mut self,
+        task_id: &str,
+        run_id: &str,
+        phase: &str,
+    ) -> EventEnvelope {
+        self.make(
+            EventType::WorkflowPhaseStarted,
+            json!({
+                "taskId": task_id,
+                "runId": run_id,
+                "phase": phase
+            }),
+        )
+    }
+
+    pub fn workflow_phase_completed(
+        &mut self,
+        task_id: &str,
+        run_id: &str,
+        phase: &str,
+        status: RunStatus,
+        summary: Option<&str>,
+    ) -> EventEnvelope {
+        self.make(
+            EventType::WorkflowPhaseCompleted,
+            json!({
+                "taskId": task_id,
+                "runId": run_id,
+                "phase": phase,
+                "status": status,
+                "summary": summary
+            }),
+        )
+    }
+
+    pub fn workflow_agent_started(
+        &mut self,
+        task_id: &str,
+        run_id: &str,
+        phase: &str,
+        agent_id: &str,
+    ) -> EventEnvelope {
+        self.make(
+            EventType::WorkflowAgentStarted,
+            json!({
+                "taskId": task_id,
+                "runId": run_id,
+                "phase": phase,
+                "agentId": agent_id
+            }),
+        )
+    }
+
+    pub fn workflow_agent_cached(
+        &mut self,
+        task_id: &str,
+        run_id: &str,
+        phase: &str,
+        agent_id: &str,
+        output: &str,
+    ) -> EventEnvelope {
+        self.make(
+            EventType::WorkflowAgentCached,
+            json!({
+                "taskId": task_id,
+                "runId": run_id,
+                "phase": phase,
+                "agentId": agent_id,
+                "output": output
+            }),
+        )
+    }
+
     pub fn workflow_agent_completed(
         &mut self,
         task_id: &str,
@@ -343,6 +433,62 @@ impl EventFactory {
                 "phase": phase,
                 "agentId": agent_id,
                 "output": output
+            }),
+        )
+    }
+
+    pub fn workflow_agent_failed(
+        &mut self,
+        task_id: &str,
+        run_id: &str,
+        phase: &str,
+        agent_id: &str,
+        error: &str,
+    ) -> EventEnvelope {
+        self.make(
+            EventType::WorkflowAgentFailed,
+            json!({
+                "taskId": task_id,
+                "runId": run_id,
+                "phase": phase,
+                "agentId": agent_id,
+                "error": error
+            }),
+        )
+    }
+
+    pub fn workflow_paused(
+        &mut self,
+        task_id: &str,
+        run_id: &str,
+        workflow_name: &str,
+        reason: &str,
+    ) -> EventEnvelope {
+        self.make(
+            EventType::WorkflowPaused,
+            json!({
+                "taskId": task_id,
+                "runId": run_id,
+                "workflowName": workflow_name,
+                "reason": reason
+            }),
+        )
+    }
+
+    pub fn workflow_stopped(
+        &mut self,
+        task_id: &str,
+        run_id: &str,
+        workflow_name: &str,
+        reason: &str,
+    ) -> EventEnvelope {
+        self.make(
+            EventType::WorkflowStopped,
+            json!({
+                "taskId": task_id,
+                "runId": run_id,
+                "workflowName": workflow_name,
+                "reason": reason
             }),
         )
     }
@@ -588,6 +734,57 @@ mod tests {
         assert_eq!(event.payload["toolUseId"], "tool-use-1");
         assert_eq!(event.payload["status"], "completed");
         assert_eq!(event.payload["result"], "all phases passed");
+    }
+
+    #[test]
+    fn workflow_lifecycle_payloads_cover_declared_event_types() {
+        let mut f = EventFactory::new("run-1".to_string());
+
+        let resumed = f.workflow_resumed("task-1", "workflow-run-1", "audit");
+        assert_eq!(resumed.event_type, EventType::WorkflowResumed);
+        assert_eq!(resumed.payload["taskId"], "task-1");
+        assert_eq!(resumed.payload["runId"], "workflow-run-1");
+        assert_eq!(resumed.payload["workflowName"], "audit");
+
+        let phase_started = f.workflow_phase_started("task-1", "workflow-run-1", "scan");
+        assert_eq!(phase_started.event_type, EventType::WorkflowPhaseStarted);
+        assert_eq!(phase_started.payload["phase"], "scan");
+
+        let phase_completed = f.workflow_phase_completed(
+            "task-1",
+            "workflow-run-1",
+            "scan",
+            RunStatus::Success,
+            Some("scan ok"),
+        );
+        assert_eq!(
+            phase_completed.event_type,
+            EventType::WorkflowPhaseCompleted
+        );
+        assert_eq!(phase_completed.payload["status"], "success");
+        assert_eq!(phase_completed.payload["summary"], "scan ok");
+
+        let agent_started = f.workflow_agent_started("task-1", "workflow-run-1", "scan", "agent-1");
+        assert_eq!(agent_started.event_type, EventType::WorkflowAgentStarted);
+        assert_eq!(agent_started.payload["agentId"], "agent-1");
+
+        let agent_cached =
+            f.workflow_agent_cached("task-1", "workflow-run-1", "scan", "agent-1", "cached ok");
+        assert_eq!(agent_cached.event_type, EventType::WorkflowAgentCached);
+        assert_eq!(agent_cached.payload["output"], "cached ok");
+
+        let agent_failed =
+            f.workflow_agent_failed("task-1", "workflow-run-1", "scan", "agent-1", "boom");
+        assert_eq!(agent_failed.event_type, EventType::WorkflowAgentFailed);
+        assert_eq!(agent_failed.payload["error"], "boom");
+
+        let paused = f.workflow_paused("task-1", "workflow-run-1", "audit", "user pause");
+        assert_eq!(paused.event_type, EventType::WorkflowPaused);
+        assert_eq!(paused.payload["reason"], "user pause");
+
+        let stopped = f.workflow_stopped("task-1", "workflow-run-1", "audit", "stop requested");
+        assert_eq!(stopped.event_type, EventType::WorkflowStopped);
+        assert_eq!(stopped.payload["reason"], "stop requested");
     }
 
     #[test]
