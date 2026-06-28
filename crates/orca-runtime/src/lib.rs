@@ -256,6 +256,29 @@ mod tests {
     }
 
     #[test]
+    fn readonly_tool_batch_result_recording_is_owned_by_tool_invocation_module() {
+        let agent_loop_source = include_str!("agent_loop.rs");
+        let tool_invocation_source = include_str!("tool_invocation.rs");
+
+        assert!(
+            !agent_loop_source.contains("record_tool_result_for_agent("),
+            "agent_loop must not own readonly batch result recording"
+        );
+        assert!(
+            agent_loop_source.contains("record_readonly_batch_results("),
+            "agent_loop must delegate readonly batch result recording"
+        );
+        assert!(
+            tool_invocation_source.contains("pub(crate) fn record_readonly_batch_results"),
+            "tool_invocation must expose readonly batch result recording"
+        );
+        assert!(
+            tool_invocation_source.contains("record_tool_result_for_agent"),
+            "tool_invocation must reuse shared session tool result recording"
+        );
+    }
+
+    #[test]
     fn subagent_batch_result_recording_is_owned_by_subagent_execution_module() {
         let agent_loop_source = include_str!("agent_loop.rs");
         let subagent_execution_source = include_str!("subagent_execution.rs");

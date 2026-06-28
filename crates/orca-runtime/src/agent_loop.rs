@@ -13,7 +13,7 @@ use crate::lifecycle::{
 use crate::memory::{self, MemoryBlock};
 use crate::session::{
     AgentConversationContext, bootstrap_agent_conversation, record_assistant_response_for_agent,
-    record_initial_history_for_agent, record_tool_result_for_agent,
+    record_initial_history_for_agent,
 };
 use crate::subagent_execution::{
     SubagentBatchRecordOutcome, collect_subagent_batch, execute_subagent_batch,
@@ -23,8 +23,8 @@ use crate::tasks::TaskRegistry;
 use crate::tool_execution::{ToolExecutionActor, ToolExecutionContext};
 use crate::tool_invocation::{
     AgentToolPolicyContext, NormalToolRecordOutcome, collect_readonly_batch,
-    execute_readonly_batch, record_normal_tool_result, reject_disallowed_child_tool,
-    should_run_readonly_batch,
+    execute_readonly_batch, record_normal_tool_result, record_readonly_batch_results,
+    reject_disallowed_child_tool, should_run_readonly_batch,
 };
 use crate::workflow_execution::observe_background_workflows;
 use orca_approval::ApprovalPolicy;
@@ -412,14 +412,12 @@ pub(crate) fn run_agent_loop(
                     config.tools.output_truncation,
                 )?;
 
-                for result in results {
-                    record_tool_result_for_agent(
-                        conversation,
-                        history_writer.as_deref_mut(),
-                        &result,
-                        emit_deltas,
-                    )?;
-                }
+                record_readonly_batch_results(
+                    conversation,
+                    history_writer.as_deref_mut(),
+                    results,
+                    emit_deltas,
+                )?;
                 index = batch_end;
                 continue;
             }

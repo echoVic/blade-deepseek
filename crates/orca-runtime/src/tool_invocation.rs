@@ -223,6 +223,23 @@ pub(crate) fn collect_readonly_batch(
     orca_tools::collect_readonly_batch(max_read_parallel, tool_requests, start)
 }
 
+pub(crate) fn record_readonly_batch_results(
+    conversation: &mut Conversation,
+    mut history_writer: Option<&mut SessionWriter>,
+    results: Vec<ToolResult>,
+    emit_deltas: bool,
+) -> io::Result<()> {
+    for result in results {
+        record_tool_result_for_agent(
+            conversation,
+            history_writer.as_deref_mut(),
+            &result,
+            emit_deltas,
+        )?;
+    }
+    Ok(())
+}
+
 pub(crate) fn record_normal_tool_result(
     conversation: &mut Conversation,
     mut history_writer: Option<&mut SessionWriter>,
@@ -410,7 +427,8 @@ mod tests {
 
     use super::{
         NormalToolRecordOutcome, apply_pre_tool_outcome, approval_request_for_invocation,
-        prepare_tool_invocation, record_normal_tool_result, validate_tool_invocation,
+        prepare_tool_invocation, record_normal_tool_result, record_readonly_batch_results,
+        validate_tool_invocation,
     };
 
     fn config_with_external(external_tools: Vec<ExternalToolConfig>) -> RunConfig {
@@ -526,6 +544,34 @@ mod tests {
         assert_eq!(conversation.messages.len(), 1);
         assert!(
             matches!(&conversation.messages[0], Message::Tool { tool_call_id, .. } if tool_call_id == "tool-1")
+        );
+    }
+
+    #[test]
+    fn record_readonly_batch_results_records_each_tool_message_in_order() {
+        let mut conversation = Conversation::new();
+        let first = request(ToolName::ReadFile, ActionKind::Read, Some("one.txt"), None);
+        let second = ToolRequest {
+            id: "tool-2".to_string(),
+            name: ToolName::ListFiles,
+            action: ActionKind::Read,
+            target: Some("src".to_string()),
+            raw_arguments: None,
+        };
+        let results = vec![
+            ToolResult::completed(&first, "one".to_string(), false),
+            ToolResult::completed(&second, "two".to_string(), false),
+        ];
+
+        record_readonly_batch_results(&mut conversation, None, results, false)
+            .expect("record readonly batch results");
+
+        assert_eq!(conversation.messages.len(), 2);
+        assert!(
+            matches!(&conversation.messages[0], Message::Tool { tool_call_id, .. } if tool_call_id == "tool-1")
+        );
+        assert!(
+            matches!(&conversation.messages[1], Message::Tool { tool_call_id, .. } if tool_call_id == "tool-2")
         );
     }
 
