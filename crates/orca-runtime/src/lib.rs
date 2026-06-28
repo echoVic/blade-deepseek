@@ -585,6 +585,29 @@ mod tests {
     }
 
     #[test]
+    fn agent_tool_approval_policy_construction_is_owned_by_tool_execution_module() {
+        let agent_loop_source = include_str!("agent_loop.rs");
+        let tool_execution_source = include_str!("tool_execution.rs");
+
+        assert!(
+            !agent_loop_source.contains("ApprovalPolicy::new"),
+            "agent_loop must not own tool approval policy construction"
+        );
+        assert!(
+            agent_loop_source.contains("policy_for_tool_execution"),
+            "agent_loop must delegate tool approval policy construction"
+        );
+        assert!(
+            tool_execution_source.contains("pub(crate) fn policy_for_tool_execution"),
+            "tool_execution must expose approval policy construction"
+        );
+        assert!(
+            tool_execution_source.contains("with_permission_rules"),
+            "tool_execution must preserve config permission rules in approval policy"
+        );
+    }
+
+    #[test]
     fn runtime_compaction_step_is_owned_by_lifecycle_module() {
         let agent_loop_source = include_str!("agent_loop.rs");
         let lifecycle_source = include_str!("lifecycle.rs");

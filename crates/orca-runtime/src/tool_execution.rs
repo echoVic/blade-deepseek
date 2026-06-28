@@ -57,6 +57,10 @@ pub(crate) struct ToolExecutionActor {
     runtime: RuntimeToolActorContext,
 }
 
+pub(crate) fn policy_for_tool_execution(config: &RunConfig) -> ApprovalPolicy {
+    ApprovalPolicy::new(config.approval_mode).with_permission_rules(config.permission_rules.clone())
+}
+
 impl<'a> ToolExecutionContext<'a> {
     pub(crate) fn new(
         cwd: &'a Path,
@@ -746,4 +750,76 @@ fn emit_tool_call_completed(
 ) -> io::Result<()> {
     let event = RuntimeTaskActor::tool_call_completed_event_for(events, request, result);
     sink.emit(&event)
+}
+
+#[cfg(test)]
+mod tests {
+    use orca_core::approval_rules::{PermissionRule, PermissionRules};
+    use orca_core::approval_types::{
+        ActionKind, ApprovalDecision, ApprovalMode, ApprovalRequest, Decision,
+    };
+    use orca_core::config::{
+        HistoryMode, ModelRuntimeConfig, OutputFormat, ProviderKind, RunConfig, ThemeName,
+        ToolConfig, WorkflowConfig,
+    };
+    use orca_core::model::ModelSelection;
+    use orca_core::subagent_config::SubagentConfig;
+
+    use super::policy_for_tool_execution;
+
+    fn config_with_permission_rules(permission_rules: PermissionRules) -> RunConfig {
+        RunConfig {
+            app_version: "test".to_string(),
+            prompt: "test".to_string(),
+            cwd: Some(std::env::current_dir().expect("cwd")),
+            output_format: OutputFormat::Jsonl,
+            approval_mode: ApprovalMode::FullAuto,
+            provider: ProviderKind::Mock,
+            verifier: None,
+            model: ModelSelection::from_unchecked(Some("mock".to_string())),
+            model_runtime: ModelRuntimeConfig::default(),
+            api_key: None,
+            base_url: None,
+            mcp_servers: Vec::new(),
+            hooks: Vec::new(),
+            external_tools: Vec::new(),
+            history_mode: HistoryMode::Disabled,
+            show_session_picker: false,
+            active_permission_profile: None,
+            permission_profiles: Default::default(),
+            runtime_workspace_roots: None,
+            permission_rules,
+            additional_working_directories: Vec::new(),
+            max_budget_usd: None,
+            subagents: SubagentConfig::default(),
+            tools: ToolConfig::default(),
+            workflows: WorkflowConfig::default(),
+            theme: ThemeName::Dark,
+            vim_mode: false,
+            update_check: false,
+            desktop_notifications: false,
+            auto_memory: false,
+        }
+    }
+
+    #[test]
+    fn policy_for_tool_execution_preserves_config_permission_rules() {
+        let config = config_with_permission_rules(PermissionRules {
+            rules: vec![PermissionRule::new("bash", "rm *", Decision::Deny)],
+        });
+        let request = ApprovalRequest {
+            id: "approval-tool-1".to_string(),
+            action: ActionKind::Shell,
+            description: "bash requested shell".to_string(),
+            tool: Some("bash".to_string()),
+            target: Some("rm scratch.txt".to_string()),
+            preview: None,
+        };
+
+        let policy = policy_for_tool_execution(&config);
+        let resolution = policy.resolve_for_tool(&request, "bash", Some("rm scratch.txt"));
+
+        assert_eq!(resolution.decision, ApprovalDecision::Deny);
+        assert!(resolution.reason.contains("permission deny rule"));
+    }
 }

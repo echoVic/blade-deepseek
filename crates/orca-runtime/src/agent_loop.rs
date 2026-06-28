@@ -19,7 +19,9 @@ use crate::subagent_execution::{
     record_subagent_batch_results, should_run_subagent_batch,
 };
 use crate::tasks::TaskRegistry;
-use crate::tool_execution::{ToolExecutionContext, execute_tool_with_approval};
+use crate::tool_execution::{
+    ToolExecutionContext, execute_tool_with_approval, policy_for_tool_execution,
+};
 use crate::tool_invocation::{
     AgentToolPolicyContext, NormalToolRecordOutcome, collect_readonly_batch,
     execute_readonly_batch, provider_config_for_agent_loop, record_normal_tool_result,
@@ -27,7 +29,6 @@ use crate::tool_invocation::{
     tool_requests_from_provider_steps,
 };
 use crate::workflow_execution::observe_background_workflows;
-use orca_approval::ApprovalPolicy;
 use orca_core::cancel::CancelToken;
 use orca_core::config::{OutputFormat, RunConfig};
 use orca_core::event_schema::{EventFactory, RunStatus};
@@ -114,8 +115,7 @@ pub(crate) fn run_agent_loop(
         budget_model.as_deref(),
         &config.model_runtime,
     );
-    let policy = ApprovalPolicy::new(config.approval_mode)
-        .with_permission_rules(config.permission_rules.clone());
+    let policy = policy_for_tool_execution(config);
     let provider_config = provider_config_for_agent_loop(
         config,
         subagent_depth,
