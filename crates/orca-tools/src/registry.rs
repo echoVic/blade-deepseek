@@ -229,6 +229,9 @@ fn validate_arguments(request: &ToolRequest, schema: &Value) -> Result<(), Strin
 }
 
 fn validate_value(path: &str, value: &Value, schema: &Value) -> Result<(), String> {
+    validate_one_of(path, value, schema)?;
+    validate_any_of(path, value, schema)?;
+
     if let Some(expected_type) = schema.get("type").and_then(Value::as_str) {
         match expected_type {
             "object" => validate_object(path, value, schema)?,
@@ -259,6 +262,8 @@ fn validate_value(path: &str, value: &Value, schema: &Value) -> Result<(), Strin
             }
             _ => {}
         }
+    } else if value.is_object() && has_object_keywords(schema) {
+        validate_object(path, value, schema)?;
     }
 
     if let Some(values) = schema.get("enum").and_then(Value::as_array)
@@ -273,6 +278,54 @@ fn validate_value(path: &str, value: &Value, schema: &Value) -> Result<(), Strin
     }
 
     Ok(())
+}
+
+fn has_object_keywords(schema: &Value) -> bool {
+    schema.get("properties").is_some()
+        || schema.get("required").is_some()
+        || schema.get("additionalProperties").is_some()
+}
+
+fn validate_one_of(path: &str, value: &Value, schema: &Value) -> Result<(), String> {
+    let Some(branches) = schema.get("oneOf").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    let mut matched = 0;
+    let mut failures = Vec::new();
+    for (idx, branch) in branches.iter().enumerate() {
+        match validate_value(path, value, branch) {
+            Ok(()) => matched += 1,
+            Err(error) => failures.push(format!("#{idx}: {error}")),
+        }
+    }
+    if matched == 1 {
+        return Ok(());
+    }
+    let details = if failures.is_empty() {
+        "all branches matched".to_string()
+    } else {
+        failures.join("; ")
+    };
+    Err(format!(
+        "{path}: expected exactly one oneOf schema to match, matched {matched}; {details}"
+    ))
+}
+
+fn validate_any_of(path: &str, value: &Value, schema: &Value) -> Result<(), String> {
+    let Some(branches) = schema.get("anyOf").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    let mut failures = Vec::new();
+    for (idx, branch) in branches.iter().enumerate() {
+        match validate_value(path, value, branch) {
+            Ok(()) => return Ok(()),
+            Err(error) => failures.push(format!("#{idx}: {error}")),
+        }
+    }
+    Err(format!(
+        "{path}: expected at least one anyOf schema to match; {}",
+        failures.join("; ")
+    ))
 }
 
 fn validate_object(path: &str, value: &Value, schema: &Value) -> Result<(), String> {
@@ -1578,6 +1631,96 @@ mod tests {
                 .contains("tool arguments failed schema validation"),
             "error={:?}",
             result.error
+        );
+    }
+
+    #[test]
+    fn registry_rejects_arguments_that_match_no_one_of_branch() {
+        let registry = default_tool_registry();
+        let result =
+            validate_tool_request(registry, &request(ToolName::Glob, r#"{"mode":"fuzzy"}"#));
+
+        assert!(
+            result
+                .expect_err("oneOf should reject missing query")
+                .contains("expected exactly one oneOf schema to match"),
+        );
+    }
+
+    #[test]
+    fn validator_rejects_arguments_that_match_multiple_one_of_branches() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string" },
+                "id": { "type": "integer" }
+            },
+            "oneOf": [
+                { "required": ["path"] },
+                { "required": ["id"] }
+            ],
+            "additionalProperties": false
+        });
+        let result = validate_arguments(
+            &request(
+                ToolName::plain("custom_oneof"),
+                r#"{"path":"README.md","id":1}"#,
+            ),
+            &schema,
+        );
+
+        assert!(
+            result
+                .expect_err("oneOf should reject ambiguous branch match")
+                .contains("expected exactly one oneOf schema to match"),
+        );
+    }
+
+    #[test]
+    fn validator_accepts_arguments_that_match_any_of_branch() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string" },
+                "id": { "type": "integer" }
+            },
+            "anyOf": [
+                { "required": ["path"] },
+                { "required": ["id"] }
+            ],
+            "additionalProperties": false
+        });
+
+        let result = validate_arguments(
+            &request(ToolName::plain("custom_anyof"), r#"{"path":"README.md"}"#),
+            &schema,
+        );
+
+        assert!(result.is_ok(), "result={result:?}");
+    }
+
+    #[test]
+    fn validator_rejects_arguments_that_match_no_any_of_branch() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string" },
+                "id": { "type": "integer" }
+            },
+            "anyOf": [
+                { "required": ["path"] },
+                { "required": ["id"] }
+            ],
+            "additionalProperties": false
+        });
+
+        let result =
+            validate_arguments(&request(ToolName::plain("custom_anyof"), r#"{}"#), &schema);
+
+        assert!(
+            result
+                .expect_err("anyOf should reject missing branch")
+                .contains("expected at least one anyOf schema to match")
         );
     }
 

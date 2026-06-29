@@ -4,7 +4,7 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-06-29
-Current baseline: v0.1.44 fuzzy model-facing file discovery, runtime-owned agent turn loop orchestration, workflow parity loop, process timeout hardening, runtime/TUI task-turn lifecycle seed, and configured permission-profile write/deny/network/special-root sandboxing
+Current baseline: v0.1.45 tool argument schema composition validation, fuzzy model-facing file discovery, runtime-owned agent turn loop orchestration, workflow parity loop, process timeout hardening, runtime/TUI task-turn lifecycle seed, and configured permission-profile write/deny/network/special-root sandboxing
 
 ---
 
@@ -15,7 +15,7 @@ working baseline used to prioritize the next patch releases.
 
 | Area | Current Orca State | Codex/Claude Reference | Status |
 |------|--------------------|------------------------|--------|
-| Tool registry | Built-ins, MCP tools, and TOML external tools share `ToolSpec` metadata | Codex-style spec/capability registry | Implemented |
+| Tool registry | Built-ins, MCP tools, and TOML external tools share `ToolSpec` metadata; runtime argument validation covers common object keywords plus `oneOf` / `anyOf` composition | Codex-style spec/capability registry | Implemented |
 | Tool approval | Action kind is derived from tool capabilities, with TOML allow/deny rules | Capability/policy driven approvals | Implemented |
 | File discovery | `glob` is model-facing with normal glob patterns plus `mode: "fuzzy"` path queries; `list_files` remains a compatibility alias | Claude `Glob`, Codex file search | Implemented |
 | Shell execution | `bash` and server shell ops route through a runtime shell-session manager with task ids, stdin, kill, nonblocking incremental reads, optional Unix PTY mode, PTY resize, stdout/stderr collection, macOS Seatbelt path, configurable timeout, and observable requested/effective terminal modes with pipe fallback where PTY is unavailable | Codex `exec_command` sessions, PTY, stdin, timeout | Seeded; richer shell controls still open |

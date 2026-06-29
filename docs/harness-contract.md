@@ -121,7 +121,7 @@ Built-in tools:
 | `create_goal` | read | Creates a persistent goal while goal mode is running and no unfinished goal exists |
 | `update_goal` | read | Marks the active persistent goal complete or blocked while goal mode is running |
 
-Tools are registered through a canonical registry. Each tool spec declares its capability set, renderer hint, exposure, aliases, and concurrent-safety flag. Runtime approval derives from the resolved tool spec instead of a separate hard-coded name list.
+Tools are registered through a canonical registry. Each tool spec declares its capability set, renderer hint, exposure, aliases, and concurrent-safety flag. Runtime approval derives from the resolved tool spec instead of a separate hard-coded name list. Tool arguments are validated before execution with common JSON Schema object keywords, enums, arrays, and `oneOf` / `anyOf` composition.
 
 Tool events:
 - `tool.call.requested` — emitted before execution, contains `name`, `action`, `target`
