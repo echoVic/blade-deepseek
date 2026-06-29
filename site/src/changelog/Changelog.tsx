@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.62":
+        "Realtime agent, plan, and reasoning lifecycle items now use shared projection builders, further tightening the app-server protocol boundary.",
       "v0.1.61":
         "Realtime fileChange and workflow lifecycle items now use shared projection builders, and the tag release gate runs server-heavy Rust tests serially on CI.",
       "v0.1.59":
@@ -150,6 +152,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.62":
+        "实时 agent / plan / reasoning lifecycle item 现在也由共享 projection builder 构造，继续收紧 app-server protocol 边界。",
       "v0.1.61":
         "实时 fileChange / workflow lifecycle item 现在由共享 projection builder 构造，tag 发布关口也会在 CI 串行运行 server-heavy Rust 测试。",
       "v0.1.59":
