@@ -226,6 +226,25 @@ pub(crate) fn file_change_completed_item(
     file_change_item(id, status, path, kind, diff)
 }
 
+pub(crate) fn persisted_file_change_started_item(
+    tool_call_id: &str,
+    tool: &str,
+    arguments: &Value,
+) -> Option<Value> {
+    Some(file_change_started_item(
+        format!("{tool_call_id}:file-change"),
+        file_change_path(tool, arguments),
+        file_change_kind(tool)?,
+        Value::from(String::new()),
+    ))
+}
+
+pub(crate) fn persisted_file_change_completed_item(started: &Value, status: Value) -> Value {
+    let mut item = started.clone();
+    item["status"] = status;
+    item
+}
+
 fn file_change_item(
     id: impl Into<String>,
     status: impl Into<Value>,
@@ -243,6 +262,29 @@ fn file_change_item(
             "diff": diff,
         }],
     })
+}
+
+fn file_change_kind(tool: &str) -> Option<&'static str> {
+    match tool {
+        "edit" => Some("edit"),
+        "write_file" => Some("write"),
+        _ => None,
+    }
+}
+
+fn file_change_path(tool: &str, arguments: &Value) -> Option<String> {
+    let path = arguments
+        .get("path")
+        .and_then(Value::as_str)
+        .or_else(|| arguments.get("target").and_then(Value::as_str))?
+        .trim();
+    if path.is_empty() {
+        return None;
+    }
+    match tool {
+        "edit" | "write_file" => Some(path.to_string()),
+        _ => None,
+    }
 }
 
 pub(crate) fn workflow_started_item(
@@ -513,6 +555,54 @@ mod tests {
         assert_eq!(item["changes"][0]["diff"], "diff");
         assert!(item.get("tool").is_none());
         assert!(item.get("output").is_none());
+    }
+
+    #[test]
+    fn persisted_file_change_started_item_projects_edit_history_shape() {
+        let item = persisted_file_change_started_item(
+            "edit-call-1",
+            "edit",
+            &json!({
+                "path": "src/lib.rs",
+                "old_text": "before",
+                "new_text": "after",
+            }),
+        )
+        .expect("edit projects as fileChange");
+
+        assert_eq!(item["id"], "edit-call-1:file-change");
+        assert_eq!(item["type"], "fileChange");
+        assert_eq!(item["status"], "inProgress");
+        assert_eq!(item["changes"][0]["path"], "src/lib.rs");
+        assert_eq!(item["changes"][0]["kind"], "edit");
+        assert_eq!(item["changes"][0]["diff"], "");
+        assert!(item.get("tool").is_none());
+        assert!(item.get("output").is_none());
+        assert!(item.get("error").is_none());
+    }
+
+    #[test]
+    fn persisted_file_change_completed_item_preserves_file_change_metadata() {
+        let started = persisted_file_change_started_item(
+            "write-call-1",
+            "write_file",
+            &json!({
+                "path": "notes/new.txt",
+                "content": "hello",
+            }),
+        )
+        .expect("write_file projects as fileChange");
+        let completed = persisted_file_change_completed_item(&started, Value::from("completed"));
+
+        assert_eq!(completed["id"], "write-call-1:file-change");
+        assert_eq!(completed["type"], "fileChange");
+        assert_eq!(completed["status"], "completed");
+        assert_eq!(completed["changes"][0]["path"], "notes/new.txt");
+        assert_eq!(completed["changes"][0]["kind"], "write");
+        assert_eq!(completed["changes"][0]["diff"], "");
+        assert!(completed.get("tool").is_none());
+        assert!(completed.get("output").is_none());
+        assert!(completed.get("error").is_none());
     }
 
     #[test]

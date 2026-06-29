@@ -1050,6 +1050,8 @@ mod tests {
             "workflow_completed_item",
             "persisted_command_execution_started_item",
             "persisted_command_execution_completed_item",
+            "persisted_file_change_started_item",
+            "persisted_file_change_completed_item",
             "tool_error_object_from_value",
             "tool_status_is_completed",
         ] {

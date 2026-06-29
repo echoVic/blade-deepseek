@@ -1028,6 +1028,137 @@ fn session_store_preserves_failed_command_projection_without_aggregated_output()
 }
 
 #[test]
+fn session_store_projects_file_edit_calls_as_file_change_thread_items() {
+    with_orca_home(|home| {
+        let store = SessionStore::new();
+        let mut thread = store
+            .create_live_thread(home, "mock", None, "edit projected thread")
+            .expect("create live thread");
+        let thread_id = thread.thread_id().to_string();
+        thread
+            .append_items(&[
+                Message::User {
+                    content: "edit note".to_string(),
+                    pinned: false,
+                },
+                Message::Assistant {
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: vec![RawToolCall {
+                        id: "edit-call-1".to_string(),
+                        function_name: "edit".to_string(),
+                        arguments: r#"{"path":"note.txt","old_text":"hello","new_text":"hi"}"#
+                            .to_string(),
+                    }],
+                    pinned: false,
+                },
+            ])
+            .expect("append edit tool call");
+
+        let request = ToolRequest {
+            id: "edit-call-1".to_string(),
+            name: ToolName::Edit,
+            action: ActionKind::Write,
+            target: Some("note.txt".to_string()),
+            raw_arguments: Some(
+                r#"{"path":"note.txt","old_text":"hello","new_text":"hi"}"#.to_string(),
+            ),
+        };
+        let result = ToolResult::completed(&request, "edited note.txt".to_string(), false);
+        thread
+            .writer_mut()
+            .append_tool_result_message(&result, "edited note.txt".to_string(), false)
+            .expect("append edit result");
+        thread.complete("success").expect("complete thread");
+
+        let items = store
+            .list_thread_items(&thread_id, None, None, 10, SortDirection::Asc)
+            .expect("list thread items");
+        let file_item = items
+            .data
+            .iter()
+            .find(|item| item.item["id"] == "edit-call-1:file-change")
+            .expect("projected file change item");
+        assert_eq!(file_item.item["type"], "fileChange");
+        assert_eq!(file_item.item["status"], "completed");
+        assert_eq!(file_item.item["changes"][0]["path"], "note.txt");
+        assert_eq!(file_item.item["changes"][0]["kind"], "edit");
+        assert!(file_item.item["changes"][0]["diff"].as_str().is_some());
+        assert!(file_item.item.get("tool").is_none());
+        assert!(file_item.item.get("output").is_none());
+        assert!(file_item.item.get("error").is_none());
+    });
+}
+
+#[test]
+fn session_store_projects_write_file_calls_as_file_change_thread_items() {
+    with_orca_home(|home| {
+        let store = SessionStore::new();
+        let mut thread = store
+            .create_live_thread(home, "mock", None, "write projected thread")
+            .expect("create live thread");
+        let thread_id = thread.thread_id().to_string();
+        thread
+            .append_items(&[
+                Message::User {
+                    content: "write note".to_string(),
+                    pinned: false,
+                },
+                Message::Assistant {
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: vec![RawToolCall {
+                        id: "write-call-1".to_string(),
+                        function_name: "write_file".to_string(),
+                        arguments: r#"{"path":"notes/new.txt","content":"hello"}"#.to_string(),
+                    }],
+                    pinned: false,
+                },
+            ])
+            .expect("append write_file tool call");
+
+        let request = ToolRequest {
+            id: "write-call-1".to_string(),
+            name: ToolName::WriteFile,
+            action: ActionKind::Write,
+            target: Some("notes/new.txt".to_string()),
+            raw_arguments: Some(r#"{"path":"notes/new.txt","content":"hello"}"#.to_string()),
+        };
+        let result = ToolResult::completed(
+            &request,
+            "wrote 5 bytes to notes/new.txt".to_string(),
+            false,
+        );
+        thread
+            .writer_mut()
+            .append_tool_result_message(
+                &result,
+                "wrote 5 bytes to notes/new.txt".to_string(),
+                false,
+            )
+            .expect("append write_file result");
+        thread.complete("success").expect("complete thread");
+
+        let items = store
+            .list_thread_items(&thread_id, None, None, 10, SortDirection::Asc)
+            .expect("list thread items");
+        let file_item = items
+            .data
+            .iter()
+            .find(|item| item.item["id"] == "write-call-1:file-change")
+            .expect("projected file change item");
+        assert_eq!(file_item.item["type"], "fileChange");
+        assert_eq!(file_item.item["status"], "completed");
+        assert_eq!(file_item.item["changes"][0]["path"], "notes/new.txt");
+        assert_eq!(file_item.item["changes"][0]["kind"], "write");
+        assert!(file_item.item["changes"][0]["diff"].as_str().is_some());
+        assert!(file_item.item.get("tool").is_none());
+        assert!(file_item.item.get("output").is_none());
+        assert!(file_item.item.get("error").is_none());
+    });
+}
+
+#[test]
 fn session_store_projects_builtin_read_tool_as_dynamic_thread_item() {
     with_orca_home(|home| {
         let store = SessionStore::new();

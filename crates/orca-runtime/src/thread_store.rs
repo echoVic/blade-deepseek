@@ -9,6 +9,7 @@ use crate::tool_item_projection::{
     dynamic_tool_completed_item, dynamic_tool_started_item, mcp_result_from_content,
     mcp_tool_completed_item, mcp_tool_parts, mcp_tool_started_item, parse_json_or_null,
     persisted_command_execution_completed_item, persisted_command_execution_started_item,
+    persisted_file_change_completed_item, persisted_file_change_started_item,
     tool_error_object_from_value,
 };
 use chrono::{DateTime, Utc};
@@ -2239,13 +2240,19 @@ fn merge_projected_items(turn_items: &mut Vec<Value>, items: Vec<Value>) {
             && let Some(existing) = turn_items
                 .iter_mut()
                 .rev()
-                .find(|candidate| candidate["id"].as_str() == Some(tool_call_id))
+                .find(|candidate| projected_tool_item_matches_result(candidate, tool_call_id))
         {
             complete_tool_item(existing, &item);
             continue;
         }
         turn_items.push(item);
     }
+}
+
+fn projected_tool_item_matches_result(candidate: &Value, tool_call_id: &str) -> bool {
+    candidate["id"].as_str() == Some(tool_call_id)
+        || (candidate["type"] == "fileChange"
+            && candidate["id"].as_str() == Some(&format!("{tool_call_id}:file-change")))
 }
 
 fn tool_call_to_thread_item(tool_call: &RawToolCall) -> Value {
@@ -2257,13 +2264,19 @@ fn tool_call_to_thread_item(tool_call: &RawToolCall) -> Value {
             parse_json_or_null(&tool_call.arguments),
         )
     } else {
+        let arguments = parse_json_or_null(&tool_call.arguments);
+        if let Some(item) =
+            persisted_file_change_started_item(&tool_call.id, &tool_call.function_name, &arguments)
+        {
+            return item;
+        }
         if tool_call.function_name == "bash" {
             return command_execution_thread_item(tool_call);
         }
         dynamic_tool_started_item(
             tool_call.id.clone(),
             tool_call.function_name.clone(),
-            parse_json_or_null(&tool_call.arguments),
+            arguments,
         )
     }
 }
@@ -2386,6 +2399,11 @@ fn complete_projected_tool_item(
             },
             truncated_metadata(result),
         );
+        return;
+    }
+
+    if item["type"] == "fileChange" {
+        *item = persisted_file_change_completed_item(item, Value::from(status.to_string()));
         return;
     }
 
