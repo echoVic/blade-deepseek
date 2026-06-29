@@ -131,6 +131,43 @@ pub(crate) fn reasoning_item(id: impl Into<String>, summary: impl Into<String>) 
     })
 }
 
+pub(crate) fn command_execution_started_item(
+    id: impl Into<String>,
+    tool: impl Into<String>,
+    command: Option<impl Into<String>>,
+) -> Value {
+    json!({
+        "id": id.into(),
+        "type": "commandExecution",
+        "tool": tool.into(),
+        "command": command.map(Into::into),
+        "status": "in_progress",
+    })
+}
+
+pub(crate) fn command_execution_completed_item(
+    id: impl Into<String>,
+    tool: impl Into<String>,
+    command: Option<impl Into<String>>,
+    status: Value,
+    aggregated_output: Value,
+    error: Value,
+    exit_code: Value,
+    truncated: Value,
+) -> Value {
+    json!({
+        "id": id.into(),
+        "type": "commandExecution",
+        "tool": tool.into(),
+        "command": command.map(Into::into),
+        "status": status,
+        "aggregatedOutput": aggregated_output,
+        "error": error,
+        "exitCode": exit_code,
+        "truncated": truncated,
+    })
+}
+
 pub(crate) fn file_change_started_item(
     id: impl Into<String>,
     path: Option<impl Into<String>>,
@@ -519,5 +556,67 @@ mod tests {
         assert_eq!(completed["type"], "reasoning");
         assert_eq!(completed["summary"], "thinking");
         assert_eq!(completed["content"], "");
+    }
+
+    #[test]
+    fn command_execution_started_item_projects_runtime_tool_shape() {
+        let item = command_execution_started_item("tool-1", "bash", Some("cargo test"));
+
+        assert_eq!(item["id"], "tool-1");
+        assert_eq!(item["type"], "commandExecution");
+        assert_eq!(item["tool"], "bash");
+        assert_eq!(item["command"], "cargo test");
+        assert_eq!(item["status"], "in_progress");
+        assert!(item.get("aggregatedOutput").is_none());
+        assert!(item.get("exitCode").is_none());
+    }
+
+    #[test]
+    fn command_execution_completed_item_projects_success_shape() {
+        let item = command_execution_completed_item(
+            "tool-2",
+            "bash",
+            Some("cargo test"),
+            Value::from("completed"),
+            Value::from("ok"),
+            Value::Null,
+            Value::from(0),
+            Value::Null,
+        );
+
+        assert_eq!(item["id"], "tool-2");
+        assert_eq!(item["type"], "commandExecution");
+        assert_eq!(item["tool"], "bash");
+        assert_eq!(item["command"], "cargo test");
+        assert_eq!(item["status"], "completed");
+        assert_eq!(item["aggregatedOutput"], "ok");
+        assert!(item.get("output").is_none());
+        assert!(item["error"].is_null());
+        assert_eq!(item["exitCode"], 0);
+        assert!(item["truncated"].is_null());
+    }
+
+    #[test]
+    fn command_execution_completed_item_projects_failure_diagnostics() {
+        let item = command_execution_completed_item(
+            "tool-3",
+            "bash",
+            None::<String>,
+            Value::from("failed"),
+            Value::from("test failure details"),
+            Value::from("command failed"),
+            Value::from(101),
+            Value::from(true),
+        );
+
+        assert_eq!(item["id"], "tool-3");
+        assert_eq!(item["type"], "commandExecution");
+        assert_eq!(item["tool"], "bash");
+        assert!(item["command"].is_null());
+        assert_eq!(item["status"], "failed");
+        assert_eq!(item["aggregatedOutput"], "test failure details");
+        assert_eq!(item["error"], "command failed");
+        assert_eq!(item["exitCode"], 101);
+        assert_eq!(item["truncated"], true);
     }
 }

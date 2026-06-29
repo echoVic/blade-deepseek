@@ -21,11 +21,12 @@ use crate::thread_store::{
     ThreadStore, TurnItemsView,
 };
 use crate::tool_item_projection::{
-    agent_message_item, dynamic_tool_completed_item, dynamic_tool_started_item,
-    file_change_completed_item, file_change_started_item, mcp_result_from_content,
-    mcp_tool_completed_item, mcp_tool_parts, mcp_tool_started_item, parse_json_or_null, plan_item,
-    reasoning_item, tool_error_object_from_value, tool_status_is_completed,
-    workflow_completed_item, workflow_started_item,
+    agent_message_item, command_execution_completed_item, command_execution_started_item,
+    dynamic_tool_completed_item, dynamic_tool_started_item, file_change_completed_item,
+    file_change_started_item, mcp_result_from_content, mcp_tool_completed_item, mcp_tool_parts,
+    mcp_tool_started_item, parse_json_or_null, plan_item, reasoning_item,
+    tool_error_object_from_value, tool_status_is_completed, workflow_completed_item,
+    workflow_started_item,
 };
 pub use orca_core::config::{ActivePermissionProfile, AdditionalWorkingDirectory};
 use orca_core::config::{HistoryMode, OutputFormat, RunConfig};
@@ -1132,13 +1133,7 @@ impl<W: Write> ServerRequestWriter<W> {
             protocol::ServerEvent::ItemStarted {
                 thread_id: Value::Null,
                 turn_id: Value::Null,
-                item: json!({
-                    "id": tool_id,
-                    "type": "commandExecution",
-                    "tool": tool,
-                    "command": command,
-                    "status": "in_progress",
-                }),
+                item: command_execution_started_item(tool_id, tool, command),
             },
         )
     }
@@ -1197,17 +1192,16 @@ impl<W: Write> ServerRequestWriter<W> {
             protocol::ServerEvent::ItemCompleted {
                 thread_id: Value::Null,
                 turn_id: Value::Null,
-                item: json!({
-                    "id": item.id,
-                    "type": "commandExecution",
-                    "tool": item.tool,
-                    "command": item.command,
-                    "status": payload["status"].clone(),
-                    "aggregatedOutput": payload["output"].clone(),
-                    "error": payload["error"].clone(),
-                    "exitCode": payload["exit_code"].clone(),
-                    "truncated": payload["truncated"].clone(),
-                }),
+                item: command_execution_completed_item(
+                    item.id,
+                    item.tool,
+                    item.command,
+                    payload["status"].clone(),
+                    payload["output"].clone(),
+                    payload["error"].clone(),
+                    payload["exit_code"].clone(),
+                    payload["truncated"].clone(),
+                ),
             },
         )
     }
