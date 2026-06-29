@@ -21,10 +21,11 @@ use crate::thread_store::{
     ThreadStore, TurnItemsView,
 };
 use crate::tool_item_projection::{
-    dynamic_tool_completed_item, dynamic_tool_started_item, file_change_completed_item,
-    file_change_started_item, mcp_result_from_content, mcp_tool_completed_item, mcp_tool_parts,
-    mcp_tool_started_item, parse_json_or_null, tool_error_object_from_value,
-    tool_status_is_completed, workflow_completed_item, workflow_started_item,
+    agent_message_item, dynamic_tool_completed_item, dynamic_tool_started_item,
+    file_change_completed_item, file_change_started_item, mcp_result_from_content,
+    mcp_tool_completed_item, mcp_tool_parts, mcp_tool_started_item, parse_json_or_null, plan_item,
+    reasoning_item, tool_error_object_from_value, tool_status_is_completed,
+    workflow_completed_item, workflow_started_item,
 };
 pub use orca_core::config::{ActivePermissionProfile, AdditionalWorkingDirectory};
 use orca_core::config::{HistoryMode, OutputFormat, RunConfig};
@@ -904,12 +905,7 @@ impl<W: Write> ServerRequestWriter<W> {
                     protocol::ServerEvent::ItemStarted {
                         thread_id: Value::Null,
                         turn_id: Value::Null,
-                        item: json!({
-                            "id": "item-reasoning-1",
-                            "type": "reasoning",
-                            "summary": "",
-                            "content": "",
-                        }),
+                        item: reasoning_item("item-reasoning-1", ""),
                     },
                 )?;
             }
@@ -961,11 +957,7 @@ impl<W: Write> ServerRequestWriter<W> {
                 protocol::ServerEvent::ItemCompleted {
                     thread_id: Value::Null,
                     turn_id: Value::Null,
-                    item: serde_json::json!({
-                        "id": item.id,
-                        "type": "agent_message",
-                        "text": item.text,
-                    }),
+                    item: agent_message_item(item.id, item.text),
                 },
             )?;
         }
@@ -978,11 +970,7 @@ impl<W: Write> ServerRequestWriter<W> {
                 protocol::ServerEvent::ItemCompleted {
                     thread_id: Value::Null,
                     turn_id: Value::Null,
-                    item: json!({
-                        "id": item.id,
-                        "type": "plan",
-                        "text": item.text,
-                    }),
+                    item: plan_item(item.id, item.text),
                 },
             )?;
         }
@@ -995,12 +983,7 @@ impl<W: Write> ServerRequestWriter<W> {
                 protocol::ServerEvent::ItemCompleted {
                     thread_id: Value::Null,
                     turn_id: Value::Null,
-                    item: json!({
-                        "id": item.id,
-                        "type": "reasoning",
-                        "summary": item.summary,
-                        "content": "",
-                    }),
+                    item: reasoning_item(item.id, item.summary),
                 },
             )?;
         }
@@ -1042,11 +1025,7 @@ impl<W: Write> ServerRequestWriter<W> {
                 protocol::ServerEvent::ItemStarted {
                     thread_id: Value::Null,
                     turn_id: Value::Null,
-                    item: json!({
-                        "id": "item-agent-message-1",
-                        "type": "agent_message",
-                        "text": "",
-                    }),
+                    item: agent_message_item("item-agent-message-1", ""),
                 },
             )?;
         }
@@ -1079,11 +1058,7 @@ impl<W: Write> ServerRequestWriter<W> {
                 protocol::ServerEvent::ItemStarted {
                     thread_id: Value::Null,
                     turn_id: Value::Null,
-                    item: json!({
-                        "id": "item-plan-1",
-                        "type": "plan",
-                        "text": "",
-                    }),
+                    item: plan_item("item-plan-1", ""),
                 },
             )?;
         }

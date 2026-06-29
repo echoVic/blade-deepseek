@@ -106,6 +106,31 @@ pub(crate) fn dynamic_tool_completed_item(
     })
 }
 
+pub(crate) fn agent_message_item(id: impl Into<String>, text: impl Into<String>) -> Value {
+    json!({
+        "id": id.into(),
+        "type": "agent_message",
+        "text": text.into(),
+    })
+}
+
+pub(crate) fn plan_item(id: impl Into<String>, text: impl Into<String>) -> Value {
+    json!({
+        "id": id.into(),
+        "type": "plan",
+        "text": text.into(),
+    })
+}
+
+pub(crate) fn reasoning_item(id: impl Into<String>, summary: impl Into<String>) -> Value {
+    json!({
+        "id": id.into(),
+        "type": "reasoning",
+        "summary": summary.into(),
+        "content": "",
+    })
+}
+
 pub(crate) fn file_change_started_item(
     id: impl Into<String>,
     path: Option<impl Into<String>>,
@@ -453,5 +478,46 @@ mod tests {
         assert!(item["result"].is_null());
         assert_eq!(item["error"]["message"], "boom");
         assert_eq!(item["task"]["status"], "failed");
+    }
+
+    #[test]
+    fn agent_message_item_projects_text_lifecycle_shape() {
+        let started = agent_message_item("item-agent-message-1", "");
+        let completed = agent_message_item("item-agent-message-1", "hello");
+
+        assert_eq!(started["id"], "item-agent-message-1");
+        assert_eq!(started["type"], "agent_message");
+        assert_eq!(started["text"], "");
+        assert_eq!(completed["id"], "item-agent-message-1");
+        assert_eq!(completed["type"], "agent_message");
+        assert_eq!(completed["text"], "hello");
+    }
+
+    #[test]
+    fn plan_item_projects_text_lifecycle_shape() {
+        let started = plan_item("item-plan-1", "");
+        let completed = plan_item("item-plan-1", "# Plan\n");
+
+        assert_eq!(started["id"], "item-plan-1");
+        assert_eq!(started["type"], "plan");
+        assert_eq!(started["text"], "");
+        assert_eq!(completed["id"], "item-plan-1");
+        assert_eq!(completed["type"], "plan");
+        assert_eq!(completed["text"], "# Plan\n");
+    }
+
+    #[test]
+    fn reasoning_item_projects_summary_lifecycle_shape() {
+        let started = reasoning_item("item-reasoning-1", "");
+        let completed = reasoning_item("item-reasoning-1", "thinking");
+
+        assert_eq!(started["id"], "item-reasoning-1");
+        assert_eq!(started["type"], "reasoning");
+        assert_eq!(started["summary"], "");
+        assert_eq!(started["content"], "");
+        assert_eq!(completed["id"], "item-reasoning-1");
+        assert_eq!(completed["type"], "reasoning");
+        assert_eq!(completed["summary"], "thinking");
+        assert_eq!(completed["content"], "");
     }
 }
