@@ -29,7 +29,7 @@ base64 = "0.22"
 
 [package]
 name = "blade-deepseek"
-version = "0.1.51"
+version = "0.1.52"
 edition = "2024"
 description = "Orca: a DeepSeek-native coding agent"
 license = "MIT"
