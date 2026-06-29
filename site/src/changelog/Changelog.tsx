@@ -55,8 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
-      "v0.1.60":
-        "Realtime fileChange and workflow lifecycle items now use shared projection builders, extending the item-schema boundary beyond MCP and dynamic tools.",
+      "v0.1.61":
+        "Realtime fileChange and workflow lifecycle items now use shared projection builders, and the tag release gate runs server-heavy Rust tests serially on CI.",
       "v0.1.59":
         "MCP/dynamic completed-item projection is shared across realtime streams and history, and CI stdio MCP fixtures now launch through /bin/sh to avoid Linux ETXTBSY release flakes.",
       "v0.1.58":
@@ -150,8 +150,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
-      "v0.1.60":
-        "实时 fileChange / workflow lifecycle item 现在由共享 projection builder 构造，将 item schema 边界从 MCP / dynamic tool 继续扩展出去。",
+      "v0.1.61":
+        "实时 fileChange / workflow lifecycle item 现在由共享 projection builder 构造，tag 发布关口也会在 CI 串行运行 server-heavy Rust 测试。",
       "v0.1.59":
         "MCP / dynamic completed-item projection 已在实时 stream 与 history 间共享；CI stdio MCP fixture 改为通过 /bin/sh 启动，避开 Linux ETXTBSY 发布抖动。",
       "v0.1.58":

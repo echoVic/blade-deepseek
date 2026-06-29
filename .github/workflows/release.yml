@@ -25,7 +25,10 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y ripgrep
-      - run: cargo test
+      - name: Run tests
+        env:
+          RUST_BACKTRACE: "1"
+        run: cargo test -- --test-threads=1
 
   version:
     runs-on: ubuntu-latest
