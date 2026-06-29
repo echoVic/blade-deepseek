@@ -187,6 +187,47 @@ command = "printf '%s' '{\"action\":\"inject\",\"context\":\"hooked policy conte
 }
 
 #[test]
+fn exec_pre_model_hook_rejects_unknown_structured_action() {
+    let home = TempDir::new().expect("temp home");
+    std::fs::write(
+        home.path().join("config.toml"),
+        r#"
+[[hooks]]
+event = "pre_model_call"
+command = "printf '%s' '{\"action\":\"injcet\",\"context\":\"typo should fail\"}'"
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .env("ORCA_HOME", home.path())
+        .args([
+            "exec",
+            "--output-format",
+            "jsonl",
+            "--provider",
+            "mock",
+            "hello",
+        ])
+        .output()
+        .expect("run orca");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stderr.is_empty());
+
+    let events = parse_jsonl(&output.stdout);
+    assert!(events.iter().any(|event| {
+        event["type"] == "error"
+            && event["payload"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("unsupported hook action 'injcet'")
+    }));
+    assert_eq!(events.last().unwrap()["type"], "session.completed");
+    assert_eq!(events.last().unwrap()["payload"]["status"], "failed");
+}
+
+#[test]
 fn exec_post_model_hook_observes_usage_environment() {
     let home = TempDir::new().expect("temp home");
     let usage_path = home.path().join("usage.txt");

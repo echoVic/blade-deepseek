@@ -140,7 +140,9 @@ Hook stdout protocol:
 - `{"action":"deny","reason":"..."}` blocks the hook target.
 - `{"action":"modify","modified_target":"..."}` rewrites a tool target.
 - `{"action":"inject","context":"..."}` injects model context.
-- Non-JSON stdout is treated as injected context.
+- When JSON declares an `action`, unsupported actions and malformed action
+  payloads fail the hook instead of being silently injected or ignored.
+- Non-JSON stdout and JSON without `action` are treated as injected context.
 
 Subagent events:
 - `subagent.started` — emitted when the child agent starts, contains `id`, `description`

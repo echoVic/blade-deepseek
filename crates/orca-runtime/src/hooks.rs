@@ -248,25 +248,27 @@ fn apply_hook_stdout(stdout: &str, outcome: &mut HookOutcome) -> Result<(), Stri
             .unwrap_or("hook denied request")
             .to_string()),
         "modify" => {
-            if let Some(target) = value
+            let target = value
                 .get("modified_target")
                 .or_else(|| value.get("modified_input"))
                 .and_then(|value| value.as_str())
-            {
-                outcome.modified_target = Some(target.to_string());
-            }
+                .ok_or_else(|| {
+                    "hook action 'modify' requires string field 'modified_target'".to_string()
+                })?;
+            outcome.modified_target = Some(target.to_string());
             Ok(())
         }
         "inject" => {
-            if let Some(context) = value.get("context").and_then(|value| value.as_str()) {
-                outcome.injected_context.push(context.to_string());
-            }
+            let context = value
+                .get("context")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| {
+                    "hook action 'inject' requires string field 'context'".to_string()
+                })?;
+            outcome.injected_context.push(context.to_string());
             Ok(())
         }
-        _ => {
-            outcome.injected_context.push(stdout.to_string());
-            Ok(())
-        }
+        _ => Err(format!("unsupported hook action '{action}'")),
     }
 }
 
@@ -489,6 +491,101 @@ command = "true"
         assert_eq!(
             outcome.modified_target.as_deref(),
             Some("ls -la (sanitized)")
+        );
+    }
+
+    #[test]
+    fn hook_json_rejects_unknown_action_instead_of_injecting_it() {
+        let runner = HookRunner::new(vec![HookConfig {
+            event: HookEvent::PreModelCall,
+            command: r#"printf '%s' '{"action":"injcet","context":"typo should fail"}'"#
+                .to_string(),
+            tool: None,
+        }]);
+
+        let err = runner
+            .run(
+                HookEvent::PreModelCall,
+                HookContext {
+                    cwd: ".",
+                    session_status: None,
+                    tool_request: None,
+                    tool_result: None,
+                    before_messages: None,
+                    after_messages: None,
+                    usage: None,
+                },
+            )
+            .expect_err("unknown structured hook actions should fail");
+
+        assert!(
+            err.contains("unsupported hook action 'injcet'"),
+            "err={err}"
+        );
+    }
+
+    #[test]
+    fn hook_json_rejects_inject_without_string_context() {
+        let runner = HookRunner::new(vec![HookConfig {
+            event: HookEvent::PreModelCall,
+            command: r#"printf '%s' '{"action":"inject","context":123}'"#.to_string(),
+            tool: None,
+        }]);
+
+        let err = runner
+            .run(
+                HookEvent::PreModelCall,
+                HookContext {
+                    cwd: ".",
+                    session_status: None,
+                    tool_request: None,
+                    tool_result: None,
+                    before_messages: None,
+                    after_messages: None,
+                    usage: None,
+                },
+            )
+            .expect_err("inject action should require string context");
+
+        assert!(
+            err.contains("hook action 'inject' requires string field 'context'"),
+            "err={err}"
+        );
+    }
+
+    #[test]
+    fn hook_json_rejects_modify_without_string_target() {
+        let runner = HookRunner::new(vec![HookConfig {
+            event: HookEvent::PreToolUse,
+            command: r#"printf '%s' '{"action":"modify","modified_target":123}'"#.to_string(),
+            tool: Some("bash".to_string()),
+        }]);
+        let request = ToolRequest {
+            id: "tool-1".to_string(),
+            name: ToolName::Bash,
+            action: ActionKind::Shell,
+            target: Some("echo original".to_string()),
+            raw_arguments: None,
+        };
+
+        let err = runner
+            .run(
+                HookEvent::PreToolUse,
+                HookContext {
+                    cwd: ".",
+                    session_status: None,
+                    tool_request: Some(&request),
+                    tool_result: None,
+                    before_messages: None,
+                    after_messages: None,
+                    usage: None,
+                },
+            )
+            .expect_err("modify action should require a string target");
+
+        assert!(
+            err.contains("hook action 'modify' requires string field 'modified_target'"),
+            "err={err}"
         );
     }
 

@@ -4,7 +4,7 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-06-29
-Current baseline: v0.1.45 tool argument schema composition validation, fuzzy model-facing file discovery, runtime-owned agent turn loop orchestration, workflow parity loop, process timeout hardening, runtime/TUI task-turn lifecycle seed, and configured permission-profile write/deny/network/special-root sandboxing
+Current baseline: v0.1.46 structured hook action validation, tool argument schema composition validation, fuzzy model-facing file discovery, runtime-owned agent turn loop orchestration, workflow parity loop, process timeout hardening, runtime/TUI task-turn lifecycle seed, and configured permission-profile write/deny/network/special-root sandboxing
 
 ---
 
@@ -23,7 +23,7 @@ working baseline used to prioritize the next patch releases.
 | Tool output control | Fixed byte truncation helper on tool output | Codex truncation policies by bytes/tokens with explicit warnings | Partial |
 | Model metadata | `ModelSelection` plus DeepSeek defaults | Codex `models-manager` with model capability metadata | Partial |
 | MCP | stdio/SSE config surface and tool routing | Codex MCP client/server ecosystem | Partial |
-| Hooks | Lifecycle hooks with JSON stdout actions | Codex hooks runtime and schema validation | Implemented; schema docs/validation can improve |
+| Hooks | Lifecycle hooks with JSON stdout actions; structured outputs that declare `action` now validate supported actions and required string fields | Codex hooks runtime and schema validation | Implemented; schema docs/validation improved |
 | Project instructions | User/project/rules files with includes | `AGENTS.md` style layered instructions | Implemented |
 | Memory | Manual `/remember` plus optional project extraction | Codex memories extension | Partial |
 | Persistent goals | `/goal` with persisted state plus goal-scoped `get_goal`, `create_goal`, and narrow `update_goal` | Codex goal extension | Implemented |

@@ -33,7 +33,7 @@ Set `INSTALL_DIR` to choose a destination and `ORCA_VERSION` to pin a version:
 
 ```bash
 curl -fsSL https://orcaagent.dev/install.sh | \
-  INSTALL_DIR=/usr/local/bin ORCA_VERSION=0.1.45 sh
+  INSTALL_DIR=/usr/local/bin ORCA_VERSION=0.1.46 sh
 ```
 
 ### GitHub Releases
@@ -92,7 +92,7 @@ Disable the startup check with:
 update_check = false
 ```
 
-Hooks may return structured JSON on stdout. `{"action":"deny","reason":"..."}` blocks, `{"action":"modify","modified_target":"..."}` rewrites a tool target, and `{"action":"inject","context":"..."}` adds model context. Plain non-JSON stdout is treated as injected context for compatibility. Supported events are `session_start`, `session_end`, `pre_tool_use`, `post_tool_use`, `pre_model_call`, `post_model_call`, `on_budget_warning`, `pre_compact`, and `post_compact`.
+Hooks may return structured JSON on stdout. `{"action":"deny","reason":"..."}` blocks, `{"action":"modify","modified_target":"..."}` rewrites a tool target, and `{"action":"inject","context":"..."}` adds model context. When JSON declares an `action`, Orca validates the action and required string fields so typoed or malformed structured outputs fail visibly. Plain non-JSON stdout and JSON without `action` are treated as injected context for compatibility. Supported events are `session_start`, `session_end`, `pre_tool_use`, `post_tool_use`, `pre_model_call`, `post_model_call`, `on_budget_warning`, `pre_compact`, and `post_compact`.
 
 Custom tools can be added with TOML descriptors under `~/.orca/tools/`:
 
