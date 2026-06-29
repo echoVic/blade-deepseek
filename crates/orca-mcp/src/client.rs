@@ -8,7 +8,8 @@ use serde_json::Value;
 
 use crate::transport::{self, McpTransport};
 use orca_core::mcp_types::{
-    CallToolResult, McpContent, McpServerConfig, McpTool, McpToolRef, ToolsListResult,
+    CallToolResult, McpContent, McpResource, McpServerConfig, McpTool, McpToolRef,
+    ReadResourceResult, ResourcesListResult, ToolsListResult,
 };
 
 #[derive(Clone, Default)]
@@ -140,6 +141,92 @@ impl McpRegistry {
         }
     }
 
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn from_static_resources_for_test(
+        resources: Vec<McpResource>,
+        reads: HashMap<(String, String), ReadResourceResult>,
+    ) -> Self {
+        struct StaticResourceTransport {
+            server: String,
+            resources: Vec<McpResource>,
+            reads: HashMap<(String, String), ReadResourceResult>,
+        }
+
+        impl McpTransport for StaticResourceTransport {
+            fn initialize(&self) -> Result<(), String> {
+                Ok(())
+            }
+
+            fn list_tools(&self) -> Result<Value, String> {
+                Ok(serde_json::json!({"tools": []}))
+            }
+
+            fn call_tool(&self, _name: &str, _arguments: Value) -> Result<Value, String> {
+                Err("static resource transport does not support tool calls".to_string())
+            }
+
+            fn list_resources(&self) -> Result<Value, String> {
+                let resources = self
+                    .resources
+                    .iter()
+                    .map(|resource| {
+                        serde_json::json!({
+                            "uri": resource.uri,
+                            "name": resource.name,
+                            "description": resource.description,
+                            "mimeType": resource.mime_type,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                Ok(serde_json::json!({ "resources": resources }))
+            }
+
+            fn read_resource(&self, uri: &str) -> Result<Value, String> {
+                let content = self
+                    .reads
+                    .get(&(self.server.clone(), uri.to_string()))
+                    .ok_or_else(|| format!("resource not found: {uri}"))?;
+                serde_json::to_value(content).map_err(|error| error.to_string())
+            }
+        }
+
+        let mut clients = HashMap::new();
+        let mut grouped: HashMap<String, Vec<McpResource>> = HashMap::new();
+        for resource in resources {
+            grouped
+                .entry(resource.server.clone())
+                .or_default()
+                .push(resource);
+        }
+
+        for (server, resources) in grouped {
+            clients.insert(
+                server.clone(),
+                Arc::new(McpClient {
+                    config: McpServerConfig {
+                        name: server.clone(),
+                        ..Default::default()
+                    },
+                    server_name: server.clone(),
+                    transport: Mutex::new(Box::new(StaticResourceTransport {
+                        server,
+                        resources,
+                        reads: reads.clone(),
+                    })),
+                }),
+            );
+        }
+
+        Self {
+            inner: Arc::new(McpRegistryInner {
+                clients,
+                tools: Vec::new(),
+                lookup: HashMap::new(),
+                errors: Vec::new(),
+            }),
+        }
+    }
+
     pub fn tools(&self) -> &[McpTool] {
         &self.inner.tools
     }
@@ -223,6 +310,52 @@ impl McpRegistry {
             is_error: result.is_error,
         })
     }
+
+    pub fn list_resources(&self, server: Option<&str>) -> Result<Vec<McpResource>, String> {
+        let clients = match server {
+            Some(server) => vec![(
+                server.to_string(),
+                self.inner
+                    .clients
+                    .get(server)
+                    .cloned()
+                    .ok_or_else(|| format!("MCP server '{server}' is not connected"))?,
+            )],
+            None => self
+                .inner
+                .clients
+                .iter()
+                .map(|(name, client)| (name.clone(), Arc::clone(client)))
+                .collect(),
+        };
+
+        let mut resources = Vec::new();
+        for (server, client) in clients {
+            let result = client.list_resources()?;
+            let result: ResourcesListResult = serde_json::from_value(result)
+                .map_err(|error| format!("invalid MCP resources/list result: {error}"))?;
+            resources.extend(result.resources.into_iter().map(|resource| McpResource {
+                server: server.clone(),
+                uri: resource.uri,
+                name: resource.name,
+                description: resource.description,
+                mime_type: resource.mime_type,
+            }));
+        }
+
+        Ok(resources)
+    }
+
+    pub fn read_resource(&self, server: &str, uri: &str) -> Result<ReadResourceResult, String> {
+        let client = self
+            .inner
+            .clients
+            .get(server)
+            .ok_or_else(|| format!("MCP server '{server}' is not connected"))?;
+        let result = client.read_resource(uri)?;
+        serde_json::from_value(result)
+            .map_err(|error| format!("invalid MCP resources/read result: {error}"))
+    }
 }
 
 impl McpClient {
@@ -242,6 +375,22 @@ impl McpClient {
             .lock()
             .map_err(|_| format!("MCP server '{}' transport lock poisoned", self.server_name))?;
         transport.call_tool(name, arguments)
+    }
+
+    fn list_resources(&self) -> Result<Value, String> {
+        let transport = self
+            .transport
+            .lock()
+            .map_err(|_| format!("MCP server '{}' transport lock poisoned", self.server_name))?;
+        transport.list_resources()
+    }
+
+    fn read_resource(&self, uri: &str) -> Result<Value, String> {
+        let transport = self
+            .transport
+            .lock()
+            .map_err(|_| format!("MCP server '{}' transport lock poisoned", self.server_name))?;
+        transport.read_resource(uri)
     }
 
     fn reconnect(&self) -> Result<(), String> {
@@ -363,6 +512,14 @@ mod tests {
                     "isError": false
                 }))
             }
+
+            fn list_resources(&self) -> Result<Value, String> {
+                Ok(serde_json::json!({"resources": []}))
+            }
+
+            fn read_resource(&self, _uri: &str) -> Result<Value, String> {
+                Ok(serde_json::json!({"contents": []}))
+            }
         }
 
         let tool = McpTool {
@@ -413,6 +570,77 @@ mod tests {
 
         assert!(started.elapsed() < Duration::from_millis(750));
         assert_eq!(result.unwrap_err(), "MCP tool call cancelled");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registry_lists_and_reads_mcp_resources_from_stdio_server() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let server = temp_dir.path().join("resource_mcp_server.sh");
+        std::fs::write(
+            &server,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{"resources":{}},"serverInfo":{"name":"resources","version":"1"}}}\n'
+      ;;
+    *'"method":"notifications/initialized"'*)
+      ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":2,"result":{"tools":[]}}\n'
+      ;;
+    *'"method":"resources/list"'*)
+      printf '{"jsonrpc":"2.0","id":3,"result":{"resources":[{"uri":"memo://orca/one","name":"memo one","description":"A test memo","mimeType":"text/plain"}]}}\n'
+      ;;
+    *'"method":"resources/read"'*)
+      printf '{"jsonrpc":"2.0","id":4,"result":{"contents":[{"uri":"memo://orca/one","mimeType":"text/plain","text":"resource body"}]}}\n'
+      ;;
+  esac
+done
+"#,
+        )
+        .expect("write MCP fixture");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&server).expect("metadata").permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&server, permissions).expect("chmod MCP fixture");
+        }
+
+        let registry = initialize_registry(&[McpServerConfig {
+            name: "resources".to_string(),
+            transport: orca_core::mcp_types::McpTransportKind::Stdio,
+            command: Some(server.to_string_lossy().into_owned()),
+            args: Vec::new(),
+            url: None,
+            env: Default::default(),
+            headers: Default::default(),
+            disabled: false,
+            startup_timeout_ms: Some(5000),
+            tool_timeout_ms: Some(1000),
+        }]);
+        assert!(
+            registry.errors().is_empty(),
+            "registry errors: {:?}",
+            registry.errors()
+        );
+
+        let resources = registry
+            .list_resources(None)
+            .expect("list all MCP resources");
+        assert_eq!(resources.len(), 1);
+        assert_eq!(resources[0].server, "resources");
+        assert_eq!(resources[0].uri, "memo://orca/one");
+        assert_eq!(resources[0].name, "memo one");
+        assert_eq!(resources[0].mime_type.as_deref(), Some("text/plain"));
+
+        let content = registry
+            .read_resource("resources", "memo://orca/one")
+            .expect("read MCP resource");
+        assert_eq!(content.contents.len(), 1);
+        assert_eq!(content.contents[0].text.as_deref(), Some("resource body"));
+        assert_eq!(content.contents[0].mime_type.as_deref(), Some("text/plain"));
     }
 
     #[cfg(unix)]

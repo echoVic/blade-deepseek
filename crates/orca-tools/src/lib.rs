@@ -103,7 +103,7 @@ pub fn execute_with_mcp_external_roots_policy_or_cancel(
 ) -> ToolResult {
     let shell_timeout = std::time::Duration::from_secs(shell_timeout_secs.max(1));
     let should_cancel = &should_cancel as &dyn Fn() -> bool;
-    if !matches!(&request.name, ToolName::Mcp(_)) {
+    if !tool_uses_mcp_registry(&request.name) {
         if external_tools.is_empty() {
             let reg = registry::default_tool_registry();
             let ctx = registry::ToolContext::new(cwd)
@@ -130,6 +130,13 @@ pub fn execute_with_mcp_external_roots_policy_or_cancel(
         .with_mcp(mcp_registry)
         .with_cancel(should_cancel);
     reg.execute(request, &ctx)
+}
+
+fn tool_uses_mcp_registry(name: &ToolName) -> bool {
+    matches!(
+        name,
+        ToolName::Mcp(_) | ToolName::ListMcpResources | ToolName::ReadMcpResource
+    )
 }
 
 pub fn validate_with_mcp_and_external(
@@ -292,6 +299,7 @@ mod tests {
     use orca_core::approval_types::ActionKind;
     use orca_core::mcp_types::{McpServerConfig, McpTransportKind};
     use orca_core::tool_types::{ToolStatus, truncate_output};
+    use std::collections::HashMap;
     use std::fs;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
@@ -490,6 +498,70 @@ done
         );
         assert_eq!(result.status, ToolStatus::Failed);
         assert_eq!(result.error.as_deref(), Some("MCP tool call cancelled"));
+    }
+
+    #[test]
+    fn execute_with_mcp_passes_registry_to_resource_tools() {
+        let resource = orca_core::mcp_types::McpResource {
+            server: "notes".to_string(),
+            uri: "memo://orca/one".to_string(),
+            name: "memo one".to_string(),
+            description: Some("A test memo".to_string()),
+            mime_type: Some("text/plain".to_string()),
+        };
+        let read_result = orca_core::mcp_types::ReadResourceResult {
+            contents: vec![orca_core::mcp_types::McpResourceContent {
+                uri: "memo://orca/one".to_string(),
+                mime_type: Some("text/plain".to_string()),
+                text: Some("resource body".to_string()),
+                blob: None,
+            }],
+        };
+        let registry = McpRegistry::from_static_resources_for_test(
+            vec![resource],
+            HashMap::from([(
+                ("notes".to_string(), "memo://orca/one".to_string()),
+                read_result,
+            )]),
+        );
+
+        let list = execute_with_mcp(
+            &ToolRequest {
+                id: "list-resources".to_string(),
+                name: ToolName::ListMcpResources,
+                action: ActionKind::Read,
+                target: None,
+                raw_arguments: Some(r#"{"server":"notes"}"#.to_string()),
+            },
+            Path::new("."),
+            &registry,
+        );
+        assert_eq!(list.status, ToolStatus::Completed);
+        assert!(
+            list.output
+                .as_deref()
+                .unwrap_or_default()
+                .contains(r#""uri":"memo://orca/one""#)
+        );
+
+        let read = execute_with_mcp(
+            &ToolRequest {
+                id: "read-resource".to_string(),
+                name: ToolName::ReadMcpResource,
+                action: ActionKind::Read,
+                target: None,
+                raw_arguments: Some(r#"{"server":"notes","uri":"memo://orca/one"}"#.to_string()),
+            },
+            Path::new("."),
+            &registry,
+        );
+        assert_eq!(read.status, ToolStatus::Completed);
+        assert!(
+            read.output
+                .as_deref()
+                .unwrap_or_default()
+                .contains("resource body")
+        );
     }
 
     #[test]

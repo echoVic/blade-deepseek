@@ -38,6 +38,16 @@ pub struct McpServerConfig {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct McpResource {
+    pub server: String,
+    pub uri: String,
+    pub name: String,
+    pub description: Option<String>,
+    #[serde(rename = "mimeType", skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct McpTool {
     pub server: String,
     pub name: String,
@@ -75,6 +85,21 @@ pub struct ToolsListResult {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+pub struct ResourcesListResult {
+    #[serde(default)]
+    pub resources: Vec<McpResourceDescriptor>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct McpResourceDescriptor {
+    pub uri: String,
+    pub name: String,
+    pub description: Option<String>,
+    #[serde(rename = "mimeType")]
+    pub mime_type: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
 pub struct McpToolDescriptor {
     pub name: String,
     pub description: Option<String>,
@@ -96,6 +121,23 @@ pub struct CallToolResult {
     pub content: Vec<McpContent>,
     #[serde(rename = "isError", default)]
     pub is_error: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ReadResourceResult {
+    #[serde(default)]
+    pub contents: Vec<McpResourceContent>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct McpResourceContent {
+    pub uri: String,
+    #[serde(rename = "mimeType", skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blob: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]

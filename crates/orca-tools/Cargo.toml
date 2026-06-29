@@ -17,3 +17,4 @@ chrono = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+orca-mcp = { path = "../orca-mcp", features = ["test-utils"] }

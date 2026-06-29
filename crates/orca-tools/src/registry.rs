@@ -1182,6 +1182,54 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
     ));
     registry.register(BuiltinTool::new(
         builtin_spec(
+            "list_mcp_resources",
+            "List resources exposed by connected MCP servers. Prefer this before read_mcp_resource when the user asks for MCP-provided context.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "server": {
+                        "type": "string",
+                        "description": "Optional MCP server name to filter resources by"
+                    }
+                },
+                "required": [],
+                "additionalProperties": false
+            }),
+            CapabilitySet::new(vec![ToolCapability::McpResourceRead]),
+            ToolExposure::Direct,
+            RendererHint::State,
+            true,
+        ),
+        BuiltinExecutor::ListMcpResources,
+    ));
+    registry.register(BuiltinTool::new(
+        builtin_spec(
+            "read_mcp_resource",
+            "Read a specific MCP resource by server name and resource URI.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "server": {
+                        "type": "string",
+                        "description": "MCP server name"
+                    },
+                    "uri": {
+                        "type": "string",
+                        "description": "Resource URI returned by list_mcp_resources"
+                    }
+                },
+                "required": ["server", "uri"],
+                "additionalProperties": false
+            }),
+            CapabilitySet::new(vec![ToolCapability::McpResourceRead]),
+            ToolExposure::Direct,
+            RendererHint::State,
+            true,
+        ),
+        BuiltinExecutor::ReadMcpResource,
+    ));
+    registry.register(BuiltinTool::new(
+        builtin_spec(
             "request_permissions",
             "Request additional permissions for the current turn. Compatible with Codex permission profiles; granted fileSystem.write roots are temporary and do not persist to thread metadata.",
             json!({
@@ -1423,6 +1471,8 @@ impl Tool for BuiltinTool {
             BuiltinExecutor::UpdatePlan => update_plan::execute(request),
             BuiltinExecutor::ListSkills => skills::execute_list(request, ctx.cwd),
             BuiltinExecutor::ReadSkill => skills::execute_read(request, ctx.cwd),
+            BuiltinExecutor::ListMcpResources => execute_list_mcp_resources(request, ctx),
+            BuiltinExecutor::ReadMcpResource => execute_read_mcp_resource(request, ctx),
             BuiltinExecutor::RequestPermissions => ToolResult::failed(
                 request,
                 "request_permissions must be executed by the runtime",
@@ -1467,8 +1517,74 @@ enum BuiltinExecutor {
     UpdatePlan,
     ListSkills,
     ReadSkill,
+    ListMcpResources,
+    ReadMcpResource,
     RequestPermissions,
     RequestUserInput,
+}
+
+fn execute_list_mcp_resources(request: &ToolRequest, ctx: &ToolContext<'_>) -> ToolResult {
+    let Some(registry) = ctx.mcp_registry else {
+        return ToolResult::failed(request, "MCP registry is not initialized", None);
+    };
+    let args = match parse_json_arguments(request) {
+        Ok(value) => value,
+        Err(error) => return ToolResult::failed(request, error, None),
+    };
+    let server = args.get("server").and_then(Value::as_str);
+
+    match registry.list_resources(server) {
+        Ok(resources) => match serde_json::to_string(&resources) {
+            Ok(output) => ToolResult::completed(request, output, false),
+            Err(error) => ToolResult::failed(
+                request,
+                format!("failed to serialize MCP resources: {error}"),
+                None,
+            ),
+        },
+        Err(error) => ToolResult::failed(request, error, None),
+    }
+}
+
+fn execute_read_mcp_resource(request: &ToolRequest, ctx: &ToolContext<'_>) -> ToolResult {
+    let Some(registry) = ctx.mcp_registry else {
+        return ToolResult::failed(request, "MCP registry is not initialized", None);
+    };
+    let args = match parse_json_arguments(request) {
+        Ok(value) => value,
+        Err(error) => return ToolResult::failed(request, error, None),
+    };
+    let Some(server) = args.get("server").and_then(Value::as_str) else {
+        return ToolResult::invalid_input(
+            request,
+            "read_mcp_resource requires string field 'server'",
+        );
+    };
+    let Some(uri) = args.get("uri").and_then(Value::as_str) else {
+        return ToolResult::invalid_input(request, "read_mcp_resource requires string field 'uri'");
+    };
+
+    match registry.read_resource(server, uri) {
+        Ok(result) => match serde_json::to_string(&result) {
+            Ok(output) => ToolResult::completed(request, output, false),
+            Err(error) => ToolResult::failed(
+                request,
+                format!("failed to serialize MCP resource content: {error}"),
+                None,
+            ),
+        },
+        Err(error) => ToolResult::failed(request, error, None),
+    }
+}
+
+fn parse_json_arguments(request: &ToolRequest) -> Result<Value, String> {
+    request
+        .raw_arguments
+        .as_deref()
+        .map(serde_json::from_str::<Value>)
+        .transpose()
+        .map_err(|error| format!("invalid tool arguments JSON: {error}"))
+        .map(|value| value.unwrap_or_else(|| json!({})))
 }
 
 struct McpProxyTool {
@@ -1849,6 +1965,45 @@ mod tests {
             vec![json!("read"), json!("write"), json!("readWrite")],
             "schema should expose Codex-style fileSystem.entries access modes"
         );
+    }
+
+    #[test]
+    fn mcp_resource_tools_are_model_visible_readonly_tools() {
+        let registry = default_tool_registry();
+
+        let list = registry
+            .get("list_mcp_resources")
+            .expect("list_mcp_resources tool");
+        assert_eq!(list.action_kind(), ActionKind::Read);
+        assert!(list.spec().exposure.is_model_visible());
+        assert!(
+            list.is_concurrent_safe(&request(ToolName::ListMcpResources, r#"{"server":"docs"}"#))
+        );
+        assert!(
+            list.spec()
+                .input_schema
+                .pointer("/properties/server")
+                .is_some(),
+            "list_mcp_resources should accept an optional server filter"
+        );
+
+        let read = registry
+            .get("read_mcp_resource")
+            .expect("read_mcp_resource tool");
+        assert_eq!(read.action_kind(), ActionKind::Read);
+        assert!(read.spec().exposure.is_model_visible());
+        assert!(read.is_concurrent_safe(&request(
+            ToolName::ReadMcpResource,
+            r#"{"server":"docs","uri":"memo://one"}"#
+        )));
+        let required = read
+            .spec()
+            .input_schema
+            .pointer("/required")
+            .and_then(Value::as_array)
+            .expect("required fields");
+        assert!(required.contains(&Value::String("server".to_string())));
+        assert!(required.contains(&Value::String("uri".to_string())));
     }
 
     #[test]

@@ -36,6 +36,8 @@ pub enum ToolName {
     UpdatePlan,
     RequestUserInput,
     RequestPermissions,
+    ListMcpResources,
+    ReadMcpResource,
     ListSkills,
     ReadSkill,
     Namespaced {
@@ -80,6 +82,8 @@ impl ToolName {
             "update_plan" => Self::UpdatePlan,
             "request_user_input" => Self::RequestUserInput,
             "request_permissions" => Self::RequestPermissions,
+            "list_mcp_resources" => Self::ListMcpResources,
+            "read_mcp_resource" => Self::ReadMcpResource,
             "list_skills" => Self::ListSkills,
             "read_skill" => Self::ReadSkill,
             other => Self::External(other.to_string()),
@@ -136,6 +140,8 @@ impl ToolName {
             Self::UpdatePlan => "update_plan",
             Self::RequestUserInput => "request_user_input",
             Self::RequestPermissions => "request_permissions",
+            Self::ListMcpResources => "list_mcp_resources",
+            Self::ReadMcpResource => "read_mcp_resource",
             Self::ListSkills => "list_skills",
             Self::ReadSkill => "read_skill",
             Self::Namespaced { name, .. } => name,
@@ -178,6 +184,8 @@ impl ToolName {
             Self::UpdatePlan => "update_plan",
             Self::RequestUserInput => "request_user_input",
             Self::RequestPermissions => "request_permissions",
+            Self::ListMcpResources => "list_mcp_resources",
+            Self::ReadMcpResource => "read_mcp_resource",
             Self::ListSkills => "list_skills",
             Self::ReadSkill => "read_skill",
             Self::Namespaced { serialized, .. } => serialized,
@@ -222,6 +230,8 @@ impl ToolName {
             "update_plan" => Self::UpdatePlan,
             "request_user_input" => Self::RequestUserInput,
             "request_permissions" => Self::RequestPermissions,
+            "list_mcp_resources" => Self::ListMcpResources,
+            "read_mcp_resource" => Self::ReadMcpResource,
             "list_skills" => Self::ListSkills,
             "read_skill" => Self::ReadSkill,
             other => Self::External(other.to_string()),
@@ -246,6 +256,8 @@ impl ToolName {
                 | Self::WorkflowListTasks
                 | Self::GetGoal
                 | Self::RequestUserInput
+                | Self::ListMcpResources
+                | Self::ReadMcpResource
                 | Self::ListSkills
                 | Self::ReadSkill
         )
@@ -298,6 +310,7 @@ pub enum ToolCapability {
     GoalUpdate,
     UserInputRequest,
     PermissionRequest,
+    McpResourceRead,
     SkillRead,
 }
 
@@ -348,6 +361,7 @@ impl CapabilitySet {
                         | ToolCapability::PlanUpdate
                         | ToolCapability::GoalUpdate
                         | ToolCapability::UserInputRequest
+                        | ToolCapability::McpResourceRead
                         | ToolCapability::SkillRead
                 )
             })

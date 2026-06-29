@@ -13,6 +13,8 @@ pub trait McpTransport: Send + Sync {
     fn initialize(&self) -> Result<(), String>;
     fn list_tools(&self) -> Result<Value, String>;
     fn call_tool(&self, name: &str, arguments: Value) -> Result<Value, String>;
+    fn list_resources(&self) -> Result<Value, String>;
+    fn read_resource(&self, uri: &str) -> Result<Value, String>;
 }
 
 pub fn connect(config: &McpServerConfig) -> Result<Box<dyn McpTransport>, String> {
@@ -124,6 +126,20 @@ impl McpTransport for StdioTransport {
             json!({
                 "name": name,
                 "arguments": arguments
+            }),
+            self.tool_timeout,
+        )
+    }
+
+    fn list_resources(&self) -> Result<Value, String> {
+        self.request_with_timeout("resources/list", json!({}), self.startup_timeout)
+    }
+
+    fn read_resource(&self, uri: &str) -> Result<Value, String> {
+        self.request_with_timeout(
+            "resources/read",
+            json!({
+                "uri": uri
             }),
             self.tool_timeout,
         )
@@ -287,6 +303,20 @@ impl McpTransport for SseTransport {
             json!({
                 "name": name,
                 "arguments": arguments
+            }),
+            self.tool_timeout,
+        )
+    }
+
+    fn list_resources(&self) -> Result<Value, String> {
+        self.request_with_timeout("resources/list", json!({}), self.startup_timeout)
+    }
+
+    fn read_resource(&self, uri: &str) -> Result<Value, String> {
+        self.request_with_timeout(
+            "resources/read",
+            json!({
+                "uri": uri
             }),
             self.tool_timeout,
         )

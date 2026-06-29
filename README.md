@@ -33,7 +33,7 @@ Set `INSTALL_DIR` to choose a destination and `ORCA_VERSION` to pin a version:
 
 ```bash
 curl -fsSL https://orcaagent.dev/install.sh | \
-  INSTALL_DIR=/usr/local/bin ORCA_VERSION=0.1.46 sh
+  INSTALL_DIR=/usr/local/bin ORCA_VERSION=0.1.47 sh
 ```
 
 ### GitHub Releases
@@ -240,12 +240,14 @@ Built-in tools:
 | `request_user_input` | Ask a structured clarification question; TUI answers continue the same turn |
 | `list_skills` | List Markdown skills from user and project skill directories |
 | `read_skill` | Read a skill's Markdown instructions by id |
+| `list_mcp_resources` | List read-only resources exposed by configured MCP servers |
+| `read_mcp_resource` | Read a specific MCP resource by server name and URI |
 
 Tools are registered through a canonical tool registry with capability metadata. Approval behavior is derived from those capabilities: read-only tools run directly, write tools follow write approval policy, shell tools follow shell approval policy, network tools follow network policy, and agent/workflow tools follow agent policy. Tool arguments are validated before execution, including common JSON Schema object keywords plus `oneOf` and `anyOf`, so provider-advertised schemas and runtime rejection behavior stay aligned. `glob` is the model-facing file discovery tool and supports both normal glob patterns and `mode: "fuzzy"` path queries; `list_files` remains accepted for older prompts and saved sessions. `request_user_input` stays deterministic in headless runs and becomes interactive in TUI sessions.
 
 Markdown skills live under `$ORCA_HOME/skills/*/SKILL.md`, `~/.orca/skills/*/SKILL.md`, or project `.orca/skills/*/SKILL.md`. The model can inspect them with `list_skills` and `read_skill`; when a prompt explicitly mentions a skill id such as `$debugging`, Orca injects that skill's instructions into the model context for the turn.
 
-MCP tools and custom external tools can be added at startup. External tools live under `~/.orca/tools/*.toml` or `$ORCA_HOME/tools/*.toml`, and configured MCP server tools are exposed with namespaced tool names.
+MCP tools and custom external tools can be added at startup. External tools live under `~/.orca/tools/*.toml` or `$ORCA_HOME/tools/*.toml`, and configured MCP server tools are exposed with namespaced tool names. MCP resources can also be listed and read through the read-only resource tools.
 
 ## Architecture
 
