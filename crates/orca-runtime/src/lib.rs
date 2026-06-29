@@ -1474,12 +1474,12 @@ mod tests {
             "agent_loop must not own runtime turn-start error result folding"
         );
         assert!(
-            agent_loop_source.contains("RuntimeTurnStartStep"),
-            "agent_loop must delegate runtime turn start"
+            agent_loop_source.contains("RuntimeTurnOpeningStep"),
+            "agent_loop must delegate runtime turn start through opening step"
         );
         assert!(
-            agent_loop_source.contains("RuntimeTurnStartResultStep"),
-            "agent_loop must delegate runtime turn-start result folding"
+            !agent_loop_source.contains("RuntimeTurnStartResultStep"),
+            "agent_loop must delegate runtime turn-start result folding through opening step"
         );
         assert!(
             lifecycle_source.contains("struct RuntimeTurnStartStep"),
@@ -1519,8 +1519,8 @@ mod tests {
             );
         }
         assert!(
-            agent_loop_source.contains("RuntimeModelRouteStep"),
-            "agent_loop must delegate runtime model routing"
+            agent_loop_source.contains("RuntimeTurnOpeningStep"),
+            "agent_loop must delegate runtime model routing through opening step"
         );
         assert!(
             lifecycle_source.contains("struct RuntimeModelRouteStep"),
@@ -1538,6 +1538,49 @@ mod tests {
             lifecycle_source.contains("events.model_routed("),
             "lifecycle must own runtime model-routed event emission"
         );
+    }
+
+    #[test]
+    fn runtime_turn_opening_step_is_owned_by_lifecycle_module() {
+        let agent_loop_source = include_str!("agent_loop.rs");
+        let lifecycle_source = include_str!("lifecycle.rs");
+
+        for marker in [
+            ".compact_if_needed(conversation)",
+            "RuntimeTurnStartStep::new",
+            "RuntimeTurnStartResultStep::new",
+            "RuntimeModelRouteStep::new",
+            "RuntimeSteerStep::new",
+        ] {
+            assert!(
+                !agent_loop_source.contains(marker),
+                "agent_loop must delegate runtime turn opening detail {marker}"
+            );
+        }
+        assert!(
+            agent_loop_source.contains("RuntimeTurnOpeningStep"),
+            "agent_loop must delegate runtime turn opening"
+        );
+        assert!(
+            lifecycle_source.contains("struct RuntimeTurnOpeningStep"),
+            "lifecycle must own runtime turn opening step state"
+        );
+        assert!(
+            lifecycle_source.contains("impl RuntimeTurnOpeningStep"),
+            "lifecycle must own runtime turn opening step behavior"
+        );
+        for marker in [
+            "RuntimeCompactionStep::new",
+            "RuntimeTurnStartStep::new",
+            "RuntimeTurnStartResultStep::new",
+            "RuntimeModelRouteStep::new",
+            "RuntimeSteerStep::new",
+        ] {
+            assert!(
+                lifecycle_source.contains(marker),
+                "lifecycle must compose runtime turn opening detail {marker}"
+            );
+        }
     }
 
     #[test]

@@ -105,6 +105,7 @@ pub struct RuntimeToolActorContext {
 pub(crate) struct RuntimeSteerStep;
 pub(crate) struct RuntimeConversationBootstrapStep;
 pub(crate) struct RuntimeTurnSetupStep;
+pub(crate) struct RuntimeTurnOpeningStep;
 pub(crate) struct RuntimeTurnStartStep;
 pub(crate) struct RuntimeTurnStartResultStep;
 pub(crate) struct RuntimeModelRouteStep;
@@ -147,6 +148,11 @@ pub(crate) struct RuntimeTurnStartStepOutput {
 
 pub(crate) enum RuntimeTurnStartResult {
     Continue,
+    Return(AgentLoopResult),
+}
+
+pub(crate) enum RuntimeTurnOpeningResult {
+    Continue { provider_config: ProviderConfig },
     Return(AgentLoopResult),
 }
 
@@ -2358,6 +2364,78 @@ impl RuntimeTurnStartResultStep {
     }
 }
 
+impl RuntimeTurnOpeningStep {
+    pub(crate) fn new() -> Self {
+        Self
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn open<W: io::Write>(
+        &mut self,
+        actor: &mut RuntimeTaskActor<'_>,
+        provider: ProviderKind,
+        context_config: &context::ContextConfig,
+        provider_config: &ProviderConfig,
+        cwd: &Path,
+        emit_deltas: bool,
+        hooks: &HookRunner,
+        events: &mut EventFactory,
+        sink: &mut EventSink<W>,
+        conversation: &mut Conversation,
+        mut history_writer: Option<&mut SessionWriter>,
+        prompt: &str,
+        model: &ModelSelection,
+        subagent_type: &SubagentType,
+        cost_tracker: &mut CostTracker,
+        steer_handle: Option<&ThreadSteerHandle>,
+    ) -> io::Result<RuntimeTurnOpeningResult> {
+        RuntimeCompactionStep::new(
+            provider,
+            context_config,
+            provider_config,
+            cwd,
+            emit_deltas,
+            hooks,
+            events,
+            sink,
+            history_writer.as_deref_mut(),
+        )
+        .compact_if_needed(conversation)?;
+
+        match RuntimeTurnStartResultStep::new().fold(RuntimeTurnStartStep::new().start(
+            actor,
+            events,
+            sink,
+            prompt,
+            emit_deltas,
+        )?) {
+            RuntimeTurnStartResult::Return(result) => {
+                return Ok(RuntimeTurnOpeningResult::Return(result));
+            }
+            RuntimeTurnStartResult::Continue => {}
+        }
+
+        let turn_provider_config = RuntimeModelRouteStep::new()
+            .route(
+                actor,
+                model,
+                subagent_type,
+                provider_config,
+                cost_tracker,
+                events,
+                sink,
+                emit_deltas,
+            )?
+            .provider_config;
+
+        RuntimeSteerStep::new().apply(steer_handle, conversation, history_writer.as_deref_mut())?;
+
+        Ok(RuntimeTurnOpeningResult::Continue {
+            provider_config: turn_provider_config,
+        })
+    }
+}
+
 impl RuntimeModelRouteStep {
     pub(crate) fn new() -> Self {
         Self
@@ -3458,6 +3536,67 @@ mod tests {
         let output = String::from_utf8(output).expect("jsonl is utf8");
         assert!(output.contains("\"type\":\"turn.started\""));
         assert!(output.contains("hello"));
+    }
+
+    #[test]
+    fn turn_opening_step_compacts_starts_routes_and_steers() {
+        let mut lifecycle = RuntimeSessionLifecycle::new("turn-opening-step".to_string());
+        let mut actor = RuntimeTaskActor::new(&mut lifecycle, 3);
+        let mut events = EventFactory::new("turn-opening-step".to_string());
+        let mut output = Vec::new();
+        let mut sink = EventSink::new(&mut output, OutputFormat::Jsonl);
+        let provider_config = ProviderConfig {
+            api_key: Some("test-key".to_string()),
+            base_url: None,
+            model: None,
+            tools_override: Some(Vec::new()),
+            mcp_registry: None,
+            external_tools: Vec::new(),
+        };
+        let runtime = ModelRuntimeConfig::default();
+        let context_config =
+            context::ContextConfig::for_model_with_runtime(Some("deepseek-chat"), &runtime);
+        let hooks = HookRunner::default();
+        let mut conversation = Conversation::new();
+        let mut cost_tracker = CostTracker::new(None);
+        let model = ModelSelection::parse(None).expect("model");
+        let subagent_type = SubagentType::General;
+        let cwd = Path::new(".");
+
+        let result = RuntimeTurnOpeningStep::new()
+            .open(
+                &mut actor,
+                ProviderKind::DeepSeek,
+                &context_config,
+                &provider_config,
+                cwd,
+                true,
+                &hooks,
+                &mut events,
+                &mut sink,
+                &mut conversation,
+                None,
+                "hello",
+                &model,
+                &subagent_type,
+                &mut cost_tracker,
+                None,
+            )
+            .expect("open turn");
+
+        match result {
+            RuntimeTurnOpeningResult::Continue { provider_config } => {
+                assert_eq!(provider_config.api_key.as_deref(), Some("test-key"));
+                assert_eq!(
+                    provider_config.model.as_deref(),
+                    Some(orca_core::model::PRO_MODEL)
+                );
+            }
+            RuntimeTurnOpeningResult::Return(_) => panic!("opening should continue"),
+        }
+        let output = String::from_utf8(output).expect("jsonl is utf8");
+        assert!(output.contains("\"type\":\"turn.started\""));
+        assert!(output.contains("\"type\":\"model.routed\""));
     }
 
     #[test]

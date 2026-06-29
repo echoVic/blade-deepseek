@@ -6,13 +6,12 @@ use crate::hooks::HookRunner;
 use crate::instructions::ProjectInstructions;
 use crate::lifecycle::{
     AgentLoopContext, AgentLoopResult, RuntimeCompactionStep, RuntimeConversationBootstrapStep,
-    RuntimeModelRouteStep, RuntimeProviderErrorResult, RuntimeProviderErrorResultStep,
-    RuntimeProviderErrorStep, RuntimeProviderResponseResult, RuntimeProviderResponseResultStep,
-    RuntimeProviderResponseStep, RuntimeProviderTurnResultResult,
-    RuntimeProviderTurnResultResultStep, RuntimeProviderTurnResultStep, RuntimeProviderTurnStep,
-    RuntimeSessionLifecycle, RuntimeSteerStep, RuntimeTaskActor, RuntimeTurnConfig,
-    RuntimeTurnDeps, RuntimeTurnExecution, RuntimeTurnSetupStep, RuntimeTurnStartResult,
-    RuntimeTurnStartResultStep, RuntimeTurnStartStep, RuntimeTurnState,
+    RuntimeProviderErrorResult, RuntimeProviderErrorResultStep, RuntimeProviderErrorStep,
+    RuntimeProviderResponseResult, RuntimeProviderResponseResultStep, RuntimeProviderResponseStep,
+    RuntimeProviderTurnResultResult, RuntimeProviderTurnResultResultStep,
+    RuntimeProviderTurnResultStep, RuntimeProviderTurnStep, RuntimeSessionLifecycle,
+    RuntimeTaskActor, RuntimeTurnConfig, RuntimeTurnDeps, RuntimeTurnExecution,
+    RuntimeTurnOpeningResult, RuntimeTurnOpeningStep, RuntimeTurnSetupStep, RuntimeTurnState,
 };
 use crate::memory::MemoryBlock;
 use crate::session::AgentConversationContext;
@@ -97,9 +96,10 @@ pub(crate) fn run_agent_loop(
     let mut provider_error_step = RuntimeProviderErrorStep::new();
 
     loop {
-        {
+        let turn_provider_config = {
             let (conversation, history_writer) = prepared_conversation.parts_mut();
-            RuntimeCompactionStep::new(
+            match RuntimeTurnOpeningStep::new().open(
+                &mut actor,
                 config.provider,
                 &ctx_config,
                 &provider_config,
@@ -108,39 +108,18 @@ pub(crate) fn run_agent_loop(
                 hooks,
                 events,
                 sink,
+                conversation,
                 history_writer,
-            )
-            .compact_if_needed(conversation)?;
-        }
-
-        match RuntimeTurnStartResultStep::new().fold(RuntimeTurnStartStep::new().start(
-            &mut actor,
-            events,
-            sink,
-            prompt,
-            emit_deltas,
-        )?) {
-            RuntimeTurnStartResult::Continue => {}
-            RuntimeTurnStartResult::Return(result) => return Ok(result),
-        }
-
-        let turn_provider_config = RuntimeModelRouteStep::new()
-            .route(
-                &mut actor,
+                prompt,
                 &config.model,
                 subagent_type,
-                &provider_config,
                 cost_tracker,
-                events,
-                sink,
-                emit_deltas,
-            )?
-            .provider_config;
-
-        {
-            let (conversation, history_writer) = prepared_conversation.parts_mut();
-            RuntimeSteerStep::new().apply(steer_handle, conversation, history_writer)?;
-        }
+                steer_handle,
+            )? {
+                RuntimeTurnOpeningResult::Continue { provider_config } => provider_config,
+                RuntimeTurnOpeningResult::Return(result) => return Ok(result),
+            }
+        };
 
         let cwd_display = cwd.display().to_string();
         let provider_turn = {
