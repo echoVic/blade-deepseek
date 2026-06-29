@@ -603,6 +603,43 @@ done
     }
 
     #[test]
+    fn list_mcp_resources_reports_registry_initialization_errors() {
+        let resource = orca_core::mcp_types::McpResource {
+            server: "notes".to_string(),
+            uri: "memo://orca/one".to_string(),
+            name: "memo one".to_string(),
+            description: Some("A test memo".to_string()),
+            mime_type: Some("text/plain".to_string()),
+        };
+        let registry = McpRegistry::from_resource_listing_for_test(vec![resource], Vec::new())
+            .with_registry_errors_for_test(vec![
+                "failed to start MCP server 'broken': boom".to_string(),
+            ]);
+
+        let result = execute_with_mcp(
+            &ToolRequest {
+                id: "list-resources".to_string(),
+                name: ToolName::ListMcpResources,
+                action: ActionKind::Read,
+                target: None,
+                raw_arguments: Some("{}".to_string()),
+            },
+            Path::new("."),
+            &registry,
+        );
+
+        assert_eq!(result.status, ToolStatus::Completed);
+        let output: serde_json::Value =
+            serde_json::from_str(result.output.as_deref().expect("tool output"))
+                .expect("resource listing JSON");
+        assert_eq!(output["resources"][0]["server"], "notes");
+        assert_eq!(
+            output["errors"][0],
+            "failed to start MCP server 'broken': boom"
+        );
+    }
+
+    #[test]
     fn list_mcp_resource_templates_reports_partial_template_errors() {
         let template = orca_core::mcp_types::McpResourceTemplate {
             server: "docs".to_string(),
@@ -640,6 +677,44 @@ done
         assert_eq!(
             output["errors"][0],
             "broken: resources/templates/list timed out"
+        );
+    }
+
+    #[test]
+    fn list_mcp_resource_templates_reports_registry_initialization_errors() {
+        let template = orca_core::mcp_types::McpResourceTemplate {
+            server: "docs".to_string(),
+            uri_template: "file:///{path}".to_string(),
+            name: "workspace file".to_string(),
+            description: Some("A file exposed by path".to_string()),
+            mime_type: Some("text/plain".to_string()),
+        };
+        let registry =
+            McpRegistry::from_resource_template_listing_for_test(vec![template], Vec::new())
+                .with_registry_errors_for_test(vec![
+                    "failed to start MCP server 'broken': boom".to_string(),
+                ]);
+
+        let result = execute_with_mcp(
+            &ToolRequest {
+                id: "list-resource-templates".to_string(),
+                name: ToolName::ListMcpResourceTemplates,
+                action: ActionKind::Read,
+                target: None,
+                raw_arguments: Some("{}".to_string()),
+            },
+            Path::new("."),
+            &registry,
+        );
+
+        assert_eq!(result.status, ToolStatus::Completed);
+        let output: serde_json::Value =
+            serde_json::from_str(result.output.as_deref().expect("tool output"))
+                .expect("resource template listing JSON");
+        assert_eq!(output["resourceTemplates"][0]["server"], "docs");
+        assert_eq!(
+            output["errors"][0],
+            "failed to start MCP server 'broken': boom"
         );
     }
 

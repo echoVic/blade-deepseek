@@ -274,6 +274,18 @@ impl McpRegistry {
         }
     }
 
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn with_registry_errors_for_test(&self, errors: Vec<String>) -> Self {
+        Self {
+            inner: Arc::new(McpRegistryInner {
+                clients: self.inner.clients.clone(),
+                tools: self.inner.tools.clone(),
+                lookup: self.inner.lookup.clone(),
+                errors,
+            }),
+        }
+    }
+
     pub fn tools(&self) -> &[McpTool] {
         &self.inner.tools
     }
@@ -641,7 +653,14 @@ impl McpRegistry {
                 .collect(),
         };
 
-        let mut listing = McpResourceListing::default();
+        let mut listing = McpResourceListing {
+            resources: Vec::new(),
+            errors: if server.is_none() {
+                self.inner.errors.clone()
+            } else {
+                Vec::new()
+            },
+        };
         for (server, client) in clients {
             match client.list_resources() {
                 Ok(result) => match serde_json::from_value::<ResourcesListResult>(result) {
@@ -729,7 +748,14 @@ impl McpRegistry {
                 .collect(),
         };
 
-        let mut listing = McpResourceTemplateListing::default();
+        let mut listing = McpResourceTemplateListing {
+            resource_templates: Vec::new(),
+            errors: if server.is_none() {
+                self.inner.errors.clone()
+            } else {
+                Vec::new()
+            },
+        };
         for (server, client) in clients {
             match client.list_resource_templates() {
                 Ok(result) => match serde_json::from_value::<ResourceTemplatesListResult>(result) {
@@ -1068,6 +1094,68 @@ mod tests {
     }
 
     #[test]
+    fn registry_includes_initialization_errors_in_all_server_resource_listing() {
+        struct ResourceListTransport;
+
+        impl McpTransport for ResourceListTransport {
+            fn initialize(&self) -> Result<(), String> {
+                Ok(())
+            }
+
+            fn list_tools(&self) -> Result<Value, String> {
+                Ok(serde_json::json!({"tools": []}))
+            }
+
+            fn call_tool(&self, _name: &str, _arguments: Value) -> Result<Value, String> {
+                Err("not used".to_string())
+            }
+
+            fn list_resources(&self) -> Result<Value, String> {
+                Ok(serde_json::json!({
+                    "resources": [
+                        {
+                            "uri": "memo://orca/one",
+                            "name": "memo one",
+                            "description": "A test memo",
+                            "mimeType": "text/plain"
+                        }
+                    ]
+                }))
+            }
+
+            fn list_resource_templates(&self) -> Result<Value, String> {
+                Ok(serde_json::json!({"resourceTemplates": []}))
+            }
+
+            fn read_resource(&self, _uri: &str) -> Result<Value, String> {
+                Err("not used".to_string())
+            }
+        }
+
+        let registry = McpRegistry::from_resource_transports_for_test([(
+            "notes".to_string(),
+            Box::new(ResourceListTransport) as Box<dyn McpTransport>,
+        )])
+        .with_registry_errors_for_test(vec![
+            "failed to start MCP server 'broken': boom".to_string(),
+        ]);
+
+        let listing = registry.list_resources_with_errors(None);
+
+        assert_eq!(listing.resources.len(), 1);
+        assert_eq!(listing.resources[0].server, "notes");
+        assert_eq!(
+            listing.errors,
+            vec!["failed to start MCP server 'broken': boom".to_string()]
+        );
+
+        let single_server_listing = registry
+            .list_resources(Some("notes"))
+            .expect("single-server resource listing");
+        assert_eq!(single_server_listing.len(), 1);
+    }
+
+    #[test]
     fn registry_aggregates_mcp_resource_template_errors_without_losing_successes() {
         struct TemplateListTransport {
             result: Result<Value, String>,
@@ -1137,6 +1225,68 @@ mod tests {
             .list_resource_templates(Some("broken"))
             .expect_err("single-server resource template list should stay strict");
         assert_eq!(single_server_error, "resources/templates/list timed out");
+    }
+
+    #[test]
+    fn registry_includes_initialization_errors_in_all_server_resource_template_listing() {
+        struct TemplateListTransport;
+
+        impl McpTransport for TemplateListTransport {
+            fn initialize(&self) -> Result<(), String> {
+                Ok(())
+            }
+
+            fn list_tools(&self) -> Result<Value, String> {
+                Ok(serde_json::json!({"tools": []}))
+            }
+
+            fn call_tool(&self, _name: &str, _arguments: Value) -> Result<Value, String> {
+                Err("not used".to_string())
+            }
+
+            fn list_resources(&self) -> Result<Value, String> {
+                Ok(serde_json::json!({"resources": []}))
+            }
+
+            fn read_resource(&self, _uri: &str) -> Result<Value, String> {
+                Err("not used".to_string())
+            }
+
+            fn list_resource_templates(&self) -> Result<Value, String> {
+                Ok(serde_json::json!({
+                    "resourceTemplates": [
+                        {
+                            "uriTemplate": "file:///{path}",
+                            "name": "workspace file",
+                            "description": "A file exposed by path",
+                            "mimeType": "text/plain"
+                        }
+                    ]
+                }))
+            }
+        }
+
+        let registry = McpRegistry::from_resource_transports_for_test([(
+            "docs".to_string(),
+            Box::new(TemplateListTransport) as Box<dyn McpTransport>,
+        )])
+        .with_registry_errors_for_test(vec![
+            "failed to start MCP server 'broken': boom".to_string(),
+        ]);
+
+        let listing = registry.list_resource_templates_with_errors(None);
+
+        assert_eq!(listing.resource_templates.len(), 1);
+        assert_eq!(listing.resource_templates[0].server, "docs");
+        assert_eq!(
+            listing.errors,
+            vec!["failed to start MCP server 'broken': boom".to_string()]
+        );
+
+        let single_server_listing = registry
+            .list_resource_templates(Some("docs"))
+            .expect("single-server resource template listing");
+        assert_eq!(single_server_listing.len(), 1);
     }
 
     #[cfg(unix)]
