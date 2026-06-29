@@ -168,6 +168,45 @@ pub(crate) fn command_execution_completed_item(
     })
 }
 
+pub(crate) fn persisted_command_execution_started_item(
+    id: impl Into<String>,
+    tool: impl Into<String>,
+    command: Value,
+) -> Value {
+    json!({
+        "id": id.into(),
+        "type": "commandExecution",
+        "tool": tool.into(),
+        "command": command,
+        "cwd": Value::Null,
+        "processId": Value::Null,
+        "source": Value::Null,
+        "status": "in_progress",
+        "commandActions": [],
+        "aggregatedOutput": Value::Null,
+        "error": Value::Null,
+        "exitCode": Value::Null,
+        "durationMs": Value::Null,
+    })
+}
+
+pub(crate) fn persisted_command_execution_completed_item(
+    started: &Value,
+    status: Value,
+    aggregated_output: Value,
+    error: Value,
+    truncated: Value,
+) -> Value {
+    let mut item = started.clone();
+    item["status"] = status;
+    item["aggregatedOutput"] = aggregated_output;
+    item["error"] = error;
+    if !truncated.is_null() {
+        item["truncated"] = truncated;
+    }
+    item
+}
+
 pub(crate) fn file_change_started_item(
     id: impl Into<String>,
     path: Option<impl Into<String>>,
@@ -618,5 +657,54 @@ mod tests {
         assert_eq!(item["error"], "command failed");
         assert_eq!(item["exitCode"], 101);
         assert_eq!(item["truncated"], true);
+    }
+
+    #[test]
+    fn persisted_command_execution_started_item_keeps_history_shape() {
+        let item = persisted_command_execution_started_item("tool-4", "bash", Value::from("ls"));
+
+        assert_eq!(item["id"], "tool-4");
+        assert_eq!(item["type"], "commandExecution");
+        assert_eq!(item["tool"], "bash");
+        assert_eq!(item["command"], "ls");
+        assert!(item["cwd"].is_null());
+        assert!(item["processId"].is_null());
+        assert!(item["source"].is_null());
+        assert_eq!(item["status"], "in_progress");
+        assert_eq!(item["commandActions"], json!([]));
+        assert!(item["aggregatedOutput"].is_null());
+        assert!(item["error"].is_null());
+        assert!(item["exitCode"].is_null());
+        assert!(item["durationMs"].is_null());
+    }
+
+    #[test]
+    fn persisted_command_execution_completed_item_preserves_history_metadata() {
+        let started =
+            persisted_command_execution_started_item("tool-5", "bash", Value::from("cargo test"));
+        let completed = persisted_command_execution_completed_item(
+            &started,
+            Value::from("completed"),
+            Value::from("ok"),
+            Value::Null,
+            Value::from(true),
+        );
+
+        assert_eq!(completed["id"], "tool-5");
+        assert_eq!(completed["type"], "commandExecution");
+        assert_eq!(completed["tool"], "bash");
+        assert_eq!(completed["command"], "cargo test");
+        assert!(completed["cwd"].is_null());
+        assert!(completed["processId"].is_null());
+        assert!(completed["source"].is_null());
+        assert_eq!(completed["status"], "completed");
+        assert_eq!(completed["commandActions"], json!([]));
+        assert_eq!(completed["aggregatedOutput"], "ok");
+        assert!(completed["error"].is_null());
+        assert!(completed["exitCode"].is_null());
+        assert!(completed["durationMs"].is_null());
+        assert_eq!(completed["truncated"], true);
+        assert!(completed.get("result").is_none());
+        assert!(completed.get("output").is_none());
     }
 }

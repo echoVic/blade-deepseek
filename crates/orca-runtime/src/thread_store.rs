@@ -8,6 +8,7 @@ use crate::history::{self, CompactionRecord, ContextSummaryRecord};
 use crate::tool_item_projection::{
     dynamic_tool_completed_item, dynamic_tool_started_item, mcp_result_from_content,
     mcp_tool_completed_item, mcp_tool_parts, mcp_tool_started_item, parse_json_or_null,
+    persisted_command_execution_completed_item, persisted_command_execution_started_item,
     tool_error_object_from_value,
 };
 use chrono::{DateTime, Utc};
@@ -2268,21 +2269,11 @@ fn tool_call_to_thread_item(tool_call: &RawToolCall) -> Value {
 }
 
 fn command_execution_thread_item(tool_call: &RawToolCall) -> Value {
-    json!({
-        "id": tool_call.id,
-        "type": "commandExecution",
-        "tool": tool_call.function_name,
-        "command": command_from_tool_arguments(&tool_call.arguments),
-        "cwd": Value::Null,
-        "processId": Value::Null,
-        "source": Value::Null,
-        "status": "in_progress",
-        "commandActions": [],
-        "aggregatedOutput": Value::Null,
-        "error": Value::Null,
-        "exitCode": Value::Null,
-        "durationMs": Value::Null,
-    })
+    persisted_command_execution_started_item(
+        tool_call.id.clone(),
+        tool_call.function_name.clone(),
+        command_from_tool_arguments(&tool_call.arguments),
+    )
 }
 
 fn tool_result_to_thread_item(tool_call_id: &str, content: &str) -> Value {
@@ -2378,23 +2369,42 @@ fn complete_projected_tool_item(
         return;
     }
 
+    if item["type"] == "commandExecution" {
+        let content = result["content"].as_str().unwrap_or_default();
+        *item = persisted_command_execution_completed_item(
+            item,
+            Value::from(status.to_string()),
+            if status == "completed" {
+                Value::from(content.to_string())
+            } else {
+                Value::Null
+            },
+            if status == "completed" {
+                Value::Null
+            } else {
+                error
+            },
+            truncated_metadata(result),
+        );
+        return;
+    }
+
     let content = result["content"].as_str().unwrap_or_default();
     item["status"] = Value::from(status.to_string());
     copy_truncated_metadata(item, result);
-    if item["type"] == "commandExecution" {
-        if status == "completed" {
-            item["aggregatedOutput"] = Value::from(content.to_string());
-            item["error"] = Value::Null;
-        } else {
-            item["error"] = error;
-        }
+    item["result"] = if status == "completed" {
+        Value::from(content.to_string())
     } else {
-        item["result"] = if status == "completed" {
-            Value::from(content.to_string())
-        } else {
-            Value::Null
-        };
-        item["error"] = error;
+        Value::Null
+    };
+    item["error"] = error;
+}
+
+fn truncated_metadata(result: &Value) -> Value {
+    if result["truncated"].as_bool() == Some(true) {
+        Value::from(true)
+    } else {
+        Value::Null
     }
 }
 
