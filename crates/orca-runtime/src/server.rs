@@ -4803,7 +4803,7 @@ mod tests {
             handle_line(&server_config, &mut state, &first, Arc::clone(&writer))
                 .expect("first turn");
             loop {
-                let events = parse_jsonl(&writer.lock().expect("writer").clone());
+                let events = parse_complete_jsonl(&writer.lock().expect("writer").clone());
                 if events
                     .iter()
                     .any(|event| event["id"] == "turn-1" && event["event"] == "turn_completed")
@@ -5329,6 +5329,33 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str(line).expect("valid jsonl line"))
             .collect()
+    }
+
+    fn parse_complete_jsonl(stdout: &[u8]) -> Vec<Value> {
+        let text = String::from_utf8_lossy(stdout);
+        let lines = text.lines();
+        let has_trailing_newline = stdout.ends_with(b"\n");
+        let last_index = lines.clone().count().saturating_sub(1);
+        lines
+            .enumerate()
+            .filter_map(|(index, line)| {
+                if !has_trailing_newline && index == last_index {
+                    return None;
+                }
+                Some(serde_json::from_str(line).expect("valid complete jsonl line"))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn parse_complete_jsonl_ignores_trailing_partial_line_while_writer_is_active() {
+        let output = br#"{"event":"turn_completed"}
+{"event":"message_delta","text":"partial"#;
+
+        let events = parse_complete_jsonl(output);
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["event"], "turn_completed");
     }
 
     fn with_orca_home<T>(f: impl FnOnce(&std::path::Path) -> T) -> T {
