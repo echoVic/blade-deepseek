@@ -106,7 +106,7 @@ Built-in tools:
 | Tool | Action | Description |
 |------|--------|-------------|
 | `read_file` | read | Reads UTF-8 file content, truncated at 8KB |
-| `glob` | read | Finds files and directories by glob pattern, sorted as workspace-relative paths; returns `(no matches)` when the path is missing or no entries match |
+| `glob` | read | Finds files and directories by glob pattern or `mode: "fuzzy"` path query, sorted as workspace-relative paths; returns `(no matches)` when the path is missing or no entries match |
 | `list_files` | read | Compatibility alias for directory listing; returns sorted names and `(empty)` for missing directories |
 | `grep` | read | Regex search via `rg` with line numbers, `(no matches)` for empty results |
 | `git_status` | read | Runs `git status --short` |
@@ -133,7 +133,7 @@ External tools:
 - Descriptors are advertised to the model as function tools.
 - Commands run from the workspace directory with raw JSON arguments on stdin and in `ORCA_TOOL_ARGS`.
 
-`glob` is the preferred file discovery tool. `list_files` remains accepted for compatibility but is not recommended in the system prompt.
+`glob` is the preferred file discovery tool. It accepts the existing `pattern` argument for glob searches and `{"mode":"fuzzy","query":"..."}` for fuzzy path discovery. `list_files` remains accepted for compatibility but is not recommended in the system prompt.
 
 Hook stdout protocol:
 - `{"action":"allow"}` allows the operation.

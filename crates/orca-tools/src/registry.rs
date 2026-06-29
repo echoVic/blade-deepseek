@@ -387,7 +387,7 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
     ));
     let mut glob = builtin_spec(
         "glob",
-        "Find files and directories matching a glob pattern. Use this for project file discovery.",
+        "Find files and directories by glob pattern or fuzzy path query. Use this for project file discovery.",
         json!({
             "type": "object",
             "properties": {
@@ -395,12 +395,35 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
                     "type": "string",
                     "description": "Glob pattern such as **/*.rs"
                 },
+                "query": {
+                    "type": "string",
+                    "description": "Fuzzy path query used when mode is fuzzy, such as rcm for runtime/config/mod.rs"
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["glob", "fuzzy"],
+                    "description": "Search mode. Defaults to glob."
+                },
                 "path": {
                     "type": "string",
                     "description": "Directory to search in (default: '.')"
                 }
             },
-            "required": ["pattern"]
+            "oneOf": [
+                {
+                    "required": ["pattern"],
+                    "properties": {
+                        "mode": { "enum": ["glob"] }
+                    }
+                },
+                {
+                    "required": ["mode", "query"],
+                    "properties": {
+                        "mode": { "enum": ["fuzzy"] }
+                    }
+                }
+            ],
+            "additionalProperties": false
         }),
         CapabilitySet::new(vec![ToolCapability::FsList, ToolCapability::FsSearch]),
         ToolExposure::Direct,

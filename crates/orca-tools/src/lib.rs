@@ -608,6 +608,53 @@ done
     }
 
     #[test]
+    fn registry_executes_glob_with_fuzzy_query() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        fs::create_dir_all(temp_dir.path().join("src/runtime/config")).expect("fixture dir");
+        fs::write(temp_dir.path().join("src/runtime/config/mod.rs"), "mod").expect("fixture");
+        let reg = registry::default_tool_registry();
+        let request = ToolRequest {
+            id: "glob".to_string(),
+            name: ToolName::Glob,
+            action: ActionKind::Read,
+            target: None,
+            raw_arguments: Some(r#"{"mode":"fuzzy","query":"rcm"}"#.to_string()),
+        };
+
+        let result = reg.execute(&request, &registry::ToolContext::new(temp_dir.path()));
+
+        assert_eq!(result.status, ToolStatus::Completed);
+        assert_eq!(result.kind, orca_core::tool_types::ToolResultKind::Success);
+        let output = result.output.expect("fuzzy output");
+        assert!(
+            output
+                .lines()
+                .any(|line| line == "src/runtime/config/mod.rs")
+        );
+    }
+
+    #[test]
+    fn registry_exposes_glob_fuzzy_schema() {
+        let reg = registry::default_tool_registry();
+        let glob = reg.resolve("glob").expect("glob tool").tool;
+        let schema = &glob.spec().input_schema;
+
+        assert_eq!(schema["properties"]["mode"]["enum"][1], "fuzzy");
+        assert_eq!(schema["properties"]["query"]["type"], "string");
+        assert!(
+            schema["oneOf"]
+                .as_array()
+                .expect("oneOf")
+                .iter()
+                .any(|entry| entry["required"]
+                    .as_array()
+                    .expect("required")
+                    .iter()
+                    .any(|value| value == "query"))
+        );
+    }
+
+    #[test]
     fn registry_executes_glob_with_truncated_kind() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         fs::create_dir_all(temp_dir.path().join("src")).expect("fixture dir");

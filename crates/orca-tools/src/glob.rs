@@ -9,9 +9,21 @@ use crate::resolve_workspace_path;
 
 #[derive(Deserialize)]
 struct GlobArgs {
-    pattern: String,
+    pattern: Option<String>,
+    query: Option<String>,
+    mode: Option<GlobMode>,
     path: Option<String>,
 }
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum GlobMode {
+    Glob,
+    Fuzzy,
+}
+
+const MAX_FUZZY_VISITS: usize = 10_000;
+const MAX_FUZZY_MATCHES: usize = 200;
 
 pub fn execute(request: &ToolRequest, cwd: &Path, max_bytes: usize) -> ToolResult {
     let args = match parse_args(request) {
@@ -32,7 +44,15 @@ pub fn execute(request: &ToolRequest, cwd: &Path, max_bytes: usize) -> ToolResul
         );
     }
 
-    let matcher = match build_matcher(&args.pattern) {
+    if matches!(args.mode, Some(GlobMode::Fuzzy)) {
+        return execute_fuzzy(request, cwd, &search_root, &args.query, max_bytes);
+    }
+
+    let pattern = args
+        .pattern
+        .as_deref()
+        .expect("glob mode requires parsed pattern");
+    let matcher = match build_matcher(pattern) {
         Ok(matcher) => matcher,
         Err(error) => return ToolResult::failed(request, error, None),
     };
@@ -73,10 +93,75 @@ fn parse_args(request: &ToolRequest) -> Result<GlobArgs, String> {
         .ok_or_else(|| "missing glob arguments JSON".to_string())?;
     let args: GlobArgs = serde_json::from_str(raw)
         .map_err(|error| format!("invalid glob arguments JSON: {error}"))?;
-    if args.pattern.trim().is_empty() {
-        return Err("missing required glob argument: pattern".to_string());
+    let mode = args.mode.unwrap_or(GlobMode::Glob);
+    match mode {
+        GlobMode::Glob => {
+            if args
+                .pattern
+                .as_deref()
+                .is_none_or(|pattern| pattern.trim().is_empty())
+            {
+                return Err("missing required glob argument: pattern".to_string());
+            }
+        }
+        GlobMode::Fuzzy => {
+            if args
+                .query
+                .as_deref()
+                .is_none_or(|query| query.trim().is_empty())
+            {
+                return Err("missing required glob fuzzy argument: query".to_string());
+            }
+        }
     }
     Ok(args)
+}
+
+fn execute_fuzzy(
+    request: &ToolRequest,
+    cwd: &Path,
+    search_root: &Path,
+    query: &Option<String>,
+    max_bytes: usize,
+) -> ToolResult {
+    let query = query
+        .as_deref()
+        .expect("fuzzy mode requires parsed query")
+        .trim();
+    let mut matches = Vec::new();
+    let mut visited = 0;
+    collect_fuzzy_matches(cwd, search_root, query, &mut matches, &mut visited);
+    matches.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.1.len().cmp(&right.1.len()))
+            .then_with(|| left.1.cmp(&right.1))
+    });
+    matches.dedup_by(|left, right| left.1 == right.1);
+    let matches = matches
+        .into_iter()
+        .take(MAX_FUZZY_MATCHES)
+        .map(|(_, path)| path)
+        .collect::<Vec<_>>();
+    if matches.is_empty() {
+        return ToolResult::completed_kind(
+            request,
+            "(no matches)".to_string(),
+            false,
+            ToolResultKind::NoMatches,
+        );
+    }
+    let (output, truncated) = truncate_output(matches.join("\n"), max_bytes);
+    ToolResult::completed_kind(
+        request,
+        output,
+        truncated,
+        if truncated {
+            ToolResultKind::Truncated
+        } else {
+            ToolResultKind::Success
+        },
+    )
 }
 
 fn build_matcher(pattern: &str) -> Result<globset::GlobSet, String> {
@@ -117,9 +202,163 @@ fn match_file(cwd: &Path, path: &Path, matcher: &globset::GlobSet) -> Vec<String
     }
 }
 
+fn collect_fuzzy_matches(
+    cwd: &Path,
+    search_root: &Path,
+    query: &str,
+    scored: &mut Vec<(usize, String)>,
+    visited: &mut usize,
+) {
+    if *visited >= MAX_FUZZY_VISITS {
+        return;
+    }
+    for entry in WalkDir::new(search_root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| !is_hidden_entry(entry.path(), search_root))
+    {
+        if *visited >= MAX_FUZZY_VISITS {
+            return;
+        }
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let path = entry.path();
+        if path == search_root {
+            continue;
+        }
+        *visited += 1;
+        let candidate = relative_to_workspace(cwd, path);
+        let candidate = if path.is_dir() {
+            format!("{candidate}/")
+        } else {
+            candidate
+        };
+        if let Some(score) = fuzzy_score(&candidate, query) {
+            scored.push((score, candidate));
+        }
+    }
+}
+
+fn is_hidden_entry(path: &Path, search_root: &Path) -> bool {
+    if path == search_root {
+        return false;
+    }
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with('.'))
+}
+
+fn fuzzy_score(candidate: &str, query: &str) -> Option<usize> {
+    let candidate_lower = candidate.to_lowercase();
+    let query_lower = query.to_lowercase();
+    if candidate_lower.contains(&query_lower) {
+        return candidate_lower.find(&query_lower);
+    }
+    subsequence_score(&candidate_lower, &query_lower)
+}
+
+fn subsequence_score(candidate: &str, query: &str) -> Option<usize> {
+    let mut score = 0;
+    let mut last_match = 0;
+    let mut chars = candidate.char_indices();
+    for query_char in query.chars() {
+        let mut matched = None;
+        for (index, candidate_char) in chars.by_ref() {
+            if candidate_char == query_char {
+                matched = Some(index);
+                break;
+            }
+        }
+        let index = matched?;
+        score += index.saturating_sub(last_match);
+        last_match = index + query_char.len_utf8();
+    }
+    Some(score)
+}
+
 fn relative_to_workspace(cwd: &Path, path: &Path) -> String {
     path.strip_prefix(cwd)
         .unwrap_or(path)
         .to_string_lossy()
         .replace('\\', "/")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use orca_core::approval_types::ActionKind;
+    use orca_core::tool_types::{ToolName, ToolResultKind, ToolStatus};
+    use tempfile::tempdir;
+
+    use super::*;
+
+    #[test]
+    fn fuzzy_mode_returns_ranked_relative_matches() {
+        let cwd = tempdir().expect("temp workspace");
+        fs::create_dir_all(cwd.path().join("src/runtime/config")).expect("create nested dir");
+        fs::create_dir_all(cwd.path().join("src/render")).expect("create alternate dir");
+        fs::write(cwd.path().join("src/runtime/config/mod.rs"), "hello").expect("write match");
+        fs::write(cwd.path().join("src/render/component.rs"), "hello").expect("write alternate");
+        let request = ToolRequest {
+            id: "glob-fuzzy".to_string(),
+            name: ToolName::Glob,
+            action: ActionKind::Read,
+            target: None,
+            raw_arguments: Some(
+                serde_json::json!({
+                    "mode": "fuzzy",
+                    "query": "rcm"
+                })
+                .to_string(),
+            ),
+        };
+
+        let result = execute(&request, cwd.path(), 4096);
+
+        assert_eq!(result.status, ToolStatus::Completed);
+        assert_eq!(result.kind, ToolResultKind::Success);
+        let output = result.output.expect("fuzzy output");
+        assert!(
+            output
+                .lines()
+                .any(|line| line == "src/runtime/config/mod.rs"),
+            "expected fuzzy query to match path initials, got {output}"
+        );
+    }
+
+    #[test]
+    fn fuzzy_mode_scopes_search_path() {
+        let cwd = tempdir().expect("temp workspace");
+        fs::create_dir_all(cwd.path().join("src/runtime/config")).expect("create runtime dir");
+        fs::create_dir_all(cwd.path().join("docs/runtime/config")).expect("create docs dir");
+        fs::write(cwd.path().join("src/runtime/config/mod.rs"), "hello").expect("write src");
+        fs::write(cwd.path().join("docs/runtime/config/mod.md"), "hello").expect("write docs");
+        let request = ToolRequest {
+            id: "glob-fuzzy-path".to_string(),
+            name: ToolName::Glob,
+            action: ActionKind::Read,
+            target: None,
+            raw_arguments: Some(
+                serde_json::json!({
+                    "mode": "fuzzy",
+                    "query": "rcm",
+                    "path": "docs"
+                })
+                .to_string(),
+            ),
+        };
+
+        let result = execute(&request, cwd.path(), 4096);
+
+        assert_eq!(result.status, ToolStatus::Completed);
+        let output = result.output.expect("fuzzy output");
+        assert!(
+            output
+                .lines()
+                .any(|line| line == "docs/runtime/config/mod.md")
+        );
+        assert!(!output.lines().any(|line| line.starts_with("src/")));
+    }
 }
