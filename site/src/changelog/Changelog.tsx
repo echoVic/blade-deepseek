@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.58":
+        "MCP and dynamic tool completed-item construction now uses shared projection builders across realtime streams and persisted history, with failed command projection guarded against output-shape regression.",
       "v0.1.57":
         "Realtime streams and persisted history now share MCP and dynamic tool started-item builders, keeping first-class tool-call item shape aligned at creation time.",
       "v0.1.56":
@@ -144,6 +146,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.58":
+        "MCP / dynamic tool completed-item 构造现在由实时 stream 与持久化 history 共享 projection builder，并补上失败 command projection 的输出形状回归守卫。",
       "v0.1.57":
         "实时 stream 与持久化 history 现在共享 MCP / dynamic tool started-item builder，让一等工具调用 item 从创建阶段就保持形状一致。",
       "v0.1.56":
