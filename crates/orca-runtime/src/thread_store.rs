@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::history::{self, CompactionRecord, ContextSummaryRecord};
-use crate::tool_item_projection::{mcp_result_from_content, mcp_tool_parts, parse_json_or_null};
+use crate::tool_item_projection::{
+    mcp_result_from_content, mcp_tool_parts, parse_json_or_null, tool_error_object_from_value,
+};
 use chrono::{DateTime, Utc};
 use orca_core::approval_rules::PermissionRules;
 use orca_core::approval_types::ApprovalMode;
@@ -2386,11 +2388,7 @@ fn tool_failure_from_result(result: &Value) -> Option<(&'static str, Value)> {
                 .filter(|message| !message.is_empty())
         })
         .unwrap_or("tool call failed");
-    let mut error = json!({ "message": message });
-    if let Some(exit_code) = result["exitCode"].as_i64() {
-        error["exitCode"] = Value::from(exit_code);
-    }
-    Some((status, error))
+    Some((status, tool_error_object_from_value(message, result)))
 }
 
 fn parse_tool_failure_content(content: &str) -> Option<Value> {
@@ -2407,13 +2405,7 @@ fn parse_tool_failure_content(content: &str) -> Option<Value> {
         .and_then(Value::as_str)
         .or_else(|| value.get("message").and_then(Value::as_str))
         .unwrap_or("tool call failed");
-    let mut error = json!({ "message": message });
-    if let Some(exit_code) = value.get("exit_code").and_then(Value::as_i64) {
-        error["exitCode"] = Value::from(exit_code);
-    } else if let Some(exit_code) = value.get("exitCode").and_then(Value::as_i64) {
-        error["exitCode"] = Value::from(exit_code);
-    }
-    Some(error)
+    Some(tool_error_object_from_value(message, &value))
 }
 
 fn command_from_tool_arguments(raw: &str) -> Value {

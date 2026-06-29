@@ -20,7 +20,10 @@ use crate::thread_store::{
     SessionStore, StoredThreadItem, StoredThreadProjection, StoredThreadTurn, ThreadMetadataPatch,
     ThreadStore, TurnItemsView,
 };
-use crate::tool_item_projection::{mcp_result_from_content, mcp_tool_parts, parse_json_or_null};
+use crate::tool_item_projection::{
+    mcp_result_from_content, mcp_tool_parts, parse_json_or_null, tool_error_object_from_value,
+    tool_status_is_completed,
+};
 pub use orca_core::config::{ActivePermissionProfile, AdditionalWorkingDirectory};
 use orca_core::config::{HistoryMode, OutputFormat, RunConfig};
 
@@ -1607,13 +1610,13 @@ fn mcp_tool_result(payload: &Value) -> Value {
 
 fn mcp_tool_error(payload: &Value) -> Value {
     if let Some(error) = payload["error"].as_str() {
-        return tool_error_object(error, payload);
+        return tool_error_object_from_value(error, payload);
     }
     if payload["status"].as_str() == Some("failed") {
         if let Some(output) = payload["output"].as_str() {
-            return tool_error_object(output, payload);
+            return tool_error_object_from_value(output, payload);
         }
-        return tool_error_object("MCP tool call failed", payload);
+        return tool_error_object_from_value("MCP tool call failed", payload);
     }
     Value::Null
 }
@@ -1630,14 +1633,10 @@ fn dynamic_tool_content_items(payload: &Value) -> Value {
 
 fn dynamic_tool_error(payload: &Value) -> Value {
     match tool_error_detail(payload) {
-        Value::String(message) => tool_error_object(&message, payload),
+        Value::String(message) => tool_error_object_from_value(&message, payload),
         Value::Null => Value::Null,
         other => other,
     }
-}
-
-fn tool_error_object(message: &str, payload: &Value) -> Value {
-    crate::tool_item_projection::tool_error_object(message, payload["exit_code"].as_i64())
 }
 
 fn tool_error_detail(payload: &Value) -> Value {
@@ -1651,10 +1650,6 @@ fn tool_error_detail(payload: &Value) -> Value {
         return Value::from("tool call failed");
     }
     Value::Null
-}
-
-fn tool_status_is_completed(payload: &Value) -> bool {
-    payload["status"].as_str() == Some("completed")
 }
 
 impl<W: Write> Write for ServerRequestWriter<W> {

@@ -36,6 +36,20 @@ pub(crate) fn tool_error_object(message: &str, exit_code: Option<i64>) -> Value 
     Value::Object(error)
 }
 
+pub(crate) fn tool_error_object_from_value(message: &str, value: &Value) -> Value {
+    tool_error_object(
+        message,
+        value
+            .get("exit_code")
+            .and_then(Value::as_i64)
+            .or_else(|| value.get("exitCode").and_then(Value::as_i64)),
+    )
+}
+
+pub(crate) fn tool_status_is_completed(payload: &Value) -> bool {
+    payload["status"].as_str() == Some("completed")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -58,5 +72,32 @@ mod tests {
         assert_eq!(error["message"], "failed");
         assert_eq!(error["exitCode"], 42);
         assert!(error.get("exit_code").is_none());
+    }
+
+    #[test]
+    fn tool_error_object_from_value_normalizes_exit_code_field_names() {
+        let snake_case = tool_error_object_from_value(
+            "failed",
+            &json!({
+                "exit_code": 17,
+            }),
+        );
+        let camel_case = tool_error_object_from_value(
+            "failed",
+            &json!({
+                "exitCode": 18,
+            }),
+        );
+
+        assert_eq!(snake_case["exitCode"], 17);
+        assert!(snake_case.get("exit_code").is_none());
+        assert_eq!(camel_case["exitCode"], 18);
+    }
+
+    #[test]
+    fn tool_status_is_completed_only_accepts_completed_status() {
+        assert!(tool_status_is_completed(&json!({ "status": "completed" })));
+        assert!(!tool_status_is_completed(&json!({ "status": "failed" })));
+        assert!(!tool_status_is_completed(&json!({ "status": Value::Null })));
     }
 }
