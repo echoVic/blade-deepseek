@@ -1421,12 +1421,28 @@ mod tests {
             "agent_loop must delegate provider turn terminal folding"
         );
         assert!(
+            agent_loop_source.contains("RuntimeProviderTurnResultResultStep"),
+            "agent_loop must delegate provider turn result folding"
+        );
+        assert!(
+            !agent_loop_source.contains("RuntimeProviderTurnResultOutcome"),
+            "agent_loop must not own provider turn result outcome folding"
+        );
+        assert!(
             lifecycle_source.contains("struct RuntimeProviderTurnResultStep"),
             "lifecycle must own provider turn result step state"
         );
         assert!(
+            lifecycle_source.contains("struct RuntimeProviderTurnResultResultStep"),
+            "lifecycle must own provider turn result folding step state"
+        );
+        assert!(
             lifecycle_source.contains("impl RuntimeProviderTurnResultStep"),
             "lifecycle must own provider turn result step behavior"
+        );
+        assert!(
+            lifecycle_source.contains("impl RuntimeProviderTurnResultResultStep"),
+            "lifecycle must own provider turn result folding step behavior"
         );
         assert!(
             lifecycle_source.contains("pub(crate) fn provider_response_or_terminal"),

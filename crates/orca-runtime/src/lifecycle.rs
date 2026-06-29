@@ -111,6 +111,7 @@ pub(crate) struct RuntimeProviderErrorStep {
     reactive_compacted: bool,
 }
 pub(crate) struct RuntimeProviderTurnResultStep;
+pub(crate) struct RuntimeProviderTurnResultResultStep;
 
 pub(crate) struct RuntimeProviderTurnStep;
 pub(crate) struct RuntimeProviderResponseStep;
@@ -151,6 +152,11 @@ pub(crate) enum RuntimeProviderErrorStepOutcome {
 pub(crate) enum RuntimeProviderTurnResultOutcome {
     Response(ProviderResponse),
     Failed(RuntimeTurnStartError),
+}
+
+pub(crate) enum RuntimeProviderTurnResultResult {
+    Response(ProviderResponse),
+    Return(AgentLoopResult),
 }
 
 pub(crate) enum RuntimeProviderResponseResult {
@@ -2422,6 +2428,29 @@ impl RuntimeProviderTurnResultStep {
     }
 }
 
+impl RuntimeProviderTurnResultResultStep {
+    pub(crate) fn new() -> Self {
+        Self
+    }
+
+    pub(crate) fn fold(
+        &self,
+        outcome: RuntimeProviderTurnResultOutcome,
+    ) -> RuntimeProviderTurnResultResult {
+        match outcome {
+            RuntimeProviderTurnResultOutcome::Response(response) => {
+                RuntimeProviderTurnResultResult::Response(response)
+            }
+            RuntimeProviderTurnResultOutcome::Failed(error) => {
+                RuntimeProviderTurnResultResult::Return(AgentLoopResult::failure(
+                    error.status,
+                    error.message,
+                ))
+            }
+        }
+    }
+}
+
 impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
     pub(crate) fn new(
         provider: ProviderKind,
@@ -3215,6 +3244,44 @@ mod tests {
         }
         drop(sink);
         assert!(emitted.is_empty());
+    }
+
+    #[test]
+    fn provider_turn_result_result_step_folds_response_and_failure() {
+        let response = ProviderResponse {
+            steps: vec![ProviderStep::MessageDelta("hello".to_string())],
+            assistant_content: Some("hello".to_string()),
+            assistant_reasoning: None,
+            tool_calls: Vec::new(),
+            usage: None,
+        };
+        let success = RuntimeProviderTurnResultResultStep::new()
+            .fold(RuntimeProviderTurnResultOutcome::Response(response));
+        match success {
+            RuntimeProviderTurnResultResult::Response(response) => {
+                assert_eq!(response.assistant_content.as_deref(), Some("hello"));
+            }
+            RuntimeProviderTurnResultResult::Return(_) => {
+                panic!("provider response should continue the turn")
+            }
+        }
+
+        let failed = RuntimeProviderTurnResultResultStep::new().fold(
+            RuntimeProviderTurnResultOutcome::Failed(RuntimeTurnStartError {
+                status: RunStatus::Failed,
+                message: "provider failed".to_string(),
+            }),
+        );
+        match failed {
+            RuntimeProviderTurnResultResult::Return(result) => {
+                assert_eq!(result.status, RunStatus::Failed);
+                assert_eq!(result.final_message, None);
+                assert_eq!(result.error.as_deref(), Some("provider failed"));
+            }
+            RuntimeProviderTurnResultResult::Response(_) => {
+                panic!("provider failure should return loop result")
+            }
+        }
     }
 
     #[test]

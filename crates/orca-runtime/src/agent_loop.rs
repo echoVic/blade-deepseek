@@ -8,10 +8,10 @@ use crate::lifecycle::{
     AgentLoopContext, AgentLoopResult, RuntimeCompactionStep, RuntimeConversationBootstrapStep,
     RuntimeModelRouteStep, RuntimeProviderErrorStep, RuntimeProviderErrorStepOutcome,
     RuntimeProviderResponseResult, RuntimeProviderResponseResultStep, RuntimeProviderResponseStep,
-    RuntimeProviderTurnResultOutcome, RuntimeProviderTurnResultStep, RuntimeProviderTurnStep,
-    RuntimeSessionLifecycle, RuntimeSteerStep, RuntimeTaskActor, RuntimeTurnConfig,
-    RuntimeTurnDeps, RuntimeTurnExecution, RuntimeTurnSetupStep, RuntimeTurnStartStep,
-    RuntimeTurnState,
+    RuntimeProviderTurnResultResult, RuntimeProviderTurnResultResultStep,
+    RuntimeProviderTurnResultStep, RuntimeProviderTurnStep, RuntimeSessionLifecycle,
+    RuntimeSteerStep, RuntimeTaskActor, RuntimeTurnConfig, RuntimeTurnDeps, RuntimeTurnExecution,
+    RuntimeTurnSetupStep, RuntimeTurnStartStep, RuntimeTurnState,
 };
 use crate::memory::MemoryBlock;
 use crate::session::AgentConversationContext;
@@ -156,16 +156,11 @@ pub(crate) fn run_agent_loop(
                 history_writer,
             )?
         };
-        let response = match RuntimeProviderTurnResultStep::new().fold(
-            provider_turn,
-            events,
-            sink,
-            emit_deltas,
-        )? {
-            RuntimeProviderTurnResultOutcome::Response(response) => response,
-            RuntimeProviderTurnResultOutcome::Failed(error) => {
-                return Ok(AgentLoopResult::failure(error.status, error.message));
-            }
+        let response = match RuntimeProviderTurnResultResultStep::new().fold(
+            RuntimeProviderTurnResultStep::new().fold(provider_turn, events, sink, emit_deltas)?,
+        ) {
+            RuntimeProviderTurnResultResult::Response(response) => response,
+            RuntimeProviderTurnResultResult::Return(result) => return Ok(result),
         };
 
         let provider_error_outcome = {
