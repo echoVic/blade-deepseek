@@ -5,13 +5,10 @@ use crate::cost::CostTracker;
 use crate::hooks::HookRunner;
 use crate::instructions::ProjectInstructions;
 use crate::lifecycle::{
-    AgentLoopContext, AgentLoopResult, RuntimeCompactionStep, RuntimeConversationBootstrapStep,
-    RuntimeProviderErrorResult, RuntimeProviderErrorResultStep, RuntimeProviderErrorStep,
-    RuntimeProviderResponseResult, RuntimeProviderResponseResultStep, RuntimeProviderResponseStep,
-    RuntimeProviderTurnResultResult, RuntimeProviderTurnResultResultStep,
-    RuntimeProviderTurnResultStep, RuntimeProviderTurnStep, RuntimeSessionLifecycle,
+    AgentLoopContext, AgentLoopResult, RuntimeConversationBootstrapStep, RuntimeSessionLifecycle,
     RuntimeTaskActor, RuntimeTurnConfig, RuntimeTurnDeps, RuntimeTurnExecution,
-    RuntimeTurnOpeningResult, RuntimeTurnOpeningStep, RuntimeTurnSetupStep, RuntimeTurnState,
+    RuntimeTurnOpeningResult, RuntimeTurnOpeningStep, RuntimeTurnProviderCycleResult,
+    RuntimeTurnProviderCycleStep, RuntimeTurnSetupStep, RuntimeTurnState,
 };
 use crate::memory::MemoryBlock;
 use crate::session::AgentConversationContext;
@@ -93,7 +90,7 @@ pub(crate) fn run_agent_loop(
     let mut legacy_lifecycle = RuntimeSessionLifecycle::new(events.run_id().to_string());
     let lifecycle = lifecycle.unwrap_or(&mut legacy_lifecycle);
     let mut actor = RuntimeTaskActor::new(lifecycle, max_turns);
-    let mut provider_error_step = RuntimeProviderErrorStep::new();
+    let mut provider_cycle_step = RuntimeTurnProviderCycleStep::new();
 
     loop {
         let turn_provider_config = {
@@ -121,90 +118,41 @@ pub(crate) fn run_agent_loop(
             }
         };
 
-        let cwd_display = cwd.display().to_string();
-        let provider_turn = {
-            let (conversation, history_writer) = prepared_conversation.parts_ref_mut();
-            RuntimeProviderTurnStep::new().run(
-                &mut actor,
-                config.provider,
-                conversation,
-                &turn_provider_config,
-                &cwd_display,
-                emit_deltas,
-                hooks,
-                cancel,
-                cost_tracker,
-                config.max_budget_usd,
-                events,
-                sink,
-                history_writer,
-            )?
-        };
-        let response = match RuntimeProviderTurnResultResultStep::new().fold(
-            RuntimeProviderTurnResultStep::new().fold(provider_turn, events, sink, emit_deltas)?,
-        ) {
-            RuntimeProviderTurnResultResult::Response(response) => response,
-            RuntimeProviderTurnResultResult::Return(result) => return Ok(result),
-        };
-
-        let provider_error_outcome = {
-            let (conversation, history_writer) = prepared_conversation.parts_mut();
-            provider_error_step.handle(
-                &response,
-                &mut RuntimeCompactionStep::new(
-                    config.provider,
-                    &ctx_config,
-                    &provider_config,
-                    cwd,
-                    emit_deltas,
-                    hooks,
-                    events,
-                    sink,
-                    history_writer,
-                ),
-                conversation,
-            )?
-        };
-        match RuntimeProviderErrorResultStep::new().fold(provider_error_outcome) {
-            RuntimeProviderErrorResult::ContinueLoop => {
+        match provider_cycle_step.run(
+            &mut actor,
+            config.provider,
+            &turn_provider_config,
+            cwd,
+            &ctx_config,
+            &provider_config,
+            emit_deltas,
+            hooks,
+            cancel,
+            cost_tracker,
+            config.max_budget_usd,
+            events,
+            sink,
+            &mut prepared_conversation,
+            config,
+            tool_policy,
+            subagent_depth,
+            &policy,
+            instructions,
+            memory,
+            mcp_registry,
+            task_registry,
+            background_workflows,
+            workflow_ipc,
+            permission_handler,
+            execute_child_agent_loop,
+            execute_child_agent_loop,
+            execute_child_agent_loop,
+        )? {
+            RuntimeTurnProviderCycleResult::ContinueLoop => {
                 continue;
             }
-            RuntimeProviderErrorResult::Return(result) => return Ok(result),
-            RuntimeProviderErrorResult::ContinueTurn => {}
-        }
-
-        let provider_response_outcome = {
-            let (conversation, history_writer) = prepared_conversation.parts_mut();
-            RuntimeProviderResponseStep::new().handle(
-                response,
-                config,
-                cwd,
-                events,
-                sink,
-                conversation,
-                history_writer,
-                tool_policy,
-                subagent_depth,
-                emit_deltas,
-                &policy,
-                instructions,
-                memory,
-                mcp_registry,
-                hooks,
-                cost_tracker,
-                cancel,
-                task_registry,
-                background_workflows,
-                workflow_ipc,
-                permission_handler,
-                execute_child_agent_loop,
-                execute_child_agent_loop,
-                execute_child_agent_loop,
-            )?
-        };
-        match RuntimeProviderResponseResultStep::new().fold(provider_response_outcome) {
-            RuntimeProviderResponseResult::Continue => {}
-            RuntimeProviderResponseResult::Return(result) => return Ok(result),
+            RuntimeTurnProviderCycleResult::ContinueTurn => {}
+            RuntimeTurnProviderCycleResult::Return(result) => return Ok(result),
         }
     }
 }

@@ -119,6 +119,9 @@ pub(crate) struct RuntimeProviderTurnResultResultStep;
 pub(crate) struct RuntimeProviderTurnStep;
 pub(crate) struct RuntimeProviderResponseStep;
 pub(crate) struct RuntimeProviderResponseResultStep;
+pub(crate) struct RuntimeTurnProviderCycleStep {
+    provider_error_step: RuntimeProviderErrorStep,
+}
 
 pub(crate) struct RuntimeProviderTurnOutput {
     pub(crate) response: Option<ProviderResponse>,
@@ -180,6 +183,12 @@ pub(crate) enum RuntimeProviderTurnResultResult {
 
 pub(crate) enum RuntimeProviderResponseResult {
     Continue,
+    Return(AgentLoopResult),
+}
+
+pub(crate) enum RuntimeTurnProviderCycleResult {
+    ContinueLoop,
+    ContinueTurn,
     Return(AgentLoopResult),
 }
 
@@ -2943,6 +2952,202 @@ impl RuntimeProviderResponseResultStep {
     }
 }
 
+impl RuntimeTurnProviderCycleStep {
+    pub(crate) fn new() -> Self {
+        Self {
+            provider_error_step: RuntimeProviderErrorStep::new(),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn run<W: io::Write>(
+        &mut self,
+        actor: &mut RuntimeTaskActor<'_>,
+        provider: ProviderKind,
+        turn_provider_config: &ProviderConfig,
+        cwd: &Path,
+        context_config: &context::ContextConfig,
+        base_provider_config: &ProviderConfig,
+        emit_deltas: bool,
+        hooks: &HookRunner,
+        cancel: &CancelToken,
+        cost_tracker: &mut CostTracker,
+        max_budget_usd: Option<f64>,
+        events: &mut EventFactory,
+        sink: &mut EventSink<W>,
+        conversation: &mut RuntimePreparedConversation<'_>,
+        config: &RunConfig,
+        tool_policy: AgentToolPolicyContext<'_>,
+        subagent_depth: u32,
+        policy: &ApprovalPolicy,
+        instructions: &ProjectInstructions,
+        memory: &MemoryBlock,
+        mcp_registry: &McpRegistry,
+        task_registry: &TaskRegistry,
+        background_workflows: &mut Vec<BackgroundWorkflowRun>,
+        workflow_ipc: Option<&WorkflowIpcContext>,
+        permission_handler: Option<&(dyn RuntimePermissionRequestHandler + Send + Sync)>,
+        child_executor: ChildAgentExecutor<W>,
+        workflow_child_executor: ChildAgentExecutor<SharedEventBuffer>,
+        batch_child_executor: ChildAgentExecutor<io::Sink>,
+    ) -> io::Result<RuntimeTurnProviderCycleResult> {
+        let cwd_display = cwd.display().to_string();
+        let provider_turn = {
+            let (conversation, history_writer) = conversation.parts_ref_mut();
+            RuntimeProviderTurnStep::new().run(
+                actor,
+                provider,
+                conversation,
+                turn_provider_config,
+                &cwd_display,
+                emit_deltas,
+                hooks,
+                cancel,
+                cost_tracker,
+                max_budget_usd,
+                events,
+                sink,
+                history_writer,
+            )?
+        };
+        let response = match RuntimeProviderTurnResultResultStep::new().fold(
+            RuntimeProviderTurnResultStep::new().fold(provider_turn, events, sink, emit_deltas)?,
+        ) {
+            RuntimeProviderTurnResultResult::Response(response) => response,
+            RuntimeProviderTurnResultResult::Return(result) => {
+                return Ok(RuntimeTurnProviderCycleResult::Return(result));
+            }
+        };
+
+        let provider_error_outcome = {
+            let (conversation, history_writer) = conversation.parts_mut();
+            self.provider_error_step.handle(
+                &response,
+                &mut RuntimeCompactionStep::new(
+                    provider,
+                    context_config,
+                    base_provider_config,
+                    cwd,
+                    emit_deltas,
+                    hooks,
+                    events,
+                    sink,
+                    history_writer,
+                ),
+                conversation,
+            )?
+        };
+        match RuntimeProviderErrorResultStep::new().fold(provider_error_outcome) {
+            RuntimeProviderErrorResult::ContinueLoop => {
+                return Ok(RuntimeTurnProviderCycleResult::ContinueLoop);
+            }
+            RuntimeProviderErrorResult::Return(result) => {
+                return Ok(RuntimeTurnProviderCycleResult::Return(result));
+            }
+            RuntimeProviderErrorResult::ContinueTurn => {}
+        }
+
+        let (conversation, history_writer) = conversation.parts_mut();
+        self.handle_response(
+            response,
+            config,
+            cwd,
+            context_config,
+            base_provider_config,
+            events,
+            sink,
+            conversation,
+            history_writer,
+            tool_policy,
+            subagent_depth,
+            emit_deltas,
+            policy,
+            instructions,
+            memory,
+            mcp_registry,
+            hooks,
+            cost_tracker,
+            cancel,
+            task_registry,
+            background_workflows,
+            workflow_ipc,
+            permission_handler,
+            child_executor,
+            workflow_child_executor,
+            batch_child_executor,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn handle_response<W: io::Write>(
+        &mut self,
+        response: ProviderResponse,
+        config: &RunConfig,
+        cwd: &Path,
+        _context_config: &context::ContextConfig,
+        _provider_config: &ProviderConfig,
+        events: &mut EventFactory,
+        sink: &mut EventSink<W>,
+        conversation: &mut Conversation,
+        history_writer: Option<&mut SessionWriter>,
+        tool_policy: AgentToolPolicyContext<'_>,
+        subagent_depth: u32,
+        emit_deltas: bool,
+        policy: &ApprovalPolicy,
+        instructions: &ProjectInstructions,
+        memory: &MemoryBlock,
+        mcp_registry: &McpRegistry,
+        hooks: &HookRunner,
+        cost_tracker: &mut CostTracker,
+        cancel: &CancelToken,
+        task_registry: &TaskRegistry,
+        background_workflows: &mut Vec<BackgroundWorkflowRun>,
+        workflow_ipc: Option<&WorkflowIpcContext>,
+        permission_handler: Option<&(dyn RuntimePermissionRequestHandler + Send + Sync)>,
+        child_executor: ChildAgentExecutor<W>,
+        workflow_child_executor: ChildAgentExecutor<SharedEventBuffer>,
+        batch_child_executor: ChildAgentExecutor<io::Sink>,
+    ) -> io::Result<RuntimeTurnProviderCycleResult> {
+        let provider_response_outcome = RuntimeProviderResponseStep::new().handle(
+            response,
+            config,
+            cwd,
+            events,
+            sink,
+            conversation,
+            history_writer,
+            tool_policy,
+            subagent_depth,
+            emit_deltas,
+            policy,
+            instructions,
+            memory,
+            mcp_registry,
+            hooks,
+            cost_tracker,
+            cancel,
+            task_registry,
+            background_workflows,
+            workflow_ipc,
+            permission_handler,
+            child_executor,
+            workflow_child_executor,
+            batch_child_executor,
+        )?;
+
+        Ok(
+            match RuntimeProviderResponseResultStep::new().fold(provider_response_outcome) {
+                RuntimeProviderResponseResult::Continue => {
+                    RuntimeTurnProviderCycleResult::ContinueTurn
+                }
+                RuntimeProviderResponseResult::Return(result) => {
+                    RuntimeTurnProviderCycleResult::Return(result)
+                }
+            },
+        )
+    }
+}
+
 fn cancelled_provider_turn<W: io::Write>(
     emit_deltas: bool,
     events: &mut EventFactory,
@@ -3353,6 +3558,90 @@ mod tests {
                 assert_eq!(final_message.as_deref(), Some("done"));
             }
             _ => panic!("final response should complete the agent loop"),
+        }
+        assert_eq!(conversation.messages.len(), 1);
+        assert!(
+            matches!(&conversation.messages[0], Message::Assistant { content, tool_calls, .. }
+                if content.as_deref() == Some("done") && tool_calls.is_empty())
+        );
+    }
+
+    #[test]
+    fn provider_cycle_step_handles_final_response() {
+        let config = config();
+        let response = ProviderResponse {
+            steps: vec![ProviderStep::MessageDelta("done".to_string())],
+            assistant_content: Some("done".to_string()),
+            assistant_reasoning: None,
+            tool_calls: Vec::new(),
+            usage: None,
+        };
+        let cwd = tempfile::tempdir().expect("cwd");
+        let runtime = ModelRuntimeConfig::default();
+        let context_config =
+            context::ContextConfig::for_model_with_runtime(Some("deepseek-chat"), &runtime);
+        let provider_config = ProviderConfig {
+            api_key: None,
+            base_url: None,
+            model: None,
+            tools_override: Some(Vec::new()),
+            mcp_registry: None,
+            external_tools: Vec::new(),
+        };
+        let mut events = EventFactory::new("provider-cycle-final".to_string());
+        let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+        let mut conversation = Conversation::new();
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let mcp_registry = McpRegistry::default();
+        let hooks = HookRunner::default();
+        let mut cost_tracker = CostTracker::new(None);
+        let cancel = CancelToken::new();
+        let task_registry = TaskRegistry::new("provider-cycle-final".to_string());
+        let mut background_workflows = Vec::new();
+        let policy = policy_for_tool_execution(&config);
+
+        let result = RuntimeTurnProviderCycleStep::new()
+            .handle_response(
+                response,
+                &config,
+                cwd.path(),
+                &context_config,
+                &provider_config,
+                &mut events,
+                &mut sink,
+                &mut conversation,
+                None,
+                AgentToolPolicyContext::unrestricted(),
+                0,
+                true,
+                &policy,
+                &instructions,
+                &memory,
+                &mcp_registry,
+                &hooks,
+                &mut cost_tracker,
+                &cancel,
+                &task_registry,
+                &mut background_workflows,
+                None,
+                None,
+                unused_child_executor::<Vec<u8>>,
+                unused_child_executor::<crate::workflow::runner::SharedEventBuffer>,
+                unused_child_executor::<io::Sink>,
+            )
+            .expect("handle provider cycle response");
+
+        match result {
+            RuntimeTurnProviderCycleResult::Return(result) => {
+                assert_eq!(result.status, RunStatus::Success);
+                assert_eq!(result.final_message.as_deref(), Some("done"));
+                assert_eq!(result.error, None);
+            }
+            RuntimeTurnProviderCycleResult::ContinueLoop
+            | RuntimeTurnProviderCycleResult::ContinueTurn => {
+                panic!("final response should return agent-loop result")
+            }
         }
         assert_eq!(conversation.messages.len(), 1);
         assert!(
