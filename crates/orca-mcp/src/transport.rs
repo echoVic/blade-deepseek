@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use orca_core::mcp_types::{McpServerConfig, McpTransportKind};
 
 pub trait McpTransport: Send + Sync {
-    fn initialize(&self) -> Result<(), String>;
+    fn initialize(&self) -> Result<Value, String>;
     fn list_tools(&self) -> Result<Value, String>;
     fn call_tool(&self, name: &str, arguments: Value) -> Result<Value, String>;
     fn list_resources(&self) -> Result<Value, String>;
@@ -101,8 +101,8 @@ impl StdioTransport {
 }
 
 impl McpTransport for StdioTransport {
-    fn initialize(&self) -> Result<(), String> {
-        let _ = self.request_with_timeout(
+    fn initialize(&self) -> Result<Value, String> {
+        let result = self.request_with_timeout(
             "initialize",
             json!({
                 "protocolVersion": "2024-11-05",
@@ -114,7 +114,8 @@ impl McpTransport for StdioTransport {
             }),
             self.startup_timeout,
         )?;
-        self.notify("notifications/initialized", json!({}))
+        self.notify("notifications/initialized", json!({}))?;
+        Ok(result)
     }
 
     fn list_tools(&self) -> Result<Value, String> {
@@ -282,8 +283,8 @@ impl SseTransport {
 }
 
 impl McpTransport for SseTransport {
-    fn initialize(&self) -> Result<(), String> {
-        let _ = self.request_with_timeout(
+    fn initialize(&self) -> Result<Value, String> {
+        let result = self.request_with_timeout(
             "initialize",
             json!({
                 "protocolVersion": "2024-11-05",
@@ -295,7 +296,8 @@ impl McpTransport for SseTransport {
             }),
             self.startup_timeout,
         )?;
-        self.notify("notifications/initialized", json!({}))
+        self.notify("notifications/initialized", json!({}))?;
+        Ok(result)
     }
 
     fn list_tools(&self) -> Result<Value, String> {
@@ -442,6 +444,8 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
+    const STDIO_TEST_STARTUP_TIMEOUT_MS: u64 = 15_000;
+
     #[cfg(unix)]
     #[test]
     fn stdio_tool_call_uses_configured_tool_timeout() {
@@ -484,7 +488,7 @@ done
             env: Default::default(),
             headers: Default::default(),
             disabled: false,
-            startup_timeout_ms: Some(5000),
+            startup_timeout_ms: Some(STDIO_TEST_STARTUP_TIMEOUT_MS),
             tool_timeout_ms: Some(100),
         })
         .expect("connect stdio MCP");

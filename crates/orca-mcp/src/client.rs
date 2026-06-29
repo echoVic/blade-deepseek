@@ -29,7 +29,29 @@ struct McpRegistryInner {
 struct McpClient {
     config: McpServerConfig,
     server_name: String,
+    capabilities: McpServerCapabilities,
     transport: Mutex<Box<dyn McpTransport>>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct McpServerCapabilities {
+    resources: bool,
+}
+
+impl McpServerCapabilities {
+    fn from_initialize_result(value: &Value) -> Self {
+        Self {
+            resources: value
+                .get("capabilities")
+                .and_then(|capabilities| capabilities.get("resources"))
+                .is_some(),
+        }
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    fn resource_capable_for_test() -> Self {
+        Self { resources: true }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -98,7 +120,8 @@ fn connect_server(
     server_name: &str,
 ) -> Result<(McpClient, Vec<McpTool>), String> {
     let transport = transport::connect(config)?;
-    transport.initialize()?;
+    let initialize_result = transport.initialize()?;
+    let capabilities = McpServerCapabilities::from_initialize_result(&initialize_result);
     let result = transport.list_tools()?;
     let list: ToolsListResult = serde_json::from_value(result)
         .map_err(|error| format!("invalid tools/list result for '{server_name}': {error}"))?;
@@ -122,6 +145,7 @@ fn connect_server(
         McpClient {
             config: config.clone(),
             server_name: server_name.to_string(),
+            capabilities,
             transport: Mutex::new(transport),
         },
         tools,
@@ -166,8 +190,8 @@ impl McpRegistry {
         }
 
         impl McpTransport for StaticResourceTransport {
-            fn initialize(&self) -> Result<(), String> {
-                Ok(())
+            fn initialize(&self) -> Result<Value, String> {
+                Ok(serde_json::json!({"capabilities": {"resources": {}}}))
             }
 
             fn list_tools(&self) -> Result<Value, String> {
@@ -225,6 +249,7 @@ impl McpRegistry {
                         ..Default::default()
                     },
                     server_name: server.clone(),
+                    capabilities: McpServerCapabilities::resource_capable_for_test(),
                     transport: Mutex::new(Box::new(StaticResourceTransport {
                         server,
                         resources,
@@ -259,6 +284,7 @@ impl McpRegistry {
                             ..Default::default()
                         },
                         server_name: server,
+                        capabilities: McpServerCapabilities::resource_capable_for_test(),
                         transport: Mutex::new(transport),
                     }),
                 )
@@ -348,8 +374,8 @@ impl McpRegistry {
         }
 
         impl McpTransport for StaticResourceListingTransport {
-            fn initialize(&self) -> Result<(), String> {
-                Ok(())
+            fn initialize(&self) -> Result<Value, String> {
+                Ok(serde_json::json!({"capabilities": {"resources": {}}}))
             }
 
             fn list_tools(&self) -> Result<Value, String> {
@@ -405,6 +431,7 @@ impl McpRegistry {
                         ..Default::default()
                     },
                     server_name: server,
+                    capabilities: McpServerCapabilities::resource_capable_for_test(),
                     transport: Mutex::new(Box::new(StaticResourceListingTransport {
                         resources,
                         error: None,
@@ -427,6 +454,7 @@ impl McpRegistry {
                         ..Default::default()
                     },
                     server_name: server,
+                    capabilities: McpServerCapabilities::resource_capable_for_test(),
                     transport: Mutex::new(Box::new(StaticResourceListingTransport {
                         resources: Vec::new(),
                         error: Some(
@@ -461,8 +489,8 @@ impl McpRegistry {
         }
 
         impl McpTransport for StaticResourceTemplateListingTransport {
-            fn initialize(&self) -> Result<(), String> {
-                Ok(())
+            fn initialize(&self) -> Result<Value, String> {
+                Ok(serde_json::json!({"capabilities": {"resources": {}}}))
             }
 
             fn list_tools(&self) -> Result<Value, String> {
@@ -521,6 +549,7 @@ impl McpRegistry {
                         ..Default::default()
                     },
                     server_name: server,
+                    capabilities: McpServerCapabilities::resource_capable_for_test(),
                     transport: Mutex::new(Box::new(StaticResourceTemplateListingTransport {
                         resource_templates,
                         error: None,
@@ -543,6 +572,7 @@ impl McpRegistry {
                         ..Default::default()
                     },
                     server_name: server,
+                    capabilities: McpServerCapabilities::resource_capable_for_test(),
                     transport: Mutex::new(Box::new(StaticResourceTemplateListingTransport {
                         resource_templates: Vec::new(),
                         error: Some(
@@ -613,6 +643,7 @@ impl McpRegistry {
                 .inner
                 .clients
                 .iter()
+                .filter(|(_, client)| client.capabilities.resources)
                 .map(|(name, client)| (name.clone(), Arc::clone(client)))
                 .collect(),
         };
@@ -649,6 +680,7 @@ impl McpRegistry {
                 .inner
                 .clients
                 .iter()
+                .filter(|(_, client)| client.capabilities.resources)
                 .map(|(name, client)| (name.clone(), Arc::clone(client)))
                 .collect(),
         };
@@ -703,6 +735,7 @@ impl McpRegistry {
                 .inner
                 .clients
                 .iter()
+                .filter(|(_, client)| client.capabilities.resources)
                 .map(|(name, client)| (name.clone(), Arc::clone(client)))
                 .collect(),
         };
@@ -744,6 +777,7 @@ impl McpRegistry {
                 .inner
                 .clients
                 .iter()
+                .filter(|(_, client)| client.capabilities.resources)
                 .map(|(name, client)| (name.clone(), Arc::clone(client)))
                 .collect(),
         };
@@ -901,6 +935,8 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
+    const STDIO_TEST_STARTUP_TIMEOUT_MS: u64 = 15_000;
+
     #[test]
     fn sanitizes_mcp_schema_names() {
         assert_eq!(sanitize_name("GitHub Files"), "github_files");
@@ -942,8 +978,8 @@ mod tests {
         struct BlockingTransport;
 
         impl McpTransport for BlockingTransport {
-            fn initialize(&self) -> Result<(), String> {
-                Ok(())
+            fn initialize(&self) -> Result<Value, String> {
+                Ok(serde_json::json!({"capabilities": {"resources": {}}}))
             }
 
             fn list_tools(&self) -> Result<Value, String> {
@@ -988,6 +1024,7 @@ mod tests {
                             ..Default::default()
                         },
                         server_name: "slow".to_string(),
+                        capabilities: McpServerCapabilities::resource_capable_for_test(),
                         transport: Mutex::new(Box::new(BlockingTransport)),
                     }),
                 )]),
@@ -1028,8 +1065,8 @@ mod tests {
         }
 
         impl McpTransport for ResourceListTransport {
-            fn initialize(&self) -> Result<(), String> {
-                Ok(())
+            fn initialize(&self) -> Result<Value, String> {
+                Ok(serde_json::json!({"capabilities": {"resources": {}}}))
             }
 
             fn list_tools(&self) -> Result<Value, String> {
@@ -1098,8 +1135,8 @@ mod tests {
         struct ResourceListTransport;
 
         impl McpTransport for ResourceListTransport {
-            fn initialize(&self) -> Result<(), String> {
-                Ok(())
+            fn initialize(&self) -> Result<Value, String> {
+                Ok(serde_json::json!({"capabilities": {"resources": {}}}))
             }
 
             fn list_tools(&self) -> Result<Value, String> {
@@ -1162,8 +1199,8 @@ mod tests {
         }
 
         impl McpTransport for TemplateListTransport {
-            fn initialize(&self) -> Result<(), String> {
-                Ok(())
+            fn initialize(&self) -> Result<Value, String> {
+                Ok(serde_json::json!({"capabilities": {"resources": {}}}))
             }
 
             fn list_tools(&self) -> Result<Value, String> {
@@ -1232,8 +1269,8 @@ mod tests {
         struct TemplateListTransport;
 
         impl McpTransport for TemplateListTransport {
-            fn initialize(&self) -> Result<(), String> {
-                Ok(())
+            fn initialize(&self) -> Result<Value, String> {
+                Ok(serde_json::json!({"capabilities": {"resources": {}}}))
             }
 
             fn list_tools(&self) -> Result<Value, String> {
@@ -1291,6 +1328,180 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn all_server_resource_listing_skips_servers_without_resource_capability() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let resources_server = temp_dir.path().join("resources_server.sh");
+        std::fs::write(
+            &resources_server,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{"resources":{}},"serverInfo":{"name":"resources","version":"1"}}}\n'
+      ;;
+    *'"method":"notifications/initialized"'*)
+      ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":2,"result":{"tools":[]}}\n'
+      ;;
+    *'"method":"resources/list"'*)
+      printf '{"jsonrpc":"2.0","id":3,"result":{"resources":[{"uri":"memo://orca/one","name":"memo one","description":"A test memo","mimeType":"text/plain"}]}}\n'
+      ;;
+  esac
+done
+"#,
+        )
+        .expect("write resource MCP fixture");
+        let tools_only_server = temp_dir.path().join("tools_only_server.sh");
+        std::fs::write(
+            &tools_only_server,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"tools-only","version":"1"}}}\n'
+      ;;
+    *'"method":"notifications/initialized"'*)
+      ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":2,"result":{"tools":[]}}\n'
+      ;;
+    *'"method":"resources/list"'*)
+      printf '{"jsonrpc":"2.0","id":3,"error":{"code":-32601,"message":"resources/list unsupported"}}\n'
+      ;;
+  esac
+done
+"#,
+        )
+        .expect("write tools-only MCP fixture");
+        for server in [&resources_server, &tools_only_server] {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(server).expect("metadata").permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(server, permissions).expect("chmod MCP fixture");
+        }
+
+        let registry = initialize_registry(&[
+            McpServerConfig {
+                name: "resources".to_string(),
+                command: Some(resources_server.to_string_lossy().into_owned()),
+                startup_timeout_ms: Some(STDIO_TEST_STARTUP_TIMEOUT_MS),
+                ..Default::default()
+            },
+            McpServerConfig {
+                name: "tools_only".to_string(),
+                command: Some(tools_only_server.to_string_lossy().into_owned()),
+                startup_timeout_ms: Some(STDIO_TEST_STARTUP_TIMEOUT_MS),
+                ..Default::default()
+            },
+        ]);
+
+        let listing = registry.list_resources_with_errors(None);
+
+        assert_eq!(listing.resources.len(), 1);
+        assert_eq!(listing.resources[0].server, "resources");
+        assert_eq!(listing.resources[0].uri, "memo://orca/one");
+        assert!(
+            listing.errors.is_empty(),
+            "tools-only server should be skipped, got {:?}",
+            listing.errors
+        );
+
+        let explicit_error = registry
+            .list_resources(Some("tools_only"))
+            .expect_err("explicit server filter should still call the selected server");
+        assert!(explicit_error.contains("resources/list unsupported"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn all_server_resource_template_listing_skips_servers_without_resource_capability() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let resources_server = temp_dir.path().join("resource_templates_server.sh");
+        std::fs::write(
+            &resources_server,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{"resources":{}},"serverInfo":{"name":"resources","version":"1"}}}\n'
+      ;;
+    *'"method":"notifications/initialized"'*)
+      ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":2,"result":{"tools":[]}}\n'
+      ;;
+    *'"method":"resources/templates/list"'*)
+      printf '{"jsonrpc":"2.0","id":3,"result":{"resourceTemplates":[{"uriTemplate":"file:///{path}","name":"workspace file","description":"A file exposed by path","mimeType":"text/plain"}]}}\n'
+      ;;
+  esac
+done
+"#,
+        )
+        .expect("write resource templates MCP fixture");
+        let tools_only_server = temp_dir.path().join("tools_only_templates_server.sh");
+        std::fs::write(
+            &tools_only_server,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"tools-only","version":"1"}}}\n'
+      ;;
+    *'"method":"notifications/initialized"'*)
+      ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":2,"result":{"tools":[]}}\n'
+      ;;
+    *'"method":"resources/templates/list"'*)
+      printf '{"jsonrpc":"2.0","id":3,"error":{"code":-32601,"message":"resources/templates/list unsupported"}}\n'
+      ;;
+  esac
+done
+"#,
+        )
+        .expect("write tools-only MCP fixture");
+        for server in [&resources_server, &tools_only_server] {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(server).expect("metadata").permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(server, permissions).expect("chmod MCP fixture");
+        }
+
+        let registry = initialize_registry(&[
+            McpServerConfig {
+                name: "resources".to_string(),
+                command: Some(resources_server.to_string_lossy().into_owned()),
+                startup_timeout_ms: Some(STDIO_TEST_STARTUP_TIMEOUT_MS),
+                ..Default::default()
+            },
+            McpServerConfig {
+                name: "tools_only".to_string(),
+                command: Some(tools_only_server.to_string_lossy().into_owned()),
+                startup_timeout_ms: Some(STDIO_TEST_STARTUP_TIMEOUT_MS),
+                ..Default::default()
+            },
+        ]);
+
+        let listing = registry.list_resource_templates_with_errors(None);
+
+        assert_eq!(listing.resource_templates.len(), 1);
+        assert_eq!(listing.resource_templates[0].server, "resources");
+        assert_eq!(listing.resource_templates[0].uri_template, "file:///{path}");
+        assert!(
+            listing.errors.is_empty(),
+            "tools-only server should be skipped, got {:?}",
+            listing.errors
+        );
+
+        let explicit_error = registry
+            .list_resource_templates(Some("tools_only"))
+            .expect_err("explicit server filter should still call the selected server");
+        assert!(explicit_error.contains("resources/templates/list unsupported"));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn registry_lists_and_reads_mcp_resources_from_stdio_server() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let server = temp_dir.path().join("resource_mcp_server.sh");
@@ -1334,7 +1545,7 @@ done
             env: Default::default(),
             headers: Default::default(),
             disabled: false,
-            startup_timeout_ms: Some(5000),
+            startup_timeout_ms: Some(STDIO_TEST_STARTUP_TIMEOUT_MS),
             tool_timeout_ms: Some(1000),
         }]);
         assert!(
@@ -1402,7 +1613,7 @@ done
             env: Default::default(),
             headers: Default::default(),
             disabled: false,
-            startup_timeout_ms: Some(5000),
+            startup_timeout_ms: Some(STDIO_TEST_STARTUP_TIMEOUT_MS),
             tool_timeout_ms: Some(1000),
         }]);
         assert!(
@@ -1484,7 +1695,7 @@ done
             env: Default::default(),
             headers: Default::default(),
             disabled: false,
-            startup_timeout_ms: Some(5000),
+            startup_timeout_ms: Some(STDIO_TEST_STARTUP_TIMEOUT_MS),
             tool_timeout_ms: Some(100),
         }]);
         assert!(
