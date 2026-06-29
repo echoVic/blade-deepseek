@@ -3470,16 +3470,7 @@ mod tests {
         let sandbox = test_profile_sandbox(&config, &options).expect("read roots profile");
 
         assert!(sandbox.additional_readable_roots.contains(&readable));
-        assert!(
-            sandbox
-                .additional_readable_roots
-                .contains(&PathBuf::from("/bin"))
-        );
-        assert!(
-            sandbox
-                .additional_readable_roots
-                .contains(&PathBuf::from("/usr"))
-        );
+        assert_includes_platform_default_read_roots(&sandbox.additional_readable_roots);
         assert!(sandbox.additional_writable_roots.is_empty());
     }
 
@@ -3516,16 +3507,7 @@ mod tests {
             }
         );
         assert!(sandbox.additional_readable_roots.contains(&readable));
-        assert!(
-            sandbox
-                .additional_readable_roots
-                .contains(&PathBuf::from("/bin"))
-        );
-        assert!(
-            sandbox
-                .additional_readable_roots
-                .contains(&PathBuf::from("/usr"))
-        );
+        assert_includes_platform_default_read_roots(&sandbox.additional_readable_roots);
     }
 
     #[test]
@@ -3552,16 +3534,7 @@ mod tests {
         let sandbox = test_profile_sandbox(&config, &options).expect("read-write roots profile");
 
         assert!(sandbox.additional_readable_roots.contains(&root));
-        assert!(
-            sandbox
-                .additional_readable_roots
-                .contains(&PathBuf::from("/bin"))
-        );
-        assert!(
-            sandbox
-                .additional_readable_roots
-                .contains(&PathBuf::from("/usr"))
-        );
+        assert_includes_platform_default_read_roots(&sandbox.additional_readable_roots);
         assert_eq!(sandbox.additional_writable_roots, vec![root]);
     }
 
@@ -3771,16 +3744,19 @@ mod tests {
         )
         .expect("minimal profile");
 
-        assert!(
-            sandbox
-                .additional_readable_roots
-                .contains(&PathBuf::from("/bin"))
+        assert_eq!(
+            sandbox.additional_readable_roots,
+            orca_tools::sandbox::platform_default_read_roots()
         );
-        assert!(
-            sandbox
-                .additional_readable_roots
-                .contains(&PathBuf::from("/usr"))
-        );
+    }
+
+    fn assert_includes_platform_default_read_roots(actual_roots: &[PathBuf]) {
+        for root in orca_tools::sandbox::platform_default_read_roots() {
+            assert!(
+                actual_roots.contains(&root),
+                "missing platform default read root: {root:?}"
+            );
+        }
     }
 
     #[test]
