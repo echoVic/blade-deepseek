@@ -6,7 +6,8 @@ use std::process::Command;
 
 use crate::history::{self, CompactionRecord, ContextSummaryRecord};
 use crate::tool_item_projection::{
-    mcp_result_from_content, mcp_tool_parts, parse_json_or_null, tool_error_object_from_value,
+    dynamic_tool_started_item, mcp_result_from_content, mcp_tool_parts, mcp_tool_started_item,
+    parse_json_or_null, tool_error_object_from_value,
 };
 use chrono::{DateTime, Utc};
 use orca_core::approval_rules::PermissionRules;
@@ -2247,31 +2248,21 @@ fn merge_projected_items(turn_items: &mut Vec<Value>, items: Vec<Value>) {
 
 fn tool_call_to_thread_item(tool_call: &RawToolCall) -> Value {
     if let Some((server, tool)) = mcp_tool_parts(&tool_call.function_name) {
-        json!({
-            "id": tool_call.id,
-            "type": "mcpToolCall",
-            "server": server,
-            "tool": tool,
-            "status": "in_progress",
-            "arguments": parse_json_or_null(&tool_call.arguments),
-            "result": Value::Null,
-            "error": Value::Null,
-        })
+        mcp_tool_started_item(
+            tool_call.id.clone(),
+            server,
+            tool,
+            parse_json_or_null(&tool_call.arguments),
+        )
     } else {
         if tool_call.function_name == "bash" {
             return command_execution_thread_item(tool_call);
         }
-        json!({
-            "id": tool_call.id,
-            "type": "dynamicToolCall",
-            "namespace": Value::Null,
-            "tool": tool_call.function_name,
-            "status": "in_progress",
-            "arguments": parse_json_or_null(&tool_call.arguments),
-            "contentItems": Value::Null,
-            "success": Value::Null,
-            "error": Value::Null,
-        })
+        dynamic_tool_started_item(
+            tool_call.id.clone(),
+            tool_call.function_name.clone(),
+            parse_json_or_null(&tool_call.arguments),
+        )
     }
 }
 

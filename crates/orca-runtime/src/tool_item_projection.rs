@@ -27,6 +27,42 @@ pub(crate) fn mcp_result_from_content(content: &str) -> Value {
     }
 }
 
+pub(crate) fn mcp_tool_started_item(
+    id: impl Into<String>,
+    server: impl Into<String>,
+    tool: impl Into<String>,
+    arguments: Value,
+) -> Value {
+    json!({
+        "id": id.into(),
+        "type": "mcpToolCall",
+        "server": server.into(),
+        "tool": tool.into(),
+        "status": "in_progress",
+        "arguments": arguments,
+        "result": Value::Null,
+        "error": Value::Null,
+    })
+}
+
+pub(crate) fn dynamic_tool_started_item(
+    id: impl Into<String>,
+    tool: impl Into<String>,
+    arguments: Value,
+) -> Value {
+    json!({
+        "id": id.into(),
+        "type": "dynamicToolCall",
+        "namespace": Value::Null,
+        "tool": tool.into(),
+        "status": "in_progress",
+        "arguments": arguments,
+        "contentItems": Value::Null,
+        "success": Value::Null,
+        "error": Value::Null,
+    })
+}
+
 pub(crate) fn tool_error_object(message: &str, exit_code: Option<i64>) -> Value {
     let mut error =
         serde_json::Map::from_iter([("message".to_string(), Value::from(message.to_string()))]);
@@ -99,5 +135,34 @@ mod tests {
         assert!(tool_status_is_completed(&json!({ "status": "completed" })));
         assert!(!tool_status_is_completed(&json!({ "status": "failed" })));
         assert!(!tool_status_is_completed(&json!({ "status": Value::Null })));
+    }
+
+    #[test]
+    fn mcp_tool_started_item_projects_codex_style_shape() {
+        let item = mcp_tool_started_item("call-1", "server", "search", json!({ "q": "orca" }));
+
+        assert_eq!(item["id"], "call-1");
+        assert_eq!(item["type"], "mcpToolCall");
+        assert_eq!(item["server"], "server");
+        assert_eq!(item["tool"], "search");
+        assert_eq!(item["status"], "in_progress");
+        assert_eq!(item["arguments"]["q"], "orca");
+        assert!(item["result"].is_null());
+        assert!(item["error"].is_null());
+    }
+
+    #[test]
+    fn dynamic_tool_started_item_projects_codex_style_shape() {
+        let item = dynamic_tool_started_item("call-2", "web_search", json!({ "query": "orca" }));
+
+        assert_eq!(item["id"], "call-2");
+        assert_eq!(item["type"], "dynamicToolCall");
+        assert!(item["namespace"].is_null());
+        assert_eq!(item["tool"], "web_search");
+        assert_eq!(item["status"], "in_progress");
+        assert_eq!(item["arguments"]["query"], "orca");
+        assert!(item["contentItems"].is_null());
+        assert!(item["success"].is_null());
+        assert!(item["error"].is_null());
     }
 }

@@ -21,8 +21,8 @@ use crate::thread_store::{
     ThreadStore, TurnItemsView,
 };
 use crate::tool_item_projection::{
-    mcp_result_from_content, mcp_tool_parts, parse_json_or_null, tool_error_object_from_value,
-    tool_status_is_completed,
+    dynamic_tool_started_item, mcp_result_from_content, mcp_tool_parts, mcp_tool_started_item,
+    parse_json_or_null, tool_error_object_from_value, tool_status_is_completed,
 };
 pub use orca_core::config::{ActivePermissionProfile, AdditionalWorkingDirectory};
 use orca_core::config::{HistoryMode, OutputFormat, RunConfig};
@@ -1116,16 +1116,12 @@ impl<W: Write> ServerRequestWriter<W> {
                 protocol::ServerEvent::ItemStarted {
                     thread_id: Value::Null,
                     turn_id: Value::Null,
-                    item: json!({
-                        "id": tool_id,
-                        "type": "mcpToolCall",
-                        "server": server,
-                        "tool": local_tool,
-                        "status": "in_progress",
-                        "arguments": mcp_tool_arguments(payload),
-                        "result": Value::Null,
-                        "error": Value::Null,
-                    }),
+                    item: mcp_tool_started_item(
+                        tool_id,
+                        server,
+                        local_tool,
+                        mcp_tool_arguments(payload),
+                    ),
                 },
             );
         }
@@ -1142,17 +1138,7 @@ impl<W: Write> ServerRequestWriter<W> {
                 protocol::ServerEvent::ItemStarted {
                     thread_id: Value::Null,
                     turn_id: Value::Null,
-                    item: json!({
-                        "id": tool_id,
-                        "type": "dynamicToolCall",
-                        "namespace": Value::Null,
-                        "tool": tool,
-                        "status": "in_progress",
-                        "arguments": tool_arguments(payload),
-                        "contentItems": Value::Null,
-                        "success": Value::Null,
-                        "error": Value::Null,
-                    }),
+                    item: dynamic_tool_started_item(tool_id, tool, tool_arguments(payload)),
                 },
             );
         }

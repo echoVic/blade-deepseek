@@ -1040,6 +1040,8 @@ mod tests {
             "mcp_tool_parts",
             "parse_json_or_null",
             "mcp_result_from_content",
+            "mcp_tool_started_item",
+            "dynamic_tool_started_item",
             "tool_error_object_from_value",
             "tool_status_is_completed",
         ] {
