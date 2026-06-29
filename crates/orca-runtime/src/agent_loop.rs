@@ -11,8 +11,8 @@ use crate::lifecycle::{
     RuntimeProviderResponseStep, RuntimeProviderTurnResultResult,
     RuntimeProviderTurnResultResultStep, RuntimeProviderTurnResultStep, RuntimeProviderTurnStep,
     RuntimeSessionLifecycle, RuntimeSteerStep, RuntimeTaskActor, RuntimeTurnConfig,
-    RuntimeTurnDeps, RuntimeTurnExecution, RuntimeTurnSetupStep, RuntimeTurnStartStep,
-    RuntimeTurnState,
+    RuntimeTurnDeps, RuntimeTurnExecution, RuntimeTurnSetupStep, RuntimeTurnStartResult,
+    RuntimeTurnStartResultStep, RuntimeTurnStartStep, RuntimeTurnState,
 };
 use crate::memory::MemoryBlock;
 use crate::session::AgentConversationContext;
@@ -113,11 +113,15 @@ pub(crate) fn run_agent_loop(
             .compact_if_needed(conversation)?;
         }
 
-        if let Some(error) = RuntimeTurnStartStep::new()
-            .start(&mut actor, events, sink, prompt, emit_deltas)?
-            .error
-        {
-            return Ok(AgentLoopResult::failure(error.status, error.message));
+        match RuntimeTurnStartResultStep::new().fold(RuntimeTurnStartStep::new().start(
+            &mut actor,
+            events,
+            sink,
+            prompt,
+            emit_deltas,
+        )?) {
+            RuntimeTurnStartResult::Continue => {}
+            RuntimeTurnStartResult::Return(result) => return Ok(result),
         }
 
         let turn_provider_config = RuntimeModelRouteStep::new()

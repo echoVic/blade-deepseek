@@ -106,6 +106,7 @@ pub(crate) struct RuntimeSteerStep;
 pub(crate) struct RuntimeConversationBootstrapStep;
 pub(crate) struct RuntimeTurnSetupStep;
 pub(crate) struct RuntimeTurnStartStep;
+pub(crate) struct RuntimeTurnStartResultStep;
 pub(crate) struct RuntimeModelRouteStep;
 pub(crate) struct RuntimeProviderErrorResultStep;
 pub(crate) struct RuntimeProviderErrorStep {
@@ -142,6 +143,11 @@ pub(crate) enum RuntimeProviderResponseOutcome {
 
 pub(crate) struct RuntimeTurnStartStepOutput {
     pub(crate) error: Option<RuntimeTurnStartError>,
+}
+
+pub(crate) enum RuntimeTurnStartResult {
+    Continue,
+    Return(AgentLoopResult),
 }
 
 pub(crate) enum RuntimeProviderErrorStepOutcome {
@@ -2336,6 +2342,22 @@ impl RuntimeTurnStartStep {
     }
 }
 
+impl RuntimeTurnStartResultStep {
+    pub(crate) fn new() -> Self {
+        Self
+    }
+
+    pub(crate) fn fold(&self, output: RuntimeTurnStartStepOutput) -> RuntimeTurnStartResult {
+        match output.error {
+            Some(error) => RuntimeTurnStartResult::Return(AgentLoopResult::failure(
+                error.status,
+                error.message,
+            )),
+            None => RuntimeTurnStartResult::Continue,
+        }
+    }
+}
+
 impl RuntimeModelRouteStep {
     pub(crate) fn new() -> Self {
         Self
@@ -3356,6 +3378,30 @@ mod tests {
         assert_eq!(terminal.status, RunStatus::Cancelled);
         assert_eq!(terminal.final_message, None);
         assert_eq!(terminal.error, None);
+    }
+
+    #[test]
+    fn turn_start_result_step_folds_error_and_continue() {
+        let continuing =
+            RuntimeTurnStartResultStep::new().fold(RuntimeTurnStartStepOutput { error: None });
+        assert!(matches!(continuing, RuntimeTurnStartResult::Continue));
+
+        let failed = RuntimeTurnStartResultStep::new().fold(RuntimeTurnStartStepOutput {
+            error: Some(RuntimeTurnStartError {
+                status: RunStatus::Failed,
+                message: "max turns exceeded".to_string(),
+            }),
+        });
+        match failed {
+            RuntimeTurnStartResult::Return(result) => {
+                assert_eq!(result.status, RunStatus::Failed);
+                assert_eq!(result.final_message, None);
+                assert_eq!(result.error.as_deref(), Some("max turns exceeded"));
+            }
+            RuntimeTurnStartResult::Continue => {
+                panic!("turn-start error should return loop result")
+            }
+        }
     }
 
     #[test]

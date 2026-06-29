@@ -1470,16 +1470,32 @@ mod tests {
             );
         }
         assert!(
+            !agent_loop_source.contains("AgentLoopResult::failure(error.status, error.message)"),
+            "agent_loop must not own runtime turn-start error result folding"
+        );
+        assert!(
             agent_loop_source.contains("RuntimeTurnStartStep"),
             "agent_loop must delegate runtime turn start"
+        );
+        assert!(
+            agent_loop_source.contains("RuntimeTurnStartResultStep"),
+            "agent_loop must delegate runtime turn-start result folding"
         );
         assert!(
             lifecycle_source.contains("struct RuntimeTurnStartStep"),
             "lifecycle must own runtime turn-start step state"
         );
         assert!(
+            lifecycle_source.contains("struct RuntimeTurnStartResultStep"),
+            "lifecycle must own runtime turn-start result step state"
+        );
+        assert!(
             lifecycle_source.contains("impl RuntimeTurnStartStep"),
             "lifecycle must own runtime turn-start step behavior"
+        );
+        assert!(
+            lifecycle_source.contains("impl RuntimeTurnStartResultStep"),
+            "lifecycle must own runtime turn-start result step behavior"
         );
         assert!(
             lifecycle_source.contains("actor.start_turn("),
