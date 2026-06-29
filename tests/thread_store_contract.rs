@@ -971,6 +971,63 @@ fn session_store_preserves_truncated_tool_metadata_in_thread_items() {
 }
 
 #[test]
+fn session_store_preserves_failed_command_projection_without_aggregated_output() {
+    with_orca_home(|home| {
+        let store = SessionStore::new();
+        let mut thread = store
+            .create_live_thread(home, "mock", None, "failed command projected thread")
+            .expect("create live thread");
+        let thread_id = thread.thread_id().to_string();
+        thread
+            .append_items(&[
+                Message::User {
+                    content: "run failing command".to_string(),
+                    pinned: false,
+                },
+                Message::Assistant {
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: vec![RawToolCall {
+                        id: "bash-failed-1".to_string(),
+                        function_name: "bash".to_string(),
+                        arguments: r#"{"command":"exit 42"}"#.to_string(),
+                    }],
+                    pinned: false,
+                },
+            ])
+            .expect("append tool call");
+
+        let request = ToolRequest {
+            id: "bash-failed-1".to_string(),
+            name: ToolName::Bash,
+            action: ActionKind::Shell,
+            target: Some("exit 42".to_string()),
+            raw_arguments: Some(r#"{"command":"exit 42"}"#.to_string()),
+        };
+        let result = ToolResult::failed(&request, "command failed", Some(42));
+        thread
+            .writer_mut()
+            .append_tool_result_message(&result, String::new(), false)
+            .expect("append failed command result");
+        thread.complete("failed").expect("complete thread");
+
+        let items = store
+            .list_thread_items(&thread_id, None, None, 10, SortDirection::Asc)
+            .expect("list thread items");
+        let tool_item = items
+            .data
+            .iter()
+            .find(|item| item.item["id"] == "bash-failed-1")
+            .expect("projected command item");
+        assert_eq!(tool_item.item["type"], "commandExecution");
+        assert_eq!(tool_item.item["status"], "failed");
+        assert!(tool_item.item["aggregatedOutput"].is_null());
+        assert_eq!(tool_item.item["error"]["message"], "command failed");
+        assert_eq!(tool_item.item["error"]["exitCode"], 42);
+    });
+}
+
+#[test]
 fn session_store_projects_builtin_read_tool_as_dynamic_thread_item() {
     with_orca_home(|home| {
         let store = SessionStore::new();

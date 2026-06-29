@@ -1042,6 +1042,8 @@ mod tests {
             "mcp_result_from_content",
             "mcp_tool_started_item",
             "dynamic_tool_started_item",
+            "mcp_tool_completed_item",
+            "dynamic_tool_completed_item",
             "tool_error_object_from_value",
             "tool_status_is_completed",
         ] {

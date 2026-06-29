@@ -6,8 +6,9 @@ use std::process::Command;
 
 use crate::history::{self, CompactionRecord, ContextSummaryRecord};
 use crate::tool_item_projection::{
-    dynamic_tool_started_item, mcp_result_from_content, mcp_tool_parts, mcp_tool_started_item,
-    parse_json_or_null, tool_error_object_from_value,
+    dynamic_tool_completed_item, dynamic_tool_started_item, mcp_result_from_content,
+    mcp_tool_completed_item, mcp_tool_parts, mcp_tool_started_item, parse_json_or_null,
+    tool_error_object_from_value,
 };
 use chrono::{DateTime, Utc};
 use orca_core::approval_rules::PermissionRules;
@@ -2321,38 +2322,79 @@ fn complete_tool_item(item: &mut Value, result: &Value) {
     if let Some((status, failure)) = tool_failure_from_result(result)
         .or_else(|| parse_tool_failure_content(content).map(|failure| ("failed", failure)))
     {
-        item["status"] = Value::from(status);
-        copy_truncated_metadata(item, result);
-        if item["type"] == "mcpToolCall" {
-            item["result"] = Value::Null;
-        } else if item["type"] == "dynamicToolCall" {
-            item["contentItems"] = Value::Null;
-            item["success"] = Value::from(false);
-        } else {
-            item["result"] = Value::Null;
-        }
-        item["error"] = failure;
+        complete_projected_tool_item(item, status, result, Value::Null, failure);
         return;
     }
 
-    item["status"] = Value::from("completed");
-    copy_truncated_metadata(item, result);
+    complete_projected_tool_item(
+        item,
+        "completed",
+        result,
+        mcp_result_from_content(content),
+        Value::Null,
+    );
+}
+
+fn complete_projected_tool_item(
+    item: &mut Value,
+    status: &str,
+    result: &Value,
+    mcp_result: Value,
+    error: Value,
+) {
     if item["type"] == "mcpToolCall" {
-        item["result"] = mcp_result_from_content(content);
-        item["error"] = Value::Null;
-    } else if item["type"] == "dynamicToolCall" {
-        item["contentItems"] = json!([{
-            "type": "text",
-            "text": content,
-        }]);
-        item["success"] = Value::from(true);
-        item["error"] = Value::Null;
-    } else if item["type"] == "commandExecution" {
-        item["aggregatedOutput"] = Value::from(content.to_string());
-        item["error"] = Value::Null;
+        *item = mcp_tool_completed_item(
+            item["id"].as_str().unwrap_or_default(),
+            item["server"].as_str().unwrap_or_default(),
+            item["tool"].as_str().unwrap_or_default(),
+            status,
+            item["arguments"].clone(),
+            mcp_result,
+            error,
+        );
+        copy_truncated_metadata(item, result);
+        return;
+    }
+
+    if item["type"] == "dynamicToolCall" {
+        let content_items = if status == "completed" {
+            json!([{
+                "type": "text",
+                "text": result["content"].as_str().unwrap_or_default(),
+            }])
+        } else {
+            Value::Null
+        };
+        *item = dynamic_tool_completed_item(
+            item["id"].as_str().unwrap_or_default(),
+            item["tool"].as_str().unwrap_or_default(),
+            status,
+            item["arguments"].clone(),
+            content_items,
+            status == "completed",
+            error,
+        );
+        copy_truncated_metadata(item, result);
+        return;
+    }
+
+    let content = result["content"].as_str().unwrap_or_default();
+    item["status"] = Value::from(status.to_string());
+    copy_truncated_metadata(item, result);
+    if item["type"] == "commandExecution" {
+        if status == "completed" {
+            item["aggregatedOutput"] = Value::from(content.to_string());
+            item["error"] = Value::Null;
+        } else {
+            item["error"] = error;
+        }
     } else {
-        item["result"] = Value::from(content.to_string());
-        item["error"] = Value::Null;
+        item["result"] = if status == "completed" {
+            Value::from(content.to_string())
+        } else {
+            Value::Null
+        };
+        item["error"] = error;
     }
 }
 

@@ -21,8 +21,9 @@ use crate::thread_store::{
     ThreadStore, TurnItemsView,
 };
 use crate::tool_item_projection::{
-    dynamic_tool_started_item, mcp_result_from_content, mcp_tool_parts, mcp_tool_started_item,
-    parse_json_or_null, tool_error_object_from_value, tool_status_is_completed,
+    dynamic_tool_completed_item, dynamic_tool_started_item, mcp_result_from_content,
+    mcp_tool_completed_item, mcp_tool_parts, mcp_tool_started_item, parse_json_or_null,
+    tool_error_object_from_value, tool_status_is_completed,
 };
 pub use orca_core::config::{ActivePermissionProfile, AdditionalWorkingDirectory};
 use orca_core::config::{HistoryMode, OutputFormat, RunConfig};
@@ -1175,43 +1176,42 @@ impl<W: Write> ServerRequestWriter<W> {
             command: None,
         });
         if let Some((server, local_tool)) = mcp_tool_parts(&item.tool) {
+            let status = payload["status"].as_str().unwrap_or_default().to_string();
             return protocol::write_server_event(
                 &mut self.inner,
                 &self.id,
                 protocol::ServerEvent::ItemCompleted {
                     thread_id: Value::Null,
                     turn_id: Value::Null,
-                    item: json!({
-                        "id": item.id,
-                        "type": "mcpToolCall",
-                        "server": server,
-                        "tool": local_tool,
-                        "status": payload["status"].clone(),
-                        "arguments": mcp_tool_arguments(payload),
-                        "result": mcp_tool_result(payload),
-                        "error": mcp_tool_error(payload),
-                    }),
+                    item: mcp_tool_completed_item(
+                        item.id,
+                        server,
+                        local_tool,
+                        status,
+                        mcp_tool_arguments(payload),
+                        mcp_tool_result(payload),
+                        mcp_tool_error(payload),
+                    ),
                 },
             );
         }
         if is_dynamic_tool(&item.tool) {
+            let status = payload["status"].as_str().unwrap_or_default().to_string();
             return protocol::write_server_event(
                 &mut self.inner,
                 &self.id,
                 protocol::ServerEvent::ItemCompleted {
                     thread_id: Value::Null,
                     turn_id: Value::Null,
-                    item: json!({
-                        "id": item.id,
-                        "type": "dynamicToolCall",
-                        "namespace": Value::Null,
-                        "tool": item.tool,
-                        "status": payload["status"].clone(),
-                        "arguments": tool_arguments(payload),
-                        "contentItems": dynamic_tool_content_items(payload),
-                        "success": payload["status"].as_str() == Some("completed"),
-                        "error": dynamic_tool_error(payload),
-                    }),
+                    item: dynamic_tool_completed_item(
+                        item.id,
+                        item.tool,
+                        status,
+                        tool_arguments(payload),
+                        dynamic_tool_content_items(payload),
+                        payload["status"].as_str() == Some("completed"),
+                        dynamic_tool_error(payload),
+                    ),
                 },
             );
         }

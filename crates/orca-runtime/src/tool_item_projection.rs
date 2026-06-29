@@ -63,6 +63,49 @@ pub(crate) fn dynamic_tool_started_item(
     })
 }
 
+pub(crate) fn mcp_tool_completed_item(
+    id: impl Into<String>,
+    server: impl Into<String>,
+    tool: impl Into<String>,
+    status: impl Into<String>,
+    arguments: Value,
+    result: Value,
+    error: Value,
+) -> Value {
+    json!({
+        "id": id.into(),
+        "type": "mcpToolCall",
+        "server": server.into(),
+        "tool": tool.into(),
+        "status": status.into(),
+        "arguments": arguments,
+        "result": result,
+        "error": error,
+    })
+}
+
+pub(crate) fn dynamic_tool_completed_item(
+    id: impl Into<String>,
+    tool: impl Into<String>,
+    status: impl Into<String>,
+    arguments: Value,
+    content_items: Value,
+    success: bool,
+    error: Value,
+) -> Value {
+    json!({
+        "id": id.into(),
+        "type": "dynamicToolCall",
+        "namespace": Value::Null,
+        "tool": tool.into(),
+        "status": status.into(),
+        "arguments": arguments,
+        "contentItems": content_items,
+        "success": success,
+        "error": error,
+    })
+}
+
 pub(crate) fn tool_error_object(message: &str, exit_code: Option<i64>) -> Value {
     let mut error =
         serde_json::Map::from_iter([("message".to_string(), Value::from(message.to_string()))]);
@@ -164,5 +207,96 @@ mod tests {
         assert!(item["contentItems"].is_null());
         assert!(item["success"].is_null());
         assert!(item["error"].is_null());
+    }
+
+    #[test]
+    fn mcp_tool_completed_item_projects_success_shape() {
+        let item = mcp_tool_completed_item(
+            "call-3",
+            "server",
+            "search",
+            "completed",
+            json!({ "q": "orca" }),
+            mcp_result_from_content(
+                r#"{"content":[{"type":"text","text":"found"}],"structuredContent":{"count":1},"_meta":{"source":"test"}}"#,
+            ),
+            Value::Null,
+        );
+
+        assert_eq!(item["id"], "call-3");
+        assert_eq!(item["type"], "mcpToolCall");
+        assert_eq!(item["server"], "server");
+        assert_eq!(item["tool"], "search");
+        assert_eq!(item["status"], "completed");
+        assert_eq!(item["arguments"]["q"], "orca");
+        assert_eq!(item["result"]["content"][0]["text"], "found");
+        assert_eq!(item["result"]["structuredContent"]["count"], 1);
+        assert_eq!(item["result"]["_meta"]["source"], "test");
+        assert!(item["error"].is_null());
+    }
+
+    #[test]
+    fn mcp_tool_completed_item_projects_failure_shape() {
+        let item = mcp_tool_completed_item(
+            "call-4",
+            "server",
+            "search",
+            "failed",
+            json!({ "q": "orca" }),
+            Value::Null,
+            tool_error_object("timeout", Some(124)),
+        );
+
+        assert_eq!(item["id"], "call-4");
+        assert_eq!(item["type"], "mcpToolCall");
+        assert_eq!(item["status"], "failed");
+        assert_eq!(item["arguments"]["q"], "orca");
+        assert!(item["result"].is_null());
+        assert_eq!(item["error"]["message"], "timeout");
+        assert_eq!(item["error"]["exitCode"], 124);
+    }
+
+    #[test]
+    fn dynamic_tool_completed_item_projects_success_shape() {
+        let item = dynamic_tool_completed_item(
+            "call-5",
+            "deploy",
+            "completed",
+            json!({ "env": "staging" }),
+            json!([{ "type": "text", "text": "deployed" }]),
+            true,
+            Value::Null,
+        );
+
+        assert_eq!(item["id"], "call-5");
+        assert_eq!(item["type"], "dynamicToolCall");
+        assert!(item["namespace"].is_null());
+        assert_eq!(item["tool"], "deploy");
+        assert_eq!(item["status"], "completed");
+        assert_eq!(item["arguments"]["env"], "staging");
+        assert_eq!(item["contentItems"][0]["text"], "deployed");
+        assert_eq!(item["success"], true);
+        assert!(item["error"].is_null());
+    }
+
+    #[test]
+    fn dynamic_tool_completed_item_projects_failure_shape() {
+        let item = dynamic_tool_completed_item(
+            "call-6",
+            "deploy",
+            "denied",
+            json!({ "env": "production" }),
+            Value::Null,
+            false,
+            tool_error_object("policy denied", None),
+        );
+
+        assert_eq!(item["id"], "call-6");
+        assert_eq!(item["type"], "dynamicToolCall");
+        assert_eq!(item["status"], "denied");
+        assert_eq!(item["arguments"]["env"], "production");
+        assert!(item["contentItems"].is_null());
+        assert_eq!(item["success"], false);
+        assert_eq!(item["error"]["message"], "policy denied");
     }
 }
