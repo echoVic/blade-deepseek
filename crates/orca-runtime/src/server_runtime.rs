@@ -20,6 +20,7 @@ use crate::thread_store::{
     SessionStore, StoredThreadItem, StoredThreadProjection, StoredThreadTurn, ThreadMetadataPatch,
     ThreadStore, TurnItemsView,
 };
+use crate::tool_item_projection::{mcp_result_from_content, mcp_tool_parts, parse_json_or_null};
 pub use orca_core::config::{ActivePermissionProfile, AdditionalWorkingDirectory};
 use orca_core::config::{HistoryMode, OutputFormat, RunConfig};
 
@@ -1582,17 +1583,11 @@ fn is_builtin_tool(tool: &str) -> bool {
     )
 }
 
-fn mcp_tool_parts(tool: &str) -> Option<(String, String)> {
-    let rest = tool.strip_prefix("mcp__")?;
-    let (server, local_tool) = rest.rsplit_once("__")?;
-    Some((server.to_string(), local_tool.to_string()))
-}
-
 fn tool_arguments(payload: &Value) -> Value {
     payload["raw_arguments"]
         .as_str()
         .or_else(|| payload["target"].as_str())
-        .and_then(|arguments| serde_json::from_str(arguments).ok())
+        .map(parse_json_or_null)
         .unwrap_or(Value::Null)
 }
 
@@ -1607,20 +1602,7 @@ fn mcp_tool_result(payload: &Value) -> Value {
     let Some(output) = payload["output"].as_str() else {
         return Value::Null;
     };
-    match serde_json::from_str::<Value>(output) {
-        Ok(value) if value.is_object() => json!({
-            "content": value.get("content").cloned().unwrap_or_else(|| {
-                json!([{ "type": "text", "text": output }])
-            }),
-            "structuredContent": value.get("structuredContent").cloned().unwrap_or(Value::Null),
-            "_meta": value.get("_meta").cloned().unwrap_or(Value::Null),
-        }),
-        _ => json!({
-            "content": [{ "type": "text", "text": output }],
-            "structuredContent": Value::Null,
-            "_meta": Value::Null,
-        }),
-    }
+    mcp_result_from_content(output)
 }
 
 fn mcp_tool_error(payload: &Value) -> Value {
@@ -1655,12 +1637,7 @@ fn dynamic_tool_error(payload: &Value) -> Value {
 }
 
 fn tool_error_object(message: &str, payload: &Value) -> Value {
-    let mut error =
-        serde_json::Map::from_iter([("message".to_string(), Value::from(message.to_string()))]);
-    if let Some(exit_code) = payload["exit_code"].as_i64() {
-        error.insert("exitCode".to_string(), Value::from(exit_code));
-    }
-    Value::Object(error)
+    crate::tool_item_projection::tool_error_object(message, payload["exit_code"].as_i64())
 }
 
 fn tool_error_detail(payload: &Value) -> Value {

@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::history::{self, CompactionRecord, ContextSummaryRecord};
+use crate::tool_item_projection::{mcp_result_from_content, mcp_tool_parts, parse_json_or_null};
 use chrono::{DateTime, Utc};
 use orca_core::approval_rules::PermissionRules;
 use orca_core::approval_types::ApprovalMode;
@@ -2415,39 +2416,12 @@ fn parse_tool_failure_content(content: &str) -> Option<Value> {
     Some(error)
 }
 
-fn mcp_tool_parts(tool: &str) -> Option<(String, String)> {
-    let rest = tool.strip_prefix("mcp__")?;
-    let (server, local_tool) = rest.rsplit_once("__")?;
-    Some((server.to_string(), local_tool.to_string()))
-}
-
-fn parse_json_or_null(raw: &str) -> Value {
-    serde_json::from_str(raw).unwrap_or(Value::Null)
-}
-
 fn command_from_tool_arguments(raw: &str) -> Value {
     parse_json_or_null(raw)
         .get("command")
         .and_then(Value::as_str)
         .map(|command| Value::from(command.to_string()))
         .unwrap_or(Value::Null)
-}
-
-fn mcp_result_from_content(content: &str) -> Value {
-    match serde_json::from_str::<Value>(content) {
-        Ok(value) if value.is_object() => json!({
-            "content": value.get("content").cloned().unwrap_or_else(|| {
-                json!([{ "type": "text", "text": content }])
-            }),
-            "structuredContent": value.get("structuredContent").cloned().unwrap_or(Value::Null),
-            "_meta": value.get("_meta").cloned().unwrap_or(Value::Null),
-        }),
-        _ => json!({
-            "content": [{ "type": "text", "text": content }],
-            "structuredContent": Value::Null,
-            "_meta": Value::Null,
-        }),
-    }
 }
 
 fn items_for_view(items_view: TurnItemsView, items: Vec<Value>) -> Vec<Value> {

@@ -24,6 +24,7 @@ pub mod tasks;
 pub mod thread_store;
 pub mod tool_execution;
 pub mod tool_invocation;
+pub(crate) mod tool_item_projection;
 pub mod update_check;
 pub mod workflow;
 pub mod workflow_execution;
@@ -1025,6 +1026,33 @@ mod tests {
             assert!(
                 !thread_store_source.contains(&format!("crate::history::{function_name}(")),
                 "thread_store must not bridge projection helper {function_name} through history"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_item_projection_helpers_are_owned_by_shared_projection_module() {
+        let server_runtime_source = include_str!("server_runtime.rs");
+        let thread_store_source = include_str!("thread_store.rs");
+        let projection_source = include_str!("tool_item_projection.rs");
+
+        for function_name in [
+            "mcp_tool_parts",
+            "parse_json_or_null",
+            "mcp_result_from_content",
+        ] {
+            let signature = format!("fn {function_name}(");
+            assert!(
+                !server_runtime_source.contains(&signature),
+                "server_runtime must not own shared tool item projection helper {function_name}"
+            );
+            assert!(
+                !thread_store_source.contains(&signature),
+                "thread_store must not own shared tool item projection helper {function_name}"
+            );
+            assert!(
+                projection_source.contains(&signature),
+                "tool_item_projection must own shared tool item projection helper {function_name}"
             );
         }
     }
