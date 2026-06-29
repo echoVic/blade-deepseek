@@ -482,8 +482,8 @@ done
         let transport = connect(&McpServerConfig {
             name: "slow".to_string(),
             transport: McpTransportKind::Stdio,
-            command: Some(server.to_string_lossy().into_owned()),
-            args: Vec::new(),
+            command: Some("/bin/sh".to_string()),
+            args: vec![server.to_string_lossy().into_owned()],
             url: None,
             env: Default::default(),
             headers: Default::default(),

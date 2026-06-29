@@ -937,6 +937,31 @@ mod tests {
 
     const STDIO_TEST_STARTUP_TIMEOUT_MS: u64 = 15_000;
 
+    #[cfg(unix)]
+    fn stdio_fixture_config(name: &str, server: &std::path::Path) -> McpServerConfig {
+        McpServerConfig {
+            name: name.to_string(),
+            transport: orca_core::mcp_types::McpTransportKind::Stdio,
+            command: Some("/bin/sh".to_string()),
+            args: vec![server.to_string_lossy().into_owned()],
+            url: None,
+            env: Default::default(),
+            headers: Default::default(),
+            disabled: false,
+            startup_timeout_ms: Some(STDIO_TEST_STARTUP_TIMEOUT_MS),
+            tool_timeout_ms: Some(1000),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdio_fixture_config_runs_shell_script_through_sh() {
+        let config = stdio_fixture_config("templates", std::path::Path::new("/tmp/mcp.sh"));
+
+        assert_eq!(config.command.as_deref(), Some("/bin/sh"));
+        assert_eq!(config.args, vec!["/tmp/mcp.sh"]);
+    }
+
     #[test]
     fn sanitizes_mcp_schema_names() {
         assert_eq!(sanitize_name("GitHub Files"), "github_files");
@@ -1382,18 +1407,8 @@ done
         }
 
         let registry = initialize_registry(&[
-            McpServerConfig {
-                name: "resources".to_string(),
-                command: Some(resources_server.to_string_lossy().into_owned()),
-                startup_timeout_ms: Some(STDIO_TEST_STARTUP_TIMEOUT_MS),
-                ..Default::default()
-            },
-            McpServerConfig {
-                name: "tools_only".to_string(),
-                command: Some(tools_only_server.to_string_lossy().into_owned()),
-                startup_timeout_ms: Some(STDIO_TEST_STARTUP_TIMEOUT_MS),
-                ..Default::default()
-            },
+            stdio_fixture_config("resources", &resources_server),
+            stdio_fixture_config("tools_only", &tools_only_server),
         ]);
 
         let listing = registry.list_resources_with_errors(None);
@@ -1469,18 +1484,8 @@ done
         }
 
         let registry = initialize_registry(&[
-            McpServerConfig {
-                name: "resources".to_string(),
-                command: Some(resources_server.to_string_lossy().into_owned()),
-                startup_timeout_ms: Some(STDIO_TEST_STARTUP_TIMEOUT_MS),
-                ..Default::default()
-            },
-            McpServerConfig {
-                name: "tools_only".to_string(),
-                command: Some(tools_only_server.to_string_lossy().into_owned()),
-                startup_timeout_ms: Some(STDIO_TEST_STARTUP_TIMEOUT_MS),
-                ..Default::default()
-            },
+            stdio_fixture_config("resources", &resources_server),
+            stdio_fixture_config("tools_only", &tools_only_server),
         ]);
 
         let listing = registry.list_resource_templates_with_errors(None);
@@ -1536,18 +1541,7 @@ done
             std::fs::set_permissions(&server, permissions).expect("chmod MCP fixture");
         }
 
-        let registry = initialize_registry(&[McpServerConfig {
-            name: "resources".to_string(),
-            transport: orca_core::mcp_types::McpTransportKind::Stdio,
-            command: Some(server.to_string_lossy().into_owned()),
-            args: Vec::new(),
-            url: None,
-            env: Default::default(),
-            headers: Default::default(),
-            disabled: false,
-            startup_timeout_ms: Some(STDIO_TEST_STARTUP_TIMEOUT_MS),
-            tool_timeout_ms: Some(1000),
-        }]);
+        let registry = initialize_registry(&[stdio_fixture_config("resources", &server)]);
         assert!(
             registry.errors().is_empty(),
             "registry errors: {:?}",
@@ -1604,18 +1598,7 @@ done
             std::fs::set_permissions(&server, permissions).expect("chmod MCP fixture");
         }
 
-        let registry = initialize_registry(&[McpServerConfig {
-            name: "templates".to_string(),
-            transport: orca_core::mcp_types::McpTransportKind::Stdio,
-            command: Some(server.to_string_lossy().into_owned()),
-            args: Vec::new(),
-            url: None,
-            env: Default::default(),
-            headers: Default::default(),
-            disabled: false,
-            startup_timeout_ms: Some(STDIO_TEST_STARTUP_TIMEOUT_MS),
-            tool_timeout_ms: Some(1000),
-        }]);
+        let registry = initialize_registry(&[stdio_fixture_config("templates", &server)]);
         assert!(
             registry.errors().is_empty(),
             "registry errors: {:?}",
@@ -1689,8 +1672,11 @@ done
         let registry = initialize_registry(&[McpServerConfig {
             name: "slow".to_string(),
             transport: orca_core::mcp_types::McpTransportKind::Stdio,
-            command: Some(server.to_string_lossy().into_owned()),
-            args: vec![state_dir.to_string_lossy().into_owned()],
+            command: Some("/bin/sh".to_string()),
+            args: vec![
+                server.to_string_lossy().into_owned(),
+                state_dir.to_string_lossy().into_owned(),
+            ],
             url: None,
             env: Default::default(),
             headers: Default::default(),
