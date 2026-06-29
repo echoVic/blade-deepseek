@@ -6951,10 +6951,7 @@ fn server_mode_rejects_turn_start_for_unknown_thread() {
 
 fn read_until_event<R: BufRead>(stdout: &mut R, id: &str, event_name: &str) -> Value {
     loop {
-        let mut line = String::new();
-        let bytes = stdout.read_line(&mut line).expect("read server event");
-        assert_ne!(bytes, 0, "server ended before {id}/{event_name}");
-        let event: Value = serde_json::from_str(line.trim()).expect("server json");
+        let event = read_json_event_line(stdout, &format!("{id}/{event_name}"));
         if event["id"] == id && event["event"] == event_name {
             return event;
         }
@@ -7042,10 +7039,7 @@ fn assert_command_exec_error(params: &str, expected_message: &str) {
 
 fn read_next_event_for_id<R: BufRead>(stdout: &mut R, id: &str) -> Value {
     loop {
-        let mut line = String::new();
-        let bytes = stdout.read_line(&mut line).expect("read server event");
-        assert_ne!(bytes, 0, "server ended before next event for {id}");
-        let event: Value = serde_json::from_str(line.trim()).expect("server json");
+        let event = read_json_event_line(stdout, &format!("next event for {id}"));
         if event["id"] == id {
             return event;
         }
@@ -7080,10 +7074,7 @@ fn read_shell_read_result<R: BufRead>(stdout: &mut R, id: &str) -> Value {
 fn read_events_until_event<R: BufRead>(stdout: &mut R, id: &str, event_name: &str) -> Vec<Value> {
     let mut events = Vec::new();
     loop {
-        let mut line = String::new();
-        let bytes = stdout.read_line(&mut line).expect("read server event");
-        assert_ne!(bytes, 0, "server ended before {id}/{event_name}");
-        let event: Value = serde_json::from_str(line.trim()).expect("server json");
+        let event = read_json_event_line(stdout, &format!("{id}/{event_name}"));
         let found = event["id"] == id && event["event"] == event_name;
         events.push(event);
         if found {
@@ -7095,10 +7086,7 @@ fn read_events_until_event<R: BufRead>(stdout: &mut R, id: &str, event_name: &st
 fn read_events_until_shell_read_response<R: BufRead>(stdout: &mut R, id: &str) -> Vec<Value> {
     let mut events = Vec::new();
     loop {
-        let mut line = String::new();
-        let bytes = stdout.read_line(&mut line).expect("read server event");
-        assert_ne!(bytes, 0, "server ended before shell/read response for {id}");
-        let event: Value = serde_json::from_str(line.trim()).expect("server json");
+        let event = read_json_event_line(stdout, &format!("shell/read response for {id}"));
         let done = event["id"] == id
             && matches!(
                 event["event"].as_str(),
@@ -7109,6 +7097,34 @@ fn read_events_until_shell_read_response<R: BufRead>(stdout: &mut R, id: &str) -
             return events;
         }
     }
+}
+
+fn read_json_event_line<R: BufRead>(stdout: &mut R, context: &str) -> Value {
+    loop {
+        let mut line = String::new();
+        let bytes = stdout.read_line(&mut line).expect("read server event");
+        assert_ne!(bytes, 0, "server ended before {context}");
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<Value>(line) {
+            Ok(event) => return event,
+            Err(_) => continue,
+        }
+    }
+}
+
+#[test]
+fn read_json_event_line_skips_non_protocol_stdout_noise() {
+    let mut input = BufReader::new(
+        b"noise from child process\n\n{\"id\":\"ok\",\"event\":\"done\"}\n".as_slice(),
+    );
+
+    let event = read_json_event_line(&mut input, "test event");
+
+    assert_eq!(event["id"], "ok");
+    assert_eq!(event["event"], "done");
 }
 
 fn read_command_exec_output_until<R: BufRead>(

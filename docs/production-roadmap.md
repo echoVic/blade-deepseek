@@ -4,7 +4,7 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-06-29
-Current baseline: v0.1.47 MCP resource list/read tools, structured hook action validation, tool argument schema composition validation, fuzzy model-facing file discovery, runtime-owned agent turn loop orchestration, workflow parity loop, process timeout hardening, runtime/TUI task-turn lifecycle seed, and configured permission-profile write/deny/network/special-root sandboxing
+Current baseline: v0.1.48 MCP resource list/read tools, server JSONL test harness hardening, structured hook action validation, tool argument schema composition validation, fuzzy model-facing file discovery, runtime-owned agent turn loop orchestration, workflow parity loop, process timeout hardening, runtime/TUI task-turn lifecycle seed, and configured permission-profile write/deny/network/special-root sandboxing
 
 ---
 
