@@ -763,6 +763,44 @@ mod tests {
     }
 
     #[test]
+    fn runtime_conversation_bootstrap_step_is_owned_by_lifecycle_module() {
+        let agent_loop_source = include_str!("agent_loop.rs");
+        let lifecycle_source = include_str!("lifecycle.rs");
+
+        for marker in [
+            "let mut owned_conversation",
+            "bootstrap_agent_conversation_for_loop(",
+            "record_initial_history_for_agent(",
+            "resumed.is_some()",
+        ] {
+            assert!(
+                !agent_loop_source.contains(marker),
+                "agent_loop must not own runtime conversation bootstrap detail {marker}"
+            );
+        }
+        assert!(
+            agent_loop_source.contains("RuntimeConversationBootstrapStep"),
+            "agent_loop must delegate runtime conversation bootstrap"
+        );
+        assert!(
+            lifecycle_source.contains("struct RuntimeConversationBootstrapStep"),
+            "lifecycle must own runtime conversation bootstrap step state"
+        );
+        assert!(
+            lifecycle_source.contains("impl RuntimeConversationBootstrapStep"),
+            "lifecycle must own runtime conversation bootstrap step behavior"
+        );
+        assert!(
+            lifecycle_source.contains("bootstrap_agent_conversation_for_loop("),
+            "lifecycle must compose session-owned conversation bootstrap"
+        );
+        assert!(
+            lifecycle_source.contains("record_initial_history_for_agent("),
+            "lifecycle must compose session-owned initial history recording"
+        );
+    }
+
+    #[test]
     fn agent_conversation_bootstrap_is_owned_by_session_module() {
         let agent_loop_source = include_str!("agent_loop.rs");
         let session_source = include_str!("session.rs");
@@ -789,7 +827,7 @@ mod tests {
             "session must expose agent conversation bootstrap"
         );
         assert!(
-            agent_loop_source.contains("bootstrap_agent_conversation_for_loop"),
+            agent_loop_source.contains("RuntimeConversationBootstrapStep"),
             "agent_loop must delegate system prompt construction with conversation bootstrap"
         );
         assert!(

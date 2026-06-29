@@ -26,7 +26,10 @@ use crate::cost::CostTracker;
 use crate::hooks::{HookContext, HookOutcome, HookRunner, conversation_with_hook_context};
 use crate::memory::{self, MemoryBlock};
 use crate::protocol::{PermissionGrantScope, PermissionResponseDecision, RequestPermissionProfile};
-use crate::session::record_assistant_response_for_agent;
+use crate::session::{
+    AgentConversationContext, bootstrap_agent_conversation_for_loop,
+    record_assistant_response_for_agent, record_initial_history_for_agent,
+};
 use crate::shell_session::{
     RuntimeShellSessionManager, ShellSandboxMode, ShellSessionCommand, ShellTerminalMode,
 };
@@ -100,6 +103,7 @@ pub struct RuntimeToolActorContext {
 }
 
 pub(crate) struct RuntimeSteerStep;
+pub(crate) struct RuntimeConversationBootstrapStep;
 pub(crate) struct RuntimeTurnSetupStep;
 pub(crate) struct RuntimeTurnStartStep;
 pub(crate) struct RuntimeModelRouteStep;
@@ -181,6 +185,16 @@ pub(crate) struct RuntimeTurnSetup {
     pub(crate) context_config: context::ContextConfig,
     pub(crate) policy: ApprovalPolicy,
     pub(crate) provider_config: ProviderConfig,
+}
+
+pub(crate) struct RuntimePreparedConversation<'a> {
+    conversation: RuntimePreparedConversationStorage<'a>,
+    history_writer: Option<&'a mut SessionWriter>,
+}
+
+enum RuntimePreparedConversationStorage<'a> {
+    Borrowed(&'a mut Conversation),
+    Owned(Conversation),
 }
 
 pub(crate) struct RuntimeCompactionStep<'a, W: io::Write> {
@@ -1045,6 +1059,90 @@ impl RuntimeSteerStep {
             }
         }
         Ok(injected)
+    }
+}
+
+impl RuntimeConversationBootstrapStep {
+    pub(crate) fn new() -> Self {
+        Self
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prepare<'a>(
+        &mut self,
+        conversation_context: AgentConversationContext<'a>,
+        cwd: &Path,
+        prompt: &str,
+        subagent_depth: u32,
+        subagent_type: &SubagentType,
+        instructions: &ProjectInstructions,
+        approval_mode: orca_core::approval_types::ApprovalMode,
+        memory: &MemoryBlock,
+        emit_deltas: bool,
+    ) -> io::Result<RuntimePreparedConversation<'a>> {
+        let AgentConversationContext {
+            resumed,
+            history_writer,
+            conversation,
+        } = conversation_context;
+
+        let mut prepared = RuntimePreparedConversation {
+            conversation: match conversation {
+                Some(conversation) => RuntimePreparedConversationStorage::Borrowed(conversation),
+                None => RuntimePreparedConversationStorage::Owned(
+                    bootstrap_agent_conversation_for_loop(
+                        resumed,
+                        cwd,
+                        prompt,
+                        subagent_depth,
+                        subagent_type,
+                        instructions,
+                        approval_mode,
+                        memory,
+                    ),
+                ),
+            },
+            history_writer,
+        };
+
+        let (conversation, history_writer) = prepared.parts_mut();
+        record_initial_history_for_agent(
+            conversation,
+            history_writer,
+            resumed.is_some(),
+            emit_deltas,
+        )?;
+
+        Ok(prepared)
+    }
+}
+
+impl RuntimePreparedConversation<'_> {
+    pub(crate) fn conversation_mut(&mut self) -> &mut Conversation {
+        match &mut self.conversation {
+            RuntimePreparedConversationStorage::Borrowed(conversation) => conversation,
+            RuntimePreparedConversationStorage::Owned(conversation) => conversation,
+        }
+    }
+
+    pub(crate) fn history_writer_mut(&mut self) -> Option<&mut SessionWriter> {
+        self.history_writer.as_deref_mut()
+    }
+
+    pub(crate) fn parts_mut(&mut self) -> (&mut Conversation, Option<&mut SessionWriter>) {
+        let conversation = match &mut self.conversation {
+            RuntimePreparedConversationStorage::Borrowed(conversation) => conversation,
+            RuntimePreparedConversationStorage::Owned(conversation) => conversation,
+        };
+        (conversation, self.history_writer.as_deref_mut())
+    }
+
+    pub(crate) fn parts_ref_mut(&mut self) -> (&Conversation, Option<&mut SessionWriter>) {
+        let conversation = match &self.conversation {
+            RuntimePreparedConversationStorage::Borrowed(conversation) => &**conversation,
+            RuntimePreparedConversationStorage::Owned(conversation) => conversation,
+        };
+        (conversation, self.history_writer.as_deref_mut())
     }
 }
 
@@ -2824,6 +2922,7 @@ mod tests {
     use orca_core::subagent_config::SubagentConfig;
 
     use crate::agent_child::{ChildAgentRequest, ChildAgentResult, ChildAgentRuntime};
+    use crate::session::AgentConversationContext;
     use crate::tool_execution::policy_for_tool_execution;
 
     fn config() -> RunConfig {
@@ -3198,5 +3297,40 @@ mod tests {
             Some(orca_core::model::FLASH_MODEL)
         );
         assert!(setup.provider_config.mcp_registry.is_some());
+    }
+
+    #[test]
+    fn conversation_bootstrap_step_builds_owned_conversation_when_missing() {
+        let config = config();
+        let cwd = tempfile::tempdir().expect("cwd");
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let context = AgentConversationContext::new();
+
+        let mut prepared = RuntimeConversationBootstrapStep::new()
+            .prepare(
+                context,
+                cwd.path(),
+                "inspect repo",
+                0,
+                &SubagentType::General,
+                &instructions,
+                config.approval_mode,
+                &memory,
+                true,
+            )
+            .expect("prepare conversation");
+        let conversation = prepared.conversation_mut();
+
+        assert_eq!(conversation.messages.len(), 2);
+        assert!(
+            matches!(&conversation.messages[0], Message::System { .. }),
+            "owned bootstrap should seed a system prompt"
+        );
+        assert!(
+            matches!(&conversation.messages[1], Message::User { content, .. } if content == "inspect repo"),
+            "owned bootstrap should seed the user prompt"
+        );
+        assert!(prepared.history_writer_mut().is_none());
     }
 }

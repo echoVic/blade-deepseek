@@ -5,18 +5,15 @@ use crate::cost::CostTracker;
 use crate::hooks::HookRunner;
 use crate::instructions::ProjectInstructions;
 use crate::lifecycle::{
-    AgentLoopContext, AgentLoopResult, RuntimeCompactionStep, RuntimeModelRouteStep,
-    RuntimeProviderErrorStep, RuntimeProviderErrorStepOutcome, RuntimeProviderResponseOutcome,
-    RuntimeProviderResponseStep, RuntimeProviderTurnResultOutcome, RuntimeProviderTurnResultStep,
-    RuntimeProviderTurnStep, RuntimeSessionLifecycle, RuntimeSteerStep, RuntimeTaskActor,
-    RuntimeTurnConfig, RuntimeTurnDeps, RuntimeTurnExecution, RuntimeTurnSetupStep,
-    RuntimeTurnStartStep, RuntimeTurnState,
+    AgentLoopContext, AgentLoopResult, RuntimeCompactionStep, RuntimeConversationBootstrapStep,
+    RuntimeModelRouteStep, RuntimeProviderErrorStep, RuntimeProviderErrorStepOutcome,
+    RuntimeProviderResponseOutcome, RuntimeProviderResponseStep, RuntimeProviderTurnResultOutcome,
+    RuntimeProviderTurnResultStep, RuntimeProviderTurnStep, RuntimeSessionLifecycle,
+    RuntimeSteerStep, RuntimeTaskActor, RuntimeTurnConfig, RuntimeTurnDeps, RuntimeTurnExecution,
+    RuntimeTurnSetupStep, RuntimeTurnStartStep, RuntimeTurnState,
 };
 use crate::memory::MemoryBlock;
-use crate::session::{
-    AgentConversationContext, bootstrap_agent_conversation_for_loop,
-    record_initial_history_for_agent,
-};
+use crate::session::AgentConversationContext;
 use crate::tasks::TaskRegistry;
 use crate::tool_invocation::AgentToolPolicyContext;
 use crate::workflow_execution::observe_background_workflows;
@@ -37,11 +34,6 @@ pub(crate) fn run_agent_loop(
     conversation_context: AgentConversationContext<'_>,
     tool_policy: AgentToolPolicyContext<'_>,
 ) -> io::Result<AgentLoopResult> {
-    let AgentConversationContext {
-        resumed,
-        history_writer,
-        conversation,
-    } = conversation_context;
     let AgentLoopContext {
         turn_config:
             RuntimeTurnConfig {
@@ -85,28 +77,15 @@ pub(crate) fn run_agent_loop(
     let policy = setup.policy;
     let provider_config = setup.provider_config;
 
-    let mut owned_conversation;
-    let conversation = if let Some(conversation) = conversation {
-        conversation
-    } else {
-        owned_conversation = bootstrap_agent_conversation_for_loop(
-            resumed,
-            cwd,
-            prompt,
-            subagent_depth,
-            subagent_type,
-            instructions,
-            config.approval_mode,
-            memory,
-        );
-        &mut owned_conversation
-    };
-
-    let mut history_writer = history_writer;
-    record_initial_history_for_agent(
-        conversation,
-        history_writer.as_deref_mut(),
-        resumed.is_some(),
+    let mut prepared_conversation = RuntimeConversationBootstrapStep::new().prepare(
+        conversation_context,
+        cwd,
+        prompt,
+        subagent_depth,
+        subagent_type,
+        instructions,
+        config.approval_mode,
+        memory,
         emit_deltas,
     )?;
 
@@ -116,18 +95,21 @@ pub(crate) fn run_agent_loop(
     let mut provider_error_step = RuntimeProviderErrorStep::new();
 
     loop {
-        RuntimeCompactionStep::new(
-            config.provider,
-            &ctx_config,
-            &provider_config,
-            cwd,
-            emit_deltas,
-            hooks,
-            events,
-            sink,
-            history_writer.as_deref_mut(),
-        )
-        .compact_if_needed(conversation)?;
+        {
+            let (conversation, history_writer) = prepared_conversation.parts_mut();
+            RuntimeCompactionStep::new(
+                config.provider,
+                &ctx_config,
+                &provider_config,
+                cwd,
+                emit_deltas,
+                hooks,
+                events,
+                sink,
+                history_writer,
+            )
+            .compact_if_needed(conversation)?;
+        }
 
         if let Some(error) = RuntimeTurnStartStep::new()
             .start(&mut actor, events, sink, prompt, emit_deltas)?
@@ -149,24 +131,30 @@ pub(crate) fn run_agent_loop(
             )?
             .provider_config;
 
-        RuntimeSteerStep::new().apply(steer_handle, conversation, history_writer.as_deref_mut())?;
+        {
+            let (conversation, history_writer) = prepared_conversation.parts_mut();
+            RuntimeSteerStep::new().apply(steer_handle, conversation, history_writer)?;
+        }
 
         let cwd_display = cwd.display().to_string();
-        let provider_turn = RuntimeProviderTurnStep::new().run(
-            &mut actor,
-            config.provider,
-            conversation,
-            &turn_provider_config,
-            &cwd_display,
-            emit_deltas,
-            hooks,
-            cancel,
-            cost_tracker,
-            config.max_budget_usd,
-            events,
-            sink,
-            history_writer.as_deref_mut(),
-        )?;
+        let provider_turn = {
+            let (conversation, history_writer) = prepared_conversation.parts_ref_mut();
+            RuntimeProviderTurnStep::new().run(
+                &mut actor,
+                config.provider,
+                conversation,
+                &turn_provider_config,
+                &cwd_display,
+                emit_deltas,
+                hooks,
+                cancel,
+                cost_tracker,
+                config.max_budget_usd,
+                events,
+                sink,
+                history_writer,
+            )?
+        };
         let response = match RuntimeProviderTurnResultStep::new().fold(
             provider_turn,
             events,
@@ -179,21 +167,25 @@ pub(crate) fn run_agent_loop(
             }
         };
 
-        match provider_error_step.handle(
-            &response,
-            &mut RuntimeCompactionStep::new(
-                config.provider,
-                &ctx_config,
-                &provider_config,
-                cwd,
-                emit_deltas,
-                hooks,
-                events,
-                sink,
-                history_writer.as_deref_mut(),
-            ),
-            conversation,
-        )? {
+        let provider_error_outcome = {
+            let (conversation, history_writer) = prepared_conversation.parts_mut();
+            provider_error_step.handle(
+                &response,
+                &mut RuntimeCompactionStep::new(
+                    config.provider,
+                    &ctx_config,
+                    &provider_config,
+                    cwd,
+                    emit_deltas,
+                    hooks,
+                    events,
+                    sink,
+                    history_writer,
+                ),
+                conversation,
+            )?
+        };
+        match provider_error_outcome {
             RuntimeProviderErrorStepOutcome::ContinueAfterCompaction => {
                 continue;
             }
@@ -203,32 +195,36 @@ pub(crate) fn run_agent_loop(
             RuntimeProviderErrorStepOutcome::NoError => {}
         }
 
-        match RuntimeProviderResponseStep::new().handle(
-            response,
-            config,
-            cwd,
-            events,
-            sink,
-            conversation,
-            history_writer.as_deref_mut(),
-            tool_policy,
-            subagent_depth,
-            emit_deltas,
-            &policy,
-            instructions,
-            memory,
-            mcp_registry,
-            hooks,
-            cost_tracker,
-            cancel,
-            task_registry,
-            background_workflows,
-            workflow_ipc,
-            permission_handler,
-            execute_child_agent_loop,
-            execute_child_agent_loop,
-            execute_child_agent_loop,
-        )? {
+        let provider_response_outcome = {
+            let (conversation, history_writer) = prepared_conversation.parts_mut();
+            RuntimeProviderResponseStep::new().handle(
+                response,
+                config,
+                cwd,
+                events,
+                sink,
+                conversation,
+                history_writer,
+                tool_policy,
+                subagent_depth,
+                emit_deltas,
+                &policy,
+                instructions,
+                memory,
+                mcp_registry,
+                hooks,
+                cost_tracker,
+                cancel,
+                task_registry,
+                background_workflows,
+                workflow_ipc,
+                permission_handler,
+                execute_child_agent_loop,
+                execute_child_agent_loop,
+                execute_child_agent_loop,
+            )?
+        };
+        match provider_response_outcome {
             RuntimeProviderResponseOutcome::Continue => {}
             RuntimeProviderResponseOutcome::Success { final_message } => {
                 return Ok(AgentLoopResult::success(final_message));
