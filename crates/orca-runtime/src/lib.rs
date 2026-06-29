@@ -1773,6 +1773,41 @@ mod tests {
     }
 
     #[test]
+    fn runtime_turn_loop_input_is_owned_by_lifecycle_module() {
+        let agent_loop_source = include_str!("agent_loop.rs");
+        let lifecycle_source = include_str!("lifecycle.rs");
+
+        assert!(
+            agent_loop_source.contains("RuntimeTurnLoopInput"),
+            "agent_loop must pass turn loop inputs through a lifecycle-owned input object"
+        );
+        assert!(
+            agent_loop_source.contains("RuntimeTurnLoopExecutors"),
+            "agent_loop must pass child executors through a lifecycle-owned executor object"
+        );
+        assert!(
+            lifecycle_source.contains("struct RuntimeTurnLoopInput"),
+            "lifecycle must own runtime turn loop input shape"
+        );
+        assert!(
+            lifecycle_source.contains("struct RuntimeTurnLoopExecutors"),
+            "lifecycle must own runtime turn loop executor shape"
+        );
+        assert!(
+            lifecycle_source.contains("impl<'a, 'runtime, W: io::Write> RuntimeTurnLoopInput"),
+            "lifecycle must own runtime turn loop input behavior"
+        );
+        assert!(
+            lifecycle_source.contains("impl<W: io::Write> RuntimeTurnLoopExecutors<W>"),
+            "lifecycle must own runtime turn loop executor behavior"
+        );
+        assert!(
+            !agent_loop_source.contains("execute_child_agent_loop,\n        execute_child_agent_loop,\n        execute_child_agent_loop"),
+            "agent_loop must not pass child executors as a raw repeated argument list"
+        );
+    }
+
+    #[test]
     fn session_list_load_operations_are_owned_by_thread_store_module() {
         let history_source = include_str!("history.rs");
         let thread_store_source = include_str!("thread_store.rs");
