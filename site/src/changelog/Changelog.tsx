@@ -55,8 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
-      "v0.1.54":
-        "Realtime server streams and persisted thread projections now share MCP tool parsing, JSON argument parsing, MCP result shaping, and camelCase tool error helpers to reduce item schema drift.",
+      "v0.1.55":
+        "Realtime server streams and persisted thread projections now share MCP tool parsing, JSON argument parsing, MCP result shaping, and camelCase tool error helpers, with CI JSONL polling hardened for active background turns.",
       "v0.1.53":
         "Realtime mcpToolCall and dynamicToolCall item errors now include exitCode when tool completion reports one, keeping server streams aligned with persisted thread item projections.",
       "v0.1.52":
@@ -140,8 +140,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
-      "v0.1.54":
-        "实时 server stream 与持久化 thread projection 现在共享 MCP tool 解析、JSON 参数解析、MCP result shaping 和 camelCase tool error helper，减少 item schema drift。",
+      "v0.1.55":
+        "实时 server stream 与持久化 thread projection 现在共享 MCP tool 解析、JSON 参数解析、MCP result shaping 和 camelCase tool error helper，并加固后台 turn 活跃写入时的 CI JSONL 轮询测试。",
       "v0.1.53":
         "实时 mcpToolCall / dynamicToolCall item error 现在会在工具完成事件提供 exit_code 时携带 exitCode，与持久化 thread item 投影保持一致。",
       "v0.1.52":
