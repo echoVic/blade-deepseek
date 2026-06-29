@@ -1533,6 +1533,22 @@ fn execute_list_mcp_resources(request: &ToolRequest, ctx: &ToolContext<'_>) -> T
     };
     let server = args.get("server").and_then(Value::as_str);
 
+    if server.is_none() {
+        let listing = registry.list_resources_with_errors(None);
+        let output = json!({
+            "resources": listing.resources,
+            "errors": listing.errors,
+        });
+        return match serde_json::to_string(&output) {
+            Ok(output) => ToolResult::completed(request, output, false),
+            Err(error) => ToolResult::failed(
+                request,
+                format!("failed to serialize MCP resources: {error}"),
+                None,
+            ),
+        };
+    }
+
     match registry.list_resources(server) {
         Ok(resources) => match serde_json::to_string(&resources) {
             Ok(output) => ToolResult::completed(request, output, false),

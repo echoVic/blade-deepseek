@@ -565,6 +565,41 @@ done
     }
 
     #[test]
+    fn list_mcp_resources_reports_partial_resource_errors() {
+        let resource = orca_core::mcp_types::McpResource {
+            server: "notes".to_string(),
+            uri: "memo://orca/one".to_string(),
+            name: "memo one".to_string(),
+            description: Some("A test memo".to_string()),
+            mime_type: Some("text/plain".to_string()),
+        };
+        let registry = McpRegistry::from_resource_listing_for_test(
+            vec![resource],
+            vec!["broken: resources/list timed out".to_string()],
+        );
+
+        let result = execute_with_mcp(
+            &ToolRequest {
+                id: "list-resources".to_string(),
+                name: ToolName::ListMcpResources,
+                action: ActionKind::Read,
+                target: None,
+                raw_arguments: Some("{}".to_string()),
+            },
+            Path::new("."),
+            &registry,
+        );
+
+        assert_eq!(result.status, ToolStatus::Completed);
+        let output: serde_json::Value =
+            serde_json::from_str(result.output.as_deref().expect("tool output"))
+                .expect("resource listing JSON");
+        assert_eq!(output["resources"][0]["server"], "notes");
+        assert_eq!(output["resources"][0]["uri"], "memo://orca/one");
+        assert_eq!(output["errors"][0], "broken: resources/list timed out");
+    }
+
+    #[test]
     fn external_tool_cannot_shadow_builtin_list_files_alias() {
         let external_tools = vec![ExternalToolConfig {
             name: "list_files".to_string(),

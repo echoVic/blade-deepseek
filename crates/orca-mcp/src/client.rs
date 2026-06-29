@@ -31,6 +31,12 @@ struct McpClient {
     transport: Mutex<Box<dyn McpTransport>>,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct McpResourceListing {
+    pub resources: Vec<McpResource>,
+    pub errors: Vec<String>,
+}
+
 pub fn initialize_registry(configs: &[McpServerConfig]) -> McpRegistry {
     let mut clients = HashMap::new();
     let mut tools = Vec::new();
@@ -227,6 +233,36 @@ impl McpRegistry {
         }
     }
 
+    #[cfg(test)]
+    fn from_resource_transports_for_test(
+        transports: impl IntoIterator<Item = (String, Box<dyn McpTransport>)>,
+    ) -> Self {
+        let clients = transports
+            .into_iter()
+            .map(|(server, transport)| {
+                (
+                    server.clone(),
+                    Arc::new(McpClient {
+                        config: McpServerConfig {
+                            name: server.clone(),
+                            ..Default::default()
+                        },
+                        server_name: server,
+                        transport: Mutex::new(transport),
+                    }),
+                )
+            })
+            .collect();
+        Self {
+            inner: Arc::new(McpRegistryInner {
+                clients,
+                tools: Vec::new(),
+                lookup: HashMap::new(),
+                errors: Vec::new(),
+            }),
+        }
+    }
+
     pub fn tools(&self) -> &[McpTool] {
         &self.inner.tools
     }
@@ -275,6 +311,115 @@ impl McpRegistry {
                     return Err("MCP tool call worker stopped before returning".to_string());
                 }
             }
+        }
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn from_resource_listing_for_test(
+        resources: Vec<McpResource>,
+        errors: Vec<String>,
+    ) -> Self {
+        struct StaticResourceListingTransport {
+            resources: Vec<McpResource>,
+            error: Option<String>,
+        }
+
+        impl McpTransport for StaticResourceListingTransport {
+            fn initialize(&self) -> Result<(), String> {
+                Ok(())
+            }
+
+            fn list_tools(&self) -> Result<Value, String> {
+                Ok(serde_json::json!({"tools": []}))
+            }
+
+            fn call_tool(&self, _name: &str, _arguments: Value) -> Result<Value, String> {
+                Err("static resource listing transport does not support tool calls".to_string())
+            }
+
+            fn list_resources(&self) -> Result<Value, String> {
+                if let Some(error) = &self.error {
+                    return Err(error.clone());
+                }
+                let resources = self
+                    .resources
+                    .iter()
+                    .map(|resource| {
+                        serde_json::json!({
+                            "uri": resource.uri,
+                            "name": resource.name,
+                            "description": resource.description,
+                            "mimeType": resource.mime_type,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                Ok(serde_json::json!({ "resources": resources }))
+            }
+
+            fn read_resource(&self, _uri: &str) -> Result<Value, String> {
+                Ok(serde_json::json!({"contents": []}))
+            }
+        }
+
+        let mut clients = HashMap::new();
+        let mut grouped: HashMap<String, Vec<McpResource>> = HashMap::new();
+        for resource in resources {
+            grouped
+                .entry(resource.server.clone())
+                .or_default()
+                .push(resource);
+        }
+        for (server, resources) in grouped {
+            clients.insert(
+                server.clone(),
+                Arc::new(McpClient {
+                    config: McpServerConfig {
+                        name: server.clone(),
+                        ..Default::default()
+                    },
+                    server_name: server,
+                    transport: Mutex::new(Box::new(StaticResourceListingTransport {
+                        resources,
+                        error: None,
+                    })),
+                }),
+            );
+        }
+        for error in &errors {
+            let server = error
+                .split_once(':')
+                .map(|(server, _)| server.trim())
+                .filter(|server| !server.is_empty())
+                .unwrap_or("error")
+                .to_string();
+            clients.insert(
+                server.clone(),
+                Arc::new(McpClient {
+                    config: McpServerConfig {
+                        name: server.clone(),
+                        ..Default::default()
+                    },
+                    server_name: server,
+                    transport: Mutex::new(Box::new(StaticResourceListingTransport {
+                        resources: Vec::new(),
+                        error: Some(
+                            error
+                                .split_once(':')
+                                .map(|(_, message)| message.trim().to_string())
+                                .unwrap_or_else(|| error.clone()),
+                        ),
+                    })),
+                }),
+            );
+        }
+
+        Self {
+            inner: Arc::new(McpRegistryInner {
+                clients,
+                tools: Vec::new(),
+                lookup: HashMap::new(),
+                errors: Vec::new(),
+            }),
         }
     }
 
@@ -344,6 +489,51 @@ impl McpRegistry {
         }
 
         Ok(resources)
+    }
+
+    pub fn list_resources_with_errors(&self, server: Option<&str>) -> McpResourceListing {
+        let clients = match server {
+            Some(server) => match self.inner.clients.get(server).cloned() {
+                Some(client) => vec![(server.to_string(), client)],
+                None => {
+                    return McpResourceListing {
+                        resources: Vec::new(),
+                        errors: vec![format!("MCP server '{server}' is not connected")],
+                    };
+                }
+            },
+            None => self
+                .inner
+                .clients
+                .iter()
+                .map(|(name, client)| (name.clone(), Arc::clone(client)))
+                .collect(),
+        };
+
+        let mut listing = McpResourceListing::default();
+        for (server, client) in clients {
+            match client.list_resources() {
+                Ok(result) => match serde_json::from_value::<ResourcesListResult>(result) {
+                    Ok(result) => {
+                        listing
+                            .resources
+                            .extend(result.resources.into_iter().map(|resource| McpResource {
+                                server: server.clone(),
+                                uri: resource.uri,
+                                name: resource.name,
+                                description: resource.description,
+                                mime_type: resource.mime_type,
+                            }));
+                    }
+                    Err(error) => listing.errors.push(format!(
+                        "{server}: invalid MCP resources/list result: {error}"
+                    )),
+                },
+                Err(error) => listing.errors.push(format!("{server}: {error}")),
+            }
+        }
+
+        listing
     }
 
     pub fn read_resource(&self, server: &str, uri: &str) -> Result<ReadResourceResult, String> {
@@ -570,6 +760,74 @@ mod tests {
 
         assert!(started.elapsed() < Duration::from_millis(750));
         assert_eq!(result.unwrap_err(), "MCP tool call cancelled");
+    }
+
+    #[test]
+    fn registry_aggregates_mcp_resource_list_errors_without_losing_successes() {
+        struct ResourceListTransport {
+            result: Result<Value, String>,
+        }
+
+        impl McpTransport for ResourceListTransport {
+            fn initialize(&self) -> Result<(), String> {
+                Ok(())
+            }
+
+            fn list_tools(&self) -> Result<Value, String> {
+                Ok(serde_json::json!({"tools": []}))
+            }
+
+            fn call_tool(&self, _name: &str, _arguments: Value) -> Result<Value, String> {
+                Err("not used".to_string())
+            }
+
+            fn list_resources(&self) -> Result<Value, String> {
+                self.result.clone()
+            }
+
+            fn read_resource(&self, _uri: &str) -> Result<Value, String> {
+                Err("not used".to_string())
+            }
+        }
+
+        let registry = McpRegistry::from_resource_transports_for_test([
+            (
+                "notes".to_string(),
+                Box::new(ResourceListTransport {
+                    result: Ok(serde_json::json!({
+                        "resources": [
+                            {
+                                "uri": "memo://orca/one",
+                                "name": "memo one",
+                                "description": "A test memo",
+                                "mimeType": "text/plain"
+                            }
+                        ]
+                    })),
+                }) as Box<dyn McpTransport>,
+            ),
+            (
+                "broken".to_string(),
+                Box::new(ResourceListTransport {
+                    result: Err("resources/list timed out".to_string()),
+                }) as Box<dyn McpTransport>,
+            ),
+        ]);
+
+        let listing = registry.list_resources_with_errors(None);
+
+        assert_eq!(listing.resources.len(), 1);
+        assert_eq!(listing.resources[0].server, "notes");
+        assert_eq!(listing.resources[0].uri, "memo://orca/one");
+        assert_eq!(
+            listing.errors,
+            vec!["broken: resources/list timed out".to_string()]
+        );
+
+        let single_server_error = registry
+            .list_resources(Some("broken"))
+            .expect_err("single-server resource list should stay strict");
+        assert_eq!(single_server_error, "resources/list timed out");
     }
 
     #[cfg(unix)]
