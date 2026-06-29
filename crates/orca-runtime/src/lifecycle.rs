@@ -114,6 +114,7 @@ pub(crate) struct RuntimeProviderTurnResultStep;
 
 pub(crate) struct RuntimeProviderTurnStep;
 pub(crate) struct RuntimeProviderResponseStep;
+pub(crate) struct RuntimeProviderResponseResultStep;
 
 pub(crate) struct RuntimeProviderTurnOutput {
     pub(crate) response: Option<ProviderResponse>,
@@ -150,6 +151,11 @@ pub(crate) enum RuntimeProviderErrorStepOutcome {
 pub(crate) enum RuntimeProviderTurnResultOutcome {
     Response(ProviderResponse),
     Failed(RuntimeTurnStartError),
+}
+
+pub(crate) enum RuntimeProviderResponseResult {
+    Continue,
+    Return(AgentLoopResult),
 }
 
 #[derive(Clone, Debug)]
@@ -2759,6 +2765,27 @@ impl RuntimeProviderResponseStep {
     }
 }
 
+impl RuntimeProviderResponseResultStep {
+    pub(crate) fn new() -> Self {
+        Self
+    }
+
+    pub(crate) fn fold(
+        &self,
+        outcome: RuntimeProviderResponseOutcome,
+    ) -> RuntimeProviderResponseResult {
+        match outcome {
+            RuntimeProviderResponseOutcome::Continue => RuntimeProviderResponseResult::Continue,
+            RuntimeProviderResponseOutcome::Success { final_message } => {
+                RuntimeProviderResponseResult::Return(AgentLoopResult::success(final_message))
+            }
+            RuntimeProviderResponseOutcome::Return { status, error } => {
+                RuntimeProviderResponseResult::Return(AgentLoopResult::terminal(status, error))
+            }
+        }
+    }
+}
+
 fn cancelled_provider_turn<W: io::Write>(
     emit_deltas: bool,
     events: &mut EventFactory,
@@ -3206,6 +3233,44 @@ mod tests {
         assert_eq!(terminal.status, RunStatus::Cancelled);
         assert_eq!(terminal.final_message, None);
         assert_eq!(terminal.error, None);
+    }
+
+    #[test]
+    fn provider_response_result_step_folds_success_return_and_continue() {
+        let success = RuntimeProviderResponseResultStep::new().fold(
+            RuntimeProviderResponseOutcome::Success {
+                final_message: Some("done".to_string()),
+            },
+        );
+        match success {
+            RuntimeProviderResponseResult::Return(result) => {
+                assert_eq!(result.status, RunStatus::Success);
+                assert_eq!(result.final_message.as_deref(), Some("done"));
+                assert_eq!(result.error, None);
+            }
+            RuntimeProviderResponseResult::Continue => panic!("success should return loop result"),
+        }
+
+        let terminal =
+            RuntimeProviderResponseResultStep::new().fold(RuntimeProviderResponseOutcome::Return {
+                status: RunStatus::Cancelled,
+                error: Some("cancelled".to_string()),
+            });
+        match terminal {
+            RuntimeProviderResponseResult::Return(result) => {
+                assert_eq!(result.status, RunStatus::Cancelled);
+                assert_eq!(result.final_message, None);
+                assert_eq!(result.error.as_deref(), Some("cancelled"));
+            }
+            RuntimeProviderResponseResult::Continue => panic!("terminal outcome should return"),
+        }
+
+        let continuing =
+            RuntimeProviderResponseResultStep::new().fold(RuntimeProviderResponseOutcome::Continue);
+        assert!(matches!(
+            continuing,
+            RuntimeProviderResponseResult::Continue
+        ));
     }
 
     #[test]

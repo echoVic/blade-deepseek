@@ -298,8 +298,8 @@ mod tests {
             "agent_loop must delegate tool-turn outcome state through provider response step"
         );
         assert!(
-            agent_loop_source.contains("RuntimeProviderResponseOutcome"),
-            "agent_loop must consume provider response outcome state"
+            !agent_loop_source.contains("RuntimeProviderResponseOutcome"),
+            "agent_loop must delegate provider response outcome folding through lifecycle"
         );
         assert!(
             tool_invocation_source.contains("pub(crate) enum ToolTurnOutcome"),
@@ -1285,12 +1285,36 @@ mod tests {
             "agent_loop must delegate provider response handling"
         );
         assert!(
+            agent_loop_source.contains("RuntimeProviderResponseResultStep"),
+            "agent_loop must delegate provider response result folding"
+        );
+        assert!(
+            !agent_loop_source.contains("RuntimeProviderResponseOutcome::Continue"),
+            "agent_loop must not own provider response continue outcome folding"
+        );
+        assert!(
+            !agent_loop_source.contains("RuntimeProviderResponseOutcome::Success"),
+            "agent_loop must not own provider response success outcome folding"
+        );
+        assert!(
+            !agent_loop_source.contains("RuntimeProviderResponseOutcome::Return"),
+            "agent_loop must not own provider response return outcome folding"
+        );
+        assert!(
             lifecycle_source.contains("struct RuntimeProviderResponseStep"),
             "lifecycle must own provider response step state"
         );
         assert!(
+            lifecycle_source.contains("struct RuntimeProviderResponseResultStep"),
+            "lifecycle must own provider response result folding step state"
+        );
+        assert!(
             lifecycle_source.contains("impl RuntimeProviderResponseStep"),
             "lifecycle must own provider response step behavior"
+        );
+        assert!(
+            lifecycle_source.contains("impl RuntimeProviderResponseResultStep"),
+            "lifecycle must own provider response result folding step behavior"
         );
         for marker in [
             "record_assistant_response_for_agent(",

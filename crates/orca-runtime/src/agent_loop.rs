@@ -7,10 +7,11 @@ use crate::instructions::ProjectInstructions;
 use crate::lifecycle::{
     AgentLoopContext, AgentLoopResult, RuntimeCompactionStep, RuntimeConversationBootstrapStep,
     RuntimeModelRouteStep, RuntimeProviderErrorStep, RuntimeProviderErrorStepOutcome,
-    RuntimeProviderResponseOutcome, RuntimeProviderResponseStep, RuntimeProviderTurnResultOutcome,
-    RuntimeProviderTurnResultStep, RuntimeProviderTurnStep, RuntimeSessionLifecycle,
-    RuntimeSteerStep, RuntimeTaskActor, RuntimeTurnConfig, RuntimeTurnDeps, RuntimeTurnExecution,
-    RuntimeTurnSetupStep, RuntimeTurnStartStep, RuntimeTurnState,
+    RuntimeProviderResponseResult, RuntimeProviderResponseResultStep, RuntimeProviderResponseStep,
+    RuntimeProviderTurnResultOutcome, RuntimeProviderTurnResultStep, RuntimeProviderTurnStep,
+    RuntimeSessionLifecycle, RuntimeSteerStep, RuntimeTaskActor, RuntimeTurnConfig,
+    RuntimeTurnDeps, RuntimeTurnExecution, RuntimeTurnSetupStep, RuntimeTurnStartStep,
+    RuntimeTurnState,
 };
 use crate::memory::MemoryBlock;
 use crate::session::AgentConversationContext;
@@ -224,14 +225,9 @@ pub(crate) fn run_agent_loop(
                 execute_child_agent_loop,
             )?
         };
-        match provider_response_outcome {
-            RuntimeProviderResponseOutcome::Continue => {}
-            RuntimeProviderResponseOutcome::Success { final_message } => {
-                return Ok(AgentLoopResult::success(final_message));
-            }
-            RuntimeProviderResponseOutcome::Return { status, error } => {
-                return Ok(AgentLoopResult::terminal(status, error));
-            }
+        match RuntimeProviderResponseResultStep::new().fold(provider_response_outcome) {
+            RuntimeProviderResponseResult::Continue => {}
+            RuntimeProviderResponseResult::Return(result) => return Ok(result),
         }
     }
 }
