@@ -126,6 +126,9 @@ pub(crate) struct RuntimeTurnIterationStep {
     opening_step: RuntimeTurnOpeningStep,
     provider_cycle_step: RuntimeTurnProviderCycleStep,
 }
+pub(crate) struct RuntimeTurnLoopStep {
+    iteration_step: RuntimeTurnIterationStep,
+}
 
 pub(crate) struct RuntimeProviderTurnOutput {
     pub(crate) response: Option<ProviderResponse>,
@@ -3263,6 +3266,91 @@ impl RuntimeTurnIterationStep {
             }
             RuntimeTurnProviderCycleResult::Return(result) => {
                 Ok(RuntimeTurnIterationResult::Return(result))
+            }
+        }
+    }
+}
+
+impl RuntimeTurnLoopStep {
+    pub(crate) fn new() -> Self {
+        Self {
+            iteration_step: RuntimeTurnIterationStep::new(),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn run<W: io::Write>(
+        &mut self,
+        actor: &mut RuntimeTaskActor<'_>,
+        provider: ProviderKind,
+        context_config: &context::ContextConfig,
+        provider_config: &ProviderConfig,
+        cwd: &Path,
+        emit_deltas: bool,
+        hooks: &HookRunner,
+        events: &mut EventFactory,
+        sink: &mut EventSink<W>,
+        prepared_conversation: &mut RuntimePreparedConversation<'_>,
+        prompt: &str,
+        model: &ModelSelection,
+        subagent_type: &SubagentType,
+        cost_tracker: &mut CostTracker,
+        steer_handle: Option<&ThreadSteerHandle>,
+        cancel: &CancelToken,
+        max_budget_usd: Option<f64>,
+        config: &RunConfig,
+        tool_policy: AgentToolPolicyContext<'_>,
+        subagent_depth: u32,
+        policy: &ApprovalPolicy,
+        instructions: &ProjectInstructions,
+        memory: &MemoryBlock,
+        mcp_registry: &McpRegistry,
+        task_registry: &TaskRegistry,
+        background_workflows: &mut Vec<BackgroundWorkflowRun>,
+        workflow_ipc: Option<&WorkflowIpcContext>,
+        permission_handler: Option<&(dyn RuntimePermissionRequestHandler + Send + Sync)>,
+        child_executor: ChildAgentExecutor<W>,
+        workflow_child_executor: ChildAgentExecutor<SharedEventBuffer>,
+        batch_child_executor: ChildAgentExecutor<io::Sink>,
+    ) -> io::Result<AgentLoopResult> {
+        loop {
+            match self.iteration_step.run(
+                actor,
+                provider,
+                context_config,
+                provider_config,
+                cwd,
+                emit_deltas,
+                hooks,
+                events,
+                sink,
+                prepared_conversation,
+                prompt,
+                model,
+                subagent_type,
+                cost_tracker,
+                steer_handle,
+                cancel,
+                max_budget_usd,
+                config,
+                tool_policy,
+                subagent_depth,
+                policy,
+                instructions,
+                memory,
+                mcp_registry,
+                task_registry,
+                background_workflows,
+                workflow_ipc,
+                permission_handler,
+                child_executor,
+                workflow_child_executor,
+                batch_child_executor,
+            )? {
+                RuntimeTurnIterationResult::ContinueLoop => {
+                    continue;
+                }
+                RuntimeTurnIterationResult::Return(result) => return Ok(result),
             }
         }
     }

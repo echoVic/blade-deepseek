@@ -7,7 +7,7 @@ use crate::instructions::ProjectInstructions;
 use crate::lifecycle::{
     AgentLoopContext, AgentLoopResult, RuntimeConversationBootstrapStep, RuntimeSessionLifecycle,
     RuntimeTaskActor, RuntimeTurnConfig, RuntimeTurnDeps, RuntimeTurnExecution,
-    RuntimeTurnIterationResult, RuntimeTurnIterationStep, RuntimeTurnSetupStep, RuntimeTurnState,
+    RuntimeTurnLoopStep, RuntimeTurnSetupStep, RuntimeTurnState,
 };
 use crate::memory::MemoryBlock;
 use crate::session::AgentConversationContext;
@@ -89,48 +89,41 @@ pub(crate) fn run_agent_loop(
     let mut legacy_lifecycle = RuntimeSessionLifecycle::new(events.run_id().to_string());
     let lifecycle = lifecycle.unwrap_or(&mut legacy_lifecycle);
     let mut actor = RuntimeTaskActor::new(lifecycle, max_turns);
-    let mut turn_iteration_step = RuntimeTurnIterationStep::new();
+    let mut turn_loop_step = RuntimeTurnLoopStep::new();
 
-    loop {
-        match turn_iteration_step.run(
-            &mut actor,
-            config.provider,
-            &ctx_config,
-            &provider_config,
-            cwd,
-            emit_deltas,
-            hooks,
-            events,
-            sink,
-            &mut prepared_conversation,
-            prompt,
-            &config.model,
-            subagent_type,
-            cost_tracker,
-            steer_handle,
-            cancel,
-            config.max_budget_usd,
-            config,
-            tool_policy,
-            subagent_depth,
-            &policy,
-            instructions,
-            memory,
-            mcp_registry,
-            task_registry,
-            background_workflows,
-            workflow_ipc,
-            permission_handler,
-            execute_child_agent_loop,
-            execute_child_agent_loop,
-            execute_child_agent_loop,
-        )? {
-            RuntimeTurnIterationResult::ContinueLoop => {
-                continue;
-            }
-            RuntimeTurnIterationResult::Return(result) => return Ok(result),
-        }
-    }
+    turn_loop_step.run(
+        &mut actor,
+        config.provider,
+        &ctx_config,
+        &provider_config,
+        cwd,
+        emit_deltas,
+        hooks,
+        events,
+        sink,
+        &mut prepared_conversation,
+        prompt,
+        &config.model,
+        subagent_type,
+        cost_tracker,
+        steer_handle,
+        cancel,
+        config.max_budget_usd,
+        config,
+        tool_policy,
+        subagent_depth,
+        &policy,
+        instructions,
+        memory,
+        mcp_registry,
+        task_registry,
+        background_workflows,
+        workflow_ipc,
+        permission_handler,
+        execute_child_agent_loop,
+        execute_child_agent_loop,
+        execute_child_agent_loop,
+    )
 }
 
 pub(crate) fn execute_child_agent_loop<W: io::Write>(
