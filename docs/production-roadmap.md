@@ -3,8 +3,8 @@
 > Goal: evolve Orca into a production-grade DeepSeek-native agent runtime.
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
-Last updated: 2026-06-29
-Current baseline: v0.1.59 shared tool item started/completed/status/error projection helpers, stdio MCP fixture hardening for Linux release runners, active-writer JSONL polling hardening for server background-turn tests, realtime tool item error exit-code projection, MCP resource capability caching, MCP resource/template discovery with registry-level startup errors in all-server listings, MCP resource listing error aggregation, MCP resource list/read tools, server JSONL test harness hardening, structured hook action validation, tool argument schema composition validation, fuzzy model-facing file discovery, runtime-owned agent turn loop orchestration, workflow parity loop, process timeout hardening, runtime/TUI task-turn lifecycle seed, and configured permission-profile write/deny/network/special-root sandboxing
+Last updated: 2026-06-30
+Current baseline: v0.1.60 shared tool item started/completed/status/error projection helpers, shared fileChange/workflow lifecycle item builders for realtime server streams, stdio MCP fixture hardening for Linux release runners, active-writer JSONL polling hardening for server background-turn tests, realtime tool item error exit-code projection, MCP resource capability caching, MCP resource/template discovery with registry-level startup errors in all-server listings, MCP resource listing error aggregation, MCP resource list/read tools, server JSONL test harness hardening, structured hook action validation, tool argument schema composition validation, fuzzy model-facing file discovery, runtime-owned agent turn loop orchestration, workflow parity loop, process timeout hardening, runtime/TUI task-turn lifecycle seed, and configured permission-profile write/deny/network/special-root sandboxing
 
 ---
 
