@@ -37,6 +37,7 @@ pub enum ToolName {
     RequestUserInput,
     RequestPermissions,
     ListMcpResources,
+    ListMcpResourceTemplates,
     ReadMcpResource,
     ListSkills,
     ReadSkill,
@@ -83,6 +84,7 @@ impl ToolName {
             "request_user_input" => Self::RequestUserInput,
             "request_permissions" => Self::RequestPermissions,
             "list_mcp_resources" => Self::ListMcpResources,
+            "list_mcp_resource_templates" => Self::ListMcpResourceTemplates,
             "read_mcp_resource" => Self::ReadMcpResource,
             "list_skills" => Self::ListSkills,
             "read_skill" => Self::ReadSkill,
@@ -141,6 +143,7 @@ impl ToolName {
             Self::RequestUserInput => "request_user_input",
             Self::RequestPermissions => "request_permissions",
             Self::ListMcpResources => "list_mcp_resources",
+            Self::ListMcpResourceTemplates => "list_mcp_resource_templates",
             Self::ReadMcpResource => "read_mcp_resource",
             Self::ListSkills => "list_skills",
             Self::ReadSkill => "read_skill",
@@ -185,6 +188,7 @@ impl ToolName {
             Self::RequestUserInput => "request_user_input",
             Self::RequestPermissions => "request_permissions",
             Self::ListMcpResources => "list_mcp_resources",
+            Self::ListMcpResourceTemplates => "list_mcp_resource_templates",
             Self::ReadMcpResource => "read_mcp_resource",
             Self::ListSkills => "list_skills",
             Self::ReadSkill => "read_skill",
@@ -231,6 +235,7 @@ impl ToolName {
             "request_user_input" => Self::RequestUserInput,
             "request_permissions" => Self::RequestPermissions,
             "list_mcp_resources" => Self::ListMcpResources,
+            "list_mcp_resource_templates" => Self::ListMcpResourceTemplates,
             "read_mcp_resource" => Self::ReadMcpResource,
             "list_skills" => Self::ListSkills,
             "read_skill" => Self::ReadSkill,
@@ -257,6 +262,7 @@ impl ToolName {
                 | Self::GetGoal
                 | Self::RequestUserInput
                 | Self::ListMcpResources
+                | Self::ListMcpResourceTemplates
                 | Self::ReadMcpResource
                 | Self::ListSkills
                 | Self::ReadSkill

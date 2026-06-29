@@ -1204,6 +1204,28 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
     ));
     registry.register(BuiltinTool::new(
         builtin_spec(
+            "list_mcp_resource_templates",
+            "List URI templates exposed by connected MCP servers for parameterized resources.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "server": {
+                        "type": "string",
+                        "description": "Optional MCP server name to filter resource templates by"
+                    }
+                },
+                "required": [],
+                "additionalProperties": false
+            }),
+            CapabilitySet::new(vec![ToolCapability::McpResourceRead]),
+            ToolExposure::Direct,
+            RendererHint::State,
+            true,
+        ),
+        BuiltinExecutor::ListMcpResourceTemplates,
+    ));
+    registry.register(BuiltinTool::new(
+        builtin_spec(
             "read_mcp_resource",
             "Read a specific MCP resource by server name and resource URI.",
             json!({
@@ -1472,6 +1494,9 @@ impl Tool for BuiltinTool {
             BuiltinExecutor::ListSkills => skills::execute_list(request, ctx.cwd),
             BuiltinExecutor::ReadSkill => skills::execute_read(request, ctx.cwd),
             BuiltinExecutor::ListMcpResources => execute_list_mcp_resources(request, ctx),
+            BuiltinExecutor::ListMcpResourceTemplates => {
+                execute_list_mcp_resource_templates(request, ctx)
+            }
             BuiltinExecutor::ReadMcpResource => execute_read_mcp_resource(request, ctx),
             BuiltinExecutor::RequestPermissions => ToolResult::failed(
                 request,
@@ -1518,6 +1543,7 @@ enum BuiltinExecutor {
     ListSkills,
     ReadSkill,
     ListMcpResources,
+    ListMcpResourceTemplates,
     ReadMcpResource,
     RequestPermissions,
     RequestUserInput,
@@ -1555,6 +1581,45 @@ fn execute_list_mcp_resources(request: &ToolRequest, ctx: &ToolContext<'_>) -> T
             Err(error) => ToolResult::failed(
                 request,
                 format!("failed to serialize MCP resources: {error}"),
+                None,
+            ),
+        },
+        Err(error) => ToolResult::failed(request, error, None),
+    }
+}
+
+fn execute_list_mcp_resource_templates(request: &ToolRequest, ctx: &ToolContext<'_>) -> ToolResult {
+    let Some(registry) = ctx.mcp_registry else {
+        return ToolResult::failed(request, "MCP registry is not initialized", None);
+    };
+    let args = match parse_json_arguments(request) {
+        Ok(value) => value,
+        Err(error) => return ToolResult::failed(request, error, None),
+    };
+    let server = args.get("server").and_then(Value::as_str);
+
+    if server.is_none() {
+        let listing = registry.list_resource_templates_with_errors(None);
+        let output = json!({
+            "resourceTemplates": listing.resource_templates,
+            "errors": listing.errors,
+        });
+        return match serde_json::to_string(&output) {
+            Ok(output) => ToolResult::completed(request, output, false),
+            Err(error) => ToolResult::failed(
+                request,
+                format!("failed to serialize MCP resource templates: {error}"),
+                None,
+            ),
+        };
+    }
+
+    match registry.list_resource_templates(server) {
+        Ok(resource_templates) => match serde_json::to_string(&resource_templates) {
+            Ok(output) => ToolResult::completed(request, output, false),
+            Err(error) => ToolResult::failed(
+                request,
+                format!("failed to serialize MCP resource templates: {error}"),
                 None,
             ),
         },
@@ -2001,6 +2066,24 @@ mod tests {
                 .pointer("/properties/server")
                 .is_some(),
             "list_mcp_resources should accept an optional server filter"
+        );
+
+        let templates = registry
+            .get("list_mcp_resource_templates")
+            .expect("list_mcp_resource_templates tool");
+        assert_eq!(templates.action_kind(), ActionKind::Read);
+        assert!(templates.spec().exposure.is_model_visible());
+        assert!(templates.is_concurrent_safe(&request(
+            ToolName::ListMcpResourceTemplates,
+            r#"{"server":"docs"}"#
+        )));
+        assert!(
+            templates
+                .spec()
+                .input_schema
+                .pointer("/properties/server")
+                .is_some(),
+            "list_mcp_resource_templates should accept an optional server filter"
         );
 
         let read = registry

@@ -14,6 +14,7 @@ pub trait McpTransport: Send + Sync {
     fn list_tools(&self) -> Result<Value, String>;
     fn call_tool(&self, name: &str, arguments: Value) -> Result<Value, String>;
     fn list_resources(&self) -> Result<Value, String>;
+    fn list_resource_templates(&self) -> Result<Value, String>;
     fn read_resource(&self, uri: &str) -> Result<Value, String>;
 }
 
@@ -133,6 +134,10 @@ impl McpTransport for StdioTransport {
 
     fn list_resources(&self) -> Result<Value, String> {
         self.request_with_timeout("resources/list", json!({}), self.startup_timeout)
+    }
+
+    fn list_resource_templates(&self) -> Result<Value, String> {
+        self.request_with_timeout("resources/templates/list", json!({}), self.startup_timeout)
     }
 
     fn read_resource(&self, uri: &str) -> Result<Value, String> {
@@ -310,6 +315,10 @@ impl McpTransport for SseTransport {
 
     fn list_resources(&self) -> Result<Value, String> {
         self.request_with_timeout("resources/list", json!({}), self.startup_timeout)
+    }
+
+    fn list_resource_templates(&self) -> Result<Value, String> {
+        self.request_with_timeout("resources/templates/list", json!({}), self.startup_timeout)
     }
 
     fn read_resource(&self, uri: &str) -> Result<Value, String> {

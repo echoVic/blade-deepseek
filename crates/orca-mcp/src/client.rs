@@ -8,8 +8,9 @@ use serde_json::Value;
 
 use crate::transport::{self, McpTransport};
 use orca_core::mcp_types::{
-    CallToolResult, McpContent, McpResource, McpServerConfig, McpTool, McpToolRef,
-    ReadResourceResult, ResourcesListResult, ToolsListResult,
+    CallToolResult, McpContent, McpResource, McpResourceTemplate, McpServerConfig, McpTool,
+    McpToolRef, ReadResourceResult, ResourceTemplatesListResult, ResourcesListResult,
+    ToolsListResult,
 };
 
 #[derive(Clone, Default)]
@@ -34,6 +35,12 @@ struct McpClient {
 #[derive(Clone, Debug, Default)]
 pub struct McpResourceListing {
     pub resources: Vec<McpResource>,
+    pub errors: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct McpResourceTemplateListing {
+    pub resource_templates: Vec<McpResourceTemplate>,
     pub errors: Vec<String>,
 }
 
@@ -185,6 +192,10 @@ impl McpRegistry {
                     })
                     .collect::<Vec<_>>();
                 Ok(serde_json::json!({ "resources": resources }))
+            }
+
+            fn list_resource_templates(&self) -> Result<Value, String> {
+                Ok(serde_json::json!({ "resourceTemplates": [] }))
             }
 
             fn read_resource(&self, uri: &str) -> Result<Value, String> {
@@ -356,6 +367,10 @@ impl McpRegistry {
                 Ok(serde_json::json!({ "resources": resources }))
             }
 
+            fn list_resource_templates(&self) -> Result<Value, String> {
+                Ok(serde_json::json!({ "resourceTemplates": [] }))
+            }
+
             fn read_resource(&self, _uri: &str) -> Result<Value, String> {
                 Ok(serde_json::json!({"contents": []}))
             }
@@ -402,6 +417,122 @@ impl McpRegistry {
                     server_name: server,
                     transport: Mutex::new(Box::new(StaticResourceListingTransport {
                         resources: Vec::new(),
+                        error: Some(
+                            error
+                                .split_once(':')
+                                .map(|(_, message)| message.trim().to_string())
+                                .unwrap_or_else(|| error.clone()),
+                        ),
+                    })),
+                }),
+            );
+        }
+
+        Self {
+            inner: Arc::new(McpRegistryInner {
+                clients,
+                tools: Vec::new(),
+                lookup: HashMap::new(),
+                errors: Vec::new(),
+            }),
+        }
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn from_resource_template_listing_for_test(
+        resource_templates: Vec<McpResourceTemplate>,
+        errors: Vec<String>,
+    ) -> Self {
+        struct StaticResourceTemplateListingTransport {
+            resource_templates: Vec<McpResourceTemplate>,
+            error: Option<String>,
+        }
+
+        impl McpTransport for StaticResourceTemplateListingTransport {
+            fn initialize(&self) -> Result<(), String> {
+                Ok(())
+            }
+
+            fn list_tools(&self) -> Result<Value, String> {
+                Ok(serde_json::json!({"tools": []}))
+            }
+
+            fn call_tool(&self, _name: &str, _arguments: Value) -> Result<Value, String> {
+                Err(
+                    "static resource template listing transport does not support tool calls"
+                        .to_string(),
+                )
+            }
+
+            fn list_resources(&self) -> Result<Value, String> {
+                Ok(serde_json::json!({ "resources": [] }))
+            }
+
+            fn list_resource_templates(&self) -> Result<Value, String> {
+                if let Some(error) = &self.error {
+                    return Err(error.clone());
+                }
+                let resource_templates = self
+                    .resource_templates
+                    .iter()
+                    .map(|template| {
+                        serde_json::json!({
+                            "uriTemplate": template.uri_template,
+                            "name": template.name,
+                            "description": template.description,
+                            "mimeType": template.mime_type,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                Ok(serde_json::json!({ "resourceTemplates": resource_templates }))
+            }
+
+            fn read_resource(&self, _uri: &str) -> Result<Value, String> {
+                Ok(serde_json::json!({"contents": []}))
+            }
+        }
+
+        let mut clients = HashMap::new();
+        let mut grouped: HashMap<String, Vec<McpResourceTemplate>> = HashMap::new();
+        for template in resource_templates {
+            grouped
+                .entry(template.server.clone())
+                .or_default()
+                .push(template);
+        }
+        for (server, resource_templates) in grouped {
+            clients.insert(
+                server.clone(),
+                Arc::new(McpClient {
+                    config: McpServerConfig {
+                        name: server.clone(),
+                        ..Default::default()
+                    },
+                    server_name: server,
+                    transport: Mutex::new(Box::new(StaticResourceTemplateListingTransport {
+                        resource_templates,
+                        error: None,
+                    })),
+                }),
+            );
+        }
+        for error in &errors {
+            let server = error
+                .split_once(':')
+                .map(|(server, _)| server.trim())
+                .filter(|server| !server.is_empty())
+                .unwrap_or("error")
+                .to_string();
+            clients.insert(
+                server.clone(),
+                Arc::new(McpClient {
+                    config: McpServerConfig {
+                        name: server.clone(),
+                        ..Default::default()
+                    },
+                    server_name: server,
+                    transport: Mutex::new(Box::new(StaticResourceTemplateListingTransport {
+                        resource_templates: Vec::new(),
                         error: Some(
                             error
                                 .split_once(':')
@@ -536,6 +667,96 @@ impl McpRegistry {
         listing
     }
 
+    pub fn list_resource_templates(
+        &self,
+        server: Option<&str>,
+    ) -> Result<Vec<McpResourceTemplate>, String> {
+        let clients = match server {
+            Some(server) => vec![(
+                server.to_string(),
+                self.inner
+                    .clients
+                    .get(server)
+                    .cloned()
+                    .ok_or_else(|| format!("MCP server '{server}' is not connected"))?,
+            )],
+            None => self
+                .inner
+                .clients
+                .iter()
+                .map(|(name, client)| (name.clone(), Arc::clone(client)))
+                .collect(),
+        };
+
+        let mut resource_templates = Vec::new();
+        for (server, client) in clients {
+            let result = client.list_resource_templates()?;
+            let result: ResourceTemplatesListResult = serde_json::from_value(result)
+                .map_err(|error| format!("invalid MCP resources/templates/list result: {error}"))?;
+            resource_templates.extend(result.resource_templates.into_iter().map(|template| {
+                McpResourceTemplate {
+                    server: server.clone(),
+                    uri_template: template.uri_template,
+                    name: template.name,
+                    description: template.description,
+                    mime_type: template.mime_type,
+                }
+            }));
+        }
+
+        Ok(resource_templates)
+    }
+
+    pub fn list_resource_templates_with_errors(
+        &self,
+        server: Option<&str>,
+    ) -> McpResourceTemplateListing {
+        let clients = match server {
+            Some(server) => match self.inner.clients.get(server).cloned() {
+                Some(client) => vec![(server.to_string(), client)],
+                None => {
+                    return McpResourceTemplateListing {
+                        resource_templates: Vec::new(),
+                        errors: vec![format!("MCP server '{server}' is not connected")],
+                    };
+                }
+            },
+            None => self
+                .inner
+                .clients
+                .iter()
+                .map(|(name, client)| (name.clone(), Arc::clone(client)))
+                .collect(),
+        };
+
+        let mut listing = McpResourceTemplateListing::default();
+        for (server, client) in clients {
+            match client.list_resource_templates() {
+                Ok(result) => match serde_json::from_value::<ResourceTemplatesListResult>(result) {
+                    Ok(result) => {
+                        listing.resource_templates.extend(
+                            result.resource_templates.into_iter().map(|template| {
+                                McpResourceTemplate {
+                                    server: server.clone(),
+                                    uri_template: template.uri_template,
+                                    name: template.name,
+                                    description: template.description,
+                                    mime_type: template.mime_type,
+                                }
+                            }),
+                        );
+                    }
+                    Err(error) => listing.errors.push(format!(
+                        "{server}: invalid MCP resources/templates/list result: {error}"
+                    )),
+                },
+                Err(error) => listing.errors.push(format!("{server}: {error}")),
+            }
+        }
+
+        listing
+    }
+
     pub fn read_resource(&self, server: &str, uri: &str) -> Result<ReadResourceResult, String> {
         let client = self
             .inner
@@ -573,6 +794,14 @@ impl McpClient {
             .lock()
             .map_err(|_| format!("MCP server '{}' transport lock poisoned", self.server_name))?;
         transport.list_resources()
+    }
+
+    fn list_resource_templates(&self) -> Result<Value, String> {
+        let transport = self
+            .transport
+            .lock()
+            .map_err(|_| format!("MCP server '{}' transport lock poisoned", self.server_name))?;
+        transport.list_resource_templates()
     }
 
     fn read_resource(&self, uri: &str) -> Result<Value, String> {
@@ -707,6 +936,10 @@ mod tests {
                 Ok(serde_json::json!({"resources": []}))
             }
 
+            fn list_resource_templates(&self) -> Result<Value, String> {
+                Ok(serde_json::json!({"resourceTemplates": []}))
+            }
+
             fn read_resource(&self, _uri: &str) -> Result<Value, String> {
                 Ok(serde_json::json!({"contents": []}))
             }
@@ -785,6 +1018,10 @@ mod tests {
                 self.result.clone()
             }
 
+            fn list_resource_templates(&self) -> Result<Value, String> {
+                Ok(serde_json::json!({"resourceTemplates": []}))
+            }
+
             fn read_resource(&self, _uri: &str) -> Result<Value, String> {
                 Err("not used".to_string())
             }
@@ -828,6 +1065,78 @@ mod tests {
             .list_resources(Some("broken"))
             .expect_err("single-server resource list should stay strict");
         assert_eq!(single_server_error, "resources/list timed out");
+    }
+
+    #[test]
+    fn registry_aggregates_mcp_resource_template_errors_without_losing_successes() {
+        struct TemplateListTransport {
+            result: Result<Value, String>,
+        }
+
+        impl McpTransport for TemplateListTransport {
+            fn initialize(&self) -> Result<(), String> {
+                Ok(())
+            }
+
+            fn list_tools(&self) -> Result<Value, String> {
+                Ok(serde_json::json!({"tools": []}))
+            }
+
+            fn call_tool(&self, _name: &str, _arguments: Value) -> Result<Value, String> {
+                Err("not used".to_string())
+            }
+
+            fn list_resources(&self) -> Result<Value, String> {
+                Ok(serde_json::json!({"resources": []}))
+            }
+
+            fn read_resource(&self, _uri: &str) -> Result<Value, String> {
+                Err("not used".to_string())
+            }
+
+            fn list_resource_templates(&self) -> Result<Value, String> {
+                self.result.clone()
+            }
+        }
+
+        let registry = McpRegistry::from_resource_transports_for_test([
+            (
+                "docs".to_string(),
+                Box::new(TemplateListTransport {
+                    result: Ok(serde_json::json!({
+                        "resourceTemplates": [
+                            {
+                                "uriTemplate": "file:///{path}",
+                                "name": "workspace file",
+                                "description": "A file exposed by path",
+                                "mimeType": "text/plain"
+                            }
+                        ]
+                    })),
+                }) as Box<dyn McpTransport>,
+            ),
+            (
+                "broken".to_string(),
+                Box::new(TemplateListTransport {
+                    result: Err("resources/templates/list timed out".to_string()),
+                }) as Box<dyn McpTransport>,
+            ),
+        ]);
+
+        let listing = registry.list_resource_templates_with_errors(None);
+
+        assert_eq!(listing.resource_templates.len(), 1);
+        assert_eq!(listing.resource_templates[0].server, "docs");
+        assert_eq!(listing.resource_templates[0].uri_template, "file:///{path}");
+        assert_eq!(
+            listing.errors,
+            vec!["broken: resources/templates/list timed out".to_string()]
+        );
+
+        let single_server_error = registry
+            .list_resource_templates(Some("broken"))
+            .expect_err("single-server resource template list should stay strict");
+        assert_eq!(single_server_error, "resources/templates/list timed out");
     }
 
     #[cfg(unix)]
@@ -899,6 +1208,67 @@ done
         assert_eq!(content.contents.len(), 1);
         assert_eq!(content.contents[0].text.as_deref(), Some("resource body"));
         assert_eq!(content.contents[0].mime_type.as_deref(), Some("text/plain"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registry_lists_mcp_resource_templates_from_stdio_server() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let server = temp_dir.path().join("resource_template_mcp_server.sh");
+        std::fs::write(
+            &server,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{"resources":{}},"serverInfo":{"name":"templates","version":"1"}}}\n'
+      ;;
+    *'"method":"notifications/initialized"'*)
+      ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":2,"result":{"tools":[]}}\n'
+      ;;
+    *'"method":"resources/templates/list"'*)
+      printf '{"jsonrpc":"2.0","id":3,"result":{"resourceTemplates":[{"uriTemplate":"file:///{path}","name":"workspace file","description":"A file exposed by path","mimeType":"text/plain"}]}}\n'
+      ;;
+  esac
+done
+"#,
+        )
+        .expect("write MCP fixture");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&server).expect("metadata").permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&server, permissions).expect("chmod MCP fixture");
+        }
+
+        let registry = initialize_registry(&[McpServerConfig {
+            name: "templates".to_string(),
+            transport: orca_core::mcp_types::McpTransportKind::Stdio,
+            command: Some(server.to_string_lossy().into_owned()),
+            args: Vec::new(),
+            url: None,
+            env: Default::default(),
+            headers: Default::default(),
+            disabled: false,
+            startup_timeout_ms: Some(5000),
+            tool_timeout_ms: Some(1000),
+        }]);
+        assert!(
+            registry.errors().is_empty(),
+            "registry errors: {:?}",
+            registry.errors()
+        );
+
+        let templates = registry
+            .list_resource_templates(None)
+            .expect("list all MCP resource templates");
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].server, "templates");
+        assert_eq!(templates[0].uri_template, "file:///{path}");
+        assert_eq!(templates[0].name, "workspace file");
+        assert_eq!(templates[0].mime_type.as_deref(), Some("text/plain"));
     }
 
     #[cfg(unix)]

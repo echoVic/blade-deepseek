@@ -135,7 +135,10 @@ pub fn execute_with_mcp_external_roots_policy_or_cancel(
 fn tool_uses_mcp_registry(name: &ToolName) -> bool {
     matches!(
         name,
-        ToolName::Mcp(_) | ToolName::ListMcpResources | ToolName::ReadMcpResource
+        ToolName::Mcp(_)
+            | ToolName::ListMcpResources
+            | ToolName::ListMcpResourceTemplates
+            | ToolName::ReadMcpResource
     )
 }
 
@@ -597,6 +600,47 @@ done
         assert_eq!(output["resources"][0]["server"], "notes");
         assert_eq!(output["resources"][0]["uri"], "memo://orca/one");
         assert_eq!(output["errors"][0], "broken: resources/list timed out");
+    }
+
+    #[test]
+    fn list_mcp_resource_templates_reports_partial_template_errors() {
+        let template = orca_core::mcp_types::McpResourceTemplate {
+            server: "docs".to_string(),
+            uri_template: "file:///{path}".to_string(),
+            name: "workspace file".to_string(),
+            description: Some("A file exposed by path".to_string()),
+            mime_type: Some("text/plain".to_string()),
+        };
+        let registry = McpRegistry::from_resource_template_listing_for_test(
+            vec![template],
+            vec!["broken: resources/templates/list timed out".to_string()],
+        );
+
+        let result = execute_with_mcp(
+            &ToolRequest {
+                id: "list-resource-templates".to_string(),
+                name: ToolName::ListMcpResourceTemplates,
+                action: ActionKind::Read,
+                target: None,
+                raw_arguments: Some("{}".to_string()),
+            },
+            Path::new("."),
+            &registry,
+        );
+
+        assert_eq!(result.status, ToolStatus::Completed);
+        let output: serde_json::Value =
+            serde_json::from_str(result.output.as_deref().expect("tool output"))
+                .expect("resource template listing JSON");
+        assert_eq!(output["resourceTemplates"][0]["server"], "docs");
+        assert_eq!(
+            output["resourceTemplates"][0]["uriTemplate"],
+            "file:///{path}"
+        );
+        assert_eq!(
+            output["errors"][0],
+            "broken: resources/templates/list timed out"
+        );
     }
 
     #[test]

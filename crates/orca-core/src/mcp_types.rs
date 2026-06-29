@@ -48,6 +48,17 @@ pub struct McpResource {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct McpResourceTemplate {
+    pub server: String,
+    #[serde(rename = "uriTemplate")]
+    pub uri_template: String,
+    pub name: String,
+    pub description: Option<String>,
+    #[serde(rename = "mimeType", skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct McpTool {
     pub server: String,
     pub name: String,
@@ -88,6 +99,22 @@ pub struct ToolsListResult {
 pub struct ResourcesListResult {
     #[serde(default)]
     pub resources: Vec<McpResourceDescriptor>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct ResourceTemplatesListResult {
+    #[serde(rename = "resourceTemplates", default)]
+    pub resource_templates: Vec<McpResourceTemplateDescriptor>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct McpResourceTemplateDescriptor {
+    #[serde(rename = "uriTemplate")]
+    pub uri_template: String,
+    pub name: String,
+    pub description: Option<String>,
+    #[serde(rename = "mimeType")]
+    pub mime_type: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
