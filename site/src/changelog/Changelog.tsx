@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.63":
+        "Realtime commandExecution lifecycle items now use shared projection builders, closing another app-server item-shape drift point.",
       "v0.1.62":
         "Realtime agent, plan, and reasoning lifecycle items now use shared projection builders, further tightening the app-server protocol boundary.",
       "v0.1.61":
@@ -152,6 +154,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.63":
+        "实时 commandExecution lifecycle item 现在也由共享 projection builder 构造，继续消除 app-server item shape 漂移点。",
       "v0.1.62":
         "实时 agent / plan / reasoning lifecycle item 现在也由共享 projection builder 构造，继续收紧 app-server protocol 边界。",
       "v0.1.61":
