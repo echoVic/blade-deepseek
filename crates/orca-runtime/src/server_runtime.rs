@@ -1625,13 +1625,13 @@ fn mcp_tool_result(payload: &Value) -> Value {
 
 fn mcp_tool_error(payload: &Value) -> Value {
     if let Some(error) = payload["error"].as_str() {
-        return json!({ "message": error });
+        return tool_error_object(error, payload);
     }
     if payload["status"].as_str() == Some("failed") {
         if let Some(output) = payload["output"].as_str() {
-            return json!({ "message": output });
+            return tool_error_object(output, payload);
         }
-        return json!({ "message": "MCP tool call failed" });
+        return tool_error_object("MCP tool call failed", payload);
     }
     Value::Null
 }
@@ -1648,10 +1648,19 @@ fn dynamic_tool_content_items(payload: &Value) -> Value {
 
 fn dynamic_tool_error(payload: &Value) -> Value {
     match tool_error_detail(payload) {
-        Value::String(message) => json!({ "message": message }),
+        Value::String(message) => tool_error_object(&message, payload),
         Value::Null => Value::Null,
         other => other,
     }
+}
+
+fn tool_error_object(message: &str, payload: &Value) -> Value {
+    let mut error =
+        serde_json::Map::from_iter([("message".to_string(), Value::from(message.to_string()))]);
+    if let Some(exit_code) = payload["exit_code"].as_i64() {
+        error.insert("exitCode".to_string(), Value::from(exit_code));
+    }
+    Value::Object(error)
 }
 
 fn tool_error_detail(payload: &Value) -> Value {

@@ -3864,6 +3864,43 @@ mod tests {
     }
 
     #[test]
+    fn server_writer_streams_failed_mcp_tool_exit_code_in_item_error() {
+        let mut output = Vec::new();
+        {
+            let mut writer = ServerRequestWriter::new(Value::from("turn"), &mut output);
+            writer
+                .write_all(
+                    br#"{"type":"tool.call.requested","payload":{"id":"mcp-1","name":"mcp__local__search","target":"{\"query\":\"orca\"}","raw_arguments":"{\"query\":\"orca\"}"}}"#,
+                )
+                .unwrap();
+            writer.write_all(b"\n").unwrap();
+            writer
+                .write_all(
+                    br#"{"type":"tool.call.completed","payload":{"id":"mcp-1","name":"mcp__local__search","status":"failed","error":"MCP request timed out","exit_code":124}}"#,
+                )
+                .unwrap();
+            writer.write_all(b"\n").unwrap();
+        }
+
+        let events = parse_jsonl(&output);
+        let completed = events
+            .iter()
+            .find(|event| {
+                event["event"] == "item_completed"
+                    && event["item"]["type"] == "mcpToolCall"
+                    && event["item"]["id"] == "mcp-1"
+            })
+            .expect("mcp item_completed");
+        assert_eq!(completed["item"]["status"], "failed");
+        assert!(completed["item"]["result"].is_null());
+        assert_eq!(
+            completed["item"]["error"]["message"],
+            "MCP request timed out"
+        );
+        assert_eq!(completed["item"]["error"]["exitCode"], 124);
+    }
+
+    #[test]
     fn server_writer_streams_external_tool_as_dynamic_tool_call_item() {
         let mut output = Vec::new();
         {
@@ -3949,6 +3986,41 @@ mod tests {
             completed["item"]["error"]["message"],
             "policy denied deploy"
         );
+    }
+
+    #[test]
+    fn server_writer_streams_failed_external_tool_exit_code_in_dynamic_item_error() {
+        let mut output = Vec::new();
+        {
+            let mut writer = ServerRequestWriter::new(Value::from("turn"), &mut output);
+            writer
+                .write_all(
+                    br#"{"type":"tool.call.requested","payload":{"id":"external-1","name":"deploy","target":"{\"env\":\"staging\"}","raw_arguments":"{\"env\":\"staging\"}"}}"#,
+                )
+                .unwrap();
+            writer.write_all(b"\n").unwrap();
+            writer
+                .write_all(
+                    br#"{"type":"tool.call.completed","payload":{"id":"external-1","name":"deploy","status":"failed","error":"deploy failed","exit_code":42}}"#,
+                )
+                .unwrap();
+            writer.write_all(b"\n").unwrap();
+        }
+
+        let events = parse_jsonl(&output);
+        let completed = events
+            .iter()
+            .find(|event| {
+                event["event"] == "item_completed"
+                    && event["item"]["type"] == "dynamicToolCall"
+                    && event["item"]["id"] == "external-1"
+            })
+            .expect("external item_completed");
+        assert_eq!(completed["item"]["status"], "failed");
+        assert_eq!(completed["item"]["success"], false);
+        assert!(completed["item"]["contentItems"].is_null());
+        assert_eq!(completed["item"]["error"]["message"], "deploy failed");
+        assert_eq!(completed["item"]["error"]["exitCode"], 42);
     }
 
     #[test]
