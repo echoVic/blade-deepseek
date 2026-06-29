@@ -107,6 +107,7 @@ pub(crate) struct RuntimeConversationBootstrapStep;
 pub(crate) struct RuntimeTurnSetupStep;
 pub(crate) struct RuntimeTurnStartStep;
 pub(crate) struct RuntimeModelRouteStep;
+pub(crate) struct RuntimeProviderErrorResultStep;
 pub(crate) struct RuntimeProviderErrorStep {
     reactive_compacted: bool,
 }
@@ -147,6 +148,12 @@ pub(crate) enum RuntimeProviderErrorStepOutcome {
     ContinueAfterCompaction,
     Failed(RuntimeTurnStartError),
     NoError,
+}
+
+pub(crate) enum RuntimeProviderErrorResult {
+    ContinueTurn,
+    ContinueLoop,
+    Return(AgentLoopResult),
 }
 
 pub(crate) enum RuntimeProviderTurnResultOutcome {
@@ -2354,6 +2361,27 @@ impl RuntimeModelRouteStep {
     }
 }
 
+impl RuntimeProviderErrorResultStep {
+    pub(crate) fn new() -> Self {
+        Self
+    }
+
+    pub(crate) fn fold(
+        &self,
+        outcome: RuntimeProviderErrorStepOutcome,
+    ) -> RuntimeProviderErrorResult {
+        match outcome {
+            RuntimeProviderErrorStepOutcome::NoError => RuntimeProviderErrorResult::ContinueTurn,
+            RuntimeProviderErrorStepOutcome::ContinueAfterCompaction => {
+                RuntimeProviderErrorResult::ContinueLoop
+            }
+            RuntimeProviderErrorStepOutcome::Failed(error) => RuntimeProviderErrorResult::Return(
+                AgentLoopResult::failure(error.status, error.message),
+            ),
+        }
+    }
+}
+
 impl RuntimeProviderErrorStep {
     pub(crate) fn new() -> Self {
         Self {
@@ -3137,6 +3165,34 @@ mod tests {
         let output = String::from_utf8(output).expect("jsonl is utf8");
         assert!(output.contains("\"type\":\"error\""));
         assert!(output.contains("DeepSeek provider error: quota"));
+    }
+
+    #[test]
+    fn provider_error_result_step_folds_continue_loop_and_failure() {
+        let no_error =
+            RuntimeProviderErrorResultStep::new().fold(RuntimeProviderErrorStepOutcome::NoError);
+        assert!(matches!(no_error, RuntimeProviderErrorResult::ContinueTurn));
+
+        let retry = RuntimeProviderErrorResultStep::new()
+            .fold(RuntimeProviderErrorStepOutcome::ContinueAfterCompaction);
+        assert!(matches!(retry, RuntimeProviderErrorResult::ContinueLoop));
+
+        let failed = RuntimeProviderErrorResultStep::new().fold(
+            RuntimeProviderErrorStepOutcome::Failed(RuntimeTurnStartError {
+                status: RunStatus::Failed,
+                message: "provider failed".to_string(),
+            }),
+        );
+        match failed {
+            RuntimeProviderErrorResult::Return(result) => {
+                assert_eq!(result.status, RunStatus::Failed);
+                assert_eq!(result.final_message, None);
+                assert_eq!(result.error.as_deref(), Some("provider failed"));
+            }
+            RuntimeProviderErrorResult::ContinueTurn | RuntimeProviderErrorResult::ContinueLoop => {
+                panic!("provider error failure should return loop result")
+            }
+        }
     }
 
     #[test]

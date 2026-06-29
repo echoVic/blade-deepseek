@@ -1542,16 +1542,32 @@ mod tests {
             );
         }
         assert!(
+            !agent_loop_source.contains("RuntimeProviderErrorStepOutcome"),
+            "agent_loop must not own runtime provider-error outcome folding"
+        );
+        assert!(
             agent_loop_source.contains("RuntimeProviderErrorStep"),
             "agent_loop must delegate runtime provider-error handling"
+        );
+        assert!(
+            agent_loop_source.contains("RuntimeProviderErrorResultStep"),
+            "agent_loop must delegate runtime provider-error result folding"
         );
         assert!(
             lifecycle_source.contains("struct RuntimeProviderErrorStep"),
             "lifecycle must own runtime provider-error step state"
         );
         assert!(
+            lifecycle_source.contains("struct RuntimeProviderErrorResultStep"),
+            "lifecycle must own runtime provider-error result step state"
+        );
+        assert!(
             lifecycle_source.contains("impl RuntimeProviderErrorStep"),
             "lifecycle must own runtime provider-error step behavior"
+        );
+        assert!(
+            lifecycle_source.contains("impl RuntimeProviderErrorResultStep"),
+            "lifecycle must own runtime provider-error result step behavior"
         );
         assert!(
             lifecycle_source.contains("reactive_compacted"),

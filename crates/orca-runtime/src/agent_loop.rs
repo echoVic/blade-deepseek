@@ -6,12 +6,13 @@ use crate::hooks::HookRunner;
 use crate::instructions::ProjectInstructions;
 use crate::lifecycle::{
     AgentLoopContext, AgentLoopResult, RuntimeCompactionStep, RuntimeConversationBootstrapStep,
-    RuntimeModelRouteStep, RuntimeProviderErrorStep, RuntimeProviderErrorStepOutcome,
-    RuntimeProviderResponseResult, RuntimeProviderResponseResultStep, RuntimeProviderResponseStep,
-    RuntimeProviderTurnResultResult, RuntimeProviderTurnResultResultStep,
-    RuntimeProviderTurnResultStep, RuntimeProviderTurnStep, RuntimeSessionLifecycle,
-    RuntimeSteerStep, RuntimeTaskActor, RuntimeTurnConfig, RuntimeTurnDeps, RuntimeTurnExecution,
-    RuntimeTurnSetupStep, RuntimeTurnStartStep, RuntimeTurnState,
+    RuntimeModelRouteStep, RuntimeProviderErrorResult, RuntimeProviderErrorResultStep,
+    RuntimeProviderErrorStep, RuntimeProviderResponseResult, RuntimeProviderResponseResultStep,
+    RuntimeProviderResponseStep, RuntimeProviderTurnResultResult,
+    RuntimeProviderTurnResultResultStep, RuntimeProviderTurnResultStep, RuntimeProviderTurnStep,
+    RuntimeSessionLifecycle, RuntimeSteerStep, RuntimeTaskActor, RuntimeTurnConfig,
+    RuntimeTurnDeps, RuntimeTurnExecution, RuntimeTurnSetupStep, RuntimeTurnStartStep,
+    RuntimeTurnState,
 };
 use crate::memory::MemoryBlock;
 use crate::session::AgentConversationContext;
@@ -181,14 +182,12 @@ pub(crate) fn run_agent_loop(
                 conversation,
             )?
         };
-        match provider_error_outcome {
-            RuntimeProviderErrorStepOutcome::ContinueAfterCompaction => {
+        match RuntimeProviderErrorResultStep::new().fold(provider_error_outcome) {
+            RuntimeProviderErrorResult::ContinueLoop => {
                 continue;
             }
-            RuntimeProviderErrorStepOutcome::Failed(error) => {
-                return Ok(AgentLoopResult::failure(error.status, error.message));
-            }
-            RuntimeProviderErrorStepOutcome::NoError => {}
+            RuntimeProviderErrorResult::Return(result) => return Ok(result),
+            RuntimeProviderErrorResult::ContinueTurn => {}
         }
 
         let provider_response_outcome = {
