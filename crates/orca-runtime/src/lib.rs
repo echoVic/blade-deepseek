@@ -212,11 +212,11 @@ mod tests {
         );
         assert!(
             !agent_loop_source.contains("tool_requests_from_provider_steps("),
-            "agent_loop must delegate provider tool request extraction through provider cycle"
+            "agent_loop must delegate provider tool request extraction through turn iteration"
         );
         assert!(
-            agent_loop_source.contains("RuntimeTurnProviderCycleStep"),
-            "agent_loop must delegate provider tool request extraction through provider cycle"
+            agent_loop_source.contains("RuntimeTurnIterationStep"),
+            "agent_loop must delegate provider tool request extraction through turn iteration"
         );
         assert!(
             tool_invocation_source.contains("pub(crate) fn tool_requests_from_provider_steps"),
@@ -242,8 +242,8 @@ mod tests {
             "agent_loop must delegate normal tool execution through tool-turn dispatch runner"
         );
         assert!(
-            agent_loop_source.contains("RuntimeTurnProviderCycleStep"),
-            "agent_loop must delegate normal tool turn execution through provider cycle"
+            agent_loop_source.contains("RuntimeTurnIterationStep"),
+            "agent_loop must delegate normal tool turn execution through turn iteration"
         );
         assert!(
             tool_execution_source.contains("pub(crate) fn execute_tool_with_approval"),
@@ -271,8 +271,8 @@ mod tests {
             "agent_loop must delegate tool request cursor state through tool-turn dispatch"
         );
         assert!(
-            agent_loop_source.contains("RuntimeTurnProviderCycleStep"),
-            "agent_loop must delegate tool request cursor use through provider cycle"
+            agent_loop_source.contains("RuntimeTurnIterationStep"),
+            "agent_loop must delegate tool request cursor use through turn iteration"
         );
         assert!(
             tool_invocation_source.contains("pub(crate) struct ToolRequestCursor"),
@@ -295,7 +295,7 @@ mod tests {
         );
         assert!(
             !agent_loop_source.contains("ToolTurnOutcome"),
-            "agent_loop must delegate tool-turn outcome state through provider cycle"
+            "agent_loop must delegate tool-turn outcome state through turn iteration"
         );
         assert!(
             !agent_loop_source.contains("RuntimeProviderResponseOutcome"),
@@ -331,8 +331,8 @@ mod tests {
             "agent_loop must delegate normal tool-turn execution through tool-turn dispatch"
         );
         assert!(
-            agent_loop_source.contains("RuntimeTurnProviderCycleStep"),
-            "agent_loop must delegate normal tool-turn execution through provider cycle"
+            agent_loop_source.contains("RuntimeTurnIterationStep"),
+            "agent_loop must delegate normal tool-turn execution through turn iteration"
         );
         assert!(
             tool_invocation_source.contains("pub(crate) fn run_normal_tool_turn"),
@@ -364,8 +364,8 @@ mod tests {
             "agent_loop must delegate readonly tool-turn execution through tool-turn dispatch"
         );
         assert!(
-            agent_loop_source.contains("RuntimeTurnProviderCycleStep"),
-            "agent_loop must delegate readonly tool-turn execution through provider cycle"
+            agent_loop_source.contains("RuntimeTurnIterationStep"),
+            "agent_loop must delegate readonly tool-turn execution through turn iteration"
         );
         assert!(
             tool_invocation_source.contains("pub(crate) fn run_readonly_tool_turn"),
@@ -420,8 +420,8 @@ mod tests {
             "agent_loop must delegate normal tool result recording through tool-turn dispatch"
         );
         assert!(
-            agent_loop_source.contains("RuntimeTurnProviderCycleStep"),
-            "agent_loop must delegate normal tool turn recording through provider cycle"
+            agent_loop_source.contains("RuntimeTurnIterationStep"),
+            "agent_loop must delegate normal tool turn recording through turn iteration"
         );
         assert!(
             tool_invocation_source.contains("pub(crate) fn record_normal_tool_result"),
@@ -486,8 +486,8 @@ mod tests {
             "agent_loop must delegate readonly batch result recording through tool-turn dispatch"
         );
         assert!(
-            agent_loop_source.contains("RuntimeTurnProviderCycleStep"),
-            "agent_loop must delegate readonly tool turn recording through provider cycle"
+            agent_loop_source.contains("RuntimeTurnIterationStep"),
+            "agent_loop must delegate readonly tool turn recording through turn iteration"
         );
         assert!(
             tool_invocation_source.contains("pub(crate) fn record_readonly_batch_results"),
@@ -542,8 +542,8 @@ mod tests {
             "agent_loop must delegate subagent batch tool turns through tool-turn dispatch"
         );
         assert!(
-            agent_loop_source.contains("RuntimeTurnProviderCycleStep"),
-            "agent_loop must delegate subagent batch tool turns through provider cycle"
+            agent_loop_source.contains("RuntimeTurnIterationStep"),
+            "agent_loop must delegate subagent batch tool turns through turn iteration"
         );
         assert!(
             subagent_execution_source.contains("pub(crate) fn run_subagent_batch_tool_turn"),
@@ -581,11 +581,11 @@ mod tests {
         }
         assert!(
             !agent_loop_source.contains("run_tool_turns("),
-            "agent_loop must delegate tool-turn dispatch through provider cycle"
+            "agent_loop must delegate tool-turn dispatch through turn iteration"
         );
         assert!(
-            agent_loop_source.contains("RuntimeTurnProviderCycleStep"),
-            "agent_loop must delegate tool-turn dispatch through provider cycle"
+            agent_loop_source.contains("RuntimeTurnIterationStep"),
+            "agent_loop must delegate tool-turn dispatch through turn iteration"
         );
         assert!(
             tool_invocation_source.contains("pub(crate) fn run_tool_turns"),
@@ -725,11 +725,11 @@ mod tests {
         }
         assert!(
             !agent_loop_source.contains("extract_project_memory_after_final_response("),
-            "agent_loop must delegate final memory extraction through provider cycle"
+            "agent_loop must delegate final memory extraction through turn iteration"
         );
         assert!(
-            agent_loop_source.contains("RuntimeTurnProviderCycleStep"),
-            "agent_loop must delegate final memory extraction through provider cycle"
+            agent_loop_source.contains("RuntimeTurnIterationStep"),
+            "agent_loop must delegate final memory extraction through turn iteration"
         );
         assert!(
             memory_source.contains("pub(crate) fn extract_project_memory_after_final_response"),
@@ -1281,12 +1281,12 @@ mod tests {
             );
         }
         assert!(
-            agent_loop_source.contains("RuntimeTurnProviderCycleStep"),
-            "agent_loop must delegate provider response handling through provider cycle"
+            agent_loop_source.contains("RuntimeTurnIterationStep"),
+            "agent_loop must delegate provider response handling through turn iteration"
         );
         assert!(
             !agent_loop_source.contains("RuntimeProviderResponseResultStep"),
-            "agent_loop must delegate provider response result folding through provider cycle"
+            "agent_loop must delegate provider response result folding through turn iteration"
         );
         assert!(
             !agent_loop_source.contains("RuntimeProviderResponseOutcome::Continue"),
@@ -1417,12 +1417,12 @@ mod tests {
             );
         }
         assert!(
-            agent_loop_source.contains("RuntimeTurnProviderCycleStep"),
-            "agent_loop must delegate provider turn terminal folding through provider cycle"
+            agent_loop_source.contains("RuntimeTurnIterationStep"),
+            "agent_loop must delegate provider turn terminal folding through turn iteration"
         );
         assert!(
             !agent_loop_source.contains("RuntimeProviderTurnResultResultStep"),
-            "agent_loop must delegate provider turn result folding through provider cycle"
+            "agent_loop must delegate provider turn result folding through turn iteration"
         );
         assert!(
             !agent_loop_source.contains("RuntimeProviderTurnResultOutcome"),
@@ -1474,12 +1474,12 @@ mod tests {
             "agent_loop must not own runtime turn-start error result folding"
         );
         assert!(
-            agent_loop_source.contains("RuntimeTurnOpeningStep"),
-            "agent_loop must delegate runtime turn start through opening step"
+            agent_loop_source.contains("RuntimeTurnIterationStep"),
+            "agent_loop must delegate runtime turn start through turn iteration"
         );
         assert!(
             !agent_loop_source.contains("RuntimeTurnStartResultStep"),
-            "agent_loop must delegate runtime turn-start result folding through opening step"
+            "agent_loop must delegate runtime turn-start result folding through turn iteration"
         );
         assert!(
             lifecycle_source.contains("struct RuntimeTurnStartStep"),
@@ -1519,8 +1519,8 @@ mod tests {
             );
         }
         assert!(
-            agent_loop_source.contains("RuntimeTurnOpeningStep"),
-            "agent_loop must delegate runtime model routing through opening step"
+            agent_loop_source.contains("RuntimeTurnIterationStep"),
+            "agent_loop must delegate runtime model routing through turn iteration"
         );
         assert!(
             lifecycle_source.contains("struct RuntimeModelRouteStep"),
@@ -1558,7 +1558,7 @@ mod tests {
             );
         }
         assert!(
-            agent_loop_source.contains("RuntimeTurnOpeningStep"),
+            agent_loop_source.contains("RuntimeTurnIterationStep"),
             "agent_loop must delegate runtime turn opening"
         );
         assert!(
@@ -1605,12 +1605,12 @@ mod tests {
             "agent_loop must not own runtime provider-error outcome folding"
         );
         assert!(
-            agent_loop_source.contains("RuntimeTurnProviderCycleStep"),
-            "agent_loop must delegate runtime provider-error handling through provider cycle"
+            agent_loop_source.contains("RuntimeTurnIterationStep"),
+            "agent_loop must delegate runtime provider-error handling through turn iteration"
         );
         assert!(
             !agent_loop_source.contains("RuntimeProviderErrorResultStep"),
-            "agent_loop must delegate runtime provider-error result folding through provider cycle"
+            "agent_loop must delegate runtime provider-error result folding through turn iteration"
         );
         assert!(
             lifecycle_source.contains("struct RuntimeProviderErrorStep"),
@@ -1658,7 +1658,7 @@ mod tests {
             );
         }
         assert!(
-            agent_loop_source.contains("RuntimeTurnProviderCycleStep"),
+            agent_loop_source.contains("RuntimeTurnIterationStep"),
             "agent_loop must delegate runtime provider cycle"
         );
         assert!(
@@ -1681,6 +1681,53 @@ mod tests {
             assert!(
                 lifecycle_source.contains(marker),
                 "lifecycle must compose runtime provider cycle detail {marker}"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_turn_iteration_step_is_owned_by_lifecycle_module() {
+        let agent_loop_source = include_str!("agent_loop.rs");
+        let lifecycle_source = include_str!("lifecycle.rs");
+
+        for marker in [
+            "RuntimeTurnOpeningStep::new",
+            "RuntimeTurnProviderCycleStep::new",
+            "RuntimeTurnOpeningResult::Continue",
+            "RuntimeTurnProviderCycleResult::ContinueLoop",
+            "RuntimeTurnProviderCycleResult::ContinueTurn",
+        ] {
+            assert!(
+                !agent_loop_source.contains(marker),
+                "agent_loop must delegate runtime turn iteration detail {marker}"
+            );
+        }
+        assert!(
+            agent_loop_source.contains("RuntimeTurnIterationStep"),
+            "agent_loop must delegate runtime turn iteration"
+        );
+        assert!(
+            lifecycle_source.contains("struct RuntimeTurnIterationStep"),
+            "lifecycle must own runtime turn iteration step state"
+        );
+        assert!(
+            lifecycle_source.contains("enum RuntimeTurnIterationResult"),
+            "lifecycle must own runtime turn iteration result shape"
+        );
+        assert!(
+            lifecycle_source.contains("impl RuntimeTurnIterationStep"),
+            "lifecycle must own runtime turn iteration step behavior"
+        );
+        for marker in [
+            "RuntimeTurnOpeningStep::new",
+            "RuntimeTurnProviderCycleStep::new",
+            "RuntimeTurnOpeningResult::Continue",
+            "RuntimeTurnProviderCycleResult::ContinueLoop",
+            "RuntimeTurnProviderCycleResult::ContinueTurn",
+        ] {
+            assert!(
+                lifecycle_source.contains(marker),
+                "lifecycle must compose runtime turn iteration detail {marker}"
             );
         }
     }

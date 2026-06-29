@@ -7,8 +7,7 @@ use crate::instructions::ProjectInstructions;
 use crate::lifecycle::{
     AgentLoopContext, AgentLoopResult, RuntimeConversationBootstrapStep, RuntimeSessionLifecycle,
     RuntimeTaskActor, RuntimeTurnConfig, RuntimeTurnDeps, RuntimeTurnExecution,
-    RuntimeTurnOpeningResult, RuntimeTurnOpeningStep, RuntimeTurnProviderCycleResult,
-    RuntimeTurnProviderCycleStep, RuntimeTurnSetupStep, RuntimeTurnState,
+    RuntimeTurnIterationResult, RuntimeTurnIterationStep, RuntimeTurnSetupStep, RuntimeTurnState,
 };
 use crate::memory::MemoryBlock;
 use crate::session::AgentConversationContext;
@@ -90,49 +89,27 @@ pub(crate) fn run_agent_loop(
     let mut legacy_lifecycle = RuntimeSessionLifecycle::new(events.run_id().to_string());
     let lifecycle = lifecycle.unwrap_or(&mut legacy_lifecycle);
     let mut actor = RuntimeTaskActor::new(lifecycle, max_turns);
-    let mut provider_cycle_step = RuntimeTurnProviderCycleStep::new();
+    let mut turn_iteration_step = RuntimeTurnIterationStep::new();
 
     loop {
-        let turn_provider_config = {
-            let (conversation, history_writer) = prepared_conversation.parts_mut();
-            match RuntimeTurnOpeningStep::new().open(
-                &mut actor,
-                config.provider,
-                &ctx_config,
-                &provider_config,
-                cwd,
-                emit_deltas,
-                hooks,
-                events,
-                sink,
-                conversation,
-                history_writer,
-                prompt,
-                &config.model,
-                subagent_type,
-                cost_tracker,
-                steer_handle,
-            )? {
-                RuntimeTurnOpeningResult::Continue { provider_config } => provider_config,
-                RuntimeTurnOpeningResult::Return(result) => return Ok(result),
-            }
-        };
-
-        match provider_cycle_step.run(
+        match turn_iteration_step.run(
             &mut actor,
             config.provider,
-            &turn_provider_config,
-            cwd,
             &ctx_config,
             &provider_config,
+            cwd,
             emit_deltas,
             hooks,
-            cancel,
-            cost_tracker,
-            config.max_budget_usd,
             events,
             sink,
             &mut prepared_conversation,
+            prompt,
+            &config.model,
+            subagent_type,
+            cost_tracker,
+            steer_handle,
+            cancel,
+            config.max_budget_usd,
             config,
             tool_policy,
             subagent_depth,
@@ -148,11 +125,10 @@ pub(crate) fn run_agent_loop(
             execute_child_agent_loop,
             execute_child_agent_loop,
         )? {
-            RuntimeTurnProviderCycleResult::ContinueLoop => {
+            RuntimeTurnIterationResult::ContinueLoop => {
                 continue;
             }
-            RuntimeTurnProviderCycleResult::ContinueTurn => {}
-            RuntimeTurnProviderCycleResult::Return(result) => return Ok(result),
+            RuntimeTurnIterationResult::Return(result) => return Ok(result),
         }
     }
 }
