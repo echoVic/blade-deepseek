@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.64":
+        "Persisted commandExecution history items now use shared projection builders while preserving command metadata placeholders and failed-command diagnostics.",
       "v0.1.63":
         "Realtime commandExecution lifecycle items now use shared projection builders, closing another app-server item-shape drift point.",
       "v0.1.62":
@@ -154,6 +156,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.64":
+        "持久化 commandExecution history item 现在也由共享 projection builder 构造，同时保留命令元数据占位字段和失败命令诊断语义。",
       "v0.1.63":
         "实时 commandExecution lifecycle item 现在也由共享 projection builder 构造，继续消除 app-server item shape 漂移点。",
       "v0.1.62":

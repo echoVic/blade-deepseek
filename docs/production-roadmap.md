@@ -4,7 +4,7 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-06-30
-Current baseline: v0.1.63 shared tool item started/completed/status/error projection helpers, shared agent-message/plan/reasoning/commandExecution/fileChange/workflow lifecycle item builders for realtime server streams, tag release-gate Rust tests serialized for server-heavy contracts, stdio MCP fixture hardening for Linux release runners, active-writer JSONL polling hardening for server background-turn tests, realtime tool item error exit-code projection, MCP resource capability caching, MCP resource/template discovery with registry-level startup errors in all-server listings, MCP resource listing error aggregation, MCP resource list/read tools, server JSONL test harness hardening, structured hook action validation, tool argument schema composition validation, fuzzy model-facing file discovery, runtime-owned agent turn loop orchestration, workflow parity loop, process timeout hardening, runtime/TUI task-turn lifecycle seed, and configured permission-profile write/deny/network/special-root sandboxing
+Current baseline: v0.1.64 shared tool item started/completed/status/error projection helpers, shared persisted commandExecution history projection helpers, shared agent-message/plan/reasoning/commandExecution/fileChange/workflow lifecycle item builders for realtime server streams, tag release-gate Rust tests serialized for server-heavy contracts, stdio MCP fixture hardening for Linux release runners, active-writer JSONL polling hardening for server background-turn tests, realtime tool item error exit-code projection, MCP resource capability caching, MCP resource/template discovery with registry-level startup errors in all-server listings, MCP resource listing error aggregation, MCP resource list/read tools, server JSONL test harness hardening, structured hook action validation, tool argument schema composition validation, fuzzy model-facing file discovery, runtime-owned agent turn loop orchestration, workflow parity loop, process timeout hardening, runtime/TUI task-turn lifecycle seed, and configured permission-profile write/deny/network/special-root sandboxing
 
 ---
 
@@ -418,7 +418,10 @@ commands and consume versioned events without owning turn execution details.
    `tool` / `output` / `error` fields; legacy `tool_completed` still carries
    diagnostic details for compatibility. Persisted bash tool calls now project as
    `commandExecution` history items with aggregated output/truncation metadata
-   instead of Orca's generic `tool_call` shape, and remaining persisted
+   instead of Orca's generic `tool_call` shape, and those persisted command
+   items now use shared projection helpers that preserve history-only metadata
+   such as cwd/process/source/action/duration placeholders while keeping failed
+   command aggregated output empty. Remaining persisted
    non-MCP/non-bash tool calls now use `dynamicToolCall` so public thread items
    no longer expose the legacy `tool_call` item type. Active steer injection
    now has server-mode coverage for multi-text input, proving both the
