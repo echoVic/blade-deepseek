@@ -11,7 +11,7 @@
 
 ## 执行摘要
 
-v0.1.48 基线下，Orca 的工具系统已经从早期的硬编码分发，升级为"规格驱动"的注册表模型。每个工具都有统一的 `ToolSpec`，包含名称、别名、JSON Schema、能力集合、展示方式、可见性和并发安全信息。运行时审批、TUI 展示、provider tool schema、MCP 工具与 resources、external tools、skills 工具、持久 goal 工具和结构化用户输入都围绕同一套规格工作。工具参数执行前校验现在覆盖常见 object keyword、enum、array item 以及 `oneOf` / `anyOf` 组合分支，减少模型看到的 schema 与 runtime 实际拒绝行为之间的偏差；生命周期 hooks 的结构化 JSON stdout 也会校验声明的 `action` 和必需字符串字段，避免拼写错误被静默当作上下文注入。
+v0.1.49 基线下，Orca 的工具系统已经从早期的硬编码分发，升级为"规格驱动"的注册表模型。每个工具都有统一的 `ToolSpec`，包含名称、别名、JSON Schema、能力集合、展示方式、可见性和并发安全信息。运行时审批、TUI 展示、provider tool schema、MCP 工具与 resources、external tools、skills 工具、持久 goal 工具和结构化用户输入都围绕同一套规格工作。工具参数执行前校验现在覆盖常见 object keyword、enum、array item 以及 `oneOf` / `anyOf` 组合分支，减少模型看到的 schema 与 runtime 实际拒绝行为之间的偏差；生命周期 hooks 的结构化 JSON stdout 也会校验声明的 `action` 和必需字符串字段，避免拼写错误被静默当作上下文注入。
 
 这次变化的核心目标是接近 Codex CLI 的工具系统思路：工具不是散落在 prompt、审批和执行器里的字符串列表，而是一个可以解析、过滤、授权、渲染和扩展的统一能力表。v0.1.17-v0.1.19 进一步补齐了 Markdown skills 和 TUI `request_user_input` answer loop，让模型既能显式加载可复用流程，也能在交互式会话中提出结构化澄清问题。
 
