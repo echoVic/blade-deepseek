@@ -7,7 +7,6 @@ use orca_core::config::{
 };
 use orca_core::model::ModelSelection;
 use orca_core::subagent_config::SubagentConfig;
-use orca_runtime::agent_loop::ThreadSteerHandle;
 use orca_runtime::controller::{
     ControllerRunOptions, ThreadTurnContext, ThreadTurnExecution, ThreadTurnExecutor,
     ThreadTurnRequest, run_thread_turn_to_writer,
@@ -15,6 +14,7 @@ use orca_runtime::controller::{
 use orca_runtime::history::{
     SessionStore, SortDirection, ThreadListFilters, ThreadSortKey, ThreadStore,
 };
+use orca_runtime::lifecycle::ThreadSteerHandle;
 use orca_runtime::lifecycle::{RuntimeSessionLifecycle, RuntimeTaskKind};
 use orca_runtime::server_runtime::{
     ActivePermissionProfile, AdditionalWorkingDirectory, PermissionProfileOverride,

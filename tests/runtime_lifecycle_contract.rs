@@ -821,11 +821,16 @@ fn tool_actor_context_allows_bash_writes_to_additional_working_directories() {
         return;
     }
 
-    let workspace = tempfile::tempdir().expect("workspace");
-    let extra = tempfile::tempdir().expect("extra");
-    let outside = tempfile::tempdir().expect("outside");
-    let extra_file = extra.path().join("allowed.txt");
-    let outside_file = outside.path().join("blocked.txt");
+    let parent =
+        tempfile::tempdir_in(std::env::current_dir().expect("cwd")).expect("sandbox parent");
+    let workspace = parent.path().join("workspace");
+    let extra = parent.path().join("extra");
+    let outside = parent.path().join("outside");
+    std::fs::create_dir(&workspace).expect("workspace dir");
+    std::fs::create_dir(&extra).expect("extra dir");
+    std::fs::create_dir(&outside).expect("outside dir");
+    let extra_file = extra.join("allowed.txt");
+    let outside_file = outside.join("blocked.txt");
     let mut context = RuntimeToolActorContext::new("run-tools", 2);
     let task_registry = TaskRegistry::new("run-tools".to_string());
     let request = ToolRequest {
@@ -842,8 +847,8 @@ fn tool_actor_context_allows_bash_writes_to_additional_working_directories() {
 
     let result = context.execute_normal_tool_with_roots_and_cancel(
         &request,
-        workspace.path(),
-        &[extra.path().to_path_buf()],
+        &workspace,
+        std::slice::from_ref(&extra),
         &McpRegistry::default(),
         &[],
         ToolConfig::default().output_truncation,

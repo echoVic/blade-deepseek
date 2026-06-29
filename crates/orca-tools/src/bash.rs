@@ -567,11 +567,15 @@ mod tests {
             return;
         }
 
-        let workspace = tempfile::TempDir::new().unwrap();
-        let extra = tempfile::TempDir::new().unwrap();
-        let outside = tempfile::TempDir::new().unwrap();
-        let extra_file = extra.path().join("allowed.txt");
-        let outside_file = outside.path().join("blocked.txt");
+        let parent = tempfile::TempDir::new_in(std::env::current_dir().unwrap()).unwrap();
+        let workspace = parent.path().join("workspace");
+        let extra = parent.path().join("extra");
+        let outside = parent.path().join("outside");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::create_dir(&extra).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        let extra_file = extra.join("allowed.txt");
+        let outside_file = outside.join("blocked.txt");
         let request = bash_request(&format!(
             "printf allowed > {} && printf blocked > {}",
             extra_file.display(),
@@ -580,8 +584,8 @@ mod tests {
 
         let result = execute_with_policy_roots_or_cancel(
             &request,
-            workspace.path(),
-            &[extra.path().to_path_buf()],
+            &workspace,
+            std::slice::from_ref(&extra),
             ToolOutputTruncation::bytes(1024),
             Duration::from_secs(5),
             || false,

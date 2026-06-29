@@ -1286,6 +1286,7 @@ impl RuntimeConversationBootstrapStep {
 }
 
 impl RuntimePreparedConversation<'_> {
+    #[cfg(test)]
     pub(crate) fn conversation_mut(&mut self) -> &mut Conversation {
         match &mut self.conversation {
             RuntimePreparedConversationStorage::Borrowed(conversation) => conversation,
@@ -1293,6 +1294,7 @@ impl RuntimePreparedConversation<'_> {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn history_writer_mut(&mut self) -> Option<&mut SessionWriter> {
         self.history_writer.as_deref_mut()
     }
@@ -1300,14 +1302,6 @@ impl RuntimePreparedConversation<'_> {
     pub(crate) fn parts_mut(&mut self) -> (&mut Conversation, Option<&mut SessionWriter>) {
         let conversation = match &mut self.conversation {
             RuntimePreparedConversationStorage::Borrowed(conversation) => conversation,
-            RuntimePreparedConversationStorage::Owned(conversation) => conversation,
-        };
-        (conversation, self.history_writer.as_deref_mut())
-    }
-
-    pub(crate) fn parts_ref_mut(&mut self) -> (&Conversation, Option<&mut SessionWriter>) {
-        let conversation = match &self.conversation {
-            RuntimePreparedConversationStorage::Borrowed(conversation) => &**conversation,
             RuntimePreparedConversationStorage::Owned(conversation) => conversation,
         };
         (conversation, self.history_writer.as_deref_mut())
@@ -2870,7 +2864,7 @@ impl RuntimeProviderTurnStep {
         &mut self,
         actor: &mut RuntimeTaskActor<'_>,
         provider: ProviderKind,
-        conversation: &Conversation,
+        conversation: &mut Conversation,
         provider_config: &ProviderConfig,
         cwd: &str,
         emit_deltas: bool,
@@ -2881,6 +2875,7 @@ impl RuntimeProviderTurnStep {
         events: &mut EventFactory,
         sink: &mut EventSink<W>,
         mut history_writer: Option<&mut SessionWriter>,
+        steer_handle: Option<&ThreadSteerHandle>,
     ) -> io::Result<RuntimeProviderTurnOutput> {
         let pre_model_outcome = match actor.run_pre_model_hook_with_cancel(hooks, cwd, Some(cancel))
         {
@@ -2891,6 +2886,7 @@ impl RuntimeProviderTurnStep {
             return cancelled_provider_turn(emit_deltas, events, sink);
         }
 
+        RuntimeSteerStep::new().apply(steer_handle, conversation, history_writer.as_deref_mut())?;
         let model_conversation = conversation_with_hook_context(conversation, &pre_model_outcome);
         let response = actor.call_streaming_provider(
             provider,
@@ -3115,13 +3111,14 @@ impl RuntimeTurnProviderCycleStep {
         background_workflows: &mut Vec<BackgroundWorkflowRun>,
         workflow_ipc: Option<&WorkflowIpcContext>,
         permission_handler: Option<&(dyn RuntimePermissionRequestHandler + Send + Sync)>,
+        steer_handle: Option<&ThreadSteerHandle>,
         child_executor: ChildAgentExecutor<W>,
         workflow_child_executor: ChildAgentExecutor<SharedEventBuffer>,
         batch_child_executor: ChildAgentExecutor<io::Sink>,
     ) -> io::Result<RuntimeTurnProviderCycleResult> {
         let cwd_display = cwd.display().to_string();
         let provider_turn = {
-            let (conversation, history_writer) = conversation.parts_ref_mut();
+            let (conversation, history_writer) = conversation.parts_mut();
             RuntimeProviderTurnStep::new().run(
                 actor,
                 provider,
@@ -3136,6 +3133,7 @@ impl RuntimeTurnProviderCycleStep {
                 events,
                 sink,
                 history_writer,
+                steer_handle,
             )?
         };
         let response = match RuntimeProviderTurnResultResultStep::new().fold(
@@ -3372,6 +3370,7 @@ impl RuntimeTurnIterationStep {
             background_workflows,
             workflow_ipc,
             permission_handler,
+            steer_handle,
             child_executor,
             workflow_child_executor,
             batch_child_executor,

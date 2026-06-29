@@ -1953,6 +1953,17 @@ fn shell_sandbox_mode_from_permission_profile(
         for root in orca_tools::sandbox::platform_default_read_roots() {
             push_unique_path(&mut additional_readable_roots, root);
         }
+        if !resolved.additional_writable_roots.is_empty()
+            || !resolved.denied_writable_roots.is_empty()
+        {
+            mode = match mode {
+                ShellSandboxMode::ReadOnly { network_access, .. } => ShellSandboxMode::ReadOnly {
+                    network_access,
+                    allow_global_read: true,
+                },
+                other => other,
+            };
+        }
     }
     Ok(CommandExecSandbox {
         mode,

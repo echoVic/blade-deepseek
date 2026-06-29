@@ -2982,19 +2982,23 @@ fn server_mode_command_exec_configured_permission_profile_enforces_deny_glob_ent
     }
 
     with_orca_home(|home| {
-        let workspace = tempdir().expect("workspace");
-        let allowed = tempdir().expect("allowed");
-        let denied_file = allowed.path().join("secret.env");
-        let ordinary_file = allowed.path().join("ordinary.txt");
-        let output_file = allowed.path().join("ordinary.out");
+        let parent =
+            tempfile::tempdir_in(std::env::current_dir().expect("cwd")).expect("sandbox parent");
+        let workspace = parent.path().join("workspace");
+        let allowed = parent.path().join("allowed");
+        std::fs::create_dir(&workspace).expect("workspace dir");
+        std::fs::create_dir(&allowed).expect("allowed dir");
+        let denied_file = allowed.join("secret.env");
+        let ordinary_file = allowed.join("ordinary.txt");
+        let output_file = allowed.join("ordinary.out");
         std::fs::write(&denied_file, "secret").expect("write denied file");
         std::fs::write(&ordinary_file, "ordinary").expect("write ordinary file");
         std::fs::write(
             home.join("config.toml"),
             format!(
-                "[permission_profiles.globbed]\nextends = \":read-only\"\n\n[permission_profiles.globbed.filesystem]\n\"{}\" = \"write\"\n\"{}/*.env\" = \"deny\"\n",
-                allowed.path().display(),
-                allowed.path().display()
+                "[permission_profiles.globbed]\nextends = \":read-only\"\n\n[permission_profiles.globbed.filesystem]\n\"{}\" = \"read-write\"\n\"{}/*.env\" = \"deny\"\n",
+                allowed.display(),
+                allowed.display()
             ),
         )
         .expect("write permission profile config");
@@ -3012,7 +3016,7 @@ fn server_mode_command_exec_configured_permission_profile_enforces_deny_glob_ent
                 "--provider",
                 "mock",
                 "--cwd",
-                workspace.path().to_str().unwrap(),
+                workspace.to_str().unwrap(),
             ])
             .env("ORCA_HOME", home)
             .stdin(Stdio::piped())

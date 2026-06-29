@@ -2,25 +2,19 @@ use std::io;
 
 use crate::agent_child::{ChildAgentRequest, ChildAgentResult, ChildAgentRuntime};
 use crate::cost::CostTracker;
-use crate::hooks::HookRunner;
-use crate::instructions::ProjectInstructions;
 use crate::lifecycle::{
     AgentLoopContext, AgentLoopResult, RuntimeConversationBootstrapStep, RuntimeSessionLifecycle,
     RuntimeTaskActor, RuntimeTurnConfig, RuntimeTurnDeps, RuntimeTurnExecution,
     RuntimeTurnLoopExecutors, RuntimeTurnLoopInput, RuntimeTurnLoopStep, RuntimeTurnSetupStep,
     RuntimeTurnState,
 };
-use crate::memory::MemoryBlock;
 use crate::session::AgentConversationContext;
 use crate::tasks::TaskRegistry;
 use crate::tool_invocation::AgentToolPolicyContext;
 use crate::workflow_execution::observe_background_workflows;
-use orca_core::cancel::CancelToken;
 use orca_core::config::{OutputFormat, RunConfig};
 use orca_core::event_schema::EventFactory;
 use orca_core::event_sink::EventSink;
-use orca_core::subagent_types::SubagentType;
-use orca_mcp::McpRegistry;
 
 const DEFAULT_MAX_TURNS: u32 = 128;
 
@@ -184,7 +178,13 @@ pub(crate) fn execute_child_agent_loop<W: io::Write>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hooks::HookRunner;
+    use crate::instructions::ProjectInstructions;
     use crate::lifecycle::RuntimeTaskKind;
+    use crate::memory::MemoryBlock;
+    use orca_core::cancel::CancelToken;
+    use orca_core::subagent_types::SubagentType;
+    use orca_mcp::McpRegistry;
     use std::path::PathBuf;
 
     #[test]

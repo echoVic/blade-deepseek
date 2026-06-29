@@ -382,8 +382,11 @@ fn full_auto_bash_cannot_write_outside_workspace() {
         return;
     }
 
-    let temp_dir = make_temp_workspace("bash-sandbox");
-    let outside = std::env::temp_dir().join(format!(
+    let parent =
+        tempfile::tempdir_in(std::env::current_dir().expect("cwd")).expect("sandbox parent");
+    let temp_dir = parent.path().join("workspace");
+    std::fs::create_dir(&temp_dir).expect("workspace dir");
+    let outside = parent.path().join(format!(
         "orca-outside-{}",
         SystemTime::now()
             .duration_since(UNIX_EPOCH)

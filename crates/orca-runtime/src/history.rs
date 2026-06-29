@@ -9,9 +9,7 @@ use uuid::Uuid;
 
 use crate::thread_store::sessions_dir;
 use orca_core::config::{ActivePermissionProfile, AdditionalWorkingDirectory};
-use orca_core::conversation::{
-    Conversation, Message, RawToolCall, SummaryState, normalize_tool_boundaries,
-};
+use orca_core::conversation::{Conversation, Message, SummaryState, normalize_tool_boundaries};
 use orca_core::{approval_rules::PermissionRules, approval_types::ApprovalMode};
 
 pub use crate::thread_store::{
@@ -288,6 +286,7 @@ fn title_from_prompt(prompt: &str) -> String {
 mod tests {
     use super::*;
     use crate::thread_store::ORCA_HOME_ENV;
+    use orca_core::conversation::RawToolCall;
     use orca_core::plan_types::{PlanItem, PlanStatus};
 
     #[test]
