@@ -1044,6 +1044,10 @@ mod tests {
             "dynamic_tool_started_item",
             "mcp_tool_completed_item",
             "dynamic_tool_completed_item",
+            "file_change_started_item",
+            "file_change_completed_item",
+            "workflow_started_item",
+            "workflow_completed_item",
             "tool_error_object_from_value",
             "tool_status_is_completed",
         ] {

@@ -21,9 +21,10 @@ use crate::thread_store::{
     ThreadStore, TurnItemsView,
 };
 use crate::tool_item_projection::{
-    dynamic_tool_completed_item, dynamic_tool_started_item, mcp_result_from_content,
-    mcp_tool_completed_item, mcp_tool_parts, mcp_tool_started_item, parse_json_or_null,
-    tool_error_object_from_value, tool_status_is_completed,
+    dynamic_tool_completed_item, dynamic_tool_started_item, file_change_completed_item,
+    file_change_started_item, mcp_result_from_content, mcp_tool_completed_item, mcp_tool_parts,
+    mcp_tool_started_item, parse_json_or_null, tool_error_object_from_value,
+    tool_status_is_completed, workflow_completed_item, workflow_started_item,
 };
 pub use orca_core::config::{ActivePermissionProfile, AdditionalWorkingDirectory};
 use orca_core::config::{HistoryMode, OutputFormat, RunConfig};
@@ -1257,16 +1258,12 @@ impl<W: Write> ServerRequestWriter<W> {
             protocol::ServerEvent::ItemStarted {
                 thread_id: Value::Null,
                 turn_id: Value::Null,
-                item: json!({
-                    "id": item.id,
-                    "type": "fileChange",
-                    "status": "inProgress",
-                    "changes": [{
-                        "path": item.path,
-                        "kind": item.kind,
-                        "diff": file_change_diff(payload),
-                    }],
-                }),
+                item: file_change_started_item(
+                    item.id,
+                    item.path,
+                    item.kind,
+                    file_change_diff(payload),
+                ),
             },
         )
     }
@@ -1283,16 +1280,13 @@ impl<W: Write> ServerRequestWriter<W> {
             protocol::ServerEvent::ItemCompleted {
                 thread_id: Value::Null,
                 turn_id: Value::Null,
-                item: json!({
-                    "id": item.id,
-                    "type": "fileChange",
-                    "status": file_change_status(payload),
-                    "changes": [{
-                        "path": item.path,
-                        "kind": item.kind,
-                        "diff": file_change_diff(payload),
-                    }],
-                }),
+                item: file_change_completed_item(
+                    item.id,
+                    item.path,
+                    item.kind,
+                    file_change_status(payload),
+                    file_change_diff(payload),
+                ),
             },
         )
     }
@@ -1323,14 +1317,12 @@ impl<W: Write> ServerRequestWriter<W> {
             protocol::ServerEvent::ItemStarted {
                 thread_id: Value::Null,
                 turn_id: Value::Null,
-                item: json!({
-                    "id": run_id,
-                    "type": "workflow",
-                    "workflowName": workflow_name,
-                    "taskId": task_id,
-                    "status": "running",
-                    "task": payload["task"].clone(),
-                }),
+                item: workflow_started_item(
+                    run_id,
+                    task_id,
+                    workflow_name,
+                    payload["task"].clone(),
+                ),
             },
         )
     }
@@ -1386,16 +1378,15 @@ impl<W: Write> ServerRequestWriter<W> {
             protocol::ServerEvent::ItemCompleted {
                 thread_id: Value::Null,
                 turn_id: Value::Null,
-                item: json!({
-                    "id": item.id,
-                    "type": "workflow",
-                    "workflowName": item.workflow_name,
-                    "taskId": item.task_id,
-                    "status": item.status,
-                    "result": item.result,
-                    "error": payload["error"].clone(),
-                    "task": item.task,
-                }),
+                item: workflow_completed_item(
+                    item.id,
+                    item.task_id,
+                    item.workflow_name,
+                    item.status,
+                    item.result,
+                    payload["error"].clone(),
+                    item.task,
+                ),
             },
         )
     }

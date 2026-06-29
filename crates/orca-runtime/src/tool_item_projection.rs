@@ -106,6 +106,81 @@ pub(crate) fn dynamic_tool_completed_item(
     })
 }
 
+pub(crate) fn file_change_started_item(
+    id: impl Into<String>,
+    path: Option<impl Into<String>>,
+    kind: impl Into<String>,
+    diff: Value,
+) -> Value {
+    file_change_item(id, "inProgress", path, kind, diff)
+}
+
+pub(crate) fn file_change_completed_item(
+    id: impl Into<String>,
+    path: Option<impl Into<String>>,
+    kind: impl Into<String>,
+    status: Value,
+    diff: Value,
+) -> Value {
+    file_change_item(id, status, path, kind, diff)
+}
+
+fn file_change_item(
+    id: impl Into<String>,
+    status: impl Into<Value>,
+    path: Option<impl Into<String>>,
+    kind: impl Into<String>,
+    diff: Value,
+) -> Value {
+    json!({
+        "id": id.into(),
+        "type": "fileChange",
+        "status": status.into(),
+        "changes": [{
+            "path": path.map(Into::into),
+            "kind": kind.into(),
+            "diff": diff,
+        }],
+    })
+}
+
+pub(crate) fn workflow_started_item(
+    id: impl Into<String>,
+    task_id: impl Into<String>,
+    workflow_name: impl Into<String>,
+    task: Value,
+) -> Value {
+    json!({
+        "id": id.into(),
+        "type": "workflow",
+        "workflowName": workflow_name.into(),
+        "taskId": task_id.into(),
+        "status": "running",
+        "task": task,
+    })
+}
+
+pub(crate) fn workflow_completed_item(
+    id: impl Into<String>,
+    task_id: impl Into<String>,
+    workflow_name: impl Into<String>,
+    status: impl Into<String>,
+    result: Value,
+    error: Value,
+    task: Value,
+) -> Value {
+    json!({
+        "id": id.into(),
+        "type": "workflow",
+        "workflowName": workflow_name.into(),
+        "taskId": task_id.into(),
+        "status": status.into(),
+        "result": result,
+        "error": error,
+        "task": task,
+    })
+}
+
 pub(crate) fn tool_error_object(message: &str, exit_code: Option<i64>) -> Value {
     let mut error =
         serde_json::Map::from_iter([("message".to_string(), Value::from(message.to_string()))]);
@@ -298,5 +373,85 @@ mod tests {
         assert!(item["contentItems"].is_null());
         assert_eq!(item["success"], false);
         assert_eq!(item["error"]["message"], "policy denied");
+    }
+
+    #[test]
+    fn file_change_started_item_projects_codex_style_shape() {
+        let item = file_change_started_item(
+            "call-7:file-change",
+            Some("src/main.rs"),
+            "edit",
+            Value::from(""),
+        );
+
+        assert_eq!(item["id"], "call-7:file-change");
+        assert_eq!(item["type"], "fileChange");
+        assert_eq!(item["status"], "inProgress");
+        assert_eq!(item["changes"][0]["path"], "src/main.rs");
+        assert_eq!(item["changes"][0]["kind"], "edit");
+        assert_eq!(item["changes"][0]["diff"], "");
+        assert!(item.get("tool").is_none());
+        assert!(item.get("error").is_none());
+    }
+
+    #[test]
+    fn file_change_completed_item_projects_failure_shape() {
+        let item = file_change_completed_item(
+            "call-8:file-change",
+            None::<String>,
+            "write",
+            Value::from("failed"),
+            Value::from("diff"),
+        );
+
+        assert_eq!(item["id"], "call-8:file-change");
+        assert_eq!(item["type"], "fileChange");
+        assert_eq!(item["status"], "failed");
+        assert!(item["changes"][0]["path"].is_null());
+        assert_eq!(item["changes"][0]["kind"], "write");
+        assert_eq!(item["changes"][0]["diff"], "diff");
+        assert!(item.get("tool").is_none());
+        assert!(item.get("output").is_none());
+    }
+
+    #[test]
+    fn workflow_started_item_projects_codex_style_shape() {
+        let item = workflow_started_item(
+            "workflow-run-1",
+            "workflow-task-1",
+            "audit",
+            json!({ "kind": "workflow", "status": "running" }),
+        );
+
+        assert_eq!(item["id"], "workflow-run-1");
+        assert_eq!(item["type"], "workflow");
+        assert_eq!(item["workflowName"], "audit");
+        assert_eq!(item["taskId"], "workflow-task-1");
+        assert_eq!(item["status"], "running");
+        assert_eq!(item["task"]["kind"], "workflow");
+        assert!(item.get("result").is_none());
+        assert!(item.get("error").is_none());
+    }
+
+    #[test]
+    fn workflow_completed_item_projects_failure_shape() {
+        let item = workflow_completed_item(
+            "workflow-run-2",
+            "workflow-task-2",
+            "audit",
+            "failed",
+            Value::Null,
+            json!({ "message": "boom" }),
+            json!({ "kind": "workflow", "status": "failed" }),
+        );
+
+        assert_eq!(item["id"], "workflow-run-2");
+        assert_eq!(item["type"], "workflow");
+        assert_eq!(item["workflowName"], "audit");
+        assert_eq!(item["taskId"], "workflow-task-2");
+        assert_eq!(item["status"], "failed");
+        assert!(item["result"].is_null());
+        assert_eq!(item["error"]["message"], "boom");
+        assert_eq!(item["task"]["status"], "failed");
     }
 }
