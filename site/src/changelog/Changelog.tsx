@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.66":
+        "TUI runtime event projection now lives in a dedicated module, keeping EventEnvelope-to-TuiEvent mapping and workflow notification prompt shaping out of bridge orchestration.",
       "v0.1.65":
         "Persisted edit and write_file history items now project as Codex-style fileChange items, aligning thread-read history with realtime server streams.",
       "v0.1.64":
@@ -158,6 +160,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.66":
+        "TUI runtime event projection 现在迁到专门模块，`bridge` 不再直接持有 EventEnvelope 到 TuiEvent 的映射和 workflow notification prompt 组装。",
       "v0.1.65":
         "持久化 edit / write_file history item 现在投影为 Codex 风格 fileChange item，让 thread-read 历史与实时 server stream 保持一致。",
       "v0.1.64":
