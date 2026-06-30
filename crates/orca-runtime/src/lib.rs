@@ -2,6 +2,7 @@ pub mod agent_child;
 pub mod agent_common;
 pub mod agent_loop;
 pub mod approval_resolution;
+pub mod compaction;
 pub mod controller;
 pub mod cost;
 pub mod goals;
@@ -929,6 +930,7 @@ mod tests {
     fn runtime_compaction_step_is_owned_by_lifecycle_module() {
         let agent_loop_source = include_str!("agent_loop.rs");
         let lifecycle_source = include_str!("lifecycle.rs");
+        let compaction_source = include_str!("compaction.rs");
 
         assert!(
             !agent_loop_source.contains("struct RuntimeCompactionStep"),
@@ -939,13 +941,20 @@ mod tests {
             "agent_loop must not own runtime compaction step behavior"
         );
         assert!(
-            lifecycle_source.contains("struct RuntimeCompactionStep"),
-            "lifecycle must own runtime compaction step state"
+            !lifecycle_source.contains("struct RuntimeCompactionStep"),
+            "lifecycle must not keep owning runtime compaction step state after extraction"
         );
         assert!(
-            lifecycle_source.contains("impl<'a")
-                && lifecycle_source.contains("RuntimeCompactionStep<'a"),
-            "lifecycle must own runtime compaction step behavior"
+            !lifecycle_source.contains("impl<'a, W: io::Write> RuntimeCompactionStep<'a, W>"),
+            "lifecycle must not keep owning runtime compaction step behavior after extraction"
+        );
+        assert!(
+            compaction_source.contains("struct RuntimeCompactionStep"),
+            "compaction module must own runtime compaction step state"
+        );
+        assert!(
+            compaction_source.contains("impl<'a, W: io::Write> RuntimeCompactionStep<'a, W>"),
+            "compaction module must own runtime compaction step behavior"
         );
 
         for marker in [

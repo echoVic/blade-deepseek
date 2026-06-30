@@ -12,12 +12,13 @@ use orca_mcp::McpRegistry;
 use orca_provider::{ProviderConfig, context};
 
 use crate::agent_child::ChildAgentExecutor;
+use crate::compaction::RuntimeCompactionStep;
 use crate::cost::CostTracker;
 use crate::hooks::{HookRunner, conversation_with_hook_context};
 use crate::instructions::ProjectInstructions;
 use crate::lifecycle::{
-    AgentLoopResult, RuntimeCompactionStep, RuntimePermissionRequestHandler,
-    RuntimePreparedConversation, RuntimeSteerStep, RuntimeTaskActor, RuntimeTurnStartError,
+    AgentLoopResult, RuntimePermissionRequestHandler, RuntimePreparedConversation,
+    RuntimeSteerStep, RuntimeTaskActor, RuntimeTurnStartError,
 };
 use crate::memory::{self, MemoryBlock};
 use crate::session::record_assistant_response_for_agent;

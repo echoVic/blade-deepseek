@@ -55,8 +55,10 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.71":
+        "Runtime compaction now lives in a dedicated module, keeping prompt-budget hooks, summary persistence, and prompt-too-long recovery out of the lifecycle orchestration module.",
       "v0.1.70":
-        "TUI history now splits into native terminal scrollback for settled transcript output and a live bottom viewport for streaming content, plans, input, status, and modal/full-panel states.",
+        "TUI history splits into native terminal scrollback for settled transcript output and a live bottom viewport for streaming content, plans, input, status, and modal/full-panel states.",
       "v0.1.69":
         "Tool-turn execution now lives in a dedicated runtime module, separating provider tool schema/invocation preparation from cursoring, batching, execution, and result folding.",
       "v0.1.68":
@@ -168,8 +170,10 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.71":
+        "Runtime compaction 现在迁到专门模块，prompt budget hooks、summary 持久化和 prompt-too-long 恢复不再混在 lifecycle 编排里。",
       "v0.1.70":
-        "TUI 历史现在拆成两层：已定稿 transcript 输出进入终端原生 scrollback，底部 live viewport 只保留流式内容、计划、输入框、状态栏和模态/全屏面板。",
+        "TUI 历史拆成两层：已定稿 transcript 输出进入终端原生 scrollback，底部 live viewport 保留流式内容、计划、输入框、状态栏和模态/全屏面板。",
       "v0.1.69":
         "Tool-turn 执行现在迁到专门的 runtime 模块，provider 工具 schema / invocation 准备与游标、批处理、执行、结果折叠边界分开。",
       "v0.1.68":
