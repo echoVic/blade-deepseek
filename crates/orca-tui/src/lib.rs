@@ -31,4 +31,31 @@ mod tests {
             "bridge should call the shared TUI runtime event adapter instead of owning it"
         );
     }
+
+    #[test]
+    fn runtime_interaction_adapters_are_owned_by_dedicated_module() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let adapter =
+            std::fs::read_to_string(format!("{manifest_dir}/src/runtime_interaction_adapter.rs"))
+                .expect("runtime interaction adapter module should exist");
+        assert!(
+            adapter.contains("pub(crate) struct TuiApprovalHandler"),
+            "runtime_interaction_adapter should own the TUI approval handler"
+        );
+        assert!(
+            adapter.contains("pub(crate) struct TuiUserInputHandler"),
+            "runtime_interaction_adapter should own the TUI user-input handler"
+        );
+
+        let bridge = std::fs::read_to_string(format!("{manifest_dir}/src/bridge.rs"))
+            .expect("bridge source should be readable");
+        assert!(
+            !bridge.contains("struct TuiApprovalHandler"),
+            "bridge should use the TUI approval adapter instead of owning it"
+        );
+        assert!(
+            !bridge.contains("struct TuiUserInputHandler"),
+            "bridge should use the TUI user-input adapter instead of owning it"
+        );
+    }
 }

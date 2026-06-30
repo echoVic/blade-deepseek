@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc --noEmit && vite build",
+    "build": "tsc --noEmit && vite build && node scripts/prerender.mjs",
+    "prerender": "node scripts/prerender.mjs",
     "check:seo": "node scripts/check-seo.mjs",
     "preview": "vite preview"
   },
