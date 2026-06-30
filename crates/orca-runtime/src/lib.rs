@@ -1028,7 +1028,7 @@ mod tests {
     #[test]
     fn thread_store_trait_is_owned_by_thread_store_module() {
         let history_source = include_str!("history.rs");
-        let thread_store_source = include_str!("thread_store.rs");
+        let thread_store_source = include_str!("thread_store/types.rs");
 
         assert!(
             !history_source.contains("pub trait ThreadStore"),
@@ -1041,9 +1041,54 @@ mod tests {
     }
 
     #[test]
+    fn thread_store_uses_focused_submodules() {
+        let thread_store_source = include_str!("thread_store.rs");
+        let types_source = include_str!("thread_store/types.rs");
+        let local_source = include_str!("thread_store/local.rs");
+        let live_thread_source = include_str!("thread_store/live_thread.rs");
+        let projection_source = include_str!("thread_store/projection.rs");
+        let pagination_source = include_str!("thread_store/pagination.rs");
+        let writer_source = include_str!("thread_store/writer.rs");
+
+        assert!(
+            thread_store_source.contains("mod types;")
+                && thread_store_source.contains("mod local;")
+                && thread_store_source.contains("mod live_thread;")
+                && thread_store_source.contains("mod projection;")
+                && thread_store_source.contains("mod pagination;")
+                && thread_store_source.contains("mod writer;"),
+            "thread_store.rs should be a facade over focused storage modules"
+        );
+        assert!(
+            types_source.contains("pub trait ThreadStore"),
+            "thread_store/types.rs must own storage-neutral types and trait"
+        );
+        assert!(
+            local_source.contains("impl ThreadStore for JsonlThreadStore"),
+            "thread_store/local.rs must own JSONL-backed ThreadStore behavior"
+        );
+        assert!(
+            live_thread_source.contains("pub struct LiveThread"),
+            "thread_store/live_thread.rs must own live thread handles"
+        );
+        assert!(
+            projection_source.contains("messages_to_thread_turns"),
+            "thread_store/projection.rs must own thread projection helpers"
+        );
+        assert!(
+            pagination_source.contains("page_vec"),
+            "thread_store/pagination.rs must own pagination helpers"
+        );
+        assert!(
+            writer_source.contains("pub struct SessionWriter"),
+            "thread_store/writer.rs must own JSONL writing"
+        );
+    }
+
+    #[test]
     fn jsonl_thread_store_impl_is_owned_by_thread_store_module() {
         let history_source = include_str!("history.rs");
-        let thread_store_source = include_str!("thread_store.rs");
+        let thread_store_source = include_str!("thread_store/local.rs");
 
         assert!(
             !history_source.contains("impl ThreadStore for JsonlThreadStore"),
@@ -1056,41 +1101,63 @@ mod tests {
     }
 
     #[test]
-    fn thread_projection_helpers_are_owned_by_thread_store_module() {
+    fn thread_projection_helpers_are_owned_by_focused_thread_store_modules() {
         let history_source = include_str!("history.rs");
-        let thread_store_source = include_str!("thread_store.rs");
+        let facade_source = include_str!("thread_store.rs");
+        let local_source = include_str!("thread_store/local.rs");
+        let projection_source = include_str!("thread_store/projection.rs");
+        let pagination_source = include_str!("thread_store/pagination.rs");
 
-        for (function_name, allows_generic) in [
-            ("thread_summary_matches", false),
-            ("thread_summary_matches_filters", false),
-            ("sort_thread_summaries", false),
-            ("sort_thread_search_hits", false),
-            ("message_to_thread_json", false),
-            ("stored_message_to_thread_json", false),
-            ("messages_to_thread_turns", false),
-            ("messages_to_thread_items", false),
-            ("stored_messages_to_thread_turns", false),
-            ("stored_messages_to_thread_items", false),
-            ("page_thread_turns", false),
-            ("page_thread_items", false),
-            ("page_vec", true),
-            ("next_turn_id_for_messages", false),
+        for function_name in [
+            "thread_summary_matches",
+            "thread_summary_matches_filters",
+            "sort_thread_summaries",
+            "sort_thread_search_hits",
         ] {
+            let signature = format!("fn {function_name}(");
+            assert!(
+                !history_source.contains(&signature) && !facade_source.contains(&signature),
+                "history/facade must not own ThreadStore summary helper {function_name}"
+            );
+            assert!(
+                local_source.contains(&signature),
+                "thread_store/local.rs must own ThreadStore summary helper {function_name}"
+            );
+        }
+
+        for function_name in [
+            "message_to_thread_json",
+            "stored_message_to_thread_json",
+            "messages_to_thread_turns",
+            "messages_to_thread_items",
+            "stored_messages_to_thread_turns",
+            "stored_messages_to_thread_items",
+            "next_turn_id_for_messages",
+        ] {
+            let signature = format!("fn {function_name}(");
+            assert!(
+                !history_source.contains(&signature) && !facade_source.contains(&signature),
+                "history/facade must not own ThreadStore projection helper {function_name}"
+            );
+            assert!(
+                projection_source.contains(&signature),
+                "thread_store/projection.rs must own ThreadStore projection helper {function_name}"
+            );
+        }
+
+        for function_name in ["page_thread_turns", "page_thread_items", "page_vec"] {
             let plain_fn = format!("fn {function_name}(");
             let generic_fn = format!("fn {function_name}<");
             assert!(
-                !history_source.contains(&plain_fn) && !history_source.contains(&generic_fn),
-                "history must not own ThreadStore projection helper {function_name}"
-            );
-            let thread_store_owns_helper = thread_store_source.contains(&plain_fn)
-                || (allows_generic && thread_store_source.contains(&generic_fn));
-            assert!(
-                thread_store_owns_helper,
-                "thread_store must own ThreadStore projection helper {function_name}"
+                !history_source.contains(&plain_fn)
+                    && !history_source.contains(&generic_fn)
+                    && !facade_source.contains(&plain_fn)
+                    && !facade_source.contains(&generic_fn),
+                "history/facade must not own ThreadStore pagination helper {function_name}"
             );
             assert!(
-                !thread_store_source.contains(&format!("crate::history::{function_name}(")),
-                "thread_store must not bridge projection helper {function_name} through history"
+                pagination_source.contains(&plain_fn) || pagination_source.contains(&generic_fn),
+                "thread_store/pagination.rs must own ThreadStore pagination helper {function_name}"
             );
         }
     }
@@ -1099,6 +1166,7 @@ mod tests {
     fn tool_item_projection_helpers_are_owned_by_shared_projection_module() {
         let server_runtime_source = include_str!("server_runtime.rs");
         let thread_store_source = include_str!("thread_store.rs");
+        let thread_projection_source = include_str!("thread_store/projection.rs");
         let projection_source = include_str!("tool_item_projection.rs");
 
         for function_name in [
@@ -1126,7 +1194,8 @@ mod tests {
                 "server_runtime must not own shared tool item projection helper {function_name}"
             );
             assert!(
-                !thread_store_source.contains(&signature),
+                !thread_store_source.contains(&signature)
+                    && !thread_projection_source.contains(&signature),
                 "thread_store must not own shared tool item projection helper {function_name}"
             );
             assert!(
@@ -1139,7 +1208,7 @@ mod tests {
     #[test]
     fn jsonl_thread_store_type_is_owned_by_thread_store_module() {
         let history_source = include_str!("history.rs");
-        let thread_store_source = include_str!("thread_store.rs");
+        let thread_store_source = include_str!("thread_store/local.rs");
 
         assert!(
             !history_source.contains("pub struct JsonlThreadStore"),
@@ -1162,7 +1231,7 @@ mod tests {
     #[test]
     fn thread_store_api_types_are_owned_by_thread_store_module() {
         let history_source = include_str!("history.rs");
-        let thread_store_source = include_str!("thread_store.rs");
+        let thread_store_source = include_str!("thread_store/types.rs");
 
         for type_name in [
             "StoredThreadProjection",
@@ -1186,7 +1255,7 @@ mod tests {
     #[test]
     fn live_thread_handle_is_owned_by_thread_store_module() {
         let history_source = include_str!("history.rs");
-        let thread_store_source = include_str!("thread_store.rs");
+        let thread_store_source = include_str!("thread_store/live_thread.rs");
 
         assert!(
             !history_source.contains("pub struct LiveThread"),
@@ -1209,7 +1278,7 @@ mod tests {
     #[test]
     fn session_meta_is_owned_by_thread_store_module() {
         let history_source = include_str!("history.rs");
-        let thread_store_source = include_str!("thread_store.rs");
+        let thread_store_source = include_str!("thread_store/types.rs");
 
         assert!(
             !history_source.contains("pub struct SessionMeta"),
@@ -1224,7 +1293,7 @@ mod tests {
     #[test]
     fn session_summary_is_owned_by_thread_store_module() {
         let history_source = include_str!("history.rs");
-        let thread_store_source = include_str!("thread_store.rs");
+        let thread_store_source = include_str!("thread_store/types.rs");
 
         assert!(
             !history_source.contains("pub struct SessionSummary"),
@@ -1239,7 +1308,7 @@ mod tests {
     #[test]
     fn session_transcript_is_owned_by_thread_store_module() {
         let history_source = include_str!("history.rs");
-        let thread_store_source = include_str!("thread_store.rs");
+        let thread_store_source = include_str!("thread_store/types.rs");
 
         assert!(
             !history_source.contains("pub struct SessionTranscript"),
@@ -1254,7 +1323,7 @@ mod tests {
     #[test]
     fn session_writer_is_owned_by_thread_store_module() {
         let history_source = include_str!("history.rs");
-        let thread_store_source = include_str!("thread_store.rs");
+        let thread_store_source = include_str!("thread_store/writer.rs");
 
         assert!(
             !history_source.contains("pub struct SessionWriter"),
@@ -1277,7 +1346,7 @@ mod tests {
     #[test]
     fn jsonl_record_types_are_owned_by_thread_store_module() {
         let history_source = include_str!("history.rs");
-        let thread_store_source = include_str!("thread_store.rs");
+        let thread_store_source = include_str!("thread_store/types.rs");
 
         for type_name in ["SessionRecord", "StoredMessage"] {
             assert!(
@@ -1294,7 +1363,7 @@ mod tests {
     #[test]
     fn jsonl_append_writer_helpers_are_owned_by_thread_store_module() {
         let history_source = include_str!("history.rs");
-        let thread_store_source = include_str!("thread_store.rs");
+        let thread_store_source = include_str!("thread_store/writer.rs");
 
         for function_name in [
             "write_record(",
@@ -1315,7 +1384,7 @@ mod tests {
     #[test]
     fn jsonl_read_rewrite_helpers_are_owned_by_thread_store_module() {
         let history_source = include_str!("history.rs");
-        let thread_store_source = include_str!("thread_store.rs");
+        let thread_store_source = include_str!("thread_store/writer.rs");
 
         for function_name in ["read_records(", "rewrite_records(", "write_records_to("] {
             assert!(
@@ -1332,7 +1401,7 @@ mod tests {
     #[test]
     fn session_read_models_are_owned_by_thread_store_module() {
         let history_source = include_str!("history.rs");
-        let thread_store_source = include_str!("thread_store.rs");
+        let thread_store_source = include_str!("thread_store/writer.rs");
 
         for function_name in ["read_session_meta(", "read_transcript("] {
             assert!(
@@ -1349,7 +1418,7 @@ mod tests {
     #[test]
     fn thread_record_lookup_is_owned_by_thread_store_module() {
         let history_source = include_str!("history.rs");
-        let thread_store_source = include_str!("thread_store.rs");
+        let thread_store_source = include_str!("thread_store/local.rs");
 
         for function_name in [
             "load_thread_records(",
@@ -1972,7 +2041,7 @@ mod tests {
     #[test]
     fn session_list_load_operations_are_owned_by_thread_store_module() {
         let history_source = include_str!("history.rs");
-        let thread_store_source = include_str!("thread_store.rs");
+        let thread_store_source = include_str!("thread_store/local.rs");
 
         for function_name in [
             "list_sessions(",
@@ -1995,7 +2064,7 @@ mod tests {
     #[test]
     fn session_search_operations_are_owned_by_thread_store_module() {
         let history_source = include_str!("history.rs");
-        let thread_store_source = include_str!("thread_store.rs");
+        let thread_store_source = include_str!("thread_store/local.rs");
 
         assert!(
             !history_source.contains("pub struct SearchHit"),
@@ -2028,7 +2097,7 @@ mod tests {
     #[test]
     fn session_mutation_operations_are_owned_by_thread_store_module() {
         let history_source = include_str!("history.rs");
-        let thread_store_source = include_str!("thread_store.rs");
+        let thread_store_source = include_str!("thread_store/local.rs");
 
         for function_name in [
             "delete_session(",
