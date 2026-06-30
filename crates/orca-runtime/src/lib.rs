@@ -12,6 +12,7 @@ pub mod instructions;
 pub mod lifecycle;
 pub mod memory;
 pub mod mentions;
+pub mod network_proxy;
 pub mod notify;
 pub mod protocol;
 pub mod provider_turn;

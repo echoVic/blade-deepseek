@@ -416,6 +416,12 @@ impl PermissionProfileNetworkDomainsConfig {
     pub fn get(&self, domain: &str) -> Option<&PermissionProfileNetworkAccess> {
         self.entries.get(domain)
     }
+
+    pub fn entries(&self) -> impl Iterator<Item = (&str, &PermissionProfileNetworkAccess)> {
+        self.entries
+            .iter()
+            .map(|(domain, access)| (domain.as_str(), access))
+    }
 }
 
 impl PermissionProfileNetworkUnixSocketsConfig {

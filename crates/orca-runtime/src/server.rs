@@ -16,6 +16,7 @@ use crate::lifecycle::{
     RuntimePermissionRequest, RuntimePermissionRequestHandler, RuntimePermissionResponse,
     ThreadSteerHandle,
 };
+use crate::network_proxy::{RuntimeNetworkPolicy, RuntimeNetworkProxy};
 use crate::protocol::{self, ClientOp, ServerEvent, Submission};
 use crate::server_runtime::{
     PermissionProfileOverride, ServerRequestWriter, ServerThread, ServerThreadRuntime,
@@ -1759,6 +1760,40 @@ fn run_command_exec<W: Write>(
             return protocol::write_server_event(writer, &id, ServerEvent::error(error));
         }
     }
+    let network_proxy = if effective_sandbox.network_policy_domains.is_empty() {
+        None
+    } else {
+        match RuntimeNetworkProxy::start(RuntimeNetworkPolicy::new(
+            effective_sandbox.network_policy_domains.clone(),
+        )) {
+            Ok(proxy) => Some(proxy),
+            Err(error) => {
+                if let Some(process_id) = process_id {
+                    state.command_exec.remove(process_id);
+                }
+                return protocol::write_server_event(
+                    writer,
+                    &id,
+                    ServerEvent::error(format!("failed to start network proxy: {error}")),
+                );
+            }
+        }
+    };
+    let mut command_env = env.clone();
+    if let Some(proxy) = network_proxy.as_ref() {
+        for key in [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+        ] {
+            command_env
+                .entry(key.to_string())
+                .or_insert_with(|| Some(proxy.proxy_url().to_string()));
+        }
+    }
     let manager = state.shell_manager(&cwd);
     let handle = match manager.spawn(ShellSessionCommand {
         command: command_text.clone(),
@@ -1766,7 +1801,7 @@ fn run_command_exec<W: Write>(
         additional_readable_directories: effective_sandbox.additional_readable_roots,
         additional_working_directories,
         denied_working_directories: denied_writable_directories,
-        env: env.clone(),
+        env: command_env,
         description: command_text,
         terminal,
         sandbox: effective_sandbox.mode,
@@ -1916,6 +1951,7 @@ struct CommandExecSandbox {
     additional_readable_roots: Vec<PathBuf>,
     additional_writable_roots: Vec<PathBuf>,
     denied_writable_roots: Vec<PathBuf>,
+    network_policy_domains: HashMap<String, orca_core::config::PermissionProfileNetworkAccess>,
 }
 
 impl CommandExecSandbox {
@@ -1925,6 +1961,7 @@ impl CommandExecSandbox {
             additional_readable_roots: Vec::new(),
             additional_writable_roots: Vec::new(),
             denied_writable_roots: Vec::new(),
+            network_policy_domains: HashMap::new(),
         }
     }
 }
@@ -1999,6 +2036,7 @@ fn shell_sandbox_mode_from_permission_profile(
         additional_readable_roots,
         additional_writable_roots: resolved.additional_writable_roots,
         denied_writable_roots: resolved.denied_writable_roots,
+        network_policy_domains: resolved.network_policy_domains,
     })
 }
 
@@ -2009,6 +2047,7 @@ struct ResolvedPermissionProfile {
     additional_writable_roots: Vec<PathBuf>,
     denied_writable_roots: Vec<PathBuf>,
     network_access: Option<bool>,
+    network_policy_domains: HashMap<String, orca_core::config::PermissionProfileNetworkAccess>,
 }
 
 fn resolve_permission_profile(
@@ -2024,6 +2063,7 @@ fn resolve_permission_profile(
     let mut additional_writable_roots = Vec::new();
     let mut denied_writable_roots = Vec::new();
     let mut network_access = None;
+    let mut network_policy_domains = HashMap::new();
     while let Some(name) = current {
         if is_builtin_permission_profile_name(&name) {
             return Ok(ResolvedPermissionProfile {
@@ -2032,6 +2072,7 @@ fn resolve_permission_profile(
                 additional_writable_roots,
                 denied_writable_roots,
                 network_access,
+                network_policy_domains,
             });
         }
         if seen.iter().any(|seen_name| seen_name == &name) {
@@ -2045,10 +2086,10 @@ fn resolve_permission_profile(
         let Some(profile) = config.permission_profiles.get(&name) else {
             return Err(format!("unknown command/exec permissionProfile: {name}"));
         };
-        if !profile.network.domains.is_empty() {
-            return Err(format!(
-                "command/exec permissionProfile network domain policy is parsed but not enforceable yet: {name}"
-            ));
+        for (domain, access) in profile.network.domains.entries() {
+            network_policy_domains
+                .entry(domain.to_string())
+                .or_insert(*access);
         }
         if !profile.network.unix_sockets.is_empty() {
             return Err(format!(
@@ -2119,6 +2160,7 @@ fn resolve_permission_profile(
         additional_writable_roots,
         denied_writable_roots,
         network_access,
+        network_policy_domains,
     })
 }
 
@@ -3491,6 +3533,165 @@ mod tests {
                 exclude_slash_tmp: false
             }
         );
+    }
+
+    #[test]
+    fn command_exec_sandbox_materializes_custom_permission_profile_domain_policy() {
+        let mut config = test_run_config();
+        let file_config: orca_core::config::file::FileConfig = toml::from_str(
+            r#"
+[permission_profiles.limited-network]
+extends = ":workspace"
+
+[permission_profiles.limited-network.network]
+enabled = true
+
+[permission_profiles.limited-network.network.domains]
+"api.example.com" = "allow"
+"blocked.example.com" = "deny"
+"#,
+        )
+        .expect("domain policy config");
+        config.permission_profiles = file_config.permission_profiles;
+        let options = protocol::CommandExecOptions {
+            permission_profile: Some("limited-network".to_string()),
+            ..Default::default()
+        };
+
+        let sandbox = test_profile_sandbox(&config, &options).expect("domain policy profile");
+
+        assert_eq!(
+            sandbox.network_policy_domains.get("api.example.com"),
+            Some(&orca_core::config::PermissionProfileNetworkAccess::Allow)
+        );
+        assert_eq!(
+            sandbox.network_policy_domains.get("blocked.example.com"),
+            Some(&orca_core::config::PermissionProfileNetworkAccess::Deny)
+        );
+    }
+
+    #[test]
+    fn command_exec_sandbox_child_domain_policy_overrides_parent_policy() {
+        let mut config = test_run_config();
+        let file_config: orca_core::config::file::FileConfig = toml::from_str(
+            r#"
+[permission_profiles.parent]
+extends = ":workspace"
+
+[permission_profiles.parent.network.domains]
+"api.example.com" = "deny"
+
+[permission_profiles.child]
+extends = "parent"
+
+[permission_profiles.child.network.domains]
+"api.example.com" = "allow"
+"#,
+        )
+        .expect("domain policy config");
+        config.permission_profiles = file_config.permission_profiles;
+        let options = protocol::CommandExecOptions {
+            permission_profile: Some("child".to_string()),
+            ..Default::default()
+        };
+
+        let sandbox = test_profile_sandbox(&config, &options).expect("domain policy profile");
+
+        assert_eq!(
+            sandbox.network_policy_domains.get("api.example.com"),
+            Some(&orca_core::config::PermissionProfileNetworkAccess::Allow)
+        );
+    }
+
+    #[test]
+    fn command_exec_permission_profile_domain_policy_blocks_denied_http_request() {
+        let mut config = test_run_config();
+        let file_config: orca_core::config::file::FileConfig = toml::from_str(
+            r#"
+[permission_profiles.limited-network]
+extends = ":workspace"
+
+[permission_profiles.limited-network.network]
+enabled = true
+
+[permission_profiles.limited-network.network.domains]
+"blocked.orca.invalid" = "deny"
+"#,
+        )
+        .expect("domain policy config");
+        config.permission_profiles = file_config.permission_profiles;
+        let cwd = tempdir().expect("cwd");
+        config.cwd = Some(cwd.path().to_path_buf());
+        let input = Cursor::new(
+            br#"{"id":"cmd-deny","method":"command/exec","params":{"command":["sh","-lc","curl --noproxy '' -sS -o /dev/null -w '%{http_code}' http://blocked.orca.invalid/ || true"],"permissionProfile":"limited-network","timeoutMs":5000}}"#
+                .to_vec(),
+        );
+        let output = SharedVecWriter::default();
+
+        run_with_io(ServerConfig { run_config: config }, input, output.clone())
+            .expect("server run");
+
+        let events = parse_jsonl(&output.bytes());
+        let completed = events
+            .iter()
+            .find(|event| event["event"] == "command_exec_completed")
+            .expect("command completed");
+        assert_eq!(completed["stdout"], "403");
+        assert_eq!(completed["exitCode"], 0);
+    }
+
+    #[test]
+    fn command_exec_permission_profile_domain_policy_allows_http_request() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind test server");
+        let port = listener.local_addr().expect("server addr").port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut reader = std::io::BufReader::new(stream.try_clone().expect("clone stream"));
+            let mut line = String::new();
+            while reader.read_line(&mut line).expect("read request") != 0 {
+                if line == "\r\n" || line == "\n" {
+                    break;
+                }
+                line.clear();
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 7\r\n\r\nallowed")
+                .expect("write response");
+        });
+        let mut config = test_run_config();
+        let file_config: orca_core::config::file::FileConfig = toml::from_str(
+            r#"
+[permission_profiles.limited-network]
+extends = ":workspace"
+
+[permission_profiles.limited-network.network]
+enabled = true
+
+[permission_profiles.limited-network.network.domains]
+"127.0.0.1" = "allow"
+"#,
+        )
+        .expect("domain policy config");
+        config.permission_profiles = file_config.permission_profiles;
+        let cwd = tempdir().expect("cwd");
+        config.cwd = Some(cwd.path().to_path_buf());
+        let request = format!(
+            r#"{{"id":"cmd-allow","method":"command/exec","params":{{"command":["sh","-lc","curl --noproxy '' -sS http://127.0.0.1:{port}/"],"permissionProfile":"limited-network","timeoutMs":5000}}}}"#
+        );
+        let input = Cursor::new(request.into_bytes());
+        let output = SharedVecWriter::default();
+
+        run_with_io(ServerConfig { run_config: config }, input, output.clone())
+            .expect("server run");
+
+        server.join().expect("server joined");
+        let events = parse_jsonl(&output.bytes());
+        let completed = events
+            .iter()
+            .find(|event| event["event"] == "command_exec_completed")
+            .expect("command completed");
+        assert_eq!(completed["stdout"], "allowed");
+        assert_eq!(completed["exitCode"], 0);
     }
 
     #[test]

@@ -3108,12 +3108,12 @@ fn server_mode_command_exec_configured_permission_profile_materializes_minimal_s
 }
 
 #[test]
-fn server_mode_command_exec_configured_permission_profile_rejects_network_domain_policy() {
+fn server_mode_command_exec_configured_permission_profile_enforces_network_domain_policy() {
     with_orca_home(|home| {
         let workspace = tempdir().expect("workspace");
         std::fs::write(
             home.join("config.toml"),
-            "[permission_profiles.net]\nextends = \":read-only\"\n\n[permission_profiles.net.network]\nenabled = true\n\n[permission_profiles.net.network.domains]\n\"api.example.com\" = \"allow\"\n",
+            "[permission_profiles.net]\nextends = \":workspace\"\n\n[permission_profiles.net.network]\nenabled = true\n\n[permission_profiles.net.network.domains]\n\"blocked.orca.invalid\" = \"deny\"\n",
         )
         .expect("write permission profile config");
 
@@ -3137,7 +3137,7 @@ fn server_mode_command_exec_configured_permission_profile_rejects_network_domain
             let stdin = child.stdin.as_mut().expect("server stdin");
             writeln!(
                 stdin,
-                r#"{{"id":"cmd","method":"command/exec","params":{{"command":["sh","-lc","true"],"permissionProfile":"net"}}}}"#
+                r#"{{"id":"cmd","method":"command/exec","params":{{"command":["sh","-lc","curl --noproxy '' -sS -o /dev/null -w '%{{http_code}}' http://blocked.orca.invalid/ || true"],"permissionProfile":"net","timeoutMs":5000}}}}"#
             )
             .expect("write network domain permissionProfile command/exec");
             stdin
@@ -3151,13 +3151,11 @@ fn server_mode_command_exec_configured_permission_profile_rejects_network_domain
         assert!(output.stderr.is_empty());
 
         let events = parse_jsonl(&output.stdout);
-        assert_eq!(events.len(), 1, "expected one error event: {events:?}");
+        assert_eq!(events.len(), 1, "expected one command event: {events:?}");
         assert_eq!(events[0]["id"], "cmd");
-        assert_eq!(events[0]["event"], "error");
-        assert_eq!(
-            events[0]["message"],
-            "command/exec permissionProfile network domain policy is parsed but not enforceable yet: net"
-        );
+        assert_eq!(events[0]["event"], "command_exec_completed");
+        assert_eq!(events[0]["stdout"], "403");
+        assert_eq!(events[0]["exitCode"], 0);
     });
 }
 

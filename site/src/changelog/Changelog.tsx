@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.74":
+        "Permission-profile network domain policies now run through a managed loopback HTTP proxy for command/exec, so allowed hosts can pass and denied hosts return a policy 403.",
       "v0.1.73":
         "Permission-profile filesystem globs now support configurable scan depth through glob_scan_max_depth / globScanMaxDepth, with inherited profile defaults and child-profile overrides.",
       "v0.1.72":
@@ -174,6 +176,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.74":
+        "权限 profile 的 network domain policy 现在会通过 command/exec 的本地 HTTP 代理执行：允许的 host 可访问，被 deny 的 host 返回 policy 403。",
       "v0.1.73":
         "权限 profile 的文件系统 glob 现在支持通过 glob_scan_max_depth / globScanMaxDepth 配置扫描深度，并支持父 profile 默认值与子 profile 覆盖。",
       "v0.1.72":
