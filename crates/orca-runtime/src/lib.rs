@@ -25,6 +25,7 @@ pub mod thread_store;
 pub mod tool_execution;
 pub mod tool_invocation;
 pub(crate) mod tool_item_projection;
+pub mod tool_turn;
 pub mod update_check;
 pub mod workflow;
 pub mod workflow_execution;
@@ -257,9 +258,10 @@ mod tests {
     }
 
     #[test]
-    fn tool_request_cursor_is_owned_by_tool_invocation_module() {
+    fn tool_request_cursor_is_owned_by_tool_turn_module() {
         let agent_loop_source = include_str!("agent_loop.rs");
         let tool_invocation_source = include_str!("tool_invocation.rs");
+        let tool_turn_source = include_str!("tool_turn.rs");
 
         for marker in ["let mut index = 0", "index += 1", "index = batch_end"] {
             assert!(
@@ -272,23 +274,28 @@ mod tests {
             "agent_loop must delegate tool request cursor state through tool-turn dispatch"
         );
         assert!(
+            !tool_invocation_source.contains("struct ToolRequestCursor"),
+            "tool_invocation must not own tool-turn cursor state"
+        );
+        assert!(
             agent_loop_source.contains("RuntimeTurnLoopStep"),
             "agent_loop must delegate tool request cursor use through turn loop"
         );
         assert!(
-            tool_invocation_source.contains("pub(crate) struct ToolRequestCursor"),
-            "tool_invocation must own tool request cursor state"
+            tool_turn_source.contains("pub(crate) struct ToolRequestCursor"),
+            "tool_turn must own tool request cursor state"
         );
         assert!(
-            tool_invocation_source.contains("fn advance_to"),
-            "tool_invocation must own cursor batch advancement"
+            tool_turn_source.contains("fn advance_to"),
+            "tool_turn must own cursor batch advancement"
         );
     }
 
     #[test]
-    fn tool_turn_outcome_is_owned_by_tool_invocation_module() {
+    fn tool_turn_outcome_is_owned_by_tool_turn_module() {
         let agent_loop_source = include_str!("agent_loop.rs");
         let tool_invocation_source = include_str!("tool_invocation.rs");
+        let tool_turn_source = include_str!("tool_turn.rs");
 
         assert!(
             !agent_loop_source.contains("return Ok(AgentLoopResult {\n                            status,\n                            final_message: None,\n                            error,\n                        });"),
@@ -303,19 +310,24 @@ mod tests {
             "agent_loop must delegate provider response outcome folding through lifecycle"
         );
         assert!(
-            tool_invocation_source.contains("pub(crate) enum ToolTurnOutcome"),
-            "tool_invocation must own tool-turn outcome state"
+            !tool_invocation_source.contains("enum ToolTurnOutcome"),
+            "tool_invocation must not own tool-turn outcome state"
         );
         assert!(
-            tool_invocation_source.contains("pub(crate) fn terminal_tool_turn"),
-            "tool_invocation must expose terminal tool-turn construction"
+            tool_turn_source.contains("pub(crate) enum ToolTurnOutcome"),
+            "tool_turn must own tool-turn outcome state"
+        );
+        assert!(
+            tool_turn_source.contains("pub(crate) fn terminal_tool_turn"),
+            "tool_turn must expose terminal tool-turn construction"
         );
     }
 
     #[test]
-    fn normal_tool_turn_runner_is_owned_by_tool_invocation_module() {
+    fn normal_tool_turn_runner_is_owned_by_tool_turn_module() {
         let agent_loop_source = include_str!("agent_loop.rs");
         let tool_invocation_source = include_str!("tool_invocation.rs");
+        let tool_turn_source = include_str!("tool_turn.rs");
 
         for marker in [
             "execute_tool_with_approval(",
@@ -336,23 +348,28 @@ mod tests {
             "agent_loop must delegate normal tool-turn execution through turn loop"
         );
         assert!(
-            tool_invocation_source.contains("pub(crate) fn run_normal_tool_turn"),
-            "tool_invocation must expose normal tool-turn runner"
+            !tool_invocation_source.contains("fn run_normal_tool_turn"),
+            "tool_invocation must not own normal tool-turn runner"
         );
         assert!(
-            tool_invocation_source.contains("execute_tool_with_approval"),
-            "tool_invocation must compose normal tool execution"
+            tool_turn_source.contains("pub(crate) fn run_normal_tool_turn"),
+            "tool_turn must expose normal tool-turn runner"
         );
         assert!(
-            tool_invocation_source.contains("record_normal_tool_result"),
-            "tool_invocation must compose normal tool result recording"
+            tool_turn_source.contains("execute_tool_with_approval"),
+            "tool_turn must compose normal tool execution"
+        );
+        assert!(
+            tool_turn_source.contains("record_normal_tool_result"),
+            "tool_turn must compose normal tool result recording"
         );
     }
 
     #[test]
-    fn readonly_tool_turn_runner_is_owned_by_tool_invocation_module() {
+    fn readonly_tool_turn_runner_is_owned_by_tool_turn_module() {
         let agent_loop_source = include_str!("agent_loop.rs");
         let tool_invocation_source = include_str!("tool_invocation.rs");
+        let tool_turn_source = include_str!("tool_turn.rs");
 
         for marker in ["execute_readonly_batch(", "record_readonly_batch_results("] {
             assert!(
@@ -369,16 +386,20 @@ mod tests {
             "agent_loop must delegate readonly tool-turn execution through turn loop"
         );
         assert!(
-            tool_invocation_source.contains("pub(crate) fn run_readonly_tool_turn"),
-            "tool_invocation must expose readonly tool-turn runner"
+            !tool_invocation_source.contains("fn run_readonly_tool_turn"),
+            "tool_invocation must not own readonly tool-turn runner"
         );
         assert!(
-            tool_invocation_source.contains("execute_readonly_batch"),
-            "tool_invocation must compose readonly batch execution"
+            tool_turn_source.contains("pub(crate) fn run_readonly_tool_turn"),
+            "tool_turn must expose readonly tool-turn runner"
         );
         assert!(
-            tool_invocation_source.contains("record_readonly_batch_results"),
-            "tool_invocation must compose readonly batch result recording"
+            tool_turn_source.contains("execute_readonly_batch"),
+            "tool_turn must compose readonly batch execution"
+        );
+        assert!(
+            tool_turn_source.contains("record_readonly_batch_results"),
+            "tool_turn must compose readonly batch result recording"
         );
     }
 
@@ -402,9 +423,10 @@ mod tests {
     }
 
     #[test]
-    fn normal_tool_result_recording_is_owned_by_tool_invocation_module() {
+    fn normal_tool_result_recording_is_owned_by_tool_turn_module() {
         let agent_loop_source = include_str!("agent_loop.rs");
         let tool_invocation_source = include_str!("tool_invocation.rs");
+        let tool_turn_source = include_str!("tool_turn.rs");
 
         for marker in [
             "record_plan_state_for_agent(",
@@ -425,39 +447,48 @@ mod tests {
             "agent_loop must delegate normal tool turn recording through turn loop"
         );
         assert!(
-            tool_invocation_source.contains("pub(crate) fn record_normal_tool_result"),
-            "tool_invocation must expose normal tool result recording"
+            !tool_invocation_source.contains("fn record_normal_tool_result"),
+            "tool_invocation must not own normal tool result recording"
         );
         assert!(
-            tool_invocation_source.contains("record_plan_state_for_agent"),
-            "tool_invocation must own normal tool plan-state recording"
+            tool_turn_source.contains("pub(crate) fn record_normal_tool_result"),
+            "tool_turn must expose normal tool result recording"
         );
         assert!(
-            tool_invocation_source.contains("record_tool_result_for_agent"),
-            "tool_invocation must own normal tool result recording"
+            tool_turn_source.contains("record_plan_state_for_agent"),
+            "tool_turn must own normal tool plan-state recording"
+        );
+        assert!(
+            tool_turn_source.contains("record_tool_result_for_agent"),
+            "tool_turn must own normal tool result recording"
         );
     }
 
     #[test]
-    fn readonly_tool_batch_is_owned_by_tool_invocation_module() {
+    fn readonly_tool_batch_is_owned_by_tool_turn_module() {
         let agent_loop_source = include_str!("agent_loop.rs");
         let tool_invocation_source = include_str!("tool_invocation.rs");
+        let tool_turn_source = include_str!("tool_turn.rs");
 
         assert!(
             !agent_loop_source.contains("fn execute_readonly_batch"),
             "agent_loop must not own readonly tool batch execution"
         );
         assert!(
-            tool_invocation_source.contains("pub(crate) fn execute_readonly_batch"),
-            "tool_invocation must expose readonly tool batch execution"
+            !tool_invocation_source.contains("fn execute_readonly_batch"),
+            "tool_invocation must not own readonly tool batch execution"
         );
         assert!(
-            tool_invocation_source.contains("pub(crate) fn should_run_readonly_batch"),
-            "tool_invocation must expose readonly batch planning"
+            tool_turn_source.contains("pub(crate) fn execute_readonly_batch"),
+            "tool_turn must expose readonly tool batch execution"
         );
         assert!(
-            tool_invocation_source.contains("pub(crate) fn collect_readonly_batch"),
-            "tool_invocation must expose readonly batch range collection"
+            tool_turn_source.contains("pub(crate) fn should_run_readonly_batch"),
+            "tool_turn must expose readonly batch planning"
+        );
+        assert!(
+            tool_turn_source.contains("pub(crate) fn collect_readonly_batch"),
+            "tool_turn must expose readonly batch range collection"
         );
         for marker in [
             "orca_tools::should_run_readonly_batch",
@@ -474,9 +505,10 @@ mod tests {
     }
 
     #[test]
-    fn readonly_tool_batch_result_recording_is_owned_by_tool_invocation_module() {
+    fn readonly_tool_batch_result_recording_is_owned_by_tool_turn_module() {
         let agent_loop_source = include_str!("agent_loop.rs");
         let tool_invocation_source = include_str!("tool_invocation.rs");
+        let tool_turn_source = include_str!("tool_turn.rs");
 
         assert!(
             !agent_loop_source.contains("record_tool_result_for_agent("),
@@ -491,12 +523,16 @@ mod tests {
             "agent_loop must delegate readonly tool turn recording through turn loop"
         );
         assert!(
-            tool_invocation_source.contains("pub(crate) fn record_readonly_batch_results"),
-            "tool_invocation must expose readonly batch result recording"
+            !tool_invocation_source.contains("fn record_readonly_batch_results"),
+            "tool_invocation must not own readonly batch result recording"
         );
         assert!(
-            tool_invocation_source.contains("record_tool_result_for_agent"),
-            "tool_invocation must reuse shared session tool result recording"
+            tool_turn_source.contains("pub(crate) fn record_readonly_batch_results"),
+            "tool_turn must expose readonly batch result recording"
+        );
+        assert!(
+            tool_turn_source.contains("record_tool_result_for_agent"),
+            "tool_turn must reuse shared session tool result recording"
         );
     }
 
@@ -561,9 +597,10 @@ mod tests {
     }
 
     #[test]
-    fn tool_turn_dispatch_loop_is_owned_by_tool_invocation_module() {
+    fn tool_turn_dispatch_loop_is_owned_by_tool_turn_module() {
         let agent_loop_source = include_str!("agent_loop.rs");
         let tool_invocation_source = include_str!("tool_invocation.rs");
+        let tool_turn_source = include_str!("tool_turn.rs");
 
         for marker in [
             "let mut cursor = ToolRequestCursor::new",
@@ -589,24 +626,28 @@ mod tests {
             "agent_loop must delegate tool-turn dispatch through turn loop"
         );
         assert!(
-            tool_invocation_source.contains("pub(crate) fn run_tool_turns"),
-            "tool_invocation must expose the tool-turn dispatch runner"
+            !tool_invocation_source.contains("fn run_tool_turns"),
+            "tool_invocation must not own the tool-turn dispatch runner"
         );
         assert!(
-            tool_invocation_source.contains("ToolRequestCursor::new"),
-            "tool_invocation must own dispatch cursor state"
+            tool_turn_source.contains("pub(crate) fn run_tool_turns"),
+            "tool_turn must expose the tool-turn dispatch runner"
         );
         assert!(
-            tool_invocation_source.contains("run_normal_tool_turn"),
-            "tool_invocation must compose normal tool turns"
+            tool_turn_source.contains("ToolRequestCursor::new"),
+            "tool_turn must own dispatch cursor state"
         );
         assert!(
-            tool_invocation_source.contains("run_readonly_tool_turn"),
-            "tool_invocation must compose readonly tool turns"
+            tool_turn_source.contains("run_normal_tool_turn"),
+            "tool_turn must compose normal tool turns"
         );
         assert!(
-            tool_invocation_source.contains("run_subagent_batch_tool_turn"),
-            "tool_invocation must compose subagent batch tool turns"
+            tool_turn_source.contains("run_readonly_tool_turn"),
+            "tool_turn must compose readonly tool turns"
+        );
+        assert!(
+            tool_turn_source.contains("run_subagent_batch_tool_turn"),
+            "tool_turn must compose subagent batch tool turns"
         );
     }
 

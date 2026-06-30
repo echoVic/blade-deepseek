@@ -29,9 +29,10 @@ use crate::subagent::{self, SubagentIsolation, SubagentMode};
 use crate::tasks::TaskRegistry;
 use crate::thread_store::SessionWriter;
 use crate::tool_invocation::{
-    ToolTurnOutcome, apply_pre_tool_outcome_with_external, prepare_tool_invocation_with_external,
+    apply_pre_tool_outcome_with_external, prepare_tool_invocation_with_external,
     validate_tool_invocation_with_external,
 };
+use crate::tool_turn::ToolTurnOutcome;
 use crate::workflow::ipc::WorkflowIpcContext;
 use crate::worktree::{WorktreeGuard, WorktreeOutcome};
 
@@ -972,7 +973,7 @@ mod tests {
     use orca_core::tool_types;
     use orca_mcp::McpRegistry;
 
-    use crate::tool_invocation::ToolTurnOutcome;
+    use crate::tool_turn::ToolTurnOutcome;
 
     fn config(subagents: SubagentConfig) -> RunConfig {
         RunConfig {

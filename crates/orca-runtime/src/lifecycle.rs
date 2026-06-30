@@ -37,9 +37,9 @@ use crate::tasks::TaskRegistry;
 use crate::thread_store::SessionWriter;
 use crate::tool_execution::policy_for_tool_execution;
 use crate::tool_invocation::{
-    AgentToolPolicyContext, ToolTurnOutcome, provider_config_for_agent_loop, run_tool_turns,
-    tool_requests_from_provider_steps,
+    AgentToolPolicyContext, provider_config_for_agent_loop, tool_requests_from_provider_steps,
 };
+use crate::tool_turn::{ToolTurnOutcome, run_tool_turns};
 use crate::workflow::WorkflowDraftStore;
 use crate::workflow::ipc::WorkflowIpcContext;
 use crate::workflow::runner::SharedEventBuffer;
