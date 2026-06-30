@@ -13,6 +13,7 @@ pub mod memory;
 pub mod mentions;
 pub mod notify;
 pub mod protocol;
+pub mod provider_turn;
 pub mod schema_validation;
 pub mod server;
 pub mod server_runtime;
@@ -962,9 +963,10 @@ mod tests {
     }
 
     #[test]
-    fn runtime_provider_turn_step_is_owned_by_lifecycle_module() {
+    fn runtime_provider_turn_step_is_owned_by_provider_turn_module() {
         let agent_loop_source = include_str!("agent_loop.rs");
         let lifecycle_source = include_str!("lifecycle.rs");
+        let provider_turn_source = include_str!("provider_turn.rs");
 
         assert!(
             !agent_loop_source.contains("struct RuntimeProviderTurnStep"),
@@ -975,12 +977,20 @@ mod tests {
             "agent_loop must not own runtime provider turn step behavior"
         );
         assert!(
-            lifecycle_source.contains("struct RuntimeProviderTurnStep"),
-            "lifecycle must own runtime provider turn step state"
+            !lifecycle_source.contains("struct RuntimeProviderTurnStep"),
+            "lifecycle must not own runtime provider turn step state"
         );
         assert!(
-            lifecycle_source.contains("impl RuntimeProviderTurnStep"),
-            "lifecycle must own runtime provider turn step behavior"
+            !lifecycle_source.contains("impl RuntimeProviderTurnStep"),
+            "lifecycle must not own runtime provider turn step behavior"
+        );
+        assert!(
+            provider_turn_source.contains("struct RuntimeProviderTurnStep"),
+            "provider_turn must own runtime provider turn step state"
+        );
+        assert!(
+            provider_turn_source.contains("impl RuntimeProviderTurnStep"),
+            "provider_turn must own runtime provider turn step behavior"
         );
 
         for marker in [
@@ -991,12 +1001,16 @@ mod tests {
             "ProviderStep::ReplayState",
             "ProviderStep::Error",
             "is_prompt_too_long_error",
-            "events.error(&error)",
+            "compaction.emit_error(",
             "append_usage(",
         ] {
             assert!(
                 !agent_loop_source.contains(marker),
                 "agent_loop must not own provider turn detail {marker}"
+            );
+            assert!(
+                provider_turn_source.contains(marker),
+                "provider_turn must own provider turn detail {marker}"
             );
         }
     }
@@ -1351,6 +1365,7 @@ mod tests {
     fn runtime_provider_response_step_is_owned_by_lifecycle_module() {
         let agent_loop_source = include_str!("agent_loop.rs");
         let lifecycle_source = include_str!("lifecycle.rs");
+        let provider_turn_source = include_str!("provider_turn.rs");
 
         for marker in [
             "record_assistant_response_for_agent(",
@@ -1383,21 +1398,32 @@ mod tests {
             !agent_loop_source.contains("RuntimeProviderResponseOutcome::Return"),
             "agent_loop must not own provider response return outcome folding"
         );
+        for marker in [
+            "struct RuntimeProviderResponseStep",
+            "struct RuntimeProviderResponseResultStep",
+            "impl RuntimeProviderResponseStep",
+            "impl RuntimeProviderResponseResultStep",
+        ] {
+            assert!(
+                !lifecycle_source.contains(marker),
+                "lifecycle must not own provider response step detail {marker}"
+            );
+        }
         assert!(
-            lifecycle_source.contains("struct RuntimeProviderResponseStep"),
-            "lifecycle must own provider response step state"
+            provider_turn_source.contains("struct RuntimeProviderResponseStep"),
+            "provider_turn must own provider response step state"
         );
         assert!(
-            lifecycle_source.contains("struct RuntimeProviderResponseResultStep"),
-            "lifecycle must own provider response result folding step state"
+            provider_turn_source.contains("struct RuntimeProviderResponseResultStep"),
+            "provider_turn must own provider response result folding step state"
         );
         assert!(
-            lifecycle_source.contains("impl RuntimeProviderResponseStep"),
-            "lifecycle must own provider response step behavior"
+            provider_turn_source.contains("impl RuntimeProviderResponseStep"),
+            "provider_turn must own provider response step behavior"
         );
         assert!(
-            lifecycle_source.contains("impl RuntimeProviderResponseResultStep"),
-            "lifecycle must own provider response result folding step behavior"
+            provider_turn_source.contains("impl RuntimeProviderResponseResultStep"),
+            "provider_turn must own provider response result folding step behavior"
         );
         for marker in [
             "record_assistant_response_for_agent(",
@@ -1406,8 +1432,8 @@ mod tests {
             "run_tool_turns(",
         ] {
             assert!(
-                lifecycle_source.contains(marker),
-                "lifecycle must compose provider response handling detail {marker}"
+                provider_turn_source.contains(marker),
+                "provider_turn must compose provider response handling detail {marker}"
             );
         }
     }
@@ -1487,6 +1513,7 @@ mod tests {
     fn runtime_provider_turn_terminal_folding_is_owned_by_lifecycle_module() {
         let agent_loop_source = include_str!("agent_loop.rs");
         let lifecycle_source = include_str!("lifecycle.rs");
+        let provider_turn_source = include_str!("provider_turn.rs");
 
         for marker in [
             "provider_turn.response",
@@ -1511,29 +1538,41 @@ mod tests {
             !agent_loop_source.contains("RuntimeProviderTurnResultOutcome"),
             "agent_loop must not own provider turn result outcome folding"
         );
+        for marker in [
+            "struct RuntimeProviderTurnResultStep",
+            "struct RuntimeProviderTurnResultResultStep",
+            "impl RuntimeProviderTurnResultStep",
+            "impl RuntimeProviderTurnResultResultStep",
+            "pub(crate) fn provider_response_or_terminal",
+        ] {
+            assert!(
+                !lifecycle_source.contains(marker),
+                "lifecycle must not own provider turn terminal folding detail {marker}"
+            );
+        }
         assert!(
-            lifecycle_source.contains("struct RuntimeProviderTurnResultStep"),
-            "lifecycle must own provider turn result step state"
+            provider_turn_source.contains("struct RuntimeProviderTurnResultStep"),
+            "provider_turn must own provider turn result step state"
         );
         assert!(
-            lifecycle_source.contains("struct RuntimeProviderTurnResultResultStep"),
-            "lifecycle must own provider turn result folding step state"
+            provider_turn_source.contains("struct RuntimeProviderTurnResultResultStep"),
+            "provider_turn must own provider turn result folding step state"
         );
         assert!(
-            lifecycle_source.contains("impl RuntimeProviderTurnResultStep"),
-            "lifecycle must own provider turn result step behavior"
+            provider_turn_source.contains("impl RuntimeProviderTurnResultStep"),
+            "provider_turn must own provider turn result step behavior"
         );
         assert!(
-            lifecycle_source.contains("impl RuntimeProviderTurnResultResultStep"),
-            "lifecycle must own provider turn result folding step behavior"
+            provider_turn_source.contains("impl RuntimeProviderTurnResultResultStep"),
+            "provider_turn must own provider turn result folding step behavior"
         );
         assert!(
-            lifecycle_source.contains("pub(crate) fn provider_response_or_terminal"),
-            "lifecycle must expose provider turn terminal folding"
+            provider_turn_source.contains("pub(crate) fn provider_response_or_terminal"),
+            "provider_turn must expose provider turn terminal folding"
         );
         assert!(
-            lifecycle_source.contains("terminal_error"),
-            "lifecycle must own provider turn terminal error extraction"
+            provider_turn_source.contains("terminal_error"),
+            "provider_turn must own provider turn terminal error extraction"
         );
     }
 
@@ -1670,6 +1709,7 @@ mod tests {
     fn runtime_provider_error_step_is_owned_by_lifecycle_module() {
         let agent_loop_source = include_str!("agent_loop.rs");
         let lifecycle_source = include_str!("lifecycle.rs");
+        let provider_turn_source = include_str!("provider_turn.rs");
 
         for marker in [
             "let mut reactive_compacted",
@@ -1695,29 +1735,41 @@ mod tests {
             !agent_loop_source.contains("RuntimeProviderErrorResultStep"),
             "agent_loop must delegate runtime provider-error result folding through turn loop"
         );
+        for marker in [
+            "struct RuntimeProviderErrorStep",
+            "struct RuntimeProviderErrorResultStep",
+            "impl RuntimeProviderErrorStep",
+            "impl RuntimeProviderErrorResultStep",
+            "handle_provider_error(",
+        ] {
+            assert!(
+                !lifecycle_source.contains(marker),
+                "lifecycle must not own runtime provider-error detail {marker}"
+            );
+        }
         assert!(
-            lifecycle_source.contains("struct RuntimeProviderErrorStep"),
-            "lifecycle must own runtime provider-error step state"
+            provider_turn_source.contains("struct RuntimeProviderErrorStep"),
+            "provider_turn must own runtime provider-error step state"
         );
         assert!(
-            lifecycle_source.contains("struct RuntimeProviderErrorResultStep"),
-            "lifecycle must own runtime provider-error result step state"
+            provider_turn_source.contains("struct RuntimeProviderErrorResultStep"),
+            "provider_turn must own runtime provider-error result step state"
         );
         assert!(
-            lifecycle_source.contains("impl RuntimeProviderErrorStep"),
-            "lifecycle must own runtime provider-error step behavior"
+            provider_turn_source.contains("impl RuntimeProviderErrorStep"),
+            "provider_turn must own runtime provider-error step behavior"
         );
         assert!(
-            lifecycle_source.contains("impl RuntimeProviderErrorResultStep"),
-            "lifecycle must own runtime provider-error result step behavior"
+            provider_turn_source.contains("impl RuntimeProviderErrorResultStep"),
+            "provider_turn must own runtime provider-error result step behavior"
         );
         assert!(
-            lifecycle_source.contains("reactive_compacted"),
-            "lifecycle must own reactive compaction loop state"
+            provider_turn_source.contains("reactive_compacted"),
+            "provider_turn must own reactive compaction loop state"
         );
         assert!(
-            lifecycle_source.contains("handle_provider_error("),
-            "lifecycle must keep provider error classification behind the step"
+            provider_turn_source.contains("handle_provider_error("),
+            "provider_turn must keep provider error classification behind the step"
         );
     }
 
@@ -1725,6 +1777,7 @@ mod tests {
     fn runtime_turn_provider_cycle_step_is_owned_by_lifecycle_module() {
         let agent_loop_source = include_str!("agent_loop.rs");
         let lifecycle_source = include_str!("lifecycle.rs");
+        let provider_turn_source = include_str!("provider_turn.rs");
 
         for marker in [
             "RuntimeProviderTurnStep::new",
@@ -1745,12 +1798,24 @@ mod tests {
             "agent_loop must delegate runtime provider cycle"
         );
         assert!(
-            lifecycle_source.contains("struct RuntimeTurnProviderCycleStep"),
-            "lifecycle must own runtime provider cycle step state"
+            !lifecycle_source.contains("struct RuntimeTurnProviderCycleStep"),
+            "lifecycle must not own runtime provider cycle step state"
         );
         assert!(
-            lifecycle_source.contains("impl RuntimeTurnProviderCycleStep"),
-            "lifecycle must own runtime provider cycle step behavior"
+            !lifecycle_source.contains("impl RuntimeTurnProviderCycleStep"),
+            "lifecycle must not own runtime provider cycle step behavior"
+        );
+        assert!(
+            lifecycle_source.contains("RuntimeTurnProviderCycleStep::new"),
+            "lifecycle must compose runtime provider cycle through provider_turn boundary"
+        );
+        assert!(
+            provider_turn_source.contains("struct RuntimeTurnProviderCycleStep"),
+            "provider_turn must own runtime provider cycle step state"
+        );
+        assert!(
+            provider_turn_source.contains("impl RuntimeTurnProviderCycleStep"),
+            "provider_turn must own runtime provider cycle step behavior"
         );
         for marker in [
             "RuntimeProviderTurnStep::new",
@@ -1762,8 +1827,12 @@ mod tests {
             "RuntimeProviderResponseResultStep::new",
         ] {
             assert!(
-                lifecycle_source.contains(marker),
-                "lifecycle must compose runtime provider cycle detail {marker}"
+                !lifecycle_source.contains(marker),
+                "lifecycle must not own runtime provider cycle detail {marker}"
+            );
+            assert!(
+                provider_turn_source.contains(marker),
+                "provider_turn must compose runtime provider cycle detail {marker}"
             );
         }
     }
