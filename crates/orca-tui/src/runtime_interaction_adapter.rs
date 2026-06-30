@@ -1,12 +1,20 @@
 use std::sync::mpsc::{Receiver, Sender};
 
+use orca_approval::ApprovalPolicy;
 use orca_core::approval_types::{ApprovalDecision, ApprovalRequest, ApprovalResolution};
 use orca_core::tool_types;
 use orca_runtime::lifecycle::{
-    RuntimeApprovalHandler, RuntimeUserInputHandler, RuntimeUserInputRequest,
+    RuntimeApprovalDecision, RuntimeApprovalHandler, RuntimeToolActorContext,
+    RuntimeUserInputHandler, RuntimeUserInputRequest,
 };
+use orca_runtime::tool_invocation::{ToolInvocation, approval_request_for_invocation};
 
 use crate::types::{TuiEvent, UserAction};
+
+pub(crate) enum TuiToolApprovalOutcome {
+    Continue,
+    Denied(tool_types::ToolResult),
+}
 
 pub(crate) struct TuiApprovalHandler<'a> {
     action_rx: &'a Receiver<UserAction>,
@@ -44,6 +52,107 @@ impl RuntimeApprovalHandler for TuiApprovalHandler<'_> {
                 "user denied".to_string()
             },
         })
+    }
+}
+
+pub(crate) fn resolve_tui_tool_approval(
+    invocation: &ToolInvocation,
+    tool_request: &tool_types::ToolRequest,
+    policy: &ApprovalPolicy,
+    runtime_context: &mut RuntimeToolActorContext,
+    event_tx: &Sender<TuiEvent>,
+    action_rx: &Receiver<UserAction>,
+) -> TuiToolApprovalOutcome {
+    let Some(approval) = approval_request_for_invocation(invocation) else {
+        return TuiToolApprovalOutcome::Continue;
+    };
+    if !orca_runtime::agent_common::requires_approval(approval.action) {
+        return TuiToolApprovalOutcome::Continue;
+    }
+
+    let approval_decision =
+        runtime_context.resolve_tool_approval(policy, Some(approval.clone()), tool_request);
+    match approval_decision {
+        RuntimeApprovalDecision::Allowed(_) | RuntimeApprovalDecision::NotRequired => {
+            TuiToolApprovalOutcome::Continue
+        }
+        RuntimeApprovalDecision::Ask(approval) => {
+            let mut approval = approval.clone();
+            approval.preview = build_approval_preview(tool_request);
+            let _ = event_tx.send(TuiEvent::ApprovalNeeded {
+                id: approval.id.clone(),
+                tool: approval.tool.clone().unwrap_or_default(),
+                target: approval.target.clone(),
+                preview: approval.preview.clone(),
+            });
+
+            let handler = TuiApprovalHandler::new(action_rx);
+            let resolution = runtime_context
+                .resolve_interactive_tool_approval(&handler, &approval, tool_request)
+                .unwrap_or_else(|error| ApprovalResolution {
+                    id: approval.id.clone(),
+                    decision: ApprovalDecision::Deny,
+                    reason: format!("interactive approval failed: {error}"),
+                });
+
+            if resolution.decision == ApprovalDecision::Deny {
+                TuiToolApprovalOutcome::Denied(tool_types::ToolResult::denied(
+                    tool_request,
+                    resolution.reason,
+                ))
+            } else {
+                TuiToolApprovalOutcome::Continue
+            }
+        }
+        RuntimeApprovalDecision::Denied { result, .. } => TuiToolApprovalOutcome::Denied(result),
+    }
+}
+
+/// Build a human-readable preview of what a tool call will do, parsed from its
+/// raw JSON arguments. Returns `None` when there is nothing meaningful to show.
+/// This is best-effort: the strings come straight from the pending request, so
+/// the diff/command shown is exactly what would run.
+fn build_approval_preview(request: &tool_types::ToolRequest) -> Option<String> {
+    use orca_core::tool_types::ToolName;
+
+    let raw = request.raw_arguments.as_deref()?;
+    let args: serde_json::Value = serde_json::from_str(raw).ok()?;
+
+    match &request.name {
+        ToolName::Edit => {
+            let path = args["path"].as_str().unwrap_or("(file)");
+            let old_text = args["old_text"].as_str().unwrap_or_default();
+            let new_text = args["new_text"].as_str().unwrap_or_default();
+            let mut out = format!("@@ {path} @@\n");
+            for line in old_text.lines() {
+                out.push_str(&format!("- {line}\n"));
+            }
+            for line in new_text.lines() {
+                out.push_str(&format!("+ {line}\n"));
+            }
+            Some(out.trim_end().to_string())
+        }
+        ToolName::WriteFile => {
+            let path = args["path"].as_str().unwrap_or("(file)");
+            let content = args["content"]
+                .as_str()
+                .or_else(|| args["contents"].as_str())
+                .unwrap_or_default();
+            let mut out = format!("@@ write {path} @@\n");
+            for line in content.lines().take(40) {
+                out.push_str(&format!("+ {line}\n"));
+            }
+            let total = content.lines().count();
+            if total > 40 {
+                out.push_str(&format!("+ … (+{} more lines)\n", total - 40));
+            }
+            Some(out.trim_end().to_string())
+        }
+        ToolName::Bash => {
+            let command = args["command"].as_str().or_else(|| args.as_str())?;
+            Some(format!("$ {command}"))
+        }
+        _ => None,
     }
 }
 

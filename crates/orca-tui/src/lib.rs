@@ -47,6 +47,10 @@ mod tests {
             adapter.contains("pub(crate) struct TuiUserInputHandler"),
             "runtime_interaction_adapter should own the TUI user-input handler"
         );
+        assert!(
+            adapter.contains("pub(crate) fn resolve_tui_tool_approval"),
+            "runtime_interaction_adapter should own the TUI tool approval gate"
+        );
 
         let bridge = std::fs::read_to_string(format!("{manifest_dir}/src/bridge.rs"))
             .expect("bridge source should be readable");
@@ -57,6 +61,14 @@ mod tests {
         assert!(
             !bridge.contains("struct TuiUserInputHandler"),
             "bridge should use the TUI user-input adapter instead of owning it"
+        );
+        assert!(
+            !bridge.contains("approval_request_for_invocation"),
+            "bridge should delegate TUI approval request construction to the interaction adapter"
+        );
+        assert!(
+            !bridge.contains("resolve_interactive_tool_approval"),
+            "bridge should delegate interactive approval waits to the interaction adapter"
         );
     }
 }

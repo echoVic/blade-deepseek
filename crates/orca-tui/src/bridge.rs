@@ -5,7 +5,6 @@ use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use orca_approval::ApprovalPolicy;
-use orca_core::approval_types::{ApprovalDecision, ApprovalResolution};
 use orca_core::cancel::CancelToken;
 use orca_core::config::RunConfig;
 use orca_core::conversation::Conversation;
@@ -33,20 +32,21 @@ use orca_runtime::hooks::{
 };
 use orca_runtime::instructions::ProjectInstructions;
 use orca_runtime::lifecycle::{
-    RuntimeApprovalDecision, RuntimeSessionLifecycle, RuntimeTaskKind, RuntimeToolActorContext,
-    RuntimeTurnRunner,
+    RuntimeSessionLifecycle, RuntimeTaskKind, RuntimeToolActorContext, RuntimeTurnRunner,
 };
 use orca_runtime::memory::{self, MemoryBlock};
 use orca_runtime::session::InteractiveSession;
 use orca_runtime::subagent::{self, SubagentMode};
 use orca_runtime::tasks::TaskRegistry;
-use orca_runtime::tool_invocation::{approval_request_for_invocation, prepare_tool_invocation};
+use orca_runtime::tool_invocation::prepare_tool_invocation;
 use orca_runtime::workflow::{WorkflowDraftStore, WorkflowLaunchRequest, WorkflowRunner};
 use serde::Deserialize;
 
 use crate::diff;
 use crate::runtime_event_projection::tui_event_from_runtime_event;
-use crate::runtime_interaction_adapter::{TuiApprovalHandler, TuiUserInputHandler};
+use crate::runtime_interaction_adapter::{
+    TuiToolApprovalOutcome, TuiUserInputHandler, resolve_tui_tool_approval,
+};
 use crate::types::{TuiEvent, TuiTaskLifecycle, UserAction};
 
 const DEFAULT_MAX_TURNS: u32 = 128;
@@ -1071,54 +1071,6 @@ fn execute_subagent_batch_for_tui(
         .collect()
 }
 
-/// Build a human-readable preview of what a tool call will do, parsed from its
-/// raw JSON arguments. Returns `None` when there is nothing meaningful to show.
-/// This is best-effort: the strings come straight from the pending request, so
-/// the diff/command shown is exactly what would run.
-fn build_approval_preview(request: &tool_types::ToolRequest) -> Option<String> {
-    use orca_core::tool_types::ToolName;
-
-    let raw = request.raw_arguments.as_deref()?;
-    let args: serde_json::Value = serde_json::from_str(raw).ok()?;
-
-    match &request.name {
-        ToolName::Edit => {
-            let path = args["path"].as_str().unwrap_or("(file)");
-            let old_text = args["old_text"].as_str().unwrap_or_default();
-            let new_text = args["new_text"].as_str().unwrap_or_default();
-            let mut out = format!("@@ {path} @@\n");
-            for line in old_text.lines() {
-                out.push_str(&format!("- {line}\n"));
-            }
-            for line in new_text.lines() {
-                out.push_str(&format!("+ {line}\n"));
-            }
-            Some(out.trim_end().to_string())
-        }
-        ToolName::WriteFile => {
-            let path = args["path"].as_str().unwrap_or("(file)");
-            let content = args["content"]
-                .as_str()
-                .or_else(|| args["contents"].as_str())
-                .unwrap_or_default();
-            let mut out = format!("@@ write {path} @@\n");
-            for line in content.lines().take(40) {
-                out.push_str(&format!("+ {line}\n"));
-            }
-            let total = content.lines().count();
-            if total > 40 {
-                out.push_str(&format!("+ … (+{} more lines)\n", total - 40));
-            }
-            Some(out.trim_end().to_string())
-        }
-        ToolName::Bash => {
-            let command = args["command"].as_str().or_else(|| args.as_str())?;
-            Some(format!("$ {command}"))
-        }
-        _ => None,
-    }
-}
-
 fn execute_tool_for_tui(
     config: &RunConfig,
     cwd: &Path,
@@ -1141,44 +1093,19 @@ fn execute_tool_for_tui(
             .map(str::to_string)
             .unwrap_or_else(|| "tui-tool-session".to_string()),
     );
-    if let Some(approval) = approval_request_for_invocation(&invocation)
-        && agent_common::requires_approval(approval.action)
-    {
-        let mut runtime_context =
-            RuntimeToolActorContext::new(events.run_id().to_string(), DEFAULT_MAX_TURNS);
-        let approval_decision =
-            runtime_context.resolve_tool_approval(policy, Some(approval.clone()), tool_request);
-
-        match approval_decision {
-            RuntimeApprovalDecision::Allowed(_) => {}
-            RuntimeApprovalDecision::Ask(approval) => {
-                let mut approval = approval.clone();
-                approval.preview = build_approval_preview(tool_request);
-                send_runtime_event_as_tui(event_tx, events.approval_requested(&approval));
-
-                let handler = TuiApprovalHandler::new(action_rx);
-                let resolution = runtime_context
-                    .resolve_interactive_tool_approval(&handler, &approval, tool_request)
-                    .unwrap_or_else(|error| ApprovalResolution {
-                        id: approval.id.clone(),
-                        decision: ApprovalDecision::Deny,
-                        reason: format!("interactive approval failed: {error}"),
-                    });
-
-                if resolution.decision == ApprovalDecision::Deny {
-                    let result = tool_types::ToolResult::denied(tool_request, resolution.reason);
-                    send_tool_requested_for_tui(event_tx, &mut events, tool_request);
-                    send_tool_completed_for_tui(event_tx, &mut events, &result, None);
-                    return (true, result, None);
-                }
-            }
-            RuntimeApprovalDecision::Denied { result, .. } => {
-                send_tool_requested_for_tui(event_tx, &mut events, tool_request);
-                send_tool_completed_for_tui(event_tx, &mut events, &result, None);
-                return (true, result, None);
-            }
-            RuntimeApprovalDecision::NotRequired => {}
-        }
+    let mut runtime_context =
+        RuntimeToolActorContext::new(events.run_id().to_string(), DEFAULT_MAX_TURNS);
+    if let TuiToolApprovalOutcome::Denied(result) = resolve_tui_tool_approval(
+        &invocation,
+        tool_request,
+        policy,
+        &mut runtime_context,
+        event_tx,
+        action_rx,
+    ) {
+        send_tool_requested_for_tui(event_tx, &mut events, tool_request);
+        send_tool_completed_for_tui(event_tx, &mut events, &result, None);
+        return (true, result, None);
     }
 
     let mut rendered_diff = None;
