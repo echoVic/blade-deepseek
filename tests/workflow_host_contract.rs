@@ -860,7 +860,7 @@ fn host_reports_workflow_failed_when_stdin_closes_before_agent_result() {
     )
     .unwrap();
 
-    let mut child = Command::new("node")
+    let mut child = Command::new(WorkflowHost::node_executable())
         .arg(&host)
         .arg(&script)
         .arg("null")
@@ -919,7 +919,7 @@ fn host_reports_workflow_failed_for_partial_trailing_json_on_stdin_eof() {
     )
     .unwrap();
 
-    let mut child = Command::new("node")
+    let mut child = Command::new(WorkflowHost::node_executable())
         .arg(&host)
         .arg(&script)
         .arg("null")

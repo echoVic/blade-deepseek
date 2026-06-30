@@ -257,6 +257,25 @@ impl CommandExecManager {
         writer: &mut W,
         timeout: Duration,
     ) -> io::Result<()> {
+        self.drain_inner(shell_sessions, writer, timeout, false)
+    }
+
+    fn drain_until_output_or_timeout<W: Write>(
+        &mut self,
+        shell_sessions: Option<&mut RuntimeShellSessionManager>,
+        writer: &mut W,
+        timeout: Duration,
+    ) -> io::Result<()> {
+        self.drain_inner(shell_sessions, writer, timeout, true)
+    }
+
+    fn drain_inner<W: Write>(
+        &mut self,
+        shell_sessions: Option<&mut RuntimeShellSessionManager>,
+        writer: &mut W,
+        timeout: Duration,
+        return_on_output: bool,
+    ) -> io::Result<()> {
         let Some(manager) = shell_sessions else {
             return Ok(());
         };
@@ -341,7 +360,7 @@ impl CommandExecManager {
                 }
             }
             if std::time::Instant::now() >= deadline
-                || (observed_output && timeout <= Duration::from_millis(1))
+                || (observed_output && (return_on_output || timeout <= Duration::from_millis(1)))
             {
                 return Ok(());
             }
@@ -1771,7 +1790,15 @@ fn run_command_exec<W: Write>(
                 process_id: Value::from(process_id.to_string()),
             },
         )?;
-        drain_command_exec_processes_with_timeout(state, writer, Duration::from_millis(250))?;
+        if terminal.is_pty() || options.stream_stdout_stderr {
+            drain_command_exec_processes_until_output_or_timeout(
+                state,
+                writer,
+                Duration::from_secs(1),
+            )?;
+        } else {
+            drain_command_exec_processes_with_timeout(state, writer, Duration::from_millis(250))?;
+        }
         return Ok(());
     }
 
@@ -2255,6 +2282,16 @@ fn drain_command_exec_processes_with_timeout<W: Write>(
     state
         .command_exec
         .drain_with_timeout(state.shell_sessions.as_mut(), writer, timeout)
+}
+
+fn drain_command_exec_processes_until_output_or_timeout<W: Write>(
+    state: &mut ServerState,
+    writer: &mut W,
+    timeout: Duration,
+) -> io::Result<()> {
+    state
+        .command_exec
+        .drain_until_output_or_timeout(state.shell_sessions.as_mut(), writer, timeout)
 }
 
 fn cap_text(text: &str, cap: Option<usize>) -> String {

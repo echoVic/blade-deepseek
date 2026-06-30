@@ -57,7 +57,8 @@ const binaryPath = findExecutable();
 const env = {
   ...process.env,
   ORCA_MANAGED_BY_NPM: "1",
-  ORCA_MANAGED_PACKAGE_ROOT: realpathSync(path.join(__dirname, ".."))
+  ORCA_MANAGED_PACKAGE_ROOT: realpathSync(path.join(__dirname, "..")),
+  ORCA_NODE_PATH: process.env.ORCA_NODE_PATH || process.execPath
 };
 
 const child = spawn(binaryPath, process.argv.slice(2), {

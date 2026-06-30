@@ -57,8 +57,12 @@ pub struct WorkflowHostIpcPaths {
 }
 
 impl WorkflowHost {
+    pub fn node_executable() -> PathBuf {
+        node_command()
+    }
+
     pub fn node_available() -> bool {
-        Command::new("node")
+        Command::new(Self::node_executable())
             .arg("--version")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -173,7 +177,7 @@ impl WorkflowHost {
         let args_json = serde_json::to_string(&args)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
 
-        let mut command = Command::new("node");
+        let mut command = Command::new(Self::node_executable());
         command.arg(&host_path).arg(script_path).arg(args_json);
         if let Some(ipc_paths) = ipc_paths {
             command
@@ -333,6 +337,54 @@ fn ensure_host_file() -> io::Result<PathBuf> {
     Ok(path)
 }
 
+fn node_command() -> PathBuf {
+    for key in ["ORCA_NODE_PATH", "ORCA_NODE"] {
+        if let Some(path) = env::var_os(key).filter(|path| !path.is_empty()) {
+            return PathBuf::from(path);
+        }
+    }
+
+    if let Some(path) = node_from_npm_package_root() {
+        return path;
+    }
+
+    if let Some(path) = node_from_path_sibling() {
+        return path;
+    }
+
+    PathBuf::from("node")
+}
+
+fn node_from_npm_package_root() -> Option<PathBuf> {
+    let package_root = env::var_os("ORCA_MANAGED_PACKAGE_ROOT")?;
+    let package_root = PathBuf::from(package_root);
+    for candidate in [
+        package_root.join("node").join("bin").join("node"),
+        package_root
+            .join("..")
+            .join("node")
+            .join("bin")
+            .join("node"),
+    ] {
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn node_from_path_sibling() -> Option<PathBuf> {
+    let path = env::var_os("PATH")?;
+    env::split_paths(&path).find_map(|dir| {
+        let candidate = dir.join("..").join("node").join("bin").join("node");
+        if candidate.is_file() {
+            Some(candidate)
+        } else {
+            None
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -345,5 +397,115 @@ mod tests {
         assert_ne!(first, second);
         assert!(first.exists());
         assert!(second.exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn node_available_accepts_explicit_node_path_env() {
+        let _guard = crate::history::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous_path = env::var_os("PATH");
+        let previous_node_path = env::var_os("ORCA_NODE_PATH");
+        let previous_node = env::var_os("ORCA_NODE");
+        let previous_package_root = env::var_os("ORCA_MANAGED_PACKAGE_ROOT");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let node = write_fake_node(temp.path());
+
+        unsafe {
+            env::set_var("PATH", "");
+            env::set_var("ORCA_NODE_PATH", &node);
+            env::remove_var("ORCA_NODE");
+            env::remove_var("ORCA_MANAGED_PACKAGE_ROOT");
+        }
+
+        assert!(WorkflowHost::node_available());
+
+        unsafe {
+            if let Some(previous) = previous_path {
+                env::set_var("PATH", previous);
+            } else {
+                env::remove_var("PATH");
+            }
+            if let Some(previous) = previous_node_path {
+                env::set_var("ORCA_NODE_PATH", previous);
+            } else {
+                env::remove_var("ORCA_NODE_PATH");
+            }
+            if let Some(previous) = previous_node {
+                env::set_var("ORCA_NODE", previous);
+            } else {
+                env::remove_var("ORCA_NODE");
+            }
+            if let Some(previous) = previous_package_root {
+                env::set_var("ORCA_MANAGED_PACKAGE_ROOT", previous);
+            } else {
+                env::remove_var("ORCA_MANAGED_PACKAGE_ROOT");
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn node_available_accepts_sibling_node_bin_from_path_layout() {
+        let _guard = crate::history::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous_path = env::var_os("PATH");
+        let previous_node_path = env::var_os("ORCA_NODE_PATH");
+        let previous_node = env::var_os("ORCA_NODE");
+        let previous_package_root = env::var_os("ORCA_MANAGED_PACKAGE_ROOT");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bin = temp.path().join("dependencies").join("bin");
+        let node_bin = temp.path().join("dependencies").join("node").join("bin");
+        std::fs::create_dir_all(&bin).expect("create fake bin");
+        std::fs::create_dir_all(&node_bin).expect("create fake node bin");
+        write_fake_node(&node_bin);
+
+        unsafe {
+            env::set_var("PATH", &bin);
+            env::remove_var("ORCA_NODE_PATH");
+            env::remove_var("ORCA_NODE");
+            env::remove_var("ORCA_MANAGED_PACKAGE_ROOT");
+        }
+
+        assert!(WorkflowHost::node_available());
+
+        unsafe {
+            if let Some(previous) = previous_path {
+                env::set_var("PATH", previous);
+            } else {
+                env::remove_var("PATH");
+            }
+            if let Some(previous) = previous_node_path {
+                env::set_var("ORCA_NODE_PATH", previous);
+            } else {
+                env::remove_var("ORCA_NODE_PATH");
+            }
+            if let Some(previous) = previous_node {
+                env::set_var("ORCA_NODE", previous);
+            } else {
+                env::remove_var("ORCA_NODE");
+            }
+            if let Some(previous) = previous_package_root {
+                env::set_var("ORCA_MANAGED_PACKAGE_ROOT", previous);
+            } else {
+                env::remove_var("ORCA_MANAGED_PACKAGE_ROOT");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn write_fake_node(dir: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let node = dir.join("node");
+        std::fs::write(&node, "#!/bin/sh\nexit 0\n").expect("write fake node");
+        let mut permissions = std::fs::metadata(&node)
+            .expect("fake node metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&node, permissions).expect("chmod fake node");
+        node
     }
 }

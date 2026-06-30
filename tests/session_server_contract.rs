@@ -1,4 +1,5 @@
 use std::io::{BufRead, BufReader, Read, Write};
+use std::path::Path;
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
@@ -3594,6 +3595,10 @@ fn server_mode_command_exec_rejects_invalid_option_combinations() {
 #[test]
 fn server_mode_command_exec_with_process_id_can_be_terminated() {
     let workspace = tempdir().expect("workspace");
+    let started_marker = workspace.path().join("command-started");
+    let release_marker = workspace.path().join("command-release");
+    let started_marker_arg = started_marker.to_str().expect("marker path");
+    let release_marker_arg = release_marker.to_str().expect("release marker path");
     let mut child = orca_command()
         .args([
             "--mode",
@@ -3613,7 +3618,7 @@ fn server_mode_command_exec_with_process_id_can_be_terminated() {
         let stdin = child.stdin.as_mut().expect("server stdin");
         writeln!(
             stdin,
-            r#"{{"id":"cmd","method":"command/exec","params":{{"command":["sh","-lc","printf started; sleep 30; printf done"],"processId":"sleep-1","tty":false,"streamStdin":false,"streamStdoutStderr":false}}}}"#
+            r#"{{"id":"cmd","method":"command/exec","params":{{"command":["sh","-lc","printf started; : > \"$1\"; while [ ! -e \"$2\" ]; do sleep 0.05; done; printf done","sh","{started_marker_arg}","{release_marker_arg}"],"processId":"sleep-1","tty":false,"streamStdin":false,"streamStdoutStderr":false}}}}"#
         )
         .expect("write command/exec");
         stdin.flush().expect("flush command/exec");
@@ -3622,6 +3627,7 @@ fn server_mode_command_exec_with_process_id_can_be_terminated() {
     let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
     let started = read_until_event(&mut stdout, "cmd", "command_exec_started");
     assert_eq!(started["processId"], "sleep-1");
+    wait_for_path(&started_marker);
 
     {
         let stdin = child.stdin.as_mut().expect("server stdin");
@@ -3658,7 +3664,11 @@ fn server_mode_command_exec_with_process_id_can_be_terminated() {
 #[test]
 fn server_mode_command_exec_stops_active_processes_when_input_closes() {
     let workspace = tempdir().expect("workspace");
+    let started_marker = workspace.path().join("command-started");
+    let release_marker = workspace.path().join("command-release");
     let leaked_marker = workspace.path().join("command-still-running");
+    let started_marker_arg = started_marker.to_str().expect("started marker path");
+    let release_marker_arg = release_marker.to_str().expect("release marker path");
     let leaked_marker_arg = leaked_marker.to_str().expect("marker path");
     let mut child = orca_command()
         .args([
@@ -3679,7 +3689,7 @@ fn server_mode_command_exec_stops_active_processes_when_input_closes() {
         let stdin = child.stdin.as_mut().expect("server stdin");
         writeln!(
             stdin,
-            r#"{{"id":"cmd","method":"command/exec","params":{{"command":["sh","-lc","printf started; sleep 2; printf leaked > \"$1\"","sh","{leaked_marker_arg}"],"processId":"eof-cleanup-1","streamStdoutStderr":true}}}}"#
+            r#"{{"id":"cmd","method":"command/exec","params":{{"command":["sh","-lc","printf started; : > \"$1\"; while [ ! -e \"$2\" ]; do sleep 0.05; done; printf leaked > \"$3\"","sh","{started_marker_arg}","{release_marker_arg}","{leaked_marker_arg}"],"processId":"eof-cleanup-1","streamStdoutStderr":true}}}}"#
         )
         .expect("write command/exec");
         stdin.flush().expect("flush command/exec");
@@ -3688,13 +3698,15 @@ fn server_mode_command_exec_stops_active_processes_when_input_closes() {
     let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
     let started = read_until_event(&mut stdout, "cmd", "command_exec_started");
     assert_eq!(started["processId"], "eof-cleanup-1");
+    wait_for_path(&started_marker);
 
     drop(child.stdin.take());
     let output =
         wait_for_child_output_with_timeout(child, Duration::from_secs(3)).expect("server exited");
     assert_eq!(output.status.code(), Some(0));
     assert!(output.stderr.is_empty());
-    std::thread::sleep(Duration::from_secs(3));
+    std::fs::write(&release_marker, "release").expect("write release marker");
+    std::thread::sleep(Duration::from_millis(200));
     assert!(
         !leaked_marker.exists(),
         "active command/exec process should be stopped when server input closes"
@@ -6986,6 +6998,18 @@ fn wait_for_child_output_with_timeout(
             Ok(None) => std::thread::sleep(Duration::from_millis(20)),
             Err(error) => return Err(error.to_string()),
         }
+    }
+}
+
+fn wait_for_path(path: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for path: {}",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(20));
     }
 }
 

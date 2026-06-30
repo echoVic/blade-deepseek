@@ -69,6 +69,7 @@ Priority chain (highest wins): Environment variables > CLI arguments > Config fi
 - `DEEPSEEK_API_KEY` — API key (required)
 - `DEEPSEEK_MODEL` — Model override
 - `DEEPSEEK_BASE_URL` — API base URL override
+- `ORCA_NODE_PATH` — Node.js executable used by workflow scripts when `node` is not on `PATH` (npm installs set this automatically)
 
 ### Config File
 

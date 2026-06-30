@@ -119,12 +119,18 @@ fn shell_session_kill_stops_running_task_and_collects_partial_output() {
 #[test]
 fn shell_session_reaps_task_stop_requests() {
     let temp = tempfile::tempdir().expect("tempdir");
+    let started_marker = temp.path().join("shell-started");
+    let release_marker = temp.path().join("shell-release");
+    let started_marker_arg = started_marker.to_str().expect("started marker path");
+    let release_marker_arg = release_marker.to_str().expect("release marker path");
     let tasks = TaskRegistry::new("session-shell".to_string());
     let mut sessions = RuntimeShellSessionManager::new(tasks.clone());
 
     let handle = sessions
         .spawn(ShellSessionCommand {
-            command: "printf started; sleep 30; printf done".to_string(),
+            command: format!(
+                "printf started; : > {started_marker_arg:?}; while [ ! -e {release_marker_arg:?} ]; do sleep 0.05; done; printf done"
+            ),
             cwd: temp.path().to_path_buf(),
             additional_readable_directories: Vec::new(),
             additional_working_directories: Vec::new(),
@@ -136,7 +142,7 @@ fn shell_session_reaps_task_stop_requests() {
         })
         .expect("spawn shell session");
 
-    std::thread::sleep(Duration::from_millis(150));
+    wait_for_path(&started_marker);
     tasks.request_stop(&handle.task_id).expect("request stop");
     let stopped = sessions
         .reap_requested_stops()
@@ -156,6 +162,18 @@ fn shell_session_reaps_task_stop_requests() {
     let task = tasks.get(&handle.task_id).expect("shell task");
     assert_eq!(task.status, TaskStatus::Stopped);
     assert_eq!(task.result.as_deref(), Some(stopped[0].stdout.as_str()));
+}
+
+fn wait_for_path(path: &std::path::Path) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !path.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for path: {}",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 #[test]
