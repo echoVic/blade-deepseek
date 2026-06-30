@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.72":
+        "Permission profiles now expand bounded read/write/read-write filesystem globs into concrete command sandbox roots, keeping Codex-style split filesystem policies usable without weakening broad-glob safety checks.",
       "v0.1.71":
         "Runtime compaction now lives in a dedicated module, keeping prompt-budget hooks, summary persistence, and prompt-too-long recovery out of the lifecycle orchestration module.",
       "v0.1.70":
@@ -170,6 +172,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.72":
+        "权限 profile 现在会把有界 read/write/read-write 文件系统 glob 展开成具体 command sandbox roots，在保留过宽 glob 安全拒绝的同时补齐 Codex 风格 split filesystem policy。",
       "v0.1.71":
         "Runtime compaction 现在迁到专门模块，prompt budget hooks、summary 持久化和 prompt-too-long 恢复不再混在 lifecycle 编排里。",
       "v0.1.70":

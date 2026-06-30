@@ -2055,21 +2055,21 @@ fn resolve_permission_profile(
         }
         for (path, access) in profile.filesystem.entries() {
             if contains_glob_chars(path) {
-                if *access != orca_core::config::PermissionProfileFileAccess::Deny {
-                    return Err(format!(
-                        "command/exec permissionProfile glob filesystem entry only supports deny access: {}",
-                        path.display()
-                    ));
-                }
                 for pattern in materialize_permission_profile_glob_patterns(
                     &cwd.display().to_string(),
                     runtime_workspace_roots,
                     path,
                 ) {
-                    let roots = expand_permission_profile_deny_glob(&pattern)?;
+                    let roots = expand_permission_profile_filesystem_glob(&pattern)?;
                     for root in roots {
-                        if !denied_writable_roots.contains(&root) {
-                            denied_writable_roots.push(root);
+                        if access.allows_read() {
+                            push_unique_path(&mut additional_readable_roots, root.clone());
+                        }
+                        if access.allows_write() {
+                            push_unique_path(&mut additional_writable_roots, root.clone());
+                        }
+                        if access.denies_write() {
+                            push_unique_path(&mut denied_writable_roots, root);
                         }
                     }
                 }
@@ -2128,10 +2128,10 @@ fn materialize_permission_profile_glob_patterns(
     materialize_workspace_roots_paths(cwd, runtime_workspace_roots, path)
 }
 
-fn expand_permission_profile_deny_glob(pattern: &Path) -> Result<Vec<PathBuf>, String> {
+fn expand_permission_profile_filesystem_glob(pattern: &Path) -> Result<Vec<PathBuf>, String> {
     let Some((search_root, relative_pattern)) = split_permission_profile_glob(pattern) else {
         return Err(format!(
-            "command/exec permissionProfile deny glob is too broad to scan safely: {}",
+            "command/exec permissionProfile filesystem glob is too broad to scan safely: {}",
             pattern.display()
         ));
     };
@@ -2144,7 +2144,7 @@ fn expand_permission_profile_deny_glob(pattern: &Path) -> Result<Vec<PathBuf>, S
         .build()
         .map_err(|error| {
             format!(
-                "invalid command/exec permissionProfile deny glob {}: {error}",
+                "invalid command/exec permissionProfile filesystem glob {}: {error}",
                 pattern.display()
             )
         })?
@@ -2153,7 +2153,7 @@ fn expand_permission_profile_deny_glob(pattern: &Path) -> Result<Vec<PathBuf>, S
     for entry in WalkDir::new(&search_root).follow_links(false) {
         let entry = entry.map_err(|error| {
             format!(
-                "failed to scan command/exec permissionProfile deny glob {}: {error}",
+                "failed to scan command/exec permissionProfile filesystem glob {}: {error}",
                 pattern.display()
             )
         })?;
@@ -3619,14 +3619,19 @@ mod tests {
     }
 
     #[test]
-    fn command_exec_sandbox_rejects_custom_permission_profile_write_globs() {
+    fn command_exec_sandbox_expands_custom_permission_profile_write_globs() {
+        let temp = tempdir().expect("temp");
+        let writable = temp.path().join("allowed.txt");
+        let ordinary = temp.path().join("ordinary.md");
+        std::fs::write(&writable, "allowed").expect("write allowed");
+        std::fs::write(&ordinary, "ordinary").expect("write ordinary");
         let mut config = test_run_config();
         config.permission_profiles.insert(
             "write-glob".to_string(),
             orca_core::config::PermissionProfileConfig {
                 extends: Some(":read-only".to_string()),
                 filesystem: std::collections::HashMap::from([(
-                    PathBuf::from("/tmp/*.txt"),
+                    temp.path().join("*.txt"),
                     orca_core::config::PermissionProfileFileAccess::Write,
                 )])
                 .into(),
@@ -3638,12 +3643,51 @@ mod tests {
             ..Default::default()
         };
 
-        let error = test_profile_sandbox(&config, &options).expect_err("write glob error");
+        let sandbox = test_profile_sandbox(&config, &options).expect("write glob profile");
 
-        assert_eq!(
-            error,
-            "command/exec permissionProfile glob filesystem entry only supports deny access: /tmp/*.txt"
+        assert!(sandbox.additional_writable_roots.contains(&writable));
+        assert!(!sandbox.additional_writable_roots.contains(&ordinary));
+        assert!(
+            !sandbox
+                .additional_writable_roots
+                .contains(&temp.path().to_path_buf())
         );
+    }
+
+    #[test]
+    fn command_exec_sandbox_expands_custom_permission_profile_read_write_globs() {
+        let temp = tempdir().expect("temp");
+        let shared = temp.path().join("shared");
+        let nested = shared.join("docs");
+        let matched = nested.join("guide.md");
+        let ignored = nested.join("image.png");
+        std::fs::create_dir_all(&nested).expect("mkdir nested");
+        std::fs::write(&matched, "guide").expect("write matched");
+        std::fs::write(&ignored, "image").expect("write ignored");
+        let mut config = test_run_config();
+        config.permission_profiles.insert(
+            "rw-glob".to_string(),
+            orca_core::config::PermissionProfileConfig {
+                extends: Some(":read-only".to_string()),
+                filesystem: std::collections::HashMap::from([(
+                    shared.join("**/*.md"),
+                    orca_core::config::PermissionProfileFileAccess::ReadWrite,
+                )])
+                .into(),
+                ..Default::default()
+            },
+        );
+        let options = protocol::CommandExecOptions {
+            permission_profile: Some("rw-glob".to_string()),
+            ..Default::default()
+        };
+
+        let sandbox = test_profile_sandbox(&config, &options).expect("read-write glob profile");
+
+        assert!(sandbox.additional_readable_roots.contains(&matched));
+        assert!(sandbox.additional_writable_roots.contains(&matched));
+        assert!(!sandbox.additional_readable_roots.contains(&ignored));
+        assert!(!sandbox.additional_writable_roots.contains(&ignored));
     }
 
     #[test]
@@ -3670,7 +3714,7 @@ mod tests {
 
         assert_eq!(
             error,
-            "command/exec permissionProfile deny glob is too broad to scan safely: /*.env"
+            "command/exec permissionProfile filesystem glob is too broad to scan safely: /*.env"
         );
     }
 
