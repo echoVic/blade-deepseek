@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.67":
+        "TUI runtime approval and request-user-input handlers now live in a dedicated interaction adapter module, and the site build includes the server prerender entry used by crawler-visible HTML generation.",
       "v0.1.66":
         "TUI runtime event projection now lives in a dedicated module, keeping EventEnvelope-to-TuiEvent mapping and workflow notification prompt shaping out of bridge orchestration.",
       "v0.1.65":
@@ -160,6 +162,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.67":
+        "TUI runtime approval 和 request_user_input handler 现在迁到专门的 interaction adapter 模块；站点构建也补齐了用于生成爬虫可见 HTML 的 server prerender entry。",
       "v0.1.66":
         "TUI runtime event projection 现在迁到专门模块，`bridge` 不再直接持有 EventEnvelope 到 TuiEvent 的映射和 workflow notification prompt 组装。",
       "v0.1.65":
