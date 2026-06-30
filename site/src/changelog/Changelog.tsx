@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.69":
+        "Tool-turn execution now lives in a dedicated runtime module, separating provider tool schema/invocation preparation from cursoring, batching, execution, and result folding.",
       "v0.1.68":
         "TUI tool approval gating now lives in the runtime interaction adapter, keeping approval request construction, preview generation, and interactive waits out of bridge orchestration.",
       "v0.1.67":
@@ -164,6 +166,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.69":
+        "Tool-turn 执行现在迁到专门的 runtime 模块，provider 工具 schema / invocation 准备与游标、批处理、执行、结果折叠边界分开。",
       "v0.1.68":
         "TUI tool approval gate 现在由 runtime interaction adapter 负责，`bridge` 不再直接持有 approval request 构造、preview 生成和交互等待逻辑。",
       "v0.1.67":
