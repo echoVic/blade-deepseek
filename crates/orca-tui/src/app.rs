@@ -6,13 +6,12 @@ use std::time::{Duration, Instant};
 use crossterm::ExecutableCommand;
 use crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind,
-    KeyboardEnhancementFlags, MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::terminal;
-use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::Rect;
+use ratatui::widgets::{Paragraph, Widget, Wrap};
+use ratatui::{Terminal, TerminalOptions, Viewport};
 use tui_textarea::{CursorMove, Input, TextArea};
 
 use orca_core::approval_types::ApprovalMode;
@@ -66,7 +65,6 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
         .is_ok();
 
     let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
 
     let (event_tx, event_rx) = mpsc::channel::<TuiEvent>();
     let (action_tx, action_rx) = mpsc::channel::<UserAction>();
@@ -144,6 +142,9 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                 };
                 state.messages.push(ChatMessage::System(label.to_string()));
             }
+            // The preloaded transcript is entirely past turns; freeze it so the next
+            // turn (or an initial prompt) starts a fresh live suffix.
+            state.finalized_count = state.messages.len();
             Some(transcript)
         } else {
             None
@@ -183,26 +184,49 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
         make_textarea(&vim_state, &theme)
     };
 
+    // Inline viewport: the live UI occupies a bottom strip whose height we recompute every
+    // frame. Settled messages are flushed above it into the terminal's native scrollback via
+    // `insert_before`, so the user keeps native scroll + selection over finished output.
+    let initial_size = ratatui::backend::Backend::size(&backend)?;
+    let mut live_height = ui::inline_viewport_height(
+        &state,
+        &textarea,
+        &theme,
+        initial_size.width,
+        initial_size.height,
+    );
+    let mut terminal = Terminal::with_options(
+        backend,
+        TerminalOptions {
+            viewport: Viewport::Inline(live_height),
+        },
+    )?;
+
     let exit_code;
 
     loop {
         state.advance_tick();
+
+        // Flush any newly-settled, contiguous prefix into native scrollback before drawing,
+        // shrinking the live pane to just the still-mutable tail.
+        flush_settled_messages(&mut terminal, &mut state, &theme)?;
+
+        // Strategy B: the inline viewport's height is fixed at construction. When the desired
+        // height changes (chrome grows/shrinks, modal opens, live tail grows), rebuild the
+        // Terminal so the new height takes effect. Only rebuild on an actual change to avoid
+        // tearing down the terminal every frame.
+        let size = terminal.size()?;
+        let desired_height =
+            ui::inline_viewport_height(&state, &textarea, &theme, size.width, size.height);
+        if desired_height != live_height {
+            terminal = rebuild_inline_terminal(terminal, desired_height)?;
+            live_height = desired_height;
+        }
+
         terminal.draw(|f| ui::render(f, &mut state, &textarea, &theme))?;
 
         if event::poll(Duration::from_millis(50))? {
             let ev = event::read()?;
-
-            if let Event::Mouse(mouse) = ev {
-                if let Some(scroll) =
-                    mouse_wheel_scroll_action(mouse, mouse_layout(&terminal, &state, &textarea)?)
-                {
-                    match scroll {
-                        MouseWheelScroll::Up => state.scroll_up(1),
-                        MouseWheelScroll::Down => state.scroll_down(1),
-                    }
-                }
-                continue;
-            }
 
             if let Event::Paste(pasted) = &ev {
                 match state.status {
@@ -264,8 +288,14 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                         }
                         GlobalShortcut::ClearScreen => {
                             state.messages.clear();
+                            state.finalized_count = 0;
+                            state.flushed_count = 0;
                             state.scroll_offset = 0;
                             state.auto_scroll = true;
+                            // Wipe the native scrollback too: the flushed transcript lives in
+                            // the terminal's scrollback, not our buffer, so clearing `messages`
+                            // alone would leave it on screen.
+                            clear_terminal_scrollback(&mut terminal)?;
                             continue;
                         }
                     }
@@ -387,6 +417,9 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                                 }
                                 if let Ok(transcript) = history::load_session(&session_id) {
                                     state.messages.clear();
+                                    state.flushed_count = 0;
+                                    state.scroll_offset = 0;
+                                    state.auto_scroll = true;
                                     for message in &transcript.messages {
                                         if let Some(chat_message) =
                                             chat_message_from_history(message.clone())
@@ -403,9 +436,18 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                                     state.messages.push(ChatMessage::System(
                                         "Resumed saved conversation.".to_string(),
                                     ));
+                                    // A resumed transcript is entirely past turns; freeze
+                                    // it so the live suffix starts empty for the next turn.
+                                    state.finalized_count = state.messages.len();
                                     if let Ok(mut preloaded) = preloaded_transcript.lock() {
                                         *preloaded = Some(transcript);
                                     }
+                                    // The previous session's flushed transcript lives in the
+                                    // terminal's native scrollback, not in `state.messages`, so
+                                    // resetting our buffer alone would stack the resumed
+                                    // conversation under the old one. Wipe the scrollback so the
+                                    // resumed session redraws on a clean terminal.
+                                    clear_terminal_scrollback(&mut terminal)?;
                                 }
                                 state.set_status(AppStatus::Idle);
                             }
@@ -707,7 +749,12 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
     // Codex-style: no mouse capture or alt-screen to clean up
     // let _ = io::stdout().execute(DisableMouseCapture);
     // io::stdout().execute(LeaveAlternateScreen)?;
+    // Drop the inline viewport's hold on the screen and leave the cursor on a fresh line
+    // below it, so the shell prompt returns cleanly under the final UI frame.
+    drop(terminal);
+    let _ = io::stdout().execute(crossterm::cursor::Show);
     terminal::disable_raw_mode()?;
+    println!();
 
     Ok(exit_code)
 }
@@ -736,56 +783,88 @@ fn shorten_home(path: &str) -> String {
     path.to_string()
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum MouseWheelScroll {
-    Up,
-    Down,
-}
+type InlineTerminal = Terminal<CrosstermBackend<std::io::Stdout>>;
 
-fn mouse_layout(
-    terminal: &Terminal<CrosstermBackend<std::io::Stdout>>,
-    state: &AppState,
-    textarea: &TextArea,
-) -> io::Result<ui::AppLayout> {
-    let size = terminal.size()?;
-    Ok(ui::app_layout(
-        Rect::new(0, 0, size.width, size.height),
-        state,
-        textarea,
-    ))
-}
-
-fn mouse_wheel_scroll_action(
-    mouse: MouseEvent,
-    _layout: ui::AppLayout,
-) -> Option<MouseWheelScroll> {
-    match mouse.kind {
-        MouseEventKind::ScrollUp => Some(MouseWheelScroll::Up),
-        MouseEventKind::ScrollDown => Some(MouseWheelScroll::Down),
-        _ => None,
+/// Flush the longest contiguous run of settled messages, starting at `flushed_count`, into
+/// the terminal's native scrollback via `insert_before`. Those lines then live above the
+/// inline viewport as ordinary scrollback text (natively scrollable + selectable), and the
+/// live pane only ever renders the still-mutable tail.
+fn flush_settled_messages(
+    terminal: &mut InlineTerminal,
+    state: &mut AppState,
+    theme: &Theme,
+) -> io::Result<()> {
+    // The welcome banner occupies the live pane until the first message arrives; nothing to
+    // flush yet. Once messages exist, the banner is gone and `flushed_count` drives the split.
+    if state.messages.is_empty() {
+        return Ok(());
     }
+
+    let turn_ended = state.status != AppStatus::Running;
+    let end = state.flushable_prefix_end(turn_ended);
+    if end <= state.flushed_count {
+        return Ok(());
+    }
+
+    let width = terminal.size()?.width.max(1) as usize;
+    // Flushing commits these messages to the immutable scrollback, so force the full/expanded
+    // form: a completed tool's output can never be re-expanded once flushed.
+    let lines = ui::build_lines_for_messages(
+        &state.messages[state.flushed_count..end],
+        theme,
+        width,
+        state.tick,
+        true,
+    );
+    let height = ui::visual_height_of_lines(&lines, width);
+    if height > 0 {
+        terminal.insert_before(height, |buf| {
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .render(buf.area, buf);
+        })?;
+    }
+    state.flushed_count = end;
+    Ok(())
+}
+
+/// Rebuild the inline Terminal at a new viewport height. The inline viewport's height is
+/// fixed at construction, so the only way to change it is to drop the old Terminal (releasing
+/// its screen region) and construct a fresh one anchored at the cursor's current row. The
+/// backend is just a handle to the process stdout, so a fresh `CrosstermBackend` writes to the
+/// same terminal.
+fn rebuild_inline_terminal(terminal: InlineTerminal, height: u16) -> io::Result<InlineTerminal> {
+    drop(terminal);
+    let backend = CrosstermBackend::new(io::stdout());
+    Terminal::with_options(
+        backend,
+        TerminalOptions {
+            viewport: Viewport::Inline(height.max(1)),
+        },
+    )
+}
+
+/// Erase the native scrollback and on-screen content. Used by the clear-screen shortcut so a
+/// fresh session starts on a clean terminal instead of stacking under the old transcript.
+fn clear_terminal_scrollback(terminal: &mut InlineTerminal) -> io::Result<()> {
+    use crossterm::terminal::{Clear, ClearType};
+    let stdout = terminal.backend_mut();
+    stdout.execute(crossterm::cursor::MoveTo(0, 0))?;
+    stdout.execute(Clear(ClearType::All))?;
+    stdout.execute(Clear(ClearType::Purge))?;
+    terminal.clear()?;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{MouseEvent, MouseEventKind};
     use orca_core::config::{
         ModelRuntimeConfig, OutputFormat, ProviderKind, ThemeName, ToolConfig, WorkflowConfig,
     };
-    use ratatui::layout::Rect;
     use tempfile::tempdir;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
-        MouseEvent {
-            kind,
-            column,
-            row,
-            modifiers: crossterm::event::KeyModifiers::NONE,
-        }
-    }
 
     fn test_config(history_mode: HistoryMode) -> RunConfig {
         RunConfig {
@@ -1394,82 +1473,6 @@ mod tests {
         assert!(insert_pasted_text(&mut textarea, "\nnext"));
 
         assert_eq!(textarea_text(&textarea), "prefix\nnext");
-    }
-
-    #[test]
-    fn wheel_over_composer_scrolls_content() {
-        let layout = ui::AppLayout {
-            content: Rect::new(0, 3, 80, 18),
-            input: Rect::new(0, 21, 80, 3),
-        };
-
-        assert_eq!(
-            mouse_wheel_scroll_action(mouse(MouseEventKind::ScrollUp, 10, 22), layout),
-            Some(MouseWheelScroll::Up)
-        );
-        assert_eq!(
-            mouse_wheel_scroll_action(mouse(MouseEventKind::ScrollDown, 10, 22), layout),
-            Some(MouseWheelScroll::Down)
-        );
-    }
-
-    #[test]
-    fn wheel_over_content_scrolls_content() {
-        let layout = ui::AppLayout {
-            content: Rect::new(0, 3, 80, 18),
-            input: Rect::new(0, 21, 80, 3),
-        };
-
-        assert_eq!(
-            mouse_wheel_scroll_action(mouse(MouseEventKind::ScrollUp, 10, 10), layout),
-            Some(MouseWheelScroll::Up)
-        );
-        assert_eq!(
-            mouse_wheel_scroll_action(mouse(MouseEventKind::ScrollDown, 10, 10), layout),
-            Some(MouseWheelScroll::Down)
-        );
-    }
-
-    #[test]
-    fn wheel_over_status_bar_scrolls_content() {
-        let layout = ui::AppLayout {
-            content: Rect::new(0, 3, 80, 18),
-            input: Rect::new(0, 21, 80, 3),
-        };
-
-        // Row 24 is below the input area (status bar region)
-        assert_eq!(
-            mouse_wheel_scroll_action(mouse(MouseEventKind::ScrollUp, 40, 24), layout),
-            Some(MouseWheelScroll::Up)
-        );
-        assert_eq!(
-            mouse_wheel_scroll_action(mouse(MouseEventKind::ScrollDown, 40, 24), layout),
-            Some(MouseWheelScroll::Down)
-        );
-    }
-
-    #[test]
-    fn non_scroll_mouse_events_are_ignored() {
-        let layout = ui::AppLayout {
-            content: Rect::new(0, 3, 80, 18),
-            input: Rect::new(0, 21, 80, 3),
-        };
-
-        assert_eq!(
-            mouse_wheel_scroll_action(
-                mouse(
-                    MouseEventKind::Down(crossterm::event::MouseButton::Left),
-                    10,
-                    10
-                ),
-                layout
-            ),
-            None
-        );
-        assert_eq!(
-            mouse_wheel_scroll_action(mouse(MouseEventKind::Moved, 10, 10), layout),
-            None
-        );
     }
 }
 

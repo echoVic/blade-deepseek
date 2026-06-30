@@ -19,8 +19,6 @@ use crate::shortcuts::{self, ShortcutScope};
 use crate::theme::Theme;
 use crate::types::{AppState, AppStatus, ApprovalOption, ChatMessage, PanelMode};
 
-const MODAL_BACKGROUND_MESSAGE_LIMIT: usize = 80;
-
 pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, theme: &Theme) {
     if state.status == AppStatus::Setup {
         render_setup(frame, state, textarea, theme);
@@ -43,16 +41,11 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
     }
     let compact_conversation_background = state.status == AppStatus::WaitingApproval;
     match state.panel_mode {
-        PanelMode::Conversation => render_messages(
-            frame,
-            chunks[1],
-            state,
-            theme,
-            compact_conversation_background,
-        ),
+        PanelMode::Conversation => render_live_messages(frame, chunks[1], state, theme),
         PanelMode::Workflows => render_workflows_panel(frame, chunks[1], state, theme),
         PanelMode::Agents => render_agents_panel(frame, chunks[1], state, theme),
     }
+    let _ = compact_conversation_background;
     if plan_height > 0 {
         render_plan_panel(frame, chunks[2], state, theme);
     }
@@ -73,24 +66,6 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
 
     if state.show_shortcuts {
         render_shortcuts(frame, state, theme);
-    }
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub(crate) struct AppLayout {
-    pub content: Rect,
-    pub input: Rect,
-}
-
-pub(crate) fn app_layout(area: Rect, state: &AppState, textarea: &TextArea) -> AppLayout {
-    let input_height = composer_input_height(area.width, textarea);
-    let plan_height = plan_panel_height(state);
-    let goal_height: u16 = if state.current_goal.is_some() { 3 } else { 0 };
-    let chunks = main_layout(area, goal_height, plan_height, input_height);
-
-    AppLayout {
-        content: chunks[1],
-        input: chunks[3],
     }
 }
 
@@ -336,50 +311,150 @@ fn highlight_match(text: &str, needle: &str, base: Style, theme: &Theme) -> Vec<
     spans
 }
 
-fn render_messages(
+/// Total visual (wrapped) height of `lines` at `width`. Shared by the scroll math and
+/// by the inline-viewport height computation so both agree on how tall content is.
+pub(crate) fn visual_height_of_lines(lines: &[Line], width: usize) -> u16 {
+    lines
+        .iter()
+        .map(|line| wrapped_line_count(line, width.max(1)) as u16)
+        .fold(0u16, |acc, n| acc.saturating_add(n))
+}
+
+/// The lines the live (not-yet-flushed) message pane shows: the welcome banner before
+/// the first message, otherwise `messages[flushed_count..]`. Single source of truth so
+/// the height computation and the renderer never disagree.
+fn live_pane_lines(state: &AppState, theme: &Theme, width: usize) -> Vec<Line<'static>> {
+    if state.messages.is_empty() {
+        build_welcome_lines(state, theme)
+    } else {
+        let live = &state.messages[state.flushed_count.min(state.messages.len())..];
+        build_lines_for_messages(live, theme, width, state.tick, false)
+    }
+}
+
+/// Visual height the live message pane needs at the given width, without any surrounding
+/// border. Used to size the inline viewport.
+pub(crate) fn live_messages_visual_height(state: &AppState, theme: &Theme, width: usize) -> u16 {
+    let lines = live_pane_lines(state, theme, width);
+    visual_height_of_lines(&lines, width)
+}
+
+/// Whether the current state needs the inline viewport expanded to the full terminal
+/// height: modal overlays (approval dialog, shortcuts help) and the full-panel
+/// dashboards (workflows / agents) all want the whole screen rather than a bottom strip.
+pub(crate) fn inline_wants_full_height(state: &AppState) -> bool {
+    matches!(
+        state.status,
+        AppStatus::Setup | AppStatus::SessionPicker | AppStatus::WaitingApproval
+    ) || state.show_shortcuts
+        || state.panel_mode != PanelMode::Conversation
+}
+
+/// How tall the inline viewport should be this frame: the live UI chrome (goal banner,
+/// plan panel, composer, status line) plus the live message pane, clamped to the
+/// terminal height. Modal-ish states take the full terminal height (see
+/// [`inline_wants_full_height`]).
+pub(crate) fn inline_viewport_height(
+    state: &AppState,
+    textarea: &TextArea,
+    theme: &Theme,
+    term_width: u16,
+    term_height: u16,
+) -> u16 {
+    if term_height == 0 {
+        return 1;
+    }
+    if inline_wants_full_height(state) {
+        return term_height;
+    }
+
+    let goal_height: u16 = if state.current_goal.is_some() { 3 } else { 0 };
+    let plan_height = plan_panel_height(state);
+    let input_height = composer_input_height(term_width, textarea);
+    let status_height = 1u16;
+    let chrome = goal_height
+        .saturating_add(plan_height)
+        .saturating_add(input_height)
+        .saturating_add(status_height);
+
+    // Slash-menu / mention popups float above the composer, growing upward into the
+    // message pane. Reserve enough live rows for the tallest active overlay so it can't
+    // clip against the top of a short inline viewport.
+    let overlay = active_overlay_height(state);
+    let min_live = overlay.max(1);
+
+    // Cap the live message pane at a fixed strip instead of tracking the full content
+    // height. Under Strategy B every change to the viewport height drops and rebuilds the
+    // inline Terminal, so letting the pane grow line-by-line with streaming output produces
+    // a rebuild storm (the flicker/duplication risk). Capping bounds rebuilds to the brief
+    // grow-to-cap phase; once content exceeds the cap the height is stable and the overflow
+    // becomes scrollable via the live-pane scroll keys.
+    let live_content = live_messages_visual_height(state, theme, term_width as usize);
+    let live_cap = LIVE_PANE_MAX_ROWS.max(min_live);
+    let live = live_content.clamp(min_live, live_cap);
+    let desired = chrome.saturating_add(live);
+
+    // Never exceed the terminal.
+    desired.min(term_height)
+}
+
+/// Maximum height (in rows) of the live message pane in the inline viewport. The live pane
+/// only ever shows the still-mutable tail of the current turn — settled content flushes up
+/// into the native scrollback — so a bounded strip is enough; taller content scrolls within
+/// it. Keeping this fixed is what stops streaming output from rebuilding the inline Terminal
+/// on every new line (see [`inline_viewport_height`]).
+const LIVE_PANE_MAX_ROWS: u16 = 16;
+
+/// Height of the floating popup (slash menu or mention list) the composer currently shows,
+/// or 0 when none is active. Mirrors the popup sizing in [`render_slash_menu`] /
+/// [`render_mention_candidates`] so the inline viewport can reserve room for it.
+fn active_overlay_height(state: &AppState) -> u16 {
+    if let Some(menu) = &state.slash_menu {
+        let item_count = match &menu.sub_menu {
+            Some(sub) => sub.items.len(),
+            None => menu.items.len(),
+        } as u16;
+        return (item_count + 2).min(14);
+    }
+    if !state.mention_candidates.is_empty() {
+        let item_count = state.mention_candidates.len().min(12) as u16;
+        return item_count + 2;
+    }
+    0
+}
+
+/// Render the live (not-yet-flushed) messages into `area` with no border, so the pane
+/// blends seamlessly with the native scrollback above it. While `auto_scroll` is on the
+/// newest content is pinned to the bottom of `area`; once the user scrolls up (PageUp,
+/// k/j, etc.) `auto_scroll` clears and the pane honours `scroll_offset` so they can read
+/// back through a long in-progress turn.
+pub(crate) fn render_live_messages(
     frame: &mut Frame,
     area: Rect,
     state: &mut AppState,
     theme: &Theme,
-    compact_background: bool,
 ) {
-    let content_width = area.width.saturating_sub(2) as usize;
+    let width = area.width.max(1) as usize;
+    let lines = live_pane_lines(state, theme, width);
 
-    let lines = if state.messages.is_empty() {
-        build_welcome_lines(state, theme)
-    } else {
-        build_message_lines(state, theme, content_width, compact_background)
-    };
+    let total = visual_height_of_lines(&lines, width);
+    state.total_lines = total;
+    state.visible_height = area.height;
 
-    let visible_height = area.height.saturating_sub(2);
-
-    let total_visual: u16 = lines
-        .iter()
-        .map(|line| wrapped_line_count(line, content_width) as u16)
-        .sum();
-
-    state.total_lines = total_visual;
-    state.visible_height = visible_height;
-
+    // When content is taller than the pane, `max_scroll` is the offset that shows the tail.
+    let max_scroll = total.saturating_sub(area.height);
     let scroll = if state.auto_scroll {
-        let max_scroll = total_visual.saturating_sub(visible_height);
-        state.scroll_offset = max_scroll;
         max_scroll
     } else {
-        let max_scroll = total_visual.saturating_sub(visible_height);
-        state.scroll_offset = state.scroll_offset.min(max_scroll);
-        state.scroll_offset
+        state.scroll_offset.min(max_scroll)
     };
+    // Persist the resolved offset so the status hint and the next scroll keystroke compute
+    // against the value actually shown (content may have grown or shrunk this frame).
+    state.scroll_offset = scroll;
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .title(" Orca ");
     let paragraph = Paragraph::new(lines)
-        .block(block)
         .wrap(Wrap { trim: false })
         .scroll((scroll, 0));
-
     frame.render_widget(paragraph, area);
 }
 
@@ -1028,7 +1103,11 @@ fn visual_wrapped_line_count(text: &str, width: usize) -> usize {
     let mut line_count = 0usize;
     let mut current_width = 0usize;
 
-    for segment in text.split_inclusive(|c: char| c.is_whitespace() || c == '/' || c == '-') {
+    // ratatui's word wrapper breaks only on whitespace; long tokens are hard-wrapped
+    // as a unit. Splitting on '/' or '-' here would let the estimate pack characters
+    // tighter than the renderer does, undercounting total height and scrolling the
+    // newest lines out of view. Match the renderer: break on whitespace only.
+    for segment in text.split_inclusive(char::is_whitespace) {
         let mut segment_width = UnicodeWidthStr::width(segment);
         if segment_width == 0 {
             continue;
@@ -1055,143 +1134,151 @@ fn visual_wrapped_line_count(text: &str, width: usize) -> usize {
     line_count + usize::from(current_width > 0)
 }
 
-fn rendered_message_window(
+/// Render the lines for a contiguous slice of messages. Used both to flush a settled
+/// prefix into the terminal scrollback and to draw the live bottom pane, so the two
+/// surfaces stay pixel-identical.
+///
+/// `force_expand` overrides each tool/subagent's collapsed view and renders its full
+/// output. The flush path sets this so a completed tool's output is committed to the
+/// immutable scrollback in full — once flushed it can never be re-expanded, so we must
+/// not freeze a truncated view. The live pane passes `false` and honours the per-message
+/// `expanded` flag that `e` toggles.
+pub(crate) fn build_lines_for_messages(
     messages: &[ChatMessage],
-    compact_background: bool,
-) -> (&[ChatMessage], usize) {
-    if !compact_background || messages.len() <= MODAL_BACKGROUND_MESSAGE_LIMIT {
-        return (messages, 0);
-    }
-
-    let skipped = messages.len() - MODAL_BACKGROUND_MESSAGE_LIMIT;
-    (&messages[skipped..], skipped)
-}
-
-fn build_message_lines(
-    state: &AppState,
     theme: &Theme,
     width: usize,
-    compact_background: bool,
+    tick: u64,
+    force_expand: bool,
 ) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
-    let (messages, skipped) = rendered_message_window(&state.messages, compact_background);
-
-    if skipped > 0 {
-        lines.push(Line::from(Span::styled(
-            format!("Showing latest {MODAL_BACKGROUND_MESSAGE_LIMIT} messages while dialog is open; {skipped} older messages hidden."),
-            Style::default().fg(theme.muted),
-        )));
-        lines.push(Line::from(""));
-    }
-
     for msg in messages {
-        match msg {
-            ChatMessage::User(text) => {
-                lines.push(Line::from(vec![
-                    Span::styled("> ", Style::default().fg(theme.user)),
-                    Span::styled(text.clone(), Style::default().fg(theme.user)),
-                ]));
-                lines.push(Line::from(""));
-            }
-            ChatMessage::Reasoning(text) => {
-                let prefix = Span::styled(
-                    "[thinking] ",
+        append_message_lines(&mut lines, msg, theme, width, tick, force_expand);
+    }
+    lines
+}
+
+/// Append the rendered lines for a single chat message. Pure with respect to global
+/// state: the only dynamic input is `tick`, which drives the running-tool spinner.
+fn append_message_lines(
+    lines: &mut Vec<Line<'static>>,
+    msg: &ChatMessage,
+    theme: &Theme,
+    width: usize,
+    tick: u64,
+    force_expand: bool,
+) {
+    match msg {
+        ChatMessage::User(text) => {
+            lines.push(Line::from(vec![
+                Span::styled("> ", Style::default().fg(theme.user)),
+                Span::styled(text.clone(), Style::default().fg(theme.user)),
+            ]));
+            lines.push(Line::from(""));
+        }
+        ChatMessage::Reasoning(text) => {
+            let prefix = Span::styled(
+                "[thinking] ",
+                Style::default()
+                    .fg(theme.muted)
+                    .add_modifier(Modifier::ITALIC),
+            );
+            let truncated = truncate_lines(text, 3);
+            lines.push(Line::from(vec![
+                prefix,
+                Span::styled(
+                    truncated,
                     Style::default()
                         .fg(theme.muted)
                         .add_modifier(Modifier::ITALIC),
-                );
-                let truncated = truncate_lines(text, 3);
-                lines.push(Line::from(vec![
-                    prefix,
-                    Span::styled(
-                        truncated,
-                        Style::default()
-                            .fg(theme.muted)
-                            .add_modifier(Modifier::ITALIC),
-                    ),
-                ]));
+                ),
+            ]));
+        }
+        ChatMessage::Assistant(text) => {
+            let md_lines = render_markdown(text, width);
+            for line in md_lines {
+                lines.push(line);
             }
-            ChatMessage::Assistant(text) => {
-                let md_lines = render_markdown(text, width);
-                for line in md_lines {
-                    lines.push(line);
-                }
-                lines.push(Line::from(""));
+            lines.push(Line::from(""));
+        }
+        ChatMessage::ToolCall {
+            name,
+            target,
+            status,
+            output,
+            diff,
+            kind,
+            expanded,
+            ..
+        } => {
+            let neutral_completed =
+                status == "completed" && matches!(kind.as_deref(), Some("empty" | "no_matches"));
+            let icon = match status.as_str() {
+                "completed" => "✓",
+                "running" => spinner_frame(tick),
+                "denied" => "✗",
+                "failed" => "✗",
+                _ => "·",
+            };
+            let color = match status.as_str() {
+                "completed" if neutral_completed => theme.muted,
+                "completed" => theme.success,
+                "running" => theme.warning,
+                "denied" | "failed" => theme.error,
+                _ => theme.muted,
+            };
+            let target_str = target
+                .as_deref()
+                .map(|t| format!(": {t}"))
+                .unwrap_or_default();
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("  {icon} {name}{target_str}"),
+                    Style::default().fg(color),
+                ),
+                Span::styled(format!(" ({status})"), Style::default().fg(theme.muted)),
+            ]));
+            if let Some(out) = output {
+                append_tool_output_lines(lines, out, *expanded, force_expand, theme);
             }
-            ChatMessage::ToolCall {
-                name,
-                target,
-                status,
-                output,
-                diff,
-                kind,
-                expanded,
-                ..
-            } => {
-                let neutral_completed = status == "completed"
-                    && matches!(kind.as_deref(), Some("empty" | "no_matches"));
-                let icon = match status.as_str() {
-                    "completed" => "✓",
-                    "running" => spinner_frame(state.tick),
-                    "denied" => "✗",
-                    "failed" => "✗",
-                    _ => "·",
-                };
-                let color = match status.as_str() {
-                    "completed" if neutral_completed => theme.muted,
-                    "completed" => theme.success,
-                    "running" => theme.warning,
-                    "denied" | "failed" => theme.error,
-                    _ => theme.muted,
-                };
-                let target_str = target
-                    .as_deref()
-                    .map(|t| format!(": {t}"))
-                    .unwrap_or_default();
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        format!("  {icon} {name}{target_str}"),
-                        Style::default().fg(color),
-                    ),
-                    Span::styled(format!(" ({status})"), Style::default().fg(theme.muted)),
-                ]));
-                if let Some(out) = output {
-                    append_tool_output_lines(&mut lines, out, *expanded, theme);
-                }
-                if let Some(diff) = diff {
-                    append_diff_lines(&mut lines, diff, theme);
-                }
+            if let Some(diff) = diff {
+                append_diff_lines(lines, diff, theme);
             }
-            ChatMessage::PlanUpdate { explanation, plan } => {
-                append_archived_plan_lines(&mut lines, explanation.as_deref(), plan, theme);
-            }
-            ChatMessage::Subagent {
+        }
+        ChatMessage::PlanUpdate { explanation, plan } => {
+            append_archived_plan_lines(lines, explanation.as_deref(), plan, theme);
+        }
+        ChatMessage::Subagent {
+            description,
+            status,
+            output,
+            error,
+            ..
+        } => {
+            append_subagent_lines(
+                lines,
                 description,
                 status,
                 output,
                 error,
-                ..
-            } => {
-                append_subagent_lines(&mut lines, description, status, output, error, theme);
-            }
-            ChatMessage::Error(text) => {
-                lines.push(Line::from(Span::styled(
-                    format!("ERROR: {text}"),
-                    Style::default().fg(theme.error),
-                )));
-                lines.push(Line::from(""));
-            }
-            ChatMessage::System(text) => {
-                lines.push(Line::from(Span::styled(
-                    text.clone(),
-                    Style::default().fg(theme.muted),
-                )));
-                lines.push(Line::from(""));
-            }
+                theme,
+                force_expand,
+            );
+        }
+        ChatMessage::Error(text) => {
+            lines.push(Line::from(Span::styled(
+                format!("ERROR: {text}"),
+                Style::default().fg(theme.error),
+            )));
+            lines.push(Line::from(""));
+        }
+        ChatMessage::System(text) => {
+            lines.push(Line::from(Span::styled(
+                text.clone(),
+                Style::default().fg(theme.muted),
+            )));
+            lines.push(Line::from(""));
         }
     }
-
-    lines
 }
 
 fn plan_panel_height(state: &AppState) -> u16 {
@@ -1297,6 +1384,7 @@ fn append_subagent_lines(
     output: &Option<String>,
     error: &Option<String>,
     theme: &Theme,
+    force_expand: bool,
 ) {
     let (label, color) = match status {
         "success" | "completed" => ("done", theme.success),
@@ -1315,6 +1403,10 @@ fn append_subagent_lines(
         Span::styled(description.to_string(), Style::default().fg(theme.text)),
     ]));
 
+    // The collapsed view keeps only the first few lines; when flushing to the immutable
+    // scrollback (`force_expand`) we emit the whole result/error so nothing is truncated
+    // beyond reach.
+    let body_limit = if force_expand { usize::MAX } else { 3 };
     match (status, output, error) {
         ("running", _, _) => {
             lines.push(Line::from(vec![
@@ -1328,13 +1420,19 @@ fn append_subagent_lines(
         (_, _, Some(err)) => {
             lines.push(Line::from(vec![
                 Span::styled("  │ error: ", Style::default().fg(theme.error)),
-                Span::styled(truncate_lines(err, 3), Style::default().fg(theme.error)),
+                Span::styled(
+                    truncate_lines(err, body_limit),
+                    Style::default().fg(theme.error),
+                ),
             ]));
         }
         (_, Some(out), _) => {
             lines.push(Line::from(vec![
                 Span::styled("  │ result: ", Style::default().fg(theme.success)),
-                Span::styled(truncate_lines(out, 3), Style::default().fg(theme.muted)),
+                Span::styled(
+                    truncate_lines(out, body_limit),
+                    Style::default().fg(theme.muted),
+                ),
             ]));
         }
         _ => {}
@@ -1376,9 +1474,19 @@ fn append_tool_output_lines(
     lines: &mut Vec<Line<'static>>,
     output: &str,
     expanded: bool,
+    force_expand: bool,
     theme: &Theme,
 ) {
-    let max_lines = if expanded { 40 } else { 2 };
+    // Flushing to the immutable scrollback (`force_expand`) commits the entire output so
+    // nothing is hidden behind a "[+N lines]" stub that `e` can no longer reveal. The live
+    // pane caps the `e`-expanded view at 40 rows and the collapsed view at 2.
+    let max_lines = if force_expand {
+        usize::MAX
+    } else if expanded {
+        40
+    } else {
+        2
+    };
     let output_lines: Vec<&str> = output.lines().collect();
     let shown = output_lines.len().min(max_lines);
 
@@ -2740,6 +2848,147 @@ mod tests {
     }
 
     #[test]
+    fn inline_viewport_reserves_rows_for_an_active_slash_menu() {
+        let mut state = test_state();
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let textarea = TextArea::default();
+
+        // A fully-flushed buffer leaves an empty (1-row) live pane: the popup reservation,
+        // not the live content, is what must keep the floating menu from clipping.
+        state.messages.push(ChatMessage::User("hi".to_string()));
+        state.flushed_count = state.messages.len();
+
+        let baseline = inline_viewport_height(&state, &textarea, &theme, 80, 40);
+
+        // Open a slash menu with 6 items; the popup is `items + 2` rows tall and floats up
+        // into the live pane, so the viewport must grow to keep it from clipping.
+        state.slash_menu = Some(crate::types::SlashMenu {
+            items: (0..6)
+                .map(|i| crate::types::SlashMenuItem {
+                    command: format!("/cmd{i}"),
+                    description: String::new(),
+                })
+                .collect(),
+            selected: 0,
+            sub_menu: None,
+        });
+        let with_menu = inline_viewport_height(&state, &textarea, &theme, 80, 40);
+
+        assert!(
+            with_menu >= baseline + 7,
+            "expected viewport to reserve the 8-row popup (got {with_menu} vs baseline {baseline})"
+        );
+        assert!(with_menu <= 40, "viewport must never exceed the terminal");
+    }
+
+    #[test]
+    fn inline_viewport_is_capped_at_terminal_height() {
+        let mut state = test_state();
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let textarea = TextArea::default();
+
+        // A huge mention list can't push the viewport past the terminal height.
+        state.mention_candidates = (0..40).map(|i| format!("file{i}.rs")).collect();
+        let height = inline_viewport_height(&state, &textarea, &theme, 80, 12);
+        assert!(height <= 12);
+    }
+
+    #[test]
+    fn setup_and_session_picker_use_full_inline_viewport_height() {
+        let mut state = test_state();
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let textarea = TextArea::default();
+
+        state.status = AppStatus::Setup;
+        assert_eq!(
+            inline_viewport_height(&state, &textarea, &theme, 80, 40),
+            40
+        );
+
+        state.status = AppStatus::SessionPicker;
+        assert_eq!(
+            inline_viewport_height(&state, &textarea, &theme, 80, 40),
+            40
+        );
+    }
+
+    #[test]
+    fn live_pane_is_capped_so_streaming_does_not_grow_the_viewport_unbounded() {
+        let mut state = test_state();
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let textarea = TextArea::default();
+
+        // A live assistant message far taller than the cap. On a tall terminal the viewport
+        // must still stop growing at chrome + LIVE_PANE_MAX_ROWS rather than tracking the
+        // whole 200-line body — otherwise every streamed line would rebuild the Terminal.
+        let body = (0..200)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        state.messages.push(ChatMessage::Assistant(body));
+
+        let height = inline_viewport_height(&state, &textarea, &theme, 80, 200);
+        // chrome here is just the 1-row status line (no goal/plan, empty composer).
+        let status_height = 1u16;
+        assert!(
+            height <= status_height + LIVE_PANE_MAX_ROWS + composer_input_height(80, &textarea),
+            "viewport {height} should be bounded by chrome + the live-pane cap"
+        );
+    }
+
+    #[test]
+    fn live_pane_honours_scroll_offset_when_content_overflows() {
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+
+        let body = (0..50)
+            .map(|i| format!("L{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Auto-scroll on: the pane pins to the bottom and shows the last lines.
+        let mut auto = test_state();
+        auto.messages.push(ChatMessage::Assistant(body.clone()));
+        auto.auto_scroll = true;
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(20, 6))
+            .expect("test backend");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_live_messages(frame, area, &mut auto, &theme);
+            })
+            .expect("draw");
+        let rendered = format!("{:?}", terminal.backend().buffer());
+        assert!(rendered.contains("L49"), "auto-scroll should show the tail");
+        assert!(
+            !rendered.contains("L0 "),
+            "auto-scroll should not show the very first line"
+        );
+
+        // Scrolled to the top: the pane shows the earliest lines instead of the tail.
+        let mut scrolled = test_state();
+        scrolled.messages.push(ChatMessage::Assistant(body));
+        scrolled.auto_scroll = false;
+        scrolled.scroll_offset = 0;
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(20, 6))
+            .expect("test backend");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_live_messages(frame, area, &mut scrolled, &theme);
+            })
+            .expect("draw");
+        let rendered = format!("{:?}", terminal.backend().buffer());
+        assert!(
+            rendered.contains("L0"),
+            "scroll-to-top should show the first line"
+        );
+        assert!(
+            !rendered.contains("L49"),
+            "scroll-to-top should not show the tail"
+        );
+    }
+
+    #[test]
     fn context_cell_is_hidden_until_a_budget_is_known() {
         let state = test_state();
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
@@ -3059,12 +3308,10 @@ mod tests {
 
     #[test]
     fn composer_layout_counts_soft_wrapped_visual_lines() {
-        let state = test_state();
         let mut textarea = TextArea::from(vec!["alpha bravo charlie".to_string()]);
         textarea.set_block(Block::default().borders(Borders::ALL));
-        let layout = app_layout(Rect::new(0, 0, 12, 24), &state, &textarea);
 
-        assert_eq!(layout.input.height, 5);
+        assert_eq!(composer_input_height(12, &textarea), 5);
     }
 
     #[test]
@@ -3115,30 +3362,35 @@ mod tests {
     }
 
     #[test]
-    fn modal_message_window_limits_background_history() {
-        let messages = (0..200)
-            .map(|index| ChatMessage::System(format!("message {index}")))
-            .collect::<Vec<_>>();
+    fn wrapped_line_count_keeps_hyphenated_tokens_whole() {
+        // ratatui breaks only on whitespace, so "bb-cc-dd" is one 8-wide token that
+        // wraps as a unit after "aa": "aa" / "bb-cc-" / "dd" = 3 rows. A splitter that
+        // also broke on '-' would pack tighter and undercount to 2, under-scrolling the
+        // newest content out of view.
+        let line = Line::from("aa bb-cc-dd");
 
-        let (visible, skipped) = rendered_message_window(&messages, true);
-
-        assert_eq!(visible.len(), MODAL_BACKGROUND_MESSAGE_LIMIT);
-        assert_eq!(skipped, 120);
-        assert!(matches!(
-            visible.first(),
-            Some(ChatMessage::System(text)) if text == "message 120"
-        ));
+        assert_eq!(wrapped_line_count(&line, 6), 3);
     }
 
     #[test]
-    fn normal_message_window_keeps_full_history() {
-        let messages = (0..200)
-            .map(|index| ChatMessage::System(format!("message {index}")))
-            .collect::<Vec<_>>();
+    fn ground_truth_ratatui_wraps_hyphenated_token_on_whitespace_only() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        use ratatui::widgets::Widget;
 
-        let (visible, skipped) = rendered_message_window(&messages, false);
+        // Render through the real widget at the same width the estimator uses and count
+        // rows that received any glyph. This pins wrapped_line_count to actual behavior.
+        let area = Rect::new(0, 0, 6, 8);
+        let mut buffer = Buffer::empty(area);
+        Paragraph::new(Line::from("aa bb-cc-dd"))
+            .wrap(Wrap { trim: false })
+            .render(area, &mut buffer);
 
-        assert_eq!(visible.len(), 200);
-        assert_eq!(skipped, 0);
+        let used_rows = (0..area.height)
+            .filter(|&y| (0..area.width).any(|x| !buffer[(x, y)].symbol().trim().is_empty()))
+            .count();
+
+        assert_eq!(used_rows, 3);
+        assert_eq!(wrapped_line_count(&Line::from("aa bb-cc-dd"), 6), used_rows);
     }
 }

@@ -277,6 +277,19 @@ pub struct SubMenu {
 
 pub struct AppState {
     pub messages: Vec<ChatMessage>,
+    /// Watermark splitting `messages` into an immutable prefix `[..finalized_count]`
+    /// (a finished turn's transcript) and a live, mutable suffix `[finalized_count..]`
+    /// (the current turn). Finalized messages are frozen: streaming deltas, tool-status
+    /// flips, and `e`-expand only touch the live suffix. This is the seam at which a
+    /// later phase flushes the prefix into the terminal's native scrollback.
+    pub finalized_count: usize,
+    /// How many messages have already been flushed into the terminal's native
+    /// scrollback via `insert_before`. `messages[..flushed_count]` are gone from the
+    /// inline viewport and are immutable (scrollback is append-only); the live pane
+    /// renders only `messages[flushed_count..]`. Unlike `finalized_count`, this advances
+    /// eagerly — a settled sub-item (a completed tool call, a reasoning block that a
+    /// newer message now follows) flushes mid-turn so the live pane stays small.
+    pub flushed_count: usize,
     pub status: AppStatus,
     pub running_started_at: Option<Instant>,
     pub scroll_offset: u16,
@@ -325,6 +338,8 @@ impl AppState {
     ) -> Self {
         Self {
             messages: Vec::new(),
+            finalized_count: 0,
+            flushed_count: 0,
             status: AppStatus::Idle,
             running_started_at: None,
             scroll_offset: 0,
@@ -436,7 +451,11 @@ impl AppState {
     }
 
     pub fn toggle_latest_tool_output(&mut self) -> bool {
-        for message in self.messages.iter_mut().rev() {
+        // Only the live pane is mutable and re-renderable. Anything below `flushed_count`
+        // has been committed to the terminal's immutable scrollback (in fully-expanded
+        // form), so `e` can only toggle a tool call that is still in `messages[flushed_count..]`.
+        let live_start = self.flushed_count.min(self.messages.len());
+        for message in self.messages[live_start..].iter_mut().rev() {
             if let ChatMessage::ToolCall { expanded, .. } = message {
                 *expanded = !*expanded;
                 return true;
@@ -801,6 +820,7 @@ impl AppState {
             TuiEvent::SessionCompleted { .. } => {
                 self.promote_trailing_reasoning();
                 self.archive_current_plan();
+                self.finalize_turn();
                 self.set_status(AppStatus::Idle);
             }
             TuiEvent::Compacted {
@@ -880,6 +900,53 @@ impl AppState {
         }
     }
 
+    /// Freeze the current turn: everything in `messages` becomes the immutable,
+    /// finalized prefix. Called once a turn ends, after trailing reasoning is promoted
+    /// and the live plan is archived, so the frozen transcript is in its final shape.
+    fn finalize_turn(&mut self) {
+        self.finalized_count = self.messages.len();
+    }
+
+    /// Whether the message at `index` will never change again, so it is safe to flush
+    /// into the append-only scrollback.
+    ///
+    /// - A finalized message (`index < finalized_count`) is frozen by definition.
+    /// - A `ToolCall`/`Subagent` is settled once it leaves the `running` status; its
+    ///   output/diff are then complete.
+    /// - A `Reasoning`/`Assistant` block grows via streaming deltas only while it is the
+    ///   last message, so it is settled once a newer message follows it, or once the turn
+    ///   ends (`turn_ended`).
+    /// - Everything else (`User`/`Error`/`System`/`PlanUpdate`) is immutable on arrival.
+    fn message_is_settled(&self, index: usize, turn_ended: bool) -> bool {
+        if index < self.finalized_count {
+            return true;
+        }
+        let is_last = index + 1 == self.messages.len();
+        match &self.messages[index] {
+            ChatMessage::ToolCall { status, .. } | ChatMessage::Subagent { status, .. } => {
+                status != "running"
+            }
+            ChatMessage::Reasoning(_) | ChatMessage::Assistant(_) => turn_ended || !is_last,
+            ChatMessage::User(_)
+            | ChatMessage::Error(_)
+            | ChatMessage::System(_)
+            | ChatMessage::PlanUpdate { .. } => true,
+        }
+    }
+
+    /// The new value `flushed_count` may advance to: the end of the longest run of
+    /// settled messages starting at the current `flushed_count`. Scrollback is
+    /// append-only, so a single unsettled message (e.g. a still-running tool call)
+    /// blocks everything after it from flushing, even if those later messages are
+    /// themselves settled — flushing them now would print them out of order.
+    pub fn flushable_prefix_end(&self, turn_ended: bool) -> usize {
+        let mut end = self.flushed_count;
+        while end < self.messages.len() && self.message_is_settled(end, turn_ended) {
+            end += 1;
+        }
+        end
+    }
+
     pub fn remove_after_last_user(&mut self) {
         if let Some(index) = self
             .messages
@@ -887,6 +954,8 @@ impl AppState {
             .rposition(|message| matches!(message, ChatMessage::User(_)))
         {
             self.messages.truncate(index);
+            self.finalized_count = self.finalized_count.min(self.messages.len());
+            self.flushed_count = self.flushed_count.min(self.messages.len());
         }
     }
 }
@@ -1173,6 +1242,204 @@ mod tests {
             }
             other => panic!("expected plan update message, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn session_completion_finalizes_the_turn_and_freezes_it() {
+        let mut state = state();
+        state.messages.push(ChatMessage::User("hi".to_string()));
+        state.update(TuiEvent::MessageDelta("answer".to_string()));
+
+        // Mid-turn nothing is finalized: the whole transcript is still live.
+        assert_eq!(state.finalized_count, 0);
+
+        state.update(TuiEvent::SessionCompleted {
+            status: "success".to_string(),
+        });
+
+        // After completion every message is frozen.
+        assert_eq!(state.finalized_count, state.messages.len());
+        assert!(state.finalized_count > 0);
+    }
+
+    #[test]
+    fn expand_toggle_only_affects_live_tools_not_flushed_ones() {
+        let mut state = state();
+
+        // Turn 1: a tool call that gets completed.
+        state.update(TuiEvent::ToolRequested {
+            id: "t1".to_string(),
+            name: "grep".to_string(),
+            target: Some("a".to_string()),
+        });
+        state.update(TuiEvent::ToolCompleted {
+            id: "t1".to_string(),
+            name: "grep".to_string(),
+            status: "completed".to_string(),
+            output: "hit".to_string(),
+            diff: None,
+            kind: Some("success".to_string()),
+        });
+        state.update(TuiEvent::SessionCompleted {
+            status: "success".to_string(),
+        });
+
+        // Simulate the render loop flushing the settled prefix into scrollback: once
+        // `flushed_count` covers the tool it is committed to the immutable scrollback.
+        state.flushed_count = state.messages.len();
+
+        // The flushed tool is frozen: `e` finds nothing in the (empty) live pane.
+        assert!(!state.toggle_latest_tool_output());
+        let ChatMessage::ToolCall { expanded, .. } = &state.messages[0] else {
+            panic!("expected flushed tool call");
+        };
+        assert!(!expanded, "flushed tool must stay collapsed");
+
+        // Turn 2: a new live tool call (beyond `flushed_count`) can be expanded.
+        state.update(TuiEvent::ToolRequested {
+            id: "t2".to_string(),
+            name: "grep".to_string(),
+            target: Some("b".to_string()),
+        });
+        assert!(state.toggle_latest_tool_output());
+        let ChatMessage::ToolCall { expanded, .. } = state.messages.last().unwrap() else {
+            panic!("expected live tool call");
+        };
+        assert!(expanded, "live tool should toggle expanded");
+    }
+
+    #[test]
+    fn clearing_messages_resets_the_finalized_watermark() {
+        let mut state = state();
+        state.messages.push(ChatMessage::User("hi".to_string()));
+        state.update(TuiEvent::SessionCompleted {
+            status: "success".to_string(),
+        });
+        assert!(state.finalized_count > 0);
+
+        state.messages.clear();
+        state.finalized_count = 0;
+
+        // Watermark must never dangle past the (now empty) message list.
+        assert_eq!(state.finalized_count, 0);
+        assert!(state.messages.is_empty());
+    }
+
+    #[test]
+    fn backtrack_clamps_watermark_into_remaining_messages() {
+        let mut state = state();
+        state.messages.push(ChatMessage::User("first".to_string()));
+        state
+            .messages
+            .push(ChatMessage::Assistant("reply".to_string()));
+        state.update(TuiEvent::SessionCompleted {
+            status: "success".to_string(),
+        });
+        let finalized_before = state.finalized_count;
+        assert_eq!(finalized_before, 2);
+
+        // A second user prompt starts a new live turn, then we backtrack it away.
+        state.messages.push(ChatMessage::User("second".to_string()));
+        state.remove_after_last_user();
+
+        // Everything from the last user prompt onward is gone, and the watermark is
+        // clamped so it can never exceed the remaining message count.
+        assert!(state.finalized_count <= state.messages.len());
+        assert_eq!(state.messages.len(), 2);
+    }
+
+    #[test]
+    fn flushable_prefix_stops_at_a_running_tool_call() {
+        let mut state = state();
+        state.messages.push(ChatMessage::User("hi".to_string()));
+        state.update(TuiEvent::ToolRequested {
+            id: "t1".to_string(),
+            name: "grep".to_string(),
+            target: Some("a".to_string()),
+        });
+        // User is settled, the running tool blocks everything after it.
+        assert_eq!(state.flushable_prefix_end(false), 1);
+
+        state.update(TuiEvent::ToolCompleted {
+            id: "t1".to_string(),
+            name: "grep".to_string(),
+            status: "completed".to_string(),
+            output: "hit".to_string(),
+            diff: None,
+            kind: Some("success".to_string()),
+        });
+        // Now the completed tool can flush too.
+        assert_eq!(state.flushable_prefix_end(false), 2);
+    }
+
+    #[test]
+    fn flushable_prefix_holds_back_the_streaming_tail_until_turn_end() {
+        let mut state = state();
+        state.messages.push(ChatMessage::User("hi".to_string()));
+        state.update(TuiEvent::MessageDelta("partial".to_string()));
+
+        // The trailing assistant block is still growing, so mid-turn only the user
+        // prompt is flushable.
+        assert_eq!(state.flushable_prefix_end(false), 1);
+        // When the turn ends the tail is settled and the whole prefix can flush.
+        assert_eq!(state.flushable_prefix_end(true), 2);
+    }
+
+    #[test]
+    fn flushable_prefix_releases_an_assistant_block_once_a_newer_message_follows() {
+        let mut state = state();
+        state.update(TuiEvent::MessageDelta("first answer".to_string()));
+        // While it is the last message it is still mutable.
+        assert_eq!(state.flushable_prefix_end(false), 0);
+
+        // A following tool call means the assistant block will never grow again.
+        state.update(TuiEvent::ToolRequested {
+            id: "t1".to_string(),
+            name: "grep".to_string(),
+            target: None,
+        });
+        state.update(TuiEvent::ToolCompleted {
+            id: "t1".to_string(),
+            name: "grep".to_string(),
+            status: "completed".to_string(),
+            output: "out".to_string(),
+            diff: None,
+            kind: None,
+        });
+        assert_eq!(state.flushable_prefix_end(false), 2);
+    }
+
+    #[test]
+    fn flushable_prefix_is_bounded_by_already_flushed_count() {
+        let mut state = state();
+        state.messages.push(ChatMessage::User("a".to_string()));
+        state.messages.push(ChatMessage::System("b".to_string()));
+        state.flushed_count = 1;
+        // Counts the contiguous settled run starting from flushed_count, not from 0.
+        assert_eq!(state.flushable_prefix_end(false), 2);
+
+        state.flushed_count = 2;
+        assert_eq!(state.flushable_prefix_end(false), 2);
+    }
+
+    #[test]
+    fn backtrack_clamps_flushed_watermark_too() {
+        let mut state = state();
+        state.messages.push(ChatMessage::User("first".to_string()));
+        state
+            .messages
+            .push(ChatMessage::Assistant("reply".to_string()));
+        state.flushed_count = 2;
+        state.finalized_count = 2;
+
+        state.messages.push(ChatMessage::User("second".to_string()));
+        state
+            .messages
+            .push(ChatMessage::Assistant("reply2".to_string()));
+        state.remove_after_last_user();
+
+        assert!(state.flushed_count <= state.messages.len());
+        assert_eq!(state.messages.len(), 2);
     }
 
     #[test]

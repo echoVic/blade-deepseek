@@ -12,7 +12,7 @@ orca-approval = { path = "../orca-approval" }
 orca-runtime = { path = "../orca-runtime" }
 serde = { workspace = true }
 serde_json = { workspace = true }
-ratatui = { workspace = true }
+ratatui = { workspace = true, features = ["scrolling-regions"] }
 crossterm = { workspace = true }
 tui-textarea = { workspace = true }
 pulldown-cmark = { workspace = true }

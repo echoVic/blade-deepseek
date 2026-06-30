@@ -2286,6 +2286,7 @@ mod tests {
     use orca_core::approval_types::ApprovalMode;
     use orca_core::config::{HistoryMode, OutputFormat, ProviderKind, RunConfig};
     use orca_core::model::ModelSelection;
+    use orca_runtime::workflow::host::WorkflowHost;
 
     fn config() -> RunConfig {
         RunConfig {
@@ -2490,6 +2491,10 @@ mod tests {
 
     #[test]
     fn tui_workflow_tool_launches_runtime_instead_of_placeholder_executor() {
+        if !WorkflowHost::node_available() {
+            return;
+        }
+
         let config = full_auto_config();
         let (event_tx, event_rx) = mpsc::channel();
         let (_action_tx, action_rx) = mpsc::channel();
