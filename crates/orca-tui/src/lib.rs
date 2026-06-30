@@ -3,6 +3,7 @@ pub mod bridge;
 pub mod commands;
 pub mod diff;
 mod runtime_event_projection;
+mod runtime_interaction_adapter;
 pub mod shortcuts;
 pub mod theme;
 pub mod types;
