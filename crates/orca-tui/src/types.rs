@@ -280,15 +280,11 @@ pub struct AppState {
     /// Watermark splitting `messages` into an immutable prefix `[..finalized_count]`
     /// (a finished turn's transcript) and a live, mutable suffix `[finalized_count..]`
     /// (the current turn). Finalized messages are frozen: streaming deltas, tool-status
-    /// flips, and `e`-expand only touch the live suffix. This is the seam at which a
-    /// later phase flushes the prefix into the terminal's native scrollback.
+    /// flips, and `e`-expand only touch the live suffix.
     pub finalized_count: usize,
-    /// How many messages have already been flushed into the terminal's native
-    /// scrollback via `insert_before`. `messages[..flushed_count]` are gone from the
-    /// inline viewport and are immutable (scrollback is append-only); the live pane
-    /// renders only `messages[flushed_count..]`. Unlike `finalized_count`, this advances
-    /// eagerly — a settled sub-item (a completed tool call, a reasoning block that a
-    /// newer message now follows) flushes mid-turn so the live pane stays small.
+    /// How many messages are omitted from the live transcript renderer. This is zero in the
+    /// current fullscreen TUI, but remains part of the state model for older inline-viewport
+    /// behavior and tests that exercise finalized/live suffix boundaries.
     pub flushed_count: usize,
     pub status: AppStatus,
     pub running_started_at: Option<Instant>,

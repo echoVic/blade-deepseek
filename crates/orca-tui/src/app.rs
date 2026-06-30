@@ -5,13 +5,13 @@ use std::time::{Duration, Instant};
 
 use crossterm::ExecutableCommand;
 use crossterm::event::{
-    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind,
-    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEventKind, KeyboardEnhancementFlags, MouseEventKind,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::terminal;
+use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::widgets::{Paragraph, Widget, Wrap};
-use ratatui::{Terminal, TerminalOptions, Viewport};
 use tui_textarea::{CursorMove, Input, TextArea};
 
 use orca_core::approval_types::ApprovalMode;
@@ -50,9 +50,11 @@ pub fn run_tui(config: RunConfig) -> i32 {
 fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
     terminal::enable_raw_mode()?;
     let mut stdout = io::stdout();
-    // Codex-style: no alt-screen, no mouse capture → native terminal selection works
+    // No alt-screen, so the terminal keeps its normal scrollback buffer. We DO enable mouse
+    // capture so the wheel scrolls the conversation in-app; copying is done with the terminal's
+    // modifier-drag (Shift/Option+drag on most terminals), which bypasses mouse capture.
     // stdout.execute(EnterAlternateScreen)?;
-    // stdout.execute(EnableMouseCapture)?;
+    let mouse_captured = stdout.execute(EnableMouseCapture).is_ok();
     let bracketed_paste = stdout.execute(EnableBracketedPaste).is_ok();
     // Kitty keyboard protocol: push enhancement AFTER entering alternate screen,
     // otherwise the terminal may reset the keyboard state stack on screen switch.
@@ -184,46 +186,23 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
         make_textarea(&vim_state, &theme)
     };
 
-    // Inline viewport: the live UI occupies a bottom strip whose height we recompute every
-    // frame. Settled messages are flushed above it into the terminal's native scrollback via
-    // `insert_before`, so the user keeps native scroll + selection over finished output.
-    let initial_size = ratatui::backend::Backend::size(&backend)?;
-    let mut live_height = ui::inline_viewport_height(
-        &state,
-        &textarea,
-        &theme,
-        initial_size.width,
-        initial_size.height,
-    );
-    let mut terminal = Terminal::with_options(
-        backend,
-        TerminalOptions {
-            viewport: Viewport::Inline(live_height),
-        },
-    )?;
+    // Fullscreen viewport: the UI occupies the whole terminal and is fully repainted every
+    // frame. We deliberately do NOT enter the alternate screen (see the commented
+    // EnterAlternateScreen above). Mouse capture IS on so the wheel scrolls the conversation;
+    // copying uses the terminal's modifier-drag, which bypasses capture.
+    let mut terminal = Terminal::new(backend)?;
+    // Clear once on startup. Without the alternate screen, ratatui's diffing draw only writes
+    // cells that differ from the previous frame; on the very first frame the "previous" buffer
+    // is empty, and our blank trailing cells match it, so whatever the shell/cargo left on
+    // screen would show through underneath our text. A full clear gives us a clean canvas.
+    terminal.clear()?;
 
     let exit_code;
 
+    terminal.draw(|f| ui::render(f, &mut state, &textarea, &theme))?;
+
     loop {
         state.advance_tick();
-
-        // Flush any newly-settled, contiguous prefix into native scrollback before drawing,
-        // shrinking the live pane to just the still-mutable tail.
-        flush_settled_messages(&mut terminal, &mut state, &theme)?;
-
-        // Strategy B: the inline viewport's height is fixed at construction. When the desired
-        // height changes (chrome grows/shrinks, modal opens, live tail grows), rebuild the
-        // Terminal so the new height takes effect. Only rebuild on an actual change to avoid
-        // tearing down the terminal every frame.
-        let size = terminal.size()?;
-        let desired_height =
-            ui::inline_viewport_height(&state, &textarea, &theme, size.width, size.height);
-        if desired_height != live_height {
-            terminal = rebuild_inline_terminal(terminal, desired_height)?;
-            live_height = desired_height;
-        }
-
-        terminal.draw(|f| ui::render(f, &mut state, &textarea, &theme))?;
 
         if event::poll(Duration::from_millis(50))? {
             let ev = event::read()?;
@@ -241,6 +220,21 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                         }
                     }
                     _ => {}
+                }
+                continue;
+            }
+
+            // Mouse wheel scrolls the conversation transcript. Other mouse events (clicks,
+            // drags) are ignored — text selection/copy is handled by the terminal via
+            // modifier-drag, which bypasses our capture. Scrolling only applies to the
+            // conversation view; the panel dashboards have their own keyboard navigation.
+            if let Event::Mouse(mouse) = &ev {
+                if state.panel_mode == PanelMode::Conversation {
+                    match mouse.kind {
+                        MouseEventKind::ScrollUp => state.scroll_up(3),
+                        MouseEventKind::ScrollDown => state.scroll_down(3),
+                        _ => {}
+                    }
                 }
                 continue;
             }
@@ -292,9 +286,9 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                             state.flushed_count = 0;
                             state.scroll_offset = 0;
                             state.auto_scroll = true;
-                            // Wipe the native scrollback too: the flushed transcript lives in
-                            // the terminal's scrollback, not our buffer, so clearing `messages`
-                            // alone would leave it on screen.
+                            // Wipe terminal contents as well as the in-memory transcript.
+                            // Without the alternate screen, previous frames live in the
+                            // terminal's normal buffer even after `messages` is cleared.
                             clear_terminal_scrollback(&mut terminal)?;
                             continue;
                         }
@@ -442,11 +436,9 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                                     if let Ok(mut preloaded) = preloaded_transcript.lock() {
                                         *preloaded = Some(transcript);
                                     }
-                                    // The previous session's flushed transcript lives in the
-                                    // terminal's native scrollback, not in `state.messages`, so
-                                    // resetting our buffer alone would stack the resumed
-                                    // conversation under the old one. Wipe the scrollback so the
-                                    // resumed session redraws on a clean terminal.
+                                    // Without the alternate screen, the old frame remains in the
+                                    // terminal's normal buffer. Clear it so the resumed session
+                                    // redraws on a clean terminal.
                                     clear_terminal_scrollback(&mut terminal)?;
                                 }
                                 state.set_status(AppStatus::Idle);
@@ -737,6 +729,8 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                 state.scroll_to_bottom();
             }
         }
+
+        terminal.draw(|f| ui::render(f, &mut state, &textarea, &theme))?;
     }
 
     // Cleanup: pop keyboard enhancement, disable bracketed paste
@@ -746,11 +740,12 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
     if bracketed_paste {
         let _ = io::stdout().execute(DisableBracketedPaste);
     }
-    // Codex-style: no mouse capture or alt-screen to clean up
-    // let _ = io::stdout().execute(DisableMouseCapture);
+    if mouse_captured {
+        let _ = io::stdout().execute(DisableMouseCapture);
+    }
+    // No alternate screen to leave.
     // io::stdout().execute(LeaveAlternateScreen)?;
-    // Drop the inline viewport's hold on the screen and leave the cursor on a fresh line
-    // below it, so the shell prompt returns cleanly under the final UI frame.
+    // Leave the cursor on a fresh line below the final frame so the shell prompt returns cleanly.
     drop(terminal);
     let _ = io::stdout().execute(crossterm::cursor::Show);
     terminal::disable_raw_mode()?;
@@ -784,65 +779,6 @@ fn shorten_home(path: &str) -> String {
 }
 
 type InlineTerminal = Terminal<CrosstermBackend<std::io::Stdout>>;
-
-/// Flush the longest contiguous run of settled messages, starting at `flushed_count`, into
-/// the terminal's native scrollback via `insert_before`. Those lines then live above the
-/// inline viewport as ordinary scrollback text (natively scrollable + selectable), and the
-/// live pane only ever renders the still-mutable tail.
-fn flush_settled_messages(
-    terminal: &mut InlineTerminal,
-    state: &mut AppState,
-    theme: &Theme,
-) -> io::Result<()> {
-    // The welcome banner occupies the live pane until the first message arrives; nothing to
-    // flush yet. Once messages exist, the banner is gone and `flushed_count` drives the split.
-    if state.messages.is_empty() {
-        return Ok(());
-    }
-
-    let turn_ended = state.status != AppStatus::Running;
-    let end = state.flushable_prefix_end(turn_ended);
-    if end <= state.flushed_count {
-        return Ok(());
-    }
-
-    let width = terminal.size()?.width.max(1) as usize;
-    // Flushing commits these messages to the immutable scrollback, so force the full/expanded
-    // form: a completed tool's output can never be re-expanded once flushed.
-    let lines = ui::build_lines_for_messages(
-        &state.messages[state.flushed_count..end],
-        theme,
-        width,
-        state.tick,
-        true,
-    );
-    let height = ui::visual_height_of_lines(&lines, width);
-    if height > 0 {
-        terminal.insert_before(height, |buf| {
-            Paragraph::new(lines)
-                .wrap(Wrap { trim: false })
-                .render(buf.area, buf);
-        })?;
-    }
-    state.flushed_count = end;
-    Ok(())
-}
-
-/// Rebuild the inline Terminal at a new viewport height. The inline viewport's height is
-/// fixed at construction, so the only way to change it is to drop the old Terminal (releasing
-/// its screen region) and construct a fresh one anchored at the cursor's current row. The
-/// backend is just a handle to the process stdout, so a fresh `CrosstermBackend` writes to the
-/// same terminal.
-fn rebuild_inline_terminal(terminal: InlineTerminal, height: u16) -> io::Result<InlineTerminal> {
-    drop(terminal);
-    let backend = CrosstermBackend::new(io::stdout());
-    Terminal::with_options(
-        backend,
-        TerminalOptions {
-            viewport: Viewport::Inline(height.max(1)),
-        },
-    )
-}
 
 /// Erase the native scrollback and on-screen content. Used by the clear-screen shortcut so a
 /// fresh session starts on a clean terminal instead of stacking under the old transcript.
@@ -1265,6 +1201,36 @@ mod tests {
             action_rx.try_recv(),
             Ok(UserAction::Submit(prompt)) if prompt == "<task-notification>done</task-notification>"
         ));
+    }
+
+    #[test]
+    fn settled_messages_remain_in_fullscreen_transcript_after_turn_end() {
+        let theme = Theme::named(ThemeName::Dark);
+        let (tx, _rx) = mpsc::channel();
+        let mut state = AppState::new(
+            tx,
+            "0.0.0-test".to_string(),
+            "auto".to_string(),
+            "/tmp".to_string(),
+        );
+        state.messages.push(ChatMessage::User("hi".to_string()));
+        state
+            .messages
+            .push(ChatMessage::Assistant("answer".to_string()));
+        state.finalized_count = state.messages.len();
+        state.status = AppStatus::Idle;
+
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 10))
+            .expect("test backend");
+
+        terminal
+            .draw(|frame| ui::render(frame, &mut state, &TextArea::default(), &theme))
+            .expect("draw");
+
+        assert_eq!(state.flushed_count, 0);
+        let rendered = format!("{:?}", terminal.backend().buffer());
+        assert!(rendered.contains("hi"));
+        assert!(rendered.contains("answer"));
     }
 
     #[test]

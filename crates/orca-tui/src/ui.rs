@@ -29,7 +29,11 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
         return;
     }
 
-    let input_height = composer_input_height(frame.area().width, textarea);
+    let input_height = if composer_visible(state) {
+        composer_input_height(frame.area().width, textarea)
+    } else {
+        0
+    };
 
     let plan_height = plan_panel_height(state);
     let goal_height: u16 = if state.current_goal.is_some() { 3 } else { 0 };
@@ -49,7 +53,9 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
     if plan_height > 0 {
         render_plan_panel(frame, chunks[2], state, theme);
     }
-    render_input(frame, chunks[3], textarea);
+    if composer_visible(state) {
+        render_input(frame, chunks[3], textarea);
+    }
     render_status(frame, chunks[4], state, theme);
 
     if state.slash_menu.is_some() {
@@ -75,14 +81,47 @@ fn main_layout(
     plan_height: u16,
     input_height: u16,
 ) -> std::rc::Rc<[Rect]> {
+    // The fixed chrome (goal banner, plan, input box, status line) MUST keep its height so the
+    // input box stays pinned at the bottom; the message transcript takes whatever is left.
+    // In ratatui 0.29 `Min` has the HIGHEST solver priority and `Fill` the LOWEST, so giving
+    // the transcript `Min(5)` made it steal rows from the `Length` chrome when the transcript
+    // overflowed — the input box got squeezed off-screen and the auto-scrolled tail landed
+    // behind it. `Fill(1)` makes the transcript yield to the fixed chrome instead.
     Layout::vertical([
         Constraint::Length(goal_height),
-        Constraint::Min(5),
+        Constraint::Fill(1),
         Constraint::Length(plan_height),
         Constraint::Length(input_height),
         Constraint::Length(1),
     ])
     .split(area)
+}
+
+/// A `width`×`height` rect centered inside `area`, clamped so it never extends past
+/// `area`'s bounds.
+///
+/// Floating popups (setup, approval dialog, shortcuts, panel overlays) are positioned by
+/// centering within `frame.area()`. Under the inline viewport, `frame.area()` does NOT start
+/// at `(0, 0)` — its origin is wherever the viewport is anchored (e.g. `y: 31`). Computing the
+/// offset as `(area.height - height) / 2` alone yields a coordinate relative to `(0, 0)`, so
+/// the popup lands *above* the viewport's buffer and `Buffer::index_of` panics with "index
+/// outside of buffer". Adding `area.x`/`area.y` keeps the popup inside the actual buffer; the
+/// final `clamp`/`min` guarantees it stays in bounds even when `width`/`height` exceed `area`.
+fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    Rect {
+        x,
+        y,
+        width,
+        height,
+    }
+}
+
+fn composer_visible(state: &AppState) -> bool {
+    !matches!(state.status, AppStatus::WaitingApproval)
 }
 
 fn render_goal_banner(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
@@ -320,9 +359,9 @@ pub(crate) fn visual_height_of_lines(lines: &[Line], width: usize) -> u16 {
         .fold(0u16, |acc, n| acc.saturating_add(n))
 }
 
-/// The lines the live (not-yet-flushed) message pane shows: the welcome banner before
-/// the first message, otherwise `messages[flushed_count..]`. Single source of truth so
-/// the height computation and the renderer never disagree.
+/// The lines the transcript pane shows: the welcome banner before the first message,
+/// otherwise `messages[flushed_count..]`. Single source of truth so the height computation
+/// and the renderer never disagree.
 fn live_pane_lines(state: &AppState, theme: &Theme, width: usize) -> Vec<Line<'static>> {
     if state.messages.is_empty() {
         build_welcome_lines(state, theme)
@@ -332,102 +371,25 @@ fn live_pane_lines(state: &AppState, theme: &Theme, width: usize) -> Vec<Line<'s
     }
 }
 
-/// Visual height the live message pane needs at the given width, without any surrounding
-/// border. Used to size the inline viewport.
-pub(crate) fn live_messages_visual_height(state: &AppState, theme: &Theme, width: usize) -> u16 {
-    let lines = live_pane_lines(state, theme, width);
-    visual_height_of_lines(&lines, width)
+fn approval_dialog_height(dialog: &crate::types::ApprovalDialog) -> u16 {
+    let diff_lines = dialog
+        .diff
+        .as_ref()
+        .map(|diff| diff.lines().take(12).count() as u16)
+        .unwrap_or(0);
+    let diff_truncated = dialog
+        .diff
+        .as_ref()
+        .map(|diff| diff.lines().count() > 12)
+        .unwrap_or(false);
+    let diff_h = diff_lines + u16::from(diff_truncated);
+    let option_count = dialog.options.len() as u16;
+    (3 + diff_h + option_count + 3).max(8)
 }
 
-/// Whether the current state needs the inline viewport expanded to the full terminal
-/// height: modal overlays (approval dialog, shortcuts help) and the full-panel
-/// dashboards (workflows / agents) all want the whole screen rather than a bottom strip.
-pub(crate) fn inline_wants_full_height(state: &AppState) -> bool {
-    matches!(
-        state.status,
-        AppStatus::Setup | AppStatus::SessionPicker | AppStatus::WaitingApproval
-    ) || state.show_shortcuts
-        || state.panel_mode != PanelMode::Conversation
-}
-
-/// How tall the inline viewport should be this frame: the live UI chrome (goal banner,
-/// plan panel, composer, status line) plus the live message pane, clamped to the
-/// terminal height. Modal-ish states take the full terminal height (see
-/// [`inline_wants_full_height`]).
-pub(crate) fn inline_viewport_height(
-    state: &AppState,
-    textarea: &TextArea,
-    theme: &Theme,
-    term_width: u16,
-    term_height: u16,
-) -> u16 {
-    if term_height == 0 {
-        return 1;
-    }
-    if inline_wants_full_height(state) {
-        return term_height;
-    }
-
-    let goal_height: u16 = if state.current_goal.is_some() { 3 } else { 0 };
-    let plan_height = plan_panel_height(state);
-    let input_height = composer_input_height(term_width, textarea);
-    let status_height = 1u16;
-    let chrome = goal_height
-        .saturating_add(plan_height)
-        .saturating_add(input_height)
-        .saturating_add(status_height);
-
-    // Slash-menu / mention popups float above the composer, growing upward into the
-    // message pane. Reserve enough live rows for the tallest active overlay so it can't
-    // clip against the top of a short inline viewport.
-    let overlay = active_overlay_height(state);
-    let min_live = overlay.max(1);
-
-    // Cap the live message pane at a fixed strip instead of tracking the full content
-    // height. Under Strategy B every change to the viewport height drops and rebuilds the
-    // inline Terminal, so letting the pane grow line-by-line with streaming output produces
-    // a rebuild storm (the flicker/duplication risk). Capping bounds rebuilds to the brief
-    // grow-to-cap phase; once content exceeds the cap the height is stable and the overflow
-    // becomes scrollable via the live-pane scroll keys.
-    let live_content = live_messages_visual_height(state, theme, term_width as usize);
-    let live_cap = LIVE_PANE_MAX_ROWS.max(min_live);
-    let live = live_content.clamp(min_live, live_cap);
-    let desired = chrome.saturating_add(live);
-
-    // Never exceed the terminal.
-    desired.min(term_height)
-}
-
-/// Maximum height (in rows) of the live message pane in the inline viewport. The live pane
-/// only ever shows the still-mutable tail of the current turn — settled content flushes up
-/// into the native scrollback — so a bounded strip is enough; taller content scrolls within
-/// it. Keeping this fixed is what stops streaming output from rebuilding the inline Terminal
-/// on every new line (see [`inline_viewport_height`]).
-const LIVE_PANE_MAX_ROWS: u16 = 16;
-
-/// Height of the floating popup (slash menu or mention list) the composer currently shows,
-/// or 0 when none is active. Mirrors the popup sizing in [`render_slash_menu`] /
-/// [`render_mention_candidates`] so the inline viewport can reserve room for it.
-fn active_overlay_height(state: &AppState) -> u16 {
-    if let Some(menu) = &state.slash_menu {
-        let item_count = match &menu.sub_menu {
-            Some(sub) => sub.items.len(),
-            None => menu.items.len(),
-        } as u16;
-        return (item_count + 2).min(14);
-    }
-    if !state.mention_candidates.is_empty() {
-        let item_count = state.mention_candidates.len().min(12) as u16;
-        return item_count + 2;
-    }
-    0
-}
-
-/// Render the live (not-yet-flushed) messages into `area` with no border, so the pane
-/// blends seamlessly with the native scrollback above it. While `auto_scroll` is on the
-/// newest content is pinned to the bottom of `area`; once the user scrolls up (PageUp,
-/// k/j, etc.) `auto_scroll` clears and the pane honours `scroll_offset` so they can read
-/// back through a long in-progress turn.
+/// Render the transcript messages into `area` with no border. While `auto_scroll` is on
+/// the newest content is pinned to the bottom of `area`; once the user scrolls up
+/// (PageUp, k/j, etc.) `auto_scroll` clears and the pane honours `scroll_offset`.
 pub(crate) fn render_live_messages(
     frame: &mut Frame,
     area: Rect,
@@ -1827,6 +1789,7 @@ fn render_status(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
             Style::default().fg(theme.muted),
         ),
         context_cell(state, theme),
+        Span::styled(" | shift+drag to copy", Style::default().fg(theme.muted)),
         Span::styled(" | F1/ctrl+k shortcuts", Style::default().fg(theme.muted)),
     ]);
 
@@ -1898,9 +1861,7 @@ fn render_shortcuts(frame: &mut Frame, state: &AppState, theme: &Theme) {
     let scopes = active_shortcut_scopes(state);
     let lines = shortcuts::shortcut_lines(&scopes);
     let height = ((lines.len() as u16) + 2).min(max_height).max(3);
-    let x = (area.width.saturating_sub(width)) / 2;
-    let y = (area.height.saturating_sub(height)) / 2;
-    let popup_area = Rect::new(x, y, width, height);
+    let popup_area = centered_rect(area, width, height);
 
     frame.render_widget(Clear, popup_area);
 
@@ -2068,14 +2029,11 @@ fn render_approval_dialog(frame: &mut Frame, state: &AppState, theme: &Theme) {
         .unwrap_or(false);
 
     // Header (3) + diff + options + footer (2); clamp to the screen.
-    let option_count = dialog.options.len() as u16;
-    let diff_h = diff_lines.len() as u16 + if diff_truncated { 1 } else { 0 };
-    let content_h = 3 + diff_h + option_count + 3;
     let width = 64u16.min(area.width.saturating_sub(4));
-    let height = content_h.min(area.height.saturating_sub(4)).max(8);
-    let x = (area.width.saturating_sub(width)) / 2;
-    let y = (area.height.saturating_sub(height)) / 2;
-    let popup_area = Rect::new(x, y, width, height);
+    let height = approval_dialog_height(dialog)
+        .min(area.height.saturating_sub(4))
+        .max(8);
+    let popup_area = centered_rect(area, width, height);
 
     frame.render_widget(Clear, popup_area);
 
@@ -2160,9 +2118,7 @@ fn render_setup(frame: &mut Frame, state: &AppState, textarea: &TextArea, _theme
         0 => {
             let width = 60u16.min(area.width.saturating_sub(4));
             let height = 16u16.min(area.height.saturating_sub(2));
-            let x = (area.width.saturating_sub(width)) / 2;
-            let y = (area.height.saturating_sub(height)) / 2;
-            let popup_area = Rect::new(x, y, width, height);
+            let popup_area = centered_rect(area, width, height);
 
             let content = vec![
                 Line::from(""),
@@ -2215,9 +2171,7 @@ fn render_setup(frame: &mut Frame, state: &AppState, textarea: &TextArea, _theme
         1 => {
             let width = 60u16.min(area.width.saturating_sub(4));
             let height = 14u16.min(area.height.saturating_sub(2));
-            let x = (area.width.saturating_sub(width)) / 2;
-            let y = (area.height.saturating_sub(height)) / 2;
-            let popup_area = Rect::new(x, y, width, height);
+            let popup_area = centered_rect(area, width, height);
 
             let inner =
                 Layout::vertical([Constraint::Min(3), Constraint::Length(3)]).split(Rect::new(
@@ -2264,9 +2218,7 @@ fn render_setup(frame: &mut Frame, state: &AppState, textarea: &TextArea, _theme
         2 => {
             let width = 60u16.min(area.width.saturating_sub(4));
             let height = 12u16.min(area.height.saturating_sub(2));
-            let x = (area.width.saturating_sub(width)) / 2;
-            let y = (area.height.saturating_sub(height)) / 2;
-            let popup_area = Rect::new(x, y, width, height);
+            let popup_area = centered_rect(area, width, height);
 
             let content = vec![
                 Line::from(""),
@@ -2741,6 +2693,7 @@ fn truncate_lines(text: &str, max_lines: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::TuiEvent;
     use chrono::Utc;
     use orca_core::config::AdditionalWorkingDirectory;
     use orca_runtime::history::SessionSummary;
@@ -2848,91 +2801,29 @@ mod tests {
     }
 
     #[test]
-    fn inline_viewport_reserves_rows_for_an_active_slash_menu() {
+    fn waiting_approval_does_not_render_composer_under_dialog() {
         let mut state = test_state();
-        let theme = Theme::named(orca_core::config::ThemeName::Dark);
-        let textarea = TextArea::default();
-
-        // A fully-flushed buffer leaves an empty (1-row) live pane: the popup reservation,
-        // not the live content, is what must keep the floating menu from clipping.
-        state.messages.push(ChatMessage::User("hi".to_string()));
-        state.flushed_count = state.messages.len();
-
-        let baseline = inline_viewport_height(&state, &textarea, &theme, 80, 40);
-
-        // Open a slash menu with 6 items; the popup is `items + 2` rows tall and floats up
-        // into the live pane, so the viewport must grow to keep it from clipping.
-        state.slash_menu = Some(crate::types::SlashMenu {
-            items: (0..6)
-                .map(|i| crate::types::SlashMenuItem {
-                    command: format!("/cmd{i}"),
-                    description: String::new(),
-                })
-                .collect(),
-            selected: 0,
-            sub_menu: None,
+        state.update(TuiEvent::ApprovalNeeded {
+            id: "approval-1".to_string(),
+            tool: "web_search".to_string(),
+            target: Some("A股 2026年6月30日 尾盘资金走向".to_string()),
+            preview: None,
         });
-        let with_menu = inline_viewport_height(&state, &textarea, &theme, 80, 40);
 
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let textarea = TextArea::default();
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30))
+            .expect("test backend");
+
+        terminal
+            .draw(|frame| render(frame, &mut state, &textarea, &theme))
+            .expect("draw");
+        let rendered = format!("{:?}", terminal.backend().buffer());
+
+        assert!(rendered.contains("Approval Required"));
         assert!(
-            with_menu >= baseline + 7,
-            "expected viewport to reserve the 8-row popup (got {with_menu} vs baseline {baseline})"
-        );
-        assert!(with_menu <= 40, "viewport must never exceed the terminal");
-    }
-
-    #[test]
-    fn inline_viewport_is_capped_at_terminal_height() {
-        let mut state = test_state();
-        let theme = Theme::named(orca_core::config::ThemeName::Dark);
-        let textarea = TextArea::default();
-
-        // A huge mention list can't push the viewport past the terminal height.
-        state.mention_candidates = (0..40).map(|i| format!("file{i}.rs")).collect();
-        let height = inline_viewport_height(&state, &textarea, &theme, 80, 12);
-        assert!(height <= 12);
-    }
-
-    #[test]
-    fn setup_and_session_picker_use_full_inline_viewport_height() {
-        let mut state = test_state();
-        let theme = Theme::named(orca_core::config::ThemeName::Dark);
-        let textarea = TextArea::default();
-
-        state.status = AppStatus::Setup;
-        assert_eq!(
-            inline_viewport_height(&state, &textarea, &theme, 80, 40),
-            40
-        );
-
-        state.status = AppStatus::SessionPicker;
-        assert_eq!(
-            inline_viewport_height(&state, &textarea, &theme, 80, 40),
-            40
-        );
-    }
-
-    #[test]
-    fn live_pane_is_capped_so_streaming_does_not_grow_the_viewport_unbounded() {
-        let mut state = test_state();
-        let theme = Theme::named(orca_core::config::ThemeName::Dark);
-        let textarea = TextArea::default();
-
-        // A live assistant message far taller than the cap. On a tall terminal the viewport
-        // must still stop growing at chrome + LIVE_PANE_MAX_ROWS rather than tracking the
-        // whole 200-line body — otherwise every streamed line would rebuild the Terminal.
-        let body = (0..200)
-            .map(|i| format!("line {i}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        state.messages.push(ChatMessage::Assistant(body));
-
-        let height = inline_viewport_height(&state, &textarea, &theme, 80, 200);
-        // chrome here is just the 1-row status line (no goal/plan, empty composer).
-        let status_height = 1u16;
-        assert!(
-            height <= status_height + LIVE_PANE_MAX_ROWS + composer_input_height(80, &textarea),
-            "viewport {height} should be bounded by chrome + the live-pane cap"
+            !rendered.contains("Input"),
+            "approval modal should own the foreground without drawing the idle composer"
         );
     }
 
@@ -3392,5 +3283,93 @@ mod tests {
 
         assert_eq!(used_rows, 3);
         assert_eq!(wrapped_line_count(&Line::from("aa bb-cc-dd"), 6), used_rows);
+    }
+
+    #[test]
+    fn centered_rect_stays_inside_a_non_origin_inline_viewport() {
+        use ratatui::layout::Rect;
+        // Reproduces the approval-dialog panic: under the inline viewport the frame area is
+        // anchored below the origin (the real crash had `Rect{x:0,y:31,width:90,height:24}`).
+        // A popup centered relative to (0,0) lands above the buffer and panics in
+        // `Buffer::index_of`. `centered_rect` must keep the popup fully inside `area`.
+        let area = Rect::new(0, 31, 90, 24);
+        let popup = centered_rect(area, 64, 12);
+        assert!(
+            popup.y >= area.y,
+            "popup top {} above viewport {}",
+            popup.y,
+            area.y
+        );
+        assert!(
+            popup.bottom() <= area.bottom(),
+            "popup bottom {} past viewport {}",
+            popup.bottom(),
+            area.bottom()
+        );
+        assert!(popup.right() <= area.right());
+        assert!(popup.x >= area.x);
+    }
+
+    #[test]
+    fn centered_rect_clamps_oversized_popup_to_area() {
+        use ratatui::layout::Rect;
+        // A popup larger than the (small) inline viewport must shrink to fit, never overflow.
+        let area = Rect::new(0, 10, 40, 6);
+        let popup = centered_rect(area, 64, 20);
+        assert_eq!(popup.width, area.width);
+        assert_eq!(popup.height, area.height);
+        assert!(popup.bottom() <= area.bottom());
+        assert!(popup.right() <= area.right());
+    }
+
+    #[test]
+    fn overflowing_transcript_keeps_input_and_status_pinned() {
+        // Regression: a transcript taller than the screen must NOT squeeze the input box or
+        // status line off-screen. The fixed chrome stays; the transcript yields. (Previously
+        // the messages area used `Constraint::Min(5)`, which has higher solver priority than
+        // the `Length` chrome and stole its rows when content overflowed.)
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let mut state = test_state();
+        state.status = AppStatus::Idle;
+        let body = (0..80)
+            .map(|i| format!("数据行内容{i}测试"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        state.messages.push(ChatMessage::Assistant(body));
+        state.auto_scroll = true;
+        // Real composer carries a bordered "Input" block (3 rows tall), like make_textarea.
+        let mut textarea = TextArea::default();
+        textarea.set_block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .title(" Input "),
+        );
+        let h = 24u16;
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(50, h))
+            .expect("test backend");
+        terminal
+            .draw(|frame| render(frame, &mut state, &textarea, &theme))
+            .expect("draw");
+        let buf = terminal.backend().buffer().clone();
+        let row_text =
+            |y: u16| -> String { (0..50).map(|x| buf[(x, y)].symbol().to_string()).collect() };
+        let has = |needle: &str| (0..h).any(|y| row_text(y).contains(needle));
+
+        assert!(
+            has("Input"),
+            "input box must stay visible when the transcript overflows"
+        );
+        assert!(
+            has("idle"),
+            "status line must stay visible when the transcript overflows"
+        );
+        // The composer (input) needs its full height; the messages area is everything above
+        // the input + status, so visible_height must leave room for them.
+        assert!(
+            state.visible_height <= h - 2,
+            "messages area ({}) must not consume the input/status rows (term {h})",
+            state.visible_height
+        );
     }
 }
