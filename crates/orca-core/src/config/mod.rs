@@ -65,6 +65,8 @@ pub const DEFAULT_MAX_WORKFLOW_CONCURRENT_AGENTS: usize = 16;
 pub const DEFAULT_MAX_WORKFLOW_AGENTS_PER_RUN: u32 = 1000;
 pub const DEFAULT_MAX_WORKFLOW_AGENT_RETRIES: u32 = 1;
 pub const MAX_WORKFLOW_AGENT_RETRIES: u32 = 5;
+pub const DEFAULT_PERMISSION_PROFILE_GLOB_SCAN_MAX_DEPTH: usize = 32;
+pub const MAX_PERMISSION_PROFILE_GLOB_SCAN_MAX_DEPTH: usize = 256;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ModelRuntimeConfig {
@@ -277,6 +279,8 @@ pub struct PermissionProfileConfig {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct PermissionProfileFilesystemConfig {
+    #[serde(default, alias = "globScanMaxDepth")]
+    glob_scan_max_depth: Option<usize>,
     entries: HashMap<PathBuf, PermissionProfileFileAccess>,
 }
 
@@ -292,9 +296,17 @@ impl<'de> Deserialize<'de> for PermissionProfileFilesystemConfig {
     where
         D: serde::Deserializer<'de>,
     {
-        let raw = HashMap::<PathBuf, PermissionProfileFilesystemEntry>::deserialize(deserializer)?;
+        #[derive(Deserialize)]
+        struct RawPermissionProfileFilesystemConfig {
+            #[serde(default, alias = "globScanMaxDepth")]
+            glob_scan_max_depth: Option<usize>,
+            #[serde(flatten)]
+            entries: HashMap<PathBuf, PermissionProfileFilesystemEntry>,
+        }
+
+        let raw = RawPermissionProfileFilesystemConfig::deserialize(deserializer)?;
         let mut entries = HashMap::new();
-        for (path, entry) in raw {
+        for (path, entry) in raw.entries {
             let path = normalize_permission_profile_filesystem_path(path);
             match entry {
                 PermissionProfileFilesystemEntry::Access(access) => {
@@ -310,8 +322,15 @@ impl<'de> Deserialize<'de> for PermissionProfileFilesystemConfig {
                 }
             }
         }
-        Ok(Self { entries })
+        Ok(Self {
+            glob_scan_max_depth: raw.glob_scan_max_depth.map(normalize_glob_scan_max_depth),
+            entries,
+        })
     }
+}
+
+fn normalize_glob_scan_max_depth(depth: usize) -> usize {
+    depth.clamp(1, MAX_PERMISSION_PROFILE_GLOB_SCAN_MAX_DEPTH)
 }
 
 fn normalize_permission_profile_filesystem_path(path: PathBuf) -> PathBuf {
@@ -328,6 +347,10 @@ fn normalize_permission_profile_filesystem_path(path: PathBuf) -> PathBuf {
 }
 
 impl PermissionProfileFilesystemConfig {
+    pub fn glob_scan_max_depth(&self) -> Option<usize> {
+        self.glob_scan_max_depth
+    }
+
     pub fn get(&self, path: &std::path::Path) -> Option<&PermissionProfileFileAccess> {
         self.entries.get(path)
     }
@@ -335,11 +358,24 @@ impl PermissionProfileFilesystemConfig {
     pub fn entries(&self) -> impl Iterator<Item = (&PathBuf, &PermissionProfileFileAccess)> {
         self.entries.iter()
     }
+
+    pub fn from_parts(
+        glob_scan_max_depth: Option<usize>,
+        entries: HashMap<PathBuf, PermissionProfileFileAccess>,
+    ) -> Self {
+        Self {
+            glob_scan_max_depth: glob_scan_max_depth.map(normalize_glob_scan_max_depth),
+            entries,
+        }
+    }
 }
 
 impl From<HashMap<PathBuf, PermissionProfileFileAccess>> for PermissionProfileFilesystemConfig {
     fn from(entries: HashMap<PathBuf, PermissionProfileFileAccess>) -> Self {
-        Self { entries }
+        Self {
+            glob_scan_max_depth: None,
+            entries,
+        }
     }
 }
 

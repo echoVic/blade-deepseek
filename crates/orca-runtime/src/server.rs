@@ -27,7 +27,9 @@ use crate::thread_store::{
     SessionStore, SortDirection, StoredThreadSummary, ThreadListFilters, ThreadMetadataPatch,
     ThreadSortKey, ThreadStore, TurnItemsView,
 };
-use orca_core::config::{HistoryMode, OutputFormat, RunConfig};
+use orca_core::config::{
+    DEFAULT_PERMISSION_PROFILE_GLOB_SCAN_MAX_DEPTH, HistoryMode, OutputFormat, RunConfig,
+};
 
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
@@ -2053,6 +2055,11 @@ fn resolve_permission_profile(
                 "command/exec permissionProfile network unix socket policy is parsed but not enforceable yet: {name}"
             ));
         }
+        let glob_scan_max_depth = profile
+            .filesystem
+            .glob_scan_max_depth()
+            .or_else(|| inherited_permission_profile_glob_scan_max_depth(config, profile, &seen))
+            .unwrap_or(DEFAULT_PERMISSION_PROFILE_GLOB_SCAN_MAX_DEPTH);
         for (path, access) in profile.filesystem.entries() {
             if contains_glob_chars(path) {
                 for pattern in materialize_permission_profile_glob_patterns(
@@ -2060,7 +2067,8 @@ fn resolve_permission_profile(
                     runtime_workspace_roots,
                     path,
                 ) {
-                    let roots = expand_permission_profile_filesystem_glob(&pattern)?;
+                    let roots =
+                        expand_permission_profile_filesystem_glob(&pattern, glob_scan_max_depth)?;
                     for root in roots {
                         if access.allows_read() {
                             push_unique_path(&mut additional_readable_roots, root.clone());
@@ -2114,6 +2122,37 @@ fn resolve_permission_profile(
     })
 }
 
+fn inherited_permission_profile_glob_scan_max_depth(
+    config: &RunConfig,
+    profile: &orca_core::config::PermissionProfileConfig,
+    seen: &[String],
+) -> Option<usize> {
+    let mut current = profile
+        .extends
+        .as_deref()
+        .and_then(normalize_permission_profile_name)
+        .map(str::to_string);
+    let mut seen = seen.to_vec();
+    while let Some(name) = current {
+        if is_builtin_permission_profile_name(&name)
+            || seen.iter().any(|seen_name| seen_name == &name)
+        {
+            return None;
+        }
+        seen.push(name.clone());
+        let profile = config.permission_profiles.get(&name)?;
+        if let Some(depth) = profile.filesystem.glob_scan_max_depth() {
+            return Some(depth);
+        }
+        current = profile
+            .extends
+            .as_deref()
+            .and_then(normalize_permission_profile_name)
+            .map(str::to_string);
+    }
+    None
+}
+
 fn contains_glob_chars(path: &std::path::Path) -> bool {
     path.to_string_lossy()
         .chars()
@@ -2128,7 +2167,10 @@ fn materialize_permission_profile_glob_patterns(
     materialize_workspace_roots_paths(cwd, runtime_workspace_roots, path)
 }
 
-fn expand_permission_profile_filesystem_glob(pattern: &Path) -> Result<Vec<PathBuf>, String> {
+fn expand_permission_profile_filesystem_glob(
+    pattern: &Path,
+    max_depth: usize,
+) -> Result<Vec<PathBuf>, String> {
     let Some((search_root, relative_pattern)) = split_permission_profile_glob(pattern) else {
         return Err(format!(
             "command/exec permissionProfile filesystem glob is too broad to scan safely: {}",
@@ -2150,7 +2192,10 @@ fn expand_permission_profile_filesystem_glob(pattern: &Path) -> Result<Vec<PathB
         })?
         .compile_matcher();
     let mut matches = Vec::new();
-    for entry in WalkDir::new(&search_root).follow_links(false) {
+    for entry in WalkDir::new(&search_root)
+        .follow_links(false)
+        .max_depth(max_depth)
+    {
         let entry = entry.map_err(|error| {
             format!(
                 "failed to scan command/exec permissionProfile filesystem glob {}: {error}",
@@ -3688,6 +3733,134 @@ mod tests {
         assert!(sandbox.additional_writable_roots.contains(&matched));
         assert!(!sandbox.additional_readable_roots.contains(&ignored));
         assert!(!sandbox.additional_writable_roots.contains(&ignored));
+    }
+
+    #[test]
+    fn command_exec_sandbox_respects_permission_profile_glob_scan_max_depth() {
+        let temp = tempdir().expect("temp");
+        let shallow = temp.path().join("docs");
+        let deep = shallow.join("nested");
+        let shallow_match = shallow.join("guide.md");
+        let deep_match = deep.join("hidden.md");
+        std::fs::create_dir_all(&deep).expect("mkdir nested");
+        std::fs::write(&shallow_match, "guide").expect("write shallow");
+        std::fs::write(&deep_match, "hidden").expect("write deep");
+        let mut config = test_run_config();
+        config.permission_profiles.insert(
+            "shallow-docs".to_string(),
+            orca_core::config::PermissionProfileConfig {
+                extends: Some(":read-only".to_string()),
+                filesystem: orca_core::config::PermissionProfileFilesystemConfig::from_parts(
+                    Some(2),
+                    std::collections::HashMap::from([(
+                        temp.path().join("**/*.md"),
+                        orca_core::config::PermissionProfileFileAccess::Read,
+                    )]),
+                ),
+                ..Default::default()
+            },
+        );
+        let options = protocol::CommandExecOptions {
+            permission_profile: Some("shallow-docs".to_string()),
+            ..Default::default()
+        };
+
+        let sandbox = test_profile_sandbox(&config, &options).expect("shallow glob profile");
+
+        assert!(sandbox.additional_readable_roots.contains(&shallow_match));
+        assert!(!sandbox.additional_readable_roots.contains(&deep_match));
+    }
+
+    #[test]
+    fn command_exec_sandbox_inherits_permission_profile_glob_scan_max_depth() {
+        let temp = tempdir().expect("temp");
+        let shallow = temp.path().join("docs");
+        let deep = shallow.join("nested");
+        let shallow_match = shallow.join("guide.md");
+        let deep_match = deep.join("hidden.md");
+        std::fs::create_dir_all(&deep).expect("mkdir nested");
+        std::fs::write(&shallow_match, "guide").expect("write shallow");
+        std::fs::write(&deep_match, "hidden").expect("write deep");
+        let mut config = test_run_config();
+        config.permission_profiles.insert(
+            "base-depth".to_string(),
+            orca_core::config::PermissionProfileConfig {
+                extends: Some(":read-only".to_string()),
+                filesystem: orca_core::config::PermissionProfileFilesystemConfig::from_parts(
+                    Some(2),
+                    Default::default(),
+                ),
+                ..Default::default()
+            },
+        );
+        config.permission_profiles.insert(
+            "child-docs".to_string(),
+            orca_core::config::PermissionProfileConfig {
+                extends: Some("base-depth".to_string()),
+                filesystem: std::collections::HashMap::from([(
+                    temp.path().join("**/*.md"),
+                    orca_core::config::PermissionProfileFileAccess::Read,
+                )])
+                .into(),
+                ..Default::default()
+            },
+        );
+        let options = protocol::CommandExecOptions {
+            permission_profile: Some("child-docs".to_string()),
+            ..Default::default()
+        };
+
+        let sandbox = test_profile_sandbox(&config, &options).expect("inherited depth profile");
+
+        assert!(sandbox.additional_readable_roots.contains(&shallow_match));
+        assert!(!sandbox.additional_readable_roots.contains(&deep_match));
+    }
+
+    #[test]
+    fn command_exec_sandbox_overrides_inherited_permission_profile_glob_scan_max_depth() {
+        let temp = tempdir().expect("temp");
+        let shallow = temp.path().join("docs");
+        let deep = shallow.join("nested");
+        let shallow_match = shallow.join("guide.md");
+        let deep_match = deep.join("hidden.md");
+        std::fs::create_dir_all(&deep).expect("mkdir nested");
+        std::fs::write(&shallow_match, "guide").expect("write shallow");
+        std::fs::write(&deep_match, "hidden").expect("write deep");
+        let mut config = test_run_config();
+        config.permission_profiles.insert(
+            "base-depth".to_string(),
+            orca_core::config::PermissionProfileConfig {
+                extends: Some(":read-only".to_string()),
+                filesystem: orca_core::config::PermissionProfileFilesystemConfig::from_parts(
+                    Some(2),
+                    Default::default(),
+                ),
+                ..Default::default()
+            },
+        );
+        config.permission_profiles.insert(
+            "child-docs".to_string(),
+            orca_core::config::PermissionProfileConfig {
+                extends: Some("base-depth".to_string()),
+                filesystem: orca_core::config::PermissionProfileFilesystemConfig::from_parts(
+                    Some(4),
+                    std::collections::HashMap::from([(
+                        temp.path().join("**/*.md"),
+                        orca_core::config::PermissionProfileFileAccess::Read,
+                    )]),
+                ),
+                ..Default::default()
+            },
+        );
+        let options = protocol::CommandExecOptions {
+            permission_profile: Some("child-docs".to_string()),
+            ..Default::default()
+        };
+
+        let sandbox = test_profile_sandbox(&config, &options).expect("overridden depth profile");
+
+        assert!(sandbox.additional_readable_roots.contains(&shallow_match));
+        assert!(sandbox.additional_readable_roots.contains(&deep_match));
     }
 
     #[test]

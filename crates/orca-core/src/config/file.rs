@@ -561,6 +561,42 @@ secrets = "deny"
     }
 
     #[test]
+    fn parse_permission_profile_filesystem_glob_scan_max_depth() {
+        let toml = r#"
+[permission_profiles.docs]
+extends = ":read-only"
+
+[permission_profiles.docs.filesystem]
+glob_scan_max_depth = 2
+"/tmp/orca-docs/**/*.md" = "read"
+"#;
+        let config: FileConfig = toml::from_str(toml).unwrap();
+        let profile = config.permission_profiles.get("docs").unwrap();
+
+        assert_eq!(profile.filesystem.glob_scan_max_depth(), Some(2));
+        assert_eq!(
+            profile.filesystem.get(Path::new("/tmp/orca-docs/**/*.md")),
+            Some(&crate::config::PermissionProfileFileAccess::Read)
+        );
+    }
+
+    #[test]
+    fn parse_permission_profile_filesystem_glob_scan_max_depth_alias() {
+        let toml = r#"
+[permission_profiles.docs]
+extends = ":read-only"
+
+[permission_profiles.docs.filesystem]
+globScanMaxDepth = 3
+"/tmp/orca-docs/**/*.md" = "read"
+"#;
+        let config: FileConfig = toml::from_str(toml).unwrap();
+        let profile = config.permission_profiles.get("docs").unwrap();
+
+        assert_eq!(profile.filesystem.glob_scan_max_depth(), Some(3));
+    }
+
+    #[test]
     fn parse_permission_profile_network_enabled() {
         let toml = r#"
 [permission_profiles.net-on]
