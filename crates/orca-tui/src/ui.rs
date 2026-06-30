@@ -2880,6 +2880,34 @@ mod tests {
     }
 
     #[test]
+    fn live_pane_auto_scrolls_cjk_content_to_the_tail() {
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let body = (0..24)
+            .map(|i| format!("第{i}行中文内容，用来测试首问长答案是否能正确顶到底部"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let mut state = test_state();
+        state.messages.push(ChatMessage::Assistant(body));
+        state.auto_scroll = true;
+
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(24, 8))
+            .expect("test backend");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_live_messages(frame, area, &mut state, &theme);
+            })
+            .expect("draw");
+
+        let rendered = format!("{:?}", terminal.backend().buffer());
+        assert!(
+            rendered.contains("第23行"),
+            "auto-scroll should pin the tail of long CJK content"
+        );
+    }
+
+    #[test]
     fn context_cell_is_hidden_until_a_budget_is_known() {
         let state = test_state();
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
