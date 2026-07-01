@@ -1384,16 +1384,29 @@ fn controller_turn_started_events_include_agent_task_lifecycle() {
     let exit = orca_runtime::controller::run_to_writer(config, &mut output);
 
     assert_eq!(exit, 0);
-    let turn_started = String::from_utf8(output)
+    let events = String::from_utf8(output)
         .expect("utf8")
         .lines()
         .map(|line| serde_json::from_str::<Value>(line).expect("json event"))
+        .collect::<Vec<_>>();
+    let session_started = events
+        .iter()
+        .find(|event| event["type"] == "session.started")
+        .expect("session.started event");
+    let turn_started = events
+        .iter()
         .find(|event| event["type"] == "turn.started")
         .expect("turn.started event");
+    let session_completed = events
+        .iter()
+        .find(|event| event["type"] == "session.completed")
+        .expect("session.completed event");
 
     assert_eq!(turn_started["payload"]["task"]["kind"], "agent");
     assert_eq!(turn_started["payload"]["task"]["status"], "running");
     assert_eq!(turn_started["payload"]["task"]["turn"], 1);
+    assert_eq!(turn_started["runId"], session_started["runId"]);
+    assert_eq!(session_completed["runId"], session_started["runId"]);
 }
 
 fn workflow_script() -> &'static str {

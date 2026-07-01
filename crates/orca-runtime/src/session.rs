@@ -70,11 +70,6 @@ impl<'a> AgentConversationContext<'a> {
         }
     }
 
-    pub(crate) fn with_resumed(mut self, resumed: Option<&'a SessionTranscript>) -> Self {
-        self.resumed = resumed;
-        self
-    }
-
     pub(crate) fn with_history_writer(
         mut self,
         history_writer: Option<&'a mut SessionWriter>,

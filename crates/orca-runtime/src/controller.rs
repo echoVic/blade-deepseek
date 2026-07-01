@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use orca_core::cancel::CancelToken;
-use orca_core::config::{HistoryMode, OutputFormat, RunConfig};
+use orca_core::config::{OutputFormat, RunConfig};
 use orca_core::event_schema::{EventFactory, RunStatus};
 use orca_core::event_sink::EventSink;
 use orca_core::subagent_types::SubagentType;
@@ -16,19 +16,25 @@ use orca_tools;
 
 use crate::agent_common;
 use crate::agent_loop::run_agent_loop;
+#[cfg(test)]
 use crate::cost::CostTracker;
-use crate::hooks::{HookContext, HookRunner};
-use crate::instructions;
+use crate::hooks::HookContext;
+#[cfg(test)]
+use crate::hooks::HookRunner;
+#[cfg(test)]
 use crate::instructions::ProjectInstructions;
+#[cfg(test)]
+use crate::lifecycle::RuntimeTaskKind;
 use crate::lifecycle::{
-    AgentLoopContext, RuntimePermissionRequestHandler, RuntimeSessionLifecycle, RuntimeTaskKind,
-    ThreadSteerHandle,
+    AgentLoopContext, RuntimePermissionRequestHandler, RuntimeSessionLifecycle, ThreadSteerHandle,
 };
-use crate::memory;
 use crate::session::{
-    AgentConversationContext, InteractiveSession, InteractiveSessionRuntimeParts, new_run_id,
+    AgentConversationContext, InteractiveSession, InteractiveSessionRuntimeParts,
 };
+#[cfg(test)]
 use crate::tasks::TaskRegistry;
+use crate::thread::RuntimeThread;
+#[cfg(test)]
 use crate::thread_store::SessionStore;
 use crate::tool_invocation::AgentToolPolicyContext;
 #[cfg(test)]
@@ -85,6 +91,7 @@ pub struct ThreadTurnExecution<W: io::Write> {
 pub struct ThreadTurnRequest {
     prompt: String,
     options: ControllerRunOptions,
+    emit_session_completed: bool,
     steer_handle: Option<ThreadSteerHandle>,
     permission_handler: Option<Arc<dyn RuntimePermissionRequestHandler + Send + Sync>>,
 }
@@ -127,6 +134,23 @@ impl<'a> ThreadTurnExecutor<'a> {
             request,
             writer,
             cancel,
+        )
+    }
+
+    pub fn run_request_with_event_factory<W: io::Write>(
+        &mut self,
+        request: &ThreadTurnRequest,
+        writer: W,
+        events: &mut EventFactory,
+    ) -> io::Result<RunStatus> {
+        run_thread_turn_inner_with_events(
+            self.config,
+            self.session,
+            self.lifecycle,
+            request,
+            writer,
+            CancelToken::new(),
+            Some(events),
         )
     }
 }
@@ -177,8 +201,22 @@ impl<W: io::Write> ThreadTurnExecution<W> {
         output_format: OutputFormat,
         cancel: CancelToken,
     ) -> Self {
+        Self::new_with_events(
+            EventFactory::new(lifecycle.run_id().to_string()),
+            writer,
+            output_format,
+            cancel,
+        )
+    }
+
+    pub fn new_with_events(
+        events: EventFactory,
+        writer: W,
+        output_format: OutputFormat,
+        cancel: CancelToken,
+    ) -> Self {
         Self {
-            events: EventFactory::new(lifecycle.run_id().to_string()),
+            events,
             sink: EventSink::new(writer, output_format),
             cancel,
             background_workflows: Vec::new(),
@@ -199,6 +237,7 @@ impl ThreadTurnRequest {
         Self {
             prompt: prompt.into(),
             options: ControllerRunOptions::default(),
+            emit_session_completed: true,
             steer_handle: None,
             permission_handler: None,
         }
@@ -220,6 +259,15 @@ impl ThreadTurnRequest {
     pub fn with_wait_for_background_workflows(mut self, wait: bool) -> Self {
         self.options.wait_for_background_workflows = wait;
         self
+    }
+
+    pub fn with_session_completed_event(mut self, emit: bool) -> Self {
+        self.emit_session_completed = emit;
+        self
+    }
+
+    pub fn emit_session_completed(&self) -> bool {
+        self.emit_session_completed
     }
 
     pub fn with_steer_handle(mut self, handle: ThreadSteerHandle) -> Self {
@@ -290,71 +338,19 @@ fn run_inner<W: io::Write>(
         config.prompt.trim().to_string()
     };
 
-    let mut lifecycle = RuntimeSessionLifecycle::new(new_run_id());
-    lifecycle.start_task(RuntimeTaskKind::Agent);
-    let mut events = EventFactory::new(lifecycle.run_id().to_string());
-    let task_registry = TaskRegistry::new_for_cwd(lifecycle.run_id().to_string(), &cwd_path);
-    let mut background_workflows = Vec::new();
     let mut sink = EventSink::new(writer, config.output_format);
-    let store = SessionStore::new();
-    let instructions = load_project_instructions(&cwd_path);
-    let memory = memory::load_for_cwd(&cwd_path);
-    let hooks = HookRunner::new(config.hooks.clone());
-    let mcp_registry = orca_mcp::initialize_registry(&config.mcp_servers);
-    for error in mcp_registry.errors() {
+    let mut thread = RuntimeThread::start(&config, &prompt)?;
+    for error in thread.session().mcp_registry().errors() {
         eprintln!("orca: warning: {error}");
     }
-
-    let resumed = match &config.history_mode {
-        HistoryMode::Resume(selector) | HistoryMode::Fork(selector) => {
-            Some(store.load_session(selector)?)
-        }
-        HistoryMode::Record | HistoryMode::Disabled => None,
-    };
-
-    let mut history_writer = match &config.history_mode {
-        HistoryMode::Disabled => None,
-        HistoryMode::Record | HistoryMode::Resume(_) => match store.start_writer(
-            &cwd_path,
-            config.provider.as_str(),
-            config.model.as_history_value(),
-            &prompt,
-        ) {
-            Ok(writer) => Some(writer),
-            Err(error) => {
-                eprintln!("orca: warning: failed to initialize history: {error}");
-                None
-            }
-        },
-        HistoryMode::Fork(_) => {
-            let parent_id = resumed
-                .as_ref()
-                .map(|transcript| transcript.meta.session_id.clone())
-                .unwrap_or_default();
-            let meta = store.create_fork_meta(
-                &cwd_path,
-                config.provider.as_str(),
-                config.model.as_history_value(),
-                &prompt,
-                parent_id,
-            );
-            match store.start_writer_from_meta(meta) {
-                Ok(writer) => Some(writer),
-                Err(error) => {
-                    eprintln!("orca: warning: failed to initialize history: {error}");
-                    None
-                }
-            }
-        }
-    };
-
+    let mut events = EventFactory::new(thread.thread_id().to_string());
     sink.emit(&events.session_started(
         &cwd,
         config.approval_mode.as_str(),
         config.provider.as_str(),
         config.verifier.as_deref(),
     ))?;
-    if let Err(error) = hooks.run(
+    if let Err(error) = thread.session().hooks().run(
         HookEvent::SessionStart,
         HookContext {
             cwd: &cwd,
@@ -369,38 +365,16 @@ fn run_inner<W: io::Write>(
         sink.emit(&events.error(&format!("session_start hook failed: {error}")))?;
     }
 
-    let cancel = CancelToken::new();
-    let mut cost_tracker = CostTracker::new(config.model.as_deref());
-    let result = run_agent_loop(
+    let status = thread.run_request_with_event_factory(
         &config,
-        AgentLoopContext::new(&cwd_path, &prompt, 0, true, &SubagentType::General)
-            .with_services(&instructions, &memory, &mcp_registry, &hooks)
-            .with_runtime(&mut cost_tracker, &cancel, &task_registry)
-            .with_execution(&mut background_workflows, None, Some(&mut lifecycle)),
+        &ThreadTurnRequest::new(&prompt)
+            .with_options(options)
+            .with_session_completed_event(false),
+        sink.writer_mut(),
         &mut events,
-        &mut sink,
-        AgentConversationContext::new()
-            .with_resumed(resumed.as_ref())
-            .with_history_writer(history_writer.as_mut()),
-        AgentToolPolicyContext::unrestricted(),
-    )?;
-    let status = result.status;
-    lifecycle.finish_task(status);
-
-    observe_background_workflows(
-        options.wait_for_background_workflows,
-        &mut events,
-        &mut sink,
-        &mut background_workflows,
     )?;
 
-    let status =
-        run_verifier_if_needed(status, config.verifier.as_deref(), &mut events, &mut sink)?;
-
-    if let Some(writer) = history_writer.as_mut() {
-        writer.complete(status.as_str())?;
-    }
-    if let Err(error) = hooks.run(
+    if let Err(error) = thread.session().hooks().run(
         HookEvent::SessionEnd,
         HookContext {
             cwd: &cwd,
@@ -463,11 +437,63 @@ fn run_thread_turn_inner<W: io::Write>(
     writer: W,
     cancel: CancelToken,
 ) -> io::Result<RunStatus> {
+    run_thread_turn_inner_with_events(config, session, lifecycle, request, writer, cancel, None)
+}
+
+fn run_thread_turn_inner_with_events<W: io::Write>(
+    config: &RunConfig,
+    session: &mut InteractiveSession,
+    lifecycle: &mut RuntimeSessionLifecycle,
+    request: &ThreadTurnRequest,
+    writer: W,
+    cancel: CancelToken,
+    events: Option<&mut EventFactory>,
+) -> io::Result<RunStatus> {
     let context = ThreadTurnContext::prepare(config, session, request)?;
-    let mut execution =
-        ThreadTurnExecution::new_with_cancel(lifecycle, writer, config.output_format, cancel);
     let ThreadTurnContext { cwd, prompt, parts } = context;
 
+    if let Some(events) = events {
+        let mut sink = EventSink::new(writer, config.output_format);
+        let cancel_ref = cancel;
+        let mut background_workflows = Vec::new();
+        let result = run_agent_loop(
+            config,
+            AgentLoopContext::new(&cwd, &prompt, 0, true, &SubagentType::General)
+                .with_services(
+                    parts.instructions,
+                    parts.memory,
+                    parts.mcp_registry,
+                    parts.hooks,
+                )
+                .with_runtime(parts.cost_tracker, &cancel_ref, parts.task_registry)
+                .with_execution(&mut background_workflows, None, Some(lifecycle))
+                .with_steer_handle(request.steer_handle())
+                .with_permission_handler(request.permission_handler()),
+            events,
+            &mut sink,
+            AgentConversationContext::new()
+                .with_history_writer(parts.writer)
+                .with_conversation(Some(parts.conversation)),
+            AgentToolPolicyContext::unrestricted(),
+        )?;
+        let status = result.status;
+        lifecycle.finish_task(status);
+        observe_background_workflows(
+            request.options().wait_for_background_workflows,
+            events,
+            &mut sink,
+            &mut background_workflows,
+        )?;
+        let status = run_verifier_if_needed(status, config.verifier.as_deref(), events, &mut sink)?;
+        session.complete(status.as_str());
+        if request.emit_session_completed() {
+            sink.emit(&events.session_completed(status))?;
+        }
+        return Ok(status);
+    }
+
+    let mut execution =
+        ThreadTurnExecution::new_with_cancel(lifecycle, writer, config.output_format, cancel);
     let result = run_agent_loop(
         config,
         AgentLoopContext::new(&cwd, &prompt, 0, true, &SubagentType::General)
@@ -503,9 +529,11 @@ fn run_thread_turn_inner<W: io::Write>(
         &mut execution.sink,
     )?;
     session.complete(status.as_str());
-    execution
-        .sink
-        .emit(&execution.events.session_completed(status))?;
+    if request.emit_session_completed() {
+        execution
+            .sink
+            .emit(&execution.events.session_completed(status))?;
+    }
     Ok(status)
 }
 
@@ -632,10 +660,6 @@ fn run_verifier_if_needed(
     } else {
         Ok(RunStatus::VerificationFailed)
     }
-}
-
-fn load_project_instructions(cwd: &Path) -> ProjectInstructions {
-    instructions::load_for_cwd_or_default(cwd)
 }
 
 #[cfg(test)]

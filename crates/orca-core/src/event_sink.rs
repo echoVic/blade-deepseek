@@ -13,6 +13,10 @@ impl<W: Write> EventSink<W> {
         Self { writer, format }
     }
 
+    pub fn writer_mut(&mut self) -> &mut W {
+        &mut self.writer
+    }
+
     pub fn emit(&mut self, event: &EventEnvelope) -> io::Result<()> {
         match self.format {
             OutputFormat::Jsonl => {

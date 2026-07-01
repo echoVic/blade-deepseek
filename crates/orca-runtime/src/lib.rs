@@ -1295,6 +1295,35 @@ mod tests {
     }
 
     #[test]
+    fn headless_run_inner_enters_agent_loop_through_runtime_thread() {
+        let controller_source = include_str!("controller.rs");
+        let run_inner_source = controller_source
+            .split("fn run_inner")
+            .nth(1)
+            .and_then(|source| source.split("pub fn run_thread_turn_to_writer").next())
+            .expect("controller run_inner body");
+
+        assert!(
+            run_inner_source.contains("RuntimeThread::start"),
+            "headless run_inner must create long-lived agent state through RuntimeThread"
+        );
+        assert!(
+            run_inner_source.contains(".run_request_with_event_factory("),
+            "headless run_inner must delegate turn execution through RuntimeThread"
+        );
+        for forbidden in [
+            "RuntimeSessionLifecycle::new(new_run_id())",
+            "TaskRegistry::new_for_cwd",
+            "run_agent_loop(",
+        ] {
+            assert!(
+                !run_inner_source.contains(forbidden),
+                "headless run_inner must not directly assemble {forbidden}; use RuntimeThread"
+            );
+        }
+    }
+
+    #[test]
     fn jsonl_thread_store_type_is_owned_by_thread_store_module() {
         let history_source = include_str!("history.rs");
         let thread_store_source = include_str!("thread_store/local.rs");

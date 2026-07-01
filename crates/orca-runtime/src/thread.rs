@@ -2,7 +2,7 @@ use std::io;
 
 use orca_core::cancel::CancelToken;
 use orca_core::config::RunConfig;
-use orca_core::event_schema::RunStatus;
+use orca_core::event_schema::{EventFactory, RunStatus};
 
 use crate::controller::{ControllerRunOptions, ThreadTurnExecutor, ThreadTurnRequest};
 use crate::lifecycle::{RuntimeSessionLifecycle, RuntimeTaskKind};
@@ -97,6 +97,17 @@ impl RuntimeThread {
     ) -> io::Result<RunStatus> {
         ThreadTurnExecutor::new(config, &mut self.session, &mut self.lifecycle)
             .run_request_with_cancel(request, writer, cancel)
+    }
+
+    pub fn run_request_with_event_factory<W: io::Write>(
+        &mut self,
+        config: &RunConfig,
+        request: &ThreadTurnRequest,
+        writer: W,
+        events: &mut EventFactory,
+    ) -> io::Result<RunStatus> {
+        ThreadTurnExecutor::new(config, &mut self.session, &mut self.lifecycle)
+            .run_request_with_event_factory(request, writer, events)
     }
 }
 
