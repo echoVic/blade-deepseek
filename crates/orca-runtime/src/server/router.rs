@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 mod processors;
 
 use super::*;
-use processors::thread;
+use processors::{thread, turn};
 
 pub(super) fn dispatch_submission<W: Write + Send + 'static>(
     config: &ServerConfig,
@@ -20,6 +20,15 @@ pub(super) fn dispatch_submission<W: Write + Send + 'static>(
             &submission.op,
             submission.id.clone(),
             &mut *writer,
+        );
+    }
+
+    if turn::is_control_operation(&submission.op) {
+        return turn::dispatch_control_operation(
+            state,
+            &submission.op,
+            submission.id.clone(),
+            writer,
         );
     }
 
@@ -85,37 +94,6 @@ pub(super) fn dispatch_submission<W: Write + Send + 'static>(
                 &mut *writer,
             )
         }
-        ClientOp::TurnInterrupt { thread_id, turn_id } => run_turn_control(
-            state,
-            "interrupt",
-            thread_id.as_deref(),
-            turn_id,
-            None,
-            submission.id.clone(),
-            writer,
-        ),
-        ClientOp::TurnResume { thread_id, turn_id } => run_turn_control(
-            state,
-            "resume",
-            thread_id.as_deref(),
-            turn_id,
-            None,
-            submission.id.clone(),
-            writer,
-        ),
-        ClientOp::TurnSteer {
-            thread_id,
-            turn_id,
-            input,
-        } => run_turn_control(
-            state,
-            "steer",
-            thread_id.as_deref(),
-            turn_id,
-            Some(input),
-            submission.id.clone(),
-            writer,
-        ),
         ClientOp::PermissionRespond {
             request_id,
             decision,
@@ -269,7 +247,9 @@ pub(super) fn dispatch_submission<W: Write + Send + 'static>(
             let mut writer = writer.lock().map_err(lock_error)?;
             run_command_exec_terminate(state, process_id, submission.id.clone(), &mut *writer)
         }
-        _ => unreachable!("thread query operations are delegated before router dispatch"),
+        _ => unreachable!(
+            "thread query and turn control operations are delegated before router dispatch"
+        ),
     };
     result
 }

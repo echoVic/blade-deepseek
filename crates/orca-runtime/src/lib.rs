@@ -128,6 +128,39 @@ mod tests {
     }
 
     #[test]
+    fn server_turn_control_dispatch_is_owned_by_turn_processor() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let router_source = std::fs::read_to_string(manifest_dir.join("src/server/router.rs"))
+            .expect("server router source");
+        let processor_source =
+            std::fs::read_to_string(manifest_dir.join("src/server/processors/turn.rs"))
+                .expect("server turn processor source");
+
+        assert!(
+            router_source.contains("turn::dispatch_control_operation("),
+            "server router must delegate turn control operations to the turn processor"
+        );
+        for variant in [
+            "ClientOp::TurnInterrupt",
+            "ClientOp::TurnResume",
+            "ClientOp::TurnSteer",
+        ] {
+            assert!(
+                !router_source.contains(variant),
+                "server router must not own {variant} dispatch details"
+            );
+            assert!(
+                processor_source.contains(variant),
+                "server turn processor must own {variant} dispatch details"
+            );
+        }
+        assert!(
+            processor_source.contains("fn dispatch_control_operation"),
+            "server turn processor must expose control dispatch inside the router module"
+        );
+    }
+
+    #[test]
     fn protocol_uses_focused_submodules() {
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let protocol_dir = manifest_dir.join("src/protocol");
