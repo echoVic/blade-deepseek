@@ -2908,6 +2908,90 @@ mod tests {
     }
 
     #[test]
+    fn completed_turn_auto_scrolls_markdown_table_tail_above_composer() {
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let diff = (0..96)
+            .map(|_| {
+                "+ .hero .meta-row { margin-top: 28px; display: flex; justify-content: center; gap: 32px; flex-wrap: wrap; font-size: 14px; opacity: 0.8; }"
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let answer =
+            r#"报告已生成，保存在 `tavily-research-report.html`。下面是这份报告覆盖的核心内容概要：
+
+📋 报告结构 (10 大章节)
+
+| 章节 | 要点 |
+| --- | --- |
+| 一、公司概览 | 2024 年成立于以色列，CEO Rotem Weiss，定位 "AI Agent 的 Google" |
+| 二、发展历程 | 成立 → 2025 年 17x 增长 → $25M Series A → 2026.02 被 Nebius $2.75 亿收购 |
+| 三、核心产品与技术 | Search/Extract/Crawl/Research/MCP 五大 API，GAIA Benchmark SOTA |
+| 四、定价模型 | Free (1K/月) → Developer ($20) → Pro ($150) → Enterprise 定制 |
+| 五、竞争格局 | 与 Exa、Brave、Serper、Perplexity 的 8 维度横向对比 |
+| 六、Nebius 收购分析 | $275M-$400M 交易，战略意义：补全 AI 云平台搜索能力 |
+| 七、应用场景 | 编码助手/RAG/市场调研/新闻监控/学术文献 六大场景 |
+| 八、关键洞察 | 成功原因 + 风险挑战 + 未来趋势判断 |
+| 九、开发者资源 | SDK、MCP、LangChain、文档等速查链接 |
+| 十、总结 | Agentic Search 正在成为 AI 基础设施标配 |
+
+你可以直接在浏览器中打开 `tavily-research-report.html`
+查看完整的可视化报告，支持响应式布局，手机和桌面均可阅读。"#
+                .to_string();
+
+        let mut textarea = TextArea::default();
+        textarea.set_block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .title(" Input "),
+        );
+        for (width, height) in [
+            (90, 24),
+            (120, 32),
+            (150, 42),
+            (180, 52),
+            (180, 63),
+            (200, 70),
+        ] {
+            let mut state = test_state();
+            state.status = AppStatus::Idle;
+            state.auto_scroll = true;
+            state.messages.push(ChatMessage::ToolCall {
+                id: "tool-1".to_string(),
+                name: "edit".to_string(),
+                target: Some("site/styles.css".to_string()),
+                status: "completed".to_string(),
+                output: None,
+                diff: Some(diff.clone()),
+                kind: None,
+                expanded: false,
+            });
+            state.messages.push(ChatMessage::Reasoning(
+                "The HTML report has been created. Let me verify it and provide a summary to the user."
+                    .to_string(),
+            ));
+            state.messages.push(ChatMessage::Assistant(answer.clone()));
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+                    .expect("test backend");
+
+            terminal
+                .draw(|frame| render(frame, &mut state, &textarea, &theme))
+                .expect("draw");
+            let rendered = format!("{:?}", terminal.backend().buffer());
+
+            assert!(
+                rendered.contains("支持响应式布局"),
+                "completed answer tail should be visible immediately at {width}x{height}, not only after the next prompt"
+            );
+            assert!(
+                rendered.contains("Input"),
+                "composer should remain pinned below the transcript at {width}x{height}"
+            );
+        }
+    }
+
+    #[test]
     fn context_cell_is_hidden_until_a_budget_is_known() {
         let state = test_state();
         let theme = Theme::named(orca_core::config::ThemeName::Dark);

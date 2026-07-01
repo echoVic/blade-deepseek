@@ -818,6 +818,7 @@ impl AppState {
                 self.archive_current_plan();
                 self.finalize_turn();
                 self.set_status(AppStatus::Idle);
+                self.scroll_to_bottom();
             }
             TuiEvent::Compacted {
                 before_messages,
@@ -1416,6 +1417,29 @@ mod tests {
 
         state.flushed_count = 2;
         assert_eq!(state.flushable_prefix_end(false), 2);
+    }
+
+    #[test]
+    fn session_completion_re_pins_to_bottom_after_incidental_scroll() {
+        let mut state = state();
+        state.enter_running();
+        state.total_lines = 100;
+        state.visible_height = 20;
+        state.scroll_offset = 60;
+        state.auto_scroll = false;
+        state
+            .messages
+            .push(ChatMessage::Assistant("final answer".to_string()));
+
+        state.update(TuiEvent::SessionCompleted {
+            status: "success".to_string(),
+        });
+
+        assert!(
+            state.auto_scroll,
+            "finished turns should leave the final answer pinned above the composer"
+        );
+        assert_eq!(state.scroll_offset, 80);
     }
 
     #[test]
