@@ -110,15 +110,14 @@ pub(crate) fn execute_bash_with_shell_session(
             )),
             permissions,
         };
-        let response = match permission_handler.request_permissions(&permission_request) {
-            Ok(response) => response,
-            Err(error) => return ToolResult::failed(request, error.to_string(), None),
-        };
+        let response =
+            match permission_overlay.request_and_merge(permission_handler, permission_request) {
+                Ok(response) => response,
+                Err(error) => return ToolResult::failed(request, error.to_string(), None),
+            };
         if response.decision == PermissionResponseDecision::Deny {
             return ToolResult::denied(request, "permission request denied".to_string());
         }
-        permission_overlay.merge_network_permissions(&response.permissions);
-        permission_overlay.merge_strict_auto_review(response.strict_auto_review);
         let mut retry_sandbox = sandbox;
         if let Some(network) = response.permissions.network {
             for (domain, access) in network.domains {

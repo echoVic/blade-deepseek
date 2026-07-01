@@ -2,7 +2,8 @@ use orca_approval::ApprovalPolicy;
 use orca_core::approval_rules::PermissionRules;
 use orca_core::approval_types::{ActionKind, ApprovalDecision, ApprovalMode, ApprovalRequest};
 use orca_core::config::{
-    HistoryMode, OutputFormat, ProviderKind, RunConfig, ThemeName, ToolConfig, WorkflowConfig,
+    HistoryMode, OutputFormat, PermissionProfileNetworkAccess, ProviderKind, RunConfig, ThemeName,
+    ToolConfig, WorkflowConfig,
 };
 use orca_core::conversation::Conversation;
 use orca_core::event_schema::{EventFactory, RunStatus};
@@ -23,11 +24,11 @@ use orca_runtime::lifecycle::{
     RuntimeSpecialToolDispatch, RuntimeSubagentStatusLookup, RuntimeSubagentStatusRecord,
     RuntimeTaskActor, RuntimeTaskKind, RuntimeTaskStatus, RuntimeToolActorContext,
     RuntimeTurnRunner, RuntimeUserInputHandler, RuntimeUserInputRequest,
-    RuntimeWorkflowDraftRequest, RuntimeWorkflowIpc,
+    RuntimeWorkflowDraftRequest, RuntimeWorkflowIpc, TurnPermissionOverlay,
 };
 use orca_runtime::protocol::{
     PermissionGrantScope, PermissionResponseDecision, RequestFileSystemPermissions,
-    RequestPermissionProfile,
+    RequestNetworkPermissions, RequestPermissionProfile,
 };
 use orca_runtime::tasks::TaskRegistry;
 use serde_json::Value;
@@ -760,6 +761,161 @@ fn tool_actor_context_reports_request_permissions_network_domain_grants() {
         output["granted"]["network"]["domains"]["api.example.com"],
         "allow"
     );
+}
+
+#[test]
+fn turn_permission_overlay_requests_and_merges_network_grants() {
+    struct AllowNetwork;
+
+    impl RuntimePermissionRequestHandler for AllowNetwork {
+        fn request_permissions(
+            &self,
+            request: &RuntimePermissionRequest,
+        ) -> std::io::Result<RuntimePermissionResponse> {
+            assert_eq!(request.id, "net-tool");
+            assert_eq!(
+                request.reason.as_deref(),
+                Some("tool attempted network access")
+            );
+            Ok(RuntimePermissionResponse {
+                decision: PermissionResponseDecision::Allow,
+                scope: PermissionGrantScope::Turn,
+                permissions: request.permissions.clone(),
+                strict_auto_review: true,
+            })
+        }
+    }
+
+    let mut overlay = TurnPermissionOverlay::default();
+    let response = overlay
+        .request_and_merge(
+            &AllowNetwork,
+            RuntimePermissionRequest {
+                id: "net-tool".to_string(),
+                reason: Some("tool attempted network access".to_string()),
+                permissions: RequestPermissionProfile {
+                    file_system: None,
+                    network: Some(RequestNetworkPermissions {
+                        enabled: None,
+                        domains: std::collections::HashMap::from([(
+                            "api.example.com".to_string(),
+                            PermissionProfileNetworkAccess::Allow,
+                        )]),
+                    }),
+                },
+            },
+        )
+        .expect("permission request");
+
+    assert_eq!(response.decision, PermissionResponseDecision::Allow);
+    assert_eq!(
+        overlay.network_domain_permissions().get("api.example.com"),
+        Some(&PermissionProfileNetworkAccess::Allow)
+    );
+    assert!(overlay.strict_auto_review());
+}
+
+#[test]
+fn turn_permission_overlay_requests_and_merges_file_system_write_grants() {
+    struct AllowFileSystem {
+        root: std::path::PathBuf,
+    }
+
+    impl RuntimePermissionRequestHandler for AllowFileSystem {
+        fn request_permissions(
+            &self,
+            request: &RuntimePermissionRequest,
+        ) -> std::io::Result<RuntimePermissionResponse> {
+            Ok(RuntimePermissionResponse {
+                decision: PermissionResponseDecision::Allow,
+                scope: PermissionGrantScope::Turn,
+                permissions: RequestPermissionProfile {
+                    file_system: Some(RequestFileSystemPermissions {
+                        read: None,
+                        write: Some(vec![self.root.clone()]),
+                        entries: request
+                            .permissions
+                            .file_system
+                            .as_ref()
+                            .and_then(|file_system| file_system.entries.clone()),
+                    }),
+                    network: None,
+                },
+                strict_auto_review: false,
+            })
+        }
+    }
+
+    let root = tempfile::tempdir().expect("write root");
+    let mut overlay = TurnPermissionOverlay::default();
+    overlay
+        .request_and_merge(
+            &AllowFileSystem {
+                root: root.path().to_path_buf(),
+            },
+            RuntimePermissionRequest {
+                id: "fs-tool".to_string(),
+                reason: Some("tool needs write access".to_string()),
+                permissions: RequestPermissionProfile {
+                    file_system: Some(RequestFileSystemPermissions {
+                        read: None,
+                        write: Some(vec![root.path().to_path_buf()]),
+                        entries: None,
+                    }),
+                    network: None,
+                },
+            },
+        )
+        .expect("permission request");
+
+    assert_eq!(
+        overlay.additional_working_directories(),
+        &[root.path().to_path_buf()]
+    );
+}
+
+#[test]
+fn turn_permission_overlay_does_not_merge_denied_responses() {
+    struct DenyNetwork;
+
+    impl RuntimePermissionRequestHandler for DenyNetwork {
+        fn request_permissions(
+            &self,
+            request: &RuntimePermissionRequest,
+        ) -> std::io::Result<RuntimePermissionResponse> {
+            Ok(RuntimePermissionResponse {
+                decision: PermissionResponseDecision::Deny,
+                scope: PermissionGrantScope::Turn,
+                permissions: request.permissions.clone(),
+                strict_auto_review: true,
+            })
+        }
+    }
+
+    let mut overlay = TurnPermissionOverlay::default();
+    let response = overlay
+        .request_and_merge(
+            &DenyNetwork,
+            RuntimePermissionRequest {
+                id: "denied-network".to_string(),
+                reason: Some("blocked network".to_string()),
+                permissions: RequestPermissionProfile {
+                    file_system: None,
+                    network: Some(RequestNetworkPermissions {
+                        enabled: None,
+                        domains: std::collections::HashMap::from([(
+                            "api.example.com".to_string(),
+                            PermissionProfileNetworkAccess::Allow,
+                        )]),
+                    }),
+                },
+            },
+        )
+        .expect("permission request");
+
+    assert_eq!(response.decision, PermissionResponseDecision::Deny);
+    assert!(overlay.network_domain_permissions().is_empty());
+    assert!(!overlay.strict_auto_review());
 }
 
 #[test]

@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.91":
+        "Runtime permission requests now share one overlay merge path for file-system grants, network domain grants, and strict auto-review, keeping request_permissions and bash retry behavior aligned.",
       "v0.1.90":
         "Model-visible bash now inherits the active permission profile's managed network policy, turns eligible proxy blocks into permission requests, and retries after a turn-scoped network allow.",
       "v0.1.89":
@@ -208,6 +210,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.91":
+        "runtime 权限请求现在统一走同一个 overlay 合并路径，覆盖文件系统授权、网络域名授权和 strict auto-review，让 request_permissions 与 bash 重试行为保持一致。",
       "v0.1.90":
         "模型可见 bash 现在会继承 active permission profile 的托管网络策略：符合条件的代理阻断会转成权限请求，并在 turn 级网络 allow 后重试。",
       "v0.1.89":

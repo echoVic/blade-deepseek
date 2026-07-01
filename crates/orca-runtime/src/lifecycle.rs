@@ -497,6 +497,34 @@ impl TurnPermissionOverlay {
     pub(crate) fn merge_strict_auto_review(&mut self, strict_auto_review: bool) {
         self.strict_auto_review |= strict_auto_review;
     }
+
+    pub fn request_and_merge(
+        &mut self,
+        handler: &dyn RuntimePermissionRequestHandler,
+        request: RuntimePermissionRequest,
+    ) -> io::Result<RuntimePermissionResponse> {
+        let response = handler.request_permissions(&request)?;
+        if response.decision == PermissionResponseDecision::Allow {
+            self.merge_permissions(&response.permissions);
+            self.merge_strict_auto_review(response.strict_auto_review);
+        }
+        Ok(response)
+    }
+
+    pub(crate) fn merge_permissions(&mut self, permissions: &RequestPermissionProfile) {
+        if let Some(file_system) = permissions.file_system.as_ref() {
+            if let Some(write_roots) = file_system.write.as_ref() {
+                for root in write_roots {
+                    if !root.as_os_str().is_empty()
+                        && !self.additional_working_directories.contains(root)
+                    {
+                        self.additional_working_directories.push(root.clone());
+                    }
+                }
+            }
+        }
+        self.merge_network_permissions(permissions);
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1631,7 +1659,10 @@ impl RuntimeToolActorContext {
             reason: args.reason,
             permissions: args.permissions,
         };
-        let response = match handler.request_permissions(&permission_request) {
+        let response = match self
+            .permission_overlay
+            .request_and_merge(handler, permission_request.clone())
+        {
             Ok(response) => response,
             Err(error) => return ToolResult::failed(request, error.to_string(), None),
         };
@@ -1647,22 +1678,6 @@ impl RuntimeToolActorContext {
             .into_iter()
             .filter(|path| !path.as_os_str().is_empty())
             .collect::<Vec<_>>();
-
-        for root in &write_roots {
-            if !self
-                .permission_overlay
-                .additional_working_directories
-                .contains(root)
-            {
-                self.permission_overlay
-                    .additional_working_directories
-                    .push(root.clone());
-            }
-        }
-        self.permission_overlay
-            .merge_network_permissions(&response.permissions);
-        self.permission_overlay.strict_auto_review |= response.strict_auto_review;
-
         let read_roots = response
             .permissions
             .file_system
