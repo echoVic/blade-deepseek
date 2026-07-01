@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.80":
+        "The TUI conversation session now owns RuntimeThread instead of rebuilding InteractiveSession and RuntimeSessionLifecycle locally, completing the first headless/server/TUI runtime-state convergence pass while preserving TUI behavior.",
       "v0.1.79":
         "Headless exec now creates and runs long-lived agent state through RuntimeThread, aligning CLI turns with server-mode ownership while preserving JSONL sequencing, session hooks, history, verifier, and npm behavior.",
       "v0.1.78":
@@ -186,6 +188,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.80":
+        "TUI conversation session 现在直接拥有 RuntimeThread，不再本地重建 InteractiveSession 和 RuntimeSessionLifecycle，完成 headless/server/TUI 第一轮 runtime state ownership 收敛，同时保持 TUI 行为不变。",
       "v0.1.79":
         "Headless exec 现在也通过 RuntimeThread 创建并运行长期 agent state，让 CLI turn 与 server-mode 共享同一所有权边界，同时保留 JSONL 顺序、session hook、history、verifier 和 npm 行为。",
       "v0.1.78":
