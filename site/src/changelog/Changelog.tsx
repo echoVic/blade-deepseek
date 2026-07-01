@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.92":
+        "Server-mode operation dispatch now lives behind a focused router boundary, preserving every existing wire method while opening the next request-processor refactor path.",
       "v0.1.91":
         "Runtime permission requests now share one overlay merge path for file-system grants, network domain grants, and strict auto-review, keeping request_permissions and bash retry behavior aligned.",
       "v0.1.90":
@@ -210,6 +212,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.92":
+        "server 模式的 operation dispatch 现在进入独立 router 边界，在保持所有现有 wire method 不变的同时，为后续 request processor 重构铺路。",
       "v0.1.91":
         "runtime 权限请求现在统一走同一个 overlay 合并路径，覆盖文件系统授权、网络域名授权和 strict auto-review，让 request_permissions 与 bash 重试行为保持一致。",
       "v0.1.90":
