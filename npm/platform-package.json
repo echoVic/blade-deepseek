@@ -1,5 +1,6 @@
 {
   "license": "MIT",
+  "homepage": "https://orcaagent.dev/",
   "files": [
     "vendor",
     "README.md"

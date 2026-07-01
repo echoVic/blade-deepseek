@@ -18,6 +18,7 @@ const TARGETS = [
   ["orca-linux-arm64", "aarch64-unknown-linux-gnu", "linux-arm64"],
   ["orca-linux-x64", "x86_64-unknown-linux-gnu", "linux-x64"]
 ];
+const HOMEPAGE = "https://orcaagent.dev/";
 
 function readJson(filePath) {
   return JSON.parse(readFileSync(filePath, "utf8"));
@@ -68,12 +69,14 @@ try {
     const packageJson = readJson(path.join(outDir, "stage", aliasDir, "package.json"));
     assertEqual(packageJson.name, "@blade-ai/orca", `${aliasDir} package name`);
     assertEqual(packageJson.version, `${VERSION}-${suffix}`, `${aliasDir} package version`);
+    assertEqual(packageJson.homepage, HOMEPAGE, `${aliasDir} homepage`);
     assertExists(path.join(outDir, "tarballs", `blade-ai-orca-${VERSION}-${suffix}.tgz`));
   }
 
   const mainPackage = readJson(path.join(outDir, "stage", "orca", "package.json"));
   assertEqual(mainPackage.name, "@blade-ai/orca", "main package name");
   assertEqual(mainPackage.version, VERSION, "main package version");
+  assertEqual(mainPackage.homepage, HOMEPAGE, "main package homepage");
 
   const expectedOptionalDependencies = Object.fromEntries(
     TARGETS.map(([aliasDir, , suffix]) => [
