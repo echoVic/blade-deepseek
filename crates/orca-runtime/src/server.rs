@@ -1769,10 +1769,19 @@ fn run_command_exec<W: Write>(
         }
     };
     for (domain, access) in thread_network_domain_permissions {
-        effective_sandbox
-            .network_policy_domains
-            .entry(domain)
-            .or_insert(access);
+        match access {
+            orca_core::config::PermissionProfileNetworkAccess::Deny => {
+                effective_sandbox
+                    .network_policy_domains
+                    .insert(domain, access);
+            }
+            orca_core::config::PermissionProfileNetworkAccess::Allow => {
+                effective_sandbox
+                    .network_policy_domains
+                    .entry(domain)
+                    .or_insert(access);
+            }
+        }
     }
     additional_working_directories.extend(effective_sandbox.additional_writable_roots.clone());
     let denied_writable_directories = effective_sandbox.denied_writable_roots.clone();

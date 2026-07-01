@@ -2217,6 +2217,105 @@ fn server_mode_command_exec_uses_session_network_domain_grants() {
 }
 
 #[test]
+fn server_mode_session_network_deny_overrides_permission_profile_allow() {
+    let home = tempdir().expect("orca home");
+    let home_path = home.path();
+    let workspace = home_path.join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    std::fs::write(
+        home_path.join("config.toml"),
+        "mode = \"full-auto\"\n\n[permission_profiles.net]\nextends = \":workspace\"\n\n[permission_profiles.net.network]\nenabled = true\n\n[permission_profiles.net.network.domains]\n\"blocked.orca.invalid\" = \"allow\"\n",
+    )
+    .expect("write config");
+
+    let mut child = orca_command()
+        .args([
+            "--mode",
+            "server",
+            "--provider",
+            "mock",
+            "--cwd",
+            workspace.to_str().unwrap(),
+        ])
+        .env("ORCA_HOME", home_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn orca server");
+    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
+
+    {
+        let stdin = child.stdin.as_mut().expect("server stdin");
+        writeln!(
+            stdin,
+            r#"{{"id":"thread-req","method":"thread/start","params":{{}}}}"#
+        )
+        .expect("write thread/start");
+        stdin.flush().expect("flush thread/start");
+    }
+    let thread_started = read_until_event(&mut stdout, "thread-req", "thread_started");
+    let thread_id = thread_started["threadId"]
+        .as_str()
+        .expect("thread id")
+        .to_string();
+
+    {
+        let stdin = child.stdin.as_mut().expect("server stdin");
+        writeln!(
+            stdin,
+            r#"{{"id":"turn","method":"turn/start","params":{{"threadId":"{}","input":[{{"type":"text","text":"request_network_permissions_then_done blocked.orca.invalid"}}]}}}}"#,
+            thread_id,
+        )
+        .expect("write turn/start");
+        stdin.flush().expect("flush turn/start");
+    }
+    let permission_request = read_until_event(&mut stdout, "turn", "permission_request");
+    let request_id = permission_request["requestId"]
+        .as_str()
+        .expect("permission request id")
+        .to_string();
+
+    {
+        let stdin = child.stdin.as_mut().expect("server stdin");
+        writeln!(
+            stdin,
+            r#"{{"id":"permission-response","method":"permission/respond","params":{{"requestId":"{}","decision":"allow","scope":"session","permissions":{{"fileSystem":null,"network":{{"enabled":true,"domains":{{"blocked.orca.invalid":"deny"}}}}}}}}}}"#,
+            request_id,
+        )
+        .expect("write permission/respond");
+        stdin.flush().expect("flush permission/respond");
+    }
+    read_until_event(&mut stdout, "permission-response", "permission_resolved");
+    read_until_event(&mut stdout, "turn", "turn_completed");
+
+    {
+        let stdin = child.stdin.as_mut().expect("server stdin");
+        writeln!(
+            stdin,
+            r#"{{"id":"cmd","method":"command/exec","params":{{"threadId":"{}","permissionProfile":"net","command":["sh","-lc","curl --noproxy '' -sS -D - -o /dev/null http://blocked.orca.invalid/ || true"],"timeoutMs":5000}}}}"#,
+            thread_id,
+        )
+        .expect("write command/exec");
+        stdin.flush().expect("flush command/exec");
+    }
+    let completed = read_until_event(&mut stdout, "cmd", "command_exec_completed");
+    drop(child.stdin.take());
+    assert!(
+        completed["stdout"]
+            .as_str()
+            .expect("stdout")
+            .contains("x-proxy-error: blocked-by-denylist"),
+        "stdout should show session deny overriding profile allow: {completed:?}"
+    );
+    assert_eq!(completed["exitCode"], 0);
+
+    let output = child.wait_with_output().expect("wait for server");
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn server_mode_command_exec_danger_full_access_bypasses_workspace_sandbox() {
     if !sandbox_seatbelt_available() {
         return;

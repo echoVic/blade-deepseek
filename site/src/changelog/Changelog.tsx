@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.86":
+        "Session-scoped request_permissions network denials now override permission-profile allow entries, so interactive deny decisions can tighten later command/exec proxy policy.",
       "v0.1.85":
         "Session-scoped request_permissions network domain grants now persist on server threads and feed command/exec's managed proxy, so later commands inherit interactive allowlist decisions.",
       "v0.1.84":
@@ -198,6 +200,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.86":
+        "session 级 request_permissions 网络拒绝现在会覆盖 permission profile 的 allow 条目，让交互式 deny 决策能收紧后续 command/exec 的代理策略。",
       "v0.1.85":
         "session 级 request_permissions 网络域名授权现在会持久化到 server thread，并传入 command/exec 的托管代理，让后续命令继承交互式 allowlist 决策。",
       "v0.1.84":
