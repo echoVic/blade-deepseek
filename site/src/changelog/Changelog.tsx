@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.81":
+        "Permission-profile network blocks now preserve Codex-style proxy reasons, so command/exec clients can distinguish denylist hits from allowlist misses instead of seeing only a generic policy 403.",
       "v0.1.80":
         "The TUI conversation session now owns RuntimeThread instead of rebuilding InteractiveSession and RuntimeSessionLifecycle locally, completing the first headless/server/TUI runtime-state convergence pass while preserving TUI behavior.",
       "v0.1.79":
@@ -188,6 +190,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.81":
+        "权限 profile 的网络拦截现在保留 Codex 风格的 proxy reason，command/exec 客户端可以区分 denylist 命中和 allowlist 未命中，而不是只看到泛化的 policy 403。",
       "v0.1.80":
         "TUI conversation session 现在直接拥有 RuntimeThread，不再本地重建 InteractiveSession 和 RuntimeSessionLifecycle，完成 headless/server/TUI 第一轮 runtime state ownership 收敛，同时保持 TUI 行为不变。",
       "v0.1.79":
