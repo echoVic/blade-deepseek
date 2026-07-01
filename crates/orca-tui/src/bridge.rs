@@ -31,13 +31,11 @@ use orca_runtime::hooks::{
     HookContext, HookRunner, conversation_with_hook_context, tool_request_with_hook_outcome,
 };
 use orca_runtime::instructions::ProjectInstructions;
-use orca_runtime::lifecycle::{
-    RuntimeSessionLifecycle, RuntimeTaskKind, RuntimeToolActorContext, RuntimeTurnRunner,
-};
+use orca_runtime::lifecycle::{RuntimeTaskKind, RuntimeToolActorContext, RuntimeTurnRunner};
 use orca_runtime::memory::{self, MemoryBlock};
-use orca_runtime::session::InteractiveSession;
 use orca_runtime::subagent::{self, SubagentMode};
 use orca_runtime::tasks::TaskRegistry;
+use orca_runtime::thread::RuntimeThread;
 use orca_runtime::tool_invocation::prepare_tool_invocation;
 use orca_runtime::workflow::{WorkflowDraftStore, WorkflowLaunchRequest, WorkflowRunner};
 use serde::Deserialize;
@@ -196,8 +194,7 @@ fn send_workflow_notification_for_tui(
 }
 
 pub struct TuiConversationSession {
-    runtime: InteractiveSession,
-    lifecycle: RuntimeSessionLifecycle,
+    runtime: RuntimeThread,
 }
 
 impl TuiConversationSession {
@@ -206,106 +203,101 @@ impl TuiConversationSession {
         prompt_for_title: &str,
         preloaded: Option<history::SessionTranscript>,
     ) -> std::io::Result<Self> {
-        let runtime = InteractiveSession::new_with_preloaded(config, prompt_for_title, preloaded)?;
-        let run_id = runtime
-            .session_id()
-            .unwrap_or_else(|| "tui-session")
-            .to_string();
-        Ok(Self {
-            runtime,
-            lifecycle: RuntimeSessionLifecycle::new(run_id),
-        })
+        let runtime = RuntimeThread::start_with_preloaded(config, prompt_for_title, preloaded)?;
+        Ok(Self { runtime })
     }
 
-    pub fn runtime_session(&self) -> &InteractiveSession {
-        &self.runtime
+    pub fn runtime_session(&self) -> &orca_runtime::session::InteractiveSession {
+        self.runtime.session()
     }
 
     fn conversation(&self) -> &orca_core::conversation::Conversation {
-        self.runtime.conversation()
+        self.runtime.session().conversation()
     }
 
     fn conversation_mut(&mut self) -> &mut orca_core::conversation::Conversation {
-        self.runtime.conversation_mut()
+        self.runtime.session_mut().conversation_mut()
     }
 
     fn writer_mut(&mut self) -> Option<&mut orca_runtime::history::SessionWriter> {
-        self.runtime.writer_mut()
+        self.runtime.session_mut().writer_mut()
     }
 
     fn instructions(&self) -> &ProjectInstructions {
-        self.runtime.instructions()
+        self.runtime.session().instructions()
     }
 
     fn cost_tracker_mut(&mut self) -> &mut CostTracker {
-        self.runtime.cost_tracker_mut()
+        self.runtime.session_mut().cost_tracker_mut()
     }
 
     fn mcp_registry(&self) -> &McpRegistry {
-        self.runtime.mcp_registry()
+        self.runtime.session().mcp_registry()
     }
 
     fn hooks(&self) -> &HookRunner {
-        self.runtime.hooks()
+        self.runtime.session().hooks()
     }
 
     fn memory(&self) -> &MemoryBlock {
-        self.runtime.memory()
+        self.runtime.session().memory()
     }
 
     fn task_registry(&self) -> &TaskRegistry {
-        self.runtime.task_registry()
+        self.runtime.session().task_registry()
     }
 
     fn append_message(&mut self, message: &orca_core::conversation::Message) {
-        self.runtime.append_message(message);
+        self.runtime.session_mut().append_message(message);
     }
 
     fn complete(&mut self, status: &str) {
-        self.runtime.complete(status);
+        self.runtime.session_mut().complete(status);
     }
 
     pub fn session_id(&self) -> Option<&str> {
-        self.runtime.session_id()
+        self.runtime.session().session_id()
     }
 
     pub fn usage_totals(&self) -> UsageTotals {
-        self.runtime.usage_totals()
+        self.runtime.session().usage_totals()
     }
 
     pub fn has_active_workflows(&self) -> bool {
-        self.runtime.has_active_workflows()
+        self.runtime.session().has_active_workflows()
     }
 
     pub fn backtrack_last_user(&mut self) -> Option<String> {
-        self.runtime.backtrack_last_user()
+        self.runtime.session_mut().backtrack_last_user()
     }
 
     pub fn set_model(&mut self, model: Option<&str>) {
-        self.runtime.set_model(model);
+        self.runtime.session_mut().set_model(model);
     }
 
     pub fn add_pinned_context(&mut self, content: String) {
-        self.runtime.add_pinned_context(content);
+        self.runtime.session_mut().add_pinned_context(content);
     }
 
     pub fn replace_goal_context(&mut self, content: String) {
-        self.runtime.replace_goal_context(content);
+        self.runtime.session_mut().replace_goal_context(content);
     }
 
     fn replace_skill_context(&mut self, content: Option<String>) {
-        self.runtime.replace_skill_context(content);
+        self.runtime.session_mut().replace_skill_context(content);
     }
 
     pub fn compact(&mut self, config: &RunConfig, cwd: &Path) -> (usize, usize) {
-        self.runtime.compact(config, cwd)
+        self.runtime.session_mut().compact(config, cwd)
     }
 
     fn next_turn_lifecycle(&mut self) -> (u32, Option<TuiTaskLifecycle>) {
-        if self.lifecycle.active_task().is_none() {
-            self.lifecycle.start_task(RuntimeTaskKind::Agent);
+        if self.runtime.lifecycle().active_task().is_none() {
+            self.runtime
+                .lifecycle_mut()
+                .start_task(RuntimeTaskKind::Agent);
         }
-        let started = RuntimeTurnRunner::new(&mut self.lifecycle).advance_turn();
+        let started = RuntimeTurnRunner::new(self.runtime.lifecycle_mut()).advance_turn();
         let task = started.task().map(|task| TuiTaskLifecycle {
             id: task.id().to_string(),
             kind: lifecycle_kind_label(task.kind()).to_string(),
@@ -2340,6 +2332,32 @@ mod tests {
         let value = parse_saved_workflow_args(r#"{"target":"crates","maxAgents":4}"#).unwrap();
         assert_eq!(value["target"], "crates");
         assert_eq!(value["maxAgents"], 4);
+    }
+
+    #[test]
+    fn tui_session_owns_runtime_thread_boundary() {
+        let source = include_str!("bridge.rs");
+        let session_start = source
+            .find("pub struct TuiConversationSession")
+            .expect("TuiConversationSession source");
+        let session_source = &source[session_start..];
+        let session_end = session_source
+            .find("impl TuiConversationSession")
+            .expect("TuiConversationSession impl");
+        let session_struct = &session_source[..session_end];
+
+        assert!(
+            session_struct.contains("runtime: RuntimeThread"),
+            "TUI session must own RuntimeThread instead of rebuilding runtime state locally"
+        );
+        assert!(
+            !session_struct.contains("RuntimeSessionLifecycle"),
+            "TUI session lifecycle must be owned through RuntimeThread"
+        );
+        assert!(
+            !session_struct.contains("InteractiveSession"),
+            "TUI session must not own InteractiveSession outside RuntimeThread"
+        );
     }
 
     #[test]

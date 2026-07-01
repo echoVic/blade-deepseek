@@ -21,6 +21,15 @@ impl RuntimeThread {
         Ok(Self::from_session(session))
     }
 
+    pub fn start_with_preloaded(
+        config: &RunConfig,
+        title: impl Into<String>,
+        preloaded: Option<SessionTranscript>,
+    ) -> io::Result<Self> {
+        let session = InteractiveSession::new_with_preloaded(config, &title.into(), preloaded)?;
+        Ok(Self::from_session(session))
+    }
+
     pub(crate) fn resume_same_thread(
         config: &RunConfig,
         transcript: SessionTranscript,
