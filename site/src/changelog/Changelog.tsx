@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.84":
+        "Permission-profile Unix socket allowlists now flow into command/exec sandboxing on macOS, allowing configured AF_UNIX socket paths without enabling full network access.",
       "v0.1.83":
         "The managed command/exec network proxy now checks resolved socket addresses before connecting, blocking DNS names that resolve to local, private, reserved, or otherwise non-public targets.",
       "v0.1.82":
@@ -194,6 +196,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.84":
+        "permission profile 中的 Unix socket allowlist 现在会传入 macOS command/exec 沙箱，允许显式配置的 AF_UNIX socket 路径，同时不需要开启完整网络访问。",
       "v0.1.83":
         "command/exec 的托管网络代理现在会在连接前检查 DNS 解析后的 socket 地址，阻止解析到本地、私网、保留地址或其他非公网目标的域名。",
       "v0.1.82":
