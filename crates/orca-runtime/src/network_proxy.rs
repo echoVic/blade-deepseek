@@ -13,6 +13,29 @@ pub struct RuntimeNetworkPolicy {
     domains: HashMap<String, PermissionProfileNetworkAccess>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RuntimeNetworkBlockReason {
+    Allowlist,
+    Denylist,
+    Policy,
+}
+
+impl RuntimeNetworkBlockReason {
+    fn proxy_error(self) -> &'static str {
+        match self {
+            Self::Allowlist => "blocked-by-allowlist",
+            Self::Denylist => "blocked-by-denylist",
+            Self::Policy => "blocked-by-policy",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RuntimeNetworkDecision {
+    Allow,
+    Block(RuntimeNetworkBlockReason),
+}
+
 impl RuntimeNetworkPolicy {
     pub fn new(domains: HashMap<String, PermissionProfileNetworkAccess>) -> Self {
         let domains = domains
@@ -35,14 +58,25 @@ impl RuntimeNetworkPolicy {
         })
     }
 
+    #[cfg(test)]
     fn allows_host(&self, host: &str) -> bool {
+        matches!(self.decision_for_host(host), RuntimeNetworkDecision::Allow)
+    }
+
+    fn decision_for_host(&self, host: &str) -> RuntimeNetworkDecision {
         match self.access_for_host(host) {
-            Some(PermissionProfileNetworkAccess::Deny) => false,
-            Some(PermissionProfileNetworkAccess::Allow) => true,
-            None => !self
+            Some(PermissionProfileNetworkAccess::Deny) => {
+                RuntimeNetworkDecision::Block(RuntimeNetworkBlockReason::Denylist)
+            }
+            Some(PermissionProfileNetworkAccess::Allow) => RuntimeNetworkDecision::Allow,
+            None if self
                 .domains
                 .values()
-                .any(|access| matches!(access, PermissionProfileNetworkAccess::Allow)),
+                .any(|access| matches!(access, PermissionProfileNetworkAccess::Allow)) =>
+            {
+                RuntimeNetworkDecision::Block(RuntimeNetworkBlockReason::Allowlist)
+            }
+            None => RuntimeNetworkDecision::Allow,
         }
     }
 }
@@ -126,8 +160,12 @@ fn handle_proxy_connection(mut client: TcpStream, policy: &RuntimeNetworkPolicy)
     let host = proxy_target_host(target)
         .or_else(|| header_host(&headers))
         .unwrap_or_default();
-    if host.is_empty() || !policy.allows_host(&host) {
-        write_forbidden(&mut client)?;
+    if host.is_empty() {
+        write_forbidden(&mut client, RuntimeNetworkBlockReason::Policy)?;
+        return Ok(());
+    }
+    if let RuntimeNetworkDecision::Block(reason) = policy.decision_for_host(&host) {
+        write_forbidden(&mut client, reason)?;
         return Ok(());
     }
 
@@ -145,7 +183,7 @@ fn proxy_http(
     headers: &[String],
 ) -> io::Result<()> {
     let Some((host, port, path)) = parse_http_target(target, headers) else {
-        write_forbidden(&mut client)?;
+        write_forbidden(&mut client, RuntimeNetworkBlockReason::Policy)?;
         return Ok(());
     };
     let mut upstream = TcpStream::connect((host.as_str(), port))?;
@@ -187,9 +225,11 @@ fn proxy_connect(mut client: TcpStream, target: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn write_forbidden(client: &mut TcpStream) -> io::Result<()> {
-    client.write_all(
-        b"HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\nx-proxy-error: blocked-by-policy\r\n\r\n",
+fn write_forbidden(client: &mut TcpStream, reason: RuntimeNetworkBlockReason) -> io::Result<()> {
+    write!(
+        client,
+        "HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\nx-proxy-error: {}\r\n\r\n",
+        reason.proxy_error()
     )
 }
 
@@ -316,5 +356,67 @@ mod tests {
 
         assert!(!policy.allows_host("blocked.example.com"));
         assert!(policy.allows_host("api.example.com"));
+    }
+
+    #[test]
+    fn runtime_network_proxy_reports_denylist_blocks() {
+        let proxy = RuntimeNetworkProxy::start(RuntimeNetworkPolicy::new(HashMap::from([
+            (
+                "api.example.com".to_string(),
+                PermissionProfileNetworkAccess::Allow,
+            ),
+            (
+                "blocked.example.com".to_string(),
+                PermissionProfileNetworkAccess::Deny,
+            ),
+        ])))
+        .expect("start proxy");
+        let addr = proxy
+            .proxy_url()
+            .strip_prefix("http://")
+            .expect("proxy url prefix")
+            .to_string();
+        let mut stream = TcpStream::connect(addr).expect("connect proxy");
+
+        stream
+            .write_all(
+                b"GET http://blocked.example.com/ HTTP/1.1\r\nHost: blocked.example.com\r\n\r\n",
+            )
+            .expect("write request");
+        let mut response = String::new();
+        std::io::Read::read_to_string(&mut stream, &mut response).expect("read response");
+
+        assert!(response.starts_with("HTTP/1.1 403 Forbidden"));
+        assert!(
+            response.contains("x-proxy-error: blocked-by-denylist"),
+            "response should identify denylist block: {response:?}"
+        );
+    }
+
+    #[test]
+    fn runtime_network_proxy_reports_allowlist_misses() {
+        let proxy = RuntimeNetworkProxy::start(RuntimeNetworkPolicy::new(HashMap::from([(
+            "api.example.com".to_string(),
+            PermissionProfileNetworkAccess::Allow,
+        )])))
+        .expect("start proxy");
+        let addr = proxy
+            .proxy_url()
+            .strip_prefix("http://")
+            .expect("proxy url prefix")
+            .to_string();
+        let mut stream = TcpStream::connect(addr).expect("connect proxy");
+
+        stream
+            .write_all(b"GET http://other.example.com/ HTTP/1.1\r\nHost: other.example.com\r\n\r\n")
+            .expect("write request");
+        let mut response = String::new();
+        std::io::Read::read_to_string(&mut stream, &mut response).expect("read response");
+
+        assert!(response.starts_with("HTTP/1.1 403 Forbidden"));
+        assert!(
+            response.contains("x-proxy-error: blocked-by-allowlist"),
+            "response should identify allowlist block: {response:?}"
+        );
     }
 }

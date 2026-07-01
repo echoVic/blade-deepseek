@@ -3623,7 +3623,7 @@ enabled = true
         let cwd = tempdir().expect("cwd");
         config.cwd = Some(cwd.path().to_path_buf());
         let input = Cursor::new(
-            br#"{"id":"cmd-deny","method":"command/exec","params":{"command":["sh","-lc","curl --noproxy '' -sS -o /dev/null -w '%{http_code}' http://blocked.orca.invalid/ || true"],"permissionProfile":"limited-network","timeoutMs":5000}}"#
+            br#"{"id":"cmd-deny","method":"command/exec","params":{"command":["sh","-lc","curl --noproxy '' -sS -D - -o /dev/null http://blocked.orca.invalid/ || true"],"permissionProfile":"limited-network","timeoutMs":5000}}"#
                 .to_vec(),
         );
         let output = SharedVecWriter::default();
@@ -3636,7 +3636,13 @@ enabled = true
             .iter()
             .find(|event| event["event"] == "command_exec_completed")
             .expect("command completed");
-        assert_eq!(completed["stdout"], "403");
+        assert!(
+            completed["stdout"]
+                .as_str()
+                .expect("stdout")
+                .contains("x-proxy-error: blocked-by-denylist"),
+            "stdout should include structured proxy block reason: {completed:?}"
+        );
         assert_eq!(completed["exitCode"], 0);
     }
 

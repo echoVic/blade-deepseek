@@ -3137,7 +3137,7 @@ fn server_mode_command_exec_configured_permission_profile_enforces_network_domai
             let stdin = child.stdin.as_mut().expect("server stdin");
             writeln!(
                 stdin,
-                r#"{{"id":"cmd","method":"command/exec","params":{{"command":["sh","-lc","curl --noproxy '' -sS -o /dev/null -w '%{{http_code}}' http://blocked.orca.invalid/ || true"],"permissionProfile":"net","timeoutMs":5000}}}}"#
+                r#"{{"id":"cmd","method":"command/exec","params":{{"command":["sh","-lc","curl --noproxy '' -sS -D - -o /dev/null http://blocked.orca.invalid/ || true"],"permissionProfile":"net","timeoutMs":5000}}}}"#
             )
             .expect("write network domain permissionProfile command/exec");
             stdin
@@ -3154,7 +3154,13 @@ fn server_mode_command_exec_configured_permission_profile_enforces_network_domai
         assert_eq!(events.len(), 1, "expected one command event: {events:?}");
         assert_eq!(events[0]["id"], "cmd");
         assert_eq!(events[0]["event"], "command_exec_completed");
-        assert_eq!(events[0]["stdout"], "403");
+        assert!(
+            events[0]["stdout"]
+                .as_str()
+                .expect("stdout")
+                .contains("x-proxy-error: blocked-by-denylist"),
+            "stdout should include structured proxy block reason: {events:?}"
+        );
         assert_eq!(events[0]["exitCode"], 0);
     });
 }
