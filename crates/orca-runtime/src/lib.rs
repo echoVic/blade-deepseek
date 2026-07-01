@@ -82,8 +82,8 @@ mod tests {
             "server router must dispatch submit operations"
         );
         assert!(
-            router_source.contains("ClientOp::CommandExecTerminate"),
-            "server router must dispatch command exec termination operations"
+            router_source.contains("command_exec::dispatch_command_exec_operation("),
+            "server router must delegate command exec operations"
         );
     }
 
@@ -195,6 +195,40 @@ mod tests {
         assert!(
             processor_source.contains("fn dispatch_shell_operation"),
             "server shell processor must expose shell dispatch inside the router module"
+        );
+    }
+
+    #[test]
+    fn server_command_exec_dispatch_is_owned_by_command_exec_processor() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let router_source = std::fs::read_to_string(manifest_dir.join("src/server/router.rs"))
+            .expect("server router source");
+        let processor_source =
+            std::fs::read_to_string(manifest_dir.join("src/server/processors/command_exec.rs"))
+                .expect("server command exec processor source");
+
+        assert!(
+            router_source.contains("command_exec::dispatch_command_exec_operation("),
+            "server router must delegate command exec operations to the command exec processor"
+        );
+        for variant in [
+            "ClientOp::CommandExec",
+            "ClientOp::CommandExecWrite",
+            "ClientOp::CommandExecResize",
+            "ClientOp::CommandExecTerminate",
+        ] {
+            assert!(
+                !router_source.contains(variant),
+                "server router must not own {variant} dispatch details"
+            );
+            assert!(
+                processor_source.contains(variant),
+                "server command exec processor must own {variant} dispatch details"
+            );
+        }
+        assert!(
+            processor_source.contains("fn dispatch_command_exec_operation"),
+            "server command exec processor must expose command exec dispatch inside the router module"
         );
     }
 

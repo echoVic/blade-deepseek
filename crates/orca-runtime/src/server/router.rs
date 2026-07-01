@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 mod processors;
 
 use super::*;
-use processors::{shell, thread, turn};
+use processors::{command_exec, shell, thread, turn};
 
 pub(super) fn dispatch_submission<W: Write + Send + 'static>(
     config: &ServerConfig,
@@ -35,6 +35,17 @@ pub(super) fn dispatch_submission<W: Write + Send + 'static>(
     if shell::is_shell_operation(&submission.op) {
         let mut writer = writer.lock().map_err(lock_error)?;
         return shell::dispatch_shell_operation(
+            config,
+            state,
+            &submission.op,
+            submission.id.clone(),
+            &mut *writer,
+        );
+    }
+
+    if command_exec::is_command_exec_operation(&submission.op) {
+        let mut writer = writer.lock().map_err(lock_error)?;
+        return command_exec::dispatch_command_exec_operation(
             config,
             state,
             &submission.op,
@@ -125,66 +136,8 @@ pub(super) fn dispatch_submission<W: Write + Send + 'static>(
                 &mut *writer,
             )
         }
-        ClientOp::CommandExec {
-            thread_id,
-            command,
-            process_id,
-            cwd,
-            env,
-            options,
-            terminal,
-        } => {
-            let mut writer = writer.lock().map_err(lock_error)?;
-            run_command_exec(
-                config,
-                state,
-                thread_id.as_deref(),
-                command,
-                process_id.as_deref(),
-                cwd.as_ref(),
-                env,
-                options,
-                *terminal,
-                submission.id.clone(),
-                &mut *writer,
-            )
-        }
-        ClientOp::CommandExecWrite {
-            process_id,
-            delta_base64,
-            close_stdin,
-        } => {
-            let mut writer = writer.lock().map_err(lock_error)?;
-            run_command_exec_write(
-                state,
-                process_id,
-                delta_base64.as_deref(),
-                *close_stdin,
-                submission.id.clone(),
-                &mut *writer,
-            )
-        }
-        ClientOp::CommandExecResize {
-            process_id,
-            cols,
-            rows,
-        } => {
-            let mut writer = writer.lock().map_err(lock_error)?;
-            run_command_exec_resize(
-                state,
-                process_id,
-                *cols,
-                *rows,
-                submission.id.clone(),
-                &mut *writer,
-            )
-        }
-        ClientOp::CommandExecTerminate { process_id } => {
-            let mut writer = writer.lock().map_err(lock_error)?;
-            run_command_exec_terminate(state, process_id, submission.id.clone(), &mut *writer)
-        }
         _ => unreachable!(
-            "thread query, turn control, and shell operations are delegated before router dispatch"
+            "thread query, turn control, shell, and command exec operations are delegated before router dispatch"
         ),
     };
     result
