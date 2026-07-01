@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.93":
+        "Synchronous server thread query and metadata operations now route through a focused thread processor, shrinking the generic router while preserving thread/read, list, search, turns, items, and metadata behavior.",
       "v0.1.92":
         "Server-mode operation dispatch now lives behind a focused router boundary, preserving every existing wire method while opening the next request-processor refactor path.",
       "v0.1.91":
@@ -212,6 +214,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.93":
+        "server 里的同步 thread 查询和 metadata 操作现在进入独立 thread processor，缩小通用 router，同时保持 thread/read、list、search、turns、items 和 metadata 行为不变。",
       "v0.1.92":
         "server 模式的 operation dispatch 现在进入独立 router 边界，在保持所有现有 wire method 不变的同时，为后续 request processor 重构铺路。",
       "v0.1.91":
