@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.96":
+        "Server command/exec dispatch now routes through a focused command-exec processor, preserving buffered, streaming, stdin, resize, terminate, sandbox, and permission-profile behavior while shrinking the generic router.",
       "v0.1.95":
         "Server shell-session dispatch now routes through a focused shell processor, preserving shell start, write, update, close, resize, list, read, and kill behavior while shrinking the generic router.",
       "v0.1.94":
@@ -218,6 +220,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.96":
+        "server 的 command/exec dispatch 现在进入独立 command-exec processor，保持 buffered、streaming、stdin、resize、terminate、sandbox 与 permission-profile 行为不变，同时继续缩小通用 router。",
       "v0.1.95":
         "server 的 shell-session dispatch 现在进入独立 shell processor，保持 start、write、update、close、resize、list、read、kill 行为不变，同时继续缩小通用 router。",
       "v0.1.94":
