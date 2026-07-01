@@ -88,6 +88,46 @@ mod tests {
     }
 
     #[test]
+    fn server_thread_query_dispatch_is_owned_by_thread_processor() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let router_source = std::fs::read_to_string(manifest_dir.join("src/server/router.rs"))
+            .expect("server router source");
+        let processor_source =
+            std::fs::read_to_string(manifest_dir.join("src/server/processors/thread.rs"))
+                .expect("server thread processor source");
+
+        assert!(
+            router_source.contains("mod processors;"),
+            "server router must declare focused processor modules"
+        );
+        assert!(
+            router_source.contains("thread::dispatch_query_operation("),
+            "server router must delegate thread query operations to the thread processor"
+        );
+        for variant in [
+            "ClientOp::ThreadRead",
+            "ClientOp::ThreadList",
+            "ClientOp::ThreadSearch",
+            "ClientOp::ThreadTurnsList",
+            "ClientOp::ThreadItemsList",
+            "ClientOp::ThreadMetadataUpdate",
+        ] {
+            assert!(
+                !router_source.contains(variant),
+                "server router must not own {variant} dispatch details"
+            );
+            assert!(
+                processor_source.contains(variant),
+                "server thread processor must own {variant} dispatch details"
+            );
+        }
+        assert!(
+            processor_source.contains("fn dispatch_query_operation"),
+            "server thread processor must expose query dispatch inside the router module"
+        );
+    }
+
+    #[test]
     fn protocol_uses_focused_submodules() {
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let protocol_dir = manifest_dir.join("src/protocol");

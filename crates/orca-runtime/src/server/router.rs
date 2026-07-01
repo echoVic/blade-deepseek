@@ -1,7 +1,11 @@
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 
+#[path = "processors/mod.rs"]
+mod processors;
+
 use super::*;
+use processors::thread;
 
 pub(super) fn dispatch_submission<W: Write + Send + 'static>(
     config: &ServerConfig,
@@ -9,6 +13,16 @@ pub(super) fn dispatch_submission<W: Write + Send + 'static>(
     submission: Submission,
     writer: Arc<Mutex<W>>,
 ) -> io::Result<()> {
+    if thread::is_query_operation(&submission.op) {
+        let mut writer = writer.lock().map_err(lock_error)?;
+        return thread::dispatch_query_operation(
+            state,
+            &submission.op,
+            submission.id.clone(),
+            &mut *writer,
+        );
+    }
+
     let result = match &submission.op {
         ClientOp::Submit { thread_id, .. } => {
             if let Some(thread_id) = thread_id {
@@ -67,112 +81,6 @@ pub(super) fn dispatch_submission<W: Write + Send + 'static>(
                 state,
                 thread_id,
                 permissions.clone(),
-                submission.id.clone(),
-                &mut *writer,
-            )
-        }
-        ClientOp::ThreadRead {
-            thread_id,
-            include_messages,
-            include_turns,
-        } => {
-            state.reclaim_finished_thread(thread_id);
-            let mut writer = writer.lock().map_err(lock_error)?;
-            run_thread_read(
-                state,
-                thread_id,
-                *include_messages,
-                *include_turns,
-                submission.id.clone(),
-                &mut *writer,
-            )
-        }
-        ClientOp::ThreadList {
-            cursor,
-            sort_key,
-            sort_direction,
-            search_term,
-            limit,
-            filters,
-        } => {
-            let mut writer = writer.lock().map_err(lock_error)?;
-            run_thread_list(
-                cursor.as_deref(),
-                *limit,
-                filters.clone(),
-                *sort_key,
-                *sort_direction,
-                search_term.as_deref(),
-                submission.id.clone(),
-                &mut *writer,
-            )
-        }
-        ClientOp::ThreadSearch {
-            query,
-            cursor,
-            sort_key,
-            sort_direction,
-            include_archived,
-            limit,
-        } => {
-            let mut writer = writer.lock().map_err(lock_error)?;
-            run_thread_search(
-                query,
-                cursor.as_deref(),
-                *limit,
-                *include_archived,
-                *sort_key,
-                *sort_direction,
-                submission.id.clone(),
-                &mut *writer,
-            )
-        }
-        ClientOp::ThreadTurnsList {
-            thread_id,
-            cursor,
-            sort_direction,
-            items_view,
-            limit,
-        } => {
-            state.reclaim_finished_thread(thread_id);
-            let mut writer = writer.lock().map_err(lock_error)?;
-            run_thread_turns_list(
-                state,
-                thread_id,
-                cursor.as_deref(),
-                *limit,
-                *sort_direction,
-                *items_view,
-                submission.id.clone(),
-                &mut *writer,
-            )
-        }
-        ClientOp::ThreadItemsList {
-            thread_id,
-            turn_id,
-            cursor,
-            sort_direction,
-            limit,
-        } => {
-            state.reclaim_finished_thread(thread_id);
-            let mut writer = writer.lock().map_err(lock_error)?;
-            run_thread_items_list(
-                state,
-                thread_id,
-                turn_id.as_deref(),
-                cursor.as_deref(),
-                *limit,
-                *sort_direction,
-                submission.id.clone(),
-                &mut *writer,
-            )
-        }
-        ClientOp::ThreadMetadataUpdate { thread_id, title } => {
-            let mut writer = writer.lock().map_err(lock_error)?;
-            run_thread_metadata_update(
-                state,
-                thread_id,
-                title.clone(),
                 submission.id.clone(),
                 &mut *writer,
             )
@@ -361,6 +269,7 @@ pub(super) fn dispatch_submission<W: Write + Send + 'static>(
             let mut writer = writer.lock().map_err(lock_error)?;
             run_command_exec_terminate(state, process_id, submission.id.clone(), &mut *writer)
         }
+        _ => unreachable!("thread query operations are delegated before router dispatch"),
     };
     result
 }
