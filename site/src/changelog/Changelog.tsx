@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.78":
+        "Server-mode threads now store their long-lived agent state through RuntimeThread, removing duplicated session/lifecycle/executor assembly while preserving thread projection, resume/fork, cancellation, and permission behavior.",
       "v0.1.77":
         "RuntimeThread now groups the runtime-owned interactive session and lifecycle state behind one boundary, creating the next convergence point for server, TUI, and headless execution without changing public behavior.",
       "v0.1.76":
@@ -182,6 +184,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.78":
+        "Server-mode thread 现在通过 RuntimeThread 保存长期 agent state，不再重复拼 session/lifecycle/executor，同时保持 thread projection、resume/fork、cancel 和权限行为不变。",
       "v0.1.77":
         "RuntimeThread 现在把 runtime-owned interactive session 和 lifecycle state 收到同一个边界里，为 server、TUI、headless 后续收敛提供新的承载点，同时不改变公开行为。",
       "v0.1.76":
