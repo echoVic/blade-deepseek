@@ -10,12 +10,10 @@ use orca_core::{
 };
 use serde_json::{Value, json};
 
-use crate::controller::{ThreadTurnExecutor, ThreadTurnRequest};
-use crate::lifecycle::{
-    RuntimePermissionRequestHandler, RuntimeSessionLifecycle, RuntimeTaskKind, ThreadSteerHandle,
-};
+use crate::controller::ThreadTurnRequest;
+use crate::lifecycle::{RuntimePermissionRequestHandler, RuntimeTaskKind, ThreadSteerHandle};
 use crate::protocol;
-use crate::session::{InteractiveSession, new_run_id};
+use crate::thread::RuntimeThread;
 use crate::thread_store::{
     SessionStore, StoredThreadItem, StoredThreadProjection, StoredThreadTurn, ThreadMetadataPatch,
     ThreadStore, TurnItemsView,
@@ -124,9 +122,7 @@ pub struct ServerThreadTurn {
 }
 
 pub struct ServerThread {
-    thread_id: String,
-    session: InteractiveSession,
-    lifecycle: RuntimeSessionLifecycle,
+    thread: RuntimeThread,
     title: String,
     cwd: String,
     runtime_workspace_roots: Vec<std::path::PathBuf>,
@@ -159,17 +155,9 @@ impl ServerThread {
             .unwrap_or(std::env::current_dir()?)
             .display()
             .to_string();
-        let session = InteractiveSession::new_with_preloaded(&run_config, "", None)?;
-        let thread_id = session
-            .session_id()
-            .map(ToString::to_string)
-            .unwrap_or_else(new_run_id);
-        let mut lifecycle = RuntimeSessionLifecycle::new(thread_id.clone());
-        lifecycle.start_task(RuntimeTaskKind::Agent);
+        let thread = RuntimeThread::start(run_config, "")?;
         Ok(Self {
-            thread_id,
-            session,
-            lifecycle,
+            thread,
             title: "(empty prompt)".to_string(),
             runtime_workspace_roots: run_config
                 .runtime_workspace_roots
@@ -189,17 +177,9 @@ impl ServerThread {
             .display()
             .to_string();
         let transcript = SessionStore::new().load_session(thread_id)?;
-        let session = InteractiveSession::resume_same_thread(run_config, transcript)?;
-        let thread_id = session
-            .session_id()
-            .map(ToString::to_string)
-            .unwrap_or_else(|| thread_id.to_string());
-        let mut lifecycle = RuntimeSessionLifecycle::new(thread_id.clone());
-        lifecycle.start_task(RuntimeTaskKind::Agent);
+        let thread = RuntimeThread::resume_same_thread(run_config, transcript)?;
         Ok(Self {
-            thread_id,
-            session,
-            lifecycle,
+            thread,
             title: "(resumed prompt)".to_string(),
             runtime_workspace_roots: run_config
                 .runtime_workspace_roots
@@ -212,19 +192,20 @@ impl ServerThread {
     }
 
     pub fn thread_id(&self) -> &str {
-        &self.thread_id
+        self.thread.thread_id()
     }
 
     pub fn active_task_id(&self) -> Option<String> {
-        self.lifecycle
+        self.thread
+            .lifecycle()
             .active_task()
             .map(|task| task.id().to_string())
     }
 
     pub fn next_persisted_turn_id(&self) -> String {
         crate::thread_store::next_turn_id_for_messages(
-            &self.thread_id,
-            &self.session.conversation().messages,
+            self.thread.thread_id(),
+            &self.thread.session().conversation().messages,
         )
     }
 
@@ -258,8 +239,7 @@ impl ServerThread {
 
         let request =
             ThreadTurnRequest::new(turn.prompt()).with_wait_for_background_workflows(false);
-        let status = ThreadTurnExecutor::new(&run_config, &mut self.session, &mut self.lifecycle)
-            .run_request(&request, writer)?;
+        let status = self.thread.run_request(&run_config, &request, writer)?;
         let _ = status;
         Ok(())
     }
@@ -287,8 +267,8 @@ impl ServerThread {
         let request = ThreadTurnRequest::new(prompt)
             .with_wait_for_background_workflows(false)
             .with_steer_handle(steer_handle);
-        ThreadTurnExecutor::new(&run_config, &mut self.session, &mut self.lifecycle)
-            .run_request_with_cancel(&request, writer, cancel)
+        self.thread
+            .run_request_with_cancel(&run_config, &request, writer, cancel)
     }
 
     pub fn run_turn_with_permissions_and_cancel<W: Write>(
@@ -305,7 +285,7 @@ impl ServerThread {
         }
         let mut run_config = config.clone();
         apply_permission_override(&mut run_config, permissions);
-        persist_permission_profile(&run_config, &self.thread_id)?;
+        persist_permission_profile(&run_config, self.thread.thread_id())?;
         self.active_permission_profile = run_config.active_permission_profile.clone();
         self.runtime_workspace_roots = run_config
             .runtime_workspace_roots
@@ -333,7 +313,7 @@ impl ServerThread {
         }
         if !permissions.is_empty() {
             apply_permission_override(&mut run_config, permissions);
-            persist_permission_profile(&run_config, &self.thread_id)?;
+            persist_permission_profile(&run_config, self.thread.thread_id())?;
         }
         self.active_permission_profile = run_config.active_permission_profile.clone();
         self.runtime_workspace_roots = run_config
@@ -346,13 +326,14 @@ impl ServerThread {
             .with_wait_for_background_workflows(false)
             .with_steer_handle(steer_handle)
             .with_permission_handler(permission_handler);
-        ThreadTurnExecutor::new(&run_config, &mut self.session, &mut self.lifecycle)
-            .run_request_with_cancel(&request, writer, cancel)
+        self.thread
+            .run_request_with_cancel(&run_config, &request, writer, cancel)
     }
 
     fn start_persisted_turn_task(&mut self) {
         let turn_id = self.next_persisted_turn_id();
-        self.lifecycle
+        self.thread
+            .lifecycle_mut()
             .start_task_with_id(RuntimeTaskKind::Agent, turn_id);
     }
 
@@ -362,7 +343,8 @@ impl ServerThread {
         include_turns: bool,
     ) -> StoredThreadProjection {
         let messages = if include_messages {
-            self.session
+            self.thread
+                .session()
                 .conversation()
                 .messages
                 .iter()
@@ -373,8 +355,8 @@ impl ServerThread {
         };
         let turns = if include_turns {
             crate::thread_store::messages_to_thread_turns(
-                &self.thread_id,
-                &self.session.conversation().messages,
+                self.thread.thread_id(),
+                &self.thread.session().conversation().messages,
                 usize::MAX,
                 TurnItemsView::Full,
             )
@@ -382,13 +364,13 @@ impl ServerThread {
             Vec::new()
         };
         StoredThreadProjection {
-            thread_id: self.thread_id.clone(),
+            thread_id: self.thread.thread_id().to_string(),
             title: self.title.clone(),
             cwd: self.cwd.clone(),
             runtime_workspace_roots: self.runtime_workspace_roots.clone(),
             active_permission_profile: self.active_permission_profile.clone(),
             additional_working_directories: self.additional_working_directories.clone(),
-            message_count: self.session.conversation().messages.len(),
+            message_count: self.thread.session().conversation().messages.len(),
             messages,
             turns,
         }
@@ -403,8 +385,8 @@ impl ServerThread {
     ) -> crate::thread_store::StoredThreadTurnPage {
         crate::thread_store::page_thread_turns(
             crate::thread_store::messages_to_thread_turns(
-                &self.thread_id,
-                &self.session.conversation().messages,
+                self.thread.thread_id(),
+                &self.thread.session().conversation().messages,
                 usize::MAX,
                 items_view,
             ),
@@ -423,8 +405,8 @@ impl ServerThread {
     ) -> crate::thread_store::StoredThreadItemPage {
         crate::thread_store::page_thread_items(
             crate::thread_store::messages_to_thread_items(
-                &self.thread_id,
-                &self.session.conversation().messages,
+                self.thread.thread_id(),
+                &self.thread.session().conversation().messages,
                 turn_id,
                 usize::MAX,
             ),
@@ -450,7 +432,7 @@ impl ServerThread {
     }
 
     pub fn task_registry(&self) -> crate::tasks::TaskRegistry {
-        self.session.task_registry().clone()
+        self.thread.session().task_registry().clone()
     }
 
     pub fn additional_working_directories(&self) -> &[AdditionalWorkingDirectory] {

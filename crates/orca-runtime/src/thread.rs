@@ -1,11 +1,13 @@
 use std::io;
 
+use orca_core::cancel::CancelToken;
 use orca_core::config::RunConfig;
 use orca_core::event_schema::RunStatus;
 
 use crate::controller::{ControllerRunOptions, ThreadTurnExecutor, ThreadTurnRequest};
 use crate::lifecycle::{RuntimeSessionLifecycle, RuntimeTaskKind};
 use crate::session::{InteractiveSession, new_run_id};
+use crate::thread_store::SessionTranscript;
 
 pub struct RuntimeThread {
     thread_id: String,
@@ -16,6 +18,18 @@ pub struct RuntimeThread {
 impl RuntimeThread {
     pub fn start(config: &RunConfig, title: impl Into<String>) -> io::Result<Self> {
         let session = InteractiveSession::new_with_preloaded(config, &title.into(), None)?;
+        Ok(Self::from_session(session))
+    }
+
+    pub(crate) fn resume_same_thread(
+        config: &RunConfig,
+        transcript: SessionTranscript,
+    ) -> io::Result<Self> {
+        let session = InteractiveSession::resume_same_thread(config, transcript)?;
+        Ok(Self::from_session(session))
+    }
+
+    fn from_session(session: InteractiveSession) -> Self {
         let thread_id = session
             .session_id()
             .map(ToString::to_string)
@@ -23,11 +37,11 @@ impl RuntimeThread {
         let mut lifecycle = RuntimeSessionLifecycle::new(thread_id.clone());
         lifecycle.start_task(RuntimeTaskKind::Agent);
 
-        Ok(Self {
+        Self {
             thread_id,
             session,
             lifecycle,
-        })
+        }
     }
 
     pub fn thread_id(&self) -> &str {
@@ -57,10 +71,32 @@ impl RuntimeThread {
         writer: W,
         options: ControllerRunOptions,
     ) -> io::Result<RunStatus> {
-        ThreadTurnExecutor::new(config, &mut self.session, &mut self.lifecycle).run_request(
+        self.run_request(
+            config,
             &ThreadTurnRequest::new(prompt).with_options(options),
             writer,
         )
+    }
+
+    pub fn run_request<W: io::Write>(
+        &mut self,
+        config: &RunConfig,
+        request: &ThreadTurnRequest,
+        writer: W,
+    ) -> io::Result<RunStatus> {
+        ThreadTurnExecutor::new(config, &mut self.session, &mut self.lifecycle)
+            .run_request(request, writer)
+    }
+
+    pub fn run_request_with_cancel<W: io::Write>(
+        &mut self,
+        config: &RunConfig,
+        request: &ThreadTurnRequest,
+        writer: W,
+        cancel: CancelToken,
+    ) -> io::Result<RunStatus> {
+        ThreadTurnExecutor::new(config, &mut self.session, &mut self.lifecycle)
+            .run_request_with_cancel(request, writer, cancel)
     }
 }
 
