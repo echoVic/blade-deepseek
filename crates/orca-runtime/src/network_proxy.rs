@@ -169,11 +169,11 @@ fn handle_proxy_connection(mut client: TcpStream, policy: &RuntimeNetworkPolicy)
         .or_else(|| header_host(&headers))
         .unwrap_or_default();
     if host.is_empty() {
-        write_forbidden(&mut client, RuntimeNetworkBlockReason::Policy)?;
+        write_forbidden(&mut client, RuntimeNetworkBlockReason::Policy, None)?;
         return Ok(());
     }
     if let RuntimeNetworkDecision::Block(reason) = policy.decision_for_host(&host) {
-        write_forbidden(&mut client, reason)?;
+        write_forbidden(&mut client, reason, Some(&host))?;
         return Ok(());
     }
 
@@ -190,7 +190,11 @@ fn handle_proxy_connection(mut client: TcpStream, policy: &RuntimeNetworkPolicy)
         )
     };
     if matches!(proxy_result, Err(ref error) if error.kind() == io::ErrorKind::PermissionDenied) {
-        write_forbidden(&mut client, RuntimeNetworkBlockReason::NotAllowedLocal)?;
+        write_forbidden(
+            &mut client,
+            RuntimeNetworkBlockReason::NotAllowedLocal,
+            Some(&host),
+        )?;
         return Ok(());
     }
     proxy_result
@@ -205,7 +209,7 @@ fn proxy_http(
     policy: &RuntimeNetworkPolicy,
 ) -> io::Result<()> {
     let Some((host, port, path)) = parse_http_target(target, headers) else {
-        write_forbidden(&mut client, RuntimeNetworkBlockReason::Policy)?;
+        write_forbidden(&mut client, RuntimeNetworkBlockReason::Policy, None)?;
         return Ok(());
     };
     let mut upstream = connect_checked_resolved(&host, port, policy)?;
@@ -305,11 +309,20 @@ where
     Ok(addrs)
 }
 
-fn write_forbidden(client: &mut TcpStream, reason: RuntimeNetworkBlockReason) -> io::Result<()> {
+fn write_forbidden(
+    client: &mut TcpStream,
+    reason: RuntimeNetworkBlockReason,
+    host: Option<&str>,
+) -> io::Result<()> {
+    let host_header = host
+        .map(normalize_host)
+        .filter(|host| !host.is_empty())
+        .map(|host| format!("x-proxy-host: {host}\r\n"))
+        .unwrap_or_default();
     write!(
         client,
-        "HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\nx-proxy-error: {}\r\n\r\n",
-        reason.proxy_error()
+        "HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\nx-proxy-error: {}\r\n{host_header}\r\n",
+        reason.proxy_error(),
     )
 }
 
@@ -552,6 +565,10 @@ mod tests {
         assert!(
             response.contains("x-proxy-error: blocked-by-allowlist"),
             "response should identify allowlist block: {response:?}"
+        );
+        assert!(
+            response.contains("x-proxy-host: other.example.com"),
+            "response should identify blocked host for permission attribution: {response:?}"
         );
     }
 

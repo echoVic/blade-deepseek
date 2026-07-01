@@ -3756,6 +3756,51 @@ enabled = true
     }
 
     #[test]
+    fn command_exec_permission_profile_domain_policy_reports_blocked_host() {
+        let mut config = test_run_config();
+        let file_config: orca_core::config::file::FileConfig = toml::from_str(
+            r#"
+[permission_profiles.limited-network]
+extends = ":workspace"
+
+[permission_profiles.limited-network.network]
+enabled = true
+
+[permission_profiles.limited-network.network.domains]
+"api.orca.invalid" = "allow"
+"#,
+        )
+        .expect("domain policy config");
+        config.permission_profiles = file_config.permission_profiles;
+        let cwd = tempdir().expect("cwd");
+        config.cwd = Some(cwd.path().to_path_buf());
+        let input = Cursor::new(
+            br#"{"id":"cmd-allowlist","method":"command/exec","params":{"command":["sh","-lc","curl --noproxy '' -sS -D - -o /dev/null http://other.orca.invalid/ || true"],"permissionProfile":"limited-network","timeoutMs":5000}}"#
+                .to_vec(),
+        );
+        let output = SharedVecWriter::default();
+
+        run_with_io(ServerConfig { run_config: config }, input, output.clone())
+            .expect("server run");
+
+        let events = parse_jsonl(&output.bytes());
+        let completed = events
+            .iter()
+            .find(|event| event["event"] == "command_exec_completed")
+            .expect("command completed");
+        let stdout = completed["stdout"].as_str().expect("stdout");
+        assert!(
+            stdout.contains("x-proxy-error: blocked-by-allowlist"),
+            "stdout should include structured proxy block reason: {completed:?}"
+        );
+        assert!(
+            stdout.contains("x-proxy-host: other.orca.invalid"),
+            "stdout should include blocked host for permission attribution: {completed:?}"
+        );
+        assert_eq!(completed["exitCode"], 0);
+    }
+
+    #[test]
     fn command_exec_permission_profile_domain_policy_allows_http_request() {
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind test server");
         let port = listener.local_addr().expect("server addr").port();

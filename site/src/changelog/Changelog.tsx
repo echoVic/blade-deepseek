@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.87":
+        "Managed command/exec network blocks now include the normalized blocked host in proxy diagnostics, giving clients a stable attribution hook for upcoming automatic network permission prompts.",
       "v0.1.86":
         "Session-scoped request_permissions network denials now override permission-profile allow entries, so interactive deny decisions can tighten later command/exec proxy policy.",
       "v0.1.85":
@@ -200,6 +202,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.87":
+        "command/exec 托管网络代理的阻断诊断现在会包含规范化后的被拦截 host，为后续自动网络权限提示提供稳定归因点。",
       "v0.1.86":
         "session 级 request_permissions 网络拒绝现在会覆盖 permission profile 的 allow 条目，让交互式 deny 决策能收紧后续 command/exec 的代理策略。",
       "v0.1.85":
