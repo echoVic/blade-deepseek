@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.83":
+        "The managed command/exec network proxy now checks resolved socket addresses before connecting, blocking DNS names that resolve to local, private, reserved, or otherwise non-public targets.",
       "v0.1.82":
         "The managed command/exec network proxy now blocks local and private IP targets unless they are explicitly allowlisted, matching Codex's local-network guard while keeping allowlisted loopback workflows working.",
       "v0.1.81":
@@ -192,6 +194,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.83":
+        "command/exec 的托管网络代理现在会在连接前检查 DNS 解析后的 socket 地址，阻止解析到本地、私网、保留地址或其他非公网目标的域名。",
       "v0.1.82":
         "command/exec 的托管网络代理现在默认阻止本地和私网 IP 目标，除非显式 allowlist；这对齐 Codex 的 local-network guard，同时保留已 allowlist 的 loopback 工作流。",
       "v0.1.81":
