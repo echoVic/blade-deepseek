@@ -3747,6 +3747,47 @@ enabled = true
     }
 
     #[test]
+    fn command_exec_permission_profile_domain_policy_blocks_localhost_resolution() {
+        let mut config = test_run_config();
+        let file_config: orca_core::config::file::FileConfig = toml::from_str(
+            r#"
+[permission_profiles.limited-network]
+extends = ":workspace"
+
+[permission_profiles.limited-network.network]
+enabled = true
+
+[permission_profiles.limited-network.network.domains]
+"blocked.orca.invalid" = "deny"
+"#,
+        )
+        .expect("domain policy config");
+        config.permission_profiles = file_config.permission_profiles;
+        let cwd = tempdir().expect("cwd");
+        config.cwd = Some(cwd.path().to_path_buf());
+        let request = br#"{"id":"cmd-localhost-deny","method":"command/exec","params":{"command":["sh","-lc","curl --noproxy '' -sS -D - -o /dev/null http://localhost/ || true"],"permissionProfile":"limited-network","timeoutMs":5000}}"#;
+        let input = Cursor::new(request.to_vec());
+        let output = SharedVecWriter::default();
+
+        run_with_io(ServerConfig { run_config: config }, input, output.clone())
+            .expect("server run");
+
+        let events = parse_jsonl(&output.bytes());
+        let completed = events
+            .iter()
+            .find(|event| event["event"] == "command_exec_completed")
+            .expect("command completed");
+        assert!(
+            completed["stdout"]
+                .as_str()
+                .expect("stdout")
+                .contains("x-proxy-error: blocked-by-policy"),
+            "stdout should include resolved localhost policy block: {completed:?}"
+        );
+        assert_eq!(completed["exitCode"], 0);
+    }
+
+    #[test]
     fn command_exec_sandbox_materializes_custom_permission_profile_workspace_roots() {
         let mut config = test_run_config();
         let runtime_root = std::env::current_dir().unwrap().join("runtime-root");

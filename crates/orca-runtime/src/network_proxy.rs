@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Write};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, TcpListener, TcpStream};
+use std::net::{
+    IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs,
+};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -175,10 +177,23 @@ fn handle_proxy_connection(mut client: TcpStream, policy: &RuntimeNetworkPolicy)
         return Ok(());
     }
 
-    if method.eq_ignore_ascii_case("CONNECT") {
-        return proxy_connect(client, target);
+    let proxy_result = if method.eq_ignore_ascii_case("CONNECT") {
+        proxy_connect(client.try_clone()?, target, policy)
+    } else {
+        proxy_http(
+            client.try_clone()?,
+            method,
+            target,
+            version,
+            &headers,
+            policy,
+        )
+    };
+    if matches!(proxy_result, Err(ref error) if error.kind() == io::ErrorKind::PermissionDenied) {
+        write_forbidden(&mut client, RuntimeNetworkBlockReason::NotAllowedLocal)?;
+        return Ok(());
     }
-    proxy_http(client, method, target, version, &headers)
+    proxy_result
 }
 
 fn proxy_http(
@@ -187,12 +202,13 @@ fn proxy_http(
     target: &str,
     version: &str,
     headers: &[String],
+    policy: &RuntimeNetworkPolicy,
 ) -> io::Result<()> {
     let Some((host, port, path)) = parse_http_target(target, headers) else {
         write_forbidden(&mut client, RuntimeNetworkBlockReason::Policy)?;
         return Ok(());
     };
-    let mut upstream = TcpStream::connect((host.as_str(), port))?;
+    let mut upstream = connect_checked_resolved(&host, port, policy)?;
     upstream
         .set_read_timeout(Some(Duration::from_secs(10)))
         .ok();
@@ -215,9 +231,13 @@ fn proxy_http(
     Ok(())
 }
 
-fn proxy_connect(mut client: TcpStream, target: &str) -> io::Result<()> {
+fn proxy_connect(
+    mut client: TcpStream,
+    target: &str,
+    policy: &RuntimeNetworkPolicy,
+) -> io::Result<()> {
     let (host, port) = split_host_port(target, 443);
-    let mut upstream = TcpStream::connect((host.as_str(), port))?;
+    let mut upstream = connect_checked_resolved(&host, port, policy)?;
     client.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")?;
     let mut client_read = client.try_clone()?;
     let mut upstream_write = upstream.try_clone()?;
@@ -229,6 +249,60 @@ fn proxy_connect(mut client: TcpStream, target: &str) -> io::Result<()> {
     let _ = client.shutdown(Shutdown::Write);
     let _ = join.join();
     Ok(())
+}
+
+fn connect_checked_resolved(
+    host: &str,
+    port: u16,
+    policy: &RuntimeNetworkPolicy,
+) -> io::Result<TcpStream> {
+    connect_checked(host, port, policy, (host, port).to_socket_addrs()?)
+}
+
+fn connect_checked<I>(
+    host: &str,
+    _port: u16,
+    policy: &RuntimeNetworkPolicy,
+    resolved: I,
+) -> io::Result<TcpStream>
+where
+    I: IntoIterator<Item = SocketAddr>,
+{
+    let addrs = checked_socket_addrs(host, policy, resolved)?;
+    TcpStream::connect(addrs.as_slice())
+}
+
+fn checked_socket_addrs<I>(
+    host: &str,
+    policy: &RuntimeNetworkPolicy,
+    resolved: I,
+) -> io::Result<Vec<SocketAddr>>
+where
+    I: IntoIterator<Item = SocketAddr>,
+{
+    let normalized_host = normalize_host(host);
+    let allow_explicit_local_literal = is_local_or_private_host_literal(&normalized_host)
+        && matches!(
+            policy.access_for_host(&normalized_host),
+            Some(PermissionProfileNetworkAccess::Allow)
+        );
+    let mut addrs = Vec::new();
+    for addr in resolved {
+        if is_local_or_private_ip(addr.ip()) && !allow_explicit_local_literal {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "network target rejected by policy",
+            ));
+        }
+        addrs.push(addr);
+    }
+    if addrs.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "network target did not resolve",
+        ));
+    }
+    Ok(addrs)
 }
 
 fn write_forbidden(client: &mut TcpStream, reason: RuntimeNetworkBlockReason) -> io::Result<()> {
@@ -306,13 +380,36 @@ fn is_local_or_private_ipv4(ip: Ipv4Addr) -> bool {
         || ip.is_private()
         || ip.is_link_local()
         || ip.is_unspecified()
-        || ip.octets()[0] == 100 && (64..=127).contains(&ip.octets()[1])
-        || ip.octets()[0] == 169 && ip.octets()[1] == 254
+        || ip.is_multicast()
+        || ip.is_broadcast()
+        || ipv4_in_cidr(ip, [0, 0, 0, 0], 8)
+        || ipv4_in_cidr(ip, [100, 64, 0, 0], 10)
+        || ipv4_in_cidr(ip, [192, 0, 0, 0], 24)
+        || ipv4_in_cidr(ip, [192, 0, 2, 0], 24)
+        || ipv4_in_cidr(ip, [198, 18, 0, 0], 15)
+        || ipv4_in_cidr(ip, [198, 51, 100, 0], 24)
+        || ipv4_in_cidr(ip, [203, 0, 113, 0], 24)
+        || ipv4_in_cidr(ip, [240, 0, 0, 0], 4)
+}
+
+fn ipv4_in_cidr(ip: Ipv4Addr, base: [u8; 4], prefix: u8) -> bool {
+    let ip = u32::from(ip);
+    let base = u32::from(Ipv4Addr::from(base));
+    let mask = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    };
+    (ip & mask) == (base & mask)
 }
 
 fn is_local_or_private_ipv6(ip: Ipv6Addr) -> bool {
+    if let Some(v4) = ip.to_ipv4_mapped() {
+        return is_local_or_private_ipv4(v4) || ip.is_loopback();
+    }
     ip.is_loopback()
         || ip.is_unspecified()
+        || ip.is_multicast()
         || ip.segments()[0] & 0xfe00 == 0xfc00
         || ip.segments()[0] & 0xffc0 == 0xfe80
 }
@@ -482,6 +579,61 @@ mod tests {
         assert!(
             response.contains("x-proxy-error: blocked-by-policy"),
             "response should block local network targets by policy: {response:?}"
+        );
+    }
+
+    #[test]
+    fn runtime_network_proxy_blocks_resolved_private_targets_without_explicit_allowlist() {
+        let policy = RuntimeNetworkPolicy::new(HashMap::from([(
+            "blocked.example.com".to_string(),
+            PermissionProfileNetworkAccess::Deny,
+        )]));
+        let resolved = vec!["127.0.0.1:80".parse().expect("socket addr")];
+
+        let error = connect_checked("private.test", 80, &policy, resolved)
+            .expect_err("resolved private target should be blocked");
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn runtime_network_proxy_blocks_allowlisted_domains_that_resolve_private() {
+        let policy = RuntimeNetworkPolicy::new(HashMap::from([(
+            "private.test".to_string(),
+            PermissionProfileNetworkAccess::Allow,
+        )]));
+        let resolved = vec!["10.0.0.10:80".parse().expect("socket addr")];
+
+        let error = checked_socket_addrs("private.test", &policy, resolved)
+            .expect_err("allowlisted domain resolving private should be blocked");
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn runtime_network_proxy_reports_resolved_private_target_blocks() {
+        let proxy = RuntimeNetworkProxy::start(RuntimeNetworkPolicy::new(HashMap::from([(
+            "blocked.example.com".to_string(),
+            PermissionProfileNetworkAccess::Deny,
+        )])))
+        .expect("start proxy");
+        let addr = proxy
+            .proxy_url()
+            .strip_prefix("http://")
+            .expect("proxy url prefix")
+            .to_string();
+        let mut stream = TcpStream::connect(addr).expect("connect proxy");
+
+        stream
+            .write_all(b"GET http://localhost/ HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .expect("write request");
+        let mut response = String::new();
+        std::io::Read::read_to_string(&mut stream, &mut response).expect("read response");
+
+        assert!(response.starts_with("HTTP/1.1 403 Forbidden"));
+        assert!(
+            response.contains("x-proxy-error: blocked-by-policy"),
+            "response should identify resolved local target block: {response:?}"
         );
     }
 
