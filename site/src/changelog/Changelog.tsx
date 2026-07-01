@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.94":
+        "Server turn-control dispatch now routes through a focused turn processor, keeping interrupt, resume, and steer behavior intact while shrinking the generic router.",
       "v0.1.93":
         "Synchronous server thread query and metadata operations now route through a focused thread processor, shrinking the generic router while preserving thread/read, list, search, turns, items, and metadata behavior.",
       "v0.1.92":
@@ -214,6 +216,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.94":
+        "server 的 turn-control dispatch 现在进入独立 turn processor，保持 interrupt、resume、steer 行为不变，同时继续缩小通用 router。",
       "v0.1.93":
         "server 里的同步 thread 查询和 metadata 操作现在进入独立 thread processor，缩小通用 router，同时保持 thread/read、list、search、turns、items 和 metadata 行为不变。",
       "v0.1.92":
