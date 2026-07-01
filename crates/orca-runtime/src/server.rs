@@ -457,6 +457,8 @@ struct ActiveTurnControl {
     cancel: CancelToken,
     steer_handle: ThreadSteerHandle,
     session_permission_directories: Vec<orca_core::config::AdditionalWorkingDirectory>,
+    session_network_domain_permissions:
+        HashMap<String, orca_core::config::PermissionProfileNetworkAccess>,
 }
 
 struct ActiveTurnHandle {
@@ -584,17 +586,22 @@ fn merge_completed_turn_metadata(
     mut thread: ServerThread,
     control: Option<ActiveTurnControl>,
 ) -> ServerThread {
-    if let Some(control) = control
-        && !control.session_permission_directories.is_empty()
-    {
-        thread.update_metadata(ThreadMetadataPatch {
-            title: None,
-            active_permission_profile: None,
-            approval_mode: None,
-            runtime_workspace_roots: None,
-            permission_rules: None,
-            additional_working_directories: Some(control.session_permission_directories),
-        });
+    if let Some(control) = control {
+        let additional_working_directories = (!control.session_permission_directories.is_empty())
+            .then_some(control.session_permission_directories);
+        let network_domain_permissions = (!control.session_network_domain_permissions.is_empty())
+            .then_some(control.session_network_domain_permissions);
+        if additional_working_directories.is_some() || network_domain_permissions.is_some() {
+            thread.update_metadata(ThreadMetadataPatch {
+                title: None,
+                active_permission_profile: None,
+                approval_mode: None,
+                runtime_workspace_roots: None,
+                permission_rules: None,
+                additional_working_directories,
+                network_domain_permissions,
+            });
+        }
     }
     thread
 }
@@ -1163,14 +1170,17 @@ fn run_permission_respond<W: Write>(
     if decision == protocol::PermissionResponseDecision::Allow
         && scope == protocol::PermissionGrantScope::Session
     {
-        let directories = persist_session_permission_grant(
+        let session_grants = persist_session_permission_grant(
             &pending.thread_id,
             &pending.runtime_workspace_roots,
             &permissions,
         )?;
         for control in state.active_turns.values_mut() {
             if control.thread_id == pending.thread_id {
-                control.session_permission_directories = directories.clone();
+                control.session_permission_directories =
+                    session_grants.additional_working_directories.clone();
+                control.session_network_domain_permissions =
+                    session_grants.network_domain_permissions.clone();
             }
         }
     }
@@ -1204,11 +1214,16 @@ fn run_permission_respond<W: Write>(
     )
 }
 
+struct PersistedSessionPermissionGrant {
+    additional_working_directories: Vec<orca_core::config::AdditionalWorkingDirectory>,
+    network_domain_permissions: HashMap<String, orca_core::config::PermissionProfileNetworkAccess>,
+}
+
 fn persist_session_permission_grant(
     thread_id: &str,
     runtime_workspace_roots: &[PathBuf],
     permissions: &protocol::RequestPermissionProfile,
-) -> io::Result<Vec<orca_core::config::AdditionalWorkingDirectory>> {
+) -> io::Result<PersistedSessionPermissionGrant> {
     let file_system = permissions.file_system.as_ref();
     let roots = file_system
         .into_iter()
@@ -1238,6 +1253,14 @@ fn persist_session_permission_grant(
             }
         }
     }
+    if let Some(network) = permissions.network.as_ref() {
+        for (domain, access) in &network.domains {
+            transcript
+                .meta
+                .network_domain_permissions
+                .insert(domain.clone(), *access);
+        }
+    }
     store.update_thread_metadata(
         thread_id,
         ThreadMetadataPatch {
@@ -1247,10 +1270,14 @@ fn persist_session_permission_grant(
             runtime_workspace_roots: None,
             permission_rules: Some(transcript.meta.permission_rules),
             additional_working_directories: Some(transcript.meta.additional_working_directories),
+            network_domain_permissions: Some(transcript.meta.network_domain_permissions),
         },
     )?;
     let updated = store.load_session(thread_id)?;
-    Ok(updated.meta.additional_working_directories)
+    Ok(PersistedSessionPermissionGrant {
+        additional_working_directories: updated.meta.additional_working_directories,
+        network_domain_permissions: updated.meta.network_domain_permissions,
+    })
 }
 
 fn materialize_workspace_roots_paths(
@@ -1689,40 +1716,46 @@ fn run_command_exec<W: Write>(
     }
     let command_text = protocol::shell_join(command);
     let cwd = cwd.cloned().unwrap_or(server_cwd(&config.run_config)?);
-    let (mut additional_working_directories, thread_permission_profile, runtime_workspace_roots) =
-        match thread_id {
-            Some(thread_id) => {
-                state.reclaim_finished_thread(thread_id);
-                match state.threads.thread(thread_id) {
-                    Some(thread) => (
-                        thread
-                            .additional_working_directories()
-                            .iter()
-                            .map(|directory| directory.path.clone())
-                            .collect(),
-                        thread.active_permission_profile().cloned(),
-                        thread.runtime_workspace_roots().to_vec(),
-                    ),
-                    None => {
-                        return protocol::write_server_event(
-                            writer,
-                            &id,
-                            ServerEvent::error(format!("unknown thread: {thread_id}")),
-                        );
-                    }
+    let (
+        mut additional_working_directories,
+        thread_permission_profile,
+        runtime_workspace_roots,
+        thread_network_domain_permissions,
+    ) = match thread_id {
+        Some(thread_id) => {
+            state.reclaim_finished_thread(thread_id);
+            match state.threads.thread(thread_id) {
+                Some(thread) => (
+                    thread
+                        .additional_working_directories()
+                        .iter()
+                        .map(|directory| directory.path.clone())
+                        .collect(),
+                    thread.active_permission_profile().cloned(),
+                    thread.runtime_workspace_roots().to_vec(),
+                    thread.network_domain_permissions().clone(),
+                ),
+                None => {
+                    return protocol::write_server_event(
+                        writer,
+                        &id,
+                        ServerEvent::error(format!("unknown thread: {thread_id}")),
+                    );
                 }
             }
-            None => (
-                Vec::new(),
-                None,
-                config
-                    .run_config
-                    .runtime_workspace_roots
-                    .clone()
-                    .unwrap_or_default(),
-            ),
-        };
-    let effective_sandbox = match command_exec_sandbox_mode(
+        }
+        None => (
+            Vec::new(),
+            None,
+            config
+                .run_config
+                .runtime_workspace_roots
+                .clone()
+                .unwrap_or_default(),
+            HashMap::new(),
+        ),
+    };
+    let mut effective_sandbox = match command_exec_sandbox_mode(
         &config.run_config,
         options,
         thread_permission_profile.as_ref(),
@@ -1735,6 +1768,12 @@ fn run_command_exec<W: Write>(
             return protocol::write_server_event(writer, &id, ServerEvent::error(error));
         }
     };
+    for (domain, access) in thread_network_domain_permissions {
+        effective_sandbox
+            .network_policy_domains
+            .entry(domain)
+            .or_insert(access);
+    }
     additional_working_directories.extend(effective_sandbox.additional_writable_roots.clone());
     let denied_writable_directories = effective_sandbox.denied_writable_roots.clone();
     if let protocol::CommandSandboxPolicy::WorkspaceWrite { writable_roots, .. } =
@@ -2677,7 +2716,15 @@ fn thread_summary_to_json(summary: StoredThreadSummary) -> Value {
         "permissionRuleCount": summary.permission_rule_count,
         "additionalWorkingDirectoryCount": summary.additional_working_directories.len(),
         "additionalWorkingDirectories": additional_working_directories_to_json(summary.additional_working_directories),
+        "networkDomainPermissionCount": summary.network_domain_permissions.len(),
+        "networkDomainPermissions": network_domain_permissions_to_json(summary.network_domain_permissions),
     })
+}
+
+fn network_domain_permissions_to_json(
+    permissions: HashMap<String, orca_core::config::PermissionProfileNetworkAccess>,
+) -> Value {
+    serde_json::to_value(permissions).unwrap_or_else(|_| Value::Object(Default::default()))
 }
 
 fn additional_working_directories_to_json(
@@ -2946,6 +2993,7 @@ fn run_thread_submit_async<W: Write + Send + 'static>(
             cancel: cancel.clone(),
             steer_handle: steer_handle.clone(),
             session_permission_directories: Vec::new(),
+            session_network_domain_permissions: HashMap::new(),
         },
     );
 
@@ -3019,6 +3067,12 @@ fn run_thread_read<W: Write>(
                 additional_working_directories: additional_working_directories_to_json(
                     thread.additional_working_directories,
                 ),
+                network_domain_permission_count: Value::from(
+                    thread.network_domain_permissions.len() as u64,
+                ),
+                network_domain_permissions: network_domain_permissions_to_json(
+                    thread.network_domain_permissions,
+                ),
                 message_count: Value::from(thread.message_count as u64),
                 messages: Value::from(thread.messages),
                 turns: Value::from(
@@ -3055,6 +3109,12 @@ fn run_thread_read<W: Write>(
                 ),
                 additional_working_directories: additional_working_directories_to_json(
                     thread.additional_working_directories,
+                ),
+                network_domain_permission_count: Value::from(
+                    thread.network_domain_permissions.len() as u64,
+                ),
+                network_domain_permissions: network_domain_permissions_to_json(
+                    thread.network_domain_permissions,
                 ),
                 message_count: Value::from(thread.message_count as u64),
                 messages: Value::from(thread.messages),

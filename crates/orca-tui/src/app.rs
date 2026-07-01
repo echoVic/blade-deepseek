@@ -867,6 +867,7 @@ mod tests {
                 runtime_workspace_roots: Vec::new(),
                 permission_rules: Default::default(),
                 additional_working_directories: Vec::new(),
+                network_domain_permissions: Default::default(),
             },
             messages: Vec::new(),
             compactions: Vec::new(),

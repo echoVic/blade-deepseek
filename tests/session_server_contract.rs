@@ -2081,6 +2081,142 @@ fn server_mode_command_exec_uses_thread_additional_working_directories() {
 }
 
 #[test]
+fn server_mode_command_exec_uses_session_network_domain_grants() {
+    let home = tempdir().expect("orca home");
+    let home_path = home.path();
+    let workspace = home_path.join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    std::fs::write(home_path.join("config.toml"), "mode = \"full-auto\"\n").expect("write config");
+
+    let mut child = orca_command()
+        .args([
+            "--mode",
+            "server",
+            "--provider",
+            "mock",
+            "--cwd",
+            workspace.to_str().unwrap(),
+        ])
+        .env("ORCA_HOME", home_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn orca server");
+    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
+
+    {
+        let stdin = child.stdin.as_mut().expect("server stdin");
+        writeln!(
+            stdin,
+            r#"{{"id":"thread-req","method":"thread/start","params":{{}}}}"#
+        )
+        .expect("write thread/start");
+        stdin.flush().expect("flush thread/start");
+    }
+    let thread_started = read_until_event(&mut stdout, "thread-req", "thread_started");
+    let thread_id = thread_started["threadId"]
+        .as_str()
+        .expect("thread id")
+        .to_string();
+
+    {
+        let stdin = child.stdin.as_mut().expect("server stdin");
+        writeln!(
+            stdin,
+            r#"{{"id":"turn","method":"turn/start","params":{{"threadId":"{}","input":[{{"type":"text","text":"request_network_permissions_then_done api.example.com"}}]}}}}"#,
+            thread_id,
+        )
+        .expect("write turn/start");
+        stdin.flush().expect("flush turn/start");
+    }
+
+    let permission_request = read_until_event(&mut stdout, "turn", "permission_request");
+    let request_id = permission_request["requestId"]
+        .as_str()
+        .expect("permission request id")
+        .to_string();
+    assert_eq!(
+        permission_request["permissions"]["network"]["domains"]["api.example.com"],
+        "allow"
+    );
+
+    {
+        let stdin = child.stdin.as_mut().expect("server stdin");
+        writeln!(
+            stdin,
+            r#"{{"id":"permission-response","method":"permission/respond","params":{{"requestId":"{}","decision":"allow","scope":"session","permissions":{{"fileSystem":null,"network":{{"enabled":true,"domains":{{"api.example.com":"allow"}}}}}}}}}}"#,
+            request_id,
+        )
+        .expect("write permission/respond");
+        stdin.flush().expect("flush permission/respond");
+    }
+    read_until_event(&mut stdout, "permission-response", "permission_resolved");
+    read_until_event(&mut stdout, "turn", "turn_completed");
+
+    {
+        let stdin = child.stdin.as_mut().expect("server stdin");
+        writeln!(
+            stdin,
+            r#"{{"id":"read","method":"thread/read","params":{{"threadId":"{}"}}}}"#,
+            thread_id,
+        )
+        .expect("write thread/read");
+        stdin.flush().expect("flush thread/read");
+    }
+    let read = read_until_event(&mut stdout, "read", "thread_read");
+    assert_eq!(read["networkDomainPermissionCount"], 1);
+    assert_eq!(read["networkDomainPermissions"]["api.example.com"], "allow");
+
+    {
+        let stdin = child.stdin.as_mut().expect("server stdin");
+        writeln!(
+            stdin,
+            r#"{{"id":"list","method":"thread/list","params":{{"limit":10}}}}"#
+        )
+        .expect("write thread/list");
+        stdin.flush().expect("flush thread/list");
+    }
+    let list = read_until_event(&mut stdout, "list", "thread_list");
+    let listed = list["data"]
+        .as_array()
+        .expect("thread list data")
+        .iter()
+        .find(|thread| thread["threadId"] == thread_id)
+        .expect("listed thread");
+    assert_eq!(listed["networkDomainPermissionCount"], 1);
+    assert_eq!(
+        listed["networkDomainPermissions"]["api.example.com"],
+        "allow"
+    );
+
+    {
+        let stdin = child.stdin.as_mut().expect("server stdin");
+        writeln!(
+            stdin,
+            r#"{{"id":"cmd","method":"command/exec","params":{{"threadId":"{}","command":["sh","-lc","curl --noproxy '' -sS -D - -o /dev/null http://blocked.orca.invalid/ || true"],"timeoutMs":5000}}}}"#,
+            thread_id,
+        )
+        .expect("write command/exec");
+        stdin.flush().expect("flush command/exec");
+    }
+    let completed = read_until_event(&mut stdout, "cmd", "command_exec_completed");
+    drop(child.stdin.take());
+    assert!(
+        completed["stdout"]
+            .as_str()
+            .expect("stdout")
+            .contains("x-proxy-error: blocked-by-allowlist"),
+        "stdout should include session network grant proxy diagnostic: {completed:?}"
+    );
+    assert_eq!(completed["exitCode"], 0);
+
+    let output = child.wait_with_output().expect("wait for server");
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn server_mode_command_exec_danger_full_access_bypasses_workspace_sandbox() {
     if !sandbox_seatbelt_available() {
         return;

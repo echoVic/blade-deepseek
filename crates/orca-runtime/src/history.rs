@@ -240,6 +240,7 @@ pub fn create_meta(cwd: &Path, provider: &str, model: Option<String>, prompt: &s
         runtime_workspace_roots: vec![cwd.to_path_buf()],
         permission_rules: PermissionRules::default(),
         additional_working_directories: Vec::new(),
+        network_domain_permissions: Default::default(),
     }
 }
 

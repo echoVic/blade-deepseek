@@ -727,6 +727,42 @@ fn tool_actor_context_grants_request_permissions_entry_write_roots() {
 }
 
 #[test]
+fn tool_actor_context_reports_request_permissions_network_domain_grants() {
+    let mut context = RuntimeToolActorContext::new("run-tools", 2);
+    let request = ToolRequest {
+        id: "grant-network".to_string(),
+        name: ToolName::RequestPermissions,
+        action: ActionKind::Network,
+        target: Some("api.example.com".to_string()),
+        raw_arguments: Some(
+            serde_json::json!({
+                "reason": "fetch release metadata",
+                "permissions": {
+                    "fileSystem": null,
+                    "network": {
+                        "enabled": true,
+                        "domains": {
+                            "api.example.com": "allow"
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        ),
+    };
+
+    let result = context.execute_request_permissions_tool(&request);
+
+    assert_eq!(result.status, orca_core::tool_types::ToolStatus::Completed);
+    let output: Value = serde_json::from_str(result.output.as_deref().unwrap()).unwrap();
+    assert_eq!(output["granted"]["network"]["enabled"], true);
+    assert_eq!(
+        output["granted"]["network"]["domains"]["api.example.com"],
+        "allow"
+    );
+}
+
+#[test]
 fn tool_actor_context_includes_strict_auto_review_in_permission_output() {
     struct StrictHandler {
         root: std::path::PathBuf,

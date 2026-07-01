@@ -1,5 +1,7 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 
+use orca_core::config::PermissionProfileNetworkAccess;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -180,4 +182,6 @@ fn special_path_label(base: &str, subpath: Option<PathBuf>) -> PathBuf {
 pub struct RequestNetworkPermissions {
     #[serde(default)]
     pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub domains: HashMap<String, PermissionProfileNetworkAccess>,
 }

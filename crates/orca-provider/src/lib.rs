@@ -494,6 +494,49 @@ fn mock_call(conversation: &Conversation) -> ProviderResponse {
         };
     }
 
+    if let Some(domain) = prompt
+        .trim()
+        .strip_prefix("request_network_permissions_then_done ")
+        .map(str::trim)
+        .filter(|domain| !domain.is_empty())
+    {
+        let request_permissions = ToolRequest {
+            id: "mock-tool-1".to_string(),
+            name: ToolName::RequestPermissions,
+            action: ActionKind::Network,
+            target: Some(domain.to_string()),
+            raw_arguments: Some(
+                serde_json::json!({
+                    "reason": "mock provider needs temporary network access",
+                    "permissions": {
+                        "fileSystem": null,
+                        "network": {
+                            "enabled": true,
+                            "domains": {
+                                domain: "allow"
+                            }
+                        }
+                    }
+                })
+                .to_string(),
+            ),
+        };
+        return ProviderResponse {
+            steps: vec![
+                ProviderStep::ToolCall(request_permissions.clone()),
+                ProviderStep::MessageDelta("done".to_string()),
+            ],
+            assistant_content: Some("done".to_string()),
+            assistant_reasoning: None,
+            tool_calls: vec![RawToolCall {
+                id: request_permissions.id.clone(),
+                function_name: request_permissions.name.as_str().to_string(),
+                arguments: request_permissions.raw_arguments.unwrap_or_default(),
+            }],
+            usage: None,
+        };
+    }
+
     if let Some(tool_request) = parse_mock_prompt(prompt) {
         let raw_call = RawToolCall {
             id: tool_request.id.clone(),
@@ -1035,6 +1078,26 @@ mod tests {
                 ProviderStep::ToolCall(second)
             ] if first.name == ToolName::RequestPermissions && second.name == ToolName::Bash
         ));
+    }
+
+    #[test]
+    fn mock_provider_can_request_network_permissions() {
+        let mut conversation = Conversation::new();
+        conversation.add_user("request_network_permissions_then_done api.example.com".to_string());
+
+        let response = mock_call(&conversation);
+
+        assert_eq!(response.tool_calls.len(), 1);
+        let Some(ProviderStep::ToolCall(request)) = response.steps.first() else {
+            panic!("expected request_permissions tool call");
+        };
+        assert_eq!(request.name, ToolName::RequestPermissions);
+        let arguments: serde_json::Value =
+            serde_json::from_str(request.raw_arguments.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            arguments["permissions"]["network"]["domains"]["api.example.com"],
+            "allow"
+        );
     }
 
     #[test]

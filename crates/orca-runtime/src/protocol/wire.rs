@@ -1755,6 +1755,32 @@ mod tests {
     }
 
     #[test]
+    fn submission_decodes_permission_response_network_domain_grants() {
+        let submission = Submission::decode(
+            r#"{"id":"perm-response","method":"permission/respond","params":{"requestId":"perm-1","decision":"allow","scope":"session","permissions":{"fileSystem":null,"network":{"enabled":true,"domains":{"api.example.com":"allow","blocked.example.com":"deny"}}}}}"#,
+        )
+        .expect("permission/respond submission");
+
+        let ClientOp::PermissionRespond {
+            permissions, scope, ..
+        } = submission.op
+        else {
+            panic!("expected permission response op");
+        };
+        assert_eq!(scope, PermissionGrantScope::Session);
+        let network = permissions.network.expect("network permission grants");
+        assert_eq!(network.enabled, Some(true));
+        assert_eq!(
+            network.domains.get("api.example.com"),
+            Some(&orca_core::config::PermissionProfileNetworkAccess::Allow)
+        );
+        assert_eq!(
+            network.domains.get("blocked.example.com"),
+            Some(&orca_core::config::PermissionProfileNetworkAccess::Deny)
+        );
+    }
+
+    #[test]
     fn submission_decodes_shell_resize_wire_shape() {
         let resize = Submission::decode(
             r#"{"id":"resize","method":"shell/resize","params":{"shellId":"shell-1","cols":120,"rows":33}}"#,

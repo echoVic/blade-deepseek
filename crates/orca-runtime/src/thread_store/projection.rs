@@ -583,6 +583,7 @@ impl From<SessionSummary> for StoredThreadSummary {
             permission_rule_count: summary.permission_rule_count,
             runtime_workspace_roots: summary.runtime_workspace_roots,
             additional_working_directories: summary.additional_working_directories,
+            network_domain_permissions: summary.network_domain_permissions,
         }
     }
 }

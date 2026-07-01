@@ -1299,7 +1299,14 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
                             "network": {
                                 "type": ["object", "null"],
                                 "properties": {
-                                    "enabled": { "type": ["boolean", "null"] }
+                                    "enabled": { "type": ["boolean", "null"] },
+                                    "domains": {
+                                        "type": "object",
+                                        "additionalProperties": {
+                                            "type": "string",
+                                            "enum": ["allow", "deny"]
+                                        }
+                                    }
                                 },
                                 "additionalProperties": false
                             }
@@ -2045,6 +2052,16 @@ mod tests {
                 .unwrap_or_default(),
             vec![json!("read"), json!("write"), json!("readWrite")],
             "schema should expose Codex-style fileSystem.entries access modes"
+        );
+        assert_eq!(
+            tool.spec()
+                .input_schema
+                .pointer("/properties/permissions/properties/network/properties/domains/additionalProperties/enum")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+            vec![json!("allow"), json!("deny")],
+            "schema should expose permission-profile network domain requests"
         );
     }
 

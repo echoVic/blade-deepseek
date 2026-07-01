@@ -2753,6 +2753,7 @@ mod tests {
             runtime_workspace_roots: Vec::new(),
             permission_rule_count: 0,
             additional_working_directories: Vec::new(),
+            network_domain_permissions: Default::default(),
         }
     }
 

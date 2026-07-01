@@ -262,6 +262,7 @@ pub(crate) fn summarize_session_with_archive_flag(
         permission_rule_count: meta.permission_rules.rules.len(),
         runtime_workspace_roots: meta.runtime_workspace_roots,
         additional_working_directories: meta.additional_working_directories,
+        network_domain_permissions: meta.network_domain_permissions,
     })
 }
 
@@ -619,6 +620,10 @@ impl ThreadStore for JsonlThreadStore {
                     meta.additional_working_directories = additional_working_directories;
                     patched = true;
                 }
+                if let Some(network_domain_permissions) = patch.network_domain_permissions {
+                    meta.network_domain_permissions = network_domain_permissions;
+                    patched = true;
+                }
                 break;
             }
         }
@@ -664,6 +669,7 @@ impl ThreadStore for JsonlThreadStore {
             runtime_workspace_roots: meta.runtime_workspace_roots,
             active_permission_profile: meta.active_permission_profile,
             additional_working_directories: meta.additional_working_directories,
+            network_domain_permissions: meta.network_domain_permissions,
             message_count: stored_messages.len(),
             messages: projected_messages,
             turns,

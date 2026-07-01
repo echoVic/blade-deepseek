@@ -1,10 +1,13 @@
+use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use orca_core::approval_rules::PermissionRules;
 use orca_core::approval_types::ApprovalMode;
-use orca_core::config::{ActivePermissionProfile, AdditionalWorkingDirectory};
+use orca_core::config::{
+    ActivePermissionProfile, AdditionalWorkingDirectory, PermissionProfileNetworkAccess,
+};
 use orca_core::conversation::{Message, RawToolCall};
 use orca_core::cost_types::UsageTotals;
 use orca_core::plan_types::PlanItem;
@@ -38,6 +41,8 @@ pub struct SessionMeta {
     pub permission_rules: PermissionRules,
     #[serde(default)]
     pub additional_working_directories: Vec<AdditionalWorkingDirectory>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub network_domain_permissions: HashMap<String, PermissionProfileNetworkAccess>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -58,6 +63,7 @@ pub struct SessionSummary {
     pub runtime_workspace_roots: Vec<PathBuf>,
     pub permission_rule_count: usize,
     pub additional_working_directories: Vec<AdditionalWorkingDirectory>,
+    pub network_domain_permissions: HashMap<String, PermissionProfileNetworkAccess>,
 }
 
 #[derive(Clone, Debug)]
@@ -216,6 +222,7 @@ pub struct ThreadMetadataPatch {
     pub runtime_workspace_roots: Option<Vec<PathBuf>>,
     pub permission_rules: Option<PermissionRules>,
     pub additional_working_directories: Option<Vec<AdditionalWorkingDirectory>>,
+    pub network_domain_permissions: Option<HashMap<String, PermissionProfileNetworkAccess>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -226,6 +233,7 @@ pub struct StoredThreadProjection {
     pub runtime_workspace_roots: Vec<PathBuf>,
     pub active_permission_profile: Option<ActivePermissionProfile>,
     pub additional_working_directories: Vec<AdditionalWorkingDirectory>,
+    pub network_domain_permissions: HashMap<String, PermissionProfileNetworkAccess>,
     pub message_count: usize,
     pub messages: Vec<Value>,
     pub turns: Vec<StoredThreadTurn>,
@@ -349,6 +357,7 @@ pub struct StoredThreadSummary {
     pub permission_rule_count: usize,
     pub runtime_workspace_roots: Vec<PathBuf>,
     pub additional_working_directories: Vec<AdditionalWorkingDirectory>,
+    pub network_domain_permissions: HashMap<String, PermissionProfileNetworkAccess>,
 }
 
 pub trait ThreadStore {

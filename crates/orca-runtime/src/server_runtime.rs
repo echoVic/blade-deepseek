@@ -26,7 +26,9 @@ use crate::tool_item_projection::{
     tool_error_object_from_value, tool_status_is_completed, workflow_completed_item,
     workflow_started_item,
 };
-pub use orca_core::config::{ActivePermissionProfile, AdditionalWorkingDirectory};
+pub use orca_core::config::{
+    ActivePermissionProfile, AdditionalWorkingDirectory, PermissionProfileNetworkAccess,
+};
 use orca_core::config::{HistoryMode, OutputFormat, RunConfig};
 
 #[derive(Default)]
@@ -128,6 +130,7 @@ pub struct ServerThread {
     runtime_workspace_roots: Vec<std::path::PathBuf>,
     active_permission_profile: Option<ActivePermissionProfile>,
     additional_working_directories: Vec<AdditionalWorkingDirectory>,
+    network_domain_permissions: HashMap<String, PermissionProfileNetworkAccess>,
 }
 
 impl ServerThreadTurn {
@@ -166,6 +169,7 @@ impl ServerThread {
             cwd,
             active_permission_profile: run_config.active_permission_profile.clone(),
             additional_working_directories: run_config.additional_working_directories.clone(),
+            network_domain_permissions: HashMap::new(),
         })
     }
 
@@ -177,6 +181,7 @@ impl ServerThread {
             .display()
             .to_string();
         let transcript = SessionStore::new().load_session(thread_id)?;
+        let network_domain_permissions = transcript.meta.network_domain_permissions.clone();
         let thread = RuntimeThread::resume_same_thread(run_config, transcript)?;
         Ok(Self {
             thread,
@@ -188,6 +193,7 @@ impl ServerThread {
             cwd,
             active_permission_profile: run_config.active_permission_profile.clone(),
             additional_working_directories: run_config.additional_working_directories.clone(),
+            network_domain_permissions,
         })
     }
 
@@ -370,6 +376,7 @@ impl ServerThread {
             runtime_workspace_roots: self.runtime_workspace_roots.clone(),
             active_permission_profile: self.active_permission_profile.clone(),
             additional_working_directories: self.additional_working_directories.clone(),
+            network_domain_permissions: self.network_domain_permissions.clone(),
             message_count: self.thread.session().conversation().messages.len(),
             messages,
             turns,
@@ -429,6 +436,9 @@ impl ServerThread {
         if let Some(additional_working_directories) = patch.additional_working_directories {
             self.additional_working_directories = additional_working_directories;
         }
+        if let Some(network_domain_permissions) = patch.network_domain_permissions {
+            self.network_domain_permissions = network_domain_permissions;
+        }
     }
 
     pub fn task_registry(&self) -> crate::tasks::TaskRegistry {
@@ -437,6 +447,10 @@ impl ServerThread {
 
     pub fn additional_working_directories(&self) -> &[AdditionalWorkingDirectory] {
         &self.additional_working_directories
+    }
+
+    pub fn network_domain_permissions(&self) -> &HashMap<String, PermissionProfileNetworkAccess> {
+        &self.network_domain_permissions
     }
 
     pub fn runtime_workspace_roots(&self) -> &[std::path::PathBuf] {
@@ -762,6 +776,7 @@ fn persist_permission_profile(config: &RunConfig, thread_id: &str) -> io::Result
             runtime_workspace_roots: config.runtime_workspace_roots.clone(),
             permission_rules: Some(config.permission_rules.clone()),
             additional_working_directories: Some(config.additional_working_directories.clone()),
+            network_domain_permissions: None,
         },
     )?;
     Ok(())

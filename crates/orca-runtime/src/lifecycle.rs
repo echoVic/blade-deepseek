@@ -1665,6 +1665,12 @@ impl RuntimeToolActorContext {
             .network
             .as_ref()
             .and_then(|network| network.enabled);
+        let network_domains = response
+            .permissions
+            .network
+            .as_ref()
+            .map(|network| network.domains.clone())
+            .unwrap_or_default();
         let output = json!({
             "message": "Permissions granted for the current turn",
             "reason": permission_request.reason,
@@ -1675,6 +1681,7 @@ impl RuntimeToolActorContext {
                 },
                 "network": {
                     "enabled": network_enabled,
+                    "domains": network_domains,
                 },
             },
             "scope": response.scope,
@@ -2104,8 +2111,7 @@ fn parse_runtime_permission_request(
         .permissions
         .network
         .as_ref()
-        .and_then(|network| network.enabled)
-        .is_some();
+        .is_some_and(|network| network.enabled.is_some() || !network.domains.is_empty());
     if !has_file_system_request && !has_network_request {
         return Err("request_permissions requires at least one permission request".to_string());
     }

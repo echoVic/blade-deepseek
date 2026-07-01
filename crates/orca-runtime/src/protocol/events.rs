@@ -159,6 +159,10 @@ pub enum ServerEvent {
         additional_working_directories: Value,
         #[serde(rename = "additionalWorkingDirectoryCount")]
         additional_working_directory_count: Value,
+        #[serde(rename = "networkDomainPermissions")]
+        network_domain_permissions: Value,
+        #[serde(rename = "networkDomainPermissionCount")]
+        network_domain_permission_count: Value,
         #[serde(rename = "messageCount")]
         message_count: Value,
         messages: Value,
