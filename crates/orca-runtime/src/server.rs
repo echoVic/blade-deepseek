@@ -16,7 +16,7 @@ use crate::lifecycle::{
     RuntimePermissionRequest, RuntimePermissionRequestHandler, RuntimePermissionResponse,
     ThreadSteerHandle,
 };
-use crate::network_proxy::{RuntimeNetworkPolicy, RuntimeNetworkProxy};
+use crate::network_proxy::{RuntimeNetworkBlockReport, RuntimeNetworkPolicy, RuntimeNetworkProxy};
 use crate::protocol::{self, ClientOp, ServerEvent, Submission};
 use crate::server_runtime::{
     PermissionProfileOverride, ServerRequestWriter, ServerThread, ServerThreadRuntime,
@@ -465,10 +465,51 @@ struct ActiveTurnHandle {
     handle: thread::JoinHandle<(String, String, ServerThread)>,
 }
 
-struct PendingPermissionRequest {
-    sender: mpsc::Sender<RuntimePermissionResponse>,
+enum PendingPermissionRequest {
+    Runtime {
+        sender: mpsc::Sender<RuntimePermissionResponse>,
+        thread_id: String,
+        runtime_workspace_roots: Vec<PathBuf>,
+    },
+    CommandExec {
+        request: PendingCommandExecPermissionRequest,
+    },
+}
+
+struct PendingCommandExecPermissionRequest {
     thread_id: String,
     runtime_workspace_roots: Vec<PathBuf>,
+    command: Vec<String>,
+    process_id: Option<String>,
+    cwd: Option<PathBuf>,
+    env: protocol::CommandEnvOverrides,
+    options: protocol::CommandExecOptions,
+    terminal: crate::shell_session::ShellTerminalMode,
+    event_id: Value,
+}
+
+struct CommandExecNetworkRetryCandidate {
+    request: PendingCommandExecPermissionRequest,
+    blocked_hosts: mpsc::Receiver<RuntimeNetworkBlockReport>,
+}
+
+impl PendingPermissionRequest {
+    fn thread_id(&self) -> &str {
+        match self {
+            Self::Runtime { thread_id, .. } => thread_id,
+            Self::CommandExec { request } => &request.thread_id,
+        }
+    }
+
+    fn runtime_workspace_roots(&self) -> &[PathBuf] {
+        match self {
+            Self::Runtime {
+                runtime_workspace_roots,
+                ..
+            } => runtime_workspace_roots,
+            Self::CommandExec { request } => &request.runtime_workspace_roots,
+        }
+    }
 }
 
 struct ServerPermissionRequestHandler<W: Write + Send + 'static> {
@@ -493,7 +534,7 @@ impl<W: Write + Send + 'static> RuntimePermissionRequestHandler
             let mut pending = self.pending.lock().map_err(lock_error)?;
             pending.insert(
                 request_id.clone(),
-                PendingPermissionRequest {
+                PendingPermissionRequest::Runtime {
                     sender,
                     thread_id: self.thread_id.clone(),
                     runtime_workspace_roots: self.runtime_workspace_roots.clone(),
@@ -833,6 +874,7 @@ fn handle_line<W: Write + Send + 'static>(
         } => {
             let mut writer = writer.lock().map_err(lock_error)?;
             run_permission_respond(
+                config,
                 state,
                 request_id,
                 *decision,
@@ -1147,6 +1189,7 @@ fn run_turn_control<W: Write + Send + 'static>(
 }
 
 fn run_permission_respond<W: Write>(
+    config: &ServerConfig,
     state: &mut ServerState,
     request_id: &str,
     decision: protocol::PermissionResponseDecision,
@@ -1171,35 +1214,29 @@ fn run_permission_respond<W: Write>(
         && scope == protocol::PermissionGrantScope::Session
     {
         let session_grants = persist_session_permission_grant(
-            &pending.thread_id,
-            &pending.runtime_workspace_roots,
+            pending.thread_id(),
+            pending.runtime_workspace_roots(),
             &permissions,
         )?;
         for control in state.active_turns.values_mut() {
-            if control.thread_id == pending.thread_id {
+            if control.thread_id == pending.thread_id() {
                 control.session_permission_directories =
                     session_grants.additional_working_directories.clone();
                 control.session_network_domain_permissions =
                     session_grants.network_domain_permissions.clone();
             }
         }
-    }
-    if pending
-        .sender
-        .send(RuntimePermissionResponse {
-            decision,
-            scope,
-            permissions,
-            strict_auto_review,
-        })
-        .is_err()
-    {
-        return protocol::write_server_event(
-            writer,
-            &id,
-            ServerEvent::error(format!(
-                "permission request is no longer active: {request_id}"
-            )),
+        state.threads.update_thread_metadata(
+            pending.thread_id(),
+            ThreadMetadataPatch {
+                title: None,
+                active_permission_profile: None,
+                approval_mode: None,
+                runtime_workspace_roots: None,
+                permission_rules: None,
+                additional_working_directories: Some(session_grants.additional_working_directories),
+                network_domain_permissions: Some(session_grants.network_domain_permissions),
+            },
         );
     }
     protocol::write_server_event(
@@ -1211,7 +1248,53 @@ fn run_permission_respond<W: Write>(
             scope: json!(scope),
             strict_auto_review: json!(strict_auto_review),
         },
-    )
+    )?;
+    match pending {
+        PendingPermissionRequest::Runtime { sender, .. } => {
+            if sender
+                .send(RuntimePermissionResponse {
+                    decision,
+                    scope,
+                    permissions,
+                    strict_auto_review,
+                })
+                .is_err()
+            {
+                return protocol::write_server_event(
+                    writer,
+                    &id,
+                    ServerEvent::error(format!(
+                        "permission request is no longer active: {request_id}"
+                    )),
+                );
+            }
+            Ok(())
+        }
+        PendingPermissionRequest::CommandExec { request } => {
+            if decision != protocol::PermissionResponseDecision::Allow {
+                return protocol::write_server_event(
+                    writer,
+                    &request.event_id,
+                    ServerEvent::error(format!(
+                        "command/exec network permission denied: {request_id}"
+                    )),
+                );
+            }
+            run_command_exec(
+                config,
+                state,
+                Some(&request.thread_id),
+                &request.command,
+                request.process_id.as_deref(),
+                request.cwd.as_ref(),
+                &request.env,
+                &request.options,
+                request.terminal,
+                request.event_id,
+                writer,
+            )
+        }
+    }
 }
 
 struct PersistedSessionPermissionGrant {
@@ -1809,12 +1892,39 @@ fn run_command_exec<W: Write>(
             return protocol::write_server_event(writer, &id, ServerEvent::error(error));
         }
     }
+    let retry_candidate =
+        if process_id.is_none() && thread_id.is_some() && options.permission_profile.is_some() {
+            let (block_sender, block_receiver) = mpsc::channel();
+            Some((
+                block_sender,
+                CommandExecNetworkRetryCandidate {
+                    request: PendingCommandExecPermissionRequest {
+                        thread_id: thread_id.expect("checked command thread id").to_string(),
+                        runtime_workspace_roots: runtime_workspace_roots.clone(),
+                        command: command.to_vec(),
+                        process_id: process_id.map(ToString::to_string),
+                        cwd: Some(cwd.clone()),
+                        env: env.clone(),
+                        options: options.clone(),
+                        terminal,
+                        event_id: id.clone(),
+                    },
+                    blocked_hosts: block_receiver,
+                },
+            ))
+        } else {
+            None
+        };
     let network_proxy = if effective_sandbox.network_policy_domains.is_empty() {
         None
     } else {
-        match RuntimeNetworkProxy::start(RuntimeNetworkPolicy::new(
-            effective_sandbox.network_policy_domains.clone(),
-        )) {
+        let block_reporter = retry_candidate
+            .as_ref()
+            .map(|(block_sender, _)| block_sender.clone());
+        match RuntimeNetworkProxy::start_with_block_reporter(
+            RuntimeNetworkPolicy::new(effective_sandbox.network_policy_domains.clone()),
+            block_reporter,
+        ) {
             Ok(proxy) => Some(proxy),
             Err(error) => {
                 if let Some(process_id) = process_id {
@@ -1828,6 +1938,7 @@ fn run_command_exec<W: Write>(
             }
         }
     };
+    let retry_candidate = retry_candidate.map(|(_, retry_candidate)| retry_candidate);
     let mut command_env = env.clone();
     if let Some(proxy) = network_proxy.as_ref() {
         for key in [
@@ -1904,6 +2015,16 @@ fn run_command_exec<W: Write>(
             );
         }
     };
+    if let Some(retry_candidate) = retry_candidate
+        && let Some(block) = command_exec_network_permission_block(retry_candidate.blocked_hosts)
+    {
+        return request_command_exec_network_permission(
+            state,
+            retry_candidate.request,
+            block,
+            writer,
+        );
+    }
     protocol::write_server_event(
         writer,
         &id,
@@ -1922,6 +2043,64 @@ fn run_command_exec<W: Write>(
                     .output_bytes_cap
                     .and_then(|cap| usize::try_from(cap).ok()),
             )),
+        },
+    )
+}
+
+fn command_exec_network_permission_block(
+    blocked_hosts: mpsc::Receiver<RuntimeNetworkBlockReport>,
+) -> Option<RuntimeNetworkBlockReport> {
+    blocked_hosts
+        .try_iter()
+        .find(|block| block.error != "blocked-by-denylist")
+}
+
+fn request_command_exec_network_permission<W: Write>(
+    state: &mut ServerState,
+    request: PendingCommandExecPermissionRequest,
+    block: RuntimeNetworkBlockReport,
+    writer: &mut W,
+) -> io::Result<()> {
+    let thread_id = request.thread_id.clone();
+    let request_id = format!(
+        "permission-command-{}",
+        request
+            .event_id
+            .as_str()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| request.event_id.to_string())
+    );
+    let mut domains = HashMap::new();
+    domains.insert(
+        block.host.clone(),
+        orca_core::config::PermissionProfileNetworkAccess::Allow,
+    );
+    let permissions = protocol::RequestPermissionProfile {
+        file_system: None,
+        network: Some(protocol::RequestNetworkPermissions {
+            enabled: None,
+            domains,
+        }),
+    };
+    {
+        let mut pending = state.pending_permissions.lock().map_err(lock_error)?;
+        pending.insert(
+            request_id.clone(),
+            PendingPermissionRequest::CommandExec { request },
+        );
+    }
+    protocol::write_server_event(
+        writer,
+        &Value::from(request_id.clone()),
+        ServerEvent::PermissionRequest {
+            request_id: json!(request_id),
+            thread_id: json!(thread_id),
+            turn_id: Value::Null,
+            reason: json!(format!(
+                "command/exec attempted network access to {} ({})",
+                block.host, block.error
+            )),
+            permissions: serde_json::to_value(&permissions).unwrap_or(Value::Null),
         },
     )
 }
@@ -3798,6 +3977,177 @@ enabled = true
             "stdout should include blocked host for permission attribution: {completed:?}"
         );
         assert_eq!(completed["exitCode"], 0);
+    }
+
+    #[test]
+    fn command_exec_permission_profile_allowlist_miss_requests_permission_and_retries() {
+        with_orca_home(|home| {
+            let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind test server");
+            let port = listener.local_addr().expect("server addr").port();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept request");
+                let mut reader = std::io::BufReader::new(stream.try_clone().expect("clone stream"));
+                let mut line = String::new();
+                while reader.read_line(&mut line).expect("read request") != 0 {
+                    if line == "\r\n" || line == "\n" {
+                        break;
+                    }
+                    line.clear();
+                }
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 15\r\n\r\nnetwork-granted")
+                    .expect("write response");
+            });
+            let mut config = test_run_config();
+            let file_config: orca_core::config::file::FileConfig = toml::from_str(
+                r#"
+[permission_profiles.limited-network]
+extends = ":workspace"
+
+[permission_profiles.limited-network.network]
+enabled = true
+
+[permission_profiles.limited-network.network.domains]
+"api.orca.invalid" = "allow"
+"#,
+            )
+            .expect("domain policy config");
+            config.permission_profiles = file_config.permission_profiles;
+            config.cwd = Some(home.to_path_buf());
+            config.history_mode = HistoryMode::Record;
+            let server_config = ServerConfig { run_config: config };
+            let mut state = ServerState::default();
+            let writer = Arc::new(Mutex::new(Vec::new()));
+
+            handle_line(
+                &server_config,
+                &mut state,
+                r#"{"id":"thread","method":"thread/start","params":{}}"#,
+                Arc::clone(&writer),
+            )
+            .expect("thread start");
+            let thread_id = parse_jsonl(&writer.lock().expect("writer").clone())
+                .into_iter()
+                .find(|event| event["event"] == "thread_started")
+                .and_then(|event| event["threadId"].as_str().map(ToString::to_string))
+                .expect("thread id");
+
+            let request = format!(
+                r#"{{"id":"cmd-network","method":"command/exec","params":{{"threadId":"{thread_id}","command":["sh","-lc","curl --noproxy '' -sS http://127.0.0.1:{port}/"],"permissionProfile":"limited-network","timeoutMs":5000}}}}"#
+            );
+            handle_line(&server_config, &mut state, &request, Arc::clone(&writer))
+                .expect("command exec");
+            let events = parse_jsonl(&writer.lock().expect("writer").clone());
+            let permission_request = events
+                .iter()
+                .find(|event| event["event"] == "permission_request")
+                .expect("permission request");
+            let request_id = permission_request["requestId"]
+                .as_str()
+                .expect("request id")
+                .to_string();
+            assert_eq!(permission_request["threadId"], thread_id);
+            assert_eq!(
+                permission_request["permissions"]["network"]["domains"]["127.0.0.1"],
+                "allow"
+            );
+            assert!(
+                events
+                    .iter()
+                    .all(|event| event["event"] != "command_exec_completed"),
+                "command should wait for permission before completing: {events:?}"
+            );
+
+            let response = format!(
+                r#"{{"id":"perm-allow","method":"permission/respond","params":{{"requestId":"{request_id}","decision":"allow","scope":"session","permissions":{{"network":{{"domains":{{"127.0.0.1":"allow"}}}}}}}}}}"#
+            );
+            handle_line(&server_config, &mut state, &response, Arc::clone(&writer))
+                .expect("permission response");
+            server.join().expect("server joined");
+            let events = parse_jsonl(&writer.lock().expect("writer").clone());
+            let resolved = events
+                .iter()
+                .find(|event| event["event"] == "permission_resolved")
+                .expect("permission resolved");
+            assert_eq!(resolved["requestId"], request_id);
+            let completed = events
+                .iter()
+                .find(|event| event["event"] == "command_exec_completed")
+                .expect("command completed");
+            assert_eq!(completed["stdout"], "network-granted");
+            assert_eq!(completed["exitCode"], 0);
+            let read = crate::thread_store::SessionStore::new()
+                .load_session(&thread_id)
+                .expect("stored thread");
+            assert_eq!(
+                read.meta.network_domain_permissions.get("127.0.0.1"),
+                Some(&orca_core::config::PermissionProfileNetworkAccess::Allow)
+            );
+        });
+    }
+
+    #[test]
+    fn command_exec_permission_profile_denylist_block_does_not_request_network_permission() {
+        with_orca_home(|home| {
+            let mut config = test_run_config();
+            let file_config: orca_core::config::file::FileConfig = toml::from_str(
+                r#"
+[permission_profiles.limited-network]
+extends = ":workspace"
+
+[permission_profiles.limited-network.network]
+enabled = true
+
+[permission_profiles.limited-network.network.domains]
+"blocked.orca.invalid" = "deny"
+"#,
+            )
+            .expect("domain policy config");
+            config.permission_profiles = file_config.permission_profiles;
+            config.cwd = Some(home.to_path_buf());
+            config.history_mode = HistoryMode::Record;
+            let server_config = ServerConfig { run_config: config };
+            let mut state = ServerState::default();
+            let writer = Arc::new(Mutex::new(Vec::new()));
+
+            handle_line(
+                &server_config,
+                &mut state,
+                r#"{"id":"thread","method":"thread/start","params":{}}"#,
+                Arc::clone(&writer),
+            )
+            .expect("thread start");
+            let thread_id = parse_jsonl(&writer.lock().expect("writer").clone())
+                .into_iter()
+                .find(|event| event["event"] == "thread_started")
+                .and_then(|event| event["threadId"].as_str().map(ToString::to_string))
+                .expect("thread id");
+
+            let request = format!(
+                r#"{{"id":"cmd-deny","method":"command/exec","params":{{"threadId":"{thread_id}","command":["sh","-lc","curl --noproxy '' -sS -D - -o /dev/null http://blocked.orca.invalid/ || true"],"permissionProfile":"limited-network","timeoutMs":5000}}}}"#
+            );
+            handle_line(&server_config, &mut state, &request, Arc::clone(&writer))
+                .expect("command exec");
+
+            let events = parse_jsonl(&writer.lock().expect("writer").clone());
+            assert!(
+                events
+                    .iter()
+                    .all(|event| event["event"] != "permission_request"),
+                "denylist should not be escalated into a permission request: {events:?}"
+            );
+            let completed = events
+                .iter()
+                .find(|event| event["event"] == "command_exec_completed")
+                .expect("command completed");
+            assert!(
+                completed["stdout"]
+                    .as_str()
+                    .expect("stdout")
+                    .contains("x-proxy-error: blocked-by-denylist"),
+                "denylist block should remain a final proxy diagnostic: {completed:?}"
+            );
+        });
     }
 
     #[test]

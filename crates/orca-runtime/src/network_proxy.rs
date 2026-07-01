@@ -5,6 +5,7 @@ use std::net::{
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
@@ -97,10 +98,18 @@ pub struct RuntimeNetworkProxy {
 
 impl RuntimeNetworkProxy {
     pub fn start(policy: RuntimeNetworkPolicy) -> io::Result<Self> {
+        Self::start_with_block_reporter(policy, None)
+    }
+
+    pub fn start_with_block_reporter(
+        policy: RuntimeNetworkPolicy,
+        block_reporter: Option<mpsc::Sender<RuntimeNetworkBlockReport>>,
+    ) -> io::Result<Self> {
         let listener = TcpListener::bind(("127.0.0.1", 0))?;
         let addr = listener.local_addr()?;
         listener.set_nonblocking(true)?;
         let policy = Arc::new(policy);
+        let block_reporter = Arc::new(block_reporter);
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
         let accept_thread = thread::spawn(move || {
@@ -114,8 +123,9 @@ impl RuntimeNetworkProxy {
                     Err(_) => break,
                 };
                 let policy = Arc::clone(&policy);
+                let block_reporter = Arc::clone(&block_reporter);
                 thread::spawn(move || {
-                    let _ = handle_proxy_connection(stream, &policy);
+                    let _ = handle_proxy_connection(stream, &policy, block_reporter.as_ref());
                 });
             }
         });
@@ -140,7 +150,17 @@ impl Drop for RuntimeNetworkProxy {
     }
 }
 
-fn handle_proxy_connection(mut client: TcpStream, policy: &RuntimeNetworkPolicy) -> io::Result<()> {
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeNetworkBlockReport {
+    pub host: String,
+    pub error: &'static str,
+}
+
+fn handle_proxy_connection(
+    mut client: TcpStream,
+    policy: &RuntimeNetworkPolicy,
+    block_reporter: &Option<mpsc::Sender<RuntimeNetworkBlockReport>>,
+) -> io::Result<()> {
     client.set_read_timeout(Some(Duration::from_secs(10))).ok();
     client.set_write_timeout(Some(Duration::from_secs(10))).ok();
     let mut reader = BufReader::new(client.try_clone()?);
@@ -173,6 +193,7 @@ fn handle_proxy_connection(mut client: TcpStream, policy: &RuntimeNetworkPolicy)
         return Ok(());
     }
     if let RuntimeNetworkDecision::Block(reason) = policy.decision_for_host(&host) {
+        report_block(block_reporter, &host, reason);
         write_forbidden(&mut client, reason, Some(&host))?;
         return Ok(());
     }
@@ -190,6 +211,11 @@ fn handle_proxy_connection(mut client: TcpStream, policy: &RuntimeNetworkPolicy)
         )
     };
     if matches!(proxy_result, Err(ref error) if error.kind() == io::ErrorKind::PermissionDenied) {
+        report_block(
+            block_reporter,
+            &host,
+            RuntimeNetworkBlockReason::NotAllowedLocal,
+        );
         write_forbidden(
             &mut client,
             RuntimeNetworkBlockReason::NotAllowedLocal,
@@ -198,6 +224,20 @@ fn handle_proxy_connection(mut client: TcpStream, policy: &RuntimeNetworkPolicy)
         return Ok(());
     }
     proxy_result
+}
+
+fn report_block(
+    block_reporter: &Option<mpsc::Sender<RuntimeNetworkBlockReport>>,
+    host: &str,
+    reason: RuntimeNetworkBlockReason,
+) {
+    let Some(block_reporter) = block_reporter else {
+        return;
+    };
+    let _ = block_reporter.send(RuntimeNetworkBlockReport {
+        host: normalize_host(host),
+        error: reason.proxy_error(),
+    });
 }
 
 fn proxy_http(
