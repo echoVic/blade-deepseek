@@ -161,6 +161,44 @@ mod tests {
     }
 
     #[test]
+    fn server_shell_dispatch_is_owned_by_shell_processor() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let router_source = std::fs::read_to_string(manifest_dir.join("src/server/router.rs"))
+            .expect("server router source");
+        let processor_source =
+            std::fs::read_to_string(manifest_dir.join("src/server/processors/shell.rs"))
+                .expect("server shell processor source");
+
+        assert!(
+            router_source.contains("shell::dispatch_shell_operation("),
+            "server router must delegate shell operations to the shell processor"
+        );
+        for variant in [
+            "ClientOp::ShellStart",
+            "ClientOp::ShellWrite",
+            "ClientOp::ShellUpdate",
+            "ClientOp::ShellClose",
+            "ClientOp::ShellResize",
+            "ClientOp::ShellList",
+            "ClientOp::ShellRead",
+            "ClientOp::ShellKill",
+        ] {
+            assert!(
+                !router_source.contains(variant),
+                "server router must not own {variant} dispatch details"
+            );
+            assert!(
+                processor_source.contains(variant),
+                "server shell processor must own {variant} dispatch details"
+            );
+        }
+        assert!(
+            processor_source.contains("fn dispatch_shell_operation"),
+            "server shell processor must expose shell dispatch inside the router module"
+        );
+    }
+
+    #[test]
     fn protocol_uses_focused_submodules() {
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let protocol_dir = manifest_dir.join("src/protocol");
