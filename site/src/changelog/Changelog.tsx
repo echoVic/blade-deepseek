@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.90":
+        "Model-visible bash now inherits the active permission profile's managed network policy, turns eligible proxy blocks into permission requests, and retries after a turn-scoped network allow.",
       "v0.1.89":
         "Streaming command/exec processes now share the managed network permission flow: eligible proxy blocks request a session-scoped allow, then restart the same processId and stream output after the grant.",
       "v0.1.88":
@@ -206,6 +208,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.90":
+        "模型可见 bash 现在会继承 active permission profile 的托管网络策略：符合条件的代理阻断会转成权限请求，并在 turn 级网络 allow 后重试。",
       "v0.1.89":
         "streaming command/exec 进程现在也接入托管网络权限流：符合条件的代理阻断会请求 session 级 allow，授权后用同一个 processId 重启并继续流式输出。",
       "v0.1.88":

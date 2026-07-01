@@ -882,6 +882,7 @@ fn tool_actor_context_allows_bash_writes_to_additional_working_directories() {
     };
 
     let result = context.execute_normal_tool_with_roots_and_cancel(
+        None,
         &request,
         &workspace,
         std::slice::from_ref(&extra),
@@ -890,6 +891,7 @@ fn tool_actor_context_allows_bash_writes_to_additional_working_directories() {
         ToolConfig::default().output_truncation,
         5,
         Some(&task_registry),
+        None,
         None,
     );
 

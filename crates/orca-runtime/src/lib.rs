@@ -16,6 +16,7 @@ pub mod network_proxy;
 pub mod notify;
 pub mod protocol;
 pub mod provider_turn;
+pub(crate) mod runtime_bash;
 pub mod schema_validation;
 pub mod server;
 pub mod server_runtime;

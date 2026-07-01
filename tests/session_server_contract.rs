@@ -1,4 +1,5 @@
 use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpListener;
 use std::path::Path;
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -3397,6 +3398,199 @@ fn server_mode_command_exec_configured_permission_profile_enforces_network_domai
             "stdout should include structured proxy block reason: {events:?}"
         );
         assert_eq!(events[0]["exitCode"], 0);
+    });
+}
+
+#[test]
+fn server_mode_bash_inherits_thread_active_permission_profile_network_policy() {
+    with_orca_home(|home| {
+        let workspace = tempdir().expect("workspace");
+        std::fs::write(
+            home.join("config.toml"),
+            "mode = \"full-auto\"\n\n[permission_profiles.net]\nextends = \":workspace\"\n\n[permission_profiles.net.network]\nenabled = true\n\n[permission_profiles.net.network.domains]\n\"api.example.com\" = \"allow\"\n",
+        )
+        .expect("write permission profile config");
+
+        let mut child = orca_command()
+            .args([
+                "--mode",
+                "server",
+                "--provider",
+                "mock",
+                "--cwd",
+                workspace.path().to_str().unwrap(),
+            ])
+            .env("ORCA_HOME", home)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn orca server");
+
+        let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
+        {
+            let stdin = child.stdin.as_mut().expect("server stdin");
+            writeln!(
+                stdin,
+                r#"{{"id":"thread","method":"thread/start","params":{{}}}}"#
+            )
+            .expect("write thread/start request");
+            stdin.flush().expect("flush thread/start request");
+        }
+        let thread_started = read_until_event(&mut stdout, "thread", "thread_started");
+        let thread_id = thread_started["threadId"].as_str().expect("thread id");
+
+        {
+            let stdin = child.stdin.as_mut().expect("server stdin");
+            writeln!(
+                stdin,
+                r#"{{"id":"turn","method":"turn/start","params":{{"threadId":"{}","activePermissionProfile":{{"id":"net"}},"input":[{{"type":"text","text":"bash curl --max-time 2 --proxy \"$HTTP_PROXY\" -sS -D - -o /dev/null http://blocked.orca.invalid/ || true"}}]}}}}"#,
+                thread_id
+            )
+            .expect("write bash turn");
+            stdin.flush().expect("flush bash turn");
+        }
+
+        let permission_request = read_until_event(&mut stdout, "turn", "permission_request");
+        assert_eq!(permission_request["threadId"], thread_id);
+        assert!(
+            permission_request["reason"]
+                .as_str()
+                .expect("permission reason")
+                .contains("blocked.orca.invalid"),
+            "permission request should identify blocked host: {permission_request:?}"
+        );
+        assert_eq!(
+            permission_request["permissions"]["network"]["domains"]["blocked.orca.invalid"],
+            "allow"
+        );
+        let request_id = permission_request["requestId"]
+            .as_str()
+            .expect("permission request id");
+
+        {
+            let stdin = child.stdin.as_mut().expect("server stdin");
+            writeln!(
+                stdin,
+                r#"{{"id":"permission-response","method":"permission/respond","params":{{"requestId":"{}","decision":"deny","scope":"turn","permissions":{{"fileSystem":null,"network":{{"domains":{{"blocked.orca.invalid":"allow"}}}}}}}}}}"#,
+                request_id
+            )
+            .expect("write permission/respond");
+            stdin.flush().expect("flush permission/respond");
+        }
+        let resolved = read_until_event(&mut stdout, "permission-response", "permission_resolved");
+        assert_eq!(resolved["requestId"], request_id);
+        assert_eq!(resolved["decision"], "deny");
+        let _completed = read_until_event(&mut stdout, "turn", "turn_completed");
+
+        drop(child.stdin.take());
+        let output = child.wait_with_output().expect("wait for server");
+        assert_eq!(output.status.code(), Some(0));
+        assert!(output.stderr.is_empty());
+    });
+}
+
+#[test]
+fn server_mode_bash_network_permission_allow_retries_with_grant() {
+    with_orca_home(|home| {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind local test server");
+        let port = listener.local_addr().expect("server addr").port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+            let mut line = String::new();
+            while reader.read_line(&mut line).expect("read request") != 0 {
+                if line == "\r\n" || line == "\n" {
+                    break;
+                }
+                line.clear();
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 15\r\n\r\nbash-network-ok")
+                .expect("write response");
+        });
+        let workspace = tempdir().expect("workspace");
+        std::fs::write(
+            home.join("config.toml"),
+            "mode = \"full-auto\"\n\n[permission_profiles.net]\nextends = \":workspace\"\n\n[permission_profiles.net.network]\nenabled = true\n\n[permission_profiles.net.network.domains]\n\"api.example.com\" = \"allow\"\n",
+        )
+        .expect("write permission profile config");
+
+        let mut child = orca_command()
+            .args([
+                "--mode",
+                "server",
+                "--provider",
+                "mock",
+                "--cwd",
+                workspace.path().to_str().unwrap(),
+            ])
+            .env("ORCA_HOME", home)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn orca server");
+
+        let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
+        {
+            let stdin = child.stdin.as_mut().expect("server stdin");
+            writeln!(
+                stdin,
+                r#"{{"id":"thread","method":"thread/start","params":{{}}}}"#
+            )
+            .expect("write thread/start request");
+            stdin.flush().expect("flush thread/start request");
+        }
+        let thread_started = read_until_event(&mut stdout, "thread", "thread_started");
+        let thread_id = thread_started["threadId"].as_str().expect("thread id");
+
+        {
+            let stdin = child.stdin.as_mut().expect("server stdin");
+            writeln!(
+                stdin,
+                r#"{{"id":"turn","method":"turn/start","params":{{"threadId":"{}","activePermissionProfile":{{"id":"net"}},"input":[{{"type":"text","text":"bash curl --max-time 2 --proxy \"$HTTP_PROXY\" -sS http://127.0.0.1:{}/"}}]}}}}"#,
+                thread_id,
+                port
+            )
+            .expect("write bash turn");
+            stdin.flush().expect("flush bash turn");
+        }
+
+        let permission_request = read_until_event(&mut stdout, "turn", "permission_request");
+        assert_eq!(permission_request["threadId"], thread_id);
+        assert_eq!(
+            permission_request["permissions"]["network"]["domains"]["127.0.0.1"],
+            "allow"
+        );
+        let request_id = permission_request["requestId"]
+            .as_str()
+            .expect("permission request id");
+
+        {
+            let stdin = child.stdin.as_mut().expect("server stdin");
+            writeln!(
+                stdin,
+                r#"{{"id":"permission-response","method":"permission/respond","params":{{"requestId":"{}","decision":"allow","scope":"turn","permissions":{{"fileSystem":null,"network":{{"domains":{{"127.0.0.1":"allow"}}}}}}}}}}"#,
+                request_id
+            )
+            .expect("write permission/respond");
+            stdin.flush().expect("flush permission/respond");
+        }
+        let resolved = read_until_event(&mut stdout, "permission-response", "permission_resolved");
+        assert_eq!(resolved["requestId"], request_id);
+        assert_eq!(resolved["decision"], "allow");
+        server.join().expect("server joined");
+
+        let completed = read_until_tool_completed(&mut stdout, "turn", "bash");
+        assert_eq!(completed["status"], "completed");
+        assert_eq!(completed["output"], "bash-network-ok");
+        let _turn_completed = read_until_event(&mut stdout, "turn", "turn_completed");
+
+        drop(child.stdin.take());
+        let output = child.wait_with_output().expect("wait for server");
+        assert_eq!(output.status.code(), Some(0));
+        assert!(output.stderr.is_empty());
     });
 }
 
@@ -7204,6 +7398,15 @@ fn read_until_event<R: BufRead>(stdout: &mut R, id: &str, event_name: &str) -> V
     loop {
         let event = read_json_event_line(stdout, &format!("{id}/{event_name}"));
         if event["id"] == id && event["event"] == event_name {
+            return event;
+        }
+    }
+}
+
+fn read_until_tool_completed<R: BufRead>(stdout: &mut R, id: &str, tool: &str) -> Value {
+    loop {
+        let event = read_json_event_line(stdout, &format!("{id}/tool_completed"));
+        if event["id"] == id && event["event"] == "tool_completed" && event["tool"] == tool {
             return event;
         }
     }

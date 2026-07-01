@@ -28,12 +28,10 @@ use crate::hooks::{HookContext, HookOutcome, HookRunner};
 use crate::memory::MemoryBlock;
 use crate::protocol::{PermissionGrantScope, PermissionResponseDecision, RequestPermissionProfile};
 use crate::provider_turn::{RuntimeTurnProviderCycleResult, RuntimeTurnProviderCycleStep};
+use crate::runtime_bash::execute_bash_with_shell_session;
 use crate::session::{
     AgentConversationContext, bootstrap_agent_conversation_for_loop,
     record_initial_history_for_agent,
-};
-use crate::shell_session::{
-    RuntimeShellSessionManager, ShellSandboxMode, ShellSessionCommand, ShellTerminalMode,
 };
 use crate::tasks::TaskRegistry;
 use crate::thread_store::SessionWriter;
@@ -454,12 +452,20 @@ struct RuntimeUserInputRequestArgs {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TurnPermissionOverlay {
     additional_working_directories: Vec<PathBuf>,
+    network_domain_permissions:
+        std::collections::HashMap<String, orca_core::config::PermissionProfileNetworkAccess>,
     strict_auto_review: bool,
 }
 
 impl TurnPermissionOverlay {
     pub fn additional_working_directories(&self) -> &[PathBuf] {
         &self.additional_working_directories
+    }
+
+    pub fn network_domain_permissions(
+        &self,
+    ) -> &std::collections::HashMap<String, orca_core::config::PermissionProfileNetworkAccess> {
+        &self.network_domain_permissions
     }
 
     pub fn strict_auto_review(&self) -> bool {
@@ -472,7 +478,24 @@ impl TurnPermissionOverlay {
                 self.additional_working_directories.push(root.clone());
             }
         }
+        for (domain, access) in &other.network_domain_permissions {
+            self.network_domain_permissions
+                .insert(domain.clone(), *access);
+        }
         self.strict_auto_review |= other.strict_auto_review;
+    }
+
+    pub(crate) fn merge_network_permissions(&mut self, permissions: &RequestPermissionProfile) {
+        if let Some(network) = permissions.network.as_ref() {
+            for (domain, access) in &network.domains {
+                self.network_domain_permissions
+                    .insert(domain.clone(), *access);
+            }
+        }
+    }
+
+    pub(crate) fn merge_strict_auto_review(&mut self, strict_auto_review: bool) {
+        self.strict_auto_review |= strict_auto_review;
     }
 }
 
@@ -1014,6 +1037,7 @@ impl<'a> RuntimeTaskActor<'a> {
         cancel: Option<&CancelToken>,
     ) -> ToolResult {
         self.execute_normal_tool_with_roots_and_cancel(
+            None,
             request,
             cwd,
             &[],
@@ -1023,12 +1047,14 @@ impl<'a> RuntimeTaskActor<'a> {
             shell_timeout_secs,
             task_registry,
             cancel,
+            None,
         )
     }
 
     #[allow(clippy::too_many_arguments)]
     pub fn execute_normal_tool_with_roots_and_cancel(
         &mut self,
+        _config: Option<&RunConfig>,
         request: &ToolRequest,
         cwd: &Path,
         additional_roots: &[PathBuf],
@@ -1036,22 +1062,10 @@ impl<'a> RuntimeTaskActor<'a> {
         external_tools: &[ExternalToolConfig],
         output_truncation: ToolOutputTruncation,
         shell_timeout_secs: u64,
-        task_registry: Option<&TaskRegistry>,
+        _task_registry: Option<&TaskRegistry>,
         cancel: Option<&CancelToken>,
+        _permission_handler: Option<&dyn RuntimePermissionRequestHandler>,
     ) -> ToolResult {
-        if request.name == ToolName::Bash
-            && let Some(task_registry) = task_registry
-        {
-            return execute_bash_with_shell_session(
-                request,
-                cwd,
-                additional_roots,
-                output_truncation,
-                shell_timeout_secs,
-                task_registry,
-                cancel,
-            );
-        }
         orca_tools::execute_with_mcp_external_roots_policy_or_cancel(
             request,
             cwd,
@@ -1645,6 +1659,8 @@ impl RuntimeToolActorContext {
                     .push(root.clone());
             }
         }
+        self.permission_overlay
+            .merge_network_permissions(&response.permissions);
         self.permission_overlay.strict_auto_review |= response.strict_auto_review;
 
         let read_roots = response
@@ -1764,14 +1780,18 @@ impl RuntimeToolActorContext {
         shell_timeout_secs: u64,
         task_registry: Option<&TaskRegistry>,
     ) -> ToolResult {
-        self.actor().execute_normal_tool(
+        self.execute_normal_tool_with_roots_and_cancel(
+            None,
             request,
             cwd,
+            &[],
             mcp_registry,
             external_tools,
             output_truncation,
             shell_timeout_secs,
             task_registry,
+            None,
+            None,
         )
     }
 
@@ -1787,21 +1807,25 @@ impl RuntimeToolActorContext {
         task_registry: Option<&TaskRegistry>,
         cancel: Option<&CancelToken>,
     ) -> ToolResult {
-        self.actor().execute_normal_tool_with_cancel(
+        self.execute_normal_tool_with_roots_and_cancel(
+            None,
             request,
             cwd,
+            &[],
             mcp_registry,
             external_tools,
             output_truncation,
             shell_timeout_secs,
             task_registry,
             cancel,
+            None,
         )
     }
 
     #[allow(clippy::too_many_arguments)]
     pub fn execute_normal_tool_with_roots_and_cancel(
         &mut self,
+        config: Option<&RunConfig>,
         request: &ToolRequest,
         cwd: &Path,
         additional_roots: &[PathBuf],
@@ -1811,8 +1835,26 @@ impl RuntimeToolActorContext {
         shell_timeout_secs: u64,
         task_registry: Option<&TaskRegistry>,
         cancel: Option<&CancelToken>,
+        permission_handler: Option<&dyn RuntimePermissionRequestHandler>,
     ) -> ToolResult {
+        if request.name == ToolName::Bash
+            && let Some(task_registry) = task_registry
+        {
+            return execute_bash_with_shell_session(
+                config,
+                request,
+                cwd,
+                additional_roots,
+                output_truncation,
+                shell_timeout_secs,
+                task_registry,
+                cancel,
+                permission_handler,
+                &mut self.permission_overlay,
+            );
+        }
         self.actor().execute_normal_tool_with_roots_and_cancel(
+            config,
             request,
             cwd,
             additional_roots,
@@ -1822,6 +1864,7 @@ impl RuntimeToolActorContext {
             shell_timeout_secs,
             task_registry,
             cancel,
+            permission_handler,
         )
     }
 
@@ -2172,103 +2215,6 @@ fn is_terminal_task_status(status: TaskStatus) -> bool {
         status,
         TaskStatus::Stopped | TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
     )
-}
-
-fn execute_bash_with_shell_session(
-    request: &ToolRequest,
-    cwd: &Path,
-    additional_roots: &[PathBuf],
-    output_truncation: ToolOutputTruncation,
-    shell_timeout_secs: u64,
-    task_registry: &TaskRegistry,
-    cancel: Option<&CancelToken>,
-) -> ToolResult {
-    let Some(command) = request
-        .target
-        .as_deref()
-        .filter(|target| !target.is_empty())
-    else {
-        return ToolResult::failed(request, "bash command is required", None);
-    };
-
-    let mut manager = RuntimeShellSessionManager::new(task_registry.clone());
-    let handle = match manager.spawn(ShellSessionCommand {
-        command: command.to_string(),
-        cwd: cwd.to_path_buf(),
-        additional_readable_directories: Vec::new(),
-        additional_working_directories: additional_roots.to_vec(),
-        denied_working_directories: Vec::new(),
-        allowed_unix_socket_roots: Vec::new(),
-        env: Default::default(),
-        description: command.to_string(),
-        terminal: ShellTerminalMode::pipe(),
-        sandbox: ShellSandboxMode::default(),
-    }) {
-        Ok(handle) => handle,
-        Err(error) => {
-            return ToolResult::failed(
-                request,
-                format!("failed to run shell command: {error}"),
-                None,
-            );
-        }
-    };
-    let _ = manager.close_stdin(&handle.id);
-    let output = match manager.wait_or_cancel(
-        &handle.id,
-        std::time::Duration::from_secs(shell_timeout_secs.max(1)),
-        || {
-            cancel.is_some_and(CancelToken::is_cancelled)
-                || task_registry.is_cancelled(&handle.task_id)
-        },
-    ) {
-        Ok(output) => output,
-        Err(error) => {
-            return ToolResult::failed(
-                request,
-                format!("failed to wait for shell command: {error}"),
-                None,
-            );
-        }
-    };
-
-    let stdout = output.stdout.trim_end().to_string();
-    let stderr = output.stderr.trim_end().to_string();
-    if cancel.is_some_and(CancelToken::is_cancelled) || task_registry.is_cancelled(&handle.task_id)
-    {
-        let message = if stderr.is_empty() && stdout.is_empty() {
-            "shell command cancelled".to_string()
-        } else if stderr.is_empty() {
-            format!("shell command cancelled: {stdout}")
-        } else if stdout.is_empty() {
-            format!("shell command cancelled: {stderr}")
-        } else {
-            format!("shell command cancelled: {stdout}\n{stderr}")
-        };
-        let (message, truncated) =
-            orca_core::tool_types::truncate_output_with_policy(message, output_truncation);
-        let mut result = ToolResult::failed(request, message, output.exit_code);
-        result.truncated = truncated;
-        return result;
-    }
-    if output.status == orca_core::task_types::TaskStatus::Completed {
-        let (stdout, truncated) =
-            orca_core::tool_types::truncate_output_with_policy(stdout, output_truncation);
-        return ToolResult::completed(request, stdout, truncated);
-    }
-
-    let message = if stderr.is_empty() {
-        stdout
-    } else if stdout.is_empty() {
-        stderr
-    } else {
-        format!("{stdout}\n{stderr}")
-    };
-    let (message, truncated) =
-        orca_core::tool_types::truncate_output_with_policy(message, output_truncation);
-    let mut result = ToolResult::failed(request, message, output.exit_code);
-    result.truncated = truncated;
-    result
 }
 
 fn extract_tool_string_field(request: &ToolRequest, field: &str) -> Option<String> {

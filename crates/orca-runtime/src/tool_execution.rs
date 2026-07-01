@@ -318,6 +318,7 @@ impl ToolExecutionActor {
 
     fn execute_normal_tool(
         &mut self,
+        config: &RunConfig,
         request: &tool_types::ToolRequest,
         cwd: &Path,
         mcp_registry: &McpRegistry,
@@ -327,8 +328,10 @@ impl ToolExecutionActor {
         task_registry: Option<&TaskRegistry>,
         additional_roots: &[std::path::PathBuf],
         cancel: Option<&CancelToken>,
+        permission_handler: Option<&(dyn RuntimePermissionRequestHandler + Send + Sync)>,
     ) -> tool_types::ToolResult {
         self.runtime.execute_normal_tool_with_roots_and_cancel(
+            Some(config),
             request,
             cwd,
             additional_roots,
@@ -338,6 +341,7 @@ impl ToolExecutionActor {
             shell_timeout_secs,
             task_registry,
             cancel,
+            permission_handler.map(|handler| handler as &dyn RuntimePermissionRequestHandler),
         )
     }
 
@@ -675,6 +679,7 @@ impl ToolExecutionActor {
                     )
                     .collect::<Vec<_>>();
                 Ok(self.execute_normal_tool(
+                    config,
                     execution_request,
                     cwd,
                     mcp_registry,
@@ -684,6 +689,7 @@ impl ToolExecutionActor {
                     Some(task_registry),
                     &additional_roots,
                     Some(cancel),
+                    permission_handler,
                 ))
             }
         }

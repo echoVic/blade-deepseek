@@ -2173,7 +2173,7 @@ fn shell_sandbox_mode_from_command_policy(
     }
 }
 
-fn command_exec_sandbox_mode(
+pub(crate) fn command_exec_sandbox_mode(
     config: &RunConfig,
     options: &protocol::CommandExecOptions,
     thread_permission_profile: Option<&crate::server_runtime::ActivePermissionProfile>,
@@ -2211,13 +2211,14 @@ fn command_exec_sandbox_mode(
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct CommandExecSandbox {
-    mode: ShellSandboxMode,
-    additional_readable_roots: Vec<PathBuf>,
-    additional_writable_roots: Vec<PathBuf>,
-    denied_writable_roots: Vec<PathBuf>,
-    allowed_unix_socket_roots: Vec<PathBuf>,
-    network_policy_domains: HashMap<String, orca_core::config::PermissionProfileNetworkAccess>,
+pub(crate) struct CommandExecSandbox {
+    pub(crate) mode: ShellSandboxMode,
+    pub(crate) additional_readable_roots: Vec<PathBuf>,
+    pub(crate) additional_writable_roots: Vec<PathBuf>,
+    pub(crate) denied_writable_roots: Vec<PathBuf>,
+    pub(crate) allowed_unix_socket_roots: Vec<PathBuf>,
+    pub(crate) network_policy_domains:
+        HashMap<String, orca_core::config::PermissionProfileNetworkAccess>,
 }
 
 impl CommandExecSandbox {
