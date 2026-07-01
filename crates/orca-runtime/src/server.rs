@@ -3701,6 +3701,52 @@ enabled = true
     }
 
     #[test]
+    fn command_exec_permission_profile_domain_policy_blocks_unallowlisted_local_request() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind test server");
+        let port = listener.local_addr().expect("server addr").port();
+        let mut config = test_run_config();
+        let file_config: orca_core::config::file::FileConfig = toml::from_str(
+            r#"
+[permission_profiles.limited-network]
+extends = ":workspace"
+
+[permission_profiles.limited-network.network]
+enabled = true
+
+[permission_profiles.limited-network.network.domains]
+"blocked.orca.invalid" = "deny"
+"#,
+        )
+        .expect("domain policy config");
+        config.permission_profiles = file_config.permission_profiles;
+        let cwd = tempdir().expect("cwd");
+        config.cwd = Some(cwd.path().to_path_buf());
+        let request = format!(
+            r#"{{"id":"cmd-local-deny","method":"command/exec","params":{{"command":["sh","-lc","curl --noproxy '' -sS -D - -o /dev/null http://127.0.0.1:{port}/ || true"],"permissionProfile":"limited-network","timeoutMs":5000}}}}"#
+        );
+        let input = Cursor::new(request.into_bytes());
+        let output = SharedVecWriter::default();
+
+        run_with_io(ServerConfig { run_config: config }, input, output.clone())
+            .expect("server run");
+
+        drop(listener);
+        let events = parse_jsonl(&output.bytes());
+        let completed = events
+            .iter()
+            .find(|event| event["event"] == "command_exec_completed")
+            .expect("command completed");
+        assert!(
+            completed["stdout"]
+                .as_str()
+                .expect("stdout")
+                .contains("x-proxy-error: blocked-by-policy"),
+            "stdout should include local-network policy block: {completed:?}"
+        );
+        assert_eq!(completed["exitCode"], 0);
+    }
+
+    #[test]
     fn command_exec_sandbox_materializes_custom_permission_profile_workspace_roots() {
         let mut config = test_run_config();
         let runtime_root = std::env::current_dir().unwrap().join("runtime-root");

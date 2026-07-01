@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Write};
-use std::net::{Shutdown, TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -17,6 +17,7 @@ pub struct RuntimeNetworkPolicy {
 enum RuntimeNetworkBlockReason {
     Allowlist,
     Denylist,
+    NotAllowedLocal,
     Policy,
 }
 
@@ -25,6 +26,7 @@ impl RuntimeNetworkBlockReason {
         match self {
             Self::Allowlist => "blocked-by-allowlist",
             Self::Denylist => "blocked-by-denylist",
+            Self::NotAllowedLocal => "blocked-by-policy",
             Self::Policy => "blocked-by-policy",
         }
     }
@@ -64,11 +66,15 @@ impl RuntimeNetworkPolicy {
     }
 
     fn decision_for_host(&self, host: &str) -> RuntimeNetworkDecision {
+        let normalized_host = normalize_host(host);
         match self.access_for_host(host) {
             Some(PermissionProfileNetworkAccess::Deny) => {
                 RuntimeNetworkDecision::Block(RuntimeNetworkBlockReason::Denylist)
             }
             Some(PermissionProfileNetworkAccess::Allow) => RuntimeNetworkDecision::Allow,
+            None if is_local_or_private_host_literal(&normalized_host) => {
+                RuntimeNetworkDecision::Block(RuntimeNetworkBlockReason::NotAllowedLocal)
+            }
             None if self
                 .domains
                 .values()
@@ -279,6 +285,38 @@ fn normalize_host(host: &str) -> String {
         .to_ascii_lowercase()
 }
 
+fn is_local_or_private_host_literal(host: &str) -> bool {
+    if host == "localhost" {
+        return true;
+    }
+    host.parse::<IpAddr>()
+        .map(is_local_or_private_ip)
+        .unwrap_or(false)
+}
+
+fn is_local_or_private_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => is_local_or_private_ipv4(ip),
+        IpAddr::V6(ip) => is_local_or_private_ipv6(ip),
+    }
+}
+
+fn is_local_or_private_ipv4(ip: Ipv4Addr) -> bool {
+    ip.is_loopback()
+        || ip.is_private()
+        || ip.is_link_local()
+        || ip.is_unspecified()
+        || ip.octets()[0] == 100 && (64..=127).contains(&ip.octets()[1])
+        || ip.octets()[0] == 169 && ip.octets()[1] == 254
+}
+
+fn is_local_or_private_ipv6(ip: Ipv6Addr) -> bool {
+    ip.is_loopback()
+        || ip.is_unspecified()
+        || ip.segments()[0] & 0xfe00 == 0xfc00
+        || ip.segments()[0] & 0xffc0 == 0xfe80
+}
+
 fn domain_pattern_matches(pattern: &str, host: &str) -> bool {
     if let Some(domain) = pattern.strip_prefix("**.") {
         return host == domain || host.ends_with(&format!(".{domain}"));
@@ -417,6 +455,76 @@ mod tests {
         assert!(
             response.contains("x-proxy-error: blocked-by-allowlist"),
             "response should identify allowlist block: {response:?}"
+        );
+    }
+
+    #[test]
+    fn runtime_network_proxy_blocks_loopback_targets_without_explicit_allowlist() {
+        let proxy = RuntimeNetworkProxy::start(RuntimeNetworkPolicy::new(HashMap::from([(
+            "blocked.example.com".to_string(),
+            PermissionProfileNetworkAccess::Deny,
+        )])))
+        .expect("start proxy");
+        let addr = proxy
+            .proxy_url()
+            .strip_prefix("http://")
+            .expect("proxy url prefix")
+            .to_string();
+        let mut stream = TcpStream::connect(addr).expect("connect proxy");
+
+        stream
+            .write_all(b"GET http://127.0.0.1/ HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            .expect("write request");
+        let mut response = String::new();
+        std::io::Read::read_to_string(&mut stream, &mut response).expect("read response");
+
+        assert!(response.starts_with("HTTP/1.1 403 Forbidden"));
+        assert!(
+            response.contains("x-proxy-error: blocked-by-policy"),
+            "response should block local network targets by policy: {response:?}"
+        );
+    }
+
+    #[test]
+    fn runtime_network_proxy_allows_loopback_targets_when_explicitly_allowlisted() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind local test server");
+        let port = listener.local_addr().expect("server addr").port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+            let mut line = String::new();
+            while reader.read_line(&mut line).expect("read request") != 0 {
+                if line == "\r\n" || line == "\n" {
+                    break;
+                }
+                line.clear();
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 7\r\n\r\nallowed")
+                .expect("write response");
+        });
+        let proxy = RuntimeNetworkProxy::start(RuntimeNetworkPolicy::new(HashMap::from([(
+            "127.0.0.1".to_string(),
+            PermissionProfileNetworkAccess::Allow,
+        )])))
+        .expect("start proxy");
+        let addr = proxy
+            .proxy_url()
+            .strip_prefix("http://")
+            .expect("proxy url prefix")
+            .to_string();
+        let mut stream = TcpStream::connect(addr).expect("connect proxy");
+        let request =
+            format!("GET http://127.0.0.1:{port}/ HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n");
+
+        stream.write_all(request.as_bytes()).expect("write request");
+        let mut response = String::new();
+        std::io::Read::read_to_string(&mut stream, &mut response).expect("read response");
+
+        server.join().expect("server joined");
+        assert!(
+            response.contains("allowed"),
+            "response should proxy explicitly allowlisted loopback target: {response:?}"
         );
     }
 }
