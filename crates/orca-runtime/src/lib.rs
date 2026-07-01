@@ -233,6 +233,33 @@ mod tests {
     }
 
     #[test]
+    fn server_permission_dispatch_is_owned_by_permission_processor() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let router_source = std::fs::read_to_string(manifest_dir.join("src/server/router.rs"))
+            .expect("server router source");
+        let processor_source =
+            std::fs::read_to_string(manifest_dir.join("src/server/processors/permission.rs"))
+                .expect("server permission processor source");
+
+        assert!(
+            router_source.contains("permission::dispatch_permission_operation("),
+            "server router must delegate permission operations to the permission processor"
+        );
+        assert!(
+            !router_source.contains("ClientOp::PermissionRespond"),
+            "server router must not own PermissionRespond dispatch details"
+        );
+        assert!(
+            processor_source.contains("ClientOp::PermissionRespond"),
+            "server permission processor must own PermissionRespond dispatch details"
+        );
+        assert!(
+            processor_source.contains("fn dispatch_permission_operation"),
+            "server permission processor must expose permission dispatch inside the router module"
+        );
+    }
+
+    #[test]
     fn protocol_uses_focused_submodules() {
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let protocol_dir = manifest_dir.join("src/protocol");

@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 mod processors;
 
 use super::*;
-use processors::{command_exec, shell, thread, turn};
+use processors::{command_exec, permission, shell, thread, turn};
 
 pub(super) fn dispatch_submission<W: Write + Send + 'static>(
     config: &ServerConfig,
@@ -46,6 +46,17 @@ pub(super) fn dispatch_submission<W: Write + Send + 'static>(
     if command_exec::is_command_exec_operation(&submission.op) {
         let mut writer = writer.lock().map_err(lock_error)?;
         return command_exec::dispatch_command_exec_operation(
+            config,
+            state,
+            &submission.op,
+            submission.id.clone(),
+            &mut *writer,
+        );
+    }
+
+    if permission::is_permission_operation(&submission.op) {
+        let mut writer = writer.lock().map_err(lock_error)?;
+        return permission::dispatch_permission_operation(
             config,
             state,
             &submission.op,
@@ -116,28 +127,8 @@ pub(super) fn dispatch_submission<W: Write + Send + 'static>(
                 &mut *writer,
             )
         }
-        ClientOp::PermissionRespond {
-            request_id,
-            decision,
-            scope,
-            permissions,
-            strict_auto_review,
-        } => {
-            let mut writer = writer.lock().map_err(lock_error)?;
-            run_permission_respond(
-                config,
-                state,
-                request_id,
-                *decision,
-                *scope,
-                permissions.clone(),
-                *strict_auto_review,
-                submission.id.clone(),
-                &mut *writer,
-            )
-        }
         _ => unreachable!(
-            "thread query, turn control, shell, and command exec operations are delegated before router dispatch"
+            "thread query, turn control, shell, command exec, and permission operations are delegated before router dispatch"
         ),
     };
     result
