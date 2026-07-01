@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.76":
+        "The runtime protocol boundary now uses a small facade backed by focused command_exec, events, permissions, shell, thread, turn, and wire modules, preserving the public protocol API while making the next server dispatch split easier.",
       "v0.1.75":
         "ThreadStore now has a focused storage facade backed by separate types, local JSONL, writer, projection, pagination, and live-thread modules, preserving the public runtime API while shrinking the monolithic store file.",
       "v0.1.74":
@@ -178,6 +180,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.76":
+        "Runtime protocol 边界现在变成小 facade，并由 command_exec、events、permissions、shell、thread、turn、wire 等专门模块支撑；公开 protocol API 保持不变，同时为下一步拆 server dispatch 铺路。",
       "v0.1.75":
         "ThreadStore 现在拆成清晰的存储 facade：types、local JSONL、writer、projection、pagination 和 live-thread 各自成模块，在保持公开 runtime API 不变的同时拆掉原来的巨型 store 文件。",
       "v0.1.74":

@@ -48,6 +48,74 @@ mod tests {
     }
 
     #[test]
+    fn protocol_uses_focused_submodules() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let protocol_dir = manifest_dir.join("src/protocol");
+        let facade = std::fs::read_to_string(manifest_dir.join("src/protocol.rs"))
+            .expect("protocol facade source");
+
+        for module in [
+            "command_exec",
+            "events",
+            "permissions",
+            "shell",
+            "thread",
+            "turn",
+            "wire",
+        ] {
+            let module_path = protocol_dir.join(format!("{module}.rs"));
+            assert!(
+                module_path.is_file(),
+                "protocol module {module} must live in src/protocol/{module}.rs"
+            );
+            assert!(
+                facade.contains(&format!("mod {module};")),
+                "protocol facade must declare focused module {module}"
+            );
+        }
+
+        let command_exec =
+            std::fs::read_to_string(protocol_dir.join("command_exec.rs")).unwrap_or_default();
+        assert!(
+            command_exec.contains("pub struct CommandExecOptions")
+                && command_exec.contains("pub enum CommandSandboxPolicy"),
+            "command execution wire types must be owned by protocol::command_exec"
+        );
+
+        let events = std::fs::read_to_string(protocol_dir.join("events.rs")).unwrap_or_default();
+        assert!(
+            events.contains("pub enum ServerEvent") && events.contains("pub fn write_server_event"),
+            "server event serialization must be owned by protocol::events"
+        );
+
+        let permissions =
+            std::fs::read_to_string(protocol_dir.join("permissions.rs")).unwrap_or_default();
+        assert!(
+            permissions.contains("pub enum PermissionResponseDecision")
+                && permissions.contains("pub struct RequestPermissionProfile"),
+            "permission response wire types must be owned by protocol::permissions"
+        );
+
+        assert!(
+            facade.lines().count() <= 180,
+            "protocol facade should stay small enough to show module boundaries at a glance"
+        );
+
+        for reexport in [
+            "pub use command_exec::",
+            "pub use events::",
+            "pub use permissions::",
+            "pub use shell::",
+            "pub use wire::",
+        ] {
+            assert!(
+                facade.contains(reexport),
+                "protocol facade must preserve external API with {reexport}"
+            );
+        }
+    }
+
+    #[test]
     fn runtime_turn_context_types_are_owned_by_lifecycle_module() {
         let agent_loop_source = include_str!("agent_loop.rs");
         let lifecycle_source = include_str!("lifecycle.rs");
