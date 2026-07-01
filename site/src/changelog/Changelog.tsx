@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.89":
+        "Streaming command/exec processes now share the managed network permission flow: eligible proxy blocks request a session-scoped allow, then restart the same processId and stream output after the grant.",
       "v0.1.88":
         "Command/exec can now turn managed network proxy blocks into a network permission request and retry the command after a session-scoped allow response, while denylist blocks remain final diagnostics.",
       "v0.1.87":
@@ -204,6 +206,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.89":
+        "streaming command/exec 进程现在也接入托管网络权限流：符合条件的代理阻断会请求 session 级 allow，授权后用同一个 processId 重启并继续流式输出。",
       "v0.1.88":
         "command/exec 现在可以把托管网络代理阻断转成网络权限请求，并在收到 session 级 allow 后重试命令；denylist 阻断仍保持为最终诊断。",
       "v0.1.87":

@@ -84,7 +84,6 @@ impl ServerState {
     }
 }
 
-#[derive(Clone)]
 struct CommandExecProcess {
     shell_id: Option<String>,
     command_event_id: Value,
@@ -94,11 +93,22 @@ struct CommandExecProcess {
     stderr_len: usize,
     stdout_cap_reached: bool,
     stderr_cap_reached: bool,
+    network_permission_blocks: Option<mpsc::Receiver<RuntimeNetworkBlockReport>>,
+    network_permission_request: Option<PendingCommandExecPermissionRequest>,
+    _network_proxy: Option<RuntimeNetworkProxy>,
 }
 
 #[derive(Default)]
 struct CommandExecManager {
     processes: HashMap<String, CommandExecProcess>,
+}
+
+enum CommandExecDrainOutcome {
+    Drained,
+    NetworkPermissionRequired {
+        request: PendingCommandExecPermissionRequest,
+        block: RuntimeNetworkBlockReport,
+    },
 }
 
 impl CommandExecManager {
@@ -119,6 +129,12 @@ impl CommandExecManager {
         };
         process.shell_id = Some(shell_id);
         true
+    }
+
+    fn retain_network_proxy(&mut self, process_id: &str, proxy: RuntimeNetworkProxy) {
+        if let Some(process) = self.processes.get_mut(process_id) {
+            process._network_proxy = Some(proxy);
+        }
     }
 
     fn get(&self, process_id: &str) -> Option<&CommandExecProcess> {
@@ -146,14 +162,14 @@ impl CommandExecManager {
         id: &Value,
         writer: &mut W,
     ) -> io::Result<()> {
-        let Some(process) = self.get(process_id).cloned() else {
+        let Some(process) = self.get(process_id) else {
             return protocol::write_server_event(
                 writer,
                 id,
                 ServerEvent::error(format!("unknown command process: {process_id}")),
             );
         };
-        let Some(shell_id) = process.shell_id.as_deref() else {
+        let Some(shell_id) = process.shell_id.clone() else {
             return protocol::write_server_event(
                 writer,
                 id,
@@ -181,7 +197,7 @@ impl CommandExecManager {
                 }
             };
             let input = String::from_utf8_lossy(&bytes);
-            if let Err(error) = manager.write_stdin(shell_id, &input) {
+            if let Err(error) = manager.write_stdin(&shell_id, &input) {
                 return protocol::write_server_event(
                     writer,
                     id,
@@ -189,7 +205,7 @@ impl CommandExecManager {
                 );
             }
         }
-        if close_stdin && let Err(error) = manager.close_stdin(shell_id) {
+        if close_stdin && let Err(error) = manager.close_stdin(&shell_id) {
             return protocol::write_server_event(writer, id, ServerEvent::error(error.to_string()));
         }
         protocol::write_server_event(
@@ -200,6 +216,7 @@ impl CommandExecManager {
             },
         )?;
         self.drain_with_timeout(Some(manager), writer, Duration::from_secs(5))
+            .map(|_| ())
     }
 
     fn resize_process<W: Write>(
@@ -211,14 +228,14 @@ impl CommandExecManager {
         id: &Value,
         writer: &mut W,
     ) -> io::Result<()> {
-        let Some(process) = self.get(process_id).cloned() else {
+        let Some(process) = self.get(process_id) else {
             return protocol::write_server_event(
                 writer,
                 id,
                 ServerEvent::error(format!("unknown command process: {process_id}")),
             );
         };
-        let Some(shell_id) = process.shell_id.as_deref() else {
+        let Some(shell_id) = process.shell_id.clone() else {
             return protocol::write_server_event(
                 writer,
                 id,
@@ -232,7 +249,7 @@ impl CommandExecManager {
                 ServerEvent::error(format!("unknown command process: {process_id}")),
             );
         };
-        if let Err(error) = manager.resize(shell_id, cols, rows) {
+        if let Err(error) = manager.resize(&shell_id, cols, rows) {
             return protocol::write_server_event(writer, id, ServerEvent::error(error.to_string()));
         }
         protocol::write_server_event(
@@ -250,7 +267,7 @@ impl CommandExecManager {
         &mut self,
         shell_sessions: Option<&mut RuntimeShellSessionManager>,
         writer: &mut W,
-    ) -> io::Result<()> {
+    ) -> io::Result<CommandExecDrainOutcome> {
         self.drain_with_timeout(shell_sessions, writer, Duration::from_millis(1))
     }
 
@@ -259,7 +276,7 @@ impl CommandExecManager {
         shell_sessions: Option<&mut RuntimeShellSessionManager>,
         writer: &mut W,
         timeout: Duration,
-    ) -> io::Result<()> {
+    ) -> io::Result<CommandExecDrainOutcome> {
         self.drain_inner(shell_sessions, writer, timeout, false)
     }
 
@@ -268,7 +285,7 @@ impl CommandExecManager {
         shell_sessions: Option<&mut RuntimeShellSessionManager>,
         writer: &mut W,
         timeout: Duration,
-    ) -> io::Result<()> {
+    ) -> io::Result<CommandExecDrainOutcome> {
         self.drain_inner(shell_sessions, writer, timeout, true)
     }
 
@@ -278,9 +295,9 @@ impl CommandExecManager {
         writer: &mut W,
         timeout: Duration,
         return_on_output: bool,
-    ) -> io::Result<()> {
+    ) -> io::Result<CommandExecDrainOutcome> {
         let Some(manager) = shell_sessions else {
-            return Ok(());
+            return Ok(CommandExecDrainOutcome::Drained);
         };
         let deadline = std::time::Instant::now()
             .checked_add(timeout)
@@ -288,19 +305,22 @@ impl CommandExecManager {
         loop {
             let process_ids = self.process_ids();
             if process_ids.is_empty() {
-                return Ok(());
+                return Ok(CommandExecDrainOutcome::Drained);
             }
             let mut observed_output = false;
             for process_id in process_ids {
-                let Some(process) = self.get(&process_id).cloned() else {
+                let Some(shell_id) = self
+                    .get(&process_id)
+                    .and_then(|process| process.shell_id.clone())
+                else {
                     continue;
                 };
-                let Some(shell_id) = process.shell_id.as_deref() else {
-                    continue;
-                };
-                let output = match manager.read(shell_id, Duration::from_millis(1)) {
+                let output = match manager.read(&shell_id, Duration::from_millis(1)) {
                     Ok(output) => output,
                     Err(_) => continue,
+                };
+                let Some(process) = self.get(&process_id) else {
+                    continue;
                 };
                 if process.stream_output {
                     let stdout_observed_len = output.stdout.len();
@@ -341,7 +361,21 @@ impl CommandExecManager {
                     }
                 }
                 if output.status != orca_core::task_types::TaskStatus::Running {
-                    self.remove(&process_id);
+                    let Some(process) = self.remove(&process_id) else {
+                        continue;
+                    };
+                    if let Some(block) = process
+                        .network_permission_blocks
+                        .and_then(command_exec_network_permission_block)
+                    {
+                        let request = process.network_permission_request.expect(
+                            "command/exec process with network block reporter has retry request",
+                        );
+                        return Ok(CommandExecDrainOutcome::NetworkPermissionRequired {
+                            request,
+                            block,
+                        });
+                    }
                     protocol::write_server_event(
                         writer,
                         &process.command_event_id,
@@ -365,7 +399,7 @@ impl CommandExecManager {
             if std::time::Instant::now() >= deadline
                 || (observed_output && (return_on_output || timeout <= Duration::from_millis(1)))
             {
-                return Ok(());
+                return Ok(CommandExecDrainOutcome::Drained);
             }
             thread::sleep(Duration::from_millis(10));
         }
@@ -378,14 +412,14 @@ impl CommandExecManager {
         id: &Value,
         writer: &mut W,
     ) -> io::Result<()> {
-        let Some(process) = self.get(process_id).cloned() else {
+        let Some(process) = self.get(process_id) else {
             return protocol::write_server_event(
                 writer,
                 id,
                 ServerEvent::error(format!("unknown command process: {process_id}")),
             );
         };
-        let Some(shell_id) = process.shell_id.as_deref() else {
+        let Some(shell_id) = process.shell_id.clone() else {
             return protocol::write_server_event(
                 writer,
                 id,
@@ -399,9 +433,15 @@ impl CommandExecManager {
                 ServerEvent::error(format!("unknown command process: {process_id}")),
             );
         };
-        match manager.kill(shell_id) {
+        match manager.kill(&shell_id) {
             Ok(output) => {
-                self.remove(process_id);
+                let Some(process) = self.remove(process_id) else {
+                    return protocol::write_server_event(
+                        writer,
+                        id,
+                        ServerEvent::error(format!("unknown command process: {process_id}")),
+                    );
+                };
                 protocol::write_server_event(
                     writer,
                     id,
@@ -486,11 +526,6 @@ struct PendingCommandExecPermissionRequest {
     options: protocol::CommandExecOptions,
     terminal: crate::shell_session::ShellTerminalMode,
     event_id: Value,
-}
-
-struct CommandExecNetworkRetryCandidate {
-    request: PendingCommandExecPermissionRequest,
-    blocked_hosts: mpsc::Receiver<RuntimeNetworkBlockReport>,
 }
 
 impl PendingPermissionRequest {
@@ -663,7 +698,11 @@ fn handle_line<W: Write + Send + 'static>(
     };
     {
         let mut writer = writer.lock().map_err(lock_error)?;
-        drain_command_exec_processes(state, &mut *writer)?;
+        if let CommandExecDrainOutcome::NetworkPermissionRequired { request, block } =
+            drain_command_exec_processes(state, &mut *writer)?
+        {
+            request_command_exec_network_permission(state, request, block, &mut *writer)?;
+        }
     }
 
     let result = match &submission.op {
@@ -1873,6 +1912,25 @@ fn run_command_exec<W: Write>(
     {
         additional_working_directories.extend(writable_roots.iter().cloned());
     }
+    let mut retry_block_reporter = None;
+    let mut retry_block_receiver = None;
+    let mut retry_request = None;
+    if thread_id.is_some() && options.permission_profile.is_some() {
+        let (block_sender, block_receiver) = mpsc::channel();
+        retry_block_reporter = Some(block_sender);
+        retry_block_receiver = Some(block_receiver);
+        retry_request = Some(PendingCommandExecPermissionRequest {
+            thread_id: thread_id.expect("checked command thread id").to_string(),
+            runtime_workspace_roots: runtime_workspace_roots.clone(),
+            command: command.to_vec(),
+            process_id: process_id.map(ToString::to_string),
+            cwd: Some(cwd.clone()),
+            env: env.clone(),
+            options: options.clone(),
+            terminal,
+            event_id: id.clone(),
+        });
+    }
     if let Some(process_id) = process_id {
         if let Err(error) = state.command_exec.insert(
             process_id.to_string(),
@@ -1887,43 +1945,20 @@ fn run_command_exec<W: Write>(
                 stderr_len: 0,
                 stdout_cap_reached: false,
                 stderr_cap_reached: false,
+                network_permission_blocks: retry_block_receiver.take(),
+                network_permission_request: retry_request.take(),
+                _network_proxy: None,
             },
         ) {
             return protocol::write_server_event(writer, &id, ServerEvent::error(error));
         }
     }
-    let retry_candidate =
-        if process_id.is_none() && thread_id.is_some() && options.permission_profile.is_some() {
-            let (block_sender, block_receiver) = mpsc::channel();
-            Some((
-                block_sender,
-                CommandExecNetworkRetryCandidate {
-                    request: PendingCommandExecPermissionRequest {
-                        thread_id: thread_id.expect("checked command thread id").to_string(),
-                        runtime_workspace_roots: runtime_workspace_roots.clone(),
-                        command: command.to_vec(),
-                        process_id: process_id.map(ToString::to_string),
-                        cwd: Some(cwd.clone()),
-                        env: env.clone(),
-                        options: options.clone(),
-                        terminal,
-                        event_id: id.clone(),
-                    },
-                    blocked_hosts: block_receiver,
-                },
-            ))
-        } else {
-            None
-        };
-    let network_proxy = if effective_sandbox.network_policy_domains.is_empty() {
+    let mut network_proxy = if effective_sandbox.network_policy_domains.is_empty() {
         None
     } else {
-        let block_reporter = retry_candidate
-            .as_ref()
-            .map(|(block_sender, _)| block_sender.clone());
         match RuntimeNetworkProxy::start_with_block_reporter(
             RuntimeNetworkPolicy::new(effective_sandbox.network_policy_domains.clone()),
-            block_reporter,
+            retry_block_reporter,
         ) {
             Ok(proxy) => Some(proxy),
             Err(error) => {
@@ -1938,7 +1973,6 @@ fn run_command_exec<W: Write>(
             }
         }
     };
-    let retry_candidate = retry_candidate.map(|(_, retry_candidate)| retry_candidate);
     let mut command_env = env.clone();
     if let Some(proxy) = network_proxy.as_ref() {
         for key in [
@@ -1980,6 +2014,9 @@ fn run_command_exec<W: Write>(
         }
     };
     if let Some(process_id) = process_id {
+        if let Some(proxy) = network_proxy.take() {
+            state.command_exec.retain_network_proxy(process_id, proxy);
+        }
         state.command_exec.activate(process_id, handle.id);
         protocol::write_server_event(
             writer,
@@ -1988,14 +2025,18 @@ fn run_command_exec<W: Write>(
                 process_id: Value::from(process_id.to_string()),
             },
         )?;
-        if terminal.is_pty() || options.stream_stdout_stderr {
+        let drain_outcome = if terminal.is_pty() || options.stream_stdout_stderr {
             drain_command_exec_processes_until_output_or_timeout(
                 state,
                 writer,
                 Duration::from_secs(1),
-            )?;
+            )?
         } else {
-            drain_command_exec_processes_with_timeout(state, writer, Duration::from_millis(250))?;
+            drain_command_exec_processes_with_timeout(state, writer, Duration::from_millis(250))?
+        };
+        if let CommandExecDrainOutcome::NetworkPermissionRequired { request, block } = drain_outcome
+        {
+            return request_command_exec_network_permission(state, request, block, writer);
         }
         return Ok(());
     }
@@ -2015,15 +2056,10 @@ fn run_command_exec<W: Write>(
             );
         }
     };
-    if let Some(retry_candidate) = retry_candidate
-        && let Some(block) = command_exec_network_permission_block(retry_candidate.blocked_hosts)
+    if let (Some(request), Some(blocked_hosts)) = (retry_request, retry_block_receiver)
+        && let Some(block) = command_exec_network_permission_block(blocked_hosts)
     {
-        return request_command_exec_network_permission(
-            state,
-            retry_candidate.request,
-            block,
-            writer,
-        );
+        return request_command_exec_network_permission(state, request, block, writer);
     }
     protocol::write_server_event(
         writer,
@@ -2594,7 +2630,7 @@ fn run_command_exec_resize<W: Write>(
 fn drain_command_exec_processes<W: Write>(
     state: &mut ServerState,
     writer: &mut W,
-) -> io::Result<()> {
+) -> io::Result<CommandExecDrainOutcome> {
     state
         .command_exec
         .drain(state.shell_sessions.as_mut(), writer)
@@ -2604,7 +2640,7 @@ fn drain_command_exec_processes_with_timeout<W: Write>(
     state: &mut ServerState,
     writer: &mut W,
     timeout: Duration,
-) -> io::Result<()> {
+) -> io::Result<CommandExecDrainOutcome> {
     state
         .command_exec
         .drain_with_timeout(state.shell_sessions.as_mut(), writer, timeout)
@@ -2614,7 +2650,7 @@ fn drain_command_exec_processes_until_output_or_timeout<W: Write>(
     state: &mut ServerState,
     writer: &mut W,
     timeout: Duration,
-) -> io::Result<()> {
+) -> io::Result<CommandExecDrainOutcome> {
     state
         .command_exec
         .drain_until_output_or_timeout(state.shell_sessions.as_mut(), writer, timeout)
@@ -4087,6 +4123,211 @@ enabled = true
     }
 
     #[test]
+    fn command_exec_streaming_permission_profile_block_requests_permission_and_retries_process() {
+        with_orca_home(|home| {
+            let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind test server");
+            let port = listener.local_addr().expect("server addr").port();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept request");
+                let mut reader = std::io::BufReader::new(stream.try_clone().expect("clone stream"));
+                let mut line = String::new();
+                while reader.read_line(&mut line).expect("read request") != 0 {
+                    if line == "\r\n" || line == "\n" {
+                        break;
+                    }
+                    line.clear();
+                }
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 14\r\n\r\nstream-granted")
+                    .expect("write response");
+            });
+            let mut config = test_run_config();
+            let file_config: orca_core::config::file::FileConfig = toml::from_str(
+                r#"
+[permission_profiles.limited-network]
+extends = ":workspace"
+
+[permission_profiles.limited-network.network]
+enabled = true
+
+[permission_profiles.limited-network.network.domains]
+"api.orca.invalid" = "allow"
+"#,
+            )
+            .expect("domain policy config");
+            config.permission_profiles = file_config.permission_profiles;
+            config.cwd = Some(home.to_path_buf());
+            config.history_mode = HistoryMode::Record;
+            let server_config = ServerConfig { run_config: config };
+            let mut state = ServerState::default();
+            let writer = Arc::new(Mutex::new(Vec::new()));
+
+            handle_line(
+                &server_config,
+                &mut state,
+                r#"{"id":"thread","method":"thread/start","params":{}}"#,
+                Arc::clone(&writer),
+            )
+            .expect("thread start");
+            let thread_id = parse_jsonl(&writer.lock().expect("writer").clone())
+                .into_iter()
+                .find(|event| event["event"] == "thread_started")
+                .and_then(|event| event["threadId"].as_str().map(ToString::to_string))
+                .expect("thread id");
+
+            let request = format!(
+                r#"{{"id":"cmd-stream","method":"command/exec","params":{{"threadId":"{thread_id}","command":["sh","-lc","curl --noproxy '' -sS http://127.0.0.1:{port}/"],"processId":"net-stream-1","streamStdoutStderr":true,"permissionProfile":"limited-network","timeoutMs":5000}}}}"#
+            );
+            handle_line(&server_config, &mut state, &request, Arc::clone(&writer))
+                .expect("command exec");
+            let events = parse_jsonl(&writer.lock().expect("writer").clone());
+            assert!(
+                events.iter().any(|event| {
+                    event["event"] == "command_exec_started" && event["processId"] == "net-stream-1"
+                }),
+                "streaming command should initially start: {events:?}"
+            );
+            let permission_request = events
+                .iter()
+                .find(|event| event["event"] == "permission_request")
+                .expect("permission request");
+            let request_id = permission_request["requestId"]
+                .as_str()
+                .expect("request id")
+                .to_string();
+            assert_eq!(
+                permission_request["permissions"]["network"]["domains"]["127.0.0.1"],
+                "allow"
+            );
+            assert!(
+                events
+                    .iter()
+                    .all(|event| event["event"] != "command_exec_completed"),
+                "streaming command should wait for permission before completion: {events:?}"
+            );
+
+            let response = format!(
+                r#"{{"id":"perm-allow","method":"permission/respond","params":{{"requestId":"{request_id}","decision":"allow","scope":"session","permissions":{{"network":{{"domains":{{"127.0.0.1":"allow"}}}}}}}}}}"#
+            );
+            handle_line(&server_config, &mut state, &response, Arc::clone(&writer))
+                .expect("permission response");
+            drain_command_exec_processes_with_timeout(
+                &mut state,
+                &mut *writer.lock().expect("writer"),
+                Duration::from_secs(2),
+            )
+            .expect("drain retried process");
+            server.join().expect("server joined");
+            let events = parse_jsonl(&writer.lock().expect("writer").clone());
+            let starts = events
+                .iter()
+                .filter(|event| {
+                    event["event"] == "command_exec_started" && event["processId"] == "net-stream-1"
+                })
+                .count();
+            assert_eq!(
+                starts, 2,
+                "same process id should restart after grant: {events:?}"
+            );
+            assert!(events.iter().any(|event| {
+                event["event"] == "command_exec_output_delta"
+                    && event["processId"] == "net-stream-1"
+                    && event["stream"] == "stdout"
+                    && event["delta"]
+                        .as_str()
+                        .is_some_and(|delta| delta.contains("stream-granted"))
+            }));
+            let completed = events
+                .iter()
+                .find(|event| {
+                    event["event"] == "command_exec_completed"
+                        && event["processId"] == "net-stream-1"
+                })
+                .expect("command completed");
+            assert_eq!(completed["exitCode"], 0);
+        });
+    }
+
+    #[test]
+    fn command_exec_streaming_permission_profile_delayed_block_requests_permission_on_next_drain() {
+        with_orca_home(|home| {
+            let mut config = test_run_config();
+            let file_config: orca_core::config::file::FileConfig = toml::from_str(
+                r#"
+[permission_profiles.limited-network]
+extends = ":workspace"
+
+[permission_profiles.limited-network.network]
+enabled = true
+
+[permission_profiles.limited-network.network.domains]
+"api.orca.invalid" = "allow"
+"#,
+            )
+            .expect("domain policy config");
+            config.permission_profiles = file_config.permission_profiles;
+            config.cwd = Some(home.to_path_buf());
+            config.history_mode = HistoryMode::Record;
+            let server_config = ServerConfig { run_config: config };
+            let mut state = ServerState::default();
+            let writer = Arc::new(Mutex::new(Vec::new()));
+
+            handle_line(
+                &server_config,
+                &mut state,
+                r#"{"id":"thread","method":"thread/start","params":{}}"#,
+                Arc::clone(&writer),
+            )
+            .expect("thread start");
+            let thread_id = parse_jsonl(&writer.lock().expect("writer").clone())
+                .into_iter()
+                .find(|event| event["event"] == "thread_started")
+                .and_then(|event| event["threadId"].as_str().map(ToString::to_string))
+                .expect("thread id");
+
+            let request = format!(
+                r#"{{"id":"cmd-stream","method":"command/exec","params":{{"threadId":"{thread_id}","command":["sh","-lc","sleep 1.2; curl --noproxy '' -sS http://127.0.0.1:9/"],"processId":"net-stream-delayed","streamStdoutStderr":true,"permissionProfile":"limited-network","timeoutMs":5000}}}}"#
+            );
+            handle_line(&server_config, &mut state, &request, Arc::clone(&writer))
+                .expect("command exec");
+            let events = parse_jsonl(&writer.lock().expect("writer").clone());
+            assert!(
+                events
+                    .iter()
+                    .all(|event| event["event"] != "permission_request"),
+                "delayed block should not be observed during initial drain: {events:?}"
+            );
+
+            std::thread::sleep(Duration::from_millis(500));
+            handle_line(
+                &server_config,
+                &mut state,
+                r#"{"id":"threads","method":"thread/list","params":{}}"#,
+                Arc::clone(&writer),
+            )
+            .expect("thread list");
+            let events = parse_jsonl(&writer.lock().expect("writer").clone());
+            let permission_request = events
+                .iter()
+                .find(|event| event["event"] == "permission_request")
+                .unwrap_or_else(|| {
+                    panic!("permission request after delayed process drain: {events:?}")
+                });
+            assert_eq!(
+                permission_request["permissions"]["network"]["domains"]["127.0.0.1"],
+                "allow"
+            );
+            assert!(
+                events.iter().all(|event| {
+                    !(event["event"] == "command_exec_completed"
+                        && event["processId"] == "net-stream-delayed")
+                }),
+                "delayed block should request permission before completion: {events:?}"
+            );
+        });
+    }
+
+    #[test]
     fn command_exec_permission_profile_denylist_block_does_not_request_network_permission() {
         with_orca_home(|home| {
             let mut config = test_run_config();
@@ -4862,6 +5103,9 @@ enabled = true
             stderr_len: 0,
             stdout_cap_reached: false,
             stderr_cap_reached: false,
+            network_permission_blocks: None,
+            network_permission_request: None,
+            _network_proxy: None,
         }
     }
 
