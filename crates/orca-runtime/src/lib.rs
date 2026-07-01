@@ -24,6 +24,7 @@ pub mod shell_session;
 pub mod subagent;
 pub mod subagent_execution;
 pub mod tasks;
+pub mod thread;
 pub mod thread_store;
 pub mod tool_execution;
 pub mod tool_invocation;
