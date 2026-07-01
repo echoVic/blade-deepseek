@@ -2192,6 +2192,7 @@ fn execute_bash_with_shell_session(
         additional_readable_directories: Vec::new(),
         additional_working_directories: additional_roots.to_vec(),
         denied_working_directories: Vec::new(),
+        allowed_unix_socket_roots: Vec::new(),
         env: Default::default(),
         description: command.to_string(),
         terminal: ShellTerminalMode::pipe(),

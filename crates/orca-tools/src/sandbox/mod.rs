@@ -32,6 +32,30 @@ pub fn workspace_write_bash_command(
     exclude_tmpdir_env_var: bool,
     exclude_slash_tmp: bool,
 ) -> Command {
+    workspace_write_bash_command_with_unix_sockets(
+        command,
+        cwd,
+        readable_roots,
+        additional_roots,
+        denied_roots,
+        network_access,
+        exclude_tmpdir_env_var,
+        exclude_slash_tmp,
+        &[],
+    )
+}
+
+pub fn workspace_write_bash_command_with_unix_sockets(
+    command: &str,
+    cwd: &Path,
+    readable_roots: &[PathBuf],
+    additional_roots: &[PathBuf],
+    denied_roots: &[PathBuf],
+    network_access: bool,
+    exclude_tmpdir_env_var: bool,
+    exclude_slash_tmp: bool,
+    allowed_unix_socket_roots: &[PathBuf],
+) -> Command {
     let mut command = platform::workspace_write_bash_command(
         command,
         cwd,
@@ -41,6 +65,7 @@ pub fn workspace_write_bash_command(
         network_access,
         exclude_tmpdir_env_var,
         exclude_slash_tmp,
+        allowed_unix_socket_roots,
     );
     crate::process::prepare_non_interactive_command(&mut command);
     command
@@ -55,6 +80,28 @@ pub fn read_only_bash_command(
     network_access: bool,
     allow_global_read: bool,
 ) -> Command {
+    read_only_bash_command_with_unix_sockets(
+        command,
+        cwd,
+        readable_roots,
+        additional_roots,
+        denied_roots,
+        network_access,
+        allow_global_read,
+        &[],
+    )
+}
+
+pub fn read_only_bash_command_with_unix_sockets(
+    command: &str,
+    cwd: &Path,
+    readable_roots: &[PathBuf],
+    additional_roots: &[PathBuf],
+    denied_roots: &[PathBuf],
+    network_access: bool,
+    allow_global_read: bool,
+    allowed_unix_socket_roots: &[PathBuf],
+) -> Command {
     let mut command = platform::read_only_bash_command(
         command,
         cwd,
@@ -63,6 +110,7 @@ pub fn read_only_bash_command(
         denied_roots,
         network_access,
         allow_global_read,
+        allowed_unix_socket_roots,
     );
     crate::process::prepare_non_interactive_command(&mut command);
     command
@@ -90,6 +138,7 @@ mod platform {
         network_access: bool,
         exclude_tmpdir_env_var: bool,
         exclude_slash_tmp: bool,
+        allowed_unix_socket_roots: &[PathBuf],
     ) -> Command {
         crate::sandbox::seatbelt::workspace_write_bash_command(
             command,
@@ -100,6 +149,7 @@ mod platform {
             network_access,
             exclude_tmpdir_env_var,
             exclude_slash_tmp,
+            allowed_unix_socket_roots,
         )
     }
 
@@ -111,6 +161,7 @@ mod platform {
         denied_roots: &[PathBuf],
         network_access: bool,
         allow_global_read: bool,
+        allowed_unix_socket_roots: &[PathBuf],
     ) -> Command {
         crate::sandbox::seatbelt::read_only_bash_command(
             command,
@@ -120,6 +171,7 @@ mod platform {
             denied_roots,
             network_access,
             allow_global_read,
+            allowed_unix_socket_roots,
         )
     }
 
@@ -181,6 +233,7 @@ mod platform {
         _network_access: bool,
         _exclude_tmpdir_env_var: bool,
         _exclude_slash_tmp: bool,
+        _allowed_unix_socket_roots: &[PathBuf],
     ) -> Command {
         let mut cmd = Command::new("sh");
         cmd.arg("-c").arg(command).current_dir(cwd);
@@ -195,6 +248,7 @@ mod platform {
         _denied_roots: &[PathBuf],
         _network_access: bool,
         _allow_global_read: bool,
+        _allowed_unix_socket_roots: &[PathBuf],
     ) -> Command {
         let mut cmd = Command::new("sh");
         cmd.arg("-c").arg(command).current_dir(cwd);

@@ -28,6 +28,7 @@ pub struct ShellSessionCommand {
     pub additional_readable_directories: Vec<PathBuf>,
     pub additional_working_directories: Vec<PathBuf>,
     pub denied_working_directories: Vec<PathBuf>,
+    pub allowed_unix_socket_roots: Vec<PathBuf>,
     pub env: BTreeMap<String, Option<String>>,
     pub description: String,
     pub terminal: ShellTerminalMode,
@@ -180,7 +181,7 @@ impl RuntimeShellSessionManager {
                 network_access,
                 exclude_tmpdir_env_var,
                 exclude_slash_tmp,
-            } => orca_tools::sandbox::workspace_write_bash_command(
+            } => orca_tools::sandbox::workspace_write_bash_command_with_unix_sockets(
                 &command.command,
                 &command.cwd,
                 &command.additional_readable_directories,
@@ -189,11 +190,12 @@ impl RuntimeShellSessionManager {
                 network_access,
                 exclude_tmpdir_env_var,
                 exclude_slash_tmp,
+                &command.allowed_unix_socket_roots,
             ),
             ShellSandboxMode::ReadOnly {
                 network_access,
                 allow_global_read,
-            } => orca_tools::sandbox::read_only_bash_command(
+            } => orca_tools::sandbox::read_only_bash_command_with_unix_sockets(
                 &command.command,
                 &command.cwd,
                 &command.additional_readable_directories,
@@ -201,6 +203,7 @@ impl RuntimeShellSessionManager {
                 &command.denied_working_directories,
                 network_access,
                 allow_global_read,
+                &command.allowed_unix_socket_roots,
             ),
             ShellSandboxMode::DangerFullAccess => {
                 orca_tools::sandbox::plain_bash_command(&command.command, &command.cwd)

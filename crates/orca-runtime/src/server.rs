@@ -1343,6 +1343,7 @@ fn run_shell_start<W: Write>(
         additional_readable_directories: Vec::new(),
         additional_working_directories: Vec::new(),
         denied_working_directories: Vec::new(),
+        allowed_unix_socket_roots: Vec::new(),
         env: Default::default(),
         description: description.unwrap_or_else(|| command_text.clone()),
         terminal,
@@ -1801,6 +1802,7 @@ fn run_command_exec<W: Write>(
         additional_readable_directories: effective_sandbox.additional_readable_roots,
         additional_working_directories,
         denied_working_directories: denied_writable_directories,
+        allowed_unix_socket_roots: effective_sandbox.allowed_unix_socket_roots,
         env: command_env,
         description: command_text,
         terminal,
@@ -1951,6 +1953,7 @@ struct CommandExecSandbox {
     additional_readable_roots: Vec<PathBuf>,
     additional_writable_roots: Vec<PathBuf>,
     denied_writable_roots: Vec<PathBuf>,
+    allowed_unix_socket_roots: Vec<PathBuf>,
     network_policy_domains: HashMap<String, orca_core::config::PermissionProfileNetworkAccess>,
 }
 
@@ -1961,6 +1964,7 @@ impl CommandExecSandbox {
             additional_readable_roots: Vec::new(),
             additional_writable_roots: Vec::new(),
             denied_writable_roots: Vec::new(),
+            allowed_unix_socket_roots: Vec::new(),
             network_policy_domains: HashMap::new(),
         }
     }
@@ -2036,6 +2040,7 @@ fn shell_sandbox_mode_from_permission_profile(
         additional_readable_roots,
         additional_writable_roots: resolved.additional_writable_roots,
         denied_writable_roots: resolved.denied_writable_roots,
+        allowed_unix_socket_roots: resolved.allowed_unix_socket_roots,
         network_policy_domains: resolved.network_policy_domains,
     })
 }
@@ -2046,6 +2051,7 @@ struct ResolvedPermissionProfile {
     additional_readable_roots: Vec<PathBuf>,
     additional_writable_roots: Vec<PathBuf>,
     denied_writable_roots: Vec<PathBuf>,
+    allowed_unix_socket_roots: Vec<PathBuf>,
     network_access: Option<bool>,
     network_policy_domains: HashMap<String, orca_core::config::PermissionProfileNetworkAccess>,
 }
@@ -2062,6 +2068,7 @@ fn resolve_permission_profile(
     let mut additional_readable_roots = Vec::new();
     let mut additional_writable_roots = Vec::new();
     let mut denied_writable_roots = Vec::new();
+    let mut allowed_unix_socket_roots = Vec::new();
     let mut network_access = None;
     let mut network_policy_domains = HashMap::new();
     while let Some(name) = current {
@@ -2071,6 +2078,7 @@ fn resolve_permission_profile(
                 additional_readable_roots,
                 additional_writable_roots,
                 denied_writable_roots,
+                allowed_unix_socket_roots,
                 network_access,
                 network_policy_domains,
             });
@@ -2091,10 +2099,13 @@ fn resolve_permission_profile(
                 .entry(domain.to_string())
                 .or_insert(*access);
         }
-        if !profile.network.unix_sockets.is_empty() {
-            return Err(format!(
-                "command/exec permissionProfile network unix socket policy is parsed but not enforceable yet: {name}"
-            ));
+        for (path, access) in profile.network.unix_sockets.entries() {
+            if matches!(
+                access,
+                orca_core::config::PermissionProfileNetworkAccess::Allow
+            ) {
+                push_unique_path(&mut allowed_unix_socket_roots, path.to_path_buf());
+            }
         }
         let glob_scan_max_depth = profile
             .filesystem
@@ -2159,6 +2170,7 @@ fn resolve_permission_profile(
         additional_readable_roots,
         additional_writable_roots,
         denied_writable_roots,
+        allowed_unix_socket_roots,
         network_access,
         network_policy_domains,
     })
@@ -3567,6 +3579,34 @@ enabled = true
         assert_eq!(
             sandbox.network_policy_domains.get("blocked.example.com"),
             Some(&orca_core::config::PermissionProfileNetworkAccess::Deny)
+        );
+    }
+
+    #[test]
+    fn command_exec_sandbox_materializes_custom_permission_profile_unix_socket_allowlist() {
+        let mut config = test_run_config();
+        let file_config: orca_core::config::file::FileConfig = toml::from_str(
+            r#"
+[permission_profiles.browser-socket]
+extends = ":workspace"
+
+[permission_profiles.browser-socket.network.unix_sockets]
+"/tmp/orca-browser.sock" = "allow"
+"/tmp/orca-blocked.sock" = "deny"
+"#,
+        )
+        .expect("unix socket policy config");
+        config.permission_profiles = file_config.permission_profiles;
+        let options = protocol::CommandExecOptions {
+            permission_profile: Some("browser-socket".to_string()),
+            ..Default::default()
+        };
+
+        let sandbox = test_profile_sandbox(&config, &options).expect("unix socket policy profile");
+
+        assert_eq!(
+            sandbox.allowed_unix_socket_roots,
+            vec![PathBuf::from("/tmp/orca-browser.sock")]
         );
     }
 

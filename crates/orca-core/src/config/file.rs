@@ -638,6 +638,35 @@ enabled = true
     }
 
     #[test]
+    fn parse_permission_profile_network_unix_socket_policy() {
+        let toml = r#"
+[permission_profiles.browser-socket]
+extends = ":read-only"
+
+[permission_profiles.browser-socket.network.unix_sockets]
+"/tmp/orca-browser.sock" = "allow"
+"/tmp/orca-denied.sock" = "deny"
+"#;
+        let config: FileConfig = toml::from_str(toml).unwrap();
+        let profile = config.permission_profiles.get("browser-socket").unwrap();
+        let entries = profile
+            .network
+            .unix_sockets
+            .entries()
+            .map(|(path, access)| (path.to_path_buf(), *access))
+            .collect::<HashMap<_, _>>();
+
+        assert_eq!(
+            entries.get(std::path::Path::new("/tmp/orca-browser.sock")),
+            Some(&crate::config::PermissionProfileNetworkAccess::Allow)
+        );
+        assert_eq!(
+            entries.get(std::path::Path::new("/tmp/orca-denied.sock")),
+            Some(&crate::config::PermissionProfileNetworkAccess::Deny)
+        );
+    }
+
+    #[test]
     fn parse_partial_config() {
         let toml = r#"model = "deepseek-v4-flash""#;
         let config: FileConfig = toml::from_str(toml).unwrap();

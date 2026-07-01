@@ -5,7 +5,7 @@ use std::sync::OnceLock;
 static SEATBELT_AVAILABLE: OnceLock<bool> = OnceLock::new();
 
 pub fn bash_command(command: &str, cwd: &Path) -> Command {
-    workspace_write_bash_command(command, cwd, &[], &[], &[], true, false, false)
+    workspace_write_bash_command(command, cwd, &[], &[], &[], true, false, false, &[])
 }
 
 pub fn bash_command_with_additional_roots(
@@ -13,7 +13,17 @@ pub fn bash_command_with_additional_roots(
     cwd: &Path,
     additional_roots: &[PathBuf],
 ) -> Command {
-    workspace_write_bash_command(command, cwd, &[], additional_roots, &[], true, false, false)
+    workspace_write_bash_command(
+        command,
+        cwd,
+        &[],
+        additional_roots,
+        &[],
+        true,
+        false,
+        false,
+        &[],
+    )
 }
 
 pub fn workspace_write_bash_command(
@@ -25,6 +35,7 @@ pub fn workspace_write_bash_command(
     network_access: bool,
     exclude_tmpdir_env_var: bool,
     exclude_slash_tmp: bool,
+    allowed_unix_socket_roots: &[PathBuf],
 ) -> Command {
     if !available() {
         return plain_bash_command(command, cwd);
@@ -53,6 +64,7 @@ pub fn workspace_write_bash_command(
             network_access,
             exclude_tmpdir_env_var,
             exclude_slash_tmp,
+            allowed_unix_socket_roots,
         ))
         .arg("sh")
         .arg("-c")
@@ -69,6 +81,7 @@ pub fn read_only_bash_command(
     denied_roots: &[PathBuf],
     network_access: bool,
     allow_global_read: bool,
+    allowed_unix_socket_roots: &[PathBuf],
 ) -> Command {
     if !available() {
         return plain_bash_command(command, cwd);
@@ -94,6 +107,7 @@ pub fn read_only_bash_command(
             &canonical_denied_roots,
             network_access,
             allow_global_read,
+            allowed_unix_socket_roots,
         ))
         .arg("sh")
         .arg("-c")
@@ -135,6 +149,7 @@ fn workspace_write_profile(
     network_access: bool,
     exclude_tmpdir_env_var: bool,
     exclude_slash_tmp: bool,
+    allowed_unix_socket_roots: &[PathBuf],
 ) -> String {
     let cwd_escaped = seatbelt_escape(&cwd.display().to_string());
     let additional_read_rules = read_allow_rules(readable_roots);
@@ -192,6 +207,7 @@ fn workspace_write_profile(
     } else {
         ""
     };
+    let unix_socket_rules = unix_socket_allow_rules(allowed_unix_socket_roots);
     // Seatbelt uses last-match-wins: deny rules MUST come after allow to override.
     format!(
         r#"(version 1)
@@ -210,6 +226,7 @@ fn workspace_write_profile(
 {ssh_deny}
 {orca_deny}
 {network_rule}
+{unix_socket_rules}
 "#
     )
 }
@@ -220,6 +237,7 @@ fn read_only_profile(
     denied_roots: &[PathBuf],
     network_access: bool,
     allow_global_read: bool,
+    allowed_unix_socket_roots: &[PathBuf],
 ) -> String {
     let additional_read_rules = read_allow_rules(readable_roots);
     let additional_write_rules = additional_roots
@@ -243,6 +261,7 @@ fn read_only_profile(
     } else {
         ""
     };
+    let unix_socket_rules = unix_socket_allow_rules(allowed_unix_socket_roots);
     format!(
         r#"(version 1)
 (deny default)
@@ -255,8 +274,27 @@ fn read_only_profile(
 {additional_write_rules}
 {denied_access_rules}
 {network_rule}
+{unix_socket_rules}
 "#
     )
+}
+
+fn unix_socket_allow_rules(allowed_unix_socket_roots: &[PathBuf]) -> String {
+    if allowed_unix_socket_roots.is_empty() {
+        return String::new();
+    }
+    let socket_rules = allowed_unix_socket_roots
+        .iter()
+        .map(|root| {
+            let root = seatbelt_escape(&root.display().to_string());
+            format!(
+                r#"(allow network-bind (local unix-socket (subpath "{root}")))
+(allow network-outbound (remote unix-socket (subpath "{root}")))"#
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("(allow system-socket (socket-domain AF_UNIX))\n{socket_rules}")
 }
 
 fn read_allow_rules(readable_roots: &[PathBuf]) -> String {
@@ -299,7 +337,8 @@ mod tests {
     #[test]
     fn sandbox_profile_allows_workspace_and_null_device() {
         let workspace = TempDir::new().unwrap();
-        let content = workspace_write_profile(workspace.path(), &[], &[], &[], true, false, false);
+        let content =
+            workspace_write_profile(workspace.path(), &[], &[], &[], true, false, false, &[]);
         assert!(content.contains("(version 1)"));
         assert!(content.contains(&workspace.path().display().to_string()));
         assert!(content.contains(r#"(allow file-read* file-write* (literal "/dev/null"))"#));
@@ -317,7 +356,8 @@ mod tests {
     #[test]
     fn profile_denies_sensitive_orca_and_ssh_paths() {
         let workspace = TempDir::new().unwrap();
-        let profile = workspace_write_profile(workspace.path(), &[], &[], &[], true, false, false);
+        let profile =
+            workspace_write_profile(workspace.path(), &[], &[], &[], true, false, false, &[]);
 
         assert!(profile.contains("(deny file-read* file-write*"));
         assert!(profile.contains("/.ssh"));
@@ -334,7 +374,7 @@ mod tests {
     #[test]
     fn read_only_profile_does_not_allow_workspace_writes() {
         let workspace = TempDir::new().unwrap();
-        let profile = read_only_profile(&[], &[], &[], false, true);
+        let profile = read_only_profile(&[], &[], &[], false, true, &[]);
 
         assert!(!profile.contains(&workspace.path().display().to_string()));
         assert!(!profile.contains("file-write* (subpath"));
@@ -345,7 +385,7 @@ mod tests {
     fn read_only_profile_allows_additional_write_roots() {
         let workspace = TempDir::new().unwrap();
         let extra = TempDir::new().unwrap();
-        let profile = read_only_profile(&[], &[extra.path().to_path_buf()], &[], false, true);
+        let profile = read_only_profile(&[], &[extra.path().to_path_buf()], &[], false, true, &[]);
 
         assert!(!profile.contains(&workspace.path().display().to_string()));
         assert!(profile.contains(&format!(
@@ -358,7 +398,8 @@ mod tests {
     #[test]
     fn read_only_profile_allows_additional_read_roots_without_writes() {
         let readable = TempDir::new().unwrap();
-        let profile = read_only_profile(&[readable.path().to_path_buf()], &[], &[], false, true);
+        let profile =
+            read_only_profile(&[readable.path().to_path_buf()], &[], &[], false, true, &[]);
 
         assert!(profile.contains(&format!(
             r#"(allow file-read* (subpath "{}"))"#,
@@ -380,6 +421,7 @@ mod tests {
             &[blocked.clone()],
             false,
             true,
+            &[],
         );
 
         let allow = format!(
@@ -410,6 +452,7 @@ mod tests {
             &[denied_file.clone()],
             false,
             true,
+            &[],
         );
 
         assert!(profile.contains(&format!(
@@ -421,7 +464,14 @@ mod tests {
     #[test]
     fn read_only_profile_can_disable_global_reads() {
         let readable = TempDir::new().unwrap();
-        let profile = read_only_profile(&[readable.path().to_path_buf()], &[], &[], false, false);
+        let profile = read_only_profile(
+            &[readable.path().to_path_buf()],
+            &[],
+            &[],
+            false,
+            false,
+            &[],
+        );
 
         assert!(!profile.contains("\n(allow file-read*)\n"));
         assert!(profile.contains(&format!(
@@ -458,6 +508,7 @@ mod tests {
             &[],
             false,
             false,
+            &[],
         )
         .output()
         .unwrap();
@@ -471,10 +522,53 @@ mod tests {
     #[test]
     fn workspace_write_profile_can_exclude_tmp_writes_and_network() {
         let workspace = TempDir::new().unwrap();
-        let profile = workspace_write_profile(workspace.path(), &[], &[], &[], false, true, true);
+        let profile =
+            workspace_write_profile(workspace.path(), &[], &[], &[], false, true, true, &[]);
 
         assert!(!profile.contains(r#"(subpath "/tmp")"#));
         assert!(!profile.contains("network-outbound"));
+    }
+
+    #[test]
+    fn workspace_write_profile_allows_configured_unix_sockets_without_full_network() {
+        let workspace = TempDir::new().unwrap();
+        let socket_root = PathBuf::from("/tmp/orca-browser.sock");
+        let profile = workspace_write_profile(
+            workspace.path(),
+            &[],
+            &[],
+            &[],
+            false,
+            true,
+            true,
+            &[socket_root],
+        );
+
+        assert!(profile.contains("(allow system-socket (socket-domain AF_UNIX))"));
+        assert!(
+            profile.contains(
+                r#"(allow network-bind (local unix-socket (subpath "/tmp/orca-browser.sock")))"#
+            ),
+            "profile should allow binding the configured unix socket: {profile}"
+        );
+        assert!(
+            profile.contains(r#"(allow network-outbound (remote unix-socket (subpath "/tmp/orca-browser.sock")))"#),
+            "profile should allow outbound traffic to the configured unix socket: {profile}"
+        );
+        assert!(!profile.contains("\n(allow network-outbound)\n"));
+    }
+
+    #[test]
+    fn read_only_profile_allows_configured_unix_sockets_without_full_network() {
+        let socket_root = PathBuf::from("/tmp/orca-browser.sock");
+        let profile = read_only_profile(&[], &[], &[], false, false, &[socket_root]);
+
+        assert!(profile.contains("(allow system-socket (socket-domain AF_UNIX))"));
+        assert!(
+            profile.contains(r#"(allow network-outbound (remote unix-socket (subpath "/tmp/orca-browser.sock")))"#),
+            "profile should allow outbound traffic to the configured unix socket: {profile}"
+        );
+        assert!(!profile.contains("\n(allow network-outbound)\n"));
     }
 
     #[test]

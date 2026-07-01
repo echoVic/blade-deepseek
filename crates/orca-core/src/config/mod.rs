@@ -428,6 +428,14 @@ impl PermissionProfileNetworkUnixSocketsConfig {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+
+    pub fn entries(
+        &self,
+    ) -> impl Iterator<Item = (&std::path::Path, &PermissionProfileNetworkAccess)> {
+        self.entries
+            .iter()
+            .map(|(path, access)| (path.as_path(), access))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
