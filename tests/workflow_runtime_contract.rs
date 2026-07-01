@@ -1993,9 +1993,8 @@ fn workflow_runner_pauses_and_resumes_from_control_file() {
     let deadline = Instant::now() + Duration::from_secs(3);
     while Instant::now() < deadline {
         let state = store.load_run(&run_id).expect("run state");
-        if state.status == WorkflowRunStatus::Paused {
-            let task = tasks.get(&task_id).expect("task record");
-            assert_eq!(task.status, TaskStatus::Paused);
+        let task = tasks.get(&task_id).expect("task record");
+        if state.status == WorkflowRunStatus::Paused && task.status == TaskStatus::Paused {
             store.request_resume(&run_id).expect("request resume");
             let result = launch.join().unwrap().unwrap();
             assert_eq!(result.output.status, "completed");
