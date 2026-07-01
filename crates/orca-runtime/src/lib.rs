@@ -50,6 +50,44 @@ mod tests {
     }
 
     #[test]
+    fn server_operation_dispatch_is_owned_by_router_module() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let server_source =
+            std::fs::read_to_string(manifest_dir.join("src/server.rs")).expect("server source");
+        let router_source = std::fs::read_to_string(manifest_dir.join("src/server/router.rs"))
+            .expect("server router source");
+
+        assert!(
+            server_source.contains("mod router;"),
+            "server entry module must declare a focused router submodule"
+        );
+        assert!(
+            server_source.contains("router::dispatch_submission("),
+            "server entry module must delegate decoded submissions to router"
+        );
+        assert!(
+            !server_source.contains("match &submission.op"),
+            "server entry module must not own the ClientOp dispatch match"
+        );
+        assert!(
+            router_source.contains("pub(super) fn dispatch_submission"),
+            "server router must expose submission dispatch inside the server module"
+        );
+        assert!(
+            router_source.contains("match &submission.op"),
+            "server router must own the ClientOp dispatch match"
+        );
+        assert!(
+            router_source.contains("ClientOp::Submit"),
+            "server router must dispatch submit operations"
+        );
+        assert!(
+            router_source.contains("ClientOp::CommandExecTerminate"),
+            "server router must dispatch command exec termination operations"
+        );
+    }
+
+    #[test]
     fn protocol_uses_focused_submodules() {
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let protocol_dir = manifest_dir.join("src/protocol");
