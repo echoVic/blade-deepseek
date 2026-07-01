@@ -70,7 +70,7 @@ const copy = {
       titleHighlight: "DeepSeek-native",
       titleSuffix: "coding agent, in your terminal.",
       subtitle:
-        "Orca is a local terminal coding agent built in Rust around DeepSeek's reasoning and tool-use semantics. Multi-turn agent loop, spec-driven tools, Markdown skills, TUI clarification prompts, SSE streaming, and 1M context — one command, hand it the task.",
+        "Orca is a local terminal coding agent built for DeepSeek: long-context coding, multi-turn tool use, resumable history, persistent goals, and approval-aware automation in one Rust binary.",
       primary: "Get started",
       secondary: "View on GitHub",
       meta: {
@@ -98,7 +98,7 @@ const copy = {
       },
       {
         title: "Approval modes",
-        body: "Tool specs declare capabilities; reads run directly, while write, shell, network, and agent actions follow your configured approval policy.",
+        body: "Tool specs declare capabilities; reads run directly, while write, shell, network, and agent actions follow your configured approval and sandbox policy.",
       },
       {
         title: "Skills and user input",
@@ -134,12 +134,12 @@ const copy = {
         body: "Pass --verifier \"cargo test\" to gate a run on a real command; pass/fail is reported with exit code 2 on failure.",
       },
       {
-        title: "Hooks & custom tools",
-        body: "Lifecycle hooks return structured JSON to deny, modify, or inject context; built-ins, MCP tools, and TOML descriptors share one registry.",
+        title: "Sandbox & hooks",
+        body: "Permission profiles can scope filesystem and network access, while lifecycle hooks return structured JSON to deny, modify, or inject context.",
       },
       {
         title: "Structured event stream",
-        body: "--output-format jsonl emits versioned events from session.started to tool.call.completed for your orchestration layer.",
+        body: "--output-format jsonl emits readable session, reasoning, approval, tool, workflow, and completion events for automation or audit trails.",
       },
     ],
     workflowEyebrow: "Command surface",
@@ -234,7 +234,7 @@ const copy = {
       titleHighlight: "DeepSeek 原生",
       titleSuffix: "代码智能体。",
       subtitle:
-        "Orca 是一个用 Rust 构建的本地终端代码智能体，围绕 DeepSeek 的推理与工具调用语义设计。多轮智能体循环、规格驱动工具、Markdown skills、TUI 澄清问题、SSE 流式输出与 1M 上下文，一个命令就能把任务交给它。",
+        "Orca 是面向 DeepSeek 的本地终端代码智能体：长上下文编码、多轮工具调用、可恢复历史、持久 goal，以及带审批策略的自动化，都内建在一个 Rust 二进制里。",
       primary: "开始使用",
       secondary: "查看 GitHub",
       meta: {
@@ -262,7 +262,7 @@ const copy = {
       },
       {
         title: "审批模式",
-        body: "工具规格声明能力；读取直接运行，写入、shell、网络和 agent 操作按你的审批策略执行。",
+        body: "工具规格声明能力；读取直接运行，写入、shell、网络和 agent 操作按你的审批与沙箱策略执行。",
       },
       {
         title: "Skills 与用户输入",
@@ -298,12 +298,12 @@ const copy = {
         body: "通过 --verifier \"cargo test\" 用真实命令约束运行；失败会以 exit code 2 报告。",
       },
       {
-        title: "Hooks 与自定义工具",
-        body: "生命周期 hooks 返回结构化 JSON，可拒绝、修改或注入上下文；内置工具、MCP 工具和 TOML 描述符共用同一注册表。",
+        title: "沙箱与 Hooks",
+        body: "Permission profiles 可限制文件系统与网络访问；生命周期 hooks 可返回结构化 JSON 来拒绝、修改或注入上下文。",
       },
       {
         title: "结构化事件流",
-        body: "--output-format jsonl 会从 session.started 到 tool.call.completed 输出版本化事件，便于接入编排系统。",
+        body: "--output-format jsonl 输出可读的会话、推理、审批、工具、工作流和完成事件，便于自动化或审计。",
       },
     ],
     workflowEyebrow: "命令界面",
@@ -886,7 +886,7 @@ function App() {
               <span className="l">{t.hero.meta.turns}</span>
             </div>
             <div>
-              <span className="k">14</span>
+              <span className="k">16</span>
               <span className="l">{t.hero.meta.tools}</span>
             </div>
             <div>
@@ -1032,7 +1032,7 @@ function App() {
             <p>{t.specs.platforms}</p>
           </div>
           <div>
-            <div className="num">14</div>
+            <div className="num">16</div>
             <p>{t.specs.tools}</p>
           </div>
           <div>

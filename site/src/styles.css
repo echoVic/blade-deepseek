@@ -1270,8 +1270,13 @@ footer a:hover {
 }
 
 @media (max-width: 860px) {
-  .nav-actions nav {
+  .nav-actions nav a:not(.nav-cta) {
     display: none;
+  }
+
+  .nav-actions nav {
+    display: flex;
+    gap: 0;
   }
 }
 

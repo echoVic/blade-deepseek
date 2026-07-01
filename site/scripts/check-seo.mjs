@@ -13,6 +13,7 @@ const readme = readFileSync(new URL("../README.md", root), "utf8");
 const robotsTxt = readFileSync(new URL("public/robots.txt", root), "utf8");
 const sitemapXml = readFileSync(new URL("public/sitemap.xml", root), "utf8");
 const socialPng = readFileSync(new URL("public/orca-social.png", root));
+const npmPackage = JSON.parse(readFileSync(new URL("../npm/orca/package.json", root), "utf8"));
 
 const failures = [];
 
@@ -25,6 +26,13 @@ function check(condition, message) {
 function includes(value, message) {
   check(indexHtml.includes(value), message);
 }
+
+const latestRelease = sharedSource.match(
+  /releaseVersion\s*=\s*"v([^"]+)"[\s\S]*?version:\s*"v\1"[\s\S]*?date:\s*"([^"]+)"/,
+);
+check(latestRelease, "Could not parse latest release version/date from shared.ts");
+const latestVersion = latestRelease?.[1] ?? "";
+const latestDate = latestRelease?.[2] ?? "";
 
 includes(`<link rel="canonical" href="${canonicalUrl}" />`, "Missing canonical URL");
 includes('<meta name="robots" content="index, follow" />', "Missing robots index directive");
@@ -53,7 +61,14 @@ check(robotsTxt.includes(`Sitemap: ${canonicalUrl}sitemap.xml`), "robots.txt mis
 check(sitemapXml.includes("<urlset"), "sitemap.xml missing urlset");
 check(sitemapXml.includes(`<loc>${canonicalUrl}</loc>`), "sitemap.xml missing canonical loc");
 check(sitemapXml.includes(`<loc>${changelogUrl}</loc>`), "sitemap.xml missing changelog loc");
-check(sitemapXml.includes("<lastmod>2026-06-24</lastmod>"), "sitemap.xml missing lastmod");
+check(
+  sitemapXml.includes(`<lastmod>${latestDate}</lastmod>`),
+  "sitemap.xml lastmod must match the latest release date",
+);
+check(
+  npmPackage.version === latestVersion,
+  "npm package version must match the site releaseVersion",
+);
 
 check(
   changelogHtml.includes(`<link rel="canonical" href="${changelogUrl}" />`),
@@ -89,6 +104,12 @@ check(
 check(
   /\.hero-copy\s*\{[^}]*align-self:\s*start;/s.test(styles),
   "Hero copy must stay top-aligned while the terminal animation grows",
+);
+check(
+  /@media\s*\(max-width:\s*860px\)[\s\S]*\.nav-actions nav a:not\(\.nav-cta\)\s*\{[\s\S]*display:\s*none;/s.test(
+    styles,
+  ),
+  "Mobile nav must keep the GitHub CTA visible while hiding secondary links",
 );
 
 const jsonLdBlocks = [
