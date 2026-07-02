@@ -105,6 +105,7 @@ pub(crate) fn provider_config_for_agent_loop(
         api_key: config.api_key.clone(),
         base_url: config.base_url.clone(),
         model: config.model.as_option(),
+        reasoning_effort: config.reasoning_effort,
         tools_override: provider_tool_schema_override(
             subagent_depth,
             subagent_type,
@@ -341,6 +342,7 @@ mod tests {
             provider: ProviderKind::Mock,
             model: ModelSelection::from_unchecked(Some("mock".to_string())),
             model_runtime: ModelRuntimeConfig::default(),
+            reasoning_effort: orca_core::config::ReasoningEffort::Max,
             api_key: None,
             base_url: None,
             approval_mode: ApprovalMode::Suggest,

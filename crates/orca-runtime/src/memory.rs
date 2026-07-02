@@ -106,6 +106,7 @@ pub fn extract_project_memory(
             .model
             .clone()
             .or_else(|| Some("deepseek-v4-flash".to_string())),
+        reasoning_effort: provider_config.reasoning_effort,
         tools_override: Some(Vec::new()),
         mcp_registry: None,
         external_tools: Vec::new(),
@@ -147,6 +148,7 @@ fn auto_memory_provider_config(config: &RunConfig) -> ProviderConfig {
         api_key: config.api_key.clone(),
         base_url: config.base_url.clone(),
         model: Some(model::auxiliary_model().to_string()),
+        reasoning_effort: config.reasoning_effort,
         tools_override: Some(Vec::new()),
         mcp_registry: None,
         external_tools: Vec::new(),
@@ -262,6 +264,7 @@ mod tests {
             verifier: None,
             model: ModelSelection::parse(None).expect("model"),
             model_runtime: ModelRuntimeConfig::default(),
+            reasoning_effort: orca_core::config::ReasoningEffort::Max,
             api_key: None,
             base_url: None,
             mcp_servers: Vec::new(),

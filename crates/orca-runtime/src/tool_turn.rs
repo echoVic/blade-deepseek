@@ -482,6 +482,7 @@ mod tests {
             provider: ProviderKind::Mock,
             model: ModelSelection::from_unchecked(Some("mock".to_string())),
             model_runtime: ModelRuntimeConfig::default(),
+            reasoning_effort: orca_core::config::ReasoningEffort::Max,
             api_key: None,
             base_url: None,
             approval_mode: ApprovalMode::Suggest,

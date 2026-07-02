@@ -9,7 +9,7 @@ pub mod tool_schema;
 
 use orca_core::approval_types::ActionKind;
 use orca_core::cancel::CancelToken;
-use orca_core::config::ProviderKind;
+use orca_core::config::{ProviderKind, ReasoningEffort};
 use orca_core::conversation::{Conversation, Message, RawToolCall};
 use orca_core::external_config::ExternalToolConfig;
 use orca_core::provider_types::{ProviderResponse, ProviderStep, Usage};
@@ -21,6 +21,7 @@ pub struct ProviderConfig {
     pub api_key: Option<String>,
     pub base_url: Option<String>,
     pub model: Option<String>,
+    pub reasoning_effort: ReasoningEffort,
     pub tools_override: Option<Vec<serde_json::Value>>,
     pub mcp_registry: Option<McpRegistry>,
     pub external_tools: Vec<ExternalToolConfig>,

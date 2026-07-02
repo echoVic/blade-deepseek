@@ -145,6 +145,7 @@ mod tests {
             verifier: None,
             model: ModelSelection::from_unchecked(model.map(str::to_string)),
             model_runtime: Default::default(),
+            reasoning_effort: orca_core::config::ReasoningEffort::Max,
             api_key: None,
             base_url: None,
             mcp_servers: Vec::<McpServerConfig>::new(),

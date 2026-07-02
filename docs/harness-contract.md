@@ -183,6 +183,7 @@ The default (and only production) provider is DeepSeek. Internal test providers 
 
 - Default model: `auto` (main loop uses `deepseek-v4-pro`, auxiliary tasks use `deepseek-v4-flash`)
 - Default base URL: `https://api.deepseek.com`
+- Default reasoning effort: `max` (`reasoning_effort = "high"` or `DEEPSEEK_REASONING_EFFORT=high` lowers it)
 - Streaming: SSE with real-time reasoning/content deltas
 - Authentication: `DEEPSEEK_API_KEY` (required)
 - HTTP retry: 3 attempts with exponential backoff for 429/5xx status codes

@@ -69,6 +69,7 @@ Priority chain (highest wins): Environment variables > CLI arguments > Config fi
 - `DEEPSEEK_API_KEY` — API key (required)
 - `DEEPSEEK_MODEL` — Model override
 - `DEEPSEEK_BASE_URL` — API base URL override
+- `DEEPSEEK_REASONING_EFFORT` — Reasoning effort override (`high` or `max`; default `max`)
 - `ORCA_NODE_PATH` — Node.js executable used by workflow scripts when `node` is not on `PATH` (npm installs set this automatically)
 
 ### Config File
@@ -77,6 +78,7 @@ Priority chain (highest wins): Environment variables > CLI arguments > Config fi
 
 ```toml
 model = "auto"
+reasoning_effort = "max"
 api_key = "sk-..."
 base_url = "https://api.deepseek.com"
 ```
@@ -117,6 +119,7 @@ output_truncation = { mode = "tokens", limit = 2000 }
 ### Defaults
 
 - Model: `auto` (main loop uses `deepseek-v4-pro`, auxiliary tasks use `deepseek-v4-flash`)
+- Reasoning effort: `max`
 - Base URL: `https://api.deepseek.com`
 - Approval mode: `suggest`
 - Output format: `text`

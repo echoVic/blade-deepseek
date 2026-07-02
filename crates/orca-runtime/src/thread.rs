@@ -144,6 +144,7 @@ mod tests {
             verifier: None,
             model: ModelSelection::parse(None).unwrap(),
             model_runtime: ModelRuntimeConfig::default(),
+            reasoning_effort: orca_core::config::ReasoningEffort::Max,
             api_key: None,
             base_url: None,
             mcp_servers: Vec::new(),

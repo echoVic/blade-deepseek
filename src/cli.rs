@@ -32,7 +32,7 @@ use serde_json::Value;
 use crate::approval::policy::ApprovalMode;
 use crate::config::file;
 use crate::config::file::ConfigOverrides;
-use crate::config::{HistoryMode, OutputFormat, ProviderKind, RunConfig};
+use crate::config::{HistoryMode, OutputFormat, ProviderKind, ReasoningEffort, RunConfig};
 use crate::model::ModelSelection;
 use crate::runtime::controller;
 use crate::runtime::history;
@@ -628,6 +628,13 @@ fn env_overrides() -> Result<ConfigOverrides, String> {
         base_url: env::var("ORCA_BASE_URL")
             .ok()
             .or_else(|| env::var("DEEPSEEK_BASE_URL").ok()),
+        reasoning_effort: match env::var("ORCA_REASONING_EFFORT")
+            .ok()
+            .or_else(|| env::var("DEEPSEEK_REASONING_EFFORT").ok())
+        {
+            Some(value) => Some(parse_reasoning_effort_value(&value)?),
+            None => None,
+        },
     })
 }
 
@@ -635,6 +642,16 @@ fn parse_approval_mode_value(mode: &str) -> Result<ApprovalMode, String> {
     ApprovalMode::from_str(mode, true).map_err(|_| {
         format!("unsupported mode '{mode}'. Use suggest, auto-edit, full-auto, or plan")
     })
+}
+
+fn parse_reasoning_effort_value(value: &str) -> Result<ReasoningEffort, String> {
+    match value {
+        "high" => Ok(ReasoningEffort::High),
+        "max" => Ok(ReasoningEffort::Max),
+        other => Err(format!(
+            "unsupported reasoning_effort '{other}'. Use high or max"
+        )),
+    }
 }
 
 fn read_stdin_text() -> Result<String, String> {
@@ -723,6 +740,7 @@ fn run_exec(args: ExecArgs) -> i32 {
             mode: args.approval_mode,
             api_key: args.api_key,
             base_url: args.base_url,
+            reasoning_effort: None,
         },
     ) {
         Ok(config) => config,
@@ -770,6 +788,7 @@ fn run_exec(args: ExecArgs) -> i32 {
         verifier: args.verifier,
         model,
         model_runtime: file_config.model_runtime,
+        reasoning_effort: file_config.reasoning_effort,
         api_key,
         base_url,
         history_mode,
@@ -1463,6 +1482,7 @@ fn build_workflow_run_config(
             mode: None,
             api_key: api_key_override,
             base_url: base_url_override,
+            reasoning_effort: None,
         },
     )?;
     if !file_config.workflows.resolved().enabled {
@@ -1480,6 +1500,7 @@ fn build_workflow_run_config(
         verifier: None,
         model,
         model_runtime: file_config.model_runtime,
+        reasoning_effort: file_config.reasoning_effort,
         api_key: file_config.api_key,
         base_url: file_config.base_url,
         history_mode: HistoryMode::Disabled,
@@ -1518,6 +1539,7 @@ fn build_worker_run_config(
             mode: None,
             api_key: api_key_override,
             base_url: base_url_override,
+            reasoning_effort: None,
         },
     )?;
     let model = ModelSelection::parse(file_config.model)?;
@@ -1532,6 +1554,7 @@ fn build_worker_run_config(
         verifier: None,
         model,
         model_runtime: file_config.model_runtime,
+        reasoning_effort: file_config.reasoning_effort,
         api_key: file_config.api_key,
         base_url: file_config.base_url,
         history_mode: HistoryMode::Disabled,
@@ -1900,6 +1923,7 @@ fn run_placeholder(cli: Cli) -> i32 {
             mode,
             api_key: cli.api_key,
             base_url: cli.base_url,
+            reasoning_effort: None,
         },
     ) {
         Ok(config) => config,
@@ -1938,6 +1962,7 @@ fn run_placeholder(cli: Cli) -> i32 {
         verifier: None,
         model,
         model_runtime: file_config.model_runtime,
+        reasoning_effort: file_config.reasoning_effort,
         api_key,
         base_url,
         history_mode,
@@ -2157,6 +2182,7 @@ fn run_server(cli: Cli) -> i32 {
             mode: None,
             api_key: cli.api_key,
             base_url: cli.base_url,
+            reasoning_effort: None,
         },
     ) {
         Ok(config) => config,
@@ -2184,6 +2210,7 @@ fn run_server(cli: Cli) -> i32 {
         verifier: None,
         model,
         model_runtime: file_config.model_runtime,
+        reasoning_effort: file_config.reasoning_effort,
         api_key: file_config.api_key,
         base_url: file_config.base_url,
         history_mode: HistoryMode::Record,

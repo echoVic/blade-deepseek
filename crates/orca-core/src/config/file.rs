@@ -9,8 +9,8 @@ use crate::approval_rules::PermissionRules;
 use crate::approval_types::ApprovalMode;
 use crate::config::{
     DEFAULT_MAX_WORKFLOW_AGENTS_PER_RUN, DEFAULT_MAX_WORKFLOW_CONCURRENT_AGENTS,
-    MAX_WORKFLOW_AGENT_RETRIES, ModelRuntimeConfig, PermissionProfileConfig, ThemeName, ToolConfig,
-    WorkflowConfig, WorkflowTeamConfig,
+    MAX_WORKFLOW_AGENT_RETRIES, ModelRuntimeConfig, PermissionProfileConfig, ReasoningEffort,
+    ThemeName, ToolConfig, WorkflowConfig, WorkflowTeamConfig,
 };
 use crate::subagent_config::SubagentConfig;
 
@@ -23,6 +23,7 @@ pub struct FileConfig {
     pub mode: Option<ApprovalMode>,
     pub api_key: Option<String>,
     pub base_url: Option<String>,
+    pub reasoning_effort: ReasoningEffort,
     #[serde(default)]
     pub model_runtime: ModelRuntimeConfig,
     #[serde(default)]
@@ -57,6 +58,8 @@ struct RawFileConfig {
     pub mode: Option<ApprovalMode>,
     pub api_key: Option<String>,
     pub base_url: Option<String>,
+    #[serde(default)]
+    pub reasoning_effort: ReasoningEffort,
     #[serde(default, alias = "disableWorkflows")]
     legacy_disable_workflows: Option<bool>,
     #[serde(default, alias = "enableWorkflows")]
@@ -98,6 +101,7 @@ impl Default for FileConfig {
             mode: None,
             api_key: None,
             base_url: None,
+            reasoning_effort: ReasoningEffort::default(),
             model_runtime: ModelRuntimeConfig::default(),
             mcp_servers: Vec::new(),
             hooks: Vec::new(),
@@ -129,6 +133,7 @@ impl From<RawFileConfig> for FileConfig {
             mode: raw.mode,
             api_key: raw.api_key,
             base_url: raw.base_url,
+            reasoning_effort: raw.reasoning_effort,
             model_runtime: raw.model_runtime.normalized(),
             mcp_servers: raw.mcp_servers,
             hooks: raw.hooks,
@@ -152,6 +157,7 @@ pub struct ConfigOverrides {
     pub mode: Option<ApprovalMode>,
     pub api_key: Option<String>,
     pub base_url: Option<String>,
+    pub reasoning_effort: Option<ReasoningEffort>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -393,6 +399,9 @@ fn apply_overrides(config: &mut FileConfig, overrides: ConfigOverrides) {
     }
     if overrides.base_url.is_some() {
         config.base_url = overrides.base_url;
+    }
+    if let Some(reasoning_effort) = overrides.reasoning_effort {
+        config.reasoning_effort = reasoning_effort;
     }
 }
 
@@ -773,6 +782,35 @@ auto_compact_token_limit = 96000
     }
 
     #[test]
+    fn parse_reasoning_effort_config() {
+        let config: FileConfig = toml::from_str(r#"reasoning_effort = "high""#).unwrap();
+
+        assert_eq!(
+            config.reasoning_effort,
+            crate::config::ReasoningEffort::High
+        );
+    }
+
+    #[test]
+    fn env_reasoning_effort_overrides_file_config() {
+        let file_config = FileConfig {
+            reasoning_effort: crate::config::ReasoningEffort::High,
+            ..FileConfig::default()
+        };
+
+        let config = apply_override_layers(
+            file_config,
+            ConfigOverrides {
+                reasoning_effort: Some(crate::config::ReasoningEffort::Max),
+                ..ConfigOverrides::default()
+            },
+            ConfigOverrides::default(),
+        );
+
+        assert_eq!(config.reasoning_effort, crate::config::ReasoningEffort::Max);
+    }
+
+    #[test]
     fn parse_workflow_config() {
         let toml = r#"
 [workflows]
@@ -1040,12 +1078,14 @@ decision = "allow"
             mode: Some(crate::approval_types::ApprovalMode::AutoEdit),
             api_key: Some("sk-env".to_string()),
             base_url: None,
+            reasoning_effort: None,
         };
         let cli = ConfigOverrides {
             model: Some("auto".to_string()),
             mode: Some(crate::approval_types::ApprovalMode::Plan),
             api_key: Some("sk-cli".to_string()),
             base_url: Some("https://cli.example".to_string()),
+            reasoning_effort: None,
         };
 
         let config = apply_override_layers(base, env, cli);

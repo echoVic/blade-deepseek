@@ -25,6 +25,8 @@ struct ChatRequest {
     stream_options: Option<StreamOptions>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<orca_core::config::ReasoningEffort>,
 }
 
 #[derive(Debug, Serialize)]
@@ -184,6 +186,7 @@ fn request_chat_streaming(
             include_usage: true,
         }),
         tools: Some(tools),
+        reasoning_effort: Some(config.reasoning_effort),
     };
 
     let response = crate::http_client::execute_streaming_with_retry(|client| {
@@ -307,6 +310,7 @@ fn request_chat(
         stream: false,
         stream_options: None,
         tools: Some(tools),
+        reasoning_effort: Some(config.reasoning_effort),
     };
 
     let response = crate::http_client::execute_with_retry(|client| {
@@ -851,5 +855,21 @@ mod tests {
             &conv.messages[2],
             Message::Assistant { tool_calls, .. } if tool_calls.len() == 1
         ));
+    }
+
+    #[test]
+    fn chat_request_serializes_reasoning_effort() {
+        let request = ChatRequest {
+            model: "deepseek-v4-pro".to_string(),
+            messages: Vec::new(),
+            stream: true,
+            stream_options: None,
+            tools: None,
+            reasoning_effort: Some(orca_core::config::ReasoningEffort::Max),
+        };
+
+        let json = serde_json::to_value(request).expect("serialize request");
+
+        assert_eq!(json["reasoning_effort"], "max");
     }
 }

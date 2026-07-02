@@ -85,6 +85,23 @@ impl ModelRuntimeConfig {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+    High,
+    #[default]
+    Max,
+}
+
+impl ReasoningEffort {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::High => "high",
+            Self::Max => "max",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ToolConfig {
     #[serde(default = "default_max_read_parallel")]
@@ -232,6 +249,7 @@ pub struct RunConfig {
     pub verifier: Option<String>,
     pub model: ModelSelection,
     pub model_runtime: ModelRuntimeConfig,
+    pub reasoning_effort: ReasoningEffort,
     pub api_key: Option<String>,
     pub base_url: Option<String>,
     pub mcp_servers: Vec<McpServerConfig>,
@@ -505,6 +523,7 @@ pub fn format_config_show(config: &RunConfig) -> String {
             "api_key = \"{}\"\n",
             "base_url = \"{}\"\n",
             "provider = \"{}\"\n",
+            "reasoning_effort = \"{}\"\n",
             "model_context_window = \"{}\"\n",
             "model_auto_compact_token_limit = \"{}\"\n",
             "cwd = \"{}\"\n",
@@ -547,6 +566,7 @@ pub fn format_config_show(config: &RunConfig) -> String {
         api_key,
         base_url,
         config.provider.as_str(),
+        config.reasoning_effort.as_str(),
         config
             .model_runtime
             .context_window
@@ -673,6 +693,7 @@ mod tests {
                 context_window: Some(128_000),
                 auto_compact_token_limit: Some(96_000),
             },
+            reasoning_effort: ReasoningEffort::Max,
             api_key: Some("sk-secret".to_string()),
             base_url: Some("https://api.example".to_string()),
             mcp_servers: Vec::new(),
@@ -699,6 +720,7 @@ mod tests {
         let shown = format_config_show(&config);
 
         assert!(shown.contains("model = \"deepseek-v4-flash\""));
+        assert!(shown.contains("reasoning_effort = \"max\""));
         assert!(shown.contains("model_context_window = \"128000\""));
         assert!(shown.contains("model_auto_compact_token_limit = \"96000\""));
         assert!(shown.contains("mode = \"full-auto\""));

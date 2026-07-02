@@ -53,6 +53,7 @@ mod tests {
             verifier: None,
             model: ModelSelection::parse(None).unwrap(),
             model_runtime: Default::default(),
+            reasoning_effort: orca_core::config::ReasoningEffort::Max,
             api_key: None,
             base_url: None,
             history_mode: orca_core::config::HistoryMode::Disabled,
