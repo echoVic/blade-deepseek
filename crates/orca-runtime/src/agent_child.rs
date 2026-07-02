@@ -8,6 +8,7 @@ use orca_core::conversation::Conversation;
 use orca_core::event_schema::{EventFactory, RunStatus};
 use orca_core::event_sink::EventSink;
 use orca_core::model::ModelRouteContext;
+use orca_core::provider_types::{ProviderResponse, ProviderStep};
 use orca_core::subagent_types::SubagentType;
 use orca_mcp::McpRegistry;
 use orca_provider::ProviderConfig;
@@ -61,6 +62,12 @@ pub struct ChildAgentResult {
     pub status: RunStatus,
     pub final_message: Option<String>,
     pub error: Option<String>,
+}
+
+#[derive(Debug)]
+pub enum ChildAgentProviderErrorDecision {
+    RetryAfterCompaction,
+    Fail(ChildAgentResult),
 }
 
 pub struct ChildAgentLoopSetup {
@@ -252,6 +259,50 @@ pub fn compact_child_agent_conversation_if_needed(
     compaction.compact_if_needed(&mut setup.conversation)
 }
 
+pub fn handle_child_agent_provider_error(
+    config: &RunConfig,
+    setup: &mut ChildAgentLoopSetup,
+    cwd: &Path,
+    hooks: &HookRunner,
+    response: &ProviderResponse,
+    reactive_compacted: &mut bool,
+) -> io::Result<Option<ChildAgentProviderErrorDecision>> {
+    let Some(error) = response.steps.iter().find_map(|step| match step {
+        ProviderStep::Error(message) => Some(message.clone()),
+        _ => None,
+    }) else {
+        *reactive_compacted = false;
+        return Ok(None);
+    };
+
+    if orca_provider::context::is_prompt_too_long_error(&error) && !*reactive_compacted {
+        let mut events = EventFactory::new("child-agent-compaction".to_string());
+        let mut sink = EventSink::new(io::sink(), config.output_format);
+        let mut compaction = RuntimeCompactionStep::new(
+            config.provider,
+            &setup.context_config,
+            &setup.provider_config,
+            cwd,
+            false,
+            hooks,
+            &mut events,
+            &mut sink,
+            None,
+        );
+        compaction.compact_after_prompt_too_long(&mut setup.conversation)?;
+        *reactive_compacted = true;
+        return Ok(Some(ChildAgentProviderErrorDecision::RetryAfterCompaction));
+    }
+
+    Ok(Some(ChildAgentProviderErrorDecision::Fail(
+        ChildAgentResult {
+            status: RunStatus::Failed,
+            final_message: None,
+            error: Some(error),
+        },
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -268,7 +319,7 @@ mod tests {
     use orca_core::hook_types::HookConfig;
     use orca_core::mcp_types::McpServerConfig;
     use orca_core::model::{AUTO_MODEL, FLASH_MODEL, ModelSelection};
-    use orca_core::provider_types::Usage;
+    use orca_core::provider_types::{ProviderResponse, ProviderStep, Usage};
     use orca_core::subagent_config::SubagentConfig;
     use std::io::Cursor;
 
@@ -459,6 +510,91 @@ mod tests {
 
         assert!(compacted);
         assert!(setup.conversation.messages.len() < before_messages);
+    }
+
+    #[test]
+    fn handle_child_agent_provider_error_retries_prompt_too_long_once() {
+        let request = ChildAgentRequest::new(
+            "inspect repo".to_string(),
+            SubagentType::General,
+            None,
+            2,
+            false,
+        );
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let mut runtime_config = config(None);
+        runtime_config.model_runtime.context_window = Some(128);
+        runtime_config.model_runtime.auto_compact_token_limit = Some(64);
+        let mut setup = prepare_child_agent_loop(
+            &runtime_config,
+            &request,
+            std::env::temp_dir().as_path(),
+            &instructions,
+            &memory,
+        );
+        for index in 0..20 {
+            setup.conversation.add_user(format!(
+                "child message {index}: {}",
+                "important context ".repeat(20)
+            ));
+            setup.conversation.add_assistant(
+                Some(format!(
+                    "child answer {index}: {}",
+                    "detailed response ".repeat(20)
+                )),
+                None,
+                vec![],
+            );
+        }
+        let before_messages = setup.conversation.messages.len();
+        let response = ProviderResponse {
+            steps: vec![ProviderStep::Error("prompt_too_long".to_string())],
+            assistant_content: None,
+            assistant_reasoning: None,
+            tool_calls: vec![],
+            usage: None,
+        };
+        let mut reactive_compacted = false;
+
+        let decision = handle_child_agent_provider_error(
+            &runtime_config,
+            &mut setup,
+            std::env::temp_dir().as_path(),
+            &HookRunner::default(),
+            &response,
+            &mut reactive_compacted,
+        )
+        .expect("provider-error handling should not fail")
+        .expect("prompt-too-long should produce a decision");
+
+        assert!(matches!(
+            decision,
+            ChildAgentProviderErrorDecision::RetryAfterCompaction
+        ));
+        assert!(reactive_compacted);
+        assert!(setup.conversation.messages.len() < before_messages);
+
+        let decision = handle_child_agent_provider_error(
+            &runtime_config,
+            &mut setup,
+            std::env::temp_dir().as_path(),
+            &HookRunner::default(),
+            &response,
+            &mut reactive_compacted,
+        )
+        .expect("provider-error handling should not fail")
+        .expect("repeated prompt-too-long should fail");
+
+        match decision {
+            ChildAgentProviderErrorDecision::Fail(result) => {
+                assert_eq!(result.status, RunStatus::Failed);
+                assert_eq!(result.error.as_deref(), Some("prompt_too_long"));
+            }
+            ChildAgentProviderErrorDecision::RetryAfterCompaction => {
+                panic!("repeated prompt-too-long should not retry")
+            }
+        }
     }
 
     #[test]

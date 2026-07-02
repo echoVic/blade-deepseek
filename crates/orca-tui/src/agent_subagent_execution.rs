@@ -11,7 +11,8 @@ use orca_core::provider_types::ProviderStep;
 use orca_core::subagent_types::SubagentType;
 use orca_core::tool_types;
 use orca_runtime::agent_child::{
-    ChildAgentRequest, ChildAgentResult, compact_child_agent_conversation_if_needed,
+    ChildAgentProviderErrorDecision, ChildAgentRequest, ChildAgentResult,
+    compact_child_agent_conversation_if_needed, handle_child_agent_provider_error,
     prepare_child_agent_loop, route_child_agent_model, run_child_agent_with_executor,
 };
 use orca_runtime::agent_common;
@@ -559,28 +560,18 @@ fn run_child_agent_for_tui(
                     });
                 }
 
-                if let Some(error) = response.steps.iter().find_map(|step| match step {
-                    ProviderStep::Error(message) => Some(message.clone()),
-                    _ => None,
-                }) {
-                    if orca_provider::context::is_prompt_too_long_error(&error)
-                        && !reactive_compacted
-                    {
-                        setup.conversation = orca_provider::context::compact(
-                            &setup.conversation,
-                            &setup.context_config,
-                        );
-                        reactive_compacted = true;
-                        continue;
-                    }
-                    return Ok(ChildAgentResult {
-                        status: RunStatus::Failed,
-                        final_message: None,
-                        error: Some(error),
-                    });
+                match handle_child_agent_provider_error(
+                    config,
+                    &mut setup,
+                    cwd,
+                    hooks,
+                    &response,
+                    &mut reactive_compacted,
+                )? {
+                    Some(ChildAgentProviderErrorDecision::RetryAfterCompaction) => continue,
+                    Some(ChildAgentProviderErrorDecision::Fail(result)) => return Ok(result),
+                    None => {}
                 }
-
-                reactive_compacted = false;
 
                 if let Some(usage) = response.usage
                     && !usage.is_empty()

@@ -263,4 +263,24 @@ mod tests {
             "agent_subagent_execution should not run child budget-warning hooks directly"
         );
     }
+
+    #[test]
+    fn tui_subagent_child_provider_error_handling_is_runtime_owned() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let subagent =
+            std::fs::read_to_string(format!("{manifest_dir}/src/agent_subagent_execution.rs"))
+                .expect("TUI agent subagent execution module should exist");
+        assert!(
+            subagent.contains("handle_child_agent_provider_error"),
+            "agent_subagent_execution should delegate child provider-error handling to runtime"
+        );
+        assert!(
+            !subagent.contains("is_prompt_too_long_error"),
+            "agent_subagent_execution should not classify prompt-too-long provider errors"
+        );
+        assert!(
+            !subagent.contains("orca_provider::context::compact("),
+            "agent_subagent_execution should not compact child conversations directly"
+        );
+    }
 }
