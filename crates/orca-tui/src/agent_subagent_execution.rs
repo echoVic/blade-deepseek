@@ -15,7 +15,9 @@ use orca_core::subagent_types::SubagentType;
 use orca_core::tool_types;
 use orca_provider::ProviderConfig;
 use orca_provider::tool_schema::deepseek_tools_schema_for_type_with_mcp_and_external;
-use orca_runtime::agent_child::ChildAgentResult;
+use orca_runtime::agent_child::{
+    ChildAgentRequest, ChildAgentResult, run_child_agent_with_executor,
+};
 use orca_runtime::agent_common;
 use orca_runtime::cost::CostTracker;
 use orca_runtime::hooks::{HookContext, HookRunner, conversation_with_hook_context};
@@ -99,12 +101,10 @@ pub(crate) fn execute_subagent_batch_for_tui(
             continue;
         }
 
-        let mut child_config = config.clone();
-        child_config.model = child_config
-            .model
-            .with_subagent_override(request.model.clone());
+        let child_config = config.clone();
         let child_cwd = cwd.to_path_buf();
         let child_prompt = request.prompt;
+        let child_model = request.model;
         let child_instructions = instructions.clone();
         let child_memory = memory.clone();
         let child_hooks = hooks.clone();
@@ -117,6 +117,7 @@ pub(crate) fn execute_subagent_batch_for_tui(
                     &child_config,
                     &child_cwd,
                     &child_prompt,
+                    child_model,
                     subagent_depth + 1,
                     &subagent_type,
                     &child_instructions,
@@ -227,14 +228,11 @@ pub(crate) fn execute_subagent_for_tui(
         return (result, CostTracker::new(None));
     }
 
-    let mut child_config = config.clone();
-    child_config.model = child_config
-        .model
-        .with_subagent_override(request.model.clone());
     let (child, child_cost_tracker) = run_child_agent_for_tui(
-        &child_config,
+        config,
         cwd,
         &request.prompt,
+        request.model.clone(),
         event_tx,
         action_rx,
         subagent_depth + 1,
@@ -303,12 +301,10 @@ fn launch_async_subagent_for_tui(
         .and_then(|value| value.as_str().map(str::to_string));
     let task = task_registry.create_subagent(request.description.clone(), agent_type);
     let agent_id = task.id.clone();
-    let mut child_config = config.clone();
-    child_config.model = child_config
-        .model
-        .with_subagent_override(request.model.clone());
+    let child_config = config.clone();
     let child_cwd = cwd.to_path_buf();
     let child_prompt = request.prompt;
+    let child_model = request.model;
     let child_type = request.subagent_type;
     let child_instructions = instructions.clone();
     let child_memory = memory.clone();
@@ -324,6 +320,7 @@ fn launch_async_subagent_for_tui(
             &child_config,
             &child_cwd,
             &child_prompt,
+            child_model,
             subagent_depth + 1,
             &child_type,
             &child_instructions,
@@ -476,6 +473,7 @@ fn run_child_agent_for_tui(
     config: &RunConfig,
     cwd: &Path,
     prompt: &str,
+    subagent_model: Option<String>,
     event_tx: &Sender<TuiEvent>,
     action_rx: &Receiver<UserAction>,
     subagent_depth: u32,
@@ -484,233 +482,224 @@ fn run_child_agent_for_tui(
     memory: &MemoryBlock,
     hooks: &HookRunner,
 ) -> (ChildAgentResult, CostTracker) {
-    let mcp_registry = orca_mcp::initialize_registry(&config.mcp_servers);
-    let provider_config = ProviderConfig {
-        api_key: config.api_key.clone(),
-        base_url: config.base_url.clone(),
-        model: Some(orca_core::model::FLASH_MODEL.to_string()),
-        reasoning_effort: config.reasoning_effort,
-        tools_override: Some(deepseek_tools_schema_for_type_with_mcp_and_external(
-            subagent_type,
-            Some(&mcp_registry),
-            &config.external_tools,
-        )),
-        mcp_registry: Some(mcp_registry.clone()),
-        external_tools: config.external_tools.clone(),
-    };
-
-    let budget_model = config.model.as_option();
-    let ctx_config = orca_provider::context::ContextConfig::for_model_with_runtime(
-        budget_model.as_deref(),
-        &config.model_runtime,
-    );
-    let mut conversation = Conversation::new();
-    conversation.add_system(agent_common::build_agent_system_prompt(
-        cwd,
+    let child_request = ChildAgentRequest::new(
+        prompt.to_string(),
+        subagent_type.clone(),
+        subagent_model,
         subagent_depth,
-        subagent_type,
-        Some(instructions),
-        config.approval_mode,
-        Some(memory),
-    ));
-    conversation.add_user(prompt.to_string());
+        false,
+    );
+    run_child_agent_with_executor(config, &child_request, |config, _, child_cost_tracker| {
+        let mcp_registry = orca_mcp::initialize_registry(&config.mcp_servers);
+        let provider_config = ProviderConfig {
+            api_key: config.api_key.clone(),
+            base_url: config.base_url.clone(),
+            model: Some(orca_core::model::FLASH_MODEL.to_string()),
+            reasoning_effort: config.reasoning_effort,
+            tools_override: Some(deepseek_tools_schema_for_type_with_mcp_and_external(
+                subagent_type,
+                Some(&mcp_registry),
+                &config.external_tools,
+            )),
+            mcp_registry: Some(mcp_registry.clone()),
+            external_tools: config.external_tools.clone(),
+        };
 
-    let policy = ApprovalPolicy::new(config.approval_mode)
-        .with_permission_rules(config.permission_rules.clone());
-    let mut child_cost_tracker = CostTracker::new(None);
-    let mut turn: u32 = 0;
-    let mut reactive_compacted = false;
-    loop {
-        turn += 1;
-        if turn > DEFAULT_MAX_TURNS {
-            return (
-                ChildAgentResult {
+        let budget_model = config.model.as_option();
+        let ctx_config = orca_provider::context::ContextConfig::for_model_with_runtime(
+            budget_model.as_deref(),
+            &config.model_runtime,
+        );
+        let mut conversation = Conversation::new();
+        conversation.add_system(agent_common::build_agent_system_prompt(
+            cwd,
+            subagent_depth,
+            subagent_type,
+            Some(instructions),
+            config.approval_mode,
+            Some(memory),
+        ));
+        conversation.add_user(prompt.to_string());
+
+        let policy = ApprovalPolicy::new(config.approval_mode)
+            .with_permission_rules(config.permission_rules.clone());
+        let mut turn: u32 = 0;
+        let mut reactive_compacted = false;
+        loop {
+            turn += 1;
+            if turn > DEFAULT_MAX_TURNS {
+                return Ok(ChildAgentResult {
                     status: RunStatus::BudgetExhausted,
                     final_message: None,
                     error: Some("max turns exhausted".to_string()),
-                },
-                child_cost_tracker,
-            );
-        }
+                });
+            }
 
-        if orca_provider::context::needs_compaction_wire(
-            &conversation,
-            &ctx_config,
-            &provider_config,
-        ) {
-            let before_messages = conversation.messages.len();
-            if let Ok(outcome) = hooks.run(
-                HookEvent::OnBudgetWarning,
+            if orca_provider::context::needs_compaction_wire(
+                &conversation,
+                &ctx_config,
+                &provider_config,
+            ) {
+                let before_messages = conversation.messages.len();
+                if let Ok(outcome) = hooks.run(
+                    HookEvent::OnBudgetWarning,
+                    HookContext {
+                        cwd: &cwd.display().to_string(),
+                        session_status: None,
+                        tool_request: None,
+                        tool_result: None,
+                        before_messages: Some(before_messages),
+                        after_messages: None,
+                        usage: None,
+                    },
+                ) {
+                    if !outcome.injected_context.is_empty() {
+                        conversation = conversation_with_hook_context(&conversation, &outcome);
+                    }
+                }
+                conversation = orca_provider::context::compact(&conversation, &ctx_config);
+            }
+
+            let child_cancel = CancelToken::new();
+            let route_decision = config.model.route(ModelRouteContext {
+                subagent_type,
+                subagent_model: None,
+            });
+            child_cost_tracker.set_model(Some(&route_decision.actual_model));
+            let mut turn_provider_config = provider_config.clone();
+            turn_provider_config.model = Some(route_decision.actual_model.clone());
+
+            let pre_model_outcome = match hooks.run(
+                HookEvent::PreModelCall,
                 HookContext {
                     cwd: &cwd.display().to_string(),
                     session_status: None,
                     tool_request: None,
                     tool_result: None,
-                    before_messages: Some(before_messages),
+                    before_messages: None,
                     after_messages: None,
                     usage: None,
                 },
             ) {
-                if !outcome.injected_context.is_empty() {
-                    conversation = conversation_with_hook_context(&conversation, &outcome);
-                }
-            }
-            conversation = orca_provider::context::compact(&conversation, &ctx_config);
-        }
-
-        let child_cancel = CancelToken::new();
-        let route_decision = config.model.route(ModelRouteContext {
-            subagent_type,
-            subagent_model: None,
-        });
-        child_cost_tracker.set_model(Some(&route_decision.actual_model));
-        let mut turn_provider_config = provider_config.clone();
-        turn_provider_config.model = Some(route_decision.actual_model.clone());
-
-        let pre_model_outcome = match hooks.run(
-            HookEvent::PreModelCall,
-            HookContext {
-                cwd: &cwd.display().to_string(),
-                session_status: None,
-                tool_request: None,
-                tool_result: None,
-                before_messages: None,
-                after_messages: None,
-                usage: None,
-            },
-        ) {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                return (
-                    ChildAgentResult {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    return Ok(ChildAgentResult {
                         status: RunStatus::Failed,
                         final_message: None,
                         error: Some(format!("pre_model_call hook failed: {error}")),
-                    },
-                    child_cost_tracker,
-                );
-            }
-        };
-        let model_conversation = conversation_with_hook_context(&conversation, &pre_model_outcome);
+                    });
+                }
+            };
+            let model_conversation =
+                conversation_with_hook_context(&conversation, &pre_model_outcome);
 
-        let response = orca_provider::call_streaming(
-            config.provider,
-            &model_conversation,
-            &turn_provider_config,
-            &child_cancel,
-            &mut |_| {},
-        );
+            let response = orca_provider::call_streaming(
+                config.provider,
+                &model_conversation,
+                &turn_provider_config,
+                &child_cancel,
+                &mut |_| {},
+            );
 
-        if let Err(error) = hooks.run(
-            HookEvent::PostModelCall,
-            HookContext {
-                cwd: &cwd.display().to_string(),
-                session_status: None,
-                tool_request: None,
-                tool_result: None,
-                before_messages: None,
-                after_messages: None,
-                usage: response.usage.as_ref(),
-            },
-        ) {
-            return (
-                ChildAgentResult {
+            if let Err(error) = hooks.run(
+                HookEvent::PostModelCall,
+                HookContext {
+                    cwd: &cwd.display().to_string(),
+                    session_status: None,
+                    tool_request: None,
+                    tool_result: None,
+                    before_messages: None,
+                    after_messages: None,
+                    usage: response.usage.as_ref(),
+                },
+            ) {
+                return Ok(ChildAgentResult {
                     status: RunStatus::Failed,
                     final_message: None,
                     error: Some(format!("post_model_call hook failed: {error}")),
-                },
-                child_cost_tracker,
-            );
-        }
-
-        if let Some(error) = response.steps.iter().find_map(|step| match step {
-            ProviderStep::Error(message) => Some(message.clone()),
-            _ => None,
-        }) {
-            if orca_provider::context::is_prompt_too_long_error(&error) && !reactive_compacted {
-                conversation = orca_provider::context::compact(&conversation, &ctx_config);
-                reactive_compacted = true;
-                continue;
+                });
             }
-            return (
-                ChildAgentResult {
+
+            if let Some(error) = response.steps.iter().find_map(|step| match step {
+                ProviderStep::Error(message) => Some(message.clone()),
+                _ => None,
+            }) {
+                if orca_provider::context::is_prompt_too_long_error(&error) && !reactive_compacted {
+                    conversation = orca_provider::context::compact(&conversation, &ctx_config);
+                    reactive_compacted = true;
+                    continue;
+                }
+                return Ok(ChildAgentResult {
                     status: RunStatus::Failed,
                     final_message: None,
                     error: Some(error),
-                },
-                child_cost_tracker,
-            );
-        }
+                });
+            }
 
-        reactive_compacted = false;
+            reactive_compacted = false;
 
-        if let Some(usage) = response.usage
-            && !usage.is_empty()
-        {
-            child_cost_tracker.add_usage(usage);
-        }
+            if let Some(usage) = response.usage
+                && !usage.is_empty()
+            {
+                child_cost_tracker.add_usage(usage);
+            }
 
-        if response.tool_calls.is_empty() {
-            conversation.add_assistant(
-                response.assistant_content.clone(),
-                response.assistant_reasoning,
-                vec![],
-            );
-            return (
-                ChildAgentResult {
+            if response.tool_calls.is_empty() {
+                conversation.add_assistant(
+                    response.assistant_content.clone(),
+                    response.assistant_reasoning,
+                    vec![],
+                );
+                return Ok(ChildAgentResult {
                     status: RunStatus::Success,
                     final_message: response.assistant_content,
                     error: None,
-                },
-                child_cost_tracker,
+                });
+            }
+
+            conversation.add_assistant(
+                response.assistant_content,
+                response.assistant_reasoning,
+                response.tool_calls.clone(),
             );
-        }
 
-        conversation.add_assistant(
-            response.assistant_content,
-            response.assistant_reasoning,
-            response.tool_calls.clone(),
-        );
+            for step in &response.steps {
+                if let ProviderStep::ToolCall(tool_request) = step {
+                    let (should_stop, result, child_cost) = execute_tool_for_tui(
+                        config,
+                        cwd,
+                        tool_request,
+                        event_tx,
+                        action_rx,
+                        subagent_depth,
+                        None,
+                        &policy,
+                        instructions,
+                        memory,
+                        &mcp_registry,
+                        hooks,
+                        None,
+                        &child_cancel,
+                    );
 
-        for step in &response.steps {
-            if let ProviderStep::ToolCall(tool_request) = step {
-                let (should_stop, result, child_cost) = execute_tool_for_tui(
-                    config,
-                    cwd,
-                    tool_request,
-                    event_tx,
-                    action_rx,
-                    subagent_depth,
-                    None,
-                    &policy,
-                    instructions,
-                    memory,
-                    &mcp_registry,
-                    hooks,
-                    None,
-                    &child_cancel,
-                );
+                    if let Some(c) = child_cost {
+                        child_cost_tracker.merge(&c);
+                    }
 
-                if let Some(c) = child_cost {
-                    child_cost_tracker.merge(&c);
-                }
+                    let result_content = agent_common::format_tool_result_for_model(&result);
+                    conversation.add_tool_result(tool_request.id.clone(), result_content);
 
-                let result_content = agent_common::format_tool_result_for_model(&result);
-                conversation.add_tool_result(tool_request.id.clone(), result_content);
-
-                if should_stop {
-                    return (
-                        ChildAgentResult {
+                    if should_stop {
+                        return Ok(ChildAgentResult {
                             status: RunStatus::Failed,
                             final_message: None,
                             error: result.error,
-                        },
-                        child_cost_tracker,
-                    );
+                        });
+                    }
                 }
             }
         }
-    }
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -718,6 +707,7 @@ pub(crate) fn run_child_agent_for_tui_silent(
     config: &RunConfig,
     cwd: &Path,
     prompt: &str,
+    subagent_model: Option<String>,
     subagent_depth: u32,
     subagent_type: &SubagentType,
     instructions: &ProjectInstructions,
@@ -731,6 +721,7 @@ pub(crate) fn run_child_agent_for_tui_silent(
         config,
         cwd,
         prompt,
+        subagent_model,
         &event_tx,
         &action_rx,
         subagent_depth,

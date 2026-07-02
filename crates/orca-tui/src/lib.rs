@@ -183,4 +183,20 @@ mod tests {
             "agent_subagent_execution should use the runtime child-agent result type"
         );
     }
+
+    #[test]
+    fn tui_subagent_child_runs_delegate_model_override_to_runtime() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let subagent =
+            std::fs::read_to_string(format!("{manifest_dir}/src/agent_subagent_execution.rs"))
+                .expect("TUI agent subagent execution module should exist");
+        assert!(
+            subagent.contains("run_child_agent_with_executor"),
+            "agent_subagent_execution should delegate child-agent model/cost setup to runtime"
+        );
+        assert!(
+            !subagent.contains("with_subagent_override"),
+            "agent_subagent_execution should not own child-agent model override logic"
+        );
+    }
 }

@@ -1418,6 +1418,7 @@ mod tests {
             &config,
             config.cwd.as_deref().unwrap_or_else(|| Path::new(".")),
             "bad_plan_then_fix",
+            None,
             1,
             &SubagentType::General,
             &instructions,
