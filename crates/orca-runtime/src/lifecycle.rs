@@ -26,7 +26,9 @@ use crate::cost::CostTracker;
 use crate::hooks::{HookContext, HookOutcome, HookRunner};
 use crate::memory::MemoryBlock;
 use crate::protocol::{PermissionGrantScope, PermissionResponseDecision, RequestPermissionProfile};
-use crate::provider_turn::{RuntimeTurnProviderCycleResult, RuntimeTurnProviderCycleStep};
+use crate::provider_turn::{
+    RuntimeProviderCycleInput, RuntimeTurnProviderCycleResult, RuntimeTurnProviderCycleStep,
+};
 use crate::runtime_bash::execute_bash_with_shell_session;
 use crate::session::{
     AgentConversationContext, bootstrap_agent_conversation_for_loop,
@@ -2099,32 +2101,34 @@ impl RuntimeTurnIterationStep {
         };
 
         match self.provider_cycle_step.run(
-            input.actor,
-            input.provider,
-            &turn_provider_config,
-            input.cwd,
-            input.context_config,
-            input.provider_config,
-            input.emit_deltas,
-            input.hooks,
-            input.cancel,
-            input.cost_tracker,
-            input.max_budget_usd,
-            input.events,
-            input.sink,
-            input.prepared_conversation,
-            input.config,
-            input.tool_policy,
-            input.subagent_depth,
-            input.policy,
-            input.instructions,
-            input.memory,
-            input.mcp_registry,
-            input.task_registry,
-            input.background_workflows,
-            input.workflow_ipc,
-            input.permission_handler,
-            input.steer_handle,
+            RuntimeProviderCycleInput {
+                actor: input.actor,
+                provider: input.provider,
+                turn_provider_config: &turn_provider_config,
+                cwd: input.cwd,
+                context_config: input.context_config,
+                base_provider_config: input.provider_config,
+                emit_deltas: input.emit_deltas,
+                hooks: input.hooks,
+                cancel: input.cancel,
+                cost_tracker: input.cost_tracker,
+                max_budget_usd: input.max_budget_usd,
+                events: input.events,
+                sink: input.sink,
+                conversation: input.prepared_conversation,
+                config: input.config,
+                tool_policy: input.tool_policy,
+                subagent_depth: input.subagent_depth,
+                policy: input.policy,
+                instructions: input.instructions,
+                memory: input.memory,
+                mcp_registry: input.mcp_registry,
+                task_registry: input.task_registry,
+                background_workflows: input.background_workflows,
+                workflow_ipc: input.workflow_ipc,
+                permission_handler: input.permission_handler,
+                steer_handle: input.steer_handle,
+            },
             child_executor,
             workflow_child_executor,
             batch_child_executor,

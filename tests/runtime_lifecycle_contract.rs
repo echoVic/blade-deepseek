@@ -97,6 +97,35 @@ fn turn_iteration_step_uses_grouped_runtime_input() {
 }
 
 #[test]
+fn provider_cycle_step_uses_grouped_runtime_input() {
+    let provider_turn = std::fs::read_to_string("crates/orca-runtime/src/provider_turn.rs")
+        .expect("provider turn source");
+
+    assert!(
+        provider_turn.contains("struct RuntimeProviderCycleInput"),
+        "provider cycle should have a grouped input boundary before deeper response/tool-turn refactors"
+    );
+
+    let run_impl = provider_turn
+        .split("impl RuntimeTurnProviderCycleStep")
+        .nth(1)
+        .and_then(|text| text.split("fn cancelled_provider_turn").next())
+        .expect("runtime turn provider cycle impl block");
+    assert!(
+        run_impl.contains("input: RuntimeProviderCycleInput"),
+        "provider cycle run should take grouped input instead of a long flat parameter list"
+    );
+    assert!(
+        !run_impl.contains("provider: ProviderKind"),
+        "provider should be carried by RuntimeProviderCycleInput"
+    );
+    assert!(
+        !run_impl.contains("background_workflows: &mut Vec<BackgroundWorkflowRun>"),
+        "mutable workflow state should be carried by RuntimeProviderCycleInput"
+    );
+}
+
+#[test]
 fn session_lifecycle_assigns_agent_task_and_monotonic_turns() {
     let mut lifecycle = RuntimeSessionLifecycle::new("run-test");
     let task = lifecycle.start_task(RuntimeTaskKind::Agent);
