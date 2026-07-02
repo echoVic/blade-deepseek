@@ -7,6 +7,7 @@ use orca_core::config::RunConfig;
 use orca_core::conversation::Conversation;
 use orca_core::event_schema::{EventFactory, RunStatus};
 use orca_core::event_sink::EventSink;
+use orca_core::model::ModelRouteContext;
 use orca_core::subagent_types::SubagentType;
 use orca_mcp::McpRegistry;
 use orca_provider::ProviderConfig;
@@ -212,6 +213,22 @@ pub fn prepare_child_agent_loop(
     }
 }
 
+pub fn route_child_agent_model(
+    config: &RunConfig,
+    request: &ChildAgentRequest,
+    setup: &ChildAgentLoopSetup,
+    child_cost_tracker: &mut CostTracker,
+) -> ProviderConfig {
+    let route_decision = config.model.route(ModelRouteContext {
+        subagent_type: &request.subagent_type,
+        subagent_model: None,
+    });
+    child_cost_tracker.set_model(Some(&route_decision.actual_model));
+    let mut provider_config = setup.provider_config.clone();
+    provider_config.model = Some(route_decision.actual_model);
+    provider_config
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -333,6 +350,43 @@ mod tests {
             Some(Message::User { content, .. }) if content == "inspect repo"
         ));
         assert!(format!("{:?}", setup.policy).contains("Suggest"));
+    }
+
+    #[test]
+    fn route_child_agent_model_updates_provider_config_and_cost_model() {
+        let request = ChildAgentRequest::new(
+            "inspect repo".to_string(),
+            SubagentType::General,
+            None,
+            2,
+            false,
+        );
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let runtime_config = config(None);
+        let setup = prepare_child_agent_loop(
+            &runtime_config,
+            &request,
+            std::env::temp_dir().as_path(),
+            &instructions,
+            &memory,
+        );
+        let mut tracker = CostTracker::new(None);
+
+        let provider_config =
+            route_child_agent_model(&runtime_config, &request, &setup, &mut tracker);
+        let totals = tracker.add_usage(Usage {
+            input_tokens: 1_000,
+            output_tokens: 1_000,
+            cache_tokens: 0,
+        });
+
+        assert_eq!(
+            provider_config.model.as_deref(),
+            Some(orca_core::model::PRO_MODEL)
+        );
+        let expected_pro_cost = (1_000.0 * 0.435 + 1_000.0 * 0.87) / 1_000_000.0;
+        assert!((totals.estimated_cost_usd - expected_pro_cost).abs() < 1e-12);
     }
 
     #[test]

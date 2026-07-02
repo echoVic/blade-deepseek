@@ -7,12 +7,12 @@ use orca_core::config::RunConfig;
 use orca_core::cost_types::UsageTotals;
 use orca_core::event_schema::{EventFactory, RunStatus};
 use orca_core::hook_types::HookEvent;
-use orca_core::model::ModelRouteContext;
 use orca_core::provider_types::ProviderStep;
 use orca_core::subagent_types::SubagentType;
 use orca_core::tool_types;
 use orca_runtime::agent_child::{
-    ChildAgentRequest, ChildAgentResult, prepare_child_agent_loop, run_child_agent_with_executor,
+    ChildAgentRequest, ChildAgentResult, prepare_child_agent_loop, route_child_agent_model,
+    run_child_agent_with_executor,
 };
 use orca_runtime::agent_common;
 use orca_runtime::cost::CostTracker;
@@ -530,13 +530,8 @@ fn run_child_agent_for_tui(
                 }
 
                 let child_cancel = CancelToken::new();
-                let route_decision = config.model.route(ModelRouteContext {
-                    subagent_type: &request.subagent_type,
-                    subagent_model: None,
-                });
-                child_cost_tracker.set_model(Some(&route_decision.actual_model));
-                let mut turn_provider_config = setup.provider_config.clone();
-                turn_provider_config.model = Some(route_decision.actual_model.clone());
+                let turn_provider_config =
+                    route_child_agent_model(config, request, &setup, child_cost_tracker);
 
                 let pre_model_outcome = match hooks.run(
                     HookEvent::PreModelCall,

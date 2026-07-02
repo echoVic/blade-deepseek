@@ -223,4 +223,24 @@ mod tests {
             "agent_subagent_execution should not own child system prompt construction"
         );
     }
+
+    #[test]
+    fn tui_subagent_child_model_routing_is_runtime_owned() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let subagent =
+            std::fs::read_to_string(format!("{manifest_dir}/src/agent_subagent_execution.rs"))
+                .expect("TUI agent subagent execution module should exist");
+        assert!(
+            subagent.contains("route_child_agent_model"),
+            "agent_subagent_execution should delegate child model routing to runtime"
+        );
+        assert!(
+            !subagent.contains("ModelRouteContext"),
+            "agent_subagent_execution should not construct child model route context"
+        );
+        assert!(
+            !subagent.contains("set_model"),
+            "agent_subagent_execution should not update child cost model directly"
+        );
+    }
 }
