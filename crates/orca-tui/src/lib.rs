@@ -1,3 +1,4 @@
+mod agent_runner;
 pub mod app;
 pub mod bridge;
 pub mod commands;
@@ -69,6 +70,24 @@ mod tests {
         assert!(
             !bridge.contains("resolve_interactive_tool_approval"),
             "bridge should delegate interactive approval waits to the interaction adapter"
+        );
+    }
+
+    #[test]
+    fn tui_agent_runner_is_owned_by_dedicated_module() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let runner = std::fs::read_to_string(format!("{manifest_dir}/src/agent_runner.rs"))
+            .expect("TUI agent runner module should exist");
+        assert!(
+            runner.contains("pub fn run_agent_for_tui"),
+            "agent_runner should own the TUI agent turn loop entrypoint"
+        );
+
+        let bridge = std::fs::read_to_string(format!("{manifest_dir}/src/bridge.rs"))
+            .expect("bridge source should be readable");
+        assert!(
+            !bridge.contains("pub fn run_agent_for_tui"),
+            "bridge should not own the TUI agent turn loop"
         );
     }
 }
