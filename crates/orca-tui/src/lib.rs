@@ -402,6 +402,26 @@ mod tests {
     }
 
     #[test]
+    fn tui_subagent_child_tool_executor_uses_runtime_tool_context() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let subagent =
+            std::fs::read_to_string(format!("{manifest_dir}/src/agent_subagent_execution.rs"))
+                .expect("TUI agent subagent execution module should exist");
+        assert!(
+            subagent.contains("tool_context.policy"),
+            "agent_subagent_execution should consume a narrow runtime tool context"
+        );
+        assert!(
+            subagent.contains("tool_context.mcp_registry"),
+            "agent_subagent_execution should consume runtime MCP context through tool context"
+        );
+        assert!(
+            !subagent.contains("setup.policy") && !subagent.contains("setup.mcp_registry"),
+            "agent_subagent_execution should not depend on child loop setup internals"
+        );
+    }
+
+    #[test]
     fn tui_subagent_child_tool_request_extraction_is_runtime_owned() {
         let manifest_dir = env!("CARGO_MANIFEST_DIR");
         let subagent =

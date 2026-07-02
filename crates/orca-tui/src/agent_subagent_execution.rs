@@ -493,7 +493,7 @@ fn run_child_agent_for_tui(
                 memory,
                 hooks,
                 child_cost_tracker,
-                |setup, child_cancel, tool_request| {
+                |tool_context, child_cancel, tool_request| {
                     let (should_stop, result, child_cost) = execute_tool_for_tui(
                         config,
                         cwd,
@@ -502,10 +502,10 @@ fn run_child_agent_for_tui(
                         action_rx,
                         request.depth,
                         None,
-                        &setup.policy,
+                        tool_context.policy,
                         instructions,
                         memory,
-                        &setup.mcp_registry,
+                        tool_context.mcp_registry,
                         hooks,
                         None,
                         child_cancel,

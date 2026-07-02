@@ -94,6 +94,11 @@ pub struct ChildAgentToolExecution {
     pub child_cost: Option<CostTracker>,
 }
 
+pub struct ChildAgentToolContext<'a> {
+    pub policy: &'a ApprovalPolicy,
+    pub mcp_registry: &'a McpRegistry,
+}
+
 pub enum ChildAgentTurnBudget {
     Continue,
     Stop(ChildAgentResult),
@@ -471,7 +476,7 @@ pub fn run_child_agent_loop_with_tool_executor<F>(
     mut execute_tool: F,
 ) -> io::Result<ChildAgentResult>
 where
-    F: FnMut(&ChildAgentLoopSetup, &CancelToken, &ToolRequest) -> ChildAgentToolExecution,
+    F: FnMut(&ChildAgentToolContext<'_>, &CancelToken, &ToolRequest) -> ChildAgentToolExecution,
 {
     let mut setup = prepare_child_agent_loop(config, request, cwd, instructions, memory);
     loop {
@@ -510,7 +515,11 @@ where
         }
 
         for tool_request in child_agent_tool_requests(&response) {
-            let tool_execution = execute_tool(&setup, &child_cancel, tool_request);
+            let tool_context = ChildAgentToolContext {
+                policy: &setup.policy,
+                mcp_registry: &setup.mcp_registry,
+            };
+            let tool_execution = execute_tool(&tool_context, &child_cancel, tool_request);
             match fold_child_agent_tool_result(
                 &mut setup,
                 tool_request,
