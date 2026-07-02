@@ -437,6 +437,17 @@ pub fn fold_child_agent_provider_response(
     ChildAgentProviderResponseFold::ContinueToTools
 }
 
+pub fn child_agent_tool_requests(response: &ProviderResponse) -> Vec<&ToolRequest> {
+    response
+        .steps
+        .iter()
+        .filter_map(|step| match step {
+            ProviderStep::ToolCall(request) => Some(request),
+            _ => None,
+        })
+        .collect()
+}
+
 pub fn fold_child_agent_tool_result(
     setup: &mut ChildAgentLoopSetup,
     tool_request: &ToolRequest,
@@ -1033,6 +1044,42 @@ mod tests {
                 ..
             }) if content == "I need a tool" && tool_calls.len() == 1
         ));
+    }
+
+    #[test]
+    fn child_agent_tool_requests_extracts_only_provider_tool_calls() {
+        let first = ToolRequest {
+            id: "tool-1".to_string(),
+            name: ToolName::Bash,
+            action: ActionKind::Shell,
+            target: Some("echo one".to_string()),
+            raw_arguments: None,
+        };
+        let second = ToolRequest {
+            id: "tool-2".to_string(),
+            name: ToolName::ReadFile,
+            action: ActionKind::Read,
+            target: Some("Cargo.toml".to_string()),
+            raw_arguments: None,
+        };
+        let response = ProviderResponse {
+            steps: vec![
+                ProviderStep::MessageDelta("before".to_string()),
+                ProviderStep::ToolCall(first.clone()),
+                ProviderStep::Error("ignored here".to_string()),
+                ProviderStep::ToolCall(second.clone()),
+            ],
+            assistant_content: Some("tool please".to_string()),
+            assistant_reasoning: None,
+            tool_calls: vec![],
+            usage: None,
+        };
+
+        let requests = child_agent_tool_requests(&response);
+
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].id, first.id);
+        assert_eq!(requests[1].id, second.id);
     }
 
     #[test]

@@ -6,16 +6,15 @@ use orca_core::cancel::CancelToken;
 use orca_core::config::RunConfig;
 use orca_core::cost_types::UsageTotals;
 use orca_core::event_schema::{EventFactory, RunStatus};
-use orca_core::provider_types::ProviderStep;
 use orca_core::subagent_types::SubagentType;
 use orca_core::tool_types;
 use orca_runtime::agent_child::{
     ChildAgentProviderErrorDecision, ChildAgentProviderResponseFold, ChildAgentProviderTurn,
     ChildAgentRequest, ChildAgentResult, ChildAgentToolResultFold, ChildAgentTurnBudget,
-    advance_child_agent_turn, compact_child_agent_conversation_if_needed,
-    fold_child_agent_provider_response, fold_child_agent_tool_result,
-    handle_child_agent_provider_error, prepare_child_agent_loop, route_child_agent_model,
-    run_child_agent_provider_turn, run_child_agent_with_executor,
+    advance_child_agent_turn, child_agent_tool_requests,
+    compact_child_agent_conversation_if_needed, fold_child_agent_provider_response,
+    fold_child_agent_tool_result, handle_child_agent_provider_error, prepare_child_agent_loop,
+    route_child_agent_model, run_child_agent_provider_turn, run_child_agent_with_executor,
 };
 use orca_runtime::cost::CostTracker;
 use orca_runtime::hooks::HookRunner;
@@ -537,36 +536,34 @@ fn run_child_agent_for_tui(
                     ChildAgentProviderResponseFold::ContinueToTools => {}
                 }
 
-                for step in &response.steps {
-                    if let ProviderStep::ToolCall(tool_request) = step {
-                        let (should_stop, result, child_cost) = execute_tool_for_tui(
-                            config,
-                            cwd,
-                            tool_request,
-                            event_tx,
-                            action_rx,
-                            request.depth,
-                            None,
-                            &setup.policy,
-                            instructions,
-                            memory,
-                            &setup.mcp_registry,
-                            hooks,
-                            None,
-                            &child_cancel,
-                        );
+                for tool_request in child_agent_tool_requests(&response) {
+                    let (should_stop, result, child_cost) = execute_tool_for_tui(
+                        config,
+                        cwd,
+                        tool_request,
+                        event_tx,
+                        action_rx,
+                        request.depth,
+                        None,
+                        &setup.policy,
+                        instructions,
+                        memory,
+                        &setup.mcp_registry,
+                        hooks,
+                        None,
+                        &child_cancel,
+                    );
 
-                        match fold_child_agent_tool_result(
-                            &mut setup,
-                            tool_request,
-                            should_stop,
-                            result,
-                            child_cost,
-                            child_cost_tracker,
-                        ) {
-                            ChildAgentToolResultFold::Continue => {}
-                            ChildAgentToolResultFold::Stop(result) => return Ok(result),
-                        }
+                    match fold_child_agent_tool_result(
+                        &mut setup,
+                        tool_request,
+                        should_stop,
+                        result,
+                        child_cost,
+                        child_cost_tracker,
+                    ) {
+                        ChildAgentToolResultFold::Continue => {}
+                        ChildAgentToolResultFold::Stop(result) => return Ok(result),
                     }
                 }
             }

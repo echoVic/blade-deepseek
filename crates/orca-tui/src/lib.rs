@@ -380,4 +380,24 @@ mod tests {
             "agent_subagent_execution should not construct child budget-exhausted results"
         );
     }
+
+    #[test]
+    fn tui_subagent_child_tool_request_extraction_is_runtime_owned() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let subagent =
+            std::fs::read_to_string(format!("{manifest_dir}/src/agent_subagent_execution.rs"))
+                .expect("TUI agent subagent execution module should exist");
+        assert!(
+            subagent.contains("child_agent_tool_requests"),
+            "agent_subagent_execution should delegate provider tool-call extraction to runtime"
+        );
+        assert!(
+            !subagent.contains("ProviderStep"),
+            "agent_subagent_execution should not inspect provider steps directly"
+        );
+        assert!(
+            !subagent.contains("response.steps"),
+            "agent_subagent_execution should not iterate provider response steps directly"
+        );
+    }
 }
