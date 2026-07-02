@@ -535,6 +535,40 @@ where
     }
 }
 
+pub fn run_child_agent_with_tool_executor<F>(
+    config: &RunConfig,
+    request: &ChildAgentRequest,
+    cwd: &Path,
+    instructions: &ProjectInstructions,
+    memory: &MemoryBlock,
+    hooks: &HookRunner,
+    mut execute_tool: F,
+) -> (ChildAgentResult, CostTracker)
+where
+    F: FnMut(
+        &RunConfig,
+        &ChildAgentRequest,
+        &ChildAgentToolContext<'_>,
+        &CancelToken,
+        &ToolRequest,
+    ) -> ChildAgentToolExecution,
+{
+    run_child_agent_with_executor(config, request, |config, request, child_cost_tracker| {
+        run_child_agent_loop_with_tool_executor(
+            config,
+            request,
+            cwd,
+            instructions,
+            memory,
+            hooks,
+            child_cost_tracker,
+            |tool_context, child_cancel, tool_request| {
+                execute_tool(config, request, tool_context, child_cancel, tool_request)
+            },
+        )
+    })
+}
+
 pub fn fold_child_agent_tool_result(
     setup: &mut ChildAgentLoopSetup,
     tool_request: &ToolRequest,
@@ -1234,6 +1268,51 @@ mod tests {
             result.final_message.as_deref(),
             Some("Mock completed after tool execution.")
         );
+        assert_eq!(tool_count, 1);
+    }
+
+    #[test]
+    fn run_child_agent_with_tool_executor_applies_override_and_runs_loop() {
+        let request = ChildAgentRequest::new(
+            "bash echo child".to_string(),
+            SubagentType::General,
+            Some(FLASH_MODEL.to_string()),
+            3,
+            false,
+        );
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let runtime_config = config(None);
+        let mut saw_child_config = false;
+        let mut tool_count = 0;
+
+        let (result, _tracker) = run_child_agent_with_tool_executor(
+            &runtime_config,
+            &request,
+            std::env::temp_dir().as_path(),
+            &instructions,
+            &memory,
+            &HookRunner::default(),
+            |child_config, child_request, _tool_context, _cancel, tool_request| {
+                saw_child_config = true;
+                tool_count += 1;
+                assert_eq!(child_config.model.as_deref(), Some(FLASH_MODEL));
+                assert_eq!(child_request.depth, 3);
+                assert_eq!(tool_request.name, ToolName::Bash);
+                ChildAgentToolExecution {
+                    should_stop: false,
+                    result: ToolResult::completed(
+                        tool_request,
+                        "child tool ran".to_string(),
+                        false,
+                    ),
+                    child_cost: None,
+                }
+            },
+        );
+
+        assert_eq!(result.status, RunStatus::Success);
+        assert!(saw_child_config);
         assert_eq!(tool_count, 1);
     }
 

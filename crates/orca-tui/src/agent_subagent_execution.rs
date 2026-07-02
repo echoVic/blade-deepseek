@@ -9,7 +9,7 @@ use orca_core::subagent_types::SubagentType;
 use orca_core::tool_types;
 use orca_runtime::agent_child::{
     ChildAgentRequest, ChildAgentResult, ChildAgentToolExecution,
-    run_child_agent_loop_with_tool_executor, run_child_agent_with_executor,
+    run_child_agent_with_tool_executor,
 };
 use orca_runtime::cost::CostTracker;
 use orca_runtime::hooks::HookRunner;
@@ -481,42 +481,35 @@ fn run_child_agent_for_tui(
         subagent_depth,
         false,
     );
-    run_child_agent_with_executor(
+    run_child_agent_with_tool_executor(
         config,
         &child_request,
-        |config, request, child_cost_tracker| {
-            run_child_agent_loop_with_tool_executor(
+        cwd,
+        instructions,
+        memory,
+        hooks,
+        |config, request, tool_context, child_cancel, tool_request| {
+            let (should_stop, result, child_cost) = execute_tool_for_tui(
                 config,
-                request,
                 cwd,
+                tool_request,
+                event_tx,
+                action_rx,
+                request.depth,
+                None,
+                tool_context.policy,
                 instructions,
                 memory,
+                tool_context.mcp_registry,
                 hooks,
-                child_cost_tracker,
-                |tool_context, child_cancel, tool_request| {
-                    let (should_stop, result, child_cost) = execute_tool_for_tui(
-                        config,
-                        cwd,
-                        tool_request,
-                        event_tx,
-                        action_rx,
-                        request.depth,
-                        None,
-                        tool_context.policy,
-                        instructions,
-                        memory,
-                        tool_context.mcp_registry,
-                        hooks,
-                        None,
-                        child_cancel,
-                    );
-                    ChildAgentToolExecution {
-                        should_stop,
-                        result,
-                        child_cost,
-                    }
-                },
-            )
+                None,
+                child_cancel,
+            );
+            ChildAgentToolExecution {
+                should_stop,
+                result,
+                child_cost,
+            }
         },
     )
 }

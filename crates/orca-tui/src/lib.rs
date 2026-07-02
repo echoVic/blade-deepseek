@@ -191,8 +191,12 @@ mod tests {
             std::fs::read_to_string(format!("{manifest_dir}/src/agent_subagent_execution.rs"))
                 .expect("TUI agent subagent execution module should exist");
         assert!(
-            subagent.contains("run_child_agent_with_executor"),
+            subagent.contains("run_child_agent_with_tool_executor"),
             "agent_subagent_execution should delegate child-agent model/cost setup to runtime"
+        );
+        assert!(
+            !subagent.contains("run_child_agent_with_executor"),
+            "agent_subagent_execution should not call the low-level child-agent executor wrapper"
         );
         assert!(
             !subagent.contains("with_subagent_override"),
@@ -207,7 +211,7 @@ mod tests {
             std::fs::read_to_string(format!("{manifest_dir}/src/agent_subagent_execution.rs"))
                 .expect("TUI agent subagent execution module should exist");
         assert!(
-            subagent.contains("run_child_agent_loop_with_tool_executor"),
+            subagent.contains("run_child_agent_with_tool_executor"),
             "agent_subagent_execution should delegate child loop orchestration to runtime"
         );
         assert!(
