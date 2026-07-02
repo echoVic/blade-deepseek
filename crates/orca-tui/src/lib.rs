@@ -382,6 +382,22 @@ mod tests {
     }
 
     #[test]
+    fn tui_subagent_child_loop_state_is_runtime_owned() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let subagent =
+            std::fs::read_to_string(format!("{manifest_dir}/src/agent_subagent_execution.rs"))
+                .expect("TUI agent subagent execution module should exist");
+        assert!(
+            !subagent.contains("let mut turn"),
+            "agent_subagent_execution should not own child turn state"
+        );
+        assert!(
+            !subagent.contains("reactive_compacted"),
+            "agent_subagent_execution should not own child reactive compaction state"
+        );
+    }
+
+    #[test]
     fn tui_subagent_child_tool_request_extraction_is_runtime_owned() {
         let manifest_dir = env!("CARGO_MANIFEST_DIR");
         let subagent =

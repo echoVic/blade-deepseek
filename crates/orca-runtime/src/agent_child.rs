@@ -99,6 +99,8 @@ pub struct ChildAgentLoopSetup {
     pub context_config: ContextConfig,
     pub conversation: Conversation,
     pub policy: ApprovalPolicy,
+    turn: u32,
+    reactive_compacted: bool,
 }
 
 pub(crate) type ChildAgentExecutor<W> = fn(
@@ -241,16 +243,21 @@ pub fn prepare_child_agent_loop(
         context_config,
         conversation,
         policy,
+        turn: 0,
+        reactive_compacted: false,
     }
 }
 
-pub fn advance_child_agent_turn(turn: &mut u32) -> ChildAgentTurnBudget {
-    advance_child_agent_turn_with_limit(turn, DEFAULT_CHILD_AGENT_MAX_TURNS)
+pub fn advance_child_agent_turn(setup: &mut ChildAgentLoopSetup) -> ChildAgentTurnBudget {
+    advance_child_agent_turn_with_limit(setup, DEFAULT_CHILD_AGENT_MAX_TURNS)
 }
 
-pub fn advance_child_agent_turn_with_limit(turn: &mut u32, max_turns: u32) -> ChildAgentTurnBudget {
-    *turn = turn.saturating_add(1);
-    if *turn > max_turns {
+pub fn advance_child_agent_turn_with_limit(
+    setup: &mut ChildAgentLoopSetup,
+    max_turns: u32,
+) -> ChildAgentTurnBudget {
+    setup.turn = setup.turn.saturating_add(1);
+    if setup.turn > max_turns {
         return ChildAgentTurnBudget::Stop(ChildAgentResult {
             status: RunStatus::BudgetExhausted,
             final_message: None,
@@ -367,17 +374,16 @@ pub fn handle_child_agent_provider_error(
     cwd: &Path,
     hooks: &HookRunner,
     response: &ProviderResponse,
-    reactive_compacted: &mut bool,
 ) -> io::Result<Option<ChildAgentProviderErrorDecision>> {
     let Some(error) = response.steps.iter().find_map(|step| match step {
         ProviderStep::Error(message) => Some(message.clone()),
         _ => None,
     }) else {
-        *reactive_compacted = false;
+        setup.reactive_compacted = false;
         return Ok(None);
     };
 
-    if orca_provider::context::is_prompt_too_long_error(&error) && !*reactive_compacted {
+    if orca_provider::context::is_prompt_too_long_error(&error) && !setup.reactive_compacted {
         let mut events = EventFactory::new("child-agent-compaction".to_string());
         let mut sink = EventSink::new(io::sink(), config.output_format);
         let mut compaction = RuntimeCompactionStep::new(
@@ -392,7 +398,7 @@ pub fn handle_child_agent_provider_error(
             None,
         );
         compaction.compact_after_prompt_too_long(&mut setup.conversation)?;
-        *reactive_compacted = true;
+        setup.reactive_compacted = true;
         return Ok(Some(ChildAgentProviderErrorDecision::RetryAfterCompaction));
     }
 
@@ -562,6 +568,25 @@ mod tests {
         )
     }
 
+    fn child_loop_setup(runtime_config: &RunConfig) -> ChildAgentLoopSetup {
+        let request = ChildAgentRequest::new(
+            "inspect repo".to_string(),
+            SubagentType::General,
+            None,
+            2,
+            false,
+        );
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        prepare_child_agent_loop(
+            runtime_config,
+            &request,
+            std::env::temp_dir().as_path(),
+            &instructions,
+            &memory,
+        )
+    }
+
     #[test]
     fn prepare_child_agent_loop_builds_provider_conversation_and_policy() {
         let request = ChildAgentRequest::new(
@@ -598,38 +623,42 @@ mod tests {
             Some(Message::User { content, .. }) if content == "inspect repo"
         ));
         assert!(format!("{:?}", setup.policy).contains("Suggest"));
+        assert_eq!(setup.turn, 0);
+        assert!(!setup.reactive_compacted);
     }
 
     #[test]
     fn advance_child_agent_turn_stops_after_runtime_owned_limit() {
-        let mut turn = 0;
+        let runtime_config = config(None);
+        let mut setup = child_loop_setup(&runtime_config);
 
         assert!(matches!(
-            advance_child_agent_turn_with_limit(&mut turn, 1),
+            advance_child_agent_turn_with_limit(&mut setup, 1),
             ChildAgentTurnBudget::Continue
         ));
-        assert_eq!(turn, 1);
+        assert_eq!(setup.turn, 1);
 
-        match advance_child_agent_turn_with_limit(&mut turn, 1) {
+        match advance_child_agent_turn_with_limit(&mut setup, 1) {
             ChildAgentTurnBudget::Stop(result) => {
                 assert_eq!(result.status, RunStatus::BudgetExhausted);
                 assert_eq!(result.error.as_deref(), Some("max turns exhausted"));
             }
             ChildAgentTurnBudget::Continue => panic!("turn beyond limit should stop"),
         }
-        assert_eq!(turn, 2);
+        assert_eq!(setup.turn, 2);
     }
 
     #[test]
     fn advance_child_agent_turn_uses_default_child_limit() {
-        let mut turn = 0;
+        let runtime_config = config(None);
+        let mut setup = child_loop_setup(&runtime_config);
 
         assert!(matches!(
-            advance_child_agent_turn(&mut turn),
+            advance_child_agent_turn(&mut setup),
             ChildAgentTurnBudget::Continue
         ));
 
-        assert_eq!(turn, 1);
+        assert_eq!(setup.turn, 1);
     }
 
     #[test]
@@ -901,7 +930,6 @@ mod tests {
             tool_calls: vec![],
             usage: None,
         };
-        let mut reactive_compacted = false;
 
         let decision = handle_child_agent_provider_error(
             &runtime_config,
@@ -909,7 +937,6 @@ mod tests {
             std::env::temp_dir().as_path(),
             &HookRunner::default(),
             &response,
-            &mut reactive_compacted,
         )
         .expect("provider-error handling should not fail")
         .expect("prompt-too-long should produce a decision");
@@ -918,7 +945,7 @@ mod tests {
             decision,
             ChildAgentProviderErrorDecision::RetryAfterCompaction
         ));
-        assert!(reactive_compacted);
+        assert!(setup.reactive_compacted);
         assert!(setup.conversation.messages.len() < before_messages);
 
         let decision = handle_child_agent_provider_error(
@@ -927,7 +954,6 @@ mod tests {
             std::env::temp_dir().as_path(),
             &HookRunner::default(),
             &response,
-            &mut reactive_compacted,
         )
         .expect("provider-error handling should not fail")
         .expect("repeated prompt-too-long should fail");

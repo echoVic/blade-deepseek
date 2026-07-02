@@ -491,10 +491,8 @@ fn run_child_agent_for_tui(
         &child_request,
         |config, request, child_cost_tracker| {
             let mut setup = prepare_child_agent_loop(config, request, cwd, instructions, memory);
-            let mut turn: u32 = 0;
-            let mut reactive_compacted = false;
             loop {
-                match advance_child_agent_turn(&mut turn) {
+                match advance_child_agent_turn(&mut setup) {
                     ChildAgentTurnBudget::Continue => {}
                     ChildAgentTurnBudget::Stop(result) => return Ok(result),
                 }
@@ -517,14 +515,8 @@ fn run_child_agent_for_tui(
                     ChildAgentProviderTurn::Fail(result) => return Ok(result),
                 };
 
-                match handle_child_agent_provider_error(
-                    config,
-                    &mut setup,
-                    cwd,
-                    hooks,
-                    &response,
-                    &mut reactive_compacted,
-                )? {
+                match handle_child_agent_provider_error(config, &mut setup, cwd, hooks, &response)?
+                {
                     Some(ChildAgentProviderErrorDecision::RetryAfterCompaction) => continue,
                     Some(ChildAgentProviderErrorDecision::Fail(result)) => return Ok(result),
                     None => {}
