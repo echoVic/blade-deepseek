@@ -18,7 +18,7 @@ use orca_provider::tool_schema::deepseek_tools_schema_for_type_with_mcp_and_exte
 use crate::agent_common;
 use crate::compaction::RuntimeCompactionStep;
 use crate::cost::CostTracker;
-use crate::hooks::HookRunner;
+use crate::hooks::{HookContext, HookRunner, conversation_with_hook_context};
 use crate::instructions::ProjectInstructions;
 use crate::lifecycle::RuntimeSessionLifecycle;
 use crate::memory::MemoryBlock;
@@ -67,6 +67,11 @@ pub struct ChildAgentResult {
 #[derive(Debug)]
 pub enum ChildAgentProviderErrorDecision {
     RetryAfterCompaction,
+    Fail(ChildAgentResult),
+}
+
+pub enum ChildAgentProviderTurn {
+    Response(ProviderResponse),
     Fail(ChildAgentResult),
 }
 
@@ -237,6 +242,68 @@ pub fn route_child_agent_model(
     provider_config
 }
 
+pub fn run_child_agent_provider_turn(
+    config: &RunConfig,
+    setup: &ChildAgentLoopSetup,
+    cwd: &Path,
+    hooks: &HookRunner,
+    provider_config: &ProviderConfig,
+    cancel: &CancelToken,
+) -> ChildAgentProviderTurn {
+    let pre_model_outcome = match hooks.run(
+        orca_core::hook_types::HookEvent::PreModelCall,
+        HookContext {
+            cwd: &cwd.display().to_string(),
+            session_status: None,
+            tool_request: None,
+            tool_result: None,
+            before_messages: None,
+            after_messages: None,
+            usage: None,
+        },
+    ) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            return ChildAgentProviderTurn::Fail(ChildAgentResult {
+                status: RunStatus::Failed,
+                final_message: None,
+                error: Some(format!("pre_model_call hook failed: {error}")),
+            });
+        }
+    };
+    let model_conversation =
+        conversation_with_hook_context(&setup.conversation, &pre_model_outcome);
+
+    let response = orca_provider::call_streaming(
+        config.provider,
+        &model_conversation,
+        provider_config,
+        cancel,
+        &mut |_| {},
+    );
+
+    if let Err(error) = hooks.run(
+        orca_core::hook_types::HookEvent::PostModelCall,
+        HookContext {
+            cwd: &cwd.display().to_string(),
+            session_status: None,
+            tool_request: None,
+            tool_result: None,
+            before_messages: None,
+            after_messages: None,
+            usage: response.usage.as_ref(),
+        },
+    ) {
+        return ChildAgentProviderTurn::Fail(ChildAgentResult {
+            status: RunStatus::Failed,
+            final_message: None,
+            error: Some(format!("post_model_call hook failed: {error}")),
+        });
+    }
+
+    ChildAgentProviderTurn::Response(response)
+}
+
 pub fn compact_child_agent_conversation_if_needed(
     config: &RunConfig,
     setup: &mut ChildAgentLoopSetup,
@@ -316,7 +383,7 @@ mod tests {
     use orca_core::event_schema::EventFactory;
     use orca_core::event_sink::EventSink;
     use orca_core::external_config::ExternalToolConfig;
-    use orca_core::hook_types::HookConfig;
+    use orca_core::hook_types::{HookConfig, HookEvent};
     use orca_core::mcp_types::McpServerConfig;
     use orca_core::model::{AUTO_MODEL, FLASH_MODEL, ModelSelection};
     use orca_core::provider_types::{ProviderResponse, ProviderStep, Usage};
@@ -461,6 +528,146 @@ mod tests {
         );
         let expected_pro_cost = (1_000.0 * 0.435 + 1_000.0 * 0.87) / 1_000_000.0;
         assert!((totals.estimated_cost_usd - expected_pro_cost).abs() < 1e-12);
+    }
+
+    #[test]
+    fn run_child_agent_provider_turn_applies_model_hooks_around_provider_call() {
+        let request = ChildAgentRequest::new(
+            "mock_system_echo".to_string(),
+            SubagentType::General,
+            None,
+            2,
+            false,
+        );
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let runtime_config = config(None);
+        let setup = prepare_child_agent_loop(
+            &runtime_config,
+            &request,
+            std::env::temp_dir().as_path(),
+            &instructions,
+            &memory,
+        );
+        let provider_config = route_child_agent_model(
+            &runtime_config,
+            &request,
+            &setup,
+            &mut CostTracker::new(None),
+        );
+        let hooks = HookRunner::new(vec![HookConfig {
+            event: HookEvent::PreModelCall,
+            command: "printf runtime-hook-context".to_string(),
+            tool: None,
+        }]);
+        let cancel = CancelToken::new();
+
+        let turn = run_child_agent_provider_turn(
+            &runtime_config,
+            &setup,
+            std::env::temp_dir().as_path(),
+            &hooks,
+            &provider_config,
+            &cancel,
+        );
+
+        let ChildAgentProviderTurn::Response(response) = turn else {
+            panic!("expected provider response")
+        };
+        assert!(
+            response
+                .assistant_content
+                .as_deref()
+                .unwrap_or_default()
+                .contains("runtime-hook-context")
+        );
+    }
+
+    #[test]
+    fn run_child_agent_provider_turn_returns_child_failure_for_model_hook_errors() {
+        let request = ChildAgentRequest::new(
+            "inspect repo".to_string(),
+            SubagentType::General,
+            None,
+            2,
+            false,
+        );
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let runtime_config = config(None);
+        let setup = prepare_child_agent_loop(
+            &runtime_config,
+            &request,
+            std::env::temp_dir().as_path(),
+            &instructions,
+            &memory,
+        );
+        let provider_config = route_child_agent_model(
+            &runtime_config,
+            &request,
+            &setup,
+            &mut CostTracker::new(None),
+        );
+        let cancel = CancelToken::new();
+        let pre_hooks = HookRunner::new(vec![HookConfig {
+            event: HookEvent::PreModelCall,
+            command: "printf pre-failed >&2; exit 7".to_string(),
+            tool: None,
+        }]);
+
+        let pre_turn = run_child_agent_provider_turn(
+            &runtime_config,
+            &setup,
+            std::env::temp_dir().as_path(),
+            &pre_hooks,
+            &provider_config,
+            &cancel,
+        );
+
+        match pre_turn {
+            ChildAgentProviderTurn::Fail(result) => {
+                assert_eq!(result.status, RunStatus::Failed);
+                assert!(
+                    result
+                        .error
+                        .as_deref()
+                        .unwrap_or_default()
+                        .contains("pre_model_call hook failed")
+                );
+            }
+            ChildAgentProviderTurn::Response(_) => panic!("pre hook failure should fail the child"),
+        }
+
+        let post_hooks = HookRunner::new(vec![HookConfig {
+            event: HookEvent::PostModelCall,
+            command: "printf post-failed >&2; exit 8".to_string(),
+            tool: None,
+        }]);
+
+        let post_turn = run_child_agent_provider_turn(
+            &runtime_config,
+            &setup,
+            std::env::temp_dir().as_path(),
+            &post_hooks,
+            &provider_config,
+            &cancel,
+        );
+
+        match post_turn {
+            ChildAgentProviderTurn::Fail(result) => {
+                assert_eq!(result.status, RunStatus::Failed);
+                assert!(
+                    result
+                        .error
+                        .as_deref()
+                        .unwrap_or_default()
+                        .contains("post_model_call hook failed")
+                );
+            }
+            ChildAgentProviderTurn::Response(_) => {
+                panic!("post hook failure should fail the child")
+            }
+        }
     }
 
     #[test]

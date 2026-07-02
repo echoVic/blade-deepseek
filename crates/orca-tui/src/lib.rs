@@ -283,4 +283,29 @@ mod tests {
             "agent_subagent_execution should not compact child conversations directly"
         );
     }
+
+    #[test]
+    fn tui_subagent_child_provider_turn_is_runtime_owned() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let subagent =
+            std::fs::read_to_string(format!("{manifest_dir}/src/agent_subagent_execution.rs"))
+                .expect("TUI agent subagent execution module should exist");
+        assert!(
+            subagent.contains("run_child_agent_provider_turn"),
+            "agent_subagent_execution should delegate child provider turns to runtime"
+        );
+        assert!(
+            !subagent.contains("call_streaming"),
+            "agent_subagent_execution should not call providers directly"
+        );
+        assert!(
+            !subagent.contains("HookEvent::PreModelCall")
+                && !subagent.contains("HookEvent::PostModelCall"),
+            "agent_subagent_execution should not run child model hooks directly"
+        );
+        assert!(
+            !subagent.contains("conversation_with_hook_context"),
+            "agent_subagent_execution should not build child model hook conversations"
+        );
+    }
 }

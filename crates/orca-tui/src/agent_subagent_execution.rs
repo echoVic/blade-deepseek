@@ -6,18 +6,18 @@ use orca_core::cancel::CancelToken;
 use orca_core::config::RunConfig;
 use orca_core::cost_types::UsageTotals;
 use orca_core::event_schema::{EventFactory, RunStatus};
-use orca_core::hook_types::HookEvent;
 use orca_core::provider_types::ProviderStep;
 use orca_core::subagent_types::SubagentType;
 use orca_core::tool_types;
 use orca_runtime::agent_child::{
-    ChildAgentProviderErrorDecision, ChildAgentRequest, ChildAgentResult,
+    ChildAgentProviderErrorDecision, ChildAgentProviderTurn, ChildAgentRequest, ChildAgentResult,
     compact_child_agent_conversation_if_needed, handle_child_agent_provider_error,
-    prepare_child_agent_loop, route_child_agent_model, run_child_agent_with_executor,
+    prepare_child_agent_loop, route_child_agent_model, run_child_agent_provider_turn,
+    run_child_agent_with_executor,
 };
 use orca_runtime::agent_common;
 use orca_runtime::cost::CostTracker;
-use orca_runtime::hooks::{HookContext, HookRunner, conversation_with_hook_context};
+use orca_runtime::hooks::HookRunner;
 use orca_runtime::instructions::ProjectInstructions;
 use orca_runtime::memory::MemoryBlock;
 use orca_runtime::subagent::{self, SubagentMode};
@@ -509,56 +509,17 @@ fn run_child_agent_for_tui(
                 let turn_provider_config =
                     route_child_agent_model(config, request, &setup, child_cost_tracker);
 
-                let pre_model_outcome = match hooks.run(
-                    HookEvent::PreModelCall,
-                    HookContext {
-                        cwd: &cwd.display().to_string(),
-                        session_status: None,
-                        tool_request: None,
-                        tool_result: None,
-                        before_messages: None,
-                        after_messages: None,
-                        usage: None,
-                    },
-                ) {
-                    Ok(outcome) => outcome,
-                    Err(error) => {
-                        return Ok(ChildAgentResult {
-                            status: RunStatus::Failed,
-                            final_message: None,
-                            error: Some(format!("pre_model_call hook failed: {error}")),
-                        });
-                    }
-                };
-                let model_conversation =
-                    conversation_with_hook_context(&setup.conversation, &pre_model_outcome);
-
-                let response = orca_provider::call_streaming(
-                    config.provider,
-                    &model_conversation,
+                let response = match run_child_agent_provider_turn(
+                    config,
+                    &setup,
+                    cwd,
+                    hooks,
                     &turn_provider_config,
                     &child_cancel,
-                    &mut |_| {},
-                );
-
-                if let Err(error) = hooks.run(
-                    HookEvent::PostModelCall,
-                    HookContext {
-                        cwd: &cwd.display().to_string(),
-                        session_status: None,
-                        tool_request: None,
-                        tool_result: None,
-                        before_messages: None,
-                        after_messages: None,
-                        usage: response.usage.as_ref(),
-                    },
                 ) {
-                    return Ok(ChildAgentResult {
-                        status: RunStatus::Failed,
-                        final_message: None,
-                        error: Some(format!("post_model_call hook failed: {error}")),
-                    });
-                }
+                    ChildAgentProviderTurn::Response(response) => response,
+                    ChildAgentProviderTurn::Fail(result) => return Ok(result),
+                };
 
                 match handle_child_agent_provider_error(
                     config,
