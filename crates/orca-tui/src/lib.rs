@@ -356,4 +356,28 @@ mod tests {
             "agent_subagent_execution should not record child tool results directly"
         );
     }
+
+    #[test]
+    fn tui_subagent_child_turn_budget_is_runtime_owned() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let subagent =
+            std::fs::read_to_string(format!("{manifest_dir}/src/agent_subagent_execution.rs"))
+                .expect("TUI agent subagent execution module should exist");
+        assert!(
+            subagent.contains("advance_child_agent_turn"),
+            "agent_subagent_execution should delegate child turn-budget checks to runtime"
+        );
+        assert!(
+            !subagent.contains("DEFAULT_MAX_TURNS"),
+            "agent_subagent_execution should not own child max-turn limits"
+        );
+        assert!(
+            !subagent.contains("turn += 1"),
+            "agent_subagent_execution should not advance child turn counters directly"
+        );
+        assert!(
+            !subagent.contains("RunStatus::BudgetExhausted"),
+            "agent_subagent_execution should not construct child budget-exhausted results"
+        );
+    }
 }

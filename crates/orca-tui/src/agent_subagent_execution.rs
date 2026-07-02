@@ -11,10 +11,11 @@ use orca_core::subagent_types::SubagentType;
 use orca_core::tool_types;
 use orca_runtime::agent_child::{
     ChildAgentProviderErrorDecision, ChildAgentProviderResponseFold, ChildAgentProviderTurn,
-    ChildAgentRequest, ChildAgentResult, ChildAgentToolResultFold,
-    compact_child_agent_conversation_if_needed, fold_child_agent_provider_response,
-    fold_child_agent_tool_result, handle_child_agent_provider_error, prepare_child_agent_loop,
-    route_child_agent_model, run_child_agent_provider_turn, run_child_agent_with_executor,
+    ChildAgentRequest, ChildAgentResult, ChildAgentToolResultFold, ChildAgentTurnBudget,
+    advance_child_agent_turn, compact_child_agent_conversation_if_needed,
+    fold_child_agent_provider_response, fold_child_agent_tool_result,
+    handle_child_agent_provider_error, prepare_child_agent_loop, route_child_agent_model,
+    run_child_agent_provider_turn, run_child_agent_with_executor,
 };
 use orca_runtime::cost::CostTracker;
 use orca_runtime::hooks::HookRunner;
@@ -24,7 +25,7 @@ use orca_runtime::subagent::{self, SubagentMode};
 use orca_runtime::tasks::TaskRegistry;
 
 use crate::agent_runner::{
-    DEFAULT_MAX_TURNS, send_subagent_completed_for_tui, send_subagent_started_for_tui,
+    send_subagent_completed_for_tui, send_subagent_started_for_tui,
     send_workflow_tasks_updated_for_tui,
 };
 use crate::agent_tool_execution::execute_tool_for_tui;
@@ -494,13 +495,9 @@ fn run_child_agent_for_tui(
             let mut turn: u32 = 0;
             let mut reactive_compacted = false;
             loop {
-                turn += 1;
-                if turn > DEFAULT_MAX_TURNS {
-                    return Ok(ChildAgentResult {
-                        status: RunStatus::BudgetExhausted,
-                        final_message: None,
-                        error: Some("max turns exhausted".to_string()),
-                    });
+                match advance_child_agent_turn(&mut turn) {
+                    ChildAgentTurnBudget::Continue => {}
+                    ChildAgentTurnBudget::Stop(result) => return Ok(result),
                 }
 
                 compact_child_agent_conversation_if_needed(config, &mut setup, cwd, hooks)?;

@@ -25,6 +25,8 @@ use crate::lifecycle::RuntimeSessionLifecycle;
 use crate::memory::MemoryBlock;
 use crate::workflow::ipc::WorkflowIpcContext;
 
+pub const DEFAULT_CHILD_AGENT_MAX_TURNS: u32 = 128;
+
 #[derive(Clone, Debug)]
 pub struct ChildAgentRequest {
     pub prompt: String,
@@ -82,6 +84,11 @@ pub enum ChildAgentProviderResponseFold {
 }
 
 pub enum ChildAgentToolResultFold {
+    Continue,
+    Stop(ChildAgentResult),
+}
+
+pub enum ChildAgentTurnBudget {
     Continue,
     Stop(ChildAgentResult),
 }
@@ -235,6 +242,23 @@ pub fn prepare_child_agent_loop(
         conversation,
         policy,
     }
+}
+
+pub fn advance_child_agent_turn(turn: &mut u32) -> ChildAgentTurnBudget {
+    advance_child_agent_turn_with_limit(turn, DEFAULT_CHILD_AGENT_MAX_TURNS)
+}
+
+pub fn advance_child_agent_turn_with_limit(turn: &mut u32, max_turns: u32) -> ChildAgentTurnBudget {
+    *turn = turn.saturating_add(1);
+    if *turn > max_turns {
+        return ChildAgentTurnBudget::Stop(ChildAgentResult {
+            status: RunStatus::BudgetExhausted,
+            final_message: None,
+            error: Some("max turns exhausted".to_string()),
+        });
+    }
+
+    ChildAgentTurnBudget::Continue
 }
 
 pub fn route_child_agent_model(
@@ -563,6 +587,38 @@ mod tests {
             Some(Message::User { content, .. }) if content == "inspect repo"
         ));
         assert!(format!("{:?}", setup.policy).contains("Suggest"));
+    }
+
+    #[test]
+    fn advance_child_agent_turn_stops_after_runtime_owned_limit() {
+        let mut turn = 0;
+
+        assert!(matches!(
+            advance_child_agent_turn_with_limit(&mut turn, 1),
+            ChildAgentTurnBudget::Continue
+        ));
+        assert_eq!(turn, 1);
+
+        match advance_child_agent_turn_with_limit(&mut turn, 1) {
+            ChildAgentTurnBudget::Stop(result) => {
+                assert_eq!(result.status, RunStatus::BudgetExhausted);
+                assert_eq!(result.error.as_deref(), Some("max turns exhausted"));
+            }
+            ChildAgentTurnBudget::Continue => panic!("turn beyond limit should stop"),
+        }
+        assert_eq!(turn, 2);
+    }
+
+    #[test]
+    fn advance_child_agent_turn_uses_default_child_limit() {
+        let mut turn = 0;
+
+        assert!(matches!(
+            advance_child_agent_turn(&mut turn),
+            ChildAgentTurnBudget::Continue
+        ));
+
+        assert_eq!(turn, 1);
     }
 
     #[test]
