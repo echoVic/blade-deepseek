@@ -1,4 +1,5 @@
 mod agent_runner;
+mod agent_subagent_execution;
 mod agent_tool_execution;
 mod agent_workflow_execution;
 pub mod app;
@@ -129,6 +130,38 @@ mod tests {
         assert!(
             !execution.contains("fn execute_workflow_for_tui"),
             "agent_tool_execution should not own TUI workflow helpers"
+        );
+    }
+
+    #[test]
+    fn tui_agent_subagent_execution_is_owned_by_dedicated_module() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let subagent =
+            std::fs::read_to_string(format!("{manifest_dir}/src/agent_subagent_execution.rs"))
+                .expect("TUI agent subagent execution module should exist");
+        assert!(
+            subagent.contains("pub(crate) fn execute_subagent_batch_for_tui"),
+            "agent_subagent_execution should own the TUI subagent batch entrypoint"
+        );
+        assert!(
+            subagent.contains("pub(crate) fn execute_subagent_for_tui"),
+            "agent_subagent_execution should own the TUI subagent execution entrypoint"
+        );
+        assert!(
+            subagent.contains("pub(crate) fn execute_subagent_status_for_tui"),
+            "agent_subagent_execution should own the TUI subagent status entrypoint"
+        );
+
+        let execution =
+            std::fs::read_to_string(format!("{manifest_dir}/src/agent_tool_execution.rs"))
+                .expect("TUI agent tool execution source should be readable");
+        assert!(
+            !execution.contains("fn execute_subagent_for_tui"),
+            "agent_tool_execution should not own TUI subagent helpers"
+        );
+        assert!(
+            !execution.contains("fn execute_subagent_batch_for_tui"),
+            "agent_tool_execution should not own TUI subagent batch helpers"
         );
     }
 }

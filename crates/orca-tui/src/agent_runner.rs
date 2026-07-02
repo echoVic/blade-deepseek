@@ -22,10 +22,10 @@ use orca_runtime::cost::CostTracker;
 use orca_runtime::hooks::{HookContext, conversation_with_hook_context};
 use orca_runtime::memory;
 
-use crate::agent_tool_execution::{
-    collect_subagent_batch, execute_readonly_batch_for_tui, execute_subagent_batch_for_tui,
-    execute_tool_for_tui, should_run_subagent_batch,
+use crate::agent_subagent_execution::{
+    collect_subagent_batch, execute_subagent_batch_for_tui, should_run_subagent_batch,
 };
+use crate::agent_tool_execution::{execute_readonly_batch_for_tui, execute_tool_for_tui};
 use crate::agent_workflow_execution::execute_workflow_for_tui;
 use crate::bridge::TuiConversationSession;
 use crate::runtime_event_projection::tui_event_from_runtime_event;
@@ -720,11 +720,11 @@ pub fn run_agent_for_tui(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent_tool_execution::{
-        canonical_action_for_tool, collect_subagent_batch, execute_subagent_batch_for_tui,
-        execute_subagent_for_tui, execute_subagent_status_for_tui, execute_tool_for_tui,
-        run_child_agent_for_tui_silent, should_run_subagent_batch,
+    use crate::agent_subagent_execution::{
+        collect_subagent_batch, execute_subagent_batch_for_tui, execute_subagent_for_tui,
+        execute_subagent_status_for_tui, run_child_agent_for_tui_silent, should_run_subagent_batch,
     };
+    use crate::agent_tool_execution::{canonical_action_for_tool, execute_tool_for_tui};
     use orca_runtime::hooks::HookRunner;
     use orca_runtime::instructions::ProjectInstructions;
     use orca_runtime::memory::MemoryBlock;
