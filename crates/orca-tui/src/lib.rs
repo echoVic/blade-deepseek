@@ -191,7 +191,7 @@ mod tests {
             std::fs::read_to_string(format!("{manifest_dir}/src/agent_subagent_execution.rs"))
                 .expect("TUI agent subagent execution module should exist");
         assert!(
-            subagent.contains("run_child_agent_with_tool_executor"),
+            subagent.contains("run_child_agent_prompt_with_tool_executor"),
             "agent_subagent_execution should delegate child-agent model/cost setup to runtime"
         );
         assert!(
@@ -205,13 +205,29 @@ mod tests {
     }
 
     #[test]
+    fn tui_subagent_child_request_construction_is_runtime_owned() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let subagent =
+            std::fs::read_to_string(format!("{manifest_dir}/src/agent_subagent_execution.rs"))
+                .expect("TUI agent subagent execution module should exist");
+        assert!(
+            subagent.contains("run_child_agent_prompt_with_tool_executor"),
+            "agent_subagent_execution should delegate child request construction to runtime"
+        );
+        assert!(
+            !subagent.contains("ChildAgentRequest::new"),
+            "agent_subagent_execution should not construct child requests directly"
+        );
+    }
+
+    #[test]
     fn tui_subagent_child_loop_setup_is_runtime_owned() {
         let manifest_dir = env!("CARGO_MANIFEST_DIR");
         let subagent =
             std::fs::read_to_string(format!("{manifest_dir}/src/agent_subagent_execution.rs"))
                 .expect("TUI agent subagent execution module should exist");
         assert!(
-            subagent.contains("run_child_agent_with_tool_executor"),
+            subagent.contains("run_child_agent_prompt_with_tool_executor"),
             "agent_subagent_execution should delegate child loop orchestration to runtime"
         );
         assert!(

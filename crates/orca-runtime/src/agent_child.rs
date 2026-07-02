@@ -569,6 +569,45 @@ where
     })
 }
 
+pub fn run_child_agent_prompt_with_tool_executor<F>(
+    config: &RunConfig,
+    prompt: String,
+    subagent_type: &SubagentType,
+    subagent_model: Option<String>,
+    subagent_depth: u32,
+    cwd: &Path,
+    instructions: &ProjectInstructions,
+    memory: &MemoryBlock,
+    hooks: &HookRunner,
+    execute_tool: F,
+) -> (ChildAgentResult, CostTracker)
+where
+    F: FnMut(
+        &RunConfig,
+        &ChildAgentRequest,
+        &ChildAgentToolContext<'_>,
+        &CancelToken,
+        &ToolRequest,
+    ) -> ChildAgentToolExecution,
+{
+    let request = ChildAgentRequest::new(
+        prompt,
+        subagent_type.clone(),
+        subagent_model,
+        subagent_depth,
+        false,
+    );
+    run_child_agent_with_tool_executor(
+        config,
+        &request,
+        cwd,
+        instructions,
+        memory,
+        hooks,
+        execute_tool,
+    )
+}
+
 pub fn fold_child_agent_tool_result(
     setup: &mut ChildAgentLoopSetup,
     tool_request: &ToolRequest,
@@ -1314,6 +1353,49 @@ mod tests {
         assert_eq!(result.status, RunStatus::Success);
         assert!(saw_child_config);
         assert_eq!(tool_count, 1);
+    }
+
+    #[test]
+    fn run_child_agent_prompt_with_tool_executor_builds_runtime_request() {
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let runtime_config = config(None);
+        let mut saw_request = false;
+
+        let (result, _tracker) = run_child_agent_prompt_with_tool_executor(
+            &runtime_config,
+            "bash echo child".to_string(),
+            &SubagentType::General,
+            Some(FLASH_MODEL.to_string()),
+            4,
+            std::env::temp_dir().as_path(),
+            &instructions,
+            &memory,
+            &HookRunner::default(),
+            |child_config, child_request, _tool_context, _cancel, tool_request| {
+                saw_request = true;
+                assert_eq!(child_config.model.as_deref(), Some(FLASH_MODEL));
+                assert_eq!(child_request.prompt.as_str(), "bash echo child");
+                assert!(matches!(
+                    &child_request.subagent_type,
+                    SubagentType::General
+                ));
+                assert_eq!(child_request.depth, 4);
+                assert_eq!(tool_request.name, ToolName::Bash);
+                ChildAgentToolExecution {
+                    should_stop: false,
+                    result: ToolResult::completed(
+                        tool_request,
+                        "child tool ran".to_string(),
+                        false,
+                    ),
+                    child_cost: None,
+                }
+            },
+        );
+
+        assert_eq!(result.status, RunStatus::Success);
+        assert!(saw_request);
     }
 
     #[test]

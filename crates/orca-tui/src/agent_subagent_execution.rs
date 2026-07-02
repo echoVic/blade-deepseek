@@ -8,8 +8,7 @@ use orca_core::event_schema::{EventFactory, RunStatus};
 use orca_core::subagent_types::SubagentType;
 use orca_core::tool_types;
 use orca_runtime::agent_child::{
-    ChildAgentRequest, ChildAgentResult, ChildAgentToolExecution,
-    run_child_agent_with_tool_executor,
+    ChildAgentResult, ChildAgentToolExecution, run_child_agent_prompt_with_tool_executor,
 };
 use orca_runtime::cost::CostTracker;
 use orca_runtime::hooks::HookRunner;
@@ -474,16 +473,12 @@ fn run_child_agent_for_tui(
     memory: &MemoryBlock,
     hooks: &HookRunner,
 ) -> (ChildAgentResult, CostTracker) {
-    let child_request = ChildAgentRequest::new(
+    run_child_agent_prompt_with_tool_executor(
+        config,
         prompt.to_string(),
-        subagent_type.clone(),
+        subagent_type,
         subagent_model,
         subagent_depth,
-        false,
-    );
-    run_child_agent_with_tool_executor(
-        config,
-        &child_request,
         cwd,
         instructions,
         memory,
