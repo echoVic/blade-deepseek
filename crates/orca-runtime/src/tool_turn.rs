@@ -18,6 +18,7 @@ use crate::instructions::ProjectInstructions;
 use crate::lifecycle::{RuntimePermissionRequestHandler, TurnPermissionOverlay};
 use crate::memory::MemoryBlock;
 use crate::session::{record_plan_state_for_agent, record_tool_result_for_agent};
+use crate::step_context::RuntimeStepContext;
 use crate::subagent_execution::{
     collect_subagent_batch, run_subagent_batch_tool_turn, should_run_subagent_batch,
 };
@@ -25,8 +26,8 @@ use crate::tasks::TaskRegistry;
 use crate::thread_store::SessionWriter;
 use crate::tool_execution::{ToolExecutionContext, execute_tool_with_approval};
 use crate::tool_invocation::{
-    AgentToolPolicyContext, apply_pre_tool_outcome_with_external,
-    prepare_tool_invocation_with_external, reject_disallowed_child_tool,
+    apply_pre_tool_outcome_with_external, prepare_tool_invocation_with_external,
+    reject_disallowed_child_tool,
 };
 use crate::workflow::ipc::WorkflowIpcContext;
 use crate::workflow::runner::SharedEventBuffer;
@@ -221,33 +222,33 @@ pub(crate) fn run_readonly_tool_turn(
     Ok(ToolTurnOutcome::Continue)
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_tool_turns<W: io::Write>(
-    config: &RunConfig,
-    cwd: &Path,
+    step_context: RuntimeStepContext<'_>,
     events: &mut EventFactory,
     sink: &mut EventSink<W>,
     conversation: &mut Conversation,
     mut history_writer: Option<&mut SessionWriter>,
     tool_requests: &[ToolRequest],
-    tool_policy: AgentToolPolicyContext<'_>,
-    subagent_depth: u32,
-    emit_deltas: bool,
-    policy: &ApprovalPolicy,
-    instructions: &ProjectInstructions,
-    memory: &MemoryBlock,
-    mcp_registry: &McpRegistry,
-    hooks: &HookRunner,
     cost_tracker: &mut CostTracker,
-    cancel: &CancelToken,
-    task_registry: &TaskRegistry,
     background_workflows: &mut Vec<BackgroundWorkflowRun>,
-    workflow_ipc: Option<&WorkflowIpcContext>,
-    permission_handler: Option<&(dyn RuntimePermissionRequestHandler + Send + Sync)>,
     child_executor: ChildAgentExecutor<W>,
     workflow_child_executor: ChildAgentExecutor<SharedEventBuffer>,
     batch_child_executor: ChildAgentExecutor<io::Sink>,
 ) -> io::Result<ToolTurnOutcome> {
+    let config = step_context.config;
+    let cwd = step_context.cwd;
+    let tool_policy = step_context.tool_policy;
+    let subagent_depth = step_context.subagent_depth;
+    let emit_deltas = step_context.emit_deltas;
+    let policy = step_context.policy;
+    let instructions = step_context.instructions;
+    let memory = step_context.memory;
+    let mcp_registry = step_context.mcp_registry;
+    let hooks = step_context.hooks;
+    let cancel = step_context.cancel;
+    let task_registry = step_context.task_registry;
+    let workflow_ipc = step_context.workflow_ipc;
+    let permission_handler = step_context.permission_handler;
     let mut cursor = ToolRequestCursor::new(tool_requests);
     let mut permission_overlay = TurnPermissionOverlay::default();
     while let Some(tool_request) = cursor.current() {
@@ -473,6 +474,7 @@ mod tests {
     use crate::agent_child::{ChildAgentRequest, ChildAgentResult, ChildAgentRuntime};
     use crate::hooks::HookRunner;
     use crate::tool_execution::policy_for_tool_execution;
+    use crate::tool_invocation::AgentToolPolicyContext;
 
     fn config_with_external(external_tools: Vec<ExternalToolConfig>) -> RunConfig {
         RunConfig {
@@ -807,15 +809,9 @@ mod tests {
         let task_registry = TaskRegistry::new("tool-turns-disallowed".to_string());
         let mut background_workflows = Vec::new();
         let policy = policy_for_tool_execution(&config);
-
-        let outcome = run_tool_turns(
+        let step_context = RuntimeStepContext::new(
             &config,
             cwd.path(),
-            &mut events,
-            &mut sink,
-            &mut conversation,
-            None,
-            &[request],
             AgentToolPolicyContext::new(Some(&allowed), Some("test child")),
             1,
             true,
@@ -824,12 +820,21 @@ mod tests {
             &memory,
             &mcp_registry,
             &hooks,
-            &mut cost_tracker,
             &cancel,
             &task_registry,
+            None,
+            None,
+        );
+
+        let outcome = run_tool_turns(
+            step_context,
+            &mut events,
+            &mut sink,
+            &mut conversation,
+            None,
+            &[request],
+            &mut cost_tracker,
             &mut background_workflows,
-            None,
-            None,
             unused_child_executor::<Vec<u8>>,
             unused_child_executor::<SharedEventBuffer>,
             unused_child_executor::<io::Sink>,

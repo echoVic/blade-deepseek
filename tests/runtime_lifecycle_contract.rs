@@ -126,6 +126,63 @@ fn provider_cycle_step_uses_grouped_runtime_input() {
 }
 
 #[test]
+fn provider_response_and_tool_turn_share_runtime_step_context() {
+    let lib =
+        std::fs::read_to_string("crates/orca-runtime/src/lib.rs").expect("runtime lib source");
+    let step_context = std::fs::read_to_string("crates/orca-runtime/src/step_context.rs")
+        .expect("runtime step context source");
+    let provider_turn = std::fs::read_to_string("crates/orca-runtime/src/provider_turn.rs")
+        .expect("provider turn source");
+    let tool_turn =
+        std::fs::read_to_string("crates/orca-runtime/src/tool_turn.rs").expect("tool turn source");
+
+    assert!(
+        lib.contains("mod step_context;"),
+        "runtime crate should own a focused request-scoped step context module"
+    );
+    assert!(
+        step_context.contains("pub(crate) struct RuntimeStepContext"),
+        "runtime step context should group request-scoped runtime inputs"
+    );
+
+    let provider_response_impl = provider_turn
+        .split("impl RuntimeProviderResponseStep")
+        .nth(1)
+        .and_then(|text| text.split("impl RuntimeProviderResponseResultStep").next())
+        .expect("runtime provider response impl block");
+    assert!(
+        provider_response_impl.contains("step_context: RuntimeStepContext"),
+        "provider response handling should consume RuntimeStepContext instead of repeating request state"
+    );
+    assert!(
+        !provider_response_impl.contains("tool_policy: AgentToolPolicyContext"),
+        "tool policy should be carried by RuntimeStepContext"
+    );
+    assert!(
+        !provider_response_impl.contains("mcp_registry: &McpRegistry"),
+        "MCP registry should be carried by RuntimeStepContext"
+    );
+
+    let run_tool_turns_signature = tool_turn
+        .split("pub(crate) fn run_tool_turns")
+        .nth(1)
+        .and_then(|text| text.split(") -> io::Result<ToolTurnOutcome>").next())
+        .expect("run_tool_turns signature");
+    assert!(
+        run_tool_turns_signature.contains("step_context: RuntimeStepContext"),
+        "tool turns should share the provider response step context"
+    );
+    assert!(
+        !run_tool_turns_signature.contains("tool_policy: AgentToolPolicyContext"),
+        "tool policy should not be a separate run_tool_turns argument"
+    );
+    assert!(
+        !run_tool_turns_signature.contains("hooks: &HookRunner"),
+        "hooks should not be a separate run_tool_turns argument"
+    );
+}
+
+#[test]
 fn session_lifecycle_assigns_agent_task_and_monotonic_turns() {
     let mut lifecycle = RuntimeSessionLifecycle::new("run-test");
     let task = lifecycle.start_task(RuntimeTaskKind::Agent);

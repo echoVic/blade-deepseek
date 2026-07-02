@@ -23,6 +23,7 @@ pub mod server;
 pub mod server_runtime;
 pub mod session;
 pub mod shell_session;
+mod step_context;
 pub mod subagent;
 pub mod subagent_execution;
 pub mod tasks;

@@ -22,6 +22,7 @@ use crate::lifecycle::{
 };
 use crate::memory::{self, MemoryBlock};
 use crate::session::record_assistant_response_for_agent;
+use crate::step_context::RuntimeStepContext;
 use crate::tasks::TaskRegistry;
 use crate::thread_store::SessionWriter;
 use crate::tool_invocation::{AgentToolPolicyContext, tool_requests_from_provider_steps};
@@ -74,26 +75,13 @@ pub(crate) struct RuntimeProviderCycleInput<'a, 'runtime, W: io::Write> {
 }
 
 pub(crate) struct RuntimeProviderResponseInput<'a, W: io::Write> {
-    pub(crate) config: &'a RunConfig,
-    pub(crate) cwd: &'a Path,
+    pub(crate) step_context: RuntimeStepContext<'a>,
     pub(crate) events: &'a mut EventFactory,
     pub(crate) sink: &'a mut EventSink<W>,
     pub(crate) conversation: &'a mut Conversation,
     pub(crate) history_writer: Option<&'a mut SessionWriter>,
-    pub(crate) tool_policy: AgentToolPolicyContext<'a>,
-    pub(crate) subagent_depth: u32,
-    pub(crate) emit_deltas: bool,
-    pub(crate) policy: &'a ApprovalPolicy,
-    pub(crate) instructions: &'a ProjectInstructions,
-    pub(crate) memory: &'a MemoryBlock,
-    pub(crate) mcp_registry: &'a McpRegistry,
-    pub(crate) hooks: &'a HookRunner,
     pub(crate) cost_tracker: &'a mut CostTracker,
-    pub(crate) cancel: &'a CancelToken,
-    pub(crate) task_registry: &'a TaskRegistry,
     pub(crate) background_workflows: &'a mut Vec<BackgroundWorkflowRun>,
-    pub(crate) workflow_ipc: Option<&'a WorkflowIpcContext>,
-    pub(crate) permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
 }
 
 pub(crate) struct RuntimeProviderTurnOutput {
@@ -374,30 +362,16 @@ impl RuntimeProviderResponseStep {
         Self
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn handle<W: io::Write>(
         &mut self,
         response: ProviderResponse,
-        config: &RunConfig,
-        cwd: &Path,
+        step_context: RuntimeStepContext<'_>,
         events: &mut EventFactory,
         sink: &mut EventSink<W>,
         conversation: &mut Conversation,
         mut history_writer: Option<&mut SessionWriter>,
-        tool_policy: AgentToolPolicyContext<'_>,
-        subagent_depth: u32,
-        emit_deltas: bool,
-        policy: &ApprovalPolicy,
-        instructions: &ProjectInstructions,
-        memory: &MemoryBlock,
-        mcp_registry: &McpRegistry,
-        hooks: &HookRunner,
         cost_tracker: &mut CostTracker,
-        cancel: &CancelToken,
-        task_registry: &TaskRegistry,
         background_workflows: &mut Vec<BackgroundWorkflowRun>,
-        workflow_ipc: Option<&WorkflowIpcContext>,
-        permission_handler: Option<&(dyn RuntimePermissionRequestHandler + Send + Sync)>,
         child_executor: ChildAgentExecutor<W>,
         workflow_child_executor: ChildAgentExecutor<SharedEventBuffer>,
         batch_child_executor: ChildAgentExecutor<io::Sink>,
@@ -410,12 +384,12 @@ impl RuntimeProviderResponseStep {
                 response.assistant_content,
                 response.assistant_reasoning,
                 vec![],
-                emit_deltas,
+                step_context.emit_deltas,
             )?;
-            if emit_deltas && config.auto_memory {
+            if step_context.emit_deltas && step_context.config.auto_memory {
                 memory::extract_project_memory_after_final_response(
-                    config,
-                    cwd,
+                    step_context.config,
+                    step_context.cwd,
                     &conversation.messages,
                     events,
                     sink,
@@ -430,32 +404,19 @@ impl RuntimeProviderResponseStep {
             response.assistant_content,
             response.assistant_reasoning,
             response.tool_calls.clone(),
-            emit_deltas,
+            step_context.emit_deltas,
         )?;
 
         let tool_requests = tool_requests_from_provider_steps(&response.steps);
         match run_tool_turns(
-            config,
-            cwd,
+            step_context,
             events,
             sink,
             conversation,
             history_writer.as_deref_mut(),
             &tool_requests,
-            tool_policy,
-            subagent_depth,
-            emit_deltas,
-            policy,
-            instructions,
-            memory,
-            mcp_registry,
-            hooks,
             cost_tracker,
-            cancel,
-            task_registry,
             background_workflows,
-            workflow_ipc,
-            permission_handler,
             child_executor,
             workflow_child_executor,
             batch_child_executor,
@@ -569,26 +530,28 @@ impl RuntimeTurnProviderCycleStep {
         self.handle_response(
             response,
             RuntimeProviderResponseInput {
-                config: input.config,
-                cwd: input.cwd,
+                step_context: RuntimeStepContext::new(
+                    input.config,
+                    input.cwd,
+                    input.tool_policy,
+                    input.subagent_depth,
+                    input.emit_deltas,
+                    input.policy,
+                    input.instructions,
+                    input.memory,
+                    input.mcp_registry,
+                    input.hooks,
+                    input.cancel,
+                    input.task_registry,
+                    input.workflow_ipc,
+                    input.permission_handler,
+                ),
                 events: input.events,
                 sink: input.sink,
                 conversation,
                 history_writer,
-                tool_policy: input.tool_policy,
-                subagent_depth: input.subagent_depth,
-                emit_deltas: input.emit_deltas,
-                policy: input.policy,
-                instructions: input.instructions,
-                memory: input.memory,
-                mcp_registry: input.mcp_registry,
-                hooks: input.hooks,
                 cost_tracker: input.cost_tracker,
-                cancel: input.cancel,
-                task_registry: input.task_registry,
                 background_workflows: input.background_workflows,
-                workflow_ipc: input.workflow_ipc,
-                permission_handler: input.permission_handler,
             },
             child_executor,
             workflow_child_executor,
@@ -606,26 +569,13 @@ impl RuntimeTurnProviderCycleStep {
     ) -> io::Result<RuntimeTurnProviderCycleResult> {
         let provider_response_outcome = RuntimeProviderResponseStep::new().handle(
             response,
-            input.config,
-            input.cwd,
+            input.step_context,
             input.events,
             input.sink,
             input.conversation,
             input.history_writer,
-            input.tool_policy,
-            input.subagent_depth,
-            input.emit_deltas,
-            input.policy,
-            input.instructions,
-            input.memory,
-            input.mcp_registry,
-            input.hooks,
             input.cost_tracker,
-            input.cancel,
-            input.task_registry,
             input.background_workflows,
-            input.workflow_ipc,
-            input.permission_handler,
             child_executor,
             workflow_child_executor,
             batch_child_executor,
@@ -939,30 +889,33 @@ mod tests {
         let task_registry = TaskRegistry::new("provider-response-final".to_string());
         let mut background_workflows = Vec::new();
         let policy = policy_for_tool_execution(&config);
+        let step_context = RuntimeStepContext::new(
+            &config,
+            cwd.path(),
+            AgentToolPolicyContext::unrestricted(),
+            0,
+            true,
+            &policy,
+            &instructions,
+            &memory,
+            &mcp_registry,
+            &hooks,
+            &cancel,
+            &task_registry,
+            None,
+            None,
+        );
 
         let outcome = RuntimeProviderResponseStep::new()
             .handle(
                 response,
-                &config,
-                cwd.path(),
+                step_context,
                 &mut events,
                 &mut sink,
                 &mut conversation,
                 None,
-                AgentToolPolicyContext::unrestricted(),
-                0,
-                true,
-                &policy,
-                &instructions,
-                &memory,
-                &mcp_registry,
-                &hooks,
                 &mut cost_tracker,
-                &cancel,
-                &task_registry,
                 &mut background_workflows,
-                None,
-                None,
                 unused_child_executor::<Vec<u8>>,
                 unused_child_executor::<crate::workflow::runner::SharedEventBuffer>,
                 unused_child_executor::<io::Sink>,
@@ -1005,31 +958,34 @@ mod tests {
         let task_registry = TaskRegistry::new("provider-cycle-final".to_string());
         let mut background_workflows = Vec::new();
         let policy = policy_for_tool_execution(&config);
+        let step_context = RuntimeStepContext::new(
+            &config,
+            cwd.path(),
+            AgentToolPolicyContext::unrestricted(),
+            0,
+            true,
+            &policy,
+            &instructions,
+            &memory,
+            &mcp_registry,
+            &hooks,
+            &cancel,
+            &task_registry,
+            None,
+            None,
+        );
 
         let result = RuntimeTurnProviderCycleStep::new()
             .handle_response(
                 response,
                 RuntimeProviderResponseInput {
-                    config: &config,
-                    cwd: cwd.path(),
+                    step_context,
                     events: &mut events,
                     sink: &mut sink,
                     conversation: &mut conversation,
                     history_writer: None,
-                    tool_policy: AgentToolPolicyContext::unrestricted(),
-                    subagent_depth: 0,
-                    emit_deltas: true,
-                    policy: &policy,
-                    instructions: &instructions,
-                    memory: &memory,
-                    mcp_registry: &mcp_registry,
-                    hooks: &hooks,
                     cost_tracker: &mut cost_tracker,
-                    cancel: &cancel,
-                    task_registry: &task_registry,
                     background_workflows: &mut background_workflows,
-                    workflow_ipc: None,
-                    permission_handler: None,
                 },
                 unused_child_executor::<Vec<u8>>,
                 unused_child_executor::<crate::workflow::runner::SharedEventBuffer>,
