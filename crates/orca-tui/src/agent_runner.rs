@@ -24,8 +24,9 @@ use orca_runtime::memory;
 
 use crate::agent_tool_execution::{
     collect_subagent_batch, execute_readonly_batch_for_tui, execute_subagent_batch_for_tui,
-    execute_tool_for_tui, execute_workflow_for_tui, should_run_subagent_batch,
+    execute_tool_for_tui, should_run_subagent_batch,
 };
+use crate::agent_workflow_execution::execute_workflow_for_tui;
 use crate::bridge::TuiConversationSession;
 use crate::runtime_event_projection::tui_event_from_runtime_event;
 use crate::types::{TuiEvent, UserAction};

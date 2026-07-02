@@ -1,5 +1,6 @@
 mod agent_runner;
 mod agent_tool_execution;
+mod agent_workflow_execution;
 pub mod app;
 pub mod bridge;
 pub mod commands;
@@ -108,6 +109,26 @@ mod tests {
         assert!(
             !runner.contains("fn execute_tool_for_tui"),
             "agent_runner should not own TUI tool execution helpers"
+        );
+    }
+
+    #[test]
+    fn tui_agent_workflow_execution_is_owned_by_dedicated_module() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let workflow =
+            std::fs::read_to_string(format!("{manifest_dir}/src/agent_workflow_execution.rs"))
+                .expect("TUI agent workflow execution module should exist");
+        assert!(
+            workflow.contains("pub(crate) fn execute_workflow_for_tui"),
+            "agent_workflow_execution should own the TUI workflow execution entrypoint"
+        );
+
+        let execution =
+            std::fs::read_to_string(format!("{manifest_dir}/src/agent_tool_execution.rs"))
+                .expect("TUI agent tool execution source should be readable");
+        assert!(
+            !execution.contains("fn execute_workflow_for_tui"),
+            "agent_tool_execution should not own TUI workflow helpers"
         );
     }
 }
