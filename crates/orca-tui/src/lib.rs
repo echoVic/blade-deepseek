@@ -199,4 +199,28 @@ mod tests {
             "agent_subagent_execution should not own child-agent model override logic"
         );
     }
+
+    #[test]
+    fn tui_subagent_child_loop_setup_is_runtime_owned() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let subagent =
+            std::fs::read_to_string(format!("{manifest_dir}/src/agent_subagent_execution.rs"))
+                .expect("TUI agent subagent execution module should exist");
+        assert!(
+            subagent.contains("prepare_child_agent_loop"),
+            "agent_subagent_execution should delegate child loop setup to runtime"
+        );
+        assert!(
+            !subagent.contains("ProviderConfig"),
+            "agent_subagent_execution should not construct child provider config"
+        );
+        assert!(
+            !subagent.contains("Conversation::new"),
+            "agent_subagent_execution should not bootstrap child conversation"
+        );
+        assert!(
+            !subagent.contains("build_agent_system_prompt"),
+            "agent_subagent_execution should not own child system prompt construction"
+        );
+    }
 }

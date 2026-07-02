@@ -1,13 +1,19 @@
 use std::io;
 use std::path::Path;
 
+use orca_approval::ApprovalPolicy;
 use orca_core::cancel::CancelToken;
 use orca_core::config::RunConfig;
+use orca_core::conversation::Conversation;
 use orca_core::event_schema::{EventFactory, RunStatus};
 use orca_core::event_sink::EventSink;
 use orca_core::subagent_types::SubagentType;
 use orca_mcp::McpRegistry;
+use orca_provider::ProviderConfig;
+use orca_provider::context::ContextConfig;
+use orca_provider::tool_schema::deepseek_tools_schema_for_type_with_mcp_and_external;
 
+use crate::agent_common;
 use crate::cost::CostTracker;
 use crate::hooks::HookRunner;
 use crate::instructions::ProjectInstructions;
@@ -53,6 +59,14 @@ pub struct ChildAgentResult {
     pub status: RunStatus,
     pub final_message: Option<String>,
     pub error: Option<String>,
+}
+
+pub struct ChildAgentLoopSetup {
+    pub mcp_registry: McpRegistry,
+    pub provider_config: ProviderConfig,
+    pub context_config: ContextConfig,
+    pub conversation: Conversation,
+    pub policy: ApprovalPolicy,
 }
 
 pub(crate) type ChildAgentExecutor<W> = fn(
@@ -150,6 +164,54 @@ where
     (result, child_cost_tracker)
 }
 
+pub fn prepare_child_agent_loop(
+    config: &RunConfig,
+    request: &ChildAgentRequest,
+    cwd: &Path,
+    instructions: &ProjectInstructions,
+    memory: &MemoryBlock,
+) -> ChildAgentLoopSetup {
+    let mcp_registry = orca_mcp::initialize_registry(&config.mcp_servers);
+    let provider_config = ProviderConfig {
+        api_key: config.api_key.clone(),
+        base_url: config.base_url.clone(),
+        model: Some(orca_core::model::FLASH_MODEL.to_string()),
+        reasoning_effort: config.reasoning_effort,
+        tools_override: Some(deepseek_tools_schema_for_type_with_mcp_and_external(
+            &request.subagent_type,
+            Some(&mcp_registry),
+            &config.external_tools,
+        )),
+        mcp_registry: Some(mcp_registry.clone()),
+        external_tools: config.external_tools.clone(),
+    };
+
+    let budget_model = config.model.as_option();
+    let context_config =
+        ContextConfig::for_model_with_runtime(budget_model.as_deref(), &config.model_runtime);
+    let mut conversation = Conversation::new();
+    conversation.add_system(agent_common::build_agent_system_prompt(
+        cwd,
+        request.depth,
+        &request.subagent_type,
+        Some(instructions),
+        config.approval_mode,
+        Some(memory),
+    ));
+    conversation.add_user(request.prompt.clone());
+
+    let policy = ApprovalPolicy::new(config.approval_mode)
+        .with_permission_rules(config.permission_rules.clone());
+
+    ChildAgentLoopSetup {
+        mcp_registry,
+        provider_config,
+        context_config,
+        conversation,
+        policy,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -159,6 +221,7 @@ mod tests {
     use orca_core::config::{
         HistoryMode, OutputFormat, ProviderKind, RunConfig, ThemeName, ToolConfig, WorkflowConfig,
     };
+    use orca_core::conversation::Message;
     use orca_core::event_schema::EventFactory;
     use orca_core::event_sink::EventSink;
     use orca_core::external_config::ExternalToolConfig;
@@ -232,6 +295,44 @@ mod tests {
             None,
             executor,
         )
+    }
+
+    #[test]
+    fn prepare_child_agent_loop_builds_provider_conversation_and_policy() {
+        let request = ChildAgentRequest::new(
+            "inspect repo".to_string(),
+            SubagentType::General,
+            None,
+            2,
+            false,
+        );
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let setup = prepare_child_agent_loop(
+            &config(Some("deepseek-v4-pro")),
+            &request,
+            std::env::temp_dir().as_path(),
+            &instructions,
+            &memory,
+        );
+
+        assert_eq!(
+            setup.provider_config.model.as_deref(),
+            Some(orca_core::model::FLASH_MODEL)
+        );
+        assert!(setup.provider_config.tools_override.is_some());
+        assert!(setup.provider_config.mcp_registry.is_some());
+        assert!(setup.context_config.max_tokens > 0);
+        assert_eq!(setup.conversation.messages.len(), 2);
+        assert!(matches!(
+            setup.conversation.messages.first(),
+            Some(Message::System { .. })
+        ));
+        assert!(matches!(
+            setup.conversation.messages.get(1),
+            Some(Message::User { content, .. }) if content == "inspect repo"
+        ));
+        assert!(format!("{:?}", setup.policy).contains("Suggest"));
     }
 
     #[test]

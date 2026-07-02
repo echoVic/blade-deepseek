@@ -2,10 +2,8 @@ use std::path::Path;
 use std::sync::mpsc::{Receiver, Sender};
 use std::thread;
 
-use orca_approval::ApprovalPolicy;
 use orca_core::cancel::CancelToken;
 use orca_core::config::RunConfig;
-use orca_core::conversation::Conversation;
 use orca_core::cost_types::UsageTotals;
 use orca_core::event_schema::{EventFactory, RunStatus};
 use orca_core::hook_types::HookEvent;
@@ -13,10 +11,8 @@ use orca_core::model::ModelRouteContext;
 use orca_core::provider_types::ProviderStep;
 use orca_core::subagent_types::SubagentType;
 use orca_core::tool_types;
-use orca_provider::ProviderConfig;
-use orca_provider::tool_schema::deepseek_tools_schema_for_type_with_mcp_and_external;
 use orca_runtime::agent_child::{
-    ChildAgentRequest, ChildAgentResult, run_child_agent_with_executor,
+    ChildAgentRequest, ChildAgentResult, prepare_child_agent_loop, run_child_agent_with_executor,
 };
 use orca_runtime::agent_common;
 use orca_runtime::cost::CostTracker;
@@ -489,217 +485,198 @@ fn run_child_agent_for_tui(
         subagent_depth,
         false,
     );
-    run_child_agent_with_executor(config, &child_request, |config, _, child_cost_tracker| {
-        let mcp_registry = orca_mcp::initialize_registry(&config.mcp_servers);
-        let provider_config = ProviderConfig {
-            api_key: config.api_key.clone(),
-            base_url: config.base_url.clone(),
-            model: Some(orca_core::model::FLASH_MODEL.to_string()),
-            reasoning_effort: config.reasoning_effort,
-            tools_override: Some(deepseek_tools_schema_for_type_with_mcp_and_external(
-                subagent_type,
-                Some(&mcp_registry),
-                &config.external_tools,
-            )),
-            mcp_registry: Some(mcp_registry.clone()),
-            external_tools: config.external_tools.clone(),
-        };
+    run_child_agent_with_executor(
+        config,
+        &child_request,
+        |config, request, child_cost_tracker| {
+            let mut setup = prepare_child_agent_loop(config, request, cwd, instructions, memory);
+            let mut turn: u32 = 0;
+            let mut reactive_compacted = false;
+            loop {
+                turn += 1;
+                if turn > DEFAULT_MAX_TURNS {
+                    return Ok(ChildAgentResult {
+                        status: RunStatus::BudgetExhausted,
+                        final_message: None,
+                        error: Some("max turns exhausted".to_string()),
+                    });
+                }
 
-        let budget_model = config.model.as_option();
-        let ctx_config = orca_provider::context::ContextConfig::for_model_with_runtime(
-            budget_model.as_deref(),
-            &config.model_runtime,
-        );
-        let mut conversation = Conversation::new();
-        conversation.add_system(agent_common::build_agent_system_prompt(
-            cwd,
-            subagent_depth,
-            subagent_type,
-            Some(instructions),
-            config.approval_mode,
-            Some(memory),
-        ));
-        conversation.add_user(prompt.to_string());
+                if orca_provider::context::needs_compaction_wire(
+                    &setup.conversation,
+                    &setup.context_config,
+                    &setup.provider_config,
+                ) {
+                    let before_messages = setup.conversation.messages.len();
+                    if let Ok(outcome) = hooks.run(
+                        HookEvent::OnBudgetWarning,
+                        HookContext {
+                            cwd: &cwd.display().to_string(),
+                            session_status: None,
+                            tool_request: None,
+                            tool_result: None,
+                            before_messages: Some(before_messages),
+                            after_messages: None,
+                            usage: None,
+                        },
+                    ) {
+                        if !outcome.injected_context.is_empty() {
+                            setup.conversation =
+                                conversation_with_hook_context(&setup.conversation, &outcome);
+                        }
+                    }
+                    setup.conversation =
+                        orca_provider::context::compact(&setup.conversation, &setup.context_config);
+                }
 
-        let policy = ApprovalPolicy::new(config.approval_mode)
-            .with_permission_rules(config.permission_rules.clone());
-        let mut turn: u32 = 0;
-        let mut reactive_compacted = false;
-        loop {
-            turn += 1;
-            if turn > DEFAULT_MAX_TURNS {
-                return Ok(ChildAgentResult {
-                    status: RunStatus::BudgetExhausted,
-                    final_message: None,
-                    error: Some("max turns exhausted".to_string()),
+                let child_cancel = CancelToken::new();
+                let route_decision = config.model.route(ModelRouteContext {
+                    subagent_type: &request.subagent_type,
+                    subagent_model: None,
                 });
-            }
+                child_cost_tracker.set_model(Some(&route_decision.actual_model));
+                let mut turn_provider_config = setup.provider_config.clone();
+                turn_provider_config.model = Some(route_decision.actual_model.clone());
 
-            if orca_provider::context::needs_compaction_wire(
-                &conversation,
-                &ctx_config,
-                &provider_config,
-            ) {
-                let before_messages = conversation.messages.len();
-                if let Ok(outcome) = hooks.run(
-                    HookEvent::OnBudgetWarning,
+                let pre_model_outcome = match hooks.run(
+                    HookEvent::PreModelCall,
                     HookContext {
                         cwd: &cwd.display().to_string(),
                         session_status: None,
                         tool_request: None,
                         tool_result: None,
-                        before_messages: Some(before_messages),
+                        before_messages: None,
                         after_messages: None,
                         usage: None,
                     },
                 ) {
-                    if !outcome.injected_context.is_empty() {
-                        conversation = conversation_with_hook_context(&conversation, &outcome);
-                    }
-                }
-                conversation = orca_provider::context::compact(&conversation, &ctx_config);
-            }
-
-            let child_cancel = CancelToken::new();
-            let route_decision = config.model.route(ModelRouteContext {
-                subagent_type,
-                subagent_model: None,
-            });
-            child_cost_tracker.set_model(Some(&route_decision.actual_model));
-            let mut turn_provider_config = provider_config.clone();
-            turn_provider_config.model = Some(route_decision.actual_model.clone());
-
-            let pre_model_outcome = match hooks.run(
-                HookEvent::PreModelCall,
-                HookContext {
-                    cwd: &cwd.display().to_string(),
-                    session_status: None,
-                    tool_request: None,
-                    tool_result: None,
-                    before_messages: None,
-                    after_messages: None,
-                    usage: None,
-                },
-            ) {
-                Ok(outcome) => outcome,
-                Err(error) => {
-                    return Ok(ChildAgentResult {
-                        status: RunStatus::Failed,
-                        final_message: None,
-                        error: Some(format!("pre_model_call hook failed: {error}")),
-                    });
-                }
-            };
-            let model_conversation =
-                conversation_with_hook_context(&conversation, &pre_model_outcome);
-
-            let response = orca_provider::call_streaming(
-                config.provider,
-                &model_conversation,
-                &turn_provider_config,
-                &child_cancel,
-                &mut |_| {},
-            );
-
-            if let Err(error) = hooks.run(
-                HookEvent::PostModelCall,
-                HookContext {
-                    cwd: &cwd.display().to_string(),
-                    session_status: None,
-                    tool_request: None,
-                    tool_result: None,
-                    before_messages: None,
-                    after_messages: None,
-                    usage: response.usage.as_ref(),
-                },
-            ) {
-                return Ok(ChildAgentResult {
-                    status: RunStatus::Failed,
-                    final_message: None,
-                    error: Some(format!("post_model_call hook failed: {error}")),
-                });
-            }
-
-            if let Some(error) = response.steps.iter().find_map(|step| match step {
-                ProviderStep::Error(message) => Some(message.clone()),
-                _ => None,
-            }) {
-                if orca_provider::context::is_prompt_too_long_error(&error) && !reactive_compacted {
-                    conversation = orca_provider::context::compact(&conversation, &ctx_config);
-                    reactive_compacted = true;
-                    continue;
-                }
-                return Ok(ChildAgentResult {
-                    status: RunStatus::Failed,
-                    final_message: None,
-                    error: Some(error),
-                });
-            }
-
-            reactive_compacted = false;
-
-            if let Some(usage) = response.usage
-                && !usage.is_empty()
-            {
-                child_cost_tracker.add_usage(usage);
-            }
-
-            if response.tool_calls.is_empty() {
-                conversation.add_assistant(
-                    response.assistant_content.clone(),
-                    response.assistant_reasoning,
-                    vec![],
-                );
-                return Ok(ChildAgentResult {
-                    status: RunStatus::Success,
-                    final_message: response.assistant_content,
-                    error: None,
-                });
-            }
-
-            conversation.add_assistant(
-                response.assistant_content,
-                response.assistant_reasoning,
-                response.tool_calls.clone(),
-            );
-
-            for step in &response.steps {
-                if let ProviderStep::ToolCall(tool_request) = step {
-                    let (should_stop, result, child_cost) = execute_tool_for_tui(
-                        config,
-                        cwd,
-                        tool_request,
-                        event_tx,
-                        action_rx,
-                        subagent_depth,
-                        None,
-                        &policy,
-                        instructions,
-                        memory,
-                        &mcp_registry,
-                        hooks,
-                        None,
-                        &child_cancel,
-                    );
-
-                    if let Some(c) = child_cost {
-                        child_cost_tracker.merge(&c);
-                    }
-
-                    let result_content = agent_common::format_tool_result_for_model(&result);
-                    conversation.add_tool_result(tool_request.id.clone(), result_content);
-
-                    if should_stop {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
                         return Ok(ChildAgentResult {
                             status: RunStatus::Failed,
                             final_message: None,
-                            error: result.error,
+                            error: Some(format!("pre_model_call hook failed: {error}")),
                         });
+                    }
+                };
+                let model_conversation =
+                    conversation_with_hook_context(&setup.conversation, &pre_model_outcome);
+
+                let response = orca_provider::call_streaming(
+                    config.provider,
+                    &model_conversation,
+                    &turn_provider_config,
+                    &child_cancel,
+                    &mut |_| {},
+                );
+
+                if let Err(error) = hooks.run(
+                    HookEvent::PostModelCall,
+                    HookContext {
+                        cwd: &cwd.display().to_string(),
+                        session_status: None,
+                        tool_request: None,
+                        tool_result: None,
+                        before_messages: None,
+                        after_messages: None,
+                        usage: response.usage.as_ref(),
+                    },
+                ) {
+                    return Ok(ChildAgentResult {
+                        status: RunStatus::Failed,
+                        final_message: None,
+                        error: Some(format!("post_model_call hook failed: {error}")),
+                    });
+                }
+
+                if let Some(error) = response.steps.iter().find_map(|step| match step {
+                    ProviderStep::Error(message) => Some(message.clone()),
+                    _ => None,
+                }) {
+                    if orca_provider::context::is_prompt_too_long_error(&error)
+                        && !reactive_compacted
+                    {
+                        setup.conversation = orca_provider::context::compact(
+                            &setup.conversation,
+                            &setup.context_config,
+                        );
+                        reactive_compacted = true;
+                        continue;
+                    }
+                    return Ok(ChildAgentResult {
+                        status: RunStatus::Failed,
+                        final_message: None,
+                        error: Some(error),
+                    });
+                }
+
+                reactive_compacted = false;
+
+                if let Some(usage) = response.usage
+                    && !usage.is_empty()
+                {
+                    child_cost_tracker.add_usage(usage);
+                }
+
+                if response.tool_calls.is_empty() {
+                    setup.conversation.add_assistant(
+                        response.assistant_content.clone(),
+                        response.assistant_reasoning,
+                        vec![],
+                    );
+                    return Ok(ChildAgentResult {
+                        status: RunStatus::Success,
+                        final_message: response.assistant_content,
+                        error: None,
+                    });
+                }
+
+                setup.conversation.add_assistant(
+                    response.assistant_content,
+                    response.assistant_reasoning,
+                    response.tool_calls.clone(),
+                );
+
+                for step in &response.steps {
+                    if let ProviderStep::ToolCall(tool_request) = step {
+                        let (should_stop, result, child_cost) = execute_tool_for_tui(
+                            config,
+                            cwd,
+                            tool_request,
+                            event_tx,
+                            action_rx,
+                            request.depth,
+                            None,
+                            &setup.policy,
+                            instructions,
+                            memory,
+                            &setup.mcp_registry,
+                            hooks,
+                            None,
+                            &child_cancel,
+                        );
+
+                        if let Some(c) = child_cost {
+                            child_cost_tracker.merge(&c);
+                        }
+
+                        let result_content = agent_common::format_tool_result_for_model(&result);
+                        setup
+                            .conversation
+                            .add_tool_result(tool_request.id.clone(), result_content);
+
+                        if should_stop {
+                            return Ok(ChildAgentResult {
+                                status: RunStatus::Failed,
+                                final_message: None,
+                                error: result.error,
+                            });
+                        }
                     }
                 }
             }
-        }
-    })
+        },
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
