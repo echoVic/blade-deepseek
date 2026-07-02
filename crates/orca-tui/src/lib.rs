@@ -1,4 +1,5 @@
 mod agent_runner;
+mod agent_tool_execution;
 pub mod app;
 pub mod bridge;
 pub mod commands;
@@ -88,6 +89,25 @@ mod tests {
         assert!(
             !bridge.contains("pub fn run_agent_for_tui"),
             "bridge should not own the TUI agent turn loop"
+        );
+    }
+
+    #[test]
+    fn tui_agent_tool_execution_is_owned_by_dedicated_module() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let execution =
+            std::fs::read_to_string(format!("{manifest_dir}/src/agent_tool_execution.rs"))
+                .expect("TUI agent tool execution module should exist");
+        assert!(
+            execution.contains("pub(crate) fn execute_tool_for_tui"),
+            "agent_tool_execution should own the TUI tool execution entrypoint"
+        );
+
+        let runner = std::fs::read_to_string(format!("{manifest_dir}/src/agent_runner.rs"))
+            .expect("TUI agent runner source should be readable");
+        assert!(
+            !runner.contains("fn execute_tool_for_tui"),
+            "agent_runner should not own TUI tool execution helpers"
         );
     }
 }
