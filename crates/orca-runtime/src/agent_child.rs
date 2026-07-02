@@ -88,6 +88,12 @@ pub enum ChildAgentToolResultFold {
     Stop(ChildAgentResult),
 }
 
+pub struct ChildAgentToolExecution {
+    pub should_stop: bool,
+    pub result: ToolResult,
+    pub child_cost: Option<CostTracker>,
+}
+
 pub enum ChildAgentTurnBudget {
     Continue,
     Stop(ChildAgentResult),
@@ -452,6 +458,72 @@ pub fn child_agent_tool_requests(response: &ProviderResponse) -> Vec<&ToolReques
             _ => None,
         })
         .collect()
+}
+
+pub fn run_child_agent_loop_with_tool_executor<F>(
+    config: &RunConfig,
+    request: &ChildAgentRequest,
+    cwd: &Path,
+    instructions: &ProjectInstructions,
+    memory: &MemoryBlock,
+    hooks: &HookRunner,
+    child_cost_tracker: &mut CostTracker,
+    mut execute_tool: F,
+) -> io::Result<ChildAgentResult>
+where
+    F: FnMut(&ChildAgentLoopSetup, &CancelToken, &ToolRequest) -> ChildAgentToolExecution,
+{
+    let mut setup = prepare_child_agent_loop(config, request, cwd, instructions, memory);
+    loop {
+        match advance_child_agent_turn(&mut setup) {
+            ChildAgentTurnBudget::Continue => {}
+            ChildAgentTurnBudget::Stop(result) => return Ok(result),
+        }
+
+        compact_child_agent_conversation_if_needed(config, &mut setup, cwd, hooks)?;
+
+        let child_cancel = CancelToken::new();
+        let turn_provider_config =
+            route_child_agent_model(config, request, &setup, child_cost_tracker);
+
+        let response = match run_child_agent_provider_turn(
+            config,
+            &setup,
+            cwd,
+            hooks,
+            &turn_provider_config,
+            &child_cancel,
+        ) {
+            ChildAgentProviderTurn::Response(response) => response,
+            ChildAgentProviderTurn::Fail(result) => return Ok(result),
+        };
+
+        match handle_child_agent_provider_error(config, &mut setup, cwd, hooks, &response)? {
+            Some(ChildAgentProviderErrorDecision::RetryAfterCompaction) => continue,
+            Some(ChildAgentProviderErrorDecision::Fail(result)) => return Ok(result),
+            None => {}
+        }
+
+        match fold_child_agent_provider_response(&mut setup, &response, child_cost_tracker) {
+            ChildAgentProviderResponseFold::Complete(result) => return Ok(result),
+            ChildAgentProviderResponseFold::ContinueToTools => {}
+        }
+
+        for tool_request in child_agent_tool_requests(&response) {
+            let tool_execution = execute_tool(&setup, &child_cancel, tool_request);
+            match fold_child_agent_tool_result(
+                &mut setup,
+                tool_request,
+                tool_execution.should_stop,
+                tool_execution.result,
+                tool_execution.child_cost,
+                child_cost_tracker,
+            ) {
+                ChildAgentToolResultFold::Continue => {}
+                ChildAgentToolResultFold::Stop(result) => return Ok(result),
+            }
+        }
+    }
 }
 
 pub fn fold_child_agent_tool_result(
@@ -1106,6 +1178,54 @@ mod tests {
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0].id, first.id);
         assert_eq!(requests[1].id, second.id);
+    }
+
+    #[test]
+    fn run_child_agent_loop_with_tool_executor_runs_tools_until_provider_completes() {
+        let request = ChildAgentRequest::new(
+            "bash echo child".to_string(),
+            SubagentType::General,
+            None,
+            2,
+            false,
+        );
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let runtime_config = config(None);
+        let mut tracker = CostTracker::new(None);
+        let mut tool_count = 0;
+
+        let result = run_child_agent_loop_with_tool_executor(
+            &runtime_config,
+            &request,
+            std::env::temp_dir().as_path(),
+            &instructions,
+            &memory,
+            &HookRunner::default(),
+            &mut tracker,
+            |_setup, _cancel, tool_request| {
+                tool_count += 1;
+                assert_eq!(tool_request.name, ToolName::Bash);
+                assert_eq!(tool_request.target.as_deref(), Some("echo child"));
+                ChildAgentToolExecution {
+                    should_stop: false,
+                    result: ToolResult::completed(
+                        tool_request,
+                        "child tool ran".to_string(),
+                        false,
+                    ),
+                    child_cost: None,
+                }
+            },
+        )
+        .expect("child loop runner should complete");
+
+        assert_eq!(result.status, RunStatus::Success);
+        assert_eq!(
+            result.final_message.as_deref(),
+            Some("Mock completed after tool execution.")
+        );
+        assert_eq!(tool_count, 1);
     }
 
     #[test]

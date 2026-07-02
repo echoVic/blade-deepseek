@@ -207,8 +207,12 @@ mod tests {
             std::fs::read_to_string(format!("{manifest_dir}/src/agent_subagent_execution.rs"))
                 .expect("TUI agent subagent execution module should exist");
         assert!(
-            subagent.contains("prepare_child_agent_loop"),
-            "agent_subagent_execution should delegate child loop setup to runtime"
+            subagent.contains("run_child_agent_loop_with_tool_executor"),
+            "agent_subagent_execution should delegate child loop orchestration to runtime"
+        );
+        assert!(
+            !subagent.contains("prepare_child_agent_loop"),
+            "agent_subagent_execution should not prepare child loop setup directly"
         );
         assert!(
             !subagent.contains("ProviderConfig"),
@@ -231,8 +235,8 @@ mod tests {
             std::fs::read_to_string(format!("{manifest_dir}/src/agent_subagent_execution.rs"))
                 .expect("TUI agent subagent execution module should exist");
         assert!(
-            subagent.contains("route_child_agent_model"),
-            "agent_subagent_execution should delegate child model routing to runtime"
+            !subagent.contains("route_child_agent_model"),
+            "agent_subagent_execution should not route child models directly"
         );
         assert!(
             !subagent.contains("ModelRouteContext"),
@@ -251,8 +255,8 @@ mod tests {
             std::fs::read_to_string(format!("{manifest_dir}/src/agent_subagent_execution.rs"))
                 .expect("TUI agent subagent execution module should exist");
         assert!(
-            subagent.contains("compact_child_agent_conversation_if_needed"),
-            "agent_subagent_execution should delegate child compaction to runtime"
+            !subagent.contains("compact_child_agent_conversation_if_needed"),
+            "agent_subagent_execution should not trigger child compaction directly"
         );
         assert!(
             !subagent.contains("needs_compaction_wire"),
@@ -271,8 +275,8 @@ mod tests {
             std::fs::read_to_string(format!("{manifest_dir}/src/agent_subagent_execution.rs"))
                 .expect("TUI agent subagent execution module should exist");
         assert!(
-            subagent.contains("handle_child_agent_provider_error"),
-            "agent_subagent_execution should delegate child provider-error handling to runtime"
+            !subagent.contains("handle_child_agent_provider_error"),
+            "agent_subagent_execution should not handle child provider errors directly"
         );
         assert!(
             !subagent.contains("is_prompt_too_long_error"),
@@ -291,8 +295,8 @@ mod tests {
             std::fs::read_to_string(format!("{manifest_dir}/src/agent_subagent_execution.rs"))
                 .expect("TUI agent subagent execution module should exist");
         assert!(
-            subagent.contains("run_child_agent_provider_turn"),
-            "agent_subagent_execution should delegate child provider turns to runtime"
+            !subagent.contains("run_child_agent_provider_turn"),
+            "agent_subagent_execution should not run child provider turns directly"
         );
         assert!(
             !subagent.contains("call_streaming"),
@@ -316,8 +320,8 @@ mod tests {
             std::fs::read_to_string(format!("{manifest_dir}/src/agent_subagent_execution.rs"))
                 .expect("TUI agent subagent execution module should exist");
         assert!(
-            subagent.contains("fold_child_agent_provider_response"),
-            "agent_subagent_execution should delegate child provider response folding to runtime"
+            !subagent.contains("fold_child_agent_provider_response"),
+            "agent_subagent_execution should not fold child provider responses directly"
         );
         assert!(
             !subagent.contains("add_usage"),
@@ -340,8 +344,8 @@ mod tests {
             std::fs::read_to_string(format!("{manifest_dir}/src/agent_subagent_execution.rs"))
                 .expect("TUI agent subagent execution module should exist");
         assert!(
-            subagent.contains("fold_child_agent_tool_result"),
-            "agent_subagent_execution should delegate child tool-result folding to runtime"
+            !subagent.contains("fold_child_agent_tool_result"),
+            "agent_subagent_execution should not fold child tool results directly"
         );
         assert!(
             !subagent.contains("child_cost_tracker.merge"),
@@ -364,8 +368,8 @@ mod tests {
             std::fs::read_to_string(format!("{manifest_dir}/src/agent_subagent_execution.rs"))
                 .expect("TUI agent subagent execution module should exist");
         assert!(
-            subagent.contains("advance_child_agent_turn"),
-            "agent_subagent_execution should delegate child turn-budget checks to runtime"
+            !subagent.contains("advance_child_agent_turn"),
+            "agent_subagent_execution should not advance child turns directly"
         );
         assert!(
             !subagent.contains("DEFAULT_MAX_TURNS"),
@@ -404,8 +408,8 @@ mod tests {
             std::fs::read_to_string(format!("{manifest_dir}/src/agent_subagent_execution.rs"))
                 .expect("TUI agent subagent execution module should exist");
         assert!(
-            subagent.contains("child_agent_tool_requests"),
-            "agent_subagent_execution should delegate provider tool-call extraction to runtime"
+            !subagent.contains("child_agent_tool_requests"),
+            "agent_subagent_execution should not extract child provider tool calls directly"
         );
         assert!(
             !subagent.contains("ProviderStep"),

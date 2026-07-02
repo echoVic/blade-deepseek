@@ -2,19 +2,14 @@ use std::path::Path;
 use std::sync::mpsc::{Receiver, Sender};
 use std::thread;
 
-use orca_core::cancel::CancelToken;
 use orca_core::config::RunConfig;
 use orca_core::cost_types::UsageTotals;
 use orca_core::event_schema::{EventFactory, RunStatus};
 use orca_core::subagent_types::SubagentType;
 use orca_core::tool_types;
 use orca_runtime::agent_child::{
-    ChildAgentProviderErrorDecision, ChildAgentProviderResponseFold, ChildAgentProviderTurn,
-    ChildAgentRequest, ChildAgentResult, ChildAgentToolResultFold, ChildAgentTurnBudget,
-    advance_child_agent_turn, child_agent_tool_requests,
-    compact_child_agent_conversation_if_needed, fold_child_agent_provider_response,
-    fold_child_agent_tool_result, handle_child_agent_provider_error, prepare_child_agent_loop,
-    route_child_agent_model, run_child_agent_provider_turn, run_child_agent_with_executor,
+    ChildAgentRequest, ChildAgentResult, ChildAgentToolExecution,
+    run_child_agent_loop_with_tool_executor, run_child_agent_with_executor,
 };
 use orca_runtime::cost::CostTracker;
 use orca_runtime::hooks::HookRunner;
@@ -490,45 +485,15 @@ fn run_child_agent_for_tui(
         config,
         &child_request,
         |config, request, child_cost_tracker| {
-            let mut setup = prepare_child_agent_loop(config, request, cwd, instructions, memory);
-            loop {
-                match advance_child_agent_turn(&mut setup) {
-                    ChildAgentTurnBudget::Continue => {}
-                    ChildAgentTurnBudget::Stop(result) => return Ok(result),
-                }
-
-                compact_child_agent_conversation_if_needed(config, &mut setup, cwd, hooks)?;
-
-                let child_cancel = CancelToken::new();
-                let turn_provider_config =
-                    route_child_agent_model(config, request, &setup, child_cost_tracker);
-
-                let response = match run_child_agent_provider_turn(
-                    config,
-                    &setup,
-                    cwd,
-                    hooks,
-                    &turn_provider_config,
-                    &child_cancel,
-                ) {
-                    ChildAgentProviderTurn::Response(response) => response,
-                    ChildAgentProviderTurn::Fail(result) => return Ok(result),
-                };
-
-                match handle_child_agent_provider_error(config, &mut setup, cwd, hooks, &response)?
-                {
-                    Some(ChildAgentProviderErrorDecision::RetryAfterCompaction) => continue,
-                    Some(ChildAgentProviderErrorDecision::Fail(result)) => return Ok(result),
-                    None => {}
-                }
-
-                match fold_child_agent_provider_response(&mut setup, &response, child_cost_tracker)
-                {
-                    ChildAgentProviderResponseFold::Complete(result) => return Ok(result),
-                    ChildAgentProviderResponseFold::ContinueToTools => {}
-                }
-
-                for tool_request in child_agent_tool_requests(&response) {
+            run_child_agent_loop_with_tool_executor(
+                config,
+                request,
+                cwd,
+                instructions,
+                memory,
+                hooks,
+                child_cost_tracker,
+                |setup, child_cancel, tool_request| {
                     let (should_stop, result, child_cost) = execute_tool_for_tui(
                         config,
                         cwd,
@@ -543,22 +508,15 @@ fn run_child_agent_for_tui(
                         &setup.mcp_registry,
                         hooks,
                         None,
-                        &child_cancel,
+                        child_cancel,
                     );
-
-                    match fold_child_agent_tool_result(
-                        &mut setup,
-                        tool_request,
+                    ChildAgentToolExecution {
                         should_stop,
                         result,
                         child_cost,
-                        child_cost_tracker,
-                    ) {
-                        ChildAgentToolResultFold::Continue => {}
-                        ChildAgentToolResultFold::Stop(result) => return Ok(result),
                     }
-                }
-            }
+                },
+            )
         },
     )
 }
