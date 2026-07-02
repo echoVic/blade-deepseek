@@ -10,8 +10,9 @@ use orca_core::provider_types::ProviderStep;
 use orca_core::subagent_types::SubagentType;
 use orca_core::tool_types;
 use orca_runtime::agent_child::{
-    ChildAgentProviderErrorDecision, ChildAgentProviderTurn, ChildAgentRequest, ChildAgentResult,
-    compact_child_agent_conversation_if_needed, handle_child_agent_provider_error,
+    ChildAgentProviderErrorDecision, ChildAgentProviderResponseFold, ChildAgentProviderTurn,
+    ChildAgentRequest, ChildAgentResult, compact_child_agent_conversation_if_needed,
+    fold_child_agent_provider_response, handle_child_agent_provider_error,
     prepare_child_agent_loop, route_child_agent_model, run_child_agent_provider_turn,
     run_child_agent_with_executor,
 };
@@ -534,30 +535,11 @@ fn run_child_agent_for_tui(
                     None => {}
                 }
 
-                if let Some(usage) = response.usage
-                    && !usage.is_empty()
+                match fold_child_agent_provider_response(&mut setup, &response, child_cost_tracker)
                 {
-                    child_cost_tracker.add_usage(usage);
+                    ChildAgentProviderResponseFold::Complete(result) => return Ok(result),
+                    ChildAgentProviderResponseFold::ContinueToTools => {}
                 }
-
-                if response.tool_calls.is_empty() {
-                    setup.conversation.add_assistant(
-                        response.assistant_content.clone(),
-                        response.assistant_reasoning,
-                        vec![],
-                    );
-                    return Ok(ChildAgentResult {
-                        status: RunStatus::Success,
-                        final_message: response.assistant_content,
-                        error: None,
-                    });
-                }
-
-                setup.conversation.add_assistant(
-                    response.assistant_content,
-                    response.assistant_reasoning,
-                    response.tool_calls.clone(),
-                );
 
                 for step in &response.steps {
                     if let ProviderStep::ToolCall(tool_request) = step {

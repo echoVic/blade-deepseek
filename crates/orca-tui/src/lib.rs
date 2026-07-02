@@ -308,4 +308,28 @@ mod tests {
             "agent_subagent_execution should not build child model hook conversations"
         );
     }
+
+    #[test]
+    fn tui_subagent_child_provider_response_folding_is_runtime_owned() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let subagent =
+            std::fs::read_to_string(format!("{manifest_dir}/src/agent_subagent_execution.rs"))
+                .expect("TUI agent subagent execution module should exist");
+        assert!(
+            subagent.contains("fold_child_agent_provider_response"),
+            "agent_subagent_execution should delegate child provider response folding to runtime"
+        );
+        assert!(
+            !subagent.contains("add_usage"),
+            "agent_subagent_execution should not update child provider usage directly"
+        );
+        assert!(
+            !subagent.contains("tool_calls.is_empty"),
+            "agent_subagent_execution should not decide terminal provider response state"
+        );
+        assert!(
+            !subagent.contains("add_assistant"),
+            "agent_subagent_execution should not record child assistant responses directly"
+        );
+    }
 }

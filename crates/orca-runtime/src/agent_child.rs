@@ -75,6 +75,11 @@ pub enum ChildAgentProviderTurn {
     Fail(ChildAgentResult),
 }
 
+pub enum ChildAgentProviderResponseFold {
+    Complete(ChildAgentResult),
+    ContinueToTools,
+}
+
 pub struct ChildAgentLoopSetup {
     pub mcp_registry: McpRegistry,
     pub provider_config: ProviderConfig,
@@ -370,6 +375,38 @@ pub fn handle_child_agent_provider_error(
     )))
 }
 
+pub fn fold_child_agent_provider_response(
+    setup: &mut ChildAgentLoopSetup,
+    response: &ProviderResponse,
+    child_cost_tracker: &mut CostTracker,
+) -> ChildAgentProviderResponseFold {
+    if let Some(usage) = response.usage
+        && !usage.is_empty()
+    {
+        child_cost_tracker.add_usage(usage);
+    }
+
+    if response.tool_calls.is_empty() {
+        setup.conversation.add_assistant(
+            response.assistant_content.clone(),
+            response.assistant_reasoning.clone(),
+            vec![],
+        );
+        return ChildAgentProviderResponseFold::Complete(ChildAgentResult {
+            status: RunStatus::Success,
+            final_message: response.assistant_content.clone(),
+            error: None,
+        });
+    }
+
+    setup.conversation.add_assistant(
+        response.assistant_content.clone(),
+        response.assistant_reasoning.clone(),
+        response.tool_calls.clone(),
+    );
+    ChildAgentProviderResponseFold::ContinueToTools
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -379,7 +416,7 @@ mod tests {
     use orca_core::config::{
         HistoryMode, OutputFormat, ProviderKind, RunConfig, ThemeName, ToolConfig, WorkflowConfig,
     };
-    use orca_core::conversation::Message;
+    use orca_core::conversation::{Message, RawToolCall};
     use orca_core::event_schema::EventFactory;
     use orca_core::event_sink::EventSink;
     use orca_core::external_config::ExternalToolConfig;
@@ -802,6 +839,109 @@ mod tests {
                 panic!("repeated prompt-too-long should not retry")
             }
         }
+    }
+
+    #[test]
+    fn fold_child_agent_provider_response_records_usage_and_terminal_assistant() {
+        let request = ChildAgentRequest::new(
+            "inspect repo".to_string(),
+            SubagentType::General,
+            None,
+            2,
+            false,
+        );
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let runtime_config = config(None);
+        let mut setup = prepare_child_agent_loop(
+            &runtime_config,
+            &request,
+            std::env::temp_dir().as_path(),
+            &instructions,
+            &memory,
+        );
+        let response = ProviderResponse {
+            steps: vec![ProviderStep::MessageDelta("done".to_string())],
+            assistant_content: Some("done".to_string()),
+            assistant_reasoning: Some("reasoned".to_string()),
+            tool_calls: vec![],
+            usage: Some(Usage {
+                input_tokens: 120,
+                output_tokens: 30,
+                cache_tokens: 10,
+            }),
+        };
+        let mut tracker = CostTracker::new(Some(orca_core::model::PRO_MODEL));
+
+        let fold = fold_child_agent_provider_response(&mut setup, &response, &mut tracker);
+
+        match fold {
+            ChildAgentProviderResponseFold::Complete(result) => {
+                assert_eq!(result.status, RunStatus::Success);
+                assert_eq!(result.final_message.as_deref(), Some("done"));
+            }
+            ChildAgentProviderResponseFold::ContinueToTools => {
+                panic!("terminal response should complete child run")
+            }
+        }
+        assert!(tracker.totals().total_tokens() > 0);
+        assert!(matches!(
+            setup.conversation.messages.last(),
+            Some(Message::Assistant {
+                content: Some(content),
+                reasoning_content: Some(reasoning),
+                tool_calls,
+                ..
+            }) if content == "done" && reasoning == "reasoned" && tool_calls.is_empty()
+        ));
+    }
+
+    #[test]
+    fn fold_child_agent_provider_response_records_assistant_before_tools() {
+        let request = ChildAgentRequest::new(
+            "inspect repo".to_string(),
+            SubagentType::General,
+            None,
+            2,
+            false,
+        );
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let runtime_config = config(None);
+        let mut setup = prepare_child_agent_loop(
+            &runtime_config,
+            &request,
+            std::env::temp_dir().as_path(),
+            &instructions,
+            &memory,
+        );
+        let response = ProviderResponse {
+            steps: vec![],
+            assistant_content: Some("I need a tool".to_string()),
+            assistant_reasoning: None,
+            tool_calls: vec![RawToolCall {
+                id: "tool-1".to_string(),
+                function_name: "bash".to_string(),
+                arguments: "{\"command\":\"echo hi\"}".to_string(),
+            }],
+            usage: None,
+        };
+        let mut tracker = CostTracker::new(None);
+
+        let fold = fold_child_agent_provider_response(&mut setup, &response, &mut tracker);
+
+        assert!(matches!(
+            fold,
+            ChildAgentProviderResponseFold::ContinueToTools
+        ));
+        assert!(matches!(
+            setup.conversation.messages.last(),
+            Some(Message::Assistant {
+                content: Some(content),
+                tool_calls,
+                ..
+            }) if content == "I need a tool" && tool_calls.len() == 1
+        ));
     }
 
     #[test]
