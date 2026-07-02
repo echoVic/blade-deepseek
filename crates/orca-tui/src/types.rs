@@ -273,6 +273,10 @@ pub struct SubMenu {
     pub title: String,
     pub items: Vec<String>,
     pub selected: usize,
+    /// Carries a value chosen in an earlier step of a multi-step picker (e.g. the
+    /// model picked in step 1 of `/model`, while step 2 asks for reasoning effort).
+    /// Nothing is applied until the final step confirms, so Esc cancels cleanly.
+    pub context: Option<String>,
 }
 
 pub struct AppState {
@@ -294,6 +298,7 @@ pub struct AppState {
     pub visible_height: u16,
     pub app_version: String,
     pub model_name: String,
+    pub reasoning_effort: orca_core::config::ReasoningEffort,
     pub approval_mode: ApprovalMode,
     pub cwd: String,
     #[allow(dead_code)]
@@ -345,6 +350,7 @@ impl AppState {
             visible_height: 0,
             app_version,
             model_name,
+            reasoning_effort: orca_core::config::ReasoningEffort::default(),
             approval_mode: ApprovalMode::default(),
             cwd,
             event_tx,

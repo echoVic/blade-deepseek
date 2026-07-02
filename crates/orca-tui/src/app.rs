@@ -103,6 +103,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
         cwd_display,
     );
     state.approval_mode = config.approval_mode;
+    state.reasoning_effort = config.reasoning_effort;
     let theme = Theme::named(config.theme);
     if should_show_picker && !picker_sessions.is_empty() {
         state.status = AppStatus::SessionPicker;
@@ -1349,7 +1350,7 @@ mod tests {
     }
 
     #[test]
-    fn slash_submenu_tab_applies_model_like_enter() {
+    fn slash_submenu_model_flow_asks_for_reasoning_effort_then_applies_both() {
         let (mut state, _rx) = test_state();
         state.slash_menu = Some(SlashMenu {
             items: Vec::new(),
@@ -1358,41 +1359,76 @@ mod tests {
                 title: "/model".to_string(),
                 items: vec!["deepseek-v4-pro".to_string()],
                 selected: 0,
+                context: None,
             }),
         });
         let mut config = test_config(HistoryMode::Record);
+        config.reasoning_effort = orca_core::config::ReasoningEffort::Max;
         let shared_config = Arc::new(Mutex::new(config.clone()));
         let (action_tx, action_rx) = mpsc::channel();
         let theme = Theme::named(ThemeName::Dark);
         let mut textarea = make_textarea(&VimState::new(false), &theme);
         let vim_state = VimState::new(false);
-        let event = Event::Key(crossterm::event::KeyEvent::new(
-            KeyCode::Tab,
-            crossterm::event::KeyModifiers::NONE,
-        ));
-        let key = match &event {
-            Event::Key(key) => key,
-            _ => unreachable!(),
+
+        let press = |key_code: KeyCode,
+                     state: &mut AppState,
+                     config: &mut RunConfig,
+                     textarea: &mut TextArea| {
+            let event = Event::Key(crossterm::event::KeyEvent::new(
+                key_code,
+                crossterm::event::KeyModifiers::NONE,
+            ));
+            let key = match &event {
+                Event::Key(key) => *key,
+                _ => unreachable!(),
+            };
+            assert!(handle_slash_menu_key(
+                &event,
+                &key,
+                state,
+                config,
+                &shared_config,
+                &action_tx,
+                textarea,
+                &vim_state,
+                &theme,
+            ));
         };
 
-        assert!(handle_slash_menu_key(
-            &event,
-            key,
-            &mut state,
-            &mut config,
-            &shared_config,
-            &action_tx,
-            &mut textarea,
-            &vim_state,
-            &theme,
-        ));
+        // Step 1: picking a model must NOT apply anything yet — it opens the
+        // reasoning-effort picker, pre-selected on the current effort (max).
+        press(KeyCode::Tab, &mut state, &mut config, &mut textarea);
+        let sub = state
+            .slash_menu
+            .as_ref()
+            .and_then(|menu| menu.sub_menu.as_ref())
+            .expect("reasoning submenu should open");
+        assert_eq!(sub.title, REASONING_SUBMENU_TITLE);
+        assert_eq!(sub.context.as_deref(), Some("deepseek-v4-pro"));
+        assert!(sub.items[sub.selected].starts_with("max"));
+        assert_eq!(state.model_name, "auto", "not applied yet");
+
+        // Step 2: pick "high" (first item), applying model + effort together.
+        press(KeyCode::Up, &mut state, &mut config, &mut textarea);
+        press(KeyCode::Enter, &mut state, &mut config, &mut textarea);
 
         assert_eq!(state.model_name, "deepseek-v4-pro");
+        assert_eq!(
+            state.reasoning_effort,
+            orca_core::config::ReasoningEffort::High
+        );
         assert_eq!(config.model.display_name(), "deepseek-v4-pro");
         assert_eq!(
-            shared_config.lock().unwrap().model.display_name(),
-            "deepseek-v4-pro"
+            config.reasoning_effort,
+            orca_core::config::ReasoningEffort::High
         );
+        let shared = shared_config.lock().unwrap();
+        assert_eq!(shared.model.display_name(), "deepseek-v4-pro");
+        assert_eq!(
+            shared.reasoning_effort,
+            orca_core::config::ReasoningEffort::High
+        );
+        drop(shared);
         assert!(matches!(
             action_rx.try_recv(),
             Ok(UserAction::SetModel(model)) if model == "deepseek-v4-pro"
@@ -1597,25 +1633,44 @@ fn handle_slash_menu_key(
             }
             KeyCode::Tab | KeyCode::Enter => {
                 let chosen = sub.items[sub.selected].clone();
+                let title = sub.title.clone();
+                let pending_model = sub.context.clone();
                 // Execute the sub-command
-                if sub.title == "/model" {
+                if title == "/model" {
+                    // Step 1 of 2: remember the model, then ask for reasoning effort.
+                    // Nothing is applied yet, so Esc still cancels the whole switch.
                     let chosen_model = chosen
                         .split_whitespace()
                         .next()
                         .unwrap_or(&chosen)
                         .to_string();
                     if let Ok(()) = commands::validate_model(&chosen_model) {
-                        config.model = ModelSelection::from_unchecked(Some(chosen_model.clone()));
-                        if let Ok(mut cfg) = shared_config.lock() {
-                            cfg.model = ModelSelection::from_unchecked(Some(chosen_model.clone()));
-                        }
-                        state.model_name = chosen_model.clone();
-                        state.messages.push(ChatMessage::System(format!(
-                            "Model switched to {chosen_model}."
-                        )));
-                        let _ = action_tx.send(UserAction::SetModel(chosen_model));
+                        menu.sub_menu = Some(reasoning_effort_submenu(
+                            chosen_model,
+                            config.reasoning_effort,
+                        ));
+                        return true;
                     }
-                } else if sub.title == "/mode" {
+                } else if title == REASONING_SUBMENU_TITLE {
+                    // Step 2 of 2: apply model + reasoning effort together.
+                    if let (Some(model), Some(effort)) =
+                        (pending_model, parse_reasoning_effort(&chosen))
+                    {
+                        config.model = ModelSelection::from_unchecked(Some(model.clone()));
+                        config.reasoning_effort = effort;
+                        if let Ok(mut cfg) = shared_config.lock() {
+                            cfg.model = ModelSelection::from_unchecked(Some(model.clone()));
+                            cfg.reasoning_effort = effort;
+                        }
+                        state.model_name = model.clone();
+                        state.reasoning_effort = effort;
+                        state.messages.push(ChatMessage::System(format!(
+                            "Model switched to {model} (reasoning effort: {}).",
+                            effort.as_str()
+                        )));
+                        let _ = action_tx.send(UserAction::SetModel(model));
+                    }
+                } else if title == "/mode" {
                     if let Some(mode) = parse_approval_mode(&chosen) {
                         config.approval_mode = mode;
                         if let Ok(mut cfg) = shared_config.lock() {
@@ -1731,6 +1786,7 @@ fn select_slash_menu_command(
                     title: "/model".to_string(),
                     items: models,
                     selected: 0,
+                    context: None,
                 }),
             });
         }
@@ -1748,6 +1804,7 @@ fn select_slash_menu_command(
                     title: "/mode".to_string(),
                     items: modes,
                     selected: 0,
+                    context: None,
                 }),
             });
         }
@@ -2530,8 +2587,9 @@ fn handle_slash_command(
         },
         SlashCommand::Model(None) => {
             state.messages.push(ChatMessage::System(format!(
-                "Current model: {}",
-                state.model_name
+                "Current model: {} (reasoning effort: {}). Use the /model menu to change both.",
+                state.model_name,
+                state.reasoning_effort.as_str()
             )));
         }
         SlashCommand::Cost => {
@@ -2688,6 +2746,47 @@ fn parse_approval_mode(mode: &str) -> Option<ApprovalMode> {
         "plan" => Some(ApprovalMode::Plan),
         _ => None,
     }
+}
+
+/// Title of step 2 of the `/model` picker. The submenu key handler dispatches on it.
+const REASONING_SUBMENU_TITLE: &str = "/model · reasoning effort";
+
+/// Step 2 of the `/model` picker: choose reasoning effort for the model picked in
+/// step 1 (carried in `context`). Pre-selects the currently configured effort.
+fn reasoning_effort_submenu(
+    pending_model: String,
+    current: orca_core::config::ReasoningEffort,
+) -> SubMenu {
+    let items: Vec<String> = reasoning_effort_options()
+        .iter()
+        .map(|(effort, description)| format!("{} {description}", effort.as_str()))
+        .collect();
+    let selected = reasoning_effort_options()
+        .iter()
+        .position(|(effort, _)| *effort == current)
+        .unwrap_or(0);
+    SubMenu {
+        title: REASONING_SUBMENU_TITLE.to_string(),
+        items,
+        selected,
+        context: Some(pending_model),
+    }
+}
+
+fn reasoning_effort_options() -> &'static [(orca_core::config::ReasoningEffort, &'static str)] {
+    use orca_core::config::ReasoningEffort;
+    &[
+        (ReasoningEffort::High, "(faster, lighter reasoning)"),
+        (ReasoningEffort::Max, "(deepest reasoning, default)"),
+    ]
+}
+
+fn parse_reasoning_effort(choice: &str) -> Option<orca_core::config::ReasoningEffort> {
+    let token = choice.split_whitespace().next().unwrap_or(choice);
+    reasoning_effort_options()
+        .iter()
+        .find(|(effort, _)| effort.as_str() == token)
+        .map(|(effort, _)| *effort)
 }
 
 fn chat_message_from_history(message: Message) -> Option<ChatMessage> {

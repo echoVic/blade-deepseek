@@ -1739,7 +1739,11 @@ fn render_status(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
     let line = Line::from(vec![
         Span::styled(format!(" {scroll_hint}"), Style::default().fg(theme.muted)),
         Span::styled(
-            format!("model: {}", state.model_name),
+            format!(
+                "model: {} ({})",
+                state.model_name,
+                state.reasoning_effort.as_str()
+            ),
             Style::default().fg(theme.muted),
         ),
         Span::styled(

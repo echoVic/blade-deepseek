@@ -97,7 +97,7 @@ fn parse_static(input: &str) -> Option<SlashCommand> {
 
 pub fn all_commands() -> &'static [(&'static str, &'static str)] {
     &[
-        ("/model", "Switch model: auto, flash, or pro"),
+        ("/model", "Switch model and reasoning effort"),
         ("/compact", "Compress conversation context"),
         ("/cost", "Show session cost"),
         ("/config show", "Show merged config"),

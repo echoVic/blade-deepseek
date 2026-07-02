@@ -86,7 +86,7 @@ const copy = {
     features: [
       {
         title: "DeepSeek-native",
-        body: "Built around DeepSeek reasoning, SSE streaming, tool-use semantics, and prefix-cache behavior. One orca exec hands off the task — no context switch.",
+        body: "Built around DeepSeek reasoning, max reasoning effort by default, SSE streaming, tool-use semantics, and prefix-cache behavior. One orca exec hands off the task — no context switch.",
       },
       {
         title: "1M context, self-managed",
@@ -164,6 +164,7 @@ const copy = {
       historyStored:
         "  Stored under ~/.orca/sessions/YYYY/MM/DD/; large runs can be zstd-compressed.",
       configMainLoop: "main loop v4-pro, aux tasks v4-flash",
+      configReasoning: "max reasoning effort",
       configPriority: "Priority: env vars > CLI args > config file > defaults",
     },
     specsEyebrow: "Technical specs",
@@ -250,7 +251,7 @@ const copy = {
     features: [
       {
         title: "DeepSeek 原生",
-        body: "围绕 DeepSeek 推理、SSE 流式输出、工具调用语义和前缀缓存行为构建。一个 orca exec 就能交付任务，不必切换上下文。",
+        body: "围绕 DeepSeek 推理构建，默认启用 max reasoning effort，并适配 SSE 流式输出、工具调用语义和前缀缓存行为。一个 orca exec 就能交付任务，不必切换上下文。",
       },
       {
         title: "1M 上下文，自主管理",
@@ -327,6 +328,7 @@ const copy = {
       historyBrowse: "浏览、搜索和恢复会话记录",
       historyStored: "  存放在 ~/.orca/sessions/YYYY/MM/DD/；大型运行可用 zstd 压缩。",
       configMainLoop: "主循环 v4-pro，辅助任务 v4-flash",
+      configReasoning: "max 推理强度",
       configPriority: "优先级：环境变量 > CLI 参数 > 配置文件 > 默认值",
     },
     specsEyebrow: "技术规格",
@@ -630,6 +632,9 @@ function renderCodeTab(tab: CodeTab, t: (typeof copy)[Locale]) {
         {"\n"}
         model = <span className="k-str">"auto"</span>{" "}
         <span className="k-com"># {c.configMainLoop}</span>
+        {"\n"}
+        reasoning_effort = <span className="k-str">"max"</span>{" "}
+        <span className="k-com"># {c.configReasoning}</span>
         {"\n"}
         api_key = <span className="k-str">"sk-..."</span>
         {"\n"}
