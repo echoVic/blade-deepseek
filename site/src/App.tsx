@@ -26,20 +26,20 @@ const seoCopy = {
   en: {
     title: "Orca - DeepSeek-native terminal coding agent",
     description:
-      "Orca is a DeepSeek-native local coding agent for terminal workflows, spec-driven tools, Markdown skills, TUI user input, persistent goals, resumable history, and verifier-gated automation.",
+      "Orca is a DeepSeek-native local terminal coding agent for long-context coding, multi-turn tool use, prefix-cache friendly prompts, persistent goals, resumable history, and approval-aware automation.",
     ogTitle: "Orca - DeepSeek-native terminal coding agent",
     ogDescription:
-      "Run DeepSeek-native coding agent workflows locally with spec-driven tools, Markdown skills, TUI user input, persistent goals, resumable history, and verifier-gated automation.",
+      "Run DeepSeek-native coding work locally with long context, multi-turn tools, prefix-cache friendly prompts, persistent goals, resumable history, and verifier-gated automation.",
     imageAlt: "Orca terminal coding agent product preview",
     locale: "en_US",
   },
   zh: {
     title: "Orca - DeepSeek 原生终端代码智能体",
     description:
-      "Orca 是 DeepSeek 原生的本地终端代码智能体，支持规格驱动工具、Markdown skills、TUI 用户输入、持久 goal、可恢复历史、工作流和 verifier 校验自动化。",
+      "Orca 是 DeepSeek 原生的本地终端代码智能体，支持长上下文编码、多轮工具调用、前缀缓存友好提示词、持久 goal、可恢复历史和审批可控自动化。",
     ogTitle: "Orca - DeepSeek 原生终端代码智能体",
     ogDescription:
-      "在本地终端运行 DeepSeek 原生代码智能体工作流，覆盖规格驱动工具、Markdown skills、TUI 用户输入、持久 goal、可恢复历史和 verifier 校验自动化。",
+      "在本地终端运行 DeepSeek 原生代码任务，覆盖长上下文、多轮工具、前缀缓存友好提示词、持久 goal、可恢复历史和 verifier 校验自动化。",
     imageAlt: "Orca 终端代码智能体产品预览",
     locale: "zh_CN",
   },
@@ -70,7 +70,7 @@ const copy = {
       titleHighlight: "DeepSeek-native",
       titleSuffix: "coding agent, in your terminal.",
       subtitle:
-        "Orca is a local terminal coding agent built for DeepSeek: long-context coding, multi-turn tool use, resumable history, persistent goals, and approval-aware automation in one Rust binary.",
+        "Orca is a local terminal coding agent built around DeepSeek: long-context coding, multi-turn tool use, prefix-cache friendly prompts, resumable history, persistent goals, and approval-aware automation in one Rust binary.",
       primary: "Get started",
       secondary: "View on GitHub",
       meta: {
@@ -82,11 +82,11 @@ const copy = {
       },
     },
     featuresEyebrow: "What you'll notice",
-    featuresTitle: "Not a wrapper — built for DeepSeek semantics.",
+    featuresTitle: "Built around DeepSeek, not around a generic agent shell.",
     features: [
       {
         title: "DeepSeek-native",
-        body: "Built around DeepSeek reasoning, SSE streaming, and tool-use semantics. One orca exec hands off the task — no context switch.",
+        body: "Built around DeepSeek reasoning, SSE streaming, tool-use semantics, and prefix-cache behavior. One orca exec hands off the task — no context switch.",
       },
       {
         title: "1M context, self-managed",
@@ -119,10 +119,10 @@ const copy = {
         { k: "0", l: "duplicate remote summary calls (hashed cache)" },
       ],
     },
-    capabilitiesEyebrow: "Inside the engine",
-    capabilitiesTitle: "Every turn stays in your control.",
+    capabilitiesEyebrow: "Control surface",
+    capabilitiesTitle: "Inspect, resume, and gate every turn.",
     capabilitiesSubtitle:
-      "From prompt to tool call to result, Orca exposes the whole agent loop as a readable, verifiable, resumable flow — not a black box.",
+      "From prompt to tool call to result, Orca keeps coding runs readable, verifiable, and resumable instead of hiding them behind a black box.",
     builtInToolsLabel: "Built-in tools",
     capabilities: [
       {
@@ -234,7 +234,7 @@ const copy = {
       titleHighlight: "DeepSeek 原生",
       titleSuffix: "代码智能体。",
       subtitle:
-        "Orca 是面向 DeepSeek 的本地终端代码智能体：长上下文编码、多轮工具调用、可恢复历史、持久 goal，以及带审批策略的自动化，都内建在一个 Rust 二进制里。",
+        "Orca 是围绕 DeepSeek 构建的本地终端代码智能体：长上下文编码、多轮工具调用、前缀缓存友好提示词、可恢复历史、持久 goal，以及带审批策略的自动化，都内建在一个 Rust 二进制里。",
       primary: "开始使用",
       secondary: "查看 GitHub",
       meta: {
@@ -246,11 +246,11 @@ const copy = {
       },
     },
     featuresEyebrow: "你会注意到",
-    featuresTitle: "不是包装器，而是为 DeepSeek 语义构建。",
+    featuresTitle: "围绕 DeepSeek 构建，而不是套一层通用智能体外壳。",
     features: [
       {
         title: "DeepSeek 原生",
-        body: "围绕 DeepSeek 推理、SSE 流式输出和工具调用语义构建。一个 orca exec 就能交付任务，不必切换上下文。",
+        body: "围绕 DeepSeek 推理、SSE 流式输出、工具调用语义和前缀缓存行为构建。一个 orca exec 就能交付任务，不必切换上下文。",
       },
       {
         title: "1M 上下文，自主管理",
@@ -283,10 +283,10 @@ const copy = {
         { k: "0", l: "重复 remote summary 调用（哈希缓存）" },
       ],
     },
-    capabilitiesEyebrow: "引擎内部",
-    capabilitiesTitle: "每一轮都在你的控制之下。",
+    capabilitiesEyebrow: "控制界面",
+    capabilitiesTitle: "每一轮都可检查、可恢复、可校验。",
     capabilitiesSubtitle:
-      "从提示词到工具调用再到结果，Orca 把整个智能体循环呈现为可读、可验证、可恢复的流程，而不是黑箱。",
+      "从提示词到工具调用再到结果，Orca 让代码任务保持可读、可验证、可恢复，而不是藏在黑箱里。",
     builtInToolsLabel: "内置工具",
     capabilities: [
       {

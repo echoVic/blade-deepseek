@@ -686,6 +686,12 @@ pub fn run_agent_for_tui(
                 session.append_message(&message);
             }
             if config.auto_memory {
+                // Memory extraction makes its own LLM round-trip. Running it inline held
+                // back `SessionCompleted` and the TUI visibly hung at "running" for
+                // seconds after the final answer had already streamed. Run it on a
+                // detached background thread instead: the turn completes immediately and
+                // a failed/slow extraction only costs (at worst) that one memory note.
+                let provider_kind = config.provider;
                 let provider_config = ProviderConfig {
                     api_key: config.api_key.clone(),
                     base_url: config.base_url.clone(),
@@ -694,18 +700,25 @@ pub fn run_agent_for_tui(
                     mcp_registry: None,
                     external_tools: Vec::new(),
                 };
-                if let Err(error) = memory::extract_project_memory(
-                    config.provider,
-                    &provider_config,
-                    &cwd,
-                    &session.conversation().messages,
-                ) {
-                    send_error_for_tui(
-                        event_tx,
-                        &mut runtime_events,
-                        &format!("memory extraction failed: {error}"),
-                    );
-                }
+                let memory_cwd = cwd.clone();
+                let messages = session.conversation().messages.clone();
+                let memory_tx = event_tx.clone();
+                let run_id = runtime_events.run_id().to_string();
+                thread::spawn(move || {
+                    if let Err(error) = memory::extract_project_memory(
+                        provider_kind,
+                        &provider_config,
+                        &memory_cwd,
+                        &messages,
+                    ) {
+                        let mut events = EventFactory::new(run_id);
+                        send_error_for_tui(
+                            &memory_tx,
+                            &mut events,
+                            &format!("memory extraction failed: {error}"),
+                        );
+                    }
+                });
             }
             send_session_completed_for_tui(
                 event_tx,

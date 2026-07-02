@@ -230,10 +230,12 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
             // conversation view; the panel dashboards have their own keyboard navigation.
             if let Event::Mouse(mouse) = &ev {
                 if state.panel_mode == PanelMode::Conversation {
-                    match mouse.kind {
-                        MouseEventKind::ScrollUp => state.scroll_up(3),
-                        MouseEventKind::ScrollDown => state.scroll_down(3),
-                        _ => {}
+                    if state.accepts_mouse_scroll_at(Instant::now()) {
+                        match mouse.kind {
+                            MouseEventKind::ScrollUp => state.scroll_up(3),
+                            MouseEventKind::ScrollDown => state.scroll_down(3),
+                            _ => {}
+                        }
                     }
                 }
                 continue;

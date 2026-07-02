@@ -308,6 +308,7 @@ pub struct AppState {
     pub history_cursor: Option<usize>,
     pub draft_before_history: Option<String>,
     pub last_ctrl_c: Option<Instant>,
+    pub last_completed_at: Option<Instant>,
     pub session_picker_sessions: Vec<SessionSummary>,
     pub session_picker_selected: usize,
     pub session_picker_query: String,
@@ -355,6 +356,7 @@ impl AppState {
             history_cursor: None,
             draft_before_history: None,
             last_ctrl_c: None,
+            last_completed_at: None,
             session_picker_sessions: Vec::new(),
             session_picker_selected: 0,
             session_picker_query: String::new(),
@@ -395,6 +397,19 @@ impl AppState {
     }
 
     pub fn scroll_up(&mut self, lines: u16) {
+        // With everything already on screen there is nothing to scroll: a wheel tick
+        // here (trackpad inertia, an accidental touch) must not silently unpin
+        // auto-follow — the view wouldn't move, so the user gets no feedback that
+        // follow was disarmed, and the transcript then stops tracking new content
+        // the moment it grows past one screen.
+        // With everything already on screen there is nothing to scroll: a wheel tick
+        // here (trackpad inertia, an accidental touch) must not silently unpin
+        // auto-follow — the view wouldn't move, so the user gets no feedback that
+        // follow was disarmed, and the transcript then stops tracking new content
+        // the moment it grows past one screen.
+        if self.total_lines <= self.visible_height {
+            return;
+        }
         self.scroll_offset = self.scroll_offset.saturating_sub(lines);
         self.auto_scroll = false;
     }
@@ -416,6 +431,14 @@ impl AppState {
     pub fn scroll_to_top(&mut self) {
         self.scroll_offset = 0;
         self.auto_scroll = false;
+    }
+
+    pub fn accepts_mouse_scroll_at(&self, now: Instant) -> bool {
+        const COMPLETION_MOUSE_SCROLL_GRACE: std::time::Duration =
+            std::time::Duration::from_millis(800);
+        self.last_completed_at.is_none_or(|completed_at| {
+            now.duration_since(completed_at) >= COMPLETION_MOUSE_SCROLL_GRACE
+        })
     }
 
     pub fn toggle_shortcuts(&mut self) {
@@ -818,6 +841,7 @@ impl AppState {
                 self.archive_current_plan();
                 self.finalize_turn();
                 self.set_status(AppStatus::Idle);
+                self.last_completed_at = Some(Instant::now());
                 self.scroll_to_bottom();
             }
             TuiEvent::Compacted {
@@ -1441,6 +1465,65 @@ mod tests {
             "finished turns should leave the final answer pinned above the composer"
         );
         assert_eq!(state.scroll_offset, 80);
+    }
+
+    #[test]
+    fn scroll_up_with_content_shorter_than_pane_keeps_auto_follow() {
+        // First screen: everything fits, nothing to scroll. A stray wheel-up (trackpad
+        // inertia, accidental touch) must not disarm auto-follow, or the transcript
+        // stops tracking new streamed content once it grows past one screen and the
+        // user is forced to scroll down by hand.
+        let mut state = state();
+        state.total_lines = 10;
+        state.visible_height = 24;
+        state.auto_scroll = true;
+
+        state.scroll_up(3);
+
+        assert!(
+            state.auto_scroll,
+            "wheel-up on a not-yet-overflowing transcript must keep auto-follow armed"
+        );
+        assert_eq!(state.scroll_offset, 0);
+    }
+
+    #[test]
+    fn scroll_up_with_overflow_disarms_auto_follow() {
+        let mut state = state();
+        state.total_lines = 100;
+        state.visible_height = 24;
+        state.scroll_offset = 76;
+        state.auto_scroll = true;
+
+        state.scroll_up(3);
+
+        assert!(
+            !state.auto_scroll,
+            "wheel-up on an overflowing transcript should still let the user break away"
+        );
+        assert_eq!(state.scroll_offset, 73);
+    }
+
+    #[test]
+    fn session_completion_temporarily_ignores_inertial_mouse_scroll() {
+        let mut state = state();
+        state.enter_running();
+        state.update(TuiEvent::SessionCompleted {
+            status: "success".to_string(),
+        });
+
+        let completed_at = state
+            .last_completed_at
+            .expect("session completion should record completion time");
+
+        assert!(
+            !state.accepts_mouse_scroll_at(completed_at),
+            "trackpad inertia immediately after completion must not undo bottom pinning"
+        );
+        assert!(
+            state.accepts_mouse_scroll_at(completed_at + std::time::Duration::from_millis(900)),
+            "manual mouse scrolling should work again after the completion grace period"
+        );
     }
 
     #[test]

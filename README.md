@@ -202,7 +202,7 @@ In the TUI, `Esc` during an idle composer backtracks to the previous user messag
 
 ## Persistent Goal Mode
 
-TUI sessions support Codex-style persistent goals with `/goal`. A goal is stored by session id in `~/.orca/goals_1.json` or `$ORCA_HOME/goals_1.json`, so it survives process restarts when the session is saved.
+TUI sessions support persistent goals with `/goal`. A goal is stored by session id in `~/.orca/goals_1.json` or `$ORCA_HOME/goals_1.json`, so it survives process restarts when the session is saved.
 
 ```text
 /goal                         # show the current goal

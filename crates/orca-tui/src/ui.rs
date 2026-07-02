@@ -37,8 +37,20 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
 
     let plan_height = plan_panel_height(state);
     let goal_height: u16 = if state.current_goal.is_some() { 3 } else { 0 };
+    // An activity indicator sits above the composer while the agent is working (or
+    // waiting on the user), showing status + elapsed time. It takes two rows — a blank
+    // spacer, then the text — so the transcript tail, the indicator, and the input box
+    // don't sit flush against each other. Idle collapses it to zero height so a resting
+    // session has no chrome noise there.
+    let activity_height: u16 = if activity_line(state, theme).is_some() { 2 } else { 0 };
 
-    let chunks = main_layout(frame.area(), goal_height, plan_height, input_height);
+    let chunks = main_layout(
+        frame.area(),
+        goal_height,
+        plan_height,
+        activity_height,
+        input_height,
+    );
 
     if goal_height > 0 {
         render_goal_banner(frame, chunks[0], state, theme);
@@ -53,17 +65,20 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
     if plan_height > 0 {
         render_plan_panel(frame, chunks[2], state, theme);
     }
-    if composer_visible(state) {
-        render_input(frame, chunks[3], textarea);
+    if activity_height > 0 {
+        render_activity(frame, chunks[3], state, theme);
     }
-    render_status(frame, chunks[4], state, theme);
+    if composer_visible(state) {
+        render_input(frame, chunks[4], textarea);
+    }
+    render_status(frame, chunks[5], state, theme);
 
     if state.slash_menu.is_some() {
-        render_slash_menu(frame, chunks[3], state, theme);
+        render_slash_menu(frame, chunks[4], state, theme);
     }
 
     if !state.mention_candidates.is_empty() && state.slash_menu.is_none() {
-        render_mention_candidates(frame, chunks[3], state, theme);
+        render_mention_candidates(frame, chunks[4], state, theme);
     }
 
     if state.status == AppStatus::WaitingApproval {
@@ -79,18 +94,20 @@ fn main_layout(
     area: Rect,
     goal_height: u16,
     plan_height: u16,
+    activity_height: u16,
     input_height: u16,
 ) -> std::rc::Rc<[Rect]> {
-    // The fixed chrome (goal banner, plan, input box, status line) MUST keep its height so the
-    // input box stays pinned at the bottom; the message transcript takes whatever is left.
-    // In ratatui 0.29 `Min` has the HIGHEST solver priority and `Fill` the LOWEST, so giving
-    // the transcript `Min(5)` made it steal rows from the `Length` chrome when the transcript
-    // overflowed — the input box got squeezed off-screen and the auto-scrolled tail landed
-    // behind it. `Fill(1)` makes the transcript yield to the fixed chrome instead.
+    // The fixed chrome (goal banner, plan, activity line, input box, status line) MUST keep
+    // its height so the input box stays pinned at the bottom; the message transcript takes
+    // whatever is left. In ratatui 0.29 `Min` has the HIGHEST solver priority and `Fill` the
+    // LOWEST, so giving the transcript `Min(5)` made it steal rows from the `Length` chrome
+    // when the transcript overflowed — the input box got squeezed off-screen and the
+    // auto-scrolled tail landed behind it. `Fill(1)` makes the transcript yield instead.
     Layout::vertical([
         Constraint::Length(goal_height),
         Constraint::Fill(1),
         Constraint::Length(plan_height),
+        Constraint::Length(activity_height),
         Constraint::Length(input_height),
         Constraint::Length(1),
     ])
@@ -350,15 +367,6 @@ fn highlight_match(text: &str, needle: &str, base: Style, theme: &Theme) -> Vec<
     spans
 }
 
-/// Total visual (wrapped) height of `lines` at `width`. Shared by the scroll math and
-/// by the inline-viewport height computation so both agree on how tall content is.
-pub(crate) fn visual_height_of_lines(lines: &[Line], width: usize) -> u16 {
-    lines
-        .iter()
-        .map(|line| wrapped_line_count(line, width.max(1)) as u16)
-        .fold(0u16, |acc, n| acc.saturating_add(n))
-}
-
 /// The lines the transcript pane shows: the welcome banner before the first message,
 /// otherwise `messages[flushed_count..]`. Single source of truth so the height computation
 /// and the renderer never disagree.
@@ -399,7 +407,15 @@ pub(crate) fn render_live_messages(
     let width = area.width.max(1) as usize;
     let lines = live_pane_lines(state, theme, width);
 
-    let total = visual_height_of_lines(&lines, width);
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+    // Measure with ratatui's own word wrapper (`Paragraph::line_count`) so the scroll
+    // math and the renderer agree on wrapped height by construction. A hand-rolled
+    // estimate kept diverging on mixed-width CJK/ASCII runs (a 2-cell char at a row
+    // with 1 cell left wraps early, "wasting" a cell), undercounting the height and
+    // pinning auto-scroll a few rows above the real tail.
+    let total = paragraph
+        .line_count(area.width.max(1))
+        .min(u16::MAX as usize) as u16;
     state.total_lines = total;
     state.visible_height = area.height;
 
@@ -414,10 +430,7 @@ pub(crate) fn render_live_messages(
     // against the value actually shown (content may have grown or shrunk this frame).
     state.scroll_offset = scroll;
 
-    let paragraph = Paragraph::new(lines)
-        .wrap(Wrap { trim: false })
-        .scroll((scroll, 0));
-    frame.render_widget(paragraph, area);
+    frame.render_widget(paragraph.scroll((scroll, 0)), area);
 }
 
 fn render_workflows_panel(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) {
@@ -1046,54 +1059,6 @@ fn build_welcome_lines<'a>(state: &AppState, theme: &Theme) -> Vec<Line<'a>> {
         )),
         Line::from(""),
     ]
-}
-
-fn wrapped_line_count(line: &Line, width: usize) -> usize {
-    let text = line
-        .spans
-        .iter()
-        .map(|span| span.content.as_ref())
-        .collect::<String>();
-    visual_wrapped_line_count(&text, width)
-}
-
-fn visual_wrapped_line_count(text: &str, width: usize) -> usize {
-    if width == 0 || text.is_empty() {
-        return 1;
-    }
-
-    let mut line_count = 0usize;
-    let mut current_width = 0usize;
-
-    // ratatui's word wrapper breaks only on whitespace; long tokens are hard-wrapped
-    // as a unit. Splitting on '/' or '-' here would let the estimate pack characters
-    // tighter than the renderer does, undercounting total height and scrolling the
-    // newest lines out of view. Match the renderer: break on whitespace only.
-    for segment in text.split_inclusive(char::is_whitespace) {
-        let mut segment_width = UnicodeWidthStr::width(segment);
-        if segment_width == 0 {
-            continue;
-        }
-
-        if segment_width > width {
-            if current_width > 0 {
-                line_count += 1;
-            }
-            line_count += segment_width / width;
-            segment_width %= width;
-            current_width = segment_width;
-            continue;
-        }
-
-        if current_width == 0 || current_width + segment_width <= width {
-            current_width += segment_width;
-        } else {
-            line_count += 1;
-            current_width = segment_width;
-        }
-    }
-
-    line_count + usize::from(current_width > 0)
 }
 
 /// Render the lines for a contiguous slice of messages. Used both to flush a settled
@@ -1761,7 +1726,7 @@ fn push_hard_wrapped_segment(
 fn render_status(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let scroll_hint = if !state.auto_scroll {
         format!(
-            " | scroll: {}/{}",
+            "scroll: {}/{} | ",
             state.scroll_offset,
             state.total_lines.saturating_sub(state.visible_height)
         )
@@ -1769,11 +1734,12 @@ fn render_status(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
         String::new()
     };
 
+    // The live status dot + elapsed time moved to the activity line above the composer
+    // (see `render_activity`); this bottom line is now purely persistent metadata.
     let line = Line::from(vec![
-        status_cell(state, theme),
-        Span::styled(scroll_hint, Style::default().fg(theme.muted)),
+        Span::styled(format!(" {scroll_hint}"), Style::default().fg(theme.muted)),
         Span::styled(
-            format!(" | model: {}", state.model_name),
+            format!("model: {}", state.model_name),
             Style::default().fg(theme.muted),
         ),
         Span::styled(
@@ -1797,22 +1763,38 @@ fn render_status(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
     frame.render_widget(paragraph, area);
 }
 
-fn status_cell(state: &AppState, theme: &Theme) -> Span<'static> {
-    let (status_text, color) = match &state.status {
-        AppStatus::Setup => ("● setup".to_string(), theme.border),
-        AppStatus::SessionPicker => ("● sessions".to_string(), theme.border),
-        AppStatus::Idle => ("● idle".to_string(), theme.success),
+/// The activity indicator shown on its own line directly above the composer. Returns
+/// `None` while idle so the line collapses to zero height and a resting session stays
+/// clean; every other status renders a coloured dot, a label, and (while running) the
+/// elapsed wall-clock time.
+fn activity_line(state: &AppState, theme: &Theme) -> Option<(String, ratatui::style::Color)> {
+    match &state.status {
+        AppStatus::Idle | AppStatus::Setup | AppStatus::SessionPicker => None,
         AppStatus::Running => {
             let elapsed = state
                 .running_started_at
                 .map(|started| format_elapsed_compact(started.elapsed().as_secs()))
                 .unwrap_or_else(|| "0s".to_string());
-            (format!("● running {elapsed}"), theme.warning)
+            Some((format!("● running {elapsed}"), theme.warning))
         }
-        AppStatus::WaitingApproval => ("● approval".to_string(), theme.approval),
-        AppStatus::WaitingUserInput => ("● input".to_string(), theme.approval),
+        AppStatus::WaitingApproval => Some(("● approval".to_string(), theme.approval)),
+        AppStatus::WaitingUserInput => Some(("● input".to_string(), theme.approval)),
+    }
+}
+
+fn render_activity(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    let Some((text, color)) = activity_line(state, theme) else {
+        return;
     };
-    Span::styled(format!(" {status_text}"), Style::default().fg(color))
+    // First row stays blank as a spacer between the transcript tail and the indicator.
+    let paragraph = Paragraph::new(vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            format!(" {text}"),
+            Style::default().fg(color),
+        )),
+    ]);
+    frame.render_widget(paragraph, area);
 }
 
 fn format_elapsed_compact(elapsed_secs: u64) -> String {
@@ -3027,15 +3009,27 @@ mod tests {
     }
 
     #[test]
-    fn running_status_shows_elapsed_time() {
+    fn running_activity_line_shows_elapsed_time() {
         let mut state = test_state();
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         state.status = AppStatus::Running;
         state.running_started_at = Some(Instant::now() - Duration::from_secs(65));
 
-        let cell = status_cell(&state, &theme);
-        assert_eq!(cell.content.as_ref(), " ● running 1m 05s");
-        assert_eq!(cell.style.fg, Some(theme.warning));
+        let (text, color) = activity_line(&state, &theme).expect("running shows an activity line");
+        assert_eq!(text, "● running 1m 05s");
+        assert_eq!(color, theme.warning);
+    }
+
+    #[test]
+    fn idle_has_no_activity_line() {
+        let mut state = test_state();
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        state.status = AppStatus::Idle;
+
+        assert!(
+            activity_line(&state, &theme).is_none(),
+            "idle sessions must not render an activity line above the composer"
+        );
     }
 
     #[test]
@@ -3351,29 +3345,365 @@ mod tests {
         assert_eq!(cursor_line, 1);
     }
 
-    #[test]
-    fn wrapped_line_count_matches_ratatui_word_wrap() {
-        let line = Line::from("alpha bravo charlie");
-
-        assert_eq!(wrapped_line_count(&line, 10), 3);
+    /// Wrapped height the scroll math sees for `text` at `width` — the same
+    /// `Paragraph::line_count` call `render_live_messages` uses.
+    fn measured_rows(text: &str, width: u16) -> usize {
+        Paragraph::new(Line::from(text))
+            .wrap(Wrap { trim: false })
+            .line_count(width)
     }
 
     #[test]
-    fn wrapped_line_count_hard_wraps_long_tokens() {
-        let line = Line::from("abcdefghijkl");
-
-        assert_eq!(wrapped_line_count(&line, 5), 3);
+    fn line_count_matches_ratatui_word_wrap() {
+        assert_eq!(measured_rows("alpha bravo charlie", 10), 3);
     }
 
     #[test]
-    fn wrapped_line_count_keeps_hyphenated_tokens_whole() {
+    fn line_count_hard_wraps_long_tokens() {
+        assert_eq!(measured_rows("abcdefghijkl", 5), 3);
+    }
+
+    #[test]
+    fn line_count_keeps_hyphenated_tokens_whole() {
         // ratatui breaks only on whitespace, so "bb-cc-dd" is one 8-wide token that
-        // wraps as a unit after "aa": "aa" / "bb-cc-" / "dd" = 3 rows. A splitter that
+        // wraps as a unit after "aa": "aa" / "bb-cc-" / "dd" = 3 rows. A measure that
         // also broke on '-' would pack tighter and undercount to 2, under-scrolling the
         // newest content out of view.
-        let line = Line::from("aa bb-cc-dd");
+        assert_eq!(measured_rows("aa bb-cc-dd", 6), 3);
+    }
 
-        assert_eq!(wrapped_line_count(&line, 6), 3);
+    #[test]
+    fn completed_turn_keeps_tail_marker_visible_after_large_diff() {
+        let mut state = test_state();
+        state.messages.push(ChatMessage::User(
+            "生成一份长报告，并在最后输出固定尾部标记。".to_string(),
+        ));
+        let diff = (0..96)
+            .map(|index| {
+                format!(
+                    "+     .summary-card-{index:02} {{ grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); margin-bottom: 30px; border-radius: 12px; }}"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        state.messages.push(ChatMessage::ToolCall {
+            id: "tool-write".to_string(),
+            name: "write_file".to_string(),
+            target: Some("stock_report_20260702.html".to_string()),
+            status: "completed".to_string(),
+            output: Some("wrote report".to_string()),
+            diff: Some(diff),
+            kind: Some("success".to_string()),
+            expanded: false,
+        });
+        let mut answer = String::new();
+        answer.push_str("HTML 报告已生成：`/tmp/stock_report_20260702.html`\n\n");
+        answer.push_str("📊 7月2日早市速览\n");
+        for index in 1..=32 {
+            answer.push_str(&format!(
+                "• 第 {index:02} 条：板块分化剧烈，资金偏好在高股息、防御资产与成长题材之间快速切换，需要关注成交量、波动率和风险偏好变化。\n"
+            ));
+        }
+        answer.push_str("EXACT_TAIL_VISIBLE_20260702");
+        state.messages.push(ChatMessage::Assistant(answer));
+        state.update(TuiEvent::SessionCompleted {
+            status: "success".to_string(),
+        });
+
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let textarea = TextArea::default();
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(92, 24))
+            .expect("test backend");
+
+        terminal
+            .draw(|frame| render(frame, &mut state, &textarea, &theme))
+            .expect("draw");
+        let rendered = format!("{:?}", terminal.backend().buffer());
+
+        assert!(
+            rendered.contains("EXACT_TAIL_VISIBLE_20260702"),
+            "completed assistant tail marker should be visible above the composer; rendered buffer:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn completed_turn_keeps_tail_marker_visible_after_large_diff_and_markdown_table() {
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let textarea = TextArea::default();
+        let mut failures = Vec::new();
+        for width in [92, 120, 160, 210, 260] {
+            for height in [24, 36, 48, 64, 72] {
+                let mut state = completed_table_tail_state();
+                let mut terminal =
+                    ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+                        .expect("test backend");
+
+                terminal
+                    .draw(|frame| render(frame, &mut state, &textarea, &theme))
+                    .expect("draw");
+                let rendered = format!("{:?}", terminal.backend().buffer());
+                if !rendered.contains("EXACT_TABLE_TAIL_VISIBLE_20260702") {
+                    failures.push(format!("{width}x{height}"));
+                }
+            }
+        }
+
+        assert!(
+            failures.is_empty(),
+            "completed assistant tail marker after a wide markdown table should be visible above the composer; missing at: {}",
+            failures.join(", ")
+        );
+    }
+
+    fn completed_table_tail_state() -> AppState {
+        let mut state = test_state();
+        state.messages.push(ChatMessage::User(
+            "生成一份包含宽表格的市场报告，并在最后输出固定尾部标记。".to_string(),
+        ));
+        let diff = (0..96)
+            .map(|index| {
+                format!(
+                    "+     .index-card-{index:02} {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); padding: 60px 40px 50px; border-radius: 14px; }}"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        state.messages.push(ChatMessage::ToolCall {
+            id: "tool-write".to_string(),
+            name: "write_file".to_string(),
+            target: Some("market_table_report_20260702.html".to_string()),
+            status: "completed".to_string(),
+            output: Some("wrote report".to_string()),
+            diff: Some(diff),
+            kind: Some("success".to_string()),
+            expanded: false,
+        });
+        let mut answer = String::new();
+        answer.push_str(
+            "[thinking] The HTML report has been created. Let me provide a summary to the user.\n",
+        );
+        answer.push_str(
+            "报告已生成，保存至 `/Users/bytedance/美股走势分析报告_2026年7月.html`。\n\n",
+        );
+        answer.push_str("📊 报告核心亮点\n\n");
+        answer.push_str("| 章节 | 内容 |\n");
+        answer.push_str("| --- | --- |\n");
+        answer.push_str(
+            "| 指数速览 | S&P 500 -0.62%、纳指 -1.21%、道指 -0.18%，盘中曾创新高但尾盘回落 |\n",
+        );
+        answer.push_str(
+            "| Q2 回顾 | 纳指 Q2 狂飙 +21%，六年最佳；费半 +81%，历史最佳，但季末急跌预警 |\n",
+        );
+        answer.push_str("| 板块轮动 | 科技成长仍是主线，能源、金融和防御板块出现明显分化 |\n");
+        answer.push_str("| 风险提示 | 估值扩张、流动性预期和财报窗口同时影响短线风险偏好 |\n");
+        answer.push_str("| 后市展望 | 维持中性偏多，但需要观察成交量、波动率和资金流向的确认 |\n");
+        answer.push_str("| 操作建议 | 仓位控制在 6-7 成，保留机动资金应对外围不确定性 |\n\n");
+        for index in 1..=24 {
+            answer.push_str(&format!(
+                "• 第 {index:02} 条：表格之后的补充要点需要完整可见，不能停在表格开头或摘要中段。\n"
+            ));
+        }
+        answer.push_str("EXACT_TABLE_TAIL_VISIBLE_20260702");
+        state.messages.push(ChatMessage::Assistant(answer));
+        state.update(TuiEvent::SessionCompleted {
+            status: "success".to_string(),
+        });
+        state
+    }
+
+    #[test]
+    fn completed_turn_keeps_tail_marker_visible_with_mixed_width_cjk_runs() {
+        // Long runs mixing 2-cell CJK and 1-cell ASCII are the worst case for wrap-height
+        // accounting: when a row has 1 cell left and the next char is 2 cells wide,
+        // ratatui wraps early and "wastes" the cell, so a cells/width estimate undercounts
+        // rows. The undercount accumulates across paragraphs and used to push the newest
+        // lines below the viewport. Each width's paragraphs were found by fuzzing the old
+        // estimator against ratatui's real word wrapper (estimate < actual at that width).
+        let cases: &[(u16, &[&str])] = &[
+            (
+                34,
+                &[
+                    "，d能dA栈首d全2芯业是、型环训（练力栈全3首b3/片闭b）芯a全d%b是型训）模d1闭2（I型、（能型模：/1首c模能训参fd芯，型）。栈闭a首闭力-3e环 a",
+                    "I-（a片%首栈界）型型数参闭）界A栈d环力1ffI型参c训环数d能闭cI，模首界gb/片闭参22业f，）（e片2业能。闭是-数A。是d闭首数数%能是（2能1gga首是A是2模个（/c环f栈全栈片全-Ia能3环训 能是芯cb栈b环 是-力%d，f1A3a片%",
+                    "是模1界：（模训a，数be环、cd全/b/这闭参c，能能e2。g，A业1力能环gIb全个能bb闭首1训芯：界）模Ic力界g芯首A全型数。e （-c模首A）环首-a）、）",
+                ],
+            ),
+            (
+                61,
+                &[
+                    "能模型2栈环型b能-AAA数（/c2（e-环/A栈A：、力栈。闭c环界个AA力b全这个d%bbI/力这闭数A数g、bb：1芯界Ie（-I环-（、：力，片a（（。g闭能：）A（是I练 3%练模界栈界能（%力能-%：/e片a%个界c练a2",
+                    "，这数%首是（/1全业b是个型闭I片栈I、能（/环数环栈力片。cg数练（全是2业。训模芯闭1界）业是%业I数栈、个。个/-界参闭e环f个首，型：能、，-栈力栈全，是个 环f（练是力闭芯数栈1环芯，c模训业I",
+                    "模/个Ie练A参/栈力全Ic。 型A）A界是c片fI练2全全a：能模（gb环模，芯：f片首，）/全1a型A环%这全片模：）：这3aA 、个训Ia参芯。e2这数：：c界fggg2训是3fa",
+                ],
+            ),
+            (
+                92,
+                &[
+                    "%这e全练、闭。环A，、-（参I这型g（能全界参环Ag3ba模g型，21Ac训界环c。g/练个2片片全1闭：能（片%闭a片g能）环业数eb闭%首栈）d3（I型I数a能片，参1界练1训（d栈e力-A 模数栈是c1数是个力3I%、ea",
+                    "个2）芯片A闭d3业（闭2这数训1。数/界全c练型训能%A1）练型训2训首是芯%，数d界c闭是练栈b、片片/练芯训d2能数-数是f（3，模Ic -：数个这这、ecgI力：型是bd环b-，界，个23片环（，片片）。3ca3e参I",
+                    "能全e是栈闭。型业模力数2模：d。这、2个32首、g片数闭芯界/练模界a-。：，，1是b栈闭模e训能，这。个个全力31能型界力能a是参个、3栈环参是（1（练dc、首（g片/个栈参闭训），I 1A闭c 芯首-业：，c",
+                ],
+            ),
+        ];
+
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let textarea = TextArea::default();
+        let mut failures = Vec::new();
+        for &(width, paragraphs) in cases {
+            for height in [24u16, 36, 48] {
+                let mut state = test_state();
+                state.messages.push(ChatMessage::User(
+                    "输出多段中英混排长文本，并在最后输出固定尾部标记。".to_string(),
+                ));
+                let mut answer = String::new();
+                for _ in 0..4 {
+                    for paragraph in paragraphs {
+                        answer.push_str(paragraph);
+                        answer.push_str("\n\n");
+                    }
+                }
+                answer.push_str("EXACT_CJK_TAIL_VISIBLE_20260702");
+                state.messages.push(ChatMessage::Assistant(answer));
+                state.update(TuiEvent::SessionCompleted {
+                    status: "success".to_string(),
+                });
+
+                let mut terminal =
+                    ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+                        .expect("test backend");
+                terminal
+                    .draw(|frame| render(frame, &mut state, &textarea, &theme))
+                    .expect("draw");
+                let rendered = format!("{:?}", terminal.backend().buffer());
+                if !rendered.contains("EXACT_CJK_TAIL_VISIBLE_20260702") {
+                    failures.push(format!("{width}x{height}"));
+                }
+            }
+        }
+
+        assert!(
+            failures.is_empty(),
+            "auto-scrolled tail must stay visible for mixed-width CJK/ASCII runs; missing at: {}",
+            failures.join(", ")
+        );
+    }
+
+    #[test]
+    fn streaming_deltas_keep_the_newest_line_visible_without_user_input() {
+        // Mirrors the app loop: each TuiEvent is applied, then `scroll_to_bottom()` runs
+        // while auto_scroll is on, then a frame is drawn. The newest streamed text must
+        // be on screen after every frame — no manual scrolling.
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let textarea = TextArea::default();
+        let mut state = test_state();
+        state.messages.push(ChatMessage::User("流式输出一篇长文".to_string()));
+        state.update(TuiEvent::TurnStarted { turn: 1, task: None });
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(92, 24))
+            .expect("test backend");
+
+        for index in 0..120u32 {
+            state.update(TuiEvent::MessageDelta(format!(
+                "第{index:03}段:混排AI模型栈能力闭环片全2芯业是、型环训（练力栈全3首b3/片闭b）尾标{index:03}\n\n"
+            )));
+            if state.auto_scroll {
+                state.scroll_to_bottom();
+            }
+            terminal
+                .draw(|frame| render(frame, &mut state, &textarea, &theme))
+                .expect("draw");
+            let rendered = format!("{:?}", terminal.backend().buffer());
+            assert!(
+                rendered.contains(&format!("尾标{index:03}")),
+                "delta {index} scrolled out of view; auto_scroll={} scroll_offset={} total={} visible={}",
+                state.auto_scroll,
+                state.scroll_offset,
+                state.total_lines,
+                state.visible_height,
+            );
+        }
+    }
+
+    #[test]
+    fn stray_wheel_up_on_first_screen_does_not_break_streaming_follow() {
+        // Reported regression: after the first screenful, new streamed content stopped
+        // being followed. Trigger: a wheel-up (trackpad inertia counts) while the
+        // transcript still fit on one screen disarmed auto-follow with no visual
+        // feedback, so the pane silently stopped tracking once content overflowed.
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let textarea = TextArea::default();
+        let mut state = test_state();
+        state.messages.push(ChatMessage::User("流式输出一篇长文".to_string()));
+        state.update(TuiEvent::TurnStarted { turn: 1, task: None });
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(92, 24))
+            .expect("test backend");
+
+        for index in 0..60u32 {
+            state.update(TuiEvent::MessageDelta(format!(
+                "第{index:03}段:混排AI模型栈能力闭环片全2芯业是、型环训（练力栈全3首b3/片闭b）尾标{index:03}\n\n"
+            )));
+            if state.auto_scroll {
+                state.scroll_to_bottom();
+            }
+            terminal
+                .draw(|frame| render(frame, &mut state, &textarea, &theme))
+                .expect("draw");
+            // A stray wheel tick lands while everything still fits on the first screen.
+            if index == 2 {
+                state.scroll_up(3);
+            }
+            let rendered = format!("{:?}", terminal.backend().buffer());
+            assert!(
+                rendered.contains(&format!("尾标{index:03}")),
+                "delta {index} scrolled out of view; auto_scroll={} scroll_offset={} total={} visible={}",
+                state.auto_scroll,
+                state.scroll_offset,
+                state.total_lines,
+                state.visible_height,
+            );
+        }
+    }
+
+    #[test]
+    fn scrolling_back_to_bottom_mid_stream_re_arms_follow() {
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let textarea = TextArea::default();
+        let mut state = test_state();
+        state.messages.push(ChatMessage::User("流式输出一篇长文".to_string()));
+        state.update(TuiEvent::TurnStarted { turn: 1, task: None });
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(92, 24))
+            .expect("test backend");
+
+        let mut draw = |state: &mut AppState| {
+            if state.auto_scroll {
+                state.scroll_to_bottom();
+            }
+            terminal
+                .draw(|frame| render(frame, state, &textarea, &theme))
+                .expect("draw");
+            format!("{:?}", terminal.backend().buffer())
+        };
+
+        // Stream well past one screen, then deliberately scroll up: follow disarms.
+        for index in 0..40u32 {
+            state.update(TuiEvent::MessageDelta(format!("第{index:03}段:内容片全芯业型环训练力栈全首片闭\n\n")));
+            draw(&mut state);
+        }
+        state.scroll_up(6);
+        draw(&mut state);
+        assert!(!state.auto_scroll, "deliberate scroll-up should disarm follow");
+
+        // Wheel back down until the bottom is reached: follow re-arms and new
+        // deltas are tracked again without further input.
+        while !state.auto_scroll {
+            state.scroll_down(3);
+            draw(&mut state);
+        }
+        state.update(TuiEvent::MessageDelta("重新跟随后的新内容尾标RESUME\n\n".to_string()));
+        let rendered = draw(&mut state);
+        assert!(
+            rendered.contains("尾标RESUME"),
+            "after re-arming, new deltas must be visible again"
+        );
     }
 
     #[test]
@@ -3382,8 +3712,10 @@ mod tests {
         use ratatui::layout::Rect;
         use ratatui::widgets::Widget;
 
-        // Render through the real widget at the same width the estimator uses and count
-        // rows that received any glyph. This pins wrapped_line_count to actual behavior.
+        // Render through the real widget at the same width the scroll math uses and count
+        // rows that received any glyph. This pins `Paragraph::line_count` (an unstable
+        // ratatui feature) to actual render behavior, so a semantic change in a ratatui
+        // upgrade shows up here instead of as a mis-scrolled transcript.
         let area = Rect::new(0, 0, 6, 8);
         let mut buffer = Buffer::empty(area);
         Paragraph::new(Line::from("aa bb-cc-dd"))
@@ -3395,7 +3727,7 @@ mod tests {
             .count();
 
         assert_eq!(used_rows, 3);
-        assert_eq!(wrapped_line_count(&Line::from("aa bb-cc-dd"), 6), used_rows);
+        assert_eq!(measured_rows("aa bb-cc-dd", 6), used_rows);
     }
 
     #[test]
@@ -3474,7 +3806,7 @@ mod tests {
             "input box must stay visible when the transcript overflows"
         );
         assert!(
-            has("idle"),
+            has("model:"),
             "status line must stay visible when the transcript overflows"
         );
         // The composer (input) needs its full height; the messages area is everything above
