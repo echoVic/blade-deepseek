@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.100":
+        "TUI polish: inline scrolling now detects real overflow via rendered-line-info, keeps auto-follow armed until content actually overflows, fixes CJK-aware wrap heights, moves memory extraction off the render thread, adds a live activity bar, and debounces inertial mouse scroll right after a turn completes.",
       "v0.1.99":
         "Runtime-special tool dispatch and small executors now live in a focused runtime_special module, keeping request_permissions, workflow IPC, subagent status, task list/stop, and workflow draft preview behavior intact while shrinking lifecycle.rs.",
       "v0.1.98":
@@ -226,6 +228,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.100":
+        "TUI 体验优化：inline 滚动现在通过 rendered-line-info 判断真实溢出，内容未溢出时保持自动跟随，修复 CJK 混排的换行高度计算，将内存提取移出渲染线程，新增实时活动指示栏，并在回合结束后对惯性鼠标滚动做防抖处理。",
       "v0.1.99":
         "runtime-special 工具分发和小型 executor 现在进入独立 runtime_special 模块，保持 request_permissions、workflow IPC、subagent status、task list/stop、workflow draft preview 行为不变，同时缩小 lifecycle.rs。",
       "v0.1.98":
