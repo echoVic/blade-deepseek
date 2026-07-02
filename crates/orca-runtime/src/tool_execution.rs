@@ -17,10 +17,10 @@ use crate::hooks::{HookOutcome, HookRunner};
 use crate::instructions::ProjectInstructions;
 use crate::lifecycle::{
     RuntimeApprovalDecision, RuntimeConfigApprovalHandler, RuntimePermissionRequestHandler,
-    RuntimeSpecialToolDispatch, RuntimeTaskActor, RuntimeToolActorContext,
-    RuntimeWorkflowDraftRequest, TurnPermissionOverlay,
+    RuntimeTaskActor, RuntimeToolActorContext, TurnPermissionOverlay,
 };
 use crate::memory::MemoryBlock;
+use crate::runtime_special::{RuntimeSpecialToolDispatch, RuntimeWorkflowDraftRequest};
 use crate::subagent_execution::execute_subagent_tool;
 use crate::tasks::TaskRegistry;
 use crate::tool_invocation::{

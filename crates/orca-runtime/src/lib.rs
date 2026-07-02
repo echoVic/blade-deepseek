@@ -17,6 +17,7 @@ pub mod notify;
 pub mod protocol;
 pub mod provider_turn;
 pub(crate) mod runtime_bash;
+pub(crate) mod runtime_special;
 pub mod schema_validation;
 pub mod server;
 pub mod server_runtime;
@@ -85,6 +86,44 @@ mod tests {
             router_source.contains("permission::dispatch_permission_operation("),
             "server router must delegate permission operations"
         );
+    }
+
+    #[test]
+    fn runtime_special_dispatch_is_owned_by_runtime_special_module() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let lib_source =
+            std::fs::read_to_string(manifest_dir.join("src/lib.rs")).expect("lib source");
+        let lifecycle_source = std::fs::read_to_string(manifest_dir.join("src/lifecycle.rs"))
+            .expect("lifecycle source");
+        let runtime_special_source =
+            std::fs::read_to_string(manifest_dir.join("src/runtime_special.rs"))
+                .expect("runtime special source");
+
+        assert!(
+            lib_source.contains("pub(crate) mod runtime_special;"),
+            "runtime crate must declare a focused runtime_special module"
+        );
+
+        for marker in [
+            "pub enum RuntimeSpecialToolDispatch",
+            "pub fn classify_dispatch",
+            "pub fn execute_request_permissions_tool",
+            "pub fn execute_request_permissions_tool_with_handler",
+            "pub fn execute_workflow_ipc_tool",
+            "pub fn execute_subagent_status_tool",
+            "pub fn execute_task_list_tool",
+            "pub fn execute_task_stop_tool",
+            "pub fn execute_workflow_draft_tool",
+        ] {
+            assert!(
+                runtime_special_source.contains(marker),
+                "runtime_special must own runtime-special detail {marker}"
+            );
+            assert!(
+                !lifecycle_source.contains(marker),
+                "lifecycle must not own runtime-special detail {marker}"
+            );
+        }
     }
 
     #[test]

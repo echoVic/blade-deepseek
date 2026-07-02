@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.99":
+        "Runtime-special tool dispatch and small executors now live in a focused runtime_special module, keeping request_permissions, workflow IPC, subagent status, task list/stop, and workflow draft preview behavior intact while shrinking lifecycle.rs.",
       "v0.1.98":
         "Server submit-family dispatch now routes through a focused submit processor, preserving legacy submit, thread-bound turns, thread/start, thread/resume, and thread/fork behavior while leaving the generic router as a pure operation-family dispatcher.",
       "v0.1.97":
@@ -224,6 +226,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.99":
+        "runtime-special 工具分发和小型 executor 现在进入独立 runtime_special 模块，保持 request_permissions、workflow IPC、subagent status、task list/stop、workflow draft preview 行为不变，同时缩小 lifecycle.rs。",
       "v0.1.98":
         "server 的 submit-family dispatch 现在进入独立 submit processor，保持 legacy submit、thread-bound turn、thread/start、thread/resume、thread/fork 行为不变，同时让通用 router 只保留 operation-family 分发职责。",
       "v0.1.97":
