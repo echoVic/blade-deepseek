@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.103":
+        "Runtime turn execution now carries cleaner grouped inputs: turn iteration, provider cycle, provider response, and tool turns share request-scoped context boundaries. This Codex/package-3-inspired slice reduces repeated runtime state plumbing while preserving CLI, TUI, server, tool, workflow, and history behavior.",
       "v0.1.102":
         "TUI child-agent execution now flows through runtime-owned request construction, model/cost setup, loop orchestration, provider handling, tool request extraction, and tool-result folding while TUI keeps only the interactive tool adapter. This keeps the new reasoning-effort configuration intact across child provider calls.",
       "v0.1.101":
@@ -232,6 +234,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.103":
+        "runtime turn 执行现在使用更清晰的分组输入边界：turn iteration、provider cycle、provider response 与 tool turns 共享 request-scoped context。这个参考 Codex/package 3 的架构切片减少了重复的 runtime 状态传递，同时保持 CLI、TUI、server、tool、workflow 与 history 行为不变。",
       "v0.1.102":
         "TUI child-agent 执行现在通过 runtime 统一负责 request 构造、model/cost setup、loop 编排、provider 处理、tool request 提取与 tool-result folding；TUI 只保留交互式 tool adapter，并且新的 reasoning-effort 配置会继续传入 child provider 调用。",
       "v0.1.101":
