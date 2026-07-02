@@ -68,6 +68,35 @@ fn tool_execution_does_not_call_interactive_approval_resolution_directly() {
 }
 
 #[test]
+fn turn_iteration_step_uses_grouped_runtime_input() {
+    let lifecycle =
+        std::fs::read_to_string("crates/orca-runtime/src/lifecycle.rs").expect("lifecycle source");
+
+    assert!(
+        lifecycle.contains("struct RuntimeTurnIterationInput"),
+        "turn iteration should have a grouped input boundary before more runtime-loop refactors"
+    );
+
+    let run_impl = lifecycle
+        .split("impl RuntimeTurnIterationStep")
+        .nth(1)
+        .and_then(|text| text.split("impl RuntimeTurnLoopStep").next())
+        .expect("runtime turn iteration impl block");
+    assert!(
+        run_impl.contains("input: RuntimeTurnIterationInput"),
+        "turn iteration run should take grouped input instead of a long flat parameter list"
+    );
+    assert!(
+        !run_impl.contains("provider: ProviderKind"),
+        "provider should be carried by RuntimeTurnIterationInput"
+    );
+    assert!(
+        !run_impl.contains("background_workflows: &mut Vec<BackgroundWorkflowRun>"),
+        "mutable workflow state should be carried by RuntimeTurnIterationInput"
+    );
+}
+
+#[test]
 fn session_lifecycle_assigns_agent_task_and_monotonic_turns() {
     let mut lifecycle = RuntimeSessionLifecycle::new("run-test");
     let task = lifecycle.start_task(RuntimeTaskKind::Agent);
