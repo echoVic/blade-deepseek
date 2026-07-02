@@ -10,6 +10,7 @@ use orca_core::event_sink::EventSink;
 use orca_core::model::ModelRouteContext;
 use orca_core::provider_types::{ProviderResponse, ProviderStep};
 use orca_core::subagent_types::SubagentType;
+use orca_core::tool_types::{ToolRequest, ToolResult};
 use orca_mcp::McpRegistry;
 use orca_provider::ProviderConfig;
 use orca_provider::context::ContextConfig;
@@ -78,6 +79,11 @@ pub enum ChildAgentProviderTurn {
 pub enum ChildAgentProviderResponseFold {
     Complete(ChildAgentResult),
     ContinueToTools,
+}
+
+pub enum ChildAgentToolResultFold {
+    Continue,
+    Stop(ChildAgentResult),
 }
 
 pub struct ChildAgentLoopSetup {
@@ -407,11 +413,39 @@ pub fn fold_child_agent_provider_response(
     ChildAgentProviderResponseFold::ContinueToTools
 }
 
+pub fn fold_child_agent_tool_result(
+    setup: &mut ChildAgentLoopSetup,
+    tool_request: &ToolRequest,
+    should_stop: bool,
+    result: ToolResult,
+    child_cost: Option<CostTracker>,
+    child_cost_tracker: &mut CostTracker,
+) -> ChildAgentToolResultFold {
+    if let Some(cost) = child_cost {
+        child_cost_tracker.merge(&cost);
+    }
+
+    let result_content = agent_common::format_tool_result_for_model(&result);
+    setup
+        .conversation
+        .add_tool_result(tool_request.id.clone(), result_content);
+
+    if should_stop {
+        return ChildAgentToolResultFold::Stop(ChildAgentResult {
+            status: RunStatus::Failed,
+            final_message: None,
+            error: result.error,
+        });
+    }
+
+    ChildAgentToolResultFold::Continue
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use orca_core::approval_rules::PermissionRules;
-    use orca_core::approval_types::ApprovalMode;
+    use orca_core::approval_types::{ActionKind, ApprovalMode};
     use orca_core::cancel::CancelToken;
     use orca_core::config::{
         HistoryMode, OutputFormat, ProviderKind, RunConfig, ThemeName, ToolConfig, WorkflowConfig,
@@ -425,6 +459,7 @@ mod tests {
     use orca_core::model::{AUTO_MODEL, FLASH_MODEL, ModelSelection};
     use orca_core::provider_types::{ProviderResponse, ProviderStep, Usage};
     use orca_core::subagent_config::SubagentConfig;
+    use orca_core::tool_types::{ToolName, ToolRequest, ToolResult};
     use std::io::Cursor;
 
     use crate::hooks::HookRunner;
@@ -941,6 +976,117 @@ mod tests {
                 tool_calls,
                 ..
             }) if content == "I need a tool" && tool_calls.len() == 1
+        ));
+    }
+
+    #[test]
+    fn fold_child_agent_tool_result_merges_cost_and_records_model_context() {
+        let request = ChildAgentRequest::new(
+            "inspect repo".to_string(),
+            SubagentType::General,
+            None,
+            2,
+            false,
+        );
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let runtime_config = config(None);
+        let mut setup = prepare_child_agent_loop(
+            &runtime_config,
+            &request,
+            std::env::temp_dir().as_path(),
+            &instructions,
+            &memory,
+        );
+        let tool_request = ToolRequest {
+            id: "tool-1".to_string(),
+            name: ToolName::Bash,
+            action: ActionKind::Shell,
+            target: Some("echo hi".to_string()),
+            raw_arguments: None,
+        };
+        let result = ToolResult::completed(&tool_request, "hello from tool".to_string(), false);
+        let mut nested_cost = CostTracker::new(Some(orca_core::model::PRO_MODEL));
+        nested_cost.add_usage(Usage {
+            input_tokens: 10,
+            output_tokens: 5,
+            cache_tokens: 0,
+        });
+        let mut tracker = CostTracker::new(None);
+
+        let fold = fold_child_agent_tool_result(
+            &mut setup,
+            &tool_request,
+            false,
+            result,
+            Some(nested_cost),
+            &mut tracker,
+        );
+
+        assert!(matches!(fold, ChildAgentToolResultFold::Continue));
+        assert!(tracker.totals().total_tokens() > 0);
+        assert!(matches!(
+            setup.conversation.messages.last(),
+            Some(Message::Tool {
+                tool_call_id,
+                content,
+                ..
+            }) if tool_call_id == "tool-1" && content.contains("hello from tool")
+        ));
+    }
+
+    #[test]
+    fn fold_child_agent_tool_result_turns_stop_into_failed_child_result() {
+        let request = ChildAgentRequest::new(
+            "inspect repo".to_string(),
+            SubagentType::General,
+            None,
+            2,
+            false,
+        );
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let runtime_config = config(None);
+        let mut setup = prepare_child_agent_loop(
+            &runtime_config,
+            &request,
+            std::env::temp_dir().as_path(),
+            &instructions,
+            &memory,
+        );
+        let tool_request = ToolRequest {
+            id: "tool-1".to_string(),
+            name: ToolName::Bash,
+            action: ActionKind::Shell,
+            target: Some("exit 1".to_string()),
+            raw_arguments: None,
+        };
+        let result = ToolResult::failed(&tool_request, "tool failed", Some(1));
+        let mut tracker = CostTracker::new(None);
+
+        let fold = fold_child_agent_tool_result(
+            &mut setup,
+            &tool_request,
+            true,
+            result,
+            None,
+            &mut tracker,
+        );
+
+        match fold {
+            ChildAgentToolResultFold::Stop(result) => {
+                assert_eq!(result.status, RunStatus::Failed);
+                assert_eq!(result.error.as_deref(), Some("tool failed"));
+            }
+            ChildAgentToolResultFold::Continue => panic!("should_stop should stop child execution"),
+        }
+        assert!(matches!(
+            setup.conversation.messages.last(),
+            Some(Message::Tool {
+                tool_call_id,
+                content,
+                ..
+            }) if tool_call_id == "tool-1" && content.contains("tool failed")
         ));
     }
 

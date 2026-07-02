@@ -11,12 +11,11 @@ use orca_core::subagent_types::SubagentType;
 use orca_core::tool_types;
 use orca_runtime::agent_child::{
     ChildAgentProviderErrorDecision, ChildAgentProviderResponseFold, ChildAgentProviderTurn,
-    ChildAgentRequest, ChildAgentResult, compact_child_agent_conversation_if_needed,
-    fold_child_agent_provider_response, handle_child_agent_provider_error,
-    prepare_child_agent_loop, route_child_agent_model, run_child_agent_provider_turn,
-    run_child_agent_with_executor,
+    ChildAgentRequest, ChildAgentResult, ChildAgentToolResultFold,
+    compact_child_agent_conversation_if_needed, fold_child_agent_provider_response,
+    fold_child_agent_tool_result, handle_child_agent_provider_error, prepare_child_agent_loop,
+    route_child_agent_model, run_child_agent_provider_turn, run_child_agent_with_executor,
 };
-use orca_runtime::agent_common;
 use orca_runtime::cost::CostTracker;
 use orca_runtime::hooks::HookRunner;
 use orca_runtime::instructions::ProjectInstructions;
@@ -560,21 +559,16 @@ fn run_child_agent_for_tui(
                             &child_cancel,
                         );
 
-                        if let Some(c) = child_cost {
-                            child_cost_tracker.merge(&c);
-                        }
-
-                        let result_content = agent_common::format_tool_result_for_model(&result);
-                        setup
-                            .conversation
-                            .add_tool_result(tool_request.id.clone(), result_content);
-
-                        if should_stop {
-                            return Ok(ChildAgentResult {
-                                status: RunStatus::Failed,
-                                final_message: None,
-                                error: result.error,
-                            });
+                        match fold_child_agent_tool_result(
+                            &mut setup,
+                            tool_request,
+                            should_stop,
+                            result,
+                            child_cost,
+                            child_cost_tracker,
+                        ) {
+                            ChildAgentToolResultFold::Continue => {}
+                            ChildAgentToolResultFold::Stop(result) => return Ok(result),
                         }
                     }
                 }

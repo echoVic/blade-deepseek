@@ -332,4 +332,28 @@ mod tests {
             "agent_subagent_execution should not record child assistant responses directly"
         );
     }
+
+    #[test]
+    fn tui_subagent_child_tool_result_folding_is_runtime_owned() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let subagent =
+            std::fs::read_to_string(format!("{manifest_dir}/src/agent_subagent_execution.rs"))
+                .expect("TUI agent subagent execution module should exist");
+        assert!(
+            subagent.contains("fold_child_agent_tool_result"),
+            "agent_subagent_execution should delegate child tool-result folding to runtime"
+        );
+        assert!(
+            !subagent.contains("child_cost_tracker.merge"),
+            "agent_subagent_execution should not merge child tool costs directly"
+        );
+        assert!(
+            !subagent.contains("format_tool_result_for_model"),
+            "agent_subagent_execution should not format child tool results for model context"
+        );
+        assert!(
+            !subagent.contains("add_tool_result"),
+            "agent_subagent_execution should not record child tool results directly"
+        );
+    }
 }
