@@ -15,6 +15,7 @@ use orca_core::subagent_types::SubagentType;
 use orca_core::tool_types;
 use orca_provider::ProviderConfig;
 use orca_provider::tool_schema::deepseek_tools_schema_for_type_with_mcp_and_external;
+use orca_runtime::agent_child::ChildAgentResult;
 use orca_runtime::agent_common;
 use orca_runtime::cost::CostTracker;
 use orca_runtime::hooks::{HookContext, HookRunner, conversation_with_hook_context};
@@ -24,8 +25,8 @@ use orca_runtime::subagent::{self, SubagentMode};
 use orca_runtime::tasks::TaskRegistry;
 
 use crate::agent_runner::{
-    DEFAULT_MAX_TURNS, TuiAgentResult, send_subagent_completed_for_tui,
-    send_subagent_started_for_tui, send_workflow_tasks_updated_for_tui,
+    DEFAULT_MAX_TURNS, send_subagent_completed_for_tui, send_subagent_started_for_tui,
+    send_workflow_tasks_updated_for_tui,
 };
 use crate::agent_tool_execution::execute_tool_for_tui;
 use crate::types::{TuiEvent, UserAction};
@@ -112,7 +113,7 @@ pub(crate) fn execute_subagent_batch_for_tui(
             idx,
             description,
             thread::spawn(move || {
-                let child = run_child_agent_for_tui_silent(
+                let (child, child_cost_tracker) = run_child_agent_for_tui_silent(
                     &child_config,
                     &child_cwd,
                     &child_prompt,
@@ -122,13 +123,13 @@ pub(crate) fn execute_subagent_batch_for_tui(
                     &child_memory,
                     &child_hooks,
                 );
-                (child_tool_request, child)
+                (child_tool_request, child, child_cost_tracker)
             }),
         ));
     }
 
     for (idx, description, handle) in handles {
-        let (tool_request, child) = match handle.join() {
+        let (tool_request, child, child_cost_tracker) = match handle.join() {
             Ok(result) => result,
             Err(_) => {
                 let tool_request = &tool_requests[idx];
@@ -148,8 +149,13 @@ pub(crate) fn execute_subagent_batch_for_tui(
             }
         };
 
-        let (should_stop, result, cost_tracker) =
-            child_result_to_tui_tool_result(&tool_request, &description, child, event_tx);
+        let (should_stop, result, cost_tracker) = child_result_to_tui_tool_result(
+            &tool_request,
+            &description,
+            child,
+            child_cost_tracker,
+            event_tx,
+        );
         results[idx] = Some((should_stop, result, cost_tracker));
     }
 
@@ -225,7 +231,7 @@ pub(crate) fn execute_subagent_for_tui(
     child_config.model = child_config
         .model
         .with_subagent_override(request.model.clone());
-    let child = run_child_agent_for_tui(
+    let (child, child_cost_tracker) = run_child_agent_for_tui(
         &child_config,
         cwd,
         &request.prompt,
@@ -238,7 +244,7 @@ pub(crate) fn execute_subagent_for_tui(
         hooks,
     );
 
-    if child.status == "success" {
+    if child.status == RunStatus::Success {
         let output = child
             .final_message
             .unwrap_or_else(|| "(subagent completed without a final message)".to_string());
@@ -257,12 +263,12 @@ pub(crate) fn execute_subagent_for_tui(
                 format!("Subagent status: success\n\n{output}"),
                 false,
             ),
-            child.cost_tracker,
+            child_cost_tracker,
         )
     } else {
         let error = child
             .error
-            .unwrap_or_else(|| format!("subagent ended with status {}", child.status));
+            .unwrap_or_else(|| format!("subagent ended with status {:?}", child.status));
         send_subagent_completed_for_tui(
             event_tx,
             &mut events,
@@ -274,7 +280,7 @@ pub(crate) fn execute_subagent_for_tui(
         );
         (
             tool_types::ToolResult::failed(tool_request, error, None),
-            child.cost_tracker,
+            child_cost_tracker,
         )
     }
 }
@@ -314,7 +320,7 @@ fn launch_async_subagent_for_tui(
     thread::spawn(move || {
         let mut events = EventFactory::new(thread_agent_id.clone());
         let _ = child_registry.mark_running(&thread_agent_id);
-        let child = run_child_agent_for_tui_silent(
+        let (child, child_cost_tracker) = run_child_agent_for_tui_silent(
             &child_config,
             &child_cwd,
             &child_prompt,
@@ -324,8 +330,8 @@ fn launch_async_subagent_for_tui(
             &child_memory,
             &child_hooks,
         );
-        let usage = usage_totals_if_non_empty(child.cost_tracker.totals());
-        if child.status == "success" {
+        let usage = usage_totals_if_non_empty(child_cost_tracker.totals());
+        if child.status == RunStatus::Success {
             let output = child
                 .final_message
                 .unwrap_or_else(|| "(subagent completed without a final message)".to_string());
@@ -334,7 +340,7 @@ fn launch_async_subagent_for_tui(
             let error = child
                 .error
                 .or(child.final_message)
-                .unwrap_or_else(|| format!("subagent ended with status {}", child.status));
+                .unwrap_or_else(|| format!("subagent ended with status {:?}", child.status));
             let _ = child_registry.fail_with_usage(&thread_agent_id, error, usage);
         }
         send_workflow_tasks_updated_for_tui(&child_event_tx, &mut events, &child_registry.list());
@@ -417,12 +423,12 @@ fn usage_totals_json(usage: UsageTotals) -> serde_json::Value {
 fn child_result_to_tui_tool_result(
     tool_request: &tool_types::ToolRequest,
     description: &str,
-    child: TuiAgentResult,
+    child: ChildAgentResult,
+    cost_tracker: CostTracker,
     event_tx: &Sender<TuiEvent>,
 ) -> (bool, tool_types::ToolResult, CostTracker) {
-    let cost_tracker = child.cost_tracker.clone();
     let mut events = EventFactory::new("tui-subagent-child".to_string());
-    if child.status == "success" {
+    if child.status == RunStatus::Success {
         let output = child
             .final_message
             .unwrap_or_else(|| "(subagent completed without a final message)".to_string());
@@ -447,7 +453,7 @@ fn child_result_to_tui_tool_result(
     } else {
         let error = child
             .error
-            .unwrap_or_else(|| format!("subagent ended with status {}", child.status));
+            .unwrap_or_else(|| format!("subagent ended with status {:?}", child.status));
         send_subagent_completed_for_tui(
             event_tx,
             &mut events,
@@ -477,7 +483,7 @@ fn run_child_agent_for_tui(
     instructions: &ProjectInstructions,
     memory: &MemoryBlock,
     hooks: &HookRunner,
-) -> TuiAgentResult {
+) -> (ChildAgentResult, CostTracker) {
     let mcp_registry = orca_mcp::initialize_registry(&config.mcp_servers);
     let provider_config = ProviderConfig {
         api_key: config.api_key.clone(),
@@ -517,12 +523,14 @@ fn run_child_agent_for_tui(
     loop {
         turn += 1;
         if turn > DEFAULT_MAX_TURNS {
-            return TuiAgentResult {
-                status: "budget_exhausted".to_string(),
-                final_message: None,
-                error: Some("max turns exhausted".to_string()),
-                cost_tracker: child_cost_tracker,
-            };
+            return (
+                ChildAgentResult {
+                    status: RunStatus::BudgetExhausted,
+                    final_message: None,
+                    error: Some("max turns exhausted".to_string()),
+                },
+                child_cost_tracker,
+            );
         }
 
         if orca_provider::context::needs_compaction_wire(
@@ -573,12 +581,14 @@ fn run_child_agent_for_tui(
         ) {
             Ok(outcome) => outcome,
             Err(error) => {
-                return TuiAgentResult {
-                    status: "failed".to_string(),
-                    final_message: None,
-                    error: Some(format!("pre_model_call hook failed: {error}")),
-                    cost_tracker: child_cost_tracker,
-                };
+                return (
+                    ChildAgentResult {
+                        status: RunStatus::Failed,
+                        final_message: None,
+                        error: Some(format!("pre_model_call hook failed: {error}")),
+                    },
+                    child_cost_tracker,
+                );
             }
         };
         let model_conversation = conversation_with_hook_context(&conversation, &pre_model_outcome);
@@ -603,12 +613,14 @@ fn run_child_agent_for_tui(
                 usage: response.usage.as_ref(),
             },
         ) {
-            return TuiAgentResult {
-                status: "failed".to_string(),
-                final_message: None,
-                error: Some(format!("post_model_call hook failed: {error}")),
-                cost_tracker: child_cost_tracker,
-            };
+            return (
+                ChildAgentResult {
+                    status: RunStatus::Failed,
+                    final_message: None,
+                    error: Some(format!("post_model_call hook failed: {error}")),
+                },
+                child_cost_tracker,
+            );
         }
 
         if let Some(error) = response.steps.iter().find_map(|step| match step {
@@ -620,12 +632,14 @@ fn run_child_agent_for_tui(
                 reactive_compacted = true;
                 continue;
             }
-            return TuiAgentResult {
-                status: "failed".to_string(),
-                final_message: None,
-                error: Some(error),
-                cost_tracker: child_cost_tracker,
-            };
+            return (
+                ChildAgentResult {
+                    status: RunStatus::Failed,
+                    final_message: None,
+                    error: Some(error),
+                },
+                child_cost_tracker,
+            );
         }
 
         reactive_compacted = false;
@@ -642,12 +656,14 @@ fn run_child_agent_for_tui(
                 response.assistant_reasoning,
                 vec![],
             );
-            return TuiAgentResult {
-                status: "success".to_string(),
-                final_message: response.assistant_content,
-                error: None,
-                cost_tracker: child_cost_tracker,
-            };
+            return (
+                ChildAgentResult {
+                    status: RunStatus::Success,
+                    final_message: response.assistant_content,
+                    error: None,
+                },
+                child_cost_tracker,
+            );
         }
 
         conversation.add_assistant(
@@ -683,12 +699,14 @@ fn run_child_agent_for_tui(
                 conversation.add_tool_result(tool_request.id.clone(), result_content);
 
                 if should_stop {
-                    return TuiAgentResult {
-                        status: "failed".to_string(),
-                        final_message: None,
-                        error: result.error,
-                        cost_tracker: child_cost_tracker,
-                    };
+                    return (
+                        ChildAgentResult {
+                            status: RunStatus::Failed,
+                            final_message: None,
+                            error: result.error,
+                        },
+                        child_cost_tracker,
+                    );
                 }
             }
         }
@@ -705,7 +723,7 @@ pub(crate) fn run_child_agent_for_tui_silent(
     instructions: &ProjectInstructions,
     memory: &MemoryBlock,
     hooks: &HookRunner,
-) -> TuiAgentResult {
+) -> (ChildAgentResult, CostTracker) {
     let (event_tx, _event_rx) = std::sync::mpsc::channel();
     let (action_tx, action_rx) = std::sync::mpsc::channel();
     drop(action_tx);

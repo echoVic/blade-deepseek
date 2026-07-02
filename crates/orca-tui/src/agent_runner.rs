@@ -18,7 +18,6 @@ use orca_provider::tool_schema::{
     deepseek_goal_tools_schema_with_mcp_and_external, deepseek_tools_schema_with_mcp_and_external,
 };
 use orca_runtime::agent_common;
-use orca_runtime::cost::CostTracker;
 use orca_runtime::hooks::{HookContext, conversation_with_hook_context};
 use orca_runtime::memory;
 
@@ -32,14 +31,6 @@ use crate::runtime_event_projection::tui_event_from_runtime_event;
 use crate::types::{TuiEvent, UserAction};
 
 pub(crate) const DEFAULT_MAX_TURNS: u32 = 128;
-
-#[derive(Clone, Debug)]
-pub(crate) struct TuiAgentResult {
-    pub(crate) status: String,
-    pub(crate) final_message: Option<String>,
-    pub(crate) error: Option<String>,
-    pub(crate) cost_tracker: CostTracker,
-}
 
 fn send_error_for_tui(event_tx: &Sender<TuiEvent>, events: &mut EventFactory, message: &str) {
     send_runtime_event_as_tui(event_tx, events.error(message));
@@ -735,6 +726,7 @@ mod tests {
 
     use orca_core::approval_types::ApprovalMode;
     use orca_core::config::{HistoryMode, OutputFormat, ProviderKind, RunConfig};
+    use orca_core::event_schema::RunStatus;
     use orca_core::model::ModelSelection;
     use orca_runtime::workflow::host::WorkflowHost;
 
@@ -1422,7 +1414,7 @@ mod tests {
         let memory = MemoryBlock::default();
         let hooks = HookRunner::default();
 
-        let child = run_child_agent_for_tui_silent(
+        let (child, _child_cost_tracker) = run_child_agent_for_tui_silent(
             &config,
             config.cwd.as_deref().unwrap_or_else(|| Path::new(".")),
             "bad_plan_then_fix",
@@ -1433,7 +1425,7 @@ mod tests {
             &hooks,
         );
 
-        assert_eq!(child.status, "success");
+        assert_eq!(child.status, RunStatus::Success);
         assert!(
             child
                 .final_message

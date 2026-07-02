@@ -164,4 +164,23 @@ mod tests {
             "agent_tool_execution should not own TUI subagent batch helpers"
         );
     }
+
+    #[test]
+    fn tui_subagent_results_use_runtime_child_agent_result() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let runner = std::fs::read_to_string(format!("{manifest_dir}/src/agent_runner.rs"))
+            .expect("TUI agent runner source should be readable");
+        assert!(
+            !runner.contains("struct TuiAgentResult"),
+            "agent_runner should not own the child-agent result type"
+        );
+
+        let subagent =
+            std::fs::read_to_string(format!("{manifest_dir}/src/agent_subagent_execution.rs"))
+                .expect("TUI agent subagent execution module should exist");
+        assert!(
+            subagent.contains("ChildAgentResult"),
+            "agent_subagent_execution should use the runtime child-agent result type"
+        );
+    }
 }
