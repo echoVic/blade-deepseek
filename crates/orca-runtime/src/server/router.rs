@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 mod processors;
 
 use super::*;
-use processors::{command_exec, permission, shell, thread, turn};
+use processors::{command_exec, permission, shell, submit, thread, turn};
 
 pub(super) fn dispatch_submission<W: Write + Send + 'static>(
     config: &ServerConfig,
@@ -65,71 +65,17 @@ pub(super) fn dispatch_submission<W: Write + Send + 'static>(
         );
     }
 
-    let result = match &submission.op {
-        ClientOp::Submit { thread_id, .. } => {
-            if let Some(thread_id) = thread_id {
-                if !state.threads.has_thread(thread_id)
-                    && !state
-                        .active_turns
-                        .values()
-                        .any(|turn| turn.thread_id == *thread_id)
-                {
-                    protocol::write_server_event(
-                        &mut *writer.lock().map_err(lock_error)?,
-                        &submission.id,
-                        ServerEvent::error(format!("unknown thread: {thread_id}")),
-                    )?;
-                    return Ok(());
-                }
-                run_thread_submit_async(config, state, submission.id, submission.op, writer)
-            } else {
-                let mut writer = writer.lock().map_err(lock_error)?;
-                run_submit(config, submission.id, submission.op, &mut *writer)
-            }
-        }
-        ClientOp::ThreadStart {
-            runtime_workspace_roots,
-        } => {
-            let mut writer = writer.lock().map_err(lock_error)?;
-            run_thread_start(
-                config,
-                state,
-                runtime_workspace_roots.clone(),
-                submission.id,
-                &mut *writer,
-            )
-        }
-        ClientOp::ThreadResume {
-            thread_id,
-            permissions,
-        } => {
-            let mut writer = writer.lock().map_err(lock_error)?;
-            run_thread_resume(
-                config,
-                state,
-                thread_id,
-                permissions.clone(),
-                submission.id.clone(),
-                &mut *writer,
-            )
-        }
-        ClientOp::ThreadFork {
-            thread_id,
-            permissions,
-        } => {
-            let mut writer = writer.lock().map_err(lock_error)?;
-            run_thread_fork(
-                config,
-                state,
-                thread_id,
-                permissions.clone(),
-                submission.id.clone(),
-                &mut *writer,
-            )
-        }
-        _ => unreachable!(
-            "thread query, turn control, shell, command exec, and permission operations are delegated before router dispatch"
-        ),
-    };
-    result
+    if submit::is_submit_operation(&submission.op) {
+        return submit::dispatch_submit_operation(
+            config,
+            state,
+            submission.op,
+            submission.id,
+            writer,
+        );
+    }
+
+    unreachable!(
+        "thread query, turn control, shell, command exec, permission, and submit operations are delegated before router dispatch"
+    )
 }

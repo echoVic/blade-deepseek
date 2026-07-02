@@ -74,16 +74,16 @@ mod tests {
             "server router must expose submission dispatch inside the server module"
         );
         assert!(
-            router_source.contains("match &submission.op"),
-            "server router must own the ClientOp dispatch match"
-        );
-        assert!(
-            router_source.contains("ClientOp::Submit"),
-            "server router must dispatch submit operations"
+            router_source.contains("submit::dispatch_submit_operation("),
+            "server router must delegate submit-family operations"
         );
         assert!(
             router_source.contains("command_exec::dispatch_command_exec_operation("),
             "server router must delegate command exec operations"
+        );
+        assert!(
+            router_source.contains("permission::dispatch_permission_operation("),
+            "server router must delegate permission operations"
         );
     }
 
@@ -256,6 +256,40 @@ mod tests {
         assert!(
             processor_source.contains("fn dispatch_permission_operation"),
             "server permission processor must expose permission dispatch inside the router module"
+        );
+    }
+
+    #[test]
+    fn server_submit_dispatch_is_owned_by_submit_processor() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let router_source = std::fs::read_to_string(manifest_dir.join("src/server/router.rs"))
+            .expect("server router source");
+        let processor_source =
+            std::fs::read_to_string(manifest_dir.join("src/server/processors/submit.rs"))
+                .expect("server submit processor source");
+
+        assert!(
+            router_source.contains("submit::dispatch_submit_operation("),
+            "server router must delegate submit-family operations to the submit processor"
+        );
+        for variant in [
+            "ClientOp::Submit",
+            "ClientOp::ThreadStart",
+            "ClientOp::ThreadResume",
+            "ClientOp::ThreadFork",
+        ] {
+            assert!(
+                !router_source.contains(variant),
+                "server router must not own {variant} dispatch details"
+            );
+            assert!(
+                processor_source.contains(variant),
+                "server submit processor must own {variant} dispatch details"
+            );
+        }
+        assert!(
+            processor_source.contains("fn dispatch_submit_operation"),
+            "server submit processor must expose submit dispatch inside the router module"
         );
     }
 
