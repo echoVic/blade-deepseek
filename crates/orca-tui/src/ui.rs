@@ -42,7 +42,11 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
     // spacer, then the text — so the transcript tail, the indicator, and the input box
     // don't sit flush against each other. Idle collapses it to zero height so a resting
     // session has no chrome noise there.
-    let activity_height: u16 = if activity_line(state, theme).is_some() { 2 } else { 0 };
+    let activity_height: u16 = if activity_line(state, theme).is_some() {
+        2
+    } else {
+        0
+    };
 
     let chunks = main_layout(
         frame.area(),
@@ -1793,10 +1797,7 @@ fn render_activity(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
     // First row stays blank as a spacer between the transcript tail and the indicator.
     let paragraph = Paragraph::new(vec![
         Line::from(""),
-        Line::from(Span::styled(
-            format!(" {text}"),
-            Style::default().fg(color),
-        )),
+        Line::from(Span::styled(format!(" {text}"), Style::default().fg(color))),
     ]);
     frame.render_widget(paragraph, area);
 }
@@ -3600,8 +3601,13 @@ mod tests {
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         let textarea = TextArea::default();
         let mut state = test_state();
-        state.messages.push(ChatMessage::User("流式输出一篇长文".to_string()));
-        state.update(TuiEvent::TurnStarted { turn: 1, task: None });
+        state
+            .messages
+            .push(ChatMessage::User("流式输出一篇长文".to_string()));
+        state.update(TuiEvent::TurnStarted {
+            turn: 1,
+            task: None,
+        });
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(92, 24))
             .expect("test backend");
 
@@ -3636,8 +3642,13 @@ mod tests {
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         let textarea = TextArea::default();
         let mut state = test_state();
-        state.messages.push(ChatMessage::User("流式输出一篇长文".to_string()));
-        state.update(TuiEvent::TurnStarted { turn: 1, task: None });
+        state
+            .messages
+            .push(ChatMessage::User("流式输出一篇长文".to_string()));
+        state.update(TuiEvent::TurnStarted {
+            turn: 1,
+            task: None,
+        });
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(92, 24))
             .expect("test backend");
 
@@ -3672,8 +3683,13 @@ mod tests {
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         let textarea = TextArea::default();
         let mut state = test_state();
-        state.messages.push(ChatMessage::User("流式输出一篇长文".to_string()));
-        state.update(TuiEvent::TurnStarted { turn: 1, task: None });
+        state
+            .messages
+            .push(ChatMessage::User("流式输出一篇长文".to_string()));
+        state.update(TuiEvent::TurnStarted {
+            turn: 1,
+            task: None,
+        });
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(92, 24))
             .expect("test backend");
 
@@ -3689,12 +3705,17 @@ mod tests {
 
         // Stream well past one screen, then deliberately scroll up: follow disarms.
         for index in 0..40u32 {
-            state.update(TuiEvent::MessageDelta(format!("第{index:03}段:内容片全芯业型环训练力栈全首片闭\n\n")));
+            state.update(TuiEvent::MessageDelta(format!(
+                "第{index:03}段:内容片全芯业型环训练力栈全首片闭\n\n"
+            )));
             draw(&mut state);
         }
         state.scroll_up(6);
         draw(&mut state);
-        assert!(!state.auto_scroll, "deliberate scroll-up should disarm follow");
+        assert!(
+            !state.auto_scroll,
+            "deliberate scroll-up should disarm follow"
+        );
 
         // Wheel back down until the bottom is reached: follow re-arms and new
         // deltas are tracked again without further input.
@@ -3702,7 +3723,9 @@ mod tests {
             state.scroll_down(3);
             draw(&mut state);
         }
-        state.update(TuiEvent::MessageDelta("重新跟随后的新内容尾标RESUME\n\n".to_string()));
+        state.update(TuiEvent::MessageDelta(
+            "重新跟随后的新内容尾标RESUME\n\n".to_string(),
+        ));
         let rendered = draw(&mut state);
         assert!(
             rendered.contains("尾标RESUME"),

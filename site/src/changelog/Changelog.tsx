@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.102":
+        "TUI child-agent execution now flows through runtime-owned request construction, model/cost setup, loop orchestration, provider handling, tool request extraction, and tool-result folding while TUI keeps only the interactive tool adapter. This keeps the new reasoning-effort configuration intact across child provider calls.",
       "v0.1.101":
         "Reasoning effort is now configurable (high or max, default max) via env vars, config file, and CLI arguments, carried on DeepSeek API requests. The TUI /model command becomes a two-step picker — choose the model, then the reasoning effort — with deferred apply, clean Esc cancellation, and a status bar that shows both.",
       "v0.1.100":
@@ -230,6 +232,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.102":
+        "TUI child-agent 执行现在通过 runtime 统一负责 request 构造、model/cost setup、loop 编排、provider 处理、tool request 提取与 tool-result folding；TUI 只保留交互式 tool adapter，并且新的 reasoning-effort 配置会继续传入 child provider 调用。",
       "v0.1.101":
         "推理强度现在可配置（high 或 max，默认 max），支持通过环境变量、配置文件和 CLI 参数设置，并在 DeepSeek API 请求中携带。TUI 的 /model 命令改为两步选择——先选模型，再选推理强度——选择过程中不立即应用，按 Esc 可完整取消，状态栏同时显示模型与推理强度。",
       "v0.1.100":
