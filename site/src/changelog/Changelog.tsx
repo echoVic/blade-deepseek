@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.97":
+        "Server permission/respond dispatch now routes through a focused permission processor, preserving turn/session grants, strict auto-review, filesystem overlays, and network allow/deny behavior while shrinking the generic router.",
       "v0.1.96":
         "Server command/exec dispatch now routes through a focused command-exec processor, preserving buffered, streaming, stdin, resize, terminate, sandbox, and permission-profile behavior while shrinking the generic router.",
       "v0.1.95":
@@ -220,6 +222,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.97":
+        "server 的 permission/respond dispatch 现在进入独立 permission processor，保持 turn/session 授权、strict auto-review、文件系统 overlay 与网络 allow/deny 行为不变，同时继续缩小通用 router。",
       "v0.1.96":
         "server 的 command/exec dispatch 现在进入独立 command-exec processor，保持 buffered、streaming、stdin、resize、terminate、sandbox 与 permission-profile 行为不变，同时继续缩小通用 router。",
       "v0.1.95":
