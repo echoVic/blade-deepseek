@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.101":
+        "Reasoning effort is now configurable (high or max, default max) via env vars, config file, and CLI arguments, carried on DeepSeek API requests. The TUI /model command becomes a two-step picker — choose the model, then the reasoning effort — with deferred apply, clean Esc cancellation, and a status bar that shows both.",
       "v0.1.100":
         "TUI polish: inline scrolling now detects real overflow via rendered-line-info, keeps auto-follow armed until content actually overflows, fixes CJK-aware wrap heights, moves memory extraction off the render thread, adds a live activity bar, and debounces inertial mouse scroll right after a turn completes.",
       "v0.1.99":
@@ -228,6 +230,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.101":
+        "推理强度现在可配置（high 或 max，默认 max），支持通过环境变量、配置文件和 CLI 参数设置，并在 DeepSeek API 请求中携带。TUI 的 /model 命令改为两步选择——先选模型，再选推理强度——选择过程中不立即应用，按 Esc 可完整取消，状态栏同时显示模型与推理强度。",
       "v0.1.100":
         "TUI 体验优化：inline 滚动现在通过 rendered-line-info 判断真实溢出，内容未溢出时保持自动跟随，修复 CJK 混排的换行高度计算，将内存提取移出渲染线程，新增实时活动指示栏，并在回合结束后对惯性鼠标滚动做防抖处理。",
       "v0.1.99":
