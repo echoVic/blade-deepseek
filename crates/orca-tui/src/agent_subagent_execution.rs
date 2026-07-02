@@ -11,8 +11,8 @@ use orca_core::provider_types::ProviderStep;
 use orca_core::subagent_types::SubagentType;
 use orca_core::tool_types;
 use orca_runtime::agent_child::{
-    ChildAgentRequest, ChildAgentResult, prepare_child_agent_loop, route_child_agent_model,
-    run_child_agent_with_executor,
+    ChildAgentRequest, ChildAgentResult, compact_child_agent_conversation_if_needed,
+    prepare_child_agent_loop, route_child_agent_model, run_child_agent_with_executor,
 };
 use orca_runtime::agent_common;
 use orca_runtime::cost::CostTracker;
@@ -502,32 +502,7 @@ fn run_child_agent_for_tui(
                     });
                 }
 
-                if orca_provider::context::needs_compaction_wire(
-                    &setup.conversation,
-                    &setup.context_config,
-                    &setup.provider_config,
-                ) {
-                    let before_messages = setup.conversation.messages.len();
-                    if let Ok(outcome) = hooks.run(
-                        HookEvent::OnBudgetWarning,
-                        HookContext {
-                            cwd: &cwd.display().to_string(),
-                            session_status: None,
-                            tool_request: None,
-                            tool_result: None,
-                            before_messages: Some(before_messages),
-                            after_messages: None,
-                            usage: None,
-                        },
-                    ) {
-                        if !outcome.injected_context.is_empty() {
-                            setup.conversation =
-                                conversation_with_hook_context(&setup.conversation, &outcome);
-                        }
-                    }
-                    setup.conversation =
-                        orca_provider::context::compact(&setup.conversation, &setup.context_config);
-                }
+                compact_child_agent_conversation_if_needed(config, &mut setup, cwd, hooks)?;
 
                 let child_cancel = CancelToken::new();
                 let turn_provider_config =

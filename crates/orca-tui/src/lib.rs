@@ -243,4 +243,24 @@ mod tests {
             "agent_subagent_execution should not update child cost model directly"
         );
     }
+
+    #[test]
+    fn tui_subagent_child_compaction_is_runtime_owned() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let subagent =
+            std::fs::read_to_string(format!("{manifest_dir}/src/agent_subagent_execution.rs"))
+                .expect("TUI agent subagent execution module should exist");
+        assert!(
+            subagent.contains("compact_child_agent_conversation_if_needed"),
+            "agent_subagent_execution should delegate child compaction to runtime"
+        );
+        assert!(
+            !subagent.contains("needs_compaction_wire"),
+            "agent_subagent_execution should not decide child compaction thresholds"
+        );
+        assert!(
+            !subagent.contains("HookEvent::OnBudgetWarning"),
+            "agent_subagent_execution should not run child budget-warning hooks directly"
+        );
+    }
 }

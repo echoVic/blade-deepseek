@@ -15,6 +15,7 @@ use orca_provider::context::ContextConfig;
 use orca_provider::tool_schema::deepseek_tools_schema_for_type_with_mcp_and_external;
 
 use crate::agent_common;
+use crate::compaction::RuntimeCompactionStep;
 use crate::cost::CostTracker;
 use crate::hooks::HookRunner;
 use crate::instructions::ProjectInstructions;
@@ -229,6 +230,28 @@ pub fn route_child_agent_model(
     provider_config
 }
 
+pub fn compact_child_agent_conversation_if_needed(
+    config: &RunConfig,
+    setup: &mut ChildAgentLoopSetup,
+    cwd: &Path,
+    hooks: &HookRunner,
+) -> io::Result<bool> {
+    let mut events = EventFactory::new("child-agent-compaction".to_string());
+    let mut sink = EventSink::new(io::sink(), config.output_format);
+    let mut compaction = RuntimeCompactionStep::new(
+        config.provider,
+        &setup.context_config,
+        &setup.provider_config,
+        cwd,
+        false,
+        hooks,
+        &mut events,
+        &mut sink,
+        None,
+    );
+    compaction.compact_if_needed(&mut setup.conversation)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -387,6 +410,55 @@ mod tests {
         );
         let expected_pro_cost = (1_000.0 * 0.435 + 1_000.0 * 0.87) / 1_000_000.0;
         assert!((totals.estimated_cost_usd - expected_pro_cost).abs() < 1e-12);
+    }
+
+    #[test]
+    fn compact_child_agent_conversation_uses_runtime_compaction_step() {
+        let request = ChildAgentRequest::new(
+            "inspect repo".to_string(),
+            SubagentType::General,
+            None,
+            2,
+            false,
+        );
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let mut runtime_config = config(None);
+        runtime_config.model_runtime.context_window = Some(128);
+        runtime_config.model_runtime.auto_compact_token_limit = Some(64);
+        let mut setup = prepare_child_agent_loop(
+            &runtime_config,
+            &request,
+            std::env::temp_dir().as_path(),
+            &instructions,
+            &memory,
+        );
+        for index in 0..20 {
+            setup.conversation.add_user(format!(
+                "child message {index}: {}",
+                "important context ".repeat(20)
+            ));
+            setup.conversation.add_assistant(
+                Some(format!(
+                    "child answer {index}: {}",
+                    "detailed response ".repeat(20)
+                )),
+                None,
+                vec![],
+            );
+        }
+        let before_messages = setup.conversation.messages.len();
+
+        let compacted = compact_child_agent_conversation_if_needed(
+            &runtime_config,
+            &mut setup,
+            std::env::temp_dir().as_path(),
+            &HookRunner::default(),
+        )
+        .expect("child compaction should not fail");
+
+        assert!(compacted);
+        assert!(setup.conversation.messages.len() < before_messages);
     }
 
     #[test]
