@@ -71,16 +71,23 @@ fn tool_execution_does_not_call_interactive_approval_resolution_directly() {
 fn turn_iteration_step_uses_grouped_runtime_input() {
     let lifecycle =
         std::fs::read_to_string("crates/orca-runtime/src/lifecycle.rs").expect("lifecycle source");
+    let runtime_turn_iteration =
+        std::fs::read_to_string("crates/orca-runtime/src/runtime_turn_iteration.rs")
+            .expect("runtime turn iteration source");
 
     assert!(
-        lifecycle.contains("struct RuntimeTurnIterationInput"),
-        "turn iteration should have a grouped input boundary before more runtime-loop refactors"
+        runtime_turn_iteration.contains("struct RuntimeTurnIterationInput"),
+        "turn iteration should have a grouped input boundary in its own runtime module"
+    );
+    assert!(
+        !lifecycle.contains("struct RuntimeTurnIterationInput"),
+        "lifecycle should not own turn iteration input after the iteration module split"
     );
 
-    let run_impl = lifecycle
+    let run_impl = runtime_turn_iteration
         .split("impl RuntimeTurnIterationStep")
         .nth(1)
-        .and_then(|text| text.split("impl RuntimeTaskLifecycle").next())
+        .and_then(|text| text.split("impl RuntimeTurnIterationStep").next())
         .expect("runtime turn iteration impl block");
     assert!(
         run_impl.contains("input: RuntimeTurnIterationInput"),

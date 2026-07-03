@@ -17,10 +17,12 @@ use crate::hooks::HookRunner;
 use crate::instructions::ProjectInstructions;
 use crate::lifecycle::{
     AgentLoopResult, RuntimePermissionRequestHandler, RuntimePreparedConversation,
-    RuntimeTaskActor, RuntimeTurnIterationInput, RuntimeTurnIterationResult,
-    RuntimeTurnIterationStep, ThreadSteerHandle,
+    RuntimeTaskActor, ThreadSteerHandle,
 };
 use crate::memory::MemoryBlock;
+use crate::runtime_turn_iteration::{
+    RuntimeTurnIterationInput, RuntimeTurnIterationResult, RuntimeTurnIterationStep,
+};
 use crate::tasks::TaskRegistry;
 use crate::tool_invocation::AgentToolPolicyContext;
 use crate::workflow::ipc::WorkflowIpcContext;

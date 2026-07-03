@@ -19,6 +19,7 @@ pub mod provider_turn;
 pub(crate) mod runtime_bash;
 mod runtime_normal_tool;
 pub(crate) mod runtime_special;
+mod runtime_turn_iteration;
 mod runtime_turn_loop;
 pub(crate) mod sandbox_denial;
 pub mod schema_validation;
@@ -2451,10 +2452,11 @@ mod tests {
     }
 
     #[test]
-    fn runtime_turn_provider_cycle_step_is_owned_by_lifecycle_module() {
+    fn runtime_turn_provider_cycle_step_is_composed_by_runtime_turn_iteration_module() {
         let agent_loop_source = include_str!("agent_loop.rs");
         let lifecycle_source = include_str!("lifecycle.rs");
         let provider_turn_source = include_str!("provider_turn.rs");
+        let runtime_turn_iteration_source = include_str!("runtime_turn_iteration.rs");
 
         for marker in [
             "RuntimeProviderTurnStep::new",
@@ -2483,8 +2485,12 @@ mod tests {
             "lifecycle must not own runtime provider cycle step behavior"
         );
         assert!(
-            lifecycle_source.contains("RuntimeTurnProviderCycleStep::new"),
-            "lifecycle must compose runtime provider cycle through provider_turn boundary"
+            !lifecycle_source.contains("RuntimeTurnProviderCycleStep::new"),
+            "lifecycle must not compose runtime provider cycle after the turn-iteration split"
+        );
+        assert!(
+            runtime_turn_iteration_source.contains("RuntimeTurnProviderCycleStep::new"),
+            "runtime_turn_iteration must compose runtime provider cycle through provider_turn boundary"
         );
         assert!(
             provider_turn_source.contains("struct RuntimeTurnProviderCycleStep"),
@@ -2515,9 +2521,12 @@ mod tests {
     }
 
     #[test]
-    fn runtime_turn_iteration_step_is_owned_by_lifecycle_module() {
+    fn runtime_turn_iteration_step_is_owned_by_runtime_turn_iteration_module() {
         let agent_loop_source = include_str!("agent_loop.rs");
         let lifecycle_source = include_str!("lifecycle.rs");
+        let runtime_turn_iteration_source =
+            std::fs::read_to_string("src/runtime_turn_iteration.rs")
+                .expect("runtime turn iteration source");
 
         for marker in [
             "RuntimeTurnOpeningStep::new",
@@ -2536,16 +2545,28 @@ mod tests {
             "agent_loop must delegate runtime turn loop"
         );
         assert!(
-            lifecycle_source.contains("struct RuntimeTurnIterationStep"),
-            "lifecycle must own runtime turn iteration step state"
+            !lifecycle_source.contains("struct RuntimeTurnIterationStep"),
+            "lifecycle must not own runtime turn iteration step state"
         );
         assert!(
-            lifecycle_source.contains("enum RuntimeTurnIterationResult"),
-            "lifecycle must own runtime turn iteration result shape"
+            !lifecycle_source.contains("enum RuntimeTurnIterationResult"),
+            "lifecycle must not own runtime turn iteration result shape"
         );
         assert!(
-            lifecycle_source.contains("impl RuntimeTurnIterationStep"),
-            "lifecycle must own runtime turn iteration step behavior"
+            !lifecycle_source.contains("impl RuntimeTurnIterationStep"),
+            "lifecycle must not own runtime turn iteration step behavior"
+        );
+        assert!(
+            runtime_turn_iteration_source.contains("struct RuntimeTurnIterationStep"),
+            "runtime_turn_iteration must own runtime turn iteration step state"
+        );
+        assert!(
+            runtime_turn_iteration_source.contains("enum RuntimeTurnIterationResult"),
+            "runtime_turn_iteration must own runtime turn iteration result shape"
+        );
+        assert!(
+            runtime_turn_iteration_source.contains("impl RuntimeTurnIterationStep"),
+            "runtime_turn_iteration must own runtime turn iteration step behavior"
         );
         for marker in [
             "RuntimeTurnOpeningStep::new",
@@ -2555,8 +2576,8 @@ mod tests {
             "RuntimeTurnProviderCycleResult::ContinueTurn",
         ] {
             assert!(
-                lifecycle_source.contains(marker),
-                "lifecycle must compose runtime turn iteration detail {marker}"
+                runtime_turn_iteration_source.contains(marker),
+                "runtime_turn_iteration must compose runtime turn iteration detail {marker}"
             );
         }
     }
