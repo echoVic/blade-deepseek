@@ -25,6 +25,42 @@ pub(crate) struct RuntimeNormalToolExecutionContext<'a> {
     pub(crate) permission_overlay: Option<&'a mut TurnPermissionOverlay>,
 }
 
+pub(crate) struct RuntimeNormalToolInvocation<'a> {
+    pub(crate) config: Option<&'a RunConfig>,
+    pub(crate) request: &'a ToolRequest,
+    pub(crate) cwd: &'a Path,
+    pub(crate) additional_roots: &'a [PathBuf],
+    pub(crate) mcp_registry: &'a McpRegistry,
+    pub(crate) external_tools: &'a [ExternalToolConfig],
+    pub(crate) output_truncation: ToolOutputTruncation,
+    pub(crate) shell_timeout_secs: u64,
+    pub(crate) task_registry: Option<&'a TaskRegistry>,
+    pub(crate) cancel: Option<&'a CancelToken>,
+    pub(crate) permission_handler: Option<&'a dyn RuntimePermissionRequestHandler>,
+}
+
+impl<'a> RuntimeNormalToolInvocation<'a> {
+    fn into_execution_context(
+        self,
+        permission_overlay: Option<&'a mut TurnPermissionOverlay>,
+    ) -> RuntimeNormalToolExecutionContext<'a> {
+        RuntimeNormalToolExecutionContext {
+            config: self.config,
+            request: self.request,
+            cwd: self.cwd,
+            additional_roots: self.additional_roots,
+            mcp_registry: self.mcp_registry,
+            external_tools: self.external_tools,
+            output_truncation: self.output_truncation,
+            shell_timeout_secs: self.shell_timeout_secs,
+            task_registry: self.task_registry,
+            cancel: self.cancel,
+            permission_handler: self.permission_handler,
+            permission_overlay,
+        }
+    }
+}
+
 pub(crate) struct RuntimeNormalToolFallbackContext<'a> {
     pub(crate) request: &'a ToolRequest,
     pub(crate) cwd: &'a Path,
@@ -70,6 +106,13 @@ pub(crate) fn execute_runtime_normal_tool(
     context: RuntimeNormalToolExecutionContext<'_>,
 ) -> ToolResult {
     RuntimeNormalToolExecutor::new().execute(context)
+}
+
+pub(crate) fn execute_runtime_normal_tool_invocation(
+    invocation: RuntimeNormalToolInvocation<'_>,
+    permission_overlay: Option<&mut TurnPermissionOverlay>,
+) -> ToolResult {
+    execute_runtime_normal_tool(invocation.into_execution_context(permission_overlay))
 }
 
 pub(crate) struct RuntimeNormalToolExecutor<'a> {

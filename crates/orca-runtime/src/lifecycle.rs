@@ -29,7 +29,9 @@ use crate::protocol::{PermissionGrantScope, PermissionResponseDecision, RequestP
 use crate::provider_turn::{
     RuntimeProviderCycleInput, RuntimeTurnProviderCycleResult, RuntimeTurnProviderCycleStep,
 };
-use crate::runtime_normal_tool::{RuntimeNormalToolExecutionContext, execute_runtime_normal_tool};
+use crate::runtime_normal_tool::{
+    RuntimeNormalToolInvocation, execute_runtime_normal_tool_invocation,
+};
 use crate::session::{
     AgentConversationContext, bootstrap_agent_conversation_for_loop,
     record_initial_history_for_agent,
@@ -1132,7 +1134,7 @@ impl<'a> RuntimeTaskActor<'a> {
         cancel: Option<&CancelToken>,
         permission_handler: Option<&dyn RuntimePermissionRequestHandler>,
     ) -> ToolResult {
-        execute_runtime_normal_tool(RuntimeNormalToolExecutionContext {
+        self.execute_normal_tool_invocation(RuntimeNormalToolInvocation {
             config,
             request,
             cwd,
@@ -1144,8 +1146,14 @@ impl<'a> RuntimeTaskActor<'a> {
             task_registry,
             cancel,
             permission_handler,
-            permission_overlay: None,
         })
+    }
+
+    pub(crate) fn execute_normal_tool_invocation(
+        &mut self,
+        invocation: RuntimeNormalToolInvocation<'_>,
+    ) -> ToolResult {
+        execute_runtime_normal_tool_invocation(invocation, None)
     }
 
     pub fn execute_user_input_tool(
@@ -1791,7 +1799,7 @@ impl RuntimeToolActorContext {
         cancel: Option<&CancelToken>,
         permission_handler: Option<&dyn RuntimePermissionRequestHandler>,
     ) -> ToolResult {
-        execute_runtime_normal_tool(RuntimeNormalToolExecutionContext {
+        self.execute_normal_tool_invocation(RuntimeNormalToolInvocation {
             config,
             request,
             cwd,
@@ -1803,8 +1811,14 @@ impl RuntimeToolActorContext {
             task_registry,
             cancel,
             permission_handler,
-            permission_overlay: Some(&mut self.permission_overlay),
         })
+    }
+
+    pub(crate) fn execute_normal_tool_invocation(
+        &mut self,
+        invocation: RuntimeNormalToolInvocation<'_>,
+    ) -> ToolResult {
+        execute_runtime_normal_tool_invocation(invocation, Some(&mut self.permission_overlay))
     }
 
     pub fn execute_user_input_tool(

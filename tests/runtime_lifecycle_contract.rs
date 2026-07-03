@@ -208,8 +208,9 @@ fn runtime_tool_router_owns_tool_invocation_dispatch_boundary() {
         "tool_router should classify runtime special tool dispatch"
     );
     assert!(
-        tool_router.contains("execute_normal_tool_with_roots_and_cancel"),
-        "tool_router should own normal tool execution routing"
+        tool_router.contains("RuntimeNormalToolInvocation")
+            && tool_router.contains("execute_normal_tool_invocation"),
+        "tool_router should route normal tool execution through the invocation-object entrypoint"
     );
     assert!(
         tool_execution.contains("RuntimeToolRouter::new"),
@@ -243,6 +244,10 @@ fn runtime_normal_tool_executor_owns_normal_tool_execution_boundary() {
         "runtime_normal_tool should group normal tool execution state"
     );
     assert!(
+        normal_tool.contains("pub(crate) struct RuntimeNormalToolInvocation"),
+        "runtime_normal_tool should expose a smaller invocation object for lifecycle/router callers"
+    );
+    assert!(
         normal_tool.contains("pub(crate) trait RuntimeNormalToolFallbackExecutor"),
         "runtime_normal_tool should expose a focused fallback executor boundary"
     );
@@ -271,6 +276,14 @@ fn runtime_normal_tool_executor_owns_normal_tool_execution_boundary() {
         "lifecycle should delegate normal tool execution through the runtime_normal_tool invocation helper"
     );
     assert!(
+        lifecycle.contains("pub(crate) fn execute_normal_tool_invocation"),
+        "lifecycle actors should expose one invocation-object entrypoint for normal tools"
+    );
+    assert!(
+        tool_router_uses_normal_tool_invocation(),
+        "tool_router should route normal tools through RuntimeNormalToolInvocation instead of the long roots/cancel method"
+    );
+    assert!(
         !lifecycle.contains("RuntimeNormalToolExecutor::new"),
         "lifecycle should not instantiate the normal tool executor directly"
     );
@@ -282,6 +295,14 @@ fn runtime_normal_tool_executor_owns_normal_tool_execution_boundary() {
         !lifecycle.contains("orca_tools::execute_with_mcp_external_roots_policy_or_cancel"),
         "lifecycle should not directly invoke the normal tool fallback executor"
     );
+}
+
+fn tool_router_uses_normal_tool_invocation() -> bool {
+    let tool_router = std::fs::read_to_string("crates/orca-runtime/src/tool_router.rs")
+        .expect("runtime tool router source");
+    tool_router.contains("RuntimeNormalToolInvocation")
+        && tool_router.contains("execute_normal_tool_invocation")
+        && !tool_router.contains("execute_normal_tool_with_roots_and_cancel")
 }
 
 #[test]
