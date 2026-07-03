@@ -3,11 +3,9 @@ use orca_core::tool_types::ToolStatus;
 use serde_json::{Value, json};
 
 use crate::tool_item_projection::{
-    dynamic_tool_completed_item, dynamic_tool_started_item, mcp_result_from_content,
-    mcp_tool_completed_item, mcp_tool_parts, mcp_tool_started_item, parse_json_or_null,
-    persisted_command_execution_completed_item, persisted_command_execution_started_item,
-    persisted_file_change_completed_item, persisted_file_change_started_item,
-    tool_error_object_from_value,
+    complete_projected_tool_item, dynamic_tool_started_item, mcp_tool_parts, mcp_tool_started_item,
+    parse_json_or_null, persisted_command_execution_started_item,
+    persisted_file_change_started_item,
 };
 
 use super::types::{
@@ -389,151 +387,7 @@ fn tool_result_to_thread_item_with_metadata(
 }
 
 fn complete_tool_item(item: &mut Value, result: &Value) {
-    let content = result["content"].as_str().unwrap_or_default();
-    if let Some((status, failure)) = tool_failure_from_result(result)
-        .or_else(|| parse_tool_failure_content(content).map(|failure| ("failed", failure)))
-    {
-        complete_projected_tool_item(item, status, result, Value::Null, failure);
-        return;
-    }
-
-    complete_projected_tool_item(
-        item,
-        "completed",
-        result,
-        mcp_result_from_content(content),
-        Value::Null,
-    );
-}
-
-fn complete_projected_tool_item(
-    item: &mut Value,
-    status: &str,
-    result: &Value,
-    mcp_result: Value,
-    error: Value,
-) {
-    if item["type"] == "mcpToolCall" {
-        *item = mcp_tool_completed_item(
-            item["id"].as_str().unwrap_or_default(),
-            item["server"].as_str().unwrap_or_default(),
-            item["tool"].as_str().unwrap_or_default(),
-            status,
-            item["arguments"].clone(),
-            mcp_result,
-            error,
-        );
-        copy_truncated_metadata(item, result);
-        return;
-    }
-
-    if item["type"] == "dynamicToolCall" {
-        let content_items = if status == "completed" {
-            json!([{
-                "type": "text",
-                "text": result["content"].as_str().unwrap_or_default(),
-            }])
-        } else {
-            Value::Null
-        };
-        *item = dynamic_tool_completed_item(
-            item["id"].as_str().unwrap_or_default(),
-            item["tool"].as_str().unwrap_or_default(),
-            status,
-            item["arguments"].clone(),
-            content_items,
-            status == "completed",
-            error,
-        );
-        copy_truncated_metadata(item, result);
-        return;
-    }
-
-    if item["type"] == "commandExecution" {
-        let content = result["content"].as_str().unwrap_or_default();
-        *item = persisted_command_execution_completed_item(
-            item,
-            Value::from(status.to_string()),
-            if status == "completed" {
-                Value::from(content.to_string())
-            } else {
-                Value::Null
-            },
-            if status == "completed" {
-                Value::Null
-            } else {
-                error
-            },
-            truncated_metadata(result),
-        );
-        return;
-    }
-
-    if item["type"] == "fileChange" {
-        *item = persisted_file_change_completed_item(item, Value::from(status.to_string()));
-        return;
-    }
-
-    let content = result["content"].as_str().unwrap_or_default();
-    item["status"] = Value::from(status.to_string());
-    copy_truncated_metadata(item, result);
-    item["result"] = if status == "completed" {
-        Value::from(content.to_string())
-    } else {
-        Value::Null
-    };
-    item["error"] = error;
-}
-
-fn truncated_metadata(result: &Value) -> Value {
-    if result["truncated"].as_bool() == Some(true) {
-        Value::from(true)
-    } else {
-        Value::Null
-    }
-}
-
-fn copy_truncated_metadata(item: &mut Value, result: &Value) {
-    if result["truncated"].as_bool() == Some(true) {
-        item["truncated"] = Value::from(true);
-    }
-}
-
-fn tool_failure_from_result(result: &Value) -> Option<(&'static str, Value)> {
-    let status = match result["status"].as_str()? {
-        "completed" => return None,
-        "failed" => "failed",
-        "denied" => "denied",
-        "not_implemented" => "not_implemented",
-        _ => "failed",
-    };
-    let message = result["error"]
-        .as_str()
-        .filter(|message| !message.is_empty())
-        .or_else(|| {
-            result["content"]
-                .as_str()
-                .filter(|message| !message.is_empty())
-        })
-        .unwrap_or("tool call failed");
-    Some((status, tool_error_object_from_value(message, result)))
-}
-
-fn parse_tool_failure_content(content: &str) -> Option<Value> {
-    if let Some(message) = content.strip_prefix("ERROR: ") {
-        return Some(json!({ "message": message }));
-    }
-
-    let value = serde_json::from_str::<Value>(content).ok()?;
-    if value.get("status").and_then(Value::as_str) != Some("failed") {
-        return None;
-    }
-    let message = value
-        .get("error")
-        .and_then(Value::as_str)
-        .or_else(|| value.get("message").and_then(Value::as_str))
-        .unwrap_or("tool call failed");
-    Some(tool_error_object_from_value(message, &value))
+    complete_projected_tool_item(item, result);
 }
 
 fn command_from_tool_arguments(raw: &str) -> Value {

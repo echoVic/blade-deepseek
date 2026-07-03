@@ -1541,6 +1541,7 @@ mod tests {
             "persisted_command_execution_completed_item",
             "persisted_file_change_started_item",
             "persisted_file_change_completed_item",
+            "complete_projected_tool_item",
             "tool_error_object_from_value",
             "tool_status_is_completed",
         ] {
@@ -1557,6 +1558,18 @@ mod tests {
             assert!(
                 projection_source.contains(&signature),
                 "tool_item_projection must own shared tool item projection helper {function_name}"
+            );
+        }
+
+        for completed_constructor in [
+            "mcp_tool_completed_item(",
+            "dynamic_tool_completed_item(",
+            "persisted_command_execution_completed_item(",
+            "persisted_file_change_completed_item(",
+        ] {
+            assert!(
+                !thread_projection_source.contains(completed_constructor),
+                "thread_store/projection.rs must complete projected tool items through the shared projection helper, not call {completed_constructor} directly"
             );
         }
     }
