@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.115":
+        "Shell-session bash execution now receives one grouped RuntimeBashInvocationContext instead of a long execute_bash_with_shell_session argument list. RuntimeNormalToolExecutor still owns the bash branch, permission overlays, cancellation, output truncation, task registry handoff, and network/filesystem permission retries keep the same behavior, while the bash boundary gets smaller for the next shell/session and async-subagent slices.",
       "v0.1.114":
         "Filesystem sandbox denials now recover more clearly across server command/exec and model-visible bash. Orca diagnoses macOS Seatbelt write blocks such as nested .git/index.lock failures, explains when they are sandbox scope issues rather than stale locks, requests a turn-scoped filesystem write grant when an approval handler is available, and retries the original command with the granted root.",
       "v0.1.113":
@@ -256,6 +258,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.115":
+        "shell-session bash 执行现在统一接收分组后的 RuntimeBashInvocationContext，不再暴露 execute_bash_with_shell_session 的长参数列表。RuntimeNormalToolExecutor 仍然拥有 bash 分支，permission overlay、取消、输出截断、task registry 交接以及网络/文件系统权限重试行为保持不变，同时 bash 边界为后续 shell/session 和 async-subagent 切片继续收窄。",
       "v0.1.114":
         "文件系统 sandbox 拒绝现在在 server command/exec 和模型可见 bash 两条路径上都能更清楚地恢复。Orca 会诊断 macOS Seatbelt 写入阻断，例如嵌套工作区里的 .git/index.lock 失败，并说明这通常是 sandbox 范围问题而不是 stale lock；当存在审批处理器时，会请求 turn-scoped 文件系统写入授权，并用授权后的 root 重试原命令。",
       "v0.1.113":
