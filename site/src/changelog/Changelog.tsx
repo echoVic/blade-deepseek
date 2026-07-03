@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.109":
+        "Runtime normal-tool routing now passes a grouped RuntimeNormalToolInvocation from the router into lifecycle actors instead of calling the long roots/cancel method directly. Bash shell-session execution, MCP/external fallback, permission overlays, cancellation, and output truncation keep the same behavior while the common tool path gets a smaller call surface for later shell and async-subagent work.",
       "v0.1.108":
         "Normal tool invocation now funnels through one runtime_normal_tool helper instead of letting lifecycle.rs instantiate the executor directly. RuntimeTaskActor and RuntimeToolActorContext still preserve the same bash, MCP, external, cancellation, and permission-overlay behavior, but the next shell-session and async subagent slices have a smaller call surface to build on.",
       "v0.1.107":
@@ -244,6 +246,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.109":
+        "runtime 普通工具路由现在从 router 向 lifecycle actor 传递分组后的 RuntimeNormalToolInvocation，不再直接调用带 roots/cancel 的长参数方法。bash shell-session、MCP/external fallback、permission overlay、取消和输出截断行为保持不变，同时公共工具路径为后续 shell 与 async-subagent 工作留下更窄的调用面。",
       "v0.1.108":
         "普通工具 invocation 现在统一经过 runtime_normal_tool 里的单一 helper，不再让 lifecycle.rs 直接实例化 executor。RuntimeTaskActor 和 RuntimeToolActorContext 仍保持同样的 bash、MCP、external、取消与 permission-overlay 行为，但后续 shell-session 和 async subagent 切片会有更窄的调用面可继续推进。",
       "v0.1.107":
