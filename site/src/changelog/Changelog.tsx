@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.105":
+        "Normal tool execution now lives behind a focused RuntimeNormalToolExecutor boundary. The shell-session bash branch and the MCP/external/built-in fallback path move out of lifecycle.rs, while CLI, TUI, server, workflow, permission, and model-visible tool behavior stay unchanged.",
       "v0.1.104":
         "Runtime tool invocation dispatch now lives behind a focused RuntimeToolRouter boundary. ToolExecutionActor keeps invocation prep, approval, hooks, and result finalization, while workflow, subagent, task, permission, workflow IPC, and normal-tool routing move into the router without changing model-visible behavior.",
       "v0.1.103":
@@ -236,6 +238,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.105":
+        "普通工具执行现在进入独立 RuntimeNormalToolExecutor 边界。shell-session bash 分支，以及 MCP/external/built-in fallback 路径都从 lifecycle.rs 移出，同时 CLI、TUI、server、workflow、permission 与模型可见工具行为保持不变。",
       "v0.1.104":
         "runtime tool invocation dispatch 现在进入独立 RuntimeToolRouter 边界。ToolExecutionActor 只保留 invocation 准备、审批、hook 与结果收尾；workflow、subagent、task、permission、workflow IPC 和普通工具路由都移到 router，模型可见行为保持不变。",
       "v0.1.103":
