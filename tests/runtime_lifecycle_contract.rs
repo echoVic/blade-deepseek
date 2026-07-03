@@ -255,6 +255,10 @@ fn runtime_normal_tool_executor_owns_normal_tool_execution_boundary() {
         "runtime_normal_tool should keep the orca-tools fallback behind a default executor"
     );
     assert!(
+        normal_tool.contains("pub(crate) fn execute_runtime_normal_tool"),
+        "runtime_normal_tool should expose one helper for normal tool invocations"
+    );
+    assert!(
         normal_tool.contains("execute_bash_with_shell_session"),
         "runtime_normal_tool should own the shell-session bash execution branch"
     );
@@ -263,8 +267,12 @@ fn runtime_normal_tool_executor_owns_normal_tool_execution_boundary() {
         "runtime_normal_tool should own the fallback to the orca-tools executor"
     );
     assert!(
-        lifecycle.contains("RuntimeNormalToolExecutor::new"),
-        "lifecycle should delegate normal tool execution through RuntimeNormalToolExecutor"
+        lifecycle.contains("execute_runtime_normal_tool"),
+        "lifecycle should delegate normal tool execution through the runtime_normal_tool invocation helper"
+    );
+    assert!(
+        !lifecycle.contains("RuntimeNormalToolExecutor::new"),
+        "lifecycle should not instantiate the normal tool executor directly"
     );
     assert!(
         !lifecycle.contains("execute_bash_with_shell_session("),

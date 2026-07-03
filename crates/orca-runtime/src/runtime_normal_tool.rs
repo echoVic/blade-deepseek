@@ -66,6 +66,12 @@ impl RuntimeNormalToolFallbackExecutor for DefaultRuntimeNormalToolFallbackExecu
 static DEFAULT_NORMAL_TOOL_FALLBACK: DefaultRuntimeNormalToolFallbackExecutor =
     DefaultRuntimeNormalToolFallbackExecutor;
 
+pub(crate) fn execute_runtime_normal_tool(
+    context: RuntimeNormalToolExecutionContext<'_>,
+) -> ToolResult {
+    RuntimeNormalToolExecutor::new().execute(context)
+}
+
 pub(crate) struct RuntimeNormalToolExecutor<'a> {
     fallback: &'a dyn RuntimeNormalToolFallbackExecutor,
 }

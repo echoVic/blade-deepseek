@@ -29,7 +29,7 @@ use crate::protocol::{PermissionGrantScope, PermissionResponseDecision, RequestP
 use crate::provider_turn::{
     RuntimeProviderCycleInput, RuntimeTurnProviderCycleResult, RuntimeTurnProviderCycleStep,
 };
-use crate::runtime_normal_tool::{RuntimeNormalToolExecutionContext, RuntimeNormalToolExecutor};
+use crate::runtime_normal_tool::{RuntimeNormalToolExecutionContext, execute_runtime_normal_tool};
 use crate::session::{
     AgentConversationContext, bootstrap_agent_conversation_for_loop,
     record_initial_history_for_agent,
@@ -1132,7 +1132,7 @@ impl<'a> RuntimeTaskActor<'a> {
         cancel: Option<&CancelToken>,
         permission_handler: Option<&dyn RuntimePermissionRequestHandler>,
     ) -> ToolResult {
-        RuntimeNormalToolExecutor::new().execute(RuntimeNormalToolExecutionContext {
+        execute_runtime_normal_tool(RuntimeNormalToolExecutionContext {
             config,
             request,
             cwd,
@@ -1791,7 +1791,7 @@ impl RuntimeToolActorContext {
         cancel: Option<&CancelToken>,
         permission_handler: Option<&dyn RuntimePermissionRequestHandler>,
     ) -> ToolResult {
-        RuntimeNormalToolExecutor::new().execute(RuntimeNormalToolExecutionContext {
+        execute_runtime_normal_tool(RuntimeNormalToolExecutionContext {
             config,
             request,
             cwd,
