@@ -222,6 +222,49 @@ fn runtime_tool_router_owns_tool_invocation_dispatch_boundary() {
 }
 
 #[test]
+fn runtime_normal_tool_executor_owns_normal_tool_execution_boundary() {
+    let lib =
+        std::fs::read_to_string("crates/orca-runtime/src/lib.rs").expect("runtime lib source");
+    let lifecycle =
+        std::fs::read_to_string("crates/orca-runtime/src/lifecycle.rs").expect("lifecycle source");
+    let normal_tool = std::fs::read_to_string("crates/orca-runtime/src/runtime_normal_tool.rs")
+        .expect("runtime normal tool source");
+
+    assert!(
+        lib.contains("mod runtime_normal_tool;"),
+        "orca-runtime should register a focused normal-tool execution module"
+    );
+    assert!(
+        normal_tool.contains("pub(crate) struct RuntimeNormalToolExecutor"),
+        "runtime_normal_tool should own the normal tool executor boundary"
+    );
+    assert!(
+        normal_tool.contains("pub(crate) struct RuntimeNormalToolExecutionContext"),
+        "runtime_normal_tool should group normal tool execution state"
+    );
+    assert!(
+        normal_tool.contains("execute_bash_with_shell_session"),
+        "runtime_normal_tool should own the shell-session bash execution branch"
+    );
+    assert!(
+        normal_tool.contains("execute_with_mcp_external_roots_policy_or_cancel"),
+        "runtime_normal_tool should own the fallback to the orca-tools executor"
+    );
+    assert!(
+        lifecycle.contains("RuntimeNormalToolExecutor::new"),
+        "lifecycle should delegate normal tool execution through RuntimeNormalToolExecutor"
+    );
+    assert!(
+        !lifecycle.contains("execute_bash_with_shell_session("),
+        "lifecycle should not directly own the shell-session bash execution branch"
+    );
+    assert!(
+        !lifecycle.contains("orca_tools::execute_with_mcp_external_roots_policy_or_cancel"),
+        "lifecycle should not directly invoke the normal tool fallback executor"
+    );
+}
+
+#[test]
 fn session_lifecycle_assigns_agent_task_and_monotonic_turns() {
     let mut lifecycle = RuntimeSessionLifecycle::new("run-test");
     let task = lifecycle.start_task(RuntimeTaskKind::Agent);

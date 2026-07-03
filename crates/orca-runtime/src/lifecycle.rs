@@ -10,7 +10,7 @@ use orca_core::hook_types::HookEvent;
 use orca_core::model::{ModelRouteContext, ModelRouteDecision, ModelSelection};
 use orca_core::provider_types::{ProviderResponse, ProviderStep, Usage};
 use orca_core::subagent_types::SubagentType;
-use orca_core::tool_types::{ToolName, ToolOutputTruncation, ToolRequest, ToolResult, ToolStatus};
+use orca_core::tool_types::{ToolOutputTruncation, ToolRequest, ToolResult, ToolStatus};
 use orca_core::{
     cancel::CancelToken,
     config::{ProviderKind, RunConfig},
@@ -29,7 +29,7 @@ use crate::protocol::{PermissionGrantScope, PermissionResponseDecision, RequestP
 use crate::provider_turn::{
     RuntimeProviderCycleInput, RuntimeTurnProviderCycleResult, RuntimeTurnProviderCycleStep,
 };
-use crate::runtime_bash::execute_bash_with_shell_session;
+use crate::runtime_normal_tool::{RuntimeNormalToolExecutionContext, RuntimeNormalToolExecutor};
 use crate::session::{
     AgentConversationContext, bootstrap_agent_conversation_for_loop,
     record_initial_history_for_agent,
@@ -1120,7 +1120,7 @@ impl<'a> RuntimeTaskActor<'a> {
     #[allow(clippy::too_many_arguments)]
     pub fn execute_normal_tool_with_roots_and_cancel(
         &mut self,
-        _config: Option<&RunConfig>,
+        config: Option<&RunConfig>,
         request: &ToolRequest,
         cwd: &Path,
         additional_roots: &[PathBuf],
@@ -1128,11 +1128,12 @@ impl<'a> RuntimeTaskActor<'a> {
         external_tools: &[ExternalToolConfig],
         output_truncation: ToolOutputTruncation,
         shell_timeout_secs: u64,
-        _task_registry: Option<&TaskRegistry>,
+        task_registry: Option<&TaskRegistry>,
         cancel: Option<&CancelToken>,
-        _permission_handler: Option<&dyn RuntimePermissionRequestHandler>,
+        permission_handler: Option<&dyn RuntimePermissionRequestHandler>,
     ) -> ToolResult {
-        orca_tools::execute_with_mcp_external_roots_policy_or_cancel(
+        RuntimeNormalToolExecutor::new().execute(RuntimeNormalToolExecutionContext {
+            config,
             request,
             cwd,
             additional_roots,
@@ -1140,8 +1141,11 @@ impl<'a> RuntimeTaskActor<'a> {
             external_tools,
             output_truncation,
             shell_timeout_secs,
-            || cancel.is_some_and(CancelToken::is_cancelled),
-        )
+            task_registry,
+            cancel,
+            permission_handler,
+            permission_overlay: None,
+        })
     }
 
     pub fn execute_user_input_tool(
@@ -1787,23 +1791,7 @@ impl RuntimeToolActorContext {
         cancel: Option<&CancelToken>,
         permission_handler: Option<&dyn RuntimePermissionRequestHandler>,
     ) -> ToolResult {
-        if request.name == ToolName::Bash
-            && let Some(task_registry) = task_registry
-        {
-            return execute_bash_with_shell_session(
-                config,
-                request,
-                cwd,
-                additional_roots,
-                output_truncation,
-                shell_timeout_secs,
-                task_registry,
-                cancel,
-                permission_handler,
-                &mut self.permission_overlay,
-            );
-        }
-        self.actor().execute_normal_tool_with_roots_and_cancel(
+        RuntimeNormalToolExecutor::new().execute(RuntimeNormalToolExecutionContext {
             config,
             request,
             cwd,
@@ -1815,7 +1803,8 @@ impl RuntimeToolActorContext {
             task_registry,
             cancel,
             permission_handler,
-        )
+            permission_overlay: Some(&mut self.permission_overlay),
+        })
     }
 
     pub fn execute_user_input_tool(
