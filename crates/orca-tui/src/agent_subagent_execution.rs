@@ -120,43 +120,17 @@ pub(crate) fn execute_subagent_batch_for_tui(
             description,
             registry_task_id,
             thread::spawn(move || {
-                let subagent_id = child_tool_request.id.clone();
-                let mut current_turn = None;
-                let progress_registry = child_registry.clone();
-                let progress_registry_task_id = child_registry_task_id.clone();
-                let progress_tx = child_event_tx.clone();
-                let observer = ChildAgentActivityObserver::new(move |activity| {
-                    if let ChildAgentActivity::TurnStarted { turn } = activity {
-                        current_turn = Some(*turn);
-                    }
-                    let Some(progress) =
-                        subagent_activity_to_tui_progress(&subagent_id, activity, current_turn)
-                    else {
-                        return;
-                    };
-                    if let (Some(registry), Some(task_id)) =
-                        (&progress_registry, &progress_registry_task_id)
-                    {
-                        update_registry_from_subagent_progress(registry, task_id, &progress);
-                        let mut progress_events = EventFactory::new(task_id.clone());
-                        send_workflow_tasks_updated_for_tui(
-                            &progress_tx,
-                            &mut progress_events,
-                            &registry.list(),
-                        );
-                    }
-                    let _ = child_event_tx.send(progress);
-                });
-                let (silent_event_tx, _silent_event_rx) = std::sync::mpsc::channel();
-                let (action_tx, action_rx) = std::sync::mpsc::channel();
-                drop(action_tx);
-                let (child, child_cost_tracker) = run_child_agent_for_tui_observed(
+                let observer = make_subagent_progress_observer(
+                    child_tool_request.id.clone(),
+                    child_registry,
+                    child_registry_task_id,
+                    child_event_tx,
+                );
+                let (child, child_cost_tracker) = run_child_agent_for_tui_silent(
                     &child_config,
                     &child_cwd,
                     &child_prompt,
                     child_model,
-                    &silent_event_tx,
-                    &action_rx,
                     subagent_depth + 1,
                     &subagent_type,
                     &child_instructions,
@@ -387,63 +361,23 @@ fn launch_async_subagent_for_tui(
     let child_registry = task_registry.clone();
     let child_event_tx = event_tx.clone();
     let thread_agent_id = agent_id.clone();
+    let child_chat_id = tool_request.id.clone();
+    let child_description = request.description.clone();
 
     thread::spawn(move || {
         let mut events = EventFactory::new(thread_agent_id.clone());
         let _ = child_registry.mark_running(&thread_agent_id);
-        let mut current_turn = None;
-        let progress_registry = child_registry.clone();
-        let progress_tx = child_event_tx.clone();
-        let progress_agent_id = thread_agent_id.clone();
-        let observer = ChildAgentActivityObserver::new(move |activity| {
-            if let ChildAgentActivity::TurnStarted { turn } = activity {
-                current_turn = Some(*turn);
-            }
-            let Some(progress) =
-                subagent_activity_to_tui_progress(&progress_agent_id, activity, current_turn)
-            else {
-                return;
-            };
-            if let TuiEvent::SubagentProgress {
-                activity,
-                turn,
-                usage,
-                ..
-            } = &progress
-            {
-                let registry_activity = if usage.is_some() {
-                    progress_registry
-                        .get(&progress_agent_id)
-                        .and_then(|record| record.subagent_current_activity)
-                        .unwrap_or_else(|| activity.clone())
-                } else {
-                    activity.clone()
-                };
-                let _ = progress_registry.update_subagent_activity(
-                    &progress_agent_id,
-                    registry_activity,
-                    *turn,
-                    *usage,
-                );
-                let mut progress_events = EventFactory::new(progress_agent_id.clone());
-                send_workflow_tasks_updated_for_tui(
-                    &progress_tx,
-                    &mut progress_events,
-                    &progress_registry.list(),
-                );
-            }
-            let _ = progress_tx.send(progress);
-        });
-        let (silent_event_tx, _silent_event_rx) = std::sync::mpsc::channel();
-        let (action_tx, action_rx) = std::sync::mpsc::channel();
-        drop(action_tx);
-        let (child, child_cost_tracker) = run_child_agent_for_tui_observed(
+        let observer = make_subagent_progress_observer(
+            child_chat_id.clone(),
+            Some(child_registry.clone()),
+            Some(thread_agent_id.clone()),
+            child_event_tx.clone(),
+        );
+        let (child, child_cost_tracker) = run_child_agent_for_tui_silent(
             &child_config,
             &child_cwd,
             &child_prompt,
             child_model,
-            &silent_event_tx,
-            &action_rx,
             subagent_depth + 1,
             &child_type,
             &child_instructions,
@@ -456,12 +390,30 @@ fn launch_async_subagent_for_tui(
             let output = child
                 .final_message
                 .unwrap_or_else(|| "(subagent completed without a final message)".to_string());
+            send_subagent_completed_for_tui(
+                &child_event_tx,
+                &mut events,
+                &child_chat_id,
+                &child_description,
+                RunStatus::Success,
+                Some(&output),
+                None,
+            );
             let _ = child_registry.complete_with_usage(&thread_agent_id, output, usage);
         } else {
             let error = child
                 .error
-                .or(child.final_message)
+                .or_else(|| child.final_message.clone())
                 .unwrap_or_else(|| format!("subagent ended with status {:?}", child.status));
+            send_subagent_completed_for_tui(
+                &child_event_tx,
+                &mut events,
+                &child_chat_id,
+                &child_description,
+                RunStatus::Failed,
+                child.final_message.as_deref(),
+                Some(&error),
+            );
             let _ = child_registry.fail_with_usage(&thread_agent_id, error, usage);
         }
         send_workflow_tasks_updated_for_tui(&child_event_tx, &mut events, &child_registry.list());
@@ -681,7 +633,7 @@ fn subagent_activity_to_tui_progress(
     id: &str,
     activity: &ChildAgentActivity,
     turn: Option<u32>,
-) -> Option<TuiEvent> {
+) -> TuiEvent {
     let (activity, usage) = match activity {
         ChildAgentActivity::TurnStarted { turn } => (format!("turn {turn} started"), None),
         ChildAgentActivity::ToolStarted { name, target } => {
@@ -697,11 +649,35 @@ fn subagent_activity_to_tui_progress(
         ChildAgentActivity::Streaming => ("streaming response".to_string(), None),
         ChildAgentActivity::Usage(usage) => ("usage updated".to_string(), Some(*usage)),
     };
-    Some(TuiEvent::SubagentProgress {
+    TuiEvent::SubagentProgress {
         id: id.to_string(),
         activity,
         turn,
         usage,
+    }
+}
+
+/// Shared progress wiring for every child-agent path: `chat_id` is the tool
+/// call id the conversation's subagent card is keyed by, while the registry
+/// task keeps its own id — the two are never the same value.
+fn make_subagent_progress_observer(
+    chat_id: String,
+    registry: Option<TaskRegistry>,
+    registry_task_id: Option<String>,
+    event_tx: Sender<TuiEvent>,
+) -> ChildAgentActivityObserver<'static> {
+    let mut current_turn = None;
+    ChildAgentActivityObserver::new(move |activity| {
+        if let ChildAgentActivity::TurnStarted { turn } = activity {
+            current_turn = Some(*turn);
+        }
+        let progress = subagent_activity_to_tui_progress(&chat_id, activity, current_turn);
+        if let (Some(registry), Some(task_id)) = (&registry, &registry_task_id) {
+            update_registry_from_subagent_progress(registry, task_id, &progress);
+            let mut progress_events = EventFactory::new(task_id.clone());
+            send_workflow_tasks_updated_for_tui(&event_tx, &mut progress_events, &registry.list());
+        }
+        let _ = event_tx.send(progress);
     })
 }
 
@@ -747,8 +723,9 @@ fn is_tool_completion_activity(activity: &str) -> bool {
         || activity.ends_with(" approval_required")
 }
 
+/// Runs a child agent with no live event/action wiring to the main
+/// conversation; progress (if any) flows only through `observer`.
 #[allow(clippy::too_many_arguments)]
-#[allow(dead_code)]
 pub(crate) fn run_child_agent_for_tui_silent(
     config: &RunConfig,
     cwd: &Path,
@@ -759,11 +736,12 @@ pub(crate) fn run_child_agent_for_tui_silent(
     instructions: &ProjectInstructions,
     memory: &MemoryBlock,
     hooks: &HookRunner,
+    observer: Option<&ChildAgentActivityObserver<'_>>,
 ) -> (ChildAgentResult, CostTracker) {
     let (event_tx, _event_rx) = std::sync::mpsc::channel();
     let (action_tx, action_rx) = std::sync::mpsc::channel();
     drop(action_tx);
-    run_child_agent_for_tui(
+    run_child_agent_for_tui_observed(
         config,
         cwd,
         prompt,
@@ -775,5 +753,6 @@ pub(crate) fn run_child_agent_for_tui_silent(
         instructions,
         memory,
         hooks,
+        observer,
     )
 }

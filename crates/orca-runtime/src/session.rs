@@ -802,6 +802,61 @@ mod tests {
     }
 
     #[test]
+    fn interactive_session_resume_restores_compressed_transcript_before_appending() {
+        with_orca_home(|home| {
+            let mut writer =
+                history::SessionWriter::start(home, "mock", Some("auto".to_string()), "resume")
+                    .expect("writer");
+            writer
+                .append_message(&orca_core::conversation::Message::User {
+                    content: "previous".to_string(),
+                    pinned: false,
+                })
+                .expect("message");
+            writer.complete("success").expect("complete");
+            let session_id = history::load_session("latest")
+                .expect("transcript")
+                .meta
+                .session_id;
+            let compressed_path = history::compress_session(&session_id).expect("compress");
+            assert_eq!(compressed_path.extension().and_then(|e| e.to_str()), Some("zst"));
+            let transcript = history::load_session(&session_id).expect("compressed transcript");
+            let cfg = config(home.to_path_buf(), HistoryMode::Resume(session_id.clone()));
+
+            let mut session =
+                InteractiveSession::new_with_preloaded(&cfg, "resumed prompt", Some(transcript))
+                    .expect("session");
+            session
+                .conversation_mut()
+                .add_user("after resume".to_string());
+            let last = session
+                .conversation()
+                .messages
+                .last()
+                .cloned()
+                .expect("user message");
+            session.append_message(&last);
+
+            // Appending must not leave plaintext bytes behind a zstd frame:
+            // the whole history has to stay readable.
+            assert!(!compressed_path.exists());
+            let reloaded = history::load_session(&session_id).expect("history stays readable");
+            let contents: Vec<_> = reloaded
+                .messages
+                .iter()
+                .filter_map(|message| match message {
+                    orca_core::conversation::Message::User { content, .. } => {
+                        Some(content.as_str())
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert!(contents.contains(&"previous"));
+            assert!(contents.contains(&"after resume"));
+        });
+    }
+
+    #[test]
     fn interactive_session_reports_active_workflows_from_runtime_registry() {
         with_orca_home(|home| {
             let cfg = config(home.to_path_buf(), HistoryMode::Record);

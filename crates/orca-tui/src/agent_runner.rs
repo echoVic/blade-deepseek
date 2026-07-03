@@ -1626,6 +1626,7 @@ mod tests {
             &instructions,
             &memory,
             &hooks,
+            None,
         );
 
         assert_eq!(child.status, RunStatus::Success);
@@ -1958,13 +1959,17 @@ mod tests {
             serde_json::from_str(result.output.as_deref().expect("launch output")).unwrap();
         let agent_id = launched["agent_id"].as_str().expect("agent id");
 
+        // Wait for the child to finish so the asserted registry state is
+        // final rather than a transient mid-run snapshot. The specificity
+        // rule keeps the tool activity ("bash: ...") in place through the
+        // trailing turn-started/streaming events, and the mock provider
+        // always runs exactly two turns (tool call, then final message).
         let deadline = Instant::now() + Duration::from_secs(3);
         while Instant::now() < deadline {
-            if registry
-                .get(agent_id)
-                .and_then(|record| record.subagent_current_activity)
-                .is_some_and(|activity| activity.contains("bash"))
-            {
+            let completed = registry.get(agent_id).is_some_and(|record| {
+                record.status == orca_core::task_types::TaskStatus::Completed
+            });
+            if completed {
                 break;
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -1980,6 +1985,7 @@ mod tests {
         let status = execute_subagent_status_for_tui(&status_request, &registry);
         let payload: serde_json::Value =
             serde_json::from_str(status.output.as_deref().expect("status output")).unwrap();
+        assert_eq!(payload["status"], "completed");
         assert!(
             payload["current_activity"]
                 .as_str()
@@ -1988,7 +1994,7 @@ mod tests {
             "expected bash activity in status payload: {payload:?}; record: {:?}",
             registry.get(agent_id)
         );
-        assert_eq!(payload["turn"], 1);
+        assert_eq!(payload["turn"], 2);
         assert!(payload["last_activity_at_ms"].as_i64().unwrap() > 0);
     }
 }

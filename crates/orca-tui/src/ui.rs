@@ -1016,9 +1016,6 @@ fn subagent_progress_label(task: &BackgroundTaskSummary) -> String {
     if let Some(turn) = task.subagent_turn {
         parts.push(format!("turn {turn}"));
     }
-    if let Some(activity) = task.subagent_current_activity.as_deref() {
-        parts.push(activity.to_string());
-    }
     parts.push(elapsed_label(task));
     if let Some(usage) = task.usage {
         parts.push(format!(
@@ -1027,7 +1024,21 @@ fn subagent_progress_label(task: &BackgroundTaskSummary) -> String {
             usage.estimated_cost_usd
         ));
     }
+    // The activity carries a tool target of arbitrary length (often a full
+    // shell command), so it is clamped and rendered last: when the row
+    // truncates, the fixed-width fields stay visible.
+    if let Some(activity) = task.subagent_current_activity.as_deref() {
+        parts.push(clamp_label(activity, 32));
+    }
     parts.join(", ")
+}
+
+fn clamp_label(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let clamped: String = text.chars().take(max_chars.saturating_sub(1)).collect();
+    format!("{clamped}…")
 }
 
 fn elapsed_label(task: &BackgroundTaskSummary) -> String {
@@ -3188,7 +3199,7 @@ mod tests {
         }];
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         let textarea = TextArea::default();
-        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 16))
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 16))
             .expect("test backend");
 
         terminal
@@ -3198,7 +3209,9 @@ mod tests {
 
         assert!(rendered.contains("inspect auth"));
         assert!(rendered.contains("subagent"));
+        assert!(rendered.contains("turn 2"));
         assert!(rendered.contains("150 tok"));
+        assert!(rendered.contains("bash: cargo test"));
     }
 
     #[test]
