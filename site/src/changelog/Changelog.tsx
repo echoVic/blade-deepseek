@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.107":
+        "Tool-call argument streaming now reports progress end to end: a new tool.call.progress event and ToolCallProgress provider step flow through runtime and server, and the TUI renders received-bytes progress with cache-friendly updates. Adds an SSE streaming idle-timeout guard and fixes environment-variable proxy configuration and hook-timeout output handling.",
       "v0.1.106":
         "The normal-tool fallback path is now injectable through a focused RuntimeNormalToolFallbackExecutor boundary. MCP, TOML external, and built-in tool execution still use the same default orca-tools path, but the runtime can now test fallback context handoff without hardcoding that implementation.",
       "v0.1.105":
@@ -240,6 +242,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.107":
+        "工具调用参数的流式接收现在支持端到端进度上报：新增 tool.call.progress 事件与 ToolCallProgress provider 步骤，贯穿 runtime 与 server，TUI 以缓存友好的方式展示已接收字节进度。同时新增 SSE 流式空闲超时保护，并修复环境变量代理配置与 hook 超时输出处理的问题。",
       "v0.1.106":
         "普通工具 fallback 路径现在通过独立 RuntimeNormalToolFallbackExecutor 边界注入。MCP、TOML external 和 built-in 工具仍然走默认 orca-tools 实现，但 runtime 已经可以直接测试 fallback context 的透传，不再把具体实现硬编码在执行器里。",
       "v0.1.105":
