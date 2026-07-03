@@ -33,7 +33,7 @@ Set `INSTALL_DIR` to choose a destination and `ORCA_VERSION` to pin a version:
 
 ```bash
 curl -fsSL https://orcaagent.dev/install.sh | \
-  INSTALL_DIR=/usr/local/bin ORCA_VERSION=0.1.107 sh
+  INSTALL_DIR=/usr/local/bin ORCA_VERSION=0.1.108 sh
 ```
 
 ### GitHub Releases
