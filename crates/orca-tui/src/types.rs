@@ -10,6 +10,8 @@ use orca_core::plan_types::PlanItem;
 use orca_core::task_types::BackgroundTaskSummary;
 use orca_runtime::history::SessionSummary;
 
+const SUBAGENT_ACTIVITY_TAIL_LIMIT: usize = 6;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TuiTaskLifecycle {
     pub id: String,
@@ -63,6 +65,12 @@ pub enum TuiEvent {
         status: String,
         output: Option<String>,
         error: Option<String>,
+    },
+    SubagentProgress {
+        id: String,
+        activity: String,
+        turn: Option<u32>,
+        usage: Option<UsageTotals>,
     },
     WorkflowTasksUpdated {
         tasks: Vec<BackgroundTaskSummary>,
@@ -160,6 +168,11 @@ pub enum ChatMessage {
         status: String,
         output: Option<String>,
         error: Option<String>,
+        activity: Option<String>,
+        activity_tail: Vec<String>,
+        turn: Option<u32>,
+        usage: Option<UsageTotals>,
+        expanded: bool,
     },
     Error(String),
     System(String),
@@ -495,12 +508,15 @@ impl AppState {
     pub fn toggle_latest_tool_output(&mut self) -> bool {
         // Only the live pane is mutable and re-renderable. Anything below `flushed_count`
         // has been committed to the terminal's immutable scrollback (in fully-expanded
-        // form), so `e` can only toggle a tool call that is still in `messages[flushed_count..]`.
+        // form), so `e` can only toggle a live tool/subagent message.
         let live_start = self.flushed_count.min(self.messages.len());
         for message in self.messages[live_start..].iter_mut().rev() {
-            if let ChatMessage::ToolCall { expanded, .. } = message {
-                *expanded = !*expanded;
-                return true;
+            match message {
+                ChatMessage::ToolCall { expanded, .. } | ChatMessage::Subagent { expanded, .. } => {
+                    *expanded = !*expanded;
+                    return true;
+                }
+                _ => {}
             }
         }
         false
@@ -816,6 +832,11 @@ impl AppState {
                     status: "running".to_string(),
                     output: None,
                     error: None,
+                    activity: None,
+                    activity_tail: Vec::new(),
+                    turn: None,
+                    usage: None,
+                    expanded: false,
                 });
             }
             TuiEvent::SubagentCompleted {
@@ -851,7 +872,37 @@ impl AppState {
                         status,
                         output,
                         error,
+                        activity: None,
+                        activity_tail: Vec::new(),
+                        turn: None,
+                        usage: None,
+                        expanded: false,
                     });
+                }
+            }
+            TuiEvent::SubagentProgress {
+                id,
+                activity,
+                turn,
+                usage,
+            } => {
+                if let Some(ChatMessage::Subagent {
+                    activity: existing_activity,
+                    activity_tail,
+                    turn: existing_turn,
+                    usage: existing_usage,
+                    ..
+                }) = self.messages.iter_mut().rev().find(|message| {
+                    matches!(message, ChatMessage::Subagent { id: existing_id, .. } if existing_id == &id)
+                }) {
+                    push_subagent_activity_tail(activity_tail, &activity);
+                    *existing_activity = Some(activity);
+                    if turn.is_some() {
+                        *existing_turn = turn;
+                    }
+                    if usage.is_some() {
+                        *existing_usage = usage;
+                    }
                 }
             }
             TuiEvent::WorkflowTasksUpdated { tasks } => {
@@ -1130,14 +1181,34 @@ impl ChatMessage {
                 status,
                 output,
                 error,
+                activity,
+                activity_tail,
+                turn,
+                usage,
+                expanded,
             } => {
                 id.hash(state);
                 description.hash(state);
                 status.hash(state);
                 output.hash(state);
                 error.hash(state);
+                activity.hash(state);
+                activity_tail.hash(state);
+                turn.hash(state);
+                usage.map(|usage| usage.total_tokens()).hash(state);
+                expanded.hash(state);
             }
         }
+    }
+}
+
+fn push_subagent_activity_tail(tail: &mut Vec<String>, activity: &str) {
+    if tail.last().is_some_and(|last| last == activity) {
+        return;
+    }
+    tail.push(activity.to_string());
+    if tail.len() > SUBAGENT_ACTIVITY_TAIL_LIMIT {
+        tail.drain(0..tail.len() - SUBAGENT_ACTIVITY_TAIL_LIMIT);
     }
 }
 
@@ -1324,6 +1395,7 @@ mod tests {
                 status,
                 output,
                 error,
+                ..
             } => {
                 assert_eq!(id, "agent-1");
                 assert_eq!(description, "inspect repo");
@@ -1331,6 +1403,92 @@ mod tests {
                 assert_eq!(output.as_deref(), Some("done"));
                 assert!(error.is_none());
             }
+            other => panic!("expected subagent message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn subagent_progress_updates_existing_message_without_adding_rows() {
+        let mut state = state();
+
+        state.update(TuiEvent::SubagentStarted {
+            id: "agent-1".to_string(),
+            description: "inspect repo".to_string(),
+        });
+        state.update(TuiEvent::SubagentProgress {
+            id: "agent-1".to_string(),
+            activity: "bash: echo child".to_string(),
+            turn: Some(1),
+            usage: None,
+        });
+
+        assert_eq!(state.messages.len(), 1);
+        match &state.messages[0] {
+            ChatMessage::Subagent {
+                id,
+                status,
+                activity,
+                activity_tail,
+                turn,
+                ..
+            } => {
+                assert_eq!(id, "agent-1");
+                assert_eq!(status, "running");
+                assert_eq!(activity.as_deref(), Some("bash: echo child"));
+                assert_eq!(activity_tail, &vec!["bash: echo child".to_string()]);
+                assert_eq!(*turn, Some(1));
+            }
+            other => panic!("expected subagent message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn subagent_progress_retains_recent_activity_tail() {
+        let mut state = state();
+
+        state.update(TuiEvent::SubagentStarted {
+            id: "agent-1".to_string(),
+            description: "inspect repo".to_string(),
+        });
+        for index in 1..=8 {
+            state.update(TuiEvent::SubagentProgress {
+                id: "agent-1".to_string(),
+                activity: format!("activity {index}"),
+                turn: Some(index),
+                usage: None,
+            });
+        }
+
+        match &state.messages[0] {
+            ChatMessage::Subagent {
+                activity_tail,
+                turn,
+                ..
+            } => {
+                assert_eq!(*turn, Some(8));
+                assert_eq!(activity_tail.len(), 6);
+                assert_eq!(
+                    activity_tail.first().map(String::as_str),
+                    Some("activity 3")
+                );
+                assert_eq!(activity_tail.last().map(String::as_str), Some("activity 8"));
+            }
+            other => panic!("expected subagent message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn expand_toggle_flips_latest_live_subagent() {
+        let mut state = state();
+
+        state.update(TuiEvent::SubagentStarted {
+            id: "agent-1".to_string(),
+            description: "inspect repo".to_string(),
+        });
+
+        assert!(state.toggle_latest_tool_output());
+        match &state.messages[0] {
+            ChatMessage::Subagent { expanded, .. } => assert!(*expanded),
             other => panic!("expected subagent message, got {other:?}"),
         }
     }
@@ -1355,6 +1513,7 @@ mod tests {
                 status,
                 output,
                 error,
+                ..
             } => {
                 assert_eq!(id, "agent-2");
                 assert_eq!(description, "review code");
@@ -1969,6 +2128,9 @@ mod tests {
             workflow_final_summary: None,
             workflow_failure_count: 0,
             usage: None,
+            subagent_current_activity: None,
+            subagent_turn: None,
+            last_activity_at_ms: None,
         }];
         state.workflow_panel.selected = 9;
 
@@ -2018,6 +2180,9 @@ mod tests {
                 workflow_final_summary: None,
                 workflow_failure_count: 0,
                 usage: None,
+                subagent_current_activity: None,
+                subagent_turn: None,
+                last_activity_at_ms: None,
             }],
         });
         state.update(TuiEvent::WorkflowNotification {

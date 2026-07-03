@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::io;
 use std::path::Path;
 
@@ -5,12 +6,13 @@ use orca_approval::ApprovalPolicy;
 use orca_core::cancel::CancelToken;
 use orca_core::config::RunConfig;
 use orca_core::conversation::Conversation;
+use orca_core::cost_types::UsageTotals;
 use orca_core::event_schema::{EventFactory, RunStatus};
 use orca_core::event_sink::EventSink;
 use orca_core::model::ModelRouteContext;
 use orca_core::provider_types::{ProviderResponse, ProviderStep};
 use orca_core::subagent_types::SubagentType;
-use orca_core::tool_types::{ToolRequest, ToolResult};
+use orca_core::tool_types::{ToolRequest, ToolResult, ToolStatus};
 use orca_mcp::McpRegistry;
 use orca_provider::ProviderConfig;
 use orca_provider::context::ContextConfig;
@@ -92,6 +94,42 @@ pub struct ChildAgentToolExecution {
     pub should_stop: bool,
     pub result: ToolResult,
     pub child_cost: Option<CostTracker>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ChildAgentActivity {
+    TurnStarted {
+        turn: u32,
+    },
+    ToolStarted {
+        name: String,
+        target: Option<String>,
+    },
+    ToolCompleted {
+        name: String,
+        status: RunStatus,
+    },
+    Streaming,
+    Usage(UsageTotals),
+}
+
+pub struct ChildAgentActivityObserver<'a> {
+    emit: RefCell<Box<dyn FnMut(&ChildAgentActivity) + 'a>>,
+}
+
+impl<'a> ChildAgentActivityObserver<'a> {
+    pub fn new<F>(emit: F) -> Self
+    where
+        F: FnMut(&ChildAgentActivity) + 'a,
+    {
+        Self {
+            emit: RefCell::new(Box::new(emit)),
+        }
+    }
+
+    pub fn emit(&self, activity: ChildAgentActivity) {
+        (self.emit.borrow_mut())(&activity);
+    }
 }
 
 pub struct ChildAgentToolContext<'a> {
@@ -302,6 +340,7 @@ pub fn run_child_agent_provider_turn(
     hooks: &HookRunner,
     provider_config: &ProviderConfig,
     cancel: &CancelToken,
+    observer: Option<&ChildAgentActivityObserver<'_>>,
 ) -> ChildAgentProviderTurn {
     let pre_model_outcome = match hooks.run(
         orca_core::hook_types::HookEvent::PreModelCall,
@@ -332,7 +371,11 @@ pub fn run_child_agent_provider_turn(
         &model_conversation,
         provider_config,
         cancel,
-        &mut |_| {},
+        &mut |_| {
+            if let Some(observer) = observer {
+                observer.emit(ChildAgentActivity::Streaming);
+            }
+        },
     );
 
     if let Err(error) = hooks.run(
@@ -473,6 +516,33 @@ pub fn run_child_agent_loop_with_tool_executor<F>(
     memory: &MemoryBlock,
     hooks: &HookRunner,
     child_cost_tracker: &mut CostTracker,
+    execute_tool: F,
+) -> io::Result<ChildAgentResult>
+where
+    F: FnMut(&ChildAgentToolContext<'_>, &CancelToken, &ToolRequest) -> ChildAgentToolExecution,
+{
+    run_child_agent_loop_with_tool_executor_observed(
+        config,
+        request,
+        cwd,
+        instructions,
+        memory,
+        hooks,
+        child_cost_tracker,
+        None,
+        execute_tool,
+    )
+}
+
+pub fn run_child_agent_loop_with_tool_executor_observed<F>(
+    config: &RunConfig,
+    request: &ChildAgentRequest,
+    cwd: &Path,
+    instructions: &ProjectInstructions,
+    memory: &MemoryBlock,
+    hooks: &HookRunner,
+    child_cost_tracker: &mut CostTracker,
+    observer: Option<&ChildAgentActivityObserver<'_>>,
     mut execute_tool: F,
 ) -> io::Result<ChildAgentResult>
 where
@@ -481,7 +551,11 @@ where
     let mut setup = prepare_child_agent_loop(config, request, cwd, instructions, memory);
     loop {
         match advance_child_agent_turn(&mut setup) {
-            ChildAgentTurnBudget::Continue => {}
+            ChildAgentTurnBudget::Continue => {
+                if let Some(observer) = observer {
+                    observer.emit(ChildAgentActivity::TurnStarted { turn: setup.turn });
+                }
+            }
             ChildAgentTurnBudget::Stop(result) => return Ok(result),
         }
 
@@ -498,6 +572,7 @@ where
             hooks,
             &turn_provider_config,
             &child_cancel,
+            observer,
         ) {
             ChildAgentProviderTurn::Response(response) => response,
             ChildAgentProviderTurn::Fail(result) => return Ok(result),
@@ -509,7 +584,13 @@ where
             None => {}
         }
 
-        match fold_child_agent_provider_response(&mut setup, &response, child_cost_tracker) {
+        let had_usage = response.usage.is_some_and(|usage| !usage.is_empty());
+        let provider_fold =
+            fold_child_agent_provider_response(&mut setup, &response, child_cost_tracker);
+        if had_usage && let Some(observer) = observer {
+            observer.emit(ChildAgentActivity::Usage(child_cost_tracker.totals()));
+        }
+        match provider_fold {
             ChildAgentProviderResponseFold::Complete(result) => return Ok(result),
             ChildAgentProviderResponseFold::ContinueToTools => {}
         }
@@ -519,7 +600,20 @@ where
                 policy: &setup.policy,
                 mcp_registry: &setup.mcp_registry,
             };
+            if let Some(observer) = observer {
+                observer.emit(ChildAgentActivity::ToolStarted {
+                    name: tool_request.name.as_str().to_string(),
+                    target: tool_request.target.clone(),
+                });
+            }
             let tool_execution = execute_tool(&tool_context, &child_cancel, tool_request);
+            let had_child_cost = tool_execution.child_cost.is_some();
+            if let Some(observer) = observer {
+                observer.emit(ChildAgentActivity::ToolCompleted {
+                    name: tool_request.name.as_str().to_string(),
+                    status: run_status_from_tool_status(tool_execution.result.status),
+                });
+            }
             match fold_child_agent_tool_result(
                 &mut setup,
                 tool_request,
@@ -531,7 +625,18 @@ where
                 ChildAgentToolResultFold::Continue => {}
                 ChildAgentToolResultFold::Stop(result) => return Ok(result),
             }
+            if had_child_cost && let Some(observer) = observer {
+                observer.emit(ChildAgentActivity::Usage(child_cost_tracker.totals()));
+            }
         }
+    }
+}
+
+fn run_status_from_tool_status(status: ToolStatus) -> RunStatus {
+    match status {
+        ToolStatus::Completed => RunStatus::Success,
+        ToolStatus::Denied => RunStatus::ApprovalRequired,
+        ToolStatus::Failed | ToolStatus::NotImplemented => RunStatus::Failed,
     }
 }
 
@@ -542,6 +647,37 @@ pub fn run_child_agent_with_tool_executor<F>(
     instructions: &ProjectInstructions,
     memory: &MemoryBlock,
     hooks: &HookRunner,
+    execute_tool: F,
+) -> (ChildAgentResult, CostTracker)
+where
+    F: FnMut(
+        &RunConfig,
+        &ChildAgentRequest,
+        &ChildAgentToolContext<'_>,
+        &CancelToken,
+        &ToolRequest,
+    ) -> ChildAgentToolExecution,
+{
+    run_child_agent_with_tool_executor_observed(
+        config,
+        request,
+        cwd,
+        instructions,
+        memory,
+        hooks,
+        None,
+        execute_tool,
+    )
+}
+
+pub fn run_child_agent_with_tool_executor_observed<F>(
+    config: &RunConfig,
+    request: &ChildAgentRequest,
+    cwd: &Path,
+    instructions: &ProjectInstructions,
+    memory: &MemoryBlock,
+    hooks: &HookRunner,
+    observer: Option<&ChildAgentActivityObserver<'_>>,
     mut execute_tool: F,
 ) -> (ChildAgentResult, CostTracker)
 where
@@ -554,7 +690,7 @@ where
     ) -> ChildAgentToolExecution,
 {
     run_child_agent_with_executor(config, request, |config, request, child_cost_tracker| {
-        run_child_agent_loop_with_tool_executor(
+        run_child_agent_loop_with_tool_executor_observed(
             config,
             request,
             cwd,
@@ -562,6 +698,7 @@ where
             memory,
             hooks,
             child_cost_tracker,
+            observer,
             |tool_context, child_cancel, tool_request| {
                 execute_tool(config, request, tool_context, child_cancel, tool_request)
             },
@@ -604,6 +741,47 @@ where
         instructions,
         memory,
         hooks,
+        execute_tool,
+    )
+}
+
+pub fn run_child_agent_prompt_with_tool_executor_observed<F>(
+    config: &RunConfig,
+    prompt: String,
+    subagent_type: &SubagentType,
+    subagent_model: Option<String>,
+    subagent_depth: u32,
+    cwd: &Path,
+    instructions: &ProjectInstructions,
+    memory: &MemoryBlock,
+    hooks: &HookRunner,
+    observer: Option<&ChildAgentActivityObserver<'_>>,
+    execute_tool: F,
+) -> (ChildAgentResult, CostTracker)
+where
+    F: FnMut(
+        &RunConfig,
+        &ChildAgentRequest,
+        &ChildAgentToolContext<'_>,
+        &CancelToken,
+        &ToolRequest,
+    ) -> ChildAgentToolExecution,
+{
+    let request = ChildAgentRequest::new(
+        prompt,
+        subagent_type.clone(),
+        subagent_model,
+        subagent_depth,
+        false,
+    );
+    run_child_agent_with_tool_executor_observed(
+        config,
+        &request,
+        cwd,
+        instructions,
+        memory,
+        hooks,
+        observer,
         execute_tool,
     )
 }
@@ -891,6 +1069,7 @@ mod tests {
             &hooks,
             &provider_config,
             &cancel,
+            None,
         );
 
         let ChildAgentProviderTurn::Response(response) = turn else {
@@ -944,6 +1123,7 @@ mod tests {
             &pre_hooks,
             &provider_config,
             &cancel,
+            None,
         );
 
         match pre_turn {
@@ -973,6 +1153,7 @@ mod tests {
             &post_hooks,
             &provider_config,
             &cancel,
+            None,
         );
 
         match post_turn {
@@ -1308,6 +1489,76 @@ mod tests {
             Some("Mock completed after tool execution.")
         );
         assert_eq!(tool_count, 1);
+    }
+
+    #[test]
+    fn child_agent_observer_reports_turn_tool_and_usage_activity() {
+        let request = ChildAgentRequest::new(
+            "bash echo child".to_string(),
+            SubagentType::General,
+            None,
+            2,
+            false,
+        );
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let runtime_config = config(None);
+        let mut tracker = CostTracker::new(None);
+        let mut observed = Vec::new();
+        let observer = ChildAgentActivityObserver::new(|activity| {
+            observed.push(activity.clone());
+        });
+
+        let result = run_child_agent_loop_with_tool_executor_observed(
+            &runtime_config,
+            &request,
+            std::env::temp_dir().as_path(),
+            &instructions,
+            &memory,
+            &HookRunner::default(),
+            &mut tracker,
+            Some(&observer),
+            |_setup, _cancel, tool_request| {
+                let mut nested_cost = CostTracker::new(Some(orca_core::model::PRO_MODEL));
+                nested_cost.add_usage(Usage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    cache_tokens: 0,
+                });
+                ChildAgentToolExecution {
+                    should_stop: false,
+                    result: ToolResult::completed(
+                        tool_request,
+                        "child tool ran".to_string(),
+                        false,
+                    ),
+                    child_cost: Some(nested_cost),
+                }
+            },
+        )
+        .expect("child loop runner should complete");
+
+        drop(observer);
+        assert_eq!(result.status, RunStatus::Success);
+        assert!(observed.iter().any(|activity| {
+            matches!(activity, ChildAgentActivity::TurnStarted { turn } if *turn == 1)
+        }));
+        assert!(
+            observed
+                .iter()
+                .any(|activity| matches!(activity, ChildAgentActivity::Streaming))
+        );
+        assert!(observed.iter().any(|activity| {
+            matches!(activity, ChildAgentActivity::ToolStarted { name, target }
+                if name == "bash" && target.as_deref() == Some("echo child"))
+        }));
+        assert!(observed.iter().any(|activity| {
+            matches!(activity, ChildAgentActivity::ToolCompleted { name, status }
+                if name == "bash" && *status == RunStatus::Success)
+        }));
+        assert!(observed.iter().any(|activity| {
+            matches!(activity, ChildAgentActivity::Usage(usage) if usage.total_tokens() > 0)
+        }));
     }
 
     #[test]

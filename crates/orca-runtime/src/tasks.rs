@@ -54,6 +54,9 @@ pub struct TaskRecord {
     pub workflow_final_summary: Option<String>,
     pub workflow_failure_count: u32,
     pub usage: Option<UsageTotals>,
+    pub subagent_current_activity: Option<String>,
+    pub subagent_turn: Option<u32>,
+    pub last_activity_at_ms: Option<i64>,
     pub result: Option<String>,
     pub error: Option<String>,
     pub worker_pid: Option<u32>,
@@ -100,6 +103,12 @@ struct PersistedTaskRecord {
     #[serde(default)]
     workflow_failure_count: u32,
     usage: Option<UsageTotals>,
+    #[serde(default)]
+    subagent_current_activity: Option<String>,
+    #[serde(default)]
+    subagent_turn: Option<u32>,
+    #[serde(default)]
+    last_activity_at_ms: Option<i64>,
     result: Option<String>,
     error: Option<String>,
     #[serde(default)]
@@ -176,6 +185,9 @@ impl TaskRegistry {
             workflow_final_summary: None,
             workflow_failure_count: 0,
             usage: None,
+            subagent_current_activity: None,
+            subagent_turn: None,
+            last_activity_at_ms: None,
             result: None,
             error: None,
             worker_pid: None,
@@ -220,6 +232,9 @@ impl TaskRegistry {
             workflow_final_summary: None,
             workflow_failure_count: 0,
             usage: None,
+            subagent_current_activity: None,
+            subagent_turn: None,
+            last_activity_at_ms: None,
             result: None,
             error: None,
             worker_pid: None,
@@ -264,6 +279,9 @@ impl TaskRegistry {
             workflow_final_summary: None,
             workflow_failure_count: 0,
             usage: None,
+            subagent_current_activity: None,
+            subagent_turn: None,
+            last_activity_at_ms: None,
             result: None,
             error: None,
             worker_pid: None,
@@ -309,6 +327,9 @@ impl TaskRegistry {
                         workflow_final_summary: record.workflow_final_summary.clone(),
                         workflow_failure_count: record.workflow_failure_count,
                         usage: record.usage,
+                        subagent_current_activity: record.subagent_current_activity.clone(),
+                        subagent_turn: record.subagent_turn,
+                        last_activity_at_ms: record.last_activity_at_ms,
                     })
                     .collect::<Vec<_>>()
             })
@@ -389,6 +410,29 @@ impl TaskRegistry {
         self.update_task(id, |record| {
             record.workflow_final_summary = final_summary;
             record.workflow_failure_count = failure_count;
+            Ok(())
+        })
+    }
+
+    pub fn update_subagent_activity(
+        &self,
+        id: &str,
+        activity: String,
+        turn: Option<u32>,
+        usage: Option<UsageTotals>,
+    ) -> Result<(), String> {
+        self.update_task(id, |record| {
+            if record.task_type != TaskType::Subagent {
+                return Err(format!("task '{id}' is not a subagent"));
+            }
+            record.subagent_current_activity = Some(activity);
+            if let Some(turn) = turn {
+                record.subagent_turn = Some(turn);
+            }
+            if let Some(usage) = usage {
+                record.usage = Some(usage);
+            }
+            record.last_activity_at_ms = Some(now_ms());
             Ok(())
         })
     }
@@ -680,6 +724,9 @@ impl RuntimeSubagentStatusLookup for TaskRegistry {
                 cache_tokens: usage.cache_tokens,
                 estimated_cost_usd: usage.estimated_cost_usd,
             }),
+            subagent_current_activity: record.subagent_current_activity,
+            subagent_turn: record.subagent_turn,
+            last_activity_at_ms: record.last_activity_at_ms,
         })
     }
 }
@@ -706,6 +753,9 @@ impl PersistedTaskRecord {
             workflow_final_summary: self.workflow_final_summary,
             workflow_failure_count: self.workflow_failure_count,
             usage: self.usage,
+            subagent_current_activity: self.subagent_current_activity,
+            subagent_turn: self.subagent_turn,
+            last_activity_at_ms: self.last_activity_at_ms,
             result: self.result,
             error: self.error,
             worker_pid: self.worker_pid,
@@ -743,6 +793,9 @@ impl From<&TaskRecord> for PersistedTaskRecord {
             workflow_final_summary: record.workflow_final_summary.clone(),
             workflow_failure_count: record.workflow_failure_count,
             usage: record.usage,
+            subagent_current_activity: record.subagent_current_activity.clone(),
+            subagent_turn: record.subagent_turn,
+            last_activity_at_ms: record.last_activity_at_ms,
             result: record.result.clone(),
             error: record.error.clone(),
             worker_pid: record.worker_pid,
@@ -1083,6 +1136,34 @@ mod tests {
         assert_eq!(record.usage, Some(usage));
         let summary = registry.list().into_iter().next().unwrap();
         assert_eq!(summary.usage, Some(usage));
+    }
+
+    #[test]
+    fn subagent_activity_updates_live_task_summary() {
+        let registry = TaskRegistry::new("session-1".to_string());
+        let task =
+            registry.create_subagent("inspect auth".to_string(), Some("general".to_string()));
+        registry.mark_running(&task.id).unwrap();
+
+        registry
+            .update_subagent_activity(&task.id, "bash: cargo test".to_string(), Some(2), None)
+            .unwrap();
+
+        let record = registry.get(&task.id).unwrap();
+        assert_eq!(
+            record.subagent_current_activity.as_deref(),
+            Some("bash: cargo test")
+        );
+        assert_eq!(record.subagent_turn, Some(2));
+        assert!(record.last_activity_at_ms.is_some());
+
+        let summary = registry.list().into_iter().next().unwrap();
+        assert_eq!(
+            summary.subagent_current_activity.as_deref(),
+            Some("bash: cargo test")
+        );
+        assert_eq!(summary.subagent_turn, Some(2));
+        assert!(summary.last_activity_at_ms.is_some());
     }
 
     #[test]

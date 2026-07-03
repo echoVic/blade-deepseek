@@ -649,6 +649,7 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
                     session.instructions(),
                     session.memory(),
                     session.hooks(),
+                    Some(session.task_registry()),
                 );
                 for (should_stop, result, child_cost) in results {
                     session.cost_tracker_mut().merge(&child_cost);
@@ -1680,6 +1681,7 @@ mod tests {
             &instructions,
             &memory,
             &hooks,
+            None,
         );
 
         assert_eq!(results.len(), 2);
@@ -1687,6 +1689,111 @@ mod tests {
         assert_eq!(results[0].1.status, tool_types::ToolStatus::Failed);
         assert!(!results[1].0);
         assert_eq!(results[1].1.status, tool_types::ToolStatus::Completed);
+    }
+
+    #[test]
+    fn tui_subagent_batch_emits_child_activity_progress() {
+        let config = full_auto_config();
+        let (event_tx, event_rx) = mpsc::channel();
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let hooks = HookRunner::default();
+        let request = tool_types::ToolRequest {
+            id: "subagent-progress".to_string(),
+            name: tool_types::ToolName::Subagent,
+            action: orca_core::approval_types::ActionKind::Agent,
+            target: Some("child progress".to_string()),
+            raw_arguments: Some(
+                serde_json::json!({
+                    "description": "child progress",
+                    "prompt": "bash echo child"
+                })
+                .to_string(),
+            ),
+        };
+
+        let results = execute_subagent_batch_for_tui(
+            &config,
+            config.cwd.as_deref().unwrap_or_else(|| Path::new(".")),
+            &[request],
+            &event_tx,
+            0,
+            &instructions,
+            &memory,
+            &hooks,
+            None,
+        );
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].1.status, tool_types::ToolStatus::Completed);
+        let events = event_rx.try_iter().collect::<Vec<_>>();
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                TuiEvent::SubagentProgress { id, activity, turn, .. }
+                if id == "subagent-progress"
+                    && activity.contains("bash")
+                    && *turn == Some(1)
+            )
+        }));
+    }
+
+    #[test]
+    fn tui_sync_subagent_batch_updates_task_registry_activity() {
+        let config = full_auto_config();
+        let (event_tx, event_rx) = mpsc::channel();
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let hooks = HookRunner::default();
+        let registry = TaskRegistry::new("session-sync-progress".to_string());
+        let request = tool_types::ToolRequest {
+            id: "subagent-sync-progress".to_string(),
+            name: tool_types::ToolName::Subagent,
+            action: orca_core::approval_types::ActionKind::Agent,
+            target: Some("sync progress child".to_string()),
+            raw_arguments: Some(
+                serde_json::json!({
+                    "description": "sync progress child",
+                    "prompt": "bash echo child"
+                })
+                .to_string(),
+            ),
+        };
+
+        let results = execute_subagent_batch_for_tui(
+            &config,
+            config.cwd.as_deref().unwrap_or_else(|| Path::new(".")),
+            &[request],
+            &event_tx,
+            0,
+            &instructions,
+            &memory,
+            &hooks,
+            Some(&registry),
+        );
+
+        assert_eq!(results[0].1.status, tool_types::ToolStatus::Completed);
+        let tasks = registry.list();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(
+            tasks[0].task_type,
+            orca_core::task_types::TaskType::Subagent
+        );
+        assert!(
+            tasks[0]
+                .subagent_current_activity
+                .as_deref()
+                .unwrap_or_default()
+                .contains("bash")
+        );
+        assert_eq!(
+            tasks[0].status,
+            orca_core::task_types::TaskStatus::Completed
+        );
+        assert!(event_rx.try_iter().any(|event| {
+            matches!(event, TuiEvent::WorkflowTasksUpdated { tasks }
+                if tasks.iter().any(|task| task.description == "sync progress child"))
+        }));
     }
 
     #[test]
@@ -1808,5 +1915,80 @@ mod tests {
         assert_eq!(payload["usage"]["cache_tokens"], 10);
         assert_eq!(payload["usage"]["total_tokens"], 150);
         assert!(payload["usage"]["estimated_cost_usd"].as_f64().unwrap() > 0.0);
+    }
+
+    #[test]
+    fn tui_async_subagent_records_live_activity_for_status() {
+        let config = full_auto_config();
+        let (event_tx, _event_rx) = mpsc::channel();
+        let (_action_tx, action_rx) = mpsc::channel();
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let hooks = HookRunner::default();
+        let registry = TaskRegistry::new("session-async-progress".to_string());
+        let request = tool_types::ToolRequest {
+            id: "subagent-async-progress".to_string(),
+            name: tool_types::ToolName::Subagent,
+            action: orca_core::approval_types::ActionKind::Agent,
+            target: Some("async progress child".to_string()),
+            raw_arguments: Some(
+                serde_json::json!({
+                    "description": "async progress child",
+                    "prompt": "bash echo child",
+                    "mode": "async"
+                })
+                .to_string(),
+            ),
+        };
+
+        let (result, _cost) = execute_subagent_for_tui(
+            &config,
+            config.cwd.as_deref().unwrap_or_else(|| Path::new(".")),
+            &request,
+            &event_tx,
+            &action_rx,
+            0,
+            &instructions,
+            &memory,
+            &hooks,
+            Some(&registry),
+        );
+        assert_eq!(result.status, tool_types::ToolStatus::Completed);
+        let launched: serde_json::Value =
+            serde_json::from_str(result.output.as_deref().expect("launch output")).unwrap();
+        let agent_id = launched["agent_id"].as_str().expect("agent id");
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            if registry
+                .get(agent_id)
+                .and_then(|record| record.subagent_current_activity)
+                .is_some_and(|activity| activity.contains("bash"))
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let status_request = tool_types::ToolRequest {
+            id: "subagent-status".to_string(),
+            name: tool_types::ToolName::SubagentStatus,
+            action: orca_core::approval_types::ActionKind::Read,
+            target: None,
+            raw_arguments: Some(serde_json::json!({ "agent_id": agent_id }).to_string()),
+        };
+        let status = execute_subagent_status_for_tui(&status_request, &registry);
+        let payload: serde_json::Value =
+            serde_json::from_str(status.output.as_deref().expect("status output")).unwrap();
+        assert!(
+            payload["current_activity"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("bash"),
+            "expected bash activity in status payload: {payload:?}; record: {:?}",
+            registry.get(agent_id)
+        );
+        assert_eq!(payload["turn"], 1);
+        assert!(payload["last_activity_at_ms"].as_i64().unwrap() > 0);
     }
 }

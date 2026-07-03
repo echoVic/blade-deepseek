@@ -1013,6 +1013,12 @@ fn subagent_progress_label(task: &BackgroundTaskSummary) -> String {
     if let Some(agent_type) = task.agent_type.as_deref() {
         parts.push(agent_type.to_string());
     }
+    if let Some(turn) = task.subagent_turn {
+        parts.push(format!("turn {turn}"));
+    }
+    if let Some(activity) = task.subagent_current_activity.as_deref() {
+        parts.push(activity.to_string());
+    }
     parts.push(elapsed_label(task));
     if let Some(usage) = task.usage {
         parts.push(format!(
@@ -1213,6 +1219,11 @@ fn append_message_lines(
             status,
             output,
             error,
+            activity,
+            activity_tail,
+            turn,
+            usage,
+            expanded,
             ..
         } => {
             append_subagent_lines(
@@ -1221,7 +1232,12 @@ fn append_message_lines(
                 status,
                 output,
                 error,
+                activity.as_deref(),
+                activity_tail,
+                *turn,
+                *usage,
                 theme,
+                *expanded,
                 force_expand,
             );
         }
@@ -1344,7 +1360,12 @@ fn append_subagent_lines(
     status: &str,
     output: &Option<String>,
     error: &Option<String>,
+    activity: Option<&str>,
+    activity_tail: &[String],
+    turn: Option<u32>,
+    usage: Option<orca_core::cost_types::UsageTotals>,
     theme: &Theme,
+    expanded: bool,
     force_expand: bool,
 ) {
     let (label, color) = match status {
@@ -1370,13 +1391,25 @@ fn append_subagent_lines(
     let body_limit = if force_expand { usize::MAX } else { 3 };
     match (status, output, error) {
         ("running", _, _) => {
+            let mut detail = activity.unwrap_or("working in a child context").to_string();
+            if let Some(turn) = turn {
+                detail = format!("turn {turn} · {detail}");
+            }
+            if let Some(usage) = usage {
+                detail.push_str(&format!(" · {} tok", usage.total_tokens()));
+            }
             lines.push(Line::from(vec![
                 Span::styled("  │ ", Style::default().fg(theme.border)),
-                Span::styled(
-                    "working in a child context",
-                    Style::default().fg(theme.muted),
-                ),
+                Span::styled(detail, Style::default().fg(theme.muted)),
             ]));
+            if (expanded || force_expand) && !activity_tail.is_empty() {
+                for item in activity_tail {
+                    lines.push(Line::from(vec![
+                        Span::styled("  │   ", Style::default().fg(theme.border)),
+                        Span::styled(item.clone(), Style::default().fg(theme.muted)),
+                    ]));
+                }
+            }
         }
         (_, _, Some(err)) => {
             lines.push(Line::from(vec![
@@ -3100,6 +3133,9 @@ mod tests {
             workflow_final_summary: None,
             workflow_failure_count: 0,
             usage: None,
+            subagent_current_activity: None,
+            subagent_turn: None,
+            last_activity_at_ms: None,
         };
 
         assert_eq!(
@@ -3143,6 +3179,9 @@ mod tests {
                 cache_tokens: 10,
                 estimated_cost_usd: 0.0000252,
             }),
+            subagent_current_activity: Some("bash: cargo test".to_string()),
+            subagent_turn: Some(2),
+            last_activity_at_ms: Some(1_500),
             created_at_ms: 1_000,
             started_at_ms: Some(1_000),
             completed_at_ms: None,
@@ -3216,6 +3255,9 @@ mod tests {
             workflow_final_summary: Some("completed with fallback review".to_string()),
             workflow_failure_count: 1,
             usage: None,
+            subagent_current_activity: None,
+            subagent_turn: None,
+            last_activity_at_ms: None,
             created_at_ms: 1_000,
             started_at_ms: Some(1_000),
             completed_at_ms: Some(2_000),
@@ -3333,6 +3375,9 @@ mod tests {
             workflow_final_summary: None,
             workflow_failure_count: 0,
             usage: None,
+            subagent_current_activity: None,
+            subagent_turn: None,
+            last_activity_at_ms: None,
             created_at_ms: 1_000,
             started_at_ms: Some(1_000),
             completed_at_ms: None,

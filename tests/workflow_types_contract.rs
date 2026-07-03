@@ -109,6 +109,9 @@ fn background_task_summary_matches_sdk_names() {
         workflow_final_summary: None,
         workflow_failure_count: 0,
         usage: None,
+        subagent_current_activity: None,
+        subagent_turn: None,
+        last_activity_at_ms: None,
     };
 
     let value = serde_json::to_value(summary).unwrap();

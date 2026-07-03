@@ -273,7 +273,26 @@ impl InteractiveSession {
         let mut session_id = None;
         let writer = match &config.history_mode {
             HistoryMode::Disabled => None,
-            HistoryMode::Record | HistoryMode::Resume(_) => {
+            // Resume continues the original thread: keep its session id and
+            // append future items to the existing transcript file. Only Fork
+            // mints a new session id.
+            HistoryMode::Resume(_) => match loaded_transcript {
+                Some(transcript) => {
+                    let thread_session_id = transcript.meta.session_id.clone();
+                    match SessionWriter::append_to_existing(transcript.path) {
+                        Ok(writer) => {
+                            session_id = Some(thread_session_id);
+                            Some(writer)
+                        }
+                        Err(error) => {
+                            eprintln!("orca: warning: failed to reopen history: {error}");
+                            None
+                        }
+                    }
+                }
+                None => None,
+            },
+            HistoryMode::Record => {
                 match store.create_live_thread_with_permissions(
                     &cwd,
                     config.provider.as_str(),
@@ -757,6 +776,7 @@ mod tests {
                 .expect("message");
             writer.complete("success").expect("complete");
             let transcript = history::load_session("latest").expect("transcript");
+            let original_session_id = transcript.meta.session_id.clone();
             let cfg = config(
                 home.to_path_buf(),
                 HistoryMode::Resume(transcript.meta.session_id.clone()),
@@ -766,6 +786,7 @@ mod tests {
                 InteractiveSession::new_with_preloaded(&cfg, "resumed prompt", Some(transcript))
                     .expect("session");
 
+            assert_eq!(session.session_id(), Some(original_session_id.as_str()));
             assert!(
                 session
                     .conversation()

@@ -1151,22 +1151,20 @@ mod tests {
             action_tx.send(UserAction::Cancel).unwrap();
             handle.join().unwrap();
 
-            let new_session_id = match event {
+            let resumed_session_id = match event {
                 TuiEvent::GoalUpdated(goal) => {
                     assert_eq!(goal.objective, "resume me");
                     assert_eq!(goal.status, orca_core::goal_types::ThreadGoalStatus::Active);
-                    assert_ne!(goal.session_id, old_session_id);
+                    // Resume continues the same thread: the goal must stay on
+                    // the original session id; only fork mints a new one.
+                    assert_eq!(goal.session_id, old_session_id);
                     goal.session_id
                 }
                 other => panic!("expected resumed goal update, got {other:?}"),
             };
             let store = orca_runtime::goals::GoalStore::load_default();
             assert_eq!(
-                store.get(&old_session_id).unwrap().unwrap().status,
-                orca_core::goal_types::ThreadGoalStatus::Paused
-            );
-            assert_eq!(
-                store.get(&new_session_id).unwrap().unwrap().status,
+                store.get(&resumed_session_id).unwrap().unwrap().status,
                 orca_core::goal_types::ThreadGoalStatus::Active
             );
         });

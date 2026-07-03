@@ -629,6 +629,9 @@ mod tests {
             workflow_final_summary: None,
             workflow_failure_count: 0,
             usage: None,
+            subagent_current_activity: None,
+            subagent_turn: None,
+            last_activity_at_ms: None,
         };
 
         let tui_event = tui_event_from_runtime_event(&events.workflow_tasks_updated(&[task]))
