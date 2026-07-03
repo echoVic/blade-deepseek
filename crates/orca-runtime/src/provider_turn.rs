@@ -26,7 +26,7 @@ use crate::step_context::RuntimeStepContext;
 use crate::tasks::TaskRegistry;
 use crate::thread_store::SessionWriter;
 use crate::tool_invocation::{AgentToolPolicyContext, tool_requests_from_provider_steps};
-use crate::tool_turn::{ToolTurnOutcome, run_tool_turns};
+use crate::tool_turn::{RuntimeToolTurnsContext, ToolTurnOutcome, run_tool_turns};
 use crate::workflow::ipc::WorkflowIpcContext;
 use crate::workflow::runner::SharedEventBuffer;
 use crate::workflow_execution::BackgroundWorkflowRun;
@@ -408,19 +408,19 @@ impl RuntimeProviderResponseStep {
         )?;
 
         let tool_requests = tool_requests_from_provider_steps(&response.steps);
-        match run_tool_turns(
+        match run_tool_turns(RuntimeToolTurnsContext {
             step_context,
             events,
             sink,
             conversation,
-            history_writer.as_deref_mut(),
-            &tool_requests,
+            history_writer: history_writer.as_deref_mut(),
+            tool_requests: &tool_requests,
             cost_tracker,
             background_workflows,
             child_executor,
             workflow_child_executor,
             batch_child_executor,
-        )? {
+        })? {
             ToolTurnOutcome::Continue => Ok(RuntimeProviderResponseOutcome::Continue),
             ToolTurnOutcome::Return { status, error } => {
                 Ok(RuntimeProviderResponseOutcome::Return { status, error })

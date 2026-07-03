@@ -169,8 +169,8 @@ fn provider_response_and_tool_turn_share_runtime_step_context() {
         .and_then(|text| text.split(") -> io::Result<ToolTurnOutcome>").next())
         .expect("run_tool_turns signature");
     assert!(
-        run_tool_turns_signature.contains("step_context: RuntimeStepContext"),
-        "tool turns should share the provider response step context"
+        run_tool_turns_signature.contains("context: RuntimeToolTurnsContext"),
+        "tool turns should consume grouped dispatch context"
     );
     assert!(
         !run_tool_turns_signature.contains("tool_policy: AgentToolPolicyContext"),
@@ -179,6 +179,15 @@ fn provider_response_and_tool_turn_share_runtime_step_context() {
     assert!(
         !run_tool_turns_signature.contains("hooks: &HookRunner"),
         "hooks should not be a separate run_tool_turns argument"
+    );
+    let tool_turns_context = tool_turn
+        .split("pub(crate) struct RuntimeToolTurnsContext")
+        .nth(1)
+        .and_then(|text| text.split("pub(crate) struct ToolTurnExecution").next())
+        .expect("runtime tool turns context");
+    assert!(
+        tool_turns_context.contains("step_context: RuntimeStepContext"),
+        "grouped tool-turn dispatch context should carry the provider response step context"
     );
 }
 

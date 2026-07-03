@@ -46,6 +46,20 @@ pub(crate) struct ToolRequestCursor<'a> {
     index: usize,
 }
 
+pub(crate) struct RuntimeToolTurnsContext<'a, W: io::Write> {
+    pub(crate) step_context: RuntimeStepContext<'a>,
+    pub(crate) events: &'a mut EventFactory,
+    pub(crate) sink: &'a mut EventSink<W>,
+    pub(crate) conversation: &'a mut Conversation,
+    pub(crate) history_writer: Option<&'a mut SessionWriter>,
+    pub(crate) tool_requests: &'a [ToolRequest],
+    pub(crate) cost_tracker: &'a mut CostTracker,
+    pub(crate) background_workflows: &'a mut Vec<BackgroundWorkflowRun>,
+    pub(crate) child_executor: ChildAgentExecutor<W>,
+    pub(crate) workflow_child_executor: ChildAgentExecutor<SharedEventBuffer>,
+    pub(crate) batch_child_executor: ChildAgentExecutor<io::Sink>,
+}
+
 pub(crate) struct RuntimeNormalToolTurnContext<'a, W: io::Write> {
     pub(crate) config: &'a RunConfig,
     pub(crate) cwd: &'a Path,
@@ -249,18 +263,21 @@ pub(crate) fn run_readonly_tool_turn(
 }
 
 pub(crate) fn run_tool_turns<W: io::Write>(
-    step_context: RuntimeStepContext<'_>,
-    events: &mut EventFactory,
-    sink: &mut EventSink<W>,
-    conversation: &mut Conversation,
-    mut history_writer: Option<&mut SessionWriter>,
-    tool_requests: &[ToolRequest],
-    cost_tracker: &mut CostTracker,
-    background_workflows: &mut Vec<BackgroundWorkflowRun>,
-    child_executor: ChildAgentExecutor<W>,
-    workflow_child_executor: ChildAgentExecutor<SharedEventBuffer>,
-    batch_child_executor: ChildAgentExecutor<io::Sink>,
+    context: RuntimeToolTurnsContext<'_, W>,
 ) -> io::Result<ToolTurnOutcome> {
+    let RuntimeToolTurnsContext {
+        step_context,
+        events,
+        sink,
+        conversation,
+        mut history_writer,
+        tool_requests,
+        cost_tracker,
+        background_workflows,
+        child_executor,
+        workflow_child_executor,
+        batch_child_executor,
+    } = context;
     let config = step_context.config;
     let cwd = step_context.cwd;
     let tool_policy = step_context.tool_policy;
@@ -854,19 +871,19 @@ mod tests {
             None,
         );
 
-        let outcome = run_tool_turns(
+        let outcome = run_tool_turns(RuntimeToolTurnsContext {
             step_context,
-            &mut events,
-            &mut sink,
-            &mut conversation,
-            None,
-            &[request],
-            &mut cost_tracker,
-            &mut background_workflows,
-            unused_child_executor::<Vec<u8>>,
-            unused_child_executor::<SharedEventBuffer>,
-            unused_child_executor::<io::Sink>,
-        )
+            events: &mut events,
+            sink: &mut sink,
+            conversation: &mut conversation,
+            history_writer: None,
+            tool_requests: &[request],
+            cost_tracker: &mut cost_tracker,
+            background_workflows: &mut background_workflows,
+            child_executor: unused_child_executor::<Vec<u8>>,
+            workflow_child_executor: unused_child_executor::<SharedEventBuffer>,
+            batch_child_executor: unused_child_executor::<io::Sink>,
+        })
         .expect("run tool turns");
 
         match outcome {

@@ -777,6 +777,47 @@ mod tests {
     }
 
     #[test]
+    fn tool_turn_dispatch_uses_grouped_context() {
+        let provider_turn_source = include_str!("provider_turn.rs");
+        let tool_turn_source = include_str!("tool_turn.rs");
+
+        assert!(
+            tool_turn_source.contains("pub(crate) struct RuntimeToolTurnsContext"),
+            "tool_turn must group dispatch-loop inputs into RuntimeToolTurnsContext"
+        );
+        assert!(
+            tool_turn_source.contains("context: RuntimeToolTurnsContext<"),
+            "run_tool_turns must accept the grouped dispatch-loop context"
+        );
+        assert!(
+            provider_turn_source.contains("run_tool_turns(RuntimeToolTurnsContext"),
+            "provider response must pass tool-turn dispatch inputs as one grouped context"
+        );
+        assert!(
+            !provider_turn_source.contains("run_tool_turns(\n            step_context,"),
+            "provider response must not call run_tool_turns with the old long argument list"
+        );
+        for field_name in [
+            "step_context:",
+            "events:",
+            "sink:",
+            "conversation:",
+            "history_writer:",
+            "tool_requests:",
+            "cost_tracker:",
+            "background_workflows:",
+            "child_executor:",
+            "workflow_child_executor:",
+            "batch_child_executor:",
+        ] {
+            assert!(
+                tool_turn_source.contains(field_name),
+                "RuntimeToolTurnsContext must carry tool-turn dispatch field {field_name}"
+            );
+        }
+    }
+
+    #[test]
     fn readonly_tool_turn_runner_is_owned_by_tool_turn_module() {
         let agent_loop_source = include_str!("agent_loop.rs");
         let tool_invocation_source = include_str!("tool_invocation.rs");
