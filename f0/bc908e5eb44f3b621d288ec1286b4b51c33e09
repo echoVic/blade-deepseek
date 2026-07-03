@@ -1,0 +1,21 @@
+crates/orca-tui/src/types.rs
+  s_b74d9bf48663ab::t_7f0393715baf61 2,35-39,168-176,314,367,672-684,696-736,901,918,1010-1028,1046,1069-1078,1092-1155,1569-1581,1791-1919
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "f0bc908e5eb44f3b621d288ec1286b4b51c33e09",
+  "prompts": {},
+  "sessions": {
+    "s_b74d9bf48663ab": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f260b-a5c5-7f32-b45c-1461f1f376ab",
+        "model": "unknown"
+      },
+      "human_author": "echoVic <137844255@qq.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
