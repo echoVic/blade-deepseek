@@ -32,6 +32,7 @@ pub mod thread_store;
 pub mod tool_execution;
 pub mod tool_invocation;
 pub(crate) mod tool_item_projection;
+mod tool_router;
 pub mod tool_turn;
 pub mod update_check;
 pub mod workflow;

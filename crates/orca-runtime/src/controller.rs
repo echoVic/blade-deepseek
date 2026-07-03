@@ -673,6 +673,7 @@ mod tests {
     use crate::subagent_execution::{collect_subagent_batch, should_run_subagent_batch};
     use crate::tool_execution::{ToolExecutionActor, ToolExecutionContext};
     use crate::tool_invocation::prepare_tool_invocation;
+    use crate::tool_router::{RuntimeToolInvocationContext, RuntimeToolRouter};
     use orca_approval::ApprovalPolicy;
     use orca_core::approval_types::{ActionKind, ApprovalMode};
     use orca_core::config::{HistoryMode, OutputFormat, ProviderKind};
@@ -1214,7 +1215,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_execution_actor_dispatches_normal_tool() {
+    fn runtime_tool_router_dispatches_normal_tool() {
         let cwd = tempfile::tempdir().unwrap();
         std::fs::write(cwd.path().join("tracked.txt"), "hello\n").unwrap();
         let config = config(SubagentConfig::default());
@@ -1237,30 +1238,31 @@ mod tests {
         let mut background_workflows = Vec::new();
         let mut permission_overlay = crate::lifecycle::TurnPermissionOverlay::default();
 
-        let mut actor = ToolExecutionActor::new(events.run_id().to_string(), DEFAULT_MAX_TURNS);
-        let result = actor
-            .dispatch_tool(
-                &config,
-                cwd.path(),
-                &mut events,
-                &mut sink,
-                &request,
-                0,
-                &instructions,
-                &memory,
-                &registry,
-                &hooks,
-                true,
-                &mut cost_tracker,
-                &cancel,
-                &task_registry,
-                &mut background_workflows,
-                None,
-                &mut permission_overlay,
-                None,
-                execute_child_agent_loop,
-                execute_child_agent_loop,
-            )
+        let mut runtime =
+            RuntimeToolActorContext::new(events.run_id().to_string(), DEFAULT_MAX_TURNS);
+        let result = RuntimeToolRouter::new(&mut runtime)
+            .dispatch(RuntimeToolInvocationContext {
+                config: &config,
+                cwd: cwd.path(),
+                events: &mut events,
+                sink: &mut sink,
+                execution_request: &request,
+                subagent_depth: 0,
+                instructions: &instructions,
+                memory: &memory,
+                mcp_registry: &registry,
+                hooks: &hooks,
+                emit_deltas: true,
+                cost_tracker: &mut cost_tracker,
+                cancel: &cancel,
+                task_registry: &task_registry,
+                background_workflows: &mut background_workflows,
+                workflow_ipc: None,
+                permission_overlay: &mut permission_overlay,
+                permission_handler: None,
+                child_executor: execute_child_agent_loop,
+                workflow_child_executor: execute_child_agent_loop,
+            })
             .unwrap();
 
         assert_eq!(result.status, tool_types::ToolStatus::Completed);

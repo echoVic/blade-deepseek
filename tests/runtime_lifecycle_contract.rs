@@ -183,6 +183,45 @@ fn provider_response_and_tool_turn_share_runtime_step_context() {
 }
 
 #[test]
+fn runtime_tool_router_owns_tool_invocation_dispatch_boundary() {
+    let lib =
+        std::fs::read_to_string("crates/orca-runtime/src/lib.rs").expect("runtime lib source");
+    let tool_execution = std::fs::read_to_string("crates/orca-runtime/src/tool_execution.rs")
+        .expect("tool execution source");
+    let tool_router = std::fs::read_to_string("crates/orca-runtime/src/tool_router.rs")
+        .expect("runtime tool router source");
+
+    assert!(
+        lib.contains("mod tool_router;"),
+        "orca-runtime should register a focused runtime tool-router module"
+    );
+    assert!(
+        tool_router.contains("pub(crate) struct RuntimeToolRouter"),
+        "tool_router should own the runtime tool dispatch router"
+    );
+    assert!(
+        tool_router.contains("pub(crate) struct RuntimeToolInvocationContext"),
+        "tool_router should group dispatch-time tool invocation state"
+    );
+    assert!(
+        tool_router.contains("RuntimeSpecialToolDispatch"),
+        "tool_router should classify runtime special tool dispatch"
+    );
+    assert!(
+        tool_router.contains("execute_normal_tool_with_roots_and_cancel"),
+        "tool_router should own normal tool execution routing"
+    );
+    assert!(
+        tool_execution.contains("RuntimeToolRouter::new"),
+        "tool execution actor should delegate dispatch through RuntimeToolRouter"
+    );
+    assert!(
+        !tool_execution.contains("pub(crate) fn dispatch_tool"),
+        "tool execution actor should not own the large runtime tool dispatch method"
+    );
+}
+
+#[test]
 fn session_lifecycle_assigns_agent_task_and_monotonic_turns() {
     let mut lifecycle = RuntimeSessionLifecycle::new("run-test");
     let task = lifecycle.start_task(RuntimeTaskKind::Agent);

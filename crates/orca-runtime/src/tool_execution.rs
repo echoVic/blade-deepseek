@@ -20,18 +20,15 @@ use crate::lifecycle::{
     RuntimeTaskActor, RuntimeToolActorContext, TurnPermissionOverlay,
 };
 use crate::memory::MemoryBlock;
-use crate::runtime_special::{RuntimeSpecialToolDispatch, RuntimeWorkflowDraftRequest};
-use crate::subagent_execution::execute_subagent_tool;
 use crate::tasks::TaskRegistry;
 use crate::tool_invocation::{
     ToolInvocation, apply_pre_tool_outcome, approval_request_for_invocation,
     prepare_tool_invocation, validate_tool_invocation,
 };
+use crate::tool_router::{RuntimeToolInvocationContext, RuntimeToolRouter};
 use crate::workflow::ipc::WorkflowIpcContext;
 use crate::workflow::runner::SharedEventBuffer;
-use crate::workflow_execution::{
-    BackgroundWorkflowRun, execute_workflow_draft_action_tool, execute_workflow_tool,
-};
+use crate::workflow_execution::BackgroundWorkflowRun;
 
 const DEFAULT_TOOL_MAX_TURNS: u32 = 128;
 
@@ -270,81 +267,6 @@ impl ToolExecutionActor {
             .run_post_tool_hook_with_cancel(hooks, cwd, request, result, cancel)
     }
 
-    fn classify_dispatch(&self, request: &tool_types::ToolRequest) -> RuntimeSpecialToolDispatch {
-        self.runtime.classify_dispatch(request)
-    }
-
-    fn execute_workflow_draft_tool(
-        &mut self,
-        request: &tool_types::ToolRequest,
-        draft: RuntimeWorkflowDraftRequest<'_>,
-    ) -> io::Result<tool_types::ToolResult> {
-        self.runtime.execute_workflow_draft_tool(request, draft)
-    }
-
-    fn execute_subagent_status_tool(
-        &mut self,
-        request: &tool_types::ToolRequest,
-        task_registry: &TaskRegistry,
-    ) -> tool_types::ToolResult {
-        self.runtime
-            .execute_subagent_status_tool(request, task_registry)
-    }
-
-    fn execute_task_list_tool(
-        &mut self,
-        request: &tool_types::ToolRequest,
-        task_registry: &TaskRegistry,
-    ) -> tool_types::ToolResult {
-        self.runtime.execute_task_list_tool(request, task_registry)
-    }
-
-    fn execute_task_stop_tool(
-        &mut self,
-        request: &tool_types::ToolRequest,
-        task_registry: &TaskRegistry,
-    ) -> tool_types::ToolResult {
-        self.runtime.execute_task_stop_tool(request, task_registry)
-    }
-
-    fn execute_workflow_ipc_tool(
-        &mut self,
-        request: &tool_types::ToolRequest,
-        workflow_ipc: Option<&dyn crate::lifecycle::RuntimeWorkflowIpc>,
-    ) -> tool_types::ToolResult {
-        self.runtime
-            .execute_workflow_ipc_tool(request, workflow_ipc)
-    }
-
-    fn execute_normal_tool(
-        &mut self,
-        config: &RunConfig,
-        request: &tool_types::ToolRequest,
-        cwd: &Path,
-        mcp_registry: &McpRegistry,
-        external_tools: &[orca_core::external_config::ExternalToolConfig],
-        truncation: orca_core::tool_types::ToolOutputTruncation,
-        shell_timeout_secs: u64,
-        task_registry: Option<&TaskRegistry>,
-        additional_roots: &[std::path::PathBuf],
-        cancel: Option<&CancelToken>,
-        permission_handler: Option<&(dyn RuntimePermissionRequestHandler + Send + Sync)>,
-    ) -> tool_types::ToolResult {
-        self.runtime.execute_normal_tool_with_roots_and_cancel(
-            Some(config),
-            request,
-            cwd,
-            additional_roots,
-            mcp_registry,
-            external_tools,
-            truncation,
-            shell_timeout_secs,
-            task_registry,
-            cancel,
-            permission_handler.map(|handler| handler as &dyn RuntimePermissionRequestHandler),
-        )
-    }
-
     pub(crate) fn execute<W: io::Write>(
         &mut self,
         config: &RunConfig,
@@ -428,28 +350,29 @@ impl ToolExecutionActor {
             Err(outcome) => return Ok(outcome),
         };
         let execution_request = &invocation.effective;
-        let result = self.dispatch_tool(
-            config,
-            cwd,
-            events,
-            sink,
-            execution_request,
-            subagent_depth,
-            instructions,
-            memory,
-            mcp_registry,
-            hooks,
-            emit_deltas,
-            cost_tracker,
-            cancel,
-            task_registry,
-            background_workflows,
-            workflow_ipc,
-            permission_overlay,
-            permission_handler,
-            child_executor,
-            workflow_child_executor,
-        )?;
+        let result =
+            RuntimeToolRouter::new(&mut self.runtime).dispatch(RuntimeToolInvocationContext {
+                config,
+                cwd,
+                events,
+                sink,
+                execution_request,
+                subagent_depth,
+                instructions,
+                memory,
+                mcp_registry,
+                hooks,
+                emit_deltas,
+                cost_tracker,
+                cancel,
+                task_registry,
+                background_workflows,
+                workflow_ipc,
+                permission_overlay,
+                permission_handler,
+                child_executor,
+                workflow_child_executor,
+            })?;
         self.finish_tool_result(
             events,
             sink,
@@ -566,135 +489,6 @@ impl ToolExecutionActor {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn dispatch_tool<W: io::Write>(
-        &mut self,
-        config: &RunConfig,
-        cwd: &Path,
-        events: &mut EventFactory,
-        sink: &mut EventSink<W>,
-        execution_request: &tool_types::ToolRequest,
-        subagent_depth: u32,
-        instructions: &ProjectInstructions,
-        memory: &MemoryBlock,
-        mcp_registry: &McpRegistry,
-        hooks: &HookRunner,
-        emit_deltas: bool,
-        cost_tracker: &mut CostTracker,
-        cancel: &CancelToken,
-        task_registry: &TaskRegistry,
-        background_workflows: &mut Vec<BackgroundWorkflowRun>,
-        workflow_ipc: Option<&WorkflowIpcContext>,
-        permission_overlay: &mut TurnPermissionOverlay,
-        permission_handler: Option<&(dyn RuntimePermissionRequestHandler + Send + Sync)>,
-        child_executor: ChildAgentExecutor<W>,
-        workflow_child_executor: ChildAgentExecutor<SharedEventBuffer>,
-    ) -> io::Result<tool_types::ToolResult> {
-        match self.classify_dispatch(execution_request) {
-            RuntimeSpecialToolDispatch::WorkflowDraft => self.execute_workflow_draft_tool(
-                execution_request,
-                RuntimeWorkflowDraftRequest {
-                    workflows_enabled: config.workflows.enabled,
-                    cwd,
-                    session_id: task_registry.session_id(),
-                    max_concurrent_agents: config.workflows.max_concurrent_agents,
-                },
-            ),
-            RuntimeSpecialToolDispatch::WorkflowDraftAction => execute_workflow_draft_action_tool(
-                config,
-                cwd,
-                events,
-                sink,
-                execution_request,
-                emit_deltas,
-                task_registry,
-                background_workflows,
-                workflow_child_executor,
-            ),
-            RuntimeSpecialToolDispatch::Workflow => execute_workflow_tool(
-                config,
-                cwd,
-                events,
-                sink,
-                execution_request,
-                emit_deltas,
-                task_registry,
-                background_workflows,
-                workflow_child_executor,
-            ),
-            RuntimeSpecialToolDispatch::Subagent => execute_subagent_tool(
-                config,
-                cwd,
-                events,
-                sink,
-                execution_request,
-                subagent_depth,
-                instructions,
-                memory,
-                mcp_registry,
-                hooks,
-                emit_deltas,
-                cost_tracker,
-                cancel,
-                task_registry,
-                workflow_ipc,
-                child_executor,
-            ),
-            RuntimeSpecialToolDispatch::SubagentStatus => {
-                Ok(self.execute_subagent_status_tool(execution_request, task_registry))
-            }
-            RuntimeSpecialToolDispatch::TaskList => {
-                Ok(self.execute_task_list_tool(execution_request, task_registry))
-            }
-            RuntimeSpecialToolDispatch::TaskStop => {
-                Ok(self.execute_task_stop_tool(execution_request, task_registry))
-            }
-            RuntimeSpecialToolDispatch::RequestPermissions => {
-                let result = if let Some(permission_handler) = permission_handler {
-                    self.runtime.execute_request_permissions_tool_with_handler(
-                        execution_request,
-                        permission_handler,
-                    )
-                } else {
-                    self.runtime
-                        .execute_request_permissions_tool(execution_request)
-                };
-                permission_overlay.merge(self.runtime.permission_overlay());
-                Ok(result)
-            }
-            RuntimeSpecialToolDispatch::WorkflowIpc => Ok(self.execute_workflow_ipc_tool(
-                execution_request,
-                workflow_ipc.map(|ipc| ipc as &dyn crate::lifecycle::RuntimeWorkflowIpc),
-            )),
-            RuntimeSpecialToolDispatch::Normal => {
-                let additional_roots = config
-                    .additional_working_directories
-                    .iter()
-                    .map(|directory| directory.path.clone())
-                    .chain(
-                        permission_overlay
-                            .additional_working_directories()
-                            .iter()
-                            .cloned(),
-                    )
-                    .collect::<Vec<_>>();
-                Ok(self.execute_normal_tool(
-                    config,
-                    execution_request,
-                    cwd,
-                    mcp_registry,
-                    &config.external_tools,
-                    config.tools.output_truncation,
-                    config.tools.shell_timeout_secs,
-                    Some(task_registry),
-                    &additional_roots,
-                    Some(cancel),
-                    permission_handler,
-                ))
-            }
-        }
-    }
-
     fn finish_tool_result(
         &mut self,
         events: &mut EventFactory,
@@ -723,7 +517,7 @@ impl ToolExecutionActor {
                 }
             }
             if let Some(warning) =
-                self.run_post_tool_hook(hooks, &cwd_display, execution_request, result, cancel)
+                self.run_post_tool_hook(hooks, cwd_display, execution_request, result, cancel)
             {
                 sink.emit(&events.error(&warning))?;
             }
