@@ -1,0 +1,73 @@
+crates/orca-core/src/event_schema.rs
+  s_b3068881497c15::t_498698f91dffdb 58-59,307-332,865-867
+crates/orca-core/src/event_sink.rs
+  s_b3068881497c15::t_3838b32a4d5c23 102-106
+crates/orca-core/src/subagent_config.rs
+  s_b3068881497c15::t_beb112becb9e7c 12-13,21,43-46,56,64
+crates/orca-core/src/task_types.rs
+  s_95ddc0f99eeda3::t_bba0c63b6b1d88 119-124
+crates/orca-runtime/src/agent_child.rs
+  s_e6c675f8e5699e::t_95b964cac9600f 1,9,15,99-134,343,374-378,519-545,554-558,575,587-593,603-608,610-616,628-630,635-642,650-680,693,701,748-788,1072,1126,1156,1494-1563
+crates/orca-runtime/src/controller.rs
+  s_b3068881497c15::t_f06e8c1b7a85df 811
+crates/orca-runtime/src/lifecycle.rs
+  s_95ddc0f99eeda3::t_54378eea49851c 647-649
+crates/orca-runtime/src/runtime_special.rs
+  s_95ddc0f99eeda3::t_2e19e67a7b38f0 285-287
+crates/orca-runtime/src/session.rs
+  s_95ddc0f99eeda3::t_ace5ab23db3774 276-295,779,789
+crates/orca-runtime/src/subagent_execution.rs
+  s_e6c675f8e5699e::t_c88472ea82e13b 268-279,415-426,592-612,1240-1354
+crates/orca-runtime/src/tasks.rs
+  s_e6c675f8e5699e::t_ff03ac0175505d 57-59,106-111,188-190,235-237,282-284,330-332,417-439,727-729,756-758,796-798,1141-1168
+crates/orca-tui/src/agent_runner.rs
+  s_b3068881497c15::t_47baf4f3c56c26 652,1684,1694-1798,1919-1993
+crates/orca-tui/src/agent_subagent_execution.rs
+  s_b3068881497c15::t_dd99e813829cf3 11-12,65,97-106,115-117,121,123-153,158-159,165,172,179-193,208-227,394-440,445-446,452,520-522,612-643,653,680-749,751
+crates/orca-tui/src/app.rs
+  s_95ddc0f99eeda3::t_f1a9ad79d807e1 1154,1158-1160,1167
+crates/orca-tui/src/runtime_event_projection.rs
+  s_95ddc0f99eeda3::t_d2f157f50a5ca2 632-634
+crates/orca-tui/src/types.rs
+  s_b3068881497c15::t_8268b4f818e535 13-14,69-74,171-175,511,514-519,835-839,875-879,883-907,1184-1188,1195-1199,1205-1214,1398,1410-1495,1516,2131-2133,2183-2185
+crates/orca-tui/src/ui.rs
+  s_b3068881497c15::t_5215a2ab315556 1016-1021,1222-1226,1235-1238,1240,1363-1366,1368,1394-1400,1403,1405-1412,3136-3138,3182-3184,3258-3260,3378-3380
+tests/runtime_lifecycle_contract.rs
+  s_b3068881497c15::t_804ee401896104 1847-1849
+tests/workflow_types_contract.rs
+  s_95ddc0f99eeda3::t_1b5464ffeb8880 112-114
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "93ad05b482d01bef49dd4a7d4893b84a063c7c0b",
+  "prompts": {},
+  "sessions": {
+    "s_95ddc0f99eeda3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d13f5497-ebc8-4f21-88fe-f24f3e0808fd",
+        "model": "unknown"
+      },
+      "human_author": "echoVic <137844255@qq.com>"
+    },
+    "s_b3068881497c15": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f26b3-30e8-7342-9ad8-eaf3520e630c",
+        "model": "unknown"
+      },
+      "human_author": "echoVic <137844255@qq.com>"
+    },
+    "s_e6c675f8e5699e": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f2752-059e-7bf0-b595-a7a28e16b133",
+        "model": "unknown"
+      },
+      "human_author": "echoVic <137844255@qq.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
