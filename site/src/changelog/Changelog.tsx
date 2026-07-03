@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.111":
+        "Tool approval gate inputs now move through one grouped ToolApprovalGateContext instead of a long handle_approval argument list. Config, events, sink, tool request, invocation, policy, strict auto-review, and delta emission still flow unchanged, while approval allow/ask/deny behavior and tool-call item emission keep the same public shape.",
       "v0.1.110":
         "Historical projected tool completions now rebuild through the shared complete_projected_tool_item helper in tool_item_projection.rs instead of thread_store/projection.rs calling MCP, dynamic, commandExecution, and fileChange completed-item constructors directly. Realtime and persisted history stay behavior-compatible while the remaining tool-item schema drift has one smaller ownership point.",
       "v0.1.109":
@@ -248,6 +250,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.111":
+        "工具审批 gate 的输入现在统一通过 ToolApprovalGateContext 传递，不再让 handle_approval 暴露长参数列表。config、events、sink、tool request、invocation、policy、strict auto-review 与 delta emission 的透传保持不变，同时 approval allow/ask/deny 行为和 tool-call item emission 继续保持相同的公开形状。",
       "v0.1.110":
         "历史投影工具完成态现在统一由 tool_item_projection.rs 里的 complete_projected_tool_item 重建，不再让 thread_store/projection.rs 直接调用 MCP、dynamic、commandExecution 和 fileChange completed-item 构造器。实时流和持久化 history 行为保持兼容，同时剩余 tool-item schema drift 又少了一个分散所有权点。",
       "v0.1.109":
