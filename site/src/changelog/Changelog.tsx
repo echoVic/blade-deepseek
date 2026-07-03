@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.114":
+        "Filesystem sandbox denials now recover more clearly across server command/exec and model-visible bash. Orca diagnoses macOS Seatbelt write blocks such as nested .git/index.lock failures, explains when they are sandbox scope issues rather than stale locks, requests a turn-scoped filesystem write grant when an approval handler is available, and retries the original command with the granted root.",
       "v0.1.113":
         "Tool-turn dispatch now receives one grouped RuntimeToolTurnsContext from provider response handling instead of a long run_tool_turns call. RuntimeStepContext, events, sink, conversation, history writer, tool requests, cost tracking, background workflow state, and child executors still flow unchanged while the provider-to-tool boundary gets smaller.",
       "v0.1.112":
@@ -254,6 +256,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.114":
+        "文件系统 sandbox 拒绝现在在 server command/exec 和模型可见 bash 两条路径上都能更清楚地恢复。Orca 会诊断 macOS Seatbelt 写入阻断，例如嵌套工作区里的 .git/index.lock 失败，并说明这通常是 sandbox 范围问题而不是 stale lock；当存在审批处理器时，会请求 turn-scoped 文件系统写入授权，并用授权后的 root 重试原命令。",
       "v0.1.113":
         "工具回合 dispatch 现在从 provider response 处理处接收分组后的 RuntimeToolTurnsContext，不再暴露 run_tool_turns 的长参数调用。RuntimeStepContext、events、sink、conversation、history writer、tool requests、cost tracking、background workflow 状态和 child executors 的透传保持不变，同时 provider 到 tool-turn 的边界继续收窄。",
       "v0.1.112":
