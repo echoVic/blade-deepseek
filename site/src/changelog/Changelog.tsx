@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.110":
+        "Historical projected tool completions now rebuild through the shared complete_projected_tool_item helper in tool_item_projection.rs instead of thread_store/projection.rs calling MCP, dynamic, commandExecution, and fileChange completed-item constructors directly. Realtime and persisted history stay behavior-compatible while the remaining tool-item schema drift has one smaller ownership point.",
       "v0.1.109":
         "Runtime normal-tool routing now passes a grouped RuntimeNormalToolInvocation from the router into lifecycle actors instead of calling the long roots/cancel method directly. Bash shell-session execution, MCP/external fallback, permission overlays, cancellation, and output truncation keep the same behavior while the common tool path gets a smaller call surface for later shell and async-subagent work.",
       "v0.1.108":
@@ -246,6 +248,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.110":
+        "历史投影工具完成态现在统一由 tool_item_projection.rs 里的 complete_projected_tool_item 重建，不再让 thread_store/projection.rs 直接调用 MCP、dynamic、commandExecution 和 fileChange completed-item 构造器。实时流和持久化 history 行为保持兼容，同时剩余 tool-item schema drift 又少了一个分散所有权点。",
       "v0.1.109":
         "runtime 普通工具路由现在从 router 向 lifecycle actor 传递分组后的 RuntimeNormalToolInvocation，不再直接调用带 roots/cancel 的长参数方法。bash shell-session、MCP/external fallback、permission overlay、取消和输出截断行为保持不变，同时公共工具路径为后续 shell 与 async-subagent 工作留下更窄的调用面。",
       "v0.1.108":
