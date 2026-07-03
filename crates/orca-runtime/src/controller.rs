@@ -671,7 +671,9 @@ mod tests {
     use crate::lifecycle::{RuntimeTaskStatus, RuntimeToolActorContext};
     use crate::memory::MemoryBlock;
     use crate::subagent_execution::{collect_subagent_batch, should_run_subagent_batch};
-    use crate::tool_execution::{ToolExecutionActor, ToolExecutionContext};
+    use crate::tool_execution::{
+        ToolApprovalGateContext, ToolExecutionActor, ToolExecutionContext,
+    };
     use crate::tool_invocation::prepare_tool_invocation;
     use crate::tool_router::{RuntimeToolInvocationContext, RuntimeToolRouter};
     use orca_approval::ApprovalPolicy;
@@ -1199,16 +1201,16 @@ mod tests {
 
         let mut actor = ToolExecutionActor::new(events.run_id().to_string(), DEFAULT_MAX_TURNS);
         let result = actor
-            .handle_approval(
-                &config,
-                &mut events,
-                &mut sink,
-                &request,
-                &invocation,
-                &policy,
-                false,
-                true,
-            )
+            .handle_approval(ToolApprovalGateContext {
+                config: &config,
+                events: &mut events,
+                sink: &mut sink,
+                tool_request: &request,
+                invocation: &invocation,
+                policy: &policy,
+                strict_auto_review: false,
+                emit_deltas: true,
+            })
             .unwrap();
 
         assert!(result.is_none());

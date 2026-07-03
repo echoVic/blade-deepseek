@@ -1284,6 +1284,44 @@ mod tests {
     }
 
     #[test]
+    fn tool_execution_approval_gate_uses_grouped_context() {
+        let tool_execution_source = include_str!("tool_execution.rs");
+
+        assert!(
+            tool_execution_source.contains("struct ToolApprovalGateContext"),
+            "tool_execution must group approval gate inputs into ToolApprovalGateContext"
+        );
+        assert!(
+            tool_execution_source.contains("fn handle_approval<W: io::Write>(")
+                && tool_execution_source.contains("context: ToolApprovalGateContext<"),
+            "ToolExecutionActor::handle_approval must accept the grouped approval gate context"
+        );
+        assert!(
+            tool_execution_source.contains("self.handle_approval(ToolApprovalGateContext"),
+            "ToolExecutionActor::execute must pass approval gate inputs as one grouped context"
+        );
+        assert!(
+            !tool_execution_source.contains("self.handle_approval(\n            config,"),
+            "ToolExecutionActor::execute must not call handle_approval with the old long argument list"
+        );
+        for field_name in [
+            "config:",
+            "events:",
+            "sink:",
+            "tool_request:",
+            "invocation:",
+            "policy:",
+            "strict_auto_review:",
+            "emit_deltas:",
+        ] {
+            assert!(
+                tool_execution_source.contains(field_name),
+                "ToolApprovalGateContext must carry approval input field {field_name}"
+            );
+        }
+    }
+
+    #[test]
     fn runtime_compaction_step_is_owned_by_lifecycle_module() {
         let agent_loop_source = include_str!("agent_loop.rs");
         let lifecycle_source = include_str!("lifecycle.rs");
