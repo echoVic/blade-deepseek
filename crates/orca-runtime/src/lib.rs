@@ -725,6 +725,58 @@ mod tests {
     }
 
     #[test]
+    fn normal_tool_turn_runner_uses_grouped_context() {
+        let tool_turn_source = include_str!("tool_turn.rs");
+
+        assert!(
+            tool_turn_source.contains("pub(crate) struct RuntimeNormalToolTurnContext"),
+            "tool_turn must group normal tool-turn inputs into RuntimeNormalToolTurnContext"
+        );
+        assert!(
+            tool_turn_source.contains("context: RuntimeNormalToolTurnContext<"),
+            "run_normal_tool_turn must accept the grouped normal tool-turn context"
+        );
+        assert!(
+            tool_turn_source.contains("run_normal_tool_turn(RuntimeNormalToolTurnContext"),
+            "run_tool_turns must pass normal tool-turn inputs as one grouped context"
+        );
+        assert!(
+            !tool_turn_source.contains("run_normal_tool_turn(\n            config,"),
+            "run_tool_turns must not call run_normal_tool_turn with the old long argument list"
+        );
+        for field_name in [
+            "config:",
+            "cwd:",
+            "events:",
+            "sink:",
+            "conversation:",
+            "history_writer:",
+            "tool_request:",
+            "subagent_depth:",
+            "emit_deltas:",
+            "policy:",
+            "instructions:",
+            "memory:",
+            "mcp_registry:",
+            "hooks:",
+            "cost_tracker:",
+            "cancel:",
+            "task_registry:",
+            "background_workflows:",
+            "workflow_ipc:",
+            "permission_overlay:",
+            "permission_handler:",
+            "child_executor:",
+            "workflow_child_executor:",
+        ] {
+            assert!(
+                tool_turn_source.contains(field_name),
+                "RuntimeNormalToolTurnContext must carry normal tool-turn field {field_name}"
+            );
+        }
+    }
+
+    #[test]
     fn readonly_tool_turn_runner_is_owned_by_tool_turn_module() {
         let agent_loop_source = include_str!("agent_loop.rs");
         let tool_invocation_source = include_str!("tool_invocation.rs");

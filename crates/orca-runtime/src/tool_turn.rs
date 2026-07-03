@@ -46,6 +46,32 @@ pub(crate) struct ToolRequestCursor<'a> {
     index: usize,
 }
 
+pub(crate) struct RuntimeNormalToolTurnContext<'a, W: io::Write> {
+    pub(crate) config: &'a RunConfig,
+    pub(crate) cwd: &'a Path,
+    pub(crate) events: &'a mut EventFactory,
+    pub(crate) sink: &'a mut EventSink<W>,
+    pub(crate) conversation: &'a mut Conversation,
+    pub(crate) history_writer: Option<&'a mut SessionWriter>,
+    pub(crate) tool_request: &'a ToolRequest,
+    pub(crate) subagent_depth: u32,
+    pub(crate) emit_deltas: bool,
+    pub(crate) policy: &'a ApprovalPolicy,
+    pub(crate) instructions: &'a ProjectInstructions,
+    pub(crate) memory: &'a MemoryBlock,
+    pub(crate) mcp_registry: &'a McpRegistry,
+    pub(crate) hooks: &'a HookRunner,
+    pub(crate) cost_tracker: &'a mut CostTracker,
+    pub(crate) cancel: &'a CancelToken,
+    pub(crate) task_registry: &'a TaskRegistry,
+    pub(crate) background_workflows: &'a mut Vec<BackgroundWorkflowRun>,
+    pub(crate) workflow_ipc: Option<&'a WorkflowIpcContext>,
+    pub(crate) permission_overlay: &'a mut TurnPermissionOverlay,
+    pub(crate) permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
+    pub(crate) child_executor: ChildAgentExecutor<W>,
+    pub(crate) workflow_child_executor: ChildAgentExecutor<SharedEventBuffer>,
+}
+
 impl<'a> ToolRequestCursor<'a> {
     pub(crate) fn new(requests: &'a [ToolRequest]) -> Self {
         Self { requests, index: 0 }
@@ -325,13 +351,13 @@ pub(crate) fn run_tool_turns<W: io::Write>(
             continue;
         }
 
-        match run_normal_tool_turn(
+        match run_normal_tool_turn(RuntimeNormalToolTurnContext {
             config,
             cwd,
             events,
             sink,
             conversation,
-            history_writer.as_deref_mut(),
+            history_writer: history_writer.as_deref_mut(),
             tool_request,
             subagent_depth,
             emit_deltas,
@@ -345,11 +371,11 @@ pub(crate) fn run_tool_turns<W: io::Write>(
             task_registry,
             background_workflows,
             workflow_ipc,
-            &mut permission_overlay,
+            permission_overlay: &mut permission_overlay,
             permission_handler,
             child_executor,
             workflow_child_executor,
-        )? {
+        })? {
             ToolTurnOutcome::Continue => {}
             ToolTurnOutcome::Return { status, error } => {
                 return Ok(ToolTurnOutcome::Return { status, error });
@@ -395,32 +421,34 @@ pub(crate) fn record_normal_tool_result(
     Ok(ToolTurnOutcome::Continue)
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_normal_tool_turn<W: io::Write>(
-    config: &RunConfig,
-    cwd: &Path,
-    events: &mut EventFactory,
-    sink: &mut EventSink<W>,
-    conversation: &mut Conversation,
-    history_writer: Option<&mut SessionWriter>,
-    tool_request: &ToolRequest,
-    subagent_depth: u32,
-    emit_deltas: bool,
-    policy: &ApprovalPolicy,
-    instructions: &ProjectInstructions,
-    memory: &MemoryBlock,
-    mcp_registry: &McpRegistry,
-    hooks: &HookRunner,
-    cost_tracker: &mut CostTracker,
-    cancel: &CancelToken,
-    task_registry: &TaskRegistry,
-    background_workflows: &mut Vec<BackgroundWorkflowRun>,
-    workflow_ipc: Option<&WorkflowIpcContext>,
-    permission_overlay: &mut TurnPermissionOverlay,
-    permission_handler: Option<&(dyn RuntimePermissionRequestHandler + Send + Sync)>,
-    child_executor: ChildAgentExecutor<W>,
-    workflow_child_executor: ChildAgentExecutor<SharedEventBuffer>,
+    context: RuntimeNormalToolTurnContext<'_, W>,
 ) -> io::Result<ToolTurnOutcome> {
+    let RuntimeNormalToolTurnContext {
+        config,
+        cwd,
+        events,
+        sink,
+        conversation,
+        history_writer,
+        tool_request,
+        subagent_depth,
+        emit_deltas,
+        policy,
+        instructions,
+        memory,
+        mcp_registry,
+        hooks,
+        cost_tracker,
+        cancel,
+        task_registry,
+        background_workflows,
+        workflow_ipc,
+        permission_overlay,
+        permission_handler,
+        child_executor,
+        workflow_child_executor,
+    } = context;
     let (status, result) = execute_tool_with_approval(
         config,
         events,
@@ -695,31 +723,31 @@ mod tests {
         let mut background_workflows = Vec::new();
         let mut permission_overlay = TurnPermissionOverlay::default();
 
-        let outcome = run_normal_tool_turn(
-            &config,
-            cwd.path(),
-            &mut events,
-            &mut sink,
-            &mut conversation,
-            None,
-            &request,
-            0,
-            false,
-            &policy,
-            &instructions,
-            &memory,
-            &registry,
-            &hooks,
-            &mut cost_tracker,
-            &cancel,
-            &task_registry,
-            &mut background_workflows,
-            None,
-            &mut permission_overlay,
-            None,
-            unused_child_executor,
-            unused_child_executor,
-        )
+        let outcome = run_normal_tool_turn(RuntimeNormalToolTurnContext {
+            config: &config,
+            cwd: cwd.path(),
+            events: &mut events,
+            sink: &mut sink,
+            conversation: &mut conversation,
+            history_writer: None,
+            tool_request: &request,
+            subagent_depth: 0,
+            emit_deltas: false,
+            policy: &policy,
+            instructions: &instructions,
+            memory: &memory,
+            mcp_registry: &registry,
+            hooks: &hooks,
+            cost_tracker: &mut cost_tracker,
+            cancel: &cancel,
+            task_registry: &task_registry,
+            background_workflows: &mut background_workflows,
+            workflow_ipc: None,
+            permission_overlay: &mut permission_overlay,
+            permission_handler: None,
+            child_executor: unused_child_executor,
+            workflow_child_executor: unused_child_executor,
+        })
         .expect("run normal tool turn");
 
         assert!(matches!(outcome, ToolTurnOutcome::Continue));
