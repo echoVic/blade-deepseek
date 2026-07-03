@@ -31,6 +31,15 @@ pub(crate) fn tui_event_from_runtime_event(event: &EventEnvelope) -> Option<TuiE
                 .and_then(|value| value.as_str())
                 .map(str::to_string),
         }),
+        EventType::ToolCallProgress => Some(TuiEvent::ToolCallProgress {
+            id: event.payload["id"].as_str()?.to_string(),
+            name: event
+                .payload
+                .get("name")
+                .and_then(|value| value.as_str())
+                .map(str::to_string),
+            arguments_bytes: event.payload["arguments_bytes"].as_u64()? as usize,
+        }),
         EventType::ToolCallCompleted => {
             let output = event
                 .payload
@@ -351,6 +360,32 @@ mod tests {
 
         assert!(matches!(reasoning, TuiEvent::ReasoningDelta(text) if text == "thinking"));
         assert!(matches!(message, TuiEvent::MessageDelta(text) if text == "hello"));
+    }
+
+    #[test]
+    fn runtime_tool_call_progress_event_maps_to_tui_progress() {
+        let mut events = EventFactory::new("tui-runtime-adapter".to_string());
+        let progress = orca_core::provider_types::ToolCallProgress {
+            id: "call-1".to_string(),
+            function_name: Some("write_file".to_string()),
+            arguments_bytes: 12_345,
+        };
+
+        let event = tui_event_from_runtime_event(&events.tool_call_progress(&progress))
+            .expect("tool progress event");
+
+        match event {
+            TuiEvent::ToolCallProgress {
+                id,
+                name,
+                arguments_bytes,
+            } => {
+                assert_eq!(id, "call-1");
+                assert_eq!(name.as_deref(), Some("write_file"));
+                assert_eq!(arguments_bytes, 12_345);
+            }
+            other => panic!("expected tool progress event, got {other:?}"),
+        }
     }
 
     #[test]

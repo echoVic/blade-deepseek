@@ -23,10 +23,18 @@ pub struct ProviderReplayState {
     pub tool_call_ids: Vec<String>,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ToolCallProgress {
+    pub id: String,
+    pub function_name: Option<String>,
+    pub arguments_bytes: usize,
+}
+
 #[derive(Clone, Debug)]
 pub enum ProviderStep {
     ReasoningDelta(String),
     MessageDelta(String),
+    ToolCallProgress(ToolCallProgress),
     ToolCall(ToolRequest),
     ReplayState(ProviderReplayState),
     Error(String),

@@ -17,7 +17,9 @@ use orca_runtime::history::SessionSummary;
 
 use crate::shortcuts::{self, ShortcutScope};
 use crate::theme::Theme;
-use crate::types::{AppState, AppStatus, ApprovalOption, ChatMessage, PanelMode};
+use crate::types::{
+    AppState, AppStatus, ApprovalOption, ChatMessage, LiveLineCountCache, PanelMode,
+};
 
 pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, theme: &Theme) {
     if state.status == AppStatus::Setup {
@@ -417,9 +419,11 @@ pub(crate) fn render_live_messages(
     // estimate kept diverging on mixed-width CJK/ASCII runs (a 2-cell char at a row
     // with 1 cell left wraps early, "wasting" a cell), undercounting the height and
     // pinning auto-scroll a few rows above the real tail.
-    let total = paragraph
-        .line_count(area.width.max(1))
-        .min(u16::MAX as usize) as u16;
+    let total = measure_live_line_count_cached(state, area.width.max(1), || {
+        paragraph
+            .line_count(area.width.max(1))
+            .min(u16::MAX as usize) as u16
+    });
     state.total_lines = total;
     state.visible_height = area.height;
 
@@ -435,6 +439,32 @@ pub(crate) fn render_live_messages(
     state.scroll_offset = scroll;
 
     frame.render_widget(paragraph.scroll((scroll, 0)), area);
+}
+
+fn measure_live_line_count_cached(
+    state: &mut AppState,
+    width: u16,
+    measure: impl FnOnce() -> u16,
+) -> u16 {
+    let (live_start, message_count, signature) = state.live_message_signature();
+    if let Some(cache) = state.live_line_count_cache
+        && cache.width == width
+        && cache.live_start == live_start
+        && cache.message_count == message_count
+        && cache.signature == signature
+    {
+        return cache.total;
+    }
+
+    let total = measure();
+    state.live_line_count_cache = Some(LiveLineCountCache {
+        width,
+        live_start,
+        message_count,
+        signature,
+        total,
+    });
+    total
 }
 
 fn render_workflows_panel(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) {
@@ -1145,7 +1175,7 @@ fn append_message_lines(
                 status == "completed" && matches!(kind.as_deref(), Some("empty" | "no_matches"));
             let icon = match status.as_str() {
                 "completed" => "✓",
-                "running" => spinner_frame(tick),
+                "running" | "receiving" => spinner_frame(tick),
                 "denied" => "✗",
                 "failed" => "✗",
                 _ => "·",
@@ -1153,7 +1183,7 @@ fn append_message_lines(
             let color = match status.as_str() {
                 "completed" if neutral_completed => theme.muted,
                 "completed" => theme.success,
-                "running" => theme.warning,
+                "running" | "receiving" => theme.warning,
                 "denied" | "failed" => theme.error,
                 _ => theme.muted,
             };
@@ -3375,6 +3405,37 @@ mod tests {
         // also broke on '-' would pack tighter and undercount to 2, under-scrolling the
         // newest content out of view.
         assert_eq!(measured_rows("aa bb-cc-dd", 6), 3);
+    }
+
+    #[test]
+    fn live_line_count_cache_reuses_measurement_until_live_content_changes() {
+        let mut state = test_state();
+        state
+            .messages
+            .push(ChatMessage::Assistant("alpha bravo charlie".to_string()));
+        let mut calls = 0;
+
+        let first = measure_live_line_count_cached(&mut state, 12, || {
+            calls += 1;
+            3
+        });
+        let second = measure_live_line_count_cached(&mut state, 12, || {
+            calls += 1;
+            99
+        });
+
+        assert_eq!(first, 3);
+        assert_eq!(second, 3);
+        assert_eq!(calls, 1);
+
+        state.update(TuiEvent::MessageDelta(" delta".to_string()));
+        let third = measure_live_line_count_cached(&mut state, 12, || {
+            calls += 1;
+            4
+        });
+
+        assert_eq!(third, 4);
+        assert_eq!(calls, 2);
     }
 
     #[test]

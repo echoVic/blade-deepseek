@@ -404,6 +404,9 @@ pub fn run_agent_for_tui(
                     emitted_message_delta = true;
                     send_runtime_event_as_tui(&tx, stream_events.assistant_message_delta(text));
                 }
+                ProviderStep::ToolCallProgress(progress) => {
+                    send_runtime_event_as_tui(&tx, stream_events.tool_call_progress(progress));
+                }
                 _ => {}
             },
         );

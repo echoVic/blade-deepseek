@@ -7,7 +7,7 @@ use crate::approval_types::{ApprovalRequest, ApprovalResolution};
 use crate::cost_types::UsageTotals;
 use crate::model::ModelRouteDecision;
 use crate::plan_types::UpdatePlanArgs;
-use crate::provider_types::ProviderReplayState;
+use crate::provider_types::{ProviderReplayState, ToolCallProgress};
 use crate::task_types::BackgroundTaskSummary;
 use crate::tool_types::{ToolRequest, ToolResult};
 use crate::verification::VerificationResult;
@@ -45,6 +45,8 @@ pub enum EventType {
     ApprovalRequested,
     #[serde(rename = "approval.resolved")]
     ApprovalResolved,
+    #[serde(rename = "tool.call.progress")]
+    ToolCallProgress,
     #[serde(rename = "tool.call.requested")]
     ToolCallRequested,
     #[serde(rename = "tool.call.completed")]
@@ -242,6 +244,17 @@ impl EventFactory {
                 "id": resolution.id,
                 "decision": resolution.decision,
                 "reason": resolution.reason
+            }),
+        )
+    }
+
+    pub fn tool_call_progress(&mut self, progress: &ToolCallProgress) -> EventEnvelope {
+        self.make(
+            EventType::ToolCallProgress,
+            json!({
+                "id": progress.id,
+                "name": progress.function_name,
+                "arguments_bytes": progress.arguments_bytes
             }),
         )
     }

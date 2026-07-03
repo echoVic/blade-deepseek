@@ -60,6 +60,14 @@ impl<W: Write> EventSink<W> {
             }
             EventType::ApprovalRequested => writeln!(self.writer, "approval requested"),
             EventType::ApprovalResolved => writeln!(self.writer, "approval resolved"),
+            EventType::ToolCallProgress => {
+                let name = event.payload["name"].as_str().unwrap_or("tool");
+                let bytes = event.payload["arguments_bytes"].as_u64().unwrap_or(0);
+                writeln!(
+                    self.writer,
+                    "tool receiving arguments: {name} ({bytes} bytes)"
+                )
+            }
             EventType::ToolCallRequested => {
                 let name = event.payload["name"].as_str().unwrap_or("tool");
                 writeln!(self.writer, "tool requested: {name}")

@@ -624,6 +624,9 @@ fn emit_provider_delta<W: io::Write>(
         ProviderStep::MessageDelta(text) => {
             let _ = sink.emit(&events.assistant_message_delta(text));
         }
+        ProviderStep::ToolCallProgress(progress) => {
+            let _ = sink.emit(&events.tool_call_progress(progress));
+        }
         ProviderStep::ReplayState(replay) => {
             let _ = sink.emit(&events.provider_replay_updated(replay));
         }
@@ -776,6 +779,32 @@ mod tests {
         let output = String::from_utf8(output).expect("jsonl is utf8");
         assert!(output.contains("\"type\":\"error\""));
         assert!(output.contains("DeepSeek provider error: quota"));
+    }
+
+    #[test]
+    fn provider_delta_emits_tool_call_progress_event() {
+        let mut events = EventFactory::new("provider-progress-test".to_string());
+        let mut output = Vec::new();
+        let mut sink = EventSink::new(&mut output, OutputFormat::Jsonl);
+        let progress = orca_core::provider_types::ToolCallProgress {
+            id: "call_1".to_string(),
+            function_name: Some("write_file".to_string()),
+            arguments_bytes: 12_345,
+        };
+
+        emit_provider_delta(
+            &ProviderStep::ToolCallProgress(progress),
+            true,
+            &mut events,
+            &mut sink,
+        );
+
+        drop(sink);
+        let output = String::from_utf8(output).expect("jsonl is utf8");
+        assert!(output.contains("\"type\":\"tool.call.progress\""));
+        assert!(output.contains("\"id\":\"call_1\""));
+        assert!(output.contains("\"name\":\"write_file\""));
+        assert!(output.contains("\"arguments_bytes\":12345"));
     }
 
     #[test]

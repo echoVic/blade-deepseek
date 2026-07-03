@@ -6,7 +6,7 @@ use reqwest::blocking::{Client, RequestBuilder, Response};
 
 const CONNECT_TIMEOUT_SECS: u64 = 30;
 const REQUEST_TIMEOUT_SECS: u64 = 120;
-const STREAMING_READ_TIMEOUT_SECS: u64 = 300;
+const STREAMING_IDLE_READ_TIMEOUT_SECS: u64 = 300;
 
 const MAX_RETRIES: u32 = 3;
 const INITIAL_BACKOFF_MS: u64 = 1000;
@@ -27,10 +27,14 @@ static CLIENT: LazyLock<Client> = LazyLock::new(|| {
 static STREAMING_CLIENT: LazyLock<Client> = LazyLock::new(|| {
     Client::builder()
         .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
-        .timeout(Duration::from_secs(STREAMING_READ_TIMEOUT_SECS))
+        .timeout(None)
         .build()
         .expect("failed to build streaming HTTP client")
 });
+
+pub(crate) fn streaming_idle_read_timeout() -> Duration {
+    Duration::from_secs(STREAMING_IDLE_READ_TIMEOUT_SECS)
+}
 
 pub fn client() -> &'static Client {
     &CLIENT
@@ -173,5 +177,14 @@ mod tests {
     fn jitter_value_is_in_range() {
         let v = jitter_value();
         assert!((0.0..=1.0).contains(&v));
+    }
+
+    #[test]
+    fn streaming_client_uses_idle_read_timeout() {
+        assert_eq!(
+            streaming_idle_read_timeout(),
+            Duration::from_secs(300),
+            "streaming responses should allow long active generations but fail idle reads"
+        );
     }
 }

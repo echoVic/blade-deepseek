@@ -195,15 +195,18 @@ fn request_chat_streaming(
 
     let mut steps = Vec::new();
 
-    let stream_result = crate::streaming::parse_sse_stream(response, cancel, |delta| {
-        use crate::streaming::StreamEvent;
-        let step = match delta {
-            StreamEvent::Reasoning(text) => ProviderStep::ReasoningDelta(text.to_string()),
-            StreamEvent::Content(text) => ProviderStep::MessageDelta(text.to_string()),
-        };
-        on_step(&step);
-        steps.push(step);
-    })?;
+    let stream_result = crate::streaming::parse_sse_stream_with_idle_timeout(
+        response,
+        cancel,
+        crate::http_client::streaming_idle_read_timeout(),
+        |delta| {
+            let step = provider_step_from_stream_event(delta);
+            on_step(&step);
+            if stream_step_belongs_in_response_steps(&step) {
+                steps.push(step);
+            }
+        },
+    )?;
 
     match stream_result.finish_reason.as_deref() {
         Some("length") => {
@@ -283,6 +286,19 @@ fn request_chat_streaming(
         tool_calls: raw_calls_for_history,
         usage: stream_result.usage,
     })
+}
+
+fn provider_step_from_stream_event(delta: crate::streaming::StreamEvent<'_>) -> ProviderStep {
+    use crate::streaming::StreamEvent;
+    match delta {
+        StreamEvent::Reasoning(text) => ProviderStep::ReasoningDelta(text.to_string()),
+        StreamEvent::Content(text) => ProviderStep::MessageDelta(text.to_string()),
+        StreamEvent::ToolCallProgress(progress) => ProviderStep::ToolCallProgress(progress),
+    }
+}
+
+fn stream_step_belongs_in_response_steps(step: &ProviderStep) -> bool {
+    !matches!(step, ProviderStep::ToolCallProgress(_))
 }
 
 fn request_chat(
@@ -600,6 +616,25 @@ mod tests {
                 arguments: arguments.to_string(),
             },
         }
+    }
+
+    #[test]
+    fn tool_call_progress_is_transient_stream_state() {
+        let progress = orca_core::provider_types::ToolCallProgress {
+            id: "call_1".to_string(),
+            function_name: Some("write_file".to_string()),
+            arguments_bytes: 8192,
+        };
+
+        assert!(!stream_step_belongs_in_response_steps(
+            &ProviderStep::ToolCallProgress(progress)
+        ));
+        assert!(stream_step_belongs_in_response_steps(
+            &ProviderStep::MessageDelta("hello".to_string())
+        ));
+        assert!(stream_step_belongs_in_response_steps(
+            &ProviderStep::ReasoningDelta("thinking".to_string())
+        ));
     }
 
     #[test]

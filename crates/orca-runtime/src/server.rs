@@ -1624,6 +1624,7 @@ fn run_command_exec<W: Write>(
     };
     let mut command_env = env.clone();
     if let Some(proxy) = network_proxy.as_ref() {
+        let proxy_url = proxy.proxy_url().to_string();
         for key in [
             "HTTP_PROXY",
             "HTTPS_PROXY",
@@ -1632,9 +1633,10 @@ fn run_command_exec<W: Write>(
             "https_proxy",
             "all_proxy",
         ] {
-            command_env
-                .entry(key.to_string())
-                .or_insert_with(|| Some(proxy.proxy_url().to_string()));
+            command_env.insert(key.to_string(), Some(proxy_url.clone()));
+        }
+        for key in ["NO_PROXY", "no_proxy"] {
+            command_env.insert(key.to_string(), None);
         }
     }
     let manager = state.shell_manager(&cwd);
@@ -3948,15 +3950,13 @@ enabled = true
                 "delayed block should not be observed during initial drain: {events:?}"
             );
 
-            std::thread::sleep(Duration::from_millis(500));
-            handle_line(
+            let events = handle_thread_list_until_event(
                 &server_config,
                 &mut state,
-                r#"{"id":"threads","method":"thread/list","params":{}}"#,
-                Arc::clone(&writer),
-            )
-            .expect("thread list");
-            let events = parse_jsonl(&writer.lock().expect("writer").clone());
+                &writer,
+                Duration::from_secs(3),
+                |event| event["event"] == "permission_request",
+            );
             let permission_request = events
                 .iter()
                 .find(|event| event["event"] == "permission_request")
@@ -6276,6 +6276,35 @@ enabled = true
             .lines()
             .map(|line| serde_json::from_str(line).expect("valid jsonl line"))
             .collect()
+    }
+
+    fn handle_thread_list_until_event(
+        config: &ServerConfig,
+        state: &mut ServerState,
+        writer: &Arc<Mutex<Vec<u8>>>,
+        timeout: Duration,
+        mut predicate: impl FnMut(&Value) -> bool,
+    ) -> Vec<Value> {
+        let deadline = std::time::Instant::now()
+            .checked_add(timeout)
+            .unwrap_or_else(std::time::Instant::now);
+        loop {
+            handle_line(
+                config,
+                state,
+                r#"{"id":"threads","method":"thread/list","params":{}}"#,
+                Arc::clone(writer),
+            )
+            .expect("thread list");
+            let events = parse_jsonl(&writer.lock().expect("writer").clone());
+            if events.iter().any(&mut predicate) {
+                return events;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("timed out waiting for server event: {events:?}");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     fn parse_complete_jsonl(stdout: &[u8]) -> Vec<Value> {

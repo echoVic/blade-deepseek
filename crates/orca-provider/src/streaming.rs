@@ -1,9 +1,15 @@
-use std::io::{BufRead, BufReader, Read};
+use std::io::{self, BufRead, BufReader, Read};
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
 use orca_core::cancel::CancelToken;
-use orca_core::provider_types::Usage;
+use orca_core::provider_types::{ToolCallProgress, Usage};
+
+const TOOL_CALL_PROGRESS_ARGUMENT_BYTES_STEP: usize = 8 * 1024;
+const IDLE_READ_CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Deserialize)]
 pub struct StreamChunk {
@@ -95,6 +101,20 @@ impl From<StreamUsage> for Usage {
 pub enum StreamEvent<'a> {
     Reasoning(&'a str),
     Content(&'a str),
+    ToolCallProgress(ToolCallProgress),
+}
+
+pub fn parse_sse_stream_with_idle_timeout<R: Read + Send + 'static>(
+    reader: R,
+    cancel: &CancelToken,
+    idle_timeout: Duration,
+    on_delta: impl FnMut(StreamEvent),
+) -> Result<StreamResult, String> {
+    parse_sse_stream(
+        IdleReadTimeoutReader::new(reader, idle_timeout, cancel.clone()),
+        cancel,
+        on_delta,
+    )
 }
 
 pub fn parse_sse_stream<R: Read>(
@@ -107,13 +127,20 @@ pub fn parse_sse_stream<R: Read>(
     let mut reasoning_buf = String::new();
     let mut content_buf = String::new();
     let mut tool_calls: Vec<ToolCallAccumulator> = Vec::new();
+    let mut tool_call_progress = ToolCallProgressTracker::default();
     let mut usage = None;
 
     for line in buf_reader.lines() {
         if cancel.is_cancelled() {
             return Err("cancelled".to_string());
         }
-        let line = line.map_err(|e| format!("stream read error: {e}"))?;
+        let line = line.map_err(|e| {
+            if cancel.is_cancelled() {
+                "cancelled".to_string()
+            } else {
+                format!("stream read error: {e}")
+            }
+        })?;
         let line = line.trim_end();
 
         if line.is_empty() || line.starts_with(':') {
@@ -161,6 +188,11 @@ pub fn parse_sse_stream<R: Read>(
             if let Some(ref tcs) = delta.tool_calls {
                 for tc_delta in tcs {
                     accumulate_tool_call(&mut tool_calls, tc_delta);
+                    if let Some(progress) =
+                        tool_call_progress.progress_for_delta(&tool_calls, tc_delta.index)
+                    {
+                        on_delta(StreamEvent::ToolCallProgress(progress));
+                    }
                 }
             }
         }
@@ -197,9 +229,149 @@ fn accumulate_tool_call(buf: &mut Vec<ToolCallAccumulator>, delta: &StreamToolCa
     }
 }
 
+struct IdleReadTimeoutReader {
+    request_tx: mpsc::Sender<usize>,
+    response_rx: mpsc::Receiver<io::Result<Vec<u8>>>,
+    idle_timeout: Duration,
+    cancel: CancelToken,
+}
+
+impl IdleReadTimeoutReader {
+    fn new<R: Read + Send + 'static>(
+        mut reader: R,
+        idle_timeout: Duration,
+        cancel: CancelToken,
+    ) -> Self {
+        let (request_tx, request_rx) = mpsc::channel::<usize>();
+        let (response_tx, response_rx) = mpsc::channel::<io::Result<Vec<u8>>>();
+
+        // The helper thread can outlive this wrapper if the underlying blocking
+        // read never returns after a stall. That is the deliberate tradeoff that
+        // lets the main streaming path enforce an idle timeout and observe cancel.
+        thread::spawn(move || {
+            while let Ok(len) = request_rx.recv() {
+                let mut buf = vec![0; len];
+                let result = reader.read(&mut buf).map(|read| {
+                    buf.truncate(read);
+                    buf
+                });
+                if response_tx.send(result).is_err() {
+                    break;
+                }
+            }
+        });
+
+        Self {
+            request_tx,
+            response_rx,
+            idle_timeout,
+            cancel,
+        }
+    }
+}
+
+impl Read for IdleReadTimeoutReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        self.request_tx
+            .send(buf.len())
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stream reader stopped"))?;
+        let started = Instant::now();
+        loop {
+            if self.cancel.is_cancelled() {
+                return Err(io::Error::other("cancelled"));
+            }
+            let elapsed = started.elapsed();
+            if elapsed >= self.idle_timeout {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("idle read timed out after {:?}", self.idle_timeout),
+                ));
+            }
+            let wait = (self.idle_timeout - elapsed).min(IDLE_READ_CANCEL_POLL_INTERVAL);
+            match self.response_rx.recv_timeout(wait) {
+                Ok(Ok(bytes)) => {
+                    let len = bytes.len();
+                    buf[..len].copy_from_slice(&bytes);
+                    return Ok(len);
+                }
+                Ok(Err(err)) => return Err(err),
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "stream reader stopped",
+                    ));
+                }
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct ToolCallProgressTracker {
+    calls: Vec<ToolCallProgressState>,
+}
+
+#[derive(Default)]
+struct ToolCallProgressState {
+    last_emitted_arguments_bytes: Option<usize>,
+}
+
+impl ToolCallProgressTracker {
+    fn progress_for_delta(
+        &mut self,
+        buf: &[ToolCallAccumulator],
+        index: usize,
+    ) -> Option<ToolCallProgress> {
+        while self.calls.len() <= index {
+            self.calls.push(ToolCallProgressState::default());
+        }
+        let current = buf.get(index)?;
+        if current.id.is_empty() || current.function_name.is_empty() {
+            return None;
+        }
+        let arguments_bytes = current.arguments.len();
+        let state = self.calls.get_mut(index)?;
+        let should_emit = match state.last_emitted_arguments_bytes {
+            None => true,
+            Some(last) => {
+                arguments_bytes.saturating_sub(last) >= TOOL_CALL_PROGRESS_ARGUMENT_BYTES_STEP
+            }
+        };
+        if !should_emit {
+            return None;
+        }
+        state.last_emitted_arguments_bytes = Some(arguments_bytes);
+        Some(tool_call_progress(current, arguments_bytes))
+    }
+}
+
+fn tool_call_progress(current: &ToolCallAccumulator, arguments_bytes: usize) -> ToolCallProgress {
+    ToolCallProgress {
+        id: current.id.clone(),
+        function_name: Some(current.function_name.clone()),
+        arguments_bytes,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
+
+    struct BlockingReader {
+        unblock_rx: mpsc::Receiver<()>,
+    }
+
+    impl Read for BlockingReader {
+        fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+            let _ = self.unblock_rx.recv();
+            Ok(0)
+        }
+    }
 
     #[test]
     fn parse_simple_content_stream() {
@@ -261,6 +433,112 @@ mod tests {
             "{\"path\": \"src/main.rs\"}"
         );
         assert_eq!(result.finish_reason.as_deref(), Some("tool_calls"));
+    }
+
+    #[test]
+    fn parse_tool_calls_stream_emits_argument_progress() {
+        let large_chunk = "a".repeat(8 * 1024);
+        let sse_data = format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"call_1\",\"function\":{{\"name\":\"write_file\",\"arguments\":\"\"}}}}]}},\"finish_reason\":null}}]}}\n\n\
+             data: {{\"choices\":[{{\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":null,\"function\":{{\"name\":null,\"arguments\":\"abc\"}}}}]}},\"finish_reason\":null}}]}}\n\n\
+             data: {{\"choices\":[{{\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":null,\"function\":{{\"name\":null,\"arguments\":\"{large_chunk}\"}}}}]}},\"finish_reason\":null}}]}}\n\n\
+             data: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\n\
+             data: [DONE]\n\n"
+        );
+
+        let cancel = CancelToken::new();
+        let mut progress = Vec::new();
+        let result = parse_sse_stream(sse_data.as_bytes(), &cancel, |delta| {
+            if let StreamEvent::ToolCallProgress(update) = delta {
+                progress.push((
+                    update.id.clone(),
+                    update.function_name.clone(),
+                    update.arguments_bytes,
+                ));
+            }
+        })
+        .unwrap();
+
+        assert_eq!(result.tool_calls[0].function_name, "write_file");
+        assert_eq!(
+            progress,
+            vec![
+                ("call_1".to_string(), Some("write_file".to_string()), 0),
+                (
+                    "call_1".to_string(),
+                    Some("write_file".to_string()),
+                    result.tool_calls[0].arguments.len()
+                )
+            ]
+        );
+        assert_eq!(result.tool_calls[0].arguments.len(), 3 + large_chunk.len());
+    }
+
+    #[test]
+    fn parse_tool_calls_stream_waits_for_stable_id_before_progress() {
+        let sse_data = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":null,\"function\":{\"name\":\"write_file\",\"arguments\":\"abc\"}}]},\"finish_reason\":null}]}\n\n\
+                        data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":null,\"arguments\":\"def\"}}]},\"finish_reason\":null}]}\n\n\
+                        data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n\
+                        data: [DONE]\n\n";
+
+        let cancel = CancelToken::new();
+        let mut progress = Vec::new();
+        let result = parse_sse_stream(sse_data.as_bytes(), &cancel, |delta| {
+            if let StreamEvent::ToolCallProgress(update) = delta {
+                progress.push((update.id.clone(), update.arguments_bytes));
+            }
+        })
+        .unwrap();
+
+        assert_eq!(result.tool_calls[0].id, "call_1");
+        assert_eq!(result.tool_calls[0].arguments, "abcdef");
+        assert_eq!(progress, vec![("call_1".to_string(), 6)]);
+    }
+
+    #[test]
+    fn parse_stream_with_idle_timeout_fails_when_read_stalls() {
+        let (unblock_tx, unblock_rx) = mpsc::channel();
+        let cancel = CancelToken::new();
+
+        let result = parse_sse_stream_with_idle_timeout(
+            BlockingReader { unblock_rx },
+            &cancel,
+            Duration::from_millis(10),
+            |_| {},
+        );
+
+        drop(unblock_tx);
+        assert!(
+            result
+                .unwrap_err()
+                .contains("stream read error: idle read timed out after 10ms")
+        );
+    }
+
+    #[test]
+    fn parse_stream_with_idle_timeout_observes_cancel_while_read_stalls() {
+        let (_unblock_tx, unblock_rx) = mpsc::channel();
+        let cancel = CancelToken::new();
+        let parse_cancel = cancel.clone();
+        let (result_tx, result_rx) = mpsc::channel();
+
+        thread::spawn(move || {
+            let result = parse_sse_stream_with_idle_timeout(
+                BlockingReader { unblock_rx },
+                &parse_cancel,
+                Duration::from_secs(5),
+                |_| {},
+            );
+            let _ = result_tx.send(result.map(|_| ()));
+        });
+
+        thread::sleep(Duration::from_millis(20));
+        cancel.cancel();
+
+        let result = result_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("cancel should interrupt a stalled read promptly");
+        assert_eq!(result.unwrap_err(), "cancelled");
     }
 
     #[test]

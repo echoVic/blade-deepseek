@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::hash::{Hash, Hasher};
 use std::sync::mpsc;
 use std::time::Instant;
 
@@ -30,6 +31,11 @@ pub enum TuiEvent {
         id: String,
         name: String,
         target: Option<String>,
+    },
+    ToolCallProgress {
+        id: String,
+        name: Option<String>,
+        arguments_bytes: usize,
     },
     ToolOutputDelta {
         id: String,
@@ -157,6 +163,15 @@ pub enum ChatMessage {
     },
     Error(String),
     System(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LiveLineCountCache {
+    pub width: u16,
+    pub live_start: usize,
+    pub message_count: usize,
+    pub signature: u64,
+    pub total: u16,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -296,6 +311,7 @@ pub struct AppState {
     pub auto_scroll: bool,
     pub total_lines: u16,
     pub visible_height: u16,
+    pub(crate) live_line_count_cache: Option<LiveLineCountCache>,
     pub app_version: String,
     pub model_name: String,
     pub reasoning_effort: orca_core::config::ReasoningEffort,
@@ -348,6 +364,7 @@ impl AppState {
             auto_scroll: true,
             total_lines: 0,
             visible_height: 0,
+            live_line_count_cache: None,
             app_version,
             model_name,
             reasoning_effort: orca_core::config::ReasoningEffort::default(),
@@ -652,6 +669,19 @@ impl AppState {
                 if name == "subagent" || name == "update_plan" {
                     return;
                 }
+                if let Some(ChatMessage::ToolCall {
+                    name: existing_name,
+                    target: existing_target,
+                    status,
+                    ..
+                }) = self.messages.iter_mut().rev().find(|message| {
+                    matches!(message, ChatMessage::ToolCall { id: existing_id, status, .. } if existing_id == &id && status == "receiving")
+                }) {
+                    *existing_name = name;
+                    *existing_target = target;
+                    *status = "running".to_string();
+                    return;
+                }
                 self.messages.push(ChatMessage::ToolCall {
                     id,
                     name,
@@ -662,6 +692,47 @@ impl AppState {
                     kind: None,
                     expanded: false,
                 });
+            }
+            TuiEvent::ToolCallProgress {
+                id,
+                name,
+                arguments_bytes,
+            } => {
+                if name
+                    .as_deref()
+                    .is_some_and(is_panel_owned_tool_progress_name)
+                {
+                    return;
+                }
+                let progress_output = Some(format!(
+                    "receiving arguments... {}",
+                    format_argument_bytes(arguments_bytes)
+                ));
+                if let Some(ChatMessage::ToolCall {
+                    name: existing_name,
+                    status,
+                    output,
+                    ..
+                }) = self.messages.iter_mut().rev().find(|message| {
+                    matches!(message, ChatMessage::ToolCall { id: existing_id, status, .. } if existing_id == &id && status == "receiving")
+                }) {
+                    if let Some(name) = name {
+                        *existing_name = name;
+                    }
+                    *status = "receiving".to_string();
+                    *output = progress_output;
+                } else {
+                    self.messages.push(ChatMessage::ToolCall {
+                        id,
+                        name: name.unwrap_or_else(|| "tool".to_string()),
+                        target: None,
+                        status: "receiving".to_string(),
+                        output: progress_output,
+                        diff: None,
+                        kind: None,
+                        expanded: false,
+                    });
+                }
             }
             TuiEvent::ToolOutputDelta { id, chunk } => {
                 if let Some(ChatMessage::ToolCall { output, .. }) =
@@ -827,6 +898,7 @@ impl AppState {
                 self.messages.push(ChatMessage::System(message));
             }
             TuiEvent::Error(msg) => {
+                self.clear_receiving_tool_progress();
                 self.messages.push(ChatMessage::Error(msg));
             }
             TuiEvent::Notice(msg) => {
@@ -843,6 +915,7 @@ impl AppState {
                 self.context_limit_tokens = limit_tokens;
             }
             TuiEvent::SessionCompleted { .. } => {
+                self.clear_receiving_tool_progress();
                 self.promote_trailing_reasoning();
                 self.archive_current_plan();
                 self.finalize_turn();
@@ -934,6 +1007,25 @@ impl AppState {
         self.finalized_count = self.messages.len();
     }
 
+    fn clear_receiving_tool_progress(&mut self) {
+        let mut index = 0;
+        let mut removed_before_flushed = 0;
+        self.messages.retain(|message| {
+            let remove = index >= self.finalized_count
+                && matches!(message, ChatMessage::ToolCall { status, .. } if status == "receiving");
+            if remove && index < self.flushed_count {
+                removed_before_flushed += 1;
+            }
+            index += 1;
+            !remove
+        });
+        self.finalized_count = self.finalized_count.min(self.messages.len());
+        self.flushed_count = self
+            .flushed_count
+            .saturating_sub(removed_before_flushed)
+            .min(self.messages.len());
+    }
+
     /// Whether the message at `index` will never change again, so it is safe to flush
     /// into the append-only scrollback.
     ///
@@ -951,7 +1043,7 @@ impl AppState {
         let is_last = index + 1 == self.messages.len();
         match &self.messages[index] {
             ChatMessage::ToolCall { status, .. } | ChatMessage::Subagent { status, .. } => {
-                status != "running"
+                !matches!(status.as_str(), "running" | "receiving")
             }
             ChatMessage::Reasoning(_) | ChatMessage::Assistant(_) => turn_ended || !is_last,
             ChatMessage::User(_)
@@ -974,6 +1066,16 @@ impl AppState {
         end
     }
 
+    pub(crate) fn live_message_signature(&self) -> (usize, usize, u64) {
+        let live_start = self.flushed_count.min(self.messages.len());
+        let live = &self.messages[live_start..];
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for message in live {
+            message.hash_for_layout(&mut hasher);
+        }
+        (live_start, live.len(), hasher.finish())
+    }
+
     pub fn remove_after_last_user(&mut self) {
         if let Some(index) = self
             .messages
@@ -985,6 +1087,70 @@ impl AppState {
             self.flushed_count = self.flushed_count.min(self.messages.len());
         }
     }
+}
+
+impl ChatMessage {
+    fn hash_for_layout<H: Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            ChatMessage::User(text)
+            | ChatMessage::Reasoning(text)
+            | ChatMessage::Assistant(text)
+            | ChatMessage::Error(text)
+            | ChatMessage::System(text) => text.hash(state),
+            ChatMessage::ToolCall {
+                id,
+                name,
+                target,
+                status,
+                output,
+                diff,
+                kind,
+                expanded,
+            } => {
+                id.hash(state);
+                name.hash(state);
+                target.hash(state);
+                status.hash(state);
+                output.hash(state);
+                diff.hash(state);
+                kind.hash(state);
+                expanded.hash(state);
+            }
+            ChatMessage::PlanUpdate { explanation, plan } => {
+                explanation.hash(state);
+                for item in plan {
+                    item.step.hash(state);
+                    std::mem::discriminant(&item.status).hash(state);
+                }
+            }
+            ChatMessage::Subagent {
+                id,
+                description,
+                status,
+                output,
+                error,
+            } => {
+                id.hash(state);
+                description.hash(state);
+                status.hash(state);
+                output.hash(state);
+                error.hash(state);
+            }
+        }
+    }
+}
+
+fn format_argument_bytes(bytes: usize) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    }
+}
+
+fn is_panel_owned_tool_progress_name(name: &str) -> bool {
+    matches!(name, "subagent" | "update_plan")
 }
 
 #[cfg(test)]
@@ -1401,6 +1567,19 @@ mod tests {
     }
 
     #[test]
+    fn flushable_prefix_stops_at_a_receiving_tool_call() {
+        let mut state = state();
+        state.messages.push(ChatMessage::User("hi".to_string()));
+        state.update(TuiEvent::ToolCallProgress {
+            id: "t1".to_string(),
+            name: Some("write_file".to_string()),
+            arguments_bytes: 1024,
+        });
+
+        assert_eq!(state.flushable_prefix_end(false), 1);
+    }
+
+    #[test]
     fn flushable_prefix_holds_back_the_streaming_tail_until_turn_end() {
         let mut state = state();
         state.messages.push(ChatMessage::User("hi".to_string()));
@@ -1607,6 +1786,135 @@ mod tests {
             ChatMessage::ToolCall { output, .. } => assert!(output.is_none()),
             other => panic!("expected tool call, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn tool_call_progress_creates_and_updates_running_row() {
+        let mut state = state();
+
+        state.update(TuiEvent::ToolCallProgress {
+            id: "call_1".to_string(),
+            name: Some("write_file".to_string()),
+            arguments_bytes: 12_345,
+        });
+        state.update(TuiEvent::ToolCallProgress {
+            id: "call_1".to_string(),
+            name: Some("write_file".to_string()),
+            arguments_bytes: 24_690,
+        });
+        state.update(TuiEvent::ToolRequested {
+            id: "call_1".to_string(),
+            name: "write_file".to_string(),
+            target: Some("big.js".to_string()),
+        });
+
+        assert_eq!(state.messages.len(), 1);
+        match &state.messages[0] {
+            ChatMessage::ToolCall {
+                name,
+                target,
+                status,
+                output,
+                ..
+            } => {
+                assert_eq!(name, "write_file");
+                assert_eq!(target.as_deref(), Some("big.js"));
+                assert_eq!(status, "running");
+                assert_eq!(output.as_deref(), Some("receiving arguments... 24.1 KB"));
+            }
+            other => panic!("expected tool progress row, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_call_progress_ignores_panel_owned_tools() {
+        let mut state = state();
+
+        state.update(TuiEvent::ToolCallProgress {
+            id: "plan-1".to_string(),
+            name: Some("update_plan".to_string()),
+            arguments_bytes: 1024,
+        });
+        state.update(TuiEvent::ToolCallProgress {
+            id: "subagent-1".to_string(),
+            name: Some("subagent".to_string()),
+            arguments_bytes: 2048,
+        });
+
+        assert!(state.messages.is_empty());
+    }
+
+    #[test]
+    fn terminal_events_remove_orphan_receiving_tool_progress() {
+        let mut state = state();
+
+        state.update(TuiEvent::ToolCallProgress {
+            id: "call_1".to_string(),
+            name: Some("write_file".to_string()),
+            arguments_bytes: 12_345,
+        });
+        state.update(TuiEvent::Error("failed to parse tool call".to_string()));
+
+        assert!(
+            state.messages.iter().all(|message| {
+                !matches!(message, ChatMessage::ToolCall { status, .. } if status == "receiving")
+            }),
+            "error should clear orphan receiving rows: {:?}",
+            state.messages
+        );
+
+        state.update(TuiEvent::ToolCallProgress {
+            id: "call_2".to_string(),
+            name: Some("write_file".to_string()),
+            arguments_bytes: 24_690,
+        });
+        state.update(TuiEvent::SessionCompleted {
+            status: "cancelled".to_string(),
+        });
+
+        assert!(
+            state.messages.iter().all(|message| {
+                !matches!(message, ChatMessage::ToolCall { status, .. } if status == "receiving")
+            }),
+            "completion should clear orphan receiving rows: {:?}",
+            state.messages
+        );
+    }
+
+    #[test]
+    fn clearing_receiving_progress_preserves_finalized_prefix_boundaries() {
+        let mut state = state();
+        state.messages.push(ChatMessage::ToolCall {
+            id: "frozen".to_string(),
+            name: "write_file".to_string(),
+            target: None,
+            status: "receiving".to_string(),
+            output: Some("receiving arguments... 1 KB".to_string()),
+            diff: None,
+            kind: None,
+            expanded: false,
+        });
+        state.finalized_count = 1;
+        state.flushed_count = 1;
+
+        state.update(TuiEvent::ToolCallProgress {
+            id: "live".to_string(),
+            name: Some("write_file".to_string()),
+            arguments_bytes: 24_690,
+        });
+        state.update(TuiEvent::Error("failed".to_string()));
+
+        assert_eq!(state.finalized_count, 1);
+        assert_eq!(state.flushed_count, 1);
+        assert_eq!(state.messages.len(), 2);
+        match &state.messages[0] {
+            ChatMessage::ToolCall { id, status, .. } => {
+                assert_eq!(id, "frozen");
+                assert_eq!(status, "receiving");
+            }
+            other => panic!("finalized prefix should be preserved, got {other:?}"),
+        }
+        assert!(matches!(state.messages[1], ChatMessage::Error(_)));
     }
 
     #[test]

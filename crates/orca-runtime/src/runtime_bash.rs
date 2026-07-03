@@ -256,6 +256,9 @@ fn execute_bash_with_sandbox(
                 ] {
                     env.insert(key.to_string(), Some(proxy.proxy_url().to_string()));
                 }
+                for key in ["NO_PROXY", "no_proxy"] {
+                    env.insert(key.to_string(), None);
+                }
                 Some(proxy)
             }
             Err(error) => {

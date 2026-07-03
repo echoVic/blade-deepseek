@@ -160,7 +160,12 @@ impl HookRunner {
                     String::from_utf8_lossy(&output.stdout[..output.stdout.len().min(65536)])
                         .trim()
                         .to_string();
-                let detail = if stderr.is_empty() { stdout } else { stderr };
+                let detail = match (stdout.is_empty(), stderr.is_empty()) {
+                    (true, true) => String::new(),
+                    (false, true) => stdout,
+                    (true, false) => stderr,
+                    (false, false) => format!("{stdout}\n{stderr}"),
+                };
                 return Err(if detail.is_empty() {
                     format!(
                         "hook '{}' timed out after {}s",
