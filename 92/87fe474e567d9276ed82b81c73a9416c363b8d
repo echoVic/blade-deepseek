@@ -1,0 +1,29 @@
+crates/orca-provider/src/lib.rs
+  s_b74d9bf48663ab::t_be22927311f89f 657-666,725-729,1130-1140
+crates/orca-runtime/src/workflow_execution.rs
+  s_b74d9bf48663ab::t_ca3f7186421dca 3-4,17-18,21-23,33-123,151-153,168-213,252-254,268-333,431-434,438-439,442-445,450,453-456,461,497-685
+crates/orca-tui/src/agent_runner.rs
+  s_b74d9bf48663ab::t_aab396255435ab 1,3,38-61,304-326,380,434,507,518,559,619,669,757,761-771,775-780,793,796,1013-1015,1033-1159
+crates/orca-tui/src/agent_workflow_execution.rs
+  s_b74d9bf48663ab::t_252ca91a16514a 4,11-14,23-25,101-126,313-323,360-432,475-646
+crates/orca-tui/src/bridge.rs
+  s_b74d9bf48663ab::t_0c6ea86ad0b828 1-3
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "9287fe474e567d9276ed82b81c73a9416c363b8d",
+  "prompts": {},
+  "sessions": {
+    "s_b74d9bf48663ab": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f260b-a5c5-7f32-b45c-1461f1f376ab",
+        "model": "unknown"
+      },
+      "human_author": "echoVic <137844255@qq.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
