@@ -1,20 +1,20 @@
 import {
-    useEffect,
-    useMemo,
-    useRef,
-    useState,
-    type KeyboardEvent,
-    type ReactNode,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent,
+  type ReactNode,
 } from "react";
 import {
-    applySeoHead,
-    canonicalOrigin,
-    detectInitialLocale,
-    links,
-    localeStorageKey,
-    releaseVersion,
-    type Locale,
-    type SeoEntry
+  applySeoHead,
+  canonicalOrigin,
+  detectInitialLocale,
+  links,
+  localeStorageKey,
+  releaseVersion,
+  type Locale,
+  type SeoEntry
 } from "./shared";
 
 const npmCommand = "npm install -g @blade-ai/orca";
@@ -68,7 +68,7 @@ const copy = {
       pill: `${releaseVersion} · Rust-native`,
       titlePrefix: "A",
       titleHighlight: "DeepSeek-native",
-      titleSuffix: "coding agent, in your terminal.",
+      titleSuffix: "coding agent, in your terminal",
       subtitle:
         "Orca is a local terminal coding agent built around DeepSeek: long-context coding, multi-turn tool use, prefix-cache friendly prompts, resumable history, persistent goals, and approval-aware automation in one Rust binary.",
       primary: "Get started",
@@ -233,7 +233,7 @@ const copy = {
       pill: `${releaseVersion} · Rust 原生`,
       titlePrefix: "面向终端的",
       titleHighlight: "DeepSeek 原生",
-      titleSuffix: "代码智能体。",
+      titleSuffix: "代码智能体",
       subtitle:
         "Orca 是围绕 DeepSeek 构建的本地终端代码智能体：长上下文编码、多轮工具调用、前缀缓存友好提示词、可恢复历史、持久 goal，以及带审批策略的自动化，都内建在一个 Rust 二进制里。",
       primary: "开始使用",
