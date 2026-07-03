@@ -80,7 +80,7 @@ fn turn_iteration_step_uses_grouped_runtime_input() {
     let run_impl = lifecycle
         .split("impl RuntimeTurnIterationStep")
         .nth(1)
-        .and_then(|text| text.split("impl RuntimeTurnLoopStep").next())
+        .and_then(|text| text.split("impl RuntimeTaskLifecycle").next())
         .expect("runtime turn iteration impl block");
     assert!(
         run_impl.contains("input: RuntimeTurnIterationInput"),
