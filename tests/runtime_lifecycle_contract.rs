@@ -243,6 +243,18 @@ fn runtime_normal_tool_executor_owns_normal_tool_execution_boundary() {
         "runtime_normal_tool should group normal tool execution state"
     );
     assert!(
+        normal_tool.contains("pub(crate) trait RuntimeNormalToolFallbackExecutor"),
+        "runtime_normal_tool should expose a focused fallback executor boundary"
+    );
+    assert!(
+        normal_tool.contains("pub(crate) struct RuntimeNormalToolFallbackContext"),
+        "runtime_normal_tool should group fallback executor state"
+    );
+    assert!(
+        normal_tool.contains("DefaultRuntimeNormalToolFallbackExecutor"),
+        "runtime_normal_tool should keep the orca-tools fallback behind a default executor"
+    );
+    assert!(
         normal_tool.contains("execute_bash_with_shell_session"),
         "runtime_normal_tool should own the shell-session bash execution branch"
     );
