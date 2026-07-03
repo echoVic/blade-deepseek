@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.104":
+        "Runtime tool invocation dispatch now lives behind a focused RuntimeToolRouter boundary. ToolExecutionActor keeps invocation prep, approval, hooks, and result finalization, while workflow, subagent, task, permission, workflow IPC, and normal-tool routing move into the router without changing model-visible behavior.",
       "v0.1.103":
         "Runtime turn execution now carries cleaner grouped inputs: turn iteration, provider cycle, provider response, and tool turns share request-scoped context boundaries. This Codex/package-3-inspired slice reduces repeated runtime state plumbing while preserving CLI, TUI, server, tool, workflow, and history behavior.",
       "v0.1.102":
@@ -234,6 +236,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.104":
+        "runtime tool invocation dispatch 现在进入独立 RuntimeToolRouter 边界。ToolExecutionActor 只保留 invocation 准备、审批、hook 与结果收尾；workflow、subagent、task、permission、workflow IPC 和普通工具路由都移到 router，模型可见行为保持不变。",
       "v0.1.103":
         "runtime turn 执行现在使用更清晰的分组输入边界：turn iteration、provider cycle、provider response 与 tool turns 共享 request-scoped context。这个参考 Codex/package 3 的架构切片减少了重复的 runtime 状态传递，同时保持 CLI、TUI、server、tool、workflow 与 history 行为不变。",
       "v0.1.102":
