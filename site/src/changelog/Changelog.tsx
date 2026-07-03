@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.116":
+        "Runtime turn-loop orchestration now lives in a focused runtime_turn_loop module instead of lifecycle.rs. Agent loop still delegates through RuntimeTurnLoopStep with the same grouped input/executor objects and the same iteration retry/return behavior, while lifecycle.rs gets smaller for the next Codex/package-3-inspired reducer split.",
       "v0.1.115":
         "Shell-session bash execution now receives one grouped RuntimeBashInvocationContext instead of a long execute_bash_with_shell_session argument list. RuntimeNormalToolExecutor still owns the bash branch, permission overlays, cancellation, output truncation, task registry handoff, and network/filesystem permission retries keep the same behavior, while the bash boundary gets smaller for the next shell/session and async-subagent slices.",
       "v0.1.114":
@@ -258,6 +260,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.116":
+        "Runtime turn-loop 编排现在从 lifecycle.rs 移到独立的 runtime_turn_loop 模块。agent loop 仍然通过 RuntimeTurnLoopStep 委托执行，分组后的 input/executor 对象和 iteration 重试/返回行为保持不变，同时 lifecycle.rs 进一步变小，为后续参考 Codex/package 3 的 reducer 拆分铺路。",
       "v0.1.115":
         "shell-session bash 执行现在统一接收分组后的 RuntimeBashInvocationContext，不再暴露 execute_bash_with_shell_session 的长参数列表。RuntimeNormalToolExecutor 仍然拥有 bash 分支，permission overlay、取消、输出截断、task registry 交接以及网络/文件系统权限重试行为保持不变，同时 bash 边界为后续 shell/session 和 async-subagent 切片继续收窄。",
       "v0.1.114":
