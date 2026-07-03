@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use orca_core::workflow_types::{WorkflowDraft, WorkflowSourceMutationRisk};
 
-use super::script::parse_workflow_meta;
+use super::script::{parse_workflow_meta, validate_workflow_runtime_contract};
 use super::state::WorkflowStateStore;
 
 #[derive(Clone, Debug)]
@@ -38,6 +38,7 @@ impl WorkflowDraftStore {
         max_configured_concurrent_agents: usize,
     ) -> io::Result<WorkflowDraft> {
         let meta = parse_workflow_meta(script)?;
+        validate_workflow_runtime_contract(script, &meta)?;
         let draft_id = format!("workflow-draft-{}", uuid::Uuid::new_v4());
         let script_path = self.script_path(&draft_id);
         if let Some(parent) = script_path.parent() {
@@ -88,6 +89,7 @@ impl WorkflowDraftStore {
     ) -> io::Result<WorkflowDraft> {
         let existing = self.load(draft_id)?;
         let meta = parse_workflow_meta(script)?;
+        validate_workflow_runtime_contract(script, &meta)?;
         let script_path = self.script_path(draft_id);
         if let Some(parent) = script_path.parent() {
             fs::create_dir_all(parent)?;
@@ -208,4 +210,76 @@ fn sanitize_workflow_name(raw: &str) -> io::Result<String> {
         ));
     }
     Ok(name.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WorkflowDraftStore;
+
+    #[test]
+    fn draft_rejects_string_phase_workflow_without_executable_body() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = WorkflowDraftStore::new(temp.path().join("drafts"));
+        let error = store
+            .create_from_script(
+                "session-1",
+                temp.path(),
+                r#"export const meta = { name: "noop", description: "No-op", phases: ["scan"] };"#,
+                4,
+            )
+            .expect_err("no-op string phase workflow should be rejected");
+
+        assert!(
+            error.to_string().contains("hand-written workflow"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn draft_rejects_string_phase_workflow_when_markers_only_appear_in_comments() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = WorkflowDraftStore::new(temp.path().join("drafts"));
+        let error = store
+            .create_from_script(
+                "session-1",
+                temp.path(),
+                r#"
+export const meta = { name: "noop", description: "No-op", phases: ["scan"] };
+// TODO: call phase("scan", async () => agent("inspect")) later.
+"#,
+                4,
+            )
+            .expect_err("comment-only workflow markers should not make the draft executable");
+
+        assert!(
+            error.to_string().contains("hand-written workflow"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn draft_rejects_invented_workflow_phase_apis() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = WorkflowDraftStore::new(temp.path().join("drafts"));
+        let error = store
+            .create_from_script(
+                "session-1",
+                temp.path(),
+                r#"
+export const meta = { name: "bad", description: "Bad API", phases: ["scan"] };
+async function run({ phases }) {
+  const [scan] = phases;
+  await scan.runParallel({ tasks: ["inspect"] });
+  await phase.agent("inspect", { prompt: "inspect repo" });
+}
+"#,
+                4,
+            )
+            .expect_err("invented phase API should be rejected");
+
+        assert!(
+            error.to_string().contains("unsupported workflow API"),
+            "unexpected error: {error}"
+        );
+    }
 }

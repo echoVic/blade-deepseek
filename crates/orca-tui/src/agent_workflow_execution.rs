@@ -1,13 +1,17 @@
 use std::path::Path;
 use std::sync::mpsc::Sender;
 use std::thread;
+use std::time::Duration;
 
 use orca_core::config::RunConfig;
 use orca_core::event_schema::EventFactory;
 use orca_core::tool_types;
 use orca_core::workflow_types::{WorkflowDraftActionOutput, WorkflowInput};
 use orca_runtime::tasks::TaskRegistry;
-use orca_runtime::workflow::{WorkflowDraftStore, WorkflowLaunchRequest, WorkflowRunner};
+use orca_runtime::workflow::{
+    WorkflowBackgroundLaunch, WorkflowDraftStore, WorkflowLaunchRequest, WorkflowLaunchResult,
+    WorkflowRunner,
+};
 use serde::Deserialize;
 
 use crate::agent_runner::{
@@ -15,6 +19,9 @@ use crate::agent_runner::{
     send_workflow_tasks_updated_for_tui,
 };
 use crate::types::TuiEvent;
+
+const WORKFLOW_STARTUP_HEALTH_CHECK_POLLS: usize = 2;
+const WORKFLOW_STARTUP_HEALTH_CHECK_INTERVAL: Duration = Duration::from_millis(300);
 
 pub(crate) fn execute_workflow_draft_for_tui(
     config: &RunConfig,
@@ -91,12 +98,36 @@ pub(crate) fn execute_workflow_draft_action_for_tui(
             let run_id = launch.run_id.clone();
             let workflow_name = launch.workflow_name.clone();
             let tool_use_id = request.id.clone();
+            let mut task_events = EventFactory::new(run_id.clone());
+            send_workflow_tasks_updated_for_tui(event_tx, &mut task_events, &task_registry.list());
+            let launch = match wait_for_workflow_startup(launch) {
+                WorkflowStartupStatus::StillRunning(launch) => launch,
+                WorkflowStartupStatus::Completed(result) => {
+                    send_workflow_tasks_updated_for_tui(
+                        event_tx,
+                        &mut task_events,
+                        &task_registry.list(),
+                    );
+                    return completed_workflow_draft_action_result(
+                        request,
+                        &input.draft_id,
+                        &draft.script_path,
+                        result,
+                    );
+                }
+                WorkflowStartupStatus::Failed { error } => {
+                    send_workflow_tasks_updated_for_tui(
+                        event_tx,
+                        &mut task_events,
+                        &task_registry.list(),
+                    );
+                    return tool_types::ToolResult::failed(request, error, None);
+                }
+            };
             let task_id_for_notification = task_id.clone();
             let run_id_for_notification = run_id.clone();
             let tool_use_id_for_notification = tool_use_id.clone();
             let workflow_name_for_notification = workflow_name.clone();
-            let mut task_events = EventFactory::new(run_id.clone());
-            send_workflow_tasks_updated_for_tui(event_tx, &mut task_events, &task_registry.list());
             let notify_tx = event_tx.clone();
             let notify_registry = task_registry.clone();
             thread::spawn(move || {
@@ -279,6 +310,17 @@ pub(crate) fn execute_workflow_for_tui(
     };
     let mut task_events = EventFactory::new(run_id.clone());
     send_workflow_tasks_updated_for_tui(event_tx, &mut task_events, &task_registry.list());
+    let launch = match wait_for_workflow_startup(launch) {
+        WorkflowStartupStatus::StillRunning(launch) => launch,
+        WorkflowStartupStatus::Completed(result) => {
+            send_workflow_tasks_updated_for_tui(event_tx, &mut task_events, &task_registry.list());
+            return completed_workflow_result(request, result);
+        }
+        WorkflowStartupStatus::Failed { error } => {
+            send_workflow_tasks_updated_for_tui(event_tx, &mut task_events, &task_registry.list());
+            return tool_types::ToolResult::failed(request, error, None);
+        }
+    };
 
     let notify_tx = event_tx.clone();
     let notify_registry = task_registry.clone();
@@ -313,6 +355,79 @@ pub(crate) fn execute_workflow_for_tui(
     });
 
     tool_types::ToolResult::completed(request, output, false)
+}
+
+enum WorkflowStartupStatus {
+    StillRunning(WorkflowBackgroundLaunch),
+    Completed(WorkflowLaunchResult),
+    Failed { error: String },
+}
+
+fn wait_for_workflow_startup(launch: WorkflowBackgroundLaunch) -> WorkflowStartupStatus {
+    let mut launch = Some(launch);
+    for _ in 0..WORKFLOW_STARTUP_HEALTH_CHECK_POLLS {
+        if launch
+            .as_ref()
+            .is_some_and(WorkflowBackgroundLaunch::is_finished)
+        {
+            break;
+        }
+        thread::sleep(WORKFLOW_STARTUP_HEALTH_CHECK_INTERVAL);
+    }
+
+    let launch = launch.take().expect("launch present");
+    if !launch.is_finished() {
+        return WorkflowStartupStatus::StillRunning(launch);
+    }
+
+    match launch.join() {
+        Ok(Ok(result)) => WorkflowStartupStatus::Completed(result),
+        Ok(Err(error)) => WorkflowStartupStatus::Failed {
+            error: error.to_string(),
+        },
+        Err(_) => WorkflowStartupStatus::Failed {
+            error: "workflow thread panicked".to_string(),
+        },
+    }
+}
+
+fn completed_workflow_draft_action_result(
+    request: &tool_types::ToolRequest,
+    draft_id: &str,
+    draft_script_path: &str,
+    result: WorkflowLaunchResult,
+) -> tool_types::ToolResult {
+    let action_output = WorkflowDraftActionOutput {
+        status: "completed".to_string(),
+        action: "run".to_string(),
+        draft_id: draft_id.to_string(),
+        workflow_name: result
+            .output
+            .workflow_name
+            .clone()
+            .unwrap_or_else(|| "workflow".to_string()),
+        saved_path: None,
+        task_id: Some(result.task_id),
+        run_id: result.output.run_id,
+        script_path: result
+            .output
+            .script_path
+            .or_else(|| Some(draft_script_path.to_string())),
+    };
+    match serde_json::to_string(&action_output) {
+        Ok(output) => tool_types::ToolResult::completed(request, output, false),
+        Err(error) => tool_types::ToolResult::failed(request, error.to_string(), None),
+    }
+}
+
+fn completed_workflow_result(
+    request: &tool_types::ToolRequest,
+    result: WorkflowLaunchResult,
+) -> tool_types::ToolResult {
+    match serde_json::to_string(&result.output) {
+        Ok(output) => tool_types::ToolResult::completed(request, output, false),
+        Err(error) => tool_types::ToolResult::failed(request, error.to_string(), None),
+    }
 }
 
 fn parse_workflow_input(request: &tool_types::ToolRequest) -> std::io::Result<WorkflowInput> {
@@ -356,4 +471,176 @@ fn parse_workflow_draft_action_input(
     let raw_arguments = request.raw_arguments.as_deref().unwrap_or("{}");
     serde_json::from_str(raw_arguments)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::mpsc;
+
+    use orca_core::approval_types::{ActionKind, ApprovalMode};
+    use orca_core::config::{HistoryMode, OutputFormat, ProviderKind, RunConfig};
+    use orca_core::model::ModelSelection;
+    use orca_core::tool_types::{ToolName, ToolRequest, ToolStatus};
+    use orca_runtime::tasks::TaskRegistry;
+    use orca_runtime::workflow::host::WorkflowHost;
+
+    use super::{
+        execute_workflow_draft_action_for_tui, execute_workflow_draft_for_tui,
+        execute_workflow_for_tui,
+    };
+
+    fn tool_request(id: &str, name: ToolName, raw_arguments: serde_json::Value) -> ToolRequest {
+        ToolRequest {
+            id: id.to_string(),
+            name,
+            action: ActionKind::Write,
+            target: None,
+            raw_arguments: Some(raw_arguments.to_string()),
+        }
+    }
+
+    fn config() -> RunConfig {
+        RunConfig {
+            app_version: "0.0.0-test".to_string(),
+            prompt: String::new(),
+            cwd: None,
+            output_format: OutputFormat::Text,
+            approval_mode: ApprovalMode::FullAuto,
+            provider: ProviderKind::Mock,
+            verifier: None,
+            model: ModelSelection::parse(None).unwrap(),
+            model_runtime: Default::default(),
+            reasoning_effort: orca_core::config::ReasoningEffort::Max,
+            api_key: None,
+            base_url: None,
+            history_mode: HistoryMode::Disabled,
+            show_session_picker: false,
+            active_permission_profile: None,
+            permission_profiles: Default::default(),
+            runtime_workspace_roots: None,
+            permission_rules: Default::default(),
+            additional_working_directories: Vec::new(),
+            max_budget_usd: None,
+            mcp_servers: Vec::new(),
+            hooks: Vec::new(),
+            external_tools: Vec::new(),
+            subagents: Default::default(),
+            tools: Default::default(),
+            workflows: Default::default(),
+            theme: orca_core::config::ThemeName::Dark,
+            vim_mode: false,
+            update_check: false,
+            desktop_notifications: false,
+            auto_memory: false,
+        }
+    }
+
+    #[test]
+    fn workflow_draft_action_run_reports_immediate_startup_failure() {
+        if !WorkflowHost::node_available() {
+            return;
+        }
+
+        let config = config();
+        let temp = tempfile::tempdir().unwrap();
+        let registry = TaskRegistry::new("session-immediate-failure".to_string());
+        let (event_tx, _event_rx) = mpsc::channel();
+        let script = r#"
+export const meta = {
+  name: "bad-workflow",
+  description: "Fails on load",
+  phases: [{ name: "main", tasks: [{ prompt: "noop" }] }]
+};
+throw new Error("startup boom");
+"#;
+
+        let draft_result = execute_workflow_draft_for_tui(
+            &config,
+            temp.path(),
+            &tool_request(
+                "draft",
+                ToolName::WorkflowDraft,
+                serde_json::json!({ "script": script }),
+            ),
+            &registry,
+        );
+        assert_eq!(draft_result.status, ToolStatus::Completed);
+        let draft_output = draft_result.output.as_deref().expect("draft output");
+        let draft: serde_json::Value = serde_json::from_str(draft_output).unwrap();
+        let draft_id = draft["draftId"].as_str().expect("draft id");
+
+        let run_result = execute_workflow_draft_action_for_tui(
+            &config,
+            temp.path(),
+            &tool_request(
+                "run",
+                ToolName::WorkflowDraftAction,
+                serde_json::json!({ "draftId": draft_id, "action": "run" }),
+            ),
+            &event_tx,
+            &registry,
+        );
+
+        assert_eq!(run_result.status, ToolStatus::Failed);
+        assert!(
+            run_result
+                .output
+                .as_deref()
+                .is_some_and(|output| output.contains("startup boom"))
+                || run_result
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("startup boom")),
+            "expected immediate failure details, got output={:?} error={:?}",
+            run_result.output,
+            run_result.error
+        );
+    }
+
+    #[test]
+    fn workflow_tool_reports_immediate_startup_failure() {
+        if !WorkflowHost::node_available() {
+            return;
+        }
+
+        let config = config();
+        let temp = tempfile::tempdir().unwrap();
+        let registry = TaskRegistry::new("session-workflow-immediate-failure".to_string());
+        let (event_tx, _event_rx) = mpsc::channel();
+        let script = r#"
+export const meta = {
+  name: "bad-workflow",
+  description: "Fails on load",
+  phases: [{ name: "main", tasks: [{ prompt: "noop" }] }]
+};
+throw new Error("startup boom");
+"#;
+
+        let result = execute_workflow_for_tui(
+            &config,
+            temp.path(),
+            &tool_request(
+                "workflow",
+                ToolName::Workflow,
+                serde_json::json!({ "script": script }),
+            ),
+            &event_tx,
+            &registry,
+        );
+
+        assert_eq!(result.status, ToolStatus::Failed);
+        assert!(
+            result
+                .output
+                .as_deref()
+                .is_some_and(|output| output.contains("startup boom"))
+                || result
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("startup boom")),
+            "expected immediate failure details, got output={:?} error={:?}",
+            result.output,
+            result.error
+        );
+    }
 }

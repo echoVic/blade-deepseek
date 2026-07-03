@@ -410,6 +410,10 @@ mod tests {
     use super::*;
     use orca_core::approval_types::ActionKind;
     use orca_core::tool_types::{ToolName, ToolStatus};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
     use std::time::Instant;
 
     fn bash_request(command: &str) -> ToolRequest {
@@ -528,17 +532,29 @@ mod tests {
     #[test]
     fn streaming_bash_wait_observes_cancel_callback() {
         let dir = tempfile::TempDir::new().unwrap();
-        let request = bash_request("printf before; sleep 5; printf after");
+        let request = bash_request("printf 'before\\n'; sleep 5; printf after");
         let mut chunks = Vec::new();
         let start = Instant::now();
+        let saw_output = Arc::new(AtomicBool::new(false));
+        let saw_output_for_chunk = Arc::clone(&saw_output);
+        let saw_output_for_cancel = Arc::clone(&saw_output);
 
         let result = execute_streaming_with_policy_or_cancel(
             &request,
             dir.path(),
             ToolOutputTruncation::bytes(1024),
             Duration::from_secs(30),
-            &mut |chunk| chunks.push(chunk.to_string()),
-            || start.elapsed() >= Duration::from_millis(100),
+            &mut |chunk| {
+                if chunk.contains("before") {
+                    saw_output_for_chunk.store(true, Ordering::SeqCst);
+                }
+                chunks.push(chunk.to_string());
+            },
+            || {
+                (saw_output_for_cancel.load(Ordering::SeqCst)
+                    && start.elapsed() >= Duration::from_millis(100))
+                    || start.elapsed() >= Duration::from_secs(1)
+            },
         );
 
         assert!(

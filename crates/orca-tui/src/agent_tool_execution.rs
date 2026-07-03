@@ -263,6 +263,36 @@ pub(crate) fn execute_tool_for_tui(
                 );
             };
             execute_subagent_status_for_tui(execution_request, task_registry)
+        } else if execution_request.name == tool_types::ToolName::TaskList {
+            let Some(task_registry) = task_registry else {
+                return (
+                    true,
+                    tool_types::ToolResult::failed(
+                        execution_request,
+                        "task_list requires a main TUI session",
+                        None,
+                    ),
+                    None,
+                );
+            };
+            let mut runtime_context =
+                RuntimeToolActorContext::new("tui-task-list", DEFAULT_MAX_TURNS);
+            runtime_context.execute_task_list_tool(execution_request, task_registry)
+        } else if execution_request.name == tool_types::ToolName::TaskStop {
+            let Some(task_registry) = task_registry else {
+                return (
+                    true,
+                    tool_types::ToolResult::failed(
+                        execution_request,
+                        "task_stop requires a main TUI session",
+                        None,
+                    ),
+                    None,
+                );
+            };
+            let mut runtime_context =
+                RuntimeToolActorContext::new("tui-task-stop", DEFAULT_MAX_TURNS);
+            runtime_context.execute_task_stop_tool(execution_request, task_registry)
         } else if matches!(
             execution_request.name,
             tool_types::ToolName::GetGoal

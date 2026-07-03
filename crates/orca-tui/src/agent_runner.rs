@@ -1,4 +1,6 @@
+use std::collections::VecDeque;
 use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -32,6 +34,30 @@ use crate::runtime_event_projection::tui_event_from_runtime_event;
 use crate::types::{TuiEvent, UserAction};
 
 pub(crate) const DEFAULT_MAX_TURNS: u32 = 128;
+
+pub(crate) type PendingWorkflowNotifications = Arc<Mutex<VecDeque<String>>>;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TuiAgentTurnResult {
+    pub(crate) status: String,
+    pub(crate) next_prompt: Option<String>,
+}
+
+impl TuiAgentTurnResult {
+    fn new(status: impl Into<String>) -> Self {
+        Self {
+            status: status.into(),
+            next_prompt: None,
+        }
+    }
+
+    fn with_next_prompt(status: impl Into<String>, next_prompt: String) -> Self {
+        Self {
+            status: status.into(),
+            next_prompt: Some(next_prompt),
+        }
+    }
+}
 
 fn send_error_for_tui(event_tx: &Sender<TuiEvent>, events: &mut EventFactory, message: &str) {
     send_runtime_event_as_tui(event_tx, events.error(message));
@@ -275,6 +301,29 @@ pub fn run_agent_for_tui(
     cancel: &CancelToken,
     allow_goal_tools: bool,
 ) -> String {
+    run_agent_for_tui_with_notification_queue(
+        config,
+        session,
+        prompt,
+        event_tx,
+        action_rx,
+        cancel,
+        allow_goal_tools,
+        None,
+    )
+    .status
+}
+
+pub(crate) fn run_agent_for_tui_with_notification_queue(
+    config: &RunConfig,
+    session: &mut TuiConversationSession,
+    prompt: &str,
+    event_tx: &Sender<TuiEvent>,
+    action_rx: &Receiver<UserAction>,
+    cancel: &CancelToken,
+    allow_goal_tools: bool,
+    pending_workflow_notifications: Option<&PendingWorkflowNotifications>,
+) -> TuiAgentTurnResult {
     let cwd = config
         .cwd
         .clone()
@@ -328,7 +377,7 @@ pub fn run_agent_for_tui(
                 orca_core::event_schema::RunStatus::BudgetExhausted,
             );
             session.complete("budget_exhausted");
-            return "budget_exhausted".to_string();
+            return TuiAgentTurnResult::new("budget_exhausted");
         }
 
         if orca_provider::context::needs_compaction_wire(
@@ -382,7 +431,7 @@ pub fn run_agent_for_tui(
                     orca_core::event_schema::RunStatus::Failed,
                 );
                 session.complete("failed");
-                return "failed".to_string();
+                return TuiAgentTurnResult::new("failed");
             }
         };
         let model_conversation =
@@ -455,7 +504,7 @@ pub fn run_agent_for_tui(
                     orca_core::event_schema::RunStatus::BudgetExhausted,
                 );
                 session.complete("budget_exhausted");
-                return "budget_exhausted".to_string();
+                return TuiAgentTurnResult::new("budget_exhausted");
             }
         }
 
@@ -466,7 +515,7 @@ pub fn run_agent_for_tui(
                 orca_core::event_schema::RunStatus::Cancelled,
             );
             session.complete("interrupted");
-            return "interrupted".to_string();
+            return TuiAgentTurnResult::new("interrupted");
         }
 
         if let Some(error) = response.steps.iter().find_map(|step| match step {
@@ -507,7 +556,7 @@ pub fn run_agent_for_tui(
                 orca_core::event_schema::RunStatus::Failed,
             );
             session.complete("failed");
-            return "failed".to_string();
+            return TuiAgentTurnResult::new("failed");
         }
 
         reactive_compacted = false;
@@ -567,7 +616,7 @@ pub fn run_agent_for_tui(
                 orca_core::event_schema::RunStatus::Success,
             );
             session.complete("success");
-            return "success".to_string();
+            return TuiAgentTurnResult::new("success");
         }
 
         session.conversation_mut().add_assistant(
@@ -617,7 +666,7 @@ pub fn run_agent_for_tui(
                             orca_core::event_schema::RunStatus::ApprovalRequired,
                         );
                         session.complete("approval_required");
-                        return "approval_required".to_string();
+                        return TuiAgentTurnResult::new("approval_required");
                     }
                 }
                 index = batch_end;
@@ -705,11 +754,28 @@ pub fn run_agent_for_tui(
                 };
                 send_session_completed_status_for_tui(event_tx, &mut runtime_events, status);
                 session.complete(status);
-                return status.to_string();
+                return TuiAgentTurnResult::new(status);
             }
             index += 1;
         }
+        if let Some(next_prompt) =
+            take_pending_workflow_notification(pending_workflow_notifications)
+        {
+            send_session_completed_for_tui(
+                event_tx,
+                &mut runtime_events,
+                orca_core::event_schema::RunStatus::Success,
+            );
+            session.complete("success");
+            return TuiAgentTurnResult::with_next_prompt("success", next_prompt);
+        }
     }
+}
+
+fn take_pending_workflow_notification(
+    pending_workflow_notifications: Option<&PendingWorkflowNotifications>,
+) -> Option<String> {
+    pending_workflow_notifications.and_then(|queue| queue.lock().ok()?.pop_front())
 }
 
 #[cfg(test)]
@@ -724,8 +790,10 @@ mod tests {
     use orca_runtime::instructions::ProjectInstructions;
     use orca_runtime::memory::MemoryBlock;
     use orca_runtime::tasks::TaskRegistry;
+    use std::collections::VecDeque;
     use std::path::Path;
     use std::sync::mpsc;
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     use orca_core::approval_types::ApprovalMode;
@@ -942,7 +1010,9 @@ mod tests {
 
     #[test]
     fn tui_session_exposes_runtime_owned_workflow_state() {
-        let config = config();
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = config();
+        config.cwd = Some(temp.path().to_path_buf());
         let session = TuiConversationSession::new_with_preloaded(&config, "workflow state", None)
             .expect("session");
 
@@ -960,6 +1030,133 @@ mod tests {
             .expect("running");
 
         assert!(session.has_active_workflows());
+    }
+
+    #[test]
+    fn tui_task_list_uses_runtime_task_registry() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = full_auto_config();
+        config.cwd = Some(temp.path().to_path_buf());
+        let (event_tx, event_rx) = mpsc::channel();
+        let (_action_tx, action_rx) = mpsc::channel();
+        let cancel = CancelToken::new();
+        let mut session = TuiConversationSession::new_with_preloaded(&config, "task_list", None)
+            .expect("session");
+        let task = session.runtime_session().task_registry().create_workflow(
+            "workflow-run-1".to_string(),
+            "mock-workflow".to_string(),
+            "demo workflow".to_string(),
+            1,
+        );
+        session
+            .runtime_session()
+            .task_registry()
+            .mark_running(&task.id)
+            .expect("mark workflow running");
+
+        run_agent_for_tui(
+            &config,
+            &mut session,
+            "task_list",
+            &event_tx,
+            &action_rx,
+            &cancel,
+            false,
+        );
+
+        let events: Vec<TuiEvent> = event_rx.try_iter().collect();
+        let task_list = events
+            .iter()
+            .find_map(|event| match event {
+                TuiEvent::ToolCompleted {
+                    name,
+                    status,
+                    output,
+                    ..
+                } if name == "task_list" => Some((status.as_str(), output.as_str())),
+                _ => None,
+            })
+            .expect("task_list tool completion");
+
+        assert_eq!(
+            task_list.0, "completed",
+            "expected completed task_list, got {}",
+            task_list.1
+        );
+        assert!(
+            task_list.1.contains("demo workflow"),
+            "expected runtime task output, got {}",
+            task_list.1
+        );
+        assert!(
+            !task_list
+                .1
+                .contains("task_list tool must be executed by the runtime"),
+            "TUI must not route task_list through the placeholder executor"
+        );
+    }
+
+    #[test]
+    fn failed_workflow_notification_is_returned_after_tool_batch_boundary() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = full_auto_config();
+        config.cwd = Some(temp.path().to_path_buf());
+        let (event_tx, event_rx) = mpsc::channel();
+        let (_action_tx, action_rx) = mpsc::channel();
+        let cancel = CancelToken::new();
+        let pending_notifications = Arc::new(Mutex::new(VecDeque::from([String::from(
+            "<task-notification><status>failed</status></task-notification>",
+        )])));
+        let mut session = TuiConversationSession::new_with_preloaded(&config, "task_list", None)
+            .expect("session");
+
+        let result = run_agent_for_tui_with_notification_queue(
+            &config,
+            &mut session,
+            "task_list",
+            &event_tx,
+            &action_rx,
+            &cancel,
+            false,
+            Some(&pending_notifications),
+        );
+
+        assert_eq!(result.status, "success");
+        assert_eq!(
+            result.next_prompt.as_deref(),
+            Some("<task-notification><status>failed</status></task-notification>")
+        );
+        assert!(pending_notifications.lock().unwrap().is_empty());
+        assert!(event_rx.try_iter().any(|event| {
+            matches!(event, TuiEvent::SessionCompleted { status } if status == "success")
+        }));
+    }
+
+    #[test]
+    fn empty_failed_workflow_notification_queue_does_not_inject_after_tool_batch() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = full_auto_config();
+        config.cwd = Some(temp.path().to_path_buf());
+        let (event_tx, _event_rx) = mpsc::channel();
+        let (_action_tx, action_rx) = mpsc::channel();
+        let cancel = CancelToken::new();
+        let pending_notifications = Arc::new(Mutex::new(VecDeque::new()));
+        let mut session = TuiConversationSession::new_with_preloaded(&config, "task_list", None)
+            .expect("session");
+
+        let result = run_agent_for_tui_with_notification_queue(
+            &config,
+            &mut session,
+            "task_list",
+            &event_tx,
+            &action_rx,
+            &cancel,
+            false,
+            Some(&pending_notifications),
+        );
+
+        assert_eq!(result.status, "success");
+        assert!(result.next_prompt.is_none());
     }
 
     #[test]

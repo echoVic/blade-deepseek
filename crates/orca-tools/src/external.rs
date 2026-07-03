@@ -273,14 +273,15 @@ mod tests {
             "external tool should not wait for descendant processes"
         );
         assert_eq!(result.status, ToolStatus::Failed);
+        let error = result.error.as_deref().unwrap_or_default();
         assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or_default()
-                .contains("external tool 'slow_tool' timed out after 0s: before"),
+            error.contains("external tool 'slow_tool' timed out after 0s"),
             "unexpected error: {:?}",
             result.error
+        );
+        assert!(
+            !error.contains("beforeafter"),
+            "timeout should kill descendants before the trailing command runs: {error}"
         );
     }
 

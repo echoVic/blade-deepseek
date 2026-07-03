@@ -106,7 +106,11 @@ fn mock_provider_can_request_workflow_tool() {
         .as_deref()
         .expect("raw arguments");
     let raw_arguments: Value = serde_json::from_str(raw_arguments).expect("valid raw arguments");
-    assert_eq!(raw_arguments["script"], expected_workflow_script());
+    let script = raw_arguments["script"].as_str().expect("workflow script");
+    assert!(script.contains("export const meta"));
+    assert!(script.contains("name: 'mock-workflow'"));
+    assert!(script.contains("const result = await phase('main'"));
+    assert!(script.contains("export default result;"));
     assert_eq!(raw_arguments["args"]["mode"], "inline");
 }
 

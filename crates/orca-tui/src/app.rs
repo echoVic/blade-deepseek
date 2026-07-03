@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::io;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -70,6 +71,8 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
 
     let (event_tx, event_rx) = mpsc::channel::<TuiEvent>();
     let (action_tx, action_rx) = mpsc::channel::<UserAction>();
+    let pending_workflow_failure_notifications: bridge::PendingWorkflowNotifications =
+        Arc::new(Mutex::new(VecDeque::new()));
 
     let model_name = config.model.display_name().to_string();
 
@@ -164,6 +167,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
     let agent_event_tx = event_tx.clone();
     let cancel_token = CancelToken::new();
     let agent_cancel = cancel_token.clone();
+    let agent_workflow_failure_notifications = Arc::clone(&pending_workflow_failure_notifications);
 
     let _agent_handle = std::thread::spawn(move || {
         agent_loop_thread(
@@ -172,6 +176,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
             agent_event_tx,
             action_rx,
             agent_cancel,
+            agent_workflow_failure_notifications,
         );
     });
 
@@ -722,12 +727,30 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                 TuiEvent::Backtracked { prompt } => Some(prompt.clone()),
                 _ => None,
             };
+            let workflow_notification_turn_boundary =
+                is_workflow_notification_turn_boundary(&tui_event);
+            let batch_queued_workflow_notification = queue_failed_workflow_notification(
+                &tui_event,
+                &pending_workflow_failure_notifications,
+                state.status == AppStatus::Running,
+            );
             state.update(tui_event);
+            if let Some(prompt) = batch_queued_workflow_notification {
+                remove_pending_workflow_notification(&mut state, &prompt);
+            }
             if let Some(prompt) = backtracked_prompt {
                 vim_state.reset_insert(&mut textarea, &theme);
                 textarea = make_textarea_with_text(&prompt, &vim_state, &theme);
             }
-            submit_pending_workflow_notification(&mut state, &action_tx);
+            if workflow_notification_turn_boundary {
+                drain_pending_workflow_failure_notifications(
+                    &mut state,
+                    &pending_workflow_failure_notifications,
+                );
+                submit_pending_workflow_notification(&mut state, &action_tx, false);
+            } else {
+                submit_pending_workflow_notification(&mut state, &action_tx, true);
+            }
             if state.auto_scroll {
                 state.scroll_to_bottom();
             }
@@ -760,8 +783,9 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
 fn submit_pending_workflow_notification(
     state: &mut AppState,
     action_tx: &mpsc::Sender<UserAction>,
+    require_idle: bool,
 ) {
-    if state.status != AppStatus::Idle {
+    if require_idle && state.status != AppStatus::Idle {
         return;
     }
     if let Some(prompt) = state.pending_workflow_notifications.pop_front() {
@@ -769,6 +793,49 @@ fn submit_pending_workflow_notification(
         state.scroll_to_bottom();
         let _ = action_tx.send(UserAction::Submit(prompt));
     }
+}
+
+fn queue_failed_workflow_notification(
+    event: &TuiEvent,
+    pending_notifications: &bridge::PendingWorkflowNotifications,
+    batch_injection_enabled: bool,
+) -> Option<String> {
+    if !batch_injection_enabled {
+        return None;
+    }
+    if let TuiEvent::WorkflowNotification { prompt, status, .. } = event
+        && status == "failed"
+        && let Ok(mut queue) = pending_notifications.lock()
+    {
+        queue.push_back(prompt.clone());
+        return Some(prompt.clone());
+    }
+    None
+}
+
+fn remove_pending_workflow_notification(state: &mut AppState, prompt: &str) {
+    if let Some(index) = state
+        .pending_workflow_notifications
+        .iter()
+        .position(|pending| pending == prompt)
+    {
+        state.pending_workflow_notifications.remove(index);
+    }
+}
+
+fn drain_pending_workflow_failure_notifications(
+    state: &mut AppState,
+    pending_notifications: &bridge::PendingWorkflowNotifications,
+) {
+    if let Ok(mut queue) = pending_notifications.lock() {
+        while let Some(prompt) = queue.pop_front() {
+            state.pending_workflow_notifications.push_back(prompt);
+        }
+    }
+}
+
+fn is_workflow_notification_turn_boundary(event: &TuiEvent) -> bool {
+    matches!(event, TuiEvent::SessionCompleted { .. })
 }
 
 fn shorten_home(path: &str) -> String {
@@ -900,6 +967,10 @@ mod tests {
         result
     }
 
+    fn test_pending_workflow_notifications() -> bridge::PendingWorkflowNotifications {
+        Arc::new(Mutex::new(VecDeque::new()))
+    }
+
     #[test]
     fn empty_recorded_session_goal_show_dispatches_agent_action() {
         let (mut state, rx) = test_state();
@@ -926,7 +997,16 @@ mod tests {
             let config = Arc::clone(&config);
             let preloaded = Arc::clone(&preloaded);
             let cancel = cancel.clone();
-            move || agent_loop_thread(config, preloaded, event_tx, action_rx, cancel)
+            move || {
+                agent_loop_thread(
+                    config,
+                    preloaded,
+                    event_tx,
+                    action_rx,
+                    cancel,
+                    test_pending_workflow_notifications(),
+                )
+            }
         });
 
         action_tx.send(UserAction::GoalShow).unwrap();
@@ -956,7 +1036,16 @@ mod tests {
                 let config = Arc::clone(&config);
                 let preloaded = Arc::clone(&preloaded);
                 let cancel = cancel.clone();
-                move || agent_loop_thread(config, preloaded, event_tx, action_rx, cancel)
+                move || {
+                    agent_loop_thread(
+                        config,
+                        preloaded,
+                        event_tx,
+                        action_rx,
+                        cancel,
+                        test_pending_workflow_notifications(),
+                    )
+                }
             });
 
             action_tx.send(action).unwrap();
@@ -989,7 +1078,16 @@ mod tests {
                 let config = Arc::clone(&config);
                 let preloaded = Arc::clone(&preloaded);
                 let cancel = cancel.clone();
-                move || agent_loop_thread(config, preloaded, event_tx, action_rx, cancel)
+                move || {
+                    agent_loop_thread(
+                        config,
+                        preloaded,
+                        event_tx,
+                        action_rx,
+                        cancel,
+                        test_pending_workflow_notifications(),
+                    )
+                }
             });
 
             action_tx.send(UserAction::GoalResume).unwrap();
@@ -1035,7 +1133,16 @@ mod tests {
                 let config = Arc::clone(&config);
                 let preloaded = Arc::clone(&preloaded);
                 let cancel = cancel.clone();
-                move || agent_loop_thread(config, preloaded, event_tx, action_rx, cancel)
+                move || {
+                    agent_loop_thread(
+                        config,
+                        preloaded,
+                        event_tx,
+                        action_rx,
+                        cancel,
+                        test_pending_workflow_notifications(),
+                    )
+                }
             });
 
             action_tx.send(UserAction::GoalResume).unwrap();
@@ -1090,7 +1197,16 @@ mod tests {
                 let config = Arc::clone(&config);
                 let preloaded = Arc::clone(&preloaded);
                 let cancel = cancel.clone();
-                move || agent_loop_thread(config, preloaded, event_tx, action_rx, cancel)
+                move || {
+                    agent_loop_thread(
+                        config,
+                        preloaded,
+                        event_tx,
+                        action_rx,
+                        cancel,
+                        test_pending_workflow_notifications(),
+                    )
+                }
             });
 
             action_tx.send(UserAction::GoalPause).unwrap();
@@ -1141,7 +1257,16 @@ mod tests {
                 let config = Arc::clone(&config);
                 let preloaded = Arc::clone(&preloaded);
                 let cancel = cancel.clone();
-                move || agent_loop_thread(config, preloaded, event_tx, action_rx, cancel)
+                move || {
+                    agent_loop_thread(
+                        config,
+                        preloaded,
+                        event_tx,
+                        action_rx,
+                        cancel,
+                        test_pending_workflow_notifications(),
+                    )
+                }
             });
 
             action_tx.send(UserAction::GoalShow).unwrap();
@@ -1172,7 +1297,16 @@ mod tests {
             let config = Arc::clone(&config);
             let preloaded = Arc::clone(&preloaded);
             let cancel = cancel.clone();
-            move || agent_loop_thread(config, preloaded, event_tx, action_rx, cancel)
+            move || {
+                agent_loop_thread(
+                    config,
+                    preloaded,
+                    event_tx,
+                    action_rx,
+                    cancel,
+                    test_pending_workflow_notifications(),
+                )
+            }
         });
 
         action_tx.send(UserAction::GoalShow).unwrap();
@@ -1199,13 +1333,152 @@ mod tests {
             .pending_workflow_notifications
             .push_back("<task-notification>done</task-notification>".to_string());
 
-        submit_pending_workflow_notification(&mut state, &action_tx);
+        submit_pending_workflow_notification(&mut state, &action_tx, true);
 
         assert_eq!(state.status, AppStatus::Running);
         assert!(matches!(
             action_rx.try_recv(),
             Ok(UserAction::Submit(prompt)) if prompt == "<task-notification>done</task-notification>"
         ));
+    }
+
+    #[test]
+    fn tool_completion_is_not_a_workflow_notification_turn_boundary() {
+        assert!(!is_workflow_notification_turn_boundary(
+            &TuiEvent::ToolCompleted {
+                id: "tool-1".to_string(),
+                name: "bash".to_string(),
+                status: "completed".to_string(),
+                output: String::new(),
+                diff: None,
+                kind: None,
+            }
+        ));
+        assert!(!is_workflow_notification_turn_boundary(
+            &TuiEvent::SubagentCompleted {
+                id: "agent-1".to_string(),
+                description: "inspect".to_string(),
+                status: "success".to_string(),
+                output: None,
+                error: None,
+            }
+        ));
+    }
+
+    #[test]
+    fn session_completion_submits_pending_workflow_notification() {
+        let (mut state, _rx) = test_state();
+        let (action_tx, action_rx) = mpsc::channel();
+        state.status = AppStatus::Running;
+        state
+            .pending_workflow_notifications
+            .push_back("<task-notification>failed</task-notification>".to_string());
+
+        assert!(is_workflow_notification_turn_boundary(
+            &TuiEvent::SessionCompleted {
+                status: "success".to_string(),
+            }
+        ));
+        submit_pending_workflow_notification(&mut state, &action_tx, false);
+
+        assert_eq!(state.status, AppStatus::Running);
+        assert!(matches!(
+            action_rx.try_recv(),
+            Ok(UserAction::Submit(prompt)) if prompt == "<task-notification>failed</task-notification>"
+        ));
+    }
+
+    #[test]
+    fn session_completion_drains_batch_boundary_queue_before_submitting_notification() {
+        let (mut state, _rx) = test_state();
+        let (action_tx, action_rx) = mpsc::channel();
+        let queue = test_pending_workflow_notifications();
+        queue
+            .lock()
+            .unwrap()
+            .push_back("<task-notification>failed</task-notification>".to_string());
+        state.status = AppStatus::Running;
+
+        drain_pending_workflow_failure_notifications(&mut state, &queue);
+        submit_pending_workflow_notification(&mut state, &action_tx, false);
+
+        assert!(queue.lock().unwrap().is_empty());
+        assert!(state.pending_workflow_notifications.is_empty());
+        assert_eq!(state.status, AppStatus::Running);
+        assert!(matches!(
+            action_rx.try_recv(),
+            Ok(UserAction::Submit(prompt)) if prompt == "<task-notification>failed</task-notification>"
+        ));
+    }
+
+    #[test]
+    fn only_failed_workflow_notifications_enter_batch_boundary_queue() {
+        let queue = test_pending_workflow_notifications();
+        queue_failed_workflow_notification(
+            &TuiEvent::WorkflowNotification {
+                prompt: "<task-notification>done</task-notification>".to_string(),
+                status: "completed".to_string(),
+                summary: "done".to_string(),
+            },
+            &queue,
+            true,
+        );
+        assert!(queue.lock().unwrap().is_empty());
+
+        let queued = queue_failed_workflow_notification(
+            &TuiEvent::WorkflowNotification {
+                prompt: "<task-notification>failed</task-notification>".to_string(),
+                status: "failed".to_string(),
+                summary: "failed".to_string(),
+            },
+            &queue,
+            true,
+        );
+        assert_eq!(
+            queued.as_deref(),
+            Some("<task-notification>failed</task-notification>")
+        );
+        assert_eq!(
+            queue.lock().unwrap().pop_front().as_deref(),
+            Some("<task-notification>failed</task-notification>")
+        );
+
+        let queued = queue_failed_workflow_notification(
+            &TuiEvent::WorkflowNotification {
+                prompt: "<task-notification>failed</task-notification>".to_string(),
+                status: "failed".to_string(),
+                summary: "failed".to_string(),
+            },
+            &queue,
+            false,
+        );
+        assert!(queued.is_none());
+        assert!(queue.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn batch_queued_workflow_notification_is_removed_from_ui_pending_queue() {
+        let (mut state, _rx) = test_state();
+        state
+            .pending_workflow_notifications
+            .push_back("<task-notification>completed</task-notification>".to_string());
+        state
+            .pending_workflow_notifications
+            .push_back("<task-notification>failed</task-notification>".to_string());
+
+        remove_pending_workflow_notification(
+            &mut state,
+            "<task-notification>failed</task-notification>",
+        );
+
+        assert_eq!(
+            state
+                .pending_workflow_notifications
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["<task-notification>completed</task-notification>"]
+        );
     }
 
     #[test]
@@ -2057,6 +2330,7 @@ fn run_goal_turns_for_tui(
     action_rx: &mpsc::Receiver<UserAction>,
     cancel: &CancelToken,
     starting_continuation: usize,
+    pending_workflow_failure_notifications: &bridge::PendingWorkflowNotifications,
 ) {
     let Some(session_id) = session.session_id().map(str::to_string) else {
         let _ = event_tx.send(TuiEvent::Error(
@@ -2077,8 +2351,17 @@ fn run_goal_turns_for_tui(
         }
         let before_usage = session.usage_totals();
         let started_at = std::time::Instant::now();
-        let status =
-            bridge::run_agent_for_tui(config, session, &prompt, event_tx, action_rx, cancel, true);
+        let turn_result = bridge::run_agent_for_tui_with_notification_queue(
+            config,
+            session,
+            &prompt,
+            event_tx,
+            action_rx,
+            cancel,
+            true,
+            Some(pending_workflow_failure_notifications),
+        );
+        let status = turn_result.status;
         let after_usage = session.usage_totals();
         let token_delta = after_usage
             .input_tokens
@@ -2112,6 +2395,13 @@ fn run_goal_turns_for_tui(
                 )));
             }
             break;
+        }
+        if let Some(next_prompt) = turn_result.next_prompt {
+            // Workflow failure notifications are diagnostic follow-ups for the turn that just
+            // finished, so they do not consume goal-continuation quota or wait for the next
+            // goal-status poll.
+            prompt = next_prompt;
+            continue;
         }
         if session.has_active_workflows() {
             let _ = event_tx.send(TuiEvent::Notice(
@@ -2159,6 +2449,7 @@ fn resume_latest_active_goal_for_tui(
     event_tx: &mpsc::Sender<TuiEvent>,
     action_rx: &mpsc::Receiver<UserAction>,
     cancel: &CancelToken,
+    pending_workflow_failure_notifications: &bridge::PendingWorkflowNotifications,
 ) {
     if matches!(config.lock().unwrap().history_mode, HistoryMode::Disabled) {
         let _ = event_tx.send(TuiEvent::Error(
@@ -2254,7 +2545,16 @@ fn resume_latest_active_goal_for_tui(
 
     if let Some(session) = session.as_mut() {
         let prompt = goal_continuation_prompt(&active_goal.objective, 1);
-        run_goal_turns_for_tui(&cfg, session, &prompt, event_tx, action_rx, cancel, 1);
+        run_goal_turns_for_tui(
+            &cfg,
+            session,
+            &prompt,
+            event_tx,
+            action_rx,
+            cancel,
+            1,
+            pending_workflow_failure_notifications,
+        );
     }
 }
 
@@ -2264,6 +2564,7 @@ fn agent_loop_thread(
     event_tx: mpsc::Sender<TuiEvent>,
     action_rx: mpsc::Receiver<UserAction>,
     cancel: CancelToken,
+    pending_workflow_failure_notifications: bridge::PendingWorkflowNotifications,
 ) {
     let mut session: Option<bridge::TuiConversationSession> = None;
     let mut pending_pinned_context: Vec<String> = Vec::new();
@@ -2311,6 +2612,7 @@ fn agent_loop_thread(
                     &action_rx,
                     &cancel,
                     0,
+                    &pending_workflow_failure_notifications,
                 );
                 if cfg.desktop_notifications {
                     let _ = orca_runtime::notify::notify("Orca", "Task completed");
@@ -2449,7 +2751,14 @@ fn agent_loop_thread(
                         if let Some(session) = session.as_mut() {
                             let cfg = config.lock().unwrap().clone();
                             run_goal_turns_for_tui(
-                                &cfg, session, &objective, &event_tx, &action_rx, &cancel, 0,
+                                &cfg,
+                                session,
+                                &objective,
+                                &event_tx,
+                                &action_rx,
+                                &cancel,
+                                0,
+                                &pending_workflow_failure_notifications,
                             );
                         }
                     }
@@ -2524,6 +2833,7 @@ fn agent_loop_thread(
                         &event_tx,
                         &action_rx,
                         &cancel,
+                        &pending_workflow_failure_notifications,
                     );
                     continue;
                 };
@@ -2542,7 +2852,14 @@ fn agent_loop_thread(
                         let cfg = config.lock().unwrap().clone();
                         let prompt = goal_continuation_prompt(&goal.objective, 1);
                         run_goal_turns_for_tui(
-                            &cfg, session, &prompt, &event_tx, &action_rx, &cancel, 1,
+                            &cfg,
+                            session,
+                            &prompt,
+                            &event_tx,
+                            &action_rx,
+                            &cancel,
+                            1,
+                            &pending_workflow_failure_notifications,
                         );
                     }
                 }

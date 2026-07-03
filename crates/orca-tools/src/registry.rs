@@ -658,7 +658,7 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
                     "mode": {
                         "type": "string",
                         "enum": ["sync", "async"],
-                        "description": "sync blocks until completion. async launches the child in the background and returns an agent_id for subagent_status."
+                        "description": "sync blocks until completion. Use async for long-running delegated work; it launches the child in the background, makes progress visible in task_list, and returns an agent_id for subagent_status."
                     },
                     "isolation": {
                         "type": "string",
@@ -816,7 +816,7 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
                 "properties": {
                     "script": {
                         "type": "string",
-                        "description": "Self-contained workflow script. Use export const meta = { name, description, phases: [{ name, tasks }] }, or export const meta = { name, description } plus export const phases = [{ name, tasks }]. String phase names are for hand-written agent()/phase() scripts."
+                        "description": "Self-contained workflow script. Auto mode uses export const meta = { name, description, phases: [{ name, tasks: [{ prompt: \"...\" }] }] }; every task must be an object with prompt. Hand-written mode uses string phase names plus top-level phase()/agent() calls and export default. Do not export `run` or helper functions; only export const meta, phases, args, or default."
                     },
                     "name": {
                         "type": "string",
@@ -2021,6 +2021,27 @@ mod tests {
                 .contains_key("shell_id"),
             "task_stop should accept package 3's deprecated shell_id alias"
         );
+    }
+
+    #[test]
+    fn workflow_and_subagent_schemas_document_runtime_contracts() {
+        let registry = default_tool_registry();
+
+        let workflow = registry.get("Workflow").expect("workflow tool");
+        let workflow_script_description =
+            workflow.spec().input_schema["properties"]["script"]["description"]
+                .as_str()
+                .expect("workflow script description");
+        assert!(workflow_script_description.contains("Do not export `run`"));
+        assert!(workflow_script_description.contains("tasks: [{ prompt:"));
+
+        let subagent = registry.get("subagent").expect("subagent tool");
+        let subagent_mode_description =
+            subagent.spec().input_schema["properties"]["mode"]["description"]
+                .as_str()
+                .expect("subagent mode description");
+        assert!(subagent_mode_description.contains("long-running"));
+        assert!(subagent_mode_description.contains("task_list"));
     }
 
     #[test]
