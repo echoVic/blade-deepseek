@@ -19,6 +19,7 @@ pub mod provider_turn;
 pub(crate) mod runtime_bash;
 mod runtime_normal_tool;
 pub(crate) mod runtime_special;
+pub(crate) mod sandbox_denial;
 pub mod schema_validation;
 pub mod server;
 pub mod server_runtime;

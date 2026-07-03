@@ -20,6 +20,10 @@ use crate::lifecycle::{
 };
 use crate::network_proxy::{RuntimeNetworkBlockReport, RuntimeNetworkPolicy, RuntimeNetworkProxy};
 use crate::protocol::{self, ClientOp, ServerEvent, Submission};
+use crate::sandbox_denial::{
+    SandboxDenialDiagnostic, diagnose_sandbox_denial,
+    should_request_filesystem_permission_with_denied_roots,
+};
 use crate::server_runtime::{
     PermissionProfileOverride, ServerRequestWriter, ServerThread, ServerThreadRuntime,
     thread_item_to_json, thread_run_config, thread_turn_to_json,
@@ -89,6 +93,8 @@ impl ServerState {
 struct CommandExecProcess {
     shell_id: Option<String>,
     command_event_id: Value,
+    cwd: PathBuf,
+    denied_writable_roots: Vec<PathBuf>,
     stream_output: bool,
     output_bytes_cap: Option<usize>,
     stdout_len: usize,
@@ -96,7 +102,7 @@ struct CommandExecProcess {
     stdout_cap_reached: bool,
     stderr_cap_reached: bool,
     network_permission_blocks: Option<mpsc::Receiver<RuntimeNetworkBlockReport>>,
-    network_permission_request: Option<PendingCommandExecPermissionRequest>,
+    permission_request: Option<PendingCommandExecPermissionRequest>,
     _network_proxy: Option<RuntimeNetworkProxy>,
 }
 
@@ -110,6 +116,10 @@ enum CommandExecDrainOutcome {
     NetworkPermissionRequired {
         request: PendingCommandExecPermissionRequest,
         block: RuntimeNetworkBlockReport,
+    },
+    FileSystemPermissionRequired {
+        request: PendingCommandExecPermissionRequest,
+        diagnostic: SandboxDenialDiagnostic,
     },
 }
 
@@ -370,13 +380,28 @@ impl CommandExecManager {
                         .network_permission_blocks
                         .and_then(command_exec_network_permission_block)
                     {
-                        let request = process.network_permission_request.expect(
+                        let request = process.permission_request.expect(
                             "command/exec process with network block reporter has retry request",
                         );
                         return Ok(CommandExecDrainOutcome::NetworkPermissionRequired {
                             request,
                             block,
                         });
+                    }
+                    if let Some(diagnostic) =
+                        diagnose_sandbox_denial(&process.cwd, &output.stdout, &output.stderr)
+                        && should_request_filesystem_permission_with_denied_roots(
+                            &process.cwd,
+                            &diagnostic,
+                            &process.denied_writable_roots,
+                        )
+                    {
+                        if let Some(request) = process.permission_request {
+                            return Ok(CommandExecDrainOutcome::FileSystemPermissionRequired {
+                                request,
+                                diagnostic,
+                            });
+                        }
                     }
                     protocol::write_server_event(
                         writer,
@@ -518,6 +543,7 @@ enum PendingPermissionRequest {
     },
 }
 
+#[derive(Clone)]
 struct PendingCommandExecPermissionRequest {
     thread_id: String,
     runtime_workspace_roots: Vec<PathBuf>,
@@ -700,10 +726,22 @@ fn handle_line<W: Write + Send + 'static>(
     };
     {
         let mut writer = writer.lock().map_err(lock_error)?;
-        if let CommandExecDrainOutcome::NetworkPermissionRequired { request, block } =
-            drain_command_exec_processes(state, &mut *writer)?
-        {
-            request_command_exec_network_permission(state, request, block, &mut *writer)?;
+        match drain_command_exec_processes(state, &mut *writer)? {
+            CommandExecDrainOutcome::NetworkPermissionRequired { request, block } => {
+                request_command_exec_network_permission(state, request, block, &mut *writer)?;
+            }
+            CommandExecDrainOutcome::FileSystemPermissionRequired {
+                request,
+                diagnostic,
+            } => {
+                request_command_exec_file_system_permission(
+                    state,
+                    request,
+                    diagnostic,
+                    &mut *writer,
+                )?;
+            }
+            CommandExecDrainOutcome::Drained => {}
         }
     }
 
@@ -963,9 +1001,7 @@ fn run_permission_respond<W: Write>(
                 return protocol::write_server_event(
                     writer,
                     &request.event_id,
-                    ServerEvent::error(format!(
-                        "command/exec network permission denied: {request_id}"
-                    )),
+                    ServerEvent::error(format!("command/exec permission denied: {request_id}")),
                 );
             }
             run_command_exec(
@@ -1563,13 +1599,9 @@ fn run_command_exec<W: Write>(
     }
     let mut retry_block_reporter = None;
     let mut retry_block_receiver = None;
-    let mut retry_request = None;
-    if thread_id.is_some() && options.permission_profile.is_some() {
-        let (block_sender, block_receiver) = mpsc::channel();
-        retry_block_reporter = Some(block_sender);
-        retry_block_receiver = Some(block_receiver);
-        retry_request = Some(PendingCommandExecPermissionRequest {
-            thread_id: thread_id.expect("checked command thread id").to_string(),
+    let command_permission_request =
+        thread_id.map(|thread_id| PendingCommandExecPermissionRequest {
+            thread_id: thread_id.to_string(),
             runtime_workspace_roots: runtime_workspace_roots.clone(),
             command: command.to_vec(),
             process_id: process_id.map(ToString::to_string),
@@ -1579,6 +1611,10 @@ fn run_command_exec<W: Write>(
             terminal,
             event_id: id.clone(),
         });
+    if command_permission_request.is_some() && options.permission_profile.is_some() {
+        let (block_sender, block_receiver) = mpsc::channel();
+        retry_block_reporter = Some(block_sender);
+        retry_block_receiver = Some(block_receiver);
     }
     if let Some(process_id) = process_id {
         if let Err(error) = state.command_exec.insert(
@@ -1586,6 +1622,8 @@ fn run_command_exec<W: Write>(
             CommandExecProcess {
                 shell_id: None,
                 command_event_id: id.clone(),
+                cwd: cwd.clone(),
+                denied_writable_roots: denied_writable_directories.clone(),
                 stream_output: terminal.is_pty() || options.stream_stdout_stderr,
                 output_bytes_cap: options
                     .output_bytes_cap
@@ -1595,7 +1633,7 @@ fn run_command_exec<W: Write>(
                 stdout_cap_reached: false,
                 stderr_cap_reached: false,
                 network_permission_blocks: retry_block_receiver.take(),
-                network_permission_request: retry_request.take(),
+                permission_request: command_permission_request.clone(),
                 _network_proxy: None,
             },
         ) {
@@ -1642,10 +1680,10 @@ fn run_command_exec<W: Write>(
     let manager = state.shell_manager(&cwd);
     let handle = match manager.spawn(ShellSessionCommand {
         command: command_text.clone(),
-        cwd,
+        cwd: cwd.clone(),
         additional_readable_directories: effective_sandbox.additional_readable_roots,
         additional_working_directories,
-        denied_working_directories: denied_writable_directories,
+        denied_working_directories: denied_writable_directories.clone(),
         allowed_unix_socket_roots: effective_sandbox.allowed_unix_socket_roots,
         env: command_env,
         description: command_text,
@@ -1685,14 +1723,24 @@ fn run_command_exec<W: Write>(
         } else {
             drain_command_exec_processes_with_timeout(state, writer, Duration::from_millis(250))?
         };
-        if let CommandExecDrainOutcome::NetworkPermissionRequired { request, block } = drain_outcome
-        {
-            return request_command_exec_network_permission(state, request, block, writer);
+        match drain_outcome {
+            CommandExecDrainOutcome::NetworkPermissionRequired { request, block } => {
+                return request_command_exec_network_permission(state, request, block, writer);
+            }
+            CommandExecDrainOutcome::FileSystemPermissionRequired {
+                request,
+                diagnostic,
+            } => {
+                return request_command_exec_file_system_permission(
+                    state, request, diagnostic, writer,
+                );
+            }
+            CommandExecDrainOutcome::Drained => {}
         }
         return Ok(());
     }
 
-    let output = match state
+    let mut output = match state
         .shell_sessions
         .as_mut()
         .expect("command exec shell manager")
@@ -1707,10 +1755,22 @@ fn run_command_exec<W: Write>(
             );
         }
     };
-    if let (Some(request), Some(blocked_hosts)) = (retry_request, retry_block_receiver)
+    if let (Some(request), Some(blocked_hosts)) =
+        (command_permission_request.clone(), retry_block_receiver)
         && let Some(block) = command_exec_network_permission_block(blocked_hosts)
     {
         return request_command_exec_network_permission(state, request, block, writer);
+    }
+    if let Some(diagnostic) = diagnose_sandbox_denial(&cwd, &output.stdout, &output.stderr) {
+        if should_request_filesystem_permission_with_denied_roots(
+            &cwd,
+            &diagnostic,
+            &denied_writable_directories,
+        ) && let Some(request) = command_permission_request
+        {
+            return request_command_exec_file_system_permission(state, request, diagnostic, writer);
+        }
+        append_sandbox_diagnostic_to_stderr(&mut output.stderr, &diagnostic);
     }
     protocol::write_server_event(
         writer,
@@ -1748,15 +1808,6 @@ fn request_command_exec_network_permission<W: Write>(
     block: RuntimeNetworkBlockReport,
     writer: &mut W,
 ) -> io::Result<()> {
-    let thread_id = request.thread_id.clone();
-    let request_id = format!(
-        "permission-command-{}",
-        request
-            .event_id
-            .as_str()
-            .map(ToString::to_string)
-            .unwrap_or_else(|| request.event_id.to_string())
-    );
     let mut domains = HashMap::new();
     domains.insert(
         block.host.clone(),
@@ -1769,6 +1820,69 @@ fn request_command_exec_network_permission<W: Write>(
             domains,
         }),
     };
+    request_command_exec_permission(
+        state,
+        request,
+        format!(
+            "command/exec attempted network access to {} ({})",
+            block.host, block.error
+        ),
+        permissions,
+        writer,
+    )
+}
+
+fn request_command_exec_file_system_permission<W: Write>(
+    state: &mut ServerState,
+    request: PendingCommandExecPermissionRequest,
+    diagnostic: SandboxDenialDiagnostic,
+    writer: &mut W,
+) -> io::Result<()> {
+    let Some(write_root) = diagnostic.suggested_write_root.clone() else {
+        let mut stderr = String::new();
+        append_sandbox_diagnostic_to_stderr(&mut stderr, &diagnostic);
+        return protocol::write_server_event(
+            writer,
+            &request.event_id,
+            ServerEvent::CommandExecCompleted {
+                process_id: request
+                    .process_id
+                    .as_ref()
+                    .map(|process_id| Value::from(process_id.clone()))
+                    .unwrap_or(Value::Null),
+                exit_code: Value::Null,
+                stdout: Value::from(""),
+                stderr: Value::from(stderr),
+            },
+        );
+    };
+    let permissions = protocol::RequestPermissionProfile {
+        file_system: Some(protocol::RequestFileSystemPermissions {
+            read: None,
+            write: Some(vec![write_root]),
+            entries: None,
+        }),
+        network: None,
+    };
+    request_command_exec_permission(state, request, diagnostic.message, permissions, writer)
+}
+
+fn request_command_exec_permission<W: Write>(
+    state: &mut ServerState,
+    request: PendingCommandExecPermissionRequest,
+    reason: String,
+    permissions: protocol::RequestPermissionProfile,
+    writer: &mut W,
+) -> io::Result<()> {
+    let thread_id = request.thread_id.clone();
+    let request_id = format!(
+        "permission-command-{}",
+        request
+            .event_id
+            .as_str()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| request.event_id.to_string())
+    );
     {
         let mut pending = state.pending_permissions.lock().map_err(lock_error)?;
         pending.insert(
@@ -1783,13 +1897,18 @@ fn request_command_exec_network_permission<W: Write>(
             request_id: json!(request_id),
             thread_id: json!(thread_id),
             turn_id: Value::Null,
-            reason: json!(format!(
-                "command/exec attempted network access to {} ({})",
-                block.host, block.error
-            )),
+            reason: json!(reason),
             permissions: serde_json::to_value(&permissions).unwrap_or(Value::Null),
         },
     )
+}
+
+fn append_sandbox_diagnostic_to_stderr(stderr: &mut String, diagnostic: &SandboxDenialDiagnostic) {
+    if stderr.trim_end().is_empty() {
+        *stderr = diagnostic.message.clone();
+    } else {
+        stderr.push_str(&format!("\n\nSandbox diagnostic: {}", diagnostic.message));
+    }
 }
 
 fn shell_sandbox_mode_from_command_policy(
@@ -3775,6 +3894,203 @@ enabled = true
     }
 
     #[test]
+    fn command_exec_filesystem_sandbox_denial_requests_permission_and_retries() {
+        if !std::process::Command::new("sandbox-exec")
+            .arg("-p")
+            .arg("(version 1) (allow default)")
+            .arg("true")
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+        {
+            return;
+        }
+
+        with_orca_home(|home| {
+            let repo = home.join("repo");
+            let git_dir = repo.join(".git");
+            std::fs::create_dir_all(&git_dir).expect("git dir");
+            let index_lock = git_dir.join("index.lock");
+            let mut config = test_run_config();
+            config.cwd = Some(repo.clone());
+            config.history_mode = HistoryMode::Record;
+            let server_config = ServerConfig { run_config: config };
+            let mut state = ServerState::default();
+            let writer = Arc::new(Mutex::new(Vec::new()));
+
+            handle_line(
+                &server_config,
+                &mut state,
+                r#"{"id":"thread","method":"thread/start","params":{}}"#,
+                Arc::clone(&writer),
+            )
+            .expect("thread start");
+            let thread_id = parse_jsonl(&writer.lock().expect("writer").clone())
+                .into_iter()
+                .find(|event| event["event"] == "thread_started")
+                .and_then(|event| event["threadId"].as_str().map(ToString::to_string))
+                .expect("thread id");
+
+            let request = format!(
+                r#"{{"id":"cmd-fs","method":"command/exec","params":{{"threadId":"{thread_id}","command":["sh","-lc",{}],"timeoutMs":5000}}}}"#,
+                serde_json::to_string(&format!("printf locked > {}", index_lock.display()))
+                    .expect("command json")
+            );
+            handle_line(&server_config, &mut state, &request, Arc::clone(&writer))
+                .expect("command exec");
+            let events = parse_jsonl(&writer.lock().expect("writer").clone());
+            let permission_request = events
+                .iter()
+                .find(|event| event["event"] == "permission_request")
+                .expect("permission request");
+            let request_id = permission_request["requestId"]
+                .as_str()
+                .expect("request id")
+                .to_string();
+            assert_eq!(permission_request["threadId"], thread_id);
+            assert_eq!(
+                permission_request["permissions"]["fileSystem"]["write"][0],
+                git_dir.display().to_string()
+            );
+            assert!(
+                permission_request["reason"]
+                    .as_str()
+                    .is_some_and(|reason| reason.contains("sandbox denied")),
+                "permission request should explain sandbox denial: {permission_request:?}"
+            );
+            assert!(
+                events
+                    .iter()
+                    .all(|event| event["event"] != "command_exec_completed"),
+                "command should wait for permission before completing: {events:?}"
+            );
+
+            let response = format!(
+                r#"{{"id":"perm-allow","method":"permission/respond","params":{{"requestId":"{request_id}","decision":"allow","scope":"session","permissions":{{"fileSystem":{{"write":["{}"],"read":null}},"network":null}}}}}}"#,
+                git_dir.display()
+            );
+            handle_line(&server_config, &mut state, &response, Arc::clone(&writer))
+                .expect("permission response");
+            let events = parse_jsonl(&writer.lock().expect("writer").clone());
+            let completed = events
+                .iter()
+                .find(|event| event["event"] == "command_exec_completed")
+                .expect("command completed");
+            assert_eq!(completed["exitCode"], 0);
+            assert_eq!(std::fs::read_to_string(&index_lock).unwrap(), "locked");
+            let read = crate::thread_store::SessionStore::new()
+                .load_session(&thread_id)
+                .expect("stored thread");
+            assert!(
+                read.meta
+                    .additional_working_directories
+                    .iter()
+                    .any(|directory| directory.path == git_dir)
+            );
+        });
+    }
+
+    #[test]
+    fn command_exec_streaming_filesystem_sandbox_denial_requests_permission_and_retries() {
+        if !std::process::Command::new("sandbox-exec")
+            .arg("-p")
+            .arg("(version 1) (allow default)")
+            .arg("true")
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+        {
+            return;
+        }
+
+        with_orca_home(|home| {
+            let repo = home.join("repo-stream");
+            let git_dir = repo.join(".git");
+            std::fs::create_dir_all(&git_dir).expect("git dir");
+            let index_lock = git_dir.join("index.lock");
+            let mut config = test_run_config();
+            config.cwd = Some(repo.clone());
+            config.history_mode = HistoryMode::Record;
+            let server_config = ServerConfig { run_config: config };
+            let mut state = ServerState::default();
+            let writer = Arc::new(Mutex::new(Vec::new()));
+
+            handle_line(
+                &server_config,
+                &mut state,
+                r#"{"id":"thread","method":"thread/start","params":{}}"#,
+                Arc::clone(&writer),
+            )
+            .expect("thread start");
+            let thread_id = parse_jsonl(&writer.lock().expect("writer").clone())
+                .into_iter()
+                .find(|event| event["event"] == "thread_started")
+                .and_then(|event| event["threadId"].as_str().map(ToString::to_string))
+                .expect("thread id");
+
+            let request = format!(
+                r#"{{"id":"cmd-fs-stream","method":"command/exec","params":{{"threadId":"{thread_id}","command":["sh","-lc",{}],"processId":"fs-stream-1","streamStdoutStderr":true,"timeoutMs":5000}}}}"#,
+                serde_json::to_string(&format!("printf locked > {}", index_lock.display()))
+                    .expect("command json")
+            );
+            handle_line(&server_config, &mut state, &request, Arc::clone(&writer))
+                .expect("command exec");
+            let events = parse_jsonl(&writer.lock().expect("writer").clone());
+            assert!(
+                events.iter().any(|event| {
+                    event["event"] == "command_exec_started" && event["processId"] == "fs-stream-1"
+                }),
+                "streaming command should initially start: {events:?}"
+            );
+            let permission_request = events
+                .iter()
+                .find(|event| event["event"] == "permission_request")
+                .expect("permission request");
+            let request_id = permission_request["requestId"]
+                .as_str()
+                .expect("request id")
+                .to_string();
+            assert_eq!(
+                permission_request["permissions"]["fileSystem"]["write"][0],
+                git_dir.display().to_string()
+            );
+
+            let response = format!(
+                r#"{{"id":"perm-allow","method":"permission/respond","params":{{"requestId":"{request_id}","decision":"allow","scope":"session","permissions":{{"fileSystem":{{"write":["{}"],"read":null}},"network":null}}}}}}"#,
+                git_dir.display()
+            );
+            handle_line(&server_config, &mut state, &response, Arc::clone(&writer))
+                .expect("permission response");
+            drain_command_exec_processes_with_timeout(
+                &mut state,
+                &mut *writer.lock().expect("writer"),
+                Duration::from_secs(2),
+            )
+            .expect("drain retried process");
+            let events = parse_jsonl(&writer.lock().expect("writer").clone());
+            let starts = events
+                .iter()
+                .filter(|event| {
+                    event["event"] == "command_exec_started" && event["processId"] == "fs-stream-1"
+                })
+                .count();
+            assert_eq!(
+                starts, 2,
+                "same process id should restart after grant: {events:?}"
+            );
+            let completed = events
+                .iter()
+                .find(|event| {
+                    event["event"] == "command_exec_completed"
+                        && event["processId"] == "fs-stream-1"
+                })
+                .expect("command completed");
+            assert_eq!(completed["exitCode"], 0);
+            assert_eq!(std::fs::read_to_string(&index_lock).unwrap(), "locked");
+        });
+    }
+
+    #[test]
     fn command_exec_streaming_permission_profile_block_requests_permission_and_retries_process() {
         with_orca_home(|home| {
             let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind test server");
@@ -4747,6 +5063,8 @@ enabled = true
         CommandExecProcess {
             shell_id: Some(shell_id.to_string()),
             command_event_id: Value::from("cmd"),
+            cwd: PathBuf::from("/tmp"),
+            denied_writable_roots: Vec::new(),
             stream_output: false,
             output_bytes_cap: None,
             stdout_len: 0,
@@ -4754,7 +5072,7 @@ enabled = true
             stdout_cap_reached: false,
             stderr_cap_reached: false,
             network_permission_blocks: None,
-            network_permission_request: None,
+            permission_request: None,
             _network_proxy: None,
         }
     }

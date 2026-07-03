@@ -153,6 +153,7 @@ fn workspace_write_profile(
 ) -> String {
     let cwd_escaped = seatbelt_escape(&cwd.display().to_string());
     let additional_read_rules = read_allow_rules(readable_roots);
+    let protected_metadata_rules = protected_workspace_metadata_deny_rules(cwd);
     let additional_write_rules = additional_roots
         .iter()
         .map(|root| {
@@ -221,6 +222,7 @@ fn workspace_write_profile(
 {additional_read_rules}
 {tmpdir_write}
 {slash_tmp_write}
+{protected_metadata_rules}
 {additional_write_rules}
 {denied_access_rules}
 {ssh_deny}
@@ -324,6 +326,19 @@ fn access_deny_rules(denied_roots: &[PathBuf]) -> String {
         .join("\n")
 }
 
+fn protected_workspace_metadata_deny_rules(cwd: &Path) -> String {
+    [".git", ".agents", ".codex"]
+        .into_iter()
+        .map(|name| {
+            format!(
+                r#"(deny file-read* file-write* (subpath "{}"))"#,
+                seatbelt_escape(&cwd.join(name).display().to_string())
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn seatbelt_escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
@@ -369,6 +384,100 @@ mod tests {
             deny_pos > allow_write_pos,
             "deny must come after allow for last-match-wins"
         );
+    }
+
+    #[test]
+    fn workspace_write_profile_protects_workspace_metadata_by_default() {
+        let workspace = TempDir::new().unwrap();
+        let profile =
+            workspace_write_profile(workspace.path(), &[], &[], &[], true, false, false, &[]);
+        let allow_workspace = format!(
+            r#"(allow file-write* (subpath "{}"))"#,
+            workspace.path().display()
+        );
+        let deny_git = format!(
+            r#"(deny file-read* file-write* (subpath "{}"))"#,
+            workspace.path().join(".git").display()
+        );
+
+        assert!(profile.contains(&deny_git), "{profile}");
+        assert!(
+            profile.find(&deny_git).unwrap() > profile.find(&allow_workspace).unwrap(),
+            "metadata deny must override workspace write: {profile}"
+        );
+    }
+
+    #[test]
+    fn workspace_write_profile_allows_explicit_metadata_write_root() {
+        let workspace = TempDir::new().unwrap();
+        let git_dir = workspace.path().join(".git");
+        let profile = workspace_write_profile(
+            workspace.path(),
+            &[],
+            std::slice::from_ref(&git_dir),
+            &[],
+            true,
+            false,
+            false,
+            &[],
+        );
+        let deny_git = format!(
+            r#"(deny file-read* file-write* (subpath "{}"))"#,
+            git_dir.display()
+        );
+        let allow_git = format!(r#"(allow file-write* (subpath "{}"))"#, git_dir.display());
+
+        assert!(profile.contains(&deny_git), "{profile}");
+        assert!(profile.contains(&allow_git), "{profile}");
+        assert!(
+            profile.find(&allow_git).unwrap() > profile.find(&deny_git).unwrap(),
+            "explicit metadata grant must override default metadata protection: {profile}"
+        );
+    }
+
+    #[test]
+    fn workspace_write_sandbox_blocks_workspace_git_writes_by_default() {
+        if !available() {
+            return;
+        }
+
+        let workspace = TempDir::new_in(std::env::current_dir().unwrap()).unwrap();
+        let git_dir = workspace.path().join(".git");
+        std::fs::create_dir(&git_dir).unwrap();
+        let target = git_dir.join("config");
+
+        let output = bash_command(
+            &format!("printf blocked > {}", target.display()),
+            workspace.path(),
+        )
+        .output()
+        .unwrap();
+
+        assert!(!output.status.success());
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn workspace_write_sandbox_allows_explicit_workspace_git_write_root() {
+        if !available() {
+            return;
+        }
+
+        let workspace = TempDir::new_in(std::env::current_dir().unwrap()).unwrap();
+        let git_dir = workspace.path().join(".git");
+        std::fs::create_dir(&git_dir).unwrap();
+        let target = git_dir.join("config");
+
+        let output = bash_command_with_additional_roots(
+            &format!("printf allowed > {}", target.display()),
+            workspace.path(),
+            std::slice::from_ref(&git_dir),
+        )
+        .output()
+        .unwrap();
+
+        assert!(output.status.success());
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "allowed");
     }
 
     #[test]

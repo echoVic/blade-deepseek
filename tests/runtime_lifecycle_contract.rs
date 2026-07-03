@@ -1306,6 +1306,195 @@ fn tool_actor_context_allows_bash_writes_to_additional_working_directories() {
 }
 
 #[test]
+fn tool_actor_context_retries_bash_after_filesystem_permission_grant() {
+    if !sandbox_seatbelt_available() {
+        return;
+    }
+
+    struct AllowRequestedFileSystem;
+
+    impl RuntimePermissionRequestHandler for AllowRequestedFileSystem {
+        fn request_permissions(
+            &self,
+            request: &RuntimePermissionRequest,
+        ) -> std::io::Result<RuntimePermissionResponse> {
+            let file_system = request
+                .permissions
+                .file_system
+                .as_ref()
+                .expect("filesystem permission request");
+            let write_roots = file_system.write.as_ref().expect("write roots");
+            assert_eq!(write_roots.len(), 1);
+
+            Ok(RuntimePermissionResponse {
+                decision: PermissionResponseDecision::Allow,
+                scope: PermissionGrantScope::Turn,
+                permissions: request.permissions.clone(),
+                strict_auto_review: false,
+            })
+        }
+    }
+
+    let parent =
+        tempfile::tempdir_in(std::env::current_dir().expect("cwd")).expect("sandbox parent");
+    let workspace = parent.path().join("workspace");
+    let outside = parent.path().join("outside");
+    std::fs::create_dir(&workspace).expect("workspace dir");
+    std::fs::create_dir(&outside).expect("outside dir");
+    let outside_file = outside.join("granted.txt");
+    let mut context = RuntimeToolActorContext::new("run-tools", 2);
+    let mut config = test_run_config();
+    config.cwd = Some(workspace.clone());
+    let task_registry = TaskRegistry::new("run-tools".to_string());
+    let request = ToolRequest {
+        id: "tool-1".to_string(),
+        name: ToolName::Bash,
+        action: ActionKind::Shell,
+        target: Some(format!("printf granted > {}", outside_file.display())),
+        raw_arguments: None,
+    };
+
+    let result = context.execute_normal_tool_with_roots_and_cancel(
+        Some(&config),
+        &request,
+        &workspace,
+        &[],
+        &McpRegistry::default(),
+        &[],
+        ToolConfig::default().output_truncation,
+        5,
+        Some(&task_registry),
+        None,
+        Some(&AllowRequestedFileSystem),
+    );
+
+    assert_eq!(result.status, orca_core::tool_types::ToolStatus::Completed);
+    assert_eq!(std::fs::read_to_string(outside_file).unwrap(), "granted");
+}
+
+#[test]
+fn tool_actor_context_retries_workspace_git_write_after_permission_grant() {
+    if !sandbox_seatbelt_available() {
+        return;
+    }
+
+    struct AllowGitDirectory {
+        git_dir: std::path::PathBuf,
+    }
+
+    impl RuntimePermissionRequestHandler for AllowGitDirectory {
+        fn request_permissions(
+            &self,
+            request: &RuntimePermissionRequest,
+        ) -> std::io::Result<RuntimePermissionResponse> {
+            let write_roots = request
+                .permissions
+                .file_system
+                .as_ref()
+                .and_then(|file_system| file_system.write.as_ref())
+                .expect("filesystem write roots");
+            assert_eq!(write_roots, &[self.git_dir.clone()]);
+
+            Ok(RuntimePermissionResponse {
+                decision: PermissionResponseDecision::Allow,
+                scope: PermissionGrantScope::Turn,
+                permissions: request.permissions.clone(),
+                strict_auto_review: false,
+            })
+        }
+    }
+
+    let repo = tempfile::tempdir_in(std::env::current_dir().expect("cwd")).expect("repo");
+    let git_dir = repo.path().join(".git");
+    std::fs::create_dir(&git_dir).expect("git dir");
+    let index_lock = git_dir.join("index.lock");
+    let mut context = RuntimeToolActorContext::new("run-tools", 2);
+    let mut config = test_run_config();
+    config.cwd = Some(repo.path().to_path_buf());
+    let task_registry = TaskRegistry::new("run-tools".to_string());
+    let request = ToolRequest {
+        id: "tool-1".to_string(),
+        name: ToolName::Bash,
+        action: ActionKind::Shell,
+        target: Some(format!("printf locked > {}", index_lock.display())),
+        raw_arguments: None,
+    };
+
+    let result = context.execute_normal_tool_with_roots_and_cancel(
+        Some(&config),
+        &request,
+        repo.path(),
+        &[],
+        &McpRegistry::default(),
+        &[],
+        ToolConfig::default().output_truncation,
+        5,
+        Some(&task_registry),
+        None,
+        Some(&AllowGitDirectory {
+            git_dir: git_dir.clone(),
+        }),
+    );
+
+    assert_eq!(result.status, orca_core::tool_types::ToolStatus::Completed);
+    assert_eq!(std::fs::read_to_string(index_lock).unwrap(), "locked");
+}
+
+#[test]
+fn tool_actor_context_reports_git_index_lock_sandbox_denial() {
+    if !sandbox_seatbelt_available() {
+        return;
+    }
+
+    let parent =
+        tempfile::tempdir_in(std::env::current_dir().expect("cwd")).expect("sandbox parent");
+    let repo = parent.path().join("repo");
+    let workspace = repo.join("web");
+    let git_dir = repo.join(".git");
+    std::fs::create_dir_all(&workspace).expect("workspace dir");
+    std::fs::create_dir(&git_dir).expect("git dir");
+    let index_lock = git_dir.join("index.lock");
+    let mut context = RuntimeToolActorContext::new("run-tools", 2);
+    let mut config = test_run_config();
+    config.cwd = Some(workspace.clone());
+    let task_registry = TaskRegistry::new("run-tools".to_string());
+    let request = ToolRequest {
+        id: "tool-1".to_string(),
+        name: ToolName::Bash,
+        action: ActionKind::Shell,
+        target: Some(format!(
+            "printf 'fatal: Unable to create '\\''{}'\\'': Operation not permitted\\n' >&2; exit 128",
+            index_lock.display()
+        )),
+        raw_arguments: None,
+    };
+
+    let result = context.execute_normal_tool_with_roots_and_cancel(
+        Some(&config),
+        &request,
+        &workspace,
+        &[],
+        &McpRegistry::default(),
+        &[],
+        ToolConfig::default().output_truncation,
+        5,
+        Some(&task_registry),
+        None,
+        None,
+    );
+
+    assert_eq!(result.status, orca_core::tool_types::ToolStatus::Failed);
+    let output = result.error.as_deref().expect("tool error");
+    assert!(output.contains("not a stale git lock"), "{output}");
+    assert!(output.contains("sandbox"), "{output}");
+    assert!(output.contains(&repo.display().to_string()), "{output}");
+    assert!(
+        output.contains(&workspace.display().to_string()),
+        "{output}"
+    );
+}
+
+#[test]
 fn tool_actor_context_reuses_one_runtime_task_for_approval_hooks_and_execution() {
     let mut context = RuntimeToolActorContext::new("run-tools", 2);
     let task_registry = orca_runtime::tasks::TaskRegistry::new("run-tools".to_string());

@@ -12,8 +12,12 @@ use crate::lifecycle::{
 };
 use crate::network_proxy::{RuntimeNetworkBlockReport, RuntimeNetworkPolicy, RuntimeNetworkProxy};
 use crate::protocol::{
-    CommandExecOptions, PermissionResponseDecision, RequestNetworkPermissions,
-    RequestPermissionProfile,
+    CommandExecOptions, PermissionResponseDecision, RequestFileSystemPermissions,
+    RequestNetworkPermissions, RequestPermissionProfile,
+};
+use crate::sandbox_denial::{
+    SandboxDenialDiagnostic, diagnose_sandbox_denial,
+    should_request_filesystem_permission_with_denied_roots,
 };
 use crate::shell_session::{
     RuntimeShellSessionManager, ShellSandboxMode, ShellSessionCommand, ShellTerminalMode,
@@ -136,6 +140,73 @@ pub(crate) fn execute_bash_with_shell_session(
         .output
         .into_tool_result(request, output_truncation, cancel, task_registry);
     }
+    if let Some(diagnostic) = output.sandbox_denial_diagnostic(cwd) {
+        if should_request_filesystem_permission_with_denied_roots(
+            cwd,
+            &diagnostic,
+            &sandbox.denied_writable_roots,
+        ) && let (Some(permission_handler), Some(write_root)) = (
+            permission_handler,
+            diagnostic.suggested_write_root.as_ref().cloned(),
+        ) {
+            let permissions = RequestPermissionProfile {
+                file_system: Some(RequestFileSystemPermissions {
+                    read: None,
+                    write: Some(vec![write_root.clone()]),
+                    entries: None,
+                }),
+                network: None,
+            };
+            let permission_request = RuntimePermissionRequest {
+                id: request.id.clone(),
+                reason: Some(format!(
+                    "bash attempted filesystem write outside the current sandbox: {}",
+                    write_root.display()
+                )),
+                permissions,
+            };
+            let response = match permission_overlay
+                .request_and_merge(permission_handler, permission_request)
+            {
+                Ok(response) => response,
+                Err(error) => return ToolResult::failed(request, error.to_string(), None),
+            };
+            if response.decision == PermissionResponseDecision::Deny {
+                return ToolResult::denied(request, "permission request denied".to_string());
+            }
+
+            let mut retry_sandbox = sandbox;
+            if let Some(file_system) = response.permissions.file_system
+                && let Some(write_roots) = file_system.write
+            {
+                for root in write_roots {
+                    push_unique_path(&mut retry_sandbox.additional_writable_roots, root);
+                }
+            }
+            for root in permission_overlay.additional_working_directories() {
+                push_unique_path(&mut retry_sandbox.additional_writable_roots, root.clone());
+            }
+
+            return execute_bash_with_sandbox(
+                command,
+                cwd,
+                additional_roots,
+                &retry_sandbox,
+                shell_timeout_secs,
+                task_registry,
+                cancel,
+            )
+            .output
+            .with_sandbox_diagnostic(cwd)
+            .into_tool_result(request, output_truncation, cancel, task_registry);
+        }
+        return output.with_diagnostic(diagnostic).into_tool_result(
+            request,
+            output_truncation,
+            cancel,
+            task_registry,
+        );
+    }
     output.into_tool_result(request, output_truncation, cancel, task_registry)
 }
 
@@ -167,6 +238,34 @@ struct BashShellOutput {
 }
 
 impl BashShellOutput {
+    fn sandbox_denial_diagnostic(&self, cwd: &Path) -> Option<SandboxDenialDiagnostic> {
+        let output = self.output.as_ref().ok()?;
+        if output.status == TaskStatus::Completed {
+            return None;
+        }
+        diagnose_sandbox_denial(cwd, &output.stdout, &output.stderr)
+    }
+
+    fn with_sandbox_diagnostic(self, cwd: &Path) -> Self {
+        let Some(diagnostic) = self.sandbox_denial_diagnostic(cwd) else {
+            return self;
+        };
+        self.with_diagnostic(diagnostic)
+    }
+
+    fn with_diagnostic(mut self, diagnostic: SandboxDenialDiagnostic) -> Self {
+        if let Ok(output) = &mut self.output {
+            if output.stderr.trim_end().is_empty() {
+                output.stderr = diagnostic.message;
+            } else {
+                output
+                    .stderr
+                    .push_str(&format!("\n\nSandbox diagnostic: {}", diagnostic.message));
+            }
+        }
+        self
+    }
+
     fn into_tool_result(
         self,
         request: &ToolRequest,
@@ -219,6 +318,12 @@ impl BashShellOutput {
         let mut result = ToolResult::failed(request, message, output.exit_code);
         result.truncated = truncated;
         result
+    }
+}
+
+fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if !paths.contains(&path) {
+        paths.push(path);
     }
 }
 
