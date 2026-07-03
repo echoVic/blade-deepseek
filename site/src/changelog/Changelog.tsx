@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.106":
+        "The normal-tool fallback path is now injectable through a focused RuntimeNormalToolFallbackExecutor boundary. MCP, TOML external, and built-in tool execution still use the same default orca-tools path, but the runtime can now test fallback context handoff without hardcoding that implementation.",
       "v0.1.105":
         "Normal tool execution now lives behind a focused RuntimeNormalToolExecutor boundary. The shell-session bash branch and the MCP/external/built-in fallback path move out of lifecycle.rs, while CLI, TUI, server, workflow, permission, and model-visible tool behavior stay unchanged.",
       "v0.1.104":
@@ -238,6 +240,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.106":
+        "普通工具 fallback 路径现在通过独立 RuntimeNormalToolFallbackExecutor 边界注入。MCP、TOML external 和 built-in 工具仍然走默认 orca-tools 实现，但 runtime 已经可以直接测试 fallback context 的透传，不再把具体实现硬编码在执行器里。",
       "v0.1.105":
         "普通工具执行现在进入独立 RuntimeNormalToolExecutor 边界。shell-session bash 分支，以及 MCP/external/built-in fallback 路径都从 lifecycle.rs 移出，同时 CLI、TUI、server、workflow、permission 与模型可见工具行为保持不变。",
       "v0.1.104":
