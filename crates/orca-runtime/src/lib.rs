@@ -19,6 +19,7 @@ pub mod provider_turn;
 pub(crate) mod runtime_bash;
 mod runtime_normal_tool;
 pub(crate) mod runtime_special;
+mod runtime_turn_loop;
 pub(crate) mod sandbox_denial;
 pub mod schema_validation;
 pub mod server;
@@ -2561,9 +2562,10 @@ mod tests {
     }
 
     #[test]
-    fn runtime_turn_loop_step_is_owned_by_lifecycle_module() {
+    fn runtime_turn_loop_step_is_owned_by_runtime_turn_loop_module() {
         let agent_loop_source = include_str!("agent_loop.rs");
         let lifecycle_source = include_str!("lifecycle.rs");
+        let runtime_turn_loop_source = include_str!("runtime_turn_loop.rs");
 
         for marker in [
             "loop {",
@@ -2581,12 +2583,20 @@ mod tests {
             "agent_loop must delegate runtime turn loop"
         );
         assert!(
-            lifecycle_source.contains("struct RuntimeTurnLoopStep"),
-            "lifecycle must own runtime turn loop step state"
+            !lifecycle_source.contains("struct RuntimeTurnLoopStep"),
+            "lifecycle must not own runtime turn loop step state"
         );
         assert!(
-            lifecycle_source.contains("impl RuntimeTurnLoopStep"),
-            "lifecycle must own runtime turn loop step behavior"
+            !lifecycle_source.contains("impl RuntimeTurnLoopStep"),
+            "lifecycle must not own runtime turn loop step behavior"
+        );
+        assert!(
+            runtime_turn_loop_source.contains("struct RuntimeTurnLoopStep"),
+            "runtime_turn_loop must own runtime turn loop step state"
+        );
+        assert!(
+            runtime_turn_loop_source.contains("impl RuntimeTurnLoopStep"),
+            "runtime_turn_loop must own runtime turn loop step behavior"
         );
         for marker in [
             "RuntimeTurnIterationStep::new",
@@ -2594,16 +2604,17 @@ mod tests {
             "RuntimeTurnIterationResult::Return",
         ] {
             assert!(
-                lifecycle_source.contains(marker),
-                "lifecycle must compose runtime turn loop detail {marker}"
+                runtime_turn_loop_source.contains(marker),
+                "runtime_turn_loop must compose runtime turn loop detail {marker}"
             );
         }
     }
 
     #[test]
-    fn runtime_turn_loop_input_is_owned_by_lifecycle_module() {
+    fn runtime_turn_loop_input_is_owned_by_runtime_turn_loop_module() {
         let agent_loop_source = include_str!("agent_loop.rs");
         let lifecycle_source = include_str!("lifecycle.rs");
+        let runtime_turn_loop_source = include_str!("runtime_turn_loop.rs");
 
         assert!(
             agent_loop_source.contains("RuntimeTurnLoopInput"),
@@ -2614,20 +2625,37 @@ mod tests {
             "agent_loop must pass child executors through a lifecycle-owned executor object"
         );
         assert!(
-            lifecycle_source.contains("struct RuntimeTurnLoopInput"),
-            "lifecycle must own runtime turn loop input shape"
+            !lifecycle_source.contains("struct RuntimeTurnLoopInput"),
+            "lifecycle must not own runtime turn loop input shape"
         );
         assert!(
-            lifecycle_source.contains("struct RuntimeTurnLoopExecutors"),
-            "lifecycle must own runtime turn loop executor shape"
+            !lifecycle_source.contains("struct RuntimeTurnLoopExecutors"),
+            "lifecycle must not own runtime turn loop executor shape"
         );
         assert!(
-            lifecycle_source.contains("impl<'a, 'runtime, W: io::Write> RuntimeTurnLoopInput"),
-            "lifecycle must own runtime turn loop input behavior"
+            !lifecycle_source.contains("impl<'a, 'runtime, W: io::Write> RuntimeTurnLoopInput"),
+            "lifecycle must not own runtime turn loop input behavior"
         );
         assert!(
-            lifecycle_source.contains("impl<W: io::Write> RuntimeTurnLoopExecutors<W>"),
-            "lifecycle must own runtime turn loop executor behavior"
+            !lifecycle_source.contains("impl<W: io::Write> RuntimeTurnLoopExecutors<W>"),
+            "lifecycle must not own runtime turn loop executor behavior"
+        );
+        assert!(
+            runtime_turn_loop_source.contains("struct RuntimeTurnLoopInput"),
+            "runtime_turn_loop must own runtime turn loop input shape"
+        );
+        assert!(
+            runtime_turn_loop_source.contains("struct RuntimeTurnLoopExecutors"),
+            "runtime_turn_loop must own runtime turn loop executor shape"
+        );
+        assert!(
+            runtime_turn_loop_source
+                .contains("impl<'a, 'runtime, W: io::Write> RuntimeTurnLoopInput"),
+            "runtime_turn_loop must own runtime turn loop input behavior"
+        );
+        assert!(
+            runtime_turn_loop_source.contains("impl<W: io::Write> RuntimeTurnLoopExecutors<W>"),
+            "runtime_turn_loop must own runtime turn loop executor behavior"
         );
         assert!(
             !agent_loop_source.contains("execute_child_agent_loop,\n        execute_child_agent_loop,\n        execute_child_agent_loop"),
