@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.112":
+        "Normal tool-turn execution now receives one grouped RuntimeNormalToolTurnContext instead of a long run_normal_tool_turn argument list. Tool execution, approval, result recording, plan-state recording, permission overlays, workflow/background state, and child executor handoff keep the same runtime behavior while the tool-turn boundary gets smaller.",
       "v0.1.111":
         "Tool approval gate inputs now move through one grouped ToolApprovalGateContext instead of a long handle_approval argument list. Config, events, sink, tool request, invocation, policy, strict auto-review, and delta emission still flow unchanged, while approval allow/ask/deny behavior and tool-call item emission keep the same public shape.",
       "v0.1.110":
@@ -250,6 +252,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.112":
+        "普通工具回合执行现在统一接收分组后的 RuntimeNormalToolTurnContext，不再让 run_normal_tool_turn 暴露长参数列表。工具执行、审批、结果记录、plan-state 记录、permission overlay、workflow/background 状态以及 child executor 交接都保持相同 runtime 行为，同时 tool-turn 边界继续收窄。",
       "v0.1.111":
         "工具审批 gate 的输入现在统一通过 ToolApprovalGateContext 传递，不再让 handle_approval 暴露长参数列表。config、events、sink、tool request、invocation、policy、strict auto-review 与 delta emission 的透传保持不变，同时 approval allow/ask/deny 行为和 tool-call item emission 继续保持相同的公开形状。",
       "v0.1.110":
