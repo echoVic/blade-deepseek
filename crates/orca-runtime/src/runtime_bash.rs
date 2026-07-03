@@ -24,19 +24,34 @@ use crate::shell_session::{
 };
 use crate::tasks::TaskRegistry;
 
-#[allow(clippy::too_many_arguments)]
+pub(crate) struct RuntimeBashInvocationContext<'a> {
+    pub(crate) config: Option<&'a RunConfig>,
+    pub(crate) request: &'a ToolRequest,
+    pub(crate) cwd: &'a Path,
+    pub(crate) additional_roots: &'a [PathBuf],
+    pub(crate) output_truncation: ToolOutputTruncation,
+    pub(crate) shell_timeout_secs: u64,
+    pub(crate) task_registry: &'a TaskRegistry,
+    pub(crate) cancel: Option<&'a CancelToken>,
+    pub(crate) permission_handler: Option<&'a dyn RuntimePermissionRequestHandler>,
+    pub(crate) permission_overlay: &'a mut TurnPermissionOverlay,
+}
+
 pub(crate) fn execute_bash_with_shell_session(
-    config: Option<&RunConfig>,
-    request: &ToolRequest,
-    cwd: &Path,
-    additional_roots: &[PathBuf],
-    output_truncation: ToolOutputTruncation,
-    shell_timeout_secs: u64,
-    task_registry: &TaskRegistry,
-    cancel: Option<&CancelToken>,
-    permission_handler: Option<&dyn RuntimePermissionRequestHandler>,
-    permission_overlay: &mut TurnPermissionOverlay,
+    context: RuntimeBashInvocationContext<'_>,
 ) -> ToolResult {
+    let RuntimeBashInvocationContext {
+        config,
+        request,
+        cwd,
+        additional_roots,
+        output_truncation,
+        shell_timeout_secs,
+        task_registry,
+        cancel,
+        permission_handler,
+        permission_overlay,
+    } = context;
     let Some(command) = request
         .target
         .as_deref()

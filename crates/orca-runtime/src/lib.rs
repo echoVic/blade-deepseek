@@ -778,6 +778,53 @@ mod tests {
     }
 
     #[test]
+    fn bash_runtime_runner_uses_grouped_invocation_context() {
+        let normal_tool_source = include_str!("runtime_normal_tool.rs");
+        let runtime_bash_source = include_str!("runtime_bash.rs");
+
+        assert!(
+            runtime_bash_source.contains("pub(crate) struct RuntimeBashInvocationContext"),
+            "runtime_bash must group shell-session bash inputs into RuntimeBashInvocationContext"
+        );
+        assert!(
+            runtime_bash_source.contains("context: RuntimeBashInvocationContext"),
+            "execute_bash_with_shell_session must accept the grouped bash invocation context"
+        );
+        assert!(
+            !runtime_bash_source.contains(
+                "#[allow(clippy::too_many_arguments)]\npub(crate) fn execute_bash_with_shell_session"
+            ),
+            "runtime_bash must not need a too_many_arguments escape hatch for bash invocation"
+        );
+        assert!(
+            normal_tool_source.contains("RuntimeBashInvocationContext"),
+            "runtime_normal_tool must construct the grouped bash invocation context"
+        );
+        assert!(
+            !normal_tool_source
+                .contains("execute_bash_with_shell_session(\n                config,"),
+            "runtime_normal_tool must not pass bash execution state through the old long argument list"
+        );
+        for field_name in [
+            "config:",
+            "request:",
+            "cwd:",
+            "additional_roots:",
+            "output_truncation:",
+            "shell_timeout_secs:",
+            "task_registry:",
+            "cancel:",
+            "permission_handler:",
+            "permission_overlay:",
+        ] {
+            assert!(
+                runtime_bash_source.contains(field_name),
+                "RuntimeBashInvocationContext must carry bash field {field_name}"
+            );
+        }
+    }
+
+    #[test]
     fn tool_turn_dispatch_uses_grouped_context() {
         let provider_turn_source = include_str!("provider_turn.rs");
         let tool_turn_source = include_str!("tool_turn.rs");

@@ -7,7 +7,7 @@ use orca_core::tool_types::{ToolName, ToolOutputTruncation, ToolRequest, ToolRes
 use orca_mcp::McpRegistry;
 
 use crate::lifecycle::{RuntimePermissionRequestHandler, TurnPermissionOverlay};
-use crate::runtime_bash::execute_bash_with_shell_session;
+use crate::runtime_bash::{RuntimeBashInvocationContext, execute_bash_with_shell_session};
 use crate::tasks::TaskRegistry;
 
 pub(crate) struct RuntimeNormalToolExecutionContext<'a> {
@@ -151,7 +151,7 @@ impl<'a> RuntimeNormalToolExecutor<'a> {
             && let Some(task_registry) = task_registry
             && let Some(permission_overlay) = permission_overlay
         {
-            return execute_bash_with_shell_session(
+            return execute_bash_with_shell_session(RuntimeBashInvocationContext {
                 config,
                 request,
                 cwd,
@@ -162,7 +162,7 @@ impl<'a> RuntimeNormalToolExecutor<'a> {
                 cancel,
                 permission_handler,
                 permission_overlay,
-            );
+            });
         }
 
         self.fallback.execute(RuntimeNormalToolFallbackContext {
