@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.113":
+        "Tool-turn dispatch now receives one grouped RuntimeToolTurnsContext from provider response handling instead of a long run_tool_turns call. RuntimeStepContext, events, sink, conversation, history writer, tool requests, cost tracking, background workflow state, and child executors still flow unchanged while the provider-to-tool boundary gets smaller.",
       "v0.1.112":
         "Normal tool-turn execution now receives one grouped RuntimeNormalToolTurnContext instead of a long run_normal_tool_turn argument list. Tool execution, approval, result recording, plan-state recording, permission overlays, workflow/background state, and child executor handoff keep the same runtime behavior while the tool-turn boundary gets smaller.",
       "v0.1.111":
@@ -252,6 +254,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.113":
+        "工具回合 dispatch 现在从 provider response 处理处接收分组后的 RuntimeToolTurnsContext，不再暴露 run_tool_turns 的长参数调用。RuntimeStepContext、events、sink、conversation、history writer、tool requests、cost tracking、background workflow 状态和 child executors 的透传保持不变，同时 provider 到 tool-turn 的边界继续收窄。",
       "v0.1.112":
         "普通工具回合执行现在统一接收分组后的 RuntimeNormalToolTurnContext，不再让 run_normal_tool_turn 暴露长参数列表。工具执行、审批、结果记录、plan-state 记录、permission overlay、workflow/background 状态以及 child executor 交接都保持相同 runtime 行为，同时 tool-turn 边界继续收窄。",
       "v0.1.111":
