@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.117":
+        "Runtime turn-iteration orchestration now lives in a focused runtime_turn_iteration module instead of lifecycle.rs. The outer runtime_turn_loop still delegates through RuntimeTurnIterationStep, provider-cycle behavior still lives in provider_turn, and lifecycle.rs keeps the opening/start/model-route pieces while getting smaller for the next reducer-style split.",
       "v0.1.116":
         "Runtime turn-loop orchestration now lives in a focused runtime_turn_loop module instead of lifecycle.rs. Agent loop still delegates through RuntimeTurnLoopStep with the same grouped input/executor objects and the same iteration retry/return behavior, while lifecycle.rs gets smaller for the next Codex/package-3-inspired reducer split.",
       "v0.1.115":
@@ -260,6 +262,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.117":
+        "Runtime turn-iteration 编排现在从 lifecycle.rs 移到独立的 runtime_turn_iteration 模块。外层 runtime_turn_loop 仍通过 RuntimeTurnIterationStep 委托执行，provider-cycle 行为仍归 provider_turn，lifecycle.rs 继续保留 opening/start/model-route 这些步骤，同时为下一轮 reducer 风格拆分继续变小。",
       "v0.1.116":
         "Runtime turn-loop 编排现在从 lifecycle.rs 移到独立的 runtime_turn_loop 模块。agent loop 仍然通过 RuntimeTurnLoopStep 委托执行，分组后的 input/executor 对象和 iteration 重试/返回行为保持不变，同时 lifecycle.rs 进一步变小，为后续参考 Codex/package 3 的 reducer 拆分铺路。",
       "v0.1.115":
