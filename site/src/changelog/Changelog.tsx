@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.118":
+        "Runtime turn-opening orchestration now lives in a focused runtime_turn_opening module with a grouped RuntimeTurnOpeningInput boundary. RuntimeTurnIterationStep still composes opening and provider-cycle execution in the same order, while lifecycle.rs keeps the lower-level start/model-route/steer steps and sheds another reducer-sized layer.",
       "v0.1.117":
         "Runtime turn-iteration orchestration now lives in a focused runtime_turn_iteration module instead of lifecycle.rs. The outer runtime_turn_loop still delegates through RuntimeTurnIterationStep, provider-cycle behavior still lives in provider_turn, and lifecycle.rs keeps the opening/start/model-route pieces while getting smaller for the next reducer-style split.",
       "v0.1.116":
@@ -262,6 +264,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.118":
+        "Runtime turn-opening 编排现在从 lifecycle.rs 移到独立的 runtime_turn_opening 模块，并通过分组后的 RuntimeTurnOpeningInput 传参。RuntimeTurnIterationStep 仍按原顺序组合 opening 与 provider-cycle 执行，lifecycle.rs 则继续保留更底层的 start/model-route/steer 步骤，同时再少一层 reducer 大小的职责。",
       "v0.1.117":
         "Runtime turn-iteration 编排现在从 lifecycle.rs 移到独立的 runtime_turn_iteration 模块。外层 runtime_turn_loop 仍通过 RuntimeTurnIterationStep 委托执行，provider-cycle 行为仍归 provider_turn，lifecycle.rs 继续保留 opening/start/model-route 这些步骤，同时为下一轮 reducer 风格拆分继续变小。",
       "v0.1.116":
