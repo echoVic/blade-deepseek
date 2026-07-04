@@ -17,10 +17,10 @@ use crate::cost::CostTracker;
 use crate::hooks::{HookRunner, conversation_with_hook_context};
 use crate::instructions::ProjectInstructions;
 use crate::lifecycle::{
-    AgentLoopResult, RuntimePermissionRequestHandler, RuntimePreparedConversation,
-    RuntimeTaskActor, RuntimeTurnStartError,
+    AgentLoopResult, RuntimePermissionRequestHandler, RuntimeTaskActor, RuntimeTurnStartError,
 };
 use crate::memory::{self, MemoryBlock};
+use crate::runtime_conversation_bootstrap::RuntimePreparedConversation;
 use crate::runtime_steer::{RuntimeSteerInput, RuntimeSteerStep};
 use crate::session::record_assistant_response_for_agent;
 use crate::step_context::RuntimeStepContext;

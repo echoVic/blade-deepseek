@@ -17,6 +17,7 @@ pub mod notify;
 pub mod protocol;
 pub mod provider_turn;
 pub(crate) mod runtime_bash;
+mod runtime_conversation_bootstrap;
 mod runtime_model_route;
 mod runtime_normal_tool;
 pub(crate) mod runtime_special;
@@ -1331,9 +1332,13 @@ mod tests {
     }
 
     #[test]
-    fn runtime_conversation_bootstrap_step_is_owned_by_lifecycle_module() {
+    fn runtime_conversation_bootstrap_step_is_owned_by_runtime_conversation_bootstrap_module() {
         let agent_loop_source = include_str!("agent_loop.rs");
         let lifecycle_source = include_str!("lifecycle.rs");
+        let runtime_conversation_bootstrap_source =
+            std::fs::read_to_string("src/runtime_conversation_bootstrap.rs")
+                .expect("runtime conversation bootstrap source");
+        let lib_source = include_str!("lib.rs");
 
         for marker in [
             "let mut owned_conversation",
@@ -1351,21 +1356,25 @@ mod tests {
             "agent_loop must delegate runtime conversation bootstrap"
         );
         assert!(
-            lifecycle_source.contains("struct RuntimeConversationBootstrapStep"),
-            "lifecycle must own runtime conversation bootstrap step state"
+            lib_source.contains("mod runtime_conversation_bootstrap;"),
+            "runtime crate must declare a focused runtime_conversation_bootstrap module"
         );
-        assert!(
-            lifecycle_source.contains("impl RuntimeConversationBootstrapStep"),
-            "lifecycle must own runtime conversation bootstrap step behavior"
-        );
-        assert!(
-            lifecycle_source.contains("bootstrap_agent_conversation_for_loop("),
-            "lifecycle must compose session-owned conversation bootstrap"
-        );
-        assert!(
-            lifecycle_source.contains("record_initial_history_for_agent("),
-            "lifecycle must compose session-owned initial history recording"
-        );
+        for marker in [
+            "struct RuntimeConversationBootstrapStep",
+            "impl RuntimeConversationBootstrapStep",
+            "bootstrap_agent_conversation_for_loop(",
+            "record_initial_history_for_agent(",
+            "resumed.is_some()",
+        ] {
+            assert!(
+                !lifecycle_source.contains(marker),
+                "lifecycle must not own runtime conversation bootstrap detail {marker}"
+            );
+            assert!(
+                runtime_conversation_bootstrap_source.contains(marker),
+                "runtime_conversation_bootstrap must own runtime conversation bootstrap detail {marker}"
+            );
+        }
     }
 
     #[test]

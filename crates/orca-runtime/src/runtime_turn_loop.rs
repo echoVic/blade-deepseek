@@ -16,10 +16,10 @@ use crate::cost::CostTracker;
 use crate::hooks::HookRunner;
 use crate::instructions::ProjectInstructions;
 use crate::lifecycle::{
-    AgentLoopResult, RuntimePermissionRequestHandler, RuntimePreparedConversation,
-    RuntimeTaskActor, ThreadSteerHandle,
+    AgentLoopResult, RuntimePermissionRequestHandler, RuntimeTaskActor, ThreadSteerHandle,
 };
 use crate::memory::MemoryBlock;
+use crate::runtime_conversation_bootstrap::RuntimePreparedConversation;
 use crate::runtime_turn_iteration::{
     RuntimeTurnIterationInput, RuntimeTurnIterationResult, RuntimeTurnIterationStep,
 };
