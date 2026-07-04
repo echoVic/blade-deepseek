@@ -17,11 +17,14 @@ use crate::hooks::HookRunner;
 use crate::instructions::ProjectInstructions;
 use crate::lifecycle::{
     AgentLoopResult, RuntimePermissionRequestHandler, RuntimePreparedConversation,
-    RuntimeTaskActor, RuntimeTurnOpeningResult, RuntimeTurnOpeningStep, ThreadSteerHandle,
+    RuntimeTaskActor, ThreadSteerHandle,
 };
 use crate::memory::MemoryBlock;
 use crate::provider_turn::{
     RuntimeProviderCycleInput, RuntimeTurnProviderCycleResult, RuntimeTurnProviderCycleStep,
+};
+use crate::runtime_turn_opening::{
+    RuntimeTurnOpeningInput, RuntimeTurnOpeningResult, RuntimeTurnOpeningStep,
 };
 use crate::tasks::TaskRegistry;
 use crate::tool_invocation::AgentToolPolicyContext;
@@ -87,24 +90,24 @@ impl RuntimeTurnIterationStep {
     ) -> io::Result<RuntimeTurnIterationResult> {
         let turn_provider_config = {
             let (conversation, history_writer) = input.prepared_conversation.parts_mut();
-            match self.opening_step.open(
-                input.actor,
-                input.provider,
-                input.context_config,
-                input.provider_config,
-                input.cwd,
-                input.emit_deltas,
-                input.hooks,
-                input.events,
-                input.sink,
+            match self.opening_step.open(RuntimeTurnOpeningInput {
+                actor: input.actor,
+                provider: input.provider,
+                context_config: input.context_config,
+                provider_config: input.provider_config,
+                cwd: input.cwd,
+                emit_deltas: input.emit_deltas,
+                hooks: input.hooks,
+                events: input.events,
+                sink: input.sink,
                 conversation,
                 history_writer,
-                input.prompt,
-                input.model,
-                input.subagent_type,
-                input.cost_tracker,
-                input.steer_handle,
-            )? {
+                prompt: input.prompt,
+                model: input.model,
+                subagent_type: input.subagent_type,
+                cost_tracker: input.cost_tracker,
+                steer_handle: input.steer_handle,
+            })? {
                 RuntimeTurnOpeningResult::Continue { provider_config } => provider_config,
                 RuntimeTurnOpeningResult::Return(result) => {
                     return Ok(RuntimeTurnIterationResult::Return(result));

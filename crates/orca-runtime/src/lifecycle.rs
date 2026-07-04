@@ -21,7 +21,6 @@ use orca_provider::{ProviderConfig, context};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::compaction::RuntimeCompactionStep;
 use crate::cost::CostTracker;
 use crate::hooks::{HookContext, HookOutcome, HookRunner};
 use crate::instructions::ProjectInstructions;
@@ -102,7 +101,6 @@ pub struct RuntimeToolActorContext {
 pub(crate) struct RuntimeSteerStep;
 pub(crate) struct RuntimeConversationBootstrapStep;
 pub(crate) struct RuntimeTurnSetupStep;
-pub(crate) struct RuntimeTurnOpeningStep;
 pub(crate) struct RuntimeTurnStartStep;
 pub(crate) struct RuntimeTurnStartResultStep;
 pub(crate) struct RuntimeModelRouteStep;
@@ -113,11 +111,6 @@ pub(crate) struct RuntimeTurnStartStepOutput {
 
 pub(crate) enum RuntimeTurnStartResult {
     Continue,
-    Return(AgentLoopResult),
-}
-
-pub(crate) enum RuntimeTurnOpeningResult {
-    Continue { provider_config: ProviderConfig },
     Return(AgentLoopResult),
 }
 
@@ -1766,78 +1759,6 @@ impl RuntimeTurnStartResultStep {
     }
 }
 
-impl RuntimeTurnOpeningStep {
-    pub(crate) fn new() -> Self {
-        Self
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn open<W: io::Write>(
-        &mut self,
-        actor: &mut RuntimeTaskActor<'_>,
-        provider: ProviderKind,
-        context_config: &context::ContextConfig,
-        provider_config: &ProviderConfig,
-        cwd: &Path,
-        emit_deltas: bool,
-        hooks: &HookRunner,
-        events: &mut EventFactory,
-        sink: &mut EventSink<W>,
-        conversation: &mut Conversation,
-        mut history_writer: Option<&mut SessionWriter>,
-        prompt: &str,
-        model: &ModelSelection,
-        subagent_type: &SubagentType,
-        cost_tracker: &mut CostTracker,
-        steer_handle: Option<&ThreadSteerHandle>,
-    ) -> io::Result<RuntimeTurnOpeningResult> {
-        RuntimeCompactionStep::new(
-            provider,
-            context_config,
-            provider_config,
-            cwd,
-            emit_deltas,
-            hooks,
-            events,
-            sink,
-            history_writer.as_deref_mut(),
-        )
-        .compact_if_needed(conversation)?;
-
-        match RuntimeTurnStartResultStep::new().fold(RuntimeTurnStartStep::new().start(
-            actor,
-            events,
-            sink,
-            prompt,
-            emit_deltas,
-        )?) {
-            RuntimeTurnStartResult::Return(result) => {
-                return Ok(RuntimeTurnOpeningResult::Return(result));
-            }
-            RuntimeTurnStartResult::Continue => {}
-        }
-
-        let turn_provider_config = RuntimeModelRouteStep::new()
-            .route(
-                actor,
-                model,
-                subagent_type,
-                provider_config,
-                cost_tracker,
-                events,
-                sink,
-                emit_deltas,
-            )?
-            .provider_config;
-
-        RuntimeSteerStep::new().apply(steer_handle, conversation, history_writer.as_deref_mut())?;
-
-        Ok(RuntimeTurnOpeningResult::Continue {
-            provider_config: turn_provider_config,
-        })
-    }
-}
-
 impl RuntimeModelRouteStep {
     pub(crate) fn new() -> Self {
         Self
@@ -1947,6 +1868,9 @@ impl RuntimeTurnLifecycle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime_turn_opening::{
+        RuntimeTurnOpeningInput, RuntimeTurnOpeningResult, RuntimeTurnOpeningStep,
+    };
 
     use orca_core::approval_rules::PermissionRules;
     use orca_core::approval_types::ApprovalMode;
@@ -2085,24 +2009,24 @@ mod tests {
         let cwd = Path::new(".");
 
         let result = RuntimeTurnOpeningStep::new()
-            .open(
-                &mut actor,
-                ProviderKind::DeepSeek,
-                &context_config,
-                &provider_config,
+            .open(RuntimeTurnOpeningInput {
+                actor: &mut actor,
+                provider: ProviderKind::DeepSeek,
+                context_config: &context_config,
+                provider_config: &provider_config,
                 cwd,
-                true,
-                &hooks,
-                &mut events,
-                &mut sink,
-                &mut conversation,
-                None,
-                "hello",
-                &model,
-                &subagent_type,
-                &mut cost_tracker,
-                None,
-            )
+                emit_deltas: true,
+                hooks: &hooks,
+                events: &mut events,
+                sink: &mut sink,
+                conversation: &mut conversation,
+                history_writer: None,
+                prompt: "hello",
+                model: &model,
+                subagent_type: &subagent_type,
+                cost_tracker: &mut cost_tracker,
+                steer_handle: None,
+            })
             .expect("open turn");
 
         match result {

@@ -21,6 +21,7 @@ mod runtime_normal_tool;
 pub(crate) mod runtime_special;
 mod runtime_turn_iteration;
 mod runtime_turn_loop;
+mod runtime_turn_opening;
 pub(crate) mod sandbox_denial;
 pub mod schema_validation;
 pub mod server;
@@ -2341,9 +2342,12 @@ mod tests {
     }
 
     #[test]
-    fn runtime_turn_opening_step_is_owned_by_lifecycle_module() {
+    fn runtime_turn_opening_step_is_owned_by_runtime_turn_opening_module() {
         let agent_loop_source = include_str!("agent_loop.rs");
         let lifecycle_source = include_str!("lifecycle.rs");
+        let runtime_turn_iteration_source = include_str!("runtime_turn_iteration.rs");
+        let runtime_turn_opening_source = std::fs::read_to_string("src/runtime_turn_opening.rs")
+            .expect("runtime turn opening source");
 
         for marker in [
             ".compact_if_needed(conversation)",
@@ -2362,12 +2366,36 @@ mod tests {
             "agent_loop must delegate runtime turn opening"
         );
         assert!(
-            lifecycle_source.contains("struct RuntimeTurnOpeningStep"),
-            "lifecycle must own runtime turn opening step state"
+            !lifecycle_source.contains("struct RuntimeTurnOpeningStep"),
+            "lifecycle must not own runtime turn opening step state"
         );
         assert!(
-            lifecycle_source.contains("impl RuntimeTurnOpeningStep"),
-            "lifecycle must own runtime turn opening step behavior"
+            !lifecycle_source.contains("enum RuntimeTurnOpeningResult"),
+            "lifecycle must not own runtime turn opening result shape"
+        );
+        assert!(
+            !lifecycle_source.contains("struct RuntimeTurnOpeningInput"),
+            "lifecycle must not own runtime turn opening input shape"
+        );
+        assert!(
+            !lifecycle_source.contains("impl RuntimeTurnOpeningStep"),
+            "lifecycle must not own runtime turn opening step behavior"
+        );
+        assert!(
+            runtime_turn_opening_source.contains("struct RuntimeTurnOpeningStep"),
+            "runtime_turn_opening must own runtime turn opening step state"
+        );
+        assert!(
+            runtime_turn_opening_source.contains("enum RuntimeTurnOpeningResult"),
+            "runtime_turn_opening must own runtime turn opening result shape"
+        );
+        assert!(
+            runtime_turn_opening_source.contains("struct RuntimeTurnOpeningInput"),
+            "runtime_turn_opening must own grouped runtime turn opening input"
+        );
+        assert!(
+            runtime_turn_opening_source.contains("impl RuntimeTurnOpeningStep"),
+            "runtime_turn_opening must own runtime turn opening step behavior"
         );
         for marker in [
             "RuntimeCompactionStep::new",
@@ -2377,10 +2405,14 @@ mod tests {
             "RuntimeSteerStep::new",
         ] {
             assert!(
-                lifecycle_source.contains(marker),
-                "lifecycle must compose runtime turn opening detail {marker}"
+                runtime_turn_opening_source.contains(marker),
+                "runtime_turn_opening must compose runtime turn opening detail {marker}"
             );
         }
+        assert!(
+            runtime_turn_iteration_source.contains("RuntimeTurnOpeningInput"),
+            "runtime_turn_iteration must call runtime turn opening through its grouped input"
+        );
     }
 
     #[test]
