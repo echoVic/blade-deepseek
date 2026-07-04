@@ -22,6 +22,7 @@ pub(crate) mod runtime_special;
 mod runtime_turn_iteration;
 mod runtime_turn_loop;
 mod runtime_turn_opening;
+mod runtime_turn_start;
 pub(crate) mod sandbox_denial;
 pub mod schema_validation;
 pub mod server;
@@ -2256,9 +2257,12 @@ mod tests {
     }
 
     #[test]
-    fn runtime_turn_start_step_is_owned_by_lifecycle_module() {
+    fn runtime_turn_start_step_is_owned_by_runtime_turn_start_module() {
         let agent_loop_source = include_str!("agent_loop.rs");
+        let lib_source = include_str!("lib.rs");
         let lifecycle_source = include_str!("lifecycle.rs");
+        let runtime_turn_start_source = std::fs::read_to_string("src/runtime_turn_start.rs")
+            .expect("runtime turn start source");
 
         for marker in [
             ".active_task()",
@@ -2283,25 +2287,43 @@ mod tests {
             "agent_loop must delegate runtime turn-start result folding through turn loop"
         );
         assert!(
-            lifecycle_source.contains("struct RuntimeTurnStartStep"),
-            "lifecycle must own runtime turn-start step state"
+            lib_source.contains("mod runtime_turn_start;"),
+            "runtime crate must declare a focused runtime_turn_start module"
         );
         assert!(
-            lifecycle_source.contains("struct RuntimeTurnStartResultStep"),
-            "lifecycle must own runtime turn-start result step state"
+            !lifecycle_source.contains("struct RuntimeTurnStartStep"),
+            "lifecycle must not own runtime turn-start step state"
         );
         assert!(
-            lifecycle_source.contains("impl RuntimeTurnStartStep"),
-            "lifecycle must own runtime turn-start step behavior"
+            !lifecycle_source.contains("struct RuntimeTurnStartResultStep"),
+            "lifecycle must not own runtime turn-start result step state"
         );
         assert!(
-            lifecycle_source.contains("impl RuntimeTurnStartResultStep"),
-            "lifecycle must own runtime turn-start result step behavior"
+            !lifecycle_source.contains("impl RuntimeTurnStartStep"),
+            "lifecycle must not own runtime turn-start step behavior"
         );
         assert!(
-            lifecycle_source.contains("actor.start_turn("),
-            "lifecycle must own runtime actor start_turn call"
+            !lifecycle_source.contains("impl RuntimeTurnStartResultStep"),
+            "lifecycle must not own runtime turn-start result step behavior"
         );
+        for marker in [
+            "struct RuntimeTurnStartStep",
+            "struct RuntimeTurnStartResultStep",
+            "struct RuntimeTurnStartStepOutput",
+            "enum RuntimeTurnStartResult",
+            "impl RuntimeTurnStartStep",
+            "impl RuntimeTurnStartResultStep",
+            "actor.start_turn(",
+            "started_turn.into_event()",
+            "AgentLoopResult::failure(",
+            "error.status",
+            "error.message",
+        ] {
+            assert!(
+                runtime_turn_start_source.contains(marker),
+                "runtime_turn_start must own runtime turn-start detail {marker}"
+            );
+        }
     }
 
     #[test]
