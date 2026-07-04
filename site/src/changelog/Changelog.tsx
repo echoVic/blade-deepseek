@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.120":
+        "Runtime model-route orchestration now lives in a focused runtime_model_route module with a grouped RuntimeModelRouteInput boundary. RuntimeTurnOpeningStep still composes compaction, turn start, model routing, and steering in the same order, while lifecycle.rs keeps the actor/lifecycle primitives and sheds another reducer slice without adding a new long-argument surface.",
       "v0.1.119":
         "Runtime turn-start orchestration now lives in a focused runtime_turn_start module instead of lifecycle.rs. RuntimeTurnOpeningStep still composes compaction, turn start, model routing, and steering in the same order, while lifecycle.rs keeps the actor/lifecycle primitives and sheds another lower-level reducer slice.",
       "v0.1.118":
@@ -266,6 +268,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.120":
+        "Runtime model-route 编排现在从 lifecycle.rs 移到独立的 runtime_model_route 模块，并通过分组后的 RuntimeModelRouteInput 传参。RuntimeTurnOpeningStep 仍按原顺序组合 compaction、turn start、model routing 和 steering，lifecycle.rs 保留 actor/lifecycle 原语，同时再拆掉一个 reducer 切片，并避免新增长参数调用面。",
       "v0.1.119":
         "Runtime turn-start 编排现在从 lifecycle.rs 移到独立的 runtime_turn_start 模块。RuntimeTurnOpeningStep 仍按原顺序组合 compaction、turn start、model routing 和 steering，lifecycle.rs 则保留 actor/lifecycle 原语，同时再拆掉一个更底层的 reducer 切片。",
       "v0.1.118":
