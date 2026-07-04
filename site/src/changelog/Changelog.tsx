@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.122":
+        "Runtime conversation bootstrap now lives in a focused runtime_conversation_bootstrap module. Agent loop still delegates through RuntimeConversationBootstrapStep, and the new module owns RuntimePreparedConversation, borrowed-or-owned conversation storage, session bootstrap composition, and initial history recording while lifecycle.rs keeps actor/lifecycle primitives.",
       "v0.1.121":
         "Runtime steer application now lives in a focused runtime_steer module with a grouped RuntimeSteerInput boundary. RuntimeTurnOpeningStep and RuntimeProviderTurnStep still drain pending steer inputs into the conversation and history before the model call, while lifecycle.rs keeps ThreadSteerHandle storage and sheds another reducer slice.",
       "v0.1.120":
@@ -270,6 +272,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.122":
+        "Runtime conversation bootstrap 现在从 lifecycle.rs 移到独立的 runtime_conversation_bootstrap 模块。Agent loop 仍通过 RuntimeConversationBootstrapStep 委托执行，新模块负责 RuntimePreparedConversation、borrowed/owned conversation 存储、session bootstrap 组合和初始 history 记录，lifecycle.rs 则继续保留 actor/lifecycle 原语。",
       "v0.1.121":
         "Runtime steer application 现在从 lifecycle.rs 移到独立的 runtime_steer 模块，并通过分组后的 RuntimeSteerInput 传参。RuntimeTurnOpeningStep 和 RuntimeProviderTurnStep 仍会在模型调用前把待处理 steer input 注入 conversation 和 history，lifecycle.rs 保留 ThreadSteerHandle 存储，同时再拆掉一个 reducer 切片。",
       "v0.1.120":
