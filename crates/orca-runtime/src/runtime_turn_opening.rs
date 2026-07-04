@@ -12,9 +12,8 @@ use orca_provider::{ProviderConfig, context};
 use crate::compaction::RuntimeCompactionStep;
 use crate::cost::CostTracker;
 use crate::hooks::HookRunner;
-use crate::lifecycle::{
-    AgentLoopResult, RuntimeModelRouteStep, RuntimeSteerStep, RuntimeTaskActor, ThreadSteerHandle,
-};
+use crate::lifecycle::{AgentLoopResult, RuntimeSteerStep, RuntimeTaskActor, ThreadSteerHandle};
+use crate::runtime_model_route::{RuntimeModelRouteInput, RuntimeModelRouteStep};
 use crate::runtime_turn_start::{
     RuntimeTurnStartResult, RuntimeTurnStartResultStep, RuntimeTurnStartStep,
 };
@@ -82,16 +81,16 @@ impl RuntimeTurnOpeningStep {
         }
 
         let turn_provider_config = RuntimeModelRouteStep::new()
-            .route(
-                input.actor,
-                input.model,
-                input.subagent_type,
-                input.provider_config,
-                input.cost_tracker,
-                input.events,
-                input.sink,
-                input.emit_deltas,
-            )?
+            .route(RuntimeModelRouteInput {
+                actor: input.actor,
+                model: input.model,
+                subagent_type: input.subagent_type,
+                provider_config: input.provider_config,
+                cost_tracker: input.cost_tracker,
+                events: input.events,
+                sink: input.sink,
+                emit_deltas: input.emit_deltas,
+            })?
             .provider_config;
 
         RuntimeSteerStep::new().apply(

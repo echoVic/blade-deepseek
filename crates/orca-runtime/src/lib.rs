@@ -17,6 +17,7 @@ pub mod notify;
 pub mod protocol;
 pub mod provider_turn;
 pub(crate) mod runtime_bash;
+mod runtime_model_route;
 mod runtime_normal_tool;
 pub(crate) mod runtime_special;
 mod runtime_turn_iteration;
@@ -2327,9 +2328,12 @@ mod tests {
     }
 
     #[test]
-    fn runtime_model_route_step_is_owned_by_lifecycle_module() {
+    fn runtime_model_route_step_is_owned_by_runtime_model_route_module() {
         let agent_loop_source = include_str!("agent_loop.rs");
+        let lib_source = include_str!("lib.rs");
         let lifecycle_source = include_str!("lifecycle.rs");
+        let runtime_model_route_source = std::fs::read_to_string("src/runtime_model_route.rs")
+            .expect("runtime model route source");
 
         for marker in [
             "actor.route_model_turn(",
@@ -2346,21 +2350,29 @@ mod tests {
             "agent_loop must delegate runtime model routing through turn loop"
         );
         assert!(
-            lifecycle_source.contains("struct RuntimeModelRouteStep"),
-            "lifecycle must own runtime model-route step state"
+            lib_source.contains("mod runtime_model_route;"),
+            "runtime crate must declare a focused runtime_model_route module"
         );
         assert!(
-            lifecycle_source.contains("impl RuntimeModelRouteStep"),
-            "lifecycle must own runtime model-route step behavior"
+            !lifecycle_source.contains("struct RuntimeModelRouteStep"),
+            "lifecycle must not own runtime model-route step state"
         );
         assert!(
-            lifecycle_source.contains("actor.route_model_turn("),
-            "lifecycle must own runtime actor route_model_turn call"
+            !lifecycle_source.contains("impl RuntimeModelRouteStep"),
+            "lifecycle must not own runtime model-route step behavior"
         );
-        assert!(
-            lifecycle_source.contains("events.model_routed("),
-            "lifecycle must own runtime model-routed event emission"
-        );
+        for marker in [
+            "struct RuntimeModelRouteStep",
+            "struct RuntimeModelRouteInput",
+            "impl RuntimeModelRouteStep",
+            "actor.route_model_turn(",
+            "events.model_routed(",
+        ] {
+            assert!(
+                runtime_model_route_source.contains(marker),
+                "runtime_model_route must own runtime model-route detail {marker}"
+            );
+        }
     }
 
     #[test]

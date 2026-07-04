@@ -39,7 +39,6 @@ use crate::tool_execution::policy_for_tool_execution;
 use crate::tool_invocation::{AgentToolPolicyContext, provider_config_for_agent_loop};
 use crate::workflow::ipc::WorkflowIpcContext;
 use crate::workflow_execution::BackgroundWorkflowRun;
-use orca_core::event_sink::EventSink;
 
 pub use crate::runtime_special::{RuntimeSpecialToolDispatch, RuntimeWorkflowDraftRequest};
 
@@ -101,7 +100,6 @@ pub struct RuntimeToolActorContext {
 pub(crate) struct RuntimeSteerStep;
 pub(crate) struct RuntimeConversationBootstrapStep;
 pub(crate) struct RuntimeTurnSetupStep;
-pub(crate) struct RuntimeModelRouteStep;
 
 #[derive(Clone, Debug)]
 pub(crate) struct AgentLoopResult {
@@ -1693,31 +1691,6 @@ impl RuntimeAdvancedTurn {
     }
 }
 
-impl RuntimeModelRouteStep {
-    pub(crate) fn new() -> Self {
-        Self
-    }
-
-    pub(crate) fn route<W: io::Write>(
-        &mut self,
-        actor: &mut RuntimeTaskActor<'_>,
-        model: &ModelSelection,
-        subagent_type: &SubagentType,
-        provider_config: &ProviderConfig,
-        cost_tracker: &mut CostTracker,
-        events: &mut EventFactory,
-        sink: &mut EventSink<W>,
-        emit_deltas: bool,
-    ) -> io::Result<RuntimeModelTurn> {
-        let routed_model =
-            actor.route_model_turn(model, subagent_type, None, provider_config, cost_tracker);
-        if emit_deltas {
-            sink.emit(&events.model_routed(&routed_model.decision))?;
-        }
-        Ok(routed_model)
-    }
-}
-
 impl RuntimeTaskLifecycle {
     pub fn new_snapshot(
         id: impl Into<String>,
@@ -1802,6 +1775,7 @@ impl RuntimeTurnLifecycle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime_model_route::{RuntimeModelRouteInput, RuntimeModelRouteStep};
     use crate::runtime_turn_opening::{
         RuntimeTurnOpeningInput, RuntimeTurnOpeningResult, RuntimeTurnOpeningStep,
     };
@@ -1817,6 +1791,7 @@ mod tests {
         ToolConfig, WorkflowConfig,
     };
     use orca_core::conversation::Message;
+    use orca_core::event_sink::EventSink;
     use orca_core::hook_types::HookConfig;
     use orca_core::mcp_types::McpServerConfig;
     use orca_core::model::ModelSelection;
@@ -2003,16 +1978,16 @@ mod tests {
         let subagent_type = SubagentType::General;
 
         let result = RuntimeModelRouteStep::new()
-            .route(
-                &mut actor,
-                &model,
-                &subagent_type,
-                &provider_config,
-                &mut cost_tracker,
-                &mut events,
-                &mut sink,
-                true,
-            )
+            .route(RuntimeModelRouteInput {
+                actor: &mut actor,
+                model: &model,
+                subagent_type: &subagent_type,
+                provider_config: &provider_config,
+                cost_tracker: &mut cost_tracker,
+                events: &mut events,
+                sink: &mut sink,
+                emit_deltas: true,
+            })
             .expect("route model");
 
         assert_eq!(result.provider_config.api_key.as_deref(), Some("test-key"));
