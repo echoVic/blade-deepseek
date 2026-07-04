@@ -18,9 +18,10 @@ use crate::hooks::{HookRunner, conversation_with_hook_context};
 use crate::instructions::ProjectInstructions;
 use crate::lifecycle::{
     AgentLoopResult, RuntimePermissionRequestHandler, RuntimePreparedConversation,
-    RuntimeSteerStep, RuntimeTaskActor, RuntimeTurnStartError,
+    RuntimeTaskActor, RuntimeTurnStartError,
 };
 use crate::memory::{self, MemoryBlock};
+use crate::runtime_steer::{RuntimeSteerInput, RuntimeSteerStep};
 use crate::session::record_assistant_response_for_agent;
 use crate::step_context::RuntimeStepContext;
 use crate::tasks::TaskRegistry;
@@ -289,7 +290,11 @@ impl RuntimeProviderTurnStep {
             return cancelled_provider_turn(emit_deltas, events, sink);
         }
 
-        RuntimeSteerStep::new().apply(steer_handle, conversation, history_writer.as_deref_mut())?;
+        RuntimeSteerStep::new().apply(RuntimeSteerInput {
+            steer_handle,
+            conversation,
+            history_writer: history_writer.as_deref_mut(),
+        })?;
         let model_conversation = conversation_with_hook_context(conversation, &pre_model_outcome);
         let response = actor.call_streaming_provider(
             provider,

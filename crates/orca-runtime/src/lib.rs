@@ -20,6 +20,7 @@ pub(crate) mod runtime_bash;
 mod runtime_model_route;
 mod runtime_normal_tool;
 pub(crate) mod runtime_special;
+mod runtime_steer;
 mod runtime_turn_iteration;
 mod runtime_turn_loop;
 mod runtime_turn_opening;
@@ -463,9 +464,12 @@ mod tests {
     }
 
     #[test]
-    fn runtime_steer_step_is_owned_by_lifecycle_module() {
+    fn runtime_steer_step_is_owned_by_runtime_steer_module() {
         let agent_loop_source = include_str!("agent_loop.rs");
+        let lib_source = include_str!("lib.rs");
         let lifecycle_source = include_str!("lifecycle.rs");
+        let runtime_steer_source =
+            std::fs::read_to_string("src/runtime_steer.rs").expect("runtime steer source");
 
         assert!(
             !agent_loop_source.contains("struct RuntimeSteerStep"),
@@ -476,17 +480,34 @@ mod tests {
             "agent_loop must not own runtime steer step behavior"
         );
         assert!(
-            lifecycle_source.contains("struct RuntimeSteerStep"),
-            "lifecycle must own runtime steer step state"
+            lib_source.contains("mod runtime_steer;"),
+            "runtime crate must declare a focused runtime_steer module"
         );
         assert!(
-            lifecycle_source.contains("impl RuntimeSteerStep"),
-            "lifecycle must own runtime steer step behavior"
+            !lifecycle_source.contains("struct RuntimeSteerStep"),
+            "lifecycle must not own runtime steer step state"
+        );
+        assert!(
+            !lifecycle_source.contains("impl RuntimeSteerStep"),
+            "lifecycle must not own runtime steer step behavior"
         );
         assert!(
             !agent_loop_source.contains("for input in steer_handle.drain()"),
             "agent_loop must not directly drain steer inputs into conversation"
         );
+        for marker in [
+            "struct RuntimeSteerStep",
+            "struct RuntimeSteerInput",
+            "impl RuntimeSteerStep",
+            "for steer_input in steer_handle.drain()",
+            "input.conversation.add_user(steer_input)",
+            "writer.append_message(message)",
+        ] {
+            assert!(
+                runtime_steer_source.contains(marker),
+                "runtime_steer must own runtime steer detail {marker}"
+            );
+        }
     }
 
     #[test]

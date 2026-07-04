@@ -12,8 +12,9 @@ use orca_provider::{ProviderConfig, context};
 use crate::compaction::RuntimeCompactionStep;
 use crate::cost::CostTracker;
 use crate::hooks::HookRunner;
-use crate::lifecycle::{AgentLoopResult, RuntimeSteerStep, RuntimeTaskActor, ThreadSteerHandle};
+use crate::lifecycle::{AgentLoopResult, RuntimeTaskActor, ThreadSteerHandle};
 use crate::runtime_model_route::{RuntimeModelRouteInput, RuntimeModelRouteStep};
+use crate::runtime_steer::{RuntimeSteerInput, RuntimeSteerStep};
 use crate::runtime_turn_start::{
     RuntimeTurnStartResult, RuntimeTurnStartResultStep, RuntimeTurnStartStep,
 };
@@ -93,11 +94,11 @@ impl RuntimeTurnOpeningStep {
             })?
             .provider_config;
 
-        RuntimeSteerStep::new().apply(
-            input.steer_handle,
-            input.conversation,
-            input.history_writer.as_deref_mut(),
-        )?;
+        RuntimeSteerStep::new().apply(RuntimeSteerInput {
+            steer_handle: input.steer_handle,
+            conversation: input.conversation,
+            history_writer: input.history_writer.as_deref_mut(),
+        })?;
 
         Ok(RuntimeTurnOpeningResult::Continue {
             provider_config: turn_provider_config,
