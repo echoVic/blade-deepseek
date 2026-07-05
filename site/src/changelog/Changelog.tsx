@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.130":
+        "Async subagent worker launch and completion now live in a focused subagent_async_worker module. The parent subagent executor still owns sync and batch execution, while worker spawn, task-registry usage writes, worktree handoff, and async result payloads keep the same CLI and subagent_status behavior.",
       "v0.1.129":
         "Server shell-session state now lives in a focused shell_manager module. Optional runtime shell session storage, lazy task-registry-backed initialization, shell CRUD/read/kill/reap/wait calls, and command/exec drain compatibility keep the same server shell protocol shape.",
       "v0.1.128":
@@ -286,6 +288,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.130":
+        "Async subagent worker 的启动和完成写回现在移到独立的 subagent_async_worker 模块。父级 subagent executor 继续负责同步和 batch 执行，worker spawn、task registry usage 写入、worktree handoff 和 async result payload 保持同一 CLI 与 subagent_status 行为。",
       "v0.1.129":
         "Server shell-session 状态现在移到独立的 shell_manager 模块。可选 runtime shell session 存储、带 task registry 的 lazy 初始化、shell CRUD/read/kill/reap/wait 调用，以及 command/exec drain 兼容借用都保持同一 server shell protocol 形状。",
       "v0.1.128":
