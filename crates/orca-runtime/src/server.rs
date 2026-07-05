@@ -9,6 +9,7 @@ mod active_turn_manager;
 mod command_exec_manager;
 mod permission_manager;
 mod router;
+mod shell_manager;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -28,8 +29,7 @@ use crate::server_runtime::{
     PermissionProfileOverride, ServerRequestWriter, ServerThreadRuntime, thread_item_to_json,
     thread_run_config, thread_turn_to_json,
 };
-use crate::shell_session::{RuntimeShellSessionManager, ShellSandboxMode, ShellSessionCommand};
-use crate::tasks::TaskRegistry;
+use crate::shell_session::{ShellSandboxMode, ShellSessionCommand};
 use crate::thread_store::{
     SessionStore, SortDirection, StoredThreadSummary, ThreadListFilters, ThreadMetadataPatch,
     ThreadSortKey, ThreadStore, TurnItemsView,
@@ -43,6 +43,7 @@ use permission_manager::{
     PendingCommandExecPermissionRequest, PendingPermissionManager, PendingPermissionRequest,
     ServerPermissionRequestHandler,
 };
+use shell_manager::ServerShellManager;
 
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
@@ -82,7 +83,7 @@ fn run_with_io<R: BufRead, W: Write + Send + 'static>(
 #[derive(Default)]
 struct ServerState {
     threads: ServerThreadRuntime,
-    shell_sessions: Option<RuntimeShellSessionManager>,
+    shells: ServerShellManager,
     command_exec: CommandExecManager,
     active_turns: ActiveTurnManager,
     pending_permissions: PendingPermissionManager,
@@ -90,21 +91,11 @@ struct ServerState {
 
 impl ServerState {
     fn terminate_active_command_exec_processes(&mut self) {
-        self.command_exec
-            .terminate_all(self.shell_sessions.as_mut());
+        self.command_exec.terminate_all(self.shells.sessions_mut());
     }
 }
 
 impl ServerState {
-    fn shell_manager(&mut self, cwd: &std::path::Path) -> &mut RuntimeShellSessionManager {
-        self.shell_sessions.get_or_insert_with(|| {
-            RuntimeShellSessionManager::new(TaskRegistry::new_for_cwd(
-                "server-shell".to_string(),
-                cwd,
-            ))
-        })
-    }
-
     fn join_active_turns(&mut self) {
         self.active_turns.join_all(&mut self.threads);
     }
@@ -572,11 +563,10 @@ fn run_shell_start<W: Write>(
         },
         None => None,
     };
-    let manager = state.shell_manager(&cwd);
     let command_text = command.to_string();
     let command = ShellSessionCommand {
         command: command_text.clone(),
-        cwd,
+        cwd: cwd.clone(),
         additional_readable_directories: Vec::new(),
         additional_working_directories: Vec::new(),
         denied_working_directories: Vec::new(),
@@ -590,11 +580,7 @@ fn run_shell_start<W: Write>(
             exclude_slash_tmp: false,
         },
     };
-    let spawn_result = match task_registry {
-        Some(task_registry) => manager.spawn_with_task_registry(command, task_registry),
-        None => manager.spawn(command),
-    };
-    let handle = match spawn_result {
+    let handle = match state.shells.spawn(&cwd, command, task_registry) {
         Ok(handle) => handle,
         Err(error) => {
             return protocol::write_server_event(
@@ -625,10 +611,10 @@ fn run_shell_write<W: Write>(
     id: Value,
     writer: &mut W,
 ) -> io::Result<()> {
-    let Some(manager) = state.shell_sessions.as_mut() else {
+    let Some(result) = state.shells.write_stdin(shell_id, input) else {
         return unknown_shell(writer, &id, shell_id);
     };
-    if let Err(error) = manager.write_stdin(shell_id, input) {
+    if let Err(error) = result {
         return protocol::write_server_event(writer, &id, ServerEvent::error(error.to_string()));
     }
     protocol::write_server_event(
@@ -654,9 +640,6 @@ fn run_shell_update<W: Write>(
     id: Value,
     writer: &mut W,
 ) -> io::Result<()> {
-    let Some(manager) = state.shell_sessions.as_mut() else {
-        return unknown_shell(writer, &id, shell_id);
-    };
     let Some(description) = description else {
         return protocol::write_server_event(
             writer,
@@ -664,7 +647,10 @@ fn run_shell_update<W: Write>(
             ServerEvent::error("shell update did not include any supported fields"),
         );
     };
-    if let Err(error) = manager.update_description(shell_id, description) {
+    let Some(result) = state.shells.update_description(shell_id, description) else {
+        return unknown_shell(writer, &id, shell_id);
+    };
+    if let Err(error) = result {
         return protocol::write_server_event(writer, &id, ServerEvent::error(error.to_string()));
     }
     protocol::write_server_event(
@@ -689,10 +675,10 @@ fn run_shell_close<W: Write>(
     id: Value,
     writer: &mut W,
 ) -> io::Result<()> {
-    let Some(manager) = state.shell_sessions.as_mut() else {
+    let Some(result) = state.shells.close_stdin(shell_id) else {
         return unknown_shell(writer, &id, shell_id);
     };
-    if let Err(error) = manager.close_stdin(shell_id) {
+    if let Err(error) = result {
         return protocol::write_server_event(writer, &id, ServerEvent::error(error.to_string()));
     }
     protocol::write_server_event(
@@ -719,9 +705,6 @@ fn run_shell_resize<W: Write>(
     id: Value,
     writer: &mut W,
 ) -> io::Result<()> {
-    let Some(manager) = state.shell_sessions.as_mut() else {
-        return unknown_shell(writer, &id, shell_id);
-    };
     if cols == 0 || rows == 0 {
         return protocol::write_server_event(
             writer,
@@ -729,7 +712,10 @@ fn run_shell_resize<W: Write>(
             ServerEvent::error("shell resize cols and rows must be greater than zero"),
         );
     }
-    if let Err(error) = manager.resize(shell_id, cols, rows) {
+    let Some(result) = state.shells.resize(shell_id, cols, rows) else {
+        return unknown_shell(writer, &id, shell_id);
+    };
+    if let Err(error) = result {
         return protocol::write_server_event(writer, &id, ServerEvent::error(error.to_string()));
     }
     protocol::write_server_event(
@@ -749,16 +735,12 @@ fn run_shell_resize<W: Write>(
 }
 
 fn run_shell_list<W: Write>(state: &mut ServerState, id: Value, writer: &mut W) -> io::Result<()> {
-    if let Some(manager) = state.shell_sessions.as_mut() {
-        for output in manager.reap_requested_stops()? {
-            write_shell_completed(writer, &id, output)?;
-        }
+    for output in state.shells.reap_requested_stops()? {
+        write_shell_completed(writer, &id, output)?;
     }
     let shells = state
-        .shell_sessions
-        .as_mut()
-        .map(|manager| manager.list())
-        .unwrap_or_default()
+        .shells
+        .list()
         .into_iter()
         .map(shell_snapshot_to_json)
         .collect::<Vec<_>>();
@@ -778,16 +760,19 @@ fn run_shell_read<W: Write>(
     id: Value,
     writer: &mut W,
 ) -> io::Result<()> {
-    let Some(manager) = state.shell_sessions.as_mut() else {
-        return unknown_shell(writer, &id, shell_id);
-    };
-    for output in manager.reap_requested_stops()? {
+    for output in state.shells.reap_requested_stops()? {
         if output.id == shell_id {
             return write_shell_completed(writer, &id, output);
         }
         write_shell_completed(writer, &id, output)?;
     }
-    let output = match manager.read(shell_id, Duration::from_millis(timeout_ms.max(1))) {
+    let Some(result) = state
+        .shells
+        .read(shell_id, Duration::from_millis(timeout_ms.max(1)))
+    else {
+        return unknown_shell(writer, &id, shell_id);
+    };
+    let output = match result {
         Ok(output) => output,
         Err(error) => {
             return protocol::write_server_event(
@@ -824,10 +809,10 @@ fn run_shell_kill<W: Write>(
     id: Value,
     writer: &mut W,
 ) -> io::Result<()> {
-    let Some(manager) = state.shell_sessions.as_mut() else {
+    let Some(result) = state.shells.kill(shell_id) else {
         return unknown_shell(writer, &id, shell_id);
     };
-    let output = match manager.kill(shell_id) {
+    let output = match result {
         Ok(output) => output,
         Err(error) => {
             return protocol::write_server_event(
@@ -1080,19 +1065,22 @@ fn run_command_exec<W: Write>(
             command_env.insert(key.to_string(), None);
         }
     }
-    let manager = state.shell_manager(&cwd);
-    let handle = match manager.spawn(ShellSessionCommand {
-        command: command_text.clone(),
-        cwd: cwd.clone(),
-        additional_readable_directories: effective_sandbox.additional_readable_roots,
-        additional_working_directories,
-        denied_working_directories: denied_writable_directories.clone(),
-        allowed_unix_socket_roots: effective_sandbox.allowed_unix_socket_roots,
-        env: command_env,
-        description: command_text,
-        terminal,
-        sandbox: effective_sandbox.mode,
-    }) {
+    let handle = match state.shells.spawn(
+        &cwd,
+        ShellSessionCommand {
+            command: command_text.clone(),
+            cwd: cwd.clone(),
+            additional_readable_directories: effective_sandbox.additional_readable_roots,
+            additional_working_directories,
+            denied_working_directories: denied_writable_directories.clone(),
+            allowed_unix_socket_roots: effective_sandbox.allowed_unix_socket_roots,
+            env: command_env,
+            description: command_text,
+            terminal,
+            sandbox: effective_sandbox.mode,
+        },
+        None,
+    ) {
         Ok(handle) => handle,
         Err(error) => {
             if let Some(process_id) = process_id {
@@ -1144,9 +1132,7 @@ fn run_command_exec<W: Write>(
     }
 
     let mut output = match state
-        .shell_sessions
-        .as_mut()
-        .expect("command exec shell manager")
+        .shells
         .wait(&handle.id, Duration::from_millis(timeout_ms.max(1)))
     {
         Ok(output) => output,
@@ -1763,7 +1749,7 @@ fn run_command_exec_write<W: Write>(
         );
     }
     state.command_exec.write_to_process(
-        state.shell_sessions.as_mut(),
+        state.shells.sessions_mut(),
         process_id,
         delta_base64,
         close_stdin,
@@ -1788,7 +1774,7 @@ fn run_command_exec_resize<W: Write>(
         );
     }
     state.command_exec.resize_process(
-        state.shell_sessions.as_mut(),
+        state.shells.sessions_mut(),
         process_id,
         cols,
         rows,
@@ -1803,7 +1789,7 @@ fn drain_command_exec_processes<W: Write>(
 ) -> io::Result<CommandExecDrainOutcome> {
     state
         .command_exec
-        .drain(state.shell_sessions.as_mut(), writer)
+        .drain(state.shells.sessions_mut(), writer)
 }
 
 fn drain_command_exec_processes_with_timeout<W: Write>(
@@ -1813,7 +1799,7 @@ fn drain_command_exec_processes_with_timeout<W: Write>(
 ) -> io::Result<CommandExecDrainOutcome> {
     state
         .command_exec
-        .drain_with_timeout(state.shell_sessions.as_mut(), writer, timeout)
+        .drain_with_timeout(state.shells.sessions_mut(), writer, timeout)
 }
 
 fn drain_command_exec_processes_until_output_or_timeout<W: Write>(
@@ -1823,7 +1809,7 @@ fn drain_command_exec_processes_until_output_or_timeout<W: Write>(
 ) -> io::Result<CommandExecDrainOutcome> {
     state
         .command_exec
-        .drain_until_output_or_timeout(state.shell_sessions.as_mut(), writer, timeout)
+        .drain_until_output_or_timeout(state.shells.sessions_mut(), writer, timeout)
 }
 
 fn cap_text(text: &str, cap: Option<usize>) -> String {
@@ -1903,7 +1889,7 @@ fn run_command_exec_terminate<W: Write>(
 ) -> io::Result<()> {
     state
         .command_exec
-        .terminate_process(state.shell_sessions.as_mut(), process_id, &id, writer)
+        .terminate_process(state.shells.sessions_mut(), process_id, &id, writer)
 }
 
 fn write_shell_completed<W: Write>(

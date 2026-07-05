@@ -391,6 +391,45 @@ mod tests {
     }
 
     #[test]
+    fn server_shell_manager_is_owned_by_shell_manager_module() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let server_source =
+            std::fs::read_to_string(manifest_dir.join("src/server.rs")).expect("server source");
+        let manager_source =
+            std::fs::read_to_string(manifest_dir.join("src/server/shell_manager.rs"))
+                .expect("server shell manager source");
+
+        assert!(
+            server_source.contains("mod shell_manager;"),
+            "server must declare the shell manager module"
+        );
+        assert!(
+            !server_source.contains("shell_sessions: Option<RuntimeShellSessionManager>"),
+            "server.rs must not store raw RuntimeShellSessionManager state"
+        );
+        assert!(
+            !server_source.contains("fn shell_manager("),
+            "server.rs must not own shell manager lazy initialization"
+        );
+        assert!(
+            manager_source.contains("struct ServerShellManager"),
+            "server/shell_manager.rs must own ServerShellManager"
+        );
+        assert!(
+            manager_source.contains("Option<RuntimeShellSessionManager>"),
+            "server/shell_manager.rs must own optional runtime shell session storage"
+        );
+        assert!(
+            manager_source.contains("TaskRegistry::new_for_cwd"),
+            "server/shell_manager.rs must own server shell task registry creation"
+        );
+        assert!(
+            manager_source.contains("fn sessions_mut"),
+            "server/shell_manager.rs must expose borrowed runtime shell sessions for command/exec compatibility"
+        );
+    }
+
+    #[test]
     fn server_permission_dispatch_is_owned_by_permission_processor() {
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let router_source = std::fs::read_to_string(manifest_dir.join("src/server/router.rs"))
