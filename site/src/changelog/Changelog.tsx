@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.133":
+        "Sandbox bash command construction now uses grouped WorkspaceWriteSandboxCommandContext and ReadOnlySandboxCommandContext inputs, with the macOS Seatbelt profile helpers also receiving focused profile contexts. Shell sessions, command/exec, bash sandboxing, network and filesystem policy flags, Unix socket allowlists, and non-interactive process preparation keep the same behavior while the sandbox API no longer exposes long argument lists.",
       "v0.1.132":
         "Runtime bash sandbox execution and one-shot shell spawning now use focused RuntimeBashSandboxContext and RuntimeBashOnceContext inputs. The model-visible bash flow still owns permission-profile sandboxing, network and filesystem permission retries, cancellation, task-registry handoff, output truncation, and diagnostics while runtime_bash.rs no longer needs internal long-argument helper escape hatches.",
       "v0.1.131":
@@ -292,6 +294,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.133":
+        "Sandbox bash command 构造现在改用 WorkspaceWriteSandboxCommandContext 与 ReadOnlySandboxCommandContext 聚合输入，macOS Seatbelt profile helper 也改为接收聚焦的 profile context。Shell session、command/exec、bash sandbox、网络与文件系统策略开关、Unix socket allowlist、非交互式进程准备都保持同一行为，同时 sandbox API 不再暴露长参数列表。",
       "v0.1.132":
         "运行时 bash 的 sandbox 执行和一次性 shell 启动现在改用 RuntimeBashSandboxContext 与 RuntimeBashOnceContext 聚合输入。模型可见 bash 仍保持 permission-profile 沙箱、网络和文件系统权限重试、取消、task registry 交接、输出截断和诊断行为不变，同时 runtime_bash.rs 不再需要内部长参数 helper 的逃逸口。",
       "v0.1.131":
