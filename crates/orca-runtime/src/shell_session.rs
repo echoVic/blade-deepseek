@@ -181,29 +181,33 @@ impl RuntimeShellSessionManager {
                 network_access,
                 exclude_tmpdir_env_var,
                 exclude_slash_tmp,
-            } => orca_tools::sandbox::workspace_write_bash_command_with_unix_sockets(
-                &command.command,
-                &command.cwd,
-                &command.additional_readable_directories,
-                &command.additional_working_directories,
-                &command.denied_working_directories,
-                network_access,
-                exclude_tmpdir_env_var,
-                exclude_slash_tmp,
-                &command.allowed_unix_socket_roots,
+            } => orca_tools::sandbox::workspace_write_bash_command(
+                orca_tools::sandbox::WorkspaceWriteSandboxCommandContext {
+                    command: &command.command,
+                    cwd: &command.cwd,
+                    readable_roots: &command.additional_readable_directories,
+                    additional_roots: &command.additional_working_directories,
+                    denied_roots: &command.denied_working_directories,
+                    network_access,
+                    exclude_tmpdir_env_var,
+                    exclude_slash_tmp,
+                    allowed_unix_socket_roots: &command.allowed_unix_socket_roots,
+                },
             ),
             ShellSandboxMode::ReadOnly {
                 network_access,
                 allow_global_read,
-            } => orca_tools::sandbox::read_only_bash_command_with_unix_sockets(
-                &command.command,
-                &command.cwd,
-                &command.additional_readable_directories,
-                &command.additional_working_directories,
-                &command.denied_working_directories,
-                network_access,
-                allow_global_read,
-                &command.allowed_unix_socket_roots,
+            } => orca_tools::sandbox::read_only_bash_command(
+                orca_tools::sandbox::ReadOnlySandboxCommandContext {
+                    command: &command.command,
+                    cwd: &command.cwd,
+                    readable_roots: &command.additional_readable_directories,
+                    additional_roots: &command.additional_working_directories,
+                    denied_roots: &command.denied_working_directories,
+                    network_access,
+                    allow_global_read,
+                    allowed_unix_socket_roots: &command.allowed_unix_socket_roots,
+                },
             ),
             ShellSandboxMode::DangerFullAccess => {
                 orca_tools::sandbox::plain_bash_command(&command.command, &command.cwd)
