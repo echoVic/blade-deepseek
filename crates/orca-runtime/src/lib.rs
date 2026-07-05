@@ -30,6 +30,7 @@ mod runtime_turn_loop;
 mod runtime_turn_opening;
 mod runtime_turn_setup;
 mod runtime_turn_start;
+pub(crate) mod runtime_user_input;
 pub(crate) mod sandbox_denial;
 pub mod schema_validation;
 pub mod server;
@@ -707,6 +708,41 @@ mod tests {
             lifecycle_source
                 .contains("pub use crate::runtime_tool_actor::RuntimeToolActorContext;"),
             "lifecycle must preserve existing public imports by re-exporting RuntimeToolActorContext"
+        );
+    }
+
+    #[test]
+    fn runtime_user_input_boundary_is_owned_by_runtime_user_input_module() {
+        let lib_source = include_str!("lib.rs");
+        let lifecycle_source = include_str!("lifecycle.rs");
+        let runtime_user_input_source = std::fs::read_to_string("src/runtime_user_input.rs")
+            .expect("runtime user input source");
+
+        assert!(
+            lib_source.contains("pub(crate) mod runtime_user_input;"),
+            "runtime crate must declare a focused runtime_user_input module"
+        );
+
+        for marker in [
+            "pub struct RuntimeUserInputRequest",
+            "pub trait RuntimeUserInputHandler",
+            "struct RuntimeUserInputRequestArgs",
+            "pub(crate) fn parse_runtime_user_input_request(",
+            "pub(crate) fn execute_user_input_tool(",
+        ] {
+            assert!(
+                runtime_user_input_source.contains(marker),
+                "runtime_user_input must own user-input runtime detail {marker}"
+            );
+            assert!(
+                !lifecycle_source.contains(marker),
+                "lifecycle must not own user-input runtime detail {marker}"
+            );
+        }
+
+        assert!(
+            lifecycle_source.contains("pub use crate::runtime_user_input::"),
+            "lifecycle must preserve existing public imports by re-exporting runtime user-input types"
         );
     }
 
