@@ -67,7 +67,7 @@ Run: `cargo test -p orca-runtime --all-targets -- --test-threads=1`
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 Run:
 

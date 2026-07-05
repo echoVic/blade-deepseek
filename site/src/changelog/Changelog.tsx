@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.124":
+        "Runtime lifecycle state machine types now live in a focused runtime_lifecycle module. The existing orca_runtime::lifecycle imports remain available through re-exports, while task/turn ids, status mapping, event payloads, and RuntimeTurnRunner behavior stay unchanged.",
       "v0.1.123":
         "Runtime turn setup now lives in a focused runtime_turn_setup module. Agent loop still delegates through RuntimeTurnSetupStep, and the new module owns context budget setup, tool approval policy construction, and provider config composition while lifecycle.rs keeps actor/lifecycle primitives.",
       "v0.1.122":
@@ -274,6 +276,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.124":
+        "Runtime lifecycle 状态机类型现在移到独立的 runtime_lifecycle 模块。既有 orca_runtime::lifecycle 导入仍通过 re-export 保持可用，task/turn id、状态映射、事件 payload 和 RuntimeTurnRunner 行为保持不变。",
       "v0.1.123":
         "Runtime turn setup 现在从 lifecycle.rs 移到独立的 runtime_turn_setup 模块。Agent loop 仍通过 RuntimeTurnSetupStep 委托执行，新模块负责 context budget setup、工具审批 policy 构造和 provider config 组合，lifecycle.rs 则继续保留 actor/lifecycle 原语。",
       "v0.1.122":
