@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.136":
+        "Runtime permission requests now live in a focused runtime_permission module. The existing orca_runtime::lifecycle imports remain available through re-exports, while request_permissions execution and turn permission overlay behavior keep the same runtime shape.",
       "v0.1.135":
         "Runtime request_user_input handling now lives in a focused runtime_user_input module. The existing orca_runtime::lifecycle imports remain available through re-exports, while request parsing, handler dispatch, answer completion, and cancellation failure behavior keep the same runtime and TUI shape.",
       "v0.1.134":
@@ -298,6 +300,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.136":
+        "Runtime permission request/response/handler 与 turn permission overlay 现在移到独立的 runtime_permission 模块。既有 orca_runtime::lifecycle 导入仍通过 re-export 保持可用，request_permissions 执行和 turn permission overlay 行为保持同一运行时形状。",
       "v0.1.135":
         "Runtime request_user_input 处理现在移到独立的 runtime_user_input 模块。既有 orca_runtime::lifecycle 导入仍通过 re-export 保持可用，请求解析、handler 派发、回答完成和取消失败行为都保持同一 runtime 与 TUI 形状。",
       "v0.1.134":
