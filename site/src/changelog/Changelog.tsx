@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.129":
+        "Server shell-session state now lives in a focused shell_manager module. Optional runtime shell session storage, lazy task-registry-backed initialization, shell CRUD/read/kill/reap/wait calls, and command/exec drain compatibility keep the same server shell protocol shape.",
       "v0.1.128":
         "Server pending-permission request state now lives in a focused permission_manager module. Runtime request_permissions waits, command/exec permission retry records, pending request removal, and permission request handler registration keep the same server permission protocol shape.",
       "v0.1.127":
@@ -284,6 +286,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.129":
+        "Server shell-session 状态现在移到独立的 shell_manager 模块。可选 runtime shell session 存储、带 task registry 的 lazy 初始化、shell CRUD/read/kill/reap/wait 调用，以及 command/exec drain 兼容借用都保持同一 server shell protocol 形状。",
       "v0.1.128":
         "Server pending-permission request 状态现在移到独立的 permission_manager 模块。Runtime request_permissions 等待、command/exec permission retry record、pending request removal，以及 permission request handler registration 都保持同一 server permission protocol 形状。",
       "v0.1.127":
