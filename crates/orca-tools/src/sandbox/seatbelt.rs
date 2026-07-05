@@ -331,7 +331,7 @@ fn protected_workspace_metadata_deny_rules(cwd: &Path) -> String {
         .into_iter()
         .map(|name| {
             format!(
-                r#"(deny file-read* file-write* (subpath "{}"))"#,
+                r#"(deny file-write* (subpath "{}"))"#,
                 seatbelt_escape(&cwd.join(name).display().to_string())
             )
         })
@@ -396,11 +396,19 @@ mod tests {
             workspace.path().display()
         );
         let deny_git = format!(
+            r#"(deny file-write* (subpath "{}"))"#,
+            workspace.path().join(".git").display()
+        );
+        let deny_git_reads = format!(
             r#"(deny file-read* file-write* (subpath "{}"))"#,
             workspace.path().join(".git").display()
         );
 
         assert!(profile.contains(&deny_git), "{profile}");
+        assert!(
+            !profile.contains(&deny_git_reads),
+            "metadata protection must preserve reads for git commands: {profile}"
+        );
         assert!(
             profile.find(&deny_git).unwrap() > profile.find(&allow_workspace).unwrap(),
             "metadata deny must override workspace write: {profile}"
@@ -421,10 +429,7 @@ mod tests {
             false,
             &[],
         );
-        let deny_git = format!(
-            r#"(deny file-read* file-write* (subpath "{}"))"#,
-            git_dir.display()
-        );
+        let deny_git = format!(r#"(deny file-write* (subpath "{}"))"#, git_dir.display());
         let allow_git = format!(r#"(allow file-write* (subpath "{}"))"#, git_dir.display());
 
         assert!(profile.contains(&deny_git), "{profile}");
@@ -455,6 +460,35 @@ mod tests {
 
         assert!(!output.status.success());
         assert!(!target.exists());
+    }
+
+    #[test]
+    fn workspace_write_sandbox_allows_workspace_git_reads_by_default() {
+        if !available() {
+            return;
+        }
+
+        let workspace = TempDir::new_in(std::env::current_dir().unwrap()).unwrap();
+        let git_dir = workspace.path().join(".git");
+        std::fs::create_dir(&git_dir).unwrap();
+        std::fs::write(
+            git_dir.join("config"),
+            "[core]\nrepositoryformatversion = 0\n",
+        )
+        .unwrap();
+
+        let output = bash_command("cat .git/config", workspace.path())
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "workspace metadata reads must be allowed for git commands\nstatus: {:?}\nstdout: {}\nstderr: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("repositoryformatversion"));
     }
 
     #[test]
