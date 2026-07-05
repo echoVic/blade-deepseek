@@ -57,7 +57,7 @@ mod tests {
 
     #[test]
     fn session_store_boundary_creates_loadable_jsonl_thread() {
-        let _guard = history::TEST_ENV_LOCK.lock().unwrap();
+        let _guard = history::lock_test_env();
         let home = tempfile::tempdir().unwrap();
         unsafe {
             std::env::set_var("ORCA_HOME", home.path());

@@ -666,7 +666,7 @@ mod tests {
     }
 
     fn with_orca_home<T>(f: impl FnOnce(&std::path::Path) -> T) -> T {
-        let _guard = history::TEST_ENV_LOCK.lock().expect("env lock");
+        let _guard = history::lock_test_env();
         let home = tempdir().expect("temp home");
         let previous = std::env::var_os("ORCA_HOME");
         unsafe {

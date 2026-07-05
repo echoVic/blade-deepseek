@@ -27,6 +27,18 @@ const SESSION_SCHEMA_VERSION: u32 = 1;
 #[cfg(test)]
 pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+#[cfg(test)]
+fn recover_test_lock(mutex: &'static std::sync::Mutex<()>) -> std::sync::MutexGuard<'static, ()> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
+pub(crate) fn lock_test_env() -> std::sync::MutexGuard<'static, ()> {
+    recover_test_lock(&TEST_ENV_LOCK)
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct CompactionRecord {
     pub collapsed_at: DateTime<Utc>,
@@ -298,8 +310,22 @@ mod tests {
     }
 
     #[test]
+    fn test_env_lock_recovers_after_poisoned_test_panic() {
+        static LOCAL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+        let poisoned = std::thread::spawn(|| {
+            let _guard = recover_test_lock(&LOCAL_LOCK);
+            panic!("poison a test lock");
+        })
+        .join();
+        assert!(poisoned.is_err());
+
+        drop(recover_test_lock(&LOCAL_LOCK));
+    }
+
+    #[test]
     fn writer_persists_compaction_records() {
-        let _guard = TEST_ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_test_env();
         let home = tempfile::tempdir().expect("temp home");
         let previous = std::env::var_os(ORCA_HOME_ENV);
         unsafe {
@@ -332,7 +358,7 @@ mod tests {
 
     #[test]
     fn writer_round_trips_pinned_messages() {
-        let _guard = TEST_ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_test_env();
         let home = tempfile::tempdir().expect("temp home");
         let previous = std::env::var_os(ORCA_HOME_ENV);
         unsafe {
@@ -365,7 +391,7 @@ mod tests {
 
     #[test]
     fn writer_redacts_secrets_before_persisting_transcript() {
-        let _guard = TEST_ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_test_env();
         let home = tempfile::tempdir().expect("temp home");
         let previous = std::env::var_os(ORCA_HOME_ENV);
         unsafe {
@@ -457,7 +483,7 @@ mod tests {
 
     #[test]
     fn plan_state_round_trips_through_session() {
-        let _guard = TEST_ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_test_env();
         let home = tempfile::tempdir().expect("temp home");
         let previous = std::env::var_os(ORCA_HOME_ENV);
         unsafe {
@@ -505,7 +531,7 @@ mod tests {
 
     #[test]
     fn all_completed_plan_restores_as_none() {
-        let _guard = TEST_ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_test_env();
         let home = tempfile::tempdir().expect("temp home");
         let previous = std::env::var_os(ORCA_HOME_ENV);
         unsafe {
@@ -548,7 +574,7 @@ mod tests {
 
     #[test]
     fn empty_plan_restores_as_none() {
-        let _guard = TEST_ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_test_env();
         let home = tempfile::tempdir().expect("temp home");
         let previous = std::env::var_os(ORCA_HOME_ENV);
         unsafe {
@@ -579,7 +605,7 @@ mod tests {
 
     #[test]
     fn session_without_plan_loads_normally() {
-        let _guard = TEST_ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_test_env();
         let home = tempfile::tempdir().expect("temp home");
         let previous = std::env::var_os(ORCA_HOME_ENV);
         unsafe {
@@ -610,7 +636,7 @@ mod tests {
 
     #[test]
     fn resume_restores_rolling_summary_from_last_context_summary_record() {
-        let _guard = TEST_ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_test_env();
         let home = tempfile::tempdir().expect("temp home");
         let previous = std::env::var_os(ORCA_HOME_ENV);
         unsafe {
@@ -655,7 +681,7 @@ mod tests {
 
     #[test]
     fn resume_without_summaries_has_no_rolling_summary() {
-        let _guard = TEST_ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_test_env();
         let home = tempfile::tempdir().expect("temp home");
         let previous = std::env::var_os(ORCA_HOME_ENV);
         unsafe {
@@ -728,7 +754,7 @@ mod tests {
 
     #[test]
     fn resume_prefers_persisted_summary_state_over_legacy_summary_list() {
-        let _guard = TEST_ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_test_env();
         let home = tempfile::tempdir().expect("temp home");
         let previous = std::env::var_os(ORCA_HOME_ENV);
         unsafe {
@@ -774,7 +800,7 @@ mod tests {
 
     #[test]
     fn resume_replays_compaction_records_to_drop_collapsed_messages() {
-        let _guard = TEST_ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_test_env();
         let home = tempfile::tempdir().expect("temp home");
         let previous = std::env::var_os(ORCA_HOME_ENV);
         unsafe {
