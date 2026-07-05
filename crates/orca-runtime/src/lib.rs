@@ -286,6 +286,39 @@ mod tests {
     }
 
     #[test]
+    fn server_command_exec_manager_is_owned_by_command_exec_manager_module() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let server_source =
+            std::fs::read_to_string(manifest_dir.join("src/server.rs")).expect("server source");
+        let manager_source =
+            std::fs::read_to_string(manifest_dir.join("src/server/command_exec_manager.rs"))
+                .expect("server command exec manager source");
+
+        assert!(
+            server_source.contains("mod command_exec_manager;"),
+            "server must declare the command exec manager module"
+        );
+        for type_name in [
+            "struct CommandExecProcess",
+            "struct CommandExecManager",
+            "enum CommandExecDrainOutcome",
+        ] {
+            assert!(
+                !server_source.contains(type_name),
+                "server.rs must not own {type_name}"
+            );
+            assert!(
+                manager_source.contains(type_name),
+                "server/command_exec_manager.rs must own {type_name}"
+            );
+        }
+        assert!(
+            manager_source.contains("impl CommandExecManager"),
+            "server/command_exec_manager.rs must own command exec manager behavior"
+        );
+    }
+
+    #[test]
     fn server_permission_dispatch_is_owned_by_permission_processor() {
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let router_source = std::fs::read_to_string(manifest_dir.join("src/server/router.rs"))
