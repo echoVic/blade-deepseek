@@ -352,6 +352,45 @@ mod tests {
     }
 
     #[test]
+    fn server_permission_manager_is_owned_by_permission_manager_module() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let server_source =
+            std::fs::read_to_string(manifest_dir.join("src/server.rs")).expect("server source");
+        let manager_source =
+            std::fs::read_to_string(manifest_dir.join("src/server/permission_manager.rs"))
+                .expect("server permission manager source");
+
+        assert!(
+            server_source.contains("mod permission_manager;"),
+            "server must declare the permission manager module"
+        );
+        for type_name in [
+            "struct PendingCommandExecPermissionRequest",
+            "enum PendingPermissionRequest",
+            "struct PendingPermissionManager",
+            "struct ServerPermissionRequestHandler",
+        ] {
+            assert!(
+                !server_source.contains(type_name),
+                "server.rs must not own {type_name}"
+            );
+            assert!(
+                manager_source.contains(type_name),
+                "server/permission_manager.rs must own {type_name}"
+            );
+        }
+        assert!(
+            manager_source.contains("RuntimePermissionRequestHandler")
+                && manager_source.contains("for ServerPermissionRequestHandler"),
+            "server/permission_manager.rs must own runtime permission request handling"
+        );
+        assert!(
+            manager_source.contains("fn insert_command_exec"),
+            "server/permission_manager.rs must own command/exec pending permission insertion"
+        );
+    }
+
+    #[test]
     fn server_permission_dispatch_is_owned_by_permission_processor() {
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let router_source = std::fs::read_to_string(manifest_dir.join("src/server/router.rs"))

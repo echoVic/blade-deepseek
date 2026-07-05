@@ -7,6 +7,7 @@ use std::time::Duration;
 
 mod active_turn_manager;
 mod command_exec_manager;
+mod permission_manager;
 mod router;
 
 use base64::Engine;
@@ -16,10 +17,7 @@ use orca_core::cancel::CancelToken;
 use serde_json::{Value, json};
 use walkdir::WalkDir;
 
-use crate::lifecycle::{
-    RuntimePermissionRequest, RuntimePermissionRequestHandler, RuntimePermissionResponse,
-    ThreadSteerHandle,
-};
+use crate::lifecycle::{RuntimePermissionResponse, ThreadSteerHandle};
 use crate::network_proxy::{RuntimeNetworkBlockReport, RuntimeNetworkPolicy, RuntimeNetworkProxy};
 use crate::protocol::{self, ClientOp, ServerEvent, Submission};
 use crate::sandbox_denial::{
@@ -40,6 +38,10 @@ use active_turn_manager::{ActiveTurnControl, ActiveTurnHandle, ActiveTurnManager
 use command_exec_manager::{CommandExecDrainOutcome, CommandExecManager, CommandExecProcess};
 use orca_core::config::{
     DEFAULT_PERMISSION_PROFILE_GLOB_SCAN_MAX_DEPTH, HistoryMode, OutputFormat, RunConfig,
+};
+use permission_manager::{
+    PendingCommandExecPermissionRequest, PendingPermissionManager, PendingPermissionRequest,
+    ServerPermissionRequestHandler,
 };
 
 #[derive(Clone, Debug)]
@@ -83,110 +85,13 @@ struct ServerState {
     shell_sessions: Option<RuntimeShellSessionManager>,
     command_exec: CommandExecManager,
     active_turns: ActiveTurnManager,
-    pending_permissions: Arc<Mutex<HashMap<String, PendingPermissionRequest>>>,
+    pending_permissions: PendingPermissionManager,
 }
 
 impl ServerState {
     fn terminate_active_command_exec_processes(&mut self) {
         self.command_exec
             .terminate_all(self.shell_sessions.as_mut());
-    }
-}
-
-enum PendingPermissionRequest {
-    Runtime {
-        sender: mpsc::Sender<RuntimePermissionResponse>,
-        thread_id: String,
-        runtime_workspace_roots: Vec<PathBuf>,
-    },
-    CommandExec {
-        request: PendingCommandExecPermissionRequest,
-    },
-}
-
-#[derive(Clone)]
-struct PendingCommandExecPermissionRequest {
-    thread_id: String,
-    runtime_workspace_roots: Vec<PathBuf>,
-    command: Vec<String>,
-    process_id: Option<String>,
-    cwd: Option<PathBuf>,
-    env: protocol::CommandEnvOverrides,
-    options: protocol::CommandExecOptions,
-    terminal: crate::shell_session::ShellTerminalMode,
-    event_id: Value,
-}
-
-impl PendingPermissionRequest {
-    fn thread_id(&self) -> &str {
-        match self {
-            Self::Runtime { thread_id, .. } => thread_id,
-            Self::CommandExec { request } => &request.thread_id,
-        }
-    }
-
-    fn runtime_workspace_roots(&self) -> &[PathBuf] {
-        match self {
-            Self::Runtime {
-                runtime_workspace_roots,
-                ..
-            } => runtime_workspace_roots,
-            Self::CommandExec { request } => &request.runtime_workspace_roots,
-        }
-    }
-}
-
-struct ServerPermissionRequestHandler<W: Write + Send + 'static> {
-    writer: Arc<Mutex<W>>,
-    pending: Arc<Mutex<HashMap<String, PendingPermissionRequest>>>,
-    event_id: Value,
-    thread_id: String,
-    turn_id: String,
-    runtime_workspace_roots: Vec<PathBuf>,
-}
-
-impl<W: Write + Send + 'static> RuntimePermissionRequestHandler
-    for ServerPermissionRequestHandler<W>
-{
-    fn request_permissions(
-        &self,
-        request: &RuntimePermissionRequest,
-    ) -> io::Result<RuntimePermissionResponse> {
-        let request_id = format!("permission-{}-{}", self.turn_id, request.id);
-        let (sender, receiver) = mpsc::channel();
-        {
-            let mut pending = self.pending.lock().map_err(lock_error)?;
-            pending.insert(
-                request_id.clone(),
-                PendingPermissionRequest::Runtime {
-                    sender,
-                    thread_id: self.thread_id.clone(),
-                    runtime_workspace_roots: self.runtime_workspace_roots.clone(),
-                },
-            );
-        }
-        if let Err(error) = write_locked_event(
-            &self.writer,
-            &self.event_id,
-            ServerEvent::PermissionRequest {
-                request_id: json!(request_id.clone()),
-                thread_id: json!(self.thread_id),
-                turn_id: json!(self.turn_id),
-                reason: request
-                    .reason
-                    .as_ref()
-                    .map(|reason| json!(reason))
-                    .unwrap_or(Value::Null),
-                permissions: serde_json::to_value(&request.permissions).unwrap_or(Value::Null),
-            },
-        ) {
-            let mut pending = self.pending.lock().map_err(lock_error)?;
-            pending.remove(&request_id);
-            return Err(error);
-        }
-        receiver
-            .recv()
-            .map_err(|_| io::Error::other("permission response channel closed"))
     }
 }
 
@@ -429,10 +334,7 @@ fn run_permission_respond<W: Write>(
     id: Value,
     writer: &mut W,
 ) -> io::Result<()> {
-    let pending = {
-        let mut pending = state.pending_permissions.lock().map_err(lock_error)?;
-        pending.remove(request_id)
-    };
+    let pending = state.pending_permissions.remove(request_id)?;
     let Some(pending) = pending else {
         return protocol::write_server_event(
             writer,
@@ -1384,13 +1286,9 @@ fn request_command_exec_permission<W: Write>(
             .map(ToString::to_string)
             .unwrap_or_else(|| request.event_id.to_string())
     );
-    {
-        let mut pending = state.pending_permissions.lock().map_err(lock_error)?;
-        pending.insert(
-            request_id.clone(),
-            PendingPermissionRequest::CommandExec { request },
-        );
-    }
+    state
+        .pending_permissions
+        .insert_command_exec(request_id.clone(), request)?;
     protocol::write_server_event(
         writer,
         &Value::from(request_id.clone()),
@@ -2486,14 +2384,14 @@ fn run_thread_submit_async<W: Write + Send + 'static>(
     let writer_for_thread = Arc::clone(&writer);
     let thread_id_for_return = thread_id.clone();
     let active_turn_id_for_return = active_turn_id.clone();
-    let permission_handler = Arc::new(ServerPermissionRequestHandler {
-        writer: Arc::clone(&writer),
-        pending: Arc::clone(&state.pending_permissions),
-        event_id: id.clone(),
-        thread_id: thread_id.clone(),
-        turn_id: active_turn_id.clone(),
+    let permission_handler = Arc::new(ServerPermissionRequestHandler::new(
+        Arc::clone(&writer),
+        state.pending_permissions.clone(),
+        id.clone(),
+        thread_id.clone(),
+        active_turn_id.clone(),
         runtime_workspace_roots,
-    });
+    ));
     let handle = thread::spawn(move || {
         let mut writer = SharedServerRequestWriter::new(id.clone(), Arc::clone(&writer_for_thread));
         let status = thread_state.run_turn_with_permissions_cancel_and_permission_handler(

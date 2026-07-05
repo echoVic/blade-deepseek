@@ -542,10 +542,12 @@ external tools, approvals, and future plugin-provided tools.
    v0.1.123, runtime lifecycle state machine types moved into
    `runtime_lifecycle` in v0.1.124, `RuntimeToolActorContext` moved into
    `runtime_tool_actor` in v0.1.125, and server command/exec active process
-   state moved into `server/command_exec_manager.rs` in v0.1.126, and server
+   state moved into `server/command_exec_manager.rs` in v0.1.126, server
    active-turn lifecycle state moved into `server/active_turn_manager.rs` in
-   v0.1.127. The feature work remains open after v0.1.127 for deeper
-   shell/session, async-subagent, and reducer-style runtime convergence.
+   v0.1.127, and server pending-permission request state moved into
+   `server/permission_manager.rs` in v0.1.128. The feature work remains open
+   after v0.1.128 for deeper shell/session, async-subagent, and reducer-style
+   runtime convergence.
 
 ### P3: Shell Timeout Hardening
 
