@@ -18,6 +18,7 @@ pub mod protocol;
 pub mod provider_turn;
 pub(crate) mod runtime_bash;
 mod runtime_conversation_bootstrap;
+mod runtime_lifecycle;
 mod runtime_model_route;
 mod runtime_normal_tool;
 pub(crate) mod runtime_special;
@@ -440,6 +441,48 @@ mod tests {
                 "lifecycle must own runtime turn context behavior {type_name}"
             );
         }
+    }
+
+    #[test]
+    fn runtime_lifecycle_state_machine_is_owned_by_runtime_lifecycle_module() {
+        let lib_source = include_str!("lib.rs");
+        let lifecycle_source = include_str!("lifecycle.rs");
+        let runtime_lifecycle_source =
+            std::fs::read_to_string("src/runtime_lifecycle.rs").expect("runtime lifecycle source");
+
+        assert!(
+            lib_source.contains("mod runtime_lifecycle;"),
+            "runtime crate must declare a focused runtime_lifecycle module"
+        );
+
+        for marker in [
+            "pub struct RuntimeSessionLifecycle",
+            "pub struct RuntimeTaskLifecycle",
+            "pub enum RuntimeTaskKind",
+            "pub enum RuntimeTaskStatus",
+            "pub struct RuntimeTurnLifecycle",
+            "pub struct RuntimeTurnRunner",
+            "pub struct RuntimeStartedTurn",
+            "pub struct RuntimeAdvancedTurn",
+            "impl RuntimeSessionLifecycle",
+            "impl<'a> RuntimeTurnRunner<'a>",
+            "impl RuntimeTaskLifecycle",
+            "impl RuntimeTurnLifecycle",
+        ] {
+            assert!(
+                runtime_lifecycle_source.contains(marker),
+                "runtime_lifecycle must own lifecycle state-machine detail {marker}"
+            );
+            assert!(
+                !lifecycle_source.contains(marker),
+                "lifecycle must not own lifecycle state-machine detail {marker}"
+            );
+        }
+
+        assert!(
+            lifecycle_source.contains("pub use crate::runtime_lifecycle::"),
+            "lifecycle must preserve existing public imports by re-exporting runtime_lifecycle types"
+        );
     }
 
     #[test]
