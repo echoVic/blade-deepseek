@@ -1121,6 +1121,57 @@ mod tests {
     }
 
     #[test]
+    fn runtime_bash_internal_execution_uses_grouped_contexts() {
+        let runtime_bash_source = include_str!("runtime_bash.rs");
+
+        for marker in [
+            "struct RuntimeBashSandboxContext",
+            "struct RuntimeBashOnceContext",
+            "fn execute_bash_with_sandbox(context: RuntimeBashSandboxContext",
+            "fn execute_bash_once(context: RuntimeBashOnceContext",
+        ] {
+            assert!(
+                runtime_bash_source.contains(marker),
+                "runtime_bash must own grouped internal bash execution detail {marker}"
+            );
+        }
+
+        assert!(
+            !runtime_bash_source.contains("#[allow(clippy::too_many_arguments)]"),
+            "runtime_bash internal bash execution must not need too_many_arguments escape hatches"
+        );
+
+        for field_name in [
+            "command:",
+            "cwd:",
+            "additional_roots:",
+            "sandbox:",
+            "shell_timeout_secs:",
+            "task_registry:",
+            "cancel:",
+        ] {
+            assert!(
+                runtime_bash_source.contains(field_name),
+                "RuntimeBashSandboxContext must carry sandbox field {field_name}"
+            );
+        }
+
+        for field_name in [
+            "additional_readable_directories:",
+            "additional_working_directories:",
+            "denied_working_directories:",
+            "allowed_unix_socket_roots:",
+            "env:",
+            "sandbox:",
+        ] {
+            assert!(
+                runtime_bash_source.contains(field_name),
+                "RuntimeBashOnceContext must carry shell-spawn field {field_name}"
+            );
+        }
+    }
+
+    #[test]
     fn tool_turn_dispatch_uses_grouped_context() {
         let provider_turn_source = include_str!("provider_turn.rs");
         let tool_turn_source = include_str!("tool_turn.rs");

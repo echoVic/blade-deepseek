@@ -61,19 +61,19 @@ pub(crate) fn execute_bash_with_shell_session(
     };
 
     let Some(config) = config else {
-        return execute_bash_once(
+        return execute_bash_once(RuntimeBashOnceContext {
             command,
             cwd,
-            Vec::new(),
-            additional_roots.to_vec(),
-            Vec::new(),
-            Vec::new(),
-            Default::default(),
-            ShellSandboxMode::default(),
+            additional_readable_directories: Vec::new(),
+            additional_working_directories: additional_roots.to_vec(),
+            denied_working_directories: Vec::new(),
+            allowed_unix_socket_roots: Vec::new(),
+            env: Default::default(),
+            sandbox: ShellSandboxMode::default(),
             shell_timeout_secs,
             task_registry,
             cancel,
-        )
+        })
         .into_tool_result(request, output_truncation, cancel, task_registry);
     };
     let mut sandbox = match bash_sandbox_from_active_permission_profile(config, cwd) {
@@ -95,15 +95,15 @@ pub(crate) fn execute_bash_with_shell_session(
             }
         }
     }
-    let result = execute_bash_with_sandbox(
+    let result = execute_bash_with_sandbox(RuntimeBashSandboxContext {
         command,
         cwd,
         additional_roots,
-        &sandbox,
+        sandbox: &sandbox,
         shell_timeout_secs,
         task_registry,
         cancel,
-    );
+    });
     let BashExecutionResult {
         output,
         network_block,
@@ -143,15 +143,15 @@ pub(crate) fn execute_bash_with_shell_session(
                 retry_sandbox.network_policy_domains.insert(domain, access);
             }
         }
-        return execute_bash_with_sandbox(
+        return execute_bash_with_sandbox(RuntimeBashSandboxContext {
             command,
             cwd,
             additional_roots,
-            &retry_sandbox,
+            sandbox: &retry_sandbox,
             shell_timeout_secs,
             task_registry,
             cancel,
-        )
+        })
         .output
         .into_tool_result(request, output_truncation, cancel, task_registry);
     }
@@ -202,15 +202,15 @@ pub(crate) fn execute_bash_with_shell_session(
                 push_unique_path(&mut retry_sandbox.additional_writable_roots, root.clone());
             }
 
-            return execute_bash_with_sandbox(
+            return execute_bash_with_sandbox(RuntimeBashSandboxContext {
                 command,
                 cwd,
                 additional_roots,
-                &retry_sandbox,
+                sandbox: &retry_sandbox,
                 shell_timeout_secs,
                 task_registry,
                 cancel,
-            )
+            })
             .output
             .with_sandbox_diagnostic(cwd)
             .into_tool_result(request, output_truncation, cancel, task_registry);
@@ -250,6 +250,30 @@ struct BashExecutionResult {
 struct BashShellOutput {
     output: Result<crate::shell_session::ShellSessionOutput, String>,
     task_id: Option<String>,
+}
+
+struct RuntimeBashSandboxContext<'a> {
+    command: &'a str,
+    cwd: &'a Path,
+    additional_roots: &'a [PathBuf],
+    sandbox: &'a crate::server::CommandExecSandbox,
+    shell_timeout_secs: u64,
+    task_registry: &'a TaskRegistry,
+    cancel: Option<&'a CancelToken>,
+}
+
+struct RuntimeBashOnceContext<'a> {
+    command: &'a str,
+    cwd: &'a Path,
+    additional_readable_directories: Vec<PathBuf>,
+    additional_working_directories: Vec<PathBuf>,
+    denied_working_directories: Vec<PathBuf>,
+    allowed_unix_socket_roots: Vec<PathBuf>,
+    env: BTreeMap<String, Option<String>>,
+    sandbox: ShellSandboxMode,
+    shell_timeout_secs: u64,
+    task_registry: &'a TaskRegistry,
+    cancel: Option<&'a CancelToken>,
 }
 
 impl BashShellOutput {
@@ -342,16 +366,16 @@ fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn execute_bash_with_sandbox(
-    command: &str,
-    cwd: &Path,
-    additional_roots: &[PathBuf],
-    sandbox: &crate::server::CommandExecSandbox,
-    shell_timeout_secs: u64,
-    task_registry: &TaskRegistry,
-    cancel: Option<&CancelToken>,
-) -> BashExecutionResult {
+fn execute_bash_with_sandbox(context: RuntimeBashSandboxContext<'_>) -> BashExecutionResult {
+    let RuntimeBashSandboxContext {
+        command,
+        cwd,
+        additional_roots,
+        sandbox,
+        shell_timeout_secs,
+        task_registry,
+        cancel,
+    } = context;
     let mut additional_working_directories = additional_roots.to_vec();
     additional_working_directories.extend(sandbox.additional_writable_roots.clone());
     let mut env = BTreeMap::new();
@@ -392,19 +416,19 @@ fn execute_bash_with_sandbox(
             }
         }
     };
-    let output = execute_bash_once(
+    let output = execute_bash_once(RuntimeBashOnceContext {
         command,
         cwd,
-        sandbox.additional_readable_roots.clone(),
+        additional_readable_directories: sandbox.additional_readable_roots.clone(),
         additional_working_directories,
-        sandbox.denied_writable_roots.clone(),
-        sandbox.allowed_unix_socket_roots.clone(),
+        denied_working_directories: sandbox.denied_writable_roots.clone(),
+        allowed_unix_socket_roots: sandbox.allowed_unix_socket_roots.clone(),
         env,
-        sandbox.mode.clone(),
+        sandbox: sandbox.mode,
         shell_timeout_secs,
         task_registry,
         cancel,
-    );
+    });
     let network_block = block_receiver.and_then(|receiver| {
         receiver
             .try_iter()
@@ -416,20 +440,20 @@ fn execute_bash_with_sandbox(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn execute_bash_once(
-    command: &str,
-    cwd: &Path,
-    additional_readable_directories: Vec<PathBuf>,
-    additional_working_directories: Vec<PathBuf>,
-    denied_working_directories: Vec<PathBuf>,
-    allowed_unix_socket_roots: Vec<PathBuf>,
-    env: BTreeMap<String, Option<String>>,
-    sandbox: ShellSandboxMode,
-    shell_timeout_secs: u64,
-    task_registry: &TaskRegistry,
-    cancel: Option<&CancelToken>,
-) -> BashShellOutput {
+fn execute_bash_once(context: RuntimeBashOnceContext<'_>) -> BashShellOutput {
+    let RuntimeBashOnceContext {
+        command,
+        cwd,
+        additional_readable_directories,
+        additional_working_directories,
+        denied_working_directories,
+        allowed_unix_socket_roots,
+        env,
+        sandbox,
+        shell_timeout_secs,
+        task_registry,
+        cancel,
+    } = context;
     let mut manager = RuntimeShellSessionManager::new(task_registry.clone());
     let handle = match manager.spawn(ShellSessionCommand {
         command: command.to_string(),
