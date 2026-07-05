@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.126":
+        "Server command/exec active process state now lives in a focused command_exec_manager module. Buffered output, streaming deltas, stdin writes, PTY resize, termination, output caps, sandbox diagnostics, and permission retry behavior keep the same server protocol shape.",
       "v0.1.125":
         "RuntimeToolActorContext now lives in a focused runtime_tool_actor module. Existing orca_runtime::lifecycle imports remain available through a re-export, while approval, hook, user-input, normal-tool, permission-overlay, and active-task behavior keep the same runtime shape.",
       "v0.1.124":
@@ -278,6 +280,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.126":
+        "Server command/exec 的 active process 状态现在移到独立的 command_exec_manager 模块。Buffered output、streaming delta、stdin write、PTY resize、terminate、output cap、sandbox 诊断和 permission retry 行为保持同一 server protocol 形状。",
       "v0.1.125":
         "RuntimeToolActorContext 现在移到独立的 runtime_tool_actor 模块。既有 orca_runtime::lifecycle 导入仍通过 re-export 保持可用，审批、hook、request-user-input、normal-tool、permission overlay 和 active-task 行为保持同一运行时形状。",
       "v0.1.124":
