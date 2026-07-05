@@ -25,6 +25,7 @@ mod runtime_steer;
 mod runtime_turn_iteration;
 mod runtime_turn_loop;
 mod runtime_turn_opening;
+mod runtime_turn_setup;
 mod runtime_turn_start;
 pub(crate) mod sandbox_denial;
 pub mod schema_validation;
@@ -581,8 +582,8 @@ mod tests {
             "agent_loop must delegate provider tool schema override through runtime turn setup"
         );
         assert!(
-            include_str!("lifecycle.rs").contains("provider_config_for_agent_loop"),
-            "lifecycle setup must delegate provider tool schema override through provider config construction"
+            include_str!("runtime_turn_setup.rs").contains("provider_config_for_agent_loop"),
+            "runtime_turn_setup must delegate provider tool schema override through provider config construction"
         );
         assert!(
             tool_invocation_source.contains("pub(crate) fn provider_tool_schema_override"),
@@ -2150,9 +2151,12 @@ mod tests {
     }
 
     #[test]
-    fn runtime_turn_setup_step_is_owned_by_lifecycle_module() {
+    fn runtime_turn_setup_step_is_owned_by_runtime_turn_setup_module() {
         let agent_loop_source = include_str!("agent_loop.rs");
         let lifecycle_source = include_str!("lifecycle.rs");
+        let runtime_turn_setup_source = std::fs::read_to_string("src/runtime_turn_setup.rs")
+            .expect("runtime turn setup source");
+        let lib_source = include_str!("lib.rs");
 
         for marker in [
             "ContextConfig::for_model_with_runtime",
@@ -2170,25 +2174,25 @@ mod tests {
             "agent_loop must delegate runtime turn setup"
         );
         assert!(
-            lifecycle_source.contains("struct RuntimeTurnSetupStep"),
-            "lifecycle must own runtime turn setup step state"
+            lib_source.contains("mod runtime_turn_setup;"),
+            "runtime crate must declare a focused runtime_turn_setup module"
         );
-        assert!(
-            lifecycle_source.contains("impl RuntimeTurnSetupStep"),
-            "lifecycle must own runtime turn setup step behavior"
-        );
-        assert!(
-            lifecycle_source.contains("context::ContextConfig::for_model_with_runtime"),
-            "lifecycle must own context config setup"
-        );
-        assert!(
-            lifecycle_source.contains("policy_for_tool_execution("),
-            "lifecycle must compose tool-execution-owned policy construction"
-        );
-        assert!(
-            lifecycle_source.contains("provider_config_for_agent_loop("),
-            "lifecycle must compose tool-invocation-owned provider config construction"
-        );
+        for marker in [
+            "struct RuntimeTurnSetupStep",
+            "impl RuntimeTurnSetupStep",
+            "policy_for_tool_execution(",
+            "provider_config_for_agent_loop(",
+            "let budget_model = config.model.as_option()",
+        ] {
+            assert!(
+                !lifecycle_source.contains(marker),
+                "lifecycle must not own runtime turn setup detail {marker}"
+            );
+            assert!(
+                runtime_turn_setup_source.contains(marker),
+                "runtime_turn_setup must own runtime turn setup detail {marker}"
+            );
+        }
     }
 
     #[test]

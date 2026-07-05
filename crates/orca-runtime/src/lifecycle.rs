@@ -17,7 +17,7 @@ use orca_core::{
     conversation::Conversation,
 };
 use orca_mcp::McpRegistry;
-use orca_provider::{ProviderConfig, context};
+use orca_provider::ProviderConfig;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -30,8 +30,6 @@ use crate::runtime_normal_tool::{
     RuntimeNormalToolInvocation, execute_runtime_normal_tool_invocation,
 };
 use crate::tasks::TaskRegistry;
-use crate::tool_execution::policy_for_tool_execution;
-use crate::tool_invocation::{AgentToolPolicyContext, provider_config_for_agent_loop};
 use crate::workflow::ipc::WorkflowIpcContext;
 use crate::workflow_execution::BackgroundWorkflowRun;
 
@@ -92,8 +90,6 @@ pub struct RuntimeToolActorContext {
     pub(crate) permission_overlay: TurnPermissionOverlay,
 }
 
-pub(crate) struct RuntimeTurnSetupStep;
-
 #[derive(Clone, Debug)]
 pub(crate) struct AgentLoopResult {
     pub(crate) status: RunStatus,
@@ -121,12 +117,6 @@ impl AgentLoopResult {
             error,
         }
     }
-}
-
-pub(crate) struct RuntimeTurnSetup {
-    pub(crate) context_config: context::ContextConfig,
-    pub(crate) policy: ApprovalPolicy,
-    pub(crate) provider_config: ProviderConfig,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -977,41 +967,6 @@ impl ThreadSteerHandle {
     }
 }
 
-impl RuntimeTurnSetupStep {
-    pub(crate) fn new() -> Self {
-        Self
-    }
-
-    pub(crate) fn prepare(
-        &mut self,
-        config: &RunConfig,
-        subagent_depth: u32,
-        subagent_type: &SubagentType,
-        tool_policy: AgentToolPolicyContext<'_>,
-        mcp_registry: &McpRegistry,
-    ) -> RuntimeTurnSetup {
-        let budget_model = config.model.as_option();
-        let context_config = context::ContextConfig::for_model_with_runtime(
-            budget_model.as_deref(),
-            &config.model_runtime,
-        );
-        let policy = policy_for_tool_execution(config);
-        let provider_config = provider_config_for_agent_loop(
-            config,
-            subagent_depth,
-            subagent_type,
-            tool_policy,
-            mcp_registry,
-        );
-
-        RuntimeTurnSetup {
-            context_config,
-            policy,
-            provider_config,
-        }
-    }
-}
-
 impl<'a> AgentLoopContext<'a> {
     pub fn new(
         cwd: &'a Path,
@@ -1656,10 +1611,13 @@ mod tests {
     use crate::runtime_turn_opening::{
         RuntimeTurnOpeningInput, RuntimeTurnOpeningResult, RuntimeTurnOpeningStep,
     };
+    use crate::runtime_turn_setup::RuntimeTurnSetupStep;
     use crate::runtime_turn_start::{
         RuntimeTurnStartResult, RuntimeTurnStartResultStep, RuntimeTurnStartStep,
         RuntimeTurnStartStepOutput,
     };
+    use crate::tool_invocation::AgentToolPolicyContext;
+    use orca_provider::context;
 
     use orca_core::approval_rules::PermissionRules;
     use orca_core::approval_types::ApprovalMode;
