@@ -16,6 +16,7 @@ pub mod network_proxy;
 pub mod notify;
 pub mod protocol;
 pub mod provider_turn;
+pub(crate) mod runtime_approval;
 pub(crate) mod runtime_bash;
 mod runtime_conversation_bootstrap;
 mod runtime_lifecycle;
@@ -780,6 +781,40 @@ mod tests {
         assert!(
             lifecycle_source.contains("pub use crate::runtime_permission::"),
             "lifecycle must preserve existing public imports by re-exporting runtime permission types"
+        );
+    }
+
+    #[test]
+    fn runtime_approval_boundary_is_owned_by_runtime_approval_module() {
+        let lib_source = include_str!("lib.rs");
+        let lifecycle_source = include_str!("lifecycle.rs");
+        let runtime_approval_source =
+            std::fs::read_to_string("src/runtime_approval.rs").expect("runtime approval source");
+
+        assert!(
+            lib_source.contains("pub(crate) mod runtime_approval;"),
+            "runtime crate must declare a focused runtime_approval module"
+        );
+
+        for marker in [
+            "pub enum RuntimeApprovalDecision",
+            "pub trait RuntimeApprovalHandler",
+            "pub struct RuntimeConfigApprovalHandler",
+            "impl RuntimeApprovalHandler for RuntimeConfigApprovalHandler",
+        ] {
+            assert!(
+                runtime_approval_source.contains(marker),
+                "runtime_approval must own approval runtime detail {marker}"
+            );
+            assert!(
+                !lifecycle_source.contains(marker),
+                "lifecycle must not own approval runtime detail {marker}"
+            );
+        }
+
+        assert!(
+            lifecycle_source.contains("pub use crate::runtime_approval::"),
+            "lifecycle must preserve existing public imports by re-exporting runtime approval types"
         );
     }
 
