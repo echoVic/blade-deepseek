@@ -21,6 +21,7 @@ mod runtime_conversation_bootstrap;
 mod runtime_lifecycle;
 mod runtime_model_route;
 mod runtime_normal_tool;
+pub(crate) mod runtime_readonly_tool_turn;
 pub(crate) mod runtime_special;
 mod runtime_steer;
 mod runtime_tool_actor;
@@ -137,6 +138,39 @@ mod tests {
             assert!(
                 !lifecycle_source.contains(marker),
                 "lifecycle must not own runtime-special detail {marker}"
+            );
+        }
+    }
+
+    #[test]
+    fn readonly_tool_turn_is_owned_by_runtime_readonly_module() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let lib_source =
+            std::fs::read_to_string(manifest_dir.join("src/lib.rs")).expect("lib source");
+        let tool_turn_source = std::fs::read_to_string(manifest_dir.join("src/tool_turn.rs"))
+            .expect("tool turn source");
+        let readonly_source =
+            std::fs::read_to_string(manifest_dir.join("src/runtime_readonly_tool_turn.rs"))
+                .expect("runtime readonly tool turn source");
+
+        assert!(
+            lib_source.contains("pub(crate) mod runtime_readonly_tool_turn;"),
+            "runtime crate must declare a focused readonly tool-turn module"
+        );
+        for marker in [
+            "pub(crate) fn execute_readonly_batch<W: io::Write>",
+            "pub(crate) fn should_run_readonly_batch(",
+            "pub(crate) fn collect_readonly_batch(",
+            "pub(crate) fn record_readonly_batch_results(",
+            "pub(crate) fn run_readonly_tool_turn<W: io::Write>",
+        ] {
+            assert!(
+                readonly_source.contains(marker),
+                "runtime_readonly_tool_turn must own readonly detail {marker}"
+            );
+            assert!(
+                !tool_turn_source.contains(marker),
+                "tool_turn must not own readonly detail {marker}"
             );
         }
     }
@@ -1128,10 +1162,11 @@ mod tests {
     }
 
     #[test]
-    fn readonly_tool_turn_runner_is_owned_by_tool_turn_module() {
+    fn readonly_tool_turn_runner_is_owned_by_runtime_readonly_module() {
         let agent_loop_source = include_str!("agent_loop.rs");
         let tool_invocation_source = include_str!("tool_invocation.rs");
         let tool_turn_source = include_str!("tool_turn.rs");
+        let readonly_source = include_str!("runtime_readonly_tool_turn.rs");
 
         for marker in ["execute_readonly_batch(", "record_readonly_batch_results("] {
             assert!(
@@ -1152,16 +1187,20 @@ mod tests {
             "tool_invocation must not own readonly tool-turn runner"
         );
         assert!(
-            tool_turn_source.contains("pub(crate) fn run_readonly_tool_turn"),
-            "tool_turn must expose readonly tool-turn runner"
+            !tool_turn_source.contains("pub(crate) fn run_readonly_tool_turn"),
+            "tool_turn must not own readonly tool-turn runner"
         );
         assert!(
-            tool_turn_source.contains("execute_readonly_batch"),
-            "tool_turn must compose readonly batch execution"
+            readonly_source.contains("pub(crate) fn run_readonly_tool_turn"),
+            "runtime_readonly_tool_turn must expose readonly tool-turn runner"
         );
         assert!(
-            tool_turn_source.contains("record_readonly_batch_results"),
-            "tool_turn must compose readonly batch result recording"
+            readonly_source.contains("execute_readonly_batch"),
+            "runtime_readonly_tool_turn must compose readonly batch execution"
+        );
+        assert!(
+            readonly_source.contains("record_readonly_batch_results"),
+            "runtime_readonly_tool_turn must compose readonly batch result recording"
         );
     }
 
@@ -1227,10 +1266,11 @@ mod tests {
     }
 
     #[test]
-    fn readonly_tool_batch_is_owned_by_tool_turn_module() {
+    fn readonly_tool_batch_is_owned_by_runtime_readonly_module() {
         let agent_loop_source = include_str!("agent_loop.rs");
         let tool_invocation_source = include_str!("tool_invocation.rs");
         let tool_turn_source = include_str!("tool_turn.rs");
+        let readonly_source = include_str!("runtime_readonly_tool_turn.rs");
 
         assert!(
             !agent_loop_source.contains("fn execute_readonly_batch"),
@@ -1241,16 +1281,20 @@ mod tests {
             "tool_invocation must not own readonly tool batch execution"
         );
         assert!(
-            tool_turn_source.contains("pub(crate) fn execute_readonly_batch"),
-            "tool_turn must expose readonly tool batch execution"
+            !tool_turn_source.contains("pub(crate) fn execute_readonly_batch"),
+            "tool_turn must not own readonly tool batch execution"
         );
         assert!(
-            tool_turn_source.contains("pub(crate) fn should_run_readonly_batch"),
-            "tool_turn must expose readonly batch planning"
+            readonly_source.contains("pub(crate) fn execute_readonly_batch"),
+            "runtime_readonly_tool_turn must expose readonly tool batch execution"
         );
         assert!(
-            tool_turn_source.contains("pub(crate) fn collect_readonly_batch"),
-            "tool_turn must expose readonly batch range collection"
+            readonly_source.contains("pub(crate) fn should_run_readonly_batch"),
+            "runtime_readonly_tool_turn must expose readonly batch planning"
+        );
+        assert!(
+            readonly_source.contains("pub(crate) fn collect_readonly_batch"),
+            "runtime_readonly_tool_turn must expose readonly batch range collection"
         );
         for marker in [
             "orca_tools::should_run_readonly_batch",
@@ -1267,10 +1311,11 @@ mod tests {
     }
 
     #[test]
-    fn readonly_tool_batch_result_recording_is_owned_by_tool_turn_module() {
+    fn readonly_tool_batch_result_recording_is_owned_by_runtime_readonly_module() {
         let agent_loop_source = include_str!("agent_loop.rs");
         let tool_invocation_source = include_str!("tool_invocation.rs");
         let tool_turn_source = include_str!("tool_turn.rs");
+        let readonly_source = include_str!("runtime_readonly_tool_turn.rs");
 
         assert!(
             !agent_loop_source.contains("record_tool_result_for_agent("),
@@ -1289,12 +1334,16 @@ mod tests {
             "tool_invocation must not own readonly batch result recording"
         );
         assert!(
-            tool_turn_source.contains("pub(crate) fn record_readonly_batch_results"),
-            "tool_turn must expose readonly batch result recording"
+            !tool_turn_source.contains("pub(crate) fn record_readonly_batch_results"),
+            "tool_turn must not own readonly batch result recording"
         );
         assert!(
-            tool_turn_source.contains("record_tool_result_for_agent"),
-            "tool_turn must reuse shared session tool result recording"
+            readonly_source.contains("pub(crate) fn record_readonly_batch_results"),
+            "runtime_readonly_tool_turn must expose readonly batch result recording"
+        );
+        assert!(
+            readonly_source.contains("record_tool_result_for_agent"),
+            "runtime_readonly_tool_turn must reuse shared session tool result recording"
         );
     }
 

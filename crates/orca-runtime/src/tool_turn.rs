@@ -7,16 +7,21 @@ use orca_core::config::RunConfig;
 use orca_core::conversation::Conversation;
 use orca_core::event_schema::{EventFactory, RunStatus};
 use orca_core::event_sink::EventSink;
-use orca_core::hook_types::HookEvent;
-use orca_core::tool_types::{ToolName, ToolOutputTruncation, ToolRequest, ToolResult};
+use orca_core::tool_types::{ToolName, ToolRequest, ToolResult};
 use orca_mcp::McpRegistry;
 
 use crate::agent_child::ChildAgentExecutor;
 use crate::cost::CostTracker;
-use crate::hooks::{HookContext, HookRunner};
+use crate::hooks::HookRunner;
 use crate::instructions::ProjectInstructions;
 use crate::lifecycle::{RuntimePermissionRequestHandler, TurnPermissionOverlay};
 use crate::memory::MemoryBlock;
+#[cfg(test)]
+use crate::runtime_readonly_tool_turn::record_readonly_batch_results;
+use crate::runtime_readonly_tool_turn::{
+    RuntimeReadonlyToolTurnContext, collect_readonly_batch, run_readonly_tool_turn,
+    should_run_readonly_batch,
+};
 use crate::session::{record_plan_state_for_agent, record_tool_result_for_agent};
 use crate::step_context::RuntimeStepContext;
 use crate::subagent_execution::{
@@ -25,10 +30,7 @@ use crate::subagent_execution::{
 use crate::tasks::TaskRegistry;
 use crate::thread_store::SessionWriter;
 use crate::tool_execution::{ToolExecutionContext, execute_tool_with_approval};
-use crate::tool_invocation::{
-    apply_pre_tool_outcome_with_external, prepare_tool_invocation_with_external,
-    reject_disallowed_child_tool,
-};
+use crate::tool_invocation::reject_disallowed_child_tool;
 use crate::workflow::ipc::WorkflowIpcContext;
 use crate::workflow::runner::SharedEventBuffer;
 use crate::workflow_execution::BackgroundWorkflowRun;
@@ -118,150 +120,6 @@ pub(crate) fn terminal_tool_turn(status: RunStatus, error: Option<String>) -> To
     ToolTurnOutcome::from_terminal(status, error)
 }
 
-pub(crate) fn execute_readonly_batch(
-    cwd: &Path,
-    events: &mut EventFactory,
-    sink: &mut EventSink<impl io::Write>,
-    tool_requests: &[ToolRequest],
-    emit_deltas: bool,
-    mcp_registry: &McpRegistry,
-    hooks: &HookRunner,
-    output_truncation: ToolOutputTruncation,
-) -> io::Result<Vec<ToolResult>> {
-    let mut hook_failed: Vec<Option<ToolResult>> = vec![None; tool_requests.len()];
-    let mut runnable = Vec::new();
-
-    for (idx, tool_request) in tool_requests.iter().enumerate() {
-        let invocation =
-            prepare_tool_invocation_with_external(tool_request, 0, u32::MAX, mcp_registry, &[]);
-        if emit_deltas {
-            sink.emit(&events.tool_call_requested(tool_request))?;
-        }
-        match hooks.run(
-            HookEvent::PreToolUse,
-            HookContext {
-                cwd: &cwd.display().to_string(),
-                session_status: None,
-                tool_request: Some(tool_request),
-                tool_result: None,
-                before_messages: None,
-                after_messages: None,
-                usage: None,
-            },
-        ) {
-            Ok(outcome) => {
-                match apply_pre_tool_outcome_with_external(invocation, &outcome, mcp_registry, &[])
-                {
-                    Ok(invocation) => runnable.push((idx, invocation.effective)),
-                    Err(error) => hook_failed[idx] = Some(error.into_result()),
-                }
-            }
-            Err(error) => {
-                hook_failed[idx] = Some(ToolResult::failed(
-                    tool_request,
-                    format!("pre_tool_use hook blocked tool: {error}"),
-                    None,
-                ));
-            }
-        }
-    }
-
-    let mut results = orca_tools::run_readonly_batch_parallel_with_policy(
-        tool_requests,
-        runnable,
-        cwd,
-        mcp_registry,
-        output_truncation,
-    );
-
-    for (idx, failed) in hook_failed.into_iter().enumerate() {
-        if let Some(result) = failed {
-            results[idx] = result;
-        }
-    }
-
-    for (tool_request, result) in tool_requests.iter().zip(results.iter()) {
-        if emit_deltas {
-            sink.emit(&events.tool_call_completed(result))?;
-            if let Err(error) = hooks.run(
-                HookEvent::PostToolUse,
-                HookContext {
-                    cwd: &cwd.display().to_string(),
-                    session_status: None,
-                    tool_request: Some(tool_request),
-                    tool_result: Some(result),
-                    before_messages: None,
-                    after_messages: None,
-                    usage: None,
-                },
-            ) {
-                sink.emit(&events.error(&format!("post_tool_use hook failed: {error}")))?;
-            }
-        }
-    }
-
-    Ok(results)
-}
-
-pub(crate) fn should_run_readonly_batch(
-    max_read_parallel: usize,
-    tool_request: &ToolRequest,
-) -> bool {
-    orca_tools::should_run_readonly_batch(max_read_parallel, tool_request)
-}
-
-pub(crate) fn collect_readonly_batch(
-    max_read_parallel: usize,
-    tool_requests: &[ToolRequest],
-    start: usize,
-) -> usize {
-    orca_tools::collect_readonly_batch(max_read_parallel, tool_requests, start)
-}
-
-pub(crate) fn record_readonly_batch_results(
-    conversation: &mut Conversation,
-    mut history_writer: Option<&mut SessionWriter>,
-    results: Vec<ToolResult>,
-    emit_deltas: bool,
-) -> io::Result<()> {
-    for result in results {
-        record_tool_result_for_agent(
-            conversation,
-            history_writer.as_deref_mut(),
-            &result,
-            emit_deltas,
-        )?;
-    }
-    Ok(())
-}
-
-pub(crate) fn run_readonly_tool_turn(
-    cwd: &Path,
-    events: &mut EventFactory,
-    sink: &mut EventSink<impl io::Write>,
-    conversation: &mut Conversation,
-    history_writer: Option<&mut SessionWriter>,
-    tool_requests: &[ToolRequest],
-    emit_deltas: bool,
-    mcp_registry: &McpRegistry,
-    hooks: &HookRunner,
-    output_truncation: ToolOutputTruncation,
-) -> io::Result<ToolTurnOutcome> {
-    let results = execute_readonly_batch(
-        cwd,
-        events,
-        sink,
-        tool_requests,
-        emit_deltas,
-        mcp_registry,
-        hooks,
-        output_truncation,
-    )?;
-
-    record_readonly_batch_results(conversation, history_writer, results, emit_deltas)?;
-    Ok(ToolTurnOutcome::Continue)
-}
-
 pub(crate) fn run_tool_turns<W: io::Write>(
     context: RuntimeToolTurnsContext<'_, W>,
 ) -> io::Result<ToolTurnOutcome> {
@@ -347,18 +205,18 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                 tool_requests,
                 cursor.position(),
             );
-            match run_readonly_tool_turn(
+            match run_readonly_tool_turn(RuntimeReadonlyToolTurnContext {
                 cwd,
                 events,
                 sink,
                 conversation,
-                history_writer.as_deref_mut(),
-                &tool_requests[cursor.position()..batch_end],
+                history_writer: history_writer.as_deref_mut(),
+                tool_requests: &tool_requests[cursor.position()..batch_end],
                 emit_deltas,
                 mcp_registry,
                 hooks,
-                config.tools.output_truncation,
-            )? {
+                output_truncation: config.tools.output_truncation,
+            })? {
                 ToolTurnOutcome::Continue => {}
                 ToolTurnOutcome::Return { status, error } => {
                     return Ok(ToolTurnOutcome::Return { status, error });
@@ -800,18 +658,18 @@ mod tests {
         let registry = McpRegistry::default();
         let hooks = HookRunner::default();
 
-        let outcome = run_readonly_tool_turn(
-            cwd.path(),
-            &mut events,
-            &mut sink,
-            &mut conversation,
-            None,
-            &requests,
-            false,
-            &registry,
-            &hooks,
-            ToolConfig::default().output_truncation,
-        )
+        let outcome = run_readonly_tool_turn(RuntimeReadonlyToolTurnContext {
+            cwd: cwd.path(),
+            events: &mut events,
+            sink: &mut sink,
+            conversation: &mut conversation,
+            history_writer: None,
+            tool_requests: &requests,
+            emit_deltas: false,
+            mcp_registry: &registry,
+            hooks: &hooks,
+            output_truncation: ToolConfig::default().output_truncation,
+        })
         .expect("run readonly tool turn");
 
         assert!(matches!(outcome, ToolTurnOutcome::Continue));
