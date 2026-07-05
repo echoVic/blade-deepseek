@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.132":
+        "Runtime bash sandbox execution and one-shot shell spawning now use focused RuntimeBashSandboxContext and RuntimeBashOnceContext inputs. The model-visible bash flow still owns permission-profile sandboxing, network and filesystem permission retries, cancellation, task-registry handoff, output truncation, and diagnostics while runtime_bash.rs no longer needs internal long-argument helper escape hatches.",
       "v0.1.131":
         "Readonly tool-turn batch execution now lives in a focused runtime_readonly_tool_turn module with grouped readonly batch and tool-turn contexts. The main tool_turn dispatcher still owns request cursoring, child-tool policy checks, subagent batching, readonly batch selection, and normal tool turns while readonly hook gating, parallel execution, and result recording keep the same runtime behavior.",
       "v0.1.130":
@@ -290,6 +292,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.132":
+        "运行时 bash 的 sandbox 执行和一次性 shell 启动现在改用 RuntimeBashSandboxContext 与 RuntimeBashOnceContext 聚合输入。模型可见 bash 仍保持 permission-profile 沙箱、网络和文件系统权限重试、取消、task registry 交接、输出截断和诊断行为不变，同时 runtime_bash.rs 不再需要内部长参数 helper 的逃逸口。",
       "v0.1.131":
         "Readonly tool-turn batch 执行现在移到独立的 runtime_readonly_tool_turn 模块，并使用分组后的 readonly batch / tool-turn context。主 tool_turn dispatcher 继续负责 request cursor、child-tool policy 检查、subagent batch、readonly batch 选择和 normal tool turn，readonly hook gate、并行执行与结果记录保持同一运行时行为。",
       "v0.1.130":
