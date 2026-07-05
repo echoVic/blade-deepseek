@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.135":
+        "Runtime request_user_input handling now lives in a focused runtime_user_input module. The existing orca_runtime::lifecycle imports remain available through re-exports, while request parsing, handler dispatch, answer completion, and cancellation failure behavior keep the same runtime and TUI shape.",
       "v0.1.134":
         "Runtime ORCA_HOME-scoped tests now share a poison-tolerant test environment lock helper. If one test panics while holding the shared environment mutex, later history, server, session, thread-store, and workflow-host tests can recover the lock instead of cascading into misleading PoisonError failures.",
       "v0.1.133":
@@ -296,6 +298,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.135":
+        "Runtime request_user_input 处理现在移到独立的 runtime_user_input 模块。既有 orca_runtime::lifecycle 导入仍通过 re-export 保持可用，请求解析、handler 派发、回答完成和取消失败行为都保持同一 runtime 与 TUI 形状。",
       "v0.1.134":
         "Runtime 里依赖 ORCA_HOME 的测试现在统一使用可恢复 poisoned mutex 的 test env lock helper。如果某个测试在持有共享环境锁时 panic，后续 history、server、session、thread-store 与 workflow-host 测试会恢复锁，而不是级联报出误导性的 PoisonError。",
       "v0.1.133":
