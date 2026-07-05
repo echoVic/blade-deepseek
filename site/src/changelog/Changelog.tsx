@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.125":
+        "RuntimeToolActorContext now lives in a focused runtime_tool_actor module. Existing orca_runtime::lifecycle imports remain available through a re-export, while approval, hook, user-input, normal-tool, permission-overlay, and active-task behavior keep the same runtime shape.",
       "v0.1.124":
         "Runtime lifecycle state machine types now live in a focused runtime_lifecycle module. The existing orca_runtime::lifecycle imports remain available through re-exports, while task/turn ids, status mapping, event payloads, and RuntimeTurnRunner behavior stay unchanged.",
       "v0.1.123":
@@ -276,6 +278,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.125":
+        "RuntimeToolActorContext 现在移到独立的 runtime_tool_actor 模块。既有 orca_runtime::lifecycle 导入仍通过 re-export 保持可用，审批、hook、request-user-input、normal-tool、permission overlay 和 active-task 行为保持同一运行时形状。",
       "v0.1.124":
         "Runtime lifecycle 状态机类型现在移到独立的 runtime_lifecycle 模块。既有 orca_runtime::lifecycle 导入仍通过 re-export 保持可用，task/turn id、状态映射、事件 payload 和 RuntimeTurnRunner 行为保持不变。",
       "v0.1.123":
