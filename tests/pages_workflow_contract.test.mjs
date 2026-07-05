@@ -19,3 +19,13 @@ test("Pages workflow uses Node 24 compatible GitHub actions", () => {
 
   assert.match(workflow, /node-version:\s+24/);
 });
+
+test("Pages deployment retries the transient GitHub Pages failure once", () => {
+  assert.match(workflow, /id:\s+deployment[\s\S]*?continue-on-error:\s+true/);
+  assert.match(workflow, /id:\s+deployment_retry/);
+  assert.match(workflow, /if:\s+\$\{\{\s*steps\.deployment\.outcome == 'failure'\s*\}\}/);
+  assert.match(
+    workflow,
+    /url:\s+\$\{\{\s*steps\.deployment\.outputs\.page_url \|\| steps\.deployment_retry\.outputs\.page_url\s*\}\}/,
+  );
+});
