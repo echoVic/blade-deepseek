@@ -24,7 +24,7 @@ use orca_runtime::workflow::state::WorkflowStateStore;
 use orca_runtime::workflow::{WorkflowDraftStore, WorkflowLaunchRequest, WorkflowRunner};
 use orca_runtime::{
     subagent::SubagentRequest,
-    subagent_execution::{self, AsyncSubagentWorktree},
+    subagent_async_worker::{self, AsyncSubagentWorktree},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -1016,7 +1016,7 @@ fn run_subagent_worker(args: SubagentWorkerArgs) -> i32 {
         }
     };
 
-    subagent_execution::run_async_subagent_worker(
+    subagent_async_worker::run_async_subagent_worker(
         config,
         args.cwd,
         args.child_cwd,

@@ -37,6 +37,7 @@ pub mod session;
 pub mod shell_session;
 mod step_context;
 pub mod subagent;
+pub mod subagent_async_worker;
 pub mod subagent_execution;
 pub mod tasks;
 pub mod thread;
@@ -1355,6 +1356,45 @@ mod tests {
             subagent_execution_source.contains("record_subagent_batch_results"),
             "subagent_execution must compose subagent batch result recording"
         );
+    }
+
+    #[test]
+    fn async_subagent_worker_is_owned_by_async_worker_module() {
+        let lib_source = include_str!("lib.rs");
+        let subagent_execution_source = include_str!("subagent_execution.rs");
+        let async_worker_source = include_str!("subagent_async_worker.rs");
+
+        assert!(
+            lib_source.contains("pub mod subagent_async_worker;"),
+            "orca-runtime must expose the async subagent worker module"
+        );
+        for marker in [
+            "pub fn run_async_subagent_worker(",
+            "fn spawn_async_subagent_worker(",
+            "fn async_subagent_result_payload(",
+        ] {
+            assert!(
+                !subagent_execution_source.contains(marker),
+                "subagent_execution must not own async worker detail {marker}"
+            );
+        }
+        for marker in [
+            "pub fn run_async_subagent_worker(",
+            "pub(crate) fn run_async_subagent_worker_with_executor(",
+            "pub(crate) fn launch_async_subagent(",
+            "fn spawn_async_subagent_worker(",
+            "fn async_subagent_result_payload(",
+            ".arg(\"subagent-worker\")",
+            "TaskRegistry::new_for_cwd",
+            "mark_worker_spawned",
+            "complete_with_usage",
+            "fail_with_usage",
+        ] {
+            assert!(
+                async_worker_source.contains(marker),
+                "subagent_async_worker must own async worker detail {marker}"
+            );
+        }
     }
 
     #[test]
