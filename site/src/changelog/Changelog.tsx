@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.127":
+        "Server active-turn lifecycle state now lives in a focused active_turn_manager module. Active turn controls, running turn handles, finished-turn reclamation, thread-specific reclaim waits, and session permission metadata merge keep the same server turn protocol shape.",
       "v0.1.126":
         "Server command/exec active process state now lives in a focused command_exec_manager module. Buffered output, streaming deltas, stdin writes, PTY resize, termination, output caps, sandbox diagnostics, and permission retry behavior keep the same server protocol shape.",
       "v0.1.125":
@@ -280,6 +282,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.127":
+        "Server active-turn lifecycle 状态现在移到独立的 active_turn_manager 模块。Active turn control、running turn handle、finished-turn reclaim、按 thread 等待 reclaim，以及 session permission metadata merge 都保持同一 server turn protocol 形状。",
       "v0.1.126":
         "Server command/exec 的 active process 状态现在移到独立的 command_exec_manager 模块。Buffered output、streaming delta、stdin write、PTY resize、terminate、output cap、sandbox 诊断和 permission retry 行为保持同一 server protocol 形状。",
       "v0.1.125":
