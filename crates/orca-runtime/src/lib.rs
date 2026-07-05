@@ -23,6 +23,7 @@ mod runtime_model_route;
 mod runtime_normal_tool;
 pub(crate) mod runtime_special;
 mod runtime_steer;
+mod runtime_tool_actor;
 mod runtime_turn_iteration;
 mod runtime_turn_loop;
 mod runtime_turn_opening;
@@ -482,6 +483,51 @@ mod tests {
         assert!(
             lifecycle_source.contains("pub use crate::runtime_lifecycle::"),
             "lifecycle must preserve existing public imports by re-exporting runtime_lifecycle types"
+        );
+    }
+
+    #[test]
+    fn runtime_tool_actor_context_is_owned_by_runtime_tool_actor_module() {
+        let lib_source = include_str!("lib.rs");
+        let lifecycle_source = include_str!("lifecycle.rs");
+        let runtime_tool_actor_source = std::fs::read_to_string("src/runtime_tool_actor.rs")
+            .expect("runtime tool actor source");
+
+        assert!(
+            lib_source.contains("mod runtime_tool_actor;"),
+            "runtime crate must declare a focused runtime_tool_actor module"
+        );
+
+        for marker in [
+            "pub struct RuntimeToolActorContext",
+            "impl RuntimeToolActorContext",
+        ] {
+            assert!(
+                runtime_tool_actor_source.contains(marker),
+                "runtime_tool_actor must own tool actor context detail {marker}"
+            );
+            assert!(
+                !lifecycle_source.contains(marker),
+                "lifecycle must not own tool actor context detail {marker}"
+            );
+        }
+
+        for marker in [
+            "pub fn new(run_id: impl Into<String>, max_turns: u32) -> Self",
+            "pub fn resolve_tool_approval(",
+            "pub(crate) fn execute_normal_tool_invocation(",
+            "pub fn execute_user_input_tool(",
+        ] {
+            assert!(
+                runtime_tool_actor_source.contains(marker),
+                "runtime_tool_actor must expose tool actor context adapter detail {marker}"
+            );
+        }
+
+        assert!(
+            lifecycle_source
+                .contains("pub use crate::runtime_tool_actor::RuntimeToolActorContext;"),
+            "lifecycle must preserve existing public imports by re-exporting RuntimeToolActorContext"
         );
     }
 
