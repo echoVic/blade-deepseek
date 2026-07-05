@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.128":
+        "Server pending-permission request state now lives in a focused permission_manager module. Runtime request_permissions waits, command/exec permission retry records, pending request removal, and permission request handler registration keep the same server permission protocol shape.",
       "v0.1.127":
         "Server active-turn lifecycle state now lives in a focused active_turn_manager module. Active turn controls, running turn handles, finished-turn reclamation, thread-specific reclaim waits, and session permission metadata merge keep the same server turn protocol shape.",
       "v0.1.126":
@@ -282,6 +284,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.128":
+        "Server pending-permission request 状态现在移到独立的 permission_manager 模块。Runtime request_permissions 等待、command/exec permission retry record、pending request removal，以及 permission request handler registration 都保持同一 server permission protocol 形状。",
       "v0.1.127":
         "Server active-turn lifecycle 状态现在移到独立的 active_turn_manager 模块。Active turn control、running turn handle、finished-turn reclaim、按 thread 等待 reclaim，以及 session permission metadata merge 都保持同一 server turn protocol 形状。",
       "v0.1.126":
