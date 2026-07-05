@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.131":
+        "Readonly tool-turn batch execution now lives in a focused runtime_readonly_tool_turn module with grouped readonly batch and tool-turn contexts. The main tool_turn dispatcher still owns request cursoring, child-tool policy checks, subagent batching, readonly batch selection, and normal tool turns while readonly hook gating, parallel execution, and result recording keep the same runtime behavior.",
       "v0.1.130":
         "Async subagent worker launch and completion now live in a focused subagent_async_worker module. The parent subagent executor still owns sync and batch execution, while worker spawn, task-registry usage writes, worktree handoff, and async result payloads keep the same CLI and subagent_status behavior.",
       "v0.1.129":
@@ -288,6 +290,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.131":
+        "Readonly tool-turn batch 执行现在移到独立的 runtime_readonly_tool_turn 模块，并使用分组后的 readonly batch / tool-turn context。主 tool_turn dispatcher 继续负责 request cursor、child-tool policy 检查、subagent batch、readonly batch 选择和 normal tool turn，readonly hook gate、并行执行与结果记录保持同一运行时行为。",
       "v0.1.130":
         "Async subagent worker 的启动和完成写回现在移到独立的 subagent_async_worker 模块。父级 subagent executor 继续负责同步和 batch 执行，worker spawn、task registry usage 写入、worktree handoff 和 async result payload 保持同一 CLI 与 subagent_status 行为。",
       "v0.1.129":
