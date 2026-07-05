@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.134":
+        "Runtime ORCA_HOME-scoped tests now share a poison-tolerant test environment lock helper. If one test panics while holding the shared environment mutex, later history, server, session, thread-store, and workflow-host tests can recover the lock instead of cascading into misleading PoisonError failures.",
       "v0.1.133":
         "Sandbox bash command construction now uses grouped WorkspaceWriteSandboxCommandContext and ReadOnlySandboxCommandContext inputs, with the macOS Seatbelt profile helpers also receiving focused profile contexts. Shell sessions, command/exec, bash sandboxing, network and filesystem policy flags, Unix socket allowlists, and non-interactive process preparation keep the same behavior while the sandbox API no longer exposes long argument lists.",
       "v0.1.132":
@@ -294,6 +296,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.134":
+        "Runtime 里依赖 ORCA_HOME 的测试现在统一使用可恢复 poisoned mutex 的 test env lock helper。如果某个测试在持有共享环境锁时 panic，后续 history、server、session、thread-store 与 workflow-host 测试会恢复锁，而不是级联报出误导性的 PoisonError。",
       "v0.1.133":
         "Sandbox bash command 构造现在改用 WorkspaceWriteSandboxCommandContext 与 ReadOnlySandboxCommandContext 聚合输入，macOS Seatbelt profile helper 也改为接收聚焦的 profile context。Shell session、command/exec、bash sandbox、网络与文件系统策略开关、Unix socket allowlist、非交互式进程准备都保持同一行为，同时 sandbox API 不再暴露长参数列表。",
       "v0.1.132":
