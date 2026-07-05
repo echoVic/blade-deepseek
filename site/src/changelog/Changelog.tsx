@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.123":
+        "Runtime turn setup now lives in a focused runtime_turn_setup module. Agent loop still delegates through RuntimeTurnSetupStep, and the new module owns context budget setup, tool approval policy construction, and provider config composition while lifecycle.rs keeps actor/lifecycle primitives.",
       "v0.1.122":
         "Runtime conversation bootstrap now lives in a focused runtime_conversation_bootstrap module. Agent loop still delegates through RuntimeConversationBootstrapStep, and the new module owns RuntimePreparedConversation, borrowed-or-owned conversation storage, session bootstrap composition, and initial history recording while lifecycle.rs keeps actor/lifecycle primitives.",
       "v0.1.121":
@@ -272,6 +274,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.123":
+        "Runtime turn setup 现在从 lifecycle.rs 移到独立的 runtime_turn_setup 模块。Agent loop 仍通过 RuntimeTurnSetupStep 委托执行，新模块负责 context budget setup、工具审批 policy 构造和 provider config 组合，lifecycle.rs 则继续保留 actor/lifecycle 原语。",
       "v0.1.122":
         "Runtime conversation bootstrap 现在从 lifecycle.rs 移到独立的 runtime_conversation_bootstrap 模块。Agent loop 仍通过 RuntimeConversationBootstrapStep 委托执行，新模块负责 RuntimePreparedConversation、borrowed/owned conversation 存储、session bootstrap 组合和初始 history 记录，lifecycle.rs 则继续保留 actor/lifecycle 原语。",
       "v0.1.121":
