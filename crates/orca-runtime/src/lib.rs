@@ -21,6 +21,7 @@ mod runtime_conversation_bootstrap;
 mod runtime_lifecycle;
 mod runtime_model_route;
 mod runtime_normal_tool;
+pub(crate) mod runtime_permission;
 pub(crate) mod runtime_readonly_tool_turn;
 pub(crate) mod runtime_special;
 mod runtime_steer;
@@ -743,6 +744,42 @@ mod tests {
         assert!(
             lifecycle_source.contains("pub use crate::runtime_user_input::"),
             "lifecycle must preserve existing public imports by re-exporting runtime user-input types"
+        );
+    }
+
+    #[test]
+    fn runtime_permission_boundary_is_owned_by_runtime_permission_module() {
+        let lib_source = include_str!("lib.rs");
+        let lifecycle_source = include_str!("lifecycle.rs");
+        let runtime_permission_source = std::fs::read_to_string("src/runtime_permission.rs")
+            .expect("runtime permission source");
+
+        assert!(
+            lib_source.contains("pub(crate) mod runtime_permission;"),
+            "runtime crate must declare a focused runtime_permission module"
+        );
+
+        for marker in [
+            "pub struct RuntimePermissionRequest",
+            "pub struct RuntimePermissionResponse",
+            "pub trait RuntimePermissionRequestHandler",
+            "pub(crate) struct AllowRequestedPermissions",
+            "pub struct TurnPermissionOverlay",
+            "impl TurnPermissionOverlay",
+        ] {
+            assert!(
+                runtime_permission_source.contains(marker),
+                "runtime_permission must own permission runtime detail {marker}"
+            );
+            assert!(
+                !lifecycle_source.contains(marker),
+                "lifecycle must not own permission runtime detail {marker}"
+            );
+        }
+
+        assert!(
+            lifecycle_source.contains("pub use crate::runtime_permission::"),
+            "lifecycle must preserve existing public imports by re-exporting runtime permission types"
         );
     }
 
