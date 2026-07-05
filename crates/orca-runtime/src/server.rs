@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
 
+mod active_turn_manager;
 mod command_exec_manager;
 mod router;
 
@@ -26,8 +27,8 @@ use crate::sandbox_denial::{
     should_request_filesystem_permission_with_denied_roots,
 };
 use crate::server_runtime::{
-    PermissionProfileOverride, ServerRequestWriter, ServerThread, ServerThreadRuntime,
-    thread_item_to_json, thread_run_config, thread_turn_to_json,
+    PermissionProfileOverride, ServerRequestWriter, ServerThreadRuntime, thread_item_to_json,
+    thread_run_config, thread_turn_to_json,
 };
 use crate::shell_session::{RuntimeShellSessionManager, ShellSandboxMode, ShellSessionCommand};
 use crate::tasks::TaskRegistry;
@@ -35,6 +36,7 @@ use crate::thread_store::{
     SessionStore, SortDirection, StoredThreadSummary, ThreadListFilters, ThreadMetadataPatch,
     ThreadSortKey, ThreadStore, TurnItemsView,
 };
+use active_turn_manager::{ActiveTurnControl, ActiveTurnHandle, ActiveTurnManager};
 use command_exec_manager::{CommandExecDrainOutcome, CommandExecManager, CommandExecProcess};
 use orca_core::config::{
     DEFAULT_PERMISSION_PROFILE_GLOB_SCAN_MAX_DEPTH, HistoryMode, OutputFormat, RunConfig,
@@ -80,8 +82,7 @@ struct ServerState {
     threads: ServerThreadRuntime,
     shell_sessions: Option<RuntimeShellSessionManager>,
     command_exec: CommandExecManager,
-    active_turns: HashMap<String, ActiveTurnControl>,
-    running_turns: Vec<ActiveTurnHandle>,
+    active_turns: ActiveTurnManager,
     pending_permissions: Arc<Mutex<HashMap<String, PendingPermissionRequest>>>,
 }
 
@@ -90,20 +91,6 @@ impl ServerState {
         self.command_exec
             .terminate_all(self.shell_sessions.as_mut());
     }
-}
-
-#[derive(Clone)]
-struct ActiveTurnControl {
-    thread_id: String,
-    cancel: CancelToken,
-    steer_handle: ThreadSteerHandle,
-    session_permission_directories: Vec<orca_core::config::AdditionalWorkingDirectory>,
-    session_network_domain_permissions:
-        HashMap<String, orca_core::config::PermissionProfileNetworkAccess>,
-}
-
-struct ActiveTurnHandle {
-    handle: thread::JoinHandle<(String, String, ServerThread)>,
 }
 
 enum PendingPermissionRequest {
@@ -214,74 +201,17 @@ impl ServerState {
     }
 
     fn join_active_turns(&mut self) {
-        for active in self.running_turns.drain(..) {
-            if let Ok((turn_id, _thread_id, thread)) = active.handle.join() {
-                let control = self.active_turns.remove(&turn_id);
-                let thread = merge_completed_turn_metadata(thread, control);
-                self.threads.put_thread(thread);
-            }
-        }
+        self.active_turns.join_all(&mut self.threads);
     }
 
     fn reclaim_finished_threads(&mut self) {
-        let mut pending = Vec::new();
-        for active in self.running_turns.drain(..) {
-            if active.handle.is_finished() {
-                if let Ok((turn_id, _thread_id, thread)) = active.handle.join() {
-                    let control = self.active_turns.remove(&turn_id);
-                    let thread = merge_completed_turn_metadata(thread, control);
-                    self.threads.put_thread(thread);
-                }
-            } else {
-                pending.push(active);
-            }
-        }
-        self.running_turns = pending;
+        self.active_turns.reclaim_finished(&mut self.threads);
     }
 
     fn reclaim_finished_thread(&mut self, thread_id: &str) {
-        const MAX_WAIT: Duration = Duration::from_millis(100);
-        const POLL: Duration = Duration::from_millis(5);
-        let deadline = std::time::Instant::now() + MAX_WAIT;
-        loop {
-            self.reclaim_finished_threads();
-            if self.threads.has_thread(thread_id)
-                || !self
-                    .active_turns
-                    .values()
-                    .any(|turn| turn.thread_id == thread_id)
-                || std::time::Instant::now() >= deadline
-            {
-                break;
-            }
-            thread::sleep(POLL);
-        }
-        self.reclaim_finished_threads();
+        self.active_turns
+            .reclaim_finished_thread(&mut self.threads, thread_id);
     }
-}
-
-fn merge_completed_turn_metadata(
-    mut thread: ServerThread,
-    control: Option<ActiveTurnControl>,
-) -> ServerThread {
-    if let Some(control) = control {
-        let additional_working_directories = (!control.session_permission_directories.is_empty())
-            .then_some(control.session_permission_directories);
-        let network_domain_permissions = (!control.session_network_domain_permissions.is_empty())
-            .then_some(control.session_network_domain_permissions);
-        if additional_working_directories.is_some() || network_domain_permissions.is_some() {
-            thread.update_metadata(ThreadMetadataPatch {
-                title: None,
-                active_permission_profile: None,
-                approval_mode: None,
-                runtime_workspace_roots: None,
-                permission_rules: None,
-                additional_working_directories,
-                network_domain_permissions,
-            });
-        }
-    }
-    thread
 }
 
 fn handle_line<W: Write + Send + 'static>(
@@ -518,14 +448,11 @@ fn run_permission_respond<W: Write>(
             pending.runtime_workspace_roots(),
             &permissions,
         )?;
-        for control in state.active_turns.values_mut() {
-            if control.thread_id == pending.thread_id() {
-                control.session_permission_directories =
-                    session_grants.additional_working_directories.clone();
-                control.session_network_domain_permissions =
-                    session_grants.network_domain_permissions.clone();
-            }
-        }
+        state.active_turns.apply_session_permission_grant(
+            pending.thread_id(),
+            session_grants.additional_working_directories.clone(),
+            session_grants.network_domain_permissions.clone(),
+        );
         state.threads.update_thread_metadata(
             pending.thread_id(),
             ThreadMetadataPatch {
@@ -2531,11 +2458,7 @@ fn run_thread_submit_async<W: Write + Send + 'static>(
 
     state.reclaim_finished_thread(&thread_id);
     let Some(mut thread_state) = state.threads.take_thread(&thread_id) else {
-        if state
-            .active_turns
-            .values()
-            .any(|turn| turn.thread_id == thread_id)
-        {
+        if state.active_turns.has_thread(&thread_id) {
             return write_locked_event(
                 &writer,
                 &id,
@@ -2555,15 +2478,9 @@ fn run_thread_submit_async<W: Write + Send + 'static>(
         .runtime_workspace_roots
         .clone()
         .unwrap_or_else(|| thread_state.runtime_workspace_roots().to_vec());
-    state.active_turns.insert(
+    state.active_turns.insert_control(
         active_turn_id.clone(),
-        ActiveTurnControl {
-            thread_id: thread_id.clone(),
-            cancel: cancel.clone(),
-            steer_handle: steer_handle.clone(),
-            session_permission_directories: Vec::new(),
-            session_network_domain_permissions: HashMap::new(),
-        },
+        ActiveTurnControl::new(thread_id.clone(), cancel.clone(), steer_handle.clone()),
     );
 
     let writer_for_thread = Arc::clone(&writer);
@@ -2602,7 +2519,9 @@ fn run_thread_submit_async<W: Write + Send + 'static>(
             thread_state,
         )
     });
-    state.running_turns.push(ActiveTurnHandle { handle });
+    state
+        .active_turns
+        .push_running(ActiveTurnHandle::new(handle));
     state.reclaim_finished_threads();
     Ok(())
 }
