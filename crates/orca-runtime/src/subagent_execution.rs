@@ -1,10 +1,11 @@
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::thread;
 
 use orca_core::cancel::CancelToken;
 use orca_core::config::RunConfig;
 use orca_core::conversation::Conversation;
+use orca_core::cost_types::UsageTotals;
 use orca_core::event_schema::{EventFactory, RunStatus};
 use orca_core::event_sink::EventSink;
 use orca_core::hook_types::HookEvent;
@@ -15,15 +16,21 @@ use serde_json::Value;
 use crate::agent_child::{
     ChildAgentExecutor, ChildAgentRequest, ChildAgentResult, ChildAgentRuntime, run_child_agent,
 };
+use crate::agent_loop::execute_child_agent_loop;
 use crate::cost::CostTracker;
 use crate::hooks::{HookContext, HookRunner};
+use crate::instructions;
 use crate::instructions::ProjectInstructions;
 use crate::lifecycle::{RuntimeSessionLifecycle, RuntimeTaskKind, RuntimeTaskStatus};
+use crate::memory;
 use crate::memory::MemoryBlock;
 use crate::schema_validation::validate_json_schema_subset;
 use crate::session::record_tool_result_for_agent;
 use crate::subagent::{self, SubagentIsolation, SubagentMode};
-use crate::subagent_async_worker::launch_async_subagent;
+use crate::subagent_async_worker::{
+    AsyncSubagentWorktree, async_subagent_result_payload, launch_async_subagent,
+    usage_totals_if_non_empty,
+};
 use crate::tasks::TaskRegistry;
 use crate::thread_store::SessionWriter;
 use crate::tool_invocation::{
@@ -581,7 +588,6 @@ pub(crate) fn execute_subagent_tool<W: io::Write>(
     }
 }
 
-<<<<<<< HEAD
 #[allow(clippy::too_many_arguments)]
 fn emit_subagent_progress<W: io::Write>(
     config: &RunConfig,
@@ -729,8 +735,6 @@ pub(crate) fn run_async_subagent_worker_with_executor(
     1
 }
 
-=======
->>>>>>> origin/main
 fn subagent_execution_to_tool_result(
     events: &mut EventFactory,
     sink: &mut EventSink<impl io::Write>,

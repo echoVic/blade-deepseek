@@ -9,8 +9,8 @@ use orca_provider::ProviderConfig;
 use orca_provider::context::ContextConfig;
 use orca_provider::tool_schema::deepseek_tools_schema_for_type_with_mcp_and_external;
 
-use crate::agent_child::{ChildAgentRequest, ChildAgentResult};
 use crate::agent_common;
+use crate::child_agent_types::{ChildAgentRequest, ChildAgentResult};
 use crate::instructions::ProjectInstructions;
 use crate::memory::MemoryBlock;
 

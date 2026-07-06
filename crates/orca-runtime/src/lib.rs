@@ -6,6 +6,9 @@ mod child_agent_loop_runner;
 mod child_agent_loop_setup;
 mod child_agent_provider_turn;
 mod child_agent_response_folding;
+#[cfg(test)]
+mod child_agent_tests;
+mod child_agent_types;
 pub mod compaction;
 pub mod controller;
 pub mod cost;
@@ -1028,6 +1031,76 @@ mod tests {
             agent_child_source.contains("pub use crate::child_agent_loop_runner::"),
             "agent_child must preserve existing imports by re-exporting child loop runner APIs"
         );
+    }
+
+    #[test]
+    fn child_agent_types_boundary_is_owned_by_focused_module() {
+        let lib_source = include_str!("lib.rs");
+        let agent_child_source = include_str!("agent_child.rs");
+        let agent_child_runtime_source = agent_child_source
+            .split_once("#[cfg(test)]")
+            .map(|(runtime_source, _)| runtime_source)
+            .unwrap_or(agent_child_source);
+        let child_types_source =
+            std::fs::read_to_string("src/child_agent_types.rs").expect("child agent types source");
+
+        assert!(
+            lib_source.contains("mod child_agent_types;"),
+            "runtime crate must declare a focused child_agent_types module"
+        );
+
+        for marker in [
+            "pub struct ChildAgentRequest",
+            "impl ChildAgentRequest",
+            "pub struct ChildAgentResult",
+            "pub(crate) type ChildAgentExecutor",
+            "pub(crate) struct ChildAgentRuntime",
+            "impl<'a, W: io::Write> ChildAgentRuntime<'a, W>",
+        ] {
+            assert!(
+                child_types_source.contains(marker),
+                "child_agent_types must own child-agent shared type {marker}"
+            );
+            assert!(
+                !agent_child_runtime_source.contains(marker),
+                "agent_child facade must not own child-agent shared type {marker}"
+            );
+        }
+
+        assert!(
+            agent_child_source.contains("pub use crate::child_agent_types::"),
+            "agent_child must preserve existing imports by re-exporting child-agent shared types"
+        );
+    }
+
+    #[test]
+    fn child_agent_behavior_tests_are_owned_by_focused_module() {
+        let lib_source = include_str!("lib.rs");
+        let agent_child_source = include_str!("agent_child.rs");
+        let child_tests_source =
+            std::fs::read_to_string("src/child_agent_tests.rs").expect("child agent tests source");
+
+        assert!(
+            lib_source.contains("mod child_agent_tests;"),
+            "runtime crate must declare focused child-agent behavior tests"
+        );
+        assert!(
+            !agent_child_source.contains("#[cfg(test)]"),
+            "agent_child facade must not own the child-agent behavior test module"
+        );
+
+        for marker in [
+            "fn config(model: Option<&str>) -> RunConfig",
+            "fn runtime<'a>(",
+            "prepare_child_agent_loop_builds_provider_conversation_and_policy",
+            "run_child_agent_loop_with_tool_executor_runs_tools_until_provider_completes",
+            "run_child_agent_prompt_with_tool_executor_builds_runtime_request",
+        ] {
+            assert!(
+                child_tests_source.contains(marker),
+                "child_agent_tests must own behavior test detail {marker}"
+            );
+        }
     }
 
     #[test]
