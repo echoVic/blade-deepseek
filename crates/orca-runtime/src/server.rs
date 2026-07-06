@@ -1328,6 +1328,27 @@ fn shell_sandbox_mode_from_command_policy(
     }
 }
 
+/// Derive the bash sandbox for a working directory from the config's active
+/// permission profile, exactly as `command/exec` does for the JSONL server.
+/// Frontends that execute bash themselves (e.g. the TUI) use this so profile
+/// modes and roots behave the same across entry points.
+pub fn bash_sandbox_for_cwd(
+    config: &RunConfig,
+    cwd: &std::path::Path,
+) -> Result<CommandExecSandbox, String> {
+    let runtime_workspace_roots = config.runtime_workspace_roots.clone().unwrap_or_default();
+    let profile = config.active_permission_profile.as_ref();
+    let options = protocol::CommandExecOptions::default();
+    command_exec_sandbox_mode(
+        config,
+        &options,
+        profile,
+        cwd,
+        &runtime_workspace_roots,
+        std::env::var_os("TMPDIR").map(PathBuf::from).as_deref(),
+    )
+}
+
 pub(crate) fn command_exec_sandbox_mode(
     config: &RunConfig,
     options: &protocol::CommandExecOptions,
@@ -1366,14 +1387,13 @@ pub(crate) fn command_exec_sandbox_mode(
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct CommandExecSandbox {
-    pub(crate) mode: ShellSandboxMode,
-    pub(crate) additional_readable_roots: Vec<PathBuf>,
-    pub(crate) additional_writable_roots: Vec<PathBuf>,
-    pub(crate) denied_writable_roots: Vec<PathBuf>,
-    pub(crate) allowed_unix_socket_roots: Vec<PathBuf>,
-    pub(crate) network_policy_domains:
-        HashMap<String, orca_core::config::PermissionProfileNetworkAccess>,
+pub struct CommandExecSandbox {
+    pub mode: ShellSandboxMode,
+    pub additional_readable_roots: Vec<PathBuf>,
+    pub additional_writable_roots: Vec<PathBuf>,
+    pub denied_writable_roots: Vec<PathBuf>,
+    pub allowed_unix_socket_roots: Vec<PathBuf>,
+    pub network_policy_domains: HashMap<String, orca_core::config::PermissionProfileNetworkAccess>,
 }
 
 impl CommandExecSandbox {

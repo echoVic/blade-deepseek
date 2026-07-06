@@ -41,7 +41,7 @@ mod runtime_turn_opening;
 mod runtime_turn_setup;
 mod runtime_turn_start;
 pub(crate) mod runtime_user_input;
-pub(crate) mod sandbox_denial;
+pub mod sandbox_denial;
 pub mod schema_validation;
 pub mod server;
 pub mod server_runtime;

@@ -1,13 +1,13 @@
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct SandboxDenialDiagnostic {
-    pub(crate) denied_path: Option<PathBuf>,
-    pub(crate) suggested_write_root: Option<PathBuf>,
-    pub(crate) message: String,
+pub struct SandboxDenialDiagnostic {
+    pub denied_path: Option<PathBuf>,
+    pub suggested_write_root: Option<PathBuf>,
+    pub message: String,
 }
 
-pub(crate) fn diagnose_sandbox_denial(
+pub fn diagnose_sandbox_denial(
     cwd: &Path,
     stdout: &str,
     stderr: &str,
@@ -34,7 +34,7 @@ pub(crate) fn diagnose_sandbox_denial(
     })
 }
 
-pub(crate) fn should_request_filesystem_permission_with_denied_roots(
+pub fn should_request_filesystem_permission_with_denied_roots(
     cwd: &Path,
     diagnostic: &SandboxDenialDiagnostic,
     denied_roots: &[PathBuf],

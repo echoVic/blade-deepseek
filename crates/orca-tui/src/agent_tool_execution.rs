@@ -1,10 +1,11 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender};
 
 use orca_approval::ApprovalPolicy;
+use orca_core::approval_types::{ActionKind, ApprovalDecision, ApprovalRequest};
 use orca_core::cancel::CancelToken;
-use orca_core::config::RunConfig;
+use orca_core::config::{PermissionProfileNetworkAccess, RunConfig};
 use orca_core::event_schema::EventFactory;
 use orca_core::hook_types::HookEvent;
 use orca_core::tool_types;
@@ -12,8 +13,14 @@ use orca_mcp::McpRegistry;
 use orca_runtime::cost::CostTracker;
 use orca_runtime::hooks::{HookContext, HookRunner, tool_request_with_hook_outcome};
 use orca_runtime::instructions::ProjectInstructions;
-use orca_runtime::lifecycle::RuntimeToolActorContext;
+use orca_runtime::lifecycle::{
+    RuntimePermissionRequest, RuntimeToolActorContext, TurnPermissionOverlay,
+};
 use orca_runtime::memory::MemoryBlock;
+use orca_runtime::protocol::{
+    PermissionResponseDecision, RequestFileSystemPermissions, RequestNetworkPermissions,
+    RequestPermissionProfile,
+};
 use orca_runtime::tasks::TaskRegistry;
 use orca_runtime::tool_invocation::prepare_tool_invocation;
 
@@ -27,7 +34,8 @@ use crate::agent_workflow_execution::{
 };
 use crate::diff;
 use crate::runtime_interaction_adapter::{
-    TuiToolApprovalOutcome, TuiUserInputHandler, resolve_tui_tool_approval,
+    AutoAllowPermissionRequests, TuiPermissionRequestHandler, TuiToolApprovalOutcome,
+    TuiUserInputHandler, resolve_tui_tool_approval,
 };
 use crate::types::{TuiEvent, UserAction};
 
@@ -107,6 +115,7 @@ pub(crate) fn execute_readonly_batch_for_tui(
     results
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_tool_for_tui(
     config: &RunConfig,
     cwd: &Path,
@@ -121,6 +130,7 @@ pub(crate) fn execute_tool_for_tui(
     mcp_registry: &McpRegistry,
     hooks: &HookRunner,
     task_registry: Option<&TaskRegistry>,
+    permission_overlay: &mut TurnPermissionOverlay,
     cancel: &CancelToken,
 ) -> (bool, tool_types::ToolResult, Option<CostTracker>) {
     let invocation = prepare_tool_invocation(tool_request, subagent_depth, mcp_registry, config);
@@ -131,14 +141,19 @@ pub(crate) fn execute_tool_for_tui(
     );
     let mut runtime_context =
         RuntimeToolActorContext::new(events.run_id().to_string(), DEFAULT_MAX_TURNS);
-    if let TuiToolApprovalOutcome::Denied(result) = resolve_tui_tool_approval(
-        &invocation,
-        tool_request,
-        policy,
-        &mut runtime_context,
-        event_tx,
-        action_rx,
-    ) {
+    // request_permissions is itself an approval prompt (the permission
+    // handler asks the user); gating it behind the generic tool approval
+    // would double-prompt for the same decision.
+    if tool_request.name != tool_types::ToolName::RequestPermissions
+        && let TuiToolApprovalOutcome::Denied(result) = resolve_tui_tool_approval(
+            &invocation,
+            tool_request,
+            policy,
+            &mut runtime_context,
+            event_tx,
+            action_rx,
+        )
+    {
         send_tool_requested_for_tui(event_tx, &mut events, tool_request);
         send_tool_completed_for_tui(event_tx, &mut events, &result, None);
         return (true, result, None);
@@ -188,6 +203,19 @@ pub(crate) fn execute_tool_for_tui(
             tool_request_with_hook_outcome(tool_request, &pre_tool_outcome);
         let execution_request = &effective_tool_request;
         let before = diff::capture_before(execution_request, cwd);
+        // Match the runtime path (tool_router.rs): configured extra working
+        // directories plus roots granted during this turn.
+        let additional_roots = config
+            .additional_working_directories
+            .iter()
+            .map(|directory| directory.path.clone())
+            .chain(
+                permission_overlay
+                    .additional_working_directories()
+                    .iter()
+                    .cloned(),
+            )
+            .collect::<Vec<_>>();
         let result = if execution_request.name == tool_types::ToolName::Bash {
             let mut on_output = |chunk: &str| {
                 let _ = event_tx.send(TuiEvent::ToolOutputDelta {
@@ -195,14 +223,39 @@ pub(crate) fn execute_tool_for_tui(
                     chunk: chunk.to_string(),
                 });
             };
-            orca_tools::bash::execute_streaming_with_policy_or_cancel(
-                execution_request,
-                cwd,
-                config.tools.output_truncation,
-                std::time::Duration::from_secs(config.tools.shell_timeout_secs.max(1)),
-                &mut on_output,
-                || cancel.is_cancelled(),
-            )
+            match orca_runtime::server::bash_sandbox_for_cwd(config, cwd) {
+                Err(error) => tool_types::ToolResult::failed(execution_request, error, None),
+                Ok(mut sandbox) => {
+                    apply_overlay_network_permissions(&mut sandbox, permission_overlay);
+                    execute_tui_bash_with_escalations(
+                        TuiBashRunContext {
+                            config,
+                            request: execution_request,
+                            cwd,
+                            additional_roots: &additional_roots,
+                            sandbox,
+                            task_registry,
+                            cancel,
+                        },
+                        policy,
+                        permission_overlay,
+                        event_tx,
+                        action_rx,
+                        &mut on_output,
+                    )
+                }
+            }
+        } else if execution_request.name == tool_types::ToolName::RequestPermissions {
+            let result =
+                if config.approval_mode == orca_core::approval_types::ApprovalMode::FullAuto {
+                    runtime_context.execute_request_permissions_tool(execution_request)
+                } else {
+                    let handler = TuiPermissionRequestHandler::new(event_tx, action_rx);
+                    runtime_context
+                        .execute_request_permissions_tool_with_handler(execution_request, &handler)
+                };
+            permission_overlay.merge(runtime_context.permission_overlay());
+            result
         } else if execution_request.name == tool_types::ToolName::RequestUserInput {
             execute_user_input_request_for_tui(execution_request, event_tx, action_rx)
         } else if execution_request.name == tool_types::ToolName::WorkflowDraft {
@@ -350,13 +403,15 @@ pub(crate) fn execute_tool_for_tui(
                 )
             })
         } else {
-            orca_tools::execute_with_mcp_external_and_policy(
+            orca_tools::execute_with_mcp_external_roots_policy_or_cancel(
                 execution_request,
                 cwd,
+                &additional_roots,
                 mcp_registry,
                 &config.external_tools,
                 config.tools.output_truncation,
                 config.tools.shell_timeout_secs,
+                || cancel.is_cancelled(),
             )
         };
         if matches!(result.status, tool_types::ToolStatus::Completed) {
@@ -412,6 +467,444 @@ fn should_stop_after_tui_tool_result(
             && result.status == tool_types::ToolStatus::Failed)
 }
 
+/// Everything needed to (re-)run one bash invocation in the TUI with the
+/// profile-derived sandbox.
+struct TuiBashRunContext<'a> {
+    config: &'a RunConfig,
+    request: &'a tool_types::ToolRequest,
+    cwd: &'a Path,
+    additional_roots: &'a [PathBuf],
+    sandbox: orca_runtime::server::CommandExecSandbox,
+    task_registry: Option<&'a TaskRegistry>,
+    cancel: &'a CancelToken,
+}
+
+fn apply_overlay_network_permissions(
+    sandbox: &mut orca_runtime::server::CommandExecSandbox,
+    permission_overlay: &TurnPermissionOverlay,
+) {
+    for (domain, access) in permission_overlay.network_domain_permissions() {
+        match access {
+            PermissionProfileNetworkAccess::Deny => {
+                sandbox
+                    .network_policy_domains
+                    .insert(domain.clone(), *access);
+            }
+            PermissionProfileNetworkAccess::Allow => {
+                sandbox
+                    .network_policy_domains
+                    .entry(domain.clone())
+                    .or_insert(*access);
+            }
+        }
+    }
+}
+
+/// Resolve a permission escalation through the approval policy: explicit
+/// deny rules refuse it, allow rules and full-auto grant it silently, and
+/// everything else prompts the user through the TUI approval channel.
+/// Granted permissions merge into the turn overlay.
+fn resolve_tui_permission_escalation(
+    policy: &ApprovalPolicy,
+    permission_overlay: &mut TurnPermissionOverlay,
+    approval: &ApprovalRequest,
+    permission_request: RuntimePermissionRequest,
+    event_tx: &Sender<TuiEvent>,
+    action_rx: &Receiver<UserAction>,
+) -> std::io::Result<bool> {
+    let resolution = policy.resolve_for_tool(
+        approval,
+        approval.tool.as_deref().unwrap_or_default(),
+        approval.target.as_deref(),
+    );
+    let response = match resolution.decision {
+        ApprovalDecision::Deny => return Ok(false),
+        ApprovalDecision::Allow => permission_overlay
+            .request_and_merge(&AutoAllowPermissionRequests, permission_request)?,
+        ApprovalDecision::Ask => {
+            let handler = TuiPermissionRequestHandler::new(event_tx, action_rx).with_display(
+                approval.tool.clone().unwrap_or_default(),
+                approval.target.clone(),
+                approval.preview.clone(),
+            );
+            permission_overlay.request_and_merge(&handler, permission_request)?
+        }
+    };
+    Ok(response.decision == PermissionResponseDecision::Allow)
+}
+
+fn execute_tui_bash_with_escalations(
+    mut context: TuiBashRunContext<'_>,
+    policy: &ApprovalPolicy,
+    permission_overlay: &mut TurnPermissionOverlay,
+    event_tx: &Sender<TuiEvent>,
+    action_rx: &Receiver<UserAction>,
+    on_output: &mut dyn FnMut(&str),
+) -> tool_types::ToolResult {
+    let (result, network_block) = run_tui_bash(&context, context.additional_roots, on_output);
+
+    // Network escalation (mirrors runtime_bash): a domain the proxy blocked
+    // can be granted for the rest of the turn.
+    if let Some(block) = network_block {
+        let approval = ApprovalRequest {
+            id: format!("approval-{}-network", context.request.id),
+            action: ActionKind::Network,
+            description: format!("bash requested network access to {}", block.host),
+            tool: Some("bash".to_string()),
+            target: context.request.target.clone(),
+            preview: Some(format!(
+                "$ {}\n\nbash attempted network access to {} ({})\n\nApprove to re-run this command with that domain allowed",
+                context.request.target.as_deref().unwrap_or_default(),
+                block.host,
+                block.error
+            )),
+        };
+        let mut domains = std::collections::HashMap::new();
+        domains.insert(block.host.clone(), PermissionProfileNetworkAccess::Allow);
+        let permission_request = RuntimePermissionRequest {
+            id: approval.id.clone(),
+            reason: Some(format!(
+                "bash attempted network access to {} ({})",
+                block.host, block.error
+            )),
+            permissions: RequestPermissionProfile {
+                file_system: None,
+                network: Some(RequestNetworkPermissions {
+                    enabled: None,
+                    domains,
+                }),
+            },
+        };
+        let allowed = match resolve_tui_permission_escalation(
+            policy,
+            permission_overlay,
+            &approval,
+            permission_request,
+            event_tx,
+            action_rx,
+        ) {
+            Ok(allowed) => allowed,
+            Err(error) => {
+                return tool_types::ToolResult::failed(context.request, error.to_string(), None);
+            }
+        };
+        if !allowed {
+            return tool_types::ToolResult::denied(
+                context.request,
+                "permission request denied".to_string(),
+            );
+        }
+        apply_overlay_network_permissions(&mut context.sandbox, permission_overlay);
+        return run_tui_bash(&context, context.additional_roots, on_output).0;
+    }
+
+    let base_roots = context.additional_roots;
+    escalate_sandbox_denied_bash_for_tui(
+        result,
+        context.request,
+        context.cwd,
+        policy,
+        permission_overlay,
+        event_tx,
+        action_rx,
+        context.cancel,
+        &mut |granted| {
+            let mut roots = base_roots.to_vec();
+            for root in granted {
+                if !roots.contains(root) {
+                    roots.push(root.clone());
+                }
+            }
+            run_tui_bash(&context, &roots, on_output).0
+        },
+    )
+}
+
+/// Run one sandboxed bash invocation: build the command from the sandbox
+/// mode (mirroring shell_session's mapping), enforce network domain policy
+/// through a local proxy, and register the run in the task registry so
+/// `task_list`/`task_stop` can see and cancel it.
+fn run_tui_bash(
+    context: &TuiBashRunContext<'_>,
+    extra_roots: &[PathBuf],
+    on_output: &mut dyn FnMut(&str),
+) -> (
+    tool_types::ToolResult,
+    Option<orca_runtime::network_proxy::RuntimeNetworkBlockReport>,
+) {
+    use orca_runtime::network_proxy::{RuntimeNetworkPolicy, RuntimeNetworkProxy};
+    use orca_runtime::shell_session::ShellSandboxMode;
+
+    let request = context.request;
+    let Some(command_text) = request
+        .target
+        .as_deref()
+        .filter(|target| !target.is_empty())
+    else {
+        return (
+            tool_types::ToolResult::failed(request, "bash command is required", None),
+            None,
+        );
+    };
+
+    let mut writable_roots = extra_roots.to_vec();
+    for root in &context.sandbox.additional_writable_roots {
+        if !writable_roots.contains(root) {
+            writable_roots.push(root.clone());
+        }
+    }
+
+    let mut env: Vec<(String, Option<String>)> = Vec::new();
+    let mut block_receiver = None;
+    let _network_proxy = if context.sandbox.network_policy_domains.is_empty() {
+        None
+    } else {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        block_receiver = Some(receiver);
+        match RuntimeNetworkProxy::start_with_block_reporter(
+            RuntimeNetworkPolicy::new(context.sandbox.network_policy_domains.clone()),
+            Some(sender),
+        ) {
+            Ok(proxy) => {
+                for key in [
+                    "HTTP_PROXY",
+                    "HTTPS_PROXY",
+                    "ALL_PROXY",
+                    "http_proxy",
+                    "https_proxy",
+                    "all_proxy",
+                ] {
+                    env.push((key.to_string(), Some(proxy.proxy_url().to_string())));
+                }
+                for key in ["NO_PROXY", "no_proxy"] {
+                    env.push((key.to_string(), None));
+                }
+                Some(proxy)
+            }
+            Err(error) => {
+                return (
+                    tool_types::ToolResult::failed(
+                        request,
+                        format!("failed to start network proxy: {error}"),
+                        None,
+                    ),
+                    None,
+                );
+            }
+        }
+    };
+
+    let mut command = match context.sandbox.mode {
+        ShellSandboxMode::WorkspaceWrite {
+            network_access,
+            exclude_tmpdir_env_var,
+            exclude_slash_tmp,
+        } => orca_tools::sandbox::workspace_write_bash_command(
+            orca_tools::sandbox::WorkspaceWriteSandboxCommandContext {
+                command: command_text,
+                cwd: context.cwd,
+                readable_roots: &context.sandbox.additional_readable_roots,
+                additional_roots: &writable_roots,
+                denied_roots: &context.sandbox.denied_writable_roots,
+                network_access,
+                exclude_tmpdir_env_var,
+                exclude_slash_tmp,
+                allowed_unix_socket_roots: &context.sandbox.allowed_unix_socket_roots,
+            },
+        ),
+        ShellSandboxMode::ReadOnly {
+            network_access,
+            allow_global_read,
+        } => orca_tools::sandbox::read_only_bash_command(
+            orca_tools::sandbox::ReadOnlySandboxCommandContext {
+                command: command_text,
+                cwd: context.cwd,
+                readable_roots: &context.sandbox.additional_readable_roots,
+                additional_roots: &writable_roots,
+                denied_roots: &context.sandbox.denied_writable_roots,
+                network_access,
+                allow_global_read,
+                allowed_unix_socket_roots: &context.sandbox.allowed_unix_socket_roots,
+            },
+        ),
+        ShellSandboxMode::DangerFullAccess => {
+            orca_tools::sandbox::plain_bash_command(command_text, context.cwd)
+        }
+    };
+    for (key, value) in &env {
+        match value {
+            Some(value) => {
+                command.env(key, value);
+            }
+            None => {
+                command.env_remove(key);
+            }
+        }
+    }
+
+    let task_id = context.task_registry.map(|registry| {
+        let task = registry.create_shell(command_text.to_string(), command_text.to_string());
+        let _ = registry.mark_running(&task.id);
+        task.id
+    });
+
+    let cancel = context.cancel;
+    let registry = context.task_registry;
+    let registry_cancelled = || {
+        task_id
+            .as_deref()
+            .zip(registry)
+            .is_some_and(|(id, registry)| registry.is_cancelled(id))
+    };
+    let result = orca_tools::bash::execute_streaming_command_or_cancel(
+        request,
+        command,
+        context.config.tools.output_truncation,
+        std::time::Duration::from_secs(context.config.tools.shell_timeout_secs.max(1)),
+        on_output,
+        || cancel.is_cancelled() || registry_cancelled(),
+    );
+    if let (Some(registry), Some(task_id)) = (registry, task_id.as_deref()) {
+        match result.status {
+            tool_types::ToolStatus::Completed => {
+                let _ = registry.complete(task_id, result.output.clone().unwrap_or_default());
+            }
+            _ => {
+                let _ = registry.fail(
+                    task_id,
+                    result
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "shell command failed".to_string()),
+                );
+            }
+        }
+    }
+    let network_block = block_receiver.and_then(|receiver| {
+        receiver
+            .try_iter()
+            .find(|block| block.error != "blocked-by-denylist")
+    });
+    (result, network_block)
+}
+
+/// When a sandboxed bash command fails because the sandbox denied a write to
+/// protected workspace metadata (`.git`, `.agents`, `.codex`) or a path
+/// outside the workspace, escalate through the approval policy — prompting
+/// the user in suggest/auto-edit mode — and re-run the command with the
+/// denied write root granted. Approved roots merge into the turn permission
+/// overlay so later commands in the same turn don't re-prompt. Anything else
+/// passes through unchanged.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn escalate_sandbox_denied_bash_for_tui(
+    result: tool_types::ToolResult,
+    request: &tool_types::ToolRequest,
+    cwd: &Path,
+    policy: &ApprovalPolicy,
+    permission_overlay: &mut TurnPermissionOverlay,
+    event_tx: &Sender<TuiEvent>,
+    action_rx: &Receiver<UserAction>,
+    cancel: &CancelToken,
+    retry: &mut dyn FnMut(&[PathBuf]) -> tool_types::ToolResult,
+) -> tool_types::ToolResult {
+    use orca_runtime::sandbox_denial::{
+        diagnose_sandbox_denial, should_request_filesystem_permission_with_denied_roots,
+    };
+
+    if result.status != tool_types::ToolStatus::Failed || cancel.is_cancelled() {
+        return result;
+    }
+    let Some(diagnostic) =
+        diagnose_sandbox_denial(cwd, "", result.error.as_deref().unwrap_or_default())
+    else {
+        return result;
+    };
+    if !should_request_filesystem_permission_with_denied_roots(cwd, &diagnostic, &[]) {
+        return with_sandbox_diagnostic(result, &diagnostic.message);
+    }
+    let Some(write_root) = diagnostic.suggested_write_root.clone() else {
+        return with_sandbox_diagnostic(result, &diagnostic.message);
+    };
+
+    let approval = ApprovalRequest {
+        id: format!("approval-{}-sandbox", request.id),
+        action: ActionKind::Shell,
+        description: format!(
+            "bash requested sandbox write access to {}",
+            write_root.display()
+        ),
+        tool: Some("bash".to_string()),
+        target: request.target.clone(),
+        preview: Some(format!(
+            "$ {}\n\n{}\n\nApprove to re-run this command with write access to {}",
+            request.target.as_deref().unwrap_or_default(),
+            diagnostic.message,
+            write_root.display()
+        )),
+    };
+    let permission_request = RuntimePermissionRequest {
+        id: approval.id.clone(),
+        reason: Some(format!(
+            "bash attempted filesystem write outside the current sandbox: {}",
+            write_root.display()
+        )),
+        permissions: RequestPermissionProfile {
+            file_system: Some(RequestFileSystemPermissions {
+                read: None,
+                write: Some(vec![write_root.clone()]),
+                entries: None,
+            }),
+            network: None,
+        },
+    };
+    let allowed = match resolve_tui_permission_escalation(
+        policy,
+        permission_overlay,
+        &approval,
+        permission_request,
+        event_tx,
+        action_rx,
+    ) {
+        Ok(allowed) => allowed,
+        Err(error) => {
+            return tool_types::ToolResult::failed(request, error.to_string(), None);
+        }
+    };
+    if !allowed {
+        return with_sandbox_diagnostic(
+            result,
+            &format!(
+                "{}; write access to {} was not granted",
+                diagnostic.message,
+                write_root.display()
+            ),
+        );
+    }
+
+    let granted = permission_overlay.additional_working_directories().to_vec();
+    let retry_result = retry(&granted);
+    if retry_result.status == tool_types::ToolStatus::Failed
+        && let Some(retry_diagnostic) =
+            diagnose_sandbox_denial(cwd, "", retry_result.error.as_deref().unwrap_or_default())
+    {
+        return with_sandbox_diagnostic(retry_result, &retry_diagnostic.message);
+    }
+    retry_result
+}
+
+fn with_sandbox_diagnostic(
+    mut result: tool_types::ToolResult,
+    message: &str,
+) -> tool_types::ToolResult {
+    match result.error.as_mut() {
+        Some(error) if !error.trim_end().is_empty() => {
+            error.push_str(&format!("\n\nSandbox diagnostic: {message}"));
+        }
+        _ => result.error = Some(message.to_string()),
+    }
+    result
+}
+
 fn execute_user_input_request_for_tui(
     request: &tool_types::ToolRequest,
     event_tx: &Sender<TuiEvent>,
@@ -436,4 +929,465 @@ pub(crate) fn canonical_action_for_tool(
         Some(mcp_registry),
         external_tools,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::mpsc;
+
+    use orca_core::approval_types::ApprovalMode;
+    use orca_core::config::{HistoryMode, OutputFormat, ProviderKind, RunConfig};
+    use orca_core::model::ModelSelection;
+    use orca_core::tool_types::{ToolName, ToolStatus};
+    use tempfile::TempDir;
+
+    use super::*;
+
+    fn config(approval_mode: ApprovalMode) -> RunConfig {
+        RunConfig {
+            app_version: "0.0.0-test".to_string(),
+            prompt: String::new(),
+            cwd: std::env::current_dir().ok(),
+            output_format: OutputFormat::Text,
+            approval_mode,
+            provider: ProviderKind::Mock,
+            verifier: None,
+            model: ModelSelection::parse(None).unwrap(),
+            model_runtime: Default::default(),
+            reasoning_effort: orca_core::config::ReasoningEffort::Max,
+            api_key: None,
+            base_url: None,
+            history_mode: HistoryMode::Disabled,
+            show_session_picker: false,
+            active_permission_profile: None,
+            permission_profiles: Default::default(),
+            runtime_workspace_roots: None,
+            permission_rules: Default::default(),
+            additional_working_directories: Vec::new(),
+            max_budget_usd: None,
+            mcp_servers: Vec::new(),
+            hooks: Vec::new(),
+            external_tools: Vec::new(),
+            subagents: Default::default(),
+            tools: Default::default(),
+            workflows: Default::default(),
+            theme: orca_core::config::ThemeName::Dark,
+            vim_mode: false,
+            update_check: false,
+            desktop_notifications: false,
+            auto_memory: false,
+        }
+    }
+
+    fn bash_request(command: &str) -> tool_types::ToolRequest {
+        tool_types::ToolRequest {
+            id: "bash-1".to_string(),
+            name: ToolName::Bash,
+            action: ActionKind::Shell,
+            target: Some(command.to_string()),
+            raw_arguments: None,
+        }
+    }
+
+    fn git_denied_result(
+        request: &tool_types::ToolRequest,
+        workspace: &Path,
+    ) -> tool_types::ToolResult {
+        tool_types::ToolResult::failed(
+            request,
+            format!(
+                "fatal: Unable to create '{}': Operation not permitted",
+                workspace.join(".git/index.lock").display()
+            ),
+            Some(128),
+        )
+    }
+
+    struct EscalationHarness {
+        workspace: TempDir,
+        event_tx: Sender<TuiEvent>,
+        event_rx: mpsc::Receiver<TuiEvent>,
+        action_tx: Sender<UserAction>,
+        action_rx: Receiver<UserAction>,
+    }
+
+    impl EscalationHarness {
+        fn new() -> Self {
+            let workspace = TempDir::new_in(std::env::current_dir().unwrap()).unwrap();
+            std::fs::create_dir(workspace.path().join(".git")).unwrap();
+            let (event_tx, event_rx) = mpsc::channel();
+            let (action_tx, action_rx) = mpsc::channel();
+            Self {
+                workspace,
+                event_tx,
+                event_rx,
+                action_tx,
+                action_rx,
+            }
+        }
+
+        fn run(
+            &self,
+            approval_mode: ApprovalMode,
+            request: &tool_types::ToolRequest,
+            result: tool_types::ToolResult,
+        ) -> tool_types::ToolResult {
+            self.run_with_overlay(
+                approval_mode,
+                request,
+                result,
+                &mut TurnPermissionOverlay::default(),
+            )
+        }
+
+        fn run_with_overlay(
+            &self,
+            approval_mode: ApprovalMode,
+            request: &tool_types::ToolRequest,
+            result: tool_types::ToolResult,
+            permission_overlay: &mut TurnPermissionOverlay,
+        ) -> tool_types::ToolResult {
+            let config = config(approval_mode);
+            let policy = ApprovalPolicy::new(approval_mode);
+            let cancel = CancelToken::new();
+            let cwd = self.workspace.path().to_path_buf();
+            escalate_sandbox_denied_bash_for_tui(
+                result,
+                request,
+                &cwd,
+                &policy,
+                permission_overlay,
+                &self.event_tx,
+                &self.action_rx,
+                &cancel,
+                &mut |granted| {
+                    orca_tools::bash::execute_streaming_with_policy_roots_or_cancel(
+                        request,
+                        &cwd,
+                        granted,
+                        config.tools.output_truncation,
+                        std::time::Duration::from_secs(5),
+                        &mut |_chunk| {},
+                        || false,
+                    )
+                },
+            )
+        }
+
+        fn approval_events(&self) -> Vec<TuiEvent> {
+            self.event_rx
+                .try_iter()
+                .filter(|event| matches!(event, TuiEvent::ApprovalNeeded { .. }))
+                .collect()
+        }
+    }
+
+    #[test]
+    fn sandbox_denied_git_write_escalates_and_retries_after_approval() {
+        let harness = EscalationHarness::new();
+        let marker = harness.workspace.path().join(".git/escalation-marker");
+        let request = bash_request(&format!("printf granted > {}", marker.display()));
+        let denied = git_denied_result(&request, harness.workspace.path());
+        harness.action_tx.send(UserAction::Approve(true)).unwrap();
+
+        let result = harness.run(ApprovalMode::Suggest, &request, denied);
+
+        assert_eq!(result.status, ToolStatus::Completed, "{:?}", result.error);
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "granted");
+        let approvals = harness.approval_events();
+        assert_eq!(approvals.len(), 1);
+        assert!(approvals.iter().any(|event| matches!(
+            event,
+            TuiEvent::ApprovalNeeded { tool, preview, .. }
+            if tool == "bash"
+                && preview.as_deref().unwrap_or_default().contains(".git")
+        )));
+    }
+
+    #[test]
+    fn sandbox_denied_git_write_keeps_failure_with_diagnostic_when_user_denies() {
+        let harness = EscalationHarness::new();
+        let marker = harness.workspace.path().join(".git/escalation-marker");
+        let request = bash_request(&format!("printf granted > {}", marker.display()));
+        let denied = git_denied_result(&request, harness.workspace.path());
+        harness.action_tx.send(UserAction::Approve(false)).unwrap();
+
+        let result = harness.run(ApprovalMode::Suggest, &request, denied);
+
+        assert_eq!(result.status, ToolStatus::Failed);
+        assert!(
+            !marker.exists(),
+            "denied escalation must not re-run the command"
+        );
+        let error = result.error.unwrap_or_default();
+        assert!(error.contains("Operation not permitted"), "{error}");
+        assert!(error.contains("Sandbox diagnostic"), "{error}");
+        assert!(error.contains("not granted"), "{error}");
+        assert_eq!(harness.approval_events().len(), 1);
+    }
+
+    #[test]
+    fn full_auto_retries_sandbox_denied_git_write_without_prompting() {
+        let harness = EscalationHarness::new();
+        let marker = harness.workspace.path().join(".git/escalation-marker");
+        let request = bash_request(&format!("printf granted > {}", marker.display()));
+        let denied = git_denied_result(&request, harness.workspace.path());
+
+        let result = harness.run(ApprovalMode::FullAuto, &request, denied);
+
+        assert_eq!(result.status, ToolStatus::Completed, "{:?}", result.error);
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "granted");
+        assert!(harness.approval_events().is_empty());
+    }
+
+    #[test]
+    fn approved_escalation_persists_write_root_in_turn_overlay() {
+        let harness = EscalationHarness::new();
+        let marker = harness.workspace.path().join(".git/escalation-marker");
+        let request = bash_request(&format!("printf granted > {}", marker.display()));
+        let denied = git_denied_result(&request, harness.workspace.path());
+        harness.action_tx.send(UserAction::Approve(true)).unwrap();
+        let mut overlay = TurnPermissionOverlay::default();
+
+        let result =
+            harness.run_with_overlay(ApprovalMode::Suggest, &request, denied, &mut overlay);
+
+        assert_eq!(result.status, ToolStatus::Completed, "{:?}", result.error);
+        let git_root = harness.workspace.path().join(".git");
+        assert!(
+            overlay.additional_working_directories().contains(&git_root),
+            "approved write root must persist for the rest of the turn: {:?}",
+            overlay.additional_working_directories()
+        );
+    }
+
+    #[test]
+    fn request_permissions_tool_prompts_and_merges_grant_into_overlay() {
+        let harness = EscalationHarness::new();
+        let write_root = harness.workspace.path().join(".git");
+        let request = tool_types::ToolRequest {
+            id: "perm-1".to_string(),
+            name: ToolName::RequestPermissions,
+            action: ActionKind::Read,
+            target: None,
+            raw_arguments: Some(
+                serde_json::json!({
+                    "reason": "need to stage the merge",
+                    "permissions": {
+                        "fileSystem": { "write": [write_root.display().to_string()] }
+                    }
+                })
+                .to_string(),
+            ),
+        };
+        harness.action_tx.send(UserAction::Approve(true)).unwrap();
+        let config = config(ApprovalMode::Suggest);
+        let policy = ApprovalPolicy::new(ApprovalMode::Suggest);
+        let mut overlay = TurnPermissionOverlay::default();
+
+        let (should_stop, result, _) = execute_tool_for_tui(
+            &config,
+            harness.workspace.path(),
+            &request,
+            &harness.event_tx,
+            &harness.action_rx,
+            0,
+            None,
+            &policy,
+            &ProjectInstructions::default(),
+            &MemoryBlock::default(),
+            &McpRegistry::default(),
+            &orca_runtime::hooks::HookRunner::default(),
+            None,
+            &mut overlay,
+            &CancelToken::new(),
+        );
+
+        assert!(!should_stop);
+        assert_eq!(result.status, ToolStatus::Completed, "{:?}", result.error);
+        assert!(
+            overlay
+                .additional_working_directories()
+                .contains(&write_root),
+            "granted root must merge into the turn overlay: {:?}",
+            overlay.additional_working_directories()
+        );
+        assert_eq!(harness.approval_events().len(), 1);
+    }
+
+    #[test]
+    fn request_permissions_tool_denied_by_user_grants_nothing() {
+        let harness = EscalationHarness::new();
+        let request = tool_types::ToolRequest {
+            id: "perm-1".to_string(),
+            name: ToolName::RequestPermissions,
+            action: ActionKind::Read,
+            target: None,
+            raw_arguments: Some(
+                serde_json::json!({
+                    "reason": "need broad access",
+                    "permissions": {
+                        "fileSystem": { "write": ["/"] }
+                    }
+                })
+                .to_string(),
+            ),
+        };
+        harness.action_tx.send(UserAction::Approve(false)).unwrap();
+        let config = config(ApprovalMode::Suggest);
+        let policy = ApprovalPolicy::new(ApprovalMode::Suggest);
+        let mut overlay = TurnPermissionOverlay::default();
+
+        let (_, result, _) = execute_tool_for_tui(
+            &config,
+            harness.workspace.path(),
+            &request,
+            &harness.event_tx,
+            &harness.action_rx,
+            0,
+            None,
+            &policy,
+            &ProjectInstructions::default(),
+            &MemoryBlock::default(),
+            &McpRegistry::default(),
+            &orca_runtime::hooks::HookRunner::default(),
+            None,
+            &mut overlay,
+            &CancelToken::new(),
+        );
+
+        assert_ne!(result.status, ToolStatus::Completed);
+        assert!(overlay.additional_working_directories().is_empty());
+    }
+
+    fn seatbelt_available_for_tests() -> bool {
+        std::process::Command::new("sandbox-exec")
+            .arg("-p")
+            .arg("(version 1) (allow default)")
+            .arg("true")
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn read_only_permission_profile_blocks_workspace_writes_in_tui_bash() {
+        if !seatbelt_available_for_tests() {
+            return;
+        }
+        let harness = EscalationHarness::new();
+        let target = harness.workspace.path().join("blocked.txt");
+        let request = bash_request(&format!("printf x > {}", target.display()));
+        let mut config = config(ApprovalMode::FullAuto);
+        config.active_permission_profile = Some(orca_core::config::ActivePermissionProfile {
+            id: "read-only".to_string(),
+            extends: None,
+        });
+        let policy = ApprovalPolicy::new(ApprovalMode::FullAuto);
+        let mut overlay = TurnPermissionOverlay::default();
+
+        let (_, result, _) = execute_tool_for_tui(
+            &config,
+            harness.workspace.path(),
+            &request,
+            &harness.event_tx,
+            &harness.action_rx,
+            0,
+            None,
+            &policy,
+            &ProjectInstructions::default(),
+            &MemoryBlock::default(),
+            &McpRegistry::default(),
+            &orca_runtime::hooks::HookRunner::default(),
+            None,
+            &mut overlay,
+            &CancelToken::new(),
+        );
+
+        assert_ne!(
+            result.status,
+            ToolStatus::Completed,
+            "read-only profile must deny workspace writes in the TUI bash path"
+        );
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn tui_bash_registers_shell_task_for_task_list() {
+        use orca_core::task_types::{TaskStatus, TaskType};
+
+        let harness = EscalationHarness::new();
+        let request = bash_request("printf ok");
+        let config = config(ApprovalMode::FullAuto);
+        let policy = ApprovalPolicy::new(ApprovalMode::FullAuto);
+        let registry = TaskRegistry::new("tui-bash-tasks".to_string());
+        let mut overlay = TurnPermissionOverlay::default();
+
+        let (_, result, _) = execute_tool_for_tui(
+            &config,
+            harness.workspace.path(),
+            &request,
+            &harness.event_tx,
+            &harness.action_rx,
+            0,
+            None,
+            &policy,
+            &ProjectInstructions::default(),
+            &MemoryBlock::default(),
+            &McpRegistry::default(),
+            &orca_runtime::hooks::HookRunner::default(),
+            Some(&registry),
+            &mut overlay,
+            &CancelToken::new(),
+        );
+
+        assert_eq!(result.status, ToolStatus::Completed, "{:?}", result.error);
+        let tasks = registry.list();
+        assert!(
+            tasks.iter().any(|task| task.task_type == TaskType::Shell
+                && task.status == TaskStatus::Completed
+                && task.command.as_deref() == Some("printf ok")),
+            "bash run must be visible to task_list: {tasks:?}"
+        );
+    }
+
+    #[test]
+    fn non_sandbox_failures_pass_through_untouched() {
+        let harness = EscalationHarness::new();
+        let request = bash_request("gitx status");
+        let failed =
+            tool_types::ToolResult::failed(&request, "sh: gitx: command not found", Some(127));
+
+        let result = harness.run(ApprovalMode::Suggest, &request, failed.clone());
+
+        assert_eq!(result.status, ToolStatus::Failed);
+        assert_eq!(result.error, failed.error);
+        assert!(harness.approval_events().is_empty());
+    }
+
+    #[test]
+    fn workspace_internal_denial_gets_diagnostic_but_no_prompt() {
+        let harness = EscalationHarness::new();
+        let blocked = harness.workspace.path().join("blocked.txt");
+        let request = bash_request(&format!("printf x > {}", blocked.display()));
+        let failed = tool_types::ToolResult::failed(
+            &request,
+            format!("sh: {}: Operation not permitted", blocked.display()),
+            Some(1),
+        );
+
+        let result = harness.run(ApprovalMode::Suggest, &request, failed);
+
+        assert_eq!(result.status, ToolStatus::Failed);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Sandbox diagnostic"),
+            "{:?}",
+            result.error
+        );
+        assert!(harness.approval_events().is_empty());
+    }
 }

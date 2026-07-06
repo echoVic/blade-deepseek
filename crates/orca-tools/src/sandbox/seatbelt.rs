@@ -224,7 +224,7 @@ fn workspace_write_profile(context: WorkspaceWriteProfileContext<'_>) -> String 
     let slash_tmp_write = if exclude_slash_tmp {
         String::new()
     } else {
-        r#"(allow file-write* (subpath "/tmp"))"#.to_string()
+        slash_tmp_write_rules()
     };
     let network_rule = if network_access {
         "(allow network-outbound)"
@@ -348,6 +348,22 @@ fn access_deny_rules(denied_roots: &[PathBuf]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Allow rules for `/tmp` writes. On macOS `/tmp` is a symlink to
+/// `/private/tmp` and Seatbelt matches the resolved path, so a rule for the
+/// literal `/tmp` subpath alone never applies; emit the canonical path too.
+fn slash_tmp_write_rules() -> String {
+    let mut rules = vec![r#"(allow file-write* (subpath "/tmp"))"#.to_string()];
+    if let Ok(canonical) = Path::new("/tmp").canonicalize()
+        && canonical != Path::new("/tmp")
+    {
+        rules.push(format!(
+            r#"(allow file-write* (subpath "{}"))"#,
+            seatbelt_escape(&canonical.display().to_string())
+        ));
+    }
+    rules.join("\n")
 }
 
 fn protected_workspace_metadata_deny_rules(cwd: &Path) -> String {
@@ -729,6 +745,59 @@ mod tests {
             !output.status.success(),
             "strict read-only sandbox should reject unlisted reads"
         );
+    }
+
+    #[test]
+    fn workspace_write_profile_includes_canonical_slash_tmp_rule() {
+        let workspace = TempDir::new().unwrap();
+        let profile = workspace_write_profile(WorkspaceWriteProfileContext {
+            cwd: workspace.path(),
+            readable_roots: &[],
+            additional_roots: &[],
+            denied_roots: &[],
+            network_access: true,
+            exclude_tmpdir_env_var: false,
+            exclude_slash_tmp: false,
+            allowed_unix_socket_roots: &[],
+        });
+
+        assert!(profile.contains(r#"(allow file-write* (subpath "/tmp"))"#));
+        if let Ok(canonical) = Path::new("/tmp").canonicalize()
+            && canonical != Path::new("/tmp")
+        {
+            assert!(
+                profile.contains(&format!(
+                    r#"(allow file-write* (subpath "{}"))"#,
+                    canonical.display()
+                )),
+                "profile must allow the resolved /tmp path (seatbelt matches resolved paths): {profile}"
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_write_sandbox_allows_writes_under_slash_tmp() {
+        if !available() {
+            return;
+        }
+
+        let workspace = TempDir::new_in(std::env::current_dir().unwrap()).unwrap();
+        let tmp_target = TempDir::new_in("/tmp").unwrap();
+        let target = tmp_target.path().join("allowed.txt");
+
+        let output = bash_command(
+            &format!("printf allowed > {}", target.display()),
+            workspace.path(),
+        )
+        .output()
+        .unwrap();
+
+        assert!(
+            output.status.success(),
+            "writes under /tmp must be allowed by the workspace profile\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "allowed");
     }
 
     #[test]

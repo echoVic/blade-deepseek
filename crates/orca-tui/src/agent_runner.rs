@@ -351,6 +351,7 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
     );
     let policy = ApprovalPolicy::new(config.approval_mode)
         .with_permission_rules(config.permission_rules.clone());
+    let mut permission_overlay = orca_runtime::lifecycle::TurnPermissionOverlay::default();
     session.replace_skill_context(agent_common::explicit_skill_context(&cwd, prompt));
     session.conversation_mut().add_user(prompt.to_string());
     if let Some(message) = session.conversation().messages.last().cloned() {
@@ -719,6 +720,7 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
                 session.mcp_registry(),
                 session.hooks(),
                 Some(session.task_registry()),
+                &mut permission_overlay,
                 cancel,
             );
 
@@ -1406,6 +1408,7 @@ mod tests {
             &McpRegistry::default(),
             &HookRunner::default(),
             None,
+            &mut orca_runtime::lifecycle::TurnPermissionOverlay::default(),
             &CancelToken::new(),
         );
 
@@ -1459,6 +1462,7 @@ mod tests {
             &McpRegistry::default(),
             &HookRunner::default(),
             None,
+            &mut orca_runtime::lifecycle::TurnPermissionOverlay::default(),
             &CancelToken::new(),
         );
 

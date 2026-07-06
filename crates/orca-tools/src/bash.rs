@@ -232,23 +232,42 @@ pub fn execute_streaming_with_policy_roots_or_cancel(
     else {
         return ToolResult::failed(request, "bash command is required", None);
     };
+    execute_streaming_command_or_cancel(
+        request,
+        sandbox::bash_command_with_additional_roots(command, cwd, additional_roots),
+        output_truncation,
+        shell_timeout,
+        on_output,
+        should_cancel,
+    )
+}
 
-    let mut child =
-        match sandbox::bash_command_with_additional_roots(command, cwd, additional_roots)
-            .env_remove("ORCA_API_KEY")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-        {
-            Ok(child) => child,
-            Err(error) => {
-                return ToolResult::failed(
-                    request,
-                    format!("failed to run shell command: {error}"),
-                    None,
-                );
-            }
-        };
+/// Stream a prebuilt (typically sandboxed) shell command. Callers that derive
+/// their own sandbox profile (e.g. from a permission profile) build the
+/// `Command` via `sandbox::*` and pass it here.
+pub fn execute_streaming_command_or_cancel(
+    request: &ToolRequest,
+    mut command: std::process::Command,
+    output_truncation: ToolOutputTruncation,
+    shell_timeout: Duration,
+    on_output: &mut dyn FnMut(&str),
+    should_cancel: impl Fn() -> bool,
+) -> ToolResult {
+    let mut child = match command
+        .env_remove("ORCA_API_KEY")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            return ToolResult::failed(
+                request,
+                format!("failed to run shell command: {error}"),
+                None,
+            );
+        }
+    };
     let (tx, rx) = mpsc::channel();
     let stdout_handle = child.stdout.take().map(|stdout| {
         let tx = tx.clone();

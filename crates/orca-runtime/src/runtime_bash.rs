@@ -12,8 +12,8 @@ use crate::lifecycle::{
 };
 use crate::network_proxy::{RuntimeNetworkBlockReport, RuntimeNetworkPolicy, RuntimeNetworkProxy};
 use crate::protocol::{
-    CommandExecOptions, PermissionResponseDecision, RequestFileSystemPermissions,
-    RequestNetworkPermissions, RequestPermissionProfile,
+    PermissionResponseDecision, RequestFileSystemPermissions, RequestNetworkPermissions,
+    RequestPermissionProfile,
 };
 use crate::sandbox_denial::{
     SandboxDenialDiagnostic, diagnose_sandbox_denial,
@@ -229,17 +229,7 @@ fn bash_sandbox_from_active_permission_profile(
     config: &RunConfig,
     cwd: &Path,
 ) -> Result<crate::server::CommandExecSandbox, String> {
-    let runtime_workspace_roots = config.runtime_workspace_roots.clone().unwrap_or_default();
-    let profile = config.active_permission_profile.as_ref();
-    let options = CommandExecOptions::default();
-    crate::server::command_exec_sandbox_mode(
-        config,
-        &options,
-        profile,
-        cwd,
-        &runtime_workspace_roots,
-        std::env::var_os("TMPDIR").map(PathBuf::from).as_deref(),
-    )
+    crate::server::bash_sandbox_for_cwd(config, cwd)
 }
 
 struct BashExecutionResult {

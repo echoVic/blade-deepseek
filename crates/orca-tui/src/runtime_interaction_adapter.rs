@@ -4,9 +4,11 @@ use orca_approval::ApprovalPolicy;
 use orca_core::approval_types::{ApprovalDecision, ApprovalRequest, ApprovalResolution};
 use orca_core::tool_types;
 use orca_runtime::lifecycle::{
-    RuntimeApprovalDecision, RuntimeApprovalHandler, RuntimeToolActorContext,
+    RuntimeApprovalDecision, RuntimeApprovalHandler, RuntimePermissionRequest,
+    RuntimePermissionRequestHandler, RuntimePermissionResponse, RuntimeToolActorContext,
     RuntimeUserInputHandler, RuntimeUserInputRequest,
 };
+use orca_runtime::protocol::{PermissionGrantScope, PermissionResponseDecision};
 use orca_runtime::tool_invocation::{ToolInvocation, approval_request_for_invocation};
 
 use crate::types::{TuiEvent, UserAction};
@@ -154,6 +156,125 @@ fn build_approval_preview(request: &tool_types::ToolRequest) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// Routes runtime permission requests (sandbox escalations and the
+/// `request_permissions` tool) through the TUI approval channel. Display
+/// fields can be overridden so callers like the bash sandbox escalation can
+/// show the failing command instead of the generic permission summary.
+pub(crate) struct TuiPermissionRequestHandler<'a> {
+    event_tx: &'a Sender<TuiEvent>,
+    action_rx: &'a Receiver<UserAction>,
+    tool: String,
+    target: Option<String>,
+    preview: Option<String>,
+}
+
+impl<'a> TuiPermissionRequestHandler<'a> {
+    pub(crate) fn new(event_tx: &'a Sender<TuiEvent>, action_rx: &'a Receiver<UserAction>) -> Self {
+        Self {
+            event_tx,
+            action_rx,
+            tool: "request_permissions".to_string(),
+            target: None,
+            preview: None,
+        }
+    }
+
+    pub(crate) fn with_display(
+        mut self,
+        tool: impl Into<String>,
+        target: Option<String>,
+        preview: Option<String>,
+    ) -> Self {
+        self.tool = tool.into();
+        self.target = target;
+        self.preview = preview;
+        self
+    }
+}
+
+impl RuntimePermissionRequestHandler for TuiPermissionRequestHandler<'_> {
+    fn request_permissions(
+        &self,
+        request: &RuntimePermissionRequest,
+    ) -> std::io::Result<RuntimePermissionResponse> {
+        let preview = self
+            .preview
+            .clone()
+            .unwrap_or_else(|| describe_permission_request(request));
+        let _ = self.event_tx.send(TuiEvent::ApprovalNeeded {
+            id: request.id.clone(),
+            tool: self.tool.clone(),
+            target: self.target.clone().or_else(|| request.reason.clone()),
+            preview: Some(preview),
+        });
+        let allowed = loop {
+            match self.action_rx.recv() {
+                Ok(UserAction::Approve(value)) => break value,
+                Ok(UserAction::Interrupt) | Ok(UserAction::Cancel) | Err(_) => break false,
+                _ => continue,
+            }
+        };
+        Ok(RuntimePermissionResponse {
+            decision: if allowed {
+                PermissionResponseDecision::Allow
+            } else {
+                PermissionResponseDecision::Deny
+            },
+            scope: PermissionGrantScope::Turn,
+            permissions: request.permissions.clone(),
+            strict_auto_review: false,
+        })
+    }
+}
+
+/// Grants whatever was requested without prompting; used when the approval
+/// policy already resolved the escalation to Allow (e.g. full-auto mode).
+pub(crate) struct AutoAllowPermissionRequests;
+
+impl RuntimePermissionRequestHandler for AutoAllowPermissionRequests {
+    fn request_permissions(
+        &self,
+        request: &RuntimePermissionRequest,
+    ) -> std::io::Result<RuntimePermissionResponse> {
+        Ok(RuntimePermissionResponse {
+            decision: PermissionResponseDecision::Allow,
+            scope: PermissionGrantScope::Turn,
+            permissions: request.permissions.clone(),
+            strict_auto_review: false,
+        })
+    }
+}
+
+fn describe_permission_request(request: &RuntimePermissionRequest) -> String {
+    let mut lines = Vec::new();
+    if let Some(reason) = &request.reason {
+        lines.push(reason.clone());
+    }
+    if let Some(file_system) = &request.permissions.file_system {
+        for root in file_system.read.iter().flatten() {
+            lines.push(format!("+ read {}", root.display()));
+        }
+        for root in file_system.write.iter().flatten() {
+            lines.push(format!("+ write {}", root.display()));
+        }
+    }
+    if let Some(network) = &request.permissions.network {
+        if let Some(enabled) = network.enabled {
+            lines.push(format!(
+                "+ network {}",
+                if enabled { "enabled" } else { "disabled" }
+            ));
+        }
+        for (domain, access) in &network.domains {
+            lines.push(format!("+ network domain {domain}: {access:?}"));
+        }
+    }
+    if lines.is_empty() {
+        lines.push("(no specific permissions requested)".to_string());
+    }
+    lines.join("\n")
 }
 
 pub(crate) struct TuiUserInputHandler<'a> {

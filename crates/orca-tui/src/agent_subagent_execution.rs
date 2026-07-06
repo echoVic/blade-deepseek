@@ -605,27 +605,34 @@ fn run_child_agent_for_tui_observed(
             hooks,
         },
         observer,
-        |config, request, tool_context, child_cancel, tool_request| {
-            let (should_stop, result, child_cost) = execute_tool_for_tui(
-                config,
-                cwd,
-                tool_request,
-                event_tx,
-                action_rx,
-                request.depth,
-                None,
-                tool_context.policy,
-                instructions,
-                memory,
-                tool_context.mcp_registry,
-                hooks,
-                None,
-                child_cancel,
-            );
-            ChildAgentToolExecution {
-                should_stop,
-                result,
-                child_cost,
+        {
+            // Permission grants persist across the child agent's tool calls,
+            // mirroring the per-turn overlay in the main TUI loop.
+            let permission_overlay =
+                std::cell::RefCell::new(orca_runtime::lifecycle::TurnPermissionOverlay::default());
+            move |config, request, tool_context, child_cancel, tool_request| {
+                let (should_stop, result, child_cost) = execute_tool_for_tui(
+                    config,
+                    cwd,
+                    tool_request,
+                    event_tx,
+                    action_rx,
+                    request.depth,
+                    None,
+                    tool_context.policy,
+                    instructions,
+                    memory,
+                    tool_context.mcp_registry,
+                    hooks,
+                    None,
+                    &mut permission_overlay.borrow_mut(),
+                    child_cancel,
+                );
+                ChildAgentToolExecution {
+                    should_stop,
+                    result,
+                    child_cost,
+                }
             }
         },
     )
