@@ -75,30 +75,32 @@ pub(crate) struct ChildAgentRuntime<'a, W: io::Write> {
     executor: ChildAgentExecutor<W>,
 }
 
+pub(crate) struct ChildAgentRuntimeContext<'a, W: io::Write> {
+    pub cwd: &'a Path,
+    pub events: &'a mut EventFactory,
+    pub sink: &'a mut EventSink<W>,
+    pub instructions: &'a ProjectInstructions,
+    pub memory: &'a MemoryBlock,
+    pub mcp_registry: &'a McpRegistry,
+    pub hooks: &'a HookRunner,
+    pub cancel: &'a CancelToken,
+    pub lifecycle: Option<&'a mut RuntimeSessionLifecycle>,
+    pub executor: ChildAgentExecutor<W>,
+}
+
 impl<'a, W: io::Write> ChildAgentRuntime<'a, W> {
-    pub(crate) fn new(
-        cwd: &'a Path,
-        events: &'a mut EventFactory,
-        sink: &'a mut EventSink<W>,
-        instructions: &'a ProjectInstructions,
-        memory: &'a MemoryBlock,
-        mcp_registry: &'a McpRegistry,
-        hooks: &'a HookRunner,
-        cancel: &'a CancelToken,
-        lifecycle: Option<&'a mut RuntimeSessionLifecycle>,
-        executor: ChildAgentExecutor<W>,
-    ) -> Self {
+    pub(crate) fn new(context: ChildAgentRuntimeContext<'a, W>) -> Self {
         Self {
-            cwd,
-            events,
-            sink,
-            instructions,
-            memory,
-            mcp_registry,
-            hooks,
-            cancel,
-            lifecycle,
-            executor,
+            cwd: context.cwd,
+            events: context.events,
+            sink: context.sink,
+            instructions: context.instructions,
+            memory: context.memory,
+            mcp_registry: context.mcp_registry,
+            hooks: context.hooks,
+            cancel: context.cancel,
+            lifecycle: context.lifecycle,
+            executor: context.executor,
         }
     }
 

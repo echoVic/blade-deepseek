@@ -21,5 +21,7 @@ pub use crate::child_agent_response_folding::{
     ChildAgentToolResultFold, child_agent_tool_requests, fold_child_agent_provider_response,
     fold_child_agent_tool_result,
 };
-pub(crate) use crate::child_agent_types::{ChildAgentExecutor, ChildAgentRuntime};
+pub(crate) use crate::child_agent_types::{
+    ChildAgentExecutor, ChildAgentRuntime, ChildAgentRuntimeContext,
+};
 pub use crate::child_agent_types::{ChildAgentRequest, ChildAgentResult};
