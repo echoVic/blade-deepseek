@@ -1,17 +1,14 @@
 use std::io;
 use std::path::Path;
 
-use orca_approval::ApprovalPolicy;
 use orca_core::cancel::CancelToken;
 use orca_core::config::RunConfig;
 use orca_core::event_schema::{EventFactory, RunStatus};
 use orca_core::event_sink::EventSink;
-use orca_core::provider_types::{ProviderResponse, ProviderStep};
 use orca_core::subagent_types::SubagentType;
-use orca_core::tool_types::{ToolRequest, ToolResult};
+use orca_core::tool_types::ToolRequest;
 use orca_mcp::McpRegistry;
 
-use crate::agent_common;
 use crate::cost::CostTracker;
 use crate::hooks::HookRunner;
 use crate::instructions::ProjectInstructions;
@@ -27,6 +24,11 @@ pub use crate::child_agent_provider_turn::{
     ChildAgentProviderErrorDecision, ChildAgentProviderTurn,
     compact_child_agent_conversation_if_needed, handle_child_agent_provider_error,
     route_child_agent_model, run_child_agent_provider_turn,
+};
+pub use crate::child_agent_response_folding::{
+    ChildAgentProviderResponseFold, ChildAgentToolContext, ChildAgentToolExecution,
+    ChildAgentToolResultFold, child_agent_tool_requests, fold_child_agent_provider_response,
+    fold_child_agent_tool_result,
 };
 
 #[derive(Clone, Debug)]
@@ -67,27 +69,6 @@ pub struct ChildAgentResult {
     pub status: RunStatus,
     pub final_message: Option<String>,
     pub error: Option<String>,
-}
-
-pub enum ChildAgentProviderResponseFold {
-    Complete(ChildAgentResult),
-    ContinueToTools,
-}
-
-pub enum ChildAgentToolResultFold {
-    Continue,
-    Stop(ChildAgentResult),
-}
-
-pub struct ChildAgentToolExecution {
-    pub should_stop: bool,
-    pub result: ToolResult,
-    pub child_cost: Option<CostTracker>,
-}
-
-pub struct ChildAgentToolContext<'a> {
-    pub policy: &'a ApprovalPolicy,
-    pub mcp_registry: &'a McpRegistry,
 }
 
 pub(crate) type ChildAgentExecutor<W> = fn(
@@ -183,49 +164,6 @@ where
             }
         });
     (result, child_cost_tracker)
-}
-
-pub fn fold_child_agent_provider_response(
-    setup: &mut ChildAgentLoopSetup,
-    response: &ProviderResponse,
-    child_cost_tracker: &mut CostTracker,
-) -> ChildAgentProviderResponseFold {
-    if let Some(usage) = response.usage
-        && !usage.is_empty()
-    {
-        child_cost_tracker.add_usage(usage);
-    }
-
-    if response.tool_calls.is_empty() {
-        setup.conversation.add_assistant(
-            response.assistant_content.clone(),
-            response.assistant_reasoning.clone(),
-            vec![],
-        );
-        return ChildAgentProviderResponseFold::Complete(ChildAgentResult {
-            status: RunStatus::Success,
-            final_message: response.assistant_content.clone(),
-            error: None,
-        });
-    }
-
-    setup.conversation.add_assistant(
-        response.assistant_content.clone(),
-        response.assistant_reasoning.clone(),
-        response.tool_calls.clone(),
-    );
-    ChildAgentProviderResponseFold::ContinueToTools
-}
-
-pub fn child_agent_tool_requests(response: &ProviderResponse) -> Vec<&ToolRequest> {
-    response
-        .steps
-        .iter()
-        .filter_map(|step| match step {
-            ProviderStep::ToolCall(request) => Some(request),
-            _ => None,
-        })
-        .collect()
 }
 
 pub fn run_child_agent_loop_with_tool_executor<F>(
@@ -369,34 +307,6 @@ where
         hooks,
         execute_tool,
     )
-}
-
-pub fn fold_child_agent_tool_result(
-    setup: &mut ChildAgentLoopSetup,
-    tool_request: &ToolRequest,
-    should_stop: bool,
-    result: ToolResult,
-    child_cost: Option<CostTracker>,
-    child_cost_tracker: &mut CostTracker,
-) -> ChildAgentToolResultFold {
-    if let Some(cost) = child_cost {
-        child_cost_tracker.merge(&cost);
-    }
-
-    let result_content = agent_common::format_tool_result_for_model(&result);
-    setup
-        .conversation
-        .add_tool_result(tool_request.id.clone(), result_content);
-
-    if should_stop {
-        return ChildAgentToolResultFold::Stop(ChildAgentResult {
-            status: RunStatus::Failed,
-            final_message: None,
-            error: result.error,
-        });
-    }
-
-    ChildAgentToolResultFold::Continue
 }
 
 #[cfg(test)]

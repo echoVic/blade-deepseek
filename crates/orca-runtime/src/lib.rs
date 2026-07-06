@@ -4,6 +4,7 @@ pub mod agent_loop;
 pub mod approval_resolution;
 mod child_agent_loop_setup;
 mod child_agent_provider_turn;
+mod child_agent_response_folding;
 pub mod compaction;
 pub mod controller;
 pub mod cost;
@@ -911,6 +912,65 @@ mod tests {
         assert!(
             agent_child_source.contains("pub use crate::child_agent_provider_turn::"),
             "agent_child must preserve existing imports by re-exporting child provider-turn APIs"
+        );
+    }
+
+    #[test]
+    fn child_agent_response_folding_boundary_is_owned_by_focused_module() {
+        let lib_source = include_str!("lib.rs");
+        let agent_child_source = include_str!("agent_child.rs");
+        let agent_child_runtime_source = agent_child_source
+            .split_once("#[cfg(test)]")
+            .map(|(runtime_source, _)| runtime_source)
+            .unwrap_or(agent_child_source);
+        let child_response_folding_source =
+            std::fs::read_to_string("src/child_agent_response_folding.rs")
+                .expect("child agent response folding source");
+
+        assert!(
+            lib_source.contains("mod child_agent_response_folding;"),
+            "runtime crate must declare a focused child_agent_response_folding module"
+        );
+
+        for marker in [
+            "pub enum ChildAgentProviderResponseFold",
+            "pub enum ChildAgentToolResultFold",
+            "pub struct ChildAgentToolExecution",
+            "pub struct ChildAgentToolContext",
+            "pub fn fold_child_agent_provider_response",
+            "pub fn child_agent_tool_requests",
+            "pub fn fold_child_agent_tool_result",
+        ] {
+            assert!(
+                child_response_folding_source.contains(marker),
+                "child_agent_response_folding must own response/tool folding detail {marker}"
+            );
+            assert!(
+                !agent_child_runtime_source.contains(marker),
+                "agent_child facade must not own response/tool folding detail {marker}"
+            );
+        }
+
+        for marker in [
+            "add_usage",
+            "add_assistant",
+            "ProviderStep::ToolCall",
+            "format_tool_result_for_model",
+            "add_tool_result",
+        ] {
+            assert!(
+                child_response_folding_source.contains(marker),
+                "child_agent_response_folding must keep folding behavior detail {marker}"
+            );
+            assert!(
+                !agent_child_runtime_source.contains(marker),
+                "agent_child facade must delegate folding behavior detail {marker}"
+            );
+        }
+
+        assert!(
+            agent_child_source.contains("pub use crate::child_agent_response_folding::"),
+            "agent_child must preserve existing imports by re-exporting child response-folding APIs"
         );
     }
 
