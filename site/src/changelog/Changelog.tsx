@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.162":
+        "Runtime turn-loop, iteration, and provider-cycle inputs now carry one RuntimeExtensionContext instead of parallel extension registry, thread store, and turn store fields. agent_loop creates the grouped context once, and provider turns reuse it when building RuntimeStepContext, preserving lifecycle notifications while narrowing the runtime extension boundary.",
       "v0.1.161":
         "RuntimeStepContext and RuntimeNormalToolTurnContext now carry a grouped RuntimeExtensionContext instead of parallel extension registry, thread store, and turn store fields. Provider turns still build the same stores once, while normal tool execution receives the same lifecycle data through a narrower extension boundary.",
       "v0.1.160":
@@ -350,6 +352,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.162":
+        "Runtime turn-loop、iteration 与 provider-cycle input 现在携带单一 RuntimeExtensionContext，不再暴露平行的 extension registry、thread store 和 turn store 字段。agent_loop 只创建一次 grouped context；provider turn 在构造 RuntimeStepContext 时复用它，保持 lifecycle notification 行为不变，同时继续收窄 runtime extension boundary。",
       "v0.1.161":
         "RuntimeStepContext 与 RuntimeNormalToolTurnContext 现在携带 grouped RuntimeExtensionContext，不再暴露平行的 extension registry、thread store 和 turn store 字段。Provider turn 仍只构造一次相同 stores；normal tool execution 通过更窄的 extension boundary 接收同样的 lifecycle 数据。",
       "v0.1.160":

@@ -4,18 +4,19 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-07-07
-Current baseline: v0.1.161 moves grouped runtime extension routing up to
-`RuntimeStepContext` and `RuntimeNormalToolTurnContext`, so provider/tool-turn
-handoff carries a single `RuntimeExtensionContext` instead of parallel extension
-registry, thread-store, and turn-store fields. Normal tool execution still
-receives the same lifecycle data while the extension boundary becomes harder to
-miswire. Earlier v0.1.160 moved grouped extension-store routing up to
-`ToolExecutionContext`, v0.1.159 grouped permission-sensitive turn/thread
-extension references behind `RuntimeExtensionStores`, v0.1.158 made permission
-reduction consistently instance-owned by `RuntimeTurnReducer`, v0.1.157 routed
-permission overlay mutation through the reducer, v0.1.156 routed runtime
-directive application through the reducer, and v0.1.155 introduced the reducer
-for completed-tool goal progress.
+Current baseline: v0.1.162 moves grouped runtime extension routing up to the
+turn-loop, turn-iteration, and provider-cycle inputs. `agent_loop` now creates a
+single `RuntimeExtensionContext` for the turn, and downstream runtime stages
+reuse that grouped boundary instead of carrying parallel extension registry,
+thread-store, and turn-store fields. Earlier v0.1.161 moved the grouped context
+into `RuntimeStepContext` and `RuntimeNormalToolTurnContext`, v0.1.160 moved
+grouped extension-store routing up to `ToolExecutionContext`, v0.1.159 grouped
+permission-sensitive turn/thread extension references behind
+`RuntimeExtensionStores`, v0.1.158 made permission reduction consistently
+instance-owned by `RuntimeTurnReducer`, v0.1.157 routed permission overlay
+mutation through the reducer, v0.1.156 routed runtime directive application
+through the reducer, and v0.1.155 introduced the reducer for completed-tool goal
+progress.
 
 ---
 
