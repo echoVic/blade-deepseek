@@ -23,6 +23,7 @@ use orca_provider::tool_schema::{
 use orca_runtime::agent_common;
 use orca_runtime::hooks::{HookContext, conversation_with_hook_context};
 use orca_runtime::memory;
+use orca_runtime::runtime_state::{RuntimeToolFinish, RuntimeTurnReducer};
 
 use crate::agent_subagent_execution::{
     collect_subagent_batch, execute_subagent_batch_for_tui, should_run_subagent_batch,
@@ -805,12 +806,12 @@ fn record_tui_goal_tool_finish(
     }
 
     let turn_store = orca_runtime::extension::ExtensionData::new(turn_extension_id);
-    orca_runtime::goals::record_goal_tool_finish(
-        session.thread_extensions(),
-        &turn_store,
-        result.name.as_str(),
-        &result.id,
-        orca_runtime::extension::ToolCallOutcome::Completed,
+    RuntimeTurnReducer::new(session.thread_extensions(), &turn_store).record_tool_finish(
+        RuntimeToolFinish {
+            tool_name: result.name.as_str(),
+            call_id: &result.id,
+            outcome: orca_runtime::extension::ToolCallOutcome::Completed,
+        },
     );
 }
 
@@ -917,6 +918,33 @@ mod tests {
             !session_struct.contains("InteractiveSession"),
             "TUI session must not own InteractiveSession outside RuntimeThread"
         );
+    }
+
+    #[test]
+    fn tui_completed_tool_finish_updates_runtime_reducer_progress() {
+        let config = config();
+        let session = TuiConversationSession::new_with_preloaded(&config, "goal progress", None)
+            .expect("session");
+        let result = tool_types::ToolResult {
+            id: "call-1".to_string(),
+            name: tool_types::ToolName::plain("bash"),
+            status: tool_types::ToolStatus::Completed,
+            output: Some("ok".to_string()),
+            error: None,
+            exit_code: Some(0),
+            truncated: false,
+            kind: tool_types::ToolResultKind::Success,
+        };
+
+        record_tui_goal_tool_finish(&session, "turn-1", &result);
+
+        let progress = session
+            .thread_extensions()
+            .get::<orca_runtime::goals::GoalToolProgressState>()
+            .expect("completed TUI tool should update runtime goal progress");
+        assert_eq!(progress.completed_tool_attempts(), 1);
+        assert_eq!(progress.last_turn_id().as_deref(), Some("turn-1"));
+        assert_eq!(progress.last_call_id().as_deref(), Some("call-1"));
     }
 
     #[test]

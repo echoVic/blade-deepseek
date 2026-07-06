@@ -137,6 +137,14 @@ mod tests {
             runner.contains("record_tui_goal_tool_finish"),
             "TUI agent runner must record completed tools into live runtime thread extension state"
         );
+        assert!(
+            runner.contains("RuntimeTurnReducer"),
+            "TUI completed-tool recording should route through the runtime turn reducer"
+        );
+        assert!(
+            !runner.contains("goals::record_goal_tool_finish"),
+            "TUI should not write goal progress directly; runtime turn reducer owns tool finish state"
+        );
     }
 
     #[test]

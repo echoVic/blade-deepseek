@@ -36,6 +36,7 @@ mod runtime_normal_tool;
 pub(crate) mod runtime_permission;
 pub(crate) mod runtime_readonly_tool_turn;
 pub(crate) mod runtime_special;
+pub mod runtime_state;
 mod runtime_steer;
 mod runtime_tool_actor;
 mod runtime_turn_iteration;
@@ -73,6 +74,8 @@ mod tests {
         ExtensionData, ExtensionRegistryBuilder, ToolCallOutcome, ToolFinishInput,
         ToolLifecycleContributor,
     };
+    use crate::goals::GoalToolProgressState;
+    use crate::runtime_state::{RuntimeToolFinish, RuntimeTurnReducer};
     use crate::thread_store::{SessionStore, ThreadStore};
     use std::sync::{Arc, Mutex};
 
@@ -148,6 +151,26 @@ mod tests {
             calls.lock().unwrap().as_slice(),
             ["first:thread-a:turn-1:bash", "second:thread-a:turn-1:bash"]
         );
+    }
+
+    #[test]
+    fn runtime_turn_reducer_records_tool_finish_goal_progress() {
+        let thread_store = ExtensionData::new("thread-a");
+        let turn_store = ExtensionData::new("turn-1");
+        let reducer = RuntimeTurnReducer::new(&thread_store, &turn_store);
+
+        reducer.record_tool_finish(RuntimeToolFinish {
+            tool_name: "bash",
+            call_id: "call-1",
+            outcome: ToolCallOutcome::Completed,
+        });
+
+        let progress = thread_store
+            .get::<GoalToolProgressState>()
+            .expect("tool finish should update goal progress through reducer");
+        assert_eq!(progress.completed_tool_attempts(), 1);
+        assert_eq!(progress.last_turn_id().as_deref(), Some("turn-1"));
+        assert_eq!(progress.last_call_id().as_deref(), Some("call-1"));
     }
 
     #[test]
