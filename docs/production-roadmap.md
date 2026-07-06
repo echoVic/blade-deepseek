@@ -4,14 +4,14 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-07-07
-Current baseline: v0.1.157 routes permission overlay requests and merges through
-the runtime-owned `RuntimeTurnReducer`. `request_permissions`, bash automatic
-permission escalation, and router overlay transfer keep the same behavior while
-permission state mutation leaves direct call sites. Earlier v0.1.156 routed
-runtime directive application through the reducer; v0.1.155 introduced the
-reducer for completed-tool goal progress; v0.1.154 made terminal goal updates
-consume live runtime thread extension state before accepting `complete` or
-`blocked` claims.
+Current baseline: v0.1.158 makes permission reduction consistently
+instance-owned by `RuntimeTurnReducer`. The old static permission reducer
+accessor is gone; `request_permissions`, bash automatic permission escalation,
+router overlay transfer, and direct runtime-tool actor calls keep the same
+behavior through turn/thread extension stores. Earlier v0.1.157 routed
+permission overlay mutation through the reducer, v0.1.156 routed runtime
+directive application through the reducer, and v0.1.155 introduced the reducer
+for completed-tool goal progress.
 
 ---
 

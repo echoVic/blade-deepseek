@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.158":
+        "Permission reduction is now consistently instance-owned by RuntimeTurnReducer. The old static permission reducer accessor is gone, while request_permissions, bash auto-escalation, router overlay transfer, and direct runtime-tool actor calls keep their existing behavior through turn/thread extension stores.",
       "v0.1.157":
         "Permission overlay requests and merges now reduce through RuntimeTurnReducer. request_permissions, bash auto-escalation, and router overlay transfer keep the same behavior while permission state mutation leaves the direct call sites.",
       "v0.1.156":
@@ -342,6 +344,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.158":
+        "Permission reduction 现在统一由 RuntimeTurnReducer 实例持有。旧的静态 permission reducer accessor 已移除；request_permissions、bash 自动权限升级、router overlay transfer 和直接 runtime-tool actor 调用仍通过 turn/thread extension stores 保持原有行为。",
       "v0.1.157":
         "Permission overlay 的请求与合并现在通过 RuntimeTurnReducer 归约。request_permissions、bash 自动权限升级和 router overlay transfer 保持原有行为，同时 permission state mutation 不再散落在直接调用点。",
       "v0.1.156":
