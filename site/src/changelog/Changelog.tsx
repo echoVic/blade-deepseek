@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.139":
+        "Child-agent model routing, provider hook execution, provider call dispatch, child compaction, and prompt-too-long retry/failure handling now live in a focused child_agent_provider_turn module. Existing orca_runtime::agent_child imports remain available through re-exports, while provider response folding, tool request extraction, tool result folding, subagent contracts, and TUI child-agent delegation behavior stay unchanged.",
       "v0.1.138":
         "Child-agent loop setup, provider bootstrap, conversation seed, approval policy seed, and child turn-budget state now live in a focused child_agent_loop_setup module. Existing orca_runtime::agent_child imports remain available through re-exports, while child-agent model routing, provider turns, tool folding, subagent contracts, and TUI delegation behavior stay unchanged.",
       "v0.1.137":
@@ -304,6 +306,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.139":
+        "Child-agent model routing、provider hook execution、provider call dispatch、child compaction 与 prompt-too-long retry/failure handling 现在移到独立的 child_agent_provider_turn 模块。既有 orca_runtime::agent_child 导入仍通过 re-export 保持可用，provider response folding、tool request extraction、tool result folding、subagent contract 与 TUI child-agent delegation 行为保持不变。",
       "v0.1.138":
         "Child-agent loop setup、provider bootstrap、conversation seed、approval policy seed 与 child turn-budget state 现在移到独立的 child_agent_loop_setup 模块。既有 orca_runtime::agent_child 导入仍通过 re-export 保持可用，child-agent model routing、provider turn、tool folding、subagent contract 与 TUI delegation 行为保持不变。",
       "v0.1.137":
