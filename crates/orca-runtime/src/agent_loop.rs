@@ -57,6 +57,9 @@ pub(crate) fn run_agent_loop(
         cancel,
         task_registry,
         ref directive_state,
+        ref extension_registry,
+        ref thread_extensions,
+        ref turn_extensions,
     } = turn_state;
     let RuntimeTurnExecution {
         background_workflows,
@@ -122,6 +125,9 @@ pub(crate) fn run_agent_loop(
             memory,
             mcp_registry,
             task_registry,
+            extension_registry,
+            thread_extensions,
+            turn_extensions,
             background_workflows,
             workflow_ipc,
             permission_handler,
@@ -322,6 +328,35 @@ mod tests {
         assert_eq!(state.cost_tracker().totals().total_tokens(), 0);
         assert!(std::ptr::eq(state.cancel(), &cancel));
         assert!(std::ptr::eq(state.task_registry(), &task_registry));
+    }
+
+    #[test]
+    fn runtime_turn_state_installs_goal_tool_lifecycle_extensions() {
+        let mut cost_tracker = CostTracker::new(None);
+        let cancel = CancelToken::new();
+        let task_registry = TaskRegistry::new("agent-loop-extension-state".to_string());
+        let state = RuntimeTurnState::new(&mut cost_tracker, &cancel, &task_registry);
+
+        state
+            .extension_registry()
+            .on_tool_finish(crate::extension::ToolFinishInput {
+                thread_store: state.thread_extensions(),
+                turn_store: state.turn_extensions(),
+                tool_name: "bash",
+                call_id: "tool-1",
+                outcome: crate::extension::ToolCallOutcome::Completed,
+            });
+
+        let progress = state
+            .thread_extensions()
+            .get::<crate::goals::GoalToolProgressState>()
+            .expect("goal lifecycle progress");
+        assert_eq!(progress.completed_tool_attempts(), 1);
+        assert_eq!(
+            progress.last_turn_id(),
+            Some("agent-loop-extension-state".to_string())
+        );
+        assert_eq!(progress.last_call_id(), Some("tool-1".to_string()));
     }
 
     #[test]

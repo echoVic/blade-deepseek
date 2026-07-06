@@ -21,6 +21,8 @@ use orca_provider::ProviderConfig;
 use serde_json::Value;
 
 use crate::cost::CostTracker;
+use crate::extension::{ExtensionData, ExtensionRegistry, ExtensionRegistryBuilder};
+use crate::goals::install_goal_tool_lifecycle;
 use crate::hooks::{HookContext, HookOutcome, HookRunner};
 use crate::instructions::ProjectInstructions;
 use crate::memory::MemoryBlock;
@@ -119,6 +121,9 @@ pub(crate) struct RuntimeTurnState<'a> {
     pub(crate) cancel: &'a CancelToken,
     pub(crate) task_registry: &'a TaskRegistry,
     pub(crate) directive_state: RuntimeDirectiveState,
+    pub(crate) extension_registry: ExtensionRegistry,
+    pub(crate) thread_extensions: ExtensionData,
+    pub(crate) turn_extensions: ExtensionData,
 }
 
 pub(crate) struct RuntimeTurnExecution<'a> {
@@ -879,11 +884,16 @@ impl<'a> RuntimeTurnState<'a> {
         cancel: &'a CancelToken,
         task_registry: &'a TaskRegistry,
     ) -> Self {
+        let mut extension_builder = ExtensionRegistryBuilder::new();
+        install_goal_tool_lifecycle(&mut extension_builder);
         Self {
             cost_tracker,
             cancel,
             task_registry,
             directive_state: RuntimeDirectiveState::default(),
+            extension_registry: extension_builder.build(),
+            thread_extensions: ExtensionData::new(task_registry.session_id()),
+            turn_extensions: ExtensionData::new(task_registry.session_id()),
         }
     }
 
@@ -905,6 +915,21 @@ impl<'a> RuntimeTurnState<'a> {
     #[cfg(test)]
     pub(crate) fn task_registry(&self) -> &'a TaskRegistry {
         self.task_registry
+    }
+
+    #[cfg(test)]
+    pub(crate) fn extension_registry(&self) -> &ExtensionRegistry {
+        &self.extension_registry
+    }
+
+    #[cfg(test)]
+    pub(crate) fn thread_extensions(&self) -> &ExtensionData {
+        &self.thread_extensions
+    }
+
+    #[cfg(test)]
+    pub(crate) fn turn_extensions(&self) -> &ExtensionData {
+        &self.turn_extensions
     }
 }
 

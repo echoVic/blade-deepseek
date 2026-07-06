@@ -13,6 +13,7 @@ use orca_provider::{ProviderConfig, context};
 
 use crate::agent_child::ChildAgentExecutor;
 use crate::cost::CostTracker;
+use crate::extension::{ExtensionData, ExtensionRegistry};
 use crate::hooks::HookRunner;
 use crate::instructions::ProjectInstructions;
 use crate::lifecycle::{
@@ -65,6 +66,9 @@ pub(crate) struct RuntimeTurnIterationInput<'a, 'runtime, W: io::Write> {
     pub(crate) memory: &'a MemoryBlock,
     pub(crate) mcp_registry: &'a McpRegistry,
     pub(crate) task_registry: &'a TaskRegistry,
+    pub(crate) extension_registry: &'a ExtensionRegistry,
+    pub(crate) thread_extensions: &'a ExtensionData,
+    pub(crate) turn_extensions: &'a ExtensionData,
     pub(crate) background_workflows: &'a mut Vec<BackgroundWorkflowRun>,
     pub(crate) workflow_ipc: Option<&'a WorkflowIpcContext>,
     pub(crate) permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
@@ -143,6 +147,9 @@ impl RuntimeTurnIterationStep {
                 memory: input.memory,
                 mcp_registry: input.mcp_registry,
                 task_registry: input.task_registry,
+                extension_registry: input.extension_registry,
+                thread_extensions: input.thread_extensions,
+                turn_extensions: input.turn_extensions,
                 background_workflows: input.background_workflows,
                 workflow_ipc: input.workflow_ipc,
                 permission_handler: input.permission_handler,

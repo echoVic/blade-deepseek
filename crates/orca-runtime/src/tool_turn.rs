@@ -12,6 +12,7 @@ use orca_mcp::McpRegistry;
 
 use crate::agent_child::ChildAgentExecutor;
 use crate::cost::CostTracker;
+use crate::extension::{ExtensionData, ExtensionRegistry};
 use crate::hooks::HookRunner;
 use crate::instructions::ProjectInstructions;
 use crate::lifecycle::{RuntimePermissionRequestHandler, TurnPermissionOverlay};
@@ -84,6 +85,9 @@ pub(crate) struct RuntimeNormalToolTurnContext<'a, W: io::Write> {
     pub(crate) workflow_ipc: Option<&'a WorkflowIpcContext>,
     pub(crate) permission_overlay: &'a mut TurnPermissionOverlay,
     pub(crate) permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
+    pub(crate) extension_registry: Option<&'a ExtensionRegistry>,
+    pub(crate) thread_extensions: Option<&'a ExtensionData>,
+    pub(crate) turn_extensions: Option<&'a ExtensionData>,
     pub(crate) child_executor: ChildAgentExecutor<W>,
     pub(crate) workflow_child_executor: ChildAgentExecutor<SharedEventBuffer>,
 }
@@ -150,6 +154,9 @@ pub(crate) fn run_tool_turns<W: io::Write>(
     let task_registry = step_context.task_registry;
     let workflow_ipc = step_context.workflow_ipc;
     let permission_handler = step_context.permission_handler;
+    let extension_registry = step_context.extension_registry;
+    let thread_extensions = step_context.thread_extensions;
+    let turn_extensions = step_context.turn_extensions;
     let mut cursor = ToolRequestCursor::new(tool_requests);
     let mut permission_overlay = TurnPermissionOverlay::default();
     while let Some(tool_request) = cursor.current() {
@@ -248,6 +255,9 @@ pub(crate) fn run_tool_turns<W: io::Write>(
             workflow_ipc,
             permission_overlay: &mut permission_overlay,
             permission_handler,
+            extension_registry,
+            thread_extensions,
+            turn_extensions,
             child_executor,
             workflow_child_executor,
         })? {
@@ -321,25 +331,34 @@ pub(crate) fn run_normal_tool_turn<W: io::Write>(
         workflow_ipc,
         permission_overlay,
         permission_handler,
+        extension_registry,
+        thread_extensions,
+        turn_extensions,
         child_executor,
         workflow_child_executor,
     } = context;
+    let mut execution_context = ToolExecutionContext::new(cwd, subagent_depth, emit_deltas, policy)
+        .with_services(instructions, memory, mcp_registry, hooks)
+        .with_runtime(
+            cost_tracker,
+            cancel,
+            task_registry,
+            background_workflows,
+            workflow_ipc,
+        )
+        .with_permission_overlay(permission_overlay)
+        .with_permission_handler(permission_handler);
+    if let (Some(registry), Some(thread_store), Some(turn_store)) =
+        (extension_registry, thread_extensions, turn_extensions)
+    {
+        execution_context = execution_context.with_extensions(registry, thread_store, turn_store);
+    }
     let (status, result) = execute_tool_with_approval(
         config,
         events,
         sink,
         tool_request,
-        ToolExecutionContext::new(cwd, subagent_depth, emit_deltas, policy)
-            .with_services(instructions, memory, mcp_registry, hooks)
-            .with_runtime(
-                cost_tracker,
-                cancel,
-                task_registry,
-                background_workflows,
-                workflow_ipc,
-            )
-            .with_permission_overlay(permission_overlay)
-            .with_permission_handler(permission_handler),
+        execution_context,
         child_executor,
         workflow_child_executor,
     )?;
@@ -375,6 +394,8 @@ mod tests {
 
     use super::*;
     use crate::agent_child::{ChildAgentRequest, ChildAgentResult, ChildAgentRuntime};
+    use crate::extension::{ExtensionData, ExtensionRegistryBuilder};
+    use crate::goals::{GoalToolProgressState, install_goal_tool_lifecycle};
     use crate::hooks::HookRunner;
     use crate::tool_execution::policy_for_tool_execution;
     use crate::tool_invocation::AgentToolPolicyContext;
@@ -620,6 +641,9 @@ mod tests {
             workflow_ipc: None,
             permission_overlay: &mut permission_overlay,
             permission_handler: None,
+            extension_registry: None,
+            thread_extensions: None,
+            turn_extensions: None,
             child_executor: unused_child_executor,
             workflow_child_executor: unused_child_executor,
         })
@@ -755,6 +779,80 @@ mod tests {
             ToolTurnOutcome::Continue => panic!("disallowed child tool should end the turn"),
         }
         assert!(conversation.messages.is_empty());
+    }
+
+    #[test]
+    fn run_tool_turns_notifies_extension_lifecycle_for_normal_tool() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let mut config = config_with_external(Vec::new());
+        config.approval_mode = ApprovalMode::FullAuto;
+        let mut events = EventFactory::new("tool-turns-extension-lifecycle".to_string());
+        let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+        let mut conversation = Conversation::new();
+        let request = request(
+            ToolName::Bash,
+            ActionKind::Shell,
+            Some("printf lifecycle"),
+            Some(
+                json!({ "command": "printf lifecycle" })
+                    .to_string()
+                    .as_str(),
+            ),
+        );
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let mcp_registry = McpRegistry::default();
+        let hooks = HookRunner::default();
+        let mut cost_tracker = CostTracker::new(None);
+        let cancel = CancelToken::new();
+        let task_registry = TaskRegistry::new("tool-turns-extension-lifecycle".to_string());
+        let mut background_workflows = Vec::new();
+        let policy = policy_for_tool_execution(&config);
+        let mut extension_builder = ExtensionRegistryBuilder::new();
+        install_goal_tool_lifecycle(&mut extension_builder);
+        let extension_registry = extension_builder.build();
+        let thread_extensions = ExtensionData::new("session-1");
+        let turn_extensions = ExtensionData::new("turn-1");
+        let step_context = RuntimeStepContext::new(
+            &config,
+            cwd.path(),
+            AgentToolPolicyContext::unrestricted(),
+            0,
+            false,
+            &policy,
+            &instructions,
+            &memory,
+            &mcp_registry,
+            &hooks,
+            &cancel,
+            &task_registry,
+            None,
+            None,
+        )
+        .with_extensions(&extension_registry, &thread_extensions, &turn_extensions);
+
+        let outcome = run_tool_turns(RuntimeToolTurnsContext {
+            step_context,
+            events: &mut events,
+            sink: &mut sink,
+            conversation: &mut conversation,
+            history_writer: None,
+            tool_requests: &[request],
+            cost_tracker: &mut cost_tracker,
+            background_workflows: &mut background_workflows,
+            child_executor: unused_child_executor::<Vec<u8>>,
+            workflow_child_executor: unused_child_executor::<SharedEventBuffer>,
+            batch_child_executor: unused_child_executor::<io::Sink>,
+        })
+        .expect("run tool turns");
+
+        assert!(matches!(outcome, ToolTurnOutcome::Continue));
+        let progress = thread_extensions
+            .get::<GoalToolProgressState>()
+            .expect("goal progress from tool lifecycle contributor");
+        assert_eq!(progress.completed_tool_attempts(), 1);
+        assert_eq!(progress.last_turn_id().as_deref(), Some("turn-1"));
+        assert_eq!(progress.last_call_id().as_deref(), Some("tool-1"));
     }
 
     #[test]
