@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.161":
+        "RuntimeStepContext and RuntimeNormalToolTurnContext now carry a grouped RuntimeExtensionContext instead of parallel extension registry, thread store, and turn store fields. Provider turns still build the same stores once, while normal tool execution receives the same lifecycle data through a narrower extension boundary.",
       "v0.1.160":
         "ToolExecutionContext now carries grouped RuntimeExtensionStores instead of reconstructing them from parallel thread/turn references. Tool lifecycle contributors, goal progress recording, and router dispatch keep the same behavior while the normal tool execution entrypoint has a smaller extension-store API.",
       "v0.1.159":
@@ -348,6 +350,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.161":
+        "RuntimeStepContext 与 RuntimeNormalToolTurnContext 现在携带 grouped RuntimeExtensionContext，不再暴露平行的 extension registry、thread store 和 turn store 字段。Provider turn 仍只构造一次相同 stores；normal tool execution 通过更窄的 extension boundary 接收同样的 lifecycle 数据。",
       "v0.1.160":
         "ToolExecutionContext 现在直接携带 grouped RuntimeExtensionStores，不再从平行的 thread/turn 引用重新组装。Tool lifecycle contributor、goal progress recording 和 router dispatch 保持原行为，同时 normal tool execution entrypoint 的 extension-store API 更小。",
       "v0.1.159":
