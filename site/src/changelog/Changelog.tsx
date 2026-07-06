@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.151":
+        "ToolExecutionContext can now carry an extension registry plus thread and turn extension stores, and ToolExecutionActor notifies lifecycle contributors around normal tool execution. This makes completed, blocked, aborted, and not-implemented tool outcomes visible at the extension boundary without changing CLI, TUI, server, or JSONL wire behavior.",
       "v0.1.150":
         "Orca now has a runtime extension contributor kernel with typed per-scope ExtensionData and ordered tool lifecycle contributors. Goal tool progress has the first real contributor seed, so future goal, memory, task, and tool lifecycle work can move out of the main runtime loop without changing CLI or app-server behavior.",
       "v0.1.149":
@@ -328,6 +330,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.151":
+        "ToolExecutionContext 现在可以携带 extension registry 以及 thread/turn extension store，ToolExecutionActor 会在 normal tool execution 前后通知 lifecycle contributor。Completed、blocked、aborted 与 not-implemented outcome 已经能进入 extension boundary，同时不改变 CLI、TUI、server 或 JSONL wire 行为。",
       "v0.1.150":
         "Orca 新增 runtime extension contributor kernel，提供 typed per-scope ExtensionData 和有序 tool lifecycle contributor。Goal tool progress 现在有了第一个真实 contributor seed，后续 goal、memory、task 与 tool lifecycle 可以逐步移出主 runtime loop，同时不改变 CLI 或 app-server 行为。",
       "v0.1.149":

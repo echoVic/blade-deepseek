@@ -4,12 +4,14 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-07-06
-Current baseline: v0.1.150 seeds a Codex-inspired runtime extension
-contributor kernel with typed per-scope `ExtensionData`, ordered tool
-lifecycle contributors, and a goal tool-progress contributor seed, while
-preserving CLI, TUI, app-server, goal storage, and wire behavior. Earlier
-v0.1.149 work keeps realtime server item projection behind the shared
-`RuntimeEventProjector` reducer.
+Current baseline: v0.1.151 wires the Codex-inspired extension contributor
+kernel into normal tool execution: `ToolExecutionContext` can carry an
+extension registry plus thread/turn extension stores, and `ToolExecutionActor`
+notifies lifecycle contributors for completed, blocked, aborted, and
+not-implemented outcomes while preserving CLI, TUI, app-server, goal storage,
+and wire behavior. Earlier v0.1.150 work seeded typed per-scope
+`ExtensionData`, ordered tool lifecycle contributors, and the goal
+tool-progress contributor.
 
 ---
 
