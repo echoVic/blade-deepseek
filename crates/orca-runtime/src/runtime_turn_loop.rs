@@ -31,6 +31,32 @@ pub(crate) struct RuntimeTurnLoopStep {
     iteration_step: RuntimeTurnIterationStep,
 }
 
+pub(crate) struct RuntimeAgentTurnLoopInput<'a, 'runtime, W: io::Write> {
+    pub(crate) actor: &'a mut RuntimeTaskActor<'runtime>,
+    pub(crate) context_config: &'a context::ContextConfig,
+    pub(crate) provider_config: &'a ProviderConfig,
+    pub(crate) cwd: &'a Path,
+    pub(crate) emit_deltas: bool,
+    pub(crate) hooks: &'a HookRunner,
+    pub(crate) events: &'a mut EventFactory,
+    pub(crate) sink: &'a mut EventSink<W>,
+    pub(crate) prepared_conversation: &'a mut RuntimePreparedConversation<'runtime>,
+    pub(crate) prompt: &'a str,
+    pub(crate) subagent_type: &'a SubagentType,
+    pub(crate) loop_state: RuntimeTurnLoopState<'a>,
+    pub(crate) steer_handle: Option<&'a ThreadSteerHandle>,
+    pub(crate) config: &'a RunConfig,
+    pub(crate) tool_policy: AgentToolPolicyContext<'a>,
+    pub(crate) subagent_depth: u32,
+    pub(crate) policy: &'a ApprovalPolicy,
+    pub(crate) instructions: &'a ProjectInstructions,
+    pub(crate) memory: &'a MemoryBlock,
+    pub(crate) mcp_registry: &'a McpRegistry,
+    pub(crate) background_workflows: &'a mut Vec<BackgroundWorkflowRun>,
+    pub(crate) workflow_ipc: Option<&'a WorkflowIpcContext>,
+    pub(crate) permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
+}
+
 pub(crate) struct RuntimeTurnLoopInput<'a, 'runtime, W: io::Write> {
     pub(crate) actor: &'a mut RuntimeTaskActor<'runtime>,
     pub(crate) provider: ProviderKind,
@@ -180,6 +206,14 @@ impl<W: io::Write> RuntimeTurnLoopExecutors<W> {
     }
 }
 
+pub(crate) fn run_agent_turn_loop<W: io::Write>(
+    step: &mut RuntimeTurnLoopStep,
+    input: RuntimeAgentTurnLoopInput<'_, '_, W>,
+    executors: RuntimeTurnLoopExecutors<W>,
+) -> io::Result<AgentLoopResult> {
+    step.run(input.into_turn_loop_input(), executors)
+}
+
 impl RuntimeTurnLoopStep {
     pub(crate) fn new() -> Self {
         Self {
@@ -205,5 +239,38 @@ impl RuntimeTurnLoopStep {
                 RuntimeTurnIterationResult::Return(result) => return Ok(result),
             }
         }
+    }
+}
+
+impl<'a, 'runtime, W: io::Write> RuntimeAgentTurnLoopInput<'a, 'runtime, W> {
+    fn into_turn_loop_input(self) -> RuntimeTurnLoopInput<'a, 'runtime, W> {
+        RuntimeTurnLoopInput::new(
+            self.actor,
+            self.config.provider,
+            self.context_config,
+            self.provider_config,
+            self.cwd,
+            self.emit_deltas,
+            self.hooks,
+            self.events,
+            self.sink,
+            self.prepared_conversation,
+            self.prompt,
+            &self.config.model,
+            self.subagent_type,
+            self.loop_state,
+            self.steer_handle,
+            self.config.max_budget_usd,
+            self.config,
+            self.tool_policy,
+            self.subagent_depth,
+            self.policy,
+            self.instructions,
+            self.memory,
+            self.mcp_registry,
+            self.background_workflows,
+            self.workflow_ipc,
+            self.permission_handler,
+        )
     }
 }

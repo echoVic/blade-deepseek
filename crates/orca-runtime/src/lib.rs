@@ -4155,12 +4155,16 @@ mod tests {
     #[test]
     fn runtime_turn_loop_input_is_owned_by_runtime_turn_loop_module() {
         let agent_loop_source = include_str!("agent_loop.rs");
+        let agent_loop_runtime_source = agent_loop_source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("agent loop runtime source");
         let lifecycle_source = include_str!("lifecycle.rs");
         let runtime_turn_loop_source = include_str!("runtime_turn_loop.rs");
 
         assert!(
-            agent_loop_source.contains("RuntimeTurnLoopInput"),
-            "agent_loop must pass turn loop inputs through a lifecycle-owned input object"
+            agent_loop_source.contains("RuntimeAgentTurnLoopInput"),
+            "agent_loop must pass turn loop inputs through a focused turn-loop entry object"
         );
         assert!(
             agent_loop_source.contains("RuntimeTurnLoopExecutors"),
@@ -4198,6 +4202,14 @@ mod tests {
         assert!(
             runtime_turn_loop_source.contains("impl<W: io::Write> RuntimeTurnLoopExecutors<W>"),
             "runtime_turn_loop must own runtime turn loop executor behavior"
+        );
+        assert!(
+            !agent_loop_runtime_source.contains("RuntimeTurnLoopInput::new("),
+            "agent_loop must not construct the wide turn-loop input directly"
+        );
+        assert!(
+            runtime_turn_loop_source.contains("pub(crate) fn run_agent_turn_loop"),
+            "runtime_turn_loop must expose a focused entrypoint that owns turn-loop input construction"
         );
         assert!(
             !agent_loop_source.contains("execute_child_agent_loop,\n        execute_child_agent_loop,\n        execute_child_agent_loop"),
