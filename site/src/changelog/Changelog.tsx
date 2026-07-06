@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.149":
+        "Realtime server item projection now lives behind a shared RuntimeEventProjector reducer. Assistant messages, proposed plans, reasoning, command execution, MCP/dynamic tools, file changes, and workflow lifecycle events keep the same app-server wire shape while ServerRequestWriter no longer owns the projection state maps.",
       "v0.1.148":
         "Async subagent worker entrypoints now use grouped AsyncSubagentWorkerInput, AsyncSubagentWorkerContext, AsyncSubagentLaunchContext, and spawn context objects instead of long argument lists or clippy allowances. CLI worker startup, parent async launch, task registry state, worktree handoff, async completion payloads, subagent contracts, and TUI async subagent behavior stay unchanged.",
       "v0.1.147":
@@ -324,6 +326,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.149":
+        "Realtime server item projection 现在由共享的 RuntimeEventProjector reducer 承载。Assistant message、proposed plan、reasoning、command execution、MCP/dynamic tool、file change 与 workflow lifecycle event 继续保持同一 app-server wire shape，同时 ServerRequestWriter 不再持有 projection state map。",
       "v0.1.148":
         "Async subagent worker entrypoint 现在改用 AsyncSubagentWorkerInput、AsyncSubagentWorkerContext、AsyncSubagentLaunchContext 和 spawn context 分组传递输入，不再暴露长参数列表，也不再用 clippy allow 压住设计问题。CLI worker 启动、父级 async launch、task registry 状态、worktree handoff、async completion payload、subagent contract 与 TUI async subagent 行为保持不变。",
       "v0.1.147":
