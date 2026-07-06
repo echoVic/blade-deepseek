@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.159":
+        "Permission-sensitive tool contexts now pass grouped RuntimeExtensionStores instead of parallel thread/turn extension references. RuntimeTurnReducer can be constructed from that grouped store boundary, so request_permissions, bash auto-escalation, router overlay transfer, and direct runtime-tool actor compatibility keep the same behavior while the runtime state API gets smaller.",
       "v0.1.158":
         "Permission reduction is now consistently instance-owned by RuntimeTurnReducer. The old static permission reducer accessor is gone, while request_permissions, bash auto-escalation, router overlay transfer, and direct runtime-tool actor calls keep their existing behavior through turn/thread extension stores.",
       "v0.1.157":
@@ -344,6 +346,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.159":
+        "Permission-sensitive tool context 现在传递分组后的 RuntimeExtensionStores，不再暴露平行的 thread/turn extension 引用。RuntimeTurnReducer 可以直接从这个 grouped store boundary 构造；request_permissions、bash 自动权限升级、router overlay transfer 和直接 runtime-tool actor 兼容路径保持原行为，同时 runtime state API 更小。",
       "v0.1.158":
         "Permission reduction 现在统一由 RuntimeTurnReducer 实例持有。旧的静态 permission reducer accessor 已移除；request_permissions、bash 自动权限升级、router overlay transfer 和直接 runtime-tool actor 调用仍通过 turn/thread extension stores 保持原有行为。",
       "v0.1.157":
