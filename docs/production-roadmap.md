@@ -4,13 +4,14 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-07-07
-Current baseline: v0.1.164 lets `RuntimeTurnState` hand `agent_loop` a
-lifecycle-owned `RuntimeTurnLoopState`, separating directive state from grouped
-turn-loop runtime refs. `RuntimeTurnLoopInput` now owns the runtime handoff and
-derives `RuntimeExtensionContext` at the iteration boundary, so `agent_loop` no
-longer destructures extension registry/thread/turn fields or reconstructs
-extension context from raw parts. Earlier v0.1.163 moved grouped runtime
-extension-context composition into the state boundary, v0.1.162 moved grouped
+Current baseline: v0.1.165 lets `RuntimeTurnLoopState` own the
+directive-resolved loop policy surface. `agent_loop` no longer destructures loop
+state or reads directive accessors directly; lifecycle resolves tool policy,
+runtime system messages, model override, cost/cancel/task refs, and grouped
+extension context for each turn-loop iteration. Earlier v0.1.164 let
+`RuntimeTurnState` hand `agent_loop` a lifecycle-owned `RuntimeTurnLoopState`
+and moved extension context derivation to the iteration boundary, v0.1.163 moved
+grouped runtime extension-context composition into the state boundary, v0.1.162 moved grouped
 runtime extension routing up to the turn-loop, turn-iteration, and provider-cycle inputs,
 v0.1.161 moved the grouped context into `RuntimeStepContext` and
 `RuntimeNormalToolTurnContext`, v0.1.160 moved grouped extension-store routing up

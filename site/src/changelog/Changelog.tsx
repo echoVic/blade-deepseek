@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.165":
+        "RuntimeTurnLoopState now owns the directive-resolved loop policy surface. agent_loop no longer destructures loop state or reads directive accessors directly; lifecycle resolves tool policy, runtime system messages, model override, cost/cancel/task refs, and grouped extension context for each turn-loop iteration.",
       "v0.1.164":
         "RuntimeTurnState now hands agent_loop a lifecycle-owned RuntimeTurnLoopState, separating runtime directives from the mutable turn-loop runtime refs. RuntimeTurnLoopInput owns that grouped runtime handoff and derives RuntimeExtensionContext at the iteration boundary, so agent_loop no longer destructures extension registry/thread/turn fields or reconstructs extension context from raw parts.",
       "v0.1.163":
@@ -356,6 +358,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.165":
+        "RuntimeTurnLoopState 现在拥有 directive-resolved loop policy surface。agent_loop 不再拆开 loop state，也不再直接读取 directive accessor；lifecycle 会在每次 turn-loop iteration 前解析 tool policy、runtime system messages、model override、cost/cancel/task refs，以及 grouped extension context。",
       "v0.1.164":
         "RuntimeTurnState 现在把 lifecycle-owned RuntimeTurnLoopState 交给 agent_loop，将 runtime directive 与可变 turn-loop runtime refs 分开。RuntimeTurnLoopInput 持有这个 grouped runtime handoff，并在 iteration 边界派生 RuntimeExtensionContext，因此 agent_loop 不再拆开 extension registry/thread/turn 字段，也不再从 raw parts 重建 extension context。",
       "v0.1.163":
