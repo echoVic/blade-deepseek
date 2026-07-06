@@ -24,6 +24,7 @@ use crate::cost::CostTracker;
 use crate::hooks::{HookContext, HookOutcome, HookRunner};
 use crate::instructions::ProjectInstructions;
 use crate::memory::MemoryBlock;
+use crate::runtime_directive::{RuntimeDirective, RuntimeDirectiveState};
 use crate::runtime_normal_tool::{
     RuntimeNormalToolInvocation, execute_runtime_normal_tool_invocation,
 };
@@ -117,6 +118,7 @@ pub(crate) struct RuntimeTurnState<'a> {
     pub(crate) cost_tracker: &'a mut CostTracker,
     pub(crate) cancel: &'a CancelToken,
     pub(crate) task_registry: &'a TaskRegistry,
+    pub(crate) directive_state: RuntimeDirectiveState,
 }
 
 pub(crate) struct RuntimeTurnExecution<'a> {
@@ -881,7 +883,17 @@ impl<'a> RuntimeTurnState<'a> {
             cost_tracker,
             cancel,
             task_registry,
+            directive_state: RuntimeDirectiveState::default(),
         }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn apply_directive(&mut self, directive: RuntimeDirective) {
+        self.directive_state.apply(directive);
+    }
+
+    pub(crate) fn directive_state(&self) -> &RuntimeDirectiveState {
+        &self.directive_state
     }
 
     #[cfg(test)]

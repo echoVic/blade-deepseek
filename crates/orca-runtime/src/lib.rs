@@ -27,6 +27,7 @@ pub mod provider_turn;
 pub(crate) mod runtime_approval;
 pub(crate) mod runtime_bash;
 mod runtime_conversation_bootstrap;
+pub mod runtime_directive;
 mod runtime_lifecycle;
 mod runtime_model_route;
 mod runtime_normal_tool;

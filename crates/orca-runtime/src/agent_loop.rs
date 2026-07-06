@@ -50,11 +50,14 @@ pub(crate) fn run_agent_loop(
         mcp_registry,
         hooks,
     } = turn_deps.expect("agent loop turn deps");
+    let turn_state = turn_state.expect("agent loop turn state");
+    let _ = turn_state.directive_state().transition_reasons().len();
     let RuntimeTurnState {
         cost_tracker,
         cancel,
         task_registry,
-    } = turn_state.expect("agent loop turn state");
+        ..
+    } = turn_state;
     let RuntimeTurnExecution {
         background_workflows,
         workflow_ipc,
@@ -298,6 +301,53 @@ mod tests {
         assert_eq!(state.cost_tracker().totals().total_tokens(), 0);
         assert!(std::ptr::eq(state.cancel(), &cancel));
         assert!(std::ptr::eq(state.task_registry(), &task_registry));
+    }
+
+    #[test]
+    fn runtime_turn_state_applies_runtime_directives_in_order() {
+        let mut cost_tracker = CostTracker::new(None);
+        let cancel = CancelToken::new();
+        let task_registry = TaskRegistry::new("agent-loop-directives".to_string());
+        let mut state = RuntimeTurnState::new(&mut cost_tracker, &cancel, &task_registry);
+
+        state.apply_directive(crate::runtime_directive::RuntimeDirective::SwitchModel {
+            model: orca_core::model::FLASH_MODEL.to_string(),
+            reason: "skill requested cheaper execution".to_string(),
+        });
+        state.apply_directive(
+            crate::runtime_directive::RuntimeDirective::ReplaceAllowedTools {
+                tool_names: vec!["read_file".to_string(), "grep".to_string()],
+                reason: "skill narrowed tool surface".to_string(),
+            },
+        );
+        state.apply_directive(
+            crate::runtime_directive::RuntimeDirective::InjectSystemMessage {
+                message: "Prefer focused repository evidence.".to_string(),
+                reason: "skill added runtime instruction".to_string(),
+            },
+        );
+
+        let directives = state.directive_state();
+        assert_eq!(
+            directives.model_override(),
+            Some(orca_core::model::FLASH_MODEL)
+        );
+        assert_eq!(
+            directives.allowed_tools(),
+            Some(&["read_file".to_string(), "grep".to_string()][..])
+        );
+        assert_eq!(
+            directives.pending_system_messages(),
+            &["Prefer focused repository evidence.".to_string()]
+        );
+        assert_eq!(
+            directives.transition_reasons(),
+            &[
+                "switch_model: skill requested cheaper execution".to_string(),
+                "replace_allowed_tools: skill narrowed tool surface".to_string(),
+                "inject_system_message: skill added runtime instruction".to_string(),
+            ]
+        );
     }
 
     #[test]
