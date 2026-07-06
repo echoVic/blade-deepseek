@@ -4,16 +4,16 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-07-06
-Current baseline: v0.1.153 moves thread-scoped extension data into
-`RuntimeThread`, so long-lived headless, TUI, and server threads reuse one
-thread extension store while each turn receives a fresh turn extension store.
-Goal tool progress can now build on stable thread-level runtime state instead
-of a per-turn-only store. Earlier v0.1.152 installed the Codex-inspired
-extension contributor kernel inside runtime turn state and threaded the
-registry plus stores through the live provider/tool path; v0.1.151 taught
-`ToolExecutionActor` to notify extension contributors around normal tool
-execution, and v0.1.150 seeded typed per-scope `ExtensionData`, ordered
-lifecycle contributors, and the first goal tool-progress contributor.
+Current baseline: v0.1.154 makes terminal goal updates consume live runtime
+thread extension state before accepting `complete` or `blocked` claims. TUI
+turns now record completed normal tools into the same thread-scoped goal
+progress store, while `update_goal` refuses terminal status when the live
+thread has not observed any real non-goal tool progress. Earlier v0.1.153 moved
+thread-scoped extension data into `RuntimeThread`; v0.1.152 installed the
+Codex-inspired extension contributor kernel inside runtime turn state and
+threaded the registry plus stores through the live provider/tool path; v0.1.151
+taught `ToolExecutionActor` to notify extension contributors around normal tool
+execution.
 
 ---
 

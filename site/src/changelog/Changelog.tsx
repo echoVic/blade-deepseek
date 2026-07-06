@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.154":
+        "Goal terminal updates now consult live runtime thread extension state. TUI turns record completed normal tools into the same goal progress store, and update_goal refuses complete or blocked claims until the live thread has observed real non-goal tool progress.",
       "v0.1.153":
         "RuntimeThread now owns the thread-scoped extension store and hands it to each RuntimeTurnState, while every RuntimeThread turn receives a fresh turn extension store id. Goal and future runtime contributors can now keep stable thread-level state across headless, TUI, and server turns without leaking turn-local data.",
       "v0.1.152":
@@ -334,6 +336,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.154":
+        "Goal terminal update 现在会读取 live runtime thread extension state。TUI turn 会把已完成的 normal tool 写入同一个 goal progress store；在 live thread 尚未观察到真实 non-goal tool progress 前，update_goal 会拒绝 complete 或 blocked 声明。",
       "v0.1.153":
         "RuntimeThread 现在拥有 thread-scoped extension store，并会把它传给每个 RuntimeTurnState；每个 RuntimeThread turn 仍然获得新的 turn extension store id。Goal 和后续 runtime contributor 现在可以跨 headless、TUI、server turn 保留稳定的 thread-level 状态，同时不泄漏 turn-local 数据。",
       "v0.1.152":
