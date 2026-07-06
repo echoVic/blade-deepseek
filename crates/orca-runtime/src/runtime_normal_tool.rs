@@ -6,7 +6,7 @@ use orca_core::external_config::ExternalToolConfig;
 use orca_core::tool_types::{ToolName, ToolOutputTruncation, ToolRequest, ToolResult};
 use orca_mcp::McpRegistry;
 
-use crate::extension::ExtensionData;
+use crate::extension::RuntimeExtensionStores;
 use crate::lifecycle::{RuntimePermissionRequestHandler, TurnPermissionOverlay};
 use crate::runtime_bash::{RuntimeBashInvocationContext, execute_bash_with_shell_session};
 use crate::tasks::TaskRegistry;
@@ -24,8 +24,7 @@ pub(crate) struct RuntimeNormalToolExecutionContext<'a> {
     pub(crate) cancel: Option<&'a CancelToken>,
     pub(crate) permission_handler: Option<&'a dyn RuntimePermissionRequestHandler>,
     pub(crate) permission_overlay: Option<&'a mut TurnPermissionOverlay>,
-    pub(crate) thread_extensions: Option<&'a ExtensionData>,
-    pub(crate) turn_extensions: Option<&'a ExtensionData>,
+    pub(crate) extension_stores: Option<RuntimeExtensionStores<'a>>,
 }
 
 pub(crate) struct RuntimeNormalToolInvocation<'a> {
@@ -40,18 +39,15 @@ pub(crate) struct RuntimeNormalToolInvocation<'a> {
     pub(crate) task_registry: Option<&'a TaskRegistry>,
     pub(crate) cancel: Option<&'a CancelToken>,
     pub(crate) permission_handler: Option<&'a dyn RuntimePermissionRequestHandler>,
-    pub(crate) thread_extensions: Option<&'a ExtensionData>,
-    pub(crate) turn_extensions: Option<&'a ExtensionData>,
+    pub(crate) extension_stores: Option<RuntimeExtensionStores<'a>>,
 }
 
 impl<'a> RuntimeNormalToolInvocation<'a> {
     pub(crate) fn with_extension_stores(
         mut self,
-        thread_extensions: &'a ExtensionData,
-        turn_extensions: &'a ExtensionData,
+        extension_stores: RuntimeExtensionStores<'a>,
     ) -> Self {
-        self.thread_extensions = Some(thread_extensions);
-        self.turn_extensions = Some(turn_extensions);
+        self.extension_stores = Some(extension_stores);
         self
     }
 
@@ -72,8 +68,7 @@ impl<'a> RuntimeNormalToolInvocation<'a> {
             cancel: self.cancel,
             permission_handler: self.permission_handler,
             permission_overlay,
-            thread_extensions: self.thread_extensions,
-            turn_extensions: self.turn_extensions,
+            extension_stores: self.extension_stores,
         }
     }
 }
@@ -162,15 +157,13 @@ impl<'a> RuntimeNormalToolExecutor<'a> {
             cancel,
             permission_handler,
             permission_overlay,
-            thread_extensions,
-            turn_extensions,
+            extension_stores,
         } = context;
 
         if request.name == ToolName::Bash
             && let Some(task_registry) = task_registry
             && let Some(permission_overlay) = permission_overlay
-            && let (Some(thread_extensions), Some(turn_extensions)) =
-                (thread_extensions, turn_extensions)
+            && let Some(extension_stores) = extension_stores
         {
             return execute_bash_with_shell_session(RuntimeBashInvocationContext {
                 config,
@@ -183,8 +176,7 @@ impl<'a> RuntimeNormalToolExecutor<'a> {
                 cancel,
                 permission_handler,
                 permission_overlay,
-                thread_extensions,
-                turn_extensions,
+                extension_stores,
             });
         }
 
@@ -272,8 +264,7 @@ mod tests {
             cancel: Some(&cancel),
             permission_handler: None,
             permission_overlay: None,
-            thread_extensions: None,
-            turn_extensions: None,
+            extension_stores: None,
         });
 
         assert_eq!(result.status, ToolStatus::Completed);

@@ -1,6 +1,6 @@
 use std::io;
 
-use crate::extension::{ExtensionData, ToolCallOutcome};
+use crate::extension::{ExtensionData, RuntimeExtensionStores, ToolCallOutcome};
 use crate::goals;
 use crate::runtime_directive::{RuntimeDirective, RuntimeDirectiveState};
 use crate::runtime_permission::{
@@ -35,6 +35,13 @@ impl<'a> RuntimeTurnReducer<'a> {
             permission_state: PermissionRuntimeState,
             tool_state: ToolRuntimeState::new(thread_store, turn_store),
         }
+    }
+
+    pub fn from_extension_stores(extension_stores: RuntimeExtensionStores<'a>) -> Self {
+        Self::new(
+            extension_stores.thread_store(),
+            extension_stores.turn_store(),
+        )
     }
 
     pub fn apply_directive(

@@ -9,7 +9,7 @@ use orca_core::external_config::ExternalToolConfig;
 use orca_core::tool_types::{ToolOutputTruncation, ToolRequest, ToolResult};
 use orca_mcp::McpRegistry;
 
-use crate::extension::ExtensionData;
+use crate::extension::{ExtensionData, RuntimeExtensionStores};
 use crate::lifecycle::{
     RuntimeApprovalDecision, RuntimeApprovalHandler, RuntimePermissionRequestHandler,
     RuntimeSessionLifecycle, RuntimeTaskActor, RuntimeTaskKind, RuntimeTaskLifecycle,
@@ -203,8 +203,7 @@ impl RuntimeToolActorContext {
             task_registry,
             cancel,
             permission_handler,
-            thread_extensions: None,
-            turn_extensions: None,
+            extension_stores: None,
         })
     }
 
@@ -212,11 +211,10 @@ impl RuntimeToolActorContext {
         &mut self,
         invocation: RuntimeNormalToolInvocation<'_>,
     ) -> ToolResult {
-        let thread_extensions = invocation
-            .thread_extensions
-            .unwrap_or(&self.thread_extensions);
-        let turn_extensions = invocation.turn_extensions.unwrap_or(&self.turn_extensions);
-        let invocation = invocation.with_extension_stores(thread_extensions, turn_extensions);
+        let extension_stores = invocation.extension_stores.unwrap_or_else(|| {
+            RuntimeExtensionStores::new(&self.thread_extensions, &self.turn_extensions)
+        });
+        let invocation = invocation.with_extension_stores(extension_stores);
         execute_runtime_normal_tool_invocation(invocation, Some(&mut self.permission_overlay))
     }
 

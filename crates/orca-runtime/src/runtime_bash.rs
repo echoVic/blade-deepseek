@@ -7,7 +7,7 @@ use orca_core::config::{PermissionProfileNetworkAccess, RunConfig};
 use orca_core::task_types::TaskStatus;
 use orca_core::tool_types::{ToolOutputTruncation, ToolRequest, ToolResult};
 
-use crate::extension::ExtensionData;
+use crate::extension::RuntimeExtensionStores;
 use crate::lifecycle::{
     RuntimePermissionRequest, RuntimePermissionRequestHandler, TurnPermissionOverlay,
 };
@@ -37,8 +37,7 @@ pub(crate) struct RuntimeBashInvocationContext<'a> {
     pub(crate) cancel: Option<&'a CancelToken>,
     pub(crate) permission_handler: Option<&'a dyn RuntimePermissionRequestHandler>,
     pub(crate) permission_overlay: &'a mut TurnPermissionOverlay,
-    pub(crate) thread_extensions: &'a ExtensionData,
-    pub(crate) turn_extensions: &'a ExtensionData,
+    pub(crate) extension_stores: RuntimeExtensionStores<'a>,
 }
 
 pub(crate) fn execute_bash_with_shell_session(
@@ -55,8 +54,7 @@ pub(crate) fn execute_bash_with_shell_session(
         cancel,
         permission_handler,
         permission_overlay,
-        thread_extensions,
-        turn_extensions,
+        extension_stores,
     } = context;
     let Some(command) = request
         .target
@@ -135,7 +133,7 @@ pub(crate) fn execute_bash_with_shell_session(
             )),
             permissions,
         };
-        let reducer = RuntimeTurnReducer::new(thread_extensions, turn_extensions);
+        let reducer = RuntimeTurnReducer::from_extension_stores(extension_stores);
         let response = match reducer.request_permission(
             permission_overlay,
             permission_handler,
@@ -190,7 +188,7 @@ pub(crate) fn execute_bash_with_shell_session(
                 )),
                 permissions,
             };
-            let reducer = RuntimeTurnReducer::new(thread_extensions, turn_extensions);
+            let reducer = RuntimeTurnReducer::from_extension_stores(extension_stores);
             let response = match reducer.request_permission(
                 permission_overlay,
                 permission_handler,

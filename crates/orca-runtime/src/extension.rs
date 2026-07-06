@@ -55,6 +55,29 @@ impl ExtensionData {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct RuntimeExtensionStores<'a> {
+    thread_store: &'a ExtensionData,
+    turn_store: &'a ExtensionData,
+}
+
+impl<'a> RuntimeExtensionStores<'a> {
+    pub fn new(thread_store: &'a ExtensionData, turn_store: &'a ExtensionData) -> Self {
+        Self {
+            thread_store,
+            turn_store,
+        }
+    }
+
+    pub fn thread_store(&self) -> &'a ExtensionData {
+        self.thread_store
+    }
+
+    pub fn turn_store(&self) -> &'a ExtensionData {
+        self.turn_store
+    }
+}
+
 pub struct ToolStartInput<'a> {
     pub thread_store: &'a ExtensionData,
     pub turn_store: &'a ExtensionData,

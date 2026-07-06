@@ -1330,8 +1330,7 @@ mod tests {
                 workflow_ipc: None,
                 permission_overlay: &mut permission_overlay,
                 permission_handler: None,
-                thread_extensions: None,
-                turn_extensions: None,
+                extension_stores: None,
                 child_executor: execute_child_agent_loop,
                 workflow_child_executor: execute_child_agent_loop,
             })

@@ -6,6 +6,7 @@ use orca_core::tool_types::{ToolName, ToolRequest, ToolResult};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::extension::RuntimeExtensionStores;
 use crate::lifecycle::{
     AllowRequestedPermissions, RuntimePermissionRequest, RuntimePermissionRequestHandler,
     RuntimeSubagentStatusLookup, RuntimeToolActorContext, RuntimeUsageTotals, RuntimeWorkflowIpc,
@@ -85,7 +86,10 @@ impl RuntimeToolActorContext {
             reason: args.reason,
             permissions: args.permissions,
         };
-        let reducer = RuntimeTurnReducer::new(&self.thread_extensions, &self.turn_extensions);
+        let reducer = RuntimeTurnReducer::from_extension_stores(RuntimeExtensionStores::new(
+            &self.thread_extensions,
+            &self.turn_extensions,
+        ));
         let response = match reducer.request_permission(
             &mut self.permission_overlay,
             handler,

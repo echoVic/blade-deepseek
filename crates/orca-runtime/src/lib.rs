@@ -300,10 +300,16 @@ mod tests {
     #[test]
     fn runtime_permission_overlay_mutations_route_through_runtime_reducer() {
         let runtime_state_source = include_str!("runtime_state.rs");
+        let extension_source = include_str!("extension.rs");
         let runtime_special_source = include_str!("runtime_special.rs");
         let runtime_bash_source = include_str!("runtime_bash.rs");
+        let runtime_normal_tool_source = include_str!("runtime_normal_tool.rs");
         let tool_router_source = include_str!("tool_router.rs");
 
+        assert!(
+            extension_source.contains("struct RuntimeExtensionStores"),
+            "extension module must own the grouped thread/turn extension store refs"
+        );
         assert!(
             runtime_state_source.contains("struct PermissionRuntimeState"),
             "runtime_state must own the permission reducer branch"
@@ -327,8 +333,8 @@ mod tests {
             ("tool_router", tool_router_source),
         ] {
             assert!(
-                source.contains("RuntimeTurnReducer::new("),
-                "{module_name} must create a RuntimeTurnReducer instance for permission overlay mutation"
+                source.contains("RuntimeTurnReducer::from_extension_stores("),
+                "{module_name} must create a RuntimeTurnReducer from grouped extension stores"
             );
             assert!(
                 !source.contains("RuntimeTurnReducer::permission()"),
@@ -337,6 +343,25 @@ mod tests {
             assert!(
                 !source.contains(".request_and_merge("),
                 "{module_name} must not request and merge permission overlay directly"
+            );
+        }
+
+        for (module_name, source) in [
+            ("runtime_bash", runtime_bash_source),
+            ("runtime_normal_tool", runtime_normal_tool_source),
+            ("tool_router", tool_router_source),
+        ] {
+            assert!(
+                source.contains("extension_stores"),
+                "{module_name} must pass grouped extension stores through permission-sensitive tool contexts"
+            );
+            assert!(
+                !source.contains("pub(crate) thread_extensions:"),
+                "{module_name} must not expose thread extension refs as a parallel context field"
+            );
+            assert!(
+                !source.contains("pub(crate) turn_extensions:"),
+                "{module_name} must not expose turn extension refs as a parallel context field"
             );
         }
 

@@ -14,7 +14,8 @@ use crate::agent_child::ChildAgentExecutor;
 use crate::agent_common;
 use crate::cost::CostTracker;
 use crate::extension::{
-    ExtensionData, ExtensionRegistry, ToolCallOutcome, ToolFinishInput, ToolStartInput,
+    ExtensionData, ExtensionRegistry, RuntimeExtensionStores, ToolCallOutcome, ToolFinishInput,
+    ToolStartInput,
 };
 use crate::hooks::{HookOutcome, HookRunner};
 use crate::instructions::ProjectInstructions;
@@ -395,6 +396,12 @@ impl ToolExecutionActor {
                 call_id: &execution_request.id,
             });
         }
+        let extension_stores = match (thread_extensions, turn_extensions) {
+            (Some(thread_store), Some(turn_store)) => {
+                Some(RuntimeExtensionStores::new(thread_store, turn_store))
+            }
+            _ => None,
+        };
         let result =
             match RuntimeToolRouter::new(&mut self.runtime).dispatch(RuntimeToolInvocationContext {
                 config,
@@ -415,8 +422,7 @@ impl ToolExecutionActor {
                 workflow_ipc,
                 permission_overlay,
                 permission_handler,
-                thread_extensions,
-                turn_extensions,
+                extension_stores,
                 child_executor,
                 workflow_child_executor,
             }) {
