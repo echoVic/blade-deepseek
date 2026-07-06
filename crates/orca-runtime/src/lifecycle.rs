@@ -35,6 +35,7 @@ use crate::runtime_normal_tool::{
 };
 use crate::runtime_state::RuntimeTurnReducer;
 use crate::tasks::TaskRegistry;
+use crate::tool_invocation::AgentToolPolicyContext;
 use crate::workflow::ipc::WorkflowIpcContext;
 use crate::workflow_execution::BackgroundWorkflowRun;
 
@@ -140,6 +141,16 @@ pub(crate) struct RuntimeTurnLoopRuntime<'a> {
     pub(crate) cancel: &'a CancelToken,
     pub(crate) task_registry: &'a TaskRegistry,
     pub(crate) extensions: RuntimeTurnExtensionState,
+}
+
+pub(crate) struct RuntimeTurnLoopIterationState<'a> {
+    pub(crate) runtime_system_messages: &'a [String],
+    pub(crate) model_override: Option<&'a str>,
+    pub(crate) tool_policy: AgentToolPolicyContext<'a>,
+    pub(crate) cost_tracker: &'a mut CostTracker,
+    pub(crate) cancel: &'a CancelToken,
+    pub(crate) task_registry: &'a TaskRegistry,
+    pub(crate) extensions: RuntimeExtensionContext<'a>,
 }
 
 pub(crate) struct RuntimeTurnExtensionState {
@@ -1034,6 +1045,38 @@ impl RuntimeTurnExtensionState {
             self.thread_extensions.as_ref(),
             &self.turn_extensions,
         )
+    }
+}
+
+impl<'a> RuntimeTurnLoopState<'a> {
+    pub(crate) fn tool_policy<'state>(
+        &'state self,
+        tool_policy: AgentToolPolicyContext<'state>,
+    ) -> AgentToolPolicyContext<'state> {
+        tool_policy.replace_allowed_tools(
+            self.directive_state.allowed_tools(),
+            "runtime directive tool policy",
+        )
+    }
+
+    pub(crate) fn iteration_state<'state>(
+        &'state mut self,
+        tool_policy: AgentToolPolicyContext<'state>,
+    ) -> RuntimeTurnLoopIterationState<'state> {
+        let directive_state = &self.directive_state;
+        let runtime = &mut self.runtime;
+        RuntimeTurnLoopIterationState {
+            runtime_system_messages: directive_state.pending_system_messages(),
+            model_override: directive_state.model_override(),
+            tool_policy: tool_policy.replace_allowed_tools(
+                directive_state.allowed_tools(),
+                "runtime directive tool policy",
+            ),
+            cost_tracker: &mut *runtime.cost_tracker,
+            cancel: runtime.cancel,
+            task_registry: runtime.task_registry,
+            extensions: runtime.extensions.extension_context(),
+        }
     }
 }
 

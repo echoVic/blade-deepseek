@@ -447,17 +447,18 @@ mod tests {
 
     #[test]
     fn turn_loop_iteration_and_provider_contexts_group_runtime_extensions() {
+        let lifecycle_source = include_str!("lifecycle.rs");
         let runtime_turn_loop_source = include_str!("runtime_turn_loop.rs");
         let runtime_turn_iteration_source = include_str!("runtime_turn_iteration.rs");
         let provider_turn_source = include_str!("provider_turn.rs");
 
         assert!(
-            runtime_turn_loop_source.contains("runtime: RuntimeTurnLoopRuntime"),
-            "runtime_turn_loop must carry lifecycle-owned loop runtime state"
+            runtime_turn_loop_source.contains("loop_state: RuntimeTurnLoopState"),
+            "runtime_turn_loop must carry lifecycle-owned loop state"
         );
         assert!(
-            runtime_turn_loop_source.contains("extensions.extension_context()"),
-            "runtime_turn_loop must derive grouped extension context from loop runtime state"
+            lifecycle_source.contains("extensions: runtime.extensions.extension_context()"),
+            "lifecycle must derive grouped extension context from loop runtime state"
         );
 
         for (module_name, source) in [
@@ -4201,6 +4202,56 @@ mod tests {
         assert!(
             !agent_loop_source.contains("execute_child_agent_loop,\n        execute_child_agent_loop,\n        execute_child_agent_loop"),
             "agent_loop must not pass child executors as a raw repeated argument list"
+        );
+    }
+
+    #[test]
+    fn runtime_turn_loop_state_resolves_runtime_directive_policy() {
+        let agent_loop_source = include_str!("agent_loop.rs");
+        let agent_loop_runtime_source = agent_loop_source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("agent loop runtime source");
+        let lifecycle_source = include_str!("lifecycle.rs");
+        let runtime_turn_loop_source = include_str!("runtime_turn_loop.rs");
+
+        assert!(
+            lifecycle_source.contains("struct RuntimeTurnLoopIterationState"),
+            "lifecycle must own the directive-resolved turn loop iteration state"
+        );
+        assert!(
+            lifecycle_source.contains("fn iteration_state"),
+            "RuntimeTurnLoopState must expose directive-resolved iteration state"
+        );
+        assert!(
+            lifecycle_source.contains("replace_allowed_tools(")
+                && lifecycle_source.contains("pending_system_messages()")
+                && lifecycle_source.contains("model_override()"),
+            "RuntimeTurnLoopState must resolve directive tool policy, system messages, and model override"
+        );
+        assert!(
+            runtime_turn_loop_source.contains("loop_state: RuntimeTurnLoopState"),
+            "runtime_turn_loop must consume the lifecycle-owned loop state"
+        );
+        assert!(
+            runtime_turn_loop_source.contains("iteration_state(self.tool_policy)"),
+            "runtime_turn_loop must request directive-resolved iteration state at the iteration boundary"
+        );
+        assert!(
+            !runtime_turn_loop_source.contains("runtime: RuntimeTurnLoopRuntime"),
+            "runtime_turn_loop must not receive raw loop runtime without its directive policy state"
+        );
+        assert!(
+            !agent_loop_runtime_source.contains("RuntimeTurnLoopState {"),
+            "agent_loop must not destructure runtime turn loop state"
+        );
+        assert!(
+            !agent_loop_runtime_source.contains("tool_policy_for_directive_state"),
+            "agent_loop must not resolve runtime directive tool policy directly"
+        );
+        assert!(
+            !agent_loop_runtime_source.contains("directive_state."),
+            "agent_loop must not directly read runtime directive policy accessors"
         );
     }
 

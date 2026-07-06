@@ -4,10 +4,9 @@ use crate::agent_child::{ChildAgentRequest, ChildAgentResult, ChildAgentRuntime}
 use crate::cost::CostTracker;
 use crate::lifecycle::{
     AgentLoopContext, AgentLoopResult, RuntimeSessionLifecycle, RuntimeTaskActor,
-    RuntimeTurnConfig, RuntimeTurnDeps, RuntimeTurnExecution, RuntimeTurnLoopState,
+    RuntimeTurnConfig, RuntimeTurnDeps, RuntimeTurnExecution,
 };
 use crate::runtime_conversation_bootstrap::RuntimeConversationBootstrapStep;
-use crate::runtime_directive::RuntimeDirectiveState;
 use crate::runtime_turn_loop::{
     RuntimeTurnLoopExecutors, RuntimeTurnLoopInput, RuntimeTurnLoopStep,
 };
@@ -55,22 +54,18 @@ pub(crate) fn run_agent_loop(
         hooks,
     } = turn_deps.expect("agent loop turn deps");
     let turn_state = turn_state.expect("agent loop turn state");
-    let RuntimeTurnLoopState {
-        directive_state,
-        runtime: turn_runtime,
-    } = turn_state.into_loop_state();
+    let loop_state = turn_state.into_loop_state();
     let RuntimeTurnExecution {
         background_workflows,
         workflow_ipc,
         lifecycle,
     } = turn_execution.expect("agent loop turn execution");
-    let tool_policy = tool_policy_for_directive_state(tool_policy, &directive_state);
     let max_turns = DEFAULT_MAX_TURNS;
     let setup = RuntimeTurnSetupStep::new().prepare(
         config,
         subagent_depth,
         subagent_type,
-        tool_policy,
+        loop_state.tool_policy(tool_policy),
         mcp_registry,
     );
     let ctx_config = setup.context_config;
@@ -100,7 +95,6 @@ pub(crate) fn run_agent_loop(
             config.provider,
             &ctx_config,
             &provider_config,
-            directive_state.pending_system_messages(),
             cwd,
             emit_deltas,
             hooks,
@@ -110,8 +104,7 @@ pub(crate) fn run_agent_loop(
             prompt,
             &config.model,
             subagent_type,
-            directive_state.model_override(),
-            turn_runtime,
+            loop_state,
             steer_handle,
             config.max_budget_usd,
             config,
@@ -131,24 +124,6 @@ pub(crate) fn run_agent_loop(
             execute_child_agent_loop,
         ),
     )
-}
-
-fn tool_policy_for_directive_state<'a>(
-    tool_policy: AgentToolPolicyContext<'a>,
-    directive_state: &'a RuntimeDirectiveState,
-) -> AgentToolPolicyContext<'a> {
-    tool_policy.replace_allowed_tools(
-        directive_state.allowed_tools(),
-        "runtime directive tool policy",
-    )
-}
-
-#[cfg(test)]
-fn tool_policy_for_runtime_directives<'a>(
-    tool_policy: AgentToolPolicyContext<'a>,
-    turn_state: &'a RuntimeTurnState<'_>,
-) -> AgentToolPolicyContext<'a> {
-    tool_policy_for_directive_state(tool_policy, &turn_state.directive_state)
 }
 
 pub(crate) fn execute_child_agent_loop<W: io::Write>(
@@ -433,8 +408,8 @@ mod tests {
             },
         );
 
-        let policy =
-            tool_policy_for_runtime_directives(AgentToolPolicyContext::unrestricted(), &state);
+        let loop_state = state.into_loop_state();
+        let policy = loop_state.tool_policy(AgentToolPolicyContext::unrestricted());
 
         assert_eq!(
             policy.allowed_tools().unwrap(),
