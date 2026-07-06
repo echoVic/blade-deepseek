@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.160":
+        "ToolExecutionContext now carries grouped RuntimeExtensionStores instead of reconstructing them from parallel thread/turn references. Tool lifecycle contributors, goal progress recording, and router dispatch keep the same behavior while the normal tool execution entrypoint has a smaller extension-store API.",
       "v0.1.159":
         "Permission-sensitive tool contexts now pass grouped RuntimeExtensionStores instead of parallel thread/turn extension references. RuntimeTurnReducer can be constructed from that grouped store boundary, so request_permissions, bash auto-escalation, router overlay transfer, and direct runtime-tool actor compatibility keep the same behavior while the runtime state API gets smaller.",
       "v0.1.158":
@@ -346,6 +348,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.160":
+        "ToolExecutionContext 现在直接携带 grouped RuntimeExtensionStores，不再从平行的 thread/turn 引用重新组装。Tool lifecycle contributor、goal progress recording 和 router dispatch 保持原行为，同时 normal tool execution entrypoint 的 extension-store API 更小。",
       "v0.1.159":
         "Permission-sensitive tool context 现在传递分组后的 RuntimeExtensionStores，不再暴露平行的 thread/turn extension 引用。RuntimeTurnReducer 可以直接从这个 grouped store boundary 构造；request_permissions、bash 自动权限升级、router overlay transfer 和直接 runtime-tool actor 兼容路径保持原行为，同时 runtime state API 更小。",
       "v0.1.158":

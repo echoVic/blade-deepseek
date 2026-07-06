@@ -4,12 +4,14 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-07-07
-Current baseline: v0.1.159 groups permission-sensitive turn/thread extension
-references behind `RuntimeExtensionStores` and lets `RuntimeTurnReducer` build
-from that grouped store boundary. `request_permissions`, bash automatic
-permission escalation, router overlay transfer, and direct runtime-tool actor
-compatibility keep the same behavior while the runtime state API exposes fewer
-parallel references. Earlier v0.1.158 made permission reduction consistently
+Current baseline: v0.1.160 moves grouped extension-store routing up to
+`ToolExecutionContext`, so normal tool execution receives
+`RuntimeExtensionStores` directly instead of reconstructing them from parallel
+thread/turn references. Tool lifecycle contributors, goal progress recording,
+router dispatch, and permission-sensitive reducer paths keep the same behavior
+while the extension-store API at the normal tool entrypoint gets smaller.
+Earlier v0.1.159 grouped permission-sensitive turn/thread extension references
+behind `RuntimeExtensionStores`, v0.1.158 made permission reduction consistently
 instance-owned by `RuntimeTurnReducer`, v0.1.157 routed permission overlay
 mutation through the reducer, v0.1.156 routed runtime directive application
 through the reducer, and v0.1.155 introduced the reducer for completed-tool
