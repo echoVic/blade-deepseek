@@ -643,12 +643,14 @@ fn run_child_agent_loop_with_tool_executor_runs_tools_until_provider_completes()
 
     let result = run_child_agent_loop_with_tool_executor(
         &runtime_config,
-        &request,
-        std::env::temp_dir().as_path(),
-        &instructions,
-        &memory,
-        &HookRunner::default(),
-        &mut tracker,
+        ChildAgentLoopContext {
+            request: &request,
+            cwd: std::env::temp_dir().as_path(),
+            instructions: &instructions,
+            memory: &memory,
+            hooks: &HookRunner::default(),
+            child_cost_tracker: &mut tracker,
+        },
         |_setup, _cancel, tool_request| {
             tool_count += 1;
             assert_eq!(tool_request.name, ToolName::Bash);

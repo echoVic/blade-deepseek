@@ -4,7 +4,8 @@ pub use crate::child_agent_entrypoints::{
     run_child_agent_with_executor,
 };
 pub use crate::child_agent_loop_runner::{
-    run_child_agent_loop_with_tool_executor, run_child_agent_with_tool_executor,
+    ChildAgentLoopContext, run_child_agent_loop_with_tool_executor,
+    run_child_agent_with_tool_executor,
 };
 pub use crate::child_agent_loop_setup::{
     ChildAgentLoopSetup, ChildAgentTurnBudget, DEFAULT_CHILD_AGENT_MAX_TURNS,
