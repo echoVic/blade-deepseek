@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.164":
+        "RuntimeTurnState now hands agent_loop a lifecycle-owned RuntimeTurnLoopState, separating runtime directives from the mutable turn-loop runtime refs. RuntimeTurnLoopInput owns that grouped runtime handoff and derives RuntimeExtensionContext at the iteration boundary, so agent_loop no longer destructures extension registry/thread/turn fields or reconstructs extension context from raw parts.",
       "v0.1.163":
         "RuntimeTurnState now exposes the grouped RuntimeExtensionContext boundary and owns the registry/store composition helper used by agent_loop. The loop still passes the same registry, thread store, and turn store into RuntimeTurnLoopInput, but extension-context construction no longer lives directly in the loop body.",
       "v0.1.162":
@@ -354,6 +356,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.164":
+        "RuntimeTurnState 现在把 lifecycle-owned RuntimeTurnLoopState 交给 agent_loop，将 runtime directive 与可变 turn-loop runtime refs 分开。RuntimeTurnLoopInput 持有这个 grouped runtime handoff，并在 iteration 边界派生 RuntimeExtensionContext，因此 agent_loop 不再拆开 extension registry/thread/turn 字段，也不再从 raw parts 重建 extension context。",
       "v0.1.163":
         "RuntimeTurnState 现在暴露 grouped RuntimeExtensionContext boundary，并拥有 agent_loop 使用的 registry/store 组合 helper。Loop 仍把同一套 registry、thread store 和 turn store 传给 RuntimeTurnLoopInput，但 extension-context 构造不再直接散落在 loop body 中。",
       "v0.1.162":
