@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.156":
+        "Runtime directives now reduce through RuntimeTurnReducer. Model switches, allowed-tool replacement, and injected runtime system messages keep the same behavior while RuntimeTurnState no longer writes directive state directly.",
       "v0.1.155":
         "RuntimeTurnReducer now owns completed-tool goal progress recording. TUI completed normal tools route through that reducer instead of writing goal progress directly, keeping the live thread extension guard in one runtime-owned state boundary.",
       "v0.1.154":
@@ -338,6 +340,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.156":
+        "Runtime directive 现在通过 RuntimeTurnReducer 归约。模型切换、allowed-tool 替换与 runtime system message 注入保持原有行为，同时 RuntimeTurnState 不再直接写 directive state。",
       "v0.1.155":
         "RuntimeTurnReducer 现在拥有 completed-tool 的 goal progress recording。TUI 已完成的 normal tool 会先进入这个 reducer，而不是直接写 goal progress，从而把 live thread extension guard 收束到一个 runtime-owned state boundary。",
       "v0.1.154":
