@@ -446,6 +446,42 @@ mod tests {
     }
 
     #[test]
+    fn sampling_request_state_owns_tool_permission_overlay() {
+        let step_context_source = include_str!("step_context.rs");
+        let tool_turn_source = include_str!("tool_turn.rs");
+        let tool_turn_runtime_source = tool_turn_source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("tool turn runtime source");
+
+        assert!(
+            step_context_source.contains("struct RuntimeSamplingRequestState"),
+            "RuntimeStepContext must have a sampling-request state object"
+        );
+        assert!(
+            step_context_source.contains("permission_overlay: TurnPermissionOverlay"),
+            "RuntimeSamplingRequestState must own the turn permission overlay"
+        );
+        assert!(
+            step_context_source.contains("fn permission_overlay_mut(&mut self)"),
+            "RuntimeSamplingRequestState must expose mutable permission overlay access"
+        );
+        assert!(
+            tool_turn_source.contains("sampling_state: &'a mut RuntimeSamplingRequestState"),
+            "RuntimeToolTurnsContext must receive lifecycle-owned sampling state"
+        );
+        assert!(
+            tool_turn_source
+                .contains("permission_overlay: sampling_state.permission_overlay_mut()"),
+            "normal tool turns must use the sampling state's permission overlay"
+        );
+        assert!(
+            !tool_turn_runtime_source.contains("TurnPermissionOverlay::default()"),
+            "tool_turn must not allocate a local permission overlay for production execution"
+        );
+    }
+
+    #[test]
     fn turn_loop_iteration_and_provider_contexts_group_runtime_extensions() {
         let lifecycle_source = include_str!("lifecycle.rs");
         let runtime_turn_loop_source = include_str!("runtime_turn_loop.rs");

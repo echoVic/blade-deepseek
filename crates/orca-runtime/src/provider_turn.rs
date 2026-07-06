@@ -25,7 +25,7 @@ use crate::runtime_conversation_bootstrap::RuntimePreparedConversation;
 use crate::runtime_directive::conversation_with_runtime_system_messages;
 use crate::runtime_steer::{RuntimeSteerInput, RuntimeSteerStep};
 use crate::session::record_assistant_response_for_agent;
-use crate::step_context::RuntimeStepContext;
+use crate::step_context::{RuntimeSamplingRequestState, RuntimeStepContext};
 use crate::tasks::TaskRegistry;
 use crate::thread_store::SessionWriter;
 use crate::tool_invocation::{AgentToolPolicyContext, tool_requests_from_provider_steps};
@@ -81,6 +81,7 @@ pub(crate) struct RuntimeProviderCycleInput<'a, 'runtime, W: io::Write> {
 
 pub(crate) struct RuntimeProviderResponseInput<'a, W: io::Write> {
     pub(crate) step_context: RuntimeStepContext<'a>,
+    pub(crate) sampling_state: &'a mut RuntimeSamplingRequestState,
     pub(crate) events: &'a mut EventFactory,
     pub(crate) sink: &'a mut EventSink<W>,
     pub(crate) conversation: &'a mut Conversation,
@@ -383,6 +384,7 @@ impl RuntimeProviderResponseStep {
         conversation: &mut Conversation,
         mut history_writer: Option<&mut SessionWriter>,
         cost_tracker: &mut CostTracker,
+        sampling_state: &mut RuntimeSamplingRequestState,
         background_workflows: &mut Vec<BackgroundWorkflowRun>,
         child_executor: ChildAgentExecutor<W>,
         workflow_child_executor: ChildAgentExecutor<SharedEventBuffer>,
@@ -422,6 +424,7 @@ impl RuntimeProviderResponseStep {
         let tool_requests = tool_requests_from_provider_steps(&response.steps);
         match run_tool_turns(RuntimeToolTurnsContext {
             step_context,
+            sampling_state,
             events,
             sink,
             conversation,
@@ -540,6 +543,7 @@ impl RuntimeTurnProviderCycleStep {
         }
 
         let (conversation, history_writer) = input.conversation.parts_mut();
+        let mut sampling_state = RuntimeSamplingRequestState::new();
         self.handle_response(
             response,
             RuntimeProviderResponseInput {
@@ -560,6 +564,7 @@ impl RuntimeTurnProviderCycleStep {
                     input.permission_handler,
                 )
                 .with_extensions(input.extensions.registry(), input.extensions.stores()),
+                sampling_state: &mut sampling_state,
                 events: input.events,
                 sink: input.sink,
                 conversation,
@@ -589,6 +594,7 @@ impl RuntimeTurnProviderCycleStep {
             input.conversation,
             input.history_writer,
             input.cost_tracker,
+            input.sampling_state,
             input.background_workflows,
             child_executor,
             workflow_child_executor,
@@ -993,6 +999,7 @@ mod tests {
         let cancel = CancelToken::new();
         let task_registry = TaskRegistry::new("provider-response-final".to_string());
         let mut background_workflows = Vec::new();
+        let mut sampling_state = RuntimeSamplingRequestState::new();
         let policy = policy_for_tool_execution(&config);
         let step_context = RuntimeStepContext::new(
             &config,
@@ -1020,6 +1027,7 @@ mod tests {
                 &mut conversation,
                 None,
                 &mut cost_tracker,
+                &mut sampling_state,
                 &mut background_workflows,
                 unused_child_executor::<Vec<u8>>,
                 unused_child_executor::<crate::workflow::runner::SharedEventBuffer>,
@@ -1062,6 +1070,7 @@ mod tests {
         let cancel = CancelToken::new();
         let task_registry = TaskRegistry::new("provider-cycle-final".to_string());
         let mut background_workflows = Vec::new();
+        let mut sampling_state = RuntimeSamplingRequestState::new();
         let policy = policy_for_tool_execution(&config);
         let step_context = RuntimeStepContext::new(
             &config,
@@ -1085,6 +1094,7 @@ mod tests {
                 response,
                 RuntimeProviderResponseInput {
                     step_context,
+                    sampling_state: &mut sampling_state,
                     events: &mut events,
                     sink: &mut sink,
                     conversation: &mut conversation,

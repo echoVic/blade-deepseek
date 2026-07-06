@@ -8,7 +8,7 @@ use orca_mcp::McpRegistry;
 use crate::extension::{ExtensionRegistry, RuntimeExtensionContext, RuntimeExtensionStores};
 use crate::hooks::HookRunner;
 use crate::instructions::ProjectInstructions;
-use crate::lifecycle::RuntimePermissionRequestHandler;
+use crate::lifecycle::{RuntimePermissionRequestHandler, TurnPermissionOverlay};
 use crate::memory::MemoryBlock;
 use crate::tasks::TaskRegistry;
 use crate::tool_invocation::AgentToolPolicyContext;
@@ -31,6 +31,21 @@ pub(crate) struct RuntimeStepContext<'a> {
     pub(crate) workflow_ipc: Option<&'a WorkflowIpcContext>,
     pub(crate) permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
     pub(crate) extensions: Option<RuntimeExtensionContext<'a>>,
+}
+
+#[derive(Default)]
+pub(crate) struct RuntimeSamplingRequestState {
+    pub(crate) permission_overlay: TurnPermissionOverlay,
+}
+
+impl RuntimeSamplingRequestState {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn permission_overlay_mut(&mut self) -> &mut TurnPermissionOverlay {
+        &mut self.permission_overlay
+    }
 }
 
 impl<'a> RuntimeStepContext<'a> {

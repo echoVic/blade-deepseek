@@ -24,7 +24,7 @@ use crate::runtime_readonly_tool_turn::{
     should_run_readonly_batch,
 };
 use crate::session::{record_plan_state_for_agent, record_tool_result_for_agent};
-use crate::step_context::RuntimeStepContext;
+use crate::step_context::{RuntimeSamplingRequestState, RuntimeStepContext};
 use crate::subagent_execution::{
     collect_subagent_batch, run_subagent_batch_tool_turn, should_run_subagent_batch,
 };
@@ -51,6 +51,7 @@ pub(crate) struct ToolRequestCursor<'a> {
 
 pub(crate) struct RuntimeToolTurnsContext<'a, W: io::Write> {
     pub(crate) step_context: RuntimeStepContext<'a>,
+    pub(crate) sampling_state: &'a mut RuntimeSamplingRequestState,
     pub(crate) events: &'a mut EventFactory,
     pub(crate) sink: &'a mut EventSink<W>,
     pub(crate) conversation: &'a mut Conversation,
@@ -127,6 +128,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
 ) -> io::Result<ToolTurnOutcome> {
     let RuntimeToolTurnsContext {
         step_context,
+        sampling_state,
         events,
         sink,
         conversation,
@@ -154,7 +156,6 @@ pub(crate) fn run_tool_turns<W: io::Write>(
     let permission_handler = step_context.permission_handler;
     let extensions = step_context.extensions;
     let mut cursor = ToolRequestCursor::new(tool_requests);
-    let mut permission_overlay = TurnPermissionOverlay::default();
     while let Some(tool_request) = cursor.current() {
         if let Some(result) = reject_disallowed_child_tool(
             tool_request,
@@ -249,7 +250,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
             task_registry,
             background_workflows,
             workflow_ipc,
-            permission_overlay: &mut permission_overlay,
+            permission_overlay: sampling_state.permission_overlay_mut(),
             permission_handler,
             extensions,
             child_executor,
@@ -724,6 +725,7 @@ mod tests {
         let cancel = CancelToken::new();
         let task_registry = TaskRegistry::new("tool-turns-disallowed".to_string());
         let mut background_workflows = Vec::new();
+        let mut sampling_state = RuntimeSamplingRequestState::new();
         let policy = policy_for_tool_execution(&config);
         let step_context = RuntimeStepContext::new(
             &config,
@@ -744,6 +746,7 @@ mod tests {
 
         let outcome = run_tool_turns(RuntimeToolTurnsContext {
             step_context,
+            sampling_state: &mut sampling_state,
             events: &mut events,
             sink: &mut sink,
             conversation: &mut conversation,
@@ -796,6 +799,7 @@ mod tests {
         let cancel = CancelToken::new();
         let task_registry = TaskRegistry::new("tool-turns-extension-lifecycle".to_string());
         let mut background_workflows = Vec::new();
+        let mut sampling_state = RuntimeSamplingRequestState::new();
         let policy = policy_for_tool_execution(&config);
         let mut extension_builder = ExtensionRegistryBuilder::new();
         install_goal_tool_lifecycle(&mut extension_builder);
@@ -825,6 +829,7 @@ mod tests {
 
         let outcome = run_tool_turns(RuntimeToolTurnsContext {
             step_context,
+            sampling_state: &mut sampling_state,
             events: &mut events,
             sink: &mut sink,
             conversation: &mut conversation,
