@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.155":
+        "RuntimeTurnReducer now owns completed-tool goal progress recording. TUI completed normal tools route through that reducer instead of writing goal progress directly, keeping the live thread extension guard in one runtime-owned state boundary.",
       "v0.1.154":
         "Goal terminal updates now consult live runtime thread extension state. TUI turns record completed normal tools into the same goal progress store, and update_goal refuses complete or blocked claims until the live thread has observed real non-goal tool progress.",
       "v0.1.153":
@@ -336,6 +338,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.155":
+        "RuntimeTurnReducer 现在拥有 completed-tool 的 goal progress recording。TUI 已完成的 normal tool 会先进入这个 reducer，而不是直接写 goal progress，从而把 live thread extension guard 收束到一个 runtime-owned state boundary。",
       "v0.1.154":
         "Goal terminal update 现在会读取 live runtime thread extension state。TUI turn 会把已完成的 normal tool 写入同一个 goal progress store；在 live thread 尚未观察到真实 non-goal tool progress 前，update_goal 会拒绝 complete 或 blocked 声明。",
       "v0.1.153":

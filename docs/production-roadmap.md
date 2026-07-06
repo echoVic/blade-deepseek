@@ -4,16 +4,15 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-07-06
-Current baseline: v0.1.154 makes terminal goal updates consume live runtime
-thread extension state before accepting `complete` or `blocked` claims. TUI
-turns now record completed normal tools into the same thread-scoped goal
-progress store, while `update_goal` refuses terminal status when the live
-thread has not observed any real non-goal tool progress. Earlier v0.1.153 moved
-thread-scoped extension data into `RuntimeThread`; v0.1.152 installed the
-Codex-inspired extension contributor kernel inside runtime turn state and
-threaded the registry plus stores through the live provider/tool path; v0.1.151
-taught `ToolExecutionActor` to notify extension contributors around normal tool
-execution.
+Current baseline: v0.1.155 introduces a runtime-owned `RuntimeTurnReducer` for
+completed-tool goal progress. TUI completed normal tools now route through the
+same reducer instead of writing goal progress directly, keeping the live thread
+extension guard behind the runtime state boundary. Earlier v0.1.154 made
+terminal goal updates consume live runtime thread extension state before
+accepting `complete` or `blocked` claims; v0.1.153 moved thread-scoped extension
+data into `RuntimeThread`; v0.1.152 installed the Codex-inspired extension
+contributor kernel inside runtime turn state and threaded the registry plus
+stores through the live provider/tool path.
 
 ---
 
