@@ -3,15 +3,15 @@
 > Goal: evolve Orca into a production-grade DeepSeek-native agent runtime.
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
-Last updated: 2026-07-06
-Current baseline: v0.1.156 routes runtime directive application through the
-runtime-owned `RuntimeTurnReducer`. Model switches, allowed-tool replacement,
-and injected runtime system messages keep the same behavior, while
-`RuntimeTurnState` no longer writes directive state directly. Earlier v0.1.155
-introduced the reducer for completed-tool goal progress; v0.1.154 made terminal
-goal updates consume live runtime thread extension state before accepting
-`complete` or `blocked` claims; v0.1.153 moved thread-scoped extension data into
-`RuntimeThread`.
+Last updated: 2026-07-07
+Current baseline: v0.1.157 routes permission overlay requests and merges through
+the runtime-owned `RuntimeTurnReducer`. `request_permissions`, bash automatic
+permission escalation, and router overlay transfer keep the same behavior while
+permission state mutation leaves direct call sites. Earlier v0.1.156 routed
+runtime directive application through the reducer; v0.1.155 introduced the
+reducer for completed-tool goal progress; v0.1.154 made terminal goal updates
+consume live runtime thread extension state before accepting `complete` or
+`blocked` claims.
 
 ---
 

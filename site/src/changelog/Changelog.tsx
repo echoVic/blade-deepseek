@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.157":
+        "Permission overlay requests and merges now reduce through RuntimeTurnReducer. request_permissions, bash auto-escalation, and router overlay transfer keep the same behavior while permission state mutation leaves the direct call sites.",
       "v0.1.156":
         "Runtime directives now reduce through RuntimeTurnReducer. Model switches, allowed-tool replacement, and injected runtime system messages keep the same behavior while RuntimeTurnState no longer writes directive state directly.",
       "v0.1.155":
@@ -340,6 +342,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.157":
+        "Permission overlay 的请求与合并现在通过 RuntimeTurnReducer 归约。request_permissions、bash 自动权限升级和 router overlay transfer 保持原有行为，同时 permission state mutation 不再散落在直接调用点。",
       "v0.1.156":
         "Runtime directive 现在通过 RuntimeTurnReducer 归约。模型切换、allowed-tool 替换与 runtime system message 注入保持原有行为，同时 RuntimeTurnState 不再直接写 directive state。",
       "v0.1.155":
