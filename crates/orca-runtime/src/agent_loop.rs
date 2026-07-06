@@ -2,6 +2,7 @@ use std::io;
 
 use crate::agent_child::{ChildAgentRequest, ChildAgentResult, ChildAgentRuntime};
 use crate::cost::CostTracker;
+use crate::extension::{RuntimeExtensionContext, RuntimeExtensionStores};
 use crate::lifecycle::{
     AgentLoopContext, AgentLoopResult, RuntimeSessionLifecycle, RuntimeTaskActor,
     RuntimeTurnConfig, RuntimeTurnDeps, RuntimeTurnExecution, RuntimeTurnState,
@@ -67,6 +68,10 @@ pub(crate) fn run_agent_loop(
         lifecycle,
     } = turn_execution.expect("agent loop turn execution");
     let tool_policy = tool_policy_for_directive_state(tool_policy, directive_state);
+    let extensions = RuntimeExtensionContext::new(
+        extension_registry,
+        RuntimeExtensionStores::new(thread_extensions, turn_extensions),
+    );
     let max_turns = DEFAULT_MAX_TURNS;
     let setup = RuntimeTurnSetupStep::new().prepare(
         config,
@@ -125,9 +130,7 @@ pub(crate) fn run_agent_loop(
             memory,
             mcp_registry,
             task_registry,
-            extension_registry,
-            thread_extensions,
-            turn_extensions,
+            extensions,
             background_workflows,
             workflow_ipc,
             permission_handler,

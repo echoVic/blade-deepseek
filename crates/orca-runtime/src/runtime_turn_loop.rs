@@ -13,7 +13,7 @@ use orca_provider::{ProviderConfig, context};
 
 use crate::agent_child::ChildAgentExecutor;
 use crate::cost::CostTracker;
-use crate::extension::{ExtensionData, ExtensionRegistry};
+use crate::extension::RuntimeExtensionContext;
 use crate::hooks::HookRunner;
 use crate::instructions::ProjectInstructions;
 use crate::lifecycle::{
@@ -62,9 +62,7 @@ pub(crate) struct RuntimeTurnLoopInput<'a, 'runtime, W: io::Write> {
     pub(crate) memory: &'a MemoryBlock,
     pub(crate) mcp_registry: &'a McpRegistry,
     pub(crate) task_registry: &'a TaskRegistry,
-    pub(crate) extension_registry: &'a ExtensionRegistry,
-    pub(crate) thread_extensions: &'a ExtensionData,
-    pub(crate) turn_extensions: &'a ExtensionData,
+    pub(crate) extensions: RuntimeExtensionContext<'a>,
     pub(crate) background_workflows: &'a mut Vec<BackgroundWorkflowRun>,
     pub(crate) workflow_ipc: Option<&'a WorkflowIpcContext>,
     pub(crate) permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
@@ -106,9 +104,7 @@ impl<'a, 'runtime, W: io::Write> RuntimeTurnLoopInput<'a, 'runtime, W> {
         memory: &'a MemoryBlock,
         mcp_registry: &'a McpRegistry,
         task_registry: &'a TaskRegistry,
-        extension_registry: &'a ExtensionRegistry,
-        thread_extensions: &'a ExtensionData,
-        turn_extensions: &'a ExtensionData,
+        extensions: RuntimeExtensionContext<'a>,
         background_workflows: &'a mut Vec<BackgroundWorkflowRun>,
         workflow_ipc: Option<&'a WorkflowIpcContext>,
         permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
@@ -141,9 +137,7 @@ impl<'a, 'runtime, W: io::Write> RuntimeTurnLoopInput<'a, 'runtime, W> {
             memory,
             mcp_registry,
             task_registry,
-            extension_registry,
-            thread_extensions,
-            turn_extensions,
+            extensions,
             background_workflows,
             workflow_ipc,
             permission_handler,
@@ -181,9 +175,7 @@ impl<'a, 'runtime, W: io::Write> RuntimeTurnLoopInput<'a, 'runtime, W> {
             memory: self.memory,
             mcp_registry: self.mcp_registry,
             task_registry: self.task_registry,
-            extension_registry: self.extension_registry,
-            thread_extensions: self.thread_extensions,
-            turn_extensions: self.turn_extensions,
+            extensions: self.extensions,
             background_workflows: &mut *self.background_workflows,
             workflow_ipc: self.workflow_ipc,
             permission_handler: self.permission_handler,

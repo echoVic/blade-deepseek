@@ -446,6 +446,47 @@ mod tests {
     }
 
     #[test]
+    fn turn_loop_iteration_and_provider_contexts_group_runtime_extensions() {
+        let runtime_turn_loop_source = include_str!("runtime_turn_loop.rs");
+        let runtime_turn_iteration_source = include_str!("runtime_turn_iteration.rs");
+        let provider_turn_source = include_str!("provider_turn.rs");
+
+        for (module_name, source) in [
+            ("runtime_turn_loop", runtime_turn_loop_source),
+            ("runtime_turn_iteration", runtime_turn_iteration_source),
+            ("provider_turn", provider_turn_source),
+        ] {
+            assert!(
+                source.contains("extensions: RuntimeExtensionContext"),
+                "{module_name} must carry runtime extensions as one grouped context"
+            );
+            assert!(
+                !source.contains("thread_extensions: &'a ExtensionData"),
+                "{module_name} must not expose thread extension refs as a parallel input field"
+            );
+            assert!(
+                !source.contains("turn_extensions: &'a ExtensionData"),
+                "{module_name} must not expose turn extension refs as a parallel input field"
+            );
+        }
+
+        assert!(
+            !runtime_turn_loop_source.contains("extension_registry: self.extension_registry"),
+            "runtime_turn_loop must pass grouped runtime extensions into each iteration"
+        );
+        assert!(
+            !runtime_turn_iteration_source.contains("extension_registry: input.extension_registry"),
+            "runtime_turn_iteration must pass grouped runtime extensions into provider turns"
+        );
+        assert!(
+            !provider_turn_source.contains(
+                "RuntimeExtensionStores::new(input.thread_extensions, input.turn_extensions)"
+            ),
+            "provider_turn must not reconstruct grouped stores from parallel refs"
+        );
+    }
+
+    #[test]
     fn runtime_turn_state_directives_route_through_runtime_reducer() {
         let lifecycle_source = include_str!("lifecycle.rs");
         let runtime_state_source = include_str!("runtime_state.rs");
