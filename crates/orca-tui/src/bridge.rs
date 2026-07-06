@@ -85,6 +85,16 @@ impl TuiConversationSession {
         self.runtime.session().session_id()
     }
 
+    pub(crate) fn thread_extensions(&self) -> &orca_runtime::extension::ExtensionData {
+        self.runtime.thread_extensions()
+    }
+
+    pub(crate) fn thread_extensions_handle(
+        &self,
+    ) -> std::sync::Arc<orca_runtime::extension::ExtensionData> {
+        self.runtime.thread_extensions_handle()
+    }
+
     pub fn usage_totals(&self) -> UsageTotals {
         self.runtime.session().usage_totals()
     }

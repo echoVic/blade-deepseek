@@ -124,6 +124,7 @@ pub(crate) fn execute_tool_for_tui(
     action_rx: &Receiver<UserAction>,
     subagent_depth: u32,
     session_id: Option<&str>,
+    thread_extensions: Option<Arc<orca_runtime::extension::ExtensionData>>,
     policy: &ApprovalPolicy,
     instructions: &ProjectInstructions,
     memory: &MemoryBlock,
@@ -363,6 +364,7 @@ pub(crate) fn execute_tool_for_tui(
                     None,
                 );
             };
+            let goal_thread_extensions = thread_extensions.clone();
             let handler = Arc::new(
                 move |operation: orca_tools::update_goal::GoalToolOperation| {
                     let mut store = orca_runtime::goals::GoalStore::load_default();
@@ -386,9 +388,21 @@ pub(crate) fn execute_tool_for_tui(
                                 .map(Some)
                                 .map_err(|error| error.to_string()),
                         },
-                        orca_tools::update_goal::GoalToolOperation::Update(update) => store
-                            .update(&session_id, update)
-                            .map_err(|error| error.to_string()),
+                        orca_tools::update_goal::GoalToolOperation::Update(update) => {
+                            let Some(thread_extensions) = goal_thread_extensions.as_deref() else {
+                                return Err(
+                                    "terminal update_goal status requires live runtime thread state"
+                                        .to_string(),
+                                );
+                            };
+                            orca_runtime::goals::validate_goal_terminal_update_against_extensions(
+                                &update,
+                                thread_extensions,
+                            )?;
+                            store
+                                .update(&session_id, update)
+                                .map_err(|error| error.to_string())
+                        }
                     }
                 },
             );
@@ -1193,6 +1207,7 @@ mod tests {
             &harness.action_rx,
             0,
             None,
+            None,
             &policy,
             &ProjectInstructions::default(),
             &MemoryBlock::default(),
@@ -1246,6 +1261,7 @@ mod tests {
             &harness.action_rx,
             0,
             None,
+            None,
             &policy,
             &ProjectInstructions::default(),
             &MemoryBlock::default(),
@@ -1294,6 +1310,7 @@ mod tests {
             &harness.action_rx,
             0,
             None,
+            None,
             &policy,
             &ProjectInstructions::default(),
             &MemoryBlock::default(),
@@ -1330,6 +1347,7 @@ mod tests {
             &harness.event_tx,
             &harness.action_rx,
             0,
+            None,
             None,
             &policy,
             &ProjectInstructions::default(),

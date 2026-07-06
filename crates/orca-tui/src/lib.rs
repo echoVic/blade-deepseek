@@ -114,6 +114,32 @@ mod tests {
     }
 
     #[test]
+    fn tui_goal_updates_use_runtime_thread_extension_guard() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let bridge = std::fs::read_to_string(format!("{manifest_dir}/src/bridge.rs"))
+            .expect("bridge source should be readable");
+        assert!(
+            bridge.contains("thread_extensions"),
+            "TUI session should expose RuntimeThread thread extension state"
+        );
+
+        let execution =
+            std::fs::read_to_string(format!("{manifest_dir}/src/agent_tool_execution.rs"))
+                .expect("TUI agent tool execution source should be readable");
+        assert!(
+            execution.contains("validate_goal_terminal_update_against_extensions"),
+            "TUI goal update handler must guard terminal updates with live runtime extension state"
+        );
+
+        let runner = std::fs::read_to_string(format!("{manifest_dir}/src/agent_runner.rs"))
+            .expect("TUI agent runner source should be readable");
+        assert!(
+            runner.contains("record_tui_goal_tool_finish"),
+            "TUI agent runner must record completed tools into live runtime thread extension state"
+        );
+    }
+
+    #[test]
     fn tui_agent_workflow_execution_is_owned_by_dedicated_module() {
         let manifest_dir = env!("CARGO_MANIFEST_DIR");
         let workflow =

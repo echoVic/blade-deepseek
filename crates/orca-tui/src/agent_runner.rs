@@ -396,6 +396,9 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
 
         let (turn, task) = session.next_turn_lifecycle();
         let _ = event_tx.send(TuiEvent::TurnStarted { turn, task });
+        let turn_extension_id = session
+            .session_id()
+            .map(|session_id| format!("{session_id}:turn-{turn}"));
 
         let route_decision = config.model.route(ModelRouteContext {
             subagent_type: &SubagentType::General,
@@ -653,6 +656,9 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
                     Some(session.task_registry()),
                 );
                 for (should_stop, result, child_cost) in results {
+                    if let Some(turn_extension_id) = turn_extension_id.as_deref() {
+                        record_tui_goal_tool_finish(session, turn_extension_id, &result);
+                    }
                     session.cost_tracker_mut().merge(&child_cost);
                     let result_content = agent_common::format_tool_result_for_model(&result);
                     session
@@ -693,6 +699,9 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
                     config.tools.output_truncation,
                 );
                 for result in results {
+                    if let Some(turn_extension_id) = turn_extension_id.as_deref() {
+                        record_tui_goal_tool_finish(session, turn_extension_id, &result);
+                    }
                     let result_content = agent_common::format_tool_result_for_model(&result);
                     session
                         .conversation_mut()
@@ -714,6 +723,7 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
                 action_rx,
                 0,
                 session.session_id(),
+                Some(session.thread_extensions_handle()),
                 &policy,
                 session.instructions(),
                 session.memory(),
@@ -726,6 +736,10 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
 
             if let Some(c) = child_cost {
                 session.cost_tracker_mut().merge(&c);
+            }
+
+            if let Some(turn_extension_id) = turn_extension_id.as_deref() {
+                record_tui_goal_tool_finish(session, turn_extension_id, &result);
             }
 
             if tool_request.name == tool_types::ToolName::UpdatePlan
@@ -779,6 +793,25 @@ fn take_pending_workflow_notification(
     pending_workflow_notifications: Option<&PendingWorkflowNotifications>,
 ) -> Option<String> {
     pending_workflow_notifications.and_then(|queue| queue.lock().ok()?.pop_front())
+}
+
+fn record_tui_goal_tool_finish(
+    session: &TuiConversationSession,
+    turn_extension_id: &str,
+    result: &tool_types::ToolResult,
+) {
+    if result.status != tool_types::ToolStatus::Completed {
+        return;
+    }
+
+    let turn_store = orca_runtime::extension::ExtensionData::new(turn_extension_id);
+    orca_runtime::goals::record_goal_tool_finish(
+        session.thread_extensions(),
+        &turn_store,
+        result.name.as_str(),
+        &result.id,
+        orca_runtime::extension::ToolCallOutcome::Completed,
+    );
 }
 
 #[cfg(test)]
@@ -1402,6 +1435,7 @@ mod tests {
             &action_rx,
             0,
             Some("approval-session"),
+            None,
             &ApprovalPolicy::new(config.approval_mode),
             &ProjectInstructions::default(),
             &MemoryBlock::default(),
@@ -1456,6 +1490,7 @@ mod tests {
             &action_rx,
             0,
             Some("approval-session"),
+            None,
             &ApprovalPolicy::new(config.approval_mode),
             &ProjectInstructions::default(),
             &MemoryBlock::default(),

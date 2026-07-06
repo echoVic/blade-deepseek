@@ -619,6 +619,7 @@ fn run_child_agent_for_tui_observed(
                     action_rx,
                     request.depth,
                     None,
+                    None,
                     tool_context.policy,
                     instructions,
                     memory,

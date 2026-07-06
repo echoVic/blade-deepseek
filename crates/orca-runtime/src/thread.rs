@@ -83,7 +83,7 @@ impl RuntimeThread {
         self.thread_extensions.as_ref()
     }
 
-    pub(crate) fn thread_extensions_handle(&self) -> Arc<ExtensionData> {
+    pub fn thread_extensions_handle(&self) -> Arc<ExtensionData> {
         Arc::clone(&self.thread_extensions)
     }
 
