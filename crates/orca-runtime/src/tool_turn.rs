@@ -12,7 +12,7 @@ use orca_mcp::McpRegistry;
 
 use crate::agent_child::ChildAgentExecutor;
 use crate::cost::CostTracker;
-use crate::extension::{ExtensionData, ExtensionRegistry};
+use crate::extension::{ExtensionData, ExtensionRegistry, RuntimeExtensionStores};
 use crate::hooks::HookRunner;
 use crate::instructions::ProjectInstructions;
 use crate::lifecycle::{RuntimePermissionRequestHandler, TurnPermissionOverlay};
@@ -351,7 +351,10 @@ pub(crate) fn run_normal_tool_turn<W: io::Write>(
     if let (Some(registry), Some(thread_store), Some(turn_store)) =
         (extension_registry, thread_extensions, turn_extensions)
     {
-        execution_context = execution_context.with_extensions(registry, thread_store, turn_store);
+        execution_context = execution_context.with_extensions(
+            registry,
+            RuntimeExtensionStores::new(thread_store, turn_store),
+        );
     }
     let (status, result) = execute_tool_with_approval(
         config,

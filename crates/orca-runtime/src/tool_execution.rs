@@ -14,8 +14,7 @@ use crate::agent_child::ChildAgentExecutor;
 use crate::agent_common;
 use crate::cost::CostTracker;
 use crate::extension::{
-    ExtensionData, ExtensionRegistry, RuntimeExtensionStores, ToolCallOutcome, ToolFinishInput,
-    ToolStartInput,
+    ExtensionRegistry, RuntimeExtensionStores, ToolCallOutcome, ToolFinishInput, ToolStartInput,
 };
 use crate::hooks::{HookOutcome, HookRunner};
 use crate::instructions::ProjectInstructions;
@@ -53,8 +52,7 @@ pub(crate) struct ToolExecutionContext<'a> {
     permission_overlay: Option<&'a mut TurnPermissionOverlay>,
     permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
     extension_registry: Option<&'a ExtensionRegistry>,
-    thread_extensions: Option<&'a ExtensionData>,
-    turn_extensions: Option<&'a ExtensionData>,
+    extension_stores: Option<RuntimeExtensionStores<'a>>,
 }
 
 pub(crate) struct ToolApprovalGateContext<'a, W: io::Write> {
@@ -100,8 +98,7 @@ impl<'a> ToolExecutionContext<'a> {
             permission_overlay: None,
             permission_handler: None,
             extension_registry: None,
-            thread_extensions: None,
-            turn_extensions: None,
+            extension_stores: None,
         }
     }
 
@@ -138,12 +135,10 @@ impl<'a> ToolExecutionContext<'a> {
     pub(crate) fn with_extensions(
         mut self,
         extension_registry: &'a ExtensionRegistry,
-        thread_extensions: &'a ExtensionData,
-        turn_extensions: &'a ExtensionData,
+        extension_stores: RuntimeExtensionStores<'a>,
     ) -> Self {
         self.extension_registry = Some(extension_registry);
-        self.thread_extensions = Some(thread_extensions);
-        self.turn_extensions = Some(turn_extensions);
+        self.extension_stores = Some(extension_stores);
         self
     }
 
@@ -327,8 +322,7 @@ impl ToolExecutionActor {
             permission_overlay,
             permission_handler,
             extension_registry,
-            thread_extensions,
-            turn_extensions,
+            extension_stores,
         } = context;
         let instructions = instructions.expect("tool execution instructions");
         let memory = memory.expect("tool execution memory");
@@ -386,22 +380,14 @@ impl ToolExecutionActor {
             Err(outcome) => return Ok(outcome),
         };
         let execution_request = &invocation.effective;
-        if let (Some(registry), Some(thread_store), Some(turn_store)) =
-            (extension_registry, thread_extensions, turn_extensions)
-        {
+        if let (Some(registry), Some(extension_stores)) = (extension_registry, extension_stores) {
             registry.on_tool_start(ToolStartInput {
-                thread_store,
-                turn_store,
+                thread_store: extension_stores.thread_store(),
+                turn_store: extension_stores.turn_store(),
                 tool_name: execution_request.name.as_str(),
                 call_id: &execution_request.id,
             });
         }
-        let extension_stores = match (thread_extensions, turn_extensions) {
-            (Some(thread_store), Some(turn_store)) => {
-                Some(RuntimeExtensionStores::new(thread_store, turn_store))
-            }
-            _ => None,
-        };
         let result =
             match RuntimeToolRouter::new(&mut self.runtime).dispatch(RuntimeToolInvocationContext {
                 config,
@@ -428,12 +414,12 @@ impl ToolExecutionActor {
             }) {
                 Ok(result) => result,
                 Err(error) => {
-                    if let (Some(registry), Some(thread_store), Some(turn_store)) =
-                        (extension_registry, thread_extensions, turn_extensions)
+                    if let (Some(registry), Some(extension_stores)) =
+                        (extension_registry, extension_stores)
                     {
                         registry.on_tool_finish(ToolFinishInput {
-                            thread_store,
-                            turn_store,
+                            thread_store: extension_stores.thread_store(),
+                            turn_store: extension_stores.turn_store(),
                             tool_name: execution_request.name.as_str(),
                             call_id: &execution_request.id,
                             outcome: ToolCallOutcome::Aborted,
@@ -442,12 +428,10 @@ impl ToolExecutionActor {
                     return Err(error);
                 }
             };
-        if let (Some(registry), Some(thread_store), Some(turn_store)) =
-            (extension_registry, thread_extensions, turn_extensions)
-        {
+        if let (Some(registry), Some(extension_stores)) = (extension_registry, extension_stores) {
             registry.on_tool_finish(ToolFinishInput {
-                thread_store,
-                turn_store,
+                thread_store: extension_stores.thread_store(),
+                turn_store: extension_stores.turn_store(),
                 tool_name: execution_request.name.as_str(),
                 call_id: &execution_request.id,
                 outcome: tool_call_outcome_for_result(&result),
@@ -673,8 +657,8 @@ mod tests {
     use crate::agent_child::{ChildAgentRequest, ChildAgentResult, ChildAgentRuntime};
     use crate::cost::CostTracker;
     use crate::extension::{
-        ExtensionData, ExtensionRegistryBuilder, ToolFinishInput, ToolLifecycleContributor,
-        ToolStartInput,
+        ExtensionData, ExtensionRegistryBuilder, RuntimeExtensionStores, ToolFinishInput,
+        ToolLifecycleContributor, ToolStartInput,
     };
     use crate::hooks::HookRunner;
     use crate::instructions::ProjectInstructions;
@@ -817,7 +801,10 @@ mod tests {
                 None,
             )
             .with_permission_overlay(&mut permission_overlay)
-            .with_extensions(&extension_registry, &thread_store, &turn_store);
+            .with_extensions(
+                &extension_registry,
+                RuntimeExtensionStores::new(&thread_store, &turn_store),
+            );
 
         let mut actor = ToolExecutionActor::new(events.run_id().to_string(), 128);
         let (status, result) = actor

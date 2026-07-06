@@ -372,6 +372,40 @@ mod tests {
     }
 
     #[test]
+    fn tool_execution_context_groups_extension_store_refs() {
+        let tool_execution_source = include_str!("tool_execution.rs");
+
+        assert!(
+            tool_execution_source.contains("extension_stores: Option<RuntimeExtensionStores"),
+            "ToolExecutionContext must carry grouped runtime extension stores"
+        );
+        assert!(
+            tool_execution_source.contains("with_extensions(\n        mut self,\n        extension_registry: &'a ExtensionRegistry,\n        extension_stores: RuntimeExtensionStores<'a>,"),
+            "ToolExecutionContext::with_extensions must accept grouped stores"
+        );
+        assert!(
+            !tool_execution_source.contains("thread_extensions: Option<&'a ExtensionData>"),
+            "ToolExecutionContext must not expose thread extension refs as a parallel field"
+        );
+        assert!(
+            !tool_execution_source.contains("turn_extensions: Option<&'a ExtensionData>"),
+            "ToolExecutionContext must not expose turn extension refs as a parallel field"
+        );
+        assert!(
+            !tool_execution_source.contains("match (thread_extensions, turn_extensions)"),
+            "ToolExecutionActor must not reconstruct grouped stores from parallel refs"
+        );
+        assert!(
+            tool_execution_source.contains("extension_stores.thread_store()"),
+            "tool lifecycle notifications must read the thread store from grouped stores"
+        );
+        assert!(
+            tool_execution_source.contains("extension_stores.turn_store()"),
+            "tool lifecycle notifications must read the turn store from grouped stores"
+        );
+    }
+
+    #[test]
     fn runtime_turn_state_directives_route_through_runtime_reducer() {
         let lifecycle_source = include_str!("lifecycle.rs");
         let runtime_state_source = include_str!("runtime_state.rs");
