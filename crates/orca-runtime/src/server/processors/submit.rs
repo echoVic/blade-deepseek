@@ -25,11 +25,7 @@ pub(in crate::server::router) fn dispatch_submit_operation<W: Write + Send + 'st
     match &op {
         ClientOp::Submit { thread_id, .. } => {
             if let Some(thread_id) = thread_id {
-                if !state.threads.has_thread(thread_id)
-                    && !state
-                        .active_turns
-                        .values()
-                        .any(|turn| turn.thread_id == *thread_id)
+                if !state.threads.has_thread(thread_id) && !state.active_turns.has_thread(thread_id)
                 {
                     protocol::write_server_event(
                         &mut *writer.lock().map_err(lock_error)?,

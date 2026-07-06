@@ -3,32 +3,47 @@ use std::io;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use orca_approval::ApprovalPolicy;
 use orca_core::cancel::CancelToken;
 use orca_core::config::RunConfig;
+<<<<<<< HEAD
 use orca_core::conversation::Conversation;
 use orca_core::cost_types::UsageTotals;
+=======
+>>>>>>> origin/main
 use orca_core::event_schema::{EventFactory, RunStatus};
 use orca_core::event_sink::EventSink;
-use orca_core::model::ModelRouteContext;
-use orca_core::provider_types::{ProviderResponse, ProviderStep};
 use orca_core::subagent_types::SubagentType;
+<<<<<<< HEAD
 use orca_core::tool_types::{ToolRequest, ToolResult, ToolStatus};
+=======
+use orca_core::tool_types::ToolRequest;
+>>>>>>> origin/main
 use orca_mcp::McpRegistry;
-use orca_provider::ProviderConfig;
-use orca_provider::context::ContextConfig;
-use orca_provider::tool_schema::deepseek_tools_schema_for_type_with_mcp_and_external;
 
-use crate::agent_common;
-use crate::compaction::RuntimeCompactionStep;
 use crate::cost::CostTracker;
-use crate::hooks::{HookContext, HookRunner, conversation_with_hook_context};
+use crate::hooks::HookRunner;
 use crate::instructions::ProjectInstructions;
 use crate::lifecycle::RuntimeSessionLifecycle;
 use crate::memory::MemoryBlock;
 use crate::workflow::ipc::WorkflowIpcContext;
 
-pub const DEFAULT_CHILD_AGENT_MAX_TURNS: u32 = 128;
+pub use crate::child_agent_loop_runner::{
+    run_child_agent_loop_with_tool_executor, run_child_agent_with_tool_executor,
+};
+pub use crate::child_agent_loop_setup::{
+    ChildAgentLoopSetup, ChildAgentTurnBudget, DEFAULT_CHILD_AGENT_MAX_TURNS,
+    advance_child_agent_turn, advance_child_agent_turn_with_limit, prepare_child_agent_loop,
+};
+pub use crate::child_agent_provider_turn::{
+    ChildAgentProviderErrorDecision, ChildAgentProviderTurn,
+    compact_child_agent_conversation_if_needed, handle_child_agent_provider_error,
+    route_child_agent_model, run_child_agent_provider_turn,
+};
+pub use crate::child_agent_response_folding::{
+    ChildAgentProviderResponseFold, ChildAgentToolContext, ChildAgentToolExecution,
+    ChildAgentToolResultFold, child_agent_tool_requests, fold_child_agent_provider_response,
+    fold_child_agent_tool_result,
+};
 
 #[derive(Clone, Debug)]
 pub struct ChildAgentRequest {
@@ -70,6 +85,7 @@ pub struct ChildAgentResult {
     pub error: Option<String>,
 }
 
+<<<<<<< HEAD
 #[derive(Debug)]
 pub enum ChildAgentProviderErrorDecision {
     RetryAfterCompaction,
@@ -171,6 +187,8 @@ pub struct ChildAgentLoopSetup {
     reactive_compacted: bool,
 }
 
+=======
+>>>>>>> origin/main
 pub(crate) type ChildAgentExecutor<W> = fn(
     &RunConfig,
     &ChildAgentRequest,
@@ -266,6 +284,7 @@ where
     (result, child_cost_tracker)
 }
 
+<<<<<<< HEAD
 pub fn prepare_child_agent_loop(
     config: &RunConfig,
     request: &ChildAgentRequest,
@@ -725,6 +744,8 @@ where
     })
 }
 
+=======
+>>>>>>> origin/main
 pub fn run_child_agent_prompt_with_tool_executor<F>(
     config: &RunConfig,
     prompt: String,
@@ -764,6 +785,7 @@ where
     )
 }
 
+<<<<<<< HEAD
 pub fn run_child_agent_prompt_with_tool_executor_observed<F>(
     config: &RunConfig,
     prompt: String,
@@ -833,6 +855,8 @@ pub fn fold_child_agent_tool_result(
     ChildAgentToolResultFold::Continue
 }
 
+=======
+>>>>>>> origin/main
 #[cfg(test)]
 mod tests {
     use super::*;

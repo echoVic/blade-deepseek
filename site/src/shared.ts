@@ -4,9 +4,174 @@ export const localeStorageKey = "orca-site-locale";
 export const canonicalOrigin = "https://orcaagent.dev";
 export const socialImageUrl = `${canonicalOrigin}/orca-social.png`;
 
-export const releaseVersion = "v0.1.108";
+export const releaseVersion = "v0.1.141";
 
 export const releases = [
+  {
+    version: "v0.1.141",
+    date: "2026-07-06",
+    url: "https://github.com/echoVic/blade-deepseek/releases/tag/v0.1.141",
+  },
+  {
+    version: "v0.1.140",
+    date: "2026-07-06",
+    url: "https://github.com/echoVic/blade-deepseek/releases/tag/v0.1.140",
+  },
+  {
+    version: "v0.1.139",
+    date: "2026-07-06",
+    url: "https://github.com/echoVic/blade-deepseek/releases/tag/v0.1.139",
+  },
+  {
+    version: "v0.1.138",
+    date: "2026-07-06",
+    url: "https://github.com/echoVic/blade-deepseek/releases/tag/v0.1.138",
+  },
+  {
+    version: "v0.1.137",
+    date: "2026-07-06",
+    url: "https://github.com/echoVic/blade-deepseek/releases/tag/v0.1.137",
+  },
+  {
+    version: "v0.1.136",
+    date: "2026-07-06",
+    url: "https://github.com/echoVic/blade-deepseek/releases/tag/v0.1.136",
+  },
+  {
+    version: "v0.1.135",
+    date: "2026-07-06",
+    url: "https://github.com/echoVic/blade-deepseek/releases/tag/v0.1.135",
+  },
+  {
+    version: "v0.1.134",
+    date: "2026-07-06",
+    url: "https://github.com/echoVic/blade-deepseek/releases/tag/v0.1.134",
+  },
+  {
+    version: "v0.1.133",
+    date: "2026-07-06",
+    url: "https://github.com/echoVic/blade-deepseek/releases/tag/v0.1.133",
+  },
+  {
+    version: "v0.1.132",
+    date: "2026-07-06",
+    url: "https://github.com/echoVic/blade-deepseek/releases/tag/v0.1.132",
+  },
+  {
+    version: "v0.1.131",
+    date: "2026-07-05",
+    url: "https://github.com/echoVic/blade-deepseek/releases/tag/v0.1.131",
+  },
+  {
+    version: "v0.1.130",
+    date: "2026-07-05",
+    url: "https://github.com/echoVic/blade-deepseek/releases/tag/v0.1.130",
+  },
+  {
+    version: "v0.1.129",
+    date: "2026-07-05",
+    url: "https://github.com/echoVic/blade-deepseek/releases/tag/v0.1.129",
+  },
+  {
+    version: "v0.1.128",
+    date: "2026-07-05",
+    url: "https://github.com/echoVic/blade-deepseek/releases/tag/v0.1.128",
+  },
+  {
+    version: "v0.1.127",
+    date: "2026-07-05",
+    url: "https://github.com/echoVic/blade-deepseek/releases/tag/v0.1.127",
+  },
+  {
+    version: "v0.1.126",
+    date: "2026-07-05",
+    url: "https://github.com/echoVic/blade-deepseek/releases/tag/v0.1.126",
+  },
+  {
+    version: "v0.1.125",
+    date: "2026-07-05",
+    url: "https://github.com/echoVic/blade-deepseek/releases/tag/v0.1.125",
+  },
+  {
+    version: "v0.1.124",
+    date: "2026-07-05",
+    url: "https://github.com/echoVic/blade-deepseek/releases/tag/v0.1.124",
+  },
+  {
+    version: "v0.1.123",
+    date: "2026-07-05",
+    url: "https://github.com/echoVic/blade-deepseek/releases/tag/v0.1.123",
+  },
+  {
+    version: "v0.1.122",
+    date: "2026-07-04",
+    url: "https://github.com/echoVic/blade-deepseek/releases/tag/v0.1.122",
+  },
+  {
+    version: "v0.1.121",
+    date: "2026-07-04",
+    url: "https://github.com/echoVic/blade-deepseek/releases/tag/v0.1.121",
+  },
+  {
+    version: "v0.1.120",
+    date: "2026-07-04",
+    url: "https://github.com/echoVic/blade-deepseek/releases/tag/v0.1.120",
+  },
+  {
+    version: "v0.1.119",
+    date: "2026-07-04",
+    url: "https://github.com/echoVic/blade-deepseek/releases/tag/v0.1.119",
+  },
+  {
+    version: "v0.1.118",
+    date: "2026-07-04",
+    url: "https://github.com/echoVic/blade-deepseek/releases/tag/v0.1.118",
+  },
+  {
+    version: "v0.1.117",
+    date: "2026-07-04",
+    url: "https://github.com/echoVic/blade-deepseek/releases/tag/v0.1.117",
+  },
+  {
+    version: "v0.1.116",
+    date: "2026-07-04",
+    url: "https://github.com/echoVic/blade-deepseek/releases/tag/v0.1.116",
+  },
+  {
+    version: "v0.1.115",
+    date: "2026-07-04",
+    url: "https://github.com/echoVic/blade-deepseek/releases/tag/v0.1.115",
+  },
+  {
+    version: "v0.1.114",
+    date: "2026-07-04",
+    url: "https://github.com/echoVic/blade-deepseek/releases/tag/v0.1.114",
+  },
+  {
+    version: "v0.1.113",
+    date: "2026-07-03",
+    url: "https://github.com/echoVic/blade-deepseek/releases/tag/v0.1.113",
+  },
+  {
+    version: "v0.1.112",
+    date: "2026-07-03",
+    url: "https://github.com/echoVic/blade-deepseek/releases/tag/v0.1.112",
+  },
+  {
+    version: "v0.1.111",
+    date: "2026-07-03",
+    url: "https://github.com/echoVic/blade-deepseek/releases/tag/v0.1.111",
+  },
+  {
+    version: "v0.1.110",
+    date: "2026-07-03",
+    url: "https://github.com/echoVic/blade-deepseek/releases/tag/v0.1.110",
+  },
+  {
+    version: "v0.1.109",
+    date: "2026-07-03",
+    url: "https://github.com/echoVic/blade-deepseek/releases/tag/v0.1.109",
+  },
   {
     version: "v0.1.108",
     date: "2026-07-03",

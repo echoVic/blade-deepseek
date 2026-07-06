@@ -17,304 +17,40 @@ use orca_core::{
     conversation::Conversation,
 };
 use orca_mcp::McpRegistry;
-use orca_provider::{ProviderConfig, context};
-use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use orca_provider::ProviderConfig;
+use serde_json::Value;
 
-use crate::compaction::RuntimeCompactionStep;
 use crate::cost::CostTracker;
 use crate::hooks::{HookContext, HookOutcome, HookRunner};
+use crate::instructions::ProjectInstructions;
 use crate::memory::MemoryBlock;
-use crate::protocol::{PermissionGrantScope, PermissionResponseDecision, RequestPermissionProfile};
-use crate::provider_turn::{
-    RuntimeProviderCycleInput, RuntimeTurnProviderCycleResult, RuntimeTurnProviderCycleStep,
-};
-use crate::runtime_normal_tool::{RuntimeNormalToolExecutionContext, execute_runtime_normal_tool};
-use crate::session::{
-    AgentConversationContext, bootstrap_agent_conversation_for_loop,
-    record_initial_history_for_agent,
+use crate::runtime_normal_tool::{
+    RuntimeNormalToolInvocation, execute_runtime_normal_tool_invocation,
 };
 use crate::tasks::TaskRegistry;
-use crate::thread_store::SessionWriter;
-use crate::tool_execution::policy_for_tool_execution;
-use crate::tool_invocation::{AgentToolPolicyContext, provider_config_for_agent_loop};
 use crate::workflow::ipc::WorkflowIpcContext;
-use crate::workflow::runner::SharedEventBuffer;
 use crate::workflow_execution::BackgroundWorkflowRun;
-use crate::{agent_child::ChildAgentExecutor, instructions::ProjectInstructions};
-use orca_core::event_sink::EventSink;
 
+pub use crate::runtime_approval::{
+    RuntimeApprovalDecision, RuntimeApprovalHandler, RuntimeConfigApprovalHandler,
+};
+pub use crate::runtime_lifecycle::{
+    RuntimeAdvancedTurn, RuntimeSessionLifecycle, RuntimeStartedTurn, RuntimeTaskKind,
+    RuntimeTaskLifecycle, RuntimeTaskStatus, RuntimeTurnLifecycle, RuntimeTurnRunner,
+};
+pub(crate) use crate::runtime_permission::AllowRequestedPermissions;
+pub use crate::runtime_permission::{
+    RuntimePermissionRequest, RuntimePermissionRequestHandler, RuntimePermissionResponse,
+    TurnPermissionOverlay,
+};
 pub use crate::runtime_special::{RuntimeSpecialToolDispatch, RuntimeWorkflowDraftRequest};
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RuntimeSessionLifecycle {
-    run_id: String,
-    active_task: Option<RuntimeTaskLifecycle>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RuntimeTaskLifecycle {
-    id: String,
-    kind: RuntimeTaskKind,
-    status: RuntimeTaskStatus,
-    current_turn: u32,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RuntimeTaskKind {
-    Agent,
-    Workflow,
-    Subagent,
-    Shell,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RuntimeTaskStatus {
-    Running,
-    Succeeded,
-    Failed,
-    Cancelled,
-    ApprovalRequired,
-    BudgetExhausted,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct RuntimeTurnLifecycle {
-    number: u32,
-}
-
-pub struct RuntimeTurnRunner<'a> {
-    lifecycle: &'a mut RuntimeSessionLifecycle,
-}
+pub use crate::runtime_tool_actor::RuntimeToolActorContext;
+pub use crate::runtime_user_input::{RuntimeUserInputHandler, RuntimeUserInputRequest};
 
 pub struct RuntimeTaskActor<'a> {
     lifecycle: &'a mut RuntimeSessionLifecycle,
     max_turns: u32,
     turns_started: u32,
-}
-
-pub struct RuntimeToolActorContext {
-    lifecycle: RuntimeSessionLifecycle,
-    max_turns: u32,
-    pub(crate) permission_overlay: TurnPermissionOverlay,
-}
-
-pub(crate) struct RuntimeSteerStep;
-pub(crate) struct RuntimeConversationBootstrapStep;
-pub(crate) struct RuntimeTurnSetupStep;
-pub(crate) struct RuntimeTurnOpeningStep;
-pub(crate) struct RuntimeTurnStartStep;
-pub(crate) struct RuntimeTurnStartResultStep;
-pub(crate) struct RuntimeModelRouteStep;
-pub(crate) struct RuntimeTurnIterationStep {
-    opening_step: RuntimeTurnOpeningStep,
-    provider_cycle_step: RuntimeTurnProviderCycleStep,
-}
-pub(crate) struct RuntimeTurnLoopStep {
-    iteration_step: RuntimeTurnIterationStep,
-}
-
-pub(crate) struct RuntimeTurnLoopInput<'a, 'runtime, W: io::Write> {
-    pub(crate) actor: &'a mut RuntimeTaskActor<'runtime>,
-    pub(crate) provider: ProviderKind,
-    pub(crate) context_config: &'a context::ContextConfig,
-    pub(crate) provider_config: &'a ProviderConfig,
-    pub(crate) cwd: &'a Path,
-    pub(crate) emit_deltas: bool,
-    pub(crate) hooks: &'a HookRunner,
-    pub(crate) events: &'a mut EventFactory,
-    pub(crate) sink: &'a mut EventSink<W>,
-    pub(crate) prepared_conversation: &'a mut RuntimePreparedConversation<'runtime>,
-    pub(crate) prompt: &'a str,
-    pub(crate) model: &'a ModelSelection,
-    pub(crate) subagent_type: &'a SubagentType,
-    pub(crate) cost_tracker: &'a mut CostTracker,
-    pub(crate) steer_handle: Option<&'a ThreadSteerHandle>,
-    pub(crate) cancel: &'a CancelToken,
-    pub(crate) max_budget_usd: Option<f64>,
-    pub(crate) config: &'a RunConfig,
-    pub(crate) tool_policy: AgentToolPolicyContext<'a>,
-    pub(crate) subagent_depth: u32,
-    pub(crate) policy: &'a ApprovalPolicy,
-    pub(crate) instructions: &'a ProjectInstructions,
-    pub(crate) memory: &'a MemoryBlock,
-    pub(crate) mcp_registry: &'a McpRegistry,
-    pub(crate) task_registry: &'a TaskRegistry,
-    pub(crate) background_workflows: &'a mut Vec<BackgroundWorkflowRun>,
-    pub(crate) workflow_ipc: Option<&'a WorkflowIpcContext>,
-    pub(crate) permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
-}
-
-pub(crate) struct RuntimeTurnIterationInput<'a, 'runtime, W: io::Write> {
-    pub(crate) actor: &'a mut RuntimeTaskActor<'runtime>,
-    pub(crate) provider: ProviderKind,
-    pub(crate) context_config: &'a context::ContextConfig,
-    pub(crate) provider_config: &'a ProviderConfig,
-    pub(crate) cwd: &'a Path,
-    pub(crate) emit_deltas: bool,
-    pub(crate) hooks: &'a HookRunner,
-    pub(crate) events: &'a mut EventFactory,
-    pub(crate) sink: &'a mut EventSink<W>,
-    pub(crate) prepared_conversation: &'a mut RuntimePreparedConversation<'runtime>,
-    pub(crate) prompt: &'a str,
-    pub(crate) model: &'a ModelSelection,
-    pub(crate) subagent_type: &'a SubagentType,
-    pub(crate) cost_tracker: &'a mut CostTracker,
-    pub(crate) steer_handle: Option<&'a ThreadSteerHandle>,
-    pub(crate) cancel: &'a CancelToken,
-    pub(crate) max_budget_usd: Option<f64>,
-    pub(crate) config: &'a RunConfig,
-    pub(crate) tool_policy: AgentToolPolicyContext<'a>,
-    pub(crate) subagent_depth: u32,
-    pub(crate) policy: &'a ApprovalPolicy,
-    pub(crate) instructions: &'a ProjectInstructions,
-    pub(crate) memory: &'a MemoryBlock,
-    pub(crate) mcp_registry: &'a McpRegistry,
-    pub(crate) task_registry: &'a TaskRegistry,
-    pub(crate) background_workflows: &'a mut Vec<BackgroundWorkflowRun>,
-    pub(crate) workflow_ipc: Option<&'a WorkflowIpcContext>,
-    pub(crate) permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
-}
-
-pub(crate) struct RuntimeTurnLoopExecutors<W: io::Write> {
-    pub(crate) child_executor: ChildAgentExecutor<W>,
-    pub(crate) workflow_child_executor: ChildAgentExecutor<SharedEventBuffer>,
-    pub(crate) batch_child_executor: ChildAgentExecutor<io::Sink>,
-}
-
-impl<'a, 'runtime, W: io::Write> RuntimeTurnLoopInput<'a, 'runtime, W> {
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
-        actor: &'a mut RuntimeTaskActor<'runtime>,
-        provider: ProviderKind,
-        context_config: &'a context::ContextConfig,
-        provider_config: &'a ProviderConfig,
-        cwd: &'a Path,
-        emit_deltas: bool,
-        hooks: &'a HookRunner,
-        events: &'a mut EventFactory,
-        sink: &'a mut EventSink<W>,
-        prepared_conversation: &'a mut RuntimePreparedConversation<'runtime>,
-        prompt: &'a str,
-        model: &'a ModelSelection,
-        subagent_type: &'a SubagentType,
-        cost_tracker: &'a mut CostTracker,
-        steer_handle: Option<&'a ThreadSteerHandle>,
-        cancel: &'a CancelToken,
-        max_budget_usd: Option<f64>,
-        config: &'a RunConfig,
-        tool_policy: AgentToolPolicyContext<'a>,
-        subagent_depth: u32,
-        policy: &'a ApprovalPolicy,
-        instructions: &'a ProjectInstructions,
-        memory: &'a MemoryBlock,
-        mcp_registry: &'a McpRegistry,
-        task_registry: &'a TaskRegistry,
-        background_workflows: &'a mut Vec<BackgroundWorkflowRun>,
-        workflow_ipc: Option<&'a WorkflowIpcContext>,
-        permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
-    ) -> Self {
-        Self {
-            actor,
-            provider,
-            context_config,
-            provider_config,
-            cwd,
-            emit_deltas,
-            hooks,
-            events,
-            sink,
-            prepared_conversation,
-            prompt,
-            model,
-            subagent_type,
-            cost_tracker,
-            steer_handle,
-            cancel,
-            max_budget_usd,
-            config,
-            tool_policy,
-            subagent_depth,
-            policy,
-            instructions,
-            memory,
-            mcp_registry,
-            task_registry,
-            background_workflows,
-            workflow_ipc,
-            permission_handler,
-        }
-    }
-
-    pub(crate) fn iteration_input<'iter>(
-        &'iter mut self,
-    ) -> RuntimeTurnIterationInput<'iter, 'runtime, W> {
-        RuntimeTurnIterationInput {
-            actor: &mut *self.actor,
-            provider: self.provider,
-            context_config: self.context_config,
-            provider_config: self.provider_config,
-            cwd: self.cwd,
-            emit_deltas: self.emit_deltas,
-            hooks: self.hooks,
-            events: &mut *self.events,
-            sink: &mut *self.sink,
-            prepared_conversation: &mut *self.prepared_conversation,
-            prompt: self.prompt,
-            model: self.model,
-            subagent_type: self.subagent_type,
-            cost_tracker: &mut *self.cost_tracker,
-            steer_handle: self.steer_handle,
-            cancel: self.cancel,
-            max_budget_usd: self.max_budget_usd,
-            config: self.config,
-            tool_policy: self.tool_policy,
-            subagent_depth: self.subagent_depth,
-            policy: self.policy,
-            instructions: self.instructions,
-            memory: self.memory,
-            mcp_registry: self.mcp_registry,
-            task_registry: self.task_registry,
-            background_workflows: &mut *self.background_workflows,
-            workflow_ipc: self.workflow_ipc,
-            permission_handler: self.permission_handler,
-        }
-    }
-}
-
-impl<W: io::Write> RuntimeTurnLoopExecutors<W> {
-    pub(crate) fn new(
-        child_executor: ChildAgentExecutor<W>,
-        workflow_child_executor: ChildAgentExecutor<SharedEventBuffer>,
-        batch_child_executor: ChildAgentExecutor<io::Sink>,
-    ) -> Self {
-        Self {
-            child_executor,
-            workflow_child_executor,
-            batch_child_executor,
-        }
-    }
-}
-
-pub(crate) struct RuntimeTurnStartStepOutput {
-    pub(crate) error: Option<RuntimeTurnStartError>,
-}
-
-pub(crate) enum RuntimeTurnStartResult {
-    Continue,
-    Return(AgentLoopResult),
-}
-
-pub(crate) enum RuntimeTurnOpeningResult {
-    Continue { provider_config: ProviderConfig },
-    Return(AgentLoopResult),
-}
-
-pub(crate) enum RuntimeTurnIterationResult {
-    ContinueLoop,
-    Return(AgentLoopResult),
 }
 
 #[derive(Clone, Debug)]
@@ -344,22 +80,6 @@ impl AgentLoopResult {
             error,
         }
     }
-}
-
-pub(crate) struct RuntimeTurnSetup {
-    pub(crate) context_config: context::ContextConfig,
-    pub(crate) policy: ApprovalPolicy,
-    pub(crate) provider_config: ProviderConfig,
-}
-
-pub(crate) struct RuntimePreparedConversation<'a> {
-    conversation: RuntimePreparedConversationStorage<'a>,
-    history_writer: Option<&'a mut SessionWriter>,
-}
-
-enum RuntimePreparedConversationStorage<'a> {
-    Borrowed(&'a mut Conversation),
-    Owned(Conversation),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -412,203 +132,16 @@ pub struct RuntimeModelTurn {
 }
 
 #[derive(Clone, Debug)]
-pub struct RuntimeStartedTurn {
-    turn: u32,
-    task: Option<RuntimeTaskLifecycle>,
-    pub event: EventEnvelope,
-}
-
-#[derive(Clone, Debug)]
 pub struct RuntimeActorStartedTurn {
     turn: u32,
     task: Option<RuntimeTaskLifecycle>,
     event: Option<EventEnvelope>,
 }
 
-#[derive(Clone, Debug)]
-pub struct RuntimeAdvancedTurn {
-    turn: u32,
-    task: Option<RuntimeTaskLifecycle>,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeTurnStartError {
     pub status: RunStatus,
     pub message: String,
-}
-
-#[derive(Clone, Debug)]
-pub enum RuntimeApprovalDecision {
-    NotRequired,
-    Allowed(ApprovalResolution),
-    Ask(ApprovalRequest),
-    Denied {
-        resolution: ApprovalResolution,
-        result: ToolResult,
-    },
-}
-
-pub trait RuntimeApprovalHandler {
-    fn resolve_interactive(
-        &self,
-        approval: &ApprovalRequest,
-        request: &ToolRequest,
-    ) -> io::Result<ApprovalResolution>;
-}
-
-pub struct RuntimeConfigApprovalHandler<'a> {
-    config: &'a RunConfig,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RuntimeUserInputRequest {
-    pub id: String,
-    pub question: String,
-    pub choices: Vec<String>,
-}
-
-pub trait RuntimeUserInputHandler {
-    fn request_user_input(&self, request: &RuntimeUserInputRequest) -> io::Result<Option<String>>;
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RuntimePermissionRequest {
-    pub id: String,
-    pub reason: Option<String>,
-    pub permissions: RequestPermissionProfile,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RuntimePermissionResponse {
-    pub decision: PermissionResponseDecision,
-    pub scope: PermissionGrantScope,
-    pub permissions: RequestPermissionProfile,
-    pub strict_auto_review: bool,
-}
-
-pub trait RuntimePermissionRequestHandler {
-    fn request_permissions(
-        &self,
-        request: &RuntimePermissionRequest,
-    ) -> io::Result<RuntimePermissionResponse>;
-}
-
-pub(crate) struct AllowRequestedPermissions;
-
-impl RuntimePermissionRequestHandler for AllowRequestedPermissions {
-    fn request_permissions(
-        &self,
-        request: &RuntimePermissionRequest,
-    ) -> io::Result<RuntimePermissionResponse> {
-        Ok(RuntimePermissionResponse {
-            decision: PermissionResponseDecision::Allow,
-            scope: PermissionGrantScope::Turn,
-            permissions: request.permissions.clone(),
-            strict_auto_review: false,
-        })
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct RuntimeUserInputRequestArgs {
-    question: String,
-    #[serde(default)]
-    choices: Vec<String>,
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct TurnPermissionOverlay {
-    additional_working_directories: Vec<PathBuf>,
-    network_domain_permissions:
-        std::collections::HashMap<String, orca_core::config::PermissionProfileNetworkAccess>,
-    strict_auto_review: bool,
-}
-
-impl TurnPermissionOverlay {
-    pub fn additional_working_directories(&self) -> &[PathBuf] {
-        &self.additional_working_directories
-    }
-
-    pub fn network_domain_permissions(
-        &self,
-    ) -> &std::collections::HashMap<String, orca_core::config::PermissionProfileNetworkAccess> {
-        &self.network_domain_permissions
-    }
-
-    pub fn strict_auto_review(&self) -> bool {
-        self.strict_auto_review
-    }
-
-    pub fn merge(&mut self, other: &Self) {
-        for root in &other.additional_working_directories {
-            if !self.additional_working_directories.contains(root) {
-                self.additional_working_directories.push(root.clone());
-            }
-        }
-        for (domain, access) in &other.network_domain_permissions {
-            self.network_domain_permissions
-                .insert(domain.clone(), *access);
-        }
-        self.strict_auto_review |= other.strict_auto_review;
-    }
-
-    pub(crate) fn merge_network_permissions(&mut self, permissions: &RequestPermissionProfile) {
-        if let Some(network) = permissions.network.as_ref() {
-            for (domain, access) in &network.domains {
-                self.network_domain_permissions
-                    .insert(domain.clone(), *access);
-            }
-        }
-    }
-
-    pub(crate) fn merge_strict_auto_review(&mut self, strict_auto_review: bool) {
-        self.strict_auto_review |= strict_auto_review;
-    }
-
-    pub fn request_and_merge(
-        &mut self,
-        handler: &dyn RuntimePermissionRequestHandler,
-        request: RuntimePermissionRequest,
-    ) -> io::Result<RuntimePermissionResponse> {
-        let response = handler.request_permissions(&request)?;
-        if response.decision == PermissionResponseDecision::Allow {
-            self.merge_permissions(&response.permissions);
-            self.merge_strict_auto_review(response.strict_auto_review);
-        }
-        Ok(response)
-    }
-
-    pub(crate) fn merge_permissions(&mut self, permissions: &RequestPermissionProfile) {
-        if let Some(file_system) = permissions.file_system.as_ref() {
-            if let Some(write_roots) = file_system.write.as_ref() {
-                for root in write_roots {
-                    if !root.as_os_str().is_empty()
-                        && !self.additional_working_directories.contains(root)
-                    {
-                        self.additional_working_directories.push(root.clone());
-                    }
-                }
-            }
-        }
-        self.merge_network_permissions(permissions);
-    }
-}
-
-impl<'a> RuntimeConfigApprovalHandler<'a> {
-    pub fn new(config: &'a RunConfig) -> Self {
-        Self { config }
-    }
-}
-
-impl RuntimeApprovalHandler for RuntimeConfigApprovalHandler<'_> {
-    fn resolve_interactive(
-        &self,
-        approval: &ApprovalRequest,
-        request: &ToolRequest,
-    ) -> io::Result<ApprovalResolution> {
-        crate::approval_resolution::resolve_interactive(self.config, approval, request)
-    }
 }
 
 pub trait RuntimeWorkflowIpc {
@@ -659,101 +192,6 @@ pub struct RuntimeUsageTotals {
 
 pub trait RuntimeSubagentStatusLookup {
     fn subagent_status_record(&self, agent_id: &str) -> Option<RuntimeSubagentStatusRecord>;
-}
-
-impl RuntimeSessionLifecycle {
-    pub fn new(run_id: impl Into<String>) -> Self {
-        Self {
-            run_id: run_id.into(),
-            active_task: None,
-        }
-    }
-
-    pub fn run_id(&self) -> &str {
-        &self.run_id
-    }
-
-    pub fn start_task(&mut self, kind: RuntimeTaskKind) -> &RuntimeTaskLifecycle {
-        let id = format!("{}:task-1", self.run_id);
-        self.start_task_with_id(kind, id)
-    }
-
-    pub fn start_task_with_id(
-        &mut self,
-        kind: RuntimeTaskKind,
-        id: impl Into<String>,
-    ) -> &RuntimeTaskLifecycle {
-        self.active_task = Some(RuntimeTaskLifecycle {
-            id: id.into(),
-            kind,
-            status: RuntimeTaskStatus::Running,
-            current_turn: 0,
-        });
-        self.active_task.as_ref().expect("task just started")
-    }
-
-    pub fn active_task(&self) -> Option<&RuntimeTaskLifecycle> {
-        self.active_task.as_ref()
-    }
-
-    pub fn next_turn(&mut self) -> RuntimeTurnLifecycle {
-        let task = self
-            .active_task
-            .get_or_insert_with(|| RuntimeTaskLifecycle {
-                id: format!("{}:task-1", self.run_id),
-                kind: RuntimeTaskKind::Agent,
-                status: RuntimeTaskStatus::Running,
-                current_turn: 0,
-            });
-        task.current_turn = task.current_turn.saturating_add(1);
-        RuntimeTurnLifecycle {
-            number: task.current_turn,
-        }
-    }
-
-    pub fn finish_task(&mut self, status: RunStatus) -> Option<&RuntimeTaskLifecycle> {
-        let task = self.active_task.as_mut()?;
-        task.status = RuntimeTaskStatus::from_run_status(status);
-        Some(task)
-    }
-}
-
-impl<'a> RuntimeTurnRunner<'a> {
-    pub fn new(lifecycle: &'a mut RuntimeSessionLifecycle) -> Self {
-        Self { lifecycle }
-    }
-
-    pub fn start_turn(
-        &mut self,
-        events: &mut EventFactory,
-        prompt: Option<&str>,
-    ) -> RuntimeStartedTurn {
-        let advanced = self.advance_turn();
-        let event = advanced
-            .task
-            .as_ref()
-            .map(|task| {
-                RuntimeTurnLifecycle {
-                    number: advanced.turn,
-                }
-                .started_event(events, prompt, task)
-            })
-            .unwrap_or_else(|| events.turn_started(advanced.turn, prompt));
-        RuntimeStartedTurn {
-            turn: advanced.turn,
-            task: advanced.task,
-            event,
-        }
-    }
-
-    pub fn advance_turn(&mut self) -> RuntimeAdvancedTurn {
-        let turn = self.lifecycle.next_turn();
-        let task = self.lifecycle.active_task().cloned();
-        RuntimeAdvancedTurn {
-            turn: turn.number(),
-            task,
-        }
-    }
 }
 
 impl<'a> RuntimeTaskActor<'a> {
@@ -1135,7 +573,7 @@ impl<'a> RuntimeTaskActor<'a> {
         cancel: Option<&CancelToken>,
         permission_handler: Option<&dyn RuntimePermissionRequestHandler>,
     ) -> ToolResult {
-        execute_runtime_normal_tool(RuntimeNormalToolExecutionContext {
+        self.execute_normal_tool_invocation(RuntimeNormalToolInvocation {
             config,
             request,
             cwd,
@@ -1147,8 +585,14 @@ impl<'a> RuntimeTaskActor<'a> {
             task_registry,
             cancel,
             permission_handler,
-            permission_overlay: None,
         })
+    }
+
+    pub(crate) fn execute_normal_tool_invocation(
+        &mut self,
+        invocation: RuntimeNormalToolInvocation<'_>,
+    ) -> ToolResult {
+        execute_runtime_normal_tool_invocation(invocation, None)
     }
 
     pub fn execute_user_input_tool(
@@ -1156,16 +600,7 @@ impl<'a> RuntimeTaskActor<'a> {
         request: &ToolRequest,
         handler: &dyn RuntimeUserInputHandler,
     ) -> io::Result<ToolResult> {
-        let args = parse_runtime_user_input_request(request)?;
-        let input = RuntimeUserInputRequest {
-            id: request.id.clone(),
-            question: args.question,
-            choices: args.choices,
-        };
-        Ok(match handler.request_user_input(&input)? {
-            Some(answer) => ToolResult::completed(request, answer, false),
-            None => ToolResult::failed(request, "user input request cancelled", None),
-        })
+        crate::runtime_user_input::execute_user_input_tool(request, handler)
     }
 
     pub fn record_usage(
@@ -1204,148 +639,6 @@ impl ThreadSteerHandle {
             .expect("thread steer handle lock")
             .drain(..)
             .collect()
-    }
-}
-
-impl RuntimeSteerStep {
-    pub(crate) fn new() -> Self {
-        Self
-    }
-
-    pub(crate) fn apply(
-        &mut self,
-        steer_handle: Option<&ThreadSteerHandle>,
-        conversation: &mut Conversation,
-        mut history_writer: Option<&mut SessionWriter>,
-    ) -> io::Result<usize> {
-        let Some(steer_handle) = steer_handle else {
-            return Ok(0);
-        };
-
-        let mut injected = 0;
-        for input in steer_handle.drain() {
-            conversation.add_user(input);
-            injected += 1;
-            if let Some(writer) = history_writer.as_deref_mut()
-                && let Some(message) = conversation.messages.last()
-            {
-                writer.append_message(message)?;
-            }
-        }
-        Ok(injected)
-    }
-}
-
-impl RuntimeConversationBootstrapStep {
-    pub(crate) fn new() -> Self {
-        Self
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn prepare<'a>(
-        &mut self,
-        conversation_context: AgentConversationContext<'a>,
-        cwd: &Path,
-        prompt: &str,
-        subagent_depth: u32,
-        subagent_type: &SubagentType,
-        instructions: &ProjectInstructions,
-        approval_mode: orca_core::approval_types::ApprovalMode,
-        memory: &MemoryBlock,
-        emit_deltas: bool,
-    ) -> io::Result<RuntimePreparedConversation<'a>> {
-        let AgentConversationContext {
-            resumed,
-            history_writer,
-            conversation,
-        } = conversation_context;
-
-        let mut prepared = RuntimePreparedConversation {
-            conversation: match conversation {
-                Some(conversation) => RuntimePreparedConversationStorage::Borrowed(conversation),
-                None => RuntimePreparedConversationStorage::Owned(
-                    bootstrap_agent_conversation_for_loop(
-                        resumed,
-                        cwd,
-                        prompt,
-                        subagent_depth,
-                        subagent_type,
-                        instructions,
-                        approval_mode,
-                        memory,
-                    ),
-                ),
-            },
-            history_writer,
-        };
-
-        let (conversation, history_writer) = prepared.parts_mut();
-        record_initial_history_for_agent(
-            conversation,
-            history_writer,
-            resumed.is_some(),
-            emit_deltas,
-        )?;
-
-        Ok(prepared)
-    }
-}
-
-impl RuntimePreparedConversation<'_> {
-    #[cfg(test)]
-    pub(crate) fn conversation_mut(&mut self) -> &mut Conversation {
-        match &mut self.conversation {
-            RuntimePreparedConversationStorage::Borrowed(conversation) => conversation,
-            RuntimePreparedConversationStorage::Owned(conversation) => conversation,
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn history_writer_mut(&mut self) -> Option<&mut SessionWriter> {
-        self.history_writer.as_deref_mut()
-    }
-
-    pub(crate) fn parts_mut(&mut self) -> (&mut Conversation, Option<&mut SessionWriter>) {
-        let conversation = match &mut self.conversation {
-            RuntimePreparedConversationStorage::Borrowed(conversation) => conversation,
-            RuntimePreparedConversationStorage::Owned(conversation) => conversation,
-        };
-        (conversation, self.history_writer.as_deref_mut())
-    }
-}
-
-impl RuntimeTurnSetupStep {
-    pub(crate) fn new() -> Self {
-        Self
-    }
-
-    pub(crate) fn prepare(
-        &mut self,
-        config: &RunConfig,
-        subagent_depth: u32,
-        subagent_type: &SubagentType,
-        tool_policy: AgentToolPolicyContext<'_>,
-        mcp_registry: &McpRegistry,
-    ) -> RuntimeTurnSetup {
-        let budget_model = config.model.as_option();
-        let context_config = context::ContextConfig::for_model_with_runtime(
-            budget_model.as_deref(),
-            &config.model_runtime,
-        );
-        let policy = policy_for_tool_execution(config);
-        let provider_config = provider_config_for_agent_loop(
-            config,
-            subagent_depth,
-            subagent_type,
-            tool_policy,
-            mcp_registry,
-        );
-
-        RuntimeTurnSetup {
-            context_config,
-            policy,
-            provider_config,
-        }
     }
 }
 
@@ -1636,213 +929,6 @@ impl<'a> RuntimeTurnExecution<'a> {
     }
 }
 
-impl RuntimeToolActorContext {
-    pub fn new(run_id: impl Into<String>, max_turns: u32) -> Self {
-        let mut lifecycle = RuntimeSessionLifecycle::new(run_id);
-        lifecycle.start_task(RuntimeTaskKind::Agent);
-        Self {
-            lifecycle,
-            max_turns,
-            permission_overlay: TurnPermissionOverlay::default(),
-        }
-    }
-
-    fn actor(&mut self) -> RuntimeTaskActor<'_> {
-        RuntimeTaskActor::new(&mut self.lifecycle, self.max_turns)
-    }
-
-    pub fn active_task(&self) -> Option<&RuntimeTaskLifecycle> {
-        self.lifecycle.active_task()
-    }
-
-    pub fn granted_additional_working_directories(&self) -> Vec<PathBuf> {
-        self.permission_overlay
-            .additional_working_directories
-            .clone()
-    }
-
-    pub fn permission_overlay(&self) -> &TurnPermissionOverlay {
-        &self.permission_overlay
-    }
-
-    pub fn run_pre_tool_hook(
-        &mut self,
-        hooks: &HookRunner,
-        cwd: &str,
-        request: &ToolRequest,
-    ) -> Result<HookOutcome, ToolResult> {
-        self.actor().run_pre_tool_hook(hooks, cwd, request)
-    }
-
-    pub fn run_pre_tool_hook_with_cancel(
-        &mut self,
-        hooks: &HookRunner,
-        cwd: &str,
-        request: &ToolRequest,
-        cancel: Option<&CancelToken>,
-    ) -> Result<HookOutcome, ToolResult> {
-        self.actor()
-            .run_pre_tool_hook_with_cancel(hooks, cwd, request, cancel)
-    }
-
-    pub fn run_post_tool_hook(
-        &mut self,
-        hooks: &HookRunner,
-        cwd: &str,
-        request: &ToolRequest,
-        result: &ToolResult,
-    ) -> Option<String> {
-        self.actor().run_post_tool_hook(hooks, cwd, request, result)
-    }
-
-    pub fn run_post_tool_hook_with_cancel(
-        &mut self,
-        hooks: &HookRunner,
-        cwd: &str,
-        request: &ToolRequest,
-        result: &ToolResult,
-        cancel: Option<&CancelToken>,
-    ) -> Option<String> {
-        self.actor()
-            .run_post_tool_hook_with_cancel(hooks, cwd, request, result, cancel)
-    }
-
-    pub fn resolve_tool_approval(
-        &mut self,
-        policy: &ApprovalPolicy,
-        approval: Option<ApprovalRequest>,
-        request: &ToolRequest,
-    ) -> RuntimeApprovalDecision {
-        self.actor()
-            .resolve_tool_approval(policy, approval, request)
-    }
-
-    pub fn resolve_interactive_tool_approval(
-        &mut self,
-        handler: &dyn RuntimeApprovalHandler,
-        approval: &ApprovalRequest,
-        request: &ToolRequest,
-    ) -> io::Result<ApprovalResolution> {
-        self.actor()
-            .resolve_interactive_tool_approval(handler, approval, request)
-    }
-
-    pub fn execute_normal_tool(
-        &mut self,
-        request: &ToolRequest,
-        cwd: &Path,
-        mcp_registry: &McpRegistry,
-        external_tools: &[ExternalToolConfig],
-        output_truncation: ToolOutputTruncation,
-        shell_timeout_secs: u64,
-        task_registry: Option<&TaskRegistry>,
-    ) -> ToolResult {
-        self.execute_normal_tool_with_roots_and_cancel(
-            None,
-            request,
-            cwd,
-            &[],
-            mcp_registry,
-            external_tools,
-            output_truncation,
-            shell_timeout_secs,
-            task_registry,
-            None,
-            None,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn execute_normal_tool_with_cancel(
-        &mut self,
-        request: &ToolRequest,
-        cwd: &Path,
-        mcp_registry: &McpRegistry,
-        external_tools: &[ExternalToolConfig],
-        output_truncation: ToolOutputTruncation,
-        shell_timeout_secs: u64,
-        task_registry: Option<&TaskRegistry>,
-        cancel: Option<&CancelToken>,
-    ) -> ToolResult {
-        self.execute_normal_tool_with_roots_and_cancel(
-            None,
-            request,
-            cwd,
-            &[],
-            mcp_registry,
-            external_tools,
-            output_truncation,
-            shell_timeout_secs,
-            task_registry,
-            cancel,
-            None,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn execute_normal_tool_with_roots_and_cancel(
-        &mut self,
-        config: Option<&RunConfig>,
-        request: &ToolRequest,
-        cwd: &Path,
-        additional_roots: &[PathBuf],
-        mcp_registry: &McpRegistry,
-        external_tools: &[ExternalToolConfig],
-        output_truncation: ToolOutputTruncation,
-        shell_timeout_secs: u64,
-        task_registry: Option<&TaskRegistry>,
-        cancel: Option<&CancelToken>,
-        permission_handler: Option<&dyn RuntimePermissionRequestHandler>,
-    ) -> ToolResult {
-        execute_runtime_normal_tool(RuntimeNormalToolExecutionContext {
-            config,
-            request,
-            cwd,
-            additional_roots,
-            mcp_registry,
-            external_tools,
-            output_truncation,
-            shell_timeout_secs,
-            task_registry,
-            cancel,
-            permission_handler,
-            permission_overlay: Some(&mut self.permission_overlay),
-        })
-    }
-
-    pub fn execute_user_input_tool(
-        &mut self,
-        request: &ToolRequest,
-        handler: &dyn RuntimeUserInputHandler,
-    ) -> io::Result<ToolResult> {
-        self.actor().execute_user_input_tool(request, handler)
-    }
-}
-
-fn parse_runtime_user_input_request(
-    request: &ToolRequest,
-) -> io::Result<RuntimeUserInputRequestArgs> {
-    let raw = request.raw_arguments.as_deref().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "missing request_user_input arguments JSON",
-        )
-    })?;
-    let args: RuntimeUserInputRequestArgs = serde_json::from_str(raw).map_err(|error| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("invalid request_user_input arguments JSON: {error}"),
-        )
-    })?;
-    if args.question.trim().is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "missing required request_user_input argument: question",
-        ));
-    }
-    Ok(args)
-}
-
 fn attach_shell_task_to_tool_event(
     event: EventEnvelope,
     request: &ToolRequest,
@@ -1858,16 +944,6 @@ fn attach_shell_task_to_tool_event(
 
 fn shell_task_id(request: &ToolRequest) -> String {
     format!("shell-{}:task-1", request.id)
-}
-
-impl RuntimeStartedTurn {
-    pub fn turn(&self) -> u32 {
-        self.turn
-    }
-
-    pub fn task(&self) -> Option<&RuntimeTaskLifecycle> {
-        self.task.as_ref()
-    }
 }
 
 impl RuntimeActorStartedTurn {
@@ -1888,366 +964,21 @@ impl RuntimeActorStartedTurn {
     }
 }
 
-impl RuntimeAdvancedTurn {
-    pub fn turn(&self) -> u32 {
-        self.turn
-    }
-
-    pub fn task(&self) -> Option<&RuntimeTaskLifecycle> {
-        self.task.as_ref()
-    }
-}
-
-impl RuntimeTurnStartStep {
-    pub(crate) fn new() -> Self {
-        Self
-    }
-
-    pub(crate) fn start<W: io::Write>(
-        &mut self,
-        actor: &mut RuntimeTaskActor<'_>,
-        events: &mut EventFactory,
-        sink: &mut EventSink<W>,
-        prompt: &str,
-        emit_deltas: bool,
-    ) -> io::Result<RuntimeTurnStartStepOutput> {
-        let turn_prompt = if actor
-            .active_task()
-            .map(|task| task.current_turn())
-            .unwrap_or(0)
-            == 0
-        {
-            Some(prompt)
-        } else {
-            None
-        };
-        let started_turn = match actor.start_turn(events, turn_prompt, emit_deltas) {
-            Ok(started_turn) => started_turn,
-            Err(error) => {
-                if emit_deltas {
-                    sink.emit(&events.error(&error.message))?;
-                }
-                return Ok(RuntimeTurnStartStepOutput { error: Some(error) });
-            }
-        };
-        if let Some(event) = started_turn.into_event() {
-            sink.emit(&event)?;
-        }
-        Ok(RuntimeTurnStartStepOutput { error: None })
-    }
-}
-
-impl RuntimeTurnStartResultStep {
-    pub(crate) fn new() -> Self {
-        Self
-    }
-
-    pub(crate) fn fold(&self, output: RuntimeTurnStartStepOutput) -> RuntimeTurnStartResult {
-        match output.error {
-            Some(error) => RuntimeTurnStartResult::Return(AgentLoopResult::failure(
-                error.status,
-                error.message,
-            )),
-            None => RuntimeTurnStartResult::Continue,
-        }
-    }
-}
-
-impl RuntimeTurnOpeningStep {
-    pub(crate) fn new() -> Self {
-        Self
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn open<W: io::Write>(
-        &mut self,
-        actor: &mut RuntimeTaskActor<'_>,
-        provider: ProviderKind,
-        context_config: &context::ContextConfig,
-        provider_config: &ProviderConfig,
-        cwd: &Path,
-        emit_deltas: bool,
-        hooks: &HookRunner,
-        events: &mut EventFactory,
-        sink: &mut EventSink<W>,
-        conversation: &mut Conversation,
-        mut history_writer: Option<&mut SessionWriter>,
-        prompt: &str,
-        model: &ModelSelection,
-        subagent_type: &SubagentType,
-        cost_tracker: &mut CostTracker,
-        steer_handle: Option<&ThreadSteerHandle>,
-    ) -> io::Result<RuntimeTurnOpeningResult> {
-        RuntimeCompactionStep::new(
-            provider,
-            context_config,
-            provider_config,
-            cwd,
-            emit_deltas,
-            hooks,
-            events,
-            sink,
-            history_writer.as_deref_mut(),
-        )
-        .compact_if_needed(conversation)?;
-
-        match RuntimeTurnStartResultStep::new().fold(RuntimeTurnStartStep::new().start(
-            actor,
-            events,
-            sink,
-            prompt,
-            emit_deltas,
-        )?) {
-            RuntimeTurnStartResult::Return(result) => {
-                return Ok(RuntimeTurnOpeningResult::Return(result));
-            }
-            RuntimeTurnStartResult::Continue => {}
-        }
-
-        let turn_provider_config = RuntimeModelRouteStep::new()
-            .route(
-                actor,
-                model,
-                subagent_type,
-                provider_config,
-                cost_tracker,
-                events,
-                sink,
-                emit_deltas,
-            )?
-            .provider_config;
-
-        RuntimeSteerStep::new().apply(steer_handle, conversation, history_writer.as_deref_mut())?;
-
-        Ok(RuntimeTurnOpeningResult::Continue {
-            provider_config: turn_provider_config,
-        })
-    }
-}
-
-impl RuntimeModelRouteStep {
-    pub(crate) fn new() -> Self {
-        Self
-    }
-
-    pub(crate) fn route<W: io::Write>(
-        &mut self,
-        actor: &mut RuntimeTaskActor<'_>,
-        model: &ModelSelection,
-        subagent_type: &SubagentType,
-        provider_config: &ProviderConfig,
-        cost_tracker: &mut CostTracker,
-        events: &mut EventFactory,
-        sink: &mut EventSink<W>,
-        emit_deltas: bool,
-    ) -> io::Result<RuntimeModelTurn> {
-        let routed_model =
-            actor.route_model_turn(model, subagent_type, None, provider_config, cost_tracker);
-        if emit_deltas {
-            sink.emit(&events.model_routed(&routed_model.decision))?;
-        }
-        Ok(routed_model)
-    }
-}
-
-impl RuntimeTurnIterationStep {
-    pub(crate) fn new() -> Self {
-        Self {
-            opening_step: RuntimeTurnOpeningStep::new(),
-            provider_cycle_step: RuntimeTurnProviderCycleStep::new(),
-        }
-    }
-
-    pub(crate) fn run<W: io::Write>(
-        &mut self,
-        input: RuntimeTurnIterationInput<'_, '_, W>,
-        child_executor: ChildAgentExecutor<W>,
-        workflow_child_executor: ChildAgentExecutor<SharedEventBuffer>,
-        batch_child_executor: ChildAgentExecutor<io::Sink>,
-    ) -> io::Result<RuntimeTurnIterationResult> {
-        let turn_provider_config = {
-            let (conversation, history_writer) = input.prepared_conversation.parts_mut();
-            match self.opening_step.open(
-                input.actor,
-                input.provider,
-                input.context_config,
-                input.provider_config,
-                input.cwd,
-                input.emit_deltas,
-                input.hooks,
-                input.events,
-                input.sink,
-                conversation,
-                history_writer,
-                input.prompt,
-                input.model,
-                input.subagent_type,
-                input.cost_tracker,
-                input.steer_handle,
-            )? {
-                RuntimeTurnOpeningResult::Continue { provider_config } => provider_config,
-                RuntimeTurnOpeningResult::Return(result) => {
-                    return Ok(RuntimeTurnIterationResult::Return(result));
-                }
-            }
-        };
-
-        match self.provider_cycle_step.run(
-            RuntimeProviderCycleInput {
-                actor: input.actor,
-                provider: input.provider,
-                turn_provider_config: &turn_provider_config,
-                cwd: input.cwd,
-                context_config: input.context_config,
-                base_provider_config: input.provider_config,
-                emit_deltas: input.emit_deltas,
-                hooks: input.hooks,
-                cancel: input.cancel,
-                cost_tracker: input.cost_tracker,
-                max_budget_usd: input.max_budget_usd,
-                events: input.events,
-                sink: input.sink,
-                conversation: input.prepared_conversation,
-                config: input.config,
-                tool_policy: input.tool_policy,
-                subagent_depth: input.subagent_depth,
-                policy: input.policy,
-                instructions: input.instructions,
-                memory: input.memory,
-                mcp_registry: input.mcp_registry,
-                task_registry: input.task_registry,
-                background_workflows: input.background_workflows,
-                workflow_ipc: input.workflow_ipc,
-                permission_handler: input.permission_handler,
-                steer_handle: input.steer_handle,
-            },
-            child_executor,
-            workflow_child_executor,
-            batch_child_executor,
-        )? {
-            RuntimeTurnProviderCycleResult::ContinueLoop
-            | RuntimeTurnProviderCycleResult::ContinueTurn => {
-                Ok(RuntimeTurnIterationResult::ContinueLoop)
-            }
-            RuntimeTurnProviderCycleResult::Return(result) => {
-                Ok(RuntimeTurnIterationResult::Return(result))
-            }
-        }
-    }
-}
-
-impl RuntimeTurnLoopStep {
-    pub(crate) fn new() -> Self {
-        Self {
-            iteration_step: RuntimeTurnIterationStep::new(),
-        }
-    }
-
-    pub(crate) fn run<W: io::Write>(
-        &mut self,
-        mut input: RuntimeTurnLoopInput<'_, '_, W>,
-        executors: RuntimeTurnLoopExecutors<W>,
-    ) -> io::Result<AgentLoopResult> {
-        loop {
-            match self.iteration_step.run(
-                input.iteration_input(),
-                executors.child_executor,
-                executors.workflow_child_executor,
-                executors.batch_child_executor,
-            )? {
-                RuntimeTurnIterationResult::ContinueLoop => {
-                    continue;
-                }
-                RuntimeTurnIterationResult::Return(result) => return Ok(result),
-            }
-        }
-    }
-}
-
-impl RuntimeTaskLifecycle {
-    pub fn new_snapshot(
-        id: impl Into<String>,
-        kind: RuntimeTaskKind,
-        status: RuntimeTaskStatus,
-        current_turn: u32,
-    ) -> Self {
-        Self {
-            id: id.into(),
-            kind,
-            status,
-            current_turn,
-        }
-    }
-
-    pub fn id(&self) -> &str {
-        &self.id
-    }
-
-    pub fn kind(&self) -> RuntimeTaskKind {
-        self.kind
-    }
-
-    pub fn status(&self) -> RuntimeTaskStatus {
-        self.status
-    }
-
-    pub fn current_turn(&self) -> u32 {
-        self.current_turn
-    }
-
-    pub fn payload(&self) -> Value {
-        json!({
-            "task_id": self.id,
-            "kind": self.kind,
-            "status": self.status,
-            "turn": self.current_turn
-        })
-    }
-
-    pub fn with_status(&self, status: RuntimeTaskStatus) -> Self {
-        let mut task = self.clone();
-        task.status = status;
-        task
-    }
-
-    pub fn attach_to_event(&self, mut event: EventEnvelope) -> EventEnvelope {
-        event.payload["task"] = self.payload();
-        event
-    }
-}
-
-impl RuntimeTaskStatus {
-    fn from_run_status(status: RunStatus) -> Self {
-        match status {
-            RunStatus::Success => Self::Succeeded,
-            RunStatus::Failed | RunStatus::VerificationFailed => Self::Failed,
-            RunStatus::Cancelled => Self::Cancelled,
-            RunStatus::ApprovalRequired => Self::ApprovalRequired,
-            RunStatus::BudgetExhausted => Self::BudgetExhausted,
-        }
-    }
-}
-
-impl RuntimeTurnLifecycle {
-    pub fn number(&self) -> u32 {
-        self.number
-    }
-
-    pub fn started_event(
-        self,
-        events: &mut EventFactory,
-        prompt: Option<&str>,
-        task: &RuntimeTaskLifecycle,
-    ) -> EventEnvelope {
-        let mut event = events.turn_started(self.number, prompt);
-        event.payload["task"] = task.payload();
-        event
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime_conversation_bootstrap::RuntimeConversationBootstrapStep;
+    use crate::runtime_model_route::{RuntimeModelRouteInput, RuntimeModelRouteStep};
+    use crate::runtime_turn_opening::{
+        RuntimeTurnOpeningInput, RuntimeTurnOpeningResult, RuntimeTurnOpeningStep,
+    };
+    use crate::runtime_turn_setup::RuntimeTurnSetupStep;
+    use crate::runtime_turn_start::{
+        RuntimeTurnStartResult, RuntimeTurnStartResultStep, RuntimeTurnStartStep,
+        RuntimeTurnStartStepOutput,
+    };
+    use crate::tool_invocation::AgentToolPolicyContext;
+    use orca_provider::context;
 
     use orca_core::approval_rules::PermissionRules;
     use orca_core::approval_types::ApprovalMode;
@@ -2256,6 +987,7 @@ mod tests {
         ToolConfig, WorkflowConfig,
     };
     use orca_core::conversation::Message;
+    use orca_core::event_sink::EventSink;
     use orca_core::hook_types::HookConfig;
     use orca_core::mcp_types::McpServerConfig;
     use orca_core::model::ModelSelection;
@@ -2386,24 +1118,24 @@ mod tests {
         let cwd = Path::new(".");
 
         let result = RuntimeTurnOpeningStep::new()
-            .open(
-                &mut actor,
-                ProviderKind::DeepSeek,
-                &context_config,
-                &provider_config,
+            .open(RuntimeTurnOpeningInput {
+                actor: &mut actor,
+                provider: ProviderKind::DeepSeek,
+                context_config: &context_config,
+                provider_config: &provider_config,
                 cwd,
-                true,
-                &hooks,
-                &mut events,
-                &mut sink,
-                &mut conversation,
-                None,
-                "hello",
-                &model,
-                &subagent_type,
-                &mut cost_tracker,
-                None,
-            )
+                emit_deltas: true,
+                hooks: &hooks,
+                events: &mut events,
+                sink: &mut sink,
+                conversation: &mut conversation,
+                history_writer: None,
+                prompt: "hello",
+                model: &model,
+                subagent_type: &subagent_type,
+                cost_tracker: &mut cost_tracker,
+                steer_handle: None,
+            })
             .expect("open turn");
 
         match result {
@@ -2442,16 +1174,16 @@ mod tests {
         let subagent_type = SubagentType::General;
 
         let result = RuntimeModelRouteStep::new()
-            .route(
-                &mut actor,
-                &model,
-                &subagent_type,
-                &provider_config,
-                &mut cost_tracker,
-                &mut events,
-                &mut sink,
-                true,
-            )
+            .route(RuntimeModelRouteInput {
+                actor: &mut actor,
+                model: &model,
+                subagent_type: &subagent_type,
+                provider_config: &provider_config,
+                cost_tracker: &mut cost_tracker,
+                events: &mut events,
+                sink: &mut sink,
+                emit_deltas: true,
+            })
             .expect("route model");
 
         assert_eq!(result.provider_config.api_key.as_deref(), Some("test-key"));

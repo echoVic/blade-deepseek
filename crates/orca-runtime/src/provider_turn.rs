@@ -17,16 +17,17 @@ use crate::cost::CostTracker;
 use crate::hooks::{HookRunner, conversation_with_hook_context};
 use crate::instructions::ProjectInstructions;
 use crate::lifecycle::{
-    AgentLoopResult, RuntimePermissionRequestHandler, RuntimePreparedConversation,
-    RuntimeSteerStep, RuntimeTaskActor, RuntimeTurnStartError,
+    AgentLoopResult, RuntimePermissionRequestHandler, RuntimeTaskActor, RuntimeTurnStartError,
 };
 use crate::memory::{self, MemoryBlock};
+use crate::runtime_conversation_bootstrap::RuntimePreparedConversation;
+use crate::runtime_steer::{RuntimeSteerInput, RuntimeSteerStep};
 use crate::session::record_assistant_response_for_agent;
 use crate::step_context::RuntimeStepContext;
 use crate::tasks::TaskRegistry;
 use crate::thread_store::SessionWriter;
 use crate::tool_invocation::{AgentToolPolicyContext, tool_requests_from_provider_steps};
-use crate::tool_turn::{ToolTurnOutcome, run_tool_turns};
+use crate::tool_turn::{RuntimeToolTurnsContext, ToolTurnOutcome, run_tool_turns};
 use crate::workflow::ipc::WorkflowIpcContext;
 use crate::workflow::runner::SharedEventBuffer;
 use crate::workflow_execution::BackgroundWorkflowRun;
@@ -289,7 +290,11 @@ impl RuntimeProviderTurnStep {
             return cancelled_provider_turn(emit_deltas, events, sink);
         }
 
-        RuntimeSteerStep::new().apply(steer_handle, conversation, history_writer.as_deref_mut())?;
+        RuntimeSteerStep::new().apply(RuntimeSteerInput {
+            steer_handle,
+            conversation,
+            history_writer: history_writer.as_deref_mut(),
+        })?;
         let model_conversation = conversation_with_hook_context(conversation, &pre_model_outcome);
         let response = actor.call_streaming_provider(
             provider,
@@ -408,19 +413,19 @@ impl RuntimeProviderResponseStep {
         )?;
 
         let tool_requests = tool_requests_from_provider_steps(&response.steps);
-        match run_tool_turns(
+        match run_tool_turns(RuntimeToolTurnsContext {
             step_context,
             events,
             sink,
             conversation,
-            history_writer.as_deref_mut(),
-            &tool_requests,
+            history_writer: history_writer.as_deref_mut(),
+            tool_requests: &tool_requests,
             cost_tracker,
             background_workflows,
             child_executor,
             workflow_child_executor,
             batch_child_executor,
-        )? {
+        })? {
             ToolTurnOutcome::Continue => Ok(RuntimeProviderResponseOutcome::Continue),
             ToolTurnOutcome::Return { status, error } => {
                 Ok(RuntimeProviderResponseOutcome::Return { status, error })

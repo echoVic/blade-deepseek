@@ -7400,7 +7400,19 @@ fn read_until_event<R: BufRead>(stdout: &mut R, id: &str, event_name: &str) -> V
         if event["id"] == id && event["event"] == event_name {
             return event;
         }
+        assert!(
+            !(is_thread_query_event(event_name) && event["id"] == id && event["event"] == "error"),
+            "server returned error before {id}/{event_name}: {}",
+            event["message"].as_str().unwrap_or("<missing message>")
+        );
     }
+}
+
+fn is_thread_query_event(event_name: &str) -> bool {
+    matches!(
+        event_name,
+        "thread_read" | "thread_list" | "thread_search" | "thread_turns" | "thread_items"
+    )
 }
 
 fn read_until_tool_completed<R: BufRead>(stdout: &mut R, id: &str, tool: &str) -> Value {
@@ -7591,6 +7603,18 @@ fn read_json_event_line_skips_non_protocol_stdout_noise() {
 
     assert_eq!(event["id"], "ok");
     assert_eq!(event["event"], "done");
+}
+
+#[test]
+#[should_panic(expected = "server returned error before read/thread_read")]
+fn read_until_event_fails_fast_on_matching_thread_query_error_event() {
+    let mut input = BufReader::new(
+        br#"{"id":"read","event":"error","message":"unknown thread: thread-1"}
+"#
+        .as_slice(),
+    );
+
+    let _ = read_until_event(&mut input, "read", "thread_read");
 }
 
 fn read_command_exec_output_until<R: BufRead>(

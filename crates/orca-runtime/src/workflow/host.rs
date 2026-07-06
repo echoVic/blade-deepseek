@@ -402,9 +402,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn node_available_accepts_explicit_node_path_env() {
-        let _guard = crate::history::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = crate::history::lock_test_env();
         let previous_path = env::var_os("PATH");
         let previous_node_path = env::var_os("ORCA_NODE_PATH");
         let previous_node = env::var_os("ORCA_NODE");
@@ -448,9 +446,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn node_available_accepts_sibling_node_bin_from_path_layout() {
-        let _guard = crate::history::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = crate::history::lock_test_env();
         let previous_path = env::var_os("PATH");
         let previous_node_path = env::var_os("ORCA_NODE_PATH");
         let previous_node = env::var_os("ORCA_NODE");

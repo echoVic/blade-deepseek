@@ -71,16 +71,23 @@ fn tool_execution_does_not_call_interactive_approval_resolution_directly() {
 fn turn_iteration_step_uses_grouped_runtime_input() {
     let lifecycle =
         std::fs::read_to_string("crates/orca-runtime/src/lifecycle.rs").expect("lifecycle source");
+    let runtime_turn_iteration =
+        std::fs::read_to_string("crates/orca-runtime/src/runtime_turn_iteration.rs")
+            .expect("runtime turn iteration source");
 
     assert!(
-        lifecycle.contains("struct RuntimeTurnIterationInput"),
-        "turn iteration should have a grouped input boundary before more runtime-loop refactors"
+        runtime_turn_iteration.contains("struct RuntimeTurnIterationInput"),
+        "turn iteration should have a grouped input boundary in its own runtime module"
+    );
+    assert!(
+        !lifecycle.contains("struct RuntimeTurnIterationInput"),
+        "lifecycle should not own turn iteration input after the iteration module split"
     );
 
-    let run_impl = lifecycle
+    let run_impl = runtime_turn_iteration
         .split("impl RuntimeTurnIterationStep")
         .nth(1)
-        .and_then(|text| text.split("impl RuntimeTurnLoopStep").next())
+        .and_then(|text| text.split("impl RuntimeTurnIterationStep").next())
         .expect("runtime turn iteration impl block");
     assert!(
         run_impl.contains("input: RuntimeTurnIterationInput"),
@@ -169,8 +176,8 @@ fn provider_response_and_tool_turn_share_runtime_step_context() {
         .and_then(|text| text.split(") -> io::Result<ToolTurnOutcome>").next())
         .expect("run_tool_turns signature");
     assert!(
-        run_tool_turns_signature.contains("step_context: RuntimeStepContext"),
-        "tool turns should share the provider response step context"
+        run_tool_turns_signature.contains("context: RuntimeToolTurnsContext"),
+        "tool turns should consume grouped dispatch context"
     );
     assert!(
         !run_tool_turns_signature.contains("tool_policy: AgentToolPolicyContext"),
@@ -179,6 +186,15 @@ fn provider_response_and_tool_turn_share_runtime_step_context() {
     assert!(
         !run_tool_turns_signature.contains("hooks: &HookRunner"),
         "hooks should not be a separate run_tool_turns argument"
+    );
+    let tool_turns_context = tool_turn
+        .split("pub(crate) struct RuntimeToolTurnsContext")
+        .nth(1)
+        .and_then(|text| text.split("pub(crate) struct ToolTurnExecution").next())
+        .expect("runtime tool turns context");
+    assert!(
+        tool_turns_context.contains("step_context: RuntimeStepContext"),
+        "grouped tool-turn dispatch context should carry the provider response step context"
     );
 }
 
@@ -208,8 +224,9 @@ fn runtime_tool_router_owns_tool_invocation_dispatch_boundary() {
         "tool_router should classify runtime special tool dispatch"
     );
     assert!(
-        tool_router.contains("execute_normal_tool_with_roots_and_cancel"),
-        "tool_router should own normal tool execution routing"
+        tool_router.contains("RuntimeNormalToolInvocation")
+            && tool_router.contains("execute_normal_tool_invocation"),
+        "tool_router should route normal tool execution through the invocation-object entrypoint"
     );
     assert!(
         tool_execution.contains("RuntimeToolRouter::new"),
@@ -243,6 +260,10 @@ fn runtime_normal_tool_executor_owns_normal_tool_execution_boundary() {
         "runtime_normal_tool should group normal tool execution state"
     );
     assert!(
+        normal_tool.contains("pub(crate) struct RuntimeNormalToolInvocation"),
+        "runtime_normal_tool should expose a smaller invocation object for lifecycle/router callers"
+    );
+    assert!(
         normal_tool.contains("pub(crate) trait RuntimeNormalToolFallbackExecutor"),
         "runtime_normal_tool should expose a focused fallback executor boundary"
     );
@@ -271,6 +292,14 @@ fn runtime_normal_tool_executor_owns_normal_tool_execution_boundary() {
         "lifecycle should delegate normal tool execution through the runtime_normal_tool invocation helper"
     );
     assert!(
+        lifecycle.contains("pub(crate) fn execute_normal_tool_invocation"),
+        "lifecycle actors should expose one invocation-object entrypoint for normal tools"
+    );
+    assert!(
+        tool_router_uses_normal_tool_invocation(),
+        "tool_router should route normal tools through RuntimeNormalToolInvocation instead of the long roots/cancel method"
+    );
+    assert!(
         !lifecycle.contains("RuntimeNormalToolExecutor::new"),
         "lifecycle should not instantiate the normal tool executor directly"
     );
@@ -282,6 +311,14 @@ fn runtime_normal_tool_executor_owns_normal_tool_execution_boundary() {
         !lifecycle.contains("orca_tools::execute_with_mcp_external_roots_policy_or_cancel"),
         "lifecycle should not directly invoke the normal tool fallback executor"
     );
+}
+
+fn tool_router_uses_normal_tool_invocation() -> bool {
+    let tool_router = std::fs::read_to_string("crates/orca-runtime/src/tool_router.rs")
+        .expect("runtime tool router source");
+    tool_router.contains("RuntimeNormalToolInvocation")
+        && tool_router.contains("execute_normal_tool_invocation")
+        && !tool_router.contains("execute_normal_tool_with_roots_and_cancel")
 }
 
 #[test]
@@ -1273,6 +1310,195 @@ fn tool_actor_context_allows_bash_writes_to_additional_working_directories() {
     assert_eq!(result.status, orca_core::tool_types::ToolStatus::Failed);
     assert_eq!(std::fs::read_to_string(extra_file).unwrap(), "allowed");
     assert!(!outside_file.exists());
+}
+
+#[test]
+fn tool_actor_context_retries_bash_after_filesystem_permission_grant() {
+    if !sandbox_seatbelt_available() {
+        return;
+    }
+
+    struct AllowRequestedFileSystem;
+
+    impl RuntimePermissionRequestHandler for AllowRequestedFileSystem {
+        fn request_permissions(
+            &self,
+            request: &RuntimePermissionRequest,
+        ) -> std::io::Result<RuntimePermissionResponse> {
+            let file_system = request
+                .permissions
+                .file_system
+                .as_ref()
+                .expect("filesystem permission request");
+            let write_roots = file_system.write.as_ref().expect("write roots");
+            assert_eq!(write_roots.len(), 1);
+
+            Ok(RuntimePermissionResponse {
+                decision: PermissionResponseDecision::Allow,
+                scope: PermissionGrantScope::Turn,
+                permissions: request.permissions.clone(),
+                strict_auto_review: false,
+            })
+        }
+    }
+
+    let parent =
+        tempfile::tempdir_in(std::env::current_dir().expect("cwd")).expect("sandbox parent");
+    let workspace = parent.path().join("workspace");
+    let outside = parent.path().join("outside");
+    std::fs::create_dir(&workspace).expect("workspace dir");
+    std::fs::create_dir(&outside).expect("outside dir");
+    let outside_file = outside.join("granted.txt");
+    let mut context = RuntimeToolActorContext::new("run-tools", 2);
+    let mut config = test_run_config();
+    config.cwd = Some(workspace.clone());
+    let task_registry = TaskRegistry::new("run-tools".to_string());
+    let request = ToolRequest {
+        id: "tool-1".to_string(),
+        name: ToolName::Bash,
+        action: ActionKind::Shell,
+        target: Some(format!("printf granted > {}", outside_file.display())),
+        raw_arguments: None,
+    };
+
+    let result = context.execute_normal_tool_with_roots_and_cancel(
+        Some(&config),
+        &request,
+        &workspace,
+        &[],
+        &McpRegistry::default(),
+        &[],
+        ToolConfig::default().output_truncation,
+        5,
+        Some(&task_registry),
+        None,
+        Some(&AllowRequestedFileSystem),
+    );
+
+    assert_eq!(result.status, orca_core::tool_types::ToolStatus::Completed);
+    assert_eq!(std::fs::read_to_string(outside_file).unwrap(), "granted");
+}
+
+#[test]
+fn tool_actor_context_retries_workspace_git_write_after_permission_grant() {
+    if !sandbox_seatbelt_available() {
+        return;
+    }
+
+    struct AllowGitDirectory {
+        git_dir: std::path::PathBuf,
+    }
+
+    impl RuntimePermissionRequestHandler for AllowGitDirectory {
+        fn request_permissions(
+            &self,
+            request: &RuntimePermissionRequest,
+        ) -> std::io::Result<RuntimePermissionResponse> {
+            let write_roots = request
+                .permissions
+                .file_system
+                .as_ref()
+                .and_then(|file_system| file_system.write.as_ref())
+                .expect("filesystem write roots");
+            assert_eq!(write_roots, &[self.git_dir.clone()]);
+
+            Ok(RuntimePermissionResponse {
+                decision: PermissionResponseDecision::Allow,
+                scope: PermissionGrantScope::Turn,
+                permissions: request.permissions.clone(),
+                strict_auto_review: false,
+            })
+        }
+    }
+
+    let repo = tempfile::tempdir_in(std::env::current_dir().expect("cwd")).expect("repo");
+    let git_dir = repo.path().join(".git");
+    std::fs::create_dir(&git_dir).expect("git dir");
+    let index_lock = git_dir.join("index.lock");
+    let mut context = RuntimeToolActorContext::new("run-tools", 2);
+    let mut config = test_run_config();
+    config.cwd = Some(repo.path().to_path_buf());
+    let task_registry = TaskRegistry::new("run-tools".to_string());
+    let request = ToolRequest {
+        id: "tool-1".to_string(),
+        name: ToolName::Bash,
+        action: ActionKind::Shell,
+        target: Some(format!("printf locked > {}", index_lock.display())),
+        raw_arguments: None,
+    };
+
+    let result = context.execute_normal_tool_with_roots_and_cancel(
+        Some(&config),
+        &request,
+        repo.path(),
+        &[],
+        &McpRegistry::default(),
+        &[],
+        ToolConfig::default().output_truncation,
+        5,
+        Some(&task_registry),
+        None,
+        Some(&AllowGitDirectory {
+            git_dir: git_dir.clone(),
+        }),
+    );
+
+    assert_eq!(result.status, orca_core::tool_types::ToolStatus::Completed);
+    assert_eq!(std::fs::read_to_string(index_lock).unwrap(), "locked");
+}
+
+#[test]
+fn tool_actor_context_reports_git_index_lock_sandbox_denial() {
+    if !sandbox_seatbelt_available() {
+        return;
+    }
+
+    let parent =
+        tempfile::tempdir_in(std::env::current_dir().expect("cwd")).expect("sandbox parent");
+    let repo = parent.path().join("repo");
+    let workspace = repo.join("web");
+    let git_dir = repo.join(".git");
+    std::fs::create_dir_all(&workspace).expect("workspace dir");
+    std::fs::create_dir(&git_dir).expect("git dir");
+    let index_lock = git_dir.join("index.lock");
+    let mut context = RuntimeToolActorContext::new("run-tools", 2);
+    let mut config = test_run_config();
+    config.cwd = Some(workspace.clone());
+    let task_registry = TaskRegistry::new("run-tools".to_string());
+    let request = ToolRequest {
+        id: "tool-1".to_string(),
+        name: ToolName::Bash,
+        action: ActionKind::Shell,
+        target: Some(format!(
+            "printf 'fatal: Unable to create '\\''{}'\\'': Operation not permitted\\n' >&2; exit 128",
+            index_lock.display()
+        )),
+        raw_arguments: None,
+    };
+
+    let result = context.execute_normal_tool_with_roots_and_cancel(
+        Some(&config),
+        &request,
+        &workspace,
+        &[],
+        &McpRegistry::default(),
+        &[],
+        ToolConfig::default().output_truncation,
+        5,
+        Some(&task_registry),
+        None,
+        None,
+    );
+
+    assert_eq!(result.status, orca_core::tool_types::ToolStatus::Failed);
+    let output = result.error.as_deref().expect("tool error");
+    assert!(output.contains("not a stale git lock"), "{output}");
+    assert!(output.contains("sandbox"), "{output}");
+    assert!(output.contains(&repo.display().to_string()), "{output}");
+    assert!(
+        output.contains(&workspace.display().to_string()),
+        "{output}"
+    );
 }
 
 #[test]

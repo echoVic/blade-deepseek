@@ -2,6 +2,10 @@ pub mod agent_child;
 pub mod agent_common;
 pub mod agent_loop;
 pub mod approval_resolution;
+mod child_agent_loop_runner;
+mod child_agent_loop_setup;
+mod child_agent_provider_turn;
+mod child_agent_response_folding;
 pub mod compaction;
 pub mod controller;
 pub mod cost;
@@ -16,9 +20,24 @@ pub mod network_proxy;
 pub mod notify;
 pub mod protocol;
 pub mod provider_turn;
+pub(crate) mod runtime_approval;
 pub(crate) mod runtime_bash;
+mod runtime_conversation_bootstrap;
+mod runtime_lifecycle;
+mod runtime_model_route;
 mod runtime_normal_tool;
+pub(crate) mod runtime_permission;
+pub(crate) mod runtime_readonly_tool_turn;
 pub(crate) mod runtime_special;
+mod runtime_steer;
+mod runtime_tool_actor;
+mod runtime_turn_iteration;
+mod runtime_turn_loop;
+mod runtime_turn_opening;
+mod runtime_turn_setup;
+mod runtime_turn_start;
+pub(crate) mod runtime_user_input;
+pub(crate) mod sandbox_denial;
 pub mod schema_validation;
 pub mod server;
 pub mod server_runtime;
@@ -26,6 +45,7 @@ pub mod session;
 pub mod shell_session;
 mod step_context;
 pub mod subagent;
+pub mod subagent_async_worker;
 pub mod subagent_execution;
 pub mod tasks;
 pub mod thread;
@@ -125,6 +145,39 @@ mod tests {
             assert!(
                 !lifecycle_source.contains(marker),
                 "lifecycle must not own runtime-special detail {marker}"
+            );
+        }
+    }
+
+    #[test]
+    fn readonly_tool_turn_is_owned_by_runtime_readonly_module() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let lib_source =
+            std::fs::read_to_string(manifest_dir.join("src/lib.rs")).expect("lib source");
+        let tool_turn_source = std::fs::read_to_string(manifest_dir.join("src/tool_turn.rs"))
+            .expect("tool turn source");
+        let readonly_source =
+            std::fs::read_to_string(manifest_dir.join("src/runtime_readonly_tool_turn.rs"))
+                .expect("runtime readonly tool turn source");
+
+        assert!(
+            lib_source.contains("pub(crate) mod runtime_readonly_tool_turn;"),
+            "runtime crate must declare a focused readonly tool-turn module"
+        );
+        for marker in [
+            "pub(crate) fn execute_readonly_batch<W: io::Write>",
+            "pub(crate) fn should_run_readonly_batch(",
+            "pub(crate) fn collect_readonly_batch(",
+            "pub(crate) fn record_readonly_batch_results(",
+            "pub(crate) fn run_readonly_tool_turn<W: io::Write>",
+        ] {
+            assert!(
+                readonly_source.contains(marker),
+                "runtime_readonly_tool_turn must own readonly detail {marker}"
+            );
+            assert!(
+                !tool_turn_source.contains(marker),
+                "tool_turn must not own readonly detail {marker}"
             );
         }
     }
@@ -271,6 +324,150 @@ mod tests {
         assert!(
             processor_source.contains("fn dispatch_command_exec_operation"),
             "server command exec processor must expose command exec dispatch inside the router module"
+        );
+    }
+
+    #[test]
+    fn server_command_exec_manager_is_owned_by_command_exec_manager_module() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let server_source =
+            std::fs::read_to_string(manifest_dir.join("src/server.rs")).expect("server source");
+        let manager_source =
+            std::fs::read_to_string(manifest_dir.join("src/server/command_exec_manager.rs"))
+                .expect("server command exec manager source");
+
+        assert!(
+            server_source.contains("mod command_exec_manager;"),
+            "server must declare the command exec manager module"
+        );
+        for type_name in [
+            "struct CommandExecProcess",
+            "struct CommandExecManager",
+            "enum CommandExecDrainOutcome",
+        ] {
+            assert!(
+                !server_source.contains(type_name),
+                "server.rs must not own {type_name}"
+            );
+            assert!(
+                manager_source.contains(type_name),
+                "server/command_exec_manager.rs must own {type_name}"
+            );
+        }
+        assert!(
+            manager_source.contains("impl CommandExecManager"),
+            "server/command_exec_manager.rs must own command exec manager behavior"
+        );
+    }
+
+    #[test]
+    fn server_active_turn_manager_is_owned_by_active_turn_manager_module() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let server_source =
+            std::fs::read_to_string(manifest_dir.join("src/server.rs")).expect("server source");
+        let manager_source =
+            std::fs::read_to_string(manifest_dir.join("src/server/active_turn_manager.rs"))
+                .expect("server active turn manager source");
+
+        assert!(
+            server_source.contains("mod active_turn_manager;"),
+            "server must declare the active turn manager module"
+        );
+        for type_name in [
+            "struct ActiveTurnControl",
+            "struct ActiveTurnHandle",
+            "struct ActiveTurnManager",
+        ] {
+            assert!(
+                !server_source.contains(type_name),
+                "server.rs must not own {type_name}"
+            );
+            assert!(
+                manager_source.contains(type_name),
+                "server/active_turn_manager.rs must own {type_name}"
+            );
+        }
+        assert!(
+            manager_source.contains("fn merge_completed_turn_metadata"),
+            "server/active_turn_manager.rs must own completed-turn metadata merge"
+        );
+    }
+
+    #[test]
+    fn server_permission_manager_is_owned_by_permission_manager_module() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let server_source =
+            std::fs::read_to_string(manifest_dir.join("src/server.rs")).expect("server source");
+        let manager_source =
+            std::fs::read_to_string(manifest_dir.join("src/server/permission_manager.rs"))
+                .expect("server permission manager source");
+
+        assert!(
+            server_source.contains("mod permission_manager;"),
+            "server must declare the permission manager module"
+        );
+        for type_name in [
+            "struct PendingCommandExecPermissionRequest",
+            "enum PendingPermissionRequest",
+            "struct PendingPermissionManager",
+            "struct ServerPermissionRequestHandler",
+        ] {
+            assert!(
+                !server_source.contains(type_name),
+                "server.rs must not own {type_name}"
+            );
+            assert!(
+                manager_source.contains(type_name),
+                "server/permission_manager.rs must own {type_name}"
+            );
+        }
+        assert!(
+            manager_source.contains("RuntimePermissionRequestHandler")
+                && manager_source.contains("for ServerPermissionRequestHandler"),
+            "server/permission_manager.rs must own runtime permission request handling"
+        );
+        assert!(
+            manager_source.contains("fn insert_command_exec"),
+            "server/permission_manager.rs must own command/exec pending permission insertion"
+        );
+    }
+
+    #[test]
+    fn server_shell_manager_is_owned_by_shell_manager_module() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let server_source =
+            std::fs::read_to_string(manifest_dir.join("src/server.rs")).expect("server source");
+        let manager_source =
+            std::fs::read_to_string(manifest_dir.join("src/server/shell_manager.rs"))
+                .expect("server shell manager source");
+
+        assert!(
+            server_source.contains("mod shell_manager;"),
+            "server must declare the shell manager module"
+        );
+        assert!(
+            !server_source.contains("shell_sessions: Option<RuntimeShellSessionManager>"),
+            "server.rs must not store raw RuntimeShellSessionManager state"
+        );
+        assert!(
+            !server_source.contains("fn shell_manager("),
+            "server.rs must not own shell manager lazy initialization"
+        );
+        assert!(
+            manager_source.contains("struct ServerShellManager"),
+            "server/shell_manager.rs must own ServerShellManager"
+        );
+        assert!(
+            manager_source.contains("Option<RuntimeShellSessionManager>"),
+            "server/shell_manager.rs must own optional runtime shell session storage"
+        );
+        assert!(
+            manager_source.contains("TaskRegistry::new_for_cwd"),
+            "server/shell_manager.rs must own server shell task registry creation"
+        );
+        assert!(
+            manager_source.contains("fn sessions_mut"),
+            "server/shell_manager.rs must expose borrowed runtime shell sessions for command/exec compatibility"
         );
     }
 
@@ -434,6 +631,406 @@ mod tests {
     }
 
     #[test]
+    fn runtime_lifecycle_state_machine_is_owned_by_runtime_lifecycle_module() {
+        let lib_source = include_str!("lib.rs");
+        let lifecycle_source = include_str!("lifecycle.rs");
+        let runtime_lifecycle_source =
+            std::fs::read_to_string("src/runtime_lifecycle.rs").expect("runtime lifecycle source");
+
+        assert!(
+            lib_source.contains("mod runtime_lifecycle;"),
+            "runtime crate must declare a focused runtime_lifecycle module"
+        );
+
+        for marker in [
+            "pub struct RuntimeSessionLifecycle",
+            "pub struct RuntimeTaskLifecycle",
+            "pub enum RuntimeTaskKind",
+            "pub enum RuntimeTaskStatus",
+            "pub struct RuntimeTurnLifecycle",
+            "pub struct RuntimeTurnRunner",
+            "pub struct RuntimeStartedTurn",
+            "pub struct RuntimeAdvancedTurn",
+            "impl RuntimeSessionLifecycle",
+            "impl<'a> RuntimeTurnRunner<'a>",
+            "impl RuntimeTaskLifecycle",
+            "impl RuntimeTurnLifecycle",
+        ] {
+            assert!(
+                runtime_lifecycle_source.contains(marker),
+                "runtime_lifecycle must own lifecycle state-machine detail {marker}"
+            );
+            assert!(
+                !lifecycle_source.contains(marker),
+                "lifecycle must not own lifecycle state-machine detail {marker}"
+            );
+        }
+
+        assert!(
+            lifecycle_source.contains("pub use crate::runtime_lifecycle::"),
+            "lifecycle must preserve existing public imports by re-exporting runtime_lifecycle types"
+        );
+    }
+
+    #[test]
+    fn runtime_tool_actor_context_is_owned_by_runtime_tool_actor_module() {
+        let lib_source = include_str!("lib.rs");
+        let lifecycle_source = include_str!("lifecycle.rs");
+        let runtime_tool_actor_source = std::fs::read_to_string("src/runtime_tool_actor.rs")
+            .expect("runtime tool actor source");
+
+        assert!(
+            lib_source.contains("mod runtime_tool_actor;"),
+            "runtime crate must declare a focused runtime_tool_actor module"
+        );
+
+        for marker in [
+            "pub struct RuntimeToolActorContext",
+            "impl RuntimeToolActorContext",
+        ] {
+            assert!(
+                runtime_tool_actor_source.contains(marker),
+                "runtime_tool_actor must own tool actor context detail {marker}"
+            );
+            assert!(
+                !lifecycle_source.contains(marker),
+                "lifecycle must not own tool actor context detail {marker}"
+            );
+        }
+
+        for marker in [
+            "pub fn new(run_id: impl Into<String>, max_turns: u32) -> Self",
+            "pub fn resolve_tool_approval(",
+            "pub(crate) fn execute_normal_tool_invocation(",
+            "pub fn execute_user_input_tool(",
+        ] {
+            assert!(
+                runtime_tool_actor_source.contains(marker),
+                "runtime_tool_actor must expose tool actor context adapter detail {marker}"
+            );
+        }
+
+        assert!(
+            lifecycle_source
+                .contains("pub use crate::runtime_tool_actor::RuntimeToolActorContext;"),
+            "lifecycle must preserve existing public imports by re-exporting RuntimeToolActorContext"
+        );
+    }
+
+    #[test]
+    fn runtime_user_input_boundary_is_owned_by_runtime_user_input_module() {
+        let lib_source = include_str!("lib.rs");
+        let lifecycle_source = include_str!("lifecycle.rs");
+        let runtime_user_input_source = std::fs::read_to_string("src/runtime_user_input.rs")
+            .expect("runtime user input source");
+
+        assert!(
+            lib_source.contains("pub(crate) mod runtime_user_input;"),
+            "runtime crate must declare a focused runtime_user_input module"
+        );
+
+        for marker in [
+            "pub struct RuntimeUserInputRequest",
+            "pub trait RuntimeUserInputHandler",
+            "struct RuntimeUserInputRequestArgs",
+            "pub(crate) fn parse_runtime_user_input_request(",
+            "pub(crate) fn execute_user_input_tool(",
+        ] {
+            assert!(
+                runtime_user_input_source.contains(marker),
+                "runtime_user_input must own user-input runtime detail {marker}"
+            );
+            assert!(
+                !lifecycle_source.contains(marker),
+                "lifecycle must not own user-input runtime detail {marker}"
+            );
+        }
+
+        assert!(
+            lifecycle_source.contains("pub use crate::runtime_user_input::"),
+            "lifecycle must preserve existing public imports by re-exporting runtime user-input types"
+        );
+    }
+
+    #[test]
+    fn runtime_permission_boundary_is_owned_by_runtime_permission_module() {
+        let lib_source = include_str!("lib.rs");
+        let lifecycle_source = include_str!("lifecycle.rs");
+        let runtime_permission_source = std::fs::read_to_string("src/runtime_permission.rs")
+            .expect("runtime permission source");
+
+        assert!(
+            lib_source.contains("pub(crate) mod runtime_permission;"),
+            "runtime crate must declare a focused runtime_permission module"
+        );
+
+        for marker in [
+            "pub struct RuntimePermissionRequest",
+            "pub struct RuntimePermissionResponse",
+            "pub trait RuntimePermissionRequestHandler",
+            "pub(crate) struct AllowRequestedPermissions",
+            "pub struct TurnPermissionOverlay",
+            "impl TurnPermissionOverlay",
+        ] {
+            assert!(
+                runtime_permission_source.contains(marker),
+                "runtime_permission must own permission runtime detail {marker}"
+            );
+            assert!(
+                !lifecycle_source.contains(marker),
+                "lifecycle must not own permission runtime detail {marker}"
+            );
+        }
+
+        assert!(
+            lifecycle_source.contains("pub use crate::runtime_permission::"),
+            "lifecycle must preserve existing public imports by re-exporting runtime permission types"
+        );
+    }
+
+    #[test]
+    fn runtime_approval_boundary_is_owned_by_runtime_approval_module() {
+        let lib_source = include_str!("lib.rs");
+        let lifecycle_source = include_str!("lifecycle.rs");
+        let runtime_approval_source =
+            std::fs::read_to_string("src/runtime_approval.rs").expect("runtime approval source");
+
+        assert!(
+            lib_source.contains("pub(crate) mod runtime_approval;"),
+            "runtime crate must declare a focused runtime_approval module"
+        );
+
+        for marker in [
+            "pub enum RuntimeApprovalDecision",
+            "pub trait RuntimeApprovalHandler",
+            "pub struct RuntimeConfigApprovalHandler",
+            "impl RuntimeApprovalHandler for RuntimeConfigApprovalHandler",
+        ] {
+            assert!(
+                runtime_approval_source.contains(marker),
+                "runtime_approval must own approval runtime detail {marker}"
+            );
+            assert!(
+                !lifecycle_source.contains(marker),
+                "lifecycle must not own approval runtime detail {marker}"
+            );
+        }
+
+        assert!(
+            lifecycle_source.contains("pub use crate::runtime_approval::"),
+            "lifecycle must preserve existing public imports by re-exporting runtime approval types"
+        );
+    }
+
+    #[test]
+    fn child_agent_loop_setup_boundary_is_owned_by_focused_module() {
+        let lib_source = include_str!("lib.rs");
+        let agent_child_source = include_str!("agent_child.rs");
+        let child_loop_setup_source = std::fs::read_to_string("src/child_agent_loop_setup.rs")
+            .expect("child agent loop setup source");
+
+        assert!(
+            lib_source.contains("mod child_agent_loop_setup;"),
+            "runtime crate must declare a focused child_agent_loop_setup module"
+        );
+
+        for marker in [
+            "pub const DEFAULT_CHILD_AGENT_MAX_TURNS",
+            "pub struct ChildAgentLoopSetup",
+            "pub enum ChildAgentTurnBudget",
+            "pub fn prepare_child_agent_loop",
+            "pub fn advance_child_agent_turn",
+            "pub fn advance_child_agent_turn_with_limit",
+        ] {
+            assert!(
+                child_loop_setup_source.contains(marker),
+                "child_agent_loop_setup must own child loop setup detail {marker}"
+            );
+            assert!(
+                !agent_child_source.contains(marker),
+                "agent_child facade must not own child loop setup detail {marker}"
+            );
+        }
+
+        assert!(
+            agent_child_source.contains("pub use crate::child_agent_loop_setup::"),
+            "agent_child must preserve existing imports by re-exporting child loop setup APIs"
+        );
+    }
+
+    #[test]
+    fn child_agent_provider_turn_boundary_is_owned_by_focused_module() {
+        let lib_source = include_str!("lib.rs");
+        let agent_child_source = include_str!("agent_child.rs");
+        let agent_child_runtime_source = agent_child_source
+            .split_once("#[cfg(test)]")
+            .map(|(runtime_source, _)| runtime_source)
+            .unwrap_or(agent_child_source);
+        let child_provider_turn_source =
+            std::fs::read_to_string("src/child_agent_provider_turn.rs")
+                .expect("child agent provider turn source");
+
+        assert!(
+            lib_source.contains("mod child_agent_provider_turn;"),
+            "runtime crate must declare a focused child_agent_provider_turn module"
+        );
+
+        for marker in [
+            "pub enum ChildAgentProviderErrorDecision",
+            "pub enum ChildAgentProviderTurn",
+            "pub fn route_child_agent_model",
+            "pub fn run_child_agent_provider_turn",
+            "pub fn compact_child_agent_conversation_if_needed",
+            "pub fn handle_child_agent_provider_error",
+        ] {
+            assert!(
+                child_provider_turn_source.contains(marker),
+                "child_agent_provider_turn must own provider-turn detail {marker}"
+            );
+            assert!(
+                !agent_child_source.contains(marker),
+                "agent_child facade must not own provider-turn detail {marker}"
+            );
+        }
+
+        for marker in [
+            "conversation_with_hook_context",
+            "RuntimeCompactionStep::new",
+            "is_prompt_too_long_error",
+            "PreModelCall",
+            "PostModelCall",
+        ] {
+            assert!(
+                child_provider_turn_source.contains(marker),
+                "child_agent_provider_turn must keep provider-turn behavior detail {marker}"
+            );
+            assert!(
+                !agent_child_runtime_source.contains(marker),
+                "agent_child facade must delegate provider-turn behavior detail {marker}"
+            );
+        }
+
+        assert!(
+            agent_child_source.contains("pub use crate::child_agent_provider_turn::"),
+            "agent_child must preserve existing imports by re-exporting child provider-turn APIs"
+        );
+    }
+
+    #[test]
+    fn child_agent_response_folding_boundary_is_owned_by_focused_module() {
+        let lib_source = include_str!("lib.rs");
+        let agent_child_source = include_str!("agent_child.rs");
+        let agent_child_runtime_source = agent_child_source
+            .split_once("#[cfg(test)]")
+            .map(|(runtime_source, _)| runtime_source)
+            .unwrap_or(agent_child_source);
+        let child_response_folding_source =
+            std::fs::read_to_string("src/child_agent_response_folding.rs")
+                .expect("child agent response folding source");
+
+        assert!(
+            lib_source.contains("mod child_agent_response_folding;"),
+            "runtime crate must declare a focused child_agent_response_folding module"
+        );
+
+        for marker in [
+            "pub enum ChildAgentProviderResponseFold",
+            "pub enum ChildAgentToolResultFold",
+            "pub struct ChildAgentToolExecution",
+            "pub struct ChildAgentToolContext",
+            "pub fn fold_child_agent_provider_response",
+            "pub fn child_agent_tool_requests",
+            "pub fn fold_child_agent_tool_result",
+        ] {
+            assert!(
+                child_response_folding_source.contains(marker),
+                "child_agent_response_folding must own response/tool folding detail {marker}"
+            );
+            assert!(
+                !agent_child_runtime_source.contains(marker),
+                "agent_child facade must not own response/tool folding detail {marker}"
+            );
+        }
+
+        for marker in [
+            "add_usage",
+            "add_assistant",
+            "ProviderStep::ToolCall",
+            "format_tool_result_for_model",
+            "add_tool_result",
+        ] {
+            assert!(
+                child_response_folding_source.contains(marker),
+                "child_agent_response_folding must keep folding behavior detail {marker}"
+            );
+            assert!(
+                !agent_child_runtime_source.contains(marker),
+                "agent_child facade must delegate folding behavior detail {marker}"
+            );
+        }
+
+        assert!(
+            agent_child_source.contains("pub use crate::child_agent_response_folding::"),
+            "agent_child must preserve existing imports by re-exporting child response-folding APIs"
+        );
+    }
+
+    #[test]
+    fn child_agent_loop_runner_boundary_is_owned_by_focused_module() {
+        let lib_source = include_str!("lib.rs");
+        let agent_child_source = include_str!("agent_child.rs");
+        let agent_child_runtime_source = agent_child_source
+            .split_once("#[cfg(test)]")
+            .map(|(runtime_source, _)| runtime_source)
+            .unwrap_or(agent_child_source);
+        let child_loop_runner_source = std::fs::read_to_string("src/child_agent_loop_runner.rs")
+            .expect("child agent loop runner source");
+
+        assert!(
+            lib_source.contains("mod child_agent_loop_runner;"),
+            "runtime crate must declare a focused child_agent_loop_runner module"
+        );
+
+        for marker in [
+            "pub fn run_child_agent_loop_with_tool_executor",
+            "pub fn run_child_agent_with_tool_executor",
+        ] {
+            assert!(
+                child_loop_runner_source.contains(marker),
+                "child_agent_loop_runner must own child loop runner detail {marker}"
+            );
+            assert!(
+                !agent_child_runtime_source.contains(marker),
+                "agent_child facade must not own child loop runner detail {marker}"
+            );
+        }
+
+        for marker in [
+            "prepare_child_agent_loop(",
+            "advance_child_agent_turn(",
+            "compact_child_agent_conversation_if_needed(",
+            "run_child_agent_provider_turn(",
+            "fold_child_agent_provider_response(",
+            "child_agent_tool_requests(",
+            "fold_child_agent_tool_result(",
+        ] {
+            assert!(
+                child_loop_runner_source.contains(marker),
+                "child_agent_loop_runner must compose child loop behavior detail {marker}"
+            );
+            assert!(
+                !agent_child_runtime_source.contains(marker),
+                "agent_child facade must delegate child loop behavior detail {marker}"
+            );
+        }
+
+        assert!(
+            agent_child_source.contains("pub use crate::child_agent_loop_runner::"),
+            "agent_child must preserve existing imports by re-exporting child loop runner APIs"
+        );
+    }
+
+    #[test]
     fn thread_steer_handle_is_owned_by_lifecycle_module() {
         let agent_loop_source = include_str!("agent_loop.rs");
         let lifecycle_source = include_str!("lifecycle.rs");
@@ -457,9 +1054,12 @@ mod tests {
     }
 
     #[test]
-    fn runtime_steer_step_is_owned_by_lifecycle_module() {
+    fn runtime_steer_step_is_owned_by_runtime_steer_module() {
         let agent_loop_source = include_str!("agent_loop.rs");
+        let lib_source = include_str!("lib.rs");
         let lifecycle_source = include_str!("lifecycle.rs");
+        let runtime_steer_source =
+            std::fs::read_to_string("src/runtime_steer.rs").expect("runtime steer source");
 
         assert!(
             !agent_loop_source.contains("struct RuntimeSteerStep"),
@@ -470,17 +1070,34 @@ mod tests {
             "agent_loop must not own runtime steer step behavior"
         );
         assert!(
-            lifecycle_source.contains("struct RuntimeSteerStep"),
-            "lifecycle must own runtime steer step state"
+            lib_source.contains("mod runtime_steer;"),
+            "runtime crate must declare a focused runtime_steer module"
         );
         assert!(
-            lifecycle_source.contains("impl RuntimeSteerStep"),
-            "lifecycle must own runtime steer step behavior"
+            !lifecycle_source.contains("struct RuntimeSteerStep"),
+            "lifecycle must not own runtime steer step state"
+        );
+        assert!(
+            !lifecycle_source.contains("impl RuntimeSteerStep"),
+            "lifecycle must not own runtime steer step behavior"
         );
         assert!(
             !agent_loop_source.contains("for input in steer_handle.drain()"),
             "agent_loop must not directly drain steer inputs into conversation"
         );
+        for marker in [
+            "struct RuntimeSteerStep",
+            "struct RuntimeSteerInput",
+            "impl RuntimeSteerStep",
+            "for steer_input in steer_handle.drain()",
+            "input.conversation.add_user(steer_input)",
+            "writer.append_message(message)",
+        ] {
+            assert!(
+                runtime_steer_source.contains(marker),
+                "runtime_steer must own runtime steer detail {marker}"
+            );
+        }
     }
 
     #[test]
@@ -553,8 +1170,8 @@ mod tests {
             "agent_loop must delegate provider tool schema override through runtime turn setup"
         );
         assert!(
-            include_str!("lifecycle.rs").contains("provider_config_for_agent_loop"),
-            "lifecycle setup must delegate provider tool schema override through provider config construction"
+            include_str!("runtime_turn_setup.rs").contains("provider_config_for_agent_loop"),
+            "runtime_turn_setup must delegate provider tool schema override through provider config construction"
         );
         assert!(
             tool_invocation_source.contains("pub(crate) fn provider_tool_schema_override"),
@@ -725,10 +1342,202 @@ mod tests {
     }
 
     #[test]
-    fn readonly_tool_turn_runner_is_owned_by_tool_turn_module() {
+    fn normal_tool_turn_runner_uses_grouped_context() {
+        let tool_turn_source = include_str!("tool_turn.rs");
+
+        assert!(
+            tool_turn_source.contains("pub(crate) struct RuntimeNormalToolTurnContext"),
+            "tool_turn must group normal tool-turn inputs into RuntimeNormalToolTurnContext"
+        );
+        assert!(
+            tool_turn_source.contains("context: RuntimeNormalToolTurnContext<"),
+            "run_normal_tool_turn must accept the grouped normal tool-turn context"
+        );
+        assert!(
+            tool_turn_source.contains("run_normal_tool_turn(RuntimeNormalToolTurnContext"),
+            "run_tool_turns must pass normal tool-turn inputs as one grouped context"
+        );
+        assert!(
+            !tool_turn_source.contains("run_normal_tool_turn(\n            config,"),
+            "run_tool_turns must not call run_normal_tool_turn with the old long argument list"
+        );
+        for field_name in [
+            "config:",
+            "cwd:",
+            "events:",
+            "sink:",
+            "conversation:",
+            "history_writer:",
+            "tool_request:",
+            "subagent_depth:",
+            "emit_deltas:",
+            "policy:",
+            "instructions:",
+            "memory:",
+            "mcp_registry:",
+            "hooks:",
+            "cost_tracker:",
+            "cancel:",
+            "task_registry:",
+            "background_workflows:",
+            "workflow_ipc:",
+            "permission_overlay:",
+            "permission_handler:",
+            "child_executor:",
+            "workflow_child_executor:",
+        ] {
+            assert!(
+                tool_turn_source.contains(field_name),
+                "RuntimeNormalToolTurnContext must carry normal tool-turn field {field_name}"
+            );
+        }
+    }
+
+    #[test]
+    fn bash_runtime_runner_uses_grouped_invocation_context() {
+        let normal_tool_source = include_str!("runtime_normal_tool.rs");
+        let runtime_bash_source = include_str!("runtime_bash.rs");
+
+        assert!(
+            runtime_bash_source.contains("pub(crate) struct RuntimeBashInvocationContext"),
+            "runtime_bash must group shell-session bash inputs into RuntimeBashInvocationContext"
+        );
+        assert!(
+            runtime_bash_source.contains("context: RuntimeBashInvocationContext"),
+            "execute_bash_with_shell_session must accept the grouped bash invocation context"
+        );
+        assert!(
+            !runtime_bash_source.contains(
+                "#[allow(clippy::too_many_arguments)]\npub(crate) fn execute_bash_with_shell_session"
+            ),
+            "runtime_bash must not need a too_many_arguments escape hatch for bash invocation"
+        );
+        assert!(
+            normal_tool_source.contains("RuntimeBashInvocationContext"),
+            "runtime_normal_tool must construct the grouped bash invocation context"
+        );
+        assert!(
+            !normal_tool_source
+                .contains("execute_bash_with_shell_session(\n                config,"),
+            "runtime_normal_tool must not pass bash execution state through the old long argument list"
+        );
+        for field_name in [
+            "config:",
+            "request:",
+            "cwd:",
+            "additional_roots:",
+            "output_truncation:",
+            "shell_timeout_secs:",
+            "task_registry:",
+            "cancel:",
+            "permission_handler:",
+            "permission_overlay:",
+        ] {
+            assert!(
+                runtime_bash_source.contains(field_name),
+                "RuntimeBashInvocationContext must carry bash field {field_name}"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_bash_internal_execution_uses_grouped_contexts() {
+        let runtime_bash_source = include_str!("runtime_bash.rs");
+
+        for marker in [
+            "struct RuntimeBashSandboxContext",
+            "struct RuntimeBashOnceContext",
+            "fn execute_bash_with_sandbox(context: RuntimeBashSandboxContext",
+            "fn execute_bash_once(context: RuntimeBashOnceContext",
+        ] {
+            assert!(
+                runtime_bash_source.contains(marker),
+                "runtime_bash must own grouped internal bash execution detail {marker}"
+            );
+        }
+
+        assert!(
+            !runtime_bash_source.contains("#[allow(clippy::too_many_arguments)]"),
+            "runtime_bash internal bash execution must not need too_many_arguments escape hatches"
+        );
+
+        for field_name in [
+            "command:",
+            "cwd:",
+            "additional_roots:",
+            "sandbox:",
+            "shell_timeout_secs:",
+            "task_registry:",
+            "cancel:",
+        ] {
+            assert!(
+                runtime_bash_source.contains(field_name),
+                "RuntimeBashSandboxContext must carry sandbox field {field_name}"
+            );
+        }
+
+        for field_name in [
+            "additional_readable_directories:",
+            "additional_working_directories:",
+            "denied_working_directories:",
+            "allowed_unix_socket_roots:",
+            "env:",
+            "sandbox:",
+        ] {
+            assert!(
+                runtime_bash_source.contains(field_name),
+                "RuntimeBashOnceContext must carry shell-spawn field {field_name}"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_turn_dispatch_uses_grouped_context() {
+        let provider_turn_source = include_str!("provider_turn.rs");
+        let tool_turn_source = include_str!("tool_turn.rs");
+
+        assert!(
+            tool_turn_source.contains("pub(crate) struct RuntimeToolTurnsContext"),
+            "tool_turn must group dispatch-loop inputs into RuntimeToolTurnsContext"
+        );
+        assert!(
+            tool_turn_source.contains("context: RuntimeToolTurnsContext<"),
+            "run_tool_turns must accept the grouped dispatch-loop context"
+        );
+        assert!(
+            provider_turn_source.contains("run_tool_turns(RuntimeToolTurnsContext"),
+            "provider response must pass tool-turn dispatch inputs as one grouped context"
+        );
+        assert!(
+            !provider_turn_source.contains("run_tool_turns(\n            step_context,"),
+            "provider response must not call run_tool_turns with the old long argument list"
+        );
+        for field_name in [
+            "step_context:",
+            "events:",
+            "sink:",
+            "conversation:",
+            "history_writer:",
+            "tool_requests:",
+            "cost_tracker:",
+            "background_workflows:",
+            "child_executor:",
+            "workflow_child_executor:",
+            "batch_child_executor:",
+        ] {
+            assert!(
+                tool_turn_source.contains(field_name),
+                "RuntimeToolTurnsContext must carry tool-turn dispatch field {field_name}"
+            );
+        }
+    }
+
+    #[test]
+    fn readonly_tool_turn_runner_is_owned_by_runtime_readonly_module() {
         let agent_loop_source = include_str!("agent_loop.rs");
         let tool_invocation_source = include_str!("tool_invocation.rs");
         let tool_turn_source = include_str!("tool_turn.rs");
+        let readonly_source = include_str!("runtime_readonly_tool_turn.rs");
 
         for marker in ["execute_readonly_batch(", "record_readonly_batch_results("] {
             assert!(
@@ -749,16 +1558,20 @@ mod tests {
             "tool_invocation must not own readonly tool-turn runner"
         );
         assert!(
-            tool_turn_source.contains("pub(crate) fn run_readonly_tool_turn"),
-            "tool_turn must expose readonly tool-turn runner"
+            !tool_turn_source.contains("pub(crate) fn run_readonly_tool_turn"),
+            "tool_turn must not own readonly tool-turn runner"
         );
         assert!(
-            tool_turn_source.contains("execute_readonly_batch"),
-            "tool_turn must compose readonly batch execution"
+            readonly_source.contains("pub(crate) fn run_readonly_tool_turn"),
+            "runtime_readonly_tool_turn must expose readonly tool-turn runner"
         );
         assert!(
-            tool_turn_source.contains("record_readonly_batch_results"),
-            "tool_turn must compose readonly batch result recording"
+            readonly_source.contains("execute_readonly_batch"),
+            "runtime_readonly_tool_turn must compose readonly batch execution"
+        );
+        assert!(
+            readonly_source.contains("record_readonly_batch_results"),
+            "runtime_readonly_tool_turn must compose readonly batch result recording"
         );
     }
 
@@ -824,10 +1637,11 @@ mod tests {
     }
 
     #[test]
-    fn readonly_tool_batch_is_owned_by_tool_turn_module() {
+    fn readonly_tool_batch_is_owned_by_runtime_readonly_module() {
         let agent_loop_source = include_str!("agent_loop.rs");
         let tool_invocation_source = include_str!("tool_invocation.rs");
         let tool_turn_source = include_str!("tool_turn.rs");
+        let readonly_source = include_str!("runtime_readonly_tool_turn.rs");
 
         assert!(
             !agent_loop_source.contains("fn execute_readonly_batch"),
@@ -838,16 +1652,20 @@ mod tests {
             "tool_invocation must not own readonly tool batch execution"
         );
         assert!(
-            tool_turn_source.contains("pub(crate) fn execute_readonly_batch"),
-            "tool_turn must expose readonly tool batch execution"
+            !tool_turn_source.contains("pub(crate) fn execute_readonly_batch"),
+            "tool_turn must not own readonly tool batch execution"
         );
         assert!(
-            tool_turn_source.contains("pub(crate) fn should_run_readonly_batch"),
-            "tool_turn must expose readonly batch planning"
+            readonly_source.contains("pub(crate) fn execute_readonly_batch"),
+            "runtime_readonly_tool_turn must expose readonly tool batch execution"
         );
         assert!(
-            tool_turn_source.contains("pub(crate) fn collect_readonly_batch"),
-            "tool_turn must expose readonly batch range collection"
+            readonly_source.contains("pub(crate) fn should_run_readonly_batch"),
+            "runtime_readonly_tool_turn must expose readonly batch planning"
+        );
+        assert!(
+            readonly_source.contains("pub(crate) fn collect_readonly_batch"),
+            "runtime_readonly_tool_turn must expose readonly batch range collection"
         );
         for marker in [
             "orca_tools::should_run_readonly_batch",
@@ -864,10 +1682,11 @@ mod tests {
     }
 
     #[test]
-    fn readonly_tool_batch_result_recording_is_owned_by_tool_turn_module() {
+    fn readonly_tool_batch_result_recording_is_owned_by_runtime_readonly_module() {
         let agent_loop_source = include_str!("agent_loop.rs");
         let tool_invocation_source = include_str!("tool_invocation.rs");
         let tool_turn_source = include_str!("tool_turn.rs");
+        let readonly_source = include_str!("runtime_readonly_tool_turn.rs");
 
         assert!(
             !agent_loop_source.contains("record_tool_result_for_agent("),
@@ -886,12 +1705,16 @@ mod tests {
             "tool_invocation must not own readonly batch result recording"
         );
         assert!(
-            tool_turn_source.contains("pub(crate) fn record_readonly_batch_results"),
-            "tool_turn must expose readonly batch result recording"
+            !tool_turn_source.contains("pub(crate) fn record_readonly_batch_results"),
+            "tool_turn must not own readonly batch result recording"
         );
         assert!(
-            tool_turn_source.contains("record_tool_result_for_agent"),
-            "tool_turn must reuse shared session tool result recording"
+            readonly_source.contains("pub(crate) fn record_readonly_batch_results"),
+            "runtime_readonly_tool_turn must expose readonly batch result recording"
+        );
+        assert!(
+            readonly_source.contains("record_tool_result_for_agent"),
+            "runtime_readonly_tool_turn must reuse shared session tool result recording"
         );
     }
 
@@ -953,6 +1776,45 @@ mod tests {
             subagent_execution_source.contains("record_subagent_batch_results"),
             "subagent_execution must compose subagent batch result recording"
         );
+    }
+
+    #[test]
+    fn async_subagent_worker_is_owned_by_async_worker_module() {
+        let lib_source = include_str!("lib.rs");
+        let subagent_execution_source = include_str!("subagent_execution.rs");
+        let async_worker_source = include_str!("subagent_async_worker.rs");
+
+        assert!(
+            lib_source.contains("pub mod subagent_async_worker;"),
+            "orca-runtime must expose the async subagent worker module"
+        );
+        for marker in [
+            "pub fn run_async_subagent_worker(",
+            "fn spawn_async_subagent_worker(",
+            "fn async_subagent_result_payload(",
+        ] {
+            assert!(
+                !subagent_execution_source.contains(marker),
+                "subagent_execution must not own async worker detail {marker}"
+            );
+        }
+        for marker in [
+            "pub fn run_async_subagent_worker(",
+            "pub(crate) fn run_async_subagent_worker_with_executor(",
+            "pub(crate) fn launch_async_subagent(",
+            "fn spawn_async_subagent_worker(",
+            "fn async_subagent_result_payload(",
+            ".arg(\"subagent-worker\")",
+            "TaskRegistry::new_for_cwd",
+            "mark_worker_spawned",
+            "complete_with_usage",
+            "fail_with_usage",
+        ] {
+            assert!(
+                async_worker_source.contains(marker),
+                "subagent_async_worker must own async worker detail {marker}"
+            );
+        }
     }
 
     #[test]
@@ -1164,9 +2026,13 @@ mod tests {
     }
 
     #[test]
-    fn runtime_conversation_bootstrap_step_is_owned_by_lifecycle_module() {
+    fn runtime_conversation_bootstrap_step_is_owned_by_runtime_conversation_bootstrap_module() {
         let agent_loop_source = include_str!("agent_loop.rs");
         let lifecycle_source = include_str!("lifecycle.rs");
+        let runtime_conversation_bootstrap_source =
+            std::fs::read_to_string("src/runtime_conversation_bootstrap.rs")
+                .expect("runtime conversation bootstrap source");
+        let lib_source = include_str!("lib.rs");
 
         for marker in [
             "let mut owned_conversation",
@@ -1184,21 +2050,25 @@ mod tests {
             "agent_loop must delegate runtime conversation bootstrap"
         );
         assert!(
-            lifecycle_source.contains("struct RuntimeConversationBootstrapStep"),
-            "lifecycle must own runtime conversation bootstrap step state"
+            lib_source.contains("mod runtime_conversation_bootstrap;"),
+            "runtime crate must declare a focused runtime_conversation_bootstrap module"
         );
-        assert!(
-            lifecycle_source.contains("impl RuntimeConversationBootstrapStep"),
-            "lifecycle must own runtime conversation bootstrap step behavior"
-        );
-        assert!(
-            lifecycle_source.contains("bootstrap_agent_conversation_for_loop("),
-            "lifecycle must compose session-owned conversation bootstrap"
-        );
-        assert!(
-            lifecycle_source.contains("record_initial_history_for_agent("),
-            "lifecycle must compose session-owned initial history recording"
-        );
+        for marker in [
+            "struct RuntimeConversationBootstrapStep",
+            "impl RuntimeConversationBootstrapStep",
+            "bootstrap_agent_conversation_for_loop(",
+            "record_initial_history_for_agent(",
+            "resumed.is_some()",
+        ] {
+            assert!(
+                !lifecycle_source.contains(marker),
+                "lifecycle must not own runtime conversation bootstrap detail {marker}"
+            );
+            assert!(
+                runtime_conversation_bootstrap_source.contains(marker),
+                "runtime_conversation_bootstrap must own runtime conversation bootstrap detail {marker}"
+            );
+        }
     }
 
     #[test]
@@ -1281,6 +2151,44 @@ mod tests {
             tool_execution_source.contains("with_permission_rules"),
             "tool_execution must preserve config permission rules in approval policy"
         );
+    }
+
+    #[test]
+    fn tool_execution_approval_gate_uses_grouped_context() {
+        let tool_execution_source = include_str!("tool_execution.rs");
+
+        assert!(
+            tool_execution_source.contains("struct ToolApprovalGateContext"),
+            "tool_execution must group approval gate inputs into ToolApprovalGateContext"
+        );
+        assert!(
+            tool_execution_source.contains("fn handle_approval<W: io::Write>(")
+                && tool_execution_source.contains("context: ToolApprovalGateContext<"),
+            "ToolExecutionActor::handle_approval must accept the grouped approval gate context"
+        );
+        assert!(
+            tool_execution_source.contains("self.handle_approval(ToolApprovalGateContext"),
+            "ToolExecutionActor::execute must pass approval gate inputs as one grouped context"
+        );
+        assert!(
+            !tool_execution_source.contains("self.handle_approval(\n            config,"),
+            "ToolExecutionActor::execute must not call handle_approval with the old long argument list"
+        );
+        for field_name in [
+            "config:",
+            "events:",
+            "sink:",
+            "tool_request:",
+            "invocation:",
+            "policy:",
+            "strict_auto_review:",
+            "emit_deltas:",
+        ] {
+            assert!(
+                tool_execution_source.contains(field_name),
+                "ToolApprovalGateContext must carry approval input field {field_name}"
+            );
+        }
     }
 
     #[test]
@@ -1541,6 +2449,7 @@ mod tests {
             "persisted_command_execution_completed_item",
             "persisted_file_change_started_item",
             "persisted_file_change_completed_item",
+            "complete_projected_tool_item",
             "tool_error_object_from_value",
             "tool_status_is_completed",
         ] {
@@ -1557,6 +2466,18 @@ mod tests {
             assert!(
                 projection_source.contains(&signature),
                 "tool_item_projection must own shared tool item projection helper {function_name}"
+            );
+        }
+
+        for completed_constructor in [
+            "mcp_tool_completed_item(",
+            "dynamic_tool_completed_item(",
+            "persisted_command_execution_completed_item(",
+            "persisted_file_change_completed_item(",
+        ] {
+            assert!(
+                !thread_projection_source.contains(completed_constructor),
+                "thread_store/projection.rs must complete projected tool items through the shared projection helper, not call {completed_constructor} directly"
             );
         }
     }
@@ -1923,9 +2844,12 @@ mod tests {
     }
 
     #[test]
-    fn runtime_turn_setup_step_is_owned_by_lifecycle_module() {
+    fn runtime_turn_setup_step_is_owned_by_runtime_turn_setup_module() {
         let agent_loop_source = include_str!("agent_loop.rs");
         let lifecycle_source = include_str!("lifecycle.rs");
+        let runtime_turn_setup_source = std::fs::read_to_string("src/runtime_turn_setup.rs")
+            .expect("runtime turn setup source");
+        let lib_source = include_str!("lib.rs");
 
         for marker in [
             "ContextConfig::for_model_with_runtime",
@@ -1943,25 +2867,25 @@ mod tests {
             "agent_loop must delegate runtime turn setup"
         );
         assert!(
-            lifecycle_source.contains("struct RuntimeTurnSetupStep"),
-            "lifecycle must own runtime turn setup step state"
+            lib_source.contains("mod runtime_turn_setup;"),
+            "runtime crate must declare a focused runtime_turn_setup module"
         );
-        assert!(
-            lifecycle_source.contains("impl RuntimeTurnSetupStep"),
-            "lifecycle must own runtime turn setup step behavior"
-        );
-        assert!(
-            lifecycle_source.contains("context::ContextConfig::for_model_with_runtime"),
-            "lifecycle must own context config setup"
-        );
-        assert!(
-            lifecycle_source.contains("policy_for_tool_execution("),
-            "lifecycle must compose tool-execution-owned policy construction"
-        );
-        assert!(
-            lifecycle_source.contains("provider_config_for_agent_loop("),
-            "lifecycle must compose tool-invocation-owned provider config construction"
-        );
+        for marker in [
+            "struct RuntimeTurnSetupStep",
+            "impl RuntimeTurnSetupStep",
+            "policy_for_tool_execution(",
+            "provider_config_for_agent_loop(",
+            "let budget_model = config.model.as_option()",
+        ] {
+            assert!(
+                !lifecycle_source.contains(marker),
+                "lifecycle must not own runtime turn setup detail {marker}"
+            );
+            assert!(
+                runtime_turn_setup_source.contains(marker),
+                "runtime_turn_setup must own runtime turn setup detail {marker}"
+            );
+        }
     }
 
     #[test]
@@ -2061,9 +2985,12 @@ mod tests {
     }
 
     #[test]
-    fn runtime_turn_start_step_is_owned_by_lifecycle_module() {
+    fn runtime_turn_start_step_is_owned_by_runtime_turn_start_module() {
         let agent_loop_source = include_str!("agent_loop.rs");
+        let lib_source = include_str!("lib.rs");
         let lifecycle_source = include_str!("lifecycle.rs");
+        let runtime_turn_start_source = std::fs::read_to_string("src/runtime_turn_start.rs")
+            .expect("runtime turn start source");
 
         for marker in [
             ".active_task()",
@@ -2088,31 +3015,52 @@ mod tests {
             "agent_loop must delegate runtime turn-start result folding through turn loop"
         );
         assert!(
-            lifecycle_source.contains("struct RuntimeTurnStartStep"),
-            "lifecycle must own runtime turn-start step state"
+            lib_source.contains("mod runtime_turn_start;"),
+            "runtime crate must declare a focused runtime_turn_start module"
         );
         assert!(
-            lifecycle_source.contains("struct RuntimeTurnStartResultStep"),
-            "lifecycle must own runtime turn-start result step state"
+            !lifecycle_source.contains("struct RuntimeTurnStartStep"),
+            "lifecycle must not own runtime turn-start step state"
         );
         assert!(
-            lifecycle_source.contains("impl RuntimeTurnStartStep"),
-            "lifecycle must own runtime turn-start step behavior"
+            !lifecycle_source.contains("struct RuntimeTurnStartResultStep"),
+            "lifecycle must not own runtime turn-start result step state"
         );
         assert!(
-            lifecycle_source.contains("impl RuntimeTurnStartResultStep"),
-            "lifecycle must own runtime turn-start result step behavior"
+            !lifecycle_source.contains("impl RuntimeTurnStartStep"),
+            "lifecycle must not own runtime turn-start step behavior"
         );
         assert!(
-            lifecycle_source.contains("actor.start_turn("),
-            "lifecycle must own runtime actor start_turn call"
+            !lifecycle_source.contains("impl RuntimeTurnStartResultStep"),
+            "lifecycle must not own runtime turn-start result step behavior"
         );
+        for marker in [
+            "struct RuntimeTurnStartStep",
+            "struct RuntimeTurnStartResultStep",
+            "struct RuntimeTurnStartStepOutput",
+            "enum RuntimeTurnStartResult",
+            "impl RuntimeTurnStartStep",
+            "impl RuntimeTurnStartResultStep",
+            "actor.start_turn(",
+            "started_turn.into_event()",
+            "AgentLoopResult::failure(",
+            "error.status",
+            "error.message",
+        ] {
+            assert!(
+                runtime_turn_start_source.contains(marker),
+                "runtime_turn_start must own runtime turn-start detail {marker}"
+            );
+        }
     }
 
     #[test]
-    fn runtime_model_route_step_is_owned_by_lifecycle_module() {
+    fn runtime_model_route_step_is_owned_by_runtime_model_route_module() {
         let agent_loop_source = include_str!("agent_loop.rs");
+        let lib_source = include_str!("lib.rs");
         let lifecycle_source = include_str!("lifecycle.rs");
+        let runtime_model_route_source = std::fs::read_to_string("src/runtime_model_route.rs")
+            .expect("runtime model route source");
 
         for marker in [
             "actor.route_model_turn(",
@@ -2129,27 +3077,38 @@ mod tests {
             "agent_loop must delegate runtime model routing through turn loop"
         );
         assert!(
-            lifecycle_source.contains("struct RuntimeModelRouteStep"),
-            "lifecycle must own runtime model-route step state"
+            lib_source.contains("mod runtime_model_route;"),
+            "runtime crate must declare a focused runtime_model_route module"
         );
         assert!(
-            lifecycle_source.contains("impl RuntimeModelRouteStep"),
-            "lifecycle must own runtime model-route step behavior"
+            !lifecycle_source.contains("struct RuntimeModelRouteStep"),
+            "lifecycle must not own runtime model-route step state"
         );
         assert!(
-            lifecycle_source.contains("actor.route_model_turn("),
-            "lifecycle must own runtime actor route_model_turn call"
+            !lifecycle_source.contains("impl RuntimeModelRouteStep"),
+            "lifecycle must not own runtime model-route step behavior"
         );
-        assert!(
-            lifecycle_source.contains("events.model_routed("),
-            "lifecycle must own runtime model-routed event emission"
-        );
+        for marker in [
+            "struct RuntimeModelRouteStep",
+            "struct RuntimeModelRouteInput",
+            "impl RuntimeModelRouteStep",
+            "actor.route_model_turn(",
+            "events.model_routed(",
+        ] {
+            assert!(
+                runtime_model_route_source.contains(marker),
+                "runtime_model_route must own runtime model-route detail {marker}"
+            );
+        }
     }
 
     #[test]
-    fn runtime_turn_opening_step_is_owned_by_lifecycle_module() {
+    fn runtime_turn_opening_step_is_owned_by_runtime_turn_opening_module() {
         let agent_loop_source = include_str!("agent_loop.rs");
         let lifecycle_source = include_str!("lifecycle.rs");
+        let runtime_turn_iteration_source = include_str!("runtime_turn_iteration.rs");
+        let runtime_turn_opening_source = std::fs::read_to_string("src/runtime_turn_opening.rs")
+            .expect("runtime turn opening source");
 
         for marker in [
             ".compact_if_needed(conversation)",
@@ -2168,12 +3127,36 @@ mod tests {
             "agent_loop must delegate runtime turn opening"
         );
         assert!(
-            lifecycle_source.contains("struct RuntimeTurnOpeningStep"),
-            "lifecycle must own runtime turn opening step state"
+            !lifecycle_source.contains("struct RuntimeTurnOpeningStep"),
+            "lifecycle must not own runtime turn opening step state"
         );
         assert!(
-            lifecycle_source.contains("impl RuntimeTurnOpeningStep"),
-            "lifecycle must own runtime turn opening step behavior"
+            !lifecycle_source.contains("enum RuntimeTurnOpeningResult"),
+            "lifecycle must not own runtime turn opening result shape"
+        );
+        assert!(
+            !lifecycle_source.contains("struct RuntimeTurnOpeningInput"),
+            "lifecycle must not own runtime turn opening input shape"
+        );
+        assert!(
+            !lifecycle_source.contains("impl RuntimeTurnOpeningStep"),
+            "lifecycle must not own runtime turn opening step behavior"
+        );
+        assert!(
+            runtime_turn_opening_source.contains("struct RuntimeTurnOpeningStep"),
+            "runtime_turn_opening must own runtime turn opening step state"
+        );
+        assert!(
+            runtime_turn_opening_source.contains("enum RuntimeTurnOpeningResult"),
+            "runtime_turn_opening must own runtime turn opening result shape"
+        );
+        assert!(
+            runtime_turn_opening_source.contains("struct RuntimeTurnOpeningInput"),
+            "runtime_turn_opening must own grouped runtime turn opening input"
+        );
+        assert!(
+            runtime_turn_opening_source.contains("impl RuntimeTurnOpeningStep"),
+            "runtime_turn_opening must own runtime turn opening step behavior"
         );
         for marker in [
             "RuntimeCompactionStep::new",
@@ -2183,10 +3166,14 @@ mod tests {
             "RuntimeSteerStep::new",
         ] {
             assert!(
-                lifecycle_source.contains(marker),
-                "lifecycle must compose runtime turn opening detail {marker}"
+                runtime_turn_opening_source.contains(marker),
+                "runtime_turn_opening must compose runtime turn opening detail {marker}"
             );
         }
+        assert!(
+            runtime_turn_iteration_source.contains("RuntimeTurnOpeningInput"),
+            "runtime_turn_iteration must call runtime turn opening through its grouped input"
+        );
     }
 
     #[test]
@@ -2258,10 +3245,11 @@ mod tests {
     }
 
     #[test]
-    fn runtime_turn_provider_cycle_step_is_owned_by_lifecycle_module() {
+    fn runtime_turn_provider_cycle_step_is_composed_by_runtime_turn_iteration_module() {
         let agent_loop_source = include_str!("agent_loop.rs");
         let lifecycle_source = include_str!("lifecycle.rs");
         let provider_turn_source = include_str!("provider_turn.rs");
+        let runtime_turn_iteration_source = include_str!("runtime_turn_iteration.rs");
 
         for marker in [
             "RuntimeProviderTurnStep::new",
@@ -2290,8 +3278,12 @@ mod tests {
             "lifecycle must not own runtime provider cycle step behavior"
         );
         assert!(
-            lifecycle_source.contains("RuntimeTurnProviderCycleStep::new"),
-            "lifecycle must compose runtime provider cycle through provider_turn boundary"
+            !lifecycle_source.contains("RuntimeTurnProviderCycleStep::new"),
+            "lifecycle must not compose runtime provider cycle after the turn-iteration split"
+        );
+        assert!(
+            runtime_turn_iteration_source.contains("RuntimeTurnProviderCycleStep::new"),
+            "runtime_turn_iteration must compose runtime provider cycle through provider_turn boundary"
         );
         assert!(
             provider_turn_source.contains("struct RuntimeTurnProviderCycleStep"),
@@ -2322,9 +3314,12 @@ mod tests {
     }
 
     #[test]
-    fn runtime_turn_iteration_step_is_owned_by_lifecycle_module() {
+    fn runtime_turn_iteration_step_is_owned_by_runtime_turn_iteration_module() {
         let agent_loop_source = include_str!("agent_loop.rs");
         let lifecycle_source = include_str!("lifecycle.rs");
+        let runtime_turn_iteration_source =
+            std::fs::read_to_string("src/runtime_turn_iteration.rs")
+                .expect("runtime turn iteration source");
 
         for marker in [
             "RuntimeTurnOpeningStep::new",
@@ -2343,16 +3338,28 @@ mod tests {
             "agent_loop must delegate runtime turn loop"
         );
         assert!(
-            lifecycle_source.contains("struct RuntimeTurnIterationStep"),
-            "lifecycle must own runtime turn iteration step state"
+            !lifecycle_source.contains("struct RuntimeTurnIterationStep"),
+            "lifecycle must not own runtime turn iteration step state"
         );
         assert!(
-            lifecycle_source.contains("enum RuntimeTurnIterationResult"),
-            "lifecycle must own runtime turn iteration result shape"
+            !lifecycle_source.contains("enum RuntimeTurnIterationResult"),
+            "lifecycle must not own runtime turn iteration result shape"
         );
         assert!(
-            lifecycle_source.contains("impl RuntimeTurnIterationStep"),
-            "lifecycle must own runtime turn iteration step behavior"
+            !lifecycle_source.contains("impl RuntimeTurnIterationStep"),
+            "lifecycle must not own runtime turn iteration step behavior"
+        );
+        assert!(
+            runtime_turn_iteration_source.contains("struct RuntimeTurnIterationStep"),
+            "runtime_turn_iteration must own runtime turn iteration step state"
+        );
+        assert!(
+            runtime_turn_iteration_source.contains("enum RuntimeTurnIterationResult"),
+            "runtime_turn_iteration must own runtime turn iteration result shape"
+        );
+        assert!(
+            runtime_turn_iteration_source.contains("impl RuntimeTurnIterationStep"),
+            "runtime_turn_iteration must own runtime turn iteration step behavior"
         );
         for marker in [
             "RuntimeTurnOpeningStep::new",
@@ -2362,16 +3369,17 @@ mod tests {
             "RuntimeTurnProviderCycleResult::ContinueTurn",
         ] {
             assert!(
-                lifecycle_source.contains(marker),
-                "lifecycle must compose runtime turn iteration detail {marker}"
+                runtime_turn_iteration_source.contains(marker),
+                "runtime_turn_iteration must compose runtime turn iteration detail {marker}"
             );
         }
     }
 
     #[test]
-    fn runtime_turn_loop_step_is_owned_by_lifecycle_module() {
+    fn runtime_turn_loop_step_is_owned_by_runtime_turn_loop_module() {
         let agent_loop_source = include_str!("agent_loop.rs");
         let lifecycle_source = include_str!("lifecycle.rs");
+        let runtime_turn_loop_source = include_str!("runtime_turn_loop.rs");
 
         for marker in [
             "loop {",
@@ -2389,12 +3397,20 @@ mod tests {
             "agent_loop must delegate runtime turn loop"
         );
         assert!(
-            lifecycle_source.contains("struct RuntimeTurnLoopStep"),
-            "lifecycle must own runtime turn loop step state"
+            !lifecycle_source.contains("struct RuntimeTurnLoopStep"),
+            "lifecycle must not own runtime turn loop step state"
         );
         assert!(
-            lifecycle_source.contains("impl RuntimeTurnLoopStep"),
-            "lifecycle must own runtime turn loop step behavior"
+            !lifecycle_source.contains("impl RuntimeTurnLoopStep"),
+            "lifecycle must not own runtime turn loop step behavior"
+        );
+        assert!(
+            runtime_turn_loop_source.contains("struct RuntimeTurnLoopStep"),
+            "runtime_turn_loop must own runtime turn loop step state"
+        );
+        assert!(
+            runtime_turn_loop_source.contains("impl RuntimeTurnLoopStep"),
+            "runtime_turn_loop must own runtime turn loop step behavior"
         );
         for marker in [
             "RuntimeTurnIterationStep::new",
@@ -2402,16 +3418,17 @@ mod tests {
             "RuntimeTurnIterationResult::Return",
         ] {
             assert!(
-                lifecycle_source.contains(marker),
-                "lifecycle must compose runtime turn loop detail {marker}"
+                runtime_turn_loop_source.contains(marker),
+                "runtime_turn_loop must compose runtime turn loop detail {marker}"
             );
         }
     }
 
     #[test]
-    fn runtime_turn_loop_input_is_owned_by_lifecycle_module() {
+    fn runtime_turn_loop_input_is_owned_by_runtime_turn_loop_module() {
         let agent_loop_source = include_str!("agent_loop.rs");
         let lifecycle_source = include_str!("lifecycle.rs");
+        let runtime_turn_loop_source = include_str!("runtime_turn_loop.rs");
 
         assert!(
             agent_loop_source.contains("RuntimeTurnLoopInput"),
@@ -2422,20 +3439,37 @@ mod tests {
             "agent_loop must pass child executors through a lifecycle-owned executor object"
         );
         assert!(
-            lifecycle_source.contains("struct RuntimeTurnLoopInput"),
-            "lifecycle must own runtime turn loop input shape"
+            !lifecycle_source.contains("struct RuntimeTurnLoopInput"),
+            "lifecycle must not own runtime turn loop input shape"
         );
         assert!(
-            lifecycle_source.contains("struct RuntimeTurnLoopExecutors"),
-            "lifecycle must own runtime turn loop executor shape"
+            !lifecycle_source.contains("struct RuntimeTurnLoopExecutors"),
+            "lifecycle must not own runtime turn loop executor shape"
         );
         assert!(
-            lifecycle_source.contains("impl<'a, 'runtime, W: io::Write> RuntimeTurnLoopInput"),
-            "lifecycle must own runtime turn loop input behavior"
+            !lifecycle_source.contains("impl<'a, 'runtime, W: io::Write> RuntimeTurnLoopInput"),
+            "lifecycle must not own runtime turn loop input behavior"
         );
         assert!(
-            lifecycle_source.contains("impl<W: io::Write> RuntimeTurnLoopExecutors<W>"),
-            "lifecycle must own runtime turn loop executor behavior"
+            !lifecycle_source.contains("impl<W: io::Write> RuntimeTurnLoopExecutors<W>"),
+            "lifecycle must not own runtime turn loop executor behavior"
+        );
+        assert!(
+            runtime_turn_loop_source.contains("struct RuntimeTurnLoopInput"),
+            "runtime_turn_loop must own runtime turn loop input shape"
+        );
+        assert!(
+            runtime_turn_loop_source.contains("struct RuntimeTurnLoopExecutors"),
+            "runtime_turn_loop must own runtime turn loop executor shape"
+        );
+        assert!(
+            runtime_turn_loop_source
+                .contains("impl<'a, 'runtime, W: io::Write> RuntimeTurnLoopInput"),
+            "runtime_turn_loop must own runtime turn loop input behavior"
+        );
+        assert!(
+            runtime_turn_loop_source.contains("impl<W: io::Write> RuntimeTurnLoopExecutors<W>"),
+            "runtime_turn_loop must own runtime turn loop executor behavior"
         );
         assert!(
             !agent_loop_source.contains("execute_child_agent_loop,\n        execute_child_agent_loop,\n        execute_child_agent_loop"),

@@ -50,6 +50,17 @@ pub(crate) struct ToolExecutionContext<'a> {
     permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
 }
 
+pub(crate) struct ToolApprovalGateContext<'a, W: io::Write> {
+    pub(crate) config: &'a RunConfig,
+    pub(crate) events: &'a mut EventFactory,
+    pub(crate) sink: &'a mut EventSink<W>,
+    pub(crate) tool_request: &'a tool_types::ToolRequest,
+    pub(crate) invocation: &'a ToolInvocation,
+    pub(crate) policy: &'a ApprovalPolicy,
+    pub(crate) strict_auto_review: bool,
+    pub(crate) emit_deltas: bool,
+}
+
 pub(crate) struct ToolExecutionActor {
     runtime: RuntimeToolActorContext,
 }
@@ -317,16 +328,16 @@ impl ToolExecutionActor {
             return Ok((RunStatus::Failed, result));
         }
 
-        if let Some(outcome) = self.handle_approval(
+        if let Some(outcome) = self.handle_approval(ToolApprovalGateContext {
             config,
             events,
             sink,
             tool_request,
-            &invocation,
+            invocation: &invocation,
             policy,
-            permission_overlay.strict_auto_review(),
+            strict_auto_review: permission_overlay.strict_auto_review(),
             emit_deltas,
-        )? {
+        })? {
             return Ok(outcome);
         }
 
@@ -385,17 +396,21 @@ impl ToolExecutionActor {
         )
     }
 
-    pub(crate) fn handle_approval(
+    pub(crate) fn handle_approval<W: io::Write>(
         &mut self,
-        config: &RunConfig,
-        events: &mut EventFactory,
-        sink: &mut EventSink<impl io::Write>,
-        tool_request: &tool_types::ToolRequest,
-        invocation: &ToolInvocation,
-        policy: &ApprovalPolicy,
-        strict_auto_review: bool,
-        emit_deltas: bool,
+        context: ToolApprovalGateContext<'_, W>,
     ) -> io::Result<Option<(RunStatus, tool_types::ToolResult)>> {
+        let ToolApprovalGateContext {
+            config,
+            events,
+            sink,
+            tool_request,
+            invocation,
+            policy,
+            strict_auto_review,
+            emit_deltas,
+        } = context;
+
         if let Some(approval) = approval_request_for_invocation(invocation)
             && agent_common::requires_approval(approval.action)
         {

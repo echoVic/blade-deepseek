@@ -17,6 +17,7 @@ use crate::lifecycle::{
     TurnPermissionOverlay,
 };
 use crate::memory::MemoryBlock;
+use crate::runtime_normal_tool::RuntimeNormalToolInvocation;
 use crate::runtime_special::{RuntimeSpecialToolDispatch, RuntimeWorkflowDraftRequest};
 use crate::subagent_execution::execute_subagent_tool;
 use crate::tasks::TaskRegistry;
@@ -173,20 +174,22 @@ impl<'a> RuntimeToolRouter<'a> {
                             .cloned(),
                     )
                     .collect::<Vec<_>>();
-                Ok(self.runtime.execute_normal_tool_with_roots_and_cancel(
-                    Some(config),
-                    execution_request,
-                    cwd,
-                    &additional_roots,
-                    mcp_registry,
-                    &config.external_tools,
-                    config.tools.output_truncation,
-                    config.tools.shell_timeout_secs,
-                    Some(task_registry),
-                    Some(cancel),
-                    permission_handler
-                        .map(|handler| handler as &dyn RuntimePermissionRequestHandler),
-                ))
+                Ok(self
+                    .runtime
+                    .execute_normal_tool_invocation(RuntimeNormalToolInvocation {
+                        config: Some(config),
+                        request: execution_request,
+                        cwd,
+                        additional_roots: &additional_roots,
+                        mcp_registry,
+                        external_tools: &config.external_tools,
+                        output_truncation: config.tools.output_truncation,
+                        shell_timeout_secs: config.tools.shell_timeout_secs,
+                        task_registry: Some(task_registry),
+                        cancel: Some(cancel),
+                        permission_handler: permission_handler
+                            .map(|handler| handler as &dyn RuntimePermissionRequestHandler),
+                    }))
             }
         }
     }

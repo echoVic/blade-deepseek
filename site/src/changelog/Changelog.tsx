@@ -55,6 +55,72 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.141":
+        "Child-agent loop orchestration now lives in a focused child_agent_loop_runner module. Existing orca_runtime::agent_child imports remain available through re-exports, while loop setup, provider turns, response folding, tool-result folding, subagent contracts, and TUI child-agent delegation behavior stay unchanged.",
+      "v0.1.140":
+        "Child-agent provider response folding, tool request extraction, tool execution context, and tool-result folding now live in a focused child_agent_response_folding module. Existing orca_runtime::agent_child imports remain available through re-exports, while child-agent loop orchestration, provider turns, subagent contracts, and TUI child-agent delegation behavior stay unchanged.",
+      "v0.1.139":
+        "Child-agent model routing, provider hook execution, provider call dispatch, child compaction, and prompt-too-long retry/failure handling now live in a focused child_agent_provider_turn module. Existing orca_runtime::agent_child imports remain available through re-exports, while provider response folding, tool request extraction, tool result folding, subagent contracts, and TUI child-agent delegation behavior stay unchanged.",
+      "v0.1.138":
+        "Child-agent loop setup, provider bootstrap, conversation seed, approval policy seed, and child turn-budget state now live in a focused child_agent_loop_setup module. Existing orca_runtime::agent_child imports remain available through re-exports, while child-agent model routing, provider turns, tool folding, subagent contracts, and TUI delegation behavior stay unchanged.",
+      "v0.1.137":
+        "Runtime approval decisions, approval handlers, and config-backed interactive approval handling now live in a focused runtime_approval module. Existing orca_runtime::lifecycle imports remain available through re-exports, while approval policy resolution and interactive approval behavior stay unchanged.",
+      "v0.1.136":
+        "Runtime permission requests now live in a focused runtime_permission module. The existing orca_runtime::lifecycle imports remain available through re-exports, while request_permissions execution and turn permission overlay behavior keep the same runtime shape.",
+      "v0.1.135":
+        "Runtime request_user_input handling now lives in a focused runtime_user_input module. The existing orca_runtime::lifecycle imports remain available through re-exports, while request parsing, handler dispatch, answer completion, and cancellation failure behavior keep the same runtime and TUI shape.",
+      "v0.1.134":
+        "Runtime ORCA_HOME-scoped tests now share a poison-tolerant test environment lock helper. If one test panics while holding the shared environment mutex, later history, server, session, thread-store, and workflow-host tests can recover the lock instead of cascading into misleading PoisonError failures.",
+      "v0.1.133":
+        "Sandbox bash command construction now uses grouped WorkspaceWriteSandboxCommandContext and ReadOnlySandboxCommandContext inputs, with the macOS Seatbelt profile helpers also receiving focused profile contexts. Shell sessions, command/exec, bash sandboxing, network and filesystem policy flags, Unix socket allowlists, and non-interactive process preparation keep the same behavior while the sandbox API no longer exposes long argument lists.",
+      "v0.1.132":
+        "Runtime bash sandbox execution and one-shot shell spawning now use focused RuntimeBashSandboxContext and RuntimeBashOnceContext inputs. The model-visible bash flow still owns permission-profile sandboxing, network and filesystem permission retries, cancellation, task-registry handoff, output truncation, and diagnostics while runtime_bash.rs no longer needs internal long-argument helper escape hatches.",
+      "v0.1.131":
+        "Readonly tool-turn batch execution now lives in a focused runtime_readonly_tool_turn module with grouped readonly batch and tool-turn contexts. The main tool_turn dispatcher still owns request cursoring, child-tool policy checks, subagent batching, readonly batch selection, and normal tool turns while readonly hook gating, parallel execution, and result recording keep the same runtime behavior.",
+      "v0.1.130":
+        "Async subagent worker launch and completion now live in a focused subagent_async_worker module. The parent subagent executor still owns sync and batch execution, while worker spawn, task-registry usage writes, worktree handoff, and async result payloads keep the same CLI and subagent_status behavior.",
+      "v0.1.129":
+        "Server shell-session state now lives in a focused shell_manager module. Optional runtime shell session storage, lazy task-registry-backed initialization, shell CRUD/read/kill/reap/wait calls, and command/exec drain compatibility keep the same server shell protocol shape.",
+      "v0.1.128":
+        "Server pending-permission request state now lives in a focused permission_manager module. Runtime request_permissions waits, command/exec permission retry records, pending request removal, and permission request handler registration keep the same server permission protocol shape.",
+      "v0.1.127":
+        "Server active-turn lifecycle state now lives in a focused active_turn_manager module. Active turn controls, running turn handles, finished-turn reclamation, thread-specific reclaim waits, and session permission metadata merge keep the same server turn protocol shape.",
+      "v0.1.126":
+        "Server command/exec active process state now lives in a focused command_exec_manager module. Buffered output, streaming deltas, stdin writes, PTY resize, termination, output caps, sandbox diagnostics, and permission retry behavior keep the same server protocol shape.",
+      "v0.1.125":
+        "RuntimeToolActorContext now lives in a focused runtime_tool_actor module. Existing orca_runtime::lifecycle imports remain available through a re-export, while approval, hook, user-input, normal-tool, permission-overlay, and active-task behavior keep the same runtime shape.",
+      "v0.1.124":
+        "Runtime lifecycle state machine types now live in a focused runtime_lifecycle module. The existing orca_runtime::lifecycle imports remain available through re-exports, while task/turn ids, status mapping, event payloads, and RuntimeTurnRunner behavior stay unchanged.",
+      "v0.1.123":
+        "Runtime turn setup now lives in a focused runtime_turn_setup module. Agent loop still delegates through RuntimeTurnSetupStep, and the new module owns context budget setup, tool approval policy construction, and provider config composition while lifecycle.rs keeps actor/lifecycle primitives.",
+      "v0.1.122":
+        "Runtime conversation bootstrap now lives in a focused runtime_conversation_bootstrap module. Agent loop still delegates through RuntimeConversationBootstrapStep, and the new module owns RuntimePreparedConversation, borrowed-or-owned conversation storage, session bootstrap composition, and initial history recording while lifecycle.rs keeps actor/lifecycle primitives.",
+      "v0.1.121":
+        "Runtime steer application now lives in a focused runtime_steer module with a grouped RuntimeSteerInput boundary. RuntimeTurnOpeningStep and RuntimeProviderTurnStep still drain pending steer inputs into the conversation and history before the model call, while lifecycle.rs keeps ThreadSteerHandle storage and sheds another reducer slice.",
+      "v0.1.120":
+        "Runtime model-route orchestration now lives in a focused runtime_model_route module with a grouped RuntimeModelRouteInput boundary. RuntimeTurnOpeningStep still composes compaction, turn start, model routing, and steering in the same order, while lifecycle.rs keeps the actor/lifecycle primitives and sheds another reducer slice without adding a new long-argument surface.",
+      "v0.1.119":
+        "Runtime turn-start orchestration now lives in a focused runtime_turn_start module instead of lifecycle.rs. RuntimeTurnOpeningStep still composes compaction, turn start, model routing, and steering in the same order, while lifecycle.rs keeps the actor/lifecycle primitives and sheds another lower-level reducer slice.",
+      "v0.1.118":
+        "Runtime turn-opening orchestration now lives in a focused runtime_turn_opening module with a grouped RuntimeTurnOpeningInput boundary. RuntimeTurnIterationStep still composes opening and provider-cycle execution in the same order, while lifecycle.rs keeps the lower-level start/model-route/steer steps and sheds another reducer-sized layer.",
+      "v0.1.117":
+        "Runtime turn-iteration orchestration now lives in a focused runtime_turn_iteration module instead of lifecycle.rs. The outer runtime_turn_loop still delegates through RuntimeTurnIterationStep, provider-cycle behavior still lives in provider_turn, and lifecycle.rs keeps the opening/start/model-route pieces while getting smaller for the next reducer-style split.",
+      "v0.1.116":
+        "Runtime turn-loop orchestration now lives in a focused runtime_turn_loop module instead of lifecycle.rs. Agent loop still delegates through RuntimeTurnLoopStep with the same grouped input/executor objects and the same iteration retry/return behavior, while lifecycle.rs gets smaller for the next Codex/package-3-inspired reducer split.",
+      "v0.1.115":
+        "Shell-session bash execution now receives one grouped RuntimeBashInvocationContext instead of a long execute_bash_with_shell_session argument list. RuntimeNormalToolExecutor still owns the bash branch, permission overlays, cancellation, output truncation, task registry handoff, and network/filesystem permission retries keep the same behavior, while the bash boundary gets smaller for the next shell/session and async-subagent slices.",
+      "v0.1.114":
+        "Filesystem sandbox denials now recover more clearly across server command/exec and model-visible bash. Orca diagnoses macOS Seatbelt write blocks such as nested .git/index.lock failures, explains when they are sandbox scope issues rather than stale locks, requests a turn-scoped filesystem write grant when an approval handler is available, and retries the original command with the granted root.",
+      "v0.1.113":
+        "Tool-turn dispatch now receives one grouped RuntimeToolTurnsContext from provider response handling instead of a long run_tool_turns call. RuntimeStepContext, events, sink, conversation, history writer, tool requests, cost tracking, background workflow state, and child executors still flow unchanged while the provider-to-tool boundary gets smaller.",
+      "v0.1.112":
+        "Normal tool-turn execution now receives one grouped RuntimeNormalToolTurnContext instead of a long run_normal_tool_turn argument list. Tool execution, approval, result recording, plan-state recording, permission overlays, workflow/background state, and child executor handoff keep the same runtime behavior while the tool-turn boundary gets smaller.",
+      "v0.1.111":
+        "Tool approval gate inputs now move through one grouped ToolApprovalGateContext instead of a long handle_approval argument list. Config, events, sink, tool request, invocation, policy, strict auto-review, and delta emission still flow unchanged, while approval allow/ask/deny behavior and tool-call item emission keep the same public shape.",
+      "v0.1.110":
+        "Historical projected tool completions now rebuild through the shared complete_projected_tool_item helper in tool_item_projection.rs instead of thread_store/projection.rs calling MCP, dynamic, commandExecution, and fileChange completed-item constructors directly. Realtime and persisted history stay behavior-compatible while the remaining tool-item schema drift has one smaller ownership point.",
+      "v0.1.109":
+        "Runtime normal-tool routing now passes a grouped RuntimeNormalToolInvocation from the router into lifecycle actors instead of calling the long roots/cancel method directly. Bash shell-session execution, MCP/external fallback, permission overlays, cancellation, and output truncation keep the same behavior while the common tool path gets a smaller call surface for later shell and async-subagent work.",
       "v0.1.108":
         "Normal tool invocation now funnels through one runtime_normal_tool helper instead of letting lifecycle.rs instantiate the executor directly. RuntimeTaskActor and RuntimeToolActorContext still preserve the same bash, MCP, external, cancellation, and permission-overlay behavior, but the next shell-session and async subagent slices have a smaller call surface to build on.",
       "v0.1.107":
@@ -244,6 +310,72 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.141":
+        "Child-agent loop orchestration 现在移到独立的 child_agent_loop_runner 模块。既有 orca_runtime::agent_child 导入仍通过 re-export 保持可用，loop setup、provider turn、response folding、tool-result folding、subagent contract 与 TUI child-agent delegation 行为保持不变。",
+      "v0.1.140":
+        "Child-agent provider response folding、tool request extraction、tool execution context 与 tool-result folding 现在移到独立的 child_agent_response_folding 模块。既有 orca_runtime::agent_child 导入仍通过 re-export 保持可用，child-agent loop orchestration、provider turn、subagent contract 与 TUI child-agent delegation 行为保持不变。",
+      "v0.1.139":
+        "Child-agent model routing、provider hook execution、provider call dispatch、child compaction 与 prompt-too-long retry/failure handling 现在移到独立的 child_agent_provider_turn 模块。既有 orca_runtime::agent_child 导入仍通过 re-export 保持可用，provider response folding、tool request extraction、tool result folding、subagent contract 与 TUI child-agent delegation 行为保持不变。",
+      "v0.1.138":
+        "Child-agent loop setup、provider bootstrap、conversation seed、approval policy seed 与 child turn-budget state 现在移到独立的 child_agent_loop_setup 模块。既有 orca_runtime::agent_child 导入仍通过 re-export 保持可用，child-agent model routing、provider turn、tool folding、subagent contract 与 TUI delegation 行为保持不变。",
+      "v0.1.137":
+        "Runtime approval decision、approval handler 和基于配置的 interactive approval 处理现在移到独立的 runtime_approval 模块。既有 orca_runtime::lifecycle 导入仍通过 re-export 保持可用，approval policy resolution 与 interactive approval 行为保持不变。",
+      "v0.1.136":
+        "Runtime permission request/response/handler 与 turn permission overlay 现在移到独立的 runtime_permission 模块。既有 orca_runtime::lifecycle 导入仍通过 re-export 保持可用，request_permissions 执行和 turn permission overlay 行为保持同一运行时形状。",
+      "v0.1.135":
+        "Runtime request_user_input 处理现在移到独立的 runtime_user_input 模块。既有 orca_runtime::lifecycle 导入仍通过 re-export 保持可用，请求解析、handler 派发、回答完成和取消失败行为都保持同一 runtime 与 TUI 形状。",
+      "v0.1.134":
+        "Runtime 里依赖 ORCA_HOME 的测试现在统一使用可恢复 poisoned mutex 的 test env lock helper。如果某个测试在持有共享环境锁时 panic，后续 history、server、session、thread-store 与 workflow-host 测试会恢复锁，而不是级联报出误导性的 PoisonError。",
+      "v0.1.133":
+        "Sandbox bash command 构造现在改用 WorkspaceWriteSandboxCommandContext 与 ReadOnlySandboxCommandContext 聚合输入，macOS Seatbelt profile helper 也改为接收聚焦的 profile context。Shell session、command/exec、bash sandbox、网络与文件系统策略开关、Unix socket allowlist、非交互式进程准备都保持同一行为，同时 sandbox API 不再暴露长参数列表。",
+      "v0.1.132":
+        "运行时 bash 的 sandbox 执行和一次性 shell 启动现在改用 RuntimeBashSandboxContext 与 RuntimeBashOnceContext 聚合输入。模型可见 bash 仍保持 permission-profile 沙箱、网络和文件系统权限重试、取消、task registry 交接、输出截断和诊断行为不变，同时 runtime_bash.rs 不再需要内部长参数 helper 的逃逸口。",
+      "v0.1.131":
+        "Readonly tool-turn batch 执行现在移到独立的 runtime_readonly_tool_turn 模块，并使用分组后的 readonly batch / tool-turn context。主 tool_turn dispatcher 继续负责 request cursor、child-tool policy 检查、subagent batch、readonly batch 选择和 normal tool turn，readonly hook gate、并行执行与结果记录保持同一运行时行为。",
+      "v0.1.130":
+        "Async subagent worker 的启动和完成写回现在移到独立的 subagent_async_worker 模块。父级 subagent executor 继续负责同步和 batch 执行，worker spawn、task registry usage 写入、worktree handoff 和 async result payload 保持同一 CLI 与 subagent_status 行为。",
+      "v0.1.129":
+        "Server shell-session 状态现在移到独立的 shell_manager 模块。可选 runtime shell session 存储、带 task registry 的 lazy 初始化、shell CRUD/read/kill/reap/wait 调用，以及 command/exec drain 兼容借用都保持同一 server shell protocol 形状。",
+      "v0.1.128":
+        "Server pending-permission request 状态现在移到独立的 permission_manager 模块。Runtime request_permissions 等待、command/exec permission retry record、pending request removal，以及 permission request handler registration 都保持同一 server permission protocol 形状。",
+      "v0.1.127":
+        "Server active-turn lifecycle 状态现在移到独立的 active_turn_manager 模块。Active turn control、running turn handle、finished-turn reclaim、按 thread 等待 reclaim，以及 session permission metadata merge 都保持同一 server turn protocol 形状。",
+      "v0.1.126":
+        "Server command/exec 的 active process 状态现在移到独立的 command_exec_manager 模块。Buffered output、streaming delta、stdin write、PTY resize、terminate、output cap、sandbox 诊断和 permission retry 行为保持同一 server protocol 形状。",
+      "v0.1.125":
+        "RuntimeToolActorContext 现在移到独立的 runtime_tool_actor 模块。既有 orca_runtime::lifecycle 导入仍通过 re-export 保持可用，审批、hook、request-user-input、normal-tool、permission overlay 和 active-task 行为保持同一运行时形状。",
+      "v0.1.124":
+        "Runtime lifecycle 状态机类型现在移到独立的 runtime_lifecycle 模块。既有 orca_runtime::lifecycle 导入仍通过 re-export 保持可用，task/turn id、状态映射、事件 payload 和 RuntimeTurnRunner 行为保持不变。",
+      "v0.1.123":
+        "Runtime turn setup 现在从 lifecycle.rs 移到独立的 runtime_turn_setup 模块。Agent loop 仍通过 RuntimeTurnSetupStep 委托执行，新模块负责 context budget setup、工具审批 policy 构造和 provider config 组合，lifecycle.rs 则继续保留 actor/lifecycle 原语。",
+      "v0.1.122":
+        "Runtime conversation bootstrap 现在从 lifecycle.rs 移到独立的 runtime_conversation_bootstrap 模块。Agent loop 仍通过 RuntimeConversationBootstrapStep 委托执行，新模块负责 RuntimePreparedConversation、borrowed/owned conversation 存储、session bootstrap 组合和初始 history 记录，lifecycle.rs 则继续保留 actor/lifecycle 原语。",
+      "v0.1.121":
+        "Runtime steer application 现在从 lifecycle.rs 移到独立的 runtime_steer 模块，并通过分组后的 RuntimeSteerInput 传参。RuntimeTurnOpeningStep 和 RuntimeProviderTurnStep 仍会在模型调用前把待处理 steer input 注入 conversation 和 history，lifecycle.rs 保留 ThreadSteerHandle 存储，同时再拆掉一个 reducer 切片。",
+      "v0.1.120":
+        "Runtime model-route 编排现在从 lifecycle.rs 移到独立的 runtime_model_route 模块，并通过分组后的 RuntimeModelRouteInput 传参。RuntimeTurnOpeningStep 仍按原顺序组合 compaction、turn start、model routing 和 steering，lifecycle.rs 保留 actor/lifecycle 原语，同时再拆掉一个 reducer 切片，并避免新增长参数调用面。",
+      "v0.1.119":
+        "Runtime turn-start 编排现在从 lifecycle.rs 移到独立的 runtime_turn_start 模块。RuntimeTurnOpeningStep 仍按原顺序组合 compaction、turn start、model routing 和 steering，lifecycle.rs 则保留 actor/lifecycle 原语，同时再拆掉一个更底层的 reducer 切片。",
+      "v0.1.118":
+        "Runtime turn-opening 编排现在从 lifecycle.rs 移到独立的 runtime_turn_opening 模块，并通过分组后的 RuntimeTurnOpeningInput 传参。RuntimeTurnIterationStep 仍按原顺序组合 opening 与 provider-cycle 执行，lifecycle.rs 则继续保留更底层的 start/model-route/steer 步骤，同时再少一层 reducer 大小的职责。",
+      "v0.1.117":
+        "Runtime turn-iteration 编排现在从 lifecycle.rs 移到独立的 runtime_turn_iteration 模块。外层 runtime_turn_loop 仍通过 RuntimeTurnIterationStep 委托执行，provider-cycle 行为仍归 provider_turn，lifecycle.rs 继续保留 opening/start/model-route 这些步骤，同时为下一轮 reducer 风格拆分继续变小。",
+      "v0.1.116":
+        "Runtime turn-loop 编排现在从 lifecycle.rs 移到独立的 runtime_turn_loop 模块。agent loop 仍然通过 RuntimeTurnLoopStep 委托执行，分组后的 input/executor 对象和 iteration 重试/返回行为保持不变，同时 lifecycle.rs 进一步变小，为后续参考 Codex/package 3 的 reducer 拆分铺路。",
+      "v0.1.115":
+        "shell-session bash 执行现在统一接收分组后的 RuntimeBashInvocationContext，不再暴露 execute_bash_with_shell_session 的长参数列表。RuntimeNormalToolExecutor 仍然拥有 bash 分支，permission overlay、取消、输出截断、task registry 交接以及网络/文件系统权限重试行为保持不变，同时 bash 边界为后续 shell/session 和 async-subagent 切片继续收窄。",
+      "v0.1.114":
+        "文件系统 sandbox 拒绝现在在 server command/exec 和模型可见 bash 两条路径上都能更清楚地恢复。Orca 会诊断 macOS Seatbelt 写入阻断，例如嵌套工作区里的 .git/index.lock 失败，并说明这通常是 sandbox 范围问题而不是 stale lock；当存在审批处理器时，会请求 turn-scoped 文件系统写入授权，并用授权后的 root 重试原命令。",
+      "v0.1.113":
+        "工具回合 dispatch 现在从 provider response 处理处接收分组后的 RuntimeToolTurnsContext，不再暴露 run_tool_turns 的长参数调用。RuntimeStepContext、events、sink、conversation、history writer、tool requests、cost tracking、background workflow 状态和 child executors 的透传保持不变，同时 provider 到 tool-turn 的边界继续收窄。",
+      "v0.1.112":
+        "普通工具回合执行现在统一接收分组后的 RuntimeNormalToolTurnContext，不再让 run_normal_tool_turn 暴露长参数列表。工具执行、审批、结果记录、plan-state 记录、permission overlay、workflow/background 状态以及 child executor 交接都保持相同 runtime 行为，同时 tool-turn 边界继续收窄。",
+      "v0.1.111":
+        "工具审批 gate 的输入现在统一通过 ToolApprovalGateContext 传递，不再让 handle_approval 暴露长参数列表。config、events、sink、tool request、invocation、policy、strict auto-review 与 delta emission 的透传保持不变，同时 approval allow/ask/deny 行为和 tool-call item emission 继续保持相同的公开形状。",
+      "v0.1.110":
+        "历史投影工具完成态现在统一由 tool_item_projection.rs 里的 complete_projected_tool_item 重建，不再让 thread_store/projection.rs 直接调用 MCP、dynamic、commandExecution 和 fileChange completed-item 构造器。实时流和持久化 history 行为保持兼容，同时剩余 tool-item schema drift 又少了一个分散所有权点。",
+      "v0.1.109":
+        "runtime 普通工具路由现在从 router 向 lifecycle actor 传递分组后的 RuntimeNormalToolInvocation，不再直接调用带 roots/cancel 的长参数方法。bash shell-session、MCP/external fallback、permission overlay、取消和输出截断行为保持不变，同时公共工具路径为后续 shell 与 async-subagent 工作留下更窄的调用面。",
       "v0.1.108":
         "普通工具 invocation 现在统一经过 runtime_normal_tool 里的单一 helper，不再让 lifecycle.rs 直接实例化 executor。RuntimeTaskActor 和 RuntimeToolActorContext 仍保持同样的 bash、MCP、external、取消与 permission-overlay 行为，但后续 shell-session 和 async subagent 切片会有更窄的调用面可继续推进。",
       "v0.1.107":
