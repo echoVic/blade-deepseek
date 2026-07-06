@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.153":
+        "RuntimeThread now owns the thread-scoped extension store and hands it to each RuntimeTurnState, while every RuntimeThread turn receives a fresh turn extension store id. Goal and future runtime contributors can now keep stable thread-level state across headless, TUI, and server turns without leaking turn-local data.",
       "v0.1.152":
         "RuntimeTurnState now owns the default extension registry plus thread and turn extension stores, installs the goal tool lifecycle contributor, and threads that state through the provider/tool turn path into normal tool execution. Goal progress can now observe real normal-tool completions from the live runtime path without changing CLI, TUI, server, JSONL, or goal storage behavior.",
       "v0.1.151":
@@ -332,6 +334,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.153":
+        "RuntimeThread 现在拥有 thread-scoped extension store，并会把它传给每个 RuntimeTurnState；每个 RuntimeThread turn 仍然获得新的 turn extension store id。Goal 和后续 runtime contributor 现在可以跨 headless、TUI、server turn 保留稳定的 thread-level 状态，同时不泄漏 turn-local 数据。",
       "v0.1.152":
         "RuntimeTurnState 现在拥有默认 extension registry 以及 thread/turn extension store，并会安装 goal tool lifecycle contributor，再沿 provider/tool turn path 传入 normal tool execution。Goal progress 现在可以从真实 runtime 路径观察 normal-tool completion，同时不改变 CLI、TUI、server、JSONL 或 goal storage 行为。",
       "v0.1.151":
