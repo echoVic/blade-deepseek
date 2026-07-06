@@ -58,8 +58,10 @@ const copy = {
     },
     nav: {
       features: "Features",
+      useCases: "Use cases",
       capabilities: "Capabilities",
       workflow: "Workflow",
+      faq: "FAQ",
       install: "Install",
       changelog: "Changelog",
       github: "GitHub",
@@ -119,6 +121,60 @@ const copy = {
         { k: "0", l: "duplicate remote summary calls (hashed cache)" },
       ],
     },
+    quickStart: {
+      eyebrow: "Quick Start",
+      title: "Install once, then just run orca.",
+      subtitle:
+        "After installation, start Orca from your terminal. The first run guides you through the DeepSeek API key, then drops you straight into the interactive coding TUI.",
+      steps: [
+        {
+          k: "01",
+          title: "Install",
+          body: "Use npm for the fastest path, or switch to the native curl installer below.",
+          code: ["npm install -g @blade-ai/orca"],
+        },
+        {
+          k: "02",
+          title: "Run Orca",
+          body: "Launch the TUI. If no API key is configured yet, Orca opens the setup flow and saves it for future sessions.",
+          code: ["orca"],
+        },
+        {
+          k: "03",
+          title: "Start coding",
+          body: "Type the task in the interactive terminal. For automated runs later, add verifier commands from the exec workflow.",
+          code: ['› fix the failing auth test'],
+        },
+      ],
+    },
+    useCasesEyebrow: "Common dev tasks",
+    useCasesTitle: "The loops you already run, with more memory and fewer handoffs.",
+    useCases: [
+      {
+        title: "Fix failing tests",
+        body: "Trace the failure, edit the right files, run the verifier, and keep the transcript for review.",
+      },
+      {
+        title: "Long refactors",
+        body: "Use persistent goals and automatic continuation when one turn is not enough to land the change.",
+      },
+      {
+        title: "Codebase archaeology",
+        body: "Search, read, and summarize a repo without losing the path from evidence to conclusion.",
+      },
+      {
+        title: "Release checks",
+        body: "Combine command execution, JSONL events, and release notes into an auditable final pass.",
+      },
+      {
+        title: "Reusable workflows",
+        body: "Run project or user workflows from .orca/workflows/ when a process deserves a repeatable shape.",
+      },
+      {
+        title: "Approval-aware automation",
+        body: "Let reads flow quickly while edits, shell, network, and agent actions respect policy.",
+      },
+    ],
     capabilitiesEyebrow: "Control surface",
     capabilitiesTitle: "Inspect, resume, and gate every turn.",
     capabilitiesSubtitle:
@@ -166,6 +222,58 @@ const copy = {
       configMainLoop: "main loop v4-pro, aux tasks v4-flash",
       configReasoning: "max reasoning effort",
       configPriority: "Priority: env vars > CLI args > config file > defaults",
+    },
+    comparison: {
+      eyebrow: "Why teams pick Orca",
+      title: "A local DeepSeek workflow, not another chat window.",
+      columns: [
+        {
+          title: "Regular AI chat",
+          items: [
+            "Context disappears between tasks.",
+            "File edits and test runs stay manual.",
+            "Reasoning settings are detached from the dev loop.",
+          ],
+        },
+        {
+          title: "Generic coding agents",
+          items: [
+            "DeepSeek behavior is treated as a generic OpenAI-compatible backend.",
+            "Long-context and prefix-cache behavior are rarely visible.",
+            "Resume, audit, and approval contracts vary by surface.",
+          ],
+        },
+        {
+          title: "Orca",
+          items: [
+            "DeepSeek routing, max reasoning effort, and prefix-cache-friendly prompts are first-class.",
+            "Persistent goals, workflows, and verifier gates keep long tasks moving.",
+            "Local JSONL transcripts, resume/fork, approval policies, and sandbox hooks stay inspectable.",
+          ],
+        },
+      ],
+    },
+    faq: {
+      eyebrow: "Frequently asked questions",
+      title: "Answers before you install.",
+      items: [
+        {
+          q: "Does Orca only work with DeepSeek?",
+          a: "Orca is tuned for DeepSeek V4 and gives the best experience there, but the config can point at an OpenAI-compatible endpoint when your team needs that.",
+        },
+        {
+          q: "Will my session history be lost?",
+          a: "No. Orca stores local JSONL transcripts under ~/.orca/sessions/ and supports list, search, --resume, --fork, archive, and compression.",
+        },
+        {
+          q: "Can I keep control over edits and shell commands?",
+          a: "Yes. Built-in, MCP, and external tools declare capabilities, and approval modes plus sandbox profiles decide what can run automatically.",
+        },
+        {
+          q: "What makes persistent goals different from a long prompt?",
+          a: "A /goal survives restarts, auto-continues successful turns, and requires an explicit complete or blocked audit before Orca stops.",
+        },
+      ],
     },
     specsEyebrow: "Technical specs",
     specsLabel: "Technical specs",
@@ -223,8 +331,10 @@ const copy = {
     },
     nav: {
       features: "特性",
+      useCases: "场景",
       capabilities: "能力",
       workflow: "工作流",
+      faq: "FAQ",
       install: "安装",
       changelog: "更新日志",
       github: "GitHub",
@@ -284,6 +394,60 @@ const copy = {
         { k: "0", l: "重复 remote summary 调用（哈希缓存）" },
       ],
     },
+    quickStart: {
+      eyebrow: "快速上手",
+      title: "安装一次，然后直接运行 orca。",
+      subtitle:
+        "安装后在终端输入 orca。首次运行会引导你配置 DeepSeek API key，然后直接进入交互式终端开始写代码。",
+      steps: [
+        {
+          k: "01",
+          title: "安装",
+          body: "npm 是最快路径；如果想直接安装原生二进制，也可以用下方 curl 方式。",
+          code: ["npm install -g @blade-ai/orca"],
+        },
+        {
+          k: "02",
+          title: "运行 Orca",
+          body: "启动 TUI。如果还没有配置 API key，Orca 会打开初始化引导，并为之后的会话保存配置。",
+          code: ["orca"],
+        },
+        {
+          k: "03",
+          title: "开始交互",
+          body: "进入交互式终端后直接输入任务。后续需要自动化运行时，再用 exec workflow 加 verifier。",
+          code: ["› 修复失败的 auth 测试"],
+        },
+      ],
+    },
+    useCasesEyebrow: "常见开发任务",
+    useCasesTitle: "把你每天已经在跑的循环，变成更长记忆、更少切换的流程。",
+    useCases: [
+      {
+        title: "修复失败测试",
+        body: "定位失败原因，编辑相关文件，运行 verifier，并留下可复查的会话记录。",
+      },
+      {
+        title: "长任务重构",
+        body: "一轮做不完时，用持久 goal 和自动继续把任务稳稳推进到可交付状态。",
+      },
+      {
+        title: "理解大型代码库",
+        body: "搜索、读取、归纳仓库证据，让结论能追溯到真实文件和命令输出。",
+      },
+      {
+        title: "发布前检查",
+        body: "把命令执行、JSONL 事件和 release note 串起来，形成可审计的最终检查。",
+      },
+      {
+        title: "复用工作流",
+        body: "把团队流程放进 .orca/workflows/，让重复任务不再每次重新讲一遍。",
+      },
+      {
+        title: "可审批自动化",
+        body: "读取可以快速发生，写入、shell、网络和 agent 行为则按策略执行。",
+      },
+    ],
     capabilitiesEyebrow: "控制界面",
     capabilitiesTitle: "每一轮都可检查、可恢复、可校验。",
     capabilitiesSubtitle:
@@ -330,6 +494,58 @@ const copy = {
       configMainLoop: "主循环 v4-pro，辅助任务 v4-flash",
       configReasoning: "max 推理强度",
       configPriority: "优先级：环境变量 > CLI 参数 > 配置文件 > 默认值",
+    },
+    comparison: {
+      eyebrow: "为什么选择 Orca",
+      title: "不是再开一个聊天窗口，而是本地 DeepSeek 开发工作流。",
+      columns: [
+        {
+          title: "普通 AI 聊天",
+          items: [
+            "任务之间上下文容易断掉。",
+            "文件修改和测试运行仍然靠手动搬运。",
+            "推理强度和开发闭环是分离的。",
+          ],
+        },
+        {
+          title: "通用代码智能体",
+          items: [
+            "DeepSeek 往往只是一个 OpenAI-compatible 后端。",
+            "长上下文和前缀缓存行为不够可见。",
+            "恢复、审计和审批契约会随入口变化。",
+          ],
+        },
+        {
+          title: "Orca",
+          items: [
+            "DeepSeek 路由、max reasoning effort 和前缀缓存友好提示词是一等能力。",
+            "持久 goal、workflow 和 verifier gate 能支撑更长任务。",
+            "本地 JSONL、resume/fork、审批策略和沙箱 hooks 都可检查。",
+          ],
+        },
+      ],
+    },
+    faq: {
+      eyebrow: "常见问题",
+      title: "安装前先把疑虑说清楚。",
+      items: [
+        {
+          q: "Orca 只能用 DeepSeek 吗？",
+          a: "Orca 针对 DeepSeek V4 做了调优，在 DeepSeek 上体验最好；如果团队需要，也可以把配置指向 OpenAI-compatible endpoint。",
+        },
+        {
+          q: "会话历史会不会丢？",
+          a: "不会。Orca 在 ~/.orca/sessions/ 下保存本地 JSONL transcript，并支持 list、search、--resume、--fork、archive 和压缩。",
+        },
+        {
+          q: "我能控制文件修改和 shell 命令吗？",
+          a: "可以。内置、MCP 和 external 工具都会声明能力，approval mode 与 sandbox profile 决定哪些动作能自动运行。",
+        },
+        {
+          q: "持久 goal 和写一个长 prompt 有什么不同？",
+          a: "/goal 会跨重启保留，成功后自动继续，并要求 Orca 明确审计为 complete 或 blocked 后才停止。",
+        },
+      ],
     },
     specsEyebrow: "技术规格",
     specsLabel: "技术规格",
@@ -827,8 +1043,10 @@ function App() {
         <div className="nav-actions">
           <nav aria-label={t.aria.nav}>
             <a href="#features">{t.nav.features}</a>
+            <a href="#use-cases">{t.nav.useCases}</a>
             <a href="#capabilities">{t.nav.capabilities}</a>
             <a href="#workflow">{t.nav.workflow}</a>
+            <a href="#faq">{t.nav.faq}</a>
             <a href="#install">{t.nav.install}</a>
             <a href={links.changelog}>{t.nav.changelog}</a>
             <a className="nav-cta" href={links.github} rel="noreferrer">
@@ -971,6 +1189,39 @@ function App() {
         </article>
       </section>
 
+      <section className="quick-start" id="quick-start" aria-labelledby="quick-start-heading">
+        <div className="section-heading">
+          <p className="eyebrow">{t.quickStart.eyebrow}</p>
+          <h2 id="quick-start-heading">{t.quickStart.title}</h2>
+          <p className="subtitle">{t.quickStart.subtitle}</p>
+        </div>
+        <div className="quick-grid">
+          {t.quickStart.steps.map((step) => (
+            <article key={step.k} className="quick-card">
+              <span className="step-k">{step.k}</span>
+              <h3>{step.title}</h3>
+              <p>{step.body}</p>
+              <pre>{step.code.join("\n")}</pre>
+            </article>
+          ))}
+        </div>
+      </section>
+
+      <section className="use-cases" id="use-cases" aria-labelledby="use-cases-heading">
+        <div className="section-heading">
+          <p className="eyebrow">{t.useCasesEyebrow}</p>
+          <h2 id="use-cases-heading">{t.useCasesTitle}</h2>
+        </div>
+        <div className="use-case-grid">
+          {t.useCases.map((item) => (
+            <article key={item.title}>
+              <h3>{item.title}</h3>
+              <p>{item.body}</p>
+            </article>
+          ))}
+        </div>
+      </section>
+
       <section className="capabilities" id="capabilities" aria-labelledby="capabilities-heading">
         <div className="cap-lead">
           <p className="eyebrow">{t.capabilitiesEyebrow}</p>
@@ -994,6 +1245,25 @@ function App() {
                 <p>{cap.body}</p>
               </div>
             </div>
+          ))}
+        </div>
+      </section>
+
+      <section className="comparison" id="comparison" aria-labelledby="comparison-heading">
+        <div className="section-heading">
+          <p className="eyebrow">{t.comparison.eyebrow}</p>
+          <h2 id="comparison-heading">{t.comparison.title}</h2>
+        </div>
+        <div className="comparison-grid">
+          {t.comparison.columns.map((column, index) => (
+            <article key={column.title} className={index === 2 ? "highlight" : ""}>
+              <h3>{column.title}</h3>
+              <ul>
+                {column.items.map((item) => (
+                  <li key={item}>{item}</li>
+                ))}
+              </ul>
+            </article>
           ))}
         </div>
       </section>
@@ -1046,6 +1316,21 @@ function App() {
             </div>
             <p>{t.specs.rust}</p>
           </div>
+        </div>
+      </section>
+
+      <section className="faq" id="faq" aria-labelledby="faq-heading">
+        <div className="section-heading">
+          <p className="eyebrow">{t.faq.eyebrow}</p>
+          <h2 id="faq-heading">{t.faq.title}</h2>
+        </div>
+        <div className="faq-list">
+          {t.faq.items.map((item) => (
+            <article key={item.q}>
+              <h3>{item.q}</h3>
+              <p>{item.a}</p>
+            </article>
+          ))}
         </div>
       </section>
 

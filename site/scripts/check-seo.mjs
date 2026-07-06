@@ -112,6 +112,24 @@ check(
   "Mobile nav must keep the GitHub CTA visible while hiding secondary links",
 );
 
+const requiredHomepageSource = [
+  ["Quick Start", "Homepage missing English quick start section"],
+  ["Common dev tasks", "Homepage missing English use-case section"],
+  ["Why teams pick Orca", "Homepage missing English comparison section"],
+  ["Frequently asked questions", "Homepage missing English FAQ section"],
+  ["快速上手", "Homepage missing Chinese quick start section"],
+  ["常见开发任务", "Homepage missing Chinese use-case section"],
+  ["为什么选择 Orca", "Homepage missing Chinese comparison section"],
+  ["常见问题", "Homepage missing Chinese FAQ section"],
+  ['code: ["orca"]', "Quick start must launch the interactive TUI with orca"],
+  ["guides you through the DeepSeek API key", "Quick start must describe guided key setup"],
+  ["进入交互式终端", "Chinese quick start must describe entering the interactive terminal"],
+];
+
+for (const [needle, message] of requiredHomepageSource) {
+  check(appSource.includes(needle), message);
+}
+
 const jsonLdBlocks = [
   ...indexHtml.matchAll(
     /<script type="application\/ld\+json">([\s\S]*?)<\/script>/g,
