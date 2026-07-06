@@ -9,8 +9,8 @@ use orca_core::model::ModelRouteContext;
 use orca_core::provider_types::{ProviderResponse, ProviderStep};
 use orca_provider::ProviderConfig;
 
-use crate::agent_child::{ChildAgentRequest, ChildAgentResult};
 use crate::child_agent_loop_setup::ChildAgentLoopSetup;
+use crate::child_agent_types::{ChildAgentRequest, ChildAgentResult};
 use crate::compaction::RuntimeCompactionStep;
 use crate::cost::CostTracker;
 use crate::hooks::{HookContext, HookRunner, conversation_with_hook_context};

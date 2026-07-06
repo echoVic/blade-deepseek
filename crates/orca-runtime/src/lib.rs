@@ -6,6 +6,7 @@ mod child_agent_loop_runner;
 mod child_agent_loop_setup;
 mod child_agent_provider_turn;
 mod child_agent_response_folding;
+mod child_agent_types;
 pub mod compaction;
 pub mod controller;
 pub mod cost;
@@ -1027,6 +1028,46 @@ mod tests {
         assert!(
             agent_child_source.contains("pub use crate::child_agent_loop_runner::"),
             "agent_child must preserve existing imports by re-exporting child loop runner APIs"
+        );
+    }
+
+    #[test]
+    fn child_agent_types_boundary_is_owned_by_focused_module() {
+        let lib_source = include_str!("lib.rs");
+        let agent_child_source = include_str!("agent_child.rs");
+        let agent_child_runtime_source = agent_child_source
+            .split_once("#[cfg(test)]")
+            .map(|(runtime_source, _)| runtime_source)
+            .unwrap_or(agent_child_source);
+        let child_types_source =
+            std::fs::read_to_string("src/child_agent_types.rs").expect("child agent types source");
+
+        assert!(
+            lib_source.contains("mod child_agent_types;"),
+            "runtime crate must declare a focused child_agent_types module"
+        );
+
+        for marker in [
+            "pub struct ChildAgentRequest",
+            "impl ChildAgentRequest",
+            "pub struct ChildAgentResult",
+            "pub(crate) type ChildAgentExecutor",
+            "pub(crate) struct ChildAgentRuntime",
+            "impl<'a, W: io::Write> ChildAgentRuntime<'a, W>",
+        ] {
+            assert!(
+                child_types_source.contains(marker),
+                "child_agent_types must own child-agent shared type {marker}"
+            );
+            assert!(
+                !agent_child_runtime_source.contains(marker),
+                "agent_child facade must not own child-agent shared type {marker}"
+            );
+        }
+
+        assert!(
+            agent_child_source.contains("pub use crate::child_agent_types::"),
+            "agent_child must preserve existing imports by re-exporting child-agent shared types"
         );
     }
 

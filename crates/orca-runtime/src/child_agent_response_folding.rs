@@ -4,9 +4,9 @@ use orca_core::provider_types::{ProviderResponse, ProviderStep};
 use orca_core::tool_types::{ToolRequest, ToolResult};
 use orca_mcp::McpRegistry;
 
-use crate::agent_child::ChildAgentResult;
 use crate::agent_common;
 use crate::child_agent_loop_setup::ChildAgentLoopSetup;
+use crate::child_agent_types::ChildAgentResult;
 use crate::cost::CostTracker;
 
 pub enum ChildAgentProviderResponseFold {
