@@ -402,10 +402,15 @@ commands and consume versioned events without owning turn execution details.
    plan/subagent/approval events, workflow terminal notifications, workflow
    task-list/progress refreshes, interactive approval decisions, and
    `request_user_input` continuations now also flow through runtime
-   event/handler boundaries. Realtime and persisted tool item projections now
+   event/handler boundaries. Realtime server item streaming now uses a shared
+   `RuntimeEventProjector` reducer for assistant message, plan, reasoning,
+   tool, file-change, and workflow item lifecycles instead of keeping those
+   runtime-event state machines inside `ServerRequestWriter`. Realtime and
+   persisted tool item projections now
    share MCP tool name parsing, JSON argument parsing, MCP/dynamic started-item
    builders, MCP result shaping, camelCase tool error object helpers, exit-code
-   normalization from runtime payloads or persisted result metadata, and completed-status checks. Realtime
+   normalization from runtime payloads or persisted result metadata, and
+   completed-status checks. Realtime
    MCP/dynamic tool item helpers also use the shared status check before emitting success
    result/content items, and realtime file-change item helpers now share the
    same success-output / error-detail split. Non-success output is surfaced as

@@ -28,6 +28,7 @@ pub(crate) mod runtime_approval;
 pub(crate) mod runtime_bash;
 mod runtime_conversation_bootstrap;
 pub mod runtime_directive;
+pub(crate) mod runtime_event_projector;
 mod runtime_lifecycle;
 mod runtime_model_route;
 mod runtime_normal_tool;
@@ -185,6 +186,48 @@ mod tests {
                 "tool_turn must not own readonly detail {marker}"
             );
         }
+    }
+
+    #[test]
+    fn runtime_event_projector_projects_reasoning_lifecycle() {
+        use crate::protocol::ServerEvent;
+        use crate::runtime_event_projector::RuntimeEventProjector;
+
+        let mut projector = RuntimeEventProjector::default();
+        let started = projector
+            .project_line(r#"{"type":"assistant.reasoning.delta","payload":{"text":"thinking"}}"#);
+
+        assert_eq!(started.len(), 3);
+        assert!(matches!(
+            &started[0],
+            ServerEvent::ItemStarted { item, .. }
+                if item["id"] == "item-reasoning-1"
+                    && item["type"] == "reasoning"
+                    && item["summary"] == ""
+        ));
+        assert!(matches!(
+            &started[1],
+            ServerEvent::ItemReasoningDelta { item_id, delta }
+                if item_id == "item-reasoning-1" && delta == "thinking"
+        ));
+        assert!(matches!(
+            &started[2],
+            ServerEvent::ReasoningDelta { text } if text == "thinking"
+        ));
+
+        let completed = projector
+            .project_line(r#"{"type":"session.completed","payload":{"status":"success"}}"#);
+        assert!(matches!(
+            &completed[0],
+            ServerEvent::TurnCompleted { status } if status == "success"
+        ));
+        assert!(matches!(
+            completed.last(),
+            Some(ServerEvent::ItemCompleted { item, .. })
+                if item["id"] == "item-reasoning-1"
+                    && item["type"] == "reasoning"
+                    && item["summary"] == "thinking"
+        ));
     }
 
     #[test]
