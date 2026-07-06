@@ -1,5 +1,6 @@
 use crate::extension::{ExtensionData, ToolCallOutcome};
 use crate::goals;
+use crate::runtime_directive::{RuntimeDirective, RuntimeDirectiveState};
 
 #[derive(Clone, Copy, Debug)]
 pub struct RuntimeToolFinish<'a> {
@@ -16,18 +17,37 @@ pub struct ToolRuntimeState<'a> {
 
 #[derive(Clone, Copy, Debug)]
 pub struct RuntimeTurnReducer<'a> {
+    directive_state: DirectiveRuntimeState,
     tool_state: ToolRuntimeState<'a>,
 }
 
 impl<'a> RuntimeTurnReducer<'a> {
     pub fn new(thread_store: &'a ExtensionData, turn_store: &'a ExtensionData) -> Self {
         Self {
+            directive_state: DirectiveRuntimeState,
             tool_state: ToolRuntimeState::new(thread_store, turn_store),
         }
     }
 
+    pub fn apply_directive(
+        &self,
+        directive_state: &mut RuntimeDirectiveState,
+        directive: RuntimeDirective,
+    ) {
+        self.directive_state.apply(directive_state, directive);
+    }
+
     pub fn record_tool_finish(&self, finish: RuntimeToolFinish<'_>) {
         self.tool_state.record_finish(finish);
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct DirectiveRuntimeState;
+
+impl DirectiveRuntimeState {
+    pub fn apply(&self, directive_state: &mut RuntimeDirectiveState, directive: RuntimeDirective) {
+        directive_state.apply(directive);
     }
 }
 

@@ -25,7 +25,7 @@ pub struct RuntimeDirectiveState {
 }
 
 impl RuntimeDirectiveState {
-    pub fn apply(&mut self, directive: RuntimeDirective) {
+    pub(crate) fn apply(&mut self, directive: RuntimeDirective) {
         match directive {
             RuntimeDirective::SwitchModel { model, reason } => {
                 self.model_override = Some(model);

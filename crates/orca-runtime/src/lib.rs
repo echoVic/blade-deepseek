@@ -75,6 +75,7 @@ mod tests {
         ToolLifecycleContributor,
     };
     use crate::goals::GoalToolProgressState;
+    use crate::runtime_directive::{RuntimeDirective, RuntimeDirectiveState};
     use crate::runtime_state::{RuntimeToolFinish, RuntimeTurnReducer};
     use crate::thread_store::{SessionStore, ThreadStore};
     use std::sync::{Arc, Mutex};
@@ -171,6 +172,76 @@ mod tests {
         assert_eq!(progress.completed_tool_attempts(), 1);
         assert_eq!(progress.last_turn_id().as_deref(), Some("turn-1"));
         assert_eq!(progress.last_call_id().as_deref(), Some("call-1"));
+    }
+
+    #[test]
+    fn runtime_turn_reducer_applies_runtime_directives_in_order() {
+        let thread_store = ExtensionData::new("thread-a");
+        let turn_store = ExtensionData::new("turn-1");
+        let reducer = RuntimeTurnReducer::new(&thread_store, &turn_store);
+        let mut directives = RuntimeDirectiveState::default();
+
+        reducer.apply_directive(
+            &mut directives,
+            RuntimeDirective::SwitchModel {
+                model: orca_core::model::FLASH_MODEL.to_string(),
+                reason: "skill requested cheaper execution".to_string(),
+            },
+        );
+        reducer.apply_directive(
+            &mut directives,
+            RuntimeDirective::ReplaceAllowedTools {
+                tool_names: vec!["read_file".to_string(), "grep".to_string()],
+                reason: "skill narrowed tool surface".to_string(),
+            },
+        );
+        reducer.apply_directive(
+            &mut directives,
+            RuntimeDirective::InjectSystemMessage {
+                message: "Prefer focused repository evidence.".to_string(),
+                reason: "skill added runtime instruction".to_string(),
+            },
+        );
+
+        assert_eq!(
+            directives.model_override(),
+            Some(orca_core::model::FLASH_MODEL)
+        );
+        assert_eq!(
+            directives.allowed_tools(),
+            Some(&["read_file".to_string(), "grep".to_string()][..])
+        );
+        assert_eq!(
+            directives.pending_system_messages(),
+            &["Prefer focused repository evidence.".to_string()]
+        );
+        assert_eq!(
+            directives.transition_reasons(),
+            &[
+                "switch_model: skill requested cheaper execution".to_string(),
+                "replace_allowed_tools: skill narrowed tool surface".to_string(),
+                "inject_system_message: skill added runtime instruction".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn runtime_turn_state_directives_route_through_runtime_reducer() {
+        let lifecycle_source = include_str!("lifecycle.rs");
+        let runtime_state_source = include_str!("runtime_state.rs");
+
+        assert!(
+            runtime_state_source.contains("pub fn apply_directive"),
+            "runtime_state must expose reducer-owned runtime directive application"
+        );
+        assert!(
+            lifecycle_source.contains("RuntimeTurnReducer::new("),
+            "RuntimeTurnState::apply_directive must instantiate the runtime turn reducer"
+        );
+        assert!(
+            !lifecycle_source.contains("self.directive_state.apply("),
+            "RuntimeTurnState should not write directive state directly"
+        );
     }
 
     #[test]

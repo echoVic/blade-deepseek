@@ -30,6 +30,7 @@ use crate::runtime_directive::{RuntimeDirective, RuntimeDirectiveState};
 use crate::runtime_normal_tool::{
     RuntimeNormalToolInvocation, execute_runtime_normal_tool_invocation,
 };
+use crate::runtime_state::RuntimeTurnReducer;
 use crate::tasks::TaskRegistry;
 use crate::workflow::ipc::WorkflowIpcContext;
 use crate::workflow_execution::BackgroundWorkflowRun;
@@ -933,7 +934,8 @@ impl<'a> RuntimeTurnState<'a> {
 
     #[allow(dead_code)]
     pub(crate) fn apply_directive(&mut self, directive: RuntimeDirective) {
-        self.directive_state.apply(directive);
+        RuntimeTurnReducer::new(self.thread_extensions.as_ref(), &self.turn_extensions)
+            .apply_directive(&mut self.directive_state, directive);
     }
 
     #[cfg(test)]
