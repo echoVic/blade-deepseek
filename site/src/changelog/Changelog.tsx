@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.163":
+        "RuntimeTurnState now exposes the grouped RuntimeExtensionContext boundary and owns the registry/store composition helper used by agent_loop. The loop still passes the same registry, thread store, and turn store into RuntimeTurnLoopInput, but extension-context construction no longer lives directly in the loop body.",
       "v0.1.162":
         "Runtime turn-loop, iteration, and provider-cycle inputs now carry one RuntimeExtensionContext instead of parallel extension registry, thread store, and turn store fields. agent_loop creates the grouped context once, and provider turns reuse it when building RuntimeStepContext, preserving lifecycle notifications while narrowing the runtime extension boundary.",
       "v0.1.161":
@@ -352,6 +354,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.163":
+        "RuntimeTurnState 现在暴露 grouped RuntimeExtensionContext boundary，并拥有 agent_loop 使用的 registry/store 组合 helper。Loop 仍把同一套 registry、thread store 和 turn store 传给 RuntimeTurnLoopInput，但 extension-context 构造不再直接散落在 loop body 中。",
       "v0.1.162":
         "Runtime turn-loop、iteration 与 provider-cycle input 现在携带单一 RuntimeExtensionContext，不再暴露平行的 extension registry、thread store 和 turn store 字段。agent_loop 只创建一次 grouped context；provider turn 在构造 RuntimeStepContext 时复用它，保持 lifecycle notification 行为不变，同时继续收窄 runtime extension boundary。",
       "v0.1.161":
