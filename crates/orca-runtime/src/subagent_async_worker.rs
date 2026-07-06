@@ -281,7 +281,7 @@ fn spawn_async_subagent_worker(
         .map_err(|error| error.to_string())
 }
 
-fn usage_totals_if_non_empty(usage: UsageTotals) -> Option<UsageTotals> {
+pub(crate) fn usage_totals_if_non_empty(usage: UsageTotals) -> Option<UsageTotals> {
     if usage.total_tokens() == 0 && usage.cache_tokens == 0 && usage.estimated_cost_usd == 0.0 {
         None
     } else {
@@ -289,7 +289,10 @@ fn usage_totals_if_non_empty(usage: UsageTotals) -> Option<UsageTotals> {
     }
 }
 
-fn async_subagent_result_payload(output: String, task: Option<serde_json::Value>) -> String {
+pub(crate) fn async_subagent_result_payload(
+    output: String,
+    task: Option<serde_json::Value>,
+) -> String {
     serde_json::json!({
         "output": output,
         "task": task,

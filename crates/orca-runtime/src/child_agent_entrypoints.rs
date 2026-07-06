@@ -7,9 +7,13 @@ use orca_core::event_schema::RunStatus;
 use orca_core::subagent_types::SubagentType;
 use orca_core::tool_types::ToolRequest;
 
-use crate::child_agent_loop_runner::run_child_agent_with_tool_executor;
+use crate::child_agent_loop_runner::{
+    run_child_agent_with_tool_executor, run_child_agent_with_tool_executor_observed,
+};
 use crate::child_agent_response_folding::{ChildAgentToolContext, ChildAgentToolExecution};
-use crate::child_agent_types::{ChildAgentRequest, ChildAgentResult, ChildAgentRuntime};
+use crate::child_agent_types::{
+    ChildAgentActivityObserver, ChildAgentRequest, ChildAgentResult, ChildAgentRuntime,
+};
 use crate::cost::CostTracker;
 use crate::hooks::HookRunner;
 use crate::instructions::ProjectInstructions;
@@ -92,6 +96,40 @@ where
         context.instructions,
         context.memory,
         context.hooks,
+        execute_tool,
+    )
+}
+
+pub fn run_child_agent_prompt_with_tool_executor_observed<F>(
+    config: &RunConfig,
+    context: ChildAgentPromptContext<'_>,
+    observer: Option<&ChildAgentActivityObserver<'_>>,
+    execute_tool: F,
+) -> (ChildAgentResult, CostTracker)
+where
+    F: FnMut(
+        &RunConfig,
+        &ChildAgentRequest,
+        &ChildAgentToolContext<'_>,
+        &CancelToken,
+        &ToolRequest,
+    ) -> ChildAgentToolExecution,
+{
+    let request = ChildAgentRequest::new(
+        context.prompt,
+        context.subagent_type.clone(),
+        context.subagent_model,
+        context.subagent_depth,
+        false,
+    );
+    run_child_agent_with_tool_executor_observed(
+        config,
+        &request,
+        context.cwd,
+        context.instructions,
+        context.memory,
+        context.hooks,
+        observer,
         execute_tool,
     )
 }

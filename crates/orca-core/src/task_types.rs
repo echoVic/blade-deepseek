@@ -116,4 +116,10 @@ pub struct BackgroundTaskSummary {
     pub workflow_failure_count: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<UsageTotals>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subagent_current_activity: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subagent_turn: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_activity_at_ms: Option<i64>,
 }

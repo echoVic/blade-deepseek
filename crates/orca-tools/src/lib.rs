@@ -152,6 +152,9 @@ pub fn validate_with_mcp_and_external(
 }
 
 pub fn tool_is_available_readonly_concurrent(request: &ToolRequest) -> bool {
+    if runtime_owned_tool_requires_controller(&request.name) {
+        return false;
+    }
     let reg = registry::default_tool_registry();
     reg.resolve(request.name.as_str())
         .map(|resolved| {
@@ -160,6 +163,16 @@ pub fn tool_is_available_readonly_concurrent(request: &ToolRequest) -> bool {
                 && resolved.tool.is_concurrent_safe(request)
         })
         .unwrap_or(false)
+}
+
+fn runtime_owned_tool_requires_controller(name: &ToolName) -> bool {
+    matches!(
+        name,
+        ToolName::SubagentStatus
+            | ToolName::TaskList
+            | ToolName::WorkflowReadMessages
+            | ToolName::WorkflowListTasks
+    )
 }
 
 pub fn canonical_action_kind(request: &ToolRequest) -> ActionKind {

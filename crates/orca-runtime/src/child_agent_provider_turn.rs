@@ -10,7 +10,9 @@ use orca_core::provider_types::{ProviderResponse, ProviderStep};
 use orca_provider::ProviderConfig;
 
 use crate::child_agent_loop_setup::ChildAgentLoopSetup;
-use crate::child_agent_types::{ChildAgentRequest, ChildAgentResult};
+use crate::child_agent_types::{
+    ChildAgentActivity, ChildAgentActivityObserver, ChildAgentRequest, ChildAgentResult,
+};
 use crate::compaction::RuntimeCompactionStep;
 use crate::cost::CostTracker;
 use crate::hooks::{HookContext, HookRunner, conversation_with_hook_context};
@@ -80,6 +82,73 @@ pub fn run_child_agent_provider_turn(
         provider_config,
         cancel,
         &mut |_| {},
+    );
+
+    if let Err(error) = hooks.run(
+        orca_core::hook_types::HookEvent::PostModelCall,
+        HookContext {
+            cwd: &cwd.display().to_string(),
+            session_status: None,
+            tool_request: None,
+            tool_result: None,
+            before_messages: None,
+            after_messages: None,
+            usage: response.usage.as_ref(),
+        },
+    ) {
+        return ChildAgentProviderTurn::Fail(ChildAgentResult {
+            status: RunStatus::Failed,
+            final_message: None,
+            error: Some(format!("post_model_call hook failed: {error}")),
+        });
+    }
+
+    ChildAgentProviderTurn::Response(response)
+}
+
+pub fn run_child_agent_provider_turn_observed(
+    config: &RunConfig,
+    setup: &ChildAgentLoopSetup,
+    cwd: &Path,
+    hooks: &HookRunner,
+    provider_config: &ProviderConfig,
+    cancel: &CancelToken,
+    observer: Option<&ChildAgentActivityObserver<'_>>,
+) -> ChildAgentProviderTurn {
+    let pre_model_outcome = match hooks.run(
+        orca_core::hook_types::HookEvent::PreModelCall,
+        HookContext {
+            cwd: &cwd.display().to_string(),
+            session_status: None,
+            tool_request: None,
+            tool_result: None,
+            before_messages: None,
+            after_messages: None,
+            usage: None,
+        },
+    ) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            return ChildAgentProviderTurn::Fail(ChildAgentResult {
+                status: RunStatus::Failed,
+                final_message: None,
+                error: Some(format!("pre_model_call hook failed: {error}")),
+            });
+        }
+    };
+    let model_conversation =
+        conversation_with_hook_context(&setup.conversation, &pre_model_outcome);
+
+    let response = orca_provider::call_streaming(
+        config.provider,
+        &model_conversation,
+        provider_config,
+        cancel,
+        &mut |_| {
+            if let Some(observer) = observer {
+                observer.emit(ChildAgentActivity::Streaming);
+            }
+        },
     );
 
     if let Err(error) = hooks.run(

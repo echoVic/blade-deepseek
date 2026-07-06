@@ -2070,6 +2070,9 @@ impl RuntimeSubagentStatusLookup for FakeSubagentStatusLookup {
             output: Some("finished async audit".to_string()),
             error: None,
             usage: None,
+            subagent_current_activity: None,
+            subagent_turn: None,
+            last_activity_at_ms: None,
         })
     }
 }

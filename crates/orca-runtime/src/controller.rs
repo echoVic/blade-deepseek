@@ -810,6 +810,7 @@ mod tests {
             SubagentConfig {
                 max_depth: 2,
                 max_parallel: 1,
+                ..SubagentConfig::default()
             }
             .normalized(),
         );

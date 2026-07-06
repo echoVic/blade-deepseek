@@ -9,6 +9,8 @@ pub struct SubagentConfig {
     pub max_depth: u32,
     #[serde(default = "default_max_parallel")]
     pub max_parallel: usize,
+    #[serde(default = "default_stream_progress")]
+    pub stream_progress: bool,
 }
 
 impl Default for SubagentConfig {
@@ -16,6 +18,7 @@ impl Default for SubagentConfig {
         Self {
             max_depth: DEFAULT_MAX_SUBAGENT_DEPTH,
             max_parallel: DEFAULT_MAX_PARALLEL_SUBAGENTS,
+            stream_progress: true,
         }
     }
 }
@@ -37,6 +40,10 @@ fn default_max_parallel() -> usize {
     DEFAULT_MAX_PARALLEL_SUBAGENTS
 }
 
+fn default_stream_progress() -> bool {
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -46,6 +53,7 @@ mod tests {
         let config = SubagentConfig::default();
         assert_eq!(config.max_depth, 2);
         assert_eq!(config.max_parallel, 6);
+        assert!(config.stream_progress);
     }
 
     #[test]
@@ -53,6 +61,7 @@ mod tests {
         let config = SubagentConfig {
             max_depth: 3,
             max_parallel: 0,
+            stream_progress: true,
         }
         .normalized();
         assert_eq!(config.max_depth, 3);

@@ -282,6 +282,9 @@ impl RuntimeToolActorContext {
             "error": error_output,
             "task": result_task.or(error_task),
             "usage": record.usage.map(runtime_usage_totals_json),
+            "current_activity": record.subagent_current_activity,
+            "turn": record.subagent_turn,
+            "last_activity_at_ms": record.last_activity_at_ms,
         })
         .to_string();
         ToolResult::completed(request, output, false)

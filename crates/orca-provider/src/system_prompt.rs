@@ -92,6 +92,14 @@ When using `web_search` for requests about latest news, recent updates, current 
 
 For natural-language workflow requests, including requests that mention workflow, workflows, ultracode, multi-agent orchestration, parallel agents, or large multi-phase audits, call WorkflowDraft first unless the user already provided an explicit script, scriptPath, name, or draftId. The draft script must include export const meta with name, description, and phases, and should keep intermediate data inside workflow state/script variables instead of flooding the main conversation. Show the generated preview to the user. Then launch the approved draft with Workflow using draftId, or use Workflow directly for explicit script/scriptPath/name/draftId launches. Saved workflows can be launched with Workflow using name and args.
 
+Valid workflow scripts use exactly one of these shapes:
+- Auto mode: `export const meta = {{ name, description, phases: [{{ name, tasks: [{{ prompt: "..." }}] }}] }}`. Every task must be an object with a non-empty `prompt`.
+- Hand-written mode: `export const meta = {{ name, description, phases: ["phase-name"] }}` plus top-level `await phase("phase-name", async () => agent("prompt"))`, then `export default result`.
+
+Do not export `run`, `async function run`, helper functions, or arbitrary symbols. The workflow host only supports `export const meta`, `export const phases`, `export const args`, and `export default`.
+
+For long-running delegated work outside Workflow, prefer `subagent` with `"mode":"async"` so progress appears in `task_list` and results can be checked with `subagent_status`; use sync only for short child tasks where blocking the main turn is acceptable.
+
 ## Safety Rules
 1. NEVER execute destructive commands (rm -rf /, rm -rf ~, mkfs, dd if=/dev/zero, etc.).
 2. NEVER expose, log, or transmit secrets, API keys, passwords, or credentials.
@@ -165,6 +173,10 @@ mod tests {
         assert!(prompt.contains("For natural-language workflow requests"));
         assert!(prompt.contains("call WorkflowDraft first"));
         assert!(prompt.contains("Then launch the approved draft with Workflow using draftId"));
+        assert!(prompt.contains("Do not export `run`"));
+        assert!(prompt.contains("tasks: [{ prompt:"));
+        assert!(prompt.contains("long-running delegated work"));
+        assert!(prompt.contains(r#""mode":"async""#));
     }
 
     #[test]

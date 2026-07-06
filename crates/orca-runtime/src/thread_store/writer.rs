@@ -460,6 +460,31 @@ pub struct SessionWriter {
     path: PathBuf,
 }
 
+fn restore_plaintext_transcript(path: PathBuf) -> io::Result<PathBuf> {
+    if path.extension().and_then(|ext| ext.to_str()) != Some("zst") {
+        return Ok(path);
+    }
+    let plain_path = path.with_extension("");
+    let lock = OpenOptions::new().read(true).write(true).open(&path)?;
+    lock_file(&lock)?;
+    let result = (|| {
+        let input = File::open(&path)?;
+        let output = File::create(&plain_path)?;
+        if let Err(error) = zstd::stream::copy_decode(input, output) {
+            let _ = fs::remove_file(&plain_path);
+            return Err(io::Error::other(error));
+        }
+        fs::remove_file(&path)?;
+        Ok(plain_path)
+    })();
+    let unlock_result = unlock_file(&lock);
+    match (result, unlock_result) {
+        (Ok(path), Ok(())) => Ok(path),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+    }
+}
+
 impl SessionWriter {
     pub fn start(
         cwd: &Path,
@@ -483,6 +508,10 @@ impl SessionWriter {
                 format!("history file not found: {}", path.display()),
             ));
         }
+        // Appends write plaintext JSONL; raw bytes after a zstd frame would
+        // make the whole transcript undecodable, so a compressed session must
+        // be restored to plaintext before it can be continued.
+        let path = restore_plaintext_transcript(path)?;
         Ok(Self { path })
     }
 

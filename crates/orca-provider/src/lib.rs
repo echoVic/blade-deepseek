@@ -654,6 +654,16 @@ fn parse_mock_prompt(prompt: &str) -> Option<ToolRequest> {
         });
     }
 
+    if prompt == "task_list" {
+        return Some(ToolRequest {
+            id: "mock-tool-1".to_string(),
+            name: ToolName::TaskList,
+            action: ActionKind::Read,
+            target: None,
+            raw_arguments: Some(serde_json::json!({}).to_string()),
+        });
+    }
+
     if let Some(rest) = prompt.strip_prefix("task_stop ") {
         let task_id = rest.trim();
         if task_id.is_empty() {
@@ -712,7 +722,11 @@ fn parse_mock_prompt(prompt: &str) -> Option<ToolRequest> {
 
     if let Some(rest) = prompt.strip_prefix("workflow ") {
         let mode = rest.trim();
-        let script = "export const meta = { name: 'mock-workflow', description: 'Mock workflow', phases: ['main'] };\nconst result = await phase('main', async () => agent('inspect repo'));\nexport default result;";
+        let script = if mode == "inline" {
+            "export const meta = { name: 'mock-workflow', description: 'Mock workflow', phases: ['main'] };\nconst until = Date.now() + 900;\nwhile (Date.now() < until) {}\nconst result = await phase('main', async () => agent('inspect repo'));\nexport default result;"
+        } else {
+            "export const meta = { name: 'mock-workflow', description: 'Mock workflow', phases: ['main'] };\nconst result = await phase('main', async () => agent('inspect repo'));\nexport default result;"
+        };
         return Some(ToolRequest {
             id: "mock-tool-1".to_string(),
             name: ToolName::Workflow,
@@ -1111,6 +1125,17 @@ mod tests {
         let arguments: serde_json::Value =
             serde_json::from_str(request.raw_arguments.as_deref().unwrap()).unwrap();
         assert_eq!(arguments["task_id"], "task-shell-1");
+    }
+
+    #[test]
+    fn mock_prompt_parses_task_list() {
+        let request = parse_mock_prompt("task_list").expect("tool request");
+
+        assert_eq!(request.name, ToolName::TaskList);
+        assert_eq!(request.action, ActionKind::Read);
+        let arguments: serde_json::Value =
+            serde_json::from_str(request.raw_arguments.as_deref().unwrap()).unwrap();
+        assert_eq!(arguments, serde_json::json!({}));
     }
 
     #[test]

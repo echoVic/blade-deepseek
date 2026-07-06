@@ -99,6 +99,11 @@ impl<W: Write> EventSink<W> {
                 let description = event.payload["description"].as_str().unwrap_or("subagent");
                 writeln!(self.writer, "subagent started: {description}")
             }
+            EventType::SubagentProgress => {
+                let description = event.payload["description"].as_str().unwrap_or("subagent");
+                let activity = event.payload["activity"].as_str().unwrap_or("running");
+                writeln!(self.writer, "subagent progress: {description} ({activity})")
+            }
             EventType::SubagentCompleted => {
                 let description = event.payload["description"].as_str().unwrap_or("subagent");
                 let status = event.payload["status"].as_str().unwrap_or("unknown");

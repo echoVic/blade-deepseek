@@ -55,6 +55,8 @@ pub enum EventType {
     PlanUpdated,
     #[serde(rename = "subagent.started")]
     SubagentStarted,
+    #[serde(rename = "subagent.progress")]
+    SubagentProgress,
     #[serde(rename = "subagent.completed")]
     SubagentCompleted,
     #[serde(rename = "workflow.started")]
@@ -298,6 +300,32 @@ impl EventFactory {
             json!({
                 "id": id,
                 "description": description
+            }),
+        )
+    }
+
+    pub fn subagent_progress(
+        &mut self,
+        id: &str,
+        description: &str,
+        activity: &str,
+        turn: Option<u32>,
+        usage: Option<UsageTotals>,
+    ) -> EventEnvelope {
+        self.make(
+            EventType::SubagentProgress,
+            json!({
+                "id": id,
+                "description": description,
+                "activity": activity,
+                "turn": turn,
+                "usage": usage.map(|usage| json!({
+                    "input_tokens": usage.input_tokens,
+                    "output_tokens": usage.output_tokens,
+                    "cache_tokens": usage.cache_tokens,
+                    "total_tokens": usage.total_tokens(),
+                    "estimated_cost_usd": usage.estimated_cost_usd
+                }))
             }),
         )
     }
@@ -834,6 +862,9 @@ mod tests {
             workflow_final_summary: None,
             workflow_failure_count: 0,
             usage: None,
+            subagent_current_activity: None,
+            subagent_turn: None,
+            last_activity_at_ms: None,
         };
 
         let event = f.workflow_tasks_updated(&[task]);

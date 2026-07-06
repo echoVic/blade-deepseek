@@ -95,6 +95,7 @@ pub fn resolve_workflow_script_with_user_dir_to_path(
     };
 
     let meta = parse_workflow_meta(&script)?;
+    validate_workflow_runtime_contract(&script, &meta)?;
     let args_schema = parse_workflow_args_schema(&script)?.unwrap_or_default();
     if let Some(parent) = persisted_path.parent() {
         fs::create_dir_all(parent)?;
@@ -156,6 +157,7 @@ pub fn find_saved_workflow(
 }
 
 pub fn parse_workflow_meta(script: &str) -> io::Result<WorkflowMeta> {
+    validate_supported_workflow_exports(script)?;
     let export_index = script
         .find("export const meta")
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing `export const meta`"))?;
@@ -203,6 +205,95 @@ pub fn parse_workflow_meta(script: &str) -> io::Result<WorkflowMeta> {
         tags,
         version,
     })
+}
+
+pub fn validate_workflow_runtime_contract(script: &str, meta: &WorkflowMeta) -> io::Result<()> {
+    reject_unsupported_workflow_apis(script)?;
+
+    if workflow_script_has_executable_marker(script)? {
+        return Ok(());
+    }
+
+    if !meta.phases.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "hand-written workflow with string phases must call phase()/agent() at top level and export a default result, or use auto mode tasks: [{ prompt: \"...\" }]",
+        ));
+    }
+
+    Ok(())
+}
+
+fn reject_unsupported_workflow_apis(script: &str) -> io::Result<()> {
+    for marker in ["phase.agent(", ".runParallel("] {
+        if script_contains_code_marker(script, marker)? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "unsupported workflow API `{marker}`; use top-level phase(\"name\", async () => agent(\"prompt\")) or auto mode tasks: [{{ prompt: \"...\" }}]"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn workflow_script_has_executable_marker(script: &str) -> io::Result<bool> {
+    for marker in [
+        "export default",
+        "agent(",
+        "phase(",
+        "parallel(",
+        "pipeline(",
+        "tasks",
+    ] {
+        if script_contains_code_marker(script, marker)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn script_contains_code_marker(script: &str, marker: &str) -> io::Result<bool> {
+    let mut index = 0usize;
+    while index < script.len() {
+        let rest = &script[index..];
+        if rest.starts_with("//") {
+            index = skip_line_comment(script, index + 2);
+            continue;
+        }
+        if rest.starts_with("/*") {
+            index = skip_block_comment(script, index + 2)?;
+            continue;
+        }
+
+        let Some(ch) = rest.chars().next() else {
+            break;
+        };
+        if ch == '\'' || ch == '"' || ch == '`' {
+            index = skip_quoted_or_template(script, index, ch)?;
+            continue;
+        }
+
+        if rest.starts_with(marker) && marker_has_identifier_boundaries(script, index, marker) {
+            return Ok(true);
+        }
+
+        index += ch.len_utf8();
+    }
+
+    Ok(false)
+}
+
+fn marker_has_identifier_boundaries(script: &str, start: usize, marker: &str) -> bool {
+    let end = start + marker.len();
+    let starts_with_identifier = marker.chars().next().is_some_and(is_identifier_part);
+    let ends_with_identifier = marker.chars().last().is_some_and(is_identifier_part);
+    let before = script[..start].chars().next_back();
+    let after = script[end..].chars().next();
+
+    (!starts_with_identifier || before.is_none_or(|ch| !is_identifier_part(ch)))
+        && (!ends_with_identifier || after.is_none_or(|ch| !is_identifier_part(ch)))
 }
 
 pub fn parse_workflow_args_schema(script: &str) -> io::Result<Option<WorkflowArgsSchema>> {
@@ -391,6 +482,196 @@ fn arg_value_matches_type(value: &Value, arg_type: WorkflowArgType) -> bool {
         WorkflowArgType::Boolean => value.is_boolean(),
         WorkflowArgType::Json => true,
     }
+}
+
+fn validate_supported_workflow_exports(script: &str) -> io::Result<()> {
+    let mut index = 0usize;
+
+    while index < script.len() {
+        let rest = &script[index..];
+        if rest.starts_with("//") {
+            index = skip_line_comment(script, index + 2);
+            continue;
+        }
+        if rest.starts_with("/*") {
+            index = skip_block_comment(script, index + 2)?;
+            continue;
+        }
+
+        let Some(ch) = rest.chars().next() else {
+            break;
+        };
+        if ch == '\'' || ch == '"' || ch == '`' {
+            index = skip_quoted_or_template(script, index, ch)?;
+            continue;
+        }
+
+        if is_identifier_start(ch) {
+            let ident_start = index;
+            let ident_end = read_identifier_end(script, index + ch.len_utf8());
+            if &script[ident_start..ident_end] == "export" {
+                validate_workflow_export(script, ident_start, ident_end)?;
+            }
+            index = ident_end;
+            continue;
+        }
+
+        index += ch.len_utf8();
+    }
+
+    Ok(())
+}
+
+fn validate_workflow_export(
+    script: &str,
+    export_start: usize,
+    export_end: usize,
+) -> io::Result<()> {
+    if has_identifier_neighbor(script, export_start, export_end) {
+        return Ok(());
+    }
+
+    let first_start = skip_ignorable(script, export_end)?;
+    let Some(first_char) = script[first_start..].chars().next() else {
+        return unsupported_workflow_export("export");
+    };
+    if !is_identifier_start(first_char) {
+        return unsupported_workflow_export("export");
+    }
+    let first_end = read_identifier_end(script, first_start + first_char.len_utf8());
+    let first = &script[first_start..first_end];
+
+    match first {
+        "default" => Ok(()),
+        "const" => {
+            let second_start = skip_ignorable(script, first_end)?;
+            let Some(second_char) = script[second_start..].chars().next() else {
+                return unsupported_workflow_export("export const");
+            };
+            if !is_identifier_start(second_char) {
+                return unsupported_workflow_export("export const");
+            }
+            let second_end = read_identifier_end(script, second_start + second_char.len_utf8());
+            match &script[second_start..second_end] {
+                "meta" | "phases" | "args" => Ok(()),
+                other => unsupported_workflow_export(&format!("export const {other}")),
+            }
+        }
+        other => unsupported_workflow_export(&format!("export {other}")),
+    }
+}
+
+fn unsupported_workflow_export<T>(kind: &str) -> io::Result<T> {
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "unsupported workflow export `{kind}`; workflow scripts may export only `const meta`, `const phases`, `const args`, or `default`"
+        ),
+    ))
+}
+
+fn skip_ignorable(script: &str, mut index: usize) -> io::Result<usize> {
+    while index < script.len() {
+        let rest = &script[index..];
+        if rest.starts_with("//") {
+            index = skip_line_comment(script, index + 2);
+            continue;
+        }
+        if rest.starts_with("/*") {
+            index = skip_block_comment(script, index + 2)?;
+            continue;
+        }
+        let Some(ch) = rest.chars().next() else {
+            break;
+        };
+        if !ch.is_whitespace() {
+            break;
+        }
+        index += ch.len_utf8();
+    }
+    Ok(index)
+}
+
+fn skip_line_comment(script: &str, mut index: usize) -> usize {
+    while index < script.len() {
+        let Some(ch) = script[index..].chars().next() else {
+            break;
+        };
+        index += ch.len_utf8();
+        if ch == '\n' {
+            break;
+        }
+    }
+    index
+}
+
+fn skip_block_comment(script: &str, mut index: usize) -> io::Result<usize> {
+    while index + 1 < script.len() {
+        if script[index..].starts_with("*/") {
+            return Ok(index + 2);
+        }
+        let Some(ch) = script[index..].chars().next() else {
+            break;
+        };
+        index += ch.len_utf8();
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        "unterminated block comment",
+    ))
+}
+
+fn skip_quoted_or_template(script: &str, start: usize, quote: char) -> io::Result<usize> {
+    let mut index = start + quote.len_utf8();
+    let mut escaped = false;
+    while index < script.len() {
+        let Some(ch) = script[index..].chars().next() else {
+            break;
+        };
+        index += ch.len_utf8();
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if ch == quote {
+            return Ok(index);
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        "unterminated string literal",
+    ))
+}
+
+fn read_identifier_end(script: &str, mut index: usize) -> usize {
+    while index < script.len() {
+        let Some(ch) = script[index..].chars().next() else {
+            break;
+        };
+        if !is_identifier_part(ch) {
+            break;
+        }
+        index += ch.len_utf8();
+    }
+    index
+}
+
+fn is_identifier_start(ch: char) -> bool {
+    ch == '_' || ch == '$' || ch.is_ascii_alphabetic()
+}
+
+fn is_identifier_part(ch: char) -> bool {
+    is_identifier_start(ch) || ch.is_ascii_digit()
+}
+
+fn has_identifier_neighbor(script: &str, start: usize, end: usize) -> bool {
+    let before = script[..start].chars().next_back();
+    let after = script[end..].chars().next();
+    before.is_some_and(is_identifier_part) || after.is_some_and(is_identifier_part)
 }
 
 fn parse_exported_phases(script: &str) -> io::Result<Option<Vec<String>>> {
@@ -649,18 +930,75 @@ fn parse_phase_name(input: &str) -> io::Result<String> {
     }
 
     let body = &trimmed[1..trimmed.len() - 1];
+    let mut name = None;
     for field in split_top_level(body, ',') {
         let Some((key, value)) = split_key_value(field.trim()) else {
             continue;
         };
-        if key.trim() == "name" {
-            return parse_quoted_string(value);
+        match key.trim() {
+            "name" => name = Some(parse_quoted_string(value)?),
+            "tasks" => validate_phase_tasks(value)?,
+            _ => {}
+        }
+    }
+
+    name.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "workflow phase object missing `name`",
+        )
+    })
+}
+
+fn validate_phase_tasks(input: &str) -> io::Result<()> {
+    let trimmed = input.trim();
+    if !trimmed.starts_with('[') || !trimmed.ends_with(']') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "workflow phase `tasks` must be an array",
+        ));
+    }
+
+    let body = &trimmed[1..trimmed.len() - 1];
+    if body.trim().is_empty() {
+        return Ok(());
+    }
+
+    for task in split_top_level(body, ',') {
+        validate_phase_task(task.trim())?;
+    }
+
+    Ok(())
+}
+
+fn validate_phase_task(input: &str) -> io::Result<()> {
+    if !input.starts_with('{') || !input.ends_with('}') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "workflow phase task must be an object with `prompt`",
+        ));
+    }
+
+    let body = &input[1..input.len() - 1];
+    for field in split_top_level(body, ',') {
+        let Some((key, value)) = split_key_value(field.trim()) else {
+            continue;
+        };
+        if key.trim() == "prompt" {
+            let prompt = parse_quoted_string(value)?;
+            if prompt.trim().is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "workflow phase task `prompt` cannot be empty",
+                ));
+            }
+            return Ok(());
         }
     }
 
     Err(io::Error::new(
         io::ErrorKind::InvalidData,
-        "workflow phase object missing `name`",
+        "workflow phase task must be an object with `prompt`",
     ))
 }
 
@@ -701,6 +1039,34 @@ mod tests {
         .unwrap();
         assert_eq!(meta.name, "audit");
         assert_eq!(meta.phases, vec!["scan", "review"]);
+    }
+
+    #[test]
+    fn parser_rejects_unsupported_workflow_export() {
+        let error = parse_workflow_meta(
+            "export const meta = { name: \"audit\", description: \"Audit code\", phases: [\"scan\"] };\nexport async function run() {}",
+        )
+        .expect_err("unsupported export should be rejected before launch");
+
+        assert!(
+            error.to_string().contains("unsupported workflow export"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn parser_rejects_phase_task_strings_in_auto_mode() {
+        let error = parse_workflow_meta(
+            "export const meta = { name: \"audit\", description: \"Audit code\", phases: [{ name: \"scan\", tasks: [\"inspect\"] }] };",
+        )
+        .expect_err("auto workflow tasks must be prompt objects");
+
+        assert!(
+            error
+                .to_string()
+                .contains("workflow phase task must be an object with `prompt`"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

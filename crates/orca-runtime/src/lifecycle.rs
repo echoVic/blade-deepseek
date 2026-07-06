@@ -177,6 +177,9 @@ pub struct RuntimeSubagentStatusRecord {
     pub output: Option<String>,
     pub error: Option<String>,
     pub usage: Option<RuntimeUsageTotals>,
+    pub subagent_current_activity: Option<String>,
+    pub subagent_turn: Option<u32>,
+    pub last_activity_at_ms: Option<i64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

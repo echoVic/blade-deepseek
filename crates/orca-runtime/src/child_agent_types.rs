@@ -1,8 +1,11 @@
+use std::cell::{Cell, RefCell};
 use std::io;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use orca_core::cancel::CancelToken;
 use orca_core::config::RunConfig;
+use orca_core::cost_types::UsageTotals;
 use orca_core::event_schema::{EventFactory, RunStatus};
 use orca_core::event_sink::EventSink;
 use orca_core::subagent_types::SubagentType;
@@ -111,5 +114,59 @@ impl<'a, W: io::Write> ChildAgentRuntime<'a, W> {
         child_cost_tracker: &mut CostTracker,
     ) -> io::Result<ChildAgentResult> {
         (self.executor)(config, request, self, child_cost_tracker)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ChildAgentActivity {
+    TurnStarted {
+        turn: u32,
+    },
+    ToolStarted {
+        name: String,
+        target: Option<String>,
+    },
+    ToolCompleted {
+        name: String,
+        status: RunStatus,
+    },
+    Streaming,
+    Usage(UsageTotals),
+}
+
+pub struct ChildAgentActivityObserver<'a> {
+    emit: RefCell<Box<dyn FnMut(&ChildAgentActivity) + 'a>>,
+    last_streaming: Cell<Option<Instant>>,
+}
+
+/// The provider fires one `Streaming` activity per SSE delta; consumers fan
+/// each activity out to registry writes and channel sends, so per-delta
+/// emission must be rate-limited at the source.
+const STREAMING_ACTIVITY_INTERVAL: Duration = Duration::from_millis(250);
+
+impl<'a> ChildAgentActivityObserver<'a> {
+    pub fn new<F>(emit: F) -> Self
+    where
+        F: FnMut(&ChildAgentActivity) + 'a,
+    {
+        Self {
+            emit: RefCell::new(Box::new(emit)),
+            last_streaming: Cell::new(None),
+        }
+    }
+
+    pub fn emit(&self, activity: ChildAgentActivity) {
+        if matches!(activity, ChildAgentActivity::Streaming) {
+            let now = Instant::now();
+            let throttled = self
+                .last_streaming
+                .get()
+                .is_some_and(|last| now.duration_since(last) < STREAMING_ACTIVITY_INTERVAL);
+            if throttled {
+                return;
+            }
+            self.last_streaming.set(Some(now));
+        }
+        (self.emit.borrow_mut())(&activity);
     }
 }
