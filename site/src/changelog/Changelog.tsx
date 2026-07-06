@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.166":
+        "Runtime turn-loop input construction now lives behind a focused run_agent_turn_loop entrypoint. agent_loop passes a RuntimeAgentTurnLoopInput launch object instead of constructing the wide RuntimeTurnLoopInput directly, leaving runtime_turn_loop as the owner of the internal turn-loop handoff.",
       "v0.1.165":
         "RuntimeTurnLoopState now owns the directive-resolved loop policy surface. agent_loop no longer destructures loop state or reads directive accessors directly; lifecycle resolves tool policy, runtime system messages, model override, cost/cancel/task refs, and grouped extension context for each turn-loop iteration.",
       "v0.1.164":
@@ -358,6 +360,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.166":
+        "Runtime turn-loop input construction 现在收进 focused run_agent_turn_loop 入口。agent_loop 只传 RuntimeAgentTurnLoopInput launch object，不再直接构造宽大的 RuntimeTurnLoopInput；内部 turn-loop handoff 由 runtime_turn_loop 统一持有。",
       "v0.1.165":
         "RuntimeTurnLoopState 现在拥有 directive-resolved loop policy surface。agent_loop 不再拆开 loop state，也不再直接读取 directive accessor；lifecycle 会在每次 turn-loop iteration 前解析 tool policy、runtime system messages、model override、cost/cancel/task refs，以及 grouped extension context。",
       "v0.1.164":

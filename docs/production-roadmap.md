@@ -4,11 +4,16 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-07-07
-Current baseline: v0.1.165 lets `RuntimeTurnLoopState` own the
-directive-resolved loop policy surface. `agent_loop` no longer destructures loop
-state or reads directive accessors directly; lifecycle resolves tool policy,
-runtime system messages, model override, cost/cancel/task refs, and grouped
-extension context for each turn-loop iteration. Earlier v0.1.164 let
+Current baseline: v0.1.166 moves direct `RuntimeTurnLoopInput` construction out
+of `agent_loop` and behind the focused `run_agent_turn_loop` entrypoint.
+`agent_loop` now passes a `RuntimeAgentTurnLoopInput` launch object while
+`runtime_turn_loop` owns the internal wide handoff to the iteration boundary,
+making the next per-sampling request-state split less invasive. Earlier
+v0.1.165 let `RuntimeTurnLoopState` own the directive-resolved loop policy
+surface: `agent_loop` no longer destructures loop state or reads directive
+accessors directly; lifecycle resolves tool policy, runtime system messages,
+model override, cost/cancel/task refs, and grouped extension context for each
+turn-loop iteration. Earlier v0.1.164 let
 `RuntimeTurnState` hand `agent_loop` a lifecycle-owned `RuntimeTurnLoopState`
 and moved extension context derivation to the iteration boundary, v0.1.163 moved
 grouped runtime extension-context composition into the state boundary, v0.1.162 moved grouped
