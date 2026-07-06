@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.150":
+        "Orca now has a runtime extension contributor kernel with typed per-scope ExtensionData and ordered tool lifecycle contributors. Goal tool progress has the first real contributor seed, so future goal, memory, task, and tool lifecycle work can move out of the main runtime loop without changing CLI or app-server behavior.",
       "v0.1.149":
         "Realtime server item projection now lives behind a shared RuntimeEventProjector reducer. Assistant messages, proposed plans, reasoning, command execution, MCP/dynamic tools, file changes, and workflow lifecycle events keep the same app-server wire shape while ServerRequestWriter no longer owns the projection state maps.",
       "v0.1.148":
@@ -326,6 +328,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.150":
+        "Orca 新增 runtime extension contributor kernel，提供 typed per-scope ExtensionData 和有序 tool lifecycle contributor。Goal tool progress 现在有了第一个真实 contributor seed，后续 goal、memory、task 与 tool lifecycle 可以逐步移出主 runtime loop，同时不改变 CLI 或 app-server 行为。",
       "v0.1.149":
         "Realtime server item projection 现在由共享的 RuntimeEventProjector reducer 承载。Assistant message、proposed plan、reasoning、command execution、MCP/dynamic tool、file change 与 workflow lifecycle event 继续保持同一 app-server wire shape，同时 ServerRequestWriter 不再持有 projection state map。",
       "v0.1.148":
