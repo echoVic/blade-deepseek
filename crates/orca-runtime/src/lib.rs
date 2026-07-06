@@ -2,6 +2,7 @@ pub mod agent_child;
 pub mod agent_common;
 pub mod agent_loop;
 pub mod approval_resolution;
+mod child_agent_entrypoints;
 mod child_agent_loop_runner;
 mod child_agent_loop_setup;
 mod child_agent_provider_turn;
@@ -1101,6 +1102,60 @@ mod tests {
                 "child_agent_tests must own behavior test detail {marker}"
             );
         }
+    }
+
+    #[test]
+    fn child_agent_entrypoints_are_owned_by_focused_module() {
+        let lib_source = include_str!("lib.rs");
+        let agent_child_source = include_str!("agent_child.rs");
+        let child_entrypoints_source = std::fs::read_to_string("src/child_agent_entrypoints.rs")
+            .expect("child agent entrypoints source");
+
+        assert!(
+            lib_source.contains("mod child_agent_entrypoints;"),
+            "runtime crate must declare a focused child_agent_entrypoints module"
+        );
+        assert!(
+            agent_child_source.contains("pub use crate::child_agent_entrypoints::"),
+            "agent_child must preserve existing imports by re-exporting child-agent entrypoints"
+        );
+
+        for marker in [
+            "pub(crate) fn run_child_agent<W: io::Write>",
+            "pub fn run_child_agent_with_executor<F>",
+            "pub fn run_child_agent_prompt_with_tool_executor<F>",
+        ] {
+            assert!(
+                child_entrypoints_source.contains(marker),
+                "child_agent_entrypoints must own child-agent entrypoint {marker}"
+            );
+            assert!(
+                !agent_child_source.contains(marker),
+                "agent_child facade must not own child-agent entrypoint {marker}"
+            );
+        }
+
+        for marker in [
+            "pub struct ChildAgentPromptContext<'a>",
+            "pub prompt: String",
+            "pub subagent_type: &'a SubagentType",
+            "pub subagent_model: Option<String>",
+            "pub subagent_depth: u32",
+            "pub cwd: &'a Path",
+            "pub instructions: &'a ProjectInstructions",
+            "pub memory: &'a MemoryBlock",
+            "pub hooks: &'a HookRunner",
+            "context: ChildAgentPromptContext<'_>",
+        ] {
+            assert!(
+                child_entrypoints_source.contains(marker),
+                "child_agent_entrypoints must group prompt entrypoint input behind {marker}"
+            );
+        }
+        assert!(
+            !child_entrypoints_source.contains("prompt: String,\n    subagent_type: &SubagentType"),
+            "child-agent prompt entrypoint must not expose a long prompt/subagent argument list"
+        );
     }
 
     #[test]

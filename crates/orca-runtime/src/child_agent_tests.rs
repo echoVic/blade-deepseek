@@ -643,12 +643,14 @@ fn run_child_agent_loop_with_tool_executor_runs_tools_until_provider_completes()
 
     let result = run_child_agent_loop_with_tool_executor(
         &runtime_config,
-        &request,
-        std::env::temp_dir().as_path(),
-        &instructions,
-        &memory,
-        &HookRunner::default(),
-        &mut tracker,
+        ChildAgentLoopContext {
+            request: &request,
+            cwd: std::env::temp_dir().as_path(),
+            instructions: &instructions,
+            memory: &memory,
+            hooks: &HookRunner::default(),
+            child_cost_tracker: &mut tracker,
+        },
         |_setup, _cancel, tool_request| {
             tool_count += 1;
             assert_eq!(tool_request.name, ToolName::Bash);
@@ -720,14 +722,16 @@ fn run_child_agent_prompt_with_tool_executor_builds_runtime_request() {
 
     let (result, _tracker) = run_child_agent_prompt_with_tool_executor(
         &runtime_config,
-        "bash echo child".to_string(),
-        &SubagentType::General,
-        Some(FLASH_MODEL.to_string()),
-        4,
-        std::env::temp_dir().as_path(),
-        &instructions,
-        &memory,
-        &HookRunner::default(),
+        ChildAgentPromptContext {
+            prompt: "bash echo child".to_string(),
+            subagent_type: &SubagentType::General,
+            subagent_model: Some(FLASH_MODEL.to_string()),
+            subagent_depth: 4,
+            cwd: std::env::temp_dir().as_path(),
+            instructions: &instructions,
+            memory: &memory,
+            hooks: &HookRunner::default(),
+        },
         |child_config, child_request, _tool_context, _cancel, tool_request| {
             saw_request = true;
             assert_eq!(child_config.model.as_deref(), Some(FLASH_MODEL));

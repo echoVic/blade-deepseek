@@ -264,18 +264,6 @@ pub(crate) fn execute_subagent_batch(
                 .attach_to_event(events.subagent_started(&tool_request.id, &request.description));
             sink.emit(&event)?;
         }
-        emit_subagent_progress(
-            config,
-            emit_deltas,
-            events,
-            sink,
-            &subagent_task,
-            &tool_request.id,
-            &request.description,
-            "running",
-            None,
-            None,
-        )?;
 
         let child_request = ChildAgentRequest {
             prompt: request.prompt.clone(),
@@ -411,18 +399,6 @@ pub(crate) fn execute_subagent_tool<W: io::Write>(
             subagent_task.attach_to_event(events.subagent_started(&tool_request.id, &description));
         sink.emit(&event)?;
     }
-    emit_subagent_progress(
-        config,
-        emit_deltas,
-        events,
-        sink,
-        &subagent_task,
-        &tool_request.id,
-        &description,
-        "running",
-        None,
-        None,
-    )?;
 
     if subagent_depth >= config.subagents.max_depth {
         let error = format!("subagent max depth {} reached", config.subagents.max_depth);
@@ -1093,120 +1069,5 @@ mod tests {
                 .unwrap_or_default()
                 .contains("injected child result")
         );
-    }
-
-    #[test]
-    fn sync_subagent_emits_headless_progress_when_enabled() {
-        let cwd = tempfile::tempdir().expect("temp cwd");
-        let mut subagents = SubagentConfig::default();
-        subagents.stream_progress = true;
-        let config = config(subagents);
-        let mut events = EventFactory::new("subagent-progress".to_string());
-        let mut output = Vec::new();
-        let mut sink = EventSink::new(&mut output, OutputFormat::Jsonl);
-        let request = tool_types::ToolRequest {
-            raw_arguments: Some(
-                serde_json::json!({
-                    "description": "inspect injected",
-                    "prompt": "inspect injected"
-                })
-                .to_string(),
-            ),
-            ..subagent_request("injected")
-        };
-        let instructions = ProjectInstructions::default();
-        let memory = MemoryBlock::default();
-        let mcp_registry = McpRegistry::default();
-        let hooks = HookRunner::default();
-        let mut cost_tracker = CostTracker::new(None);
-        let cancel = CancelToken::new();
-        let task_registry = TaskRegistry::new("subagent-progress".to_string());
-
-        let _ = super::execute_subagent_tool(
-            &config,
-            cwd.path(),
-            &mut events,
-            &mut sink,
-            &request,
-            0,
-            &instructions,
-            &memory,
-            &mcp_registry,
-            &hooks,
-            true,
-            &mut cost_tracker,
-            &cancel,
-            &task_registry,
-            None,
-            fake_child_executor::<&mut Vec<u8>>,
-        )
-        .expect("subagent tool");
-
-        drop(sink);
-        let events = String::from_utf8(output).expect("jsonl utf8");
-        let progress = events
-            .lines()
-            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-            .find(|event| event["type"] == "subagent.progress")
-            .expect("subagent progress event");
-        assert_eq!(progress["payload"]["id"], "injected");
-        assert_eq!(progress["payload"]["description"], "inspect injected");
-        assert_eq!(progress["payload"]["activity"], "running");
-    }
-
-    #[test]
-    fn sync_subagent_progress_respects_config_switch() {
-        let cwd = tempfile::tempdir().expect("temp cwd");
-        let mut subagents = SubagentConfig::default();
-        subagents.stream_progress = false;
-        let config = config(subagents);
-        let mut events = EventFactory::new("subagent-progress-off".to_string());
-        let mut output = Vec::new();
-        let mut sink = EventSink::new(&mut output, OutputFormat::Jsonl);
-        let request = tool_types::ToolRequest {
-            raw_arguments: Some(
-                serde_json::json!({
-                    "description": "inspect injected",
-                    "prompt": "inspect injected"
-                })
-                .to_string(),
-            ),
-            ..subagent_request("injected")
-        };
-        let instructions = ProjectInstructions::default();
-        let memory = MemoryBlock::default();
-        let mcp_registry = McpRegistry::default();
-        let hooks = HookRunner::default();
-        let mut cost_tracker = CostTracker::new(None);
-        let cancel = CancelToken::new();
-        let task_registry = TaskRegistry::new("subagent-progress-off".to_string());
-
-        let _ = super::execute_subagent_tool(
-            &config,
-            cwd.path(),
-            &mut events,
-            &mut sink,
-            &request,
-            0,
-            &instructions,
-            &memory,
-            &mcp_registry,
-            &hooks,
-            true,
-            &mut cost_tracker,
-            &cancel,
-            &task_registry,
-            None,
-            fake_child_executor::<&mut Vec<u8>>,
-        )
-        .expect("subagent tool");
-
-        drop(sink);
-        let events = String::from_utf8(output).expect("jsonl utf8");
-        assert!(!events.lines().any(|line| {
-            serde_json::from_str::<serde_json::Value>(line)
-                .ok()
-                .is_some_and(|event| event["type"] == "subagent.progress")
-        }));
     }
 }

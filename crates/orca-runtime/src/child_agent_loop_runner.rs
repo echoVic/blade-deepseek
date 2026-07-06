@@ -6,7 +6,7 @@ use orca_core::config::RunConfig;
 use orca_core::event_schema::RunStatus;
 use orca_core::tool_types::{ToolRequest, ToolStatus};
 
-use crate::agent_child::run_child_agent_with_executor;
+use crate::child_agent_entrypoints::run_child_agent_with_executor;
 use crate::child_agent_loop_setup::{
     ChildAgentTurnBudget, advance_child_agent_turn, prepare_child_agent_loop,
 };
@@ -29,37 +29,47 @@ use crate::hooks::HookRunner;
 use crate::instructions::ProjectInstructions;
 use crate::memory::MemoryBlock;
 
+pub struct ChildAgentLoopContext<'a> {
+    pub request: &'a ChildAgentRequest,
+    pub cwd: &'a Path,
+    pub instructions: &'a ProjectInstructions,
+    pub memory: &'a MemoryBlock,
+    pub hooks: &'a HookRunner,
+    pub child_cost_tracker: &'a mut CostTracker,
+}
+
 pub fn run_child_agent_loop_with_tool_executor<F>(
     config: &RunConfig,
-    request: &ChildAgentRequest,
-    cwd: &Path,
-    instructions: &ProjectInstructions,
-    memory: &MemoryBlock,
-    hooks: &HookRunner,
-    child_cost_tracker: &mut CostTracker,
+    context: ChildAgentLoopContext<'_>,
     mut execute_tool: F,
 ) -> io::Result<ChildAgentResult>
 where
     F: FnMut(&ChildAgentToolContext<'_>, &CancelToken, &ToolRequest) -> ChildAgentToolExecution,
 {
-    let mut setup = prepare_child_agent_loop(config, request, cwd, instructions, memory);
+    let mut setup = prepare_child_agent_loop(
+        config,
+        context.request,
+        context.cwd,
+        context.instructions,
+        context.memory,
+    );
     loop {
         match advance_child_agent_turn(&mut setup) {
             ChildAgentTurnBudget::Continue => {}
             ChildAgentTurnBudget::Stop(result) => return Ok(result),
         }
 
-        compact_child_agent_conversation_if_needed(config, &mut setup, cwd, hooks)?;
+        compact_child_agent_conversation_if_needed(config, &mut setup, context.cwd, context.hooks)?;
 
         let child_cancel = CancelToken::new();
         let turn_provider_config =
-            route_child_agent_model(config, request, &setup, child_cost_tracker);
+            route_child_agent_model(config, context.request, &setup, context.child_cost_tracker);
 
         let response = match run_child_agent_provider_turn(
             config,
             &setup,
-            cwd,
-            hooks,
+            context.cwd,
+            context.hooks,
             &turn_provider_config,
             &child_cancel,
         ) {
@@ -67,13 +77,20 @@ where
             ChildAgentProviderTurn::Fail(result) => return Ok(result),
         };
 
-        match handle_child_agent_provider_error(config, &mut setup, cwd, hooks, &response)? {
+        match handle_child_agent_provider_error(
+            config,
+            &mut setup,
+            context.cwd,
+            context.hooks,
+            &response,
+        )? {
             Some(ChildAgentProviderErrorDecision::RetryAfterCompaction) => continue,
             Some(ChildAgentProviderErrorDecision::Fail(result)) => return Ok(result),
             None => {}
         }
 
-        match fold_child_agent_provider_response(&mut setup, &response, child_cost_tracker) {
+        match fold_child_agent_provider_response(&mut setup, &response, context.child_cost_tracker)
+        {
             ChildAgentProviderResponseFold::Complete(result) => return Ok(result),
             ChildAgentProviderResponseFold::ContinueToTools => {}
         }
@@ -90,7 +107,7 @@ where
                 tool_execution.should_stop,
                 tool_execution.result,
                 tool_execution.child_cost,
-                child_cost_tracker,
+                context.child_cost_tracker,
             ) {
                 ChildAgentToolResultFold::Continue => {}
                 ChildAgentToolResultFold::Stop(result) => return Ok(result),
@@ -99,55 +116,22 @@ where
     }
 }
 
-pub fn run_child_agent_with_tool_executor<F>(
-    config: &RunConfig,
-    request: &ChildAgentRequest,
-    cwd: &Path,
-    instructions: &ProjectInstructions,
-    memory: &MemoryBlock,
-    hooks: &HookRunner,
-    mut execute_tool: F,
-) -> (ChildAgentResult, CostTracker)
-where
-    F: FnMut(
-        &RunConfig,
-        &ChildAgentRequest,
-        &ChildAgentToolContext<'_>,
-        &CancelToken,
-        &ToolRequest,
-    ) -> ChildAgentToolExecution,
-{
-    run_child_agent_with_executor(config, request, |config, request, child_cost_tracker| {
-        run_child_agent_loop_with_tool_executor(
-            config,
-            request,
-            cwd,
-            instructions,
-            memory,
-            hooks,
-            child_cost_tracker,
-            |tool_context, child_cancel, tool_request| {
-                execute_tool(config, request, tool_context, child_cancel, tool_request)
-            },
-        )
-    })
-}
-
 pub fn run_child_agent_loop_with_tool_executor_observed<F>(
     config: &RunConfig,
-    request: &ChildAgentRequest,
-    cwd: &Path,
-    instructions: &ProjectInstructions,
-    memory: &MemoryBlock,
-    hooks: &HookRunner,
-    child_cost_tracker: &mut CostTracker,
+    context: ChildAgentLoopContext<'_>,
     observer: Option<&ChildAgentActivityObserver<'_>>,
     mut execute_tool: F,
 ) -> io::Result<ChildAgentResult>
 where
     F: FnMut(&ChildAgentToolContext<'_>, &CancelToken, &ToolRequest) -> ChildAgentToolExecution,
 {
-    let mut setup = prepare_child_agent_loop(config, request, cwd, instructions, memory);
+    let mut setup = prepare_child_agent_loop(
+        config,
+        context.request,
+        context.cwd,
+        context.instructions,
+        context.memory,
+    );
     loop {
         match advance_child_agent_turn(&mut setup) {
             ChildAgentTurnBudget::Continue => {
@@ -158,17 +142,17 @@ where
             ChildAgentTurnBudget::Stop(result) => return Ok(result),
         }
 
-        compact_child_agent_conversation_if_needed(config, &mut setup, cwd, hooks)?;
+        compact_child_agent_conversation_if_needed(config, &mut setup, context.cwd, context.hooks)?;
 
         let child_cancel = CancelToken::new();
         let turn_provider_config =
-            route_child_agent_model(config, request, &setup, child_cost_tracker);
+            route_child_agent_model(config, context.request, &setup, context.child_cost_tracker);
 
         let response = match run_child_agent_provider_turn_observed(
             config,
             &setup,
-            cwd,
-            hooks,
+            context.cwd,
+            context.hooks,
             &turn_provider_config,
             &child_cancel,
             observer,
@@ -177,7 +161,13 @@ where
             ChildAgentProviderTurn::Fail(result) => return Ok(result),
         };
 
-        match handle_child_agent_provider_error(config, &mut setup, cwd, hooks, &response)? {
+        match handle_child_agent_provider_error(
+            config,
+            &mut setup,
+            context.cwd,
+            context.hooks,
+            &response,
+        )? {
             Some(ChildAgentProviderErrorDecision::RetryAfterCompaction) => continue,
             Some(ChildAgentProviderErrorDecision::Fail(result)) => return Ok(result),
             None => {}
@@ -185,10 +175,10 @@ where
 
         let had_usage = response.usage.as_ref().is_some_and(|usage| !usage.is_empty());
         let provider_fold =
-            fold_child_agent_provider_response(&mut setup, &response, child_cost_tracker);
+            fold_child_agent_provider_response(&mut setup, &response, context.child_cost_tracker);
         if had_usage {
             if let Some(observer) = observer {
-                observer.emit(ChildAgentActivity::Usage(child_cost_tracker.totals()));
+                observer.emit(ChildAgentActivity::Usage(context.child_cost_tracker.totals()));
             }
         }
         match provider_fold {
@@ -221,14 +211,14 @@ where
                 tool_execution.should_stop,
                 tool_execution.result,
                 tool_execution.child_cost,
-                child_cost_tracker,
+                context.child_cost_tracker,
             ) {
                 ChildAgentToolResultFold::Continue => {}
                 ChildAgentToolResultFold::Stop(result) => return Ok(result),
             }
             if had_child_cost {
                 if let Some(observer) = observer {
-                    observer.emit(ChildAgentActivity::Usage(child_cost_tracker.totals()));
+                    observer.emit(ChildAgentActivity::Usage(context.child_cost_tracker.totals()));
                 }
             }
         }
@@ -241,6 +231,42 @@ fn run_status_from_tool_status(status: ToolStatus) -> RunStatus {
         ToolStatus::Denied => RunStatus::ApprovalRequired,
         ToolStatus::Failed | ToolStatus::NotImplemented => RunStatus::Failed,
     }
+}
+
+pub fn run_child_agent_with_tool_executor<F>(
+    config: &RunConfig,
+    request: &ChildAgentRequest,
+    cwd: &Path,
+    instructions: &ProjectInstructions,
+    memory: &MemoryBlock,
+    hooks: &HookRunner,
+    mut execute_tool: F,
+) -> (ChildAgentResult, CostTracker)
+where
+    F: FnMut(
+        &RunConfig,
+        &ChildAgentRequest,
+        &ChildAgentToolContext<'_>,
+        &CancelToken,
+        &ToolRequest,
+    ) -> ChildAgentToolExecution,
+{
+    run_child_agent_with_executor(config, request, |config, request, child_cost_tracker| {
+        run_child_agent_loop_with_tool_executor(
+            config,
+            ChildAgentLoopContext {
+                request,
+                cwd,
+                instructions,
+                memory,
+                hooks,
+                child_cost_tracker,
+            },
+            |tool_context, child_cancel, tool_request| {
+                execute_tool(config, request, tool_context, child_cancel, tool_request)
+            },
+        )
+    })
 }
 
 pub fn run_child_agent_with_tool_executor_observed<F>(
@@ -265,12 +291,14 @@ where
     run_child_agent_with_executor(config, request, |config, request, child_cost_tracker| {
         run_child_agent_loop_with_tool_executor_observed(
             config,
-            request,
-            cwd,
-            instructions,
-            memory,
-            hooks,
-            child_cost_tracker,
+            ChildAgentLoopContext {
+                request,
+                cwd,
+                instructions,
+                memory,
+                hooks,
+                child_cost_tracker,
+            },
             observer,
             |tool_context, child_cancel, tool_request| {
                 execute_tool(config, request, tool_context, child_cancel, tool_request)
