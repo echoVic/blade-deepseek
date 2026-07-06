@@ -3,6 +3,7 @@ pub mod agent_common;
 pub mod agent_loop;
 pub mod approval_resolution;
 mod child_agent_loop_setup;
+mod child_agent_provider_turn;
 pub mod compaction;
 pub mod controller;
 pub mod cost;
@@ -852,6 +853,64 @@ mod tests {
         assert!(
             agent_child_source.contains("pub use crate::child_agent_loop_setup::"),
             "agent_child must preserve existing imports by re-exporting child loop setup APIs"
+        );
+    }
+
+    #[test]
+    fn child_agent_provider_turn_boundary_is_owned_by_focused_module() {
+        let lib_source = include_str!("lib.rs");
+        let agent_child_source = include_str!("agent_child.rs");
+        let agent_child_runtime_source = agent_child_source
+            .split_once("#[cfg(test)]")
+            .map(|(runtime_source, _)| runtime_source)
+            .unwrap_or(agent_child_source);
+        let child_provider_turn_source =
+            std::fs::read_to_string("src/child_agent_provider_turn.rs")
+                .expect("child agent provider turn source");
+
+        assert!(
+            lib_source.contains("mod child_agent_provider_turn;"),
+            "runtime crate must declare a focused child_agent_provider_turn module"
+        );
+
+        for marker in [
+            "pub enum ChildAgentProviderErrorDecision",
+            "pub enum ChildAgentProviderTurn",
+            "pub fn route_child_agent_model",
+            "pub fn run_child_agent_provider_turn",
+            "pub fn compact_child_agent_conversation_if_needed",
+            "pub fn handle_child_agent_provider_error",
+        ] {
+            assert!(
+                child_provider_turn_source.contains(marker),
+                "child_agent_provider_turn must own provider-turn detail {marker}"
+            );
+            assert!(
+                !agent_child_source.contains(marker),
+                "agent_child facade must not own provider-turn detail {marker}"
+            );
+        }
+
+        for marker in [
+            "conversation_with_hook_context",
+            "RuntimeCompactionStep::new",
+            "is_prompt_too_long_error",
+            "PreModelCall",
+            "PostModelCall",
+        ] {
+            assert!(
+                child_provider_turn_source.contains(marker),
+                "child_agent_provider_turn must keep provider-turn behavior detail {marker}"
+            );
+            assert!(
+                !agent_child_runtime_source.contains(marker),
+                "agent_child facade must delegate provider-turn behavior detail {marker}"
+            );
+        }
+
+        assert!(
+            agent_child_source.contains("pub use crate::child_agent_provider_turn::"),
+            "agent_child must preserve existing imports by re-exporting child provider-turn APIs"
         );
     }
 
