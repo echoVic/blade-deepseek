@@ -1,0 +1,51 @@
+Cargo.lock
+  s_03ad00d3683000::t_5ac31756a2345f 126
+Cargo.toml
+  s_03ad00d3683000::t_40ebe63ffeb586 32
+README.md
+  s_03ad00d3683000::t_e3eae8d628e949 36
+crates/orca-runtime/src/agent_child.rs
+  s_03ad00d3683000::t_c61865b88d8064 18,28
+crates/orca-runtime/src/child_agent_loop_runner.rs
+  s_03ad00d3683000::t_e022ec5b0da262 16,175-178,183-185,225-227
+crates/orca-runtime/src/child_agent_provider_turn.rs
+  s_03ad00d3683000::t_7e898e9c765597 13-15
+crates/orca-runtime/src/lib.rs
+  s_03ad00d3683000::t_ea6b58df0777a8 1001,1032-1052
+crates/orca-runtime/src/session.rs
+  s_03ad00d3683000::t_135090d151785a 822-825
+crates/orca-runtime/src/subagent_async_worker.rs
+  s_03ad00d3683000::t_f2ca5dba460ab0 290-293
+docs/production-roadmap.md
+  s_03ad00d3683000::t_6b57a671445fc6 7
+docs/releases/v0.1.144.md
+  s_03ad00d3683000::t_1820b74d65dc0f 1-84
+docs/releases/v0.1.145.md
+  s_03ad00d3683000::t_39d593a7a0e904 1-88
+docs/releases/v0.1.146.md
+  s_03ad00d3683000::t_140e845b8d2748 1-86
+npm/orca/package.json
+  s_03ad00d3683000::t_b5b9aac7750f0a 3
+site/src/changelog/Changelog.tsx
+  s_03ad00d3683000::t_22d9994cf3c943 58-63,323-328
+site/src/shared.ts
+  s_03ad00d3683000::t_a44bc8e5426de1 7,10-24
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "497662a0217d567c3092539e520a50651b34d898",
+  "prompts": {},
+  "sessions": {
+    "s_03ad00d3683000": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f35ca-dcf0-7233-9e2b-34dadb3268b0",
+        "model": "unknown"
+      },
+      "human_author": "echoVic <137844255@qq.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
