@@ -51,6 +51,7 @@ pub(crate) struct RuntimeTurnIterationInput<'a, 'runtime, W: io::Write> {
     pub(crate) prompt: &'a str,
     pub(crate) model: &'a ModelSelection,
     pub(crate) subagent_type: &'a SubagentType,
+    pub(crate) model_override: Option<&'a str>,
     pub(crate) cost_tracker: &'a mut CostTracker,
     pub(crate) steer_handle: Option<&'a ThreadSteerHandle>,
     pub(crate) cancel: &'a CancelToken,
@@ -105,6 +106,7 @@ impl RuntimeTurnIterationStep {
                 prompt: input.prompt,
                 model: input.model,
                 subagent_type: input.subagent_type,
+                model_override: input.model_override,
                 cost_tracker: input.cost_tracker,
                 steer_handle: input.steer_handle,
             })? {

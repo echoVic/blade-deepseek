@@ -892,10 +892,6 @@ impl<'a> RuntimeTurnState<'a> {
         self.directive_state.apply(directive);
     }
 
-    pub(crate) fn directive_state(&self) -> &RuntimeDirectiveState {
-        &self.directive_state
-    }
-
     #[cfg(test)]
     pub(crate) fn cost_tracker(&self) -> &CostTracker {
         self.cost_tracker
@@ -1145,6 +1141,7 @@ mod tests {
                 prompt: "hello",
                 model: &model,
                 subagent_type: &subagent_type,
+                model_override: None,
                 cost_tracker: &mut cost_tracker,
                 steer_handle: None,
             })
@@ -1190,6 +1187,7 @@ mod tests {
                 actor: &mut actor,
                 model: &model,
                 subagent_type: &subagent_type,
+                model_override: None,
                 provider_config: &provider_config,
                 cost_tracker: &mut cost_tracker,
                 events: &mut events,
@@ -1207,6 +1205,54 @@ mod tests {
         let output = String::from_utf8(output).expect("jsonl is utf8");
         assert!(output.contains("\"type\":\"model.routed\""));
         assert!(output.contains(orca_core::model::PRO_MODEL));
+    }
+
+    #[test]
+    fn model_route_step_applies_runtime_model_override_directive() {
+        let mut lifecycle = RuntimeSessionLifecycle::new("model-route-directive".to_string());
+        let mut actor = RuntimeTaskActor::new(&mut lifecycle, 3);
+        let mut events = EventFactory::new("model-route-directive".to_string());
+        let mut output = Vec::new();
+        let mut sink = EventSink::new(&mut output, OutputFormat::Jsonl);
+        let provider_config = ProviderConfig {
+            api_key: Some("test-key".to_string()),
+            base_url: None,
+            model: None,
+            reasoning_effort: orca_core::config::ReasoningEffort::Max,
+            tools_override: Some(Vec::new()),
+            mcp_registry: None,
+            external_tools: Vec::new(),
+        };
+        let mut cost_tracker = CostTracker::new(None);
+        let model = ModelSelection::parse(None).expect("model");
+        let subagent_type = SubagentType::General;
+        let mut directive_state = RuntimeDirectiveState::default();
+        directive_state.apply(RuntimeDirective::SwitchModel {
+            model: orca_core::model::FLASH_MODEL.to_string(),
+            reason: "runtime policy selected flash".to_string(),
+        });
+
+        let result = RuntimeModelRouteStep::new()
+            .route(RuntimeModelRouteInput {
+                actor: &mut actor,
+                model: &model,
+                subagent_type: &subagent_type,
+                model_override: directive_state.model_override(),
+                provider_config: &provider_config,
+                cost_tracker: &mut cost_tracker,
+                events: &mut events,
+                sink: &mut sink,
+                emit_deltas: true,
+            })
+            .expect("route model");
+
+        assert_eq!(
+            result.provider_config.model.as_deref(),
+            Some(orca_core::model::FLASH_MODEL)
+        );
+        assert_eq!(result.decision.actual_model, orca_core::model::FLASH_MODEL);
+        let output = String::from_utf8(output).expect("jsonl is utf8");
+        assert!(output.contains(orca_core::model::FLASH_MODEL));
     }
 
     #[test]

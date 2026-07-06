@@ -51,12 +51,11 @@ pub(crate) fn run_agent_loop(
         hooks,
     } = turn_deps.expect("agent loop turn deps");
     let turn_state = turn_state.expect("agent loop turn state");
-    let _ = turn_state.directive_state().transition_reasons().len();
     let RuntimeTurnState {
         cost_tracker,
         cancel,
         task_registry,
-        ..
+        directive_state,
     } = turn_state;
     let RuntimeTurnExecution {
         background_workflows,
@@ -107,6 +106,7 @@ pub(crate) fn run_agent_loop(
             prompt,
             &config.model,
             subagent_type,
+            directive_state.model_override(),
             cost_tracker,
             steer_handle,
             cancel,
@@ -327,7 +327,7 @@ mod tests {
             },
         );
 
-        let directives = state.directive_state();
+        let directives = &state.directive_state;
         assert_eq!(
             directives.model_override(),
             Some(orca_core::model::FLASH_MODEL)

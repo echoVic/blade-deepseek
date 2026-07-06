@@ -15,6 +15,7 @@ pub(crate) struct RuntimeModelRouteInput<'a, 'runtime, W: io::Write> {
     pub(crate) actor: &'a mut RuntimeTaskActor<'runtime>,
     pub(crate) model: &'a ModelSelection,
     pub(crate) subagent_type: &'a SubagentType,
+    pub(crate) model_override: Option<&'a str>,
     pub(crate) provider_config: &'a ProviderConfig,
     pub(crate) cost_tracker: &'a mut CostTracker,
     pub(crate) events: &'a mut EventFactory,
@@ -34,7 +35,7 @@ impl RuntimeModelRouteStep {
         let routed_model = input.actor.route_model_turn(
             input.model,
             input.subagent_type,
-            None,
+            input.model_override,
             input.provider_config,
             input.cost_tracker,
         );
