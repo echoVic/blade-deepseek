@@ -4,12 +4,16 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-07-07
-Current baseline: v0.1.166 moves direct `RuntimeTurnLoopInput` construction out
+Current baseline: v0.1.167 introduces `RuntimeSamplingRequestState` as the
+first per-sampling request-state home and routes normal tool turns through its
+permission overlay instead of allocating local permission state inside
+`tool_turn`. Provider response handling now creates that sampling state before
+tool dispatch, giving later Codex-style request snapshots a concrete runtime
+boundary. Earlier v0.1.166 moved direct `RuntimeTurnLoopInput` construction out
 of `agent_loop` and behind the focused `run_agent_turn_loop` entrypoint.
-`agent_loop` now passes a `RuntimeAgentTurnLoopInput` launch object while
-`runtime_turn_loop` owns the internal wide handoff to the iteration boundary,
-making the next per-sampling request-state split less invasive. Earlier
-v0.1.165 let `RuntimeTurnLoopState` own the directive-resolved loop policy
+`agent_loop` passes a `RuntimeAgentTurnLoopInput` launch object while
+`runtime_turn_loop` owns the internal wide handoff to the iteration boundary.
+Earlier v0.1.165 let `RuntimeTurnLoopState` own the directive-resolved loop policy
 surface: `agent_loop` no longer destructures loop state or reads directive
 accessors directly; lifecycle resolves tool policy, runtime system messages,
 model override, cost/cancel/task refs, and grouped extension context for each

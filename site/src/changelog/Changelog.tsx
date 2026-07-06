@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.167":
+        "RuntimeSamplingRequestState now owns the per-sampling permission overlay. Provider response handling creates the sampling state and tool turns borrow its overlay instead of allocating local permission state, giving the next Codex-style request-state split a concrete home without changing tool behavior.",
       "v0.1.166":
         "Runtime turn-loop input construction now lives behind a focused run_agent_turn_loop entrypoint. agent_loop passes a RuntimeAgentTurnLoopInput launch object instead of constructing the wide RuntimeTurnLoopInput directly, leaving runtime_turn_loop as the owner of the internal turn-loop handoff.",
       "v0.1.165":
@@ -360,6 +362,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.167":
+        "RuntimeSamplingRequestState 现在拥有每次 sampling request 的 permission overlay。Provider response handling 会创建 sampling state，tool turn 借用其中的 overlay，不再分配局部 permission state；这为下一步 Codex 风格 request-state 拆分提供了真实承载点，同时不改变工具行为。",
       "v0.1.166":
         "Runtime turn-loop input construction 现在收进 focused run_agent_turn_loop 入口。agent_loop 只传 RuntimeAgentTurnLoopInput launch object，不再直接构造宽大的 RuntimeTurnLoopInput；内部 turn-loop handoff 由 runtime_turn_loop 统一持有。",
       "v0.1.165":
