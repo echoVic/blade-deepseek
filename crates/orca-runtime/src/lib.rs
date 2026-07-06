@@ -6,6 +6,8 @@ mod child_agent_loop_runner;
 mod child_agent_loop_setup;
 mod child_agent_provider_turn;
 mod child_agent_response_folding;
+#[cfg(test)]
+mod child_agent_tests;
 mod child_agent_types;
 pub mod compaction;
 pub mod controller;
@@ -1069,6 +1071,36 @@ mod tests {
             agent_child_source.contains("pub use crate::child_agent_types::"),
             "agent_child must preserve existing imports by re-exporting child-agent shared types"
         );
+    }
+
+    #[test]
+    fn child_agent_behavior_tests_are_owned_by_focused_module() {
+        let lib_source = include_str!("lib.rs");
+        let agent_child_source = include_str!("agent_child.rs");
+        let child_tests_source =
+            std::fs::read_to_string("src/child_agent_tests.rs").expect("child agent tests source");
+
+        assert!(
+            lib_source.contains("mod child_agent_tests;"),
+            "runtime crate must declare focused child-agent behavior tests"
+        );
+        assert!(
+            !agent_child_source.contains("#[cfg(test)]"),
+            "agent_child facade must not own the child-agent behavior test module"
+        );
+
+        for marker in [
+            "fn config(model: Option<&str>) -> RunConfig",
+            "fn runtime<'a>(",
+            "prepare_child_agent_loop_builds_provider_conversation_and_policy",
+            "run_child_agent_loop_with_tool_executor_runs_tools_until_provider_completes",
+            "run_child_agent_prompt_with_tool_executor_builds_runtime_request",
+        ] {
+            assert!(
+                child_tests_source.contains(marker),
+                "child_agent_tests must own behavior test detail {marker}"
+            );
+        }
     }
 
     #[test]
