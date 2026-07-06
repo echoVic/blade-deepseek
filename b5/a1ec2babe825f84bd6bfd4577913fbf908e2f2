@@ -1,0 +1,45 @@
+Cargo.lock
+  s_95b7432a0a273e::t_cd1f14ca1638f7 126
+Cargo.toml
+  s_95b7432a0a273e::t_4ebcee055d8a08 32
+README.md
+  s_95b7432a0a273e::t_d436f0cb8085c4 36
+crates/orca-runtime/src/child_agent_loop_setup.rs
+  s_95b7432a0a273e::t_95a118d59a1acc 13
+crates/orca-runtime/src/child_agent_response_folding.rs
+  s_95b7432a0a273e::t_b8273f30f65b47 9
+crates/orca-runtime/src/child_agent_tests.rs
+  s_95b7432a0a273e::t_07338b32d80aee 1-945
+crates/orca-runtime/src/lib.rs
+  s_95b7432a0a273e::t_aa6aea35ec1441 9-11,1036-1105
+docs/production-roadmap.md
+  s_95b7432a0a273e::t_62e9b5a71a5c22 7
+docs/releases/v0.1.142.md
+  s_95b7432a0a273e::t_0afbeaf08d1c06 1-88
+docs/releases/v0.1.143.md
+  s_95b7432a0a273e::t_9640db3bf035f1 1-84
+npm/orca/package.json
+  s_95b7432a0a273e::t_713e997c7f9550 3
+site/src/changelog/Changelog.tsx
+  s_95b7432a0a273e::t_c60e4fb4c1ca35 58-61,317-320
+site/src/shared.ts
+  s_95b7432a0a273e::t_c1db8395cdfce6 7,10-19
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "b5a1ec2babe825f84bd6bfd4577913fbf908e2f2",
+  "prompts": {},
+  "sessions": {
+    "s_95b7432a0a273e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b32b9e2c-7509-47aa-a94a-d7a451921b88",
+        "model": "unknown"
+      },
+      "human_author": "echoVic <137844255@qq.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
