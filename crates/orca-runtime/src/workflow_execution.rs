@@ -576,12 +576,12 @@ mod tests {
 
     fn startup_failure_script() -> &'static str {
         r#"
+throw new Error("startup boom");
 export const meta = {
   name: "bad-workflow",
   description: "Fails on load",
   phases: [{ name: "main", tasks: [{ prompt: "noop" }] }]
 };
-throw new Error("startup boom");
 "#
     }
 
