@@ -25,7 +25,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::agent_child::{
-    ChildAgentExecutor, ChildAgentRequest, ChildAgentRuntime, run_child_agent,
+    ChildAgentExecutor, ChildAgentRequest, ChildAgentRuntime, ChildAgentRuntimeContext,
+    run_child_agent,
 };
 use crate::agent_loop::execute_child_agent_loop;
 use crate::hooks::HookRunner;
@@ -994,18 +995,18 @@ impl WorkflowRunner {
         let mut lifecycle =
             RuntimeSessionLifecycle::new(format!("workflow-child-{}", call.call_id));
         lifecycle.start_task(RuntimeTaskKind::Subagent);
-        let mut runtime = ChildAgentRuntime::new(
-            child_cwd,
-            &mut events,
-            &mut sink,
-            &instructions,
-            &memory,
-            &mcp_registry,
-            &hooks,
-            &cancel,
-            Some(&mut lifecycle),
-            self.child_executor,
-        );
+        let mut runtime = ChildAgentRuntime::new(ChildAgentRuntimeContext {
+            cwd: child_cwd,
+            events: &mut events,
+            sink: &mut sink,
+            instructions: &instructions,
+            memory: &memory,
+            mcp_registry: &mcp_registry,
+            hooks: &hooks,
+            cancel: &cancel,
+            lifecycle: Some(&mut lifecycle),
+            executor: self.child_executor,
+        });
         let (result, child_cost_tracker) =
             run_child_agent(&workflow_child_config, &child_request, &mut runtime);
         drop(runtime);

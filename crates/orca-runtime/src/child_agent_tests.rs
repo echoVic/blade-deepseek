@@ -73,8 +73,8 @@ fn runtime<'a>(
     let mcp_registry = Box::leak(Box::new(McpRegistry::default()));
     let hooks = Box::leak(Box::new(HookRunner::new(Vec::new())));
     let cwd = Box::leak(Box::new(std::env::temp_dir()));
-    ChildAgentRuntime::new(
-        cwd.as_path(),
+    ChildAgentRuntime::new(ChildAgentRuntimeContext {
+        cwd: cwd.as_path(),
         events,
         sink,
         instructions,
@@ -82,9 +82,9 @@ fn runtime<'a>(
         mcp_registry,
         hooks,
         cancel,
-        None,
+        lifecycle: None,
         executor,
-    )
+    })
 }
 
 fn child_loop_setup(runtime_config: &RunConfig) -> ChildAgentLoopSetup {

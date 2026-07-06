@@ -13,7 +13,8 @@ use orca_mcp::McpRegistry;
 use serde_json::Value;
 
 use crate::agent_child::{
-    ChildAgentExecutor, ChildAgentRequest, ChildAgentResult, ChildAgentRuntime, run_child_agent,
+    ChildAgentExecutor, ChildAgentRequest, ChildAgentResult, ChildAgentRuntime,
+    ChildAgentRuntimeContext, run_child_agent,
 };
 use crate::cost::CostTracker;
 use crate::hooks::{HookContext, HookRunner};
@@ -282,18 +283,18 @@ pub(crate) fn execute_subagent_batch(
                 let mut child_events =
                     EventFactory::new(format!("subagent-{}", child_tool_request.id));
                 let mut child_sink = EventSink::new(io::sink(), child_config.output_format);
-                let mut child_runtime = ChildAgentRuntime::new(
-                    &child_cwd,
-                    &mut child_events,
-                    &mut child_sink,
-                    &child_instructions,
-                    &child_memory,
-                    &child_mcp_registry,
-                    &child_hooks,
-                    &child_cancel,
-                    Some(&mut subagent_lifecycle),
-                    child_executor,
-                );
+                let mut child_runtime = ChildAgentRuntime::new(ChildAgentRuntimeContext {
+                    cwd: &child_cwd,
+                    events: &mut child_events,
+                    sink: &mut child_sink,
+                    instructions: &child_instructions,
+                    memory: &child_memory,
+                    mcp_registry: &child_mcp_registry,
+                    hooks: &child_hooks,
+                    cancel: &child_cancel,
+                    lifecycle: Some(&mut subagent_lifecycle),
+                    executor: child_executor,
+                });
                 let (child, child_cost_tracker) =
                     run_child_agent(&child_config, &child_request, &mut child_runtime);
                 subagent_lifecycle.finish_task(child.status);
@@ -462,8 +463,8 @@ pub(crate) fn execute_subagent_tool<W: io::Write>(
         tool_policy_label: None,
         workflow_ipc: workflow_ipc.cloned(),
     };
-    let mut runtime = ChildAgentRuntime::new(
-        child_cwd,
+    let mut runtime = ChildAgentRuntime::new(ChildAgentRuntimeContext {
+        cwd: child_cwd,
         events,
         sink,
         instructions,
@@ -471,9 +472,9 @@ pub(crate) fn execute_subagent_tool<W: io::Write>(
         mcp_registry,
         hooks,
         cancel,
-        Some(&mut subagent_lifecycle),
-        child_executor,
-    );
+        lifecycle: Some(&mut subagent_lifecycle),
+        executor: child_executor,
+    });
     let (child, child_cost_tracker) = run_child_agent(config, &child_request, &mut runtime);
     drop(runtime);
     let completed_task = subagent_lifecycle

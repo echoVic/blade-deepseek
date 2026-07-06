@@ -9,7 +9,9 @@ use orca_core::event_schema::{EventFactory, RunStatus};
 use orca_core::event_sink::EventSink;
 use orca_core::tool_types;
 
-use crate::agent_child::{ChildAgentExecutor, ChildAgentRequest, ChildAgentRuntime};
+use crate::agent_child::{
+    ChildAgentExecutor, ChildAgentRequest, ChildAgentRuntime, ChildAgentRuntimeContext,
+};
 use crate::agent_loop::execute_child_agent_loop;
 use crate::hooks::HookRunner;
 use crate::instructions;
@@ -82,18 +84,18 @@ pub(crate) fn run_async_subagent_worker_with_executor(
     child_lifecycle.start_task(RuntimeTaskKind::Subagent);
     let mut child_sink = EventSink::new(io::sink(), config.output_format);
     let (child, child_cost_tracker) = {
-        let mut child_runtime = ChildAgentRuntime::new(
-            &child_cwd,
-            &mut child_events,
-            &mut child_sink,
-            &instructions,
-            &memory,
-            &mcp_registry,
-            &hooks,
-            &cancel,
-            Some(&mut child_lifecycle),
-            child_executor,
-        );
+        let mut child_runtime = ChildAgentRuntime::new(ChildAgentRuntimeContext {
+            cwd: &child_cwd,
+            events: &mut child_events,
+            sink: &mut child_sink,
+            instructions: &instructions,
+            memory: &memory,
+            mcp_registry: &mcp_registry,
+            hooks: &hooks,
+            cancel: &cancel,
+            lifecycle: Some(&mut child_lifecycle),
+            executor: child_executor,
+        });
         crate::agent_child::run_child_agent(&config, &child_request, &mut child_runtime)
     };
     let completed_task = child_lifecycle

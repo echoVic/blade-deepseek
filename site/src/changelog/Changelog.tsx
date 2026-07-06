@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.147":
+        "Child-agent runtime constructor inputs now flow through a grouped ChildAgentRuntimeContext instead of a long cwd/events/sink/instructions/memory/MCP/hooks/cancel/lifecycle/executor argument list. Existing orca_runtime::agent_child re-exports remain available, while child-agent loop setup, provider turns, compaction, response folding, tool execution, sync and async subagent contracts, workflow child agents, and TUI child-agent delegation behavior stay unchanged.",
       "v0.1.146":
         "Child-agent loop runner inputs now flow through a grouped ChildAgentLoopContext instead of a long request/cwd/instructions/memory/hooks/cost-tracker argument list. Existing orca_runtime::agent_child re-exports remain available, while loop setup, provider turns, compaction, response folding, tool execution, subagent contracts, workflow child agents, and TUI child-agent delegation behavior stay unchanged.",
       "v0.1.145":
@@ -320,6 +322,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.147":
+        "Child-agent runtime constructor 输入现在通过分组的 ChildAgentRuntimeContext 传递，不再暴露 cwd/events/sink/instructions/memory/MCP/hooks/cancel/lifecycle/executor 长参数列表。既有 orca_runtime::agent_child re-export 仍保持可用，child-agent loop setup、provider turn、compaction、response folding、tool execution、同步和异步 subagent contract、workflow child agent 与 TUI child-agent delegation 行为保持不变。",
       "v0.1.146":
         "Child-agent loop runner 输入现在通过分组的 ChildAgentLoopContext 传递，不再暴露 request/cwd/instructions/memory/hooks/cost-tracker 长参数列表。既有 orca_runtime::agent_child re-export 仍保持可用，loop setup、provider turn、compaction、response folding、tool execution、subagent contract、workflow child agent 与 TUI child-agent delegation 行为保持不变。",
       "v0.1.145":

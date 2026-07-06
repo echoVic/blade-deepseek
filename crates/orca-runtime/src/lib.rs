@@ -1078,6 +1078,7 @@ mod tests {
             "pub struct ChildAgentResult",
             "pub(crate) type ChildAgentExecutor",
             "pub(crate) struct ChildAgentRuntime",
+            "pub(crate) struct ChildAgentRuntimeContext<'a, W: io::Write>",
             "impl<'a, W: io::Write> ChildAgentRuntime<'a, W>",
         ] {
             assert!(
@@ -1089,6 +1090,31 @@ mod tests {
                 "agent_child facade must not own child-agent shared type {marker}"
             );
         }
+
+        for marker in [
+            "pub cwd: &'a Path",
+            "pub events: &'a mut EventFactory",
+            "pub sink: &'a mut EventSink<W>",
+            "pub instructions: &'a ProjectInstructions",
+            "pub memory: &'a MemoryBlock",
+            "pub mcp_registry: &'a McpRegistry",
+            "pub hooks: &'a HookRunner",
+            "pub cancel: &'a CancelToken",
+            "pub lifecycle: Option<&'a mut RuntimeSessionLifecycle>",
+            "pub executor: ChildAgentExecutor<W>",
+            "pub(crate) fn new(context: ChildAgentRuntimeContext<'a, W>) -> Self",
+        ] {
+            assert!(
+                child_types_source.contains(marker),
+                "child_agent_types must group child runtime constructor input behind {marker}"
+            );
+        }
+        assert!(
+            !child_types_source.contains(
+                "cwd: &'a Path,\n        events: &'a mut EventFactory,\n        sink: &'a mut EventSink<W>,\n        instructions: &'a ProjectInstructions,\n        memory: &'a MemoryBlock,\n        mcp_registry: &'a McpRegistry,\n        hooks: &'a HookRunner,\n        cancel: &'a CancelToken,\n        lifecycle: Option<&'a mut RuntimeSessionLifecycle>,\n        executor: ChildAgentExecutor<W>,"
+            ),
+            "child-agent runtime constructor must not expose a long runtime dependency list"
+        );
 
         assert!(
             agent_child_source.contains("pub use crate::child_agent_types::"),
