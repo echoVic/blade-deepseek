@@ -21,7 +21,10 @@ use orca_provider::ProviderConfig;
 use serde_json::Value;
 
 use crate::cost::CostTracker;
-use crate::extension::{ExtensionData, ExtensionRegistry, ExtensionRegistryBuilder};
+use crate::extension::{
+    ExtensionData, ExtensionRegistry, ExtensionRegistryBuilder, RuntimeExtensionContext,
+    RuntimeExtensionStores,
+};
 use crate::goals::install_goal_tool_lifecycle;
 use crate::hooks::{HookContext, HookOutcome, HookRunner};
 use crate::instructions::ProjectInstructions;
@@ -937,6 +940,26 @@ impl<'a> RuntimeTurnState<'a> {
     pub(crate) fn apply_directive(&mut self, directive: RuntimeDirective) {
         RuntimeTurnReducer::new(self.thread_extensions.as_ref(), &self.turn_extensions)
             .apply_directive(&mut self.directive_state, directive);
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn extension_context(&self) -> RuntimeExtensionContext<'_> {
+        Self::extension_context_from_parts(
+            &self.extension_registry,
+            self.thread_extensions.as_ref(),
+            &self.turn_extensions,
+        )
+    }
+
+    pub(crate) fn extension_context_from_parts<'extensions>(
+        extension_registry: &'extensions ExtensionRegistry,
+        thread_extensions: &'extensions ExtensionData,
+        turn_extensions: &'extensions ExtensionData,
+    ) -> RuntimeExtensionContext<'extensions> {
+        RuntimeExtensionContext::new(
+            extension_registry,
+            RuntimeExtensionStores::new(thread_extensions, turn_extensions),
+        )
     }
 
     #[cfg(test)]

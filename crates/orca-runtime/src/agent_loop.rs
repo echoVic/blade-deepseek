@@ -2,7 +2,6 @@ use std::io;
 
 use crate::agent_child::{ChildAgentRequest, ChildAgentResult, ChildAgentRuntime};
 use crate::cost::CostTracker;
-use crate::extension::{RuntimeExtensionContext, RuntimeExtensionStores};
 use crate::lifecycle::{
     AgentLoopContext, AgentLoopResult, RuntimeSessionLifecycle, RuntimeTaskActor,
     RuntimeTurnConfig, RuntimeTurnDeps, RuntimeTurnExecution, RuntimeTurnState,
@@ -68,10 +67,6 @@ pub(crate) fn run_agent_loop(
         lifecycle,
     } = turn_execution.expect("agent loop turn execution");
     let tool_policy = tool_policy_for_directive_state(tool_policy, directive_state);
-    let extensions = RuntimeExtensionContext::new(
-        extension_registry,
-        RuntimeExtensionStores::new(thread_extensions, turn_extensions),
-    );
     let max_turns = DEFAULT_MAX_TURNS;
     let setup = RuntimeTurnSetupStep::new().prepare(
         config,
@@ -130,7 +125,11 @@ pub(crate) fn run_agent_loop(
             memory,
             mcp_registry,
             task_registry,
-            extensions,
+            RuntimeTurnState::extension_context_from_parts(
+                extension_registry,
+                thread_extensions.as_ref(),
+                turn_extensions,
+            ),
             background_workflows,
             workflow_ipc,
             permission_handler,
@@ -331,6 +330,27 @@ mod tests {
         assert_eq!(state.cost_tracker().totals().total_tokens(), 0);
         assert!(std::ptr::eq(state.cancel(), &cancel));
         assert!(std::ptr::eq(state.task_registry(), &task_registry));
+    }
+
+    #[test]
+    fn runtime_turn_state_exposes_runtime_extension_context() {
+        let mut cost_tracker = CostTracker::new(None);
+        let cancel = CancelToken::new();
+        let task_registry = TaskRegistry::new("agent-loop-extension-context".to_string());
+        let state = RuntimeTurnState::new(&mut cost_tracker, &cancel, &task_registry);
+
+        let extensions = state.extension_context();
+        let stores = extensions.stores();
+
+        assert!(std::ptr::eq(
+            extensions.registry(),
+            state.extension_registry()
+        ));
+        assert!(std::ptr::eq(
+            stores.thread_store(),
+            state.thread_extensions()
+        ));
+        assert!(std::ptr::eq(stores.turn_store(), state.turn_extensions()));
     }
 
     #[test]

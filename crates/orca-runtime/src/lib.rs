@@ -487,6 +487,35 @@ mod tests {
     }
 
     #[test]
+    fn runtime_turn_state_exposes_grouped_runtime_extension_context() {
+        let lifecycle_source = include_str!("lifecycle.rs");
+        let agent_loop_source = include_str!("agent_loop.rs");
+
+        assert!(
+            lifecycle_source
+                .contains("pub(crate) fn extension_context(&self) -> RuntimeExtensionContext"),
+            "RuntimeTurnState must expose the grouped runtime extension context it owns"
+        );
+        assert!(
+            lifecycle_source.contains("RuntimeExtensionContext::new(")
+                && lifecycle_source.contains("RuntimeExtensionStores::new("),
+            "RuntimeTurnState::extension_context must compose registry and scoped stores"
+        );
+        assert!(
+            !agent_loop_source.contains("RuntimeExtensionStores::new("),
+            "agent_loop must not reconstruct grouped runtime extension stores from turn-state fields"
+        );
+        assert!(
+            !agent_loop_source.contains("RuntimeExtensionContext::new("),
+            "agent_loop must ask RuntimeTurnState for the grouped runtime extension context"
+        );
+        assert!(
+            agent_loop_source.contains("RuntimeTurnState::extension_context_from_parts("),
+            "agent_loop must route extension context construction through RuntimeTurnState"
+        );
+    }
+
+    #[test]
     fn runtime_turn_state_directives_route_through_runtime_reducer() {
         let lifecycle_source = include_str!("lifecycle.rs");
         let runtime_state_source = include_str!("runtime_state.rs");
