@@ -998,6 +998,7 @@ mod tests {
         for marker in [
             "pub fn run_child_agent_loop_with_tool_executor",
             "pub fn run_child_agent_with_tool_executor",
+            "pub struct ChildAgentLoopContext<'a>",
         ] {
             assert!(
                 child_loop_runner_source.contains(marker),
@@ -1027,6 +1028,27 @@ mod tests {
                 "agent_child facade must delegate child loop behavior detail {marker}"
             );
         }
+
+        for marker in [
+            "pub request: &'a ChildAgentRequest",
+            "pub cwd: &'a Path",
+            "pub instructions: &'a ProjectInstructions",
+            "pub memory: &'a MemoryBlock",
+            "pub hooks: &'a HookRunner",
+            "pub child_cost_tracker: &'a mut CostTracker",
+            "context: ChildAgentLoopContext<'_>",
+        ] {
+            assert!(
+                child_loop_runner_source.contains(marker),
+                "child_agent_loop_runner must group loop runner input behind {marker}"
+            );
+        }
+        assert!(
+            !child_loop_runner_source.contains(
+                "request: &ChildAgentRequest,\n    cwd: &Path,\n    instructions: &ProjectInstructions,\n    memory: &MemoryBlock,\n    hooks: &HookRunner,\n    child_cost_tracker: &mut CostTracker,"
+            ),
+            "child-agent loop runner must not expose a long request/environment argument list"
+        );
 
         assert!(
             agent_child_source.contains("pub use crate::child_agent_loop_runner::"),

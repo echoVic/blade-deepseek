@@ -287,7 +287,10 @@ pub(crate) fn usage_totals_if_non_empty(usage: UsageTotals) -> Option<UsageTotal
     }
 }
 
-pub(crate) fn async_subagent_result_payload(output: String, task: Option<serde_json::Value>) -> String {
+pub(crate) fn async_subagent_result_payload(
+    output: String,
+    task: Option<serde_json::Value>,
+) -> String {
     serde_json::json!({
         "output": output,
         "task": task,

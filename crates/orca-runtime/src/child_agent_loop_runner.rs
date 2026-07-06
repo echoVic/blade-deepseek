@@ -13,8 +13,7 @@ use crate::child_agent_loop_setup::{
 use crate::child_agent_provider_turn::{
     ChildAgentProviderErrorDecision, ChildAgentProviderTurn,
     compact_child_agent_conversation_if_needed, handle_child_agent_provider_error,
-    route_child_agent_model, run_child_agent_provider_turn,
-    run_child_agent_provider_turn_observed,
+    route_child_agent_model, run_child_agent_provider_turn, run_child_agent_provider_turn_observed,
 };
 use crate::child_agent_response_folding::{
     ChildAgentProviderResponseFold, ChildAgentToolContext, ChildAgentToolExecution,
@@ -173,12 +172,17 @@ where
             None => {}
         }
 
-        let had_usage = response.usage.as_ref().is_some_and(|usage| !usage.is_empty());
+        let had_usage = response
+            .usage
+            .as_ref()
+            .is_some_and(|usage| !usage.is_empty());
         let provider_fold =
             fold_child_agent_provider_response(&mut setup, &response, context.child_cost_tracker);
         if had_usage {
             if let Some(observer) = observer {
-                observer.emit(ChildAgentActivity::Usage(context.child_cost_tracker.totals()));
+                observer.emit(ChildAgentActivity::Usage(
+                    context.child_cost_tracker.totals(),
+                ));
             }
         }
         match provider_fold {
@@ -218,7 +222,9 @@ where
             }
             if had_child_cost {
                 if let Some(observer) = observer {
-                    observer.emit(ChildAgentActivity::Usage(context.child_cost_tracker.totals()));
+                    observer.emit(ChildAgentActivity::Usage(
+                        context.child_cost_tracker.totals(),
+                    ));
                 }
             }
         }

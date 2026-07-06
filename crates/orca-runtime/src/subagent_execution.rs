@@ -1,11 +1,10 @@
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::thread;
 
 use orca_core::cancel::CancelToken;
 use orca_core::config::RunConfig;
 use orca_core::conversation::Conversation;
-use orca_core::cost_types::UsageTotals;
 use orca_core::event_schema::{EventFactory, RunStatus};
 use orca_core::event_sink::EventSink;
 use orca_core::hook_types::HookEvent;
@@ -16,21 +15,15 @@ use serde_json::Value;
 use crate::agent_child::{
     ChildAgentExecutor, ChildAgentRequest, ChildAgentResult, ChildAgentRuntime, run_child_agent,
 };
-use crate::agent_loop::execute_child_agent_loop;
 use crate::cost::CostTracker;
 use crate::hooks::{HookContext, HookRunner};
-use crate::instructions;
 use crate::instructions::ProjectInstructions;
 use crate::lifecycle::{RuntimeSessionLifecycle, RuntimeTaskKind, RuntimeTaskStatus};
-use crate::memory;
 use crate::memory::MemoryBlock;
 use crate::schema_validation::validate_json_schema_subset;
 use crate::session::record_tool_result_for_agent;
 use crate::subagent::{self, SubagentIsolation, SubagentMode};
-use crate::subagent_async_worker::{
-    AsyncSubagentWorktree, async_subagent_result_payload, launch_async_subagent,
-    usage_totals_if_non_empty,
-};
+use crate::subagent_async_worker::launch_async_subagent;
 use crate::tasks::TaskRegistry;
 use crate::thread_store::SessionWriter;
 use crate::tool_invocation::{
@@ -562,153 +555,6 @@ pub(crate) fn execute_subagent_tool<W: io::Write>(
             ))
         }
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn emit_subagent_progress<W: io::Write>(
-    config: &RunConfig,
-    emit_deltas: bool,
-    events: &mut EventFactory,
-    sink: &mut EventSink<W>,
-    task: &crate::lifecycle::RuntimeTaskLifecycle,
-    id: &str,
-    description: &str,
-    activity: &str,
-    turn: Option<u32>,
-    usage: Option<UsageTotals>,
-) -> io::Result<()> {
-    if emit_deltas && config.subagents.stream_progress {
-        let event =
-            task.attach_to_event(events.subagent_progress(id, description, activity, turn, usage));
-        sink.emit(&event)?;
-    }
-    Ok(())
-}
-
-pub fn run_async_subagent_worker(
-    config: RunConfig,
-    cwd: PathBuf,
-    child_cwd: PathBuf,
-    task_session_id: String,
-    agent_id: String,
-    request: subagent::SubagentRequest,
-    child_depth: u32,
-    worktree: Option<AsyncSubagentWorktree>,
-) -> i32 {
-    run_async_subagent_worker_with_executor(
-        config,
-        cwd,
-        child_cwd,
-        task_session_id,
-        agent_id,
-        request,
-        child_depth,
-        worktree,
-        execute_child_agent_loop,
-    )
-}
-
-pub(crate) fn run_async_subagent_worker_with_executor(
-    config: RunConfig,
-    cwd: PathBuf,
-    child_cwd: PathBuf,
-    task_session_id: String,
-    agent_id: String,
-    request: subagent::SubagentRequest,
-    child_depth: u32,
-    worktree: Option<AsyncSubagentWorktree>,
-    child_executor: ChildAgentExecutor<io::Sink>,
-) -> i32 {
-    let task_registry = TaskRegistry::new_for_cwd(task_session_id, &cwd);
-    let _ = task_registry.mark_running(&agent_id);
-    let instructions = instructions::load_for_cwd_or_default(&cwd);
-    let memory = memory::load_for_cwd(&cwd);
-    let hooks = HookRunner::new(config.hooks.clone());
-    let mcp_registry = orca_mcp::initialize_registry(&config.mcp_servers);
-    let cancel = CancelToken::new();
-    let child_request = ChildAgentRequest {
-        prompt: request.prompt,
-        subagent_type: request.subagent_type,
-        model: request.model,
-        depth: child_depth,
-        emit_deltas: false,
-        allowed_tools: None,
-        tool_policy_label: None,
-        workflow_ipc: None,
-    };
-    let mut child_events = EventFactory::new(format!("subagent-{agent_id}"));
-    let mut child_lifecycle = RuntimeSessionLifecycle::new(format!("subagent-{agent_id}"));
-    child_lifecycle.start_task(RuntimeTaskKind::Subagent);
-    let mut child_sink = EventSink::new(io::sink(), config.output_format);
-    let mut child_runtime = ChildAgentRuntime::new(
-        &child_cwd,
-        &mut child_events,
-        &mut child_sink,
-        &instructions,
-        &memory,
-        &mcp_registry,
-        &hooks,
-        &cancel,
-        Some(&mut child_lifecycle),
-        child_executor,
-    );
-    let (child, child_cost_tracker) = run_child_agent(&config, &child_request, &mut child_runtime);
-    drop(child_runtime);
-    let completed_task = child_lifecycle
-        .finish_task(child.status)
-        .cloned()
-        .unwrap_or_else(|| {
-            child_lifecycle.active_task().cloned().unwrap_or_else(|| {
-                RuntimeSessionLifecycle::new(format!("subagent-{agent_id}"))
-                    .start_task(RuntimeTaskKind::Subagent)
-                    .clone()
-            })
-        });
-    let worktree = worktree.and_then(|worktree| {
-        WorktreeGuard::finish_existing(worktree.repo_root, worktree.path).ok()
-    });
-    let usage = usage_totals_if_non_empty(child_cost_tracker.totals());
-    if child.status == RunStatus::Success {
-        let mut output = child
-            .final_message
-            .unwrap_or_else(|| "(subagent completed without a final message)".to_string());
-        if let Err(mut error) =
-            validate_subagent_output_schema(&request.description, request.schema.as_ref(), &output)
-        {
-            append_worktree_outcome(&mut error, worktree.as_ref());
-            let failed_task = completed_task.with_status(RuntimeTaskStatus::Failed);
-            let error = async_subagent_result_payload(error, Some(failed_task.payload()));
-            if task_registry
-                .fail_with_usage(&agent_id, error, usage)
-                .is_ok()
-            {
-                return 1;
-            }
-            return 1;
-        }
-        append_worktree_outcome(&mut output, worktree.as_ref());
-        let output = async_subagent_result_payload(output, Some(completed_task.payload()));
-        if task_registry
-            .complete_with_usage(&agent_id, output, usage)
-            .is_ok()
-        {
-            return 0;
-        }
-    } else {
-        let mut error = child
-            .error
-            .or(child.final_message)
-            .unwrap_or_else(|| format!("subagent ended with status {:?}", child.status));
-        append_worktree_outcome(&mut error, worktree.as_ref());
-        let error = async_subagent_result_payload(error, Some(completed_task.payload()));
-        if task_registry
-            .fail_with_usage(&agent_id, error, usage)
-            .is_ok()
-        {
-            return 1;
-        }
-    }
-    1
 }
 
 fn subagent_execution_to_tool_result(

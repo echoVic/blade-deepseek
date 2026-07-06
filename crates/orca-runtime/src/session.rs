@@ -819,7 +819,10 @@ mod tests {
                 .meta
                 .session_id;
             let compressed_path = history::compress_session(&session_id).expect("compress");
-            assert_eq!(compressed_path.extension().and_then(|e| e.to_str()), Some("zst"));
+            assert_eq!(
+                compressed_path.extension().and_then(|e| e.to_str()),
+                Some("zst")
+            );
             let transcript = history::load_session(&session_id).expect("compressed transcript");
             let cfg = config(home.to_path_buf(), HistoryMode::Resume(session_id.clone()));
 

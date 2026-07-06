@@ -15,15 +15,14 @@ pub use crate::child_agent_loop_setup::{
 pub use crate::child_agent_provider_turn::{
     ChildAgentProviderErrorDecision, ChildAgentProviderTurn,
     compact_child_agent_conversation_if_needed, handle_child_agent_provider_error,
-    route_child_agent_model, run_child_agent_provider_turn,
-    run_child_agent_provider_turn_observed,
+    route_child_agent_model, run_child_agent_provider_turn, run_child_agent_provider_turn_observed,
 };
 pub use crate::child_agent_response_folding::{
     ChildAgentProviderResponseFold, ChildAgentToolContext, ChildAgentToolExecution,
     ChildAgentToolResultFold, child_agent_tool_requests, fold_child_agent_provider_response,
     fold_child_agent_tool_result,
 };
-pub(crate) use crate::child_agent_types::{ChildAgentExecutor, ChildAgentRuntime};
 pub use crate::child_agent_types::{
     ChildAgentActivity, ChildAgentActivityObserver, ChildAgentRequest, ChildAgentResult,
 };
+pub(crate) use crate::child_agent_types::{ChildAgentExecutor, ChildAgentRuntime};
