@@ -2,6 +2,7 @@ pub mod agent_child;
 pub mod agent_common;
 pub mod agent_loop;
 pub mod approval_resolution;
+mod child_agent_loop_runner;
 mod child_agent_loop_setup;
 mod child_agent_provider_turn;
 mod child_agent_response_folding;
@@ -971,6 +972,61 @@ mod tests {
         assert!(
             agent_child_source.contains("pub use crate::child_agent_response_folding::"),
             "agent_child must preserve existing imports by re-exporting child response-folding APIs"
+        );
+    }
+
+    #[test]
+    fn child_agent_loop_runner_boundary_is_owned_by_focused_module() {
+        let lib_source = include_str!("lib.rs");
+        let agent_child_source = include_str!("agent_child.rs");
+        let agent_child_runtime_source = agent_child_source
+            .split_once("#[cfg(test)]")
+            .map(|(runtime_source, _)| runtime_source)
+            .unwrap_or(agent_child_source);
+        let child_loop_runner_source = std::fs::read_to_string("src/child_agent_loop_runner.rs")
+            .expect("child agent loop runner source");
+
+        assert!(
+            lib_source.contains("mod child_agent_loop_runner;"),
+            "runtime crate must declare a focused child_agent_loop_runner module"
+        );
+
+        for marker in [
+            "pub fn run_child_agent_loop_with_tool_executor",
+            "pub fn run_child_agent_with_tool_executor",
+        ] {
+            assert!(
+                child_loop_runner_source.contains(marker),
+                "child_agent_loop_runner must own child loop runner detail {marker}"
+            );
+            assert!(
+                !agent_child_runtime_source.contains(marker),
+                "agent_child facade must not own child loop runner detail {marker}"
+            );
+        }
+
+        for marker in [
+            "prepare_child_agent_loop(",
+            "advance_child_agent_turn(",
+            "compact_child_agent_conversation_if_needed(",
+            "run_child_agent_provider_turn(",
+            "fold_child_agent_provider_response(",
+            "child_agent_tool_requests(",
+            "fold_child_agent_tool_result(",
+        ] {
+            assert!(
+                child_loop_runner_source.contains(marker),
+                "child_agent_loop_runner must compose child loop behavior detail {marker}"
+            );
+            assert!(
+                !agent_child_runtime_source.contains(marker),
+                "agent_child facade must delegate child loop behavior detail {marker}"
+            );
+        }
+
+        assert!(
+            agent_child_source.contains("pub use crate::child_agent_loop_runner::"),
+            "agent_child must preserve existing imports by re-exporting child loop runner APIs"
         );
     }
 
