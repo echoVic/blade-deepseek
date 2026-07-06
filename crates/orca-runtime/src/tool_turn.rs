@@ -12,7 +12,7 @@ use orca_mcp::McpRegistry;
 
 use crate::agent_child::ChildAgentExecutor;
 use crate::cost::CostTracker;
-use crate::extension::{ExtensionData, ExtensionRegistry, RuntimeExtensionStores};
+use crate::extension::RuntimeExtensionContext;
 use crate::hooks::HookRunner;
 use crate::instructions::ProjectInstructions;
 use crate::lifecycle::{RuntimePermissionRequestHandler, TurnPermissionOverlay};
@@ -85,9 +85,7 @@ pub(crate) struct RuntimeNormalToolTurnContext<'a, W: io::Write> {
     pub(crate) workflow_ipc: Option<&'a WorkflowIpcContext>,
     pub(crate) permission_overlay: &'a mut TurnPermissionOverlay,
     pub(crate) permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
-    pub(crate) extension_registry: Option<&'a ExtensionRegistry>,
-    pub(crate) thread_extensions: Option<&'a ExtensionData>,
-    pub(crate) turn_extensions: Option<&'a ExtensionData>,
+    pub(crate) extensions: Option<RuntimeExtensionContext<'a>>,
     pub(crate) child_executor: ChildAgentExecutor<W>,
     pub(crate) workflow_child_executor: ChildAgentExecutor<SharedEventBuffer>,
 }
@@ -154,9 +152,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
     let task_registry = step_context.task_registry;
     let workflow_ipc = step_context.workflow_ipc;
     let permission_handler = step_context.permission_handler;
-    let extension_registry = step_context.extension_registry;
-    let thread_extensions = step_context.thread_extensions;
-    let turn_extensions = step_context.turn_extensions;
+    let extensions = step_context.extensions;
     let mut cursor = ToolRequestCursor::new(tool_requests);
     let mut permission_overlay = TurnPermissionOverlay::default();
     while let Some(tool_request) = cursor.current() {
@@ -255,9 +251,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
             workflow_ipc,
             permission_overlay: &mut permission_overlay,
             permission_handler,
-            extension_registry,
-            thread_extensions,
-            turn_extensions,
+            extensions,
             child_executor,
             workflow_child_executor,
         })? {
@@ -331,9 +325,7 @@ pub(crate) fn run_normal_tool_turn<W: io::Write>(
         workflow_ipc,
         permission_overlay,
         permission_handler,
-        extension_registry,
-        thread_extensions,
-        turn_extensions,
+        extensions,
         child_executor,
         workflow_child_executor,
     } = context;
@@ -348,13 +340,9 @@ pub(crate) fn run_normal_tool_turn<W: io::Write>(
         )
         .with_permission_overlay(permission_overlay)
         .with_permission_handler(permission_handler);
-    if let (Some(registry), Some(thread_store), Some(turn_store)) =
-        (extension_registry, thread_extensions, turn_extensions)
-    {
-        execution_context = execution_context.with_extensions(
-            registry,
-            RuntimeExtensionStores::new(thread_store, turn_store),
-        );
+    if let Some(extensions) = extensions {
+        execution_context =
+            execution_context.with_extensions(extensions.registry(), extensions.stores());
     }
     let (status, result) = execute_tool_with_approval(
         config,
@@ -397,7 +385,7 @@ mod tests {
 
     use super::*;
     use crate::agent_child::{ChildAgentRequest, ChildAgentResult, ChildAgentRuntime};
-    use crate::extension::{ExtensionData, ExtensionRegistryBuilder};
+    use crate::extension::{ExtensionData, ExtensionRegistryBuilder, RuntimeExtensionStores};
     use crate::goals::{GoalToolProgressState, install_goal_tool_lifecycle};
     use crate::hooks::HookRunner;
     use crate::tool_execution::policy_for_tool_execution;
@@ -644,9 +632,7 @@ mod tests {
             workflow_ipc: None,
             permission_overlay: &mut permission_overlay,
             permission_handler: None,
-            extension_registry: None,
-            thread_extensions: None,
-            turn_extensions: None,
+            extensions: None,
             child_executor: unused_child_executor,
             workflow_child_executor: unused_child_executor,
         })
@@ -832,7 +818,10 @@ mod tests {
             None,
             None,
         )
-        .with_extensions(&extension_registry, &thread_extensions, &turn_extensions);
+        .with_extensions(
+            &extension_registry,
+            RuntimeExtensionStores::new(&thread_extensions, &turn_extensions),
+        );
 
         let outcome = run_tool_turns(RuntimeToolTurnsContext {
             step_context,

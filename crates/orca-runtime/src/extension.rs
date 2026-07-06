@@ -78,6 +78,26 @@ impl<'a> RuntimeExtensionStores<'a> {
     }
 }
 
+#[derive(Clone, Copy)]
+pub struct RuntimeExtensionContext<'a> {
+    registry: &'a ExtensionRegistry,
+    stores: RuntimeExtensionStores<'a>,
+}
+
+impl<'a> RuntimeExtensionContext<'a> {
+    pub fn new(registry: &'a ExtensionRegistry, stores: RuntimeExtensionStores<'a>) -> Self {
+        Self { registry, stores }
+    }
+
+    pub fn registry(&self) -> &'a ExtensionRegistry {
+        self.registry
+    }
+
+    pub fn stores(&self) -> RuntimeExtensionStores<'a> {
+        self.stores
+    }
+}
+
 pub struct ToolStartInput<'a> {
     pub thread_store: &'a ExtensionData,
     pub turn_store: &'a ExtensionData,

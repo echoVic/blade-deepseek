@@ -406,6 +406,46 @@ mod tests {
     }
 
     #[test]
+    fn step_and_normal_tool_turn_contexts_group_runtime_extensions() {
+        let step_context_source = include_str!("step_context.rs");
+        let tool_turn_source = include_str!("tool_turn.rs");
+
+        assert!(
+            step_context_source.contains("extensions: Option<RuntimeExtensionContext"),
+            "RuntimeStepContext must carry runtime extensions as one grouped context"
+        );
+        assert!(
+            step_context_source.contains("RuntimeExtensionStores"),
+            "RuntimeStepContext::with_extensions must accept grouped runtime extension stores"
+        );
+        assert!(
+            !step_context_source.contains("thread_extensions: Option<&'a ExtensionData>"),
+            "RuntimeStepContext must not expose thread extension refs as a parallel field"
+        );
+        assert!(
+            !step_context_source.contains("turn_extensions: Option<&'a ExtensionData>"),
+            "RuntimeStepContext must not expose turn extension refs as a parallel field"
+        );
+
+        assert!(
+            tool_turn_source.contains("extensions: Option<RuntimeExtensionContext"),
+            "RuntimeNormalToolTurnContext must carry runtime extensions as one grouped context"
+        );
+        assert!(
+            !tool_turn_source.contains("thread_extensions: Option<&'a ExtensionData>"),
+            "RuntimeNormalToolTurnContext must not expose thread extension refs as a parallel field"
+        );
+        assert!(
+            !tool_turn_source.contains("turn_extensions: Option<&'a ExtensionData>"),
+            "RuntimeNormalToolTurnContext must not expose turn extension refs as a parallel field"
+        );
+        assert!(
+            !tool_turn_source.contains("(extension_registry, thread_extensions, turn_extensions)"),
+            "normal tool turns must not reconstruct grouped stores from three parallel refs"
+        );
+    }
+
+    #[test]
     fn runtime_turn_state_directives_route_through_runtime_reducer() {
         let lifecycle_source = include_str!("lifecycle.rs");
         let runtime_state_source = include_str!("runtime_state.rs");

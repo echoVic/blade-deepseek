@@ -5,7 +5,7 @@ use orca_core::cancel::CancelToken;
 use orca_core::config::RunConfig;
 use orca_mcp::McpRegistry;
 
-use crate::extension::{ExtensionData, ExtensionRegistry};
+use crate::extension::{ExtensionRegistry, RuntimeExtensionContext, RuntimeExtensionStores};
 use crate::hooks::HookRunner;
 use crate::instructions::ProjectInstructions;
 use crate::lifecycle::RuntimePermissionRequestHandler;
@@ -30,9 +30,7 @@ pub(crate) struct RuntimeStepContext<'a> {
     pub(crate) task_registry: &'a TaskRegistry,
     pub(crate) workflow_ipc: Option<&'a WorkflowIpcContext>,
     pub(crate) permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
-    pub(crate) extension_registry: Option<&'a ExtensionRegistry>,
-    pub(crate) thread_extensions: Option<&'a ExtensionData>,
-    pub(crate) turn_extensions: Option<&'a ExtensionData>,
+    pub(crate) extensions: Option<RuntimeExtensionContext<'a>>,
 }
 
 impl<'a> RuntimeStepContext<'a> {
@@ -68,21 +66,19 @@ impl<'a> RuntimeStepContext<'a> {
             task_registry,
             workflow_ipc,
             permission_handler,
-            extension_registry: None,
-            thread_extensions: None,
-            turn_extensions: None,
+            extensions: None,
         }
     }
 
     pub(crate) fn with_extensions(
         mut self,
         extension_registry: &'a ExtensionRegistry,
-        thread_extensions: &'a ExtensionData,
-        turn_extensions: &'a ExtensionData,
+        extension_stores: RuntimeExtensionStores<'a>,
     ) -> Self {
-        self.extension_registry = Some(extension_registry);
-        self.thread_extensions = Some(thread_extensions);
-        self.turn_extensions = Some(turn_extensions);
+        self.extensions = Some(RuntimeExtensionContext::new(
+            extension_registry,
+            extension_stores,
+        ));
         self
     }
 }

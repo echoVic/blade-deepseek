@@ -14,7 +14,7 @@ use orca_provider::{ProviderConfig, context};
 use crate::agent_child::ChildAgentExecutor;
 use crate::compaction::RuntimeCompactionStep;
 use crate::cost::CostTracker;
-use crate::extension::{ExtensionData, ExtensionRegistry};
+use crate::extension::{ExtensionData, ExtensionRegistry, RuntimeExtensionStores};
 use crate::hooks::{HookRunner, conversation_with_hook_context};
 use crate::instructions::ProjectInstructions;
 use crate::lifecycle::{
@@ -563,8 +563,7 @@ impl RuntimeTurnProviderCycleStep {
                 )
                 .with_extensions(
                     input.extension_registry,
-                    input.thread_extensions,
-                    input.turn_extensions,
+                    RuntimeExtensionStores::new(input.thread_extensions, input.turn_extensions),
                 ),
                 events: input.events,
                 sink: input.sink,
