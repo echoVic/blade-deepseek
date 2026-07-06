@@ -7,6 +7,7 @@ use crate::lifecycle::{
     RuntimeTurnConfig, RuntimeTurnDeps, RuntimeTurnExecution, RuntimeTurnState,
 };
 use crate::runtime_conversation_bootstrap::RuntimeConversationBootstrapStep;
+use crate::runtime_directive::RuntimeDirectiveState;
 use crate::runtime_turn_loop::{
     RuntimeTurnLoopExecutors, RuntimeTurnLoopInput, RuntimeTurnLoopStep,
 };
@@ -55,13 +56,14 @@ pub(crate) fn run_agent_loop(
         cost_tracker,
         cancel,
         task_registry,
-        directive_state,
+        ref directive_state,
     } = turn_state;
     let RuntimeTurnExecution {
         background_workflows,
         workflow_ipc,
         lifecycle,
     } = turn_execution.expect("agent loop turn execution");
+    let tool_policy = tool_policy_for_directive_state(tool_policy, directive_state);
     let max_turns = DEFAULT_MAX_TURNS;
     let setup = RuntimeTurnSetupStep::new().prepare(
         config,
@@ -130,6 +132,24 @@ pub(crate) fn run_agent_loop(
             execute_child_agent_loop,
         ),
     )
+}
+
+fn tool_policy_for_directive_state<'a>(
+    tool_policy: AgentToolPolicyContext<'a>,
+    directive_state: &'a RuntimeDirectiveState,
+) -> AgentToolPolicyContext<'a> {
+    tool_policy.replace_allowed_tools(
+        directive_state.allowed_tools(),
+        "runtime directive tool policy",
+    )
+}
+
+#[cfg(test)]
+fn tool_policy_for_runtime_directives<'a>(
+    tool_policy: AgentToolPolicyContext<'a>,
+    turn_state: &'a RuntimeTurnState<'_>,
+) -> AgentToolPolicyContext<'a> {
+    tool_policy_for_directive_state(tool_policy, &turn_state.directive_state)
 }
 
 pub(crate) fn execute_child_agent_loop<W: io::Write>(
@@ -349,6 +369,29 @@ mod tests {
                 "inject_system_message: skill added runtime instruction".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn runtime_directives_replace_agent_loop_tool_policy() {
+        let mut cost_tracker = CostTracker::new(None);
+        let cancel = CancelToken::new();
+        let task_registry = TaskRegistry::new("agent-loop-tool-directives".to_string());
+        let mut state = RuntimeTurnState::new(&mut cost_tracker, &cancel, &task_registry);
+        state.apply_directive(
+            crate::runtime_directive::RuntimeDirective::ReplaceAllowedTools {
+                tool_names: vec!["read_file".to_string()],
+                reason: "narrow current turn".to_string(),
+            },
+        );
+
+        let policy =
+            tool_policy_for_runtime_directives(AgentToolPolicyContext::unrestricted(), &state);
+
+        assert_eq!(
+            policy.allowed_tools().unwrap(),
+            &["read_file".to_string()][..]
+        );
+        assert_eq!(policy.label(), Some("runtime directive tool policy"));
     }
 
     #[test]

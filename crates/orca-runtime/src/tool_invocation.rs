@@ -48,6 +48,18 @@ impl<'a> AgentToolPolicyContext<'a> {
         Self::new(None, None)
     }
 
+    pub(crate) fn replace_allowed_tools(
+        self,
+        allowed_tools: Option<&'a [String]>,
+        label: &'a str,
+    ) -> Self {
+        if let Some(allowed_tools) = allowed_tools {
+            Self::new(Some(allowed_tools), Some(label))
+        } else {
+            self
+        }
+    }
+
     pub(crate) fn allowed_tools(&self) -> Option<&'a [String]> {
         self.allowed_tools
     }
@@ -70,22 +82,20 @@ pub(crate) fn provider_tool_schema_override(
     mcp_registry: &McpRegistry,
     external_tools: &[ExternalToolConfig],
 ) -> Option<Vec<Value>> {
-    if subagent_depth > 0 {
-        if let Some(allowed_tools) = tool_policy.allowed_tools() {
-            Some(
-                deepseek_tools_schema_for_allowed_names_with_mcp_and_external(
-                    allowed_tools,
-                    Some(mcp_registry),
-                    external_tools,
-                ),
-            )
-        } else {
-            Some(deepseek_tools_schema_for_type_with_mcp_and_external(
-                subagent_type,
+    if let Some(allowed_tools) = tool_policy.allowed_tools() {
+        Some(
+            deepseek_tools_schema_for_allowed_names_with_mcp_and_external(
+                allowed_tools,
                 Some(mcp_registry),
                 external_tools,
-            ))
-        }
+            ),
+        )
+    } else if subagent_depth > 0 {
+        Some(deepseek_tools_schema_for_type_with_mcp_and_external(
+            subagent_type,
+            Some(mcp_registry),
+            external_tools,
+        ))
     } else {
         Some(deepseek_tools_schema_with_mcp_and_external(
             Some(mcp_registry),
@@ -429,6 +439,35 @@ mod tests {
         assert!(names.contains(&"read_file"));
         assert!(!names.contains(&"bash"));
         assert!(!names.contains(&"subagent"));
+    }
+
+    #[test]
+    fn provider_tool_schema_override_limits_root_agent_to_allowed_tools() {
+        let registry = McpRegistry::default();
+        let allowed = vec!["read_file".to_string()];
+        let tools = provider_tool_schema_override(
+            0,
+            &SubagentType::General,
+            AgentToolPolicyContext::new(Some(&allowed), Some("runtime directive")),
+            &registry,
+            &[],
+        )
+        .expect("root allowed tool schema");
+        let names = schema_names(&tools);
+
+        assert!(names.contains(&"read_file"));
+        assert!(!names.contains(&"bash"));
+        assert!(!names.contains(&"subagent"));
+    }
+
+    #[test]
+    fn agent_tool_policy_context_replaces_allowed_tools_for_runtime_directive() {
+        let allowed = vec!["read_file".to_string()];
+        let policy = AgentToolPolicyContext::unrestricted()
+            .replace_allowed_tools(Some(&allowed), "runtime directive");
+
+        assert_eq!(policy.allowed_tools(), Some(allowed.as_slice()));
+        assert_eq!(policy.label(), Some("runtime directive"));
     }
 
     #[test]
