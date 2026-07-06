@@ -62,11 +62,20 @@ pub struct ToolStartInput<'a> {
     pub call_id: &'a str,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ToolCallOutcome {
+    Completed,
+    Failed { handler_executed: bool },
+    Blocked,
+    Aborted,
+}
+
 pub struct ToolFinishInput<'a> {
     pub thread_store: &'a ExtensionData,
     pub turn_store: &'a ExtensionData,
     pub tool_name: &'a str,
     pub call_id: &'a str,
+    pub outcome: ToolCallOutcome,
 }
 
 pub trait ToolLifecycleContributor: Send + Sync {

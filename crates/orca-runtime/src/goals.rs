@@ -2,7 +2,11 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex, PoisonError};
 
+use crate::extension::{
+    ExtensionRegistryBuilder, ToolCallOutcome, ToolFinishInput, ToolLifecycleContributor,
+};
 use chrono::Utc;
 use orca_core::goal_types::{
     GoalUpdate, ThreadGoal, ThreadGoalStatus, validate_thread_goal_objective,
@@ -15,6 +19,72 @@ const GOALS_DB_FILENAME: &str = "goals_1.json";
 #[derive(Debug, Clone)]
 pub struct GoalStore {
     path: PathBuf,
+}
+
+#[derive(Debug, Default)]
+pub struct GoalToolProgressState {
+    inner: Mutex<GoalToolProgressInner>,
+}
+
+#[derive(Debug, Default)]
+struct GoalToolProgressInner {
+    completed_tool_attempts: u64,
+    last_turn_id: Option<String>,
+    last_call_id: Option<String>,
+}
+
+impl GoalToolProgressState {
+    pub fn completed_tool_attempts(&self) -> u64 {
+        self.inner().completed_tool_attempts
+    }
+
+    pub fn last_turn_id(&self) -> Option<String> {
+        self.inner().last_turn_id.clone()
+    }
+
+    pub fn last_call_id(&self) -> Option<String> {
+        self.inner().last_call_id.clone()
+    }
+
+    fn record_completed_attempt(&self, turn_id: &str, call_id: &str) {
+        let mut inner = self.inner();
+        inner.completed_tool_attempts = inner.completed_tool_attempts.saturating_add(1);
+        inner.last_turn_id = Some(turn_id.to_string());
+        inner.last_call_id = Some(call_id.to_string());
+    }
+
+    fn inner(&self) -> std::sync::MutexGuard<'_, GoalToolProgressInner> {
+        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+struct GoalToolLifecycleContributor;
+
+impl ToolLifecycleContributor for GoalToolLifecycleContributor {
+    fn on_tool_finish(&self, input: ToolFinishInput<'_>) {
+        if !goal_tool_attempt_counts(input.outcome) || input.tool_name == "update_goal" {
+            return;
+        }
+
+        input
+            .thread_store
+            .get_or_init(GoalToolProgressState::default)
+            .record_completed_attempt(input.turn_store.level_id(), input.call_id);
+    }
+}
+
+pub fn install_goal_tool_lifecycle(builder: &mut ExtensionRegistryBuilder) {
+    builder.tool_lifecycle_contributor(Arc::new(GoalToolLifecycleContributor));
+}
+
+fn goal_tool_attempt_counts(outcome: ToolCallOutcome) -> bool {
+    matches!(
+        outcome,
+        ToolCallOutcome::Completed
+            | ToolCallOutcome::Failed {
+                handler_executed: true
+            }
+    )
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -184,6 +254,9 @@ fn invalid_input(message: String) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::extension::{
+        ExtensionData, ExtensionRegistryBuilder, ToolCallOutcome, ToolFinishInput,
+    };
     use orca_core::goal_types::{GoalUpdate, ThreadGoalStatus};
     use tempfile::tempdir;
 
@@ -290,5 +363,43 @@ mod tests {
             .expect("goal exists");
 
         assert_eq!(updated.status, ThreadGoalStatus::Complete);
+    }
+
+    #[test]
+    fn goal_extension_records_completed_non_goal_tool_attempts() {
+        let mut builder = ExtensionRegistryBuilder::new();
+        install_goal_tool_lifecycle(&mut builder);
+        let registry = builder.build();
+        let thread_store = ExtensionData::new("session-1");
+        let turn_store = ExtensionData::new("turn-1");
+
+        registry.on_tool_finish(ToolFinishInput {
+            thread_store: &thread_store,
+            turn_store: &turn_store,
+            tool_name: "bash",
+            call_id: "call-1",
+            outcome: ToolCallOutcome::Completed,
+        });
+        registry.on_tool_finish(ToolFinishInput {
+            thread_store: &thread_store,
+            turn_store: &turn_store,
+            tool_name: "update_goal",
+            call_id: "call-2",
+            outcome: ToolCallOutcome::Completed,
+        });
+        registry.on_tool_finish(ToolFinishInput {
+            thread_store: &thread_store,
+            turn_store: &turn_store,
+            tool_name: "read_file",
+            call_id: "call-3",
+            outcome: ToolCallOutcome::Blocked,
+        });
+
+        let progress = thread_store
+            .get::<GoalToolProgressState>()
+            .expect("goal progress state");
+        assert_eq!(progress.completed_tool_attempts(), 1);
+        assert_eq!(progress.last_turn_id().as_deref(), Some("turn-1"));
+        assert_eq!(progress.last_call_id().as_deref(), Some("call-1"));
     }
 }

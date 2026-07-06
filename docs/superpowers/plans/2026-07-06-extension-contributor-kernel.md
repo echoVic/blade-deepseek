@@ -78,7 +78,7 @@ Add the contributor adapter and registry invocation helper while keeping existin
 
 - [ ] **Step 4: Run focused tests to verify they pass**
 
-Run: `CARGO_TARGET_DIR=/tmp/blade-deepseek-target-goal-ext cargo test -p orca-runtime goal_extension extension -- --nocapture`
+Run: `CARGO_TARGET_DIR=/tmp/blade-deepseek-target-goal-ext cargo test -p orca-runtime extension -- --nocapture`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**

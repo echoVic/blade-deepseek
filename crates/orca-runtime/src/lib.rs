@@ -70,7 +70,8 @@ pub mod worktree;
 #[cfg(test)]
 mod tests {
     use crate::extension::{
-        ExtensionData, ExtensionRegistryBuilder, ToolFinishInput, ToolLifecycleContributor,
+        ExtensionData, ExtensionRegistryBuilder, ToolCallOutcome, ToolFinishInput,
+        ToolLifecycleContributor,
     };
     use crate::thread_store::{SessionStore, ThreadStore};
     use std::sync::{Arc, Mutex};
@@ -140,6 +141,7 @@ mod tests {
             turn_store: &turn_store,
             tool_name: "bash",
             call_id: "call-1",
+            outcome: ToolCallOutcome::Completed,
         });
 
         assert_eq!(
