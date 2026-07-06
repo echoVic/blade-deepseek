@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.146":
+        "Child-agent loop runner inputs now flow through a grouped ChildAgentLoopContext instead of a long request/cwd/instructions/memory/hooks/cost-tracker argument list. Existing orca_runtime::agent_child re-exports remain available, while loop setup, provider turns, compaction, response folding, tool execution, subagent contracts, workflow child agents, and TUI child-agent delegation behavior stay unchanged.",
       "v0.1.145":
         "Child-agent prompt entrypoint inputs now flow through a grouped ChildAgentPromptContext instead of a long argument list. Existing orca_runtime::agent_child re-exports remain available, while prompt-to-request construction, model override, child cost tracking, subagent contracts, workflow child agents, and TUI child-agent delegation behavior stay unchanged.",
       "v0.1.144":
@@ -318,6 +320,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.146":
+        "Child-agent loop runner 输入现在通过分组的 ChildAgentLoopContext 传递，不再暴露 request/cwd/instructions/memory/hooks/cost-tracker 长参数列表。既有 orca_runtime::agent_child re-export 仍保持可用，loop setup、provider turn、compaction、response folding、tool execution、subagent contract、workflow child agent 与 TUI child-agent delegation 行为保持不变。",
       "v0.1.145":
         "Child-agent prompt entrypoint 输入现在通过分组的 ChildAgentPromptContext 传递，不再暴露长参数列表。既有 orca_runtime::agent_child re-export 仍保持可用，prompt-to-request 构造、model override、child cost tracking、subagent contract、workflow child agent 与 TUI child-agent delegation 行为保持不变。",
       "v0.1.144":
