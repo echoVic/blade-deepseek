@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.144":
+        "Child-agent public entrypoints now live in a focused child_agent_entrypoints module instead of the agent_child facade. Existing orca_runtime::agent_child imports remain available through re-exports, while model override, child cost tracking, prompt-to-request construction, subagent contracts, workflow child agents, and TUI child-agent delegation behavior stay unchanged.",
       "v0.1.143":
         "Child-agent behavior tests now live in a focused child_agent_tests module instead of the agent_child facade. Existing orca_runtime::agent_child imports remain available through re-exports, while child-agent setup, provider turns, response folding, loop running, subagent contracts, and TUI child-agent delegation behavior stay unchanged.",
       "v0.1.142":
@@ -314,6 +316,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.144":
+        "Child-agent public entrypoints 现在移到独立的 child_agent_entrypoints 模块，不再由 agent_child facade 承载。既有 orca_runtime::agent_child 导入仍通过 re-export 保持可用，model override、child cost tracking、prompt-to-request 构造、subagent contract、workflow child agent 与 TUI child-agent delegation 行为保持不变。",
       "v0.1.143":
         "Child-agent behavior tests 现在移到独立的 child_agent_tests 模块，不再由 agent_child facade 承载。既有 orca_runtime::agent_child 导入仍通过 re-export 保持可用，child-agent setup、provider turn、response folding、loop running、subagent contract 与 TUI child-agent delegation 行为保持不变。",
       "v0.1.142":
