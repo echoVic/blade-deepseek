@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.138":
+        "Child-agent loop setup, provider bootstrap, conversation seed, approval policy seed, and child turn-budget state now live in a focused child_agent_loop_setup module. Existing orca_runtime::agent_child imports remain available through re-exports, while child-agent model routing, provider turns, tool folding, subagent contracts, and TUI delegation behavior stay unchanged.",
       "v0.1.137":
         "Runtime approval decisions, approval handlers, and config-backed interactive approval handling now live in a focused runtime_approval module. Existing orca_runtime::lifecycle imports remain available through re-exports, while approval policy resolution and interactive approval behavior stay unchanged.",
       "v0.1.136":
@@ -302,6 +304,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.138":
+        "Child-agent loop setup、provider bootstrap、conversation seed、approval policy seed 与 child turn-budget state 现在移到独立的 child_agent_loop_setup 模块。既有 orca_runtime::agent_child 导入仍通过 re-export 保持可用，child-agent model routing、provider turn、tool folding、subagent contract 与 TUI delegation 行为保持不变。",
       "v0.1.137":
         "Runtime approval decision、approval handler 和基于配置的 interactive approval 处理现在移到独立的 runtime_approval 模块。既有 orca_runtime::lifecycle 导入仍通过 re-export 保持可用，approval policy resolution 与 interactive approval 行为保持不变。",
       "v0.1.136":
