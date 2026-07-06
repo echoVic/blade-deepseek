@@ -2,6 +2,7 @@ pub mod agent_child;
 pub mod agent_common;
 pub mod agent_loop;
 pub mod approval_resolution;
+mod child_agent_loop_setup;
 pub mod compaction;
 pub mod controller;
 pub mod cost;
@@ -815,6 +816,42 @@ mod tests {
         assert!(
             lifecycle_source.contains("pub use crate::runtime_approval::"),
             "lifecycle must preserve existing public imports by re-exporting runtime approval types"
+        );
+    }
+
+    #[test]
+    fn child_agent_loop_setup_boundary_is_owned_by_focused_module() {
+        let lib_source = include_str!("lib.rs");
+        let agent_child_source = include_str!("agent_child.rs");
+        let child_loop_setup_source = std::fs::read_to_string("src/child_agent_loop_setup.rs")
+            .expect("child agent loop setup source");
+
+        assert!(
+            lib_source.contains("mod child_agent_loop_setup;"),
+            "runtime crate must declare a focused child_agent_loop_setup module"
+        );
+
+        for marker in [
+            "pub const DEFAULT_CHILD_AGENT_MAX_TURNS",
+            "pub struct ChildAgentLoopSetup",
+            "pub enum ChildAgentTurnBudget",
+            "pub fn prepare_child_agent_loop",
+            "pub fn advance_child_agent_turn",
+            "pub fn advance_child_agent_turn_with_limit",
+        ] {
+            assert!(
+                child_loop_setup_source.contains(marker),
+                "child_agent_loop_setup must own child loop setup detail {marker}"
+            );
+            assert!(
+                !agent_child_source.contains(marker),
+                "agent_child facade must not own child loop setup detail {marker}"
+            );
+        }
+
+        assert!(
+            agent_child_source.contains("pub use crate::child_agent_loop_setup::"),
+            "agent_child must preserve existing imports by re-exporting child loop setup APIs"
         );
     }
 
