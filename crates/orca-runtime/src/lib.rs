@@ -75,9 +75,21 @@ mod tests {
         ToolLifecycleContributor,
     };
     use crate::goals::GoalToolProgressState;
+    use crate::lifecycle::{
+        RuntimePermissionRequest, RuntimePermissionRequestHandler, RuntimePermissionResponse,
+        TurnPermissionOverlay,
+    };
+    use crate::protocol::{
+        PermissionGrantScope, PermissionResponseDecision, RequestFileSystemPermissions,
+        RequestNetworkPermissions, RequestPermissionProfile,
+    };
     use crate::runtime_directive::{RuntimeDirective, RuntimeDirectiveState};
     use crate::runtime_state::{RuntimeToolFinish, RuntimeTurnReducer};
     use crate::thread_store::{SessionStore, ThreadStore};
+    use orca_core::config::PermissionProfileNetworkAccess;
+    use std::collections::HashMap;
+    use std::io;
+    use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
 
     #[test]
@@ -222,6 +234,107 @@ mod tests {
                 "replace_allowed_tools: skill narrowed tool surface".to_string(),
                 "inject_system_message: skill added runtime instruction".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn runtime_turn_reducer_requests_and_merges_permission_overlay() {
+        struct AllowWithStrictReview;
+
+        impl RuntimePermissionRequestHandler for AllowWithStrictReview {
+            fn request_permissions(
+                &self,
+                request: &RuntimePermissionRequest,
+            ) -> io::Result<RuntimePermissionResponse> {
+                Ok(RuntimePermissionResponse {
+                    decision: PermissionResponseDecision::Allow,
+                    scope: PermissionGrantScope::Turn,
+                    permissions: request.permissions.clone(),
+                    strict_auto_review: true,
+                })
+            }
+        }
+
+        let thread_store = ExtensionData::new("thread-a");
+        let turn_store = ExtensionData::new("turn-1");
+        let reducer = RuntimeTurnReducer::new(&thread_store, &turn_store);
+        let mut overlay = TurnPermissionOverlay::default();
+        let write_root = PathBuf::from("/tmp/orca-write-root");
+        let mut domains = HashMap::new();
+        domains.insert(
+            "api.deepseek.com".to_string(),
+            PermissionProfileNetworkAccess::Allow,
+        );
+
+        let response = reducer
+            .request_permission(
+                &mut overlay,
+                &AllowWithStrictReview,
+                RuntimePermissionRequest {
+                    id: "permission-1".to_string(),
+                    reason: Some("bash needs a write root and network access".to_string()),
+                    permissions: RequestPermissionProfile {
+                        file_system: Some(RequestFileSystemPermissions {
+                            read: None,
+                            write: Some(vec![write_root.clone()]),
+                            entries: None,
+                        }),
+                        network: Some(RequestNetworkPermissions {
+                            enabled: None,
+                            domains,
+                        }),
+                    },
+                },
+            )
+            .expect("permission reducer should delegate to handler");
+
+        assert_eq!(response.decision, PermissionResponseDecision::Allow);
+        assert_eq!(overlay.additional_working_directories(), &[write_root]);
+        assert_eq!(
+            overlay.network_domain_permissions().get("api.deepseek.com"),
+            Some(&PermissionProfileNetworkAccess::Allow)
+        );
+        assert!(overlay.strict_auto_review());
+    }
+
+    #[test]
+    fn runtime_permission_overlay_mutations_route_through_runtime_reducer() {
+        let runtime_state_source = include_str!("runtime_state.rs");
+        let runtime_special_source = include_str!("runtime_special.rs");
+        let runtime_bash_source = include_str!("runtime_bash.rs");
+        let tool_router_source = include_str!("tool_router.rs");
+
+        assert!(
+            runtime_state_source.contains("struct PermissionRuntimeState"),
+            "runtime_state must own the permission reducer branch"
+        );
+        assert!(
+            runtime_state_source.contains("pub fn request_permission("),
+            "RuntimeTurnReducer must expose permission request reduction"
+        );
+        assert!(
+            runtime_state_source.contains("pub fn merge_permission_overlay("),
+            "RuntimeTurnReducer must expose permission overlay merge reduction"
+        );
+
+        for (module_name, source) in [
+            ("runtime_special", runtime_special_source),
+            ("runtime_bash", runtime_bash_source),
+            ("tool_router", tool_router_source),
+        ] {
+            assert!(
+                source.contains("RuntimeTurnReducer::permission()"),
+                "{module_name} must route permission overlay mutation through RuntimeTurnReducer"
+            );
+            assert!(
+                !source.contains(".request_and_merge("),
+                "{module_name} must not request and merge permission overlay directly"
+            );
+        }
+
+        assert!(
+            !tool_router_source.contains("permission_overlay.merge("),
+            "tool_router must not merge permission overlay directly"
         );
     }
 

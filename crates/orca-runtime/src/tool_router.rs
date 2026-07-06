@@ -19,6 +19,7 @@ use crate::lifecycle::{
 use crate::memory::MemoryBlock;
 use crate::runtime_normal_tool::RuntimeNormalToolInvocation;
 use crate::runtime_special::{RuntimeSpecialToolDispatch, RuntimeWorkflowDraftRequest};
+use crate::runtime_state::RuntimeTurnReducer;
 use crate::subagent_execution::execute_subagent_tool;
 use crate::tasks::TaskRegistry;
 use crate::workflow::ipc::WorkflowIpcContext;
@@ -155,7 +156,10 @@ impl<'a> RuntimeToolRouter<'a> {
                     self.runtime
                         .execute_request_permissions_tool(execution_request)
                 };
-                permission_overlay.merge(self.runtime.permission_overlay());
+                RuntimeTurnReducer::permission().merge_permission_overlay(
+                    permission_overlay,
+                    self.runtime.permission_overlay(),
+                );
                 Ok(result)
             }
             RuntimeSpecialToolDispatch::WorkflowIpc => Ok(self.runtime.execute_workflow_ipc_tool(

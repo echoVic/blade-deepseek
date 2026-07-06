@@ -15,6 +15,7 @@ use crate::protocol::{
     PermissionResponseDecision, RequestFileSystemPermissions, RequestNetworkPermissions,
     RequestPermissionProfile,
 };
+use crate::runtime_state::RuntimeTurnReducer;
 use crate::sandbox_denial::{
     SandboxDenialDiagnostic, diagnose_sandbox_denial,
     should_request_filesystem_permission_with_denied_roots,
@@ -129,11 +130,14 @@ pub(crate) fn execute_bash_with_shell_session(
             )),
             permissions,
         };
-        let response =
-            match permission_overlay.request_and_merge(permission_handler, permission_request) {
-                Ok(response) => response,
-                Err(error) => return ToolResult::failed(request, error.to_string(), None),
-            };
+        let response = match RuntimeTurnReducer::permission().request_permission(
+            permission_overlay,
+            permission_handler,
+            permission_request,
+        ) {
+            Ok(response) => response,
+            Err(error) => return ToolResult::failed(request, error.to_string(), None),
+        };
         if response.decision == PermissionResponseDecision::Deny {
             return ToolResult::denied(request, "permission request denied".to_string());
         }
@@ -180,9 +184,11 @@ pub(crate) fn execute_bash_with_shell_session(
                 )),
                 permissions,
             };
-            let response = match permission_overlay
-                .request_and_merge(permission_handler, permission_request)
-            {
+            let response = match RuntimeTurnReducer::permission().request_permission(
+                permission_overlay,
+                permission_handler,
+                permission_request,
+            ) {
                 Ok(response) => response,
                 Err(error) => return ToolResult::failed(request, error.to_string(), None),
             };

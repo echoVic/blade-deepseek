@@ -11,6 +11,7 @@ use crate::lifecycle::{
     RuntimeSubagentStatusLookup, RuntimeToolActorContext, RuntimeUsageTotals, RuntimeWorkflowIpc,
 };
 use crate::protocol::{PermissionGrantScope, PermissionResponseDecision, RequestPermissionProfile};
+use crate::runtime_state::RuntimeTurnReducer;
 use crate::tasks::TaskRegistry;
 use crate::workflow::WorkflowDraftStore;
 
@@ -84,10 +85,11 @@ impl RuntimeToolActorContext {
             reason: args.reason,
             permissions: args.permissions,
         };
-        let response = match self
-            .permission_overlay
-            .request_and_merge(handler, permission_request.clone())
-        {
+        let response = match RuntimeTurnReducer::permission().request_permission(
+            &mut self.permission_overlay,
+            handler,
+            permission_request.clone(),
+        ) {
             Ok(response) => response,
             Err(error) => return ToolResult::failed(request, error.to_string(), None),
         };
