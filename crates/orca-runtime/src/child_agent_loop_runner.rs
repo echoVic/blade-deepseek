@@ -5,7 +5,7 @@ use orca_core::cancel::CancelToken;
 use orca_core::config::RunConfig;
 use orca_core::tool_types::ToolRequest;
 
-use crate::agent_child::run_child_agent_with_executor;
+use crate::child_agent_entrypoints::run_child_agent_with_executor;
 use crate::child_agent_loop_setup::{
     ChildAgentTurnBudget, advance_child_agent_turn, prepare_child_agent_loop,
 };
