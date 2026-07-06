@@ -13,6 +13,9 @@ use orca_mcp::McpRegistry;
 use crate::agent_child::ChildAgentExecutor;
 use crate::agent_common;
 use crate::cost::CostTracker;
+use crate::extension::{
+    ExtensionData, ExtensionRegistry, ToolCallOutcome, ToolFinishInput, ToolStartInput,
+};
 use crate::hooks::{HookOutcome, HookRunner};
 use crate::instructions::ProjectInstructions;
 use crate::lifecycle::{
@@ -48,6 +51,9 @@ pub(crate) struct ToolExecutionContext<'a> {
     workflow_ipc: Option<&'a WorkflowIpcContext>,
     permission_overlay: Option<&'a mut TurnPermissionOverlay>,
     permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
+    extension_registry: Option<&'a ExtensionRegistry>,
+    thread_extensions: Option<&'a ExtensionData>,
+    turn_extensions: Option<&'a ExtensionData>,
 }
 
 pub(crate) struct ToolApprovalGateContext<'a, W: io::Write> {
@@ -92,6 +98,9 @@ impl<'a> ToolExecutionContext<'a> {
             workflow_ipc: None,
             permission_overlay: None,
             permission_handler: None,
+            extension_registry: None,
+            thread_extensions: None,
+            turn_extensions: None,
         }
     }
 
@@ -122,6 +131,18 @@ impl<'a> ToolExecutionContext<'a> {
         permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
     ) -> Self {
         self.permission_handler = permission_handler;
+        self
+    }
+
+    pub(crate) fn with_extensions(
+        mut self,
+        extension_registry: &'a ExtensionRegistry,
+        thread_extensions: &'a ExtensionData,
+        turn_extensions: &'a ExtensionData,
+    ) -> Self {
+        self.extension_registry = Some(extension_registry);
+        self.thread_extensions = Some(thread_extensions);
+        self.turn_extensions = Some(turn_extensions);
         self
     }
 
@@ -304,6 +325,9 @@ impl ToolExecutionActor {
             workflow_ipc,
             permission_overlay,
             permission_handler,
+            extension_registry,
+            thread_extensions,
+            turn_extensions,
         } = context;
         let instructions = instructions.expect("tool execution instructions");
         let memory = memory.expect("tool execution memory");
@@ -361,8 +385,18 @@ impl ToolExecutionActor {
             Err(outcome) => return Ok(outcome),
         };
         let execution_request = &invocation.effective;
+        if let (Some(registry), Some(thread_store), Some(turn_store)) =
+            (extension_registry, thread_extensions, turn_extensions)
+        {
+            registry.on_tool_start(ToolStartInput {
+                thread_store,
+                turn_store,
+                tool_name: execution_request.name.as_str(),
+                call_id: &execution_request.id,
+            });
+        }
         let result =
-            RuntimeToolRouter::new(&mut self.runtime).dispatch(RuntimeToolInvocationContext {
+            match RuntimeToolRouter::new(&mut self.runtime).dispatch(RuntimeToolInvocationContext {
                 config,
                 cwd,
                 events,
@@ -383,7 +417,34 @@ impl ToolExecutionActor {
                 permission_handler,
                 child_executor,
                 workflow_child_executor,
-            })?;
+            }) {
+                Ok(result) => result,
+                Err(error) => {
+                    if let (Some(registry), Some(thread_store), Some(turn_store)) =
+                        (extension_registry, thread_extensions, turn_extensions)
+                    {
+                        registry.on_tool_finish(ToolFinishInput {
+                            thread_store,
+                            turn_store,
+                            tool_name: execution_request.name.as_str(),
+                            call_id: &execution_request.id,
+                            outcome: ToolCallOutcome::Aborted,
+                        });
+                    }
+                    return Err(error);
+                }
+            };
+        if let (Some(registry), Some(thread_store), Some(turn_store)) =
+            (extension_registry, thread_extensions, turn_extensions)
+        {
+            registry.on_tool_finish(ToolFinishInput {
+                thread_store,
+                turn_store,
+                tool_name: execution_request.name.as_str(),
+                call_id: &execution_request.id,
+                outcome: tool_call_outcome_for_result(&result),
+            });
+        }
         self.finish_tool_result(
             events,
             sink,
@@ -548,6 +609,19 @@ impl ToolExecutionActor {
     }
 }
 
+fn tool_call_outcome_for_result(result: &tool_types::ToolResult) -> ToolCallOutcome {
+    match result.status {
+        tool_types::ToolStatus::Completed => ToolCallOutcome::Completed,
+        tool_types::ToolStatus::Failed => ToolCallOutcome::Failed {
+            handler_executed: true,
+        },
+        tool_types::ToolStatus::NotImplemented => ToolCallOutcome::Failed {
+            handler_executed: false,
+        },
+        tool_types::ToolStatus::Denied => ToolCallOutcome::Blocked,
+    }
+}
+
 fn emit_tool_call_requested(
     events: &mut EventFactory,
     sink: &mut EventSink<impl io::Write>,
@@ -569,6 +643,9 @@ fn emit_tool_call_completed(
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+    use std::sync::{Arc, Mutex};
+
     use orca_core::approval_rules::{PermissionRule, PermissionRules};
     use orca_core::approval_types::{
         ActionKind, ApprovalDecision, ApprovalMode, ApprovalRequest, Decision,
@@ -577,10 +654,25 @@ mod tests {
         HistoryMode, ModelRuntimeConfig, OutputFormat, ProviderKind, RunConfig, ThemeName,
         ToolConfig, WorkflowConfig,
     };
+    use orca_core::event_schema::{EventFactory, RunStatus};
+    use orca_core::event_sink::EventSink;
     use orca_core::model::ModelSelection;
     use orca_core::subagent_config::SubagentConfig;
+    use orca_core::tool_types::{ToolName, ToolRequest, ToolStatus};
+    use orca_mcp::McpRegistry;
 
-    use super::policy_for_tool_execution;
+    use super::{ToolExecutionActor, ToolExecutionContext, policy_for_tool_execution};
+    use crate::agent_child::{ChildAgentRequest, ChildAgentResult, ChildAgentRuntime};
+    use crate::cost::CostTracker;
+    use crate::extension::{
+        ExtensionData, ExtensionRegistryBuilder, ToolFinishInput, ToolLifecycleContributor,
+        ToolStartInput,
+    };
+    use crate::hooks::HookRunner;
+    use crate::instructions::ProjectInstructions;
+    use crate::lifecycle::TurnPermissionOverlay;
+    use crate::memory::MemoryBlock;
+    use crate::tasks::TaskRegistry;
 
     fn config_with_permission_rules(permission_rules: PermissionRules) -> RunConfig {
         RunConfig {
@@ -618,6 +710,15 @@ mod tests {
         }
     }
 
+    fn unused_child_executor<W: io::Write>(
+        _config: &RunConfig,
+        _request: &ChildAgentRequest,
+        _runtime: &mut ChildAgentRuntime<'_, W>,
+        _child_cost_tracker: &mut CostTracker,
+    ) -> io::Result<ChildAgentResult> {
+        panic!("read_file tool execution must not execute child agents")
+    }
+
     #[test]
     fn policy_for_tool_execution_preserves_config_permission_rules() {
         let config = config_with_permission_rules(PermissionRules {
@@ -637,5 +738,100 @@ mod tests {
 
         assert_eq!(resolution.decision, ApprovalDecision::Deny);
         assert!(resolution.reason.contains("permission deny rule"));
+    }
+
+    #[test]
+    fn tool_execution_notifies_extension_lifecycle_for_completed_tool() {
+        #[derive(Debug)]
+        struct RecordingContributor {
+            events: Arc<Mutex<Vec<String>>>,
+        }
+
+        impl ToolLifecycleContributor for RecordingContributor {
+            fn on_tool_start(&self, input: ToolStartInput<'_>) {
+                self.events.lock().unwrap().push(format!(
+                    "start:{}:{}:{}",
+                    input.thread_store.level_id(),
+                    input.turn_store.level_id(),
+                    input.call_id
+                ));
+            }
+
+            fn on_tool_finish(&self, input: ToolFinishInput<'_>) {
+                self.events.lock().unwrap().push(format!(
+                    "finish:{}:{}:{}:{:?}",
+                    input.thread_store.level_id(),
+                    input.turn_store.level_id(),
+                    input.call_id,
+                    input.outcome
+                ));
+            }
+        }
+
+        let cwd = tempfile::tempdir().expect("cwd");
+        std::fs::write(cwd.path().join("tracked.txt"), "hello\n").expect("write file");
+        let mut config = config_with_permission_rules(PermissionRules::default());
+        config.approval_mode = ApprovalMode::FullAuto;
+        let mut events = EventFactory::new("extension-tool-execution".to_string());
+        let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+        let request = ToolRequest {
+            id: "read-file".to_string(),
+            name: ToolName::ReadFile,
+            action: ActionKind::Read,
+            target: Some("tracked.txt".to_string()),
+            raw_arguments: Some(serde_json::json!({ "path": "tracked.txt" }).to_string()),
+        };
+        let policy = policy_for_tool_execution(&config);
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let registry = McpRegistry::default();
+        let hooks = HookRunner::default();
+        let mut cost_tracker = CostTracker::new(None);
+        let cancel = orca_core::cancel::CancelToken::new();
+        let task_registry = TaskRegistry::new("extension-tool-execution".to_string());
+        let mut background_workflows = Vec::new();
+        let mut permission_overlay = TurnPermissionOverlay::default();
+        let lifecycle_events = Arc::new(Mutex::new(Vec::new()));
+        let mut extension_builder = ExtensionRegistryBuilder::new();
+        extension_builder.tool_lifecycle_contributor(Arc::new(RecordingContributor {
+            events: Arc::clone(&lifecycle_events),
+        }));
+        let extension_registry = Arc::new(extension_builder.build());
+        let thread_store = Arc::new(ExtensionData::new("thread-1"));
+        let turn_store = Arc::new(ExtensionData::new("turn-1"));
+        let context = ToolExecutionContext::new(cwd.path(), 0, true, &policy)
+            .with_services(&instructions, &memory, &registry, &hooks)
+            .with_runtime(
+                &mut cost_tracker,
+                &cancel,
+                &task_registry,
+                &mut background_workflows,
+                None,
+            )
+            .with_permission_overlay(&mut permission_overlay)
+            .with_extensions(&extension_registry, &thread_store, &turn_store);
+
+        let mut actor = ToolExecutionActor::new(events.run_id().to_string(), 128);
+        let (status, result) = actor
+            .execute(
+                &config,
+                &mut events,
+                &mut sink,
+                &request,
+                context,
+                unused_child_executor,
+                unused_child_executor,
+            )
+            .expect("execute read_file");
+
+        assert_eq!(status, RunStatus::Success);
+        assert_eq!(result.status, ToolStatus::Completed);
+        assert_eq!(
+            lifecycle_events.lock().unwrap().as_slice(),
+            [
+                "start:thread-1:turn-1:read-file",
+                "finish:thread-1:turn-1:read-file:Completed"
+            ]
+        );
     }
 }
