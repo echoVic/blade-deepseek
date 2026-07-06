@@ -37,10 +37,6 @@ impl<'a> RuntimeTurnReducer<'a> {
         }
     }
 
-    pub fn permission() -> PermissionRuntimeState {
-        PermissionRuntimeState
-    }
-
     pub fn apply_directive(
         &self,
         directive_state: &mut RuntimeDirectiveState,

@@ -85,7 +85,8 @@ impl RuntimeToolActorContext {
             reason: args.reason,
             permissions: args.permissions,
         };
-        let response = match RuntimeTurnReducer::permission().request_permission(
+        let reducer = RuntimeTurnReducer::new(&self.thread_extensions, &self.turn_extensions);
+        let response = match reducer.request_permission(
             &mut self.permission_overlay,
             handler,
             permission_request.clone(),

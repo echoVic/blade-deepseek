@@ -415,6 +415,8 @@ impl ToolExecutionActor {
                 workflow_ipc,
                 permission_overlay,
                 permission_handler,
+                thread_extensions,
+                turn_extensions,
                 child_executor,
                 workflow_child_executor,
             }) {

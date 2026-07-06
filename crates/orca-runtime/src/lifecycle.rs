@@ -593,6 +593,8 @@ impl<'a> RuntimeTaskActor<'a> {
             task_registry,
             cancel,
             permission_handler,
+            thread_extensions: None,
+            turn_extensions: None,
         })
     }
 

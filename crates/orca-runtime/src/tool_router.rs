@@ -10,6 +10,7 @@ use orca_mcp::McpRegistry;
 
 use crate::agent_child::ChildAgentExecutor;
 use crate::cost::CostTracker;
+use crate::extension::ExtensionData;
 use crate::hooks::HookRunner;
 use crate::instructions::ProjectInstructions;
 use crate::lifecycle::{
@@ -47,6 +48,8 @@ pub(crate) struct RuntimeToolInvocationContext<'a, W: io::Write> {
     pub(crate) workflow_ipc: Option<&'a WorkflowIpcContext>,
     pub(crate) permission_overlay: &'a mut TurnPermissionOverlay,
     pub(crate) permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
+    pub(crate) thread_extensions: Option<&'a ExtensionData>,
+    pub(crate) turn_extensions: Option<&'a ExtensionData>,
     pub(crate) child_executor: ChildAgentExecutor<W>,
     pub(crate) workflow_child_executor: ChildAgentExecutor<SharedEventBuffer>,
 }
@@ -83,6 +86,8 @@ impl<'a> RuntimeToolRouter<'a> {
             workflow_ipc,
             permission_overlay,
             permission_handler,
+            thread_extensions,
+            turn_extensions,
             child_executor,
             workflow_child_executor,
         } = context;
@@ -156,7 +161,16 @@ impl<'a> RuntimeToolRouter<'a> {
                     self.runtime
                         .execute_request_permissions_tool(execution_request)
                 };
-                RuntimeTurnReducer::permission().merge_permission_overlay(
+                let reducer = match (thread_extensions, turn_extensions) {
+                    (Some(thread_extensions), Some(turn_extensions)) => {
+                        RuntimeTurnReducer::new(thread_extensions, turn_extensions)
+                    }
+                    _ => RuntimeTurnReducer::new(
+                        &self.runtime.thread_extensions,
+                        &self.runtime.turn_extensions,
+                    ),
+                };
+                reducer.merge_permission_overlay(
                     permission_overlay,
                     self.runtime.permission_overlay(),
                 );
@@ -193,6 +207,8 @@ impl<'a> RuntimeToolRouter<'a> {
                         cancel: Some(cancel),
                         permission_handler: permission_handler
                             .map(|handler| handler as &dyn RuntimePermissionRequestHandler),
+                        thread_extensions,
+                        turn_extensions,
                     }))
             }
         }

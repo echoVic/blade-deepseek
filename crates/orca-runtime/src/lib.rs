@@ -309,6 +309,10 @@ mod tests {
             "runtime_state must own the permission reducer branch"
         );
         assert!(
+            !runtime_state_source.contains("pub fn permission()"),
+            "permission reduction must be owned by RuntimeTurnReducer instances"
+        );
+        assert!(
             runtime_state_source.contains("pub fn request_permission("),
             "RuntimeTurnReducer must expose permission request reduction"
         );
@@ -323,8 +327,12 @@ mod tests {
             ("tool_router", tool_router_source),
         ] {
             assert!(
-                source.contains("RuntimeTurnReducer::permission()"),
-                "{module_name} must route permission overlay mutation through RuntimeTurnReducer"
+                source.contains("RuntimeTurnReducer::new("),
+                "{module_name} must create a RuntimeTurnReducer instance for permission overlay mutation"
+            );
+            assert!(
+                !source.contains("RuntimeTurnReducer::permission()"),
+                "{module_name} must not bypass RuntimeTurnReducer instance state for permission overlay mutation"
             );
             assert!(
                 !source.contains(".request_and_merge("),

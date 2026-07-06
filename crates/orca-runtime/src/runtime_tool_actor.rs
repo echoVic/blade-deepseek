@@ -9,6 +9,7 @@ use orca_core::external_config::ExternalToolConfig;
 use orca_core::tool_types::{ToolOutputTruncation, ToolRequest, ToolResult};
 use orca_mcp::McpRegistry;
 
+use crate::extension::ExtensionData;
 use crate::lifecycle::{
     RuntimeApprovalDecision, RuntimeApprovalHandler, RuntimePermissionRequestHandler,
     RuntimeSessionLifecycle, RuntimeTaskActor, RuntimeTaskKind, RuntimeTaskLifecycle,
@@ -23,16 +24,23 @@ pub struct RuntimeToolActorContext {
     lifecycle: RuntimeSessionLifecycle,
     max_turns: u32,
     pub(crate) permission_overlay: TurnPermissionOverlay,
+    pub(crate) thread_extensions: ExtensionData,
+    pub(crate) turn_extensions: ExtensionData,
 }
 
 impl RuntimeToolActorContext {
     pub fn new(run_id: impl Into<String>, max_turns: u32) -> Self {
+        let run_id = run_id.into();
+        let thread_extension_id = run_id.clone();
+        let turn_extension_id = format!("{run_id}:tool-actor");
         let mut lifecycle = RuntimeSessionLifecycle::new(run_id);
         lifecycle.start_task(RuntimeTaskKind::Agent);
         Self {
             lifecycle,
             max_turns,
             permission_overlay: TurnPermissionOverlay::default(),
+            thread_extensions: ExtensionData::new(thread_extension_id),
+            turn_extensions: ExtensionData::new(turn_extension_id),
         }
     }
 
@@ -195,6 +203,8 @@ impl RuntimeToolActorContext {
             task_registry,
             cancel,
             permission_handler,
+            thread_extensions: None,
+            turn_extensions: None,
         })
     }
 
@@ -202,6 +212,11 @@ impl RuntimeToolActorContext {
         &mut self,
         invocation: RuntimeNormalToolInvocation<'_>,
     ) -> ToolResult {
+        let thread_extensions = invocation
+            .thread_extensions
+            .unwrap_or(&self.thread_extensions);
+        let turn_extensions = invocation.turn_extensions.unwrap_or(&self.turn_extensions);
+        let invocation = invocation.with_extension_stores(thread_extensions, turn_extensions);
         execute_runtime_normal_tool_invocation(invocation, Some(&mut self.permission_overlay))
     }
 
