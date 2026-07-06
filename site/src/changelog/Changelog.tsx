@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.152":
+        "RuntimeTurnState now owns the default extension registry plus thread and turn extension stores, installs the goal tool lifecycle contributor, and threads that state through the provider/tool turn path into normal tool execution. Goal progress can now observe real normal-tool completions from the live runtime path without changing CLI, TUI, server, JSONL, or goal storage behavior.",
       "v0.1.151":
         "ToolExecutionContext can now carry an extension registry plus thread and turn extension stores, and ToolExecutionActor notifies lifecycle contributors around normal tool execution. This makes completed, blocked, aborted, and not-implemented tool outcomes visible at the extension boundary without changing CLI, TUI, server, or JSONL wire behavior.",
       "v0.1.150":
@@ -330,6 +332,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.152":
+        "RuntimeTurnState 现在拥有默认 extension registry 以及 thread/turn extension store，并会安装 goal tool lifecycle contributor，再沿 provider/tool turn path 传入 normal tool execution。Goal progress 现在可以从真实 runtime 路径观察 normal-tool completion，同时不改变 CLI、TUI、server、JSONL 或 goal storage 行为。",
       "v0.1.151":
         "ToolExecutionContext 现在可以携带 extension registry 以及 thread/turn extension store，ToolExecutionActor 会在 normal tool execution 前后通知 lifecycle contributor。Completed、blocked、aborted 与 not-implemented outcome 已经能进入 extension boundary，同时不改变 CLI、TUI、server 或 JSONL wire 行为。",
       "v0.1.150":

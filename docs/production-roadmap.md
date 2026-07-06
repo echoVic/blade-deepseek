@@ -4,13 +4,14 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-07-06
-Current baseline: v0.1.151 wires the Codex-inspired extension contributor
-kernel into normal tool execution: `ToolExecutionContext` can carry an
-extension registry plus thread/turn extension stores, and `ToolExecutionActor`
-notifies lifecycle contributors for completed, blocked, aborted, and
-not-implemented outcomes while preserving CLI, TUI, app-server, goal storage,
-and wire behavior. Earlier v0.1.150 work seeded typed per-scope
-`ExtensionData`, ordered tool lifecycle contributors, and the goal
+Current baseline: v0.1.152 installs the Codex-inspired extension contributor
+kernel inside runtime turn state and threads the registry plus thread/turn
+extension stores through the provider/tool turn path into normal tool
+execution. Goal tool progress now observes real normal-tool completions from
+the live runtime path while preserving CLI, TUI, app-server, goal storage, and
+wire behavior. Earlier v0.1.151 work taught `ToolExecutionActor` to notify
+extension contributors around normal tool execution, and v0.1.150 seeded typed
+per-scope `ExtensionData`, ordered lifecycle contributors, and the first goal
 tool-progress contributor.
 
 ---
