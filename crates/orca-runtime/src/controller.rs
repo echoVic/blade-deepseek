@@ -18,6 +18,7 @@ use crate::agent_common;
 use crate::agent_loop::run_agent_loop;
 #[cfg(test)]
 use crate::cost::CostTracker;
+use crate::extension::ExtensionData;
 use crate::hooks::HookContext;
 #[cfg(test)]
 use crate::hooks::HookRunner;
@@ -72,6 +73,8 @@ pub struct ThreadTurnExecutor<'a> {
     config: &'a RunConfig,
     session: &'a mut InteractiveSession,
     lifecycle: &'a mut RuntimeSessionLifecycle,
+    thread_extensions: Option<Arc<ExtensionData>>,
+    turn_extension_id: Option<String>,
 }
 
 pub struct ThreadTurnContext<'a> {
@@ -106,6 +109,24 @@ impl<'a> ThreadTurnExecutor<'a> {
             config,
             session,
             lifecycle,
+            thread_extensions: None,
+            turn_extension_id: None,
+        }
+    }
+
+    pub(crate) fn new_with_thread_extensions(
+        config: &'a RunConfig,
+        session: &'a mut InteractiveSession,
+        lifecycle: &'a mut RuntimeSessionLifecycle,
+        thread_extensions: Arc<ExtensionData>,
+        turn_extension_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            config,
+            session,
+            lifecycle,
+            thread_extensions: Some(thread_extensions),
+            turn_extension_id: Some(turn_extension_id.into()),
         }
     }
 
@@ -134,6 +155,8 @@ impl<'a> ThreadTurnExecutor<'a> {
             request,
             writer,
             cancel,
+            self.thread_extensions.clone(),
+            self.turn_extension_id.clone(),
         )
     }
 
@@ -151,6 +174,8 @@ impl<'a> ThreadTurnExecutor<'a> {
             writer,
             CancelToken::new(),
             Some(events),
+            self.thread_extensions.clone(),
+            self.turn_extension_id.clone(),
         )
     }
 }
@@ -426,6 +451,8 @@ pub fn run_thread_turn_to_writer_with_cancel<W: io::Write>(
         &ThreadTurnRequest::new(prompt).with_options(options),
         writer,
         cancel,
+        None,
+        None,
     )
 }
 
@@ -436,8 +463,20 @@ fn run_thread_turn_inner<W: io::Write>(
     request: &ThreadTurnRequest,
     writer: W,
     cancel: CancelToken,
+    thread_extensions: Option<Arc<ExtensionData>>,
+    turn_extension_id: Option<String>,
 ) -> io::Result<RunStatus> {
-    run_thread_turn_inner_with_events(config, session, lifecycle, request, writer, cancel, None)
+    run_thread_turn_inner_with_events(
+        config,
+        session,
+        lifecycle,
+        request,
+        writer,
+        cancel,
+        None,
+        thread_extensions,
+        turn_extension_id,
+    )
 }
 
 fn run_thread_turn_inner_with_events<W: io::Write>(
@@ -448,6 +487,8 @@ fn run_thread_turn_inner_with_events<W: io::Write>(
     writer: W,
     cancel: CancelToken,
     events: Option<&mut EventFactory>,
+    thread_extensions: Option<Arc<ExtensionData>>,
+    turn_extension_id: Option<String>,
 ) -> io::Result<RunStatus> {
     let context = ThreadTurnContext::prepare(config, session, request)?;
     let ThreadTurnContext { cwd, prompt, parts } = context;
@@ -456,16 +497,29 @@ fn run_thread_turn_inner_with_events<W: io::Write>(
         let mut sink = EventSink::new(writer, config.output_format);
         let cancel_ref = cancel;
         let mut background_workflows = Vec::new();
+        let loop_context = AgentLoopContext::new(&cwd, &prompt, 0, true, &SubagentType::General)
+            .with_services(
+                parts.instructions,
+                parts.memory,
+                parts.mcp_registry,
+                parts.hooks,
+            );
+        let loop_context = if let (Some(thread_extensions), Some(turn_extension_id)) =
+            (thread_extensions.clone(), turn_extension_id.clone())
+        {
+            loop_context.with_runtime_thread_extensions(
+                parts.cost_tracker,
+                &cancel_ref,
+                parts.task_registry,
+                thread_extensions,
+                turn_extension_id,
+            )
+        } else {
+            loop_context.with_runtime(parts.cost_tracker, &cancel_ref, parts.task_registry)
+        };
         let result = run_agent_loop(
             config,
-            AgentLoopContext::new(&cwd, &prompt, 0, true, &SubagentType::General)
-                .with_services(
-                    parts.instructions,
-                    parts.memory,
-                    parts.mcp_registry,
-                    parts.hooks,
-                )
-                .with_runtime(parts.cost_tracker, &cancel_ref, parts.task_registry)
+            loop_context
                 .with_execution(&mut background_workflows, None, Some(lifecycle))
                 .with_steer_handle(request.steer_handle())
                 .with_permission_handler(request.permission_handler()),
@@ -494,16 +548,29 @@ fn run_thread_turn_inner_with_events<W: io::Write>(
 
     let mut execution =
         ThreadTurnExecution::new_with_cancel(lifecycle, writer, config.output_format, cancel);
+    let loop_context = AgentLoopContext::new(&cwd, &prompt, 0, true, &SubagentType::General)
+        .with_services(
+            parts.instructions,
+            parts.memory,
+            parts.mcp_registry,
+            parts.hooks,
+        );
+    let loop_context = if let (Some(thread_extensions), Some(turn_extension_id)) =
+        (thread_extensions, turn_extension_id)
+    {
+        loop_context.with_runtime_thread_extensions(
+            parts.cost_tracker,
+            &execution.cancel,
+            parts.task_registry,
+            thread_extensions,
+            turn_extension_id,
+        )
+    } else {
+        loop_context.with_runtime(parts.cost_tracker, &execution.cancel, parts.task_registry)
+    };
     let result = run_agent_loop(
         config,
-        AgentLoopContext::new(&cwd, &prompt, 0, true, &SubagentType::General)
-            .with_services(
-                parts.instructions,
-                parts.memory,
-                parts.mcp_registry,
-                parts.hooks,
-            )
-            .with_runtime(parts.cost_tracker, &execution.cancel, parts.task_registry)
+        loop_context
             .with_execution(&mut execution.background_workflows, None, Some(lifecycle))
             .with_steer_handle(request.steer_handle())
             .with_permission_handler(request.permission_handler()),

@@ -122,7 +122,7 @@ pub(crate) struct RuntimeTurnState<'a> {
     pub(crate) task_registry: &'a TaskRegistry,
     pub(crate) directive_state: RuntimeDirectiveState,
     pub(crate) extension_registry: ExtensionRegistry,
-    pub(crate) thread_extensions: ExtensionData,
+    pub(crate) thread_extensions: Arc<ExtensionData>,
     pub(crate) turn_extensions: ExtensionData,
 }
 
@@ -729,6 +729,24 @@ impl<'a> AgentLoopContext<'a> {
         self
     }
 
+    pub(crate) fn with_runtime_thread_extensions(
+        mut self,
+        cost_tracker: &'a mut CostTracker,
+        cancel: &'a CancelToken,
+        task_registry: &'a TaskRegistry,
+        thread_extensions: Arc<ExtensionData>,
+        turn_extension_id: impl Into<String>,
+    ) -> Self {
+        self.turn_state = Some(RuntimeTurnState::new_with_thread_extensions(
+            cost_tracker,
+            cancel,
+            task_registry,
+            thread_extensions,
+            turn_extension_id,
+        ));
+        self
+    }
+
     #[cfg(test)]
     pub(crate) fn turn_state(&self) -> &RuntimeTurnState<'a> {
         self.turn_state.as_ref().expect("agent loop turn state")
@@ -884,6 +902,22 @@ impl<'a> RuntimeTurnState<'a> {
         cancel: &'a CancelToken,
         task_registry: &'a TaskRegistry,
     ) -> Self {
+        Self::new_with_thread_extensions(
+            cost_tracker,
+            cancel,
+            task_registry,
+            Arc::new(ExtensionData::new(task_registry.session_id())),
+            task_registry.session_id(),
+        )
+    }
+
+    pub(crate) fn new_with_thread_extensions(
+        cost_tracker: &'a mut CostTracker,
+        cancel: &'a CancelToken,
+        task_registry: &'a TaskRegistry,
+        thread_extensions: Arc<ExtensionData>,
+        turn_extension_id: impl Into<String>,
+    ) -> Self {
         let mut extension_builder = ExtensionRegistryBuilder::new();
         install_goal_tool_lifecycle(&mut extension_builder);
         Self {
@@ -892,8 +926,8 @@ impl<'a> RuntimeTurnState<'a> {
             task_registry,
             directive_state: RuntimeDirectiveState::default(),
             extension_registry: extension_builder.build(),
-            thread_extensions: ExtensionData::new(task_registry.session_id()),
-            turn_extensions: ExtensionData::new(task_registry.session_id()),
+            thread_extensions,
+            turn_extensions: ExtensionData::new(turn_extension_id),
         }
     }
 
@@ -924,7 +958,7 @@ impl<'a> RuntimeTurnState<'a> {
 
     #[cfg(test)]
     pub(crate) fn thread_extensions(&self) -> &ExtensionData {
-        &self.thread_extensions
+        self.thread_extensions.as_ref()
     }
 
     #[cfg(test)]

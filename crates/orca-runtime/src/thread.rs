@@ -1,10 +1,12 @@
 use std::io;
+use std::sync::Arc;
 
 use orca_core::cancel::CancelToken;
 use orca_core::config::RunConfig;
 use orca_core::event_schema::{EventFactory, RunStatus};
 
 use crate::controller::{ControllerRunOptions, ThreadTurnExecutor, ThreadTurnRequest};
+use crate::extension::ExtensionData;
 use crate::lifecycle::{RuntimeSessionLifecycle, RuntimeTaskKind};
 use crate::session::{InteractiveSession, new_run_id};
 use crate::thread_store::SessionTranscript;
@@ -13,6 +15,8 @@ pub struct RuntimeThread {
     thread_id: String,
     session: InteractiveSession,
     lifecycle: RuntimeSessionLifecycle,
+    thread_extensions: Arc<ExtensionData>,
+    next_extension_turn: u64,
 }
 
 impl RuntimeThread {
@@ -47,9 +51,11 @@ impl RuntimeThread {
         lifecycle.start_task(RuntimeTaskKind::Agent);
 
         Self {
+            thread_extensions: Arc::new(ExtensionData::new(thread_id.clone())),
             thread_id,
             session,
             lifecycle,
+            next_extension_turn: 0,
         }
     }
 
@@ -73,6 +79,14 @@ impl RuntimeThread {
         &mut self.lifecycle
     }
 
+    pub fn thread_extensions(&self) -> &ExtensionData {
+        self.thread_extensions.as_ref()
+    }
+
+    pub(crate) fn thread_extensions_handle(&self) -> Arc<ExtensionData> {
+        Arc::clone(&self.thread_extensions)
+    }
+
     pub fn run_turn_to_writer<W: io::Write>(
         &mut self,
         config: &RunConfig,
@@ -93,8 +107,16 @@ impl RuntimeThread {
         request: &ThreadTurnRequest,
         writer: W,
     ) -> io::Result<RunStatus> {
-        ThreadTurnExecutor::new(config, &mut self.session, &mut self.lifecycle)
-            .run_request(request, writer)
+        let thread_extensions = self.thread_extensions_handle();
+        let turn_extension_id = self.next_turn_extension_id();
+        ThreadTurnExecutor::new_with_thread_extensions(
+            config,
+            &mut self.session,
+            &mut self.lifecycle,
+            thread_extensions,
+            turn_extension_id,
+        )
+        .run_request(request, writer)
     }
 
     pub fn run_request_with_cancel<W: io::Write>(
@@ -104,8 +126,16 @@ impl RuntimeThread {
         writer: W,
         cancel: CancelToken,
     ) -> io::Result<RunStatus> {
-        ThreadTurnExecutor::new(config, &mut self.session, &mut self.lifecycle)
-            .run_request_with_cancel(request, writer, cancel)
+        let thread_extensions = self.thread_extensions_handle();
+        let turn_extension_id = self.next_turn_extension_id();
+        ThreadTurnExecutor::new_with_thread_extensions(
+            config,
+            &mut self.session,
+            &mut self.lifecycle,
+            thread_extensions,
+            turn_extension_id,
+        )
+        .run_request_with_cancel(request, writer, cancel)
     }
 
     pub fn run_request_with_event_factory<W: io::Write>(
@@ -115,15 +145,32 @@ impl RuntimeThread {
         writer: W,
         events: &mut EventFactory,
     ) -> io::Result<RunStatus> {
-        ThreadTurnExecutor::new(config, &mut self.session, &mut self.lifecycle)
-            .run_request_with_event_factory(request, writer, events)
+        let thread_extensions = self.thread_extensions_handle();
+        let turn_extension_id = self.next_turn_extension_id();
+        ThreadTurnExecutor::new_with_thread_extensions(
+            config,
+            &mut self.session,
+            &mut self.lifecycle,
+            thread_extensions,
+            turn_extension_id,
+        )
+        .run_request_with_event_factory(request, writer, events)
+    }
+
+    fn next_turn_extension_id(&mut self) -> String {
+        self.next_extension_turn = self.next_extension_turn.saturating_add(1);
+        format!("{}:turn-{}", self.thread_id, self.next_extension_turn)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cost::CostTracker;
+    use crate::lifecycle::RuntimeTurnState;
+    use crate::tasks::TaskRegistry;
     use orca_core::approval_types::ApprovalMode;
+    use orca_core::cancel::CancelToken;
     use orca_core::config::{
         HistoryMode, ModelRuntimeConfig, OutputFormat, ProviderKind, RunConfig, ThemeName,
         ToolConfig, WorkflowConfig,
@@ -199,5 +246,89 @@ mod tests {
             .as_deref()
             .unwrap_or_default();
         assert!(skill_context.contains("thread skill marker"));
+    }
+
+    #[derive(Debug)]
+    struct ThreadExtensionMarker(&'static str);
+
+    #[derive(Debug)]
+    struct TurnExtensionMarker(&'static str);
+
+    #[test]
+    fn runtime_thread_reuses_thread_extensions_across_turn_states() {
+        let cwd = tempfile::tempdir().unwrap();
+        let config = test_config(cwd.path().to_path_buf());
+        let mut thread = RuntimeThread::start(&config, "inspect repo").unwrap();
+        let cancel = CancelToken::new();
+        let task_registry = TaskRegistry::new(thread.thread_id().to_string());
+        let first_turn_id = thread.next_turn_extension_id();
+        let second_turn_id = thread.next_turn_extension_id();
+
+        assert_eq!(thread.thread_extensions().level_id(), thread.thread_id());
+        assert_eq!(first_turn_id, format!("{}:turn-1", thread.thread_id()));
+        assert_eq!(second_turn_id, format!("{}:turn-2", thread.thread_id()));
+        thread
+            .thread_extensions()
+            .insert(ThreadExtensionMarker("thread-scoped"));
+
+        {
+            let mut cost_tracker = CostTracker::new(None);
+            let first_turn_state = RuntimeTurnState::new_with_thread_extensions(
+                &mut cost_tracker,
+                &cancel,
+                &task_registry,
+                thread.thread_extensions_handle(),
+                first_turn_id,
+            );
+
+            first_turn_state
+                .turn_extensions()
+                .insert(TurnExtensionMarker("turn-scoped"));
+            assert_eq!(
+                first_turn_state
+                    .thread_extensions()
+                    .get::<ThreadExtensionMarker>()
+                    .expect("thread marker should persist")
+                    .0,
+                "thread-scoped"
+            );
+            assert_eq!(
+                first_turn_state
+                    .turn_extensions()
+                    .get::<TurnExtensionMarker>()
+                    .expect("turn marker should exist in first turn")
+                    .0,
+                "turn-scoped"
+            );
+        }
+
+        let mut cost_tracker = CostTracker::new(None);
+        let second_turn_state = RuntimeTurnState::new_with_thread_extensions(
+            &mut cost_tracker,
+            &cancel,
+            &task_registry,
+            thread.thread_extensions_handle(),
+            second_turn_id.clone(),
+        );
+
+        assert_eq!(
+            second_turn_state.turn_extensions().level_id(),
+            second_turn_id
+        );
+        assert_eq!(
+            second_turn_state
+                .thread_extensions()
+                .get::<ThreadExtensionMarker>()
+                .expect("thread marker should survive the next turn")
+                .0,
+            "thread-scoped"
+        );
+        assert!(
+            second_turn_state
+                .turn_extensions()
+                .get::<TurnExtensionMarker>()
+                .is_none(),
+            "turn-scoped marker must not leak into later turns"
+        );
     }
 }
