@@ -130,6 +130,24 @@ pub(crate) struct RuntimeTurnState<'a> {
     pub(crate) turn_extensions: ExtensionData,
 }
 
+pub(crate) struct RuntimeTurnLoopState<'a> {
+    pub(crate) directive_state: RuntimeDirectiveState,
+    pub(crate) runtime: RuntimeTurnLoopRuntime<'a>,
+}
+
+pub(crate) struct RuntimeTurnLoopRuntime<'a> {
+    pub(crate) cost_tracker: &'a mut CostTracker,
+    pub(crate) cancel: &'a CancelToken,
+    pub(crate) task_registry: &'a TaskRegistry,
+    pub(crate) extensions: RuntimeTurnExtensionState,
+}
+
+pub(crate) struct RuntimeTurnExtensionState {
+    extension_registry: ExtensionRegistry,
+    thread_extensions: Arc<ExtensionData>,
+    turn_extensions: ExtensionData,
+}
+
 pub(crate) struct RuntimeTurnExecution<'a> {
     pub(crate) background_workflows: &'a mut Vec<BackgroundWorkflowRun>,
     pub(crate) workflow_ipc: Option<&'a WorkflowIpcContext>,
@@ -962,6 +980,22 @@ impl<'a> RuntimeTurnState<'a> {
         )
     }
 
+    pub(crate) fn into_loop_state(self) -> RuntimeTurnLoopState<'a> {
+        RuntimeTurnLoopState {
+            directive_state: self.directive_state,
+            runtime: RuntimeTurnLoopRuntime {
+                cost_tracker: self.cost_tracker,
+                cancel: self.cancel,
+                task_registry: self.task_registry,
+                extensions: RuntimeTurnExtensionState {
+                    extension_registry: self.extension_registry,
+                    thread_extensions: self.thread_extensions,
+                    turn_extensions: self.turn_extensions,
+                },
+            },
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn cost_tracker(&self) -> &CostTracker {
         self.cost_tracker
@@ -990,6 +1024,16 @@ impl<'a> RuntimeTurnState<'a> {
     #[cfg(test)]
     pub(crate) fn turn_extensions(&self) -> &ExtensionData {
         &self.turn_extensions
+    }
+}
+
+impl RuntimeTurnExtensionState {
+    pub(crate) fn extension_context(&self) -> RuntimeExtensionContext<'_> {
+        RuntimeTurnState::extension_context_from_parts(
+            &self.extension_registry,
+            self.thread_extensions.as_ref(),
+            &self.turn_extensions,
+        )
     }
 }
 

@@ -2,7 +2,6 @@ use std::io;
 use std::path::Path;
 
 use orca_approval::ApprovalPolicy;
-use orca_core::cancel::CancelToken;
 use orca_core::config::{ProviderKind, RunConfig};
 use orca_core::event_schema::EventFactory;
 use orca_core::event_sink::EventSink;
@@ -12,19 +11,17 @@ use orca_mcp::McpRegistry;
 use orca_provider::{ProviderConfig, context};
 
 use crate::agent_child::ChildAgentExecutor;
-use crate::cost::CostTracker;
-use crate::extension::RuntimeExtensionContext;
 use crate::hooks::HookRunner;
 use crate::instructions::ProjectInstructions;
 use crate::lifecycle::{
-    AgentLoopResult, RuntimePermissionRequestHandler, RuntimeTaskActor, ThreadSteerHandle,
+    AgentLoopResult, RuntimePermissionRequestHandler, RuntimeTaskActor, RuntimeTurnLoopRuntime,
+    ThreadSteerHandle,
 };
 use crate::memory::MemoryBlock;
 use crate::runtime_conversation_bootstrap::RuntimePreparedConversation;
 use crate::runtime_turn_iteration::{
     RuntimeTurnIterationInput, RuntimeTurnIterationResult, RuntimeTurnIterationStep,
 };
-use crate::tasks::TaskRegistry;
 use crate::tool_invocation::AgentToolPolicyContext;
 use crate::workflow::ipc::WorkflowIpcContext;
 use crate::workflow::runner::SharedEventBuffer;
@@ -50,9 +47,8 @@ pub(crate) struct RuntimeTurnLoopInput<'a, 'runtime, W: io::Write> {
     pub(crate) model: &'a ModelSelection,
     pub(crate) subagent_type: &'a SubagentType,
     pub(crate) model_override: Option<&'a str>,
-    pub(crate) cost_tracker: &'a mut CostTracker,
+    pub(crate) runtime: RuntimeTurnLoopRuntime<'a>,
     pub(crate) steer_handle: Option<&'a ThreadSteerHandle>,
-    pub(crate) cancel: &'a CancelToken,
     pub(crate) max_budget_usd: Option<f64>,
     pub(crate) config: &'a RunConfig,
     pub(crate) tool_policy: AgentToolPolicyContext<'a>,
@@ -61,8 +57,6 @@ pub(crate) struct RuntimeTurnLoopInput<'a, 'runtime, W: io::Write> {
     pub(crate) instructions: &'a ProjectInstructions,
     pub(crate) memory: &'a MemoryBlock,
     pub(crate) mcp_registry: &'a McpRegistry,
-    pub(crate) task_registry: &'a TaskRegistry,
-    pub(crate) extensions: RuntimeExtensionContext<'a>,
     pub(crate) background_workflows: &'a mut Vec<BackgroundWorkflowRun>,
     pub(crate) workflow_ipc: Option<&'a WorkflowIpcContext>,
     pub(crate) permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
@@ -92,9 +86,8 @@ impl<'a, 'runtime, W: io::Write> RuntimeTurnLoopInput<'a, 'runtime, W> {
         model: &'a ModelSelection,
         subagent_type: &'a SubagentType,
         model_override: Option<&'a str>,
-        cost_tracker: &'a mut CostTracker,
+        runtime: RuntimeTurnLoopRuntime<'a>,
         steer_handle: Option<&'a ThreadSteerHandle>,
-        cancel: &'a CancelToken,
         max_budget_usd: Option<f64>,
         config: &'a RunConfig,
         tool_policy: AgentToolPolicyContext<'a>,
@@ -103,8 +96,6 @@ impl<'a, 'runtime, W: io::Write> RuntimeTurnLoopInput<'a, 'runtime, W> {
         instructions: &'a ProjectInstructions,
         memory: &'a MemoryBlock,
         mcp_registry: &'a McpRegistry,
-        task_registry: &'a TaskRegistry,
-        extensions: RuntimeExtensionContext<'a>,
         background_workflows: &'a mut Vec<BackgroundWorkflowRun>,
         workflow_ipc: Option<&'a WorkflowIpcContext>,
         permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
@@ -125,9 +116,8 @@ impl<'a, 'runtime, W: io::Write> RuntimeTurnLoopInput<'a, 'runtime, W> {
             model,
             subagent_type,
             model_override,
-            cost_tracker,
+            runtime,
             steer_handle,
-            cancel,
             max_budget_usd,
             config,
             tool_policy,
@@ -136,8 +126,6 @@ impl<'a, 'runtime, W: io::Write> RuntimeTurnLoopInput<'a, 'runtime, W> {
             instructions,
             memory,
             mcp_registry,
-            task_registry,
-            extensions,
             background_workflows,
             workflow_ipc,
             permission_handler,
@@ -163,9 +151,9 @@ impl<'a, 'runtime, W: io::Write> RuntimeTurnLoopInput<'a, 'runtime, W> {
             model: self.model,
             subagent_type: self.subagent_type,
             model_override: self.model_override,
-            cost_tracker: &mut *self.cost_tracker,
+            cost_tracker: &mut *self.runtime.cost_tracker,
             steer_handle: self.steer_handle,
-            cancel: self.cancel,
+            cancel: self.runtime.cancel,
             max_budget_usd: self.max_budget_usd,
             config: self.config,
             tool_policy: self.tool_policy,
@@ -174,8 +162,8 @@ impl<'a, 'runtime, W: io::Write> RuntimeTurnLoopInput<'a, 'runtime, W> {
             instructions: self.instructions,
             memory: self.memory,
             mcp_registry: self.mcp_registry,
-            task_registry: self.task_registry,
-            extensions: self.extensions,
+            task_registry: self.runtime.task_registry,
+            extensions: self.runtime.extensions.extension_context(),
             background_workflows: &mut *self.background_workflows,
             workflow_ipc: self.workflow_ipc,
             permission_handler: self.permission_handler,

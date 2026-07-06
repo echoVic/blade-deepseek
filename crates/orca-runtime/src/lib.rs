@@ -451,8 +451,16 @@ mod tests {
         let runtime_turn_iteration_source = include_str!("runtime_turn_iteration.rs");
         let provider_turn_source = include_str!("provider_turn.rs");
 
+        assert!(
+            runtime_turn_loop_source.contains("runtime: RuntimeTurnLoopRuntime"),
+            "runtime_turn_loop must carry lifecycle-owned loop runtime state"
+        );
+        assert!(
+            runtime_turn_loop_source.contains("extensions.extension_context()"),
+            "runtime_turn_loop must derive grouped extension context from loop runtime state"
+        );
+
         for (module_name, source) in [
-            ("runtime_turn_loop", runtime_turn_loop_source),
             ("runtime_turn_iteration", runtime_turn_iteration_source),
             ("provider_turn", provider_turn_source),
         ] {
@@ -490,6 +498,10 @@ mod tests {
     fn runtime_turn_state_exposes_grouped_runtime_extension_context() {
         let lifecycle_source = include_str!("lifecycle.rs");
         let agent_loop_source = include_str!("agent_loop.rs");
+        let agent_loop_runtime_source = agent_loop_source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("agent loop runtime source");
 
         assert!(
             lifecycle_source
@@ -510,8 +522,14 @@ mod tests {
             "agent_loop must ask RuntimeTurnState for the grouped runtime extension context"
         );
         assert!(
-            agent_loop_source.contains("RuntimeTurnState::extension_context_from_parts("),
-            "agent_loop must route extension context construction through RuntimeTurnState"
+            !agent_loop_runtime_source.contains("extension_context_from_parts("),
+            "agent_loop runtime must not reconstruct extension context from turn-state parts"
+        );
+        assert!(
+            !agent_loop_runtime_source.contains("extension_registry")
+                && !agent_loop_runtime_source.contains("thread_extensions")
+                && !agent_loop_runtime_source.contains("turn_extensions"),
+            "agent_loop runtime must consume grouped loop state instead of destructuring extension fields"
         );
     }
 

@@ -4,7 +4,7 @@ use crate::agent_child::{ChildAgentRequest, ChildAgentResult, ChildAgentRuntime}
 use crate::cost::CostTracker;
 use crate::lifecycle::{
     AgentLoopContext, AgentLoopResult, RuntimeSessionLifecycle, RuntimeTaskActor,
-    RuntimeTurnConfig, RuntimeTurnDeps, RuntimeTurnExecution, RuntimeTurnState,
+    RuntimeTurnConfig, RuntimeTurnDeps, RuntimeTurnExecution, RuntimeTurnLoopState,
 };
 use crate::runtime_conversation_bootstrap::RuntimeConversationBootstrapStep;
 use crate::runtime_directive::RuntimeDirectiveState;
@@ -19,6 +19,9 @@ use crate::workflow_execution::observe_background_workflows;
 use orca_core::config::{OutputFormat, RunConfig};
 use orca_core::event_schema::EventFactory;
 use orca_core::event_sink::EventSink;
+
+#[cfg(test)]
+use crate::lifecycle::RuntimeTurnState;
 
 const DEFAULT_MAX_TURNS: u32 = 128;
 
@@ -52,21 +55,16 @@ pub(crate) fn run_agent_loop(
         hooks,
     } = turn_deps.expect("agent loop turn deps");
     let turn_state = turn_state.expect("agent loop turn state");
-    let RuntimeTurnState {
-        cost_tracker,
-        cancel,
-        task_registry,
-        ref directive_state,
-        ref extension_registry,
-        ref thread_extensions,
-        ref turn_extensions,
-    } = turn_state;
+    let RuntimeTurnLoopState {
+        directive_state,
+        runtime: turn_runtime,
+    } = turn_state.into_loop_state();
     let RuntimeTurnExecution {
         background_workflows,
         workflow_ipc,
         lifecycle,
     } = turn_execution.expect("agent loop turn execution");
-    let tool_policy = tool_policy_for_directive_state(tool_policy, directive_state);
+    let tool_policy = tool_policy_for_directive_state(tool_policy, &directive_state);
     let max_turns = DEFAULT_MAX_TURNS;
     let setup = RuntimeTurnSetupStep::new().prepare(
         config,
@@ -113,9 +111,8 @@ pub(crate) fn run_agent_loop(
             &config.model,
             subagent_type,
             directive_state.model_override(),
-            cost_tracker,
+            turn_runtime,
             steer_handle,
-            cancel,
             config.max_budget_usd,
             config,
             tool_policy,
@@ -124,12 +121,6 @@ pub(crate) fn run_agent_loop(
             instructions,
             memory,
             mcp_registry,
-            task_registry,
-            RuntimeTurnState::extension_context_from_parts(
-                extension_registry,
-                thread_extensions.as_ref(),
-                turn_extensions,
-            ),
             background_workflows,
             workflow_ipc,
             permission_handler,
