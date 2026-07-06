@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.148":
+        "Async subagent worker entrypoints now use grouped AsyncSubagentWorkerInput, AsyncSubagentWorkerContext, AsyncSubagentLaunchContext, and spawn context objects instead of long argument lists or clippy allowances. CLI worker startup, parent async launch, task registry state, worktree handoff, async completion payloads, subagent contracts, and TUI async subagent behavior stay unchanged.",
       "v0.1.147":
         "Child-agent runtime constructor inputs now flow through a grouped ChildAgentRuntimeContext instead of a long cwd/events/sink/instructions/memory/MCP/hooks/cancel/lifecycle/executor argument list. Existing orca_runtime::agent_child re-exports remain available, while child-agent loop setup, provider turns, compaction, response folding, tool execution, sync and async subagent contracts, workflow child agents, and TUI child-agent delegation behavior stay unchanged.",
       "v0.1.146":
@@ -322,6 +324,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.148":
+        "Async subagent worker entrypoint 现在改用 AsyncSubagentWorkerInput、AsyncSubagentWorkerContext、AsyncSubagentLaunchContext 和 spawn context 分组传递输入，不再暴露长参数列表，也不再用 clippy allow 压住设计问题。CLI worker 启动、父级 async launch、task registry 状态、worktree handoff、async completion payload、subagent contract 与 TUI async subagent 行为保持不变。",
       "v0.1.147":
         "Child-agent runtime constructor 输入现在通过分组的 ChildAgentRuntimeContext 传递，不再暴露 cwd/events/sink/instructions/memory/MCP/hooks/cancel/lifecycle/executor 长参数列表。既有 orca_runtime::agent_child re-export 仍保持可用，child-agent loop setup、provider turn、compaction、response folding、tool execution、同步和异步 subagent contract、workflow child agent 与 TUI child-agent delegation 行为保持不变。",
       "v0.1.146":
