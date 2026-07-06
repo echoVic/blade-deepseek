@@ -1134,6 +1134,28 @@ mod tests {
                 "agent_child facade must not own child-agent entrypoint {marker}"
             );
         }
+
+        for marker in [
+            "pub struct ChildAgentPromptContext<'a>",
+            "pub prompt: String",
+            "pub subagent_type: &'a SubagentType",
+            "pub subagent_model: Option<String>",
+            "pub subagent_depth: u32",
+            "pub cwd: &'a Path",
+            "pub instructions: &'a ProjectInstructions",
+            "pub memory: &'a MemoryBlock",
+            "pub hooks: &'a HookRunner",
+            "context: ChildAgentPromptContext<'_>",
+        ] {
+            assert!(
+                child_entrypoints_source.contains(marker),
+                "child_agent_entrypoints must group prompt entrypoint input behind {marker}"
+            );
+        }
+        assert!(
+            !child_entrypoints_source.contains("prompt: String,\n    subagent_type: &SubagentType"),
+            "child-agent prompt entrypoint must not expose a long prompt/subagent argument list"
+        );
     }
 
     #[test]

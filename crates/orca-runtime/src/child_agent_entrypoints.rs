@@ -15,6 +15,17 @@ use crate::hooks::HookRunner;
 use crate::instructions::ProjectInstructions;
 use crate::memory::MemoryBlock;
 
+pub struct ChildAgentPromptContext<'a> {
+    pub prompt: String,
+    pub subagent_type: &'a SubagentType,
+    pub subagent_model: Option<String>,
+    pub subagent_depth: u32,
+    pub cwd: &'a Path,
+    pub instructions: &'a ProjectInstructions,
+    pub memory: &'a MemoryBlock,
+    pub hooks: &'a HookRunner,
+}
+
 pub(crate) fn run_child_agent<W: io::Write>(
     config: &RunConfig,
     request: &ChildAgentRequest,
@@ -55,14 +66,7 @@ where
 
 pub fn run_child_agent_prompt_with_tool_executor<F>(
     config: &RunConfig,
-    prompt: String,
-    subagent_type: &SubagentType,
-    subagent_model: Option<String>,
-    subagent_depth: u32,
-    cwd: &Path,
-    instructions: &ProjectInstructions,
-    memory: &MemoryBlock,
-    hooks: &HookRunner,
+    context: ChildAgentPromptContext<'_>,
     execute_tool: F,
 ) -> (ChildAgentResult, CostTracker)
 where
@@ -75,19 +79,19 @@ where
     ) -> ChildAgentToolExecution,
 {
     let request = ChildAgentRequest::new(
-        prompt,
-        subagent_type.clone(),
-        subagent_model,
-        subagent_depth,
+        context.prompt,
+        context.subagent_type.clone(),
+        context.subagent_model,
+        context.subagent_depth,
         false,
     );
     run_child_agent_with_tool_executor(
         config,
         &request,
-        cwd,
-        instructions,
-        memory,
-        hooks,
+        context.cwd,
+        context.instructions,
+        context.memory,
+        context.hooks,
         execute_tool,
     )
 }

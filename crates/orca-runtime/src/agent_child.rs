@@ -1,6 +1,7 @@
 pub(crate) use crate::child_agent_entrypoints::run_child_agent;
 pub use crate::child_agent_entrypoints::{
-    run_child_agent_prompt_with_tool_executor, run_child_agent_with_executor,
+    ChildAgentPromptContext, run_child_agent_prompt_with_tool_executor,
+    run_child_agent_with_executor,
 };
 pub use crate::child_agent_loop_runner::{
     run_child_agent_loop_with_tool_executor, run_child_agent_with_tool_executor,
