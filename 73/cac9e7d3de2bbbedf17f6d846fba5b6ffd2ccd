@@ -1,0 +1,35 @@
+crates/orca-runtime/src/lib.rs
+  s_4d753501658c09::t_8b0c60021de874 44
+crates/orca-runtime/src/runtime_bash.rs
+  s_4d753501658c09::t_61f5ed7dcb5d63 15-16,232
+crates/orca-runtime/src/sandbox_denial.rs
+  s_4d753501658c09::t_b53d12537655f4 4-7,10,37
+crates/orca-tools/src/bash.rs
+  s_4d753501658c09::t_aa18fe6f08e8d6 235-243,245-270
+crates/orca-tools/src/sandbox/seatbelt.rs
+  s_4d753501658c09::t_e0aea46b1a1e3e 227,353-368,750-802
+crates/orca-tui/src/agent_runner.rs
+  s_4d753501658c09::t_9ccfc6ea060e6f 354,723,1411,1465
+crates/orca-tui/src/agent_subagent_execution.rs
+  s_4d753501658c09::t_aa181c0eafaa6b 608-635
+crates/orca-tui/src/runtime_interaction_adapter.rs
+  s_4d753501658c09::t_3545569618f204 7-8,11,161-279
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "73cac9e7d3de2bbbedf17f6d846fba5b6ffd2ccd",
+  "prompts": {},
+  "sessions": {
+    "s_4d753501658c09": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e923e7e3-1b23-4070-aa10-76697c8d0cec",
+        "model": "unknown"
+      },
+      "human_author": "echoVic <137844255@qq.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
