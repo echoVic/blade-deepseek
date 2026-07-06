@@ -1,3 +1,5 @@
+use orca_core::conversation::Conversation;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RuntimeDirective {
     SwitchModel {
@@ -59,4 +61,18 @@ impl RuntimeDirectiveState {
     fn record_transition(&mut self, kind: &str, reason: String) {
         self.transition_reasons.push(format!("{kind}: {reason}"));
     }
+}
+
+pub(crate) fn conversation_with_runtime_system_messages(
+    conversation: &Conversation,
+    messages: &[String],
+) -> Conversation {
+    let mut conversation = conversation.clone();
+    if !messages.is_empty() {
+        conversation.add_system_pinned(format!(
+            "[Runtime directive context]\n{}",
+            messages.join("\n\n")
+        ));
+    }
+    conversation
 }

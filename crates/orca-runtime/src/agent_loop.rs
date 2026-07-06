@@ -97,6 +97,7 @@ pub(crate) fn run_agent_loop(
             config.provider,
             &ctx_config,
             &provider_config,
+            directive_state.pending_system_messages(),
             cwd,
             emit_deltas,
             hooks,

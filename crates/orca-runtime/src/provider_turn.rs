@@ -21,6 +21,7 @@ use crate::lifecycle::{
 };
 use crate::memory::{self, MemoryBlock};
 use crate::runtime_conversation_bootstrap::RuntimePreparedConversation;
+use crate::runtime_directive::conversation_with_runtime_system_messages;
 use crate::runtime_steer::{RuntimeSteerInput, RuntimeSteerStep};
 use crate::session::record_assistant_response_for_agent;
 use crate::step_context::RuntimeStepContext;
@@ -50,6 +51,7 @@ pub(crate) struct RuntimeProviderCycleInput<'a, 'runtime, W: io::Write> {
     pub(crate) actor: &'a mut RuntimeTaskActor<'runtime>,
     pub(crate) provider: ProviderKind,
     pub(crate) turn_provider_config: &'a ProviderConfig,
+    pub(crate) runtime_system_messages: &'a [String],
     pub(crate) cwd: &'a Path,
     pub(crate) context_config: &'a context::ContextConfig,
     pub(crate) base_provider_config: &'a ProviderConfig,
@@ -269,6 +271,7 @@ impl RuntimeProviderTurnStep {
         actor: &mut RuntimeTaskActor<'_>,
         provider: ProviderKind,
         conversation: &mut Conversation,
+        runtime_system_messages: &[String],
         provider_config: &ProviderConfig,
         cwd: &str,
         emit_deltas: bool,
@@ -296,6 +299,8 @@ impl RuntimeProviderTurnStep {
             history_writer: history_writer.as_deref_mut(),
         })?;
         let model_conversation = conversation_with_hook_context(conversation, &pre_model_outcome);
+        let model_conversation =
+            conversation_with_runtime_system_messages(&model_conversation, runtime_system_messages);
         let response = actor.call_streaming_provider(
             provider,
             &model_conversation,
@@ -476,6 +481,7 @@ impl RuntimeTurnProviderCycleStep {
                 input.actor,
                 input.provider,
                 conversation,
+                input.runtime_system_messages,
                 input.turn_provider_config,
                 &cwd_display,
                 input.emit_deltas,
@@ -810,6 +816,68 @@ mod tests {
         assert!(output.contains("\"id\":\"call_1\""));
         assert!(output.contains("\"name\":\"write_file\""));
         assert!(output.contains("\"arguments_bytes\":12345"));
+    }
+
+    #[test]
+    fn provider_turn_injects_runtime_system_messages_without_mutating_conversation() {
+        let mut lifecycle = crate::lifecycle::RuntimeSessionLifecycle::new(
+            "provider-runtime-system-directive".to_string(),
+        );
+        let mut actor = RuntimeTaskActor::new(&mut lifecycle, 3);
+        let mut conversation = Conversation::new();
+        conversation.add_system("base system".to_string());
+        conversation.add_user("mock_system_echo".to_string());
+        let runtime_system_messages = vec!["runtime directive context".to_string()];
+        let provider_config = ProviderConfig {
+            api_key: None,
+            base_url: None,
+            model: Some(orca_core::model::PRO_MODEL.to_string()),
+            reasoning_effort: orca_core::config::ReasoningEffort::Max,
+            tools_override: Some(Vec::new()),
+            mcp_registry: None,
+            external_tools: Vec::new(),
+        };
+        let hooks = HookRunner::default();
+        let cancel = CancelToken::new();
+        let mut cost_tracker = CostTracker::new(None);
+        let mut events = EventFactory::new("provider-runtime-system-directive".to_string());
+        let mut output = Vec::new();
+        let mut sink = EventSink::new(&mut output, OutputFormat::Jsonl);
+
+        let result = RuntimeProviderTurnStep::new()
+            .run(
+                &mut actor,
+                ProviderKind::Mock,
+                &mut conversation,
+                runtime_system_messages.as_slice(),
+                &provider_config,
+                ".",
+                true,
+                &hooks,
+                &cancel,
+                &mut cost_tracker,
+                None,
+                &mut events,
+                &mut sink,
+                None,
+                None,
+            )
+            .expect("provider turn");
+
+        let response = result.response.expect("provider response");
+        assert!(
+            response
+                .assistant_content
+                .as_deref()
+                .unwrap_or_default()
+                .contains("runtime directive context")
+        );
+        assert!(conversation.messages.iter().all(|message| {
+            !message
+                .content_str()
+                .unwrap_or_default()
+                .contains("runtime directive context")
+        }));
     }
 
     #[test]
