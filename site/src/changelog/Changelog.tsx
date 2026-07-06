@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.137":
+        "Runtime approval decisions, approval handlers, and config-backed interactive approval handling now live in a focused runtime_approval module. Existing orca_runtime::lifecycle imports remain available through re-exports, while approval policy resolution and interactive approval behavior stay unchanged.",
       "v0.1.136":
         "Runtime permission requests now live in a focused runtime_permission module. The existing orca_runtime::lifecycle imports remain available through re-exports, while request_permissions execution and turn permission overlay behavior keep the same runtime shape.",
       "v0.1.135":
@@ -300,6 +302,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.137":
+        "Runtime approval decision、approval handler 和基于配置的 interactive approval 处理现在移到独立的 runtime_approval 模块。既有 orca_runtime::lifecycle 导入仍通过 re-export 保持可用，approval policy resolution 与 interactive approval 行为保持不变。",
       "v0.1.136":
         "Runtime permission request/response/handler 与 turn permission overlay 现在移到独立的 runtime_permission 模块。既有 orca_runtime::lifecycle 导入仍通过 re-export 保持可用，request_permissions 执行和 turn permission overlay 行为保持同一运行时形状。",
       "v0.1.135":
