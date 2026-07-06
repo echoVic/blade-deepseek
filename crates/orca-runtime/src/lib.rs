@@ -13,6 +13,7 @@ mod child_agent_types;
 pub mod compaction;
 pub mod controller;
 pub mod cost;
+pub mod extension;
 pub mod goals;
 pub mod history;
 pub mod hooks;
@@ -68,7 +69,11 @@ pub mod worktree;
 
 #[cfg(test)]
 mod tests {
+    use crate::extension::{
+        ExtensionData, ExtensionRegistryBuilder, ToolFinishInput, ToolLifecycleContributor,
+    };
     use crate::thread_store::{SessionStore, ThreadStore};
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn thread_store_module_exports_session_store_boundary() {
@@ -77,6 +82,70 @@ mod tests {
         }
 
         assert_thread_store(&SessionStore::new());
+    }
+
+    #[test]
+    fn extension_data_stores_typed_values_per_scope() {
+        #[derive(Debug, Eq, PartialEq)]
+        struct Marker(&'static str);
+
+        let data = ExtensionData::new("thread-a");
+        assert_eq!(data.level_id(), "thread-a");
+        assert!(data.get::<Marker>().is_none());
+
+        assert!(data.insert(Marker("seed")).is_none());
+        assert_eq!(data.get::<Marker>().as_deref(), Some(&Marker("seed")));
+
+        let existing = data.get_or_init(|| Marker("ignored"));
+        assert_eq!(existing.as_ref(), &Marker("seed"));
+    }
+
+    #[test]
+    fn extension_registry_runs_tool_lifecycle_contributors_in_order() {
+        #[derive(Default)]
+        struct RecordingContributor {
+            label: &'static str,
+            calls: Arc<Mutex<Vec<String>>>,
+        }
+
+        impl ToolLifecycleContributor for RecordingContributor {
+            fn on_tool_finish(&self, input: ToolFinishInput<'_>) {
+                self.calls.lock().unwrap().push(format!(
+                    "{}:{}:{}:{}",
+                    self.label,
+                    input.thread_store.level_id(),
+                    input.turn_store.level_id(),
+                    input.tool_name
+                ));
+            }
+        }
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut builder = ExtensionRegistryBuilder::new();
+        builder.tool_lifecycle_contributor(Arc::new(RecordingContributor {
+            label: "first",
+            calls: Arc::clone(&calls),
+        }));
+        builder.tool_lifecycle_contributor(Arc::new(RecordingContributor {
+            label: "second",
+            calls: Arc::clone(&calls),
+        }));
+
+        let registry = builder.build();
+        let thread_store = ExtensionData::new("thread-a");
+        let turn_store = ExtensionData::new("turn-1");
+
+        registry.on_tool_finish(ToolFinishInput {
+            thread_store: &thread_store,
+            turn_store: &turn_store,
+            tool_name: "bash",
+            call_id: "call-1",
+        });
+
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            ["first:thread-a:turn-1:bash", "second:thread-a:turn-1:bash"]
+        );
     }
 
     #[test]
