@@ -1975,6 +1975,36 @@ mod tests {
             );
         }
         for marker in [
+            "pub struct AsyncSubagentWorkerInput",
+            "pub config: RunConfig",
+            "pub cwd: PathBuf",
+            "pub child_cwd: PathBuf",
+            "pub task_session_id: String",
+            "pub agent_id: String",
+            "pub request: subagent::SubagentRequest",
+            "pub child_depth: u32",
+            "pub worktree: Option<AsyncSubagentWorktree>",
+            "pub(crate) struct AsyncSubagentWorkerContext",
+            "pub input: AsyncSubagentWorkerInput",
+            "pub child_executor: ChildAgentExecutor<io::Sink>",
+            "pub(crate) struct AsyncSubagentLaunchContext<'a>",
+            "pub config: &'a RunConfig",
+            "pub cwd: &'a Path",
+            "pub tool_request: &'a tool_types::ToolRequest",
+            "pub request: subagent::SubagentRequest",
+            "pub subagent_depth: u32",
+            "pub task_registry: &'a TaskRegistry",
+            "struct AsyncSubagentWorkerSpawnContext<'a>",
+            "config: &'a RunConfig",
+            "child_cwd: &'a Path",
+            "task_session_id: &'a str",
+            "agent_id: &'a str",
+            "request: &'a subagent::SubagentRequest",
+            "worktree: Option<&'a AsyncSubagentWorktree>",
+            "pub fn run_async_subagent_worker(input: AsyncSubagentWorkerInput) -> i32",
+            "pub(crate) fn run_async_subagent_worker_with_executor(context: AsyncSubagentWorkerContext) -> i32",
+            "context: AsyncSubagentLaunchContext<'_>",
+            "context: AsyncSubagentWorkerSpawnContext<'_>",
             "pub fn run_async_subagent_worker(",
             "pub(crate) fn run_async_subagent_worker_with_executor(",
             "pub(crate) fn launch_async_subagent(",
@@ -1991,6 +2021,10 @@ mod tests {
                 "subagent_async_worker must own async worker detail {marker}"
             );
         }
+        assert!(
+            !async_worker_source.contains("#[allow(clippy::too_many_arguments)]"),
+            "async subagent worker APIs should use grouped context inputs instead of suppressing long-argument lints"
+        );
     }
 
     #[test]

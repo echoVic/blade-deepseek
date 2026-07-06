@@ -24,7 +24,7 @@ use crate::memory::MemoryBlock;
 use crate::schema_validation::validate_json_schema_subset;
 use crate::session::record_tool_result_for_agent;
 use crate::subagent::{self, SubagentIsolation, SubagentMode};
-use crate::subagent_async_worker::launch_async_subagent;
+use crate::subagent_async_worker::{AsyncSubagentLaunchContext, launch_async_subagent};
 use crate::tasks::TaskRegistry;
 use crate::thread_store::SessionWriter;
 use crate::tool_invocation::{
@@ -414,14 +414,14 @@ pub(crate) fn execute_subagent_tool<W: io::Write>(
     }
 
     if request.mode == SubagentMode::Async {
-        return Ok(launch_async_subagent(
+        return Ok(launch_async_subagent(AsyncSubagentLaunchContext {
             config,
             cwd,
             tool_request,
             request,
             subagent_depth,
             task_registry,
-        ));
+        }));
     }
 
     let worktree_guard = if request.isolation == SubagentIsolation::Worktree {

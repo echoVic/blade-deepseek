@@ -28,17 +28,55 @@ pub struct AsyncSubagentWorktree {
     pub path: PathBuf,
 }
 
-pub fn run_async_subagent_worker(
-    config: RunConfig,
-    cwd: PathBuf,
-    child_cwd: PathBuf,
-    task_session_id: String,
-    agent_id: String,
-    request: subagent::SubagentRequest,
+pub struct AsyncSubagentWorkerInput {
+    pub config: RunConfig,
+    pub cwd: PathBuf,
+    pub child_cwd: PathBuf,
+    pub task_session_id: String,
+    pub agent_id: String,
+    pub request: subagent::SubagentRequest,
+    pub child_depth: u32,
+    pub worktree: Option<AsyncSubagentWorktree>,
+}
+
+pub(crate) struct AsyncSubagentWorkerContext {
+    pub input: AsyncSubagentWorkerInput,
+    pub child_executor: ChildAgentExecutor<io::Sink>,
+}
+
+pub(crate) struct AsyncSubagentLaunchContext<'a> {
+    pub config: &'a RunConfig,
+    pub cwd: &'a Path,
+    pub tool_request: &'a tool_types::ToolRequest,
+    pub request: subagent::SubagentRequest,
+    pub subagent_depth: u32,
+    pub task_registry: &'a TaskRegistry,
+}
+
+struct AsyncSubagentWorkerSpawnContext<'a> {
+    config: &'a RunConfig,
+    cwd: &'a Path,
+    child_cwd: &'a Path,
+    task_session_id: &'a str,
+    agent_id: &'a str,
+    request: &'a subagent::SubagentRequest,
     child_depth: u32,
-    worktree: Option<AsyncSubagentWorktree>,
-) -> i32 {
-    run_async_subagent_worker_with_executor(
+    worktree: Option<&'a AsyncSubagentWorktree>,
+}
+
+pub fn run_async_subagent_worker(input: AsyncSubagentWorkerInput) -> i32 {
+    run_async_subagent_worker_with_executor(AsyncSubagentWorkerContext {
+        input,
+        child_executor: execute_child_agent_loop,
+    })
+}
+
+pub(crate) fn run_async_subagent_worker_with_executor(context: AsyncSubagentWorkerContext) -> i32 {
+    let AsyncSubagentWorkerContext {
+        input,
+        child_executor,
+    } = context;
+    let AsyncSubagentWorkerInput {
         config,
         cwd,
         child_cwd,
@@ -47,21 +85,7 @@ pub fn run_async_subagent_worker(
         request,
         child_depth,
         worktree,
-        execute_child_agent_loop,
-    )
-}
-
-pub(crate) fn run_async_subagent_worker_with_executor(
-    config: RunConfig,
-    cwd: PathBuf,
-    child_cwd: PathBuf,
-    task_session_id: String,
-    agent_id: String,
-    request: subagent::SubagentRequest,
-    child_depth: u32,
-    worktree: Option<AsyncSubagentWorktree>,
-    child_executor: ChildAgentExecutor<io::Sink>,
-) -> i32 {
+    } = input;
     let task_registry = TaskRegistry::new_for_cwd(task_session_id, &cwd);
     let _ = task_registry.mark_running(&agent_id);
     let instructions = instructions::load_for_cwd_or_default(&cwd);
@@ -155,15 +179,17 @@ pub(crate) fn run_async_subagent_worker_with_executor(
     1
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn launch_async_subagent(
-    config: &RunConfig,
-    cwd: &Path,
-    tool_request: &tool_types::ToolRequest,
-    request: subagent::SubagentRequest,
-    subagent_depth: u32,
-    task_registry: &TaskRegistry,
+    context: AsyncSubagentLaunchContext<'_>,
 ) -> tool_types::ToolResult {
+    let AsyncSubagentLaunchContext {
+        config,
+        cwd,
+        tool_request,
+        request,
+        subagent_depth,
+        task_registry,
+    } = context;
     let agent_type = serde_json::to_value(&request.subagent_type)
         .ok()
         .and_then(|value| value.as_str().map(str::to_string));
@@ -193,16 +219,16 @@ pub(crate) fn launch_async_subagent(
         let _ = task_registry.fail(&agent_id, error.clone());
         return tool_types::ToolResult::failed(tool_request, error, None);
     }
-    match spawn_async_subagent_worker(
+    match spawn_async_subagent_worker(AsyncSubagentWorkerSpawnContext {
         config,
         cwd,
-        &child_cwd,
-        task_registry.session_id(),
-        &agent_id,
-        &request,
-        subagent_depth + 1,
-        worktree.as_ref(),
-    ) {
+        child_cwd: &child_cwd,
+        task_session_id: task_registry.session_id(),
+        agent_id: &agent_id,
+        request: &request,
+        child_depth: subagent_depth + 1,
+        worktree: worktree.as_ref(),
+    }) {
         Ok(pid) => {
             let _ = task_registry.mark_worker_spawned(&agent_id, pid);
             std::mem::forget(worktree_guard);
@@ -225,17 +251,19 @@ pub(crate) fn launch_async_subagent(
     tool_types::ToolResult::completed(tool_request, output, false)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn spawn_async_subagent_worker(
-    config: &RunConfig,
-    cwd: &Path,
-    child_cwd: &Path,
-    task_session_id: &str,
-    agent_id: &str,
-    request: &subagent::SubagentRequest,
-    child_depth: u32,
-    worktree: Option<&AsyncSubagentWorktree>,
+    context: AsyncSubagentWorkerSpawnContext<'_>,
 ) -> Result<u32, String> {
+    let AsyncSubagentWorkerSpawnContext {
+        config,
+        cwd,
+        child_cwd,
+        task_session_id,
+        agent_id,
+        request,
+        child_depth,
+        worktree,
+    } = context;
     let current_exe = std::env::current_exe().map_err(|error| error.to_string())?;
     let request_json = serde_json::to_string(request).map_err(|error| error.to_string())?;
     let mut command = ProcessCommand::new(current_exe);

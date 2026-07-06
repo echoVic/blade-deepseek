@@ -1017,14 +1017,16 @@ fn run_subagent_worker(args: SubagentWorkerArgs) -> i32 {
     };
 
     subagent_async_worker::run_async_subagent_worker(
-        config,
-        args.cwd,
-        args.child_cwd,
-        args.session_id,
-        args.agent_id,
-        request,
-        args.subagent_depth,
-        worktree,
+        subagent_async_worker::AsyncSubagentWorkerInput {
+            config,
+            cwd: args.cwd,
+            child_cwd: args.child_cwd,
+            task_session_id: args.session_id,
+            agent_id: args.agent_id,
+            request,
+            child_depth: args.subagent_depth,
+            worktree,
+        },
     )
 }
 
