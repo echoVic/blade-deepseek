@@ -4652,6 +4652,60 @@ fn server_mode_command_exec_tty_supports_initial_size_and_resize() {
 }
 
 #[test]
+fn server_mode_reports_shell_capabilities() {
+    let mut child = orca_command()
+        .args(["--mode", "server", "--provider", "mock"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn orca server");
+
+    {
+        let stdin = child.stdin.as_mut().expect("server stdin");
+        writeln!(
+            stdin,
+            r#"{{"id":"shell-caps","method":"shell/capabilities","params":{{}}}}"#
+        )
+        .expect("write shell/capabilities");
+        stdin.flush().expect("flush shell/capabilities");
+    }
+
+    let output = child.wait_with_output().expect("wait for server");
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+
+    let events = parse_jsonl(&output.stdout);
+    let caps = events
+        .iter()
+        .find(|event| event["id"] == "shell-caps" && event["event"] == "shell_capabilities")
+        .expect("shell_capabilities event");
+
+    assert!(
+        caps["platform"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
+    );
+    assert_eq!(
+        caps["supportedTerminalModes"],
+        serde_json::json!(["pipe", "pty"])
+    );
+    assert_eq!(caps["fallbackTerminalMode"], "pipe");
+    assert_eq!(caps["commandExecStreamingRequiresProcessId"], true);
+
+    #[cfg(unix)]
+    {
+        assert_eq!(caps["supportsPty"], true);
+        assert_eq!(caps["supportsPtyResize"], true);
+    }
+    #[cfg(not(unix))]
+    {
+        assert_eq!(caps["supportsPty"], false);
+        assert_eq!(caps["supportsPtyResize"], false);
+    }
+}
+
+#[test]
 fn server_mode_kills_runtime_shell_session() {
     let workspace = tempdir().expect("workspace");
     let mut child = orca_command()

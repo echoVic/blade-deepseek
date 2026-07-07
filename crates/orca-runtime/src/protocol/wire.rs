@@ -113,6 +113,7 @@ pub enum ClientOp {
         description: Option<String>,
         terminal: crate::shell_session::ShellTerminalMode,
     },
+    ShellCapabilities,
     ShellWrite {
         shell_id: String,
         input: String,
@@ -637,6 +638,10 @@ impl Submission {
                         .map(shell_terminal_mode_from_params)
                         .unwrap_or_else(ShellTerminalMode::pipe),
                 },
+            }),
+            (_, Some("shell/capabilities")) => Ok(Self {
+                id: wire.id,
+                op: ClientOp::ShellCapabilities,
             }),
             (_, Some("command/exec")) => Ok(Self {
                 id: wire.id,

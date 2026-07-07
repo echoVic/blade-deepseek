@@ -58,6 +58,15 @@ pub enum ShellSandboxMode {
     DangerFullAccess,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ShellRuntimeCapabilities {
+    pub platform: &'static str,
+    pub supports_pty: bool,
+    pub supports_pty_resize: bool,
+    pub fallback_terminal_mode: ShellTerminalMode,
+    pub command_exec_streaming_requires_process_id: bool,
+}
+
 impl Default for ShellSandboxMode {
     fn default() -> Self {
         Self::WorkspaceWrite {
@@ -65,6 +74,39 @@ impl Default for ShellSandboxMode {
             exclude_tmpdir_env_var: false,
             exclude_slash_tmp: false,
         }
+    }
+}
+
+pub fn shell_runtime_capabilities() -> ShellRuntimeCapabilities {
+    ShellRuntimeCapabilities {
+        platform: shell_runtime_platform(),
+        supports_pty: cfg!(unix),
+        supports_pty_resize: cfg!(unix),
+        fallback_terminal_mode: ShellTerminalMode::pipe(),
+        command_exec_streaming_requires_process_id: true,
+    }
+}
+
+fn shell_runtime_platform() -> &'static str {
+    #[cfg(target_os = "macos")]
+    {
+        "macos"
+    }
+    #[cfg(target_os = "linux")]
+    {
+        "linux"
+    }
+    #[cfg(target_os = "windows")]
+    {
+        "windows"
+    }
+    #[cfg(all(
+        not(target_os = "macos"),
+        not(target_os = "linux"),
+        not(target_os = "windows")
+    ))]
+    {
+        std::env::consts::OS
     }
 }
 

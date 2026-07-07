@@ -612,6 +612,24 @@ fn run_shell_start<W: Write>(
     )
 }
 
+fn run_shell_capabilities<W: Write>(id: Value, writer: &mut W) -> io::Result<()> {
+    let capabilities = crate::shell_session::shell_runtime_capabilities();
+    protocol::write_server_event(
+        writer,
+        &id,
+        ServerEvent::ShellCapabilities {
+            platform: Value::from(capabilities.platform),
+            supports_pty: Value::from(capabilities.supports_pty),
+            supports_pty_resize: Value::from(capabilities.supports_pty_resize),
+            supported_terminal_modes: Value::from(vec![Value::from("pipe"), Value::from("pty")]),
+            fallback_terminal_mode: Value::from(capabilities.fallback_terminal_mode.as_str()),
+            command_exec_streaming_requires_process_id: Value::from(
+                capabilities.command_exec_streaming_requires_process_id,
+            ),
+        },
+    )
+}
+
 fn run_shell_write<W: Write>(
     state: &mut ServerState,
     shell_id: &str,

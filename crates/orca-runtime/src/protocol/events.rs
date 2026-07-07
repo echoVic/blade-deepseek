@@ -275,6 +275,19 @@ pub enum ServerEvent {
         #[serde(rename = "effectiveTerminalMode")]
         effective_terminal_mode: Value,
     },
+    ShellCapabilities {
+        platform: Value,
+        #[serde(rename = "supportsPty")]
+        supports_pty: Value,
+        #[serde(rename = "supportsPtyResize")]
+        supports_pty_resize: Value,
+        #[serde(rename = "supportedTerminalModes")]
+        supported_terminal_modes: Value,
+        #[serde(rename = "fallbackTerminalMode")]
+        fallback_terminal_mode: Value,
+        #[serde(rename = "commandExecStreamingRequiresProcessId")]
+        command_exec_streaming_requires_process_id: Value,
+    },
     ShellUpdated {
         #[serde(rename = "shellId")]
         shell_id: Value,

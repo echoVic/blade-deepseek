@@ -8,6 +8,7 @@ pub(in crate::server::router) fn is_shell_operation(op: &ClientOp) -> bool {
     matches!(
         op,
         ClientOp::ShellStart { .. }
+            | ClientOp::ShellCapabilities
             | ClientOp::ShellWrite { .. }
             | ClientOp::ShellUpdate { .. }
             | ClientOp::ShellClose { .. }
@@ -41,6 +42,7 @@ pub(in crate::server::router) fn dispatch_shell_operation<W: Write>(
             id,
             writer,
         ),
+        ClientOp::ShellCapabilities => run_shell_capabilities(id, writer),
         ClientOp::ShellWrite { shell_id, input } => {
             run_shell_write(state, shell_id, input, id, writer)
         }
