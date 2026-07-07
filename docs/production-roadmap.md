@@ -4,11 +4,16 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-07-07
-Current baseline: v0.1.175 lets server-mode `command/exec/read` requests apply
-an `outputBytesCap` byte budget to active streaming `command/exec` processes,
-tightening the process output cap before the server's normal pre-dispatch
-drain and returning UTF-8-safe `command_exec_output_delta` events with
-`capReached` metadata. Earlier v0.1.174 added server-mode
+Current baseline: v0.1.176 adds server-mode `command/exec/list` so app-server
+clients can recover active `command/exec` process handles by listing
+`processId`, original command argv, `cwd`, running status, stream-output
+settings, output cap, and stdout/stderr sent-byte counters; completed
+processes are drained before the next list response and disappear from the
+active snapshot. Earlier v0.1.175 let server-mode `command/exec/read` requests
+apply an `outputBytesCap` byte budget to active streaming `command/exec`
+processes, tightening the process output cap before the server's normal
+pre-dispatch drain and returning UTF-8-safe `command_exec_output_delta` events
+with `capReached` metadata. Earlier v0.1.174 added server-mode
 `command/exec/read` so app-server clients can actively drain long-running
 streaming `command/exec` process handles by `processId`, receive a
 `command_exec_read` acknowledgment, and reuse the existing

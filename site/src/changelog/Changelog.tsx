@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.176":
+        "Server-mode clients can now call command/exec/list to recover active command/exec process handles. The listed snapshots include processId, command, cwd, running status, stream output settings, output cap, and stdout/stderr byte counters, and completed processes are drained out before the next list response.",
       "v0.1.175":
         "Server-mode command/exec/read now accepts outputBytesCap. Read requests can tighten the active streaming process output cap before the normal pre-dispatch drain, so bounded polling returns UTF-8-safe deltas with capReached metadata instead of leaking a larger burst.",
       "v0.1.174":
@@ -378,6 +380,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.176":
+        "Server mode 客户端现在可以调用 command/exec/list 来恢复 active command/exec process handle。列表快照包含 processId、command、cwd、running 状态、stream output 设置、output cap，以及 stdout/stderr 已发送字节计数；已完成的进程会在下一次 list 响应前被 drain 出列表。",
       "v0.1.175":
         "Server mode 的 command/exec/read 现在支持 outputBytesCap。read 请求会在常规 pre-dispatch drain 前收紧 active streaming process 的输出上限，让有界轮询返回 UTF-8 安全的 delta 和 capReached 元数据，而不是泄露更大的输出突发。",
       "v0.1.174":
