@@ -498,6 +498,15 @@ impl AppState {
         }
     }
 
+    pub fn select_previous_workflow_task(&mut self) {
+        self.workflow_panel.selected = self.workflow_panel.selected.saturating_sub(1);
+    }
+
+    pub fn select_next_workflow_task(&mut self) {
+        let last = self.workflow_panel.tasks.len().saturating_sub(1);
+        self.workflow_panel.selected = (self.workflow_panel.selected + 1).min(last);
+    }
+
     pub fn show_conversation(&mut self) {
         self.panel_mode = PanelMode::Conversation;
     }
@@ -1310,6 +1319,38 @@ mod tests {
             permission_rule_count: 0,
             additional_working_directories: Vec::new(),
             network_domain_permissions: Default::default(),
+        }
+    }
+
+    fn workflow_task_summary(id: &str, name: &str) -> BackgroundTaskSummary {
+        BackgroundTaskSummary {
+            id: id.to_string(),
+            task_type: TaskType::Workflow,
+            status: TaskStatus::Running,
+            is_backgrounded: false,
+            description: name.to_string(),
+            created_at_ms: 1_000,
+            started_at_ms: Some(1_000),
+            completed_at_ms: None,
+            command: None,
+            agent_type: None,
+            server: None,
+            tool: None,
+            pending_tool_call: None,
+            name: Some(name.to_string()),
+            workflow_run_id: Some(format!("run-{id}")),
+            phase_count: Some(1),
+            workflow_progress: None,
+            workflow_phases: Vec::new(),
+            workflow_agents: Vec::new(),
+            workflow_script_path: None,
+            workflow_launch_input: None,
+            workflow_final_summary: None,
+            workflow_failure_count: 0,
+            usage: None,
+            subagent_current_activity: None,
+            subagent_turn: None,
+            last_activity_at_ms: None,
         }
     }
 
@@ -2188,6 +2229,28 @@ mod tests {
         state.show_workflows();
 
         assert_eq!(state.panel_mode, PanelMode::Workflows);
+        assert_eq!(state.workflow_panel.selected, 0);
+    }
+
+    #[test]
+    fn workflow_panel_selection_moves_within_available_tasks() {
+        let mut state = state();
+        state.workflow_panel.tasks = vec![
+            workflow_task_summary("task-1", "audit"),
+            workflow_task_summary("task-2", "repair"),
+        ];
+
+        state.select_next_workflow_task();
+        assert_eq!(state.workflow_panel.selected, 1);
+
+        state.select_next_workflow_task();
+        assert_eq!(state.workflow_panel.selected, 1);
+
+        state.select_previous_workflow_task();
+        assert_eq!(state.workflow_panel.selected, 0);
+
+        state.workflow_panel.tasks.clear();
+        state.select_next_workflow_task();
         assert_eq!(state.workflow_panel.selected, 0);
     }
 

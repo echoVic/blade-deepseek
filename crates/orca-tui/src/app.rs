@@ -543,6 +543,10 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                         }
                     }
 
+                    if handle_workflows_panel_key(key.code, &mut state) {
+                        continue;
+                    }
+
                     match idle_shortcut(*key) {
                         Some(IdleShortcut::Submit) => {
                             state.slash_menu = None;
@@ -890,6 +894,54 @@ mod tests {
             ),
             rx,
         )
+    }
+
+    fn workflow_task(id: &str, name: &str) -> orca_core::task_types::BackgroundTaskSummary {
+        orca_core::task_types::BackgroundTaskSummary {
+            id: id.to_string(),
+            task_type: orca_core::task_types::TaskType::Workflow,
+            status: orca_core::task_types::TaskStatus::Running,
+            is_backgrounded: false,
+            description: name.to_string(),
+            created_at_ms: 1_000,
+            started_at_ms: Some(1_000),
+            completed_at_ms: None,
+            command: None,
+            agent_type: None,
+            server: None,
+            tool: None,
+            pending_tool_call: None,
+            name: Some(name.to_string()),
+            workflow_run_id: Some(format!("run-{id}")),
+            phase_count: Some(1),
+            workflow_progress: None,
+            workflow_phases: Vec::new(),
+            workflow_agents: Vec::new(),
+            workflow_script_path: None,
+            workflow_launch_input: None,
+            workflow_final_summary: None,
+            workflow_failure_count: 0,
+            usage: None,
+            subagent_current_activity: None,
+            subagent_turn: None,
+            last_activity_at_ms: None,
+        }
+    }
+
+    #[test]
+    fn workflows_panel_keys_move_selected_task() {
+        let (mut state, _rx) = test_state();
+        state.show_workflows();
+        state.workflow_panel.tasks = vec![
+            workflow_task("task-1", "audit"),
+            workflow_task("task-2", "repair"),
+        ];
+
+        assert!(handle_workflows_panel_key(KeyCode::Down, &mut state));
+        assert_eq!(state.workflow_panel.selected, 1);
+
+        assert!(handle_workflows_panel_key(KeyCode::Up, &mut state));
+        assert_eq!(state.workflow_panel.selected, 0);
     }
 
     fn transcript(session_id: &str) -> history::SessionTranscript {
@@ -2539,6 +2591,24 @@ fn resolve_approval(state: &mut AppState, action_tx: &mpsc::Sender<UserAction>, 
         state.set_status(AppStatus::Idle);
     }
     state.approval_dialog = None;
+}
+
+fn handle_workflows_panel_key(key_code: KeyCode, state: &mut AppState) -> bool {
+    if state.panel_mode != PanelMode::Workflows {
+        return false;
+    }
+
+    match key_code {
+        KeyCode::Up => {
+            state.select_previous_workflow_task();
+            true
+        }
+        KeyCode::Down => {
+            state.select_next_workflow_task();
+            true
+        }
+        _ => false,
+    }
 }
 
 fn handle_running_shortcut(
