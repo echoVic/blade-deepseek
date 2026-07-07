@@ -561,18 +561,19 @@ impl RuntimeTurnProviderCycleStep {
             input.workflow_ipc,
             input.permission_handler,
         );
+        let response_input = kernel.provider_response_input(
+            step_context,
+            input.extensions.registry(),
+            input.events,
+            input.sink,
+            conversation,
+            history_writer,
+            input.cost_tracker,
+            input.background_workflows,
+        );
         self.handle_response(
             response,
-            RuntimeProviderResponseInput {
-                step_context: kernel.bind_step_context(step_context, input.extensions.registry()),
-                sampling_state: kernel.sampling_state_mut(),
-                events: input.events,
-                sink: input.sink,
-                conversation,
-                history_writer,
-                cost_tracker: input.cost_tracker,
-                background_workflows: input.background_workflows,
-            },
+            response_input,
             child_executor,
             workflow_child_executor,
             batch_child_executor,

@@ -623,8 +623,8 @@ mod tests {
             "RuntimeTurnKernel must own the runtime turn reducer"
         );
         assert!(
-            kernel_source.contains("pub(crate) fn sampling_state_mut("),
-            "RuntimeTurnKernel must expose mutable sampling state access"
+            !kernel_source.contains("pub(crate) fn sampling_state_mut("),
+            "RuntimeTurnKernel must not expose mutable sampling state outside response input assembly"
         );
         assert!(
             kernel_source.contains("pub(crate) fn reducer("),
@@ -635,8 +635,8 @@ mod tests {
             "provider_turn must construct sampling request state through RuntimeTurnKernel"
         );
         assert!(
-            provider_turn_runtime_source.contains("sampling_state: kernel.sampling_state_mut()"),
-            "provider_turn must pass kernel-owned sampling state into response handling"
+            provider_turn_runtime_source.contains("kernel.provider_response_input("),
+            "provider_turn must pass kernel-owned sampling state through response input assembly"
         );
         assert!(
             !provider_turn_runtime_source.contains("RuntimeSamplingRequestState::new()"),
@@ -658,22 +658,53 @@ mod tests {
             "RuntimeTurnKernel must retain the extension stores used by its reducer"
         );
         assert!(
-            kernel_source.contains("pub(crate) fn bind_step_context("),
-            "RuntimeTurnKernel must expose a step-context binding helper"
+            kernel_source.contains("#[cfg(test)]\n    pub(crate) fn bind_step_context("),
+            "RuntimeTurnKernel must keep the standalone step-context binding helper test-only"
         );
         assert!(
             kernel_source.contains("RuntimeExtensionContext::new("),
             "RuntimeTurnKernel must own step-context extension binding"
         );
         assert!(
-            provider_turn_runtime_source.contains("kernel.bind_step_context("),
-            "provider_turn must bind RuntimeStepContext extensions through RuntimeTurnKernel"
+            provider_turn_runtime_source.contains("kernel.provider_response_input("),
+            "provider_turn must bind RuntimeStepContext extensions through RuntimeTurnKernel response input assembly"
         );
         assert!(
             !provider_turn_runtime_source.contains(
                 ".with_extensions(input.extensions.registry(), input.extensions.stores())"
             ),
             "provider_turn must not wire step-context extension stores outside RuntimeTurnKernel"
+        );
+    }
+
+    #[test]
+    fn runtime_turn_kernel_assembles_provider_response_input() {
+        let kernel_source = include_str!("runtime_turn_kernel.rs");
+        let provider_turn_source = include_str!("provider_turn.rs");
+        let provider_turn_runtime_source = provider_turn_source
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .expect("provider turn runtime source");
+
+        assert!(
+            kernel_source.contains("pub(crate) fn provider_response_input<"),
+            "RuntimeTurnKernel must expose a provider-response input assembly helper"
+        );
+        assert!(
+            kernel_source.contains("RuntimeProviderResponseInput {"),
+            "RuntimeTurnKernel must assemble RuntimeProviderResponseInput"
+        );
+        assert!(
+            provider_turn_runtime_source.contains("kernel.provider_response_input("),
+            "provider_turn must ask RuntimeTurnKernel to assemble provider-response input"
+        );
+        assert!(
+            !provider_turn_runtime_source.contains("step_context: kernel.bind_step_context("),
+            "provider_turn must not bind response step context as a separate field"
+        );
+        assert!(
+            !provider_turn_runtime_source.contains("sampling_state: kernel.sampling_state_mut()"),
+            "provider_turn must not expose kernel-owned sampling state as a separate field"
         );
     }
 

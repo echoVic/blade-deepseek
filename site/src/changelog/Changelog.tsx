@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.180":
+        "RuntimeTurnKernel now assembles the provider-response input object itself. Provider response handling no longer exposes kernel-owned sampling state or step-context binding as separate fields, tightening the turn-state handoff while preserving behavior.",
       "v0.1.179":
         "RuntimeTurnKernel now retains the extension stores used by its reducer and binds provider-response RuntimeStepContext extensions through the same kernel. Provider response handling no longer wires extension stores directly, tightening the Codex-style turn-state boundary without changing behavior.",
       "v0.1.178":
@@ -386,6 +388,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.180":
+        "RuntimeTurnKernel 现在会自己组装 provider-response input 对象。Provider response handling 不再把 kernel-owned sampling state 或 step-context binding 作为独立字段暴露出来，在不改变行为的前提下继续收紧 turn-state handoff。",
       "v0.1.179":
         "RuntimeTurnKernel 现在会保留 reducer 使用的 extension stores，并通过同一个 kernel 绑定 provider-response RuntimeStepContext 的 extensions。Provider response handling 不再直接拼接 extension stores，在不改变行为的前提下继续收紧 Codex 风格 turn-state 边界。",
       "v0.1.178":
