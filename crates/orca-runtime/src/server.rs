@@ -1817,15 +1817,27 @@ fn normalize_permission_profile_name(profile: &str) -> Option<&str> {
 }
 
 fn run_command_exec_list<W: Write>(
-    state: &ServerState,
+    state: &mut ServerState,
     id: Value,
     writer: &mut W,
 ) -> io::Result<()> {
+    let shell_snapshots = state
+        .shells
+        .list()
+        .into_iter()
+        .map(|snapshot| (snapshot.id.clone(), snapshot))
+        .collect::<HashMap<_, _>>();
     let processes = state
         .command_exec
         .list()
         .into_iter()
-        .map(command_exec_snapshot_to_json)
+        .map(|snapshot| {
+            let shell_snapshot = snapshot
+                .shell_id
+                .as_ref()
+                .and_then(|shell_id| shell_snapshots.get(shell_id));
+            command_exec_snapshot_to_json(snapshot, shell_snapshot)
+        })
         .collect::<Vec<_>>();
     protocol::write_server_event(
         writer,
@@ -2135,12 +2147,21 @@ fn shell_snapshot_to_json(snapshot: crate::shell_session::ShellSessionSnapshot) 
     })
 }
 
-fn command_exec_snapshot_to_json(snapshot: CommandExecProcessSnapshot) -> Value {
+fn command_exec_snapshot_to_json(
+    snapshot: CommandExecProcessSnapshot,
+    shell_snapshot: Option<&crate::shell_session::ShellSessionSnapshot>,
+) -> Value {
     json!({
         "processId": snapshot.process_id,
+        "shellId": snapshot.shell_id,
+        "taskId": shell_snapshot.map(|shell| shell.task_id.clone()),
         "command": snapshot.command,
         "cwd": snapshot.cwd.display().to_string(),
-        "status": snapshot.status,
+        "status": shell_snapshot
+            .map(|shell| shell_status_label(shell.status))
+            .unwrap_or(snapshot.status),
+        "requestedTerminalMode": shell_snapshot.map(|shell| shell.requested_terminal.as_str()),
+        "effectiveTerminalMode": shell_snapshot.map(|shell| shell.effective_terminal.as_str()),
         "streamOutput": snapshot.stream_output,
         "outputBytesCap": snapshot.output_bytes_cap,
         "stdoutBytes": snapshot.stdout_bytes,

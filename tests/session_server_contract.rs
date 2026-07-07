@@ -4297,7 +4297,17 @@ fn server_mode_command_exec_list_returns_active_process_snapshots() {
     assert_eq!(processes.len(), 1);
     let process = &processes[0];
     assert_eq!(process["processId"], "listed-1");
+    assert!(
+        process["shellId"].as_str().is_some(),
+        "command/exec/list should expose the backing shell session id: {process}"
+    );
+    assert!(
+        process["taskId"].as_str().is_some(),
+        "command/exec/list should expose the backing shell task id: {process}"
+    );
     assert_eq!(process["status"], "running");
+    assert_eq!(process["requestedTerminalMode"], "pipe");
+    assert_eq!(process["effectiveTerminalMode"], "pipe");
     assert_eq!(process["cwd"], workspace.path().to_str().unwrap());
     assert_eq!(process["streamOutput"], true);
     assert_eq!(process["outputBytesCap"], 32);

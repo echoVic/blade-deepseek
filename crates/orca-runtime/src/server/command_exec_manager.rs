@@ -45,6 +45,7 @@ pub(super) struct CommandExecManager {
 
 pub(super) struct CommandExecProcessSnapshot {
     pub(super) process_id: String,
+    pub(super) shell_id: Option<String>,
     pub(super) command: Vec<String>,
     pub(super) cwd: PathBuf,
     pub(super) status: &'static str,
@@ -133,6 +134,7 @@ impl CommandExecManager {
                     .get(&process_id)
                     .map(|process| CommandExecProcessSnapshot {
                         process_id,
+                        shell_id: process.shell_id.clone(),
                         command: process.command.clone(),
                         cwd: process.cwd.clone(),
                         status: if process.shell_id.is_some() {
