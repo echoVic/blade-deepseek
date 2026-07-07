@@ -133,15 +133,16 @@ pub(crate) fn run_tool_turns<W: io::Write>(
     let subagent_depth = step_snapshot.subagent_depth;
     let emit_deltas = step_snapshot.emit_deltas;
     let policy = step_snapshot.policy;
-    let instructions = step_snapshot.instructions;
-    let memory = step_snapshot.memory;
-    let mcp_registry = step_snapshot.mcp_registry;
-    let hooks = step_snapshot.hooks;
-    let cancel = step_snapshot.cancel;
-    let task_registry = step_snapshot.task_registry;
-    let workflow_ipc = step_snapshot.workflow_ipc;
-    let permission_handler = step_snapshot.permission_handler;
-    let user_input_handler = step_snapshot.user_input_handler;
+    let capabilities = step_snapshot.capabilities();
+    let instructions = capabilities.instructions;
+    let memory = capabilities.memory;
+    let mcp_registry = capabilities.mcp_registry;
+    let hooks = capabilities.hooks;
+    let cancel = capabilities.cancel;
+    let task_registry = capabilities.task_registry;
+    let workflow_ipc = capabilities.workflow_ipc;
+    let permission_handler = capabilities.permission_handler;
+    let user_input_handler = capabilities.user_input_handler;
     while let Some(tool_request) = sampling_state.current_tool_request(tool_requests) {
         if let Some(result) = reject_disallowed_child_tool(
             tool_request,

@@ -4,7 +4,13 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-07-07
-Current baseline: v0.1.186 routes `request_user_input` through the same
+Current baseline: v0.1.187 moves request-scoped capability refs inside a named
+`RuntimeStepCapabilitySnapshot`. `RuntimeStepSnapshot` now keeps the immediate
+request execution fields while routing instructions, memory, MCP registry,
+hooks, cancellation, task registry, workflow IPC, and turn interaction handlers
+through that capability bundle; `tool_turn` consumes the bundle through
+`RuntimeStepSnapshot::capabilities()` before dispatching readonly, subagent, and
+normal tool turns. Earlier v0.1.186 routes `request_user_input` through the same
 turn-scoped interaction boundary as permission requests. `RuntimeTurnInteractionState`
 now carries both the permission handler and the runtime user-input handler,
 `ThreadTurnRequest` can install a user-input handler for a turn, and

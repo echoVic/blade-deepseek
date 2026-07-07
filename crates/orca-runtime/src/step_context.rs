@@ -23,13 +23,7 @@ use crate::tool_invocation::AgentToolPolicyContext;
 use crate::workflow::ipc::WorkflowIpcContext;
 
 #[derive(Clone, Copy)]
-pub(crate) struct RuntimeStepSnapshot<'a> {
-    pub(crate) config: &'a RunConfig,
-    pub(crate) cwd: &'a Path,
-    pub(crate) tool_policy: AgentToolPolicyContext<'a>,
-    pub(crate) subagent_depth: u32,
-    pub(crate) emit_deltas: bool,
-    pub(crate) policy: &'a ApprovalPolicy,
+pub(crate) struct RuntimeStepCapabilitySnapshot<'a> {
     pub(crate) instructions: &'a ProjectInstructions,
     pub(crate) memory: &'a MemoryBlock,
     pub(crate) mcp_registry: &'a McpRegistry,
@@ -39,6 +33,17 @@ pub(crate) struct RuntimeStepSnapshot<'a> {
     pub(crate) workflow_ipc: Option<&'a WorkflowIpcContext>,
     pub(crate) permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
     pub(crate) user_input_handler: Option<&'a dyn RuntimeUserInputHandler>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct RuntimeStepSnapshot<'a> {
+    pub(crate) config: &'a RunConfig,
+    pub(crate) cwd: &'a Path,
+    pub(crate) tool_policy: AgentToolPolicyContext<'a>,
+    pub(crate) subagent_depth: u32,
+    pub(crate) emit_deltas: bool,
+    pub(crate) policy: &'a ApprovalPolicy,
+    pub(crate) capabilities: RuntimeStepCapabilitySnapshot<'a>,
 }
 
 #[derive(Clone, Copy)]
@@ -191,6 +196,39 @@ impl<'a> RuntimeStepSnapshot<'a> {
             subagent_depth,
             emit_deltas,
             policy,
+            capabilities: RuntimeStepCapabilitySnapshot::new(
+                instructions,
+                memory,
+                mcp_registry,
+                hooks,
+                cancel,
+                task_registry,
+                workflow_ipc,
+                permission_handler,
+                user_input_handler,
+            ),
+        }
+    }
+
+    pub(crate) fn capabilities(&self) -> RuntimeStepCapabilitySnapshot<'a> {
+        self.capabilities
+    }
+}
+
+impl<'a> RuntimeStepCapabilitySnapshot<'a> {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        instructions: &'a ProjectInstructions,
+        memory: &'a MemoryBlock,
+        mcp_registry: &'a McpRegistry,
+        hooks: &'a HookRunner,
+        cancel: &'a CancelToken,
+        task_registry: &'a TaskRegistry,
+        workflow_ipc: Option<&'a WorkflowIpcContext>,
+        permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
+        user_input_handler: Option<&'a dyn RuntimeUserInputHandler>,
+    ) -> Self {
+        Self {
             instructions,
             memory,
             mcp_registry,

@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.187":
+        "RuntimeStepSnapshot now carries request-scoped capability refs through a named RuntimeStepCapabilitySnapshot. Tool dispatch reads instructions, memory, MCP registry, hooks, cancel state, task registry, workflow IPC, and interaction handlers through that capability bundle, keeping provider/tool behavior unchanged while shrinking the next Codex-style step-context boundary.",
       "v0.1.186":
         "Runtime request_user_input handling now shares RuntimeTurnInteractionState with permission requests. ThreadTurnRequest can carry a runtime user-input handler, the provider/tool cycle passes it through RuntimeStepSnapshot and ToolExecutionContext, and RuntimeToolRouter treats request_user_input as a runtime special dispatch instead of a normal tool fallback.",
       "v0.1.185":
@@ -400,6 +402,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.187":
+        "RuntimeStepSnapshot 现在通过命名的 RuntimeStepCapabilitySnapshot 承载 request-scoped capability 引用。Tool dispatch 会从这组 capability bundle 读取 instructions、memory、MCP registry、hooks、cancel state、task registry、workflow IPC 与交互 handler，保持 provider/tool 行为不变，同时继续收紧 Codex 风格的 step-context 边界。",
       "v0.1.186":
         "Runtime request_user_input 现在和 permission request 共用 RuntimeTurnInteractionState。ThreadTurnRequest 可以携带 runtime user-input handler，provider/tool cycle 会通过 RuntimeStepSnapshot 和 ToolExecutionContext 继续传递它，RuntimeToolRouter 也会把 request_user_input 当成 runtime special dispatch，而不是落回普通工具占位失败。",
       "v0.1.185":

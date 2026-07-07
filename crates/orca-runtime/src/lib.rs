@@ -597,6 +597,58 @@ mod tests {
     }
 
     #[test]
+    fn runtime_step_snapshot_groups_runtime_capabilities_contract() {
+        let step_context_source = include_str!("step_context.rs");
+        let tool_turn_source = include_str!("tool_turn.rs");
+
+        assert!(
+            step_context_source.contains("pub(crate) struct RuntimeStepCapabilitySnapshot"),
+            "RuntimeStepCapabilitySnapshot must name the request-scoped runtime capability bundle"
+        );
+        assert!(
+            step_context_source.contains("capabilities: RuntimeStepCapabilitySnapshot<'a>"),
+            "RuntimeStepSnapshot must carry runtime capability refs through one named field"
+        );
+        assert!(
+            step_context_source.contains("pub(crate) fn capabilities(&self)"),
+            "RuntimeStepSnapshot must expose runtime capability refs through an accessor"
+        );
+
+        let runtime_step_snapshot_struct = step_context_source
+            .split("pub(crate) struct RuntimeStepSnapshot<'a> {")
+            .nth(1)
+            .expect("RuntimeStepSnapshot struct body")
+            .split("}")
+            .next()
+            .expect("RuntimeStepSnapshot struct end");
+        for field_name in [
+            "instructions",
+            "memory",
+            "mcp_registry",
+            "hooks",
+            "cancel",
+            "task_registry",
+            "workflow_ipc",
+            "permission_handler",
+            "user_input_handler",
+        ] {
+            assert!(
+                !runtime_step_snapshot_struct.contains(&format!("pub(crate) {field_name}:")),
+                "RuntimeStepSnapshot must not expose capability field {field_name} outside RuntimeStepCapabilitySnapshot"
+            );
+        }
+
+        assert!(
+            tool_turn_source.contains("let capabilities = step_snapshot.capabilities();"),
+            "tool_turn dispatch must route runtime capability refs through RuntimeStepCapabilitySnapshot"
+        );
+        assert!(
+            !tool_turn_source.contains("let instructions = step_snapshot.instructions;"),
+            "tool_turn dispatch must not peel capability refs directly off RuntimeStepSnapshot"
+        );
+    }
+
+    #[test]
     fn runtime_turn_interaction_state_groups_turn_scoped_interaction_handlers() {
         let lifecycle_source = include_str!("lifecycle.rs");
         let agent_loop_source = include_str!("agent_loop.rs");
