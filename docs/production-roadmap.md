@@ -4,11 +4,17 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-07-07
-Current baseline: v0.1.170 lets `RuntimeSamplingRequestState` record normal
-tool results and own the approval-required plus subagent-failure terminal
-folding for single-tool turns. Normal tool execution now borrows its permission
-overlay and records its result through the same request state, leaving
-`tool_turn` to delegate the per-sampling state boundary. Earlier v0.1.169 let
+Current baseline: v0.1.171 fixes two sandbox/task-state rough edges: pathless
+macOS sandbox denials such as GitHub HTTPS credential prompts can now escalate
+through runtime, JSONL `command/exec`, and TUI approval flows to re-run the
+command without the filesystem sandbox, while shell task session state now lives
+under `ORCA_HOME/task-sessions` (or `~/.orca/task-sessions`) with migration from
+legacy project `.orca/task-sessions` directories. Earlier v0.1.170 let
+`RuntimeSamplingRequestState` record normal tool results and own the
+approval-required plus subagent-failure terminal folding for single-tool turns.
+Normal tool execution now borrows its permission overlay and records its result
+through the same request state, leaving `tool_turn` to delegate the
+per-sampling state boundary. Earlier v0.1.169 let
 `RuntimeSamplingRequestState` produce clamped `RuntimeToolDispatchWindow` values
 for readonly and subagent batch dispatch. Tool turns no longer read raw cursor
 positions or slice batch windows directly, and the dispatch-window API

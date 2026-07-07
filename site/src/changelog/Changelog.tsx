@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.171":
+        "Bash sandbox recovery now handles pathless macOS sandbox denials such as GitHub HTTPS credential prompts: runtime, JSONL command/exec, and the TUI can ask to re-run the command without the filesystem sandbox after approval. Shell task session state also moves to ORCA_HOME with migration from legacy project .orca/task-sessions directories.",
       "v0.1.170":
         "RuntimeSamplingRequestState now records normal tool results and owns the approval-required and subagent-failure terminal folding for single-tool turns. Normal tool execution borrows its permission overlay and records its result through the same request state, leaving tool_turn to delegate without changing user-visible behavior.",
       "v0.1.169":
@@ -368,6 +370,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.171":
+        "Bash sandbox recovery 现在能处理 macOS 上没有具体路径的 sandbox 拒绝，例如 GitHub HTTPS 凭据读取失败：runtime、JSONL command/exec 和 TUI 都会在用户同意后用无文件系统沙箱方式重跑命令。Shell task session 状态也迁移到 ORCA_HOME，并会从旧的项目 .orca/task-sessions 目录迁移历史记录。",
       "v0.1.170":
         "RuntimeSamplingRequestState 现在负责记录 normal tool result，并持有 approval-required 与 subagent-failure 的 terminal folding。Normal tool execution 会从同一个 request state 借 permission overlay 并通过它记录结果；tool_turn 只负责委托，用户可见行为不变。",
       "v0.1.169":
