@@ -597,6 +597,41 @@ mod tests {
     }
 
     #[test]
+    fn runtime_turn_interaction_state_groups_turn_scoped_interaction_handlers() {
+        let lifecycle_source = include_str!("lifecycle.rs");
+        let agent_loop_source = include_str!("agent_loop.rs");
+        let runtime_turn_loop_source = include_str!("runtime_turn_loop.rs");
+
+        assert!(
+            lifecycle_source.contains("pub(crate) struct RuntimeTurnInteractionState"),
+            "RuntimeTurnInteractionState must be the named home for turn-scoped interaction handlers"
+        );
+        assert!(
+            lifecycle_source.contains("turn_interactions: RuntimeTurnInteractionState<'a>"),
+            "AgentLoopContext must carry turn-scoped interaction handlers through one grouped field"
+        );
+        let agent_loop_context_struct = lifecycle_source
+            .split("pub(crate) struct AgentLoopContext<'a> {")
+            .nth(1)
+            .expect("AgentLoopContext struct body")
+            .split("}")
+            .next()
+            .expect("AgentLoopContext struct end");
+        assert!(
+            !agent_loop_context_struct.contains("permission_handler:"),
+            "AgentLoopContext must not expose permission_handler as a parallel top-level field"
+        );
+        assert!(
+            agent_loop_source.contains("turn_interactions"),
+            "agent_loop must route turn-scoped interaction handlers through RuntimeTurnInteractionState"
+        );
+        assert!(
+            runtime_turn_loop_source.contains("turn_interactions"),
+            "runtime_turn_loop must pass interaction handlers through the grouped turn interaction state"
+        );
+    }
+
+    #[test]
     fn sampling_request_state_owns_tool_permission_overlay() {
         let step_context_source = include_str!("step_context.rs");
         let tool_turn_source = include_str!("tool_turn.rs");

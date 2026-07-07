@@ -20,7 +20,9 @@ use orca_core::event_schema::EventFactory;
 use orca_core::event_sink::EventSink;
 
 #[cfg(test)]
-use crate::lifecycle::RuntimeTurnState;
+use crate::lifecycle::{
+    RuntimePermissionRequestHandler, RuntimeTurnInteractionState, RuntimeTurnState,
+};
 
 const DEFAULT_MAX_TURNS: u32 = 128;
 
@@ -44,8 +46,8 @@ pub(crate) fn run_agent_loop(
         turn_deps,
         turn_state,
         turn_execution,
+        turn_interactions,
         steer_handle,
-        permission_handler,
     } = loop_context;
     let RuntimeTurnDeps {
         instructions,
@@ -114,7 +116,7 @@ pub(crate) fn run_agent_loop(
             mcp_registry,
             background_workflows,
             workflow_ipc,
-            permission_handler,
+            turn_interactions,
         },
         RuntimeTurnLoopExecutors::new(
             execute_child_agent_loop,
@@ -467,6 +469,47 @@ mod tests {
             execution.lifecycle().unwrap().run_id(),
             "agent-loop-execution-group"
         );
+    }
+
+    struct TestPermissionHandler;
+
+    impl RuntimePermissionRequestHandler for TestPermissionHandler {
+        fn request_permissions(
+            &self,
+            _request: &crate::lifecycle::RuntimePermissionRequest,
+        ) -> io::Result<crate::lifecycle::RuntimePermissionResponse> {
+            unreachable!("test only checks handler routing identity")
+        }
+    }
+
+    #[test]
+    fn runtime_turn_interaction_state_groups_permission_handler() {
+        let handler = TestPermissionHandler;
+        let interactions =
+            RuntimeTurnInteractionState::new().with_permission_handler(Some(&handler));
+
+        let resolved = interactions
+            .permission_handler()
+            .expect("permission handler");
+        let expected: &(dyn RuntimePermissionRequestHandler + Send + Sync) = &handler;
+        assert!(std::ptr::eq(resolved, expected));
+    }
+
+    #[test]
+    fn agent_loop_context_exposes_runtime_turn_interactions() {
+        let cwd = PathBuf::from("/tmp/orca-agent-loop-interactions");
+        let subagent_type = SubagentType::General;
+        let handler = TestPermissionHandler;
+
+        let context = AgentLoopContext::new(&cwd, "inspect repo", 0, true, &subagent_type)
+            .with_permission_handler(Some(&handler));
+
+        let resolved = context
+            .turn_interactions()
+            .permission_handler()
+            .expect("permission handler");
+        let expected: &(dyn RuntimePermissionRequestHandler + Send + Sync) = &handler;
+        assert!(std::ptr::eq(resolved, expected));
     }
 
     #[test]

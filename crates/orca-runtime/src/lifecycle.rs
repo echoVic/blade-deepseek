@@ -101,8 +101,8 @@ pub(crate) struct AgentLoopContext<'a> {
     pub(crate) turn_deps: Option<RuntimeTurnDeps<'a>>,
     pub(crate) turn_state: Option<RuntimeTurnState<'a>>,
     pub(crate) turn_execution: Option<RuntimeTurnExecution<'a>>,
+    pub(crate) turn_interactions: RuntimeTurnInteractionState<'a>,
     pub(crate) steer_handle: Option<&'a ThreadSteerHandle>,
-    pub(crate) permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -164,6 +164,11 @@ pub(crate) struct RuntimeTurnExecution<'a> {
     pub(crate) background_workflows: &'a mut Vec<BackgroundWorkflowRun>,
     pub(crate) workflow_ipc: Option<&'a WorkflowIpcContext>,
     pub(crate) lifecycle: Option<&'a mut RuntimeSessionLifecycle>,
+}
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct RuntimeTurnInteractionState<'a> {
+    permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
 }
 
 #[derive(Clone)]
@@ -703,8 +708,8 @@ impl<'a> AgentLoopContext<'a> {
             turn_deps: None,
             turn_state: None,
             turn_execution: None,
+            turn_interactions: RuntimeTurnInteractionState::new(),
             steer_handle: None,
-            permission_handler: None,
         }
     }
 
@@ -825,8 +830,15 @@ impl<'a> AgentLoopContext<'a> {
         mut self,
         permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
     ) -> Self {
-        self.permission_handler = permission_handler;
+        self.turn_interactions = self
+            .turn_interactions
+            .with_permission_handler(permission_handler);
         self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn turn_interactions(&self) -> RuntimeTurnInteractionState<'a> {
+        self.turn_interactions
     }
 
     #[cfg(test)]
@@ -928,6 +940,28 @@ impl<'a> RuntimeTurnDeps<'a> {
     #[cfg(test)]
     pub(crate) fn hooks(&self) -> &'a HookRunner {
         self.hooks
+    }
+}
+
+impl<'a> RuntimeTurnInteractionState<'a> {
+    pub(crate) fn new() -> Self {
+        Self {
+            permission_handler: None,
+        }
+    }
+
+    pub(crate) fn with_permission_handler(
+        mut self,
+        permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
+    ) -> Self {
+        self.permission_handler = permission_handler;
+        self
+    }
+
+    pub(crate) fn permission_handler(
+        &self,
+    ) -> Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)> {
+        self.permission_handler
     }
 }
 

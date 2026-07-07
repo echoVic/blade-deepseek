@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.185":
+        "Runtime turn-scoped interaction handlers now flow through RuntimeTurnInteractionState. AgentLoopContext, runtime_turn_loop, and runtime_turn_iteration carry the permission-request handler through one grouped boundary, preserving current approval behavior while preparing request-user-input and other interaction waiters to share the same turn-owned surface.",
       "v0.1.184":
         "RuntimeStepContext now carries request-scoped runtime inputs through a named RuntimeStepSnapshot. Provider response handling reads final-response settings through the snapshot, and tool dispatch splits the step context into snapshot plus extension binding before routing normal, readonly, workflow, and subagent tool turns.",
       "v0.1.183":
@@ -396,6 +398,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.185":
+        "Runtime turn 级交互处理器现在流经 RuntimeTurnInteractionState。AgentLoopContext、runtime_turn_loop 和 runtime_turn_iteration 会通过一个 grouped boundary 传递 permission-request handler，保持现有审批行为不变，同时为后续 request_user_input 和其他交互等待状态共用同一个 turn-owned surface 做准备。",
       "v0.1.184":
         "RuntimeStepContext 现在通过命名的 RuntimeStepSnapshot 承载 request-scoped runtime 输入。Provider response handling 会从 snapshot 读取 final-response 设置，tool dispatch 也会先把 step context 拆成 snapshot 与 extension binding，再路由 normal、readonly、workflow 和 subagent tool turn。",
       "v0.1.183":

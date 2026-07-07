@@ -14,7 +14,7 @@ use crate::agent_child::ChildAgentExecutor;
 use crate::hooks::HookRunner;
 use crate::instructions::ProjectInstructions;
 use crate::lifecycle::{
-    AgentLoopResult, RuntimePermissionRequestHandler, RuntimeTaskActor, RuntimeTurnLoopState,
+    AgentLoopResult, RuntimeTaskActor, RuntimeTurnInteractionState, RuntimeTurnLoopState,
     ThreadSteerHandle,
 };
 use crate::memory::MemoryBlock;
@@ -54,7 +54,7 @@ pub(crate) struct RuntimeAgentTurnLoopInput<'a, 'runtime, W: io::Write> {
     pub(crate) mcp_registry: &'a McpRegistry,
     pub(crate) background_workflows: &'a mut Vec<BackgroundWorkflowRun>,
     pub(crate) workflow_ipc: Option<&'a WorkflowIpcContext>,
-    pub(crate) permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
+    pub(crate) turn_interactions: RuntimeTurnInteractionState<'a>,
 }
 
 pub(crate) struct RuntimeTurnLoopInput<'a, 'runtime, W: io::Write> {
@@ -83,7 +83,7 @@ pub(crate) struct RuntimeTurnLoopInput<'a, 'runtime, W: io::Write> {
     pub(crate) mcp_registry: &'a McpRegistry,
     pub(crate) background_workflows: &'a mut Vec<BackgroundWorkflowRun>,
     pub(crate) workflow_ipc: Option<&'a WorkflowIpcContext>,
-    pub(crate) permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
+    pub(crate) turn_interactions: RuntimeTurnInteractionState<'a>,
 }
 
 pub(crate) struct RuntimeTurnLoopExecutors<W: io::Write> {
@@ -120,7 +120,7 @@ impl<'a, 'runtime, W: io::Write> RuntimeTurnLoopInput<'a, 'runtime, W> {
         mcp_registry: &'a McpRegistry,
         background_workflows: &'a mut Vec<BackgroundWorkflowRun>,
         workflow_ipc: Option<&'a WorkflowIpcContext>,
-        permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
+        turn_interactions: RuntimeTurnInteractionState<'a>,
     ) -> Self {
         Self {
             actor,
@@ -148,7 +148,7 @@ impl<'a, 'runtime, W: io::Write> RuntimeTurnLoopInput<'a, 'runtime, W> {
             mcp_registry,
             background_workflows,
             workflow_ipc,
-            permission_handler,
+            turn_interactions,
         }
     }
 
@@ -187,7 +187,7 @@ impl<'a, 'runtime, W: io::Write> RuntimeTurnLoopInput<'a, 'runtime, W> {
             extensions: loop_state.extensions,
             background_workflows: &mut *self.background_workflows,
             workflow_ipc: self.workflow_ipc,
-            permission_handler: self.permission_handler,
+            turn_interactions: self.turn_interactions,
         }
     }
 }
@@ -270,7 +270,7 @@ impl<'a, 'runtime, W: io::Write> RuntimeAgentTurnLoopInput<'a, 'runtime, W> {
             self.mcp_registry,
             self.background_workflows,
             self.workflow_ipc,
-            self.permission_handler,
+            self.turn_interactions,
         )
     }
 }

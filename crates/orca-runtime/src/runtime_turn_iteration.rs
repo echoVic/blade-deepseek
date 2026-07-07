@@ -17,7 +17,7 @@ use crate::extension::RuntimeExtensionContext;
 use crate::hooks::HookRunner;
 use crate::instructions::ProjectInstructions;
 use crate::lifecycle::{
-    AgentLoopResult, RuntimePermissionRequestHandler, RuntimeTaskActor, ThreadSteerHandle,
+    AgentLoopResult, RuntimeTaskActor, RuntimeTurnInteractionState, ThreadSteerHandle,
 };
 use crate::memory::MemoryBlock;
 use crate::provider_turn::{
@@ -69,7 +69,7 @@ pub(crate) struct RuntimeTurnIterationInput<'a, 'runtime, W: io::Write> {
     pub(crate) extensions: RuntimeExtensionContext<'a>,
     pub(crate) background_workflows: &'a mut Vec<BackgroundWorkflowRun>,
     pub(crate) workflow_ipc: Option<&'a WorkflowIpcContext>,
-    pub(crate) permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
+    pub(crate) turn_interactions: RuntimeTurnInteractionState<'a>,
 }
 
 pub(crate) enum RuntimeTurnIterationResult {
@@ -148,7 +148,7 @@ impl RuntimeTurnIterationStep {
                 extensions: input.extensions,
                 background_workflows: input.background_workflows,
                 workflow_ipc: input.workflow_ipc,
-                permission_handler: input.permission_handler,
+                permission_handler: input.turn_interactions.permission_handler(),
                 steer_handle: input.steer_handle,
             },
             child_executor,
