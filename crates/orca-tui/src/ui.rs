@@ -776,6 +776,7 @@ fn workflow_gauge_label(status: TaskStatus) -> String {
 
 fn task_type_label(task: &BackgroundTaskSummary) -> &'static str {
     match task.task_type {
+        TaskType::MainSession => "session",
         TaskType::Workflow => "workflow",
         TaskType::Subagent => "subagent",
         TaskType::Shell => "shell",
@@ -787,7 +788,7 @@ fn task_detail_label(task: &BackgroundTaskSummary) -> String {
     match task.task_type {
         TaskType::Workflow => workflow_progress_label(task),
         TaskType::Subagent => subagent_progress_label(task),
-        TaskType::Shell | TaskType::Monitor => elapsed_label(task),
+        TaskType::MainSession | TaskType::Shell | TaskType::Monitor => elapsed_label(task),
     }
 }
 
@@ -3343,6 +3344,40 @@ mod tests {
         assert!(rendered.contains("running"));
         assert!(rendered.contains("completed"));
         assert!(rendered.contains("150 tok"));
+    }
+
+    #[test]
+    fn workflow_panel_labels_main_session_tasks() {
+        let task = BackgroundTaskSummary {
+            id: "task-main".to_string(),
+            task_type: TaskType::MainSession,
+            status: TaskStatus::Completed,
+            description: "Summarize architecture".to_string(),
+            created_at_ms: 1_000,
+            started_at_ms: Some(1_000),
+            completed_at_ms: Some(4_000),
+            command: None,
+            agent_type: Some("main-session".to_string()),
+            server: None,
+            tool: None,
+            name: None,
+            workflow_run_id: None,
+            phase_count: None,
+            workflow_progress: None,
+            workflow_phases: Vec::new(),
+            workflow_agents: Vec::new(),
+            workflow_script_path: None,
+            workflow_launch_input: None,
+            workflow_final_summary: None,
+            workflow_failure_count: 0,
+            usage: None,
+            subagent_current_activity: None,
+            subagent_turn: None,
+            last_activity_at_ms: Some(4_000),
+        };
+
+        assert_eq!(task_type_label(&task), "session");
+        assert_eq!(task_detail_label(&task), "elapsed 3s");
     }
 
     fn workflow_task_for_agent_dashboard(

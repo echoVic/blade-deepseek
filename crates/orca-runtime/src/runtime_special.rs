@@ -463,6 +463,7 @@ fn task_status_label(status: TaskStatus) -> &'static str {
 
 fn task_type_label(task_type: TaskType) -> &'static str {
     match task_type {
+        TaskType::MainSession => "main_session",
         TaskType::Workflow => "workflow",
         TaskType::Subagent => "subagent",
         TaskType::Shell => "shell",

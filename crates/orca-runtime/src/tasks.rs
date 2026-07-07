@@ -256,6 +256,53 @@ impl TaskRegistry {
         }
     }
 
+    pub fn create_main_session(&self, description: String) -> TaskHandle {
+        let id = new_task_id();
+        let created_at_ms = now_ms();
+        let control = TaskControl {
+            cancel: CancelToken::new(),
+            pause: Arc::new(AtomicBool::new(false)),
+        };
+        let record = TaskRecord {
+            id: id.clone(),
+            task_type: TaskType::MainSession,
+            status: TaskStatus::Queued,
+            description,
+            created_at_ms,
+            started_at_ms: None,
+            completed_at_ms: None,
+            name: None,
+            agent_type: Some("main-session".to_string()),
+            workflow_run_id: None,
+            phase_count: None,
+            workflow_progress: None,
+            workflow_phases: Vec::new(),
+            workflow_agents: Vec::new(),
+            workflow_script_path: None,
+            workflow_launch_input: None,
+            workflow_final_summary: None,
+            workflow_failure_count: 0,
+            usage: None,
+            subagent_current_activity: None,
+            subagent_turn: None,
+            last_activity_at_ms: None,
+            result: None,
+            error: None,
+            worker_pid: None,
+            command: None,
+            control,
+        };
+
+        self.insert_task(id.clone(), record)
+            .expect("task registry insert failed");
+
+        TaskHandle {
+            id,
+            task_type: TaskType::MainSession,
+            workflow_run_id: None,
+        }
+    }
+
     pub fn create_shell(&self, description: String, command: String) -> TaskHandle {
         let id = new_task_id();
         let created_at_ms = now_ms();
@@ -857,6 +904,7 @@ fn mark_interrupted_if_active(record: &mut TaskRecord) -> bool {
 
 fn task_type_label(task_type: TaskType) -> &'static str {
     match task_type {
+        TaskType::MainSession => "main session",
         TaskType::Workflow => "workflow",
         TaskType::Subagent => "subagent",
         TaskType::Shell => "shell",
@@ -1106,6 +1154,25 @@ mod tests {
         assert_eq!(list[0].status, TaskStatus::Queued);
         assert_eq!(list[0].description, "inspect auth");
         assert_eq!(list[0].agent_type.as_deref(), Some("general"));
+        assert!(list[0].created_at_ms > 0);
+        assert_eq!(list[0].started_at_ms, None);
+        assert_eq!(list[0].completed_at_ms, None);
+    }
+
+    #[test]
+    fn registry_creates_and_lists_main_session_tasks() {
+        let registry = TaskRegistry::new("session-1".to_string());
+        let task = registry.create_main_session("Summarize architecture".to_string());
+
+        assert!(task.id.starts_with("task-"));
+        assert_eq!(task.task_type, TaskType::MainSession);
+
+        let list = registry.list();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].task_type, TaskType::MainSession);
+        assert_eq!(list[0].status, TaskStatus::Queued);
+        assert_eq!(list[0].description, "Summarize architecture");
+        assert_eq!(list[0].agent_type.as_deref(), Some("main-session"));
         assert!(list[0].created_at_ms > 0);
         assert_eq!(list[0].started_at_ms, None);
         assert_eq!(list[0].completed_at_ms, None);

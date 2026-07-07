@@ -1889,6 +1889,7 @@ fn digest_value(value: &Value) -> String {
 
 fn task_type_name(task_type: TaskType) -> &'static str {
     match task_type {
+        TaskType::MainSession => "main_session",
         TaskType::Workflow => "workflow",
         TaskType::Subagent => "subagent",
         TaskType::Shell => "shell",

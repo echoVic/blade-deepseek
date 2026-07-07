@@ -19,6 +19,7 @@ pub enum TaskStatus {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskType {
+    MainSession,
     Workflow,
     Subagent,
     Shell,
