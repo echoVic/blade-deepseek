@@ -4,12 +4,16 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-07-07
-Current baseline: v0.1.171 fixes two sandbox/task-state rough edges: pathless
-macOS sandbox denials such as GitHub HTTPS credential prompts can now escalate
-through runtime, JSONL `command/exec`, and TUI approval flows to re-run the
-command without the filesystem sandbox, while shell task session state now lives
-under `ORCA_HOME/task-sessions` (or `~/.orca/task-sessions`) with migration from
-legacy project `.orca/task-sessions` directories. Earlier v0.1.170 let
+Current baseline: v0.1.172 exposes a server-mode `shell/capabilities` operation
+so app-server clients can query the current platform, native PTY and PTY resize
+availability, accepted terminal modes, pipe fallback behavior, and the
+`processId` requirement for streaming `command/exec` sessions before launching
+terminal work. Earlier v0.1.171 fixed two sandbox/task-state rough edges:
+pathless macOS sandbox denials such as GitHub HTTPS credential prompts can now
+escalate through runtime, JSONL `command/exec`, and TUI approval flows to
+re-run the command without the filesystem sandbox, while shell task session
+state now lives under `ORCA_HOME/task-sessions` (or `~/.orca/task-sessions`)
+with migration from legacy project `.orca/task-sessions` directories. Earlier v0.1.170 let
 `RuntimeSamplingRequestState` record normal tool results and own the
 approval-required plus subagent-failure terminal folding for single-tool turns.
 Normal tool execution now borrows its permission overlay and records its result
@@ -310,8 +314,10 @@ commands and consume versioned events without owning turn execution details.
    are enforced at the transport boundary, and server-mode turns surface
    timeout details in legacy `tool_completed.error`. After timeout/connection
    failures, MCP clients rebuild the transport for future calls without
-   automatically replaying the failed call. Next, expand cross-platform PTY
-   support.
+   automatically replaying the failed call. `shell/capabilities` now exposes
+   the platform/runtime capability surface that clients need before requesting
+   PTY sessions or resize operations. Next, use that boundary for deeper
+   cross-platform PTY support.
 3. **ThreadStore-backed app-server materialization:** Codex treats threads as
    resumable/forkable SDK objects. Orca has `SessionStore` and an in-process
    server path; `thread/start` is now immediately visible through the

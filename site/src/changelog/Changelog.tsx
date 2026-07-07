@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.172":
+        "Server-mode clients can now query shell/capabilities before starting shell or command/exec PTY work. The response reports the current platform, whether native PTY and PTY resize are available, accepted terminal modes, pipe fallback behavior, and the processId requirement for streaming command/exec sessions.",
       "v0.1.171":
         "Bash sandbox recovery now handles pathless macOS sandbox denials such as GitHub HTTPS credential prompts: runtime, JSONL command/exec, and the TUI can ask to re-run the command without the filesystem sandbox after approval. Shell task session state also moves to ORCA_HOME with migration from legacy project .orca/task-sessions directories.",
       "v0.1.170":
@@ -370,6 +372,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.172":
+        "Server mode 现在可以在启动 shell 或 command/exec PTY 任务前查询 shell/capabilities。响应会报告当前平台、原生 PTY 与 PTY resize 是否可用、接受的 terminal mode、pipe fallback 行为，以及 streaming command/exec session 必须提供 processId 的约束。",
       "v0.1.171":
         "Bash sandbox recovery 现在能处理 macOS 上没有具体路径的 sandbox 拒绝，例如 GitHub HTTPS 凭据读取失败：runtime、JSONL command/exec 和 TUI 都会在用户同意后用无文件系统沙箱方式重跑命令。Shell task session 状态也迁移到 ORCA_HOME，并会从旧的项目 .orca/task-sessions 目录迁移历史记录。",
       "v0.1.170":
