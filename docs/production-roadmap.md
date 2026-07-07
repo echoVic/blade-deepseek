@@ -4,12 +4,20 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-07-07
-Current baseline: v0.1.189 carries provider-response I/O refs through a named
-`RuntimeProviderResponseIo` bundle. `RuntimeTurnKernel` now assembles events,
-sink, conversation, history writer, cost tracker, and background workflow refs
-as one response handoff, while provider response handling destructures that
-bundle only at the execution boundary before dispatching final-message or tool
-turn work. Earlier v0.1.188 carries provider-cycle capability refs through the
+Current baseline: v0.1.190 carries provider-turn execution through a named
+`RuntimeProviderTurnInput` and groups provider-call I/O refs behind
+`RuntimeProviderTurnIo`. `RuntimeProviderTurnStep` now receives actor, provider,
+runtime system messages, hook/cancel refs, budget policy, steering handle, and
+the grouped conversation/history/event/sink/cost refs as one call-boundary
+object, while provider behavior remains unchanged. Earlier v0.1.189 carries
+provider-response I/O refs through a named `RuntimeProviderResponseIo` bundle.
+`RuntimeTurnKernel` now assembles events, sink, conversation, history writer,
+cost tracker, and background workflow refs as one response handoff, while
+provider response handling destructures that bundle only at the execution
+boundary before dispatching final-message or tool turn work. This continues the
+same direction seen in Codex turn/step contexts and Claude Code query/tool
+contexts: wide execution state is handed across named runtime boundaries rather
+than expanded at every call site. Earlier v0.1.188 carries provider-cycle capability refs through the
 same `RuntimeStepCapabilitySnapshot` used by step context. `RuntimeProviderCycleInput`
 keeps provider-cycle execution fields separate from the request capability
 bundle, `runtime_turn_iteration` assembles that bundle once from turn input, and

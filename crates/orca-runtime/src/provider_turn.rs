@@ -78,6 +78,28 @@ pub(crate) struct RuntimeProviderCycleInput<'a, 'runtime, W: io::Write> {
     pub(crate) steer_handle: Option<&'a crate::lifecycle::ThreadSteerHandle>,
 }
 
+pub(crate) struct RuntimeProviderTurnInput<'a, 'runtime, W: io::Write> {
+    pub(crate) actor: &'a mut RuntimeTaskActor<'runtime>,
+    pub(crate) provider: ProviderKind,
+    pub(crate) runtime_system_messages: &'a [String],
+    pub(crate) provider_config: &'a ProviderConfig,
+    pub(crate) cwd: &'a str,
+    pub(crate) emit_deltas: bool,
+    pub(crate) hooks: &'a HookRunner,
+    pub(crate) cancel: &'a CancelToken,
+    pub(crate) max_budget_usd: Option<f64>,
+    pub(crate) steer_handle: Option<&'a crate::lifecycle::ThreadSteerHandle>,
+    pub(crate) io: RuntimeProviderTurnIo<'a, W>,
+}
+
+pub(crate) struct RuntimeProviderTurnIo<'a, W: io::Write> {
+    pub(crate) conversation: &'a mut Conversation,
+    pub(crate) cost_tracker: &'a mut CostTracker,
+    pub(crate) events: &'a mut EventFactory,
+    pub(crate) sink: &'a mut EventSink<W>,
+    pub(crate) history_writer: Option<&'a mut SessionWriter>,
+}
+
 pub(crate) struct RuntimeProviderResponseInput<'a, W: io::Write> {
     pub(crate) step_context: RuntimeStepContext<'a>,
     pub(crate) sampling_state: &'a mut RuntimeSamplingRequestState,
@@ -271,69 +293,72 @@ impl RuntimeProviderTurnStep {
         Self
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn run<W: io::Write>(
         &mut self,
-        actor: &mut RuntimeTaskActor<'_>,
-        provider: ProviderKind,
-        conversation: &mut Conversation,
-        runtime_system_messages: &[String],
-        provider_config: &ProviderConfig,
-        cwd: &str,
-        emit_deltas: bool,
-        hooks: &HookRunner,
-        cancel: &CancelToken,
-        cost_tracker: &mut CostTracker,
-        max_budget_usd: Option<f64>,
-        events: &mut EventFactory,
-        sink: &mut EventSink<W>,
-        mut history_writer: Option<&mut SessionWriter>,
-        steer_handle: Option<&crate::lifecycle::ThreadSteerHandle>,
+        input: RuntimeProviderTurnInput<'_, '_, W>,
     ) -> io::Result<RuntimeProviderTurnOutput> {
-        let pre_model_outcome = match actor.run_pre_model_hook_with_cancel(hooks, cwd, Some(cancel))
-        {
+        let RuntimeProviderTurnIo {
+            conversation,
+            cost_tracker,
+            events,
+            sink,
+            mut history_writer,
+        } = input.io;
+        let pre_model_outcome = match input.actor.run_pre_model_hook_with_cancel(
+            input.hooks,
+            input.cwd,
+            Some(input.cancel),
+        ) {
             Ok(outcome) => outcome,
             Err(error) => return Ok(RuntimeProviderTurnOutput::terminal(error)),
         };
-        if cancel.is_cancelled() {
-            return cancelled_provider_turn(emit_deltas, events, sink);
+        if input.cancel.is_cancelled() {
+            return cancelled_provider_turn(input.emit_deltas, events, sink);
         }
 
         RuntimeSteerStep::new().apply(RuntimeSteerInput {
-            steer_handle,
+            steer_handle: input.steer_handle,
             conversation,
             history_writer: history_writer.as_deref_mut(),
         })?;
         let model_conversation = conversation_with_hook_context(conversation, &pre_model_outcome);
-        let model_conversation =
-            conversation_with_runtime_system_messages(&model_conversation, runtime_system_messages);
-        let response = actor.call_streaming_provider(
-            provider,
+        let model_conversation = conversation_with_runtime_system_messages(
             &model_conversation,
-            provider_config,
-            cancel,
-            &mut |step| emit_provider_delta(step, emit_deltas, events, sink),
+            input.runtime_system_messages,
         );
-        if cancel.is_cancelled() {
-            return cancelled_provider_turn(emit_deltas, events, sink);
+        let response = input.actor.call_streaming_provider(
+            input.provider,
+            &model_conversation,
+            input.provider_config,
+            input.cancel,
+            &mut |step| emit_provider_delta(step, input.emit_deltas, events, sink),
+        );
+        if input.cancel.is_cancelled() {
+            return cancelled_provider_turn(input.emit_deltas, events, sink);
         }
 
-        if let Some(warning) =
-            actor.run_post_model_hook_with_cancel(hooks, cwd, response.usage.as_ref(), Some(cancel))
-            && emit_deltas
+        if let Some(warning) = input.actor.run_post_model_hook_with_cancel(
+            input.hooks,
+            input.cwd,
+            response.usage.as_ref(),
+            Some(input.cancel),
+        ) && input.emit_deltas
         {
             sink.emit(&events.error(&warning))?;
         }
-        if cancel.is_cancelled() {
-            return cancelled_provider_turn(emit_deltas, events, sink);
+        if input.cancel.is_cancelled() {
+            return cancelled_provider_turn(input.emit_deltas, events, sink);
         }
 
         if let Some(usage) = response.usage
             && !usage.is_empty()
         {
-            match actor.record_usage(usage, cost_tracker, max_budget_usd) {
+            match input
+                .actor
+                .record_usage(usage, cost_tracker, input.max_budget_usd)
+            {
                 Ok(totals) => {
-                    if emit_deltas {
+                    if input.emit_deltas {
                         sink.emit(&events.usage_updated(totals))?;
                         if let Some(writer) = history_writer.as_deref_mut() {
                             writer.append_usage(totals)?;
@@ -487,23 +512,25 @@ impl RuntimeTurnProviderCycleStep {
         let cwd_display = input.cwd.display().to_string();
         let provider_turn = {
             let (conversation, history_writer) = input.conversation.parts_mut();
-            RuntimeProviderTurnStep::new().run(
-                input.actor,
-                input.provider,
-                conversation,
-                input.runtime_system_messages,
-                input.turn_provider_config,
-                &cwd_display,
-                input.emit_deltas,
-                capabilities.hooks,
-                capabilities.cancel,
-                input.cost_tracker,
-                input.max_budget_usd,
-                input.events,
-                input.sink,
-                history_writer,
-                input.steer_handle,
-            )?
+            RuntimeProviderTurnStep::new().run(RuntimeProviderTurnInput {
+                actor: input.actor,
+                provider: input.provider,
+                runtime_system_messages: input.runtime_system_messages,
+                provider_config: input.turn_provider_config,
+                cwd: &cwd_display,
+                emit_deltas: input.emit_deltas,
+                hooks: capabilities.hooks,
+                cancel: capabilities.cancel,
+                max_budget_usd: input.max_budget_usd,
+                steer_handle: input.steer_handle,
+                io: RuntimeProviderTurnIo {
+                    conversation,
+                    cost_tracker: input.cost_tracker,
+                    events: input.events,
+                    sink: input.sink,
+                    history_writer,
+                },
+            })?
         };
         let response = match RuntimeProviderTurnResultResultStep::new().fold(
             RuntimeProviderTurnResultStep::new().fold(
@@ -862,23 +889,25 @@ mod tests {
         let mut sink = EventSink::new(&mut output, OutputFormat::Jsonl);
 
         let result = RuntimeProviderTurnStep::new()
-            .run(
-                &mut actor,
-                ProviderKind::Mock,
-                &mut conversation,
-                runtime_system_messages.as_slice(),
-                &provider_config,
-                ".",
-                true,
-                &hooks,
-                &cancel,
-                &mut cost_tracker,
-                None,
-                &mut events,
-                &mut sink,
-                None,
-                None,
-            )
+            .run(RuntimeProviderTurnInput {
+                actor: &mut actor,
+                provider: ProviderKind::Mock,
+                runtime_system_messages: runtime_system_messages.as_slice(),
+                provider_config: &provider_config,
+                cwd: ".",
+                emit_deltas: true,
+                hooks: &hooks,
+                cancel: &cancel,
+                max_budget_usd: None,
+                steer_handle: None,
+                io: RuntimeProviderTurnIo {
+                    conversation: &mut conversation,
+                    cost_tracker: &mut cost_tracker,
+                    events: &mut events,
+                    sink: &mut sink,
+                    history_writer: None,
+                },
+            })
             .expect("provider turn");
 
         let response = result.response.expect("provider response");

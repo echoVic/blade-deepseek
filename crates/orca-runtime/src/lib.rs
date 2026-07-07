@@ -666,7 +666,7 @@ mod tests {
             .split("pub(crate) struct RuntimeProviderCycleInput")
             .nth(1)
             .expect("RuntimeProviderCycleInput struct body")
-            .split("pub(crate) struct RuntimeProviderResponseInput")
+            .split("pub(crate) struct RuntimeProviderTurnInput")
             .next()
             .expect("RuntimeProviderCycleInput struct end");
         for field_name in [
@@ -1044,6 +1044,59 @@ mod tests {
         assert!(
             provider_turn_source.contains("let RuntimeProviderResponseIo {"),
             "provider response handling should destructure the grouped I/O context at the execution boundary"
+        );
+    }
+
+    #[test]
+    fn runtime_provider_turn_input_groups_io_refs_contract() {
+        let provider_turn_source = include_str!("provider_turn.rs");
+        let provider_turn_runtime_source = provider_turn_source
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .expect("provider turn runtime source");
+
+        assert!(
+            provider_turn_source.contains("pub(crate) struct RuntimeProviderTurnInput"),
+            "provider turn execution must receive one named input object"
+        );
+        assert!(
+            provider_turn_source.contains("pub(crate) struct RuntimeProviderTurnIo"),
+            "provider turn I/O refs must live behind a named grouped context"
+        );
+        assert!(
+            provider_turn_source.contains("io: RuntimeProviderTurnIo<'a, W>"),
+            "RuntimeProviderTurnInput must carry provider-turn I/O refs through one named field"
+        );
+        assert!(
+            provider_turn_runtime_source.contains(
+                "pub(crate) fn run<W: io::Write>(\n        &mut self,\n        input: RuntimeProviderTurnInput<'_, '_, W>,"
+            ),
+            "RuntimeProviderTurnStep::run must take RuntimeProviderTurnInput instead of a flat provider-call parameter list"
+        );
+
+        let provider_turn_input_struct = provider_turn_source
+            .split("pub(crate) struct RuntimeProviderTurnInput")
+            .nth(1)
+            .expect("RuntimeProviderTurnInput struct body")
+            .split("pub(crate) struct RuntimeProviderTurnIo")
+            .next()
+            .expect("RuntimeProviderTurnInput struct end");
+        for field_name in [
+            "events",
+            "sink",
+            "conversation",
+            "history_writer",
+            "cost_tracker",
+        ] {
+            assert!(
+                !provider_turn_input_struct.contains(&format!("pub(crate) {field_name}:")),
+                "RuntimeProviderTurnInput must not expose provider-turn I/O field {field_name} outside RuntimeProviderTurnIo"
+            );
+        }
+
+        assert!(
+            provider_turn_runtime_source.contains("let RuntimeProviderTurnIo {"),
+            "provider turn execution should destructure the grouped I/O context at the execution boundary"
         );
     }
 

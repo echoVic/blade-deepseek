@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.190":
+        "RuntimeProviderTurnStep now receives provider-call state through a named RuntimeProviderTurnInput. Provider-turn I/O refs live behind RuntimeProviderTurnIo, so conversation, history, events, sink, and cost tracking are handed into provider execution as one boundary while provider behavior stays unchanged.",
       "v0.1.189":
         "RuntimeProviderResponseInput now carries provider-response I/O refs through a named RuntimeProviderResponseIo bundle. RuntimeTurnKernel assembles events, sink, conversation, history, cost tracking, and background workflow handles as one handoff, and provider response handling destructures that bundle only at the execution boundary.",
       "v0.1.188":
@@ -406,6 +408,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.190":
+        "RuntimeProviderTurnStep 现在通过命名的 RuntimeProviderTurnInput 接收 provider-call 状态。Provider-turn I/O 引用统一放在 RuntimeProviderTurnIo 后面，所以 conversation、history、events、sink 和 cost tracking 会作为一个边界交给 provider execution，provider 行为保持不变。",
       "v0.1.189":
         "RuntimeProviderResponseInput 现在通过命名的 RuntimeProviderResponseIo bundle 承载 provider-response I/O 引用。RuntimeTurnKernel 会把 events、sink、conversation、history、cost tracking 和 background workflow handles 作为一次性 handoff 组装起来，provider response handling 只在执行边界解构这组 bundle。",
       "v0.1.188":
