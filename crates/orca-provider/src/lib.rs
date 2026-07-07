@@ -90,7 +90,40 @@ pub fn call_streaming(
     on_step: &mut dyn FnMut(&ProviderStep),
 ) -> ProviderResponse {
     match kind {
-        ProviderKind::Mock | ProviderKind::DeepSeekFixture => {
+        ProviderKind::Mock => {
+            if let Some(delay_ms) = mock_stream_delay_ms(conversation) {
+                let started = ProviderStep::MessageDelta("Mock slow stream started.".to_string());
+                on_step(&started);
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                if cancel.is_cancelled() {
+                    return ProviderResponse {
+                        steps: vec![started],
+                        assistant_content: Some("Mock slow stream started.".to_string()),
+                        assistant_reasoning: None,
+                        tool_calls: Vec::new(),
+                        usage: None,
+                    };
+                }
+                let completed =
+                    ProviderStep::MessageDelta("Mock slow stream completed.".to_string());
+                on_step(&completed);
+                return ProviderResponse {
+                    steps: vec![started, completed],
+                    assistant_content: Some(
+                        "Mock slow stream started.Mock slow stream completed.".to_string(),
+                    ),
+                    assistant_reasoning: None,
+                    tool_calls: Vec::new(),
+                    usage: None,
+                };
+            }
+            let response = call(kind, conversation, config);
+            for step in &response.steps {
+                on_step(step);
+            }
+            response
+        }
+        ProviderKind::DeepSeekFixture => {
             let response = call(kind, conversation, config);
             for step in &response.steps {
                 on_step(step);
@@ -101,6 +134,16 @@ pub fn call_streaming(
             deepseek_http::call_streaming(conversation, config, cancel, on_step)
         }
     }
+}
+
+fn mock_stream_delay_ms(conversation: &Conversation) -> Option<u64> {
+    conversation
+        .last_user_message()
+        .unwrap_or("")
+        .trim()
+        .strip_prefix("mock_stream_delay_ms ")
+        .and_then(|delay| delay.trim().parse::<u64>().ok())
+        .map(|delay| delay.min(10_000))
 }
 
 fn mock_call(conversation: &Conversation) -> ProviderResponse {
@@ -1265,6 +1308,52 @@ mod tests {
                 .as_deref()
                 .unwrap_or_default()
                 .contains("Mock runtime completed after transient failure")
+        );
+    }
+
+    #[test]
+    fn mock_stream_delay_ms_emits_streaming_deltas_with_delay() {
+        let mut conversation = Conversation::new();
+        conversation.add_user("mock_stream_delay_ms 25".to_string());
+        let config = ProviderConfig {
+            api_key: None,
+            base_url: None,
+            model: None,
+            reasoning_effort: ReasoningEffort::Max,
+            tools_override: None,
+            mcp_registry: None,
+            external_tools: Vec::new(),
+        };
+        let cancel = CancelToken::new();
+        let started = std::time::Instant::now();
+        let mut deltas = Vec::new();
+
+        let response = call_streaming(
+            ProviderKind::Mock,
+            &conversation,
+            &config,
+            &cancel,
+            &mut |step| {
+                if let ProviderStep::MessageDelta(text) = step {
+                    deltas.push(text.clone());
+                }
+            },
+        );
+
+        assert_eq!(
+            deltas,
+            vec![
+                "Mock slow stream started.".to_string(),
+                "Mock slow stream completed.".to_string(),
+            ]
+        );
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(20),
+            "mock stream should delay long enough for TUI concurrency tests"
+        );
+        assert_eq!(
+            response.assistant_content.as_deref(),
+            Some("Mock slow stream started.Mock slow stream completed.")
         );
     }
 }
