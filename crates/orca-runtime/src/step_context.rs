@@ -9,7 +9,7 @@ use orca_core::event_schema::RunStatus;
 use orca_core::tool_types::{ToolName, ToolRequest, ToolResult};
 use orca_mcp::McpRegistry;
 
-use crate::extension::{ExtensionRegistry, RuntimeExtensionContext, RuntimeExtensionStores};
+use crate::extension::RuntimeExtensionContext;
 use crate::hooks::HookRunner;
 use crate::instructions::ProjectInstructions;
 use crate::lifecycle::{RuntimePermissionRequestHandler, TurnPermissionOverlay};
@@ -192,17 +192,5 @@ impl<'a> RuntimeStepContext<'a> {
             permission_handler,
             extensions: None,
         }
-    }
-
-    pub(crate) fn with_extensions(
-        mut self,
-        extension_registry: &'a ExtensionRegistry,
-        extension_stores: RuntimeExtensionStores<'a>,
-    ) -> Self {
-        self.extensions = Some(RuntimeExtensionContext::new(
-            extension_registry,
-            extension_stores,
-        ));
-        self
     }
 }

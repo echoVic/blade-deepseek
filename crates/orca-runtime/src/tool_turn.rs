@@ -344,9 +344,10 @@ mod tests {
 
     use super::*;
     use crate::agent_child::{ChildAgentRequest, ChildAgentResult, ChildAgentRuntime};
-    use crate::extension::{ExtensionData, ExtensionRegistryBuilder, RuntimeExtensionStores};
+    use crate::extension::{ExtensionData, ExtensionRegistryBuilder};
     use crate::goals::{GoalToolProgressState, install_goal_tool_lifecycle};
     use crate::hooks::HookRunner;
+    use crate::runtime_turn_kernel::RuntimeTurnKernel;
     use crate::tool_execution::policy_for_tool_execution;
     use crate::tool_invocation::AgentToolPolicyContext;
 
@@ -829,6 +830,7 @@ mod tests {
         let extension_registry = extension_builder.build();
         let thread_extensions = ExtensionData::new("session-1");
         let turn_extensions = ExtensionData::new("turn-1");
+        let kernel = RuntimeTurnKernel::new(&thread_extensions, &turn_extensions);
         let step_context = RuntimeStepContext::new(
             &config,
             cwd.path(),
@@ -844,11 +846,8 @@ mod tests {
             &task_registry,
             None,
             None,
-        )
-        .with_extensions(
-            &extension_registry,
-            RuntimeExtensionStores::new(&thread_extensions, &turn_extensions),
         );
+        let step_context = kernel.bind_step_context(step_context, &extension_registry);
 
         let outcome = run_tool_turns(RuntimeToolTurnsContext {
             step_context,

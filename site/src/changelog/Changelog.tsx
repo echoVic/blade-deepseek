@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.179":
+        "RuntimeTurnKernel now retains the extension stores used by its reducer and binds provider-response RuntimeStepContext extensions through the same kernel. Provider response handling no longer wires extension stores directly, tightening the Codex-style turn-state boundary without changing behavior.",
       "v0.1.178":
         "RuntimeTurnKernel now owns the per-sampling request state together with the runtime turn reducer. Provider response handling constructs tool-dispatch state through that kernel before passing it into tool turns, preserving behavior while giving the next Codex-style turn-state consolidation a named boundary.",
       "v0.1.177":
@@ -384,6 +386,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.179":
+        "RuntimeTurnKernel 现在会保留 reducer 使用的 extension stores，并通过同一个 kernel 绑定 provider-response RuntimeStepContext 的 extensions。Provider response handling 不再直接拼接 extension stores，在不改变行为的前提下继续收紧 Codex 风格 turn-state 边界。",
       "v0.1.178":
         "RuntimeTurnKernel 现在同时持有每次 sampling request 的状态和 runtime turn reducer。Provider response handling 会先通过这个 kernel 构造 tool-dispatch state，再交给 tool turn；用户可见行为不变，但下一步 Codex 风格 turn-state 收口有了明确边界。",
       "v0.1.177":

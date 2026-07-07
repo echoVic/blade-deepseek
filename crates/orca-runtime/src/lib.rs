@@ -417,8 +417,8 @@ mod tests {
             "RuntimeStepContext must carry runtime extensions as one grouped context"
         );
         assert!(
-            step_context_source.contains("RuntimeExtensionStores"),
-            "RuntimeStepContext::with_extensions must accept grouped runtime extension stores"
+            !step_context_source.contains("RuntimeExtensionStores"),
+            "RuntimeStepContext must not own extension-store binding; RuntimeTurnKernel binds step extensions"
         );
         assert!(
             !step_context_source.contains("thread_extensions: Option<&'a ExtensionData>"),
@@ -641,6 +641,39 @@ mod tests {
         assert!(
             !provider_turn_runtime_source.contains("RuntimeSamplingRequestState::new()"),
             "provider_turn must not allocate sampling request state outside RuntimeTurnKernel"
+        );
+    }
+
+    #[test]
+    fn runtime_turn_kernel_binds_provider_step_context_extensions() {
+        let kernel_source = include_str!("runtime_turn_kernel.rs");
+        let provider_turn_source = include_str!("provider_turn.rs");
+        let provider_turn_runtime_source = provider_turn_source
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .expect("provider turn runtime source");
+
+        assert!(
+            kernel_source.contains("extension_stores: RuntimeExtensionStores"),
+            "RuntimeTurnKernel must retain the extension stores used by its reducer"
+        );
+        assert!(
+            kernel_source.contains("pub(crate) fn bind_step_context("),
+            "RuntimeTurnKernel must expose a step-context binding helper"
+        );
+        assert!(
+            kernel_source.contains("RuntimeExtensionContext::new("),
+            "RuntimeTurnKernel must own step-context extension binding"
+        );
+        assert!(
+            provider_turn_runtime_source.contains("kernel.bind_step_context("),
+            "provider_turn must bind RuntimeStepContext extensions through RuntimeTurnKernel"
+        );
+        assert!(
+            !provider_turn_runtime_source.contains(
+                ".with_extensions(input.extensions.registry(), input.extensions.stores())"
+            ),
+            "provider_turn must not wire step-context extension stores outside RuntimeTurnKernel"
         );
     }
 

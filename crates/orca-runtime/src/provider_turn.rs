@@ -545,26 +545,26 @@ impl RuntimeTurnProviderCycleStep {
 
         let (conversation, history_writer) = input.conversation.parts_mut();
         let mut kernel = RuntimeTurnKernel::from_extension_stores(input.extensions.stores());
+        let step_context = RuntimeStepContext::new(
+            input.config,
+            input.cwd,
+            input.tool_policy,
+            input.subagent_depth,
+            input.emit_deltas,
+            input.policy,
+            input.instructions,
+            input.memory,
+            input.mcp_registry,
+            input.hooks,
+            input.cancel,
+            input.task_registry,
+            input.workflow_ipc,
+            input.permission_handler,
+        );
         self.handle_response(
             response,
             RuntimeProviderResponseInput {
-                step_context: RuntimeStepContext::new(
-                    input.config,
-                    input.cwd,
-                    input.tool_policy,
-                    input.subagent_depth,
-                    input.emit_deltas,
-                    input.policy,
-                    input.instructions,
-                    input.memory,
-                    input.mcp_registry,
-                    input.hooks,
-                    input.cancel,
-                    input.task_registry,
-                    input.workflow_ipc,
-                    input.permission_handler,
-                )
-                .with_extensions(input.extensions.registry(), input.extensions.stores()),
+                step_context: kernel.bind_step_context(step_context, input.extensions.registry()),
                 sampling_state: kernel.sampling_state_mut(),
                 events: input.events,
                 sink: input.sink,
