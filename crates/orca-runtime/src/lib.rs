@@ -1003,6 +1003,51 @@ mod tests {
     }
 
     #[test]
+    fn runtime_provider_response_input_groups_io_refs_contract() {
+        let kernel_source = include_str!("runtime_turn_kernel.rs");
+        let provider_turn_source = include_str!("provider_turn.rs");
+
+        assert!(
+            provider_turn_source.contains("pub(crate) struct RuntimeProviderResponseIo"),
+            "provider response I/O refs must live behind a named grouped context"
+        );
+        assert!(
+            provider_turn_source.contains("io: RuntimeProviderResponseIo<'a, W>"),
+            "RuntimeProviderResponseInput must carry provider-response I/O refs through one named field"
+        );
+
+        let provider_response_input_struct = provider_turn_source
+            .split("pub(crate) struct RuntimeProviderResponseInput")
+            .nth(1)
+            .expect("RuntimeProviderResponseInput struct body")
+            .split("pub(crate) struct RuntimeProviderResponseIo")
+            .next()
+            .expect("RuntimeProviderResponseInput struct end");
+        for field_name in [
+            "events",
+            "sink",
+            "conversation",
+            "history_writer",
+            "cost_tracker",
+            "background_workflows",
+        ] {
+            assert!(
+                !provider_response_input_struct.contains(&format!("pub(crate) {field_name}:")),
+                "RuntimeProviderResponseInput must not expose provider-response I/O field {field_name} outside RuntimeProviderResponseIo"
+            );
+        }
+
+        assert!(
+            kernel_source.contains("io: RuntimeProviderResponseIo {"),
+            "RuntimeTurnKernel must assemble provider-response I/O refs through RuntimeProviderResponseIo"
+        );
+        assert!(
+            provider_turn_source.contains("let RuntimeProviderResponseIo {"),
+            "provider response handling should destructure the grouped I/O context at the execution boundary"
+        );
+    }
+
+    #[test]
     fn runtime_turn_kernel_assembles_turn_loop_state() {
         let kernel_source = include_str!("runtime_turn_kernel.rs");
         let lifecycle_source = include_str!("lifecycle.rs");

@@ -4,9 +4,14 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-07-07
-Current baseline: v0.1.188 carries provider-cycle capability refs through the
+Current baseline: v0.1.189 carries provider-response I/O refs through a named
+`RuntimeProviderResponseIo` bundle. `RuntimeTurnKernel` now assembles events,
+sink, conversation, history writer, cost tracker, and background workflow refs
+as one response handoff, while provider response handling destructures that
+bundle only at the execution boundary before dispatching final-message or tool
+turn work. Earlier v0.1.188 carries provider-cycle capability refs through the
 same `RuntimeStepCapabilitySnapshot` used by step context. `RuntimeProviderCycleInput`
-now keeps provider-cycle execution fields separate from the request capability
+keeps provider-cycle execution fields separate from the request capability
 bundle, `runtime_turn_iteration` assembles that bundle once from turn input, and
 `provider_turn` passes it into `RuntimeStepContext` without expanding the flat
 instructions, memory, MCP, hook, cancellation, task, workflow IPC, or interaction

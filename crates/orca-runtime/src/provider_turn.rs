@@ -81,6 +81,10 @@ pub(crate) struct RuntimeProviderCycleInput<'a, 'runtime, W: io::Write> {
 pub(crate) struct RuntimeProviderResponseInput<'a, W: io::Write> {
     pub(crate) step_context: RuntimeStepContext<'a>,
     pub(crate) sampling_state: &'a mut RuntimeSamplingRequestState,
+    pub(crate) io: RuntimeProviderResponseIo<'a, W>,
+}
+
+pub(crate) struct RuntimeProviderResponseIo<'a, W: io::Write> {
     pub(crate) events: &'a mut EventFactory,
     pub(crate) sink: &'a mut EventSink<W>,
     pub(crate) conversation: &'a mut Conversation,
@@ -582,16 +586,24 @@ impl RuntimeTurnProviderCycleStep {
         workflow_child_executor: ChildAgentExecutor<SharedEventBuffer>,
         batch_child_executor: ChildAgentExecutor<io::Sink>,
     ) -> io::Result<RuntimeTurnProviderCycleResult> {
+        let RuntimeProviderResponseIo {
+            events,
+            sink,
+            conversation,
+            history_writer,
+            cost_tracker,
+            background_workflows,
+        } = input.io;
         let provider_response_outcome = RuntimeProviderResponseStep::new().handle(
             response,
             input.step_context,
-            input.events,
-            input.sink,
-            input.conversation,
-            input.history_writer,
-            input.cost_tracker,
+            events,
+            sink,
+            conversation,
+            history_writer,
+            cost_tracker,
             input.sampling_state,
-            input.background_workflows,
+            background_workflows,
             child_executor,
             workflow_child_executor,
             batch_child_executor,
@@ -1093,12 +1105,14 @@ mod tests {
                 RuntimeProviderResponseInput {
                     step_context,
                     sampling_state: &mut sampling_state,
-                    events: &mut events,
-                    sink: &mut sink,
-                    conversation: &mut conversation,
-                    history_writer: None,
-                    cost_tracker: &mut cost_tracker,
-                    background_workflows: &mut background_workflows,
+                    io: RuntimeProviderResponseIo {
+                        events: &mut events,
+                        sink: &mut sink,
+                        conversation: &mut conversation,
+                        history_writer: None,
+                        cost_tracker: &mut cost_tracker,
+                        background_workflows: &mut background_workflows,
+                    },
                 },
                 unused_child_executor::<Vec<u8>>,
                 unused_child_executor::<crate::workflow::runner::SharedEventBuffer>,

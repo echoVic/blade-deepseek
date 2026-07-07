@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.189":
+        "RuntimeProviderResponseInput now carries provider-response I/O refs through a named RuntimeProviderResponseIo bundle. RuntimeTurnKernel assembles events, sink, conversation, history, cost tracking, and background workflow handles as one handoff, and provider response handling destructures that bundle only at the execution boundary.",
       "v0.1.188":
         "RuntimeProviderCycleInput now reuses RuntimeStepCapabilitySnapshot for provider-cycle capability refs. runtime_turn_iteration assembles that bundle once, provider_turn passes it into RuntimeStepContext without expanding flat capability fields, and provider/tool behavior stays unchanged while the provider-cycle boundary gets smaller.",
       "v0.1.187":
@@ -404,6 +406,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.189":
+        "RuntimeProviderResponseInput 现在通过命名的 RuntimeProviderResponseIo bundle 承载 provider-response I/O 引用。RuntimeTurnKernel 会把 events、sink、conversation、history、cost tracking 和 background workflow handles 作为一次性 handoff 组装起来，provider response handling 只在执行边界解构这组 bundle。",
       "v0.1.188":
         "RuntimeProviderCycleInput 现在复用 RuntimeStepCapabilitySnapshot 来承载 provider-cycle capability 引用。runtime_turn_iteration 只组装一次这组 bundle，provider_turn 会把它交给 RuntimeStepContext，而不再展开成一串 flat capability 字段；provider/tool 行为不变，但 provider-cycle 边界更小。",
       "v0.1.187":
