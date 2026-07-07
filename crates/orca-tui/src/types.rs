@@ -129,6 +129,7 @@ pub enum UserAction {
     Approve(bool),
     RespondToUserInput(String),
     Backtrack,
+    BackgroundCurrentTurn,
     Interrupt,
     Cancel,
 }

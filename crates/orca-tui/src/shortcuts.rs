@@ -65,6 +65,7 @@ pub enum IdleShortcut {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RunningShortcut {
+    BackgroundCurrentTurn,
     Interrupt,
     ScrollUp,
     ScrollDown,
@@ -178,6 +179,10 @@ pub fn idle_shortcut(event: KeyEvent) -> Option<IdleShortcut> {
 
 pub fn running_shortcut(event: KeyEvent) -> Option<RunningShortcut> {
     let bindings = [
+        (
+            RunningShortcut::BackgroundCurrentTurn,
+            KeyBinding::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
+        ),
         (
             RunningShortcut::Interrupt,
             KeyBinding::new(KeyCode::Esc, KeyModifiers::NONE),
@@ -369,6 +374,11 @@ pub const SHORTCUT_HINTS: &[ShortcutHint] = &[
     },
     ShortcutHint {
         scope: ShortcutScope::Running,
+        keys: "ctrl+b",
+        action: "background current turn",
+    },
+    ShortcutHint {
+        scope: ShortcutScope::Running,
         keys: "esc / ctrl+g",
         action: "interrupt current turn",
     },
@@ -521,6 +531,14 @@ mod tests {
         assert_eq!(
             idle_shortcut(key(KeyCode::Char('e'), KeyModifiers::NONE)),
             Some(IdleShortcut::ExpandToolOutput)
+        );
+    }
+
+    #[test]
+    fn running_shortcuts_resolve_background_current_turn() {
+        assert_eq!(
+            running_shortcut(key(KeyCode::Char('b'), KeyModifiers::CONTROL)),
+            Some(RunningShortcut::BackgroundCurrentTurn)
         );
     }
 }

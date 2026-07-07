@@ -680,34 +680,8 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                         }
                     }
                 } else if state.status == AppStatus::Running {
-                    match running_shortcut(*key) {
-                        Some(RunningShortcut::Interrupt) => {
-                            cancel_token.cancel();
-                            let _ = action_tx.send(UserAction::Interrupt);
-                        }
-                        Some(RunningShortcut::ScrollUp) => {
-                            state.scroll_up(1);
-                        }
-                        Some(RunningShortcut::ScrollDown) => {
-                            state.scroll_down(1);
-                        }
-                        Some(RunningShortcut::PageUp) => {
-                            let page = state.visible_height.saturating_sub(2);
-                            state.scroll_up(page);
-                        }
-                        Some(RunningShortcut::PageDown) => {
-                            let page = state.visible_height.saturating_sub(2);
-                            state.scroll_down(page);
-                        }
-                        Some(RunningShortcut::HalfPageUp) => {
-                            let page = state.visible_height / 2;
-                            state.scroll_up(page);
-                        }
-                        Some(RunningShortcut::HalfPageDown) => {
-                            let page = state.visible_height / 2;
-                            state.scroll_down(page);
-                        }
-                        None => {}
+                    if let Some(shortcut) = running_shortcut(*key) {
+                        handle_running_shortcut(shortcut, &mut state, &action_tx, &cancel_token);
                     }
                 }
             }
@@ -965,6 +939,28 @@ mod tests {
 
     fn test_pending_workflow_notifications() -> bridge::PendingWorkflowNotifications {
         Arc::new(Mutex::new(VecDeque::new()))
+    }
+
+    #[test]
+    fn running_background_shortcut_dispatches_action_without_cancelling() {
+        let (mut state, action_rx) = test_state();
+        state.status = AppStatus::Running;
+        let action_tx = state.event_tx.clone();
+        let cancel = CancelToken::new();
+
+        handle_running_shortcut(
+            RunningShortcut::BackgroundCurrentTurn,
+            &mut state,
+            &action_tx,
+            &cancel,
+        );
+
+        assert!(matches!(
+            action_rx.try_recv(),
+            Ok(UserAction::BackgroundCurrentTurn)
+        ));
+        assert!(!cancel.is_cancelled());
+        assert_eq!(state.status, AppStatus::Running);
     }
 
     #[test]
@@ -2184,6 +2180,45 @@ fn resolve_approval(state: &mut AppState, action_tx: &mpsc::Sender<UserAction>, 
     state.approval_dialog = None;
 }
 
+fn handle_running_shortcut(
+    shortcut: RunningShortcut,
+    state: &mut AppState,
+    action_tx: &mpsc::Sender<UserAction>,
+    cancel_token: &CancelToken,
+) {
+    match shortcut {
+        RunningShortcut::BackgroundCurrentTurn => {
+            let _ = action_tx.send(UserAction::BackgroundCurrentTurn);
+        }
+        RunningShortcut::Interrupt => {
+            cancel_token.cancel();
+            let _ = action_tx.send(UserAction::Interrupt);
+        }
+        RunningShortcut::ScrollUp => {
+            state.scroll_up(1);
+        }
+        RunningShortcut::ScrollDown => {
+            state.scroll_down(1);
+        }
+        RunningShortcut::PageUp => {
+            let page = state.visible_height.saturating_sub(2);
+            state.scroll_up(page);
+        }
+        RunningShortcut::PageDown => {
+            let page = state.visible_height.saturating_sub(2);
+            state.scroll_down(page);
+        }
+        RunningShortcut::HalfPageUp => {
+            let page = state.visible_height / 2;
+            state.scroll_up(page);
+        }
+        RunningShortcut::HalfPageDown => {
+            let page = state.visible_height / 2;
+            state.scroll_down(page);
+        }
+    }
+}
+
 /// Resolve the approval dialog by the chosen option. The "always allow"
 /// options record a session allowlist entry so later matching approvals are
 /// auto-granted (see the ApprovalNeeded handling in the event loop). The wire
@@ -2697,6 +2732,7 @@ fn agent_loop_thread(
                     let _ = event_tx.send(TuiEvent::Error("nothing to backtrack".to_string()));
                 }
             }
+            Ok(UserAction::BackgroundCurrentTurn) => {}
             Ok(UserAction::GoalShow) => {
                 let session_id = session
                     .as_ref()
