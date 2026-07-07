@@ -60,7 +60,8 @@ pub(in crate::server::router) fn dispatch_shell_operation<W: Write>(
         ClientOp::ShellRead {
             shell_id,
             timeout_ms,
-        } => run_shell_read(state, shell_id, *timeout_ms, id, writer),
+            output_bytes_cap,
+        } => run_shell_read(state, shell_id, *timeout_ms, *output_bytes_cap, id, writer),
         ClientOp::ShellKill { shell_id } => run_shell_kill(state, shell_id, id, writer),
         _ => unreachable!("only shell operations can reach the shell processor"),
     }

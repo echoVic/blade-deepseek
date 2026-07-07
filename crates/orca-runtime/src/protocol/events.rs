@@ -302,6 +302,8 @@ pub enum ServerEvent {
         stderr: Value,
         #[serde(rename = "exitCode", skip_serializing_if = "Value::is_null")]
         exit_code: Value,
+        #[serde(rename = "capReached", skip_serializing_if = "Value::is_null")]
+        cap_reached: Value,
         #[serde(skip_serializing_if = "Value::is_null")]
         description: Value,
     },
@@ -310,6 +312,8 @@ pub enum ServerEvent {
         shell_id: Value,
         stream: Value,
         delta: Value,
+        #[serde(rename = "capReached")]
+        cap_reached: Value,
         #[serde(rename = "final")]
         final_chunk: Value,
     },
@@ -335,6 +339,8 @@ pub enum ServerEvent {
         stderr: Value,
         #[serde(rename = "exitCode")]
         exit_code: Value,
+        #[serde(rename = "capReached", skip_serializing_if = "Value::is_null")]
+        cap_reached: Value,
     },
     CommandExecStarted {
         #[serde(rename = "processId")]

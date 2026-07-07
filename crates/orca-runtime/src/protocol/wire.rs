@@ -134,6 +134,7 @@ pub enum ClientOp {
     ShellRead {
         shell_id: String,
         timeout_ms: u64,
+        output_bytes_cap: Option<usize>,
     },
     ShellKill {
         shell_id: String,
@@ -811,6 +812,11 @@ impl Submission {
                         .and_then(|params| params.timeout_ms)
                         .and_then(|timeout_ms| u64::try_from(timeout_ms).ok())
                         .unwrap_or(120_000),
+                    output_bytes_cap: wire
+                        .params
+                        .as_ref()
+                        .and_then(|params| params.output_bytes_cap)
+                        .and_then(|cap| usize::try_from(cap).ok()),
                 },
             }),
             (_, Some("shell/kill")) => Ok(Self {
@@ -1837,6 +1843,24 @@ mod tests {
     }
 
     #[test]
+    fn submission_decodes_shell_read_output_cap_wire_shape() {
+        let read = Submission::decode(
+            r#"{"id":"read","method":"shell/read","params":{"shellId":"shell-1","timeoutMs":5000,"outputBytesCap":256}}"#,
+        )
+        .expect("shell/read submission");
+
+        assert_eq!(read.id, Value::from("read"));
+        assert_eq!(
+            read.op,
+            ClientOp::ShellRead {
+                shell_id: "shell-1".to_string(),
+                timeout_ms: 5000,
+                output_bytes_cap: Some(256),
+            }
+        );
+    }
+
+    #[test]
     fn submission_decodes_shell_update_wire_shape() {
         let update = Submission::decode(
             r#"{"id":"update","method":"shell/update","params":{"shellId":"shell-1","description":"renamed shell"}}"#,
@@ -2125,6 +2149,7 @@ mod tests {
                 shell_id: Value::from("shell-1"),
                 stream: Value::from("stdout"),
                 delta: Value::from("ready"),
+                cap_reached: Value::from(false),
                 final_chunk: Value::from(false),
             },
         );
@@ -2133,6 +2158,7 @@ mod tests {
         assert_eq!(delta["shellId"], "shell-1");
         assert_eq!(delta["stream"], "stdout");
         assert_eq!(delta["delta"], "ready");
+        assert_eq!(delta["capReached"], false);
         assert_eq!(delta["final"], false);
 
         let exited = legacy_json_event(

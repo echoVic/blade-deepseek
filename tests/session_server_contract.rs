@@ -4975,6 +4975,87 @@ fn server_mode_reads_runtime_shell_session_incrementally() {
 }
 
 #[test]
+fn server_mode_shell_read_honors_output_byte_cap() {
+    let workspace = tempdir().expect("workspace");
+    let mut child = orca_command()
+        .args([
+            "--mode",
+            "server",
+            "--provider",
+            "mock",
+            "--cwd",
+            workspace.path().to_str().unwrap(),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn orca server");
+
+    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
+    {
+        let stdin = child.stdin.as_mut().expect("server stdin");
+        writeln!(
+            stdin,
+            r#"{{"id":"shell-start","method":"shell/start","params":{{"command":"printf ready-long-output; sleep 30","description":"capped server shell"}}}}"#
+        )
+        .expect("write shell/start");
+        stdin.flush().expect("flush shell/start");
+    }
+    let started = read_until_event(&mut stdout, "shell-start", "shell_started");
+    let shell_id = started["shellId"].as_str().expect("shell id").to_string();
+
+    {
+        let stdin = child.stdin.as_mut().expect("server stdin");
+        writeln!(
+            stdin,
+            r#"{{"id":"shell-read","method":"shell/read","params":{{"shellId":"{}","timeoutMs":5000,"outputBytesCap":5}}}}"#,
+            shell_id
+        )
+        .expect("write capped shell/read");
+        stdin.flush().expect("flush capped shell/read");
+    }
+
+    let read_events = read_events_until_event(&mut stdout, "shell-read", "shell_updated");
+    let output_delta = read_events
+        .iter()
+        .find(|event| event["event"] == "shell_output_delta")
+        .expect("shell output delta");
+    assert_eq!(output_delta["shellId"], shell_id);
+    assert_eq!(output_delta["stream"], "stdout");
+    assert_eq!(output_delta["delta"], "ready");
+    assert_eq!(output_delta["capReached"], true);
+    assert_eq!(output_delta["final"], false);
+
+    let update = read_events
+        .iter()
+        .find(|event| event["event"] == "shell_updated")
+        .expect("shell_updated event");
+    assert_eq!(update["shellId"], shell_id);
+    assert_eq!(update["status"], "running");
+    assert_eq!(update["stdout"], "ready");
+    assert_eq!(update["stderr"], "");
+    assert_eq!(update["capReached"], true);
+
+    {
+        let stdin = child.stdin.as_mut().expect("server stdin");
+        writeln!(
+            stdin,
+            r#"{{"id":"shell-kill","method":"shell/kill","params":{{"shellId":"{}"}}}}"#,
+            shell_id
+        )
+        .expect("write shell/kill");
+        stdin.flush().expect("flush shell/kill");
+    }
+
+    drop(child.stdin.take());
+    let _ = read_events_until_event(&mut stdout, "shell-kill", "shell_completed");
+    let output = child.wait_with_output().expect("wait for server");
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn server_mode_lists_runtime_shell_sessions() {
     let workspace = tempdir().expect("workspace");
     let mut child = orca_command()

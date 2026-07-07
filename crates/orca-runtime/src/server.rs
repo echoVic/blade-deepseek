@@ -654,6 +654,7 @@ fn run_shell_write<W: Write>(
             stdout: Value::Null,
             stderr: Value::Null,
             exit_code: Value::Null,
+            cap_reached: Value::Null,
             description: Value::Null,
         },
     )
@@ -690,6 +691,7 @@ fn run_shell_update<W: Write>(
             stdout: Value::Null,
             stderr: Value::Null,
             exit_code: Value::Null,
+            cap_reached: Value::Null,
             description: Value::from(description.trim().to_string()),
         },
     )
@@ -718,6 +720,7 @@ fn run_shell_close<W: Write>(
             stdout: Value::Null,
             stderr: Value::Null,
             exit_code: Value::Null,
+            cap_reached: Value::Null,
             description: Value::Null,
         },
     )
@@ -755,6 +758,7 @@ fn run_shell_resize<W: Write>(
             stdout: Value::Null,
             stderr: Value::Null,
             exit_code: Value::Null,
+            cap_reached: Value::Null,
             description: Value::Null,
         },
     )
@@ -783,12 +787,13 @@ fn run_shell_read<W: Write>(
     state: &mut ServerState,
     shell_id: &str,
     timeout_ms: u64,
+    output_bytes_cap: Option<usize>,
     id: Value,
     writer: &mut W,
 ) -> io::Result<()> {
     for output in state.shells.reap_requested_stops()? {
         if output.id == shell_id {
-            return write_shell_completed(writer, &id, output);
+            return write_shell_completed_with_cap(writer, &id, output, output_bytes_cap);
         }
         write_shell_completed(writer, &id, output)?;
     }
@@ -809,7 +814,10 @@ fn run_shell_read<W: Write>(
         }
     };
     if output.status == orca_core::task_types::TaskStatus::Running {
-        write_shell_output_deltas(writer, &id, &output, false)?;
+        let stdout = cap_text(&output.stdout, output_bytes_cap);
+        let stderr = cap_text(&output.stderr, output_bytes_cap);
+        let cap_reached = shell_output_cap_reached(&output, output_bytes_cap);
+        write_shell_output_deltas_with_cap(writer, &id, &output, false, output_bytes_cap)?;
         protocol::write_server_event(
             writer,
             &id,
@@ -818,14 +826,15 @@ fn run_shell_read<W: Write>(
                 status: Value::from("running"),
                 cols: Value::Null,
                 rows: Value::Null,
-                stdout: Value::from(output.stdout),
-                stderr: Value::from(output.stderr),
+                stdout: Value::from(stdout),
+                stderr: Value::from(stderr),
                 exit_code: Value::Null,
+                cap_reached: shell_cap_reached_value(output_bytes_cap, cap_reached),
                 description: Value::Null,
             },
         )
     } else {
-        write_shell_completed(writer, &id, output)
+        write_shell_completed_with_cap(writer, &id, output, output_bytes_cap)
     }
 }
 
@@ -1958,7 +1967,19 @@ fn write_shell_completed<W: Write>(
     id: &Value,
     output: crate::shell_session::ShellSessionOutput,
 ) -> io::Result<()> {
-    write_shell_output_deltas(writer, id, &output, true)?;
+    write_shell_completed_with_cap(writer, id, output, None)
+}
+
+fn write_shell_completed_with_cap<W: Write>(
+    writer: &mut W,
+    id: &Value,
+    output: crate::shell_session::ShellSessionOutput,
+    output_bytes_cap: Option<usize>,
+) -> io::Result<()> {
+    let stdout = cap_text(&output.stdout, output_bytes_cap);
+    let stderr = cap_text(&output.stderr, output_bytes_cap);
+    let cap_reached = shell_output_cap_reached(&output, output_bytes_cap);
+    write_shell_output_deltas_with_cap(writer, id, &output, true, output_bytes_cap)?;
     protocol::write_server_event(
         writer,
         id,
@@ -1976,44 +1997,69 @@ fn write_shell_completed<W: Write>(
             shell_id: Value::from(output.id),
             task_id: Value::from(output.task_id),
             status: Value::from(shell_status_label(output.status)),
-            stdout: Value::from(output.stdout),
-            stderr: Value::from(output.stderr),
+            stdout: Value::from(stdout),
+            stderr: Value::from(stderr),
             exit_code: output.exit_code.map(Value::from).unwrap_or(Value::Null),
+            cap_reached: shell_cap_reached_value(output_bytes_cap, cap_reached),
         },
     )
 }
 
-fn write_shell_output_deltas<W: Write>(
+fn write_shell_output_deltas_with_cap<W: Write>(
     writer: &mut W,
     id: &Value,
     output: &crate::shell_session::ShellSessionOutput,
     final_chunk: bool,
+    output_bytes_cap: Option<usize>,
 ) -> io::Result<()> {
-    if !output.stdout.is_empty() {
+    let stdout = cap_text(&output.stdout, output_bytes_cap);
+    let stderr = cap_text(&output.stderr, output_bytes_cap);
+    let stdout_cap_reached =
+        output_bytes_cap.is_some_and(|cap| output.stdout.len() >= cap && !output.stdout.is_empty());
+    let stderr_cap_reached =
+        output_bytes_cap.is_some_and(|cap| output.stderr.len() >= cap && !output.stderr.is_empty());
+    if !stdout.is_empty() {
         protocol::write_server_event(
             writer,
             id,
             ServerEvent::ShellOutputDelta {
                 shell_id: Value::from(output.id.clone()),
                 stream: Value::from("stdout"),
-                delta: Value::from(output.stdout.clone()),
+                delta: Value::from(stdout),
+                cap_reached: Value::from(stdout_cap_reached),
                 final_chunk: Value::from(final_chunk),
             },
         )?;
     }
-    if !output.stderr.is_empty() {
+    if !stderr.is_empty() {
         protocol::write_server_event(
             writer,
             id,
             ServerEvent::ShellOutputDelta {
                 shell_id: Value::from(output.id.clone()),
                 stream: Value::from("stderr"),
-                delta: Value::from(output.stderr.clone()),
+                delta: Value::from(stderr),
+                cap_reached: Value::from(stderr_cap_reached),
                 final_chunk: Value::from(final_chunk),
             },
         )?;
     }
     Ok(())
+}
+
+fn shell_output_cap_reached(
+    output: &crate::shell_session::ShellSessionOutput,
+    output_bytes_cap: Option<usize>,
+) -> bool {
+    output_bytes_cap.is_some_and(|cap| output.stdout.len() >= cap || output.stderr.len() >= cap)
+}
+
+fn shell_cap_reached_value(output_bytes_cap: Option<usize>, cap_reached: bool) -> Value {
+    if output_bytes_cap.is_some() {
+        Value::from(cap_reached)
+    } else {
+        Value::Null
+    }
 }
 
 fn shell_snapshot_to_json(snapshot: crate::shell_session::ShellSessionSnapshot) -> Value {
