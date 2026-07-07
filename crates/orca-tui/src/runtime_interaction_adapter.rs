@@ -271,6 +271,14 @@ fn describe_permission_request(request: &RuntimePermissionRequest) -> String {
             lines.push(format!("+ network domain {domain}: {access:?}"));
         }
     }
+    if request
+        .permissions
+        .shell
+        .as_ref()
+        .is_some_and(|shell| shell.unsandboxed)
+    {
+        lines.push("+ shell without filesystem sandbox".to_string());
+    }
     if lines.is_empty() {
         lines.push("(no specific permissions requested)".to_string());
     }

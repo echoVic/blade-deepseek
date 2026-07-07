@@ -390,13 +390,21 @@ fn run_permission_respond<W: Write>(
             }
             Ok(())
         }
-        PendingPermissionRequest::CommandExec { request } => {
+        PendingPermissionRequest::CommandExec { mut request } => {
             if decision != protocol::PermissionResponseDecision::Allow {
                 return protocol::write_server_event(
                     writer,
                     &request.event_id,
                     ServerEvent::error(format!("command/exec permission denied: {request_id}")),
                 );
+            }
+            if permissions
+                .shell
+                .as_ref()
+                .is_some_and(|shell| shell.unsandboxed)
+            {
+                request.options.permission_profile = None;
+                request.options.sandbox_policy = protocol::CommandSandboxPolicy::DangerFullAccess;
             }
             run_command_exec(
                 config,
@@ -1159,6 +1167,11 @@ fn run_command_exec<W: Write>(
         {
             return request_command_exec_file_system_permission(state, request, diagnostic, writer);
         }
+        if diagnostic.suggested_write_root.is_none()
+            && let Some(request) = command_permission_request
+        {
+            return request_command_exec_unsandboxed_permission(state, request, diagnostic, writer);
+        }
         append_sandbox_diagnostic_to_stderr(&mut output.stderr, &diagnostic);
     }
     protocol::write_server_event(
@@ -1208,6 +1221,7 @@ fn request_command_exec_network_permission<W: Write>(
             enabled: None,
             domains,
         }),
+        shell: None,
     };
     request_command_exec_permission(
         state,
@@ -1228,22 +1242,7 @@ fn request_command_exec_file_system_permission<W: Write>(
     writer: &mut W,
 ) -> io::Result<()> {
     let Some(write_root) = diagnostic.suggested_write_root.clone() else {
-        let mut stderr = String::new();
-        append_sandbox_diagnostic_to_stderr(&mut stderr, &diagnostic);
-        return protocol::write_server_event(
-            writer,
-            &request.event_id,
-            ServerEvent::CommandExecCompleted {
-                process_id: request
-                    .process_id
-                    .as_ref()
-                    .map(|process_id| Value::from(process_id.clone()))
-                    .unwrap_or(Value::Null),
-                exit_code: Value::Null,
-                stdout: Value::from(""),
-                stderr: Value::from(stderr),
-            },
-        );
+        return request_command_exec_unsandboxed_permission(state, request, diagnostic, writer);
     };
     let permissions = protocol::RequestPermissionProfile {
         file_system: Some(protocol::RequestFileSystemPermissions {
@@ -1252,8 +1251,32 @@ fn request_command_exec_file_system_permission<W: Write>(
             entries: None,
         }),
         network: None,
+        shell: None,
     };
     request_command_exec_permission(state, request, diagnostic.message, permissions, writer)
+}
+
+fn request_command_exec_unsandboxed_permission<W: Write>(
+    state: &mut ServerState,
+    request: PendingCommandExecPermissionRequest,
+    diagnostic: SandboxDenialDiagnostic,
+    writer: &mut W,
+) -> io::Result<()> {
+    let permissions = protocol::RequestPermissionProfile {
+        file_system: None,
+        network: None,
+        shell: Some(protocol::RequestShellPermissions { unsandboxed: true }),
+    };
+    request_command_exec_permission(
+        state,
+        request,
+        format!(
+            "{}; command/exec needs to re-run without the filesystem sandbox because no filesystem path was reported",
+            diagnostic.message
+        ),
+        permissions,
+        writer,
+    )
 }
 
 fn request_command_exec_permission<W: Write>(
@@ -3245,7 +3268,7 @@ enabled = true
             let permission_request = events
                 .iter()
                 .find(|event| event["event"] == "permission_request")
-                .expect("permission request");
+                .unwrap_or_else(|| panic!("permission request; events: {events:?}"));
             let request_id = permission_request["requestId"]
                 .as_str()
                 .expect("request id")
@@ -3339,7 +3362,7 @@ enabled = true
             let permission_request = events
                 .iter()
                 .find(|event| event["event"] == "permission_request")
-                .expect("permission request");
+                .unwrap_or_else(|| panic!("permission request; events: {events:?}"));
             let request_id = permission_request["requestId"]
                 .as_str()
                 .expect("request id")
@@ -3384,6 +3407,180 @@ enabled = true
                     .iter()
                     .any(|directory| directory.path == git_dir)
             );
+        });
+    }
+
+    #[test]
+    fn command_exec_pathless_sandbox_denial_requests_unsandboxed_permission_and_retries() {
+        if !std::process::Command::new("sandbox-exec")
+            .arg("-p")
+            .arg("(version 1) (allow default)")
+            .arg("true")
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+        {
+            return;
+        }
+
+        with_orca_home(|_| {
+            let parent = tempfile::tempdir_in(std::env::current_dir().expect("cwd"))
+                .expect("sandbox parent");
+            let workspace = parent.path().join("workspace-unsandboxed");
+            let outside = parent.path().join("outside-unsandboxed");
+            std::fs::create_dir_all(&workspace).expect("workspace dir");
+            std::fs::create_dir_all(&outside).expect("outside dir");
+            let marker = outside.join("credential-helper-output");
+            let mut config = test_run_config();
+            config.cwd = Some(workspace.clone());
+            config.history_mode = HistoryMode::Record;
+            let server_config = ServerConfig { run_config: config };
+            let mut state = ServerState::default();
+            let writer = Arc::new(Mutex::new(Vec::new()));
+
+            handle_line(
+                &server_config,
+                &mut state,
+                r#"{"id":"thread","method":"thread/start","params":{}}"#,
+                Arc::clone(&writer),
+            )
+            .expect("thread start");
+            let thread_id = parse_jsonl(&writer.lock().expect("writer").clone())
+                .into_iter()
+                .find(|event| event["event"] == "thread_started")
+                .and_then(|event| event["threadId"].as_str().map(ToString::to_string))
+                .expect("thread id");
+
+            let command = format!(
+                "touch {} 2>/dev/null || {{ printf %s\\\\n \"fatal: could not read Username for 'https://github.com': Operation not permitted\" >&2; exit 128; }}",
+                marker.display()
+            );
+            let request = format!(
+                r#"{{"id":"cmd-unsandboxed","method":"command/exec","params":{{"threadId":"{thread_id}","command":["sh","-lc",{}],"timeoutMs":5000}}}}"#,
+                serde_json::to_string(&command).expect("command json")
+            );
+            handle_line(&server_config, &mut state, &request, Arc::clone(&writer))
+                .expect("command exec");
+            let events = parse_jsonl(&writer.lock().expect("writer").clone());
+            let permission_request = events
+                .iter()
+                .find(|event| event["event"] == "permission_request")
+                .unwrap_or_else(|| panic!("permission request; events: {events:?}"));
+            let request_id = permission_request["requestId"]
+                .as_str()
+                .expect("request id")
+                .to_string();
+            assert_eq!(permission_request["threadId"], thread_id);
+            assert_eq!(
+                permission_request["permissions"]["shell"]["unsandboxed"],
+                true
+            );
+            assert!(
+                permission_request["reason"]
+                    .as_str()
+                    .is_some_and(|reason| reason.contains("without the filesystem sandbox")),
+                "permission request should explain unsandboxed retry: {permission_request:?}"
+            );
+            assert!(
+                events
+                    .iter()
+                    .all(|event| event["event"] != "command_exec_completed"),
+                "command should wait for permission before completing: {events:?}"
+            );
+
+            let response = format!(
+                r#"{{"id":"perm-allow","method":"permission/respond","params":{{"requestId":"{request_id}","decision":"allow","scope":"turn","permissions":{{"shell":{{"unsandboxed":true}}}}}}}}"#
+            );
+            handle_line(&server_config, &mut state, &response, Arc::clone(&writer))
+                .expect("permission response");
+            let events = parse_jsonl(&writer.lock().expect("writer").clone());
+            let completed = events
+                .iter()
+                .find(|event| event["event"] == "command_exec_completed")
+                .expect("command completed");
+            assert_eq!(completed["exitCode"], 0);
+            assert!(marker.exists());
+        });
+    }
+
+    #[test]
+    fn command_exec_streaming_pathless_sandbox_denial_requests_unsandboxed_permission_and_retries()
+    {
+        if !std::process::Command::new("sandbox-exec")
+            .arg("-p")
+            .arg("(version 1) (allow default)")
+            .arg("true")
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+        {
+            return;
+        }
+
+        with_orca_home(|_| {
+            let parent = tempfile::tempdir_in(std::env::current_dir().expect("cwd"))
+                .expect("sandbox parent");
+            let workspace = parent.path().join("workspace-unsandboxed-stream");
+            let outside = parent.path().join("outside-unsandboxed-stream");
+            std::fs::create_dir_all(&workspace).expect("workspace dir");
+            std::fs::create_dir_all(&outside).expect("outside dir");
+            let marker = outside.join("credential-helper-output");
+            let mut config = test_run_config();
+            config.cwd = Some(workspace.clone());
+            config.history_mode = HistoryMode::Record;
+            let server_config = ServerConfig { run_config: config };
+            let mut state = ServerState::default();
+            let writer = Arc::new(Mutex::new(Vec::new()));
+
+            handle_line(
+                &server_config,
+                &mut state,
+                r#"{"id":"thread","method":"thread/start","params":{}}"#,
+                Arc::clone(&writer),
+            )
+            .expect("thread start");
+            let thread_id = parse_jsonl(&writer.lock().expect("writer").clone())
+                .into_iter()
+                .find(|event| event["event"] == "thread_started")
+                .and_then(|event| event["threadId"].as_str().map(ToString::to_string))
+                .expect("thread id");
+
+            let command = format!(
+                "touch {} 2>/dev/null || {{ printf %s\\\\n \"fatal: could not read Username for 'https://github.com': Operation not permitted\" >&2; exit 128; }}",
+                marker.display()
+            );
+            let request = format!(
+                r#"{{"id":"cmd-unsandboxed-stream","method":"command/exec","params":{{"threadId":"{thread_id}","command":["sh","-lc",{}],"processId":"unsandboxed-stream-1","streamStdoutStderr":true,"timeoutMs":5000}}}}"#,
+                serde_json::to_string(&command).expect("command json")
+            );
+            handle_line(&server_config, &mut state, &request, Arc::clone(&writer))
+                .expect("command exec");
+            let events = parse_jsonl(&writer.lock().expect("writer").clone());
+            let permission_request = events
+                .iter()
+                .find(|event| event["event"] == "permission_request")
+                .unwrap_or_else(|| panic!("permission request; events: {events:?}"));
+            let request_id = permission_request["requestId"]
+                .as_str()
+                .expect("request id")
+                .to_string();
+            assert_eq!(
+                permission_request["permissions"]["shell"]["unsandboxed"],
+                true
+            );
+
+            let response = format!(
+                r#"{{"id":"perm-allow","method":"permission/respond","params":{{"requestId":"{request_id}","decision":"allow","scope":"turn","permissions":{{"shell":{{"unsandboxed":true}}}}}}}}"#
+            );
+            handle_line(&server_config, &mut state, &response, Arc::clone(&writer))
+                .expect("permission response");
+            let events = parse_jsonl(&writer.lock().expect("writer").clone());
+            let completed = events
+                .iter()
+                .find(|event| event["event"] == "command_exec_completed")
+                .expect("command completed");
+            assert_eq!(completed["exitCode"], 0);
+            assert!(marker.exists());
         });
     }
 

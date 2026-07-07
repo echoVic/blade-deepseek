@@ -14,7 +14,7 @@ use crate::lifecycle::{
 use crate::network_proxy::{RuntimeNetworkBlockReport, RuntimeNetworkPolicy, RuntimeNetworkProxy};
 use crate::protocol::{
     PermissionResponseDecision, RequestFileSystemPermissions, RequestNetworkPermissions,
-    RequestPermissionProfile,
+    RequestPermissionProfile, RequestShellPermissions,
 };
 use crate::runtime_state::RuntimeTurnReducer;
 use crate::sandbox_denial::{
@@ -124,6 +124,7 @@ pub(crate) fn execute_bash_with_shell_session(
                 enabled: None,
                 domains,
             }),
+            shell: None,
         };
         let permission_request = RuntimePermissionRequest {
             id: request.id.clone(),
@@ -179,6 +180,7 @@ pub(crate) fn execute_bash_with_shell_session(
                     entries: None,
                 }),
                 network: None,
+                shell: None,
             };
             let permission_request = RuntimePermissionRequest {
                 id: request.id.clone(),
@@ -223,6 +225,50 @@ pub(crate) fn execute_bash_with_shell_session(
                 cancel,
             })
             .output
+            .with_sandbox_diagnostic(cwd)
+            .into_tool_result(request, output_truncation, cancel, task_registry);
+        }
+        if let Some(permission_handler) = permission_handler
+            && diagnostic.suggested_write_root.is_none()
+        {
+            let permissions = RequestPermissionProfile {
+                file_system: None,
+                network: None,
+                shell: Some(RequestShellPermissions { unsandboxed: true }),
+            };
+            let permission_request = RuntimePermissionRequest {
+                id: request.id.clone(),
+                reason: Some(
+                    "bash needs to re-run without the filesystem sandbox because the sandbox denied access but did not report a filesystem path to grant".to_string(),
+                ),
+                permissions,
+            };
+            let reducer = RuntimeTurnReducer::from_extension_stores(extension_stores);
+            let response = match reducer.request_permission(
+                permission_overlay,
+                permission_handler,
+                permission_request,
+            ) {
+                Ok(response) => response,
+                Err(error) => return ToolResult::failed(request, error.to_string(), None),
+            };
+            if response.decision == PermissionResponseDecision::Deny {
+                return ToolResult::denied(request, "permission request denied".to_string());
+            }
+
+            return execute_bash_once(RuntimeBashOnceContext {
+                command,
+                cwd,
+                additional_readable_directories: Vec::new(),
+                additional_working_directories: additional_roots.to_vec(),
+                denied_working_directories: Vec::new(),
+                allowed_unix_socket_roots: Vec::new(),
+                env: Default::default(),
+                sandbox: ShellSandboxMode::DangerFullAccess,
+                shell_timeout_secs,
+                task_registry,
+                cancel,
+            })
             .with_sandbox_diagnostic(cwd)
             .into_tool_result(request, output_truncation, cancel, task_registry);
         }

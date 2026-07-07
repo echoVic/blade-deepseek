@@ -283,6 +283,7 @@ mod tests {
                             enabled: None,
                             domains,
                         }),
+                        shell: None,
                     },
                 },
             )

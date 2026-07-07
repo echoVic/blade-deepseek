@@ -19,7 +19,7 @@ use orca_runtime::lifecycle::{
 use orca_runtime::memory::MemoryBlock;
 use orca_runtime::protocol::{
     PermissionResponseDecision, RequestFileSystemPermissions, RequestNetworkPermissions,
-    RequestPermissionProfile,
+    RequestPermissionProfile, RequestShellPermissions,
 };
 use orca_runtime::tasks::TaskRegistry;
 use orca_runtime::tool_invocation::prepare_tool_invocation;
@@ -587,6 +587,7 @@ fn execute_tui_bash_with_escalations(
                     enabled: None,
                     domains,
                 }),
+                shell: None,
             },
         };
         let allowed = match resolve_tui_permission_escalation(
@@ -622,14 +623,35 @@ fn execute_tui_bash_with_escalations(
         event_tx,
         action_rx,
         context.cancel,
-        &mut |granted| {
-            let mut roots = base_roots.to_vec();
-            for root in granted {
-                if !roots.contains(root) {
-                    roots.push(root.clone());
+        &mut |retry| match retry {
+            TuiBashRetry::WriteRoots(granted) => {
+                let mut roots = base_roots.to_vec();
+                for root in granted {
+                    if !roots.contains(&root) {
+                        roots.push(root);
+                    }
                 }
+                run_tui_bash(&context, &roots, on_output).0
             }
-            run_tui_bash(&context, &roots, on_output).0
+            TuiBashRetry::Unsandboxed => {
+                let mut unsandboxed = TuiBashRunContext {
+                    config: context.config,
+                    request: context.request,
+                    cwd: context.cwd,
+                    additional_roots: context.additional_roots,
+                    sandbox: context.sandbox.clone(),
+                    task_registry: context.task_registry,
+                    cancel: context.cancel,
+                };
+                unsandboxed.sandbox.mode =
+                    orca_runtime::shell_session::ShellSandboxMode::DangerFullAccess;
+                unsandboxed.sandbox.additional_readable_roots.clear();
+                unsandboxed.sandbox.additional_writable_roots.clear();
+                unsandboxed.sandbox.denied_writable_roots.clear();
+                unsandboxed.sandbox.allowed_unix_socket_roots.clear();
+                unsandboxed.sandbox.network_policy_domains.clear();
+                run_tui_bash(&unsandboxed, context.additional_roots, on_output).0
+            }
         },
     )
 }
@@ -819,7 +841,7 @@ pub(crate) fn escalate_sandbox_denied_bash_for_tui(
     event_tx: &Sender<TuiEvent>,
     action_rx: &Receiver<UserAction>,
     cancel: &CancelToken,
-    retry: &mut dyn FnMut(&[PathBuf]) -> tool_types::ToolResult,
+    retry: &mut dyn FnMut(TuiBashRetry) -> tool_types::ToolResult,
 ) -> tool_types::ToolResult {
     use orca_runtime::sandbox_denial::{
         diagnose_sandbox_denial, should_request_filesystem_permission_with_denied_roots,
@@ -833,42 +855,100 @@ pub(crate) fn escalate_sandbox_denied_bash_for_tui(
     else {
         return result;
     };
-    if !should_request_filesystem_permission_with_denied_roots(cwd, &diagnostic, &[]) {
+    if !should_request_filesystem_permission_with_denied_roots(cwd, &diagnostic, &[])
+        && diagnostic.suggested_write_root.is_some()
+    {
         return with_sandbox_diagnostic(result, &diagnostic.message);
     }
-    let Some(write_root) = diagnostic.suggested_write_root.clone() else {
-        return with_sandbox_diagnostic(result, &diagnostic.message);
-    };
+    if let Some(write_root) = diagnostic.suggested_write_root.clone() {
+        let approval = ApprovalRequest {
+            id: format!("approval-{}-sandbox", request.id),
+            action: ActionKind::Shell,
+            description: format!(
+                "bash requested sandbox write access to {}",
+                write_root.display()
+            ),
+            tool: Some("bash".to_string()),
+            target: request.target.clone(),
+            preview: Some(format!(
+                "$ {}\n\n{}\n\nApprove to re-run this command with write access to {}",
+                request.target.as_deref().unwrap_or_default(),
+                diagnostic.message,
+                write_root.display()
+            )),
+        };
+        let permission_request = RuntimePermissionRequest {
+            id: approval.id.clone(),
+            reason: Some(format!(
+                "bash attempted filesystem write outside the current sandbox: {}",
+                write_root.display()
+            )),
+            permissions: RequestPermissionProfile {
+                file_system: Some(RequestFileSystemPermissions {
+                    read: None,
+                    write: Some(vec![write_root.clone()]),
+                    entries: None,
+                }),
+                network: None,
+                shell: None,
+            },
+        };
+        let allowed = match resolve_tui_permission_escalation(
+            policy,
+            permission_overlay,
+            &approval,
+            permission_request,
+            event_tx,
+            action_rx,
+        ) {
+            Ok(allowed) => allowed,
+            Err(error) => {
+                return tool_types::ToolResult::failed(request, error.to_string(), None);
+            }
+        };
+        if !allowed {
+            return with_sandbox_diagnostic(
+                result,
+                &format!(
+                    "{}; write access to {} was not granted",
+                    diagnostic.message,
+                    write_root.display()
+                ),
+            );
+        }
+
+        let granted = permission_overlay.additional_working_directories().to_vec();
+        let retry_result = retry(TuiBashRetry::WriteRoots(granted));
+        if retry_result.status == tool_types::ToolStatus::Failed
+            && let Some(retry_diagnostic) =
+                diagnose_sandbox_denial(cwd, "", retry_result.error.as_deref().unwrap_or_default())
+        {
+            return with_sandbox_diagnostic(retry_result, &retry_diagnostic.message);
+        }
+        return retry_result;
+    }
 
     let approval = ApprovalRequest {
-        id: format!("approval-{}-sandbox", request.id),
+        id: format!("approval-{}-unsandboxed", request.id),
         action: ActionKind::Shell,
-        description: format!(
-            "bash requested sandbox write access to {}",
-            write_root.display()
-        ),
+        description: "bash requested to re-run without the filesystem sandbox".to_string(),
         tool: Some("bash".to_string()),
         target: request.target.clone(),
         preview: Some(format!(
-            "$ {}\n\n{}\n\nApprove to re-run this command with write access to {}",
+            "$ {}\n\n{}\n\nApprove to re-run this command without the filesystem sandbox",
             request.target.as_deref().unwrap_or_default(),
-            diagnostic.message,
-            write_root.display()
+            diagnostic.message
         )),
     };
     let permission_request = RuntimePermissionRequest {
         id: approval.id.clone(),
-        reason: Some(format!(
-            "bash attempted filesystem write outside the current sandbox: {}",
-            write_root.display()
-        )),
+        reason: Some(
+            "bash needs to re-run without the filesystem sandbox because the sandbox denied access but did not report a filesystem path to grant".to_string(),
+        ),
         permissions: RequestPermissionProfile {
-            file_system: Some(RequestFileSystemPermissions {
-                read: None,
-                write: Some(vec![write_root.clone()]),
-                entries: None,
-            }),
+            file_system: None,
             network: None,
+            shell: Some(RequestShellPermissions { unsandboxed: true }),
         },
     };
     let allowed = match resolve_tui_permission_escalation(
@@ -888,15 +968,13 @@ pub(crate) fn escalate_sandbox_denied_bash_for_tui(
         return with_sandbox_diagnostic(
             result,
             &format!(
-                "{}; write access to {} was not granted",
-                diagnostic.message,
-                write_root.display()
+                "{}; unsandboxed shell access was not granted",
+                diagnostic.message
             ),
         );
     }
 
-    let granted = permission_overlay.additional_working_directories().to_vec();
-    let retry_result = retry(&granted);
+    let retry_result = retry(TuiBashRetry::Unsandboxed);
     if retry_result.status == tool_types::ToolStatus::Failed
         && let Some(retry_diagnostic) =
             diagnose_sandbox_denial(cwd, "", retry_result.error.as_deref().unwrap_or_default())
@@ -904,6 +982,11 @@ pub(crate) fn escalate_sandbox_denied_bash_for_tui(
         return with_sandbox_diagnostic(retry_result, &retry_diagnostic.message);
     }
     retry_result
+}
+
+pub(crate) enum TuiBashRetry {
+    WriteRoots(Vec<PathBuf>),
+    Unsandboxed,
 }
 
 fn with_sandbox_diagnostic(
@@ -1074,16 +1157,31 @@ mod tests {
                 &self.event_tx,
                 &self.action_rx,
                 &cancel,
-                &mut |granted| {
-                    orca_tools::bash::execute_streaming_with_policy_roots_or_cancel(
-                        request,
-                        &cwd,
-                        granted,
-                        config.tools.output_truncation,
-                        std::time::Duration::from_secs(5),
-                        &mut |_chunk| {},
-                        || false,
-                    )
+                &mut |retry| match retry {
+                    TuiBashRetry::WriteRoots(granted) => {
+                        orca_tools::bash::execute_streaming_with_policy_roots_or_cancel(
+                            request,
+                            &cwd,
+                            &granted,
+                            config.tools.output_truncation,
+                            std::time::Duration::from_secs(5),
+                            &mut |_chunk| {},
+                            || false,
+                        )
+                    }
+                    TuiBashRetry::Unsandboxed => {
+                        orca_tools::bash::execute_streaming_command_or_cancel(
+                            request,
+                            orca_tools::sandbox::plain_bash_command(
+                                request.target.as_deref().unwrap_or_default(),
+                                &cwd,
+                            ),
+                            config.tools.output_truncation,
+                            std::time::Duration::from_secs(5),
+                            &mut |_chunk| {},
+                            || false,
+                        )
+                    }
                 },
             )
         }
@@ -1172,6 +1270,59 @@ mod tests {
             overlay.additional_working_directories().contains(&git_root),
             "approved write root must persist for the rest of the turn: {:?}",
             overlay.additional_working_directories()
+        );
+    }
+
+    #[test]
+    fn tui_bash_prompts_and_retries_pathless_sandbox_denial_unsandboxed() {
+        if !seatbelt_available_for_tests() {
+            return;
+        }
+
+        let harness = EscalationHarness::new();
+        let outside = TempDir::new_in(std::env::current_dir().unwrap()).unwrap();
+        let marker = outside.path().join("credential-helper-output");
+        let request = bash_request(&format!(
+            "touch {} 2>/dev/null || {{ printf %s\\\\n \"fatal: could not read Username for 'https://github.com': Operation not permitted\" >&2; exit 128; }}",
+            marker.display()
+        ));
+        harness.action_tx.send(UserAction::Approve(true)).unwrap();
+        harness.action_tx.send(UserAction::Approve(true)).unwrap();
+        let config = config(ApprovalMode::Suggest);
+        let policy = ApprovalPolicy::new(ApprovalMode::Suggest);
+        let mut overlay = TurnPermissionOverlay::default();
+
+        let (_, result, _) = execute_tool_for_tui(
+            &config,
+            harness.workspace.path(),
+            &request,
+            &harness.event_tx,
+            &harness.action_rx,
+            0,
+            None,
+            None,
+            &policy,
+            &ProjectInstructions::default(),
+            &MemoryBlock::default(),
+            &McpRegistry::default(),
+            &orca_runtime::hooks::HookRunner::default(),
+            None,
+            &mut overlay,
+            &CancelToken::new(),
+        );
+
+        assert_eq!(result.status, ToolStatus::Completed, "{:?}", result.error);
+        assert!(marker.exists());
+        let approvals = harness.approval_events();
+        assert!(
+            approvals.iter().any(|event| matches!(
+                event,
+                TuiEvent::ApprovalNeeded { preview, .. }
+                    if preview
+                        .as_deref()
+                        .is_some_and(|preview| preview.contains("without the filesystem sandbox"))
+            )),
+            "expected a dedicated unsandboxed retry approval: {approvals:?}"
         );
     }
 

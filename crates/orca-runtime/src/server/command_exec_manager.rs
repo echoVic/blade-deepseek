@@ -325,13 +325,16 @@ impl CommandExecManager {
                     }
                     if let Some(diagnostic) =
                         diagnose_sandbox_denial(&process.cwd, &output.stdout, &output.stderr)
-                        && should_request_filesystem_permission_with_denied_roots(
-                            &process.cwd,
-                            &diagnostic,
-                            &process.denied_writable_roots,
-                        )
                     {
-                        if let Some(request) = process.permission_request {
+                        let should_request_permission =
+                            should_request_filesystem_permission_with_denied_roots(
+                                &process.cwd,
+                                &diagnostic,
+                                &process.denied_writable_roots,
+                            ) || diagnostic.suggested_write_root.is_none();
+                        if should_request_permission
+                            && let Some(request) = process.permission_request
+                        {
                             return Ok(CommandExecDrainOutcome::FileSystemPermissionRequired {
                                 request,
                                 diagnostic,
