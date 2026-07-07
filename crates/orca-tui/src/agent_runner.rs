@@ -239,24 +239,32 @@ fn spawn_background_provider_completion(
 
         let result = match status {
             "success" => task_registry.complete(&task_id, status.to_string()),
-            "approval_required" => {
-                task_registry.approval_required_for_tool(&task_id, status.to_string(), pending_tool)
-            }
+            "approval_required" => task_registry.approval_required_for_tool(
+                &task_id,
+                status.to_string(),
+                pending_tool.clone(),
+            ),
             _ => task_registry.fail(&task_id, status.to_string()),
         };
         if result.is_ok() {
             let mut events = EventFactory::new(run_id);
             send_workflow_tasks_updated_for_tui(&event_tx, &mut events, &task_registry.list());
         }
-        let _ = event_tx.send(TuiEvent::Notice(background_completion_notice(status)));
+        let _ = event_tx.send(TuiEvent::Notice(background_completion_notice(
+            status,
+            pending_tool.as_deref(),
+        )));
     });
 }
 
-fn background_completion_notice(status: &str) -> String {
+fn background_completion_notice(status: &str, pending_tool: Option<&str>) -> String {
     match status {
-        "approval_required" => {
-            "Background session needs approval before it can continue.".to_string()
-        }
+        "approval_required" => match pending_tool {
+            Some(tool) => {
+                format!("Background session needs approval for {tool} before it can continue.")
+            }
+            None => "Background session needs approval before it can continue.".to_string(),
+        },
         _ => format!("Background session completed: {status}"),
     }
 }

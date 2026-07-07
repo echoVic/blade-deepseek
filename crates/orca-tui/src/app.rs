@@ -1664,7 +1664,7 @@ mod tests {
 
             assert_eq!(
                 notice.unwrap_or_else(|| panic!("missing background notice; saw {seen:?}")),
-                "Background session needs approval before it can continue."
+                "Background session needs approval for task_list before it can continue."
             );
         });
     }
