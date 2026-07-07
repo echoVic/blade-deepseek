@@ -231,10 +231,17 @@ fn spawn_background_provider_completion(
             let mut events = EventFactory::new(run_id);
             send_workflow_tasks_updated_for_tui(&event_tx, &mut events, &task_registry.list());
         }
-        let _ = event_tx.send(TuiEvent::Notice(format!(
-            "Background session completed: {status}"
-        )));
+        let _ = event_tx.send(TuiEvent::Notice(background_completion_notice(status)));
     });
+}
+
+fn background_completion_notice(status: &str) -> String {
+    match status {
+        "approval_required" => {
+            "Background session needs approval before it can continue.".to_string()
+        }
+        _ => format!("Background session completed: {status}"),
+    }
 }
 
 fn finish_main_session_task_for_tui(

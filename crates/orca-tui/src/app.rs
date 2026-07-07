@@ -1524,6 +1524,85 @@ mod tests {
     }
 
     #[test]
+    fn backgrounded_agent_loop_notifies_approval_required_in_user_language() {
+        with_orca_home(|_| {
+            let config = Arc::new(Mutex::new(test_config(HistoryMode::Record)));
+            let preloaded = Arc::new(Mutex::new(None));
+            let (event_tx, event_rx) = mpsc::channel();
+            let (action_tx, action_rx) = mpsc::channel();
+            let cancel = CancelToken::new();
+
+            let handle = std::thread::spawn({
+                let config = Arc::clone(&config);
+                let preloaded = Arc::clone(&preloaded);
+                let cancel = cancel.clone();
+                move || {
+                    agent_loop_thread(
+                        config,
+                        preloaded,
+                        event_tx,
+                        action_rx,
+                        cancel,
+                        test_pending_workflow_notifications(),
+                    )
+                }
+            });
+
+            action_tx
+                .send(UserAction::Submit(
+                    "mock_stream_tool_delay_ms 250 task_list".to_string(),
+                ))
+                .unwrap();
+
+            loop {
+                match event_rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+                    TuiEvent::MessageDelta(text)
+                        if text.contains("Mock slow tool stream started.") =>
+                    {
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+
+            action_tx.send(UserAction::BackgroundCurrentTurn).unwrap();
+
+            let mut notice = None;
+            let mut seen = Vec::new();
+            for _ in 0..20 {
+                match event_rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+                    TuiEvent::Notice(message) if message.starts_with("Background session") => {
+                        notice = Some(message);
+                        break;
+                    }
+                    TuiEvent::Notice(message) => {
+                        seen.push(format!("notice: {message}"));
+                    }
+                    TuiEvent::WorkflowTasksUpdated { tasks } => {
+                        let statuses = tasks
+                            .into_iter()
+                            .filter(|task| {
+                                task.task_type == orca_core::task_types::TaskType::MainSession
+                            })
+                            .map(|task| format!("{:?}", task.status))
+                            .collect::<Vec<_>>();
+                        seen.push(format!("tasks: {}", statuses.join(",")));
+                    }
+                    event => seen.push(format!("{event:?}")),
+                }
+            }
+
+            action_tx.send(UserAction::Cancel).unwrap();
+            handle.join().unwrap();
+
+            assert_eq!(
+                notice.unwrap_or_else(|| panic!("missing background notice; saw {seen:?}")),
+                "Background session needs approval before it can continue."
+            );
+        });
+    }
+
+    #[test]
     fn idle_app_submits_pending_workflow_notification() {
         let (mut state, _rx) = test_state();
         let (action_tx, action_rx) = mpsc::channel();
