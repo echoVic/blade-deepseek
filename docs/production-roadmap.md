@@ -4,12 +4,19 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-07-07
-Current baseline: v0.1.183 gives runtime capability changes a named snapshot
-contract. `RuntimeCapabilityPatch` and `RuntimeCapabilitySnapshot` now own
-model overrides, allowed-tool replacements, runtime system-message injection,
-and transition reasons behind directive state, while `RuntimeDirectiveState`
-applies patches and exposes that shared snapshot for future skill, hook, MCP,
-and tool-policy paths. Earlier v0.1.182 moved turn-loop state assembly onto a
+Current baseline: v0.1.184 gives provider and tool-dispatch steps a named
+request-scoped runtime snapshot. `RuntimeStepSnapshot` now owns the stable
+per-request runtime inputs that had been spread across `RuntimeStepContext`,
+while `RuntimeStepContext` carries that snapshot plus the kernel-bound extension
+context. Provider final-response handling reads settings through the snapshot,
+and tool dispatch splits the step context into snapshot plus extension binding
+before routing normal, readonly, workflow, and subagent tool turns. Earlier
+v0.1.183 gave runtime capability changes a named snapshot contract.
+`RuntimeCapabilityPatch` and `RuntimeCapabilitySnapshot` own model overrides,
+allowed-tool replacements, runtime system-message injection, and transition
+reasons behind directive state, while `RuntimeDirectiveState` applies patches
+and exposes that shared snapshot for future skill, hook, MCP, and tool-policy
+paths. Earlier v0.1.182 moved turn-loop state assembly onto a
 `RuntimeTurnKernel` instance. `RuntimeTurnState` creates the kernel from the
 thread and turn extension stores, then asks that instance to assemble
 `RuntimeTurnLoopState`; the loop state keeps shared scoped extension stores so

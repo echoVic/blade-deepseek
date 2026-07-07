@@ -21,7 +21,7 @@ use crate::tool_invocation::AgentToolPolicyContext;
 use crate::workflow::ipc::WorkflowIpcContext;
 
 #[derive(Clone, Copy)]
-pub(crate) struct RuntimeStepContext<'a> {
+pub(crate) struct RuntimeStepSnapshot<'a> {
     pub(crate) config: &'a RunConfig,
     pub(crate) cwd: &'a Path,
     pub(crate) tool_policy: AgentToolPolicyContext<'a>,
@@ -36,6 +36,11 @@ pub(crate) struct RuntimeStepContext<'a> {
     pub(crate) task_registry: &'a TaskRegistry,
     pub(crate) workflow_ipc: Option<&'a WorkflowIpcContext>,
     pub(crate) permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct RuntimeStepContext<'a> {
+    pub(crate) snapshot: RuntimeStepSnapshot<'a>,
     pub(crate) extensions: Option<RuntimeExtensionContext<'a>>,
 }
 
@@ -157,7 +162,7 @@ impl RuntimeSamplingRequestState {
     }
 }
 
-impl<'a> RuntimeStepContext<'a> {
+impl<'a> RuntimeStepSnapshot<'a> {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         config: &'a RunConfig,
@@ -190,7 +195,56 @@ impl<'a> RuntimeStepContext<'a> {
             task_registry,
             workflow_ipc,
             permission_handler,
+        }
+    }
+}
+
+impl<'a> RuntimeStepContext<'a> {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        config: &'a RunConfig,
+        cwd: &'a Path,
+        tool_policy: AgentToolPolicyContext<'a>,
+        subagent_depth: u32,
+        emit_deltas: bool,
+        policy: &'a ApprovalPolicy,
+        instructions: &'a ProjectInstructions,
+        memory: &'a MemoryBlock,
+        mcp_registry: &'a McpRegistry,
+        hooks: &'a HookRunner,
+        cancel: &'a CancelToken,
+        task_registry: &'a TaskRegistry,
+        workflow_ipc: Option<&'a WorkflowIpcContext>,
+        permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
+    ) -> Self {
+        Self {
+            snapshot: RuntimeStepSnapshot::new(
+                config,
+                cwd,
+                tool_policy,
+                subagent_depth,
+                emit_deltas,
+                policy,
+                instructions,
+                memory,
+                mcp_registry,
+                hooks,
+                cancel,
+                task_registry,
+                workflow_ipc,
+                permission_handler,
+            ),
             extensions: None,
         }
+    }
+
+    pub(crate) fn snapshot(&self) -> RuntimeStepSnapshot<'a> {
+        self.snapshot
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (RuntimeStepSnapshot<'a>, Option<RuntimeExtensionContext<'a>>) {
+        (self.snapshot, self.extensions)
     }
 }

@@ -545,6 +545,58 @@ mod tests {
     }
 
     #[test]
+    fn runtime_step_context_exposes_request_snapshot_contract() {
+        let step_context_source = include_str!("step_context.rs");
+        let provider_turn_source = include_str!("provider_turn.rs");
+        let tool_turn_source = include_str!("tool_turn.rs");
+
+        assert!(
+            step_context_source.contains("pub(crate) struct RuntimeStepSnapshot"),
+            "RuntimeStepSnapshot must be the named request-scoped runtime snapshot"
+        );
+        assert!(
+            step_context_source.contains("snapshot: RuntimeStepSnapshot<'a>"),
+            "RuntimeStepContext must carry request-scoped inputs through one snapshot field"
+        );
+        let runtime_step_context_struct = step_context_source
+            .split("pub(crate) struct RuntimeStepContext<'a> {")
+            .nth(1)
+            .expect("RuntimeStepContext struct body")
+            .split("}")
+            .next()
+            .expect("RuntimeStepContext struct end");
+        for field_name in [
+            "config",
+            "cwd",
+            "tool_policy",
+            "subagent_depth",
+            "emit_deltas",
+            "policy",
+            "instructions",
+            "memory",
+            "mcp_registry",
+            "hooks",
+            "cancel",
+            "task_registry",
+            "workflow_ipc",
+            "permission_handler",
+        ] {
+            assert!(
+                !runtime_step_context_struct.contains(&format!("pub(crate) {field_name}:")),
+                "RuntimeStepContext must not expose request-scoped field {field_name} outside RuntimeStepSnapshot"
+            );
+        }
+        assert!(
+            provider_turn_source.contains("step_context.snapshot()"),
+            "provider_turn must read request-scoped inputs through RuntimeStepSnapshot"
+        );
+        assert!(
+            tool_turn_source.contains("step_context.into_parts()"),
+            "tool_turn dispatch must split RuntimeStepContext into its snapshot plus extension binding"
+        );
+    }
+
+    #[test]
     fn sampling_request_state_owns_tool_permission_overlay() {
         let step_context_source = include_str!("step_context.rs");
         let tool_turn_source = include_str!("tool_turn.rs");

@@ -391,6 +391,7 @@ impl RuntimeProviderResponseStep {
         workflow_child_executor: ChildAgentExecutor<SharedEventBuffer>,
         batch_child_executor: ChildAgentExecutor<io::Sink>,
     ) -> io::Result<RuntimeProviderResponseOutcome> {
+        let step_snapshot = step_context.snapshot();
         if response.tool_calls.is_empty() {
             let final_message = response.assistant_content.clone();
             record_assistant_response_for_agent(
@@ -399,12 +400,12 @@ impl RuntimeProviderResponseStep {
                 response.assistant_content,
                 response.assistant_reasoning,
                 vec![],
-                step_context.emit_deltas,
+                step_snapshot.emit_deltas,
             )?;
-            if step_context.emit_deltas && step_context.config.auto_memory {
+            if step_snapshot.emit_deltas && step_snapshot.config.auto_memory {
                 memory::extract_project_memory_after_final_response(
-                    step_context.config,
-                    step_context.cwd,
+                    step_snapshot.config,
+                    step_snapshot.cwd,
                     &conversation.messages,
                     events,
                     sink,
@@ -419,7 +420,7 @@ impl RuntimeProviderResponseStep {
             response.assistant_content,
             response.assistant_reasoning,
             response.tool_calls.clone(),
-            step_context.emit_deltas,
+            step_snapshot.emit_deltas,
         )?;
 
         let tool_requests = tool_requests_from_provider_steps(&response.steps);

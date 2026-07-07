@@ -125,21 +125,21 @@ pub(crate) fn run_tool_turns<W: io::Write>(
         workflow_child_executor,
         batch_child_executor,
     } = context;
-    let config = step_context.config;
-    let cwd = step_context.cwd;
-    let tool_policy = step_context.tool_policy;
-    let subagent_depth = step_context.subagent_depth;
-    let emit_deltas = step_context.emit_deltas;
-    let policy = step_context.policy;
-    let instructions = step_context.instructions;
-    let memory = step_context.memory;
-    let mcp_registry = step_context.mcp_registry;
-    let hooks = step_context.hooks;
-    let cancel = step_context.cancel;
-    let task_registry = step_context.task_registry;
-    let workflow_ipc = step_context.workflow_ipc;
-    let permission_handler = step_context.permission_handler;
-    let extensions = step_context.extensions;
+    let (step_snapshot, extensions) = step_context.into_parts();
+    let config = step_snapshot.config;
+    let cwd = step_snapshot.cwd;
+    let tool_policy = step_snapshot.tool_policy;
+    let subagent_depth = step_snapshot.subagent_depth;
+    let emit_deltas = step_snapshot.emit_deltas;
+    let policy = step_snapshot.policy;
+    let instructions = step_snapshot.instructions;
+    let memory = step_snapshot.memory;
+    let mcp_registry = step_snapshot.mcp_registry;
+    let hooks = step_snapshot.hooks;
+    let cancel = step_snapshot.cancel;
+    let task_registry = step_snapshot.task_registry;
+    let workflow_ipc = step_snapshot.workflow_ipc;
+    let permission_handler = step_snapshot.permission_handler;
     while let Some(tool_request) = sampling_state.current_tool_request(tool_requests) {
         if let Some(result) = reject_disallowed_child_tool(
             tool_request,

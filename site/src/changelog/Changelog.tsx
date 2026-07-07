@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.184":
+        "RuntimeStepContext now carries request-scoped runtime inputs through a named RuntimeStepSnapshot. Provider response handling reads final-response settings through the snapshot, and tool dispatch splits the step context into snapshot plus extension binding before routing normal, readonly, workflow, and subagent tool turns.",
       "v0.1.183":
         "Runtime directives now flow through a named RuntimeCapabilitySnapshot. Switch-model, allowed-tool, and runtime system-message patches share one capability contract, and RuntimeDirectiveState exposes that snapshot so later skill, hook, MCP, and tool-policy work can derive from the same state surface.",
       "v0.1.182":
@@ -394,6 +396,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.184":
+        "RuntimeStepContext 现在通过命名的 RuntimeStepSnapshot 承载 request-scoped runtime 输入。Provider response handling 会从 snapshot 读取 final-response 设置，tool dispatch 也会先把 step context 拆成 snapshot 与 extension binding，再路由 normal、readonly、workflow 和 subagent tool turn。",
       "v0.1.183":
         "Runtime directive 现在会流经命名的 RuntimeCapabilitySnapshot。模型切换、工具 allowlist 和 runtime system message patch 共享同一个 capability contract，RuntimeDirectiveState 也会暴露这份 snapshot，方便后续 skill、hook、MCP 和 tool policy 都从同一层状态派生。",
       "v0.1.182":
