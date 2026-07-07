@@ -4,11 +4,15 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-07-07
-Current baseline: v0.1.174 adds server-mode `command/exec/read` so app-server
-clients can actively drain long-running streaming `command/exec` process
-handles by `processId`, receive a `command_exec_read` acknowledgment, and reuse
-the existing `command_exec_output_delta` / `command_exec_completed` stream.
-Earlier v0.1.173 let server-mode `shell/read` requests apply an
+Current baseline: v0.1.175 lets server-mode `command/exec/read` requests apply
+an `outputBytesCap` byte budget to active streaming `command/exec` processes,
+tightening the process output cap before the server's normal pre-dispatch
+drain and returning UTF-8-safe `command_exec_output_delta` events with
+`capReached` metadata. Earlier v0.1.174 added server-mode
+`command/exec/read` so app-server clients can actively drain long-running
+streaming `command/exec` process handles by `processId`, receive a
+`command_exec_read` acknowledgment, and reuse the existing
+`command_exec_output_delta` / `command_exec_completed` stream. Earlier v0.1.173 let server-mode `shell/read` requests apply an
 `outputBytesCap` byte budget to incremental shell stdout/stderr, returning
 truncated UTF-8-safe deltas plus `capReached` metadata on
 `shell_output_delta`, `shell_updated`, and `shell_completed` events. Earlier
@@ -268,7 +272,8 @@ commands and consume versioned events without owning turn execution details.
    truncation with streamed `capReached` metadata, streamed stdout/stderr
    deltas with `command/exec/write` stdin support,
    client-driven `command/exec/read` drains for active process handles, and
-   `command/exec` TTY initial size/resize support.
+   `command/exec` TTY initial size/resize support, and read-time
+   `outputBytesCap` tightening for active streaming process drains.
 
 **Refreshed reference-driven priority order (Codex + package 3):**
 
@@ -329,7 +334,8 @@ commands and consume versioned events without owning turn execution details.
    PTY sessions or resize operations, and `shell/read` can now cap incremental
    stdout/stderr with `outputBytesCap` plus `capReached` metadata for clients
    that need bounded reads, and `command/exec/read` now gives server clients a
-   request/ack boundary for draining active streaming process output. Next, use
+   request/ack boundary for draining active streaming process output, with
+   read-time `outputBytesCap` support for bounded polling. Next, use
    those boundaries for deeper
    cross-platform PTY support.
 3. **ThreadStore-backed app-server materialization:** Codex treats threads as

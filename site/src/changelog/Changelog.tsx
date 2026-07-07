@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.175":
+        "Server-mode command/exec/read now accepts outputBytesCap. Read requests can tighten the active streaming process output cap before the normal pre-dispatch drain, so bounded polling returns UTF-8-safe deltas with capReached metadata instead of leaking a larger burst.",
       "v0.1.174":
         "Server-mode command/exec now accepts command/exec/read for client-driven drains of long-running streaming process handles. The read request acknowledges the active process and reuses the existing outputDelta stream, cap metadata, and completion path.",
       "v0.1.173":
@@ -376,6 +378,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.175":
+        "Server mode 的 command/exec/read 现在支持 outputBytesCap。read 请求会在常规 pre-dispatch drain 前收紧 active streaming process 的输出上限，让有界轮询返回 UTF-8 安全的 delta 和 capReached 元数据，而不是泄露更大的输出突发。",
       "v0.1.174":
         "Server mode 的 command/exec 现在支持 command/exec/read，客户端可以主动拉取长运行 streaming process handle 的输出。read 请求会确认活动进程，并复用现有 outputDelta 流、cap 元数据和完成事件路径。",
       "v0.1.173":
