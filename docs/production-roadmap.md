@@ -4,7 +4,13 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-07-07
-Current baseline: v0.1.187 moves request-scoped capability refs inside a named
+Current baseline: v0.1.188 carries provider-cycle capability refs through the
+same `RuntimeStepCapabilitySnapshot` used by step context. `RuntimeProviderCycleInput`
+now keeps provider-cycle execution fields separate from the request capability
+bundle, `runtime_turn_iteration` assembles that bundle once from turn input, and
+`provider_turn` passes it into `RuntimeStepContext` without expanding the flat
+instructions, memory, MCP, hook, cancellation, task, workflow IPC, or interaction
+handler refs. Earlier v0.1.187 moved request-scoped capability refs inside a named
 `RuntimeStepCapabilitySnapshot`. `RuntimeStepSnapshot` now keeps the immediate
 request execution fields while routing instructions, memory, MCP registry,
 hooks, cancellation, task registry, workflow IPC, and turn interaction handlers

@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.188":
+        "RuntimeProviderCycleInput now reuses RuntimeStepCapabilitySnapshot for provider-cycle capability refs. runtime_turn_iteration assembles that bundle once, provider_turn passes it into RuntimeStepContext without expanding flat capability fields, and provider/tool behavior stays unchanged while the provider-cycle boundary gets smaller.",
       "v0.1.187":
         "RuntimeStepSnapshot now carries request-scoped capability refs through a named RuntimeStepCapabilitySnapshot. Tool dispatch reads instructions, memory, MCP registry, hooks, cancel state, task registry, workflow IPC, and interaction handlers through that capability bundle, keeping provider/tool behavior unchanged while shrinking the next Codex-style step-context boundary.",
       "v0.1.186":
@@ -402,6 +404,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.188":
+        "RuntimeProviderCycleInput 现在复用 RuntimeStepCapabilitySnapshot 来承载 provider-cycle capability 引用。runtime_turn_iteration 只组装一次这组 bundle，provider_turn 会把它交给 RuntimeStepContext，而不再展开成一串 flat capability 字段；provider/tool 行为不变，但 provider-cycle 边界更小。",
       "v0.1.187":
         "RuntimeStepSnapshot 现在通过命名的 RuntimeStepCapabilitySnapshot 承载 request-scoped capability 引用。Tool dispatch 会从这组 capability bundle 读取 instructions、memory、MCP registry、hooks、cancel state、task registry、workflow IPC 与交互 handler，保持 provider/tool 行为不变，同时继续收紧 Codex 风格的 step-context 边界。",
       "v0.1.186":

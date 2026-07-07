@@ -8,6 +8,7 @@ use orca_core::conversation::Conversation;
 use orca_core::event_schema::{EventFactory, RunStatus};
 use orca_core::event_sink::EventSink;
 use orca_core::provider_types::{ProviderResponse, ProviderStep};
+#[cfg(test)]
 use orca_mcp::McpRegistry;
 use orca_provider::{ProviderConfig, context};
 
@@ -16,23 +17,26 @@ use crate::compaction::RuntimeCompactionStep;
 use crate::cost::CostTracker;
 use crate::extension::RuntimeExtensionContext;
 use crate::hooks::{HookRunner, conversation_with_hook_context};
+#[cfg(test)]
 use crate::instructions::ProjectInstructions;
-use crate::lifecycle::{
-    AgentLoopResult, RuntimePermissionRequestHandler, RuntimeTaskActor, RuntimeTurnStartError,
-    RuntimeUserInputHandler,
-};
-use crate::memory::{self, MemoryBlock};
+use crate::lifecycle::{AgentLoopResult, RuntimeTaskActor, RuntimeTurnStartError};
+use crate::memory;
+#[cfg(test)]
+use crate::memory::MemoryBlock;
 use crate::runtime_conversation_bootstrap::RuntimePreparedConversation;
 use crate::runtime_directive::conversation_with_runtime_system_messages;
 use crate::runtime_steer::{RuntimeSteerInput, RuntimeSteerStep};
 use crate::runtime_turn_kernel::RuntimeTurnKernel;
 use crate::session::record_assistant_response_for_agent;
-use crate::step_context::{RuntimeSamplingRequestState, RuntimeStepContext};
+use crate::step_context::{
+    RuntimeSamplingRequestState, RuntimeStepCapabilitySnapshot, RuntimeStepContext,
+    RuntimeStepSnapshot,
+};
+#[cfg(test)]
 use crate::tasks::TaskRegistry;
 use crate::thread_store::SessionWriter;
 use crate::tool_invocation::{AgentToolPolicyContext, tool_requests_from_provider_steps};
 use crate::tool_turn::{RuntimeToolTurnsContext, ToolTurnOutcome, run_tool_turns};
-use crate::workflow::ipc::WorkflowIpcContext;
 use crate::workflow::runner::SharedEventBuffer;
 use crate::workflow_execution::BackgroundWorkflowRun;
 
@@ -59,8 +63,7 @@ pub(crate) struct RuntimeProviderCycleInput<'a, 'runtime, W: io::Write> {
     pub(crate) context_config: &'a context::ContextConfig,
     pub(crate) base_provider_config: &'a ProviderConfig,
     pub(crate) emit_deltas: bool,
-    pub(crate) hooks: &'a HookRunner,
-    pub(crate) cancel: &'a CancelToken,
+    pub(crate) capabilities: RuntimeStepCapabilitySnapshot<'a>,
     pub(crate) cost_tracker: &'a mut CostTracker,
     pub(crate) max_budget_usd: Option<f64>,
     pub(crate) events: &'a mut EventFactory,
@@ -70,15 +73,8 @@ pub(crate) struct RuntimeProviderCycleInput<'a, 'runtime, W: io::Write> {
     pub(crate) tool_policy: AgentToolPolicyContext<'a>,
     pub(crate) subagent_depth: u32,
     pub(crate) policy: &'a ApprovalPolicy,
-    pub(crate) instructions: &'a ProjectInstructions,
-    pub(crate) memory: &'a MemoryBlock,
-    pub(crate) mcp_registry: &'a McpRegistry,
-    pub(crate) task_registry: &'a TaskRegistry,
     pub(crate) extensions: RuntimeExtensionContext<'a>,
     pub(crate) background_workflows: &'a mut Vec<BackgroundWorkflowRun>,
-    pub(crate) workflow_ipc: Option<&'a WorkflowIpcContext>,
-    pub(crate) permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
-    pub(crate) user_input_handler: Option<&'a dyn RuntimeUserInputHandler>,
     pub(crate) steer_handle: Option<&'a crate::lifecycle::ThreadSteerHandle>,
 }
 
@@ -483,6 +479,7 @@ impl RuntimeTurnProviderCycleStep {
         workflow_child_executor: ChildAgentExecutor<SharedEventBuffer>,
         batch_child_executor: ChildAgentExecutor<io::Sink>,
     ) -> io::Result<RuntimeTurnProviderCycleResult> {
+        let capabilities = input.capabilities;
         let cwd_display = input.cwd.display().to_string();
         let provider_turn = {
             let (conversation, history_writer) = input.conversation.parts_mut();
@@ -494,8 +491,8 @@ impl RuntimeTurnProviderCycleStep {
                 input.turn_provider_config,
                 &cwd_display,
                 input.emit_deltas,
-                input.hooks,
-                input.cancel,
+                capabilities.hooks,
+                capabilities.cancel,
                 input.cost_tracker,
                 input.max_budget_usd,
                 input.events,
@@ -528,7 +525,7 @@ impl RuntimeTurnProviderCycleStep {
                     input.base_provider_config,
                     input.cwd,
                     input.emit_deltas,
-                    input.hooks,
+                    capabilities.hooks,
                     input.events,
                     input.sink,
                     history_writer,
@@ -548,23 +545,16 @@ impl RuntimeTurnProviderCycleStep {
 
         let (conversation, history_writer) = input.conversation.parts_mut();
         let mut kernel = RuntimeTurnKernel::from_extension_stores(input.extensions.stores());
-        let step_context = RuntimeStepContext::new(
-            input.config,
-            input.cwd,
-            input.tool_policy,
-            input.subagent_depth,
-            input.emit_deltas,
-            input.policy,
-            input.instructions,
-            input.memory,
-            input.mcp_registry,
-            input.hooks,
-            input.cancel,
-            input.task_registry,
-            input.workflow_ipc,
-            input.permission_handler,
-            input.user_input_handler,
-        );
+        let step_context =
+            RuntimeStepContext::from_snapshot(RuntimeStepSnapshot::new_with_capabilities(
+                input.config,
+                input.cwd,
+                input.tool_policy,
+                input.subagent_depth,
+                input.emit_deltas,
+                input.policy,
+                capabilities,
+            ));
         let response_input = kernel.provider_response_input(
             step_context,
             input.extensions.registry(),

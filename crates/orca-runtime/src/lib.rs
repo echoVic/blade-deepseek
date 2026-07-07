@@ -649,6 +649,59 @@ mod tests {
     }
 
     #[test]
+    fn runtime_provider_cycle_reuses_step_capability_snapshot_contract() {
+        let provider_turn_source = include_str!("provider_turn.rs");
+        let runtime_turn_iteration_source = include_str!("runtime_turn_iteration.rs");
+
+        assert!(
+            provider_turn_source.contains("RuntimeStepCapabilitySnapshot"),
+            "provider cycle must reuse the step capability snapshot type instead of repeating capability refs"
+        );
+        assert!(
+            provider_turn_source.contains("capabilities: RuntimeStepCapabilitySnapshot<'a>"),
+            "RuntimeProviderCycleInput must carry request capability refs through one named field"
+        );
+
+        let provider_cycle_input_struct = provider_turn_source
+            .split("pub(crate) struct RuntimeProviderCycleInput")
+            .nth(1)
+            .expect("RuntimeProviderCycleInput struct body")
+            .split("pub(crate) struct RuntimeProviderResponseInput")
+            .next()
+            .expect("RuntimeProviderCycleInput struct end");
+        for field_name in [
+            "instructions",
+            "memory",
+            "mcp_registry",
+            "hooks",
+            "cancel",
+            "task_registry",
+            "workflow_ipc",
+            "permission_handler",
+            "user_input_handler",
+        ] {
+            assert!(
+                !provider_cycle_input_struct.contains(&format!("pub(crate) {field_name}:")),
+                "RuntimeProviderCycleInput must not expose capability field {field_name} outside RuntimeStepCapabilitySnapshot"
+            );
+        }
+
+        assert!(
+            provider_turn_source.contains("RuntimeStepContext::from_snapshot"),
+            "provider cycle should pass the grouped provider-cycle snapshot into RuntimeStepContext without expanding capability refs"
+        );
+        assert!(
+            !provider_turn_source.contains("input.instructions"),
+            "provider cycle must not expand capability refs when creating RuntimeStepContext"
+        );
+        assert!(
+            runtime_turn_iteration_source
+                .contains("capabilities: RuntimeStepCapabilitySnapshot::new("),
+            "runtime_turn_iteration must assemble provider-cycle capability refs through RuntimeStepCapabilitySnapshot"
+        );
+    }
+
+    #[test]
     fn runtime_turn_interaction_state_groups_turn_scoped_interaction_handlers() {
         let lifecycle_source = include_str!("lifecycle.rs");
         let agent_loop_source = include_str!("agent_loop.rs");

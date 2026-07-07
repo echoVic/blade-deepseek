@@ -171,6 +171,7 @@ impl RuntimeSamplingRequestState {
 }
 
 impl<'a> RuntimeStepSnapshot<'a> {
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         config: &'a RunConfig,
@@ -189,14 +190,14 @@ impl<'a> RuntimeStepSnapshot<'a> {
         permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
         user_input_handler: Option<&'a dyn RuntimeUserInputHandler>,
     ) -> Self {
-        Self {
+        Self::new_with_capabilities(
             config,
             cwd,
             tool_policy,
             subagent_depth,
             emit_deltas,
             policy,
-            capabilities: RuntimeStepCapabilitySnapshot::new(
+            RuntimeStepCapabilitySnapshot::new(
                 instructions,
                 memory,
                 mcp_registry,
@@ -207,6 +208,26 @@ impl<'a> RuntimeStepSnapshot<'a> {
                 permission_handler,
                 user_input_handler,
             ),
+        )
+    }
+
+    pub(crate) fn new_with_capabilities(
+        config: &'a RunConfig,
+        cwd: &'a Path,
+        tool_policy: AgentToolPolicyContext<'a>,
+        subagent_depth: u32,
+        emit_deltas: bool,
+        policy: &'a ApprovalPolicy,
+        capabilities: RuntimeStepCapabilitySnapshot<'a>,
+    ) -> Self {
+        Self {
+            config,
+            cwd,
+            tool_policy,
+            subagent_depth,
+            emit_deltas,
+            policy,
+            capabilities,
         }
     }
 
@@ -243,6 +264,7 @@ impl<'a> RuntimeStepCapabilitySnapshot<'a> {
 }
 
 impl<'a> RuntimeStepContext<'a> {
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         config: &'a RunConfig,
@@ -279,6 +301,13 @@ impl<'a> RuntimeStepContext<'a> {
                 permission_handler,
                 user_input_handler,
             ),
+            extensions: None,
+        }
+    }
+
+    pub(crate) fn from_snapshot(snapshot: RuntimeStepSnapshot<'a>) -> Self {
+        Self {
+            snapshot,
             extensions: None,
         }
     }

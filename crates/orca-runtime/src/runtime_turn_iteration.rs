@@ -27,6 +27,7 @@ use crate::runtime_conversation_bootstrap::RuntimePreparedConversation;
 use crate::runtime_turn_opening::{
     RuntimeTurnOpeningInput, RuntimeTurnOpeningResult, RuntimeTurnOpeningStep,
 };
+use crate::step_context::RuntimeStepCapabilitySnapshot;
 use crate::tasks::TaskRegistry;
 use crate::tool_invocation::AgentToolPolicyContext;
 use crate::workflow::ipc::WorkflowIpcContext;
@@ -130,8 +131,17 @@ impl RuntimeTurnIterationStep {
                 context_config: input.context_config,
                 base_provider_config: input.provider_config,
                 emit_deltas: input.emit_deltas,
-                hooks: input.hooks,
-                cancel: input.cancel,
+                capabilities: RuntimeStepCapabilitySnapshot::new(
+                    input.instructions,
+                    input.memory,
+                    input.mcp_registry,
+                    input.hooks,
+                    input.cancel,
+                    input.task_registry,
+                    input.workflow_ipc,
+                    input.turn_interactions.permission_handler(),
+                    input.turn_interactions.user_input_handler(),
+                ),
                 cost_tracker: input.cost_tracker,
                 max_budget_usd: input.max_budget_usd,
                 events: input.events,
@@ -141,15 +151,8 @@ impl RuntimeTurnIterationStep {
                 tool_policy: input.tool_policy,
                 subagent_depth: input.subagent_depth,
                 policy: input.policy,
-                instructions: input.instructions,
-                memory: input.memory,
-                mcp_registry: input.mcp_registry,
-                task_registry: input.task_registry,
                 extensions: input.extensions,
                 background_workflows: input.background_workflows,
-                workflow_ipc: input.workflow_ipc,
-                permission_handler: input.turn_interactions.permission_handler(),
-                user_input_handler: input.turn_interactions.user_input_handler(),
                 steer_handle: input.steer_handle,
             },
             child_executor,
