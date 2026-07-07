@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.170":
+        "RuntimeSamplingRequestState now records normal tool results and owns the approval-required and subagent-failure terminal folding for single-tool turns. Normal tool execution borrows its permission overlay and records its result through the same request state, leaving tool_turn to delegate without changing user-visible behavior.",
       "v0.1.169":
         "RuntimeSamplingRequestState now produces clamped RuntimeToolDispatchWindow values for readonly and subagent batches. Tool turns no longer read raw cursor positions or slice batch windows directly, and a stalled batch collector still advances over the current request instead of risking a stuck dispatch loop.",
       "v0.1.168":
@@ -366,6 +368,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.170":
+        "RuntimeSamplingRequestState 现在负责记录 normal tool result，并持有 approval-required 与 subagent-failure 的 terminal folding。Normal tool execution 会从同一个 request state 借 permission overlay 并通过它记录结果；tool_turn 只负责委托，用户可见行为不变。",
       "v0.1.169":
         "RuntimeSamplingRequestState 现在会为 readonly 与 subagent batch 生成 clamped RuntimeToolDispatchWindow。Tool turn 不再读取 raw cursor position，也不再直接切 batch slice；即便 batch collector 没有推进，也会至少消费当前 request，避免调度循环卡住。",
       "v0.1.168":

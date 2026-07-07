@@ -4,11 +4,16 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-07-07
-Current baseline: v0.1.169 lets `RuntimeSamplingRequestState` produce clamped
-`RuntimeToolDispatchWindow` values for readonly and subagent batch dispatch.
-Tool turns no longer read raw cursor positions or slice batch windows directly,
-and the dispatch-window API guarantees forward progress over the current request
-even if a batch collector returns the current cursor. Earlier v0.1.168 let
+Current baseline: v0.1.170 lets `RuntimeSamplingRequestState` record normal
+tool results and own the approval-required plus subagent-failure terminal
+folding for single-tool turns. Normal tool execution now borrows its permission
+overlay and records its result through the same request state, leaving
+`tool_turn` to delegate the per-sampling state boundary. Earlier v0.1.169 let
+`RuntimeSamplingRequestState` produce clamped `RuntimeToolDispatchWindow` values
+for readonly and subagent batch dispatch. Tool turns no longer read raw cursor
+positions or slice batch windows directly, and the dispatch-window API
+guarantees forward progress over the current request even if a batch collector
+returns the current cursor. Earlier v0.1.168 let
 `RuntimeSamplingRequestState` own the tool-dispatch cursor as well as the
 per-sampling permission overlay. Tool turns now read and advance the current
 request through sampling state instead of keeping a separate `ToolRequestCursor`,
