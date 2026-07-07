@@ -1317,6 +1317,73 @@ mod tests {
     }
 
     #[test]
+    fn backgrounded_agent_loop_accepts_next_submit_before_first_turn_completes() {
+        with_orca_home(|_| {
+            let config = Arc::new(Mutex::new(test_config(HistoryMode::Record)));
+            let preloaded = Arc::new(Mutex::new(None));
+            let (event_tx, event_rx) = mpsc::channel();
+            let (action_tx, action_rx) = mpsc::channel();
+            let cancel = CancelToken::new();
+
+            let handle = std::thread::spawn({
+                let config = Arc::clone(&config);
+                let preloaded = Arc::clone(&preloaded);
+                let cancel = cancel.clone();
+                move || {
+                    agent_loop_thread(
+                        config,
+                        preloaded,
+                        event_tx,
+                        action_rx,
+                        cancel,
+                        test_pending_workflow_notifications(),
+                    )
+                }
+            });
+
+            action_tx
+                .send(UserAction::Submit("mock_stream_delay_ms 250".to_string()))
+                .unwrap();
+
+            loop {
+                match event_rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+                    TuiEvent::MessageDelta(text) if text.contains("Mock slow stream started.") => {
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+
+            action_tx.send(UserAction::BackgroundCurrentTurn).unwrap();
+            action_tx
+                .send(UserAction::Submit("mock_history_echo".to_string()))
+                .unwrap();
+
+            let first_followup = loop {
+                match event_rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+                    TuiEvent::MessageDelta(text) if text.contains("Mock history users:") => {
+                        break "next-submit";
+                    }
+                    TuiEvent::MessageDelta(text)
+                        if text.contains("Mock slow stream completed.") =>
+                    {
+                        break "first-turn-completed";
+                    }
+                    _ => {}
+                }
+            };
+
+            action_tx.send(UserAction::Cancel).unwrap();
+            handle.join().unwrap();
+
+            assert_eq!(
+                first_followup, "next-submit",
+                "backgrounding must let the next foreground submit run before the backgrounded turn finishes"
+            );
+        });
+    }
+
+    #[test]
     fn idle_app_submits_pending_workflow_notification() {
         let (mut state, _rx) = test_state();
         let (action_tx, action_rx) = mpsc::channel();

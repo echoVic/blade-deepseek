@@ -1,9 +1,9 @@
 use std::cell::RefCell;
 use std::collections::VecDeque;
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use orca_approval::ApprovalPolicy;
 use orca_core::cancel::CancelToken;
@@ -11,7 +11,7 @@ use orca_core::config::RunConfig;
 use orca_core::event_schema::{EventEnvelope, EventFactory};
 use orca_core::hook_types::HookEvent;
 use orca_core::model::ModelRouteContext;
-use orca_core::provider_types::ProviderStep;
+use orca_core::provider_types::{ProviderResponse, ProviderStep};
 use orca_core::subagent_types::SubagentType;
 use orca_core::task_types::BackgroundTaskSummary;
 use orca_core::tool_types;
@@ -38,6 +38,11 @@ use crate::types::{TuiEvent, UserAction};
 pub(crate) const DEFAULT_MAX_TURNS: u32 = 128;
 
 pub(crate) type PendingWorkflowNotifications = Arc<Mutex<VecDeque<String>>>;
+
+enum ProviderStreamEvent {
+    Step(ProviderStep),
+    Done(ProviderResponse),
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TuiAgentTurnResult {
@@ -156,6 +161,72 @@ fn poll_background_current_turn_for_tui(
         *is_backgrounded = true;
         send_workflow_tasks_updated_for_tui(event_tx, events, &session.task_registry().list());
     }
+}
+
+fn spawn_provider_stream(
+    provider: orca_core::config::ProviderKind,
+    conversation: orca_core::conversation::Conversation,
+    provider_config: ProviderConfig,
+    cancel: CancelToken,
+) -> Receiver<ProviderStreamEvent> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let step_tx = tx.clone();
+        let response = orca_provider::call_streaming(
+            provider,
+            &conversation,
+            &provider_config,
+            &cancel,
+            &mut |step| {
+                let _ = step_tx.send(ProviderStreamEvent::Step(step.clone()));
+            },
+        );
+        let _ = tx.send(ProviderStreamEvent::Done(response));
+    });
+    rx
+}
+
+fn provider_response_status(response: &ProviderResponse) -> &'static str {
+    if response
+        .steps
+        .iter()
+        .any(|step| matches!(step, ProviderStep::Error(_)))
+    {
+        "failed"
+    } else {
+        "success"
+    }
+}
+
+fn spawn_background_provider_completion(
+    provider_rx: Receiver<ProviderStreamEvent>,
+    task_registry: orca_runtime::tasks::TaskRegistry,
+    event_tx: Sender<TuiEvent>,
+    run_id: String,
+    task_id: String,
+) {
+    thread::spawn(move || {
+        let mut status = "failed";
+        while let Ok(event) = provider_rx.recv() {
+            if let ProviderStreamEvent::Done(response) = event {
+                status = provider_response_status(&response);
+                break;
+            }
+        }
+
+        let result = if status == "success" {
+            task_registry.complete(&task_id, status.to_string())
+        } else {
+            task_registry.fail(&task_id, status.to_string())
+        };
+        if result.is_ok() {
+            let mut events = EventFactory::new(run_id);
+            send_workflow_tasks_updated_for_tui(&event_tx, &mut events, &task_registry.list());
+        }
+        let _ = event_tx.send(TuiEvent::Notice(format!(
+            "Background session completed: {status}"
+        )));
+    });
 }
 
 fn finish_main_session_task_for_tui(
@@ -581,31 +652,35 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
         let model_conversation =
             conversation_with_hook_context(session.conversation(), &pre_model_outcome);
 
-        let tx = event_tx.clone();
         let mut emitted_message_delta = false;
         let mut stream_events = EventFactory::new(runtime_events.run_id().to_string());
-        let response = orca_provider::call_streaming(
+        let provider_rx = spawn_provider_stream(
             config.provider,
-            &model_conversation,
-            &turn_provider_config,
-            cancel,
-            &mut |step| match step {
-                ProviderStep::ReasoningDelta(text) => {
+            model_conversation.clone(),
+            turn_provider_config.clone(),
+            cancel.clone(),
+        );
+        let response = loop {
+            match provider_rx.recv_timeout(Duration::from_millis(10)) {
+                Ok(ProviderStreamEvent::Step(ProviderStep::ReasoningDelta(text))) => {
                     poll_background_current_turn_for_tui(
                         session,
-                        &tx,
+                        event_tx,
                         &mut stream_events,
                         action_rx,
                         pending_actions,
                         &main_session_task_id,
                         &mut main_session_backgrounded,
                     );
-                    send_runtime_event_as_tui(&tx, stream_events.assistant_reasoning_delta(text));
+                    send_runtime_event_as_tui(
+                        event_tx,
+                        stream_events.assistant_reasoning_delta(&text),
+                    );
                 }
-                ProviderStep::MessageDelta(text) => {
+                Ok(ProviderStreamEvent::Step(ProviderStep::MessageDelta(text))) => {
                     poll_background_current_turn_for_tui(
                         session,
-                        &tx,
+                        event_tx,
                         &mut stream_events,
                         action_rx,
                         pending_actions,
@@ -613,23 +688,73 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
                         &mut main_session_backgrounded,
                     );
                     emitted_message_delta = true;
-                    send_runtime_event_as_tui(&tx, stream_events.assistant_message_delta(text));
+                    send_runtime_event_as_tui(
+                        event_tx,
+                        stream_events.assistant_message_delta(&text),
+                    );
                 }
-                ProviderStep::ToolCallProgress(progress) => {
+                Ok(ProviderStreamEvent::Step(ProviderStep::ToolCallProgress(progress))) => {
                     poll_background_current_turn_for_tui(
                         session,
-                        &tx,
+                        event_tx,
                         &mut stream_events,
                         action_rx,
                         pending_actions,
                         &main_session_task_id,
                         &mut main_session_backgrounded,
                     );
-                    send_runtime_event_as_tui(&tx, stream_events.tool_call_progress(progress));
+                    send_runtime_event_as_tui(
+                        event_tx,
+                        stream_events.tool_call_progress(&progress),
+                    );
                 }
-                _ => {}
-            },
-        );
+                Ok(ProviderStreamEvent::Step(_)) => {}
+                Ok(ProviderStreamEvent::Done(response)) => break response,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    poll_background_current_turn_for_tui(
+                        session,
+                        event_tx,
+                        &mut stream_events,
+                        action_rx,
+                        pending_actions,
+                        &main_session_task_id,
+                        &mut main_session_backgrounded,
+                    );
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    send_error_for_tui(
+                        event_tx,
+                        &mut runtime_events,
+                        "provider stream ended without a response",
+                    );
+                    send_session_completed_for_tui(
+                        event_tx,
+                        &mut runtime_events,
+                        orca_core::event_schema::RunStatus::Failed,
+                    );
+                    finish_main_session_task_for_tui(
+                        session,
+                        event_tx,
+                        &mut runtime_events,
+                        &main_session_task_id,
+                        "failed",
+                    );
+                    session.complete("failed");
+                    return TuiAgentTurnResult::new("failed");
+                }
+            }
+
+            if main_session_backgrounded {
+                spawn_background_provider_completion(
+                    provider_rx,
+                    session.task_registry().clone(),
+                    event_tx.clone(),
+                    runtime_events.run_id().to_string(),
+                    main_session_task_id.clone(),
+                );
+                return TuiAgentTurnResult::new("backgrounded");
+            }
+        };
 
         if let Err(error) = session.hooks().run(
             HookEvent::PostModelCall,
