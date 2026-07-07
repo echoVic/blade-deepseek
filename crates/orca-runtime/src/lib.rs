@@ -509,12 +509,12 @@ mod tests {
             "tool_turn must read the current tool request through sampling state"
         );
         assert!(
-            tool_turn_runtime_source.contains(".tool_cursor_position()"),
-            "tool_turn must read dispatch cursor position through sampling state"
+            tool_turn_runtime_source.contains(".tool_dispatch_window(tool_requests"),
+            "tool_turn must read dispatch windows through sampling state"
         );
         assert!(
-            tool_turn_runtime_source.contains(".advance_tool_cursor_to("),
-            "tool_turn must advance batch cursor position through sampling state"
+            tool_turn_runtime_source.contains(".advance_tool_cursor_to_window_end("),
+            "tool_turn must advance batch cursor windows through sampling state"
         );
         assert!(
             tool_turn_runtime_source.contains(".advance_tool_cursor_one("),
@@ -523,6 +523,48 @@ mod tests {
         assert!(
             !tool_turn_runtime_source.contains("ToolRequestCursor"),
             "tool_turn production code must not own a separate tool request cursor"
+        );
+    }
+
+    #[test]
+    fn sampling_request_state_owns_tool_dispatch_windows() {
+        let step_context_source = include_str!("step_context.rs");
+        let tool_turn_source = include_str!("tool_turn.rs");
+        let tool_turn_runtime_source = tool_turn_source
+            .split("mod tests")
+            .next()
+            .expect("tool turn runtime source");
+
+        for marker in [
+            "struct RuntimeToolDispatchWindow<'a>",
+            "fn tool_requests(&self) -> &'a [ToolRequest]",
+            "fn end_index(&self) -> usize",
+            "fn tool_dispatch_window<'a, F>(",
+            "collect_end: F",
+            "FnOnce(&[ToolRequest], usize) -> usize",
+            "fn advance_tool_cursor_to_window_end(",
+            "window: &RuntimeToolDispatchWindow<'_>",
+        ] {
+            assert!(
+                step_context_source.contains(marker),
+                "RuntimeSamplingRequestState must own dispatch-window detail {marker}"
+            );
+        }
+        assert!(
+            tool_turn_runtime_source.contains(".tool_dispatch_window(tool_requests"),
+            "tool_turn must request batch windows through sampling state"
+        );
+        assert!(
+            tool_turn_runtime_source.contains(".advance_tool_cursor_to_window_end("),
+            "tool_turn must advance batch windows through sampling state"
+        );
+        assert!(
+            !tool_turn_runtime_source.contains(".tool_cursor_position()"),
+            "tool_turn production code must not read raw cursor positions"
+        );
+        assert!(
+            !tool_turn_runtime_source.contains("&tool_requests[cursor_position..batch_end]"),
+            "tool_turn production code must not slice batch windows directly"
         );
     }
 

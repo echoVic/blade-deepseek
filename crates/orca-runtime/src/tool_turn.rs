@@ -146,8 +146,10 @@ pub(crate) fn run_tool_turns<W: io::Write>(
         }
 
         if should_run_subagent_batch(config, tool_request, subagent_depth) {
-            let cursor_position = sampling_state.tool_cursor_position();
-            let batch_end = collect_subagent_batch(config, tool_requests, cursor_position);
+            let dispatch_window =
+                sampling_state.tool_dispatch_window(tool_requests, |tool_requests, start_index| {
+                    collect_subagent_batch(config, tool_requests, start_index)
+                });
             match run_subagent_batch_tool_turn(
                 config,
                 cwd,
@@ -155,7 +157,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                 sink,
                 conversation,
                 history_writer.as_deref_mut(),
-                &tool_requests[cursor_position..batch_end],
+                dispatch_window.tool_requests(),
                 subagent_depth,
                 emit_deltas,
                 instructions,
@@ -172,24 +174,26 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                     return Ok(ToolTurnOutcome::Return { status, error });
                 }
             }
-            sampling_state.advance_tool_cursor_to(batch_end, tool_requests.len());
+            sampling_state.advance_tool_cursor_to_window_end(&dispatch_window);
             continue;
         }
 
         if should_run_readonly_batch(config.tools.max_read_parallel, tool_request) {
-            let cursor_position = sampling_state.tool_cursor_position();
-            let batch_end = collect_readonly_batch(
-                config.tools.max_read_parallel,
-                tool_requests,
-                cursor_position,
-            );
+            let dispatch_window =
+                sampling_state.tool_dispatch_window(tool_requests, |tool_requests, start_index| {
+                    collect_readonly_batch(
+                        config.tools.max_read_parallel,
+                        tool_requests,
+                        start_index,
+                    )
+                });
             match run_readonly_tool_turn(RuntimeReadonlyToolTurnContext {
                 cwd,
                 events,
                 sink,
                 conversation,
                 history_writer: history_writer.as_deref_mut(),
-                tool_requests: &tool_requests[cursor_position..batch_end],
+                tool_requests: dispatch_window.tool_requests(),
                 emit_deltas,
                 mcp_registry,
                 hooks,
@@ -200,7 +204,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                     return Ok(ToolTurnOutcome::Return { status, error });
                 }
             }
-            sampling_state.advance_tool_cursor_to(batch_end, tool_requests.len());
+            sampling_state.advance_tool_cursor_to_window_end(&dispatch_window);
             continue;
         }
 
@@ -464,6 +468,59 @@ mod tests {
         assert!(sampling_state.current_tool_request(&requests).is_none());
         sampling_state.advance_tool_cursor_to(99, requests.len());
         assert_eq!(sampling_state.tool_cursor_position(), 3);
+    }
+
+    #[test]
+    fn sampling_request_state_builds_and_advances_dispatch_windows() {
+        let first = request(ToolName::ReadFile, ActionKind::Read, Some("one.txt"), None);
+        let second = ToolRequest {
+            id: "tool-2".to_string(),
+            name: ToolName::ListFiles,
+            action: ActionKind::Read,
+            target: Some("src".to_string()),
+            raw_arguments: None,
+        };
+        let third = ToolRequest {
+            id: "tool-3".to_string(),
+            name: ToolName::Bash,
+            action: ActionKind::Shell,
+            target: Some("echo hi".to_string()),
+            raw_arguments: None,
+        };
+        let requests = vec![first, second, third];
+        let mut sampling_state = RuntimeSamplingRequestState::new();
+
+        sampling_state.advance_tool_cursor_one(requests.len());
+        let dispatch_window = sampling_state
+            .tool_dispatch_window(&requests, |_, start_index| start_index.saturating_add(99));
+
+        assert_eq!(
+            dispatch_window
+                .tool_requests()
+                .iter()
+                .map(|request| request.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["tool-2", "tool-3"]
+        );
+        assert_eq!(dispatch_window.end_index(), 3);
+        sampling_state.advance_tool_cursor_to_window_end(&dispatch_window);
+        assert_eq!(sampling_state.tool_cursor_position(), 3);
+        assert!(sampling_state.current_tool_request(&requests).is_none());
+
+        let mut sampling_state = RuntimeSamplingRequestState::new();
+        sampling_state.advance_tool_cursor_one(requests.len());
+        let stalled_window =
+            sampling_state.tool_dispatch_window(&requests, |_, start_index| start_index);
+
+        assert_eq!(
+            stalled_window
+                .tool_requests()
+                .iter()
+                .map(|request| request.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["tool-2"]
+        );
+        assert_eq!(stalled_window.end_index(), 2);
     }
 
     #[test]

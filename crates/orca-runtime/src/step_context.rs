@@ -40,6 +40,21 @@ pub(crate) struct RuntimeSamplingRequestState {
     tool_cursor_index: usize,
 }
 
+pub(crate) struct RuntimeToolDispatchWindow<'a> {
+    tool_requests: &'a [ToolRequest],
+    end_index: usize,
+}
+
+impl<'a> RuntimeToolDispatchWindow<'a> {
+    pub(crate) fn tool_requests(&self) -> &'a [ToolRequest] {
+        self.tool_requests
+    }
+
+    pub(crate) fn end_index(&self) -> usize {
+        self.end_index
+    }
+}
+
 impl RuntimeSamplingRequestState {
     pub(crate) fn new() -> Self {
         Self::default()
@@ -56,6 +71,7 @@ impl RuntimeSamplingRequestState {
         tool_requests.get(self.tool_cursor_index)
     }
 
+    #[cfg(test)]
     pub(crate) fn tool_cursor_position(&self) -> usize {
         self.tool_cursor_index
     }
@@ -66,6 +82,32 @@ impl RuntimeSamplingRequestState {
 
     pub(crate) fn advance_tool_cursor_to(&mut self, next_index: usize, tool_request_count: usize) {
         self.tool_cursor_index = next_index.min(tool_request_count);
+    }
+
+    pub(crate) fn tool_dispatch_window<'a, F>(
+        &self,
+        tool_requests: &'a [ToolRequest],
+        collect_end: F,
+    ) -> RuntimeToolDispatchWindow<'a>
+    where
+        F: FnOnce(&[ToolRequest], usize) -> usize,
+    {
+        let start_index = self.tool_cursor_index.min(tool_requests.len());
+        let minimum_end_index = start_index.saturating_add(1).min(tool_requests.len());
+        let end_index = collect_end(tool_requests, start_index)
+            .min(tool_requests.len())
+            .max(minimum_end_index);
+        RuntimeToolDispatchWindow {
+            tool_requests: &tool_requests[start_index..end_index],
+            end_index,
+        }
+    }
+
+    pub(crate) fn advance_tool_cursor_to_window_end(
+        &mut self,
+        window: &RuntimeToolDispatchWindow<'_>,
+    ) {
+        self.tool_cursor_index = window.end_index();
     }
 }
 
