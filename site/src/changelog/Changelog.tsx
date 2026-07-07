@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.173":
+        "Server-mode shell/read now accepts outputBytesCap for bounded incremental shell output. stdout/stderr deltas and shell_updated or shell_completed responses are truncated on UTF-8 boundaries and include capReached metadata when the read budget is reached.",
       "v0.1.172":
         "Server-mode clients can now query shell/capabilities before starting shell or command/exec PTY work. The response reports the current platform, whether native PTY and PTY resize are available, accepted terminal modes, pipe fallback behavior, and the processId requirement for streaming command/exec sessions.",
       "v0.1.171":
@@ -372,6 +374,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.173":
+        "Server mode 的 shell/read 现在支持 outputBytesCap，用于给增量 shell 输出设置字节预算。stdout/stderr delta 以及 shell_updated / shell_completed 响应会按 UTF-8 边界截断，并在触达预算时带上 capReached 元数据。",
       "v0.1.172":
         "Server mode 现在可以在启动 shell 或 command/exec PTY 任务前查询 shell/capabilities。响应会报告当前平台、原生 PTY 与 PTY resize 是否可用、接受的 terminal mode、pipe fallback 行为，以及 streaming command/exec session 必须提供 processId 的约束。",
       "v0.1.171":

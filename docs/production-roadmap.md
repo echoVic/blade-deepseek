@@ -4,11 +4,15 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-07-07
-Current baseline: v0.1.172 exposes a server-mode `shell/capabilities` operation
-so app-server clients can query the current platform, native PTY and PTY resize
-availability, accepted terminal modes, pipe fallback behavior, and the
-`processId` requirement for streaming `command/exec` sessions before launching
-terminal work. Earlier v0.1.171 fixed two sandbox/task-state rough edges:
+Current baseline: v0.1.173 lets server-mode `shell/read` requests apply an
+`outputBytesCap` byte budget to incremental shell stdout/stderr, returning
+truncated UTF-8-safe deltas plus `capReached` metadata on
+`shell_output_delta`, `shell_updated`, and `shell_completed` events. Earlier
+v0.1.172 exposed a server-mode `shell/capabilities` operation so app-server
+clients can query the current platform, native PTY and PTY resize availability,
+accepted terminal modes, pipe fallback behavior, and the `processId`
+requirement for streaming `command/exec` sessions before launching terminal
+work. Earlier v0.1.171 fixed two sandbox/task-state rough edges:
 pathless macOS sandbox denials such as GitHub HTTPS credential prompts can now
 escalate through runtime, JSONL `command/exec`, and TUI approval flows to
 re-run the command without the filesystem sandbox, while shell task session
@@ -316,7 +320,9 @@ commands and consume versioned events without owning turn execution details.
    failures, MCP clients rebuild the transport for future calls without
    automatically replaying the failed call. `shell/capabilities` now exposes
    the platform/runtime capability surface that clients need before requesting
-   PTY sessions or resize operations. Next, use that boundary for deeper
+   PTY sessions or resize operations, and `shell/read` can now cap incremental
+   stdout/stderr with `outputBytesCap` plus `capReached` metadata for clients
+   that need bounded reads. Next, use those boundaries for deeper
    cross-platform PTY support.
 3. **ThreadStore-backed app-server materialization:** Codex treats threads as
    resumable/forkable SDK objects. Orca has `SessionStore` and an in-process
