@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -147,6 +147,8 @@ impl TaskRegistry {
         let Some(root) = task_sessions_root() else {
             return Self::new(session_id);
         };
+        let legacy_root = legacy_project_task_sessions_root(_cwd);
+        let _ = migrate_legacy_task_sessions(&legacy_root, &root);
         Self::new_persistent(session_id.clone(), root).unwrap_or_else(|_| Self::new(session_id))
     }
 
@@ -913,9 +915,63 @@ fn task_sessions_root() -> Option<PathBuf> {
         .map(|home| home.join("task-sessions"))
 }
 
+fn legacy_project_task_sessions_root(cwd: &Path) -> PathBuf {
+    cwd.join(".orca").join("task-sessions")
+}
+
+fn migrate_legacy_task_sessions(legacy_root: &Path, target_root: &Path) -> io::Result<()> {
+    if legacy_root == target_root || !legacy_root.exists() {
+        return Ok(());
+    }
+
+    let legacy = TaskPersistence::new(legacy_root.to_path_buf(), String::new());
+    let target = TaskPersistence::new(target_root.to_path_buf(), String::new());
+    let legacy_index = legacy.load_index()?;
+    if legacy_index.is_empty() {
+        return Ok(());
+    }
+
+    let mut target_index = target.load_index()?;
+    let mut changed_index = false;
+    let session_ids = legacy_index.values().cloned().collect::<HashSet<_>>();
+    for session_id in session_ids {
+        let legacy_records = legacy.load_session_records(&session_id)?;
+        if legacy_records.is_empty() {
+            continue;
+        }
+
+        let mut target_records = target.load_session_records(&session_id)?;
+        let mut changed_session = false;
+        for (id, record) in legacy_records {
+            if legacy_index.get(&id) != Some(&session_id) || target_index.contains_key(&id) {
+                continue;
+            }
+            target_records.insert(id.clone(), record);
+            target_index.insert(id, session_id.clone());
+            changed_session = true;
+            changed_index = true;
+        }
+
+        if changed_session {
+            target.write_session_records(&session_id, &target_records)?;
+        }
+    }
+
+    if changed_index {
+        target.write_index(&target_index)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn recover_test_lock<T>(lock: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+        lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     #[test]
     fn persistent_registry_recovers_interrupted_subagent_task_by_id() {
@@ -966,6 +1022,51 @@ mod tests {
         assert_eq!(recovered.error, None);
         assert_eq!(recovered.worker_pid, Some(12345));
         assert_eq!(recovered.completed_at_ms, None);
+    }
+
+    #[test]
+    fn cwd_constructor_migrates_legacy_project_task_sessions_to_orca_home() {
+        let _guard = recover_test_lock(&TEST_ENV_LOCK);
+        let home = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os("ORCA_HOME");
+        unsafe {
+            std::env::set_var("ORCA_HOME", home.path());
+        }
+
+        let result = std::panic::catch_unwind(|| {
+            let legacy_root = cwd.path().join(".orca").join("task-sessions");
+            let legacy =
+                TaskRegistry::new_persistent("legacy-session".to_string(), legacy_root).unwrap();
+            let task = legacy
+                .create_subagent("legacy async task".to_string(), Some("general".to_string()));
+            legacy
+                .complete(&task.id, "legacy result".to_string())
+                .unwrap();
+            drop(legacy);
+
+            let registry = TaskRegistry::new_for_cwd("new-session".to_string(), cwd.path());
+            let recovered = registry.get(&task.id).expect("legacy task should migrate");
+
+            assert_eq!(recovered.status, TaskStatus::Completed);
+            assert_eq!(recovered.result.as_deref(), Some("legacy result"));
+            assert!(
+                home.path()
+                    .join("task-sessions")
+                    .join("task-index.json")
+                    .exists(),
+                "migrated task index should be written under ORCA_HOME"
+            );
+        });
+
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var("ORCA_HOME", previous);
+            } else {
+                std::env::remove_var("ORCA_HOME");
+            }
+        }
+        result.unwrap();
     }
 
     #[test]
