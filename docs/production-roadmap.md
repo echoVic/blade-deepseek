@@ -4,11 +4,16 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-07-07
-Current baseline: v0.1.168 lets `RuntimeSamplingRequestState` own the
-tool-dispatch cursor as well as the per-sampling permission overlay. Tool turns
-now read and advance the current request through sampling state instead of
-keeping a separate `ToolRequestCursor`, so the Codex-style request-scoped
-runtime state boundary has one clearer owner. Earlier v0.1.167 introduced
+Current baseline: v0.1.169 lets `RuntimeSamplingRequestState` produce clamped
+`RuntimeToolDispatchWindow` values for readonly and subagent batch dispatch.
+Tool turns no longer read raw cursor positions or slice batch windows directly,
+and the dispatch-window API guarantees forward progress over the current request
+even if a batch collector returns the current cursor. Earlier v0.1.168 let
+`RuntimeSamplingRequestState` own the tool-dispatch cursor as well as the
+per-sampling permission overlay. Tool turns now read and advance the current
+request through sampling state instead of keeping a separate `ToolRequestCursor`,
+so the Codex-style request-scoped runtime state boundary has one clearer owner.
+Earlier v0.1.167 introduced
 `RuntimeSamplingRequestState` as the first per-sampling request-state home and
 routes normal tool turns through its permission overlay instead of allocating
 local permission state inside `tool_turn`. Provider response handling now

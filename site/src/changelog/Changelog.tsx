@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.169":
+        "RuntimeSamplingRequestState now produces clamped RuntimeToolDispatchWindow values for readonly and subagent batches. Tool turns no longer read raw cursor positions or slice batch windows directly, and a stalled batch collector still advances over the current request instead of risking a stuck dispatch loop.",
       "v0.1.168":
         "RuntimeSamplingRequestState now owns the tool-dispatch cursor as well as the per-sampling permission overlay. Tool turns read and advance the current request through sampling state instead of keeping a separate ToolRequestCursor, so Codex-style request-scoped runtime state has one clearer owner without changing tool execution behavior.",
       "v0.1.167":
@@ -364,6 +366,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.169":
+        "RuntimeSamplingRequestState 现在会为 readonly 与 subagent batch 生成 clamped RuntimeToolDispatchWindow。Tool turn 不再读取 raw cursor position，也不再直接切 batch slice；即便 batch collector 没有推进，也会至少消费当前 request，避免调度循环卡住。",
       "v0.1.168":
         "RuntimeSamplingRequestState 现在同时拥有 tool-dispatch cursor 和每次 sampling request 的 permission overlay。Tool turn 通过 sampling state 读取并推进当前 request，不再保留独立的 ToolRequestCursor；Codex 风格 request-scoped runtime state 有了更清晰的单一归属，同时不改变工具执行行为。",
       "v0.1.167":
