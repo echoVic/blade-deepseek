@@ -148,6 +148,7 @@ pub enum ClientOp {
         options: CommandExecOptions,
         terminal: crate::shell_session::ShellTerminalMode,
     },
+    CommandExecList,
     CommandExecWrite {
         process_id: String,
         delta_base64: Option<String>,
@@ -685,6 +686,10 @@ impl Submission {
                         .map(shell_terminal_mode_from_params)
                         .unwrap_or_else(ShellTerminalMode::pipe),
                 },
+            }),
+            (_, Some("command/exec/list")) => Ok(Self {
+                id: wire.id,
+                op: ClientOp::CommandExecList,
             }),
             (_, Some("command/exec/write")) => Ok(Self {
                 id: wire.id,
@@ -2011,6 +2016,16 @@ mod tests {
                 terminal: crate::shell_session::ShellTerminalMode::pipe(),
             }
         );
+    }
+
+    #[test]
+    fn submission_decodes_command_exec_list_wire_shape() {
+        let list =
+            Submission::decode(r#"{"id":"cmd-list","method":"command/exec/list","params":{}}"#)
+                .expect("command/exec/list submission");
+
+        assert_eq!(list.id, Value::from("cmd-list"));
+        assert_eq!(list.op, ClientOp::CommandExecList);
     }
 
     #[test]

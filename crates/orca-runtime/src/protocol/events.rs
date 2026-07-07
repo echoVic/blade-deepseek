@@ -346,6 +346,9 @@ pub enum ServerEvent {
         #[serde(rename = "processId")]
         process_id: Value,
     },
+    CommandExecListed {
+        processes: Value,
+    },
     CommandExecTerminated {
         #[serde(rename = "processId")]
         process_id: Value,

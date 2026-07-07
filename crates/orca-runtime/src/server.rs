@@ -35,7 +35,9 @@ use crate::thread_store::{
     ThreadSortKey, ThreadStore, TurnItemsView,
 };
 use active_turn_manager::{ActiveTurnControl, ActiveTurnHandle, ActiveTurnManager};
-use command_exec_manager::{CommandExecDrainOutcome, CommandExecManager, CommandExecProcess};
+use command_exec_manager::{
+    CommandExecDrainOutcome, CommandExecManager, CommandExecProcess, CommandExecProcessSnapshot,
+};
 use orca_core::config::{
     DEFAULT_PERMISSION_PROFILE_GLOB_SCAN_MAX_DEPTH, HistoryMode, OutputFormat, RunConfig,
 };
@@ -1055,6 +1057,7 @@ fn run_command_exec<W: Write>(
             CommandExecProcess {
                 shell_id: None,
                 command_event_id: id.clone(),
+                command: command.to_vec(),
                 cwd: cwd.clone(),
                 denied_writable_roots: denied_writable_directories.clone(),
                 stream_output: terminal.is_pty() || options.stream_stdout_stderr,
@@ -1813,6 +1816,26 @@ fn normalize_permission_profile_name(profile: &str) -> Option<&str> {
         .filter(|profile| !profile.is_empty())
 }
 
+fn run_command_exec_list<W: Write>(
+    state: &ServerState,
+    id: Value,
+    writer: &mut W,
+) -> io::Result<()> {
+    let processes = state
+        .command_exec
+        .list()
+        .into_iter()
+        .map(command_exec_snapshot_to_json)
+        .collect::<Vec<_>>();
+    protocol::write_server_event(
+        writer,
+        &id,
+        ServerEvent::CommandExecListed {
+            processes: Value::from(processes),
+        },
+    )
+}
+
 fn run_command_exec_write<W: Write>(
     state: &mut ServerState,
     process_id: &str,
@@ -2109,6 +2132,19 @@ fn shell_snapshot_to_json(snapshot: crate::shell_session::ShellSessionSnapshot) 
         "status": shell_status_label(snapshot.status),
         "requestedTerminalMode": snapshot.requested_terminal.as_str(),
         "effectiveTerminalMode": snapshot.effective_terminal.as_str(),
+    })
+}
+
+fn command_exec_snapshot_to_json(snapshot: CommandExecProcessSnapshot) -> Value {
+    json!({
+        "processId": snapshot.process_id,
+        "command": snapshot.command,
+        "cwd": snapshot.cwd.display().to_string(),
+        "status": snapshot.status,
+        "streamOutput": snapshot.stream_output,
+        "outputBytesCap": snapshot.output_bytes_cap,
+        "stdoutBytes": snapshot.stdout_bytes,
+        "stderrBytes": snapshot.stderr_bytes,
     })
 }
 
@@ -4759,6 +4795,7 @@ enabled = true
         CommandExecProcess {
             shell_id: Some(shell_id.to_string()),
             command_event_id: Value::from("cmd"),
+            command: vec!["sh".to_string(), "-lc".to_string(), "true".to_string()],
             cwd: PathBuf::from("/tmp"),
             denied_writable_roots: Vec::new(),
             stream_output: false,

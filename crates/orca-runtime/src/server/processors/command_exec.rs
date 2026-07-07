@@ -8,6 +8,7 @@ pub(in crate::server::router) fn is_command_exec_operation(op: &ClientOp) -> boo
     matches!(
         op,
         ClientOp::CommandExec { .. }
+            | ClientOp::CommandExecList
             | ClientOp::CommandExecWrite { .. }
             | ClientOp::CommandExecRead { .. }
             | ClientOp::CommandExecResize { .. }
@@ -44,6 +45,7 @@ pub(in crate::server::router) fn dispatch_command_exec_operation<W: Write>(
             id,
             writer,
         ),
+        ClientOp::CommandExecList => run_command_exec_list(state, id, writer),
         ClientOp::CommandExecWrite {
             process_id,
             delta_base64,

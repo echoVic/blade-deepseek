@@ -4220,6 +4220,140 @@ fn server_mode_command_exec_rejects_duplicate_active_process_id() {
 }
 
 #[test]
+fn server_mode_command_exec_list_returns_active_process_snapshots() {
+    let workspace = tempdir().expect("workspace");
+    let started_marker = workspace.path().join("command-started");
+    let release_marker = workspace.path().join("command-release");
+    let completed_marker = workspace.path().join("command-completed");
+    let started_marker_arg = started_marker.to_str().expect("marker path");
+    let release_marker_arg = release_marker.to_str().expect("release marker path");
+    let completed_marker_arg = completed_marker.to_str().expect("completed marker path");
+    let mut child = orca_command()
+        .args([
+            "--mode",
+            "server",
+            "--provider",
+            "mock",
+            "--cwd",
+            workspace.path().to_str().unwrap(),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn orca server");
+
+    let command = "printf listed; touch $1; while test ! -e $2; do sleep 0.05; done; touch $3";
+    {
+        let stdin = child.stdin.as_mut().expect("server stdin");
+        let request = serde_json::json!({
+            "id": "cmd",
+            "method": "command/exec",
+            "params": {
+                "command": [
+                    "sh",
+                    "-lc",
+                    command,
+                    "sh",
+                    started_marker_arg,
+                    release_marker_arg,
+                    completed_marker_arg
+                ],
+                "processId": "listed-1",
+                "cwd": workspace.path().to_str().unwrap(),
+                "streamStdoutStderr": true,
+                "outputBytesCap": 32,
+            }
+        });
+        writeln!(stdin, "{request}").expect("write command/exec");
+        stdin.flush().expect("flush command/exec");
+    }
+
+    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
+    let started = read_until_event(&mut stdout, "cmd", "command_exec_started");
+    assert_eq!(started["processId"], "listed-1");
+    wait_for_path(&started_marker);
+
+    {
+        let stdin = child.stdin.as_mut().expect("server stdin");
+        writeln!(
+            stdin,
+            r#"{{"id":"cmd-list","method":"command/exec/list","params":{{}}}}"#
+        )
+        .expect("write command/exec/list");
+        stdin.flush().expect("flush command/exec/list");
+    }
+
+    let list_events =
+        read_events_until_event_or_error(&mut stdout, "cmd-list", "command_exec_listed");
+    let listed = list_events
+        .iter()
+        .find(|event| event["id"] == "cmd-list")
+        .expect("command/exec/list response");
+    assert_eq!(listed["event"], "command_exec_listed");
+    let processes = listed["processes"]
+        .as_array()
+        .expect("command exec process list");
+    assert_eq!(processes.len(), 1);
+    let process = &processes[0];
+    assert_eq!(process["processId"], "listed-1");
+    assert_eq!(process["status"], "running");
+    assert_eq!(process["cwd"], workspace.path().to_str().unwrap());
+    assert_eq!(process["streamOutput"], true);
+    assert_eq!(process["outputBytesCap"], 32);
+    assert_eq!(process["stdoutBytes"], 6);
+    assert_eq!(process["stderrBytes"], 0);
+    assert_eq!(
+        process["command"],
+        serde_json::json!([
+            "sh",
+            "-lc",
+            command,
+            "sh",
+            started_marker_arg,
+            release_marker_arg,
+            completed_marker_arg
+        ])
+    );
+
+    std::fs::write(&release_marker, "release").expect("write release marker");
+    wait_for_path(&completed_marker);
+    {
+        let stdin = child.stdin.as_mut().expect("server stdin");
+        writeln!(
+            stdin,
+            r#"{{"id":"cmd-list-after","method":"command/exec/list","params":{{}}}}"#
+        )
+        .expect("write second command/exec/list");
+        stdin.flush().expect("flush second command/exec/list");
+    }
+    let after_release_events =
+        read_events_until_event_or_error(&mut stdout, "cmd-list-after", "command_exec_listed");
+    assert!(
+        after_release_events
+            .iter()
+            .any(|event| event["id"] == "cmd" && event["event"] == "command_exec_completed"),
+        "completed command/exec process should be drained before the next list: {after_release_events:?}"
+    );
+    let after_release_listed = after_release_events
+        .iter()
+        .find(|event| event["id"] == "cmd-list-after")
+        .expect("second command/exec/list response");
+    assert_eq!(after_release_listed["event"], "command_exec_listed");
+    assert_eq!(
+        after_release_listed["processes"]
+            .as_array()
+            .expect("process list after completion")
+            .len(),
+        0
+    );
+    drop(child.stdin.take());
+    let output = child.wait_with_output().expect("wait for server");
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn server_mode_command_exec_write_requires_input_or_close() {
     let workspace = tempdir().expect("workspace");
     let mut child = orca_command()

@@ -24,6 +24,7 @@ use crate::shell_session::RuntimeShellSessionManager;
 pub(super) struct CommandExecProcess {
     pub(super) shell_id: Option<String>,
     pub(super) command_event_id: Value,
+    pub(super) command: Vec<String>,
     pub(super) cwd: PathBuf,
     pub(super) denied_writable_roots: Vec<PathBuf>,
     pub(super) stream_output: bool,
@@ -40,6 +41,17 @@ pub(super) struct CommandExecProcess {
 #[derive(Default)]
 pub(super) struct CommandExecManager {
     processes: HashMap<String, CommandExecProcess>,
+}
+
+pub(super) struct CommandExecProcessSnapshot {
+    pub(super) process_id: String,
+    pub(super) command: Vec<String>,
+    pub(super) cwd: PathBuf,
+    pub(super) status: &'static str,
+    pub(super) stream_output: bool,
+    pub(super) output_bytes_cap: Option<usize>,
+    pub(super) stdout_bytes: usize,
+    pub(super) stderr_bytes: usize,
 }
 
 pub(super) enum CommandExecDrainOutcome {
@@ -109,6 +121,32 @@ impl CommandExecManager {
 
     fn process_ids(&self) -> Vec<String> {
         self.processes.keys().cloned().collect()
+    }
+
+    pub(super) fn list(&self) -> Vec<CommandExecProcessSnapshot> {
+        let mut process_ids = self.process_ids();
+        process_ids.sort();
+        process_ids
+            .into_iter()
+            .filter_map(|process_id| {
+                self.processes
+                    .get(&process_id)
+                    .map(|process| CommandExecProcessSnapshot {
+                        process_id,
+                        command: process.command.clone(),
+                        cwd: process.cwd.clone(),
+                        status: if process.shell_id.is_some() {
+                            "running"
+                        } else {
+                            "starting"
+                        },
+                        stream_output: process.stream_output,
+                        output_bytes_cap: process.output_bytes_cap,
+                        stdout_bytes: process.stdout_len,
+                        stderr_bytes: process.stderr_len,
+                    })
+            })
+            .collect()
     }
 
     pub(super) fn write_to_process<W: Write>(
