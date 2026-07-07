@@ -1,5 +1,7 @@
 use orca_core::conversation::Conversation;
 
+use crate::runtime_capability::{RuntimeCapabilityPatch, RuntimeCapabilitySnapshot};
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RuntimeDirective {
     SwitchModel {
@@ -16,50 +18,54 @@ pub enum RuntimeDirective {
     },
 }
 
+impl From<RuntimeDirective> for RuntimeCapabilityPatch {
+    fn from(directive: RuntimeDirective) -> Self {
+        match directive {
+            RuntimeDirective::SwitchModel { model, reason } => {
+                RuntimeCapabilityPatch::SwitchModel { model, reason }
+            }
+            RuntimeDirective::ReplaceAllowedTools { tool_names, reason } => {
+                RuntimeCapabilityPatch::ReplaceAllowedTools { tool_names, reason }
+            }
+            RuntimeDirective::InjectSystemMessage { message, reason } => {
+                RuntimeCapabilityPatch::InjectSystemMessage { message, reason }
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RuntimeDirectiveState {
-    model_override: Option<String>,
-    allowed_tools: Option<Vec<String>>,
-    pending_system_messages: Vec<String>,
-    transition_reasons: Vec<String>,
+    capabilities: RuntimeCapabilitySnapshot,
 }
 
 impl RuntimeDirectiveState {
     pub(crate) fn apply(&mut self, directive: RuntimeDirective) {
-        match directive {
-            RuntimeDirective::SwitchModel { model, reason } => {
-                self.model_override = Some(model);
-                self.record_transition("switch_model", reason);
-            }
-            RuntimeDirective::ReplaceAllowedTools { tool_names, reason } => {
-                self.allowed_tools = Some(tool_names);
-                self.record_transition("replace_allowed_tools", reason);
-            }
-            RuntimeDirective::InjectSystemMessage { message, reason } => {
-                self.pending_system_messages.push(message);
-                self.record_transition("inject_system_message", reason);
-            }
-        }
+        self.apply_patch(directive.into());
+    }
+
+    pub(crate) fn apply_patch(&mut self, patch: RuntimeCapabilityPatch) {
+        self.capabilities.apply_patch(patch);
+    }
+
+    pub fn capabilities(&self) -> &RuntimeCapabilitySnapshot {
+        &self.capabilities
     }
 
     pub fn model_override(&self) -> Option<&str> {
-        self.model_override.as_deref()
+        self.capabilities.model_override()
     }
 
     pub fn allowed_tools(&self) -> Option<&[String]> {
-        self.allowed_tools.as_deref()
+        self.capabilities.allowed_tools()
     }
 
     pub fn pending_system_messages(&self) -> &[String] {
-        &self.pending_system_messages
+        self.capabilities.pending_system_messages()
     }
 
     pub fn transition_reasons(&self) -> &[String] {
-        &self.transition_reasons
-    }
-
-    fn record_transition(&mut self, kind: &str, reason: String) {
-        self.transition_reasons.push(format!("{kind}: {reason}"));
+        self.capabilities.transition_reasons()
     }
 }
 

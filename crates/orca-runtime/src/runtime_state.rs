@@ -2,6 +2,7 @@ use std::io;
 
 use crate::extension::{ExtensionData, RuntimeExtensionStores, ToolCallOutcome};
 use crate::goals;
+use crate::runtime_capability::{RuntimeCapabilityPatch, RuntimeCapabilitySnapshot};
 use crate::runtime_directive::{RuntimeDirective, RuntimeDirectiveState};
 use crate::runtime_permission::{
     RuntimePermissionRequest, RuntimePermissionRequestHandler, RuntimePermissionResponse,
@@ -52,6 +53,14 @@ impl<'a> RuntimeTurnReducer<'a> {
         self.directive_state.apply(directive_state, directive);
     }
 
+    pub fn apply_capability_patch(
+        &self,
+        snapshot: &mut RuntimeCapabilitySnapshot,
+        patch: RuntimeCapabilityPatch,
+    ) {
+        self.directive_state.apply_patch(snapshot, patch);
+    }
+
     pub fn request_permission(
         &self,
         overlay: &mut TurnPermissionOverlay,
@@ -82,6 +91,14 @@ pub struct DirectiveRuntimeState;
 impl DirectiveRuntimeState {
     pub fn apply(&self, directive_state: &mut RuntimeDirectiveState, directive: RuntimeDirective) {
         directive_state.apply(directive);
+    }
+
+    pub fn apply_patch(
+        &self,
+        snapshot: &mut RuntimeCapabilitySnapshot,
+        patch: RuntimeCapabilityPatch,
+    ) {
+        snapshot.apply_patch(patch);
     }
 }
 

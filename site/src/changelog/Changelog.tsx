@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.183":
+        "Runtime directives now flow through a named RuntimeCapabilitySnapshot. Switch-model, allowed-tool, and runtime system-message patches share one capability contract, and RuntimeDirectiveState exposes that snapshot so later skill, hook, MCP, and tool-policy work can derive from the same state surface.",
       "v0.1.182":
         "RuntimeTurnKernel now owns turn-loop state assembly as an instance handoff. RuntimeTurnState creates the kernel from scoped extension stores and asks that instance to build RuntimeTurnLoopState, while shared extension stores keep the kernel-owned borrow boundary compatible with the loop state it hands forward.",
       "v0.1.181":
@@ -392,6 +394,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.183":
+        "Runtime directive 现在会流经命名的 RuntimeCapabilitySnapshot。模型切换、工具 allowlist 和 runtime system message patch 共享同一个 capability contract，RuntimeDirectiveState 也会暴露这份 snapshot，方便后续 skill、hook、MCP 和 tool policy 都从同一层状态派生。",
       "v0.1.182":
         "RuntimeTurnKernel 现在以实例方法拥有 turn-loop state 组装。RuntimeTurnState 会用 scoped extension stores 创建 kernel，再由这个实例构建 RuntimeTurnLoopState；共享 extension stores 让 kernel 的借用边界和交给 loop 的状态保持一致。",
       "v0.1.181":

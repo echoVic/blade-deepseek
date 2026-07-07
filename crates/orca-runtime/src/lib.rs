@@ -27,6 +27,7 @@ pub mod protocol;
 pub mod provider_turn;
 pub(crate) mod runtime_approval;
 pub(crate) mod runtime_bash;
+pub mod runtime_capability;
 mod runtime_conversation_bootstrap;
 pub mod runtime_directive;
 pub(crate) mod runtime_event_projector;
@@ -84,6 +85,7 @@ mod tests {
         PermissionGrantScope, PermissionResponseDecision, RequestFileSystemPermissions,
         RequestNetworkPermissions, RequestPermissionProfile,
     };
+    use crate::runtime_capability::{RuntimeCapabilityPatch, RuntimeCapabilitySnapshot};
     use crate::runtime_directive::{RuntimeDirective, RuntimeDirectiveState};
     use crate::runtime_state::{RuntimeToolFinish, RuntimeTurnReducer};
     use crate::thread_store::{SessionStore, ThreadStore};
@@ -233,6 +235,101 @@ mod tests {
             &[
                 "switch_model: skill requested cheaper execution".to_string(),
                 "replace_allowed_tools: skill narrowed tool surface".to_string(),
+                "inject_system_message: skill added runtime instruction".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn runtime_capability_patch_updates_named_snapshot() {
+        let mut snapshot = RuntimeCapabilitySnapshot::default();
+
+        snapshot.apply_patch(RuntimeCapabilityPatch::SwitchModel {
+            model: orca_core::model::FLASH_MODEL.to_string(),
+            reason: "skill requested cheaper execution".to_string(),
+        });
+        snapshot.apply_patch(RuntimeCapabilityPatch::ReplaceAllowedTools {
+            tool_names: vec!["read_file".to_string(), "grep".to_string()],
+            reason: "skill narrowed tool surface".to_string(),
+        });
+        snapshot.apply_patch(RuntimeCapabilityPatch::InjectSystemMessage {
+            message: "Prefer focused repository evidence.".to_string(),
+            reason: "skill added runtime instruction".to_string(),
+        });
+
+        assert_eq!(
+            snapshot.model_override(),
+            Some(orca_core::model::FLASH_MODEL)
+        );
+        assert_eq!(
+            snapshot.allowed_tools(),
+            Some(&["read_file".to_string(), "grep".to_string()][..])
+        );
+        assert_eq!(
+            snapshot.pending_system_messages(),
+            &["Prefer focused repository evidence.".to_string()]
+        );
+        assert_eq!(
+            snapshot.transition_reasons(),
+            &[
+                "switch_model: skill requested cheaper execution".to_string(),
+                "replace_allowed_tools: skill narrowed tool surface".to_string(),
+                "inject_system_message: skill added runtime instruction".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn runtime_turn_reducer_applies_capability_patches_to_snapshot() {
+        let thread_store = ExtensionData::new("thread-a");
+        let turn_store = ExtensionData::new("turn-1");
+        let reducer = RuntimeTurnReducer::new(&thread_store, &turn_store);
+        let mut snapshot = RuntimeCapabilitySnapshot::default();
+
+        reducer.apply_capability_patch(
+            &mut snapshot,
+            RuntimeCapabilityPatch::SwitchModel {
+                model: orca_core::model::FLASH_MODEL.to_string(),
+                reason: "runtime chose flash".to_string(),
+            },
+        );
+
+        assert_eq!(
+            snapshot.model_override(),
+            Some(orca_core::model::FLASH_MODEL)
+        );
+        assert_eq!(
+            snapshot.transition_reasons(),
+            &["switch_model: runtime chose flash".to_string()]
+        );
+    }
+
+    #[test]
+    fn runtime_directive_state_exposes_capability_snapshot_contract() {
+        let mut directives = RuntimeDirectiveState::default();
+
+        directives.apply_patch(RuntimeCapabilityPatch::SwitchModel {
+            model: orca_core::model::FLASH_MODEL.to_string(),
+            reason: "skill requested cheaper execution".to_string(),
+        });
+        directives.apply_patch(RuntimeCapabilityPatch::InjectSystemMessage {
+            message: "Prefer focused repository evidence.".to_string(),
+            reason: "skill added runtime instruction".to_string(),
+        });
+
+        let capabilities = directives.capabilities();
+        assert_eq!(
+            capabilities.model_override(),
+            Some(orca_core::model::FLASH_MODEL)
+        );
+        assert_eq!(
+            capabilities.pending_system_messages(),
+            &["Prefer focused repository evidence.".to_string()]
+        );
+        assert_eq!(
+            capabilities.transition_reasons(),
+            &[
+                "switch_model: skill requested cheaper execution".to_string(),
                 "inject_system_message: skill added runtime instruction".to_string(),
             ]
         );
