@@ -271,6 +271,30 @@ fn mock_call(conversation: &Conversation) -> ProviderResponse {
         };
     }
 
+    if prompt == "task_stop_main_session"
+        && let Some(task_id) = find_mock_main_session_task_id(conversation)
+    {
+        let tool_request = ToolRequest {
+            id: "mock-tool-2".to_string(),
+            name: ToolName::TaskStop,
+            action: ActionKind::Write,
+            target: Some(task_id.clone()),
+            raw_arguments: Some(serde_json::json!({ "task_id": task_id }).to_string()),
+        };
+        let raw_call = RawToolCall {
+            id: tool_request.id.clone(),
+            function_name: tool_request.name.as_str().to_string(),
+            arguments: tool_request.raw_arguments.clone().unwrap_or_default(),
+        };
+        return ProviderResponse {
+            steps: vec![ProviderStep::ToolCall(tool_request)],
+            assistant_content: None,
+            assistant_reasoning: None,
+            tool_calls: vec![raw_call],
+            usage: None,
+        };
+    }
+
     if has_tool_results {
         let msg = "Mock completed after tool execution.".to_string();
         return ProviderResponse {
@@ -664,6 +688,16 @@ fn parse_mock_prompt(prompt: &str) -> Option<ToolRequest> {
         });
     }
 
+    if prompt == "task_stop_main_session" {
+        return Some(ToolRequest {
+            id: "mock-tool-1".to_string(),
+            name: ToolName::TaskList,
+            action: ActionKind::Read,
+            target: None,
+            raw_arguments: Some(serde_json::json!({}).to_string()),
+        });
+    }
+
     if let Some(rest) = prompt.strip_prefix("task_stop ") {
         let task_id = rest.trim();
         if task_id.is_empty() {
@@ -991,6 +1025,26 @@ fn parse_mock_prompt(prompt: &str) -> Option<ToolRequest> {
     None
 }
 
+fn find_mock_main_session_task_id(conversation: &Conversation) -> Option<String> {
+    conversation.messages.iter().find_map(|message| {
+        let Message::Tool { content, .. } = message else {
+            return None;
+        };
+        let value = serde_json::from_str::<serde_json::Value>(content).ok()?;
+        value
+            .get("tasks")?
+            .as_array()?
+            .iter()
+            .find(|task| {
+                task.get("task_type").and_then(serde_json::Value::as_str) == Some("main_session")
+                    && task.get("status").and_then(serde_json::Value::as_str) == Some("running")
+            })?
+            .get("id")?
+            .as_str()
+            .map(ToString::to_string)
+    })
+}
+
 fn valid_mock_plan_request(explanation: Option<&str>) -> ToolRequest {
     let arguments = serde_json::json!({
         "explanation": explanation,
@@ -1136,6 +1190,60 @@ mod tests {
         let arguments: serde_json::Value =
             serde_json::from_str(request.raw_arguments.as_deref().unwrap()).unwrap();
         assert_eq!(arguments, serde_json::json!({}));
+    }
+
+    #[test]
+    fn mock_provider_can_stop_main_session_from_task_list_output() {
+        let mut conversation = Conversation::new();
+        conversation.add_user("task_stop_main_session".to_string());
+
+        let response = mock_call(&conversation);
+        let Some(ProviderStep::ToolCall(request)) = response
+            .steps
+            .iter()
+            .find(|step| matches!(step, ProviderStep::ToolCall(_)))
+        else {
+            panic!("expected task_list tool call");
+        };
+        assert_eq!(request.name, ToolName::TaskList);
+
+        conversation.add_assistant(
+            None,
+            None,
+            vec![RawToolCall {
+                id: request.id.clone(),
+                function_name: request.name.as_str().to_string(),
+                arguments: request.raw_arguments.clone().unwrap_or_default(),
+            }],
+        );
+        conversation.add_tool_result(
+            request.id.clone(),
+            serde_json::json!({
+                "tasks": [
+                    {
+                        "id": "task-main-1",
+                        "task_type": "main_session",
+                        "status": "running",
+                        "subject": "task_stop_main_session"
+                    }
+                ]
+            })
+            .to_string(),
+        );
+
+        let response = mock_call(&conversation);
+        let Some(ProviderStep::ToolCall(request)) = response
+            .steps
+            .iter()
+            .find(|step| matches!(step, ProviderStep::ToolCall(_)))
+        else {
+            panic!("expected task_stop tool call");
+        };
+        assert_eq!(request.name, ToolName::TaskStop);
+        assert_eq!(request.target.as_deref(), Some("task-main-1"));
+        let arguments: serde_json::Value =
+            serde_json::from_str(request.raw_arguments.as_deref().unwrap()).unwrap();
+        assert_eq!(arguments["task_id"], "task-main-1");
     }
 
     #[test]

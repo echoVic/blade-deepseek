@@ -141,6 +141,25 @@ fn finish_main_session_task_for_tui(
     }
 }
 
+fn maybe_stop_cancelled_main_session_for_tui(
+    session: &mut TuiConversationSession,
+    event_tx: &Sender<TuiEvent>,
+    events: &mut EventFactory,
+    task_id: &str,
+) -> Option<TuiAgentTurnResult> {
+    if !session.task_registry().is_cancelled(task_id) {
+        return None;
+    }
+    send_session_completed_for_tui(
+        event_tx,
+        events,
+        orca_core::event_schema::RunStatus::Cancelled,
+    );
+    finish_main_session_task_for_tui(session, event_tx, events, task_id, "interrupted");
+    session.complete("interrupted");
+    Some(TuiAgentTurnResult::new("interrupted"))
+}
+
 pub(crate) fn send_tool_requested_for_tui(
     event_tx: &Sender<TuiEvent>,
     events: &mut EventFactory,
@@ -750,6 +769,14 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
                     if let Some(message) = session.conversation().messages.last().cloned() {
                         session.append_message(&message);
                     }
+                    if let Some(result) = maybe_stop_cancelled_main_session_for_tui(
+                        session,
+                        event_tx,
+                        &mut runtime_events,
+                        &main_session_task_id,
+                    ) {
+                        return result;
+                    }
                     if should_stop {
                         send_session_completed_for_tui(
                             event_tx,
@@ -798,6 +825,14 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
                         .add_tool_result(result.id.clone(), result_content);
                     if let Some(message) = session.conversation().messages.last().cloned() {
                         session.append_message(&message);
+                    }
+                    if let Some(result) = maybe_stop_cancelled_main_session_for_tui(
+                        session,
+                        event_tx,
+                        &mut runtime_events,
+                        &main_session_task_id,
+                    ) {
+                        return result;
                     }
                 }
                 index = batch_end;
@@ -851,6 +886,15 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
                 .add_tool_result(tool_request.id.clone(), result_content);
             if let Some(message) = session.conversation().messages.last().cloned() {
                 session.append_message(&message);
+            }
+
+            if let Some(result) = maybe_stop_cancelled_main_session_for_tui(
+                session,
+                event_tx,
+                &mut runtime_events,
+                &main_session_task_id,
+            ) {
+                return result;
             }
 
             if should_stop {
@@ -1211,6 +1255,61 @@ mod tests {
                     task.task_type == TaskType::MainSession
                         && task.status == TaskStatus::Completed
                         && task.description == "mock_silent_final"
+                })
+            )
+        }));
+    }
+
+    #[test]
+    fn tui_task_stop_can_stop_active_main_session_task() {
+        let config = full_auto_config();
+        let (event_tx, event_rx) = mpsc::channel();
+        let (_action_tx, action_rx) = mpsc::channel();
+        let cancel = CancelToken::new();
+        let mut session =
+            TuiConversationSession::new_with_preloaded(&config, "main session stop", None)
+                .expect("session");
+
+        let status = run_agent_for_tui(
+            &config,
+            &mut session,
+            "task_stop_main_session",
+            &event_tx,
+            &action_rx,
+            &cancel,
+            false,
+        );
+
+        assert_eq!(status, "interrupted");
+        let main_task = session
+            .runtime_session()
+            .task_registry()
+            .list()
+            .into_iter()
+            .find(|task| task.task_type == TaskType::MainSession)
+            .expect("main session task");
+        assert_eq!(main_task.status, TaskStatus::Stopped);
+        assert_eq!(main_task.description, "task_stop_main_session");
+        assert!(main_task.completed_at_ms.is_some());
+
+        let events = event_rx.try_iter().collect::<Vec<_>>();
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                TuiEvent::ToolCompleted { name, status, output, .. }
+                if name == "task_stop"
+                    && status == "completed"
+                    && output.contains("Task stop requested")
+            )
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                TuiEvent::WorkflowTasksUpdated { tasks }
+                if tasks.iter().any(|task| {
+                    task.task_type == TaskType::MainSession
+                        && task.status == TaskStatus::Stopped
+                        && task.description == "task_stop_main_session"
                 })
             )
         }));
