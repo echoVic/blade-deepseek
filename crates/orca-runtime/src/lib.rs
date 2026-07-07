@@ -450,7 +450,7 @@ mod tests {
         let step_context_source = include_str!("step_context.rs");
         let tool_turn_source = include_str!("tool_turn.rs");
         let tool_turn_runtime_source = tool_turn_source
-            .split("#[cfg(test)]")
+            .split("mod tests")
             .next()
             .expect("tool turn runtime source");
 
@@ -478,6 +478,51 @@ mod tests {
         assert!(
             !tool_turn_runtime_source.contains("TurnPermissionOverlay::default()"),
             "tool_turn must not allocate a local permission overlay for production execution"
+        );
+    }
+
+    #[test]
+    fn sampling_request_state_owns_tool_dispatch_cursor() {
+        let step_context_source = include_str!("step_context.rs");
+        let tool_turn_source = include_str!("tool_turn.rs");
+        let tool_turn_runtime_source = tool_turn_source
+            .split("mod tests")
+            .next()
+            .expect("tool turn runtime source");
+
+        for marker in [
+            "tool_cursor_index: usize",
+            "fn current_tool_request<'a>(",
+            "fn tool_cursor_position(&self)",
+            "fn advance_tool_cursor_one(&mut self, tool_request_count: usize)",
+            "fn advance_tool_cursor_to(",
+            "next_index: usize",
+            "tool_request_count: usize",
+        ] {
+            assert!(
+                step_context_source.contains(marker),
+                "RuntimeSamplingRequestState must own tool dispatch cursor detail {marker}"
+            );
+        }
+        assert!(
+            tool_turn_runtime_source.contains(".current_tool_request(tool_requests)"),
+            "tool_turn must read the current tool request through sampling state"
+        );
+        assert!(
+            tool_turn_runtime_source.contains(".tool_cursor_position()"),
+            "tool_turn must read dispatch cursor position through sampling state"
+        );
+        assert!(
+            tool_turn_runtime_source.contains(".advance_tool_cursor_to("),
+            "tool_turn must advance batch cursor position through sampling state"
+        );
+        assert!(
+            tool_turn_runtime_source.contains(".advance_tool_cursor_one("),
+            "tool_turn must advance single-tool cursor position through sampling state"
+        );
+        assert!(
+            !tool_turn_runtime_source.contains("ToolRequestCursor"),
+            "tool_turn production code must not own a separate tool request cursor"
         );
     }
 
@@ -1964,10 +2009,11 @@ mod tests {
     }
 
     #[test]
-    fn tool_request_cursor_is_owned_by_tool_turn_module() {
+    fn tool_request_cursor_is_owned_by_sampling_request_state() {
         let agent_loop_source = include_str!("agent_loop.rs");
         let tool_invocation_source = include_str!("tool_invocation.rs");
         let tool_turn_source = include_str!("tool_turn.rs");
+        let step_context_source = include_str!("step_context.rs");
 
         for marker in ["let mut index = 0", "index += 1", "index = batch_end"] {
             assert!(
@@ -1988,12 +2034,20 @@ mod tests {
             "agent_loop must delegate tool request cursor use through turn loop"
         );
         assert!(
-            tool_turn_source.contains("pub(crate) struct ToolRequestCursor"),
-            "tool_turn must own tool request cursor state"
+            step_context_source.contains("tool_cursor_index: usize"),
+            "sampling request state must own tool request cursor position"
         );
         assert!(
-            tool_turn_source.contains("fn advance_to"),
-            "tool_turn must own cursor batch advancement"
+            !tool_turn_source
+                .split("mod tests")
+                .next()
+                .expect("tool turn runtime source")
+                .contains("struct ToolRequestCursor"),
+            "tool_turn production code must not own tool request cursor state"
+        );
+        assert!(
+            step_context_source.contains("fn advance_tool_cursor_to"),
+            "sampling request state must own cursor batch advancement"
         );
     }
 
@@ -2619,8 +2673,8 @@ mod tests {
             "tool_turn must expose the tool-turn dispatch runner"
         );
         assert!(
-            tool_turn_source.contains("ToolRequestCursor::new"),
-            "tool_turn must own dispatch cursor state"
+            tool_turn_source.contains("sampling_state.current_tool_request(tool_requests)"),
+            "tool_turn must use sampling-state-owned dispatch cursor state"
         );
         assert!(
             tool_turn_source.contains("run_normal_tool_turn"),

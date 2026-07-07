@@ -44,11 +44,6 @@ pub(crate) enum ToolTurnOutcome {
     },
 }
 
-pub(crate) struct ToolRequestCursor<'a> {
-    requests: &'a [ToolRequest],
-    index: usize,
-}
-
 pub(crate) struct RuntimeToolTurnsContext<'a, W: io::Write> {
     pub(crate) step_context: RuntimeStepContext<'a>,
     pub(crate) sampling_state: &'a mut RuntimeSamplingRequestState,
@@ -89,28 +84,6 @@ pub(crate) struct RuntimeNormalToolTurnContext<'a, W: io::Write> {
     pub(crate) extensions: Option<RuntimeExtensionContext<'a>>,
     pub(crate) child_executor: ChildAgentExecutor<W>,
     pub(crate) workflow_child_executor: ChildAgentExecutor<SharedEventBuffer>,
-}
-
-impl<'a> ToolRequestCursor<'a> {
-    pub(crate) fn new(requests: &'a [ToolRequest]) -> Self {
-        Self { requests, index: 0 }
-    }
-
-    pub(crate) fn current(&self) -> Option<&'a ToolRequest> {
-        self.requests.get(self.index)
-    }
-
-    pub(crate) fn position(&self) -> usize {
-        self.index
-    }
-
-    pub(crate) fn advance_one(&mut self) {
-        self.advance_to(self.index.saturating_add(1));
-    }
-
-    pub(crate) fn advance_to(&mut self, next_index: usize) {
-        self.index = next_index.min(self.requests.len());
-    }
 }
 
 impl ToolTurnOutcome {
@@ -155,8 +128,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
     let workflow_ipc = step_context.workflow_ipc;
     let permission_handler = step_context.permission_handler;
     let extensions = step_context.extensions;
-    let mut cursor = ToolRequestCursor::new(tool_requests);
-    while let Some(tool_request) = cursor.current() {
+    while let Some(tool_request) = sampling_state.current_tool_request(tool_requests) {
         if let Some(result) = reject_disallowed_child_tool(
             tool_request,
             tool_policy,
@@ -174,7 +146,8 @@ pub(crate) fn run_tool_turns<W: io::Write>(
         }
 
         if should_run_subagent_batch(config, tool_request, subagent_depth) {
-            let batch_end = collect_subagent_batch(config, tool_requests, cursor.position());
+            let cursor_position = sampling_state.tool_cursor_position();
+            let batch_end = collect_subagent_batch(config, tool_requests, cursor_position);
             match run_subagent_batch_tool_turn(
                 config,
                 cwd,
@@ -182,7 +155,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                 sink,
                 conversation,
                 history_writer.as_deref_mut(),
-                &tool_requests[cursor.position()..batch_end],
+                &tool_requests[cursor_position..batch_end],
                 subagent_depth,
                 emit_deltas,
                 instructions,
@@ -199,15 +172,16 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                     return Ok(ToolTurnOutcome::Return { status, error });
                 }
             }
-            cursor.advance_to(batch_end);
+            sampling_state.advance_tool_cursor_to(batch_end, tool_requests.len());
             continue;
         }
 
         if should_run_readonly_batch(config.tools.max_read_parallel, tool_request) {
+            let cursor_position = sampling_state.tool_cursor_position();
             let batch_end = collect_readonly_batch(
                 config.tools.max_read_parallel,
                 tool_requests,
-                cursor.position(),
+                cursor_position,
             );
             match run_readonly_tool_turn(RuntimeReadonlyToolTurnContext {
                 cwd,
@@ -215,7 +189,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                 sink,
                 conversation,
                 history_writer: history_writer.as_deref_mut(),
-                tool_requests: &tool_requests[cursor.position()..batch_end],
+                tool_requests: &tool_requests[cursor_position..batch_end],
                 emit_deltas,
                 mcp_registry,
                 hooks,
@@ -226,7 +200,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                     return Ok(ToolTurnOutcome::Return { status, error });
                 }
             }
-            cursor.advance_to(batch_end);
+            sampling_state.advance_tool_cursor_to(batch_end, tool_requests.len());
             continue;
         }
 
@@ -261,7 +235,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                 return Ok(ToolTurnOutcome::Return { status, error });
             }
         }
-        cursor.advance_one();
+        sampling_state.advance_tool_cursor_one(tool_requests.len());
     }
 
     Ok(ToolTurnOutcome::Continue)
@@ -281,12 +255,7 @@ pub(crate) fn record_normal_tool_result(
         tool_request,
         result,
     );
-    record_tool_result_for_agent(
-        conversation,
-        history_writer.as_deref_mut(),
-        result,
-        emit_deltas,
-    )?;
+    record_tool_result_for_agent(conversation, history_writer, result, emit_deltas)?;
 
     if status == RunStatus::ApprovalRequired {
         return Ok(terminal_tool_turn(status, result.error.clone()));
@@ -456,7 +425,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_request_cursor_advances_over_single_and_batch_requests() {
+    fn sampling_request_state_advances_over_single_and_batch_tool_requests() {
         let first = request(ToolName::ReadFile, ActionKind::Read, Some("one.txt"), None);
         let second = ToolRequest {
             id: "tool-2".to_string(),
@@ -474,23 +443,27 @@ mod tests {
         };
         let requests = vec![first, second, third];
 
-        let mut cursor = ToolRequestCursor::new(&requests);
+        let mut sampling_state = RuntimeSamplingRequestState::new();
 
         assert_eq!(
-            cursor.current().map(|request| request.id.as_str()),
+            sampling_state
+                .current_tool_request(&requests)
+                .map(|request| request.id.as_str()),
             Some("tool-1")
         );
-        cursor.advance_one();
-        assert_eq!(cursor.position(), 1);
+        sampling_state.advance_tool_cursor_one(requests.len());
+        assert_eq!(sampling_state.tool_cursor_position(), 1);
         assert_eq!(
-            cursor.current().map(|request| request.id.as_str()),
+            sampling_state
+                .current_tool_request(&requests)
+                .map(|request| request.id.as_str()),
             Some("tool-2")
         );
-        cursor.advance_to(3);
-        assert_eq!(cursor.position(), 3);
-        assert!(cursor.current().is_none());
-        cursor.advance_to(99);
-        assert_eq!(cursor.position(), 3);
+        sampling_state.advance_tool_cursor_to(3, requests.len());
+        assert_eq!(sampling_state.tool_cursor_position(), 3);
+        assert!(sampling_state.current_tool_request(&requests).is_none());
+        sampling_state.advance_tool_cursor_to(99, requests.len());
+        assert_eq!(sampling_state.tool_cursor_position(), 3);
     }
 
     #[test]

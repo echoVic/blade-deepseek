@@ -13,6 +13,7 @@ use crate::memory::MemoryBlock;
 use crate::tasks::TaskRegistry;
 use crate::tool_invocation::AgentToolPolicyContext;
 use crate::workflow::ipc::WorkflowIpcContext;
+use orca_core::tool_types::ToolRequest;
 
 #[derive(Clone, Copy)]
 pub(crate) struct RuntimeStepContext<'a> {
@@ -36,6 +37,7 @@ pub(crate) struct RuntimeStepContext<'a> {
 #[derive(Default)]
 pub(crate) struct RuntimeSamplingRequestState {
     pub(crate) permission_overlay: TurnPermissionOverlay,
+    tool_cursor_index: usize,
 }
 
 impl RuntimeSamplingRequestState {
@@ -45,6 +47,25 @@ impl RuntimeSamplingRequestState {
 
     pub(crate) fn permission_overlay_mut(&mut self) -> &mut TurnPermissionOverlay {
         &mut self.permission_overlay
+    }
+
+    pub(crate) fn current_tool_request<'a>(
+        &self,
+        tool_requests: &'a [ToolRequest],
+    ) -> Option<&'a ToolRequest> {
+        tool_requests.get(self.tool_cursor_index)
+    }
+
+    pub(crate) fn tool_cursor_position(&self) -> usize {
+        self.tool_cursor_index
+    }
+
+    pub(crate) fn advance_tool_cursor_one(&mut self, tool_request_count: usize) {
+        self.advance_tool_cursor_to(self.tool_cursor_index.saturating_add(1), tool_request_count);
+    }
+
+    pub(crate) fn advance_tool_cursor_to(&mut self, next_index: usize, tool_request_count: usize) {
+        self.tool_cursor_index = next_index.min(tool_request_count);
     }
 }
 
