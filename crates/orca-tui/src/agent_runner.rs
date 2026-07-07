@@ -123,6 +123,7 @@ fn poll_background_current_turn_for_tui(
     event_tx: &Sender<TuiEvent>,
     events: &mut EventFactory,
     action_rx: &Receiver<UserAction>,
+    pending_actions: &mut VecDeque<UserAction>,
     task_id: &str,
     is_backgrounded: &mut bool,
 ) {
@@ -130,13 +131,25 @@ fn poll_background_current_turn_for_tui(
         return;
     }
 
-    let Ok(action) = action_rx.try_recv() else {
-        return;
-    };
-
-    if matches!(action, UserAction::BackgroundCurrentTurn)
-        && session.task_registry().mark_backgrounded(task_id).is_ok()
+    let mut should_background = false;
+    if let Some(index) = pending_actions
+        .iter()
+        .position(|action| matches!(action, UserAction::BackgroundCurrentTurn))
     {
+        pending_actions.remove(index);
+        should_background = true;
+    }
+    while !should_background {
+        match action_rx.try_recv() {
+            Ok(UserAction::BackgroundCurrentTurn) => {
+                should_background = true;
+            }
+            Ok(action) => pending_actions.push_back(action),
+            Err(_) => break,
+        }
+    }
+
+    if should_background && session.task_registry().mark_backgrounded(task_id).is_ok() {
         *is_backgrounded = true;
         send_workflow_tasks_updated_for_tui(event_tx, events, &session.task_registry().list());
     }
@@ -396,12 +409,14 @@ pub fn run_agent_for_tui(
     cancel: &CancelToken,
     allow_goal_tools: bool,
 ) -> String {
+    let mut pending_actions = VecDeque::new();
     run_agent_for_tui_with_notification_queue(
         config,
         session,
         prompt,
         event_tx,
         action_rx,
+        &mut pending_actions,
         cancel,
         allow_goal_tools,
         None,
@@ -415,6 +430,7 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
     prompt: &str,
     event_tx: &Sender<TuiEvent>,
     action_rx: &Receiver<UserAction>,
+    pending_actions: &mut VecDeque<UserAction>,
     cancel: &CancelToken,
     allow_goal_tools: bool,
     pending_workflow_notifications: Option<&PendingWorkflowNotifications>,
@@ -469,6 +485,7 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
         event_tx,
         &mut runtime_events,
         action_rx,
+        pending_actions,
         &main_session_task_id,
         &mut main_session_backgrounded,
     );
@@ -576,6 +593,7 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
                         &tx,
                         &mut stream_events,
                         action_rx,
+                        pending_actions,
                         &main_session_task_id,
                         &mut main_session_backgrounded,
                     );
@@ -587,6 +605,7 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
                         &tx,
                         &mut stream_events,
                         action_rx,
+                        pending_actions,
                         &main_session_task_id,
                         &mut main_session_backgrounded,
                     );
@@ -599,6 +618,7 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
                         &tx,
                         &mut stream_events,
                         action_rx,
+                        pending_actions,
                         &main_session_task_id,
                         &mut main_session_backgrounded,
                     );
@@ -1423,6 +1443,46 @@ mod tests {
     }
 
     #[test]
+    fn background_poll_preserves_non_background_actions() {
+        let config = config();
+        let (event_tx, _event_rx) = mpsc::channel();
+        let mut runtime_events = EventFactory::new("background-poll".to_string());
+        let session = TuiConversationSession::new_with_preloaded(&config, "background poll", None)
+            .expect("session");
+        let task = session
+            .runtime_session()
+            .task_registry()
+            .create_main_session("background poll".to_string());
+        session
+            .runtime_session()
+            .task_registry()
+            .mark_running(&task.id)
+            .expect("running main session");
+        let (queued_tx, queued_rx) = mpsc::channel();
+        queued_tx
+            .send(UserAction::Submit("next prompt".to_string()))
+            .expect("send queued submit");
+        let mut pending_actions = VecDeque::new();
+        let mut is_backgrounded = false;
+
+        poll_background_current_turn_for_tui(
+            &session,
+            &event_tx,
+            &mut runtime_events,
+            &queued_rx,
+            &mut pending_actions,
+            &task.id,
+            &mut is_backgrounded,
+        );
+
+        assert!(!is_backgrounded);
+        assert!(matches!(
+            pending_actions.pop_front(),
+            Some(UserAction::Submit(prompt)) if prompt == "next prompt"
+        ));
+    }
+
+    #[test]
     fn tui_task_stop_can_stop_active_main_session_task() {
         let config = full_auto_config();
         let (event_tx, event_rx) = mpsc::channel();
@@ -1650,6 +1710,7 @@ mod tests {
         )])));
         let mut session = TuiConversationSession::new_with_preloaded(&config, "task_list", None)
             .expect("session");
+        let mut pending_actions = VecDeque::new();
 
         let result = run_agent_for_tui_with_notification_queue(
             &config,
@@ -1657,6 +1718,7 @@ mod tests {
             "task_list",
             &event_tx,
             &action_rx,
+            &mut pending_actions,
             &cancel,
             false,
             Some(&pending_notifications),
@@ -1684,6 +1746,7 @@ mod tests {
         let pending_notifications = Arc::new(Mutex::new(VecDeque::new()));
         let mut session = TuiConversationSession::new_with_preloaded(&config, "task_list", None)
             .expect("session");
+        let mut pending_actions = VecDeque::new();
 
         let result = run_agent_for_tui_with_notification_queue(
             &config,
@@ -1691,6 +1754,7 @@ mod tests {
             "task_list",
             &event_tx,
             &action_rx,
+            &mut pending_actions,
             &cancel,
             false,
             Some(&pending_notifications),
