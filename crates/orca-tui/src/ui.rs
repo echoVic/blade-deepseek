@@ -792,6 +792,14 @@ fn task_detail_label(task: &BackgroundTaskSummary) -> String {
     match task.task_type {
         TaskType::Workflow => workflow_progress_label(task),
         TaskType::Subagent => subagent_progress_label(task),
+        TaskType::MainSession
+            if task.is_backgrounded && task.status == TaskStatus::ApprovalRequired =>
+        {
+            if let Some(tool) = task.tool.as_deref() {
+                return format!("waiting on {tool} • backgrounded • {}", elapsed_label(task));
+            }
+            format!("backgrounded • {}", elapsed_label(task))
+        }
         TaskType::MainSession if task.is_backgrounded => {
             format!("backgrounded • {}", elapsed_label(task))
         }
@@ -3425,6 +3433,43 @@ mod tests {
         };
 
         assert!(task_detail_label(&task).starts_with("backgrounded • elapsed "));
+    }
+
+    #[test]
+    fn workflow_panel_labels_backgrounded_approval_tool() {
+        let task = BackgroundTaskSummary {
+            id: "task-main".to_string(),
+            task_type: TaskType::MainSession,
+            status: TaskStatus::ApprovalRequired,
+            is_backgrounded: true,
+            description: "Summarize architecture".to_string(),
+            created_at_ms: 1_000,
+            started_at_ms: Some(1_000),
+            completed_at_ms: Some(4_000),
+            command: None,
+            agent_type: Some("main-session".to_string()),
+            server: None,
+            tool: Some("task_list".to_string()),
+            name: None,
+            workflow_run_id: None,
+            phase_count: None,
+            workflow_progress: None,
+            workflow_phases: Vec::new(),
+            workflow_agents: Vec::new(),
+            workflow_script_path: None,
+            workflow_launch_input: None,
+            workflow_final_summary: None,
+            workflow_failure_count: 0,
+            usage: None,
+            subagent_current_activity: None,
+            subagent_turn: None,
+            last_activity_at_ms: Some(4_000),
+        };
+
+        assert_eq!(
+            task_detail_label(&task),
+            "waiting on task_list • backgrounded • elapsed 3s"
+        );
     }
 
     fn workflow_task_for_agent_dashboard(

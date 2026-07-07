@@ -1524,6 +1524,73 @@ mod tests {
     }
 
     #[test]
+    fn backgrounded_agent_loop_reports_pending_tool_name() {
+        with_orca_home(|_| {
+            let config = Arc::new(Mutex::new(test_config(HistoryMode::Record)));
+            let preloaded = Arc::new(Mutex::new(None));
+            let (event_tx, event_rx) = mpsc::channel();
+            let (action_tx, action_rx) = mpsc::channel();
+            let cancel = CancelToken::new();
+
+            let handle = std::thread::spawn({
+                let config = Arc::clone(&config);
+                let preloaded = Arc::clone(&preloaded);
+                let cancel = cancel.clone();
+                move || {
+                    agent_loop_thread(
+                        config,
+                        preloaded,
+                        event_tx,
+                        action_rx,
+                        cancel,
+                        test_pending_workflow_notifications(),
+                    )
+                }
+            });
+
+            action_tx
+                .send(UserAction::Submit(
+                    "mock_stream_tool_delay_ms 250 task_list".to_string(),
+                ))
+                .unwrap();
+
+            loop {
+                match event_rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+                    TuiEvent::MessageDelta(text)
+                        if text.contains("Mock slow tool stream started.") =>
+                    {
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+
+            action_tx.send(UserAction::BackgroundCurrentTurn).unwrap();
+
+            let tool = loop {
+                match event_rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+                    TuiEvent::WorkflowTasksUpdated { tasks } => {
+                        if let Some(task) = tasks.into_iter().find(|task| {
+                            task.task_type == orca_core::task_types::TaskType::MainSession
+                                && task.is_backgrounded
+                                && task.status
+                                    == orca_core::task_types::TaskStatus::ApprovalRequired
+                        }) {
+                            break task.tool;
+                        }
+                    }
+                    _ => {}
+                }
+            };
+
+            action_tx.send(UserAction::Cancel).unwrap();
+            handle.join().unwrap();
+
+            assert_eq!(tool.as_deref(), Some("task_list"));
+        });
+    }
+
+    #[test]
     fn backgrounded_agent_loop_notifies_approval_required_in_user_language() {
         with_orca_home(|_| {
             let config = Arc::new(Mutex::new(test_config(HistoryMode::Record)));

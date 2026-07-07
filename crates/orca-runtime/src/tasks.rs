@@ -45,6 +45,7 @@ pub struct TaskRecord {
     pub completed_at_ms: Option<i64>,
     pub name: Option<String>,
     pub agent_type: Option<String>,
+    pub tool: Option<String>,
     pub workflow_run_id: Option<String>,
     pub phase_count: Option<usize>,
     pub workflow_progress: Option<WorkflowTaskProgress>,
@@ -90,6 +91,8 @@ struct PersistedTaskRecord {
     completed_at_ms: Option<i64>,
     name: Option<String>,
     agent_type: Option<String>,
+    #[serde(default)]
+    tool: Option<String>,
     workflow_run_id: Option<String>,
     phase_count: Option<usize>,
     workflow_progress: Option<WorkflowTaskProgress>,
@@ -183,6 +186,7 @@ impl TaskRegistry {
             completed_at_ms: None,
             name: Some(name),
             agent_type: None,
+            tool: None,
             workflow_run_id: Some(workflow_run_id.clone()),
             phase_count: Some(phase_count),
             workflow_progress: None,
@@ -231,6 +235,7 @@ impl TaskRegistry {
             completed_at_ms: None,
             name: None,
             agent_type,
+            tool: None,
             workflow_run_id: None,
             phase_count: None,
             workflow_progress: None,
@@ -279,6 +284,7 @@ impl TaskRegistry {
             completed_at_ms: None,
             name: None,
             agent_type: Some("main-session".to_string()),
+            tool: None,
             workflow_run_id: None,
             phase_count: None,
             workflow_progress: None,
@@ -327,6 +333,7 @@ impl TaskRegistry {
             completed_at_ms: None,
             name: None,
             agent_type: None,
+            tool: None,
             workflow_run_id: None,
             phase_count: None,
             workflow_progress: None,
@@ -374,7 +381,7 @@ impl TaskRegistry {
                         command: record.command.clone(),
                         agent_type: record.agent_type.clone(),
                         server: None,
-                        tool: None,
+                        tool: record.tool.clone(),
                         name: record.name.clone(),
                         workflow_run_id: record.workflow_run_id.clone(),
                         phase_count: record.phase_count,
@@ -588,6 +595,15 @@ impl TaskRegistry {
     }
 
     pub fn approval_required(&self, id: &str, summary: String) -> Result<(), String> {
+        self.approval_required_for_tool(id, summary, None)
+    }
+
+    pub fn approval_required_for_tool(
+        &self,
+        id: &str,
+        summary: String,
+        tool: Option<String>,
+    ) -> Result<(), String> {
         self.update_task(id, |record| {
             record.status = TaskStatus::ApprovalRequired;
             if record.started_at_ms.is_none() {
@@ -596,6 +612,7 @@ impl TaskRegistry {
             record.completed_at_ms = Some(now_ms());
             record.result = Some(summary);
             record.error = None;
+            record.tool = tool;
             record.worker_pid = None;
             record.control.pause.store(false, Ordering::Release);
             Ok(())
@@ -833,6 +850,7 @@ impl PersistedTaskRecord {
             completed_at_ms: self.completed_at_ms,
             name: self.name,
             agent_type: self.agent_type,
+            tool: self.tool,
             workflow_run_id: self.workflow_run_id,
             phase_count: self.phase_count,
             workflow_progress: self.workflow_progress,
@@ -874,6 +892,7 @@ impl From<&TaskRecord> for PersistedTaskRecord {
             completed_at_ms: record.completed_at_ms,
             name: record.name.clone(),
             agent_type: record.agent_type.clone(),
+            tool: record.tool.clone(),
             workflow_run_id: record.workflow_run_id.clone(),
             phase_count: record.phase_count,
             workflow_progress: record.workflow_progress,
@@ -1256,6 +1275,27 @@ mod tests {
         assert_eq!(record.result.as_deref(), Some("approval_required"));
         assert_eq!(record.error, None);
         assert!(record.completed_at_ms.is_some());
+    }
+
+    #[test]
+    fn registry_lists_approval_required_tool_name() {
+        let registry = TaskRegistry::new("session-1".to_string());
+        let task = registry.create_main_session("Needs a tool".to_string());
+
+        registry.mark_running(&task.id).unwrap();
+        registry.mark_backgrounded(&task.id).unwrap();
+        registry
+            .approval_required_for_tool(
+                &task.id,
+                "approval_required".to_string(),
+                Some("task_list".to_string()),
+            )
+            .unwrap();
+
+        let list = registry.list();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].status, TaskStatus::ApprovalRequired);
+        assert_eq!(list[0].tool.as_deref(), Some("task_list"));
     }
 
     #[test]

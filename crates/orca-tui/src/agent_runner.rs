@@ -206,6 +206,19 @@ fn provider_response_status(response: &ProviderResponse) -> &'static str {
     }
 }
 
+fn provider_response_pending_tool_name(response: &ProviderResponse) -> Option<String> {
+    response
+        .tool_calls
+        .first()
+        .map(|tool_call| tool_call.function_name.clone())
+        .or_else(|| {
+            response.steps.iter().find_map(|step| match step {
+                ProviderStep::ToolCall(request) => Some(request.name.as_str().to_string()),
+                _ => None,
+            })
+        })
+}
+
 fn spawn_background_provider_completion(
     provider_rx: Receiver<ProviderStreamEvent>,
     task_registry: orca_runtime::tasks::TaskRegistry,
@@ -215,16 +228,20 @@ fn spawn_background_provider_completion(
 ) {
     thread::spawn(move || {
         let mut status = "failed";
+        let mut pending_tool = None;
         while let Ok(event) = provider_rx.recv() {
             if let ProviderStreamEvent::Done(response) = event {
                 status = provider_response_status(&response);
+                pending_tool = provider_response_pending_tool_name(&response);
                 break;
             }
         }
 
         let result = match status {
             "success" => task_registry.complete(&task_id, status.to_string()),
-            "approval_required" => task_registry.approval_required(&task_id, status.to_string()),
+            "approval_required" => {
+                task_registry.approval_required_for_tool(&task_id, status.to_string(), pending_tool)
+            }
             _ => task_registry.fail(&task_id, status.to_string()),
         };
         if result.is_ok() {
