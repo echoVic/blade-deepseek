@@ -472,7 +472,7 @@ mod tests {
         );
         assert!(
             tool_turn_source
-                .contains("permission_overlay: sampling_state.permission_overlay_mut()"),
+                .contains(".with_permission_overlay(sampling_state.permission_overlay_mut())"),
             "normal tool turns must use the sampling state's permission overlay"
         );
         assert!(
@@ -565,6 +565,37 @@ mod tests {
         assert!(
             !tool_turn_runtime_source.contains("&tool_requests[cursor_position..batch_end]"),
             "tool_turn production code must not slice batch windows directly"
+        );
+    }
+
+    #[test]
+    fn sampling_request_state_owns_normal_tool_result_recording() {
+        let step_context_source = include_str!("step_context.rs");
+        let tool_turn_source = include_str!("tool_turn.rs");
+        let tool_turn_runtime_source = tool_turn_source
+            .split("mod tests")
+            .next()
+            .expect("tool turn runtime source");
+
+        for marker in [
+            "fn record_normal_tool_result(",
+            "record_plan_state_for_agent(",
+            "record_tool_result_for_agent(",
+            "status == RunStatus::ApprovalRequired",
+            "tool_request.name == ToolName::Subagent",
+        ] {
+            assert!(
+                step_context_source.contains(marker),
+                "RuntimeSamplingRequestState must own normal tool result recording detail {marker}"
+            );
+        }
+        assert!(
+            tool_turn_runtime_source.contains(".record_normal_tool_result("),
+            "tool_turn must record normal tool results through sampling request state"
+        );
+        assert!(
+            !tool_turn_runtime_source.contains("pub(crate) fn record_normal_tool_result"),
+            "tool_turn production code must not own normal tool result recording"
         );
     }
 
@@ -2188,6 +2219,7 @@ mod tests {
             "run_tool_turns must not call run_normal_tool_turn with the old long argument list"
         );
         for field_name in [
+            "sampling_state:",
             "config:",
             "cwd:",
             "events:",
@@ -2207,7 +2239,6 @@ mod tests {
             "task_registry:",
             "background_workflows:",
             "workflow_ipc:",
-            "permission_overlay:",
             "permission_handler:",
             "child_executor:",
             "workflow_child_executor:",
@@ -2421,10 +2452,15 @@ mod tests {
     }
 
     #[test]
-    fn normal_tool_result_recording_is_owned_by_tool_turn_module() {
+    fn normal_tool_result_recording_is_owned_by_sampling_request_state() {
         let agent_loop_source = include_str!("agent_loop.rs");
         let tool_invocation_source = include_str!("tool_invocation.rs");
+        let step_context_source = include_str!("step_context.rs");
         let tool_turn_source = include_str!("tool_turn.rs");
+        let tool_turn_runtime_source = tool_turn_source
+            .split("mod tests")
+            .next()
+            .expect("tool turn runtime source");
 
         for marker in [
             "record_plan_state_for_agent(",
@@ -2449,16 +2485,24 @@ mod tests {
             "tool_invocation must not own normal tool result recording"
         );
         assert!(
-            tool_turn_source.contains("pub(crate) fn record_normal_tool_result"),
-            "tool_turn must expose normal tool result recording"
+            step_context_source.contains("fn record_normal_tool_result("),
+            "sampling request state must expose normal tool result recording"
         );
         assert!(
-            tool_turn_source.contains("record_plan_state_for_agent"),
-            "tool_turn must own normal tool plan-state recording"
+            step_context_source.contains("record_plan_state_for_agent"),
+            "sampling request state must own normal tool plan-state recording"
         );
         assert!(
-            tool_turn_source.contains("record_tool_result_for_agent"),
-            "tool_turn must own normal tool result recording"
+            step_context_source.contains("record_tool_result_for_agent"),
+            "sampling request state must own normal tool result recording"
+        );
+        assert!(
+            tool_turn_runtime_source.contains(".record_normal_tool_result("),
+            "tool_turn must delegate normal tool result recording to sampling request state"
+        );
+        assert!(
+            !tool_turn_runtime_source.contains("record_plan_state_for_agent"),
+            "tool_turn production code must not own normal tool plan-state recording"
         );
     }
 

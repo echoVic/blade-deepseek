@@ -7,7 +7,7 @@ use orca_core::config::RunConfig;
 use orca_core::conversation::Conversation;
 use orca_core::event_schema::{EventFactory, RunStatus};
 use orca_core::event_sink::EventSink;
-use orca_core::tool_types::{ToolName, ToolRequest, ToolResult};
+use orca_core::tool_types::ToolRequest;
 use orca_mcp::McpRegistry;
 
 use crate::agent_child::ChildAgentExecutor;
@@ -15,7 +15,7 @@ use crate::cost::CostTracker;
 use crate::extension::RuntimeExtensionContext;
 use crate::hooks::HookRunner;
 use crate::instructions::ProjectInstructions;
-use crate::lifecycle::{RuntimePermissionRequestHandler, TurnPermissionOverlay};
+use crate::lifecycle::RuntimePermissionRequestHandler;
 use crate::memory::MemoryBlock;
 #[cfg(test)]
 use crate::runtime_readonly_tool_turn::record_readonly_batch_results;
@@ -23,8 +23,9 @@ use crate::runtime_readonly_tool_turn::{
     RuntimeReadonlyToolTurnContext, collect_readonly_batch, run_readonly_tool_turn,
     should_run_readonly_batch,
 };
-use crate::session::{record_plan_state_for_agent, record_tool_result_for_agent};
-use crate::step_context::{RuntimeSamplingRequestState, RuntimeStepContext};
+use crate::step_context::{
+    RuntimeSamplingRequestState, RuntimeStepContext, RuntimeToolResultRecordOutcome,
+};
 use crate::subagent_execution::{
     collect_subagent_batch, run_subagent_batch_tool_turn, should_run_subagent_batch,
 };
@@ -60,6 +61,7 @@ pub(crate) struct RuntimeToolTurnsContext<'a, W: io::Write> {
 }
 
 pub(crate) struct RuntimeNormalToolTurnContext<'a, W: io::Write> {
+    pub(crate) sampling_state: &'a mut RuntimeSamplingRequestState,
     pub(crate) config: &'a RunConfig,
     pub(crate) cwd: &'a Path,
     pub(crate) events: &'a mut EventFactory,
@@ -79,7 +81,6 @@ pub(crate) struct RuntimeNormalToolTurnContext<'a, W: io::Write> {
     pub(crate) task_registry: &'a TaskRegistry,
     pub(crate) background_workflows: &'a mut Vec<BackgroundWorkflowRun>,
     pub(crate) workflow_ipc: Option<&'a WorkflowIpcContext>,
-    pub(crate) permission_overlay: &'a mut TurnPermissionOverlay,
     pub(crate) permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
     pub(crate) extensions: Option<RuntimeExtensionContext<'a>>,
     pub(crate) child_executor: ChildAgentExecutor<W>,
@@ -87,11 +88,22 @@ pub(crate) struct RuntimeNormalToolTurnContext<'a, W: io::Write> {
 }
 
 impl ToolTurnOutcome {
+    #[cfg(test)]
     pub(crate) fn from_terminal(status: RunStatus, error: Option<String>) -> Self {
         Self::Return { status, error }
     }
+
+    pub(crate) fn from_record_outcome(outcome: RuntimeToolResultRecordOutcome) -> Self {
+        match outcome {
+            RuntimeToolResultRecordOutcome::Continue => Self::Continue,
+            RuntimeToolResultRecordOutcome::Return { status, error } => {
+                Self::Return { status, error }
+            }
+        }
+    }
 }
 
+#[cfg(test)]
 pub(crate) fn terminal_tool_turn(status: RunStatus, error: Option<String>) -> ToolTurnOutcome {
     ToolTurnOutcome::from_terminal(status, error)
 }
@@ -209,6 +221,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
         }
 
         match run_normal_tool_turn(RuntimeNormalToolTurnContext {
+            sampling_state,
             config,
             cwd,
             events,
@@ -228,7 +241,6 @@ pub(crate) fn run_tool_turns<W: io::Write>(
             task_registry,
             background_workflows,
             workflow_ipc,
-            permission_overlay: sampling_state.permission_overlay_mut(),
             permission_handler,
             extensions,
             child_executor,
@@ -245,39 +257,11 @@ pub(crate) fn run_tool_turns<W: io::Write>(
     Ok(ToolTurnOutcome::Continue)
 }
 
-pub(crate) fn record_normal_tool_result(
-    conversation: &mut Conversation,
-    mut history_writer: Option<&mut SessionWriter>,
-    tool_request: &ToolRequest,
-    result: &ToolResult,
-    status: RunStatus,
-    emit_deltas: bool,
-) -> io::Result<ToolTurnOutcome> {
-    record_plan_state_for_agent(
-        conversation,
-        history_writer.as_deref_mut(),
-        tool_request,
-        result,
-    );
-    record_tool_result_for_agent(conversation, history_writer, result, emit_deltas)?;
-
-    if status == RunStatus::ApprovalRequired {
-        return Ok(terminal_tool_turn(status, result.error.clone()));
-    }
-    if status == RunStatus::Failed && tool_request.name == ToolName::Subagent {
-        return Ok(terminal_tool_turn(
-            RunStatus::Failed,
-            Some(result.error.clone().unwrap_or_default()),
-        ));
-    }
-
-    Ok(ToolTurnOutcome::Continue)
-}
-
 pub(crate) fn run_normal_tool_turn<W: io::Write>(
     context: RuntimeNormalToolTurnContext<'_, W>,
 ) -> io::Result<ToolTurnOutcome> {
     let RuntimeNormalToolTurnContext {
+        sampling_state,
         config,
         cwd,
         events,
@@ -297,7 +281,6 @@ pub(crate) fn run_normal_tool_turn<W: io::Write>(
         task_registry,
         background_workflows,
         workflow_ipc,
-        permission_overlay,
         permission_handler,
         extensions,
         child_executor,
@@ -312,7 +295,7 @@ pub(crate) fn run_normal_tool_turn<W: io::Write>(
             background_workflows,
             workflow_ipc,
         )
-        .with_permission_overlay(permission_overlay)
+        .with_permission_overlay(sampling_state.permission_overlay_mut())
         .with_permission_handler(permission_handler);
     if let Some(extensions) = extensions {
         execution_context =
@@ -328,14 +311,16 @@ pub(crate) fn run_normal_tool_turn<W: io::Write>(
         workflow_child_executor,
     )?;
 
-    record_normal_tool_result(
-        conversation,
-        history_writer,
-        tool_request,
-        &result,
-        status,
-        emit_deltas,
-    )
+    sampling_state
+        .record_normal_tool_result(
+            conversation,
+            history_writer,
+            tool_request,
+            &result,
+            status,
+            emit_deltas,
+        )
+        .map(ToolTurnOutcome::from_record_outcome)
 }
 
 #[cfg(test)]
@@ -524,8 +509,9 @@ mod tests {
     }
 
     #[test]
-    fn record_normal_tool_result_returns_approval_required_after_recording_tool_message() {
+    fn sampling_request_state_records_approval_required_normal_tool_result() {
         let mut conversation = Conversation::new();
+        let sampling_state = RuntimeSamplingRequestState::new();
         let request = request(
             ToolName::RequestPermissions,
             ActionKind::Read,
@@ -534,22 +520,25 @@ mod tests {
         );
         let result = ToolResult::denied(&request, "needs approval");
 
-        let outcome = record_normal_tool_result(
-            &mut conversation,
-            None,
-            &request,
-            &result,
-            RunStatus::ApprovalRequired,
-            false,
-        )
-        .expect("record approval result");
+        let outcome = sampling_state
+            .record_normal_tool_result(
+                &mut conversation,
+                None,
+                &request,
+                &result,
+                RunStatus::ApprovalRequired,
+                false,
+            )
+            .expect("record approval result");
 
         match outcome {
-            ToolTurnOutcome::Return { status, error } => {
+            RuntimeToolResultRecordOutcome::Return { status, error } => {
                 assert_eq!(status, RunStatus::ApprovalRequired);
                 assert_eq!(error.as_deref(), Some("needs approval"));
             }
-            ToolTurnOutcome::Continue => panic!("approval-required result must return"),
+            RuntimeToolResultRecordOutcome::Continue => {
+                panic!("approval-required result must return")
+            }
         }
         assert_eq!(conversation.messages.len(), 1);
         assert!(
@@ -558,27 +547,31 @@ mod tests {
     }
 
     #[test]
-    fn record_normal_tool_result_returns_subagent_failure_after_recording_tool_message() {
+    fn sampling_request_state_records_subagent_failure_normal_tool_result() {
         let mut conversation = Conversation::new();
+        let sampling_state = RuntimeSamplingRequestState::new();
         let request = request(ToolName::Subagent, ActionKind::Agent, Some("audit"), None);
         let result = ToolResult::failed(&request, "child failed", None);
 
-        let outcome = record_normal_tool_result(
-            &mut conversation,
-            None,
-            &request,
-            &result,
-            RunStatus::Failed,
-            false,
-        )
-        .expect("record subagent failure");
+        let outcome = sampling_state
+            .record_normal_tool_result(
+                &mut conversation,
+                None,
+                &request,
+                &result,
+                RunStatus::Failed,
+                false,
+            )
+            .expect("record subagent failure");
 
         match outcome {
-            ToolTurnOutcome::Return { status, error } => {
+            RuntimeToolResultRecordOutcome::Return { status, error } => {
                 assert_eq!(status, RunStatus::Failed);
                 assert_eq!(error.as_deref(), Some("child failed"));
             }
-            ToolTurnOutcome::Continue => panic!("failed subagent result must return"),
+            RuntimeToolResultRecordOutcome::Continue => {
+                panic!("failed subagent result must return")
+            }
         }
         assert_eq!(conversation.messages.len(), 1);
         assert!(
@@ -639,9 +632,10 @@ mod tests {
         let cancel = CancelToken::new();
         let task_registry = TaskRegistry::new("normal-tool-turn".to_string());
         let mut background_workflows = Vec::new();
-        let mut permission_overlay = TurnPermissionOverlay::default();
+        let mut sampling_state = RuntimeSamplingRequestState::new();
 
         let outcome = run_normal_tool_turn(RuntimeNormalToolTurnContext {
+            sampling_state: &mut sampling_state,
             config: &config,
             cwd: cwd.path(),
             events: &mut events,
@@ -661,7 +655,6 @@ mod tests {
             task_registry: &task_registry,
             background_workflows: &mut background_workflows,
             workflow_ipc: None,
-            permission_overlay: &mut permission_overlay,
             permission_handler: None,
             extensions: None,
             child_executor: unused_child_executor,

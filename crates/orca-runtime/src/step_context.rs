@@ -1,8 +1,12 @@
+use std::io;
 use std::path::Path;
 
 use orca_approval::ApprovalPolicy;
 use orca_core::cancel::CancelToken;
 use orca_core::config::RunConfig;
+use orca_core::conversation::Conversation;
+use orca_core::event_schema::RunStatus;
+use orca_core::tool_types::{ToolName, ToolRequest, ToolResult};
 use orca_mcp::McpRegistry;
 
 use crate::extension::{ExtensionRegistry, RuntimeExtensionContext, RuntimeExtensionStores};
@@ -10,10 +14,11 @@ use crate::hooks::HookRunner;
 use crate::instructions::ProjectInstructions;
 use crate::lifecycle::{RuntimePermissionRequestHandler, TurnPermissionOverlay};
 use crate::memory::MemoryBlock;
+use crate::session::{record_plan_state_for_agent, record_tool_result_for_agent};
 use crate::tasks::TaskRegistry;
+use crate::thread_store::SessionWriter;
 use crate::tool_invocation::AgentToolPolicyContext;
 use crate::workflow::ipc::WorkflowIpcContext;
-use orca_core::tool_types::ToolRequest;
 
 #[derive(Clone, Copy)]
 pub(crate) struct RuntimeStepContext<'a> {
@@ -43,6 +48,14 @@ pub(crate) struct RuntimeSamplingRequestState {
 pub(crate) struct RuntimeToolDispatchWindow<'a> {
     tool_requests: &'a [ToolRequest],
     end_index: usize,
+}
+
+pub(crate) enum RuntimeToolResultRecordOutcome {
+    Continue,
+    Return {
+        status: RunStatus,
+        error: Option<String>,
+    },
 }
 
 impl<'a> RuntimeToolDispatchWindow<'a> {
@@ -108,6 +121,39 @@ impl RuntimeSamplingRequestState {
         window: &RuntimeToolDispatchWindow<'_>,
     ) {
         self.tool_cursor_index = window.end_index();
+    }
+
+    pub(crate) fn record_normal_tool_result(
+        &self,
+        conversation: &mut Conversation,
+        mut history_writer: Option<&mut SessionWriter>,
+        tool_request: &ToolRequest,
+        result: &ToolResult,
+        status: RunStatus,
+        emit_deltas: bool,
+    ) -> io::Result<RuntimeToolResultRecordOutcome> {
+        record_plan_state_for_agent(
+            conversation,
+            history_writer.as_deref_mut(),
+            tool_request,
+            result,
+        );
+        record_tool_result_for_agent(conversation, history_writer, result, emit_deltas)?;
+
+        if status == RunStatus::ApprovalRequired {
+            return Ok(RuntimeToolResultRecordOutcome::Return {
+                status,
+                error: result.error.clone(),
+            });
+        }
+        if status == RunStatus::Failed && tool_request.name == ToolName::Subagent {
+            return Ok(RuntimeToolResultRecordOutcome::Return {
+                status: RunStatus::Failed,
+                error: Some(result.error.clone().unwrap_or_default()),
+            });
+        }
+
+        Ok(RuntimeToolResultRecordOutcome::Continue)
     }
 }
 
