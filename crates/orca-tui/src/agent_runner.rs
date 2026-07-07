@@ -1586,6 +1586,58 @@ mod tests {
     }
 
     #[test]
+    fn tui_task_list_marks_backgrounded_main_session_tasks() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = full_auto_config();
+        config.cwd = Some(temp.path().to_path_buf());
+        let (event_tx, event_rx) = mpsc::channel();
+        let (_action_tx, action_rx) = mpsc::channel();
+        let cancel = CancelToken::new();
+        let mut session = TuiConversationSession::new_with_preloaded(&config, "task_list", None)
+            .expect("session");
+        let task = session
+            .runtime_session()
+            .task_registry()
+            .create_main_session("backgrounded turn".to_string());
+        session
+            .runtime_session()
+            .task_registry()
+            .mark_running(&task.id)
+            .expect("mark main session running");
+        session
+            .runtime_session()
+            .task_registry()
+            .mark_backgrounded(&task.id)
+            .expect("mark main session backgrounded");
+
+        run_agent_for_tui(
+            &config,
+            &mut session,
+            "task_list",
+            &event_tx,
+            &action_rx,
+            &cancel,
+            false,
+        );
+
+        let events: Vec<TuiEvent> = event_rx.try_iter().collect();
+        let output = events
+            .iter()
+            .find_map(|event| match event {
+                TuiEvent::ToolCompleted { name, output, .. } if name == "task_list" => Some(output),
+                _ => None,
+            })
+            .expect("task_list tool completion");
+        let value: serde_json::Value = serde_json::from_str(output).expect("task_list json");
+
+        assert!(value["tasks"].as_array().unwrap().iter().any(|task| {
+            task["task_type"] == "main_session"
+                && task["subject"] == "backgrounded turn"
+                && task["isBackgrounded"] == true
+        }));
+    }
+
+    #[test]
     fn failed_workflow_notification_is_returned_after_tool_batch_boundary() {
         let temp = tempfile::tempdir().unwrap();
         let mut config = full_auto_config();

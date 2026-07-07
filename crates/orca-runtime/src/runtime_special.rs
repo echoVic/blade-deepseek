@@ -444,6 +444,7 @@ fn task_summary_json(task: BackgroundTaskSummary) -> Value {
         "owner": Value::Null,
         "blockedBy": [],
         "task_type": task_type_label(task.task_type),
+        "isBackgrounded": task.is_backgrounded,
         "command": task.command,
     })
 }
@@ -516,4 +517,47 @@ fn workflow_draft_script_arg(request: &ToolRequest) -> io::Result<String> {
     serde_json::from_str::<WorkflowDraftInput>(raw_arguments)
         .map(|input| input.script)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn task_summary_json_marks_backgrounded_main_sessions() {
+        let task = BackgroundTaskSummary {
+            id: "task-main".to_string(),
+            task_type: TaskType::MainSession,
+            status: TaskStatus::Running,
+            is_backgrounded: true,
+            description: "long turn".to_string(),
+            created_at_ms: 1_000,
+            started_at_ms: Some(1_000),
+            completed_at_ms: None,
+            command: None,
+            agent_type: Some("main-session".to_string()),
+            server: None,
+            tool: None,
+            name: None,
+            workflow_run_id: None,
+            phase_count: None,
+            workflow_progress: None,
+            workflow_phases: Vec::new(),
+            workflow_agents: Vec::new(),
+            workflow_script_path: None,
+            workflow_launch_input: None,
+            workflow_final_summary: None,
+            workflow_failure_count: 0,
+            usage: None,
+            subagent_current_activity: None,
+            subagent_turn: None,
+            last_activity_at_ms: None,
+        };
+
+        let summary = task_summary_json(task);
+
+        assert_eq!(summary["task_type"], "main_session");
+        assert_eq!(summary["status"], "running");
+        assert_eq!(summary["isBackgrounded"], true);
+    }
 }
