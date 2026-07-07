@@ -358,6 +358,7 @@ pub struct AppState {
     pub panel_mode: PanelMode,
     pub workflow_panel: WorkflowPanelState,
     pub pending_workflow_notifications: VecDeque<String>,
+    pub suppress_background_main_session_output: bool,
     pub tick: u64,
 }
 
@@ -408,6 +409,7 @@ impl AppState {
             panel_mode: PanelMode::Conversation,
             workflow_panel: WorkflowPanelState::default(),
             pending_workflow_notifications: VecDeque::new(),
+            suppress_background_main_session_output: false,
             tick: 0,
         }
     }
@@ -666,9 +668,13 @@ impl AppState {
     pub fn update(&mut self, event: TuiEvent) {
         match event {
             TuiEvent::TurnStarted { .. } => {
+                self.suppress_background_main_session_output = false;
                 self.enter_running();
             }
             TuiEvent::ReasoningDelta(text) => {
+                if self.suppress_background_main_session_output {
+                    return;
+                }
                 if let Some(ChatMessage::Reasoning(existing)) = self.messages.last_mut() {
                     existing.push_str(&text);
                 } else {
@@ -676,6 +682,9 @@ impl AppState {
                 }
             }
             TuiEvent::MessageDelta(text) => {
+                if self.suppress_background_main_session_output {
+                    return;
+                }
                 if let Some(ChatMessage::Assistant(existing)) = self.messages.last_mut() {
                     existing.push_str(&text);
                 } else {
@@ -683,6 +692,9 @@ impl AppState {
                 }
             }
             TuiEvent::ToolRequested { id, name, target } => {
+                if self.suppress_background_main_session_output {
+                    return;
+                }
                 if name == "subagent" || name == "update_plan" {
                     return;
                 }
@@ -715,6 +727,9 @@ impl AppState {
                 name,
                 arguments_bytes,
             } => {
+                if self.suppress_background_main_session_output {
+                    return;
+                }
                 if name
                     .as_deref()
                     .is_some_and(is_panel_owned_tool_progress_name)
@@ -752,6 +767,9 @@ impl AppState {
                 }
             }
             TuiEvent::ToolOutputDelta { id, chunk } => {
+                if self.suppress_background_main_session_output {
+                    return;
+                }
                 if let Some(ChatMessage::ToolCall { output, .. }) =
                     self.messages.iter_mut().rev().find(|message| {
                         matches!(message, ChatMessage::ToolCall { id: existing_id, .. } if existing_id == &id)
@@ -768,6 +786,9 @@ impl AppState {
                 diff,
                 kind,
             } => {
+                if self.suppress_background_main_session_output {
+                    return;
+                }
                 if name == "subagent" || name == "update_plan" {
                     return;
                 }
@@ -817,6 +838,9 @@ impl AppState {
                 }
             }
             TuiEvent::PlanUpdated { explanation, plan } => {
+                if self.suppress_background_main_session_output {
+                    return;
+                }
                 // The live plan is shown in the bottom panel during the turn. It is archived
                 // inline (and the panel cleared) when the turn completes, so we avoid pushing a
                 // message on every update to keep the scrollback clean.
@@ -827,6 +851,9 @@ impl AppState {
                 };
             }
             TuiEvent::SubagentStarted { id, description } => {
+                if self.suppress_background_main_session_output {
+                    return;
+                }
                 self.messages.push(ChatMessage::Subagent {
                     id,
                     description,
@@ -847,6 +874,9 @@ impl AppState {
                 output,
                 error,
             } => {
+                if self.suppress_background_main_session_output {
+                    return;
+                }
                 let updated = self.messages.iter_mut().rev().find_map(|msg| {
                     if let ChatMessage::Subagent {
                         id: existing_id,
@@ -887,6 +917,9 @@ impl AppState {
                 turn,
                 usage,
             } => {
+                if self.suppress_background_main_session_output {
+                    return;
+                }
                 if let Some(ChatMessage::Subagent {
                     activity: existing_activity,
                     activity_tail,
@@ -907,9 +940,18 @@ impl AppState {
                 }
             }
             TuiEvent::WorkflowTasksUpdated { tasks } => {
+                if tasks.iter().any(|task| {
+                    task.task_type == orca_core::task_types::TaskType::MainSession
+                        && task.status == orca_core::task_types::TaskStatus::Running
+                        && task.is_backgrounded
+                }) {
+                    self.suppress_background_main_session_output = true;
+                    self.set_status(AppStatus::Idle);
+                }
                 self.workflow_panel.tasks = tasks;
                 if self.workflow_panel.selected >= self.workflow_panel.tasks.len() {
-                    self.workflow_panel.selected = self.workflow_panel.tasks.len().saturating_sub(1);
+                    self.workflow_panel.selected =
+                        self.workflow_panel.tasks.len().saturating_sub(1);
                 }
             }
             TuiEvent::WorkflowNotification {
@@ -918,9 +960,8 @@ impl AppState {
                 summary,
             } => {
                 self.pending_workflow_notifications.push_back(prompt);
-                self.messages.push(ChatMessage::System(format!(
-                    "Workflow {status}. {summary}"
-                )));
+                self.messages
+                    .push(ChatMessage::System(format!("Workflow {status}. {summary}")));
             }
             TuiEvent::ApprovalNeeded {
                 tool,
@@ -967,6 +1008,7 @@ impl AppState {
                 self.context_limit_tokens = limit_tokens;
             }
             TuiEvent::SessionCompleted { .. } => {
+                self.suppress_background_main_session_output = false;
                 self.clear_receiving_tool_progress();
                 self.promote_trailing_reasoning();
                 self.archive_current_plan();
@@ -2203,6 +2245,62 @@ mod tests {
         assert!(matches!(
             state.messages.last(),
             Some(ChatMessage::System(message)) if message.contains("Workflow completed. audit: done")
+        ));
+    }
+
+    #[test]
+    fn backgrounded_main_session_suppresses_foreground_output_until_completion() {
+        let mut state = state();
+        state.update(TuiEvent::WorkflowTasksUpdated {
+            tasks: vec![BackgroundTaskSummary {
+                id: "task-main".to_string(),
+                task_type: TaskType::MainSession,
+                status: TaskStatus::Running,
+                is_backgrounded: true,
+                description: "long answer".to_string(),
+                created_at_ms: 1_000,
+                started_at_ms: Some(1_000),
+                completed_at_ms: None,
+                command: None,
+                agent_type: Some("main-session".to_string()),
+                server: None,
+                tool: None,
+                name: None,
+                workflow_run_id: None,
+                phase_count: None,
+                workflow_progress: None,
+                workflow_phases: Vec::new(),
+                workflow_agents: Vec::new(),
+                workflow_script_path: None,
+                workflow_launch_input: None,
+                workflow_final_summary: None,
+                workflow_failure_count: 0,
+                usage: None,
+                subagent_current_activity: None,
+                subagent_turn: None,
+                last_activity_at_ms: None,
+            }],
+        });
+
+        state.update(TuiEvent::MessageDelta(
+            "hidden background output".to_string(),
+        ));
+        assert!(state.messages.is_empty());
+
+        state.update(TuiEvent::SessionCompleted {
+            status: "success".to_string(),
+        });
+        state.update(TuiEvent::TurnStarted {
+            turn: 2,
+            task: None,
+        });
+        state.update(TuiEvent::MessageDelta(
+            "visible foreground output".to_string(),
+        ));
+
+        assert!(matches!(
+            state.messages.last(),
+            Some(ChatMessage::Assistant(text)) if text == "visible foreground output"
         ));
     }
 
