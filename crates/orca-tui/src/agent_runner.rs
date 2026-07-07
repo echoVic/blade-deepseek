@@ -13,7 +13,7 @@ use orca_core::hook_types::HookEvent;
 use orca_core::model::ModelRouteContext;
 use orca_core::provider_types::{ProviderResponse, ProviderStep};
 use orca_core::subagent_types::SubagentType;
-use orca_core::task_types::BackgroundTaskSummary;
+use orca_core::task_types::{BackgroundTaskSummary, PendingToolCallSummary};
 use orca_core::tool_types;
 use orca_core::workflow_types::WorkflowInput;
 use orca_mcp::McpRegistry;
@@ -206,16 +206,36 @@ fn provider_response_status(response: &ProviderResponse) -> &'static str {
     }
 }
 
-fn provider_response_pending_tool_name(response: &ProviderResponse) -> Option<String> {
+fn provider_response_pending_tool_call(
+    response: &ProviderResponse,
+) -> Option<PendingToolCallSummary> {
     response
-        .tool_calls
-        .first()
-        .map(|tool_call| tool_call.function_name.clone())
+        .steps
+        .iter()
+        .find_map(|step| match step {
+            ProviderStep::ToolCall(request) => Some(PendingToolCallSummary {
+                id: request.id.clone(),
+                name: request.name.as_str().to_string(),
+                action: request.action,
+                target: request.target.clone(),
+                arguments: request
+                    .raw_arguments
+                    .clone()
+                    .unwrap_or_else(|| "{}".to_string()),
+            }),
+            _ => None,
+        })
         .or_else(|| {
-            response.steps.iter().find_map(|step| match step {
-                ProviderStep::ToolCall(request) => Some(request.name.as_str().to_string()),
-                _ => None,
-            })
+            response
+                .tool_calls
+                .first()
+                .map(|tool_call| PendingToolCallSummary {
+                    id: tool_call.id.clone(),
+                    name: tool_call.function_name.clone(),
+                    action: orca_core::approval_types::ActionKind::Read,
+                    target: None,
+                    arguments: tool_call.arguments.clone(),
+                })
         })
 }
 
@@ -228,21 +248,24 @@ fn spawn_background_provider_completion(
 ) {
     thread::spawn(move || {
         let mut status = "failed";
-        let mut pending_tool = None;
+        let mut pending_tool_call = None;
         while let Ok(event) = provider_rx.recv() {
             if let ProviderStreamEvent::Done(response) = event {
                 status = provider_response_status(&response);
-                pending_tool = provider_response_pending_tool_name(&response);
+                pending_tool_call = provider_response_pending_tool_call(&response);
                 break;
             }
         }
+        let pending_tool_name = pending_tool_call
+            .as_ref()
+            .map(|pending_tool_call| pending_tool_call.name.as_str());
 
         let result = match status {
             "success" => task_registry.complete(&task_id, status.to_string()),
-            "approval_required" => task_registry.approval_required_for_tool(
+            "approval_required" => task_registry.approval_required_for_pending_tool(
                 &task_id,
                 status.to_string(),
-                pending_tool.clone(),
+                pending_tool_call.clone(),
             ),
             _ => task_registry.fail(&task_id, status.to_string()),
         };
@@ -252,7 +275,7 @@ fn spawn_background_provider_completion(
         }
         let _ = event_tx.send(TuiEvent::Notice(background_completion_notice(
             status,
-            pending_tool.as_deref(),
+            pending_tool_name,
         )));
     });
 }

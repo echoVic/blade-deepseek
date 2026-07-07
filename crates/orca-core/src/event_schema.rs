@@ -844,6 +844,7 @@ mod tests {
             agent_type: None,
             server: None,
             tool: Some("workflow".to_string()),
+            pending_tool_call: None,
             name: Some("demo".to_string()),
             workflow_run_id: Some("workflow-run-1".to_string()),
             phase_count: Some(2),

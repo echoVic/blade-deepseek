@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use crate::approval_types::ActionKind;
 use crate::cost_types::UsageTotals;
 use crate::workflow_types::{WorkflowAgentStatus, WorkflowInput, WorkflowRunStatus};
 
@@ -77,6 +78,17 @@ pub struct WorkflowPhaseTaskSummary {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct PendingToolCallSummary {
+    pub id: String,
+    pub name: String,
+    pub action: ActionKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    pub arguments: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BackgroundTaskSummary {
     pub id: String,
     #[serde(rename = "type")]
@@ -98,6 +110,8 @@ pub struct BackgroundTaskSummary {
     pub server: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_tool_call: Option<PendingToolCallSummary>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

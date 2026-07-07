@@ -9,7 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use orca_core::cancel::CancelToken;
 use orca_core::cost_types::UsageTotals;
 use orca_core::task_types::{
-    BackgroundTaskSummary, TaskStatus, TaskType, WorkflowAgentTaskSummary,
+    BackgroundTaskSummary, PendingToolCallSummary, TaskStatus, TaskType, WorkflowAgentTaskSummary,
     WorkflowPhaseTaskSummary, WorkflowTaskProgress,
 };
 use orca_core::workflow_types::WorkflowInput;
@@ -46,6 +46,7 @@ pub struct TaskRecord {
     pub name: Option<String>,
     pub agent_type: Option<String>,
     pub tool: Option<String>,
+    pub pending_tool_call: Option<PendingToolCallSummary>,
     pub workflow_run_id: Option<String>,
     pub phase_count: Option<usize>,
     pub workflow_progress: Option<WorkflowTaskProgress>,
@@ -93,6 +94,8 @@ struct PersistedTaskRecord {
     agent_type: Option<String>,
     #[serde(default)]
     tool: Option<String>,
+    #[serde(default)]
+    pending_tool_call: Option<PendingToolCallSummary>,
     workflow_run_id: Option<String>,
     phase_count: Option<usize>,
     workflow_progress: Option<WorkflowTaskProgress>,
@@ -187,6 +190,7 @@ impl TaskRegistry {
             name: Some(name),
             agent_type: None,
             tool: None,
+            pending_tool_call: None,
             workflow_run_id: Some(workflow_run_id.clone()),
             phase_count: Some(phase_count),
             workflow_progress: None,
@@ -236,6 +240,7 @@ impl TaskRegistry {
             name: None,
             agent_type,
             tool: None,
+            pending_tool_call: None,
             workflow_run_id: None,
             phase_count: None,
             workflow_progress: None,
@@ -285,6 +290,7 @@ impl TaskRegistry {
             name: None,
             agent_type: Some("main-session".to_string()),
             tool: None,
+            pending_tool_call: None,
             workflow_run_id: None,
             phase_count: None,
             workflow_progress: None,
@@ -334,6 +340,7 @@ impl TaskRegistry {
             name: None,
             agent_type: None,
             tool: None,
+            pending_tool_call: None,
             workflow_run_id: None,
             phase_count: None,
             workflow_progress: None,
@@ -382,6 +389,7 @@ impl TaskRegistry {
                         agent_type: record.agent_type.clone(),
                         server: None,
                         tool: record.tool.clone(),
+                        pending_tool_call: record.pending_tool_call.clone(),
                         name: record.name.clone(),
                         workflow_run_id: record.workflow_run_id.clone(),
                         phase_count: record.phase_count,
@@ -604,6 +612,28 @@ impl TaskRegistry {
         summary: String,
         tool: Option<String>,
     ) -> Result<(), String> {
+        self.approval_required_with_pending_tool(id, summary, tool, None)
+    }
+
+    pub fn approval_required_for_pending_tool(
+        &self,
+        id: &str,
+        summary: String,
+        pending_tool_call: Option<PendingToolCallSummary>,
+    ) -> Result<(), String> {
+        let tool = pending_tool_call
+            .as_ref()
+            .map(|pending_tool_call| pending_tool_call.name.clone());
+        self.approval_required_with_pending_tool(id, summary, tool, pending_tool_call)
+    }
+
+    fn approval_required_with_pending_tool(
+        &self,
+        id: &str,
+        summary: String,
+        tool: Option<String>,
+        pending_tool_call: Option<PendingToolCallSummary>,
+    ) -> Result<(), String> {
         self.update_task(id, |record| {
             record.status = TaskStatus::ApprovalRequired;
             if record.started_at_ms.is_none() {
@@ -613,6 +643,7 @@ impl TaskRegistry {
             record.result = Some(summary);
             record.error = None;
             record.tool = tool;
+            record.pending_tool_call = pending_tool_call;
             record.worker_pid = None;
             record.control.pause.store(false, Ordering::Release);
             Ok(())
@@ -851,6 +882,7 @@ impl PersistedTaskRecord {
             name: self.name,
             agent_type: self.agent_type,
             tool: self.tool,
+            pending_tool_call: self.pending_tool_call,
             workflow_run_id: self.workflow_run_id,
             phase_count: self.phase_count,
             workflow_progress: self.workflow_progress,
@@ -893,6 +925,7 @@ impl From<&TaskRecord> for PersistedTaskRecord {
             name: record.name.clone(),
             agent_type: record.agent_type.clone(),
             tool: record.tool.clone(),
+            pending_tool_call: record.pending_tool_call.clone(),
             workflow_run_id: record.workflow_run_id.clone(),
             phase_count: record.phase_count,
             workflow_progress: record.workflow_progress,
@@ -1279,16 +1312,25 @@ mod tests {
 
     #[test]
     fn registry_lists_approval_required_tool_name() {
+        use orca_core::approval_types::ActionKind;
+        use orca_core::task_types::PendingToolCallSummary;
+
         let registry = TaskRegistry::new("session-1".to_string());
         let task = registry.create_main_session("Needs a tool".to_string());
 
         registry.mark_running(&task.id).unwrap();
         registry.mark_backgrounded(&task.id).unwrap();
         registry
-            .approval_required_for_tool(
+            .approval_required_for_pending_tool(
                 &task.id,
                 "approval_required".to_string(),
-                Some("task_list".to_string()),
+                Some(PendingToolCallSummary {
+                    id: "mock-tool-1".to_string(),
+                    name: "task_list".to_string(),
+                    action: ActionKind::Read,
+                    target: None,
+                    arguments: "{}".to_string(),
+                }),
             )
             .unwrap();
 
@@ -1296,6 +1338,11 @@ mod tests {
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].status, TaskStatus::ApprovalRequired);
         assert_eq!(list[0].tool.as_deref(), Some("task_list"));
+        let pending_tool = list[0].pending_tool_call.as_ref().unwrap();
+        assert_eq!(pending_tool.id, "mock-tool-1");
+        assert_eq!(pending_tool.name, "task_list");
+        assert_eq!(pending_tool.action, ActionKind::Read);
+        assert_eq!(pending_tool.arguments, "{}");
     }
 
     #[test]

@@ -454,6 +454,8 @@ fn task_summary_json(task: BackgroundTaskSummary) -> Value {
         "task_type": task_type_label(task.task_type),
         "isBackgrounded": task.is_backgrounded,
         "command": task.command,
+        "tool": task.tool,
+        "pendingToolCall": task.pending_tool_call,
     })
 }
 
@@ -531,6 +533,8 @@ fn workflow_draft_script_arg(request: &ToolRequest) -> io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use orca_core::approval_types::ActionKind;
+    use orca_core::task_types::PendingToolCallSummary;
     use orca_core::tool_types::ToolStatus;
 
     #[test]
@@ -538,16 +542,23 @@ mod tests {
         let task = BackgroundTaskSummary {
             id: "task-main".to_string(),
             task_type: TaskType::MainSession,
-            status: TaskStatus::Running,
+            status: TaskStatus::ApprovalRequired,
             is_backgrounded: true,
             description: "long turn".to_string(),
             created_at_ms: 1_000,
             started_at_ms: Some(1_000),
-            completed_at_ms: None,
+            completed_at_ms: Some(2_000),
             command: None,
             agent_type: Some("main-session".to_string()),
             server: None,
-            tool: None,
+            tool: Some("task_list".to_string()),
+            pending_tool_call: Some(PendingToolCallSummary {
+                id: "mock-tool-1".to_string(),
+                name: "task_list".to_string(),
+                action: ActionKind::Read,
+                target: None,
+                arguments: "{}".to_string(),
+            }),
             name: None,
             workflow_run_id: None,
             phase_count: None,
@@ -567,8 +578,13 @@ mod tests {
         let summary = task_summary_json(task);
 
         assert_eq!(summary["task_type"], "main_session");
-        assert_eq!(summary["status"], "running");
+        assert_eq!(summary["status"], "approval_required");
         assert_eq!(summary["isBackgrounded"], true);
+        assert_eq!(summary["tool"], "task_list");
+        assert_eq!(summary["pendingToolCall"]["id"], "mock-tool-1");
+        assert_eq!(summary["pendingToolCall"]["name"], "task_list");
+        assert_eq!(summary["pendingToolCall"]["action"], "read");
+        assert_eq!(summary["pendingToolCall"]["arguments"], "{}");
     }
 
     #[test]

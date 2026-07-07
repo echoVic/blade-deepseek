@@ -1567,7 +1567,7 @@ mod tests {
 
             action_tx.send(UserAction::BackgroundCurrentTurn).unwrap();
 
-            let tool = loop {
+            let pending_tool = loop {
                 match event_rx.recv_timeout(Duration::from_secs(2)).unwrap() {
                     TuiEvent::WorkflowTasksUpdated { tasks } => {
                         if let Some(task) = tasks.into_iter().find(|task| {
@@ -1576,7 +1576,7 @@ mod tests {
                                 && task.status
                                     == orca_core::task_types::TaskStatus::ApprovalRequired
                         }) {
-                            break task.tool;
+                            break task.pending_tool_call;
                         }
                     }
                     _ => {}
@@ -1586,7 +1586,14 @@ mod tests {
             action_tx.send(UserAction::Cancel).unwrap();
             handle.join().unwrap();
 
-            assert_eq!(tool.as_deref(), Some("task_list"));
+            let pending_tool = pending_tool.expect("pending tool call");
+            assert_eq!(pending_tool.id, "mock-tool-1");
+            assert_eq!(pending_tool.name, "task_list");
+            assert_eq!(
+                pending_tool.action,
+                orca_core::approval_types::ActionKind::Read
+            );
+            assert_eq!(pending_tool.arguments, "{}");
         });
     }
 
