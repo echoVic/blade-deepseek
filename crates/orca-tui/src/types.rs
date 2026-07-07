@@ -1007,11 +1007,17 @@ impl AppState {
                 self.context_used_tokens = used_tokens;
                 self.context_limit_tokens = limit_tokens;
             }
-            TuiEvent::SessionCompleted { .. } => {
+            TuiEvent::SessionCompleted { status } => {
+                let was_backgrounded = self.suppress_background_main_session_output;
                 self.suppress_background_main_session_output = false;
                 self.clear_receiving_tool_progress();
                 self.promote_trailing_reasoning();
                 self.archive_current_plan();
+                if was_backgrounded {
+                    self.messages.push(ChatMessage::System(format!(
+                        "Background session completed: {status}"
+                    )));
+                }
                 self.finalize_turn();
                 self.set_status(AppStatus::Idle);
                 self.last_completed_at = Some(Instant::now());
@@ -2302,6 +2308,52 @@ mod tests {
             state.messages.last(),
             Some(ChatMessage::Assistant(text)) if text == "visible foreground output"
         ));
+    }
+
+    #[test]
+    fn backgrounded_main_session_completion_adds_system_notice() {
+        let mut state = state();
+        state.update(TuiEvent::WorkflowTasksUpdated {
+            tasks: vec![BackgroundTaskSummary {
+                id: "task-main".to_string(),
+                task_type: TaskType::MainSession,
+                status: TaskStatus::Running,
+                is_backgrounded: true,
+                description: "long answer".to_string(),
+                created_at_ms: 1_000,
+                started_at_ms: Some(1_000),
+                completed_at_ms: None,
+                command: None,
+                agent_type: Some("main-session".to_string()),
+                server: None,
+                tool: None,
+                name: None,
+                workflow_run_id: None,
+                phase_count: None,
+                workflow_progress: None,
+                workflow_phases: Vec::new(),
+                workflow_agents: Vec::new(),
+                workflow_script_path: None,
+                workflow_launch_input: None,
+                workflow_final_summary: None,
+                workflow_failure_count: 0,
+                usage: None,
+                subagent_current_activity: None,
+                subagent_turn: None,
+                last_activity_at_ms: None,
+            }],
+        });
+
+        state.update(TuiEvent::SessionCompleted {
+            status: "success".to_string(),
+        });
+
+        assert!(matches!(
+            state.messages.last(),
+            Some(ChatMessage::System(message))
+                if message == "Background session completed: success"
+        ));
+        assert_eq!(state.status, AppStatus::Idle);
     }
 
     #[test]
