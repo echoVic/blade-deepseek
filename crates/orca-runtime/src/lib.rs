@@ -40,6 +40,7 @@ pub mod runtime_state;
 mod runtime_steer;
 mod runtime_tool_actor;
 mod runtime_turn_iteration;
+mod runtime_turn_kernel;
 mod runtime_turn_loop;
 mod runtime_turn_opening;
 mod runtime_turn_setup;
@@ -597,6 +598,49 @@ mod tests {
         assert!(
             !tool_turn_runtime_source.contains("pub(crate) fn record_normal_tool_result"),
             "tool_turn production code must not own normal tool result recording"
+        );
+    }
+
+    #[test]
+    fn runtime_turn_kernel_owns_sampling_request_state_and_reducer() {
+        let kernel_source = include_str!("runtime_turn_kernel.rs");
+        let provider_turn_source = include_str!("provider_turn.rs");
+        let provider_turn_runtime_source = provider_turn_source
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .expect("provider turn runtime source");
+
+        assert!(
+            kernel_source.contains("pub(crate) struct RuntimeTurnKernel"),
+            "RuntimeTurnKernel must be the named per-turn runtime kernel"
+        );
+        assert!(
+            kernel_source.contains("sampling_state: RuntimeSamplingRequestState"),
+            "RuntimeTurnKernel must own sampling-request state"
+        );
+        assert!(
+            kernel_source.contains("reducer: RuntimeTurnReducer"),
+            "RuntimeTurnKernel must own the runtime turn reducer"
+        );
+        assert!(
+            kernel_source.contains("pub(crate) fn sampling_state_mut("),
+            "RuntimeTurnKernel must expose mutable sampling state access"
+        );
+        assert!(
+            kernel_source.contains("pub(crate) fn reducer("),
+            "RuntimeTurnKernel must expose reducer access for turn transitions"
+        );
+        assert!(
+            provider_turn_runtime_source.contains("RuntimeTurnKernel::from_extension_stores("),
+            "provider_turn must construct sampling request state through RuntimeTurnKernel"
+        );
+        assert!(
+            provider_turn_runtime_source.contains("sampling_state: kernel.sampling_state_mut()"),
+            "provider_turn must pass kernel-owned sampling state into response handling"
+        );
+        assert!(
+            !provider_turn_runtime_source.contains("RuntimeSamplingRequestState::new()"),
+            "provider_turn must not allocate sampling request state outside RuntimeTurnKernel"
         );
     }
 

@@ -1850,7 +1850,8 @@ fn server_mode_controls_runtime_shell_session() {
     assert_eq!(closed["status"], "stdin_closed");
 
     let mut read_events = Vec::new();
-    for attempt in 0..5 {
+    let read_deadline = Instant::now() + Duration::from_secs(5);
+    for attempt in 0.. {
         let request_id = format!("shell-read-{attempt}");
         {
             let stdin = child.stdin.as_mut().expect("server stdin");
@@ -1870,6 +1871,11 @@ fn server_mode_controls_runtime_shell_session() {
         if completed {
             break;
         }
+        assert!(
+            Instant::now() < read_deadline,
+            "shell/read did not observe shell completion before deadline; events={read_events:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
     }
     drop(child.stdin.take());
     assert!(

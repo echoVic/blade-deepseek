@@ -24,6 +24,7 @@ use crate::memory::{self, MemoryBlock};
 use crate::runtime_conversation_bootstrap::RuntimePreparedConversation;
 use crate::runtime_directive::conversation_with_runtime_system_messages;
 use crate::runtime_steer::{RuntimeSteerInput, RuntimeSteerStep};
+use crate::runtime_turn_kernel::RuntimeTurnKernel;
 use crate::session::record_assistant_response_for_agent;
 use crate::step_context::{RuntimeSamplingRequestState, RuntimeStepContext};
 use crate::tasks::TaskRegistry;
@@ -543,7 +544,7 @@ impl RuntimeTurnProviderCycleStep {
         }
 
         let (conversation, history_writer) = input.conversation.parts_mut();
-        let mut sampling_state = RuntimeSamplingRequestState::new();
+        let mut kernel = RuntimeTurnKernel::from_extension_stores(input.extensions.stores());
         self.handle_response(
             response,
             RuntimeProviderResponseInput {
@@ -564,7 +565,7 @@ impl RuntimeTurnProviderCycleStep {
                     input.permission_handler,
                 )
                 .with_extensions(input.extensions.registry(), input.extensions.stores()),
-                sampling_state: &mut sampling_state,
+                sampling_state: kernel.sampling_state_mut(),
                 events: input.events,
                 sink: input.sink,
                 conversation,

@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.178":
+        "RuntimeTurnKernel now owns the per-sampling request state together with the runtime turn reducer. Provider response handling constructs tool-dispatch state through that kernel before passing it into tool turns, preserving behavior while giving the next Codex-style turn-state consolidation a named boundary.",
       "v0.1.177":
         "command/exec/list snapshots now include the backing shellId, taskId, requestedTerminalMode, and effectiveTerminalMode. Reconnecting app-server clients can restore active command/exec display and PTY or pipe semantics with the same task identity used by shell/list.",
       "v0.1.176":
@@ -382,6 +384,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.178":
+        "RuntimeTurnKernel 现在同时持有每次 sampling request 的状态和 runtime turn reducer。Provider response handling 会先通过这个 kernel 构造 tool-dispatch state，再交给 tool turn；用户可见行为不变，但下一步 Codex 风格 turn-state 收口有了明确边界。",
       "v0.1.177":
         "command/exec/list 快照现在包含底层 shellId、taskId、requestedTerminalMode 和 effectiveTerminalMode。重连后的 app-server 客户端可以用和 shell/list 一致的 task identity 恢复 active command/exec 的展示，以及 PTY 或 pipe 语义。",
       "v0.1.176":

@@ -4,10 +4,15 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-07-07
-Current baseline: v0.1.177 enriches server-mode `command/exec/list` snapshots
-with the backing `shellId`, `taskId`, requested terminal mode, and effective
-terminal mode, so reconnecting app-server clients can recover the same task
-identity and PTY/pipe semantics exposed by `shell/list`. Earlier v0.1.176 added
+Current baseline: v0.1.178 introduces a `RuntimeTurnKernel` that owns the
+per-sampling request state together with the runtime turn reducer. Provider
+response handling now constructs tool-dispatch state through that kernel before
+passing it into tool turns, preserving behavior while giving the next
+Codex-style turn state consolidation a named runtime boundary. Earlier v0.1.177
+enriches server-mode `command/exec/list` snapshots with the backing `shellId`,
+`taskId`, requested terminal mode, and effective terminal mode, so reconnecting
+app-server clients can recover the same task identity and PTY/pipe semantics
+exposed by `shell/list`. Earlier v0.1.176 added
 server-mode `command/exec/list` so app-server clients can recover active
 `command/exec` process handles by listing `processId`, original command argv,
 `cwd`, running status, stream-output settings, output cap, and stdout/stderr
