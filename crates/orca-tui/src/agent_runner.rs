@@ -103,6 +103,44 @@ pub(crate) fn send_workflow_tasks_updated_for_tui(
     send_runtime_event_as_tui(event_tx, events.workflow_tasks_updated(tasks));
 }
 
+fn start_main_session_task_for_tui(
+    session: &TuiConversationSession,
+    event_tx: &Sender<TuiEvent>,
+    events: &mut EventFactory,
+    prompt: &str,
+) -> String {
+    let task = session
+        .task_registry()
+        .create_main_session(prompt.to_string());
+    let _ = session.task_registry().mark_running(&task.id);
+    send_workflow_tasks_updated_for_tui(event_tx, events, &session.task_registry().list());
+    task.id
+}
+
+fn finish_main_session_task_for_tui(
+    session: &TuiConversationSession,
+    event_tx: &Sender<TuiEvent>,
+    events: &mut EventFactory,
+    task_id: &str,
+    status: &str,
+) {
+    let usage = Some(session.usage_totals());
+    let result = match status {
+        "success" => {
+            session
+                .task_registry()
+                .complete_with_usage(task_id, status.to_string(), usage)
+        }
+        "interrupted" | "cancelled" => session.task_registry().stop(task_id, status.to_string()),
+        _ => session
+            .task_registry()
+            .fail_with_usage(task_id, status.to_string(), usage),
+    };
+    if result.is_ok() {
+        send_workflow_tasks_updated_for_tui(event_tx, events, &session.task_registry().list());
+    }
+}
+
 pub(crate) fn send_tool_requested_for_tui(
     event_tx: &Sender<TuiEvent>,
     events: &mut EventFactory,
@@ -367,6 +405,8 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
             .unwrap_or("tui-agent-session")
             .to_string(),
     );
+    let main_session_task_id =
+        start_main_session_task_for_tui(session, event_tx, &mut runtime_events, prompt);
 
     loop {
         turn += 1;
@@ -377,6 +417,13 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
                 event_tx,
                 &mut runtime_events,
                 orca_core::event_schema::RunStatus::BudgetExhausted,
+            );
+            finish_main_session_task_for_tui(
+                session,
+                event_tx,
+                &mut runtime_events,
+                &main_session_task_id,
+                "budget_exhausted",
             );
             session.complete("budget_exhausted");
             return TuiAgentTurnResult::new("budget_exhausted");
@@ -434,6 +481,13 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
                     event_tx,
                     &mut runtime_events,
                     orca_core::event_schema::RunStatus::Failed,
+                );
+                finish_main_session_task_for_tui(
+                    session,
+                    event_tx,
+                    &mut runtime_events,
+                    &main_session_task_id,
+                    "failed",
                 );
                 session.complete("failed");
                 return TuiAgentTurnResult::new("failed");
@@ -508,6 +562,13 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
                     &mut runtime_events,
                     orca_core::event_schema::RunStatus::BudgetExhausted,
                 );
+                finish_main_session_task_for_tui(
+                    session,
+                    event_tx,
+                    &mut runtime_events,
+                    &main_session_task_id,
+                    "budget_exhausted",
+                );
                 session.complete("budget_exhausted");
                 return TuiAgentTurnResult::new("budget_exhausted");
             }
@@ -518,6 +579,13 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
                 event_tx,
                 &mut runtime_events,
                 orca_core::event_schema::RunStatus::Cancelled,
+            );
+            finish_main_session_task_for_tui(
+                session,
+                event_tx,
+                &mut runtime_events,
+                &main_session_task_id,
+                "interrupted",
             );
             session.complete("interrupted");
             return TuiAgentTurnResult::new("interrupted");
@@ -559,6 +627,13 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
                 event_tx,
                 &mut runtime_events,
                 orca_core::event_schema::RunStatus::Failed,
+            );
+            finish_main_session_task_for_tui(
+                session,
+                event_tx,
+                &mut runtime_events,
+                &main_session_task_id,
+                "failed",
             );
             session.complete("failed");
             return TuiAgentTurnResult::new("failed");
@@ -620,6 +695,13 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
                 &mut runtime_events,
                 orca_core::event_schema::RunStatus::Success,
             );
+            finish_main_session_task_for_tui(
+                session,
+                event_tx,
+                &mut runtime_events,
+                &main_session_task_id,
+                "success",
+            );
             session.complete("success");
             return TuiAgentTurnResult::new("success");
         }
@@ -673,6 +755,13 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
                             event_tx,
                             &mut runtime_events,
                             orca_core::event_schema::RunStatus::ApprovalRequired,
+                        );
+                        finish_main_session_task_for_tui(
+                            session,
+                            event_tx,
+                            &mut runtime_events,
+                            &main_session_task_id,
+                            "approval_required",
                         );
                         session.complete("approval_required");
                         return TuiAgentTurnResult::new("approval_required");
@@ -771,6 +860,13 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
                     "failed"
                 };
                 send_session_completed_status_for_tui(event_tx, &mut runtime_events, status);
+                finish_main_session_task_for_tui(
+                    session,
+                    event_tx,
+                    &mut runtime_events,
+                    &main_session_task_id,
+                    status,
+                );
                 session.complete(status);
                 return TuiAgentTurnResult::new(status);
             }
@@ -783,6 +879,13 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
                 event_tx,
                 &mut runtime_events,
                 orca_core::event_schema::RunStatus::Success,
+            );
+            finish_main_session_task_for_tui(
+                session,
+                event_tx,
+                &mut runtime_events,
+                &main_session_task_id,
+                "success",
             );
             session.complete("success");
             return TuiAgentTurnResult::with_next_prompt("success", next_prompt);
@@ -837,6 +940,7 @@ mod tests {
     use orca_core::config::{HistoryMode, OutputFormat, ProviderKind, RunConfig};
     use orca_core::event_schema::RunStatus;
     use orca_core::model::ModelSelection;
+    use orca_core::task_types::{TaskStatus, TaskType};
     use orca_runtime::workflow::host::WorkflowHost;
 
     fn config() -> RunConfig {
@@ -1050,6 +1154,66 @@ mod tests {
         assert_eq!(turn.1.kind, "agent");
         assert_eq!(turn.1.status, "running");
         assert_eq!(turn.1.turn, 1);
+    }
+
+    #[test]
+    fn tui_main_turn_updates_main_session_task_registry() {
+        let config = config();
+        let (event_tx, event_rx) = mpsc::channel();
+        let (_action_tx, action_rx) = mpsc::channel();
+        let cancel = CancelToken::new();
+        let mut session =
+            TuiConversationSession::new_with_preloaded(&config, "main session task", None)
+                .expect("session");
+
+        let status = run_agent_for_tui(
+            &config,
+            &mut session,
+            "mock_silent_final",
+            &event_tx,
+            &action_rx,
+            &cancel,
+            false,
+        );
+
+        assert_eq!(status, "success");
+        let main_tasks = session
+            .runtime_session()
+            .task_registry()
+            .list()
+            .into_iter()
+            .filter(|task| task.task_type == TaskType::MainSession)
+            .collect::<Vec<_>>();
+        assert_eq!(main_tasks.len(), 1);
+        assert_eq!(main_tasks[0].status, TaskStatus::Completed);
+        assert_eq!(main_tasks[0].description, "mock_silent_final");
+        assert_eq!(main_tasks[0].agent_type.as_deref(), Some("main-session"));
+        assert!(main_tasks[0].started_at_ms.is_some());
+        assert!(main_tasks[0].completed_at_ms.is_some());
+
+        let events = event_rx.try_iter().collect::<Vec<_>>();
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                TuiEvent::WorkflowTasksUpdated { tasks }
+                if tasks.iter().any(|task| {
+                    task.task_type == TaskType::MainSession
+                        && task.status == TaskStatus::Running
+                        && task.description == "mock_silent_final"
+                })
+            )
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                TuiEvent::WorkflowTasksUpdated { tasks }
+                if tasks.iter().any(|task| {
+                    task.task_type == TaskType::MainSession
+                        && task.status == TaskStatus::Completed
+                        && task.description == "mock_silent_final"
+                })
+            )
+        }));
     }
 
     #[test]
