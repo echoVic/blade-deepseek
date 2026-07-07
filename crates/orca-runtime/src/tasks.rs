@@ -143,9 +143,11 @@ impl TaskRegistry {
         })
     }
 
-    pub fn new_for_cwd(session_id: String, cwd: &Path) -> Self {
-        Self::new_persistent(session_id.clone(), cwd.join(".orca").join("task-sessions"))
-            .unwrap_or_else(|_| Self::new(session_id))
+    pub fn new_for_cwd(session_id: String, _cwd: &Path) -> Self {
+        let Some(root) = task_sessions_root() else {
+            return Self::new(session_id);
+        };
+        Self::new_persistent(session_id.clone(), root).unwrap_or_else(|_| Self::new(session_id))
     }
 
     pub fn session_id(&self) -> &str {
@@ -902,6 +904,13 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> io::Result<T> {
     let content = fs::read_to_string(path)?;
     serde_json::from_str(&content)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+fn task_sessions_root() -> Option<PathBuf> {
+    std::env::var_os("ORCA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".orca")))
+        .map(|home| home.join("task-sessions"))
 }
 
 #[cfg(test)]

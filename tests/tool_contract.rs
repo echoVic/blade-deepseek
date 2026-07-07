@@ -150,7 +150,9 @@ fn suggest_denies_bash_in_jsonl_mode() {
 #[test]
 fn full_auto_allows_bash_tool() {
     let _guard = tool_cli_test_guard();
+    let home = make_temp_workspace("bash-home");
     let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .env("ORCA_HOME", &home)
         .args([
             "exec",
             "--output-format",
@@ -176,7 +178,9 @@ fn full_auto_allows_bash_tool() {
 #[test]
 fn full_auto_bash_tool_events_include_shell_task_lifecycle() {
     let _guard = tool_cli_test_guard();
+    let home = make_temp_workspace("bash-lifecycle-home");
     let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .env("ORCA_HOME", &home)
         .args([
             "exec",
             "--output-format",
@@ -211,7 +215,9 @@ fn full_auto_bash_tool_events_include_shell_task_lifecycle() {
 fn full_auto_bash_persists_runtime_shell_task_record() {
     let _guard = tool_cli_test_guard();
     let workspace = make_temp_workspace("bash-shell-task");
+    let home = make_temp_workspace("bash-shell-task-home");
     let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .env("ORCA_HOME", &home)
         .args([
             "exec",
             "--output-format",
@@ -235,7 +241,13 @@ fn full_auto_bash_persists_runtime_shell_task_record() {
     assert_eq!(completed["payload"]["status"], "completed");
     assert_eq!(completed["payload"]["output"], "persisted-shell-task");
 
-    let sessions_root = workspace.join(".orca").join("task-sessions");
+    let project_sessions_root = workspace.join(".orca").join("task-sessions");
+    assert!(
+        !project_sessions_root.exists(),
+        "task sessions should not be written under project .orca"
+    );
+
+    let sessions_root = home.join("task-sessions");
     let task_files = find_task_files(&sessions_root);
     assert_eq!(task_files.len(), 1, "task files: {task_files:?}");
     let tasks: Value = serde_json::from_str(

@@ -405,7 +405,7 @@ struct WorkflowWorkerArgs {
 
 #[derive(Debug, Parser)]
 struct SubagentWorkerArgs {
-    /// Workspace directory that owns .orca/task-sessions.
+    /// Workspace directory where the parent async task was launched.
     #[arg(long)]
     cwd: PathBuf,
 

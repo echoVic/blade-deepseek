@@ -1148,6 +1148,25 @@ mod tests {
     }
 
     #[test]
+    fn task_registry_cwd_constructor_uses_orca_home_task_sessions() {
+        let tasks_source = include_str!("tasks.rs");
+        let constructor_source = tasks_source
+            .split("pub fn new_for_cwd")
+            .nth(1)
+            .and_then(|source| source.split("pub fn session_id").next())
+            .expect("TaskRegistry::new_for_cwd source");
+
+        assert!(
+            constructor_source.contains("task_sessions_root()"),
+            "TaskRegistry::new_for_cwd must resolve persistent task storage through the ORCA_HOME/home boundary"
+        );
+        assert!(
+            !constructor_source.contains(".orca") && !constructor_source.contains("task-sessions"),
+            "TaskRegistry::new_for_cwd must not assemble project .orca/task-sessions paths directly"
+        );
+    }
+
+    #[test]
     fn server_permission_dispatch_is_owned_by_permission_processor() {
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let router_source = std::fs::read_to_string(manifest_dir.join("src/server/router.rs"))

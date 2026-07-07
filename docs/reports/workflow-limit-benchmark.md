@@ -131,7 +131,7 @@ pub enum SubagentMode {
 
 - ✅ 支持 `mode: "async"` — 返回 `agent_id`，通过 `subagent_status` 查询
 - ✅ Async subagent 在 headless 模式通过 worker 进程运行，跨进程可恢复
-- ✅ 持久化到 `.orca/task-sessions/`
+- ✅ 持久化到 `$ORCA_HOME/task-sessions/` 或 `~/.orca/task-sessions/`
 
 ### 2.5 Resume / Retry / Fallback
 

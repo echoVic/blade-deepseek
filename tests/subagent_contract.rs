@@ -76,8 +76,10 @@ fn subagent_tool_runs_child_agent_and_emits_events() {
 fn async_subagent_launches_without_blocking_parent_tool() {
     let _guard = subagent_cli_test_guard();
     let cwd = tempdir().expect("temp cwd");
+    let orca_home = tempdir().expect("temp orca home");
     let output = Command::new(env!("CARGO_BIN_EXE_orca"))
         .current_dir(cwd.path())
+        .env("ORCA_HOME", orca_home.path())
         .args([
             "exec",
             "--output-format",
@@ -106,7 +108,11 @@ fn async_subagent_launches_without_blocking_parent_tool() {
     assert_eq!(payload["description"], "inspect repo");
     assert_eq!(events.last().unwrap()["payload"]["status"], "success");
 
-    let index_path = cwd.path().join(".orca/task-sessions/task-index.json");
+    assert!(
+        !cwd.path().join(".orca/task-sessions").exists(),
+        "task sessions should not be written under project .orca"
+    );
+    let index_path = orca_home.path().join("task-sessions/task-index.json");
     let index: Value = serde_json::from_str(&std::fs::read_to_string(index_path).unwrap()).unwrap();
     assert!(index.get(agent_id).is_some());
 }
@@ -115,8 +121,10 @@ fn async_subagent_launches_without_blocking_parent_tool() {
 fn subagent_status_can_read_persisted_async_handle() {
     let _guard = subagent_cli_test_guard();
     let cwd = tempdir().expect("temp cwd");
+    let orca_home = tempdir().expect("temp orca home");
     let launched = Command::new(env!("CARGO_BIN_EXE_orca"))
         .current_dir(cwd.path())
+        .env("ORCA_HOME", orca_home.path())
         .args([
             "exec",
             "--output-format",
@@ -138,6 +146,7 @@ fn subagent_status_can_read_persisted_async_handle() {
 
     let status = Command::new(env!("CARGO_BIN_EXE_orca"))
         .current_dir(cwd.path())
+        .env("ORCA_HOME", orca_home.path())
         .args([
             "exec",
             "--output-format",
