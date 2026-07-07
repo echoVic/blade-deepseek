@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.168":
+        "RuntimeSamplingRequestState now owns the tool-dispatch cursor as well as the per-sampling permission overlay. Tool turns read and advance the current request through sampling state instead of keeping a separate ToolRequestCursor, so Codex-style request-scoped runtime state has one clearer owner without changing tool execution behavior.",
       "v0.1.167":
         "RuntimeSamplingRequestState now owns the per-sampling permission overlay. Provider response handling creates the sampling state and tool turns borrow its overlay instead of allocating local permission state, giving the next Codex-style request-state split a concrete home without changing tool behavior.",
       "v0.1.166":
@@ -362,6 +364,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.168":
+        "RuntimeSamplingRequestState 现在同时拥有 tool-dispatch cursor 和每次 sampling request 的 permission overlay。Tool turn 通过 sampling state 读取并推进当前 request，不再保留独立的 ToolRequestCursor；Codex 风格 request-scoped runtime state 有了更清晰的单一归属，同时不改变工具执行行为。",
       "v0.1.167":
         "RuntimeSamplingRequestState 现在拥有每次 sampling request 的 permission overlay。Provider response handling 会创建 sampling state，tool turn 借用其中的 overlay，不再分配局部 permission state；这为下一步 Codex 风格 request-state 拆分提供了真实承载点，同时不改变工具行为。",
       "v0.1.166":
