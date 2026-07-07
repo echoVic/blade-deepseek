@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.174":
+        "Server-mode command/exec now accepts command/exec/read for client-driven drains of long-running streaming process handles. The read request acknowledges the active process and reuses the existing outputDelta stream, cap metadata, and completion path.",
       "v0.1.173":
         "Server-mode shell/read now accepts outputBytesCap for bounded incremental shell output. stdout/stderr deltas and shell_updated or shell_completed responses are truncated on UTF-8 boundaries and include capReached metadata when the read budget is reached.",
       "v0.1.172":
@@ -374,6 +376,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.174":
+        "Server mode 的 command/exec 现在支持 command/exec/read，客户端可以主动拉取长运行 streaming process handle 的输出。read 请求会确认活动进程，并复用现有 outputDelta 流、cap 元数据和完成事件路径。",
       "v0.1.173":
         "Server mode 的 shell/read 现在支持 outputBytesCap，用于给增量 shell 输出设置字节预算。stdout/stderr delta 以及 shell_updated / shell_completed 响应会按 UTF-8 边界截断，并在触达预算时带上 capReached 元数据。",
       "v0.1.172":

@@ -4,7 +4,11 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-07-07
-Current baseline: v0.1.173 lets server-mode `shell/read` requests apply an
+Current baseline: v0.1.174 adds server-mode `command/exec/read` so app-server
+clients can actively drain long-running streaming `command/exec` process
+handles by `processId`, receive a `command_exec_read` acknowledgment, and reuse
+the existing `command_exec_output_delta` / `command_exec_completed` stream.
+Earlier v0.1.173 let server-mode `shell/read` requests apply an
 `outputBytesCap` byte budget to incremental shell stdout/stderr, returning
 truncated UTF-8-safe deltas plus `capReached` metadata on
 `shell_output_delta`, `shell_updated`, and `shell_completed` events. Earlier
@@ -262,8 +266,9 @@ commands and consume versioned events without owning turn execution details.
    exclusive timeout/output-cap and sandbox/profile options plus
    streaming-without-process-id requests, buffered and streaming output-cap
    truncation with streamed `capReached` metadata, streamed stdout/stderr
-   deltas with `command/exec/write` stdin support, and `command/exec` TTY
-   initial size/resize support.
+   deltas with `command/exec/write` stdin support,
+   client-driven `command/exec/read` drains for active process handles, and
+   `command/exec` TTY initial size/resize support.
 
 **Refreshed reference-driven priority order (Codex + package 3):**
 
@@ -281,7 +286,8 @@ commands and consume versioned events without owning turn execution details.
    same manager rather than a second process runner, and `command/exec` now
    honors Codex-style `cwd`, env override/unset, `tty`, invalid option
    validation, output caps, streamed stdout/stderr delta, `command/exec/write`,
-   and TTY initial size/resize request fields. Server shell reads now emit
+   explicit `command/exec/read` drains, and TTY initial size/resize request
+   fields. Server shell reads now emit
    `shell_output_delta` and `shell_exited` notifications alongside legacy
    shell responses, giving clients a Codex-shaped process stream seed. The
    model-visible package-3-inspired `task_list` / `task_stop` tools now expose
@@ -322,7 +328,9 @@ commands and consume versioned events without owning turn execution details.
    the platform/runtime capability surface that clients need before requesting
    PTY sessions or resize operations, and `shell/read` can now cap incremental
    stdout/stderr with `outputBytesCap` plus `capReached` metadata for clients
-   that need bounded reads. Next, use those boundaries for deeper
+   that need bounded reads, and `command/exec/read` now gives server clients a
+   request/ack boundary for draining active streaming process output. Next, use
+   those boundaries for deeper
    cross-platform PTY support.
 3. **ThreadStore-backed app-server materialization:** Codex treats threads as
    resumable/forkable SDK objects. Orca has `SessionStore` and an in-process
