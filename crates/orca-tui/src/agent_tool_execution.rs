@@ -1,3 +1,5 @@
+use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender};
@@ -122,6 +124,7 @@ pub(crate) fn execute_tool_for_tui(
     tool_request: &tool_types::ToolRequest,
     event_tx: &Sender<TuiEvent>,
     action_rx: &Receiver<UserAction>,
+    pending_actions: &RefCell<VecDeque<UserAction>>,
     subagent_depth: u32,
     session_id: Option<&str>,
     thread_extensions: Option<Arc<orca_runtime::extension::ExtensionData>>,
@@ -153,6 +156,7 @@ pub(crate) fn execute_tool_for_tui(
             &mut runtime_context,
             event_tx,
             action_rx,
+            pending_actions,
         )
     {
         send_tool_requested_for_tui(event_tx, &mut events, tool_request);
@@ -168,6 +172,7 @@ pub(crate) fn execute_tool_for_tui(
             tool_request,
             event_tx,
             action_rx,
+            pending_actions,
             subagent_depth,
             instructions,
             memory,
@@ -242,6 +247,7 @@ pub(crate) fn execute_tool_for_tui(
                         permission_overlay,
                         event_tx,
                         action_rx,
+                        pending_actions,
                         &mut on_output,
                     )
                 }
@@ -251,14 +257,20 @@ pub(crate) fn execute_tool_for_tui(
                 if config.approval_mode == orca_core::approval_types::ApprovalMode::FullAuto {
                     runtime_context.execute_request_permissions_tool(execution_request)
                 } else {
-                    let handler = TuiPermissionRequestHandler::new(event_tx, action_rx);
+                    let handler =
+                        TuiPermissionRequestHandler::new(event_tx, action_rx, pending_actions);
                     runtime_context
                         .execute_request_permissions_tool_with_handler(execution_request, &handler)
                 };
             permission_overlay.merge(runtime_context.permission_overlay());
             result
         } else if execution_request.name == tool_types::ToolName::RequestUserInput {
-            execute_user_input_request_for_tui(execution_request, event_tx, action_rx)
+            execute_user_input_request_for_tui(
+                execution_request,
+                event_tx,
+                action_rx,
+                pending_actions,
+            )
         } else if execution_request.name == tool_types::ToolName::WorkflowDraft {
             let Some(task_registry) = task_registry else {
                 return (
@@ -525,6 +537,7 @@ fn resolve_tui_permission_escalation(
     permission_request: RuntimePermissionRequest,
     event_tx: &Sender<TuiEvent>,
     action_rx: &Receiver<UserAction>,
+    pending_actions: &RefCell<VecDeque<UserAction>>,
 ) -> std::io::Result<bool> {
     let resolution = policy.resolve_for_tool(
         approval,
@@ -536,11 +549,12 @@ fn resolve_tui_permission_escalation(
         ApprovalDecision::Allow => permission_overlay
             .request_and_merge(&AutoAllowPermissionRequests, permission_request)?,
         ApprovalDecision::Ask => {
-            let handler = TuiPermissionRequestHandler::new(event_tx, action_rx).with_display(
-                approval.tool.clone().unwrap_or_default(),
-                approval.target.clone(),
-                approval.preview.clone(),
-            );
+            let handler = TuiPermissionRequestHandler::new(event_tx, action_rx, pending_actions)
+                .with_display(
+                    approval.tool.clone().unwrap_or_default(),
+                    approval.target.clone(),
+                    approval.preview.clone(),
+                );
             permission_overlay.request_and_merge(&handler, permission_request)?
         }
     };
@@ -553,6 +567,7 @@ fn execute_tui_bash_with_escalations(
     permission_overlay: &mut TurnPermissionOverlay,
     event_tx: &Sender<TuiEvent>,
     action_rx: &Receiver<UserAction>,
+    pending_actions: &RefCell<VecDeque<UserAction>>,
     on_output: &mut dyn FnMut(&str),
 ) -> tool_types::ToolResult {
     let (result, network_block) = run_tui_bash(&context, context.additional_roots, on_output);
@@ -597,6 +612,7 @@ fn execute_tui_bash_with_escalations(
             permission_request,
             event_tx,
             action_rx,
+            pending_actions,
         ) {
             Ok(allowed) => allowed,
             Err(error) => {
@@ -622,6 +638,7 @@ fn execute_tui_bash_with_escalations(
         permission_overlay,
         event_tx,
         action_rx,
+        pending_actions,
         context.cancel,
         &mut |retry| match retry {
             TuiBashRetry::WriteRoots(granted) => {
@@ -840,6 +857,7 @@ pub(crate) fn escalate_sandbox_denied_bash_for_tui(
     permission_overlay: &mut TurnPermissionOverlay,
     event_tx: &Sender<TuiEvent>,
     action_rx: &Receiver<UserAction>,
+    pending_actions: &RefCell<VecDeque<UserAction>>,
     cancel: &CancelToken,
     retry: &mut dyn FnMut(TuiBashRetry) -> tool_types::ToolResult,
 ) -> tool_types::ToolResult {
@@ -900,6 +918,7 @@ pub(crate) fn escalate_sandbox_denied_bash_for_tui(
             permission_request,
             event_tx,
             action_rx,
+            pending_actions,
         ) {
             Ok(allowed) => allowed,
             Err(error) => {
@@ -958,6 +977,7 @@ pub(crate) fn escalate_sandbox_denied_bash_for_tui(
         permission_request,
         event_tx,
         action_rx,
+        pending_actions,
     ) {
         Ok(allowed) => allowed,
         Err(error) => {
@@ -1006,8 +1026,9 @@ fn execute_user_input_request_for_tui(
     request: &tool_types::ToolRequest,
     event_tx: &Sender<TuiEvent>,
     action_rx: &Receiver<UserAction>,
+    pending_actions: &RefCell<VecDeque<UserAction>>,
 ) -> tool_types::ToolResult {
-    let handler = TuiUserInputHandler::new(event_tx, action_rx);
+    let handler = TuiUserInputHandler::new(event_tx, action_rx, pending_actions);
     let mut runtime_context = RuntimeToolActorContext::new("tui-user-input", DEFAULT_MAX_TURNS);
     match runtime_context.execute_user_input_tool(request, &handler) {
         Ok(result) => result,
@@ -1106,6 +1127,7 @@ mod tests {
         event_rx: mpsc::Receiver<TuiEvent>,
         action_tx: Sender<UserAction>,
         action_rx: Receiver<UserAction>,
+        pending_actions: RefCell<VecDeque<UserAction>>,
     }
 
     impl EscalationHarness {
@@ -1120,6 +1142,7 @@ mod tests {
                 event_rx,
                 action_tx,
                 action_rx,
+                pending_actions: RefCell::new(VecDeque::new()),
             }
         }
 
@@ -1156,6 +1179,7 @@ mod tests {
                 permission_overlay,
                 &self.event_tx,
                 &self.action_rx,
+                &self.pending_actions,
                 &cancel,
                 &mut |retry| match retry {
                     TuiBashRetry::WriteRoots(granted) => {
@@ -1298,6 +1322,7 @@ mod tests {
             &request,
             &harness.event_tx,
             &harness.action_rx,
+            &harness.pending_actions,
             0,
             None,
             None,
@@ -1356,6 +1381,7 @@ mod tests {
             &request,
             &harness.event_tx,
             &harness.action_rx,
+            &harness.pending_actions,
             0,
             None,
             None,
@@ -1410,6 +1436,7 @@ mod tests {
             &request,
             &harness.event_tx,
             &harness.action_rx,
+            &harness.pending_actions,
             0,
             None,
             None,
@@ -1459,6 +1486,7 @@ mod tests {
             &request,
             &harness.event_tx,
             &harness.action_rx,
+            &harness.pending_actions,
             0,
             None,
             None,
@@ -1497,6 +1525,7 @@ mod tests {
             &request,
             &harness.event_tx,
             &harness.action_rx,
+            &harness.pending_actions,
             0,
             None,
             None,

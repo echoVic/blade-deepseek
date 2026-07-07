@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -123,7 +124,7 @@ fn poll_background_current_turn_for_tui(
     event_tx: &Sender<TuiEvent>,
     events: &mut EventFactory,
     action_rx: &Receiver<UserAction>,
-    pending_actions: &mut VecDeque<UserAction>,
+    pending_actions: &RefCell<VecDeque<UserAction>>,
     task_id: &str,
     is_backgrounded: &mut bool,
 ) {
@@ -132,11 +133,12 @@ fn poll_background_current_turn_for_tui(
     }
 
     let mut should_background = false;
-    if let Some(index) = pending_actions
+    let mut pending = pending_actions.borrow_mut();
+    if let Some(index) = pending
         .iter()
         .position(|action| matches!(action, UserAction::BackgroundCurrentTurn))
     {
-        pending_actions.remove(index);
+        pending.remove(index);
         should_background = true;
     }
     while !should_background {
@@ -144,10 +146,11 @@ fn poll_background_current_turn_for_tui(
             Ok(UserAction::BackgroundCurrentTurn) => {
                 should_background = true;
             }
-            Ok(action) => pending_actions.push_back(action),
+            Ok(action) => pending.push_back(action),
             Err(_) => break,
         }
     }
+    drop(pending);
 
     if should_background && session.task_registry().mark_backgrounded(task_id).is_ok() {
         *is_backgrounded = true;
@@ -409,14 +412,14 @@ pub fn run_agent_for_tui(
     cancel: &CancelToken,
     allow_goal_tools: bool,
 ) -> String {
-    let mut pending_actions = VecDeque::new();
+    let pending_actions = RefCell::new(VecDeque::new());
     run_agent_for_tui_with_notification_queue(
         config,
         session,
         prompt,
         event_tx,
         action_rx,
-        &mut pending_actions,
+        &pending_actions,
         cancel,
         allow_goal_tools,
         None,
@@ -430,7 +433,7 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
     prompt: &str,
     event_tx: &Sender<TuiEvent>,
     action_rx: &Receiver<UserAction>,
-    pending_actions: &mut VecDeque<UserAction>,
+    pending_actions: &RefCell<VecDeque<UserAction>>,
     cancel: &CancelToken,
     allow_goal_tools: bool,
     pending_workflow_notifications: Option<&PendingWorkflowNotifications>,
@@ -936,6 +939,7 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
                 tool_request,
                 event_tx,
                 action_rx,
+                pending_actions,
                 0,
                 session.session_id(),
                 Some(session.thread_extensions_handle()),
@@ -1462,7 +1466,7 @@ mod tests {
         queued_tx
             .send(UserAction::Submit("next prompt".to_string()))
             .expect("send queued submit");
-        let mut pending_actions = VecDeque::new();
+        let pending_actions = RefCell::new(VecDeque::new());
         let mut is_backgrounded = false;
 
         poll_background_current_turn_for_tui(
@@ -1470,14 +1474,14 @@ mod tests {
             &event_tx,
             &mut runtime_events,
             &queued_rx,
-            &mut pending_actions,
+            &pending_actions,
             &task.id,
             &mut is_backgrounded,
         );
 
         assert!(!is_backgrounded);
         assert!(matches!(
-            pending_actions.pop_front(),
+            pending_actions.borrow_mut().pop_front(),
             Some(UserAction::Submit(prompt)) if prompt == "next prompt"
         ));
     }
@@ -1710,7 +1714,7 @@ mod tests {
         )])));
         let mut session = TuiConversationSession::new_with_preloaded(&config, "task_list", None)
             .expect("session");
-        let mut pending_actions = VecDeque::new();
+        let pending_actions = RefCell::new(VecDeque::new());
 
         let result = run_agent_for_tui_with_notification_queue(
             &config,
@@ -1718,7 +1722,7 @@ mod tests {
             "task_list",
             &event_tx,
             &action_rx,
-            &mut pending_actions,
+            &pending_actions,
             &cancel,
             false,
             Some(&pending_notifications),
@@ -1746,7 +1750,7 @@ mod tests {
         let pending_notifications = Arc::new(Mutex::new(VecDeque::new()));
         let mut session = TuiConversationSession::new_with_preloaded(&config, "task_list", None)
             .expect("session");
-        let mut pending_actions = VecDeque::new();
+        let pending_actions = RefCell::new(VecDeque::new());
 
         let result = run_agent_for_tui_with_notification_queue(
             &config,
@@ -1754,7 +1758,7 @@ mod tests {
             "task_list",
             &event_tx,
             &action_rx,
-            &mut pending_actions,
+            &pending_actions,
             &cancel,
             false,
             Some(&pending_notifications),
@@ -1988,6 +1992,7 @@ mod tests {
         action_tx
             .send(UserAction::Approve(true))
             .expect("send approval");
+        let pending_actions = RefCell::new(VecDeque::new());
         let request = tool_types::ToolRequest {
             id: "bash".to_string(),
             name: tool_types::ToolName::Bash,
@@ -2002,6 +2007,7 @@ mod tests {
             &request,
             &event_tx,
             &action_rx,
+            &pending_actions,
             0,
             Some("approval-session"),
             None,
@@ -2043,6 +2049,7 @@ mod tests {
         let (event_tx, event_rx) = mpsc::channel();
         let (action_tx, action_rx) = mpsc::channel();
         action_tx.send(UserAction::Cancel).expect("send cancel");
+        let pending_actions = RefCell::new(VecDeque::new());
         let request = tool_types::ToolRequest {
             id: "bash".to_string(),
             name: tool_types::ToolName::Bash,
@@ -2057,6 +2064,7 @@ mod tests {
             &request,
             &event_tx,
             &action_rx,
+            &pending_actions,
             0,
             Some("approval-session"),
             None,
@@ -2449,6 +2457,7 @@ mod tests {
         let config = full_auto_config();
         let (event_tx, _event_rx) = mpsc::channel();
         let (_action_tx, action_rx) = mpsc::channel();
+        let pending_actions = RefCell::new(VecDeque::new());
         let instructions = ProjectInstructions::default();
         let memory = MemoryBlock::default();
         let hooks = HookRunner::default();
@@ -2474,6 +2483,7 @@ mod tests {
             &request,
             &event_tx,
             &action_rx,
+            &pending_actions,
             0,
             &instructions,
             &memory,
@@ -2531,6 +2541,7 @@ mod tests {
         let config = full_auto_config();
         let (event_tx, _event_rx) = mpsc::channel();
         let (_action_tx, action_rx) = mpsc::channel();
+        let pending_actions = RefCell::new(VecDeque::new());
         let instructions = ProjectInstructions::default();
         let memory = MemoryBlock::default();
         let hooks = HookRunner::default();
@@ -2556,6 +2567,7 @@ mod tests {
             &request,
             &event_tx,
             &action_rx,
+            &pending_actions,
             0,
             &instructions,
             &memory,

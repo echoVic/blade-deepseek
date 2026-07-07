@@ -1,3 +1,5 @@
+use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::sync::mpsc::{Receiver, Sender};
 
 use orca_approval::ApprovalPolicy;
@@ -20,11 +22,18 @@ pub(crate) enum TuiToolApprovalOutcome {
 
 pub(crate) struct TuiApprovalHandler<'a> {
     action_rx: &'a Receiver<UserAction>,
+    pending_actions: &'a RefCell<VecDeque<UserAction>>,
 }
 
 impl<'a> TuiApprovalHandler<'a> {
-    pub(crate) fn new(action_rx: &'a Receiver<UserAction>) -> Self {
-        Self { action_rx }
+    pub(crate) fn new(
+        action_rx: &'a Receiver<UserAction>,
+        pending_actions: &'a RefCell<VecDeque<UserAction>>,
+    ) -> Self {
+        Self {
+            action_rx,
+            pending_actions,
+        }
     }
 }
 
@@ -38,7 +47,7 @@ impl RuntimeApprovalHandler for TuiApprovalHandler<'_> {
             match self.action_rx.recv() {
                 Ok(UserAction::Approve(value)) => break value,
                 Ok(UserAction::Interrupt) | Ok(UserAction::Cancel) | Err(_) => break false,
-                _ => continue,
+                Ok(action) => self.pending_actions.borrow_mut().push_back(action),
             }
         };
         Ok(ApprovalResolution {
@@ -64,6 +73,7 @@ pub(crate) fn resolve_tui_tool_approval(
     runtime_context: &mut RuntimeToolActorContext,
     event_tx: &Sender<TuiEvent>,
     action_rx: &Receiver<UserAction>,
+    pending_actions: &RefCell<VecDeque<UserAction>>,
 ) -> TuiToolApprovalOutcome {
     let Some(approval) = approval_request_for_invocation(invocation) else {
         return TuiToolApprovalOutcome::Continue;
@@ -88,7 +98,7 @@ pub(crate) fn resolve_tui_tool_approval(
                 preview: approval.preview.clone(),
             });
 
-            let handler = TuiApprovalHandler::new(action_rx);
+            let handler = TuiApprovalHandler::new(action_rx, pending_actions);
             let resolution = runtime_context
                 .resolve_interactive_tool_approval(&handler, &approval, tool_request)
                 .unwrap_or_else(|error| ApprovalResolution {
@@ -165,16 +175,22 @@ fn build_approval_preview(request: &tool_types::ToolRequest) -> Option<String> {
 pub(crate) struct TuiPermissionRequestHandler<'a> {
     event_tx: &'a Sender<TuiEvent>,
     action_rx: &'a Receiver<UserAction>,
+    pending_actions: &'a RefCell<VecDeque<UserAction>>,
     tool: String,
     target: Option<String>,
     preview: Option<String>,
 }
 
 impl<'a> TuiPermissionRequestHandler<'a> {
-    pub(crate) fn new(event_tx: &'a Sender<TuiEvent>, action_rx: &'a Receiver<UserAction>) -> Self {
+    pub(crate) fn new(
+        event_tx: &'a Sender<TuiEvent>,
+        action_rx: &'a Receiver<UserAction>,
+        pending_actions: &'a RefCell<VecDeque<UserAction>>,
+    ) -> Self {
         Self {
             event_tx,
             action_rx,
+            pending_actions,
             tool: "request_permissions".to_string(),
             target: None,
             preview: None,
@@ -213,7 +229,7 @@ impl RuntimePermissionRequestHandler for TuiPermissionRequestHandler<'_> {
             match self.action_rx.recv() {
                 Ok(UserAction::Approve(value)) => break value,
                 Ok(UserAction::Interrupt) | Ok(UserAction::Cancel) | Err(_) => break false,
-                _ => continue,
+                Ok(action) => self.pending_actions.borrow_mut().push_back(action),
             }
         };
         Ok(RuntimePermissionResponse {
@@ -288,13 +304,19 @@ fn describe_permission_request(request: &RuntimePermissionRequest) -> String {
 pub(crate) struct TuiUserInputHandler<'a> {
     event_tx: &'a Sender<TuiEvent>,
     action_rx: &'a Receiver<UserAction>,
+    pending_actions: &'a RefCell<VecDeque<UserAction>>,
 }
 
 impl<'a> TuiUserInputHandler<'a> {
-    pub(crate) fn new(event_tx: &'a Sender<TuiEvent>, action_rx: &'a Receiver<UserAction>) -> Self {
+    pub(crate) fn new(
+        event_tx: &'a Sender<TuiEvent>,
+        action_rx: &'a Receiver<UserAction>,
+        pending_actions: &'a RefCell<VecDeque<UserAction>>,
+    ) -> Self {
         Self {
             event_tx,
             action_rx,
+            pending_actions,
         }
     }
 }
@@ -314,7 +336,7 @@ impl RuntimeUserInputHandler for TuiUserInputHandler<'_> {
             match self.action_rx.recv() {
                 Ok(UserAction::RespondToUserInput(answer)) => return Ok(Some(answer)),
                 Ok(UserAction::Interrupt) | Ok(UserAction::Cancel) | Err(_) => return Ok(None),
-                _ => continue,
+                Ok(action) => self.pending_actions.borrow_mut().push_back(action),
             }
         }
     }
@@ -322,6 +344,8 @@ impl RuntimeUserInputHandler for TuiUserInputHandler<'_> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
     use std::sync::mpsc;
 
     use orca_runtime::lifecycle::RuntimeToolActorContext;
@@ -334,7 +358,8 @@ mod tests {
         action_tx
             .send(UserAction::Approve(true))
             .expect("send approval");
-        let handler = TuiApprovalHandler::new(&action_rx);
+        let pending_actions = RefCell::new(VecDeque::new());
+        let handler = TuiApprovalHandler::new(&action_rx, &pending_actions);
         let mut context = RuntimeToolActorContext::new("tui-approval", 2);
         let approval = orca_core::approval_types::ApprovalRequest {
             id: "approval-1".to_string(),
@@ -365,10 +390,53 @@ mod tests {
     }
 
     #[test]
+    fn tui_approval_handler_preserves_queued_app_actions() {
+        let (action_tx, action_rx) = mpsc::channel();
+        action_tx
+            .send(UserAction::Submit("next prompt".to_string()))
+            .expect("send queued submit");
+        action_tx
+            .send(UserAction::Approve(true))
+            .expect("send approval");
+        let pending_actions = RefCell::new(VecDeque::new());
+        let handler = TuiApprovalHandler::new(&action_rx, &pending_actions);
+        let mut context = RuntimeToolActorContext::new("tui-approval", 2);
+        let approval = orca_core::approval_types::ApprovalRequest {
+            id: "approval-1".to_string(),
+            action: orca_core::approval_types::ActionKind::Shell,
+            description: "bash requested shell".to_string(),
+            tool: Some("bash".to_string()),
+            target: Some("echo hi".to_string()),
+            preview: Some("$ echo hi".to_string()),
+        };
+        let request = tool_types::ToolRequest {
+            id: "bash".to_string(),
+            name: tool_types::ToolName::Bash,
+            action: orca_core::approval_types::ActionKind::Shell,
+            target: Some("echo hi".to_string()),
+            raw_arguments: Some(serde_json::json!({ "command": "echo hi" }).to_string()),
+        };
+
+        let resolution = context
+            .resolve_interactive_tool_approval(&handler, &approval, &request)
+            .expect("approval resolution");
+
+        assert_eq!(
+            resolution.decision,
+            orca_core::approval_types::ApprovalDecision::Allow
+        );
+        assert!(matches!(
+            pending_actions.borrow_mut().pop_front(),
+            Some(UserAction::Submit(prompt)) if prompt == "next prompt"
+        ));
+    }
+
+    #[test]
     fn tui_approval_handler_maps_cancel_to_runtime_denial() {
         let (action_tx, action_rx) = mpsc::channel();
         action_tx.send(UserAction::Cancel).expect("send cancel");
-        let handler = TuiApprovalHandler::new(&action_rx);
+        let pending_actions = RefCell::new(VecDeque::new());
+        let handler = TuiApprovalHandler::new(&action_rx, &pending_actions);
         let mut context = RuntimeToolActorContext::new("tui-approval", 2);
         let approval = orca_core::approval_types::ApprovalRequest {
             id: "approval-1".to_string(),
@@ -405,7 +473,8 @@ mod tests {
         action_tx
             .send(UserAction::RespondToUserInput("yes".to_string()))
             .expect("send answer");
-        let handler = TuiUserInputHandler::new(&event_tx, &action_rx);
+        let pending_actions = RefCell::new(VecDeque::new());
+        let handler = TuiUserInputHandler::new(&event_tx, &action_rx, &pending_actions);
         let mut context = RuntimeToolActorContext::new("tui-user-input", 2);
         let request = tool_types::ToolRequest {
             id: "ask".to_string(),
@@ -440,11 +509,44 @@ mod tests {
     }
 
     #[test]
+    fn tui_user_input_handler_preserves_queued_app_actions() {
+        let (event_tx, _event_rx) = mpsc::channel();
+        let (action_tx, action_rx) = mpsc::channel();
+        action_tx
+            .send(UserAction::Submit("next prompt".to_string()))
+            .expect("send queued submit");
+        action_tx
+            .send(UserAction::RespondToUserInput("yes".to_string()))
+            .expect("send answer");
+        let pending_actions = RefCell::new(VecDeque::new());
+        let handler = TuiUserInputHandler::new(&event_tx, &action_rx, &pending_actions);
+        let mut context = RuntimeToolActorContext::new("tui-user-input", 2);
+        let request = tool_types::ToolRequest {
+            id: "ask".to_string(),
+            name: tool_types::ToolName::RequestUserInput,
+            action: orca_core::approval_types::ActionKind::Read,
+            target: None,
+            raw_arguments: Some(serde_json::json!({ "question": "Continue?" }).to_string()),
+        };
+
+        let result = context
+            .execute_user_input_tool(&request, &handler)
+            .expect("user input result");
+
+        assert_eq!(result.status, tool_types::ToolStatus::Completed);
+        assert!(matches!(
+            pending_actions.borrow_mut().pop_front(),
+            Some(UserAction::Submit(prompt)) if prompt == "next prompt"
+        ));
+    }
+
+    #[test]
     fn tui_user_input_handler_maps_cancel_to_runtime_failure() {
         let (event_tx, _event_rx) = mpsc::channel();
         let (action_tx, action_rx) = mpsc::channel();
         action_tx.send(UserAction::Cancel).expect("send cancel");
-        let handler = TuiUserInputHandler::new(&event_tx, &action_rx);
+        let pending_actions = RefCell::new(VecDeque::new());
+        let handler = TuiUserInputHandler::new(&event_tx, &action_rx, &pending_actions);
         let mut context = RuntimeToolActorContext::new("tui-user-input", 2);
         let request = tool_types::ToolRequest {
             id: "ask".to_string(),

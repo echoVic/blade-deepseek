@@ -1,3 +1,5 @@
+use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::mpsc::{Receiver, Sender};
 use std::thread;
@@ -221,6 +223,7 @@ pub(crate) fn execute_subagent_for_tui(
     tool_request: &tool_types::ToolRequest,
     event_tx: &Sender<TuiEvent>,
     action_rx: &Receiver<UserAction>,
+    pending_actions: &RefCell<VecDeque<UserAction>>,
     subagent_depth: u32,
     instructions: &ProjectInstructions,
     memory: &MemoryBlock,
@@ -284,6 +287,7 @@ pub(crate) fn execute_subagent_for_tui(
         request.model.clone(),
         event_tx,
         action_rx,
+        pending_actions,
         subagent_depth + 1,
         &subagent_type,
         instructions,
@@ -555,6 +559,7 @@ fn run_child_agent_for_tui(
     subagent_model: Option<String>,
     event_tx: &Sender<TuiEvent>,
     action_rx: &Receiver<UserAction>,
+    pending_actions: &RefCell<VecDeque<UserAction>>,
     subagent_depth: u32,
     subagent_type: &SubagentType,
     instructions: &ProjectInstructions,
@@ -568,6 +573,7 @@ fn run_child_agent_for_tui(
         subagent_model,
         event_tx,
         action_rx,
+        pending_actions,
         subagent_depth,
         subagent_type,
         instructions,
@@ -585,6 +591,7 @@ fn run_child_agent_for_tui_observed(
     subagent_model: Option<String>,
     event_tx: &Sender<TuiEvent>,
     action_rx: &Receiver<UserAction>,
+    pending_actions: &RefCell<VecDeque<UserAction>>,
     subagent_depth: u32,
     subagent_type: &SubagentType,
     instructions: &ProjectInstructions,
@@ -617,6 +624,7 @@ fn run_child_agent_for_tui_observed(
                     tool_request,
                     event_tx,
                     action_rx,
+                    pending_actions,
                     request.depth,
                     None,
                     None,
@@ -750,6 +758,7 @@ pub(crate) fn run_child_agent_for_tui_silent(
 ) -> (ChildAgentResult, CostTracker) {
     let (event_tx, _event_rx) = std::sync::mpsc::channel();
     let (action_tx, action_rx) = std::sync::mpsc::channel();
+    let pending_actions = RefCell::new(VecDeque::new());
     drop(action_tx);
     run_child_agent_for_tui_observed(
         config,
@@ -758,6 +767,7 @@ pub(crate) fn run_child_agent_for_tui_silent(
         subagent_model,
         &event_tx,
         &action_rx,
+        &pending_actions,
         subagent_depth,
         subagent_type,
         instructions,

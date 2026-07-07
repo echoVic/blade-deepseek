@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::io;
 use std::sync::mpsc;
@@ -2365,7 +2366,7 @@ fn run_goal_turns_for_tui(
     initial_prompt: &str,
     event_tx: &mpsc::Sender<TuiEvent>,
     action_rx: &mpsc::Receiver<UserAction>,
-    pending_actions: &mut VecDeque<UserAction>,
+    pending_actions: &RefCell<VecDeque<UserAction>>,
     cancel: &CancelToken,
     starting_continuation: usize,
     pending_workflow_notifications: &bridge::PendingWorkflowNotifications,
@@ -2487,7 +2488,7 @@ fn resume_latest_active_goal_for_tui(
     preloaded: &Arc<Mutex<Option<history::SessionTranscript>>>,
     event_tx: &mpsc::Sender<TuiEvent>,
     action_rx: &mpsc::Receiver<UserAction>,
-    pending_actions: &mut VecDeque<UserAction>,
+    pending_actions: &RefCell<VecDeque<UserAction>>,
     cancel: &CancelToken,
     pending_workflow_notifications: &bridge::PendingWorkflowNotifications,
 ) {
@@ -2601,9 +2602,9 @@ fn resume_latest_active_goal_for_tui(
 
 fn recv_next_user_action(
     action_rx: &mpsc::Receiver<UserAction>,
-    pending_actions: &mut VecDeque<UserAction>,
+    pending_actions: &RefCell<VecDeque<UserAction>>,
 ) -> Result<UserAction, mpsc::RecvError> {
-    if let Some(action) = pending_actions.pop_front() {
+    if let Some(action) = pending_actions.borrow_mut().pop_front() {
         return Ok(action);
     }
     action_rx.recv()
@@ -2619,10 +2620,10 @@ fn agent_loop_thread(
 ) {
     let mut session: Option<bridge::TuiConversationSession> = None;
     let mut pending_pinned_context: Vec<String> = Vec::new();
-    let mut pending_actions: VecDeque<UserAction> = VecDeque::new();
+    let pending_actions: RefCell<VecDeque<UserAction>> = RefCell::new(VecDeque::new());
 
     loop {
-        match recv_next_user_action(&action_rx, &mut pending_actions) {
+        match recv_next_user_action(&action_rx, &pending_actions) {
             Ok(UserAction::Submit(prompt)) => {
                 cancel.reset();
                 let cfg = config.lock().unwrap().clone();
@@ -2662,7 +2663,7 @@ fn agent_loop_thread(
                     &prompt,
                     &event_tx,
                     &action_rx,
-                    &mut pending_actions,
+                    &pending_actions,
                     &cancel,
                     0,
                     &pending_workflow_notifications,
@@ -2810,7 +2811,7 @@ fn agent_loop_thread(
                                 &objective,
                                 &event_tx,
                                 &action_rx,
-                                &mut pending_actions,
+                                &pending_actions,
                                 &cancel,
                                 0,
                                 &pending_workflow_notifications,
@@ -2887,7 +2888,7 @@ fn agent_loop_thread(
                         &preloaded,
                         &event_tx,
                         &action_rx,
-                        &mut pending_actions,
+                        &pending_actions,
                         &cancel,
                         &pending_workflow_notifications,
                     );
@@ -2913,7 +2914,7 @@ fn agent_loop_thread(
                             &prompt,
                             &event_tx,
                             &action_rx,
-                            &mut pending_actions,
+                            &pending_actions,
                             &cancel,
                             1,
                             &pending_workflow_notifications,
