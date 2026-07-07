@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.182":
+        "RuntimeTurnKernel now owns turn-loop state assembly as an instance handoff. RuntimeTurnState creates the kernel from scoped extension stores and asks that instance to build RuntimeTurnLoopState, while shared extension stores keep the kernel-owned borrow boundary compatible with the loop state it hands forward.",
       "v0.1.181":
         "RuntimeTurnKernel now assembles the lifecycle-owned RuntimeTurnLoopState. RuntimeTurnState no longer expands loop runtime and extension-state fields itself, continuing the turn-state consolidation started around provider response handling.",
       "v0.1.180":
@@ -390,6 +392,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.182":
+        "RuntimeTurnKernel 现在以实例方法拥有 turn-loop state 组装。RuntimeTurnState 会用 scoped extension stores 创建 kernel，再由这个实例构建 RuntimeTurnLoopState；共享 extension stores 让 kernel 的借用边界和交给 loop 的状态保持一致。",
       "v0.1.181":
         "RuntimeTurnKernel 现在会组装 lifecycle-owned RuntimeTurnLoopState。RuntimeTurnState 不再自行展开 loop runtime 和 extension-state 字段，延续 provider response handling 周边的 turn-state 收口。",
       "v0.1.180":

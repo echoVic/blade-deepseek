@@ -129,7 +129,7 @@ pub(crate) struct RuntimeTurnState<'a> {
     pub(crate) directive_state: RuntimeDirectiveState,
     pub(crate) extension_registry: ExtensionRegistry,
     pub(crate) thread_extensions: Arc<ExtensionData>,
-    pub(crate) turn_extensions: ExtensionData,
+    pub(crate) turn_extensions: Arc<ExtensionData>,
 }
 
 pub(crate) struct RuntimeTurnLoopState<'a> {
@@ -157,7 +157,7 @@ pub(crate) struct RuntimeTurnLoopIterationState<'a> {
 pub(crate) struct RuntimeTurnExtensionState {
     extension_registry: ExtensionRegistry,
     thread_extensions: Arc<ExtensionData>,
-    turn_extensions: ExtensionData,
+    turn_extensions: Arc<ExtensionData>,
 }
 
 pub(crate) struct RuntimeTurnExecution<'a> {
@@ -962,7 +962,7 @@ impl<'a> RuntimeTurnState<'a> {
             directive_state: RuntimeDirectiveState::default(),
             extension_registry: extension_builder.build(),
             thread_extensions,
-            turn_extensions: ExtensionData::new(turn_extension_id),
+            turn_extensions: Arc::new(ExtensionData::new(turn_extension_id)),
         }
     }
 
@@ -993,14 +993,18 @@ impl<'a> RuntimeTurnState<'a> {
     }
 
     pub(crate) fn into_loop_state(self) -> RuntimeTurnLoopState<'a> {
-        RuntimeTurnKernel::turn_loop_state(
+        let kernel = RuntimeTurnKernel::new(
+            self.thread_extensions.as_ref(),
+            self.turn_extensions.as_ref(),
+        );
+        kernel.turn_loop_state(
             self.directive_state,
             self.cost_tracker,
             self.cancel,
             self.task_registry,
             self.extension_registry,
-            self.thread_extensions,
-            self.turn_extensions,
+            Arc::clone(&self.thread_extensions),
+            Arc::clone(&self.turn_extensions),
         )
     }
 
@@ -1039,7 +1043,7 @@ impl RuntimeTurnExtensionState {
     pub(crate) fn new(
         extension_registry: ExtensionRegistry,
         thread_extensions: Arc<ExtensionData>,
-        turn_extensions: ExtensionData,
+        turn_extensions: Arc<ExtensionData>,
     ) -> Self {
         Self {
             extension_registry,

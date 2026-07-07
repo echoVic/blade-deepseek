@@ -86,15 +86,16 @@ impl<'a> RuntimeTurnKernel<'a> {
         }
     }
 
-    pub(crate) fn turn_loop_state(
+    pub(crate) fn turn_loop_state<'loop_state>(
+        &self,
         directive_state: RuntimeDirectiveState,
-        cost_tracker: &'a mut CostTracker,
-        cancel: &'a CancelToken,
-        task_registry: &'a TaskRegistry,
+        cost_tracker: &'loop_state mut CostTracker,
+        cancel: &'loop_state CancelToken,
+        task_registry: &'loop_state TaskRegistry,
         extension_registry: ExtensionRegistry,
         thread_extensions: Arc<ExtensionData>,
-        turn_extensions: ExtensionData,
-    ) -> RuntimeTurnLoopState<'a> {
+        turn_extensions: Arc<ExtensionData>,
+    ) -> RuntimeTurnLoopState<'loop_state> {
         RuntimeTurnLoopState {
             directive_state,
             runtime: RuntimeTurnLoopRuntime {

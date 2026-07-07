@@ -723,16 +723,25 @@ mod tests {
             .expect("RuntimeTurnState::into_loop_state source");
 
         assert!(
-            kernel_source.contains("pub(crate) fn turn_loop_state("),
-            "RuntimeTurnKernel must expose a turn-loop state assembly helper"
+            kernel_source.contains("pub(crate) fn turn_loop_state")
+                && kernel_source.contains("turn_loop_state<'loop_state>(\n        &self,"),
+            "RuntimeTurnKernel must expose turn-loop state assembly as an instance helper"
         );
         assert!(
             kernel_source.contains("RuntimeTurnLoopState {"),
             "RuntimeTurnKernel must assemble RuntimeTurnLoopState"
         );
         assert!(
-            lifecycle_runtime_source.contains("RuntimeTurnKernel::turn_loop_state("),
-            "RuntimeTurnState must ask RuntimeTurnKernel to assemble turn-loop state"
+            lifecycle_runtime_source.contains("let kernel = RuntimeTurnKernel::new("),
+            "RuntimeTurnState must create a RuntimeTurnKernel for turn-loop state assembly"
+        );
+        assert!(
+            lifecycle_runtime_source.contains("kernel.turn_loop_state("),
+            "RuntimeTurnState must ask the RuntimeTurnKernel instance to assemble turn-loop state"
+        );
+        assert!(
+            !into_loop_state_source.contains("RuntimeTurnKernel::turn_loop_state("),
+            "RuntimeTurnState must not use a static turn-loop state assembly helper"
         );
         assert!(
             !into_loop_state_source.contains("RuntimeTurnLoopState {"),
