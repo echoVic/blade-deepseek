@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.177":
+        "command/exec/list snapshots now include the backing shellId, taskId, requestedTerminalMode, and effectiveTerminalMode. Reconnecting app-server clients can restore active command/exec display and PTY or pipe semantics with the same task identity used by shell/list.",
       "v0.1.176":
         "Server-mode clients can now call command/exec/list to recover active command/exec process handles. The listed snapshots include processId, command, cwd, running status, stream output settings, output cap, and stdout/stderr byte counters, and completed processes are drained out before the next list response.",
       "v0.1.175":
@@ -380,6 +382,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.177":
+        "command/exec/list 快照现在包含底层 shellId、taskId、requestedTerminalMode 和 effectiveTerminalMode。重连后的 app-server 客户端可以用和 shell/list 一致的 task identity 恢复 active command/exec 的展示，以及 PTY 或 pipe 语义。",
       "v0.1.176":
         "Server mode 客户端现在可以调用 command/exec/list 来恢复 active command/exec process handle。列表快照包含 processId、command、cwd、running 状态、stream output 设置、output cap，以及 stdout/stderr 已发送字节计数；已完成的进程会在下一次 list 响应前被 drain 出列表。",
       "v0.1.175":
