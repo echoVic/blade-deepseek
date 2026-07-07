@@ -91,6 +91,35 @@ pub fn call_streaming(
 ) -> ProviderResponse {
     match kind {
         ProviderKind::Mock => {
+            if let Some((delay_ms, tool_prompt)) = mock_stream_tool_delay_ms(conversation) {
+                let started =
+                    ProviderStep::MessageDelta("Mock slow tool stream started.".to_string());
+                on_step(&started);
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                if cancel.is_cancelled() {
+                    return ProviderResponse {
+                        steps: vec![started],
+                        assistant_content: Some("Mock slow tool stream started.".to_string()),
+                        assistant_reasoning: None,
+                        tool_calls: Vec::new(),
+                        usage: None,
+                    };
+                }
+                if let Some(tool_request) = parse_mock_prompt(&tool_prompt) {
+                    let raw_call = RawToolCall {
+                        id: tool_request.id.clone(),
+                        function_name: tool_request.name.as_str().to_string(),
+                        arguments: tool_request.raw_arguments.clone().unwrap_or_default(),
+                    };
+                    return ProviderResponse {
+                        steps: vec![started, ProviderStep::ToolCall(tool_request)],
+                        assistant_content: None,
+                        assistant_reasoning: None,
+                        tool_calls: vec![raw_call],
+                        usage: None,
+                    };
+                }
+            }
             if let Some(delay_ms) = mock_stream_delay_ms(conversation) {
                 let started = ProviderStep::MessageDelta("Mock slow stream started.".to_string());
                 on_step(&started);
@@ -134,6 +163,17 @@ pub fn call_streaming(
             deepseek_http::call_streaming(conversation, config, cancel, on_step)
         }
     }
+}
+
+fn mock_stream_tool_delay_ms(conversation: &Conversation) -> Option<(u64, String)> {
+    let rest = conversation
+        .last_user_message()
+        .unwrap_or("")
+        .trim()
+        .strip_prefix("mock_stream_tool_delay_ms ")?;
+    let (delay, tool_prompt) = rest.split_once(' ')?;
+    let delay = delay.trim().parse::<u64>().ok()?.min(10_000);
+    Some((delay, tool_prompt.trim().to_string()))
 }
 
 fn mock_stream_delay_ms(conversation: &Conversation) -> Option<u64> {
@@ -1355,5 +1395,42 @@ mod tests {
             response.assistant_content.as_deref(),
             Some("Mock slow stream started.Mock slow stream completed.")
         );
+    }
+
+    #[test]
+    fn mock_stream_tool_delay_ms_returns_tool_call_after_streaming_delta() {
+        let mut conversation = Conversation::new();
+        conversation.add_user("mock_stream_tool_delay_ms 25 task_list".to_string());
+        let config = ProviderConfig {
+            api_key: None,
+            base_url: None,
+            model: None,
+            reasoning_effort: ReasoningEffort::Max,
+            tools_override: None,
+            mcp_registry: None,
+            external_tools: Vec::new(),
+        };
+        let cancel = CancelToken::new();
+        let mut deltas = Vec::new();
+
+        let response = call_streaming(
+            ProviderKind::Mock,
+            &conversation,
+            &config,
+            &cancel,
+            &mut |step| {
+                if let ProviderStep::MessageDelta(text) = step {
+                    deltas.push(text.clone());
+                }
+            },
+        );
+
+        assert_eq!(deltas, vec!["Mock slow tool stream started.".to_string()]);
+        assert_eq!(response.tool_calls.len(), 1);
+        assert!(matches!(
+            response.steps.iter().find(|step| matches!(step, ProviderStep::ToolCall(_))),
+            Some(ProviderStep::ToolCall(request)) if request.name == ToolName::TaskList
+        ));
+        assert!(response.assistant_content.is_none());
     }
 }

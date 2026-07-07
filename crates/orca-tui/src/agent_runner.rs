@@ -187,6 +187,14 @@ fn spawn_provider_stream(
 }
 
 fn provider_response_status(response: &ProviderResponse) -> &'static str {
+    if !response.tool_calls.is_empty()
+        || response
+            .steps
+            .iter()
+            .any(|step| matches!(step, ProviderStep::ToolCall(_)))
+    {
+        return "failed";
+    }
     if response
         .steps
         .iter()

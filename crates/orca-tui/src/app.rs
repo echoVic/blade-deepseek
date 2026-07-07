@@ -1384,6 +1384,76 @@ mod tests {
     }
 
     #[test]
+    fn backgrounded_agent_loop_does_not_complete_unexecuted_tool_calls() {
+        with_orca_home(|_| {
+            let config = Arc::new(Mutex::new(test_config(HistoryMode::Record)));
+            let preloaded = Arc::new(Mutex::new(None));
+            let (event_tx, event_rx) = mpsc::channel();
+            let (action_tx, action_rx) = mpsc::channel();
+            let cancel = CancelToken::new();
+
+            let handle = std::thread::spawn({
+                let config = Arc::clone(&config);
+                let preloaded = Arc::clone(&preloaded);
+                let cancel = cancel.clone();
+                move || {
+                    agent_loop_thread(
+                        config,
+                        preloaded,
+                        event_tx,
+                        action_rx,
+                        cancel,
+                        test_pending_workflow_notifications(),
+                    )
+                }
+            });
+
+            action_tx
+                .send(UserAction::Submit(
+                    "mock_stream_tool_delay_ms 250 task_list".to_string(),
+                ))
+                .unwrap();
+
+            loop {
+                match event_rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+                    TuiEvent::MessageDelta(text)
+                        if text.contains("Mock slow tool stream started.") =>
+                    {
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+
+            action_tx.send(UserAction::BackgroundCurrentTurn).unwrap();
+
+            let status = loop {
+                match event_rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+                    TuiEvent::WorkflowTasksUpdated { tasks } => {
+                        if let Some(task) = tasks.into_iter().find(|task| {
+                            task.task_type == orca_core::task_types::TaskType::MainSession
+                                && task.is_backgrounded
+                                && task.status != orca_core::task_types::TaskStatus::Running
+                        }) {
+                            break task.status;
+                        }
+                    }
+                    _ => {}
+                }
+            };
+
+            action_tx.send(UserAction::Cancel).unwrap();
+            handle.join().unwrap();
+
+            assert_ne!(
+                status,
+                orca_core::task_types::TaskStatus::Completed,
+                "background completion must not report success for tool calls that were not executed"
+            );
+        });
+    }
+
+    #[test]
     fn idle_app_submits_pending_workflow_notification() {
         let (mut state, _rx) = test_state();
         let (action_tx, action_rx) = mpsc::channel();
