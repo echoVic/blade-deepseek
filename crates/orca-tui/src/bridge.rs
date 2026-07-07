@@ -7,6 +7,7 @@ use std::path::Path;
 
 use orca_core::config::RunConfig;
 use orca_core::cost_types::UsageTotals;
+use orca_core::event_schema::RunStatus;
 use orca_mcp::McpRegistry;
 use orca_runtime::cost::CostTracker;
 use orca_runtime::history;
@@ -79,6 +80,16 @@ impl TuiConversationSession {
 
     pub(crate) fn complete(&mut self, status: &str) {
         self.runtime.session_mut().complete(status);
+    }
+
+    pub(crate) fn start_agent_lifecycle_task_with_id(&mut self, task_id: &str) {
+        self.runtime
+            .lifecycle_mut()
+            .start_task_with_id(RuntimeTaskKind::Agent, task_id.to_string());
+    }
+
+    pub(crate) fn finish_agent_lifecycle_task(&mut self, status: RunStatus) {
+        let _ = self.runtime.lifecycle_mut().finish_task(status);
     }
 
     pub fn session_id(&self) -> Option<&str> {

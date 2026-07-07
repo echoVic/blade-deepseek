@@ -104,7 +104,7 @@ pub(crate) fn send_workflow_tasks_updated_for_tui(
 }
 
 fn start_main_session_task_for_tui(
-    session: &TuiConversationSession,
+    session: &mut TuiConversationSession,
     event_tx: &Sender<TuiEvent>,
     events: &mut EventFactory,
     prompt: &str,
@@ -113,12 +113,13 @@ fn start_main_session_task_for_tui(
         .task_registry()
         .create_main_session(prompt.to_string());
     let _ = session.task_registry().mark_running(&task.id);
+    session.start_agent_lifecycle_task_with_id(&task.id);
     send_workflow_tasks_updated_for_tui(event_tx, events, &session.task_registry().list());
     task.id
 }
 
 fn finish_main_session_task_for_tui(
-    session: &TuiConversationSession,
+    session: &mut TuiConversationSession,
     event_tx: &Sender<TuiEvent>,
     events: &mut EventFactory,
     task_id: &str,
@@ -138,6 +139,18 @@ fn finish_main_session_task_for_tui(
     };
     if result.is_ok() {
         send_workflow_tasks_updated_for_tui(event_tx, events, &session.task_registry().list());
+    }
+    session.finish_agent_lifecycle_task(run_status_for_tui_status(status));
+}
+
+fn run_status_for_tui_status(status: &str) -> orca_core::event_schema::RunStatus {
+    match status {
+        "success" => orca_core::event_schema::RunStatus::Success,
+        "interrupted" | "cancelled" => orca_core::event_schema::RunStatus::Cancelled,
+        "approval_required" => orca_core::event_schema::RunStatus::ApprovalRequired,
+        "verification_failed" => orca_core::event_schema::RunStatus::VerificationFailed,
+        "budget_exhausted" => orca_core::event_schema::RunStatus::BudgetExhausted,
+        _ => orca_core::event_schema::RunStatus::Failed,
     }
 }
 
@@ -1198,6 +1211,51 @@ mod tests {
         assert_eq!(turn.1.kind, "agent");
         assert_eq!(turn.1.status, "running");
         assert_eq!(turn.1.turn, 1);
+    }
+
+    #[test]
+    fn tui_turn_started_task_matches_main_session_task_registry() {
+        let config = config();
+        let (event_tx, event_rx) = mpsc::channel();
+        let (_action_tx, action_rx) = mpsc::channel();
+        let cancel = CancelToken::new();
+        let mut session =
+            TuiConversationSession::new_with_preloaded(&config, "task identity", None)
+                .expect("session");
+
+        let status = run_agent_for_tui(
+            &config,
+            &mut session,
+            "mock_silent_final",
+            &event_tx,
+            &action_rx,
+            &cancel,
+            false,
+        );
+
+        assert_eq!(status, "success");
+        let events = event_rx.try_iter().collect::<Vec<_>>();
+        let main_session_id = events
+            .iter()
+            .find_map(|event| match event {
+                TuiEvent::WorkflowTasksUpdated { tasks } => tasks
+                    .iter()
+                    .find(|task| task.task_type == TaskType::MainSession)
+                    .map(|task| task.id.as_str()),
+                _ => None,
+            })
+            .expect("main session task update");
+        let turn_task_id = events
+            .iter()
+            .find_map(|event| match event {
+                TuiEvent::TurnStarted {
+                    task: Some(task), ..
+                } => Some(task.id.as_str()),
+                _ => None,
+            })
+            .expect("turn started task");
+
+        assert_eq!(turn_task_id, main_session_id);
     }
 
     #[test]
