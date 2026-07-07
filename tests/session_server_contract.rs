@@ -4503,6 +4503,104 @@ fn server_mode_command_exec_read_drains_streaming_output() {
 }
 
 #[test]
+fn server_mode_command_exec_read_caps_streaming_output() {
+    let workspace = tempdir().expect("workspace");
+    let release_marker = workspace.path().join("command-cap-release");
+    let release_marker_arg = release_marker.to_str().expect("release marker path");
+    let mut child = orca_command()
+        .args([
+            "--mode",
+            "server",
+            "--provider",
+            "mock",
+            "--cwd",
+            workspace.path().to_str().unwrap(),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn orca server");
+
+    {
+        let stdin = child.stdin.as_mut().expect("server stdin");
+        writeln!(
+            stdin,
+            r#"{{"id":"cmd","method":"command/exec","params":{{"command":["sh","-lc","while [ ! -e \"$1\" ]; do sleep 0.05; done; printf 'abcdef'; sleep 30","sh","{release_marker_arg}"],"processId":"read-cap-1","streamStdoutStderr":true}}}}"#
+        )
+        .expect("write command/exec");
+        stdin.flush().expect("flush command/exec");
+    }
+
+    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
+    let started = read_until_event(&mut stdout, "cmd", "command_exec_started");
+    assert_eq!(started["processId"], "read-cap-1");
+    std::thread::sleep(Duration::from_millis(1200));
+    std::fs::write(&release_marker, "release").expect("write release marker");
+
+    {
+        let stdin = child.stdin.as_mut().expect("server stdin");
+        writeln!(
+            stdin,
+            r#"{{"id":"cmd-read","method":"command/exec/read","params":{{"processId":"read-cap-1","timeoutMs":5000,"outputBytesCap":3}}}}"#
+        )
+        .expect("write command/exec/read");
+        stdin.flush().expect("flush command/exec/read");
+    }
+
+    let mut read_events =
+        read_events_until_event_or_error(&mut stdout, "cmd-read", "command_exec_read");
+    let read_ack = read_events
+        .iter()
+        .find(|event| event["id"] == "cmd-read" && event["event"] == "command_exec_read")
+        .expect("command_exec_read event");
+    assert_eq!(read_ack["processId"], "read-cap-1");
+    assert_eq!(read_ack["status"], "running");
+    if !command_exec_events_contain(&read_events, "stdout", "abc") {
+        read_events.extend(read_command_exec_output_until(
+            &mut stdout,
+            "read-cap-1",
+            |stdout, _stderr| stdout.contains("abc"),
+        ));
+    }
+    assert_command_exec_delta_seen(&read_events, "stdout", "abc");
+    assert!(
+        read_events.iter().any(|event| {
+            event["event"] == "command_exec_output_delta"
+                && event["stream"] == "stdout"
+                && event["capReached"] == true
+        }),
+        "missing capReached stdout delta: {read_events:?}"
+    );
+    assert!(
+        !read_events.iter().any(|event| {
+            event["event"] == "command_exec_output_delta"
+                && event["delta"]
+                    .as_str()
+                    .is_some_and(|delta| delta.contains('d'))
+        }),
+        "read output exceeded cap: {read_events:?}"
+    );
+
+    {
+        let stdin = child.stdin.as_mut().expect("server stdin");
+        writeln!(
+            stdin,
+            r#"{{"id":"cmd-kill","method":"command/exec/terminate","params":{{"processId":"read-cap-1"}}}}"#
+        )
+        .expect("write command/exec/terminate");
+        stdin.flush().expect("flush command/exec/terminate");
+    }
+    read_until_event(&mut stdout, "cmd-kill", "command_exec_terminated");
+    drop(child.stdin.take());
+    read_events_until_event(&mut stdout, "cmd", "command_exec_completed");
+
+    let output = child.wait_with_output().expect("wait for server");
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn server_mode_command_exec_streaming_respects_output_cap() {
     let workspace = tempdir().expect("workspace");
     let mut child = orca_command()

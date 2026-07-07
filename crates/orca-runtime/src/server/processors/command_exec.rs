@@ -59,7 +59,15 @@ pub(in crate::server::router) fn dispatch_command_exec_operation<W: Write>(
         ClientOp::CommandExecRead {
             process_id,
             timeout_ms,
-        } => run_command_exec_read(state, process_id, *timeout_ms, id, writer),
+            output_bytes_cap,
+        } => run_command_exec_read(
+            state,
+            process_id,
+            *timeout_ms,
+            *output_bytes_cap,
+            id,
+            writer,
+        ),
         ClientOp::CommandExecResize {
             process_id,
             cols,

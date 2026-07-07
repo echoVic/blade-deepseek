@@ -96,6 +96,17 @@ impl CommandExecManager {
         self.processes.remove(process_id)
     }
 
+    pub(super) fn tighten_output_cap(&mut self, process_id: &str, output_bytes_cap: usize) {
+        if let Some(process) = self.get_mut(process_id) {
+            process.output_bytes_cap = Some(
+                process
+                    .output_bytes_cap
+                    .map(|existing| existing.min(output_bytes_cap))
+                    .unwrap_or(output_bytes_cap),
+            );
+        }
+    }
+
     fn process_ids(&self) -> Vec<String> {
         self.processes.keys().cloned().collect()
     }
@@ -171,6 +182,7 @@ impl CommandExecManager {
         shell_sessions: Option<&mut RuntimeShellSessionManager>,
         process_id: &str,
         timeout: Duration,
+        output_bytes_cap: Option<usize>,
         id: &Value,
         writer: &mut W,
     ) -> io::Result<CommandExecDrainOutcome> {
@@ -198,6 +210,9 @@ impl CommandExecManager {
             )?;
             return Ok(CommandExecDrainOutcome::Drained);
         };
+        if let Some(output_bytes_cap) = output_bytes_cap {
+            self.tighten_output_cap(process_id, output_bytes_cap);
+        }
         protocol::write_server_event(
             writer,
             id,

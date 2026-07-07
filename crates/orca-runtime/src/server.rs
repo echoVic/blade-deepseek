@@ -124,6 +124,16 @@ fn handle_line<W: Write + Send + 'static>(
             return Ok(());
         }
     };
+    if let ClientOp::CommandExecRead {
+        process_id,
+        output_bytes_cap: Some(output_bytes_cap),
+        ..
+    } = &submission.op
+    {
+        state
+            .command_exec
+            .tighten_output_cap(process_id, *output_bytes_cap);
+    }
     {
         let mut writer = writer.lock().map_err(lock_error)?;
         match drain_command_exec_processes(state, &mut *writer)? {
@@ -1832,6 +1842,7 @@ fn run_command_exec_read<W: Write>(
     state: &mut ServerState,
     process_id: &str,
     timeout_ms: u64,
+    output_bytes_cap: Option<usize>,
     id: Value,
     writer: &mut W,
 ) -> io::Result<()> {
@@ -1839,6 +1850,7 @@ fn run_command_exec_read<W: Write>(
         state.shells.sessions_mut(),
         process_id,
         Duration::from_millis(timeout_ms.max(1)),
+        output_bytes_cap,
         &id,
         writer,
     )?;

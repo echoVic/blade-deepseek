@@ -156,6 +156,7 @@ pub enum ClientOp {
     CommandExecRead {
         process_id: String,
         timeout_ms: u64,
+        output_bytes_cap: Option<usize>,
     },
     CommandExecResize {
         process_id: String,
@@ -718,6 +719,11 @@ impl Submission {
                         .and_then(|params| params.timeout_ms)
                         .and_then(|timeout_ms| u64::try_from(timeout_ms).ok())
                         .unwrap_or(100),
+                    output_bytes_cap: wire
+                        .params
+                        .as_ref()
+                        .and_then(|params| params.output_bytes_cap)
+                        .and_then(|cap| usize::try_from(cap).ok()),
                 },
             }),
             (_, Some("command/exec/resize")) => Ok(Self {
@@ -2110,7 +2116,7 @@ mod tests {
         );
 
         let read = Submission::decode(
-            r#"{"id":"cmd-read","method":"command/exec/read","params":{"processId":"process-1","timeoutMs":5000}}"#,
+            r#"{"id":"cmd-read","method":"command/exec/read","params":{"processId":"process-1","timeoutMs":5000,"outputBytesCap":1024}}"#,
         )
         .expect("command/exec/read submission");
         assert_eq!(
@@ -2118,6 +2124,7 @@ mod tests {
             ClientOp::CommandExecRead {
                 process_id: "process-1".to_string(),
                 timeout_ms: 5000,
+                output_bytes_cap: Some(1024),
             }
         );
 
