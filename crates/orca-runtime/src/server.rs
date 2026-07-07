@@ -1828,6 +1828,32 @@ fn run_command_exec_write<W: Write>(
     )
 }
 
+fn run_command_exec_read<W: Write>(
+    state: &mut ServerState,
+    process_id: &str,
+    timeout_ms: u64,
+    id: Value,
+    writer: &mut W,
+) -> io::Result<()> {
+    let outcome = state.command_exec.read_process(
+        state.shells.sessions_mut(),
+        process_id,
+        Duration::from_millis(timeout_ms.max(1)),
+        &id,
+        writer,
+    )?;
+    match outcome {
+        CommandExecDrainOutcome::NetworkPermissionRequired { request, block } => {
+            request_command_exec_network_permission(state, request, block, writer)
+        }
+        CommandExecDrainOutcome::FileSystemPermissionRequired {
+            request,
+            diagnostic,
+        } => request_command_exec_file_system_permission(state, request, diagnostic, writer),
+        CommandExecDrainOutcome::Drained => Ok(()),
+    }
+}
+
 fn run_command_exec_resize<W: Write>(
     state: &mut ServerState,
     process_id: &str,

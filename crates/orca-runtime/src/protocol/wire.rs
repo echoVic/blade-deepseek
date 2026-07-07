@@ -153,6 +153,10 @@ pub enum ClientOp {
         delta_base64: Option<String>,
         close_stdin: bool,
     },
+    CommandExecRead {
+        process_id: String,
+        timeout_ms: u64,
+    },
     CommandExecResize {
         process_id: String,
         cols: u16,
@@ -698,6 +702,22 @@ impl Submission {
                         .as_ref()
                         .map(|params| params.close_stdin)
                         .unwrap_or(false),
+                },
+            }),
+            (_, Some("command/exec/read")) => Ok(Self {
+                id: wire.id,
+                op: ClientOp::CommandExecRead {
+                    process_id: wire
+                        .params
+                        .as_ref()
+                        .and_then(|params| params.process_id.clone())
+                        .unwrap_or_default(),
+                    timeout_ms: wire
+                        .params
+                        .as_ref()
+                        .and_then(|params| params.timeout_ms)
+                        .and_then(|timeout_ms| u64::try_from(timeout_ms).ok())
+                        .unwrap_or(100),
                 },
             }),
             (_, Some("command/exec/resize")) => Ok(Self {
@@ -2086,6 +2106,18 @@ mod tests {
                 process_id: "process-1".to_string(),
                 delta_base64: Some("aGVsbG8K".to_string()),
                 close_stdin: true,
+            }
+        );
+
+        let read = Submission::decode(
+            r#"{"id":"cmd-read","method":"command/exec/read","params":{"processId":"process-1","timeoutMs":5000}}"#,
+        )
+        .expect("command/exec/read submission");
+        assert_eq!(
+            read.op,
+            ClientOp::CommandExecRead {
+                process_id: "process-1".to_string(),
+                timeout_ms: 5000,
             }
         );
 

@@ -9,6 +9,7 @@ pub(in crate::server::router) fn is_command_exec_operation(op: &ClientOp) -> boo
         op,
         ClientOp::CommandExec { .. }
             | ClientOp::CommandExecWrite { .. }
+            | ClientOp::CommandExecRead { .. }
             | ClientOp::CommandExecResize { .. }
             | ClientOp::CommandExecTerminate { .. }
     )
@@ -55,6 +56,10 @@ pub(in crate::server::router) fn dispatch_command_exec_operation<W: Write>(
             id,
             writer,
         ),
+        ClientOp::CommandExecRead {
+            process_id,
+            timeout_ms,
+        } => run_command_exec_read(state, process_id, *timeout_ms, id, writer),
         ClientOp::CommandExecResize {
             process_id,
             cols,

@@ -354,6 +354,11 @@ pub enum ServerEvent {
         #[serde(rename = "processId")]
         process_id: Value,
     },
+    CommandExecRead {
+        #[serde(rename = "processId")]
+        process_id: Value,
+        status: Value,
+    },
     CommandExecResized {
         #[serde(rename = "processId")]
         process_id: Value,

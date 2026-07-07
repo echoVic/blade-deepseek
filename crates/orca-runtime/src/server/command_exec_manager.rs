@@ -166,6 +166,49 @@ impl CommandExecManager {
             .map(|_| ())
     }
 
+    pub(super) fn read_process<W: Write>(
+        &mut self,
+        shell_sessions: Option<&mut RuntimeShellSessionManager>,
+        process_id: &str,
+        timeout: Duration,
+        id: &Value,
+        writer: &mut W,
+    ) -> io::Result<CommandExecDrainOutcome> {
+        let Some(process) = self.get(process_id) else {
+            protocol::write_server_event(
+                writer,
+                id,
+                ServerEvent::error(format!("unknown command process: {process_id}")),
+            )?;
+            return Ok(CommandExecDrainOutcome::Drained);
+        };
+        if process.shell_id.is_none() {
+            protocol::write_server_event(
+                writer,
+                id,
+                ServerEvent::error(format!("command process is still starting: {process_id}")),
+            )?;
+            return Ok(CommandExecDrainOutcome::Drained);
+        }
+        let Some(manager) = shell_sessions else {
+            protocol::write_server_event(
+                writer,
+                id,
+                ServerEvent::error(format!("unknown command process: {process_id}")),
+            )?;
+            return Ok(CommandExecDrainOutcome::Drained);
+        };
+        protocol::write_server_event(
+            writer,
+            id,
+            ServerEvent::CommandExecRead {
+                process_id: Value::from(process_id.to_string()),
+                status: Value::from("running"),
+            },
+        )?;
+        self.drain_until_output_or_timeout(Some(manager), writer, timeout)
+    }
+
     pub(super) fn resize_process<W: Write>(
         &mut self,
         shell_sessions: Option<&mut RuntimeShellSessionManager>,
