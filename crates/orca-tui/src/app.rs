@@ -944,6 +944,95 @@ mod tests {
         assert_eq!(state.workflow_panel.selected, 0);
     }
 
+    #[test]
+    fn workflows_panel_enter_opens_selected_background_approval() {
+        let (mut state, _rx) = test_state();
+        let mut task = workflow_task("task-approval", "approval");
+        task.task_type = orca_core::task_types::TaskType::MainSession;
+        task.status = orca_core::task_types::TaskStatus::ApprovalRequired;
+        task.is_backgrounded = true;
+        task.pending_tool_call = Some(orca_core::task_types::PendingToolCallSummary {
+            id: "mock-tool-1".to_string(),
+            name: "task_list".to_string(),
+            action: orca_core::approval_types::ActionKind::Read,
+            target: None,
+            arguments: "{}".to_string(),
+        });
+        state.show_workflows();
+        state.workflow_panel.tasks = vec![task];
+
+        assert!(handle_workflows_panel_key(KeyCode::Enter, &mut state));
+
+        let dialog = state.approval_dialog.as_ref().expect("approval dialog");
+        assert_eq!(dialog.background_task_id.as_deref(), Some("task-approval"));
+        assert_eq!(state.status, AppStatus::WaitingApproval);
+    }
+
+    #[test]
+    fn background_approval_resolution_sends_task_scoped_action() {
+        let (mut state, rx) = test_state();
+        let action_tx = state.event_tx.clone();
+        state.approval_dialog = Some(crate::types::ApprovalDialog {
+            tool: "task_list".to_string(),
+            target: None,
+            background_task_id: Some("task-approval".to_string()),
+            selected: 0,
+            options: vec![ApprovalOption::Once, ApprovalOption::Deny],
+            diff: None,
+        });
+        state.set_status(AppStatus::WaitingApproval);
+
+        resolve_approval_option(&mut state, &action_tx, ApprovalOption::Once);
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(UserAction::ResolveBackgroundApproval { task_id, approved })
+                if task_id == "task-approval" && approved
+        ));
+        assert_eq!(state.status, AppStatus::Idle);
+        assert!(state.approval_dialog.is_none());
+    }
+
+    #[test]
+    fn background_approval_action_records_registry_response_and_refreshes_tasks() {
+        let registry = orca_runtime::tasks::TaskRegistry::new("session-1".to_string());
+        let task = registry.create_main_session("Needs approval".to_string());
+        registry.mark_running(&task.id).unwrap();
+        registry.mark_backgrounded(&task.id).unwrap();
+        registry
+            .approval_required_for_pending_tool(
+                &task.id,
+                "approval_required".to_string(),
+                Some(orca_core::task_types::PendingToolCallSummary {
+                    id: "mock-tool-1".to_string(),
+                    name: "task_list".to_string(),
+                    action: orca_core::approval_types::ActionKind::Read,
+                    target: None,
+                    arguments: "{}".to_string(),
+                }),
+            )
+            .unwrap();
+        let (event_tx, event_rx) = mpsc::channel();
+
+        submit_background_approval_response_for_tui(Some(&registry), &task.id, false, &event_tx);
+
+        assert_eq!(
+            registry
+                .take_pending_tool_approval_response(&task.id)
+                .unwrap(),
+            Some(false)
+        );
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(TuiEvent::WorkflowTasksUpdated { tasks }) if tasks.len() == 1
+        ));
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(TuiEvent::Notice(message))
+                if message.contains("Background approval denied")
+        ));
+    }
+
     fn transcript(session_id: &str) -> history::SessionTranscript {
         history::SessionTranscript {
             meta: history::SessionMeta {
@@ -2584,11 +2673,20 @@ fn make_setup_textarea<'a>(theme: &Theme) -> TextArea<'a> {
 }
 
 fn resolve_approval(state: &mut AppState, action_tx: &mpsc::Sender<UserAction>, approved: bool) {
-    let _ = action_tx.send(UserAction::Approve(approved));
-    if approved {
-        state.enter_running();
-    } else {
+    if let Some(task_id) = state
+        .approval_dialog
+        .as_ref()
+        .and_then(|dialog| dialog.background_task_id.clone())
+    {
+        let _ = action_tx.send(UserAction::ResolveBackgroundApproval { task_id, approved });
         state.set_status(AppStatus::Idle);
+    } else {
+        let _ = action_tx.send(UserAction::Approve(approved));
+        if approved {
+            state.enter_running();
+        } else {
+            state.set_status(AppStatus::Idle);
+        }
     }
     state.approval_dialog = None;
 }
@@ -2607,6 +2705,7 @@ fn handle_workflows_panel_key(key_code: KeyCode, state: &mut AppState) -> bool {
             state.select_next_workflow_task();
             true
         }
+        KeyCode::Enter => state.open_selected_background_approval_dialog(),
         _ => false,
     }
 }
@@ -2678,6 +2777,35 @@ fn resolve_approval_option(
         }
     }
     resolve_approval(state, action_tx, option.is_approve());
+}
+
+fn submit_background_approval_response_for_tui(
+    task_registry: Option<&orca_runtime::tasks::TaskRegistry>,
+    task_id: &str,
+    approved: bool,
+    event_tx: &mpsc::Sender<TuiEvent>,
+) {
+    let Some(task_registry) = task_registry else {
+        let _ = event_tx.send(TuiEvent::Error(
+            "cannot resolve background approval before a session exists".to_string(),
+        ));
+        return;
+    };
+
+    match task_registry.submit_pending_tool_approval_response(task_id, approved) {
+        Ok(()) => {
+            let _ = event_tx.send(TuiEvent::WorkflowTasksUpdated {
+                tasks: task_registry.list(),
+            });
+            let decision = if approved { "approved" } else { "denied" };
+            let _ = event_tx.send(TuiEvent::Notice(format!(
+                "Background approval {decision} for {task_id}."
+            )));
+        }
+        Err(error) => {
+            let _ = event_tx.send(TuiEvent::Error(error));
+        }
+    }
 }
 
 fn ensure_tui_session(
@@ -3181,6 +3309,14 @@ fn agent_loop_thread(
                 }
             }
             Ok(UserAction::BackgroundCurrentTurn) => {}
+            Ok(UserAction::ResolveBackgroundApproval { task_id, approved }) => {
+                submit_background_approval_response_for_tui(
+                    session.as_ref().map(|session| session.task_registry()),
+                    &task_id,
+                    approved,
+                    &event_tx,
+                );
+            }
             Ok(UserAction::GoalShow) => {
                 let session_id = session
                     .as_ref()

@@ -127,6 +127,7 @@ pub enum UserAction {
     GoalPause,
     GoalResume,
     Approve(bool),
+    ResolveBackgroundApproval { task_id: String, approved: bool },
     RespondToUserInput(String),
     Backtrack,
     BackgroundCurrentTurn,
@@ -229,6 +230,7 @@ impl ApprovalOption {
 pub struct ApprovalDialog {
     pub tool: String,
     pub target: Option<String>,
+    pub background_task_id: Option<String>,
     pub selected: usize,
     pub options: Vec<ApprovalOption>,
     pub diff: Option<String>,
@@ -505,6 +507,37 @@ impl AppState {
     pub fn select_next_workflow_task(&mut self) {
         let last = self.workflow_panel.tasks.len().saturating_sub(1);
         self.workflow_panel.selected = (self.workflow_panel.selected + 1).min(last);
+    }
+
+    pub fn open_selected_background_approval_dialog(&mut self) -> bool {
+        let Some(task) = self.workflow_panel.tasks.get(self.workflow_panel.selected) else {
+            return false;
+        };
+        if task.task_type != orca_core::task_types::TaskType::MainSession
+            || task.status != orca_core::task_types::TaskStatus::ApprovalRequired
+            || !task.is_backgrounded
+        {
+            return false;
+        }
+        let Some(pending_tool_call) = task.pending_tool_call.as_ref() else {
+            return false;
+        };
+
+        let tool = pending_tool_call.name.clone();
+        let target = pending_tool_call.target.clone();
+        let background_task_id = task.id.clone();
+        let preview = pending_tool_call.arguments.clone();
+        let options = ApprovalDialog::options_for(&tool, target.as_deref());
+        self.set_status(AppStatus::WaitingApproval);
+        self.approval_dialog = Some(ApprovalDialog {
+            tool,
+            target,
+            background_task_id: Some(background_task_id),
+            selected: 0,
+            options,
+            diff: Some(preview),
+        });
+        true
     }
 
     pub fn show_conversation(&mut self) {
@@ -983,6 +1016,7 @@ impl AppState {
                 self.approval_dialog = Some(ApprovalDialog {
                     tool,
                     target,
+                    background_task_id: None,
                     selected: 0,
                     options,
                     diff: preview,
@@ -2252,6 +2286,32 @@ mod tests {
         state.workflow_panel.tasks.clear();
         state.select_next_workflow_task();
         assert_eq!(state.workflow_panel.selected, 0);
+    }
+
+    #[test]
+    fn selected_background_approval_task_opens_approval_dialog() {
+        let mut state = state();
+        let mut task = workflow_task_summary("task-approval", "approval");
+        task.task_type = TaskType::MainSession;
+        task.status = TaskStatus::ApprovalRequired;
+        task.is_backgrounded = true;
+        task.pending_tool_call = Some(orca_core::task_types::PendingToolCallSummary {
+            id: "mock-tool-1".to_string(),
+            name: "task_list".to_string(),
+            action: orca_core::approval_types::ActionKind::Read,
+            target: Some("background task".to_string()),
+            arguments: "{\"limit\":1}".to_string(),
+        });
+        state.workflow_panel.tasks = vec![task];
+
+        assert!(state.open_selected_background_approval_dialog());
+
+        assert_eq!(state.status, AppStatus::WaitingApproval);
+        let dialog = state.approval_dialog.as_ref().expect("approval dialog");
+        assert_eq!(dialog.tool, "task_list");
+        assert_eq!(dialog.target.as_deref(), Some("background task"));
+        assert_eq!(dialog.background_task_id.as_deref(), Some("task-approval"));
+        assert_eq!(dialog.diff.as_deref(), Some("{\"limit\":1}"));
     }
 
     #[test]
