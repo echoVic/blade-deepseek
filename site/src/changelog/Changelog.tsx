@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.191":
+        "RuntimeProviderResponseStep now consumes RuntimeProviderResponseInput directly instead of flattening the response handoff. Child-agent executors travel through RuntimeProviderResponseExecutors, so provider final-message and tool-turn dispatch keep one named response boundary while behavior stays unchanged.",
       "v0.1.190":
         "RuntimeProviderTurnStep now receives provider-call state through a named RuntimeProviderTurnInput. Provider-turn I/O refs live behind RuntimeProviderTurnIo, so conversation, history, events, sink, and cost tracking are handed into provider execution as one boundary while provider behavior stays unchanged.",
       "v0.1.189":
@@ -408,6 +410,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.191":
+        "RuntimeProviderResponseStep 现在直接消费 RuntimeProviderResponseInput，而不是把 response handoff 重新展开成长参数列表。Child-agent executors 会通过 RuntimeProviderResponseExecutors 传递，所以 provider final-message 与 tool-turn dispatch 继续共享一个命名 response 边界，行为保持不变。",
       "v0.1.190":
         "RuntimeProviderTurnStep 现在通过命名的 RuntimeProviderTurnInput 接收 provider-call 状态。Provider-turn I/O 引用统一放在 RuntimeProviderTurnIo 后面，所以 conversation、history、events、sink 和 cost tracking 会作为一个边界交给 provider execution，provider 行为保持不变。",
       "v0.1.189":

@@ -4,13 +4,18 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-07-07
-Current baseline: v0.1.190 carries provider-turn execution through a named
-`RuntimeProviderTurnInput` and groups provider-call I/O refs behind
-`RuntimeProviderTurnIo`. `RuntimeProviderTurnStep` now receives actor, provider,
-runtime system messages, hook/cancel refs, budget policy, steering handle, and
-the grouped conversation/history/event/sink/cost refs as one call-boundary
-object, while provider behavior remains unchanged. Earlier v0.1.189 carries
-provider-response I/O refs through a named `RuntimeProviderResponseIo` bundle.
+Current baseline: v0.1.191 makes `RuntimeProviderResponseStep` consume the
+named `RuntimeProviderResponseInput` directly and carries child-agent executors
+through `RuntimeProviderResponseExecutors`. Provider final-message handling and
+tool-turn dispatch now keep one response handoff instead of re-expanding the
+kernel-assembled response input into a long argument list. Earlier v0.1.190
+carries provider-turn execution through a named `RuntimeProviderTurnInput` and
+groups provider-call I/O refs behind `RuntimeProviderTurnIo`.
+`RuntimeProviderTurnStep` now receives actor, provider, runtime system messages,
+hook/cancel refs, budget policy, steering handle, and the grouped
+conversation/history/event/sink/cost refs as one call-boundary object, while
+provider behavior remains unchanged. Earlier v0.1.189 carries provider-response
+I/O refs through a named `RuntimeProviderResponseIo` bundle.
 `RuntimeTurnKernel` now assembles events, sink, conversation, history writer,
 cost tracker, and background workflow refs as one response handoff, while
 provider response handling destructures that bundle only at the execution

@@ -1006,6 +1006,10 @@ mod tests {
     fn runtime_provider_response_input_groups_io_refs_contract() {
         let kernel_source = include_str!("runtime_turn_kernel.rs");
         let provider_turn_source = include_str!("provider_turn.rs");
+        let provider_turn_runtime_source = provider_turn_source
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .expect("provider turn runtime source");
 
         assert!(
             provider_turn_source.contains("pub(crate) struct RuntimeProviderResponseIo"),
@@ -1044,6 +1048,21 @@ mod tests {
         assert!(
             provider_turn_source.contains("let RuntimeProviderResponseIo {"),
             "provider response handling should destructure the grouped I/O context at the execution boundary"
+        );
+        assert!(
+            provider_turn_source.contains("pub(crate) struct RuntimeProviderResponseExecutors"),
+            "provider response child executors must live behind a named grouped context"
+        );
+        assert!(
+            provider_turn_runtime_source.contains(
+                "pub(crate) fn handle<W: io::Write>(\n        &mut self,\n        response: ProviderResponse,\n        input: RuntimeProviderResponseInput<'_, W>,\n        executors: RuntimeProviderResponseExecutors<W>,"
+            ),
+            "RuntimeProviderResponseStep::handle must take RuntimeProviderResponseInput instead of a flat provider-response parameter list"
+        );
+        assert!(
+            !provider_turn_runtime_source
+                .contains("response,\n            input.step_context,\n            events,"),
+            "provider-cycle handling must not flatten RuntimeProviderResponseInput before calling RuntimeProviderResponseStep"
         );
     }
 

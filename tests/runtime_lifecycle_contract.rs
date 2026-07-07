@@ -158,8 +158,12 @@ fn provider_response_and_tool_turn_share_runtime_step_context() {
         .and_then(|text| text.split("impl RuntimeProviderResponseResultStep").next())
         .expect("runtime provider response impl block");
     assert!(
-        provider_response_impl.contains("step_context: RuntimeStepContext"),
-        "provider response handling should consume RuntimeStepContext instead of repeating request state"
+        provider_response_impl.contains("input: RuntimeProviderResponseInput"),
+        "provider response handling should consume RuntimeProviderResponseInput instead of repeating request state"
+    );
+    assert!(
+        provider_response_impl.contains("step_context,"),
+        "provider response handling should destructure the grouped input to recover RuntimeStepContext at the execution boundary"
     );
     assert!(
         !provider_response_impl.contains("tool_policy: AgentToolPolicyContext"),

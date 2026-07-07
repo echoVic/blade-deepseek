@@ -115,6 +115,12 @@ pub(crate) struct RuntimeProviderResponseIo<'a, W: io::Write> {
     pub(crate) background_workflows: &'a mut Vec<BackgroundWorkflowRun>,
 }
 
+pub(crate) struct RuntimeProviderResponseExecutors<W: io::Write> {
+    pub(crate) child_executor: ChildAgentExecutor<W>,
+    pub(crate) workflow_child_executor: ChildAgentExecutor<SharedEventBuffer>,
+    pub(crate) batch_child_executor: ChildAgentExecutor<io::Sink>,
+}
+
 pub(crate) struct RuntimeProviderTurnOutput {
     pub(crate) response: Option<ProviderResponse>,
     pub(crate) terminal_error: Option<RuntimeTurnStartError>,
@@ -406,18 +412,27 @@ impl RuntimeProviderResponseStep {
     pub(crate) fn handle<W: io::Write>(
         &mut self,
         response: ProviderResponse,
-        step_context: RuntimeStepContext<'_>,
-        events: &mut EventFactory,
-        sink: &mut EventSink<W>,
-        conversation: &mut Conversation,
-        mut history_writer: Option<&mut SessionWriter>,
-        cost_tracker: &mut CostTracker,
-        sampling_state: &mut RuntimeSamplingRequestState,
-        background_workflows: &mut Vec<BackgroundWorkflowRun>,
-        child_executor: ChildAgentExecutor<W>,
-        workflow_child_executor: ChildAgentExecutor<SharedEventBuffer>,
-        batch_child_executor: ChildAgentExecutor<io::Sink>,
+        input: RuntimeProviderResponseInput<'_, W>,
+        executors: RuntimeProviderResponseExecutors<W>,
     ) -> io::Result<RuntimeProviderResponseOutcome> {
+        let RuntimeProviderResponseInput {
+            step_context,
+            sampling_state,
+            io,
+        } = input;
+        let RuntimeProviderResponseIo {
+            events,
+            sink,
+            conversation,
+            mut history_writer,
+            cost_tracker,
+            background_workflows,
+        } = io;
+        let RuntimeProviderResponseExecutors {
+            child_executor,
+            workflow_child_executor,
+            batch_child_executor,
+        } = executors;
         let step_snapshot = step_context.snapshot();
         if response.tool_calls.is_empty() {
             let final_message = response.assistant_content.clone();
@@ -599,9 +614,11 @@ impl RuntimeTurnProviderCycleStep {
         self.handle_response(
             response,
             response_input,
-            child_executor,
-            workflow_child_executor,
-            batch_child_executor,
+            RuntimeProviderResponseExecutors {
+                child_executor,
+                workflow_child_executor,
+                batch_child_executor,
+            },
         )
     }
 
@@ -609,32 +626,10 @@ impl RuntimeTurnProviderCycleStep {
         &mut self,
         response: ProviderResponse,
         input: RuntimeProviderResponseInput<'_, W>,
-        child_executor: ChildAgentExecutor<W>,
-        workflow_child_executor: ChildAgentExecutor<SharedEventBuffer>,
-        batch_child_executor: ChildAgentExecutor<io::Sink>,
+        executors: RuntimeProviderResponseExecutors<W>,
     ) -> io::Result<RuntimeTurnProviderCycleResult> {
-        let RuntimeProviderResponseIo {
-            events,
-            sink,
-            conversation,
-            history_writer,
-            cost_tracker,
-            background_workflows,
-        } = input.io;
-        let provider_response_outcome = RuntimeProviderResponseStep::new().handle(
-            response,
-            input.step_context,
-            events,
-            sink,
-            conversation,
-            history_writer,
-            cost_tracker,
-            input.sampling_state,
-            background_workflows,
-            child_executor,
-            workflow_child_executor,
-            batch_child_executor,
-        )?;
+        let provider_response_outcome =
+            RuntimeProviderResponseStep::new().handle(response, input, executors)?;
 
         Ok(
             match RuntimeProviderResponseResultStep::new().fold(provider_response_outcome) {
@@ -1059,17 +1054,25 @@ mod tests {
         let outcome = RuntimeProviderResponseStep::new()
             .handle(
                 response,
-                step_context,
-                &mut events,
-                &mut sink,
-                &mut conversation,
-                None,
-                &mut cost_tracker,
-                &mut sampling_state,
-                &mut background_workflows,
-                unused_child_executor::<Vec<u8>>,
-                unused_child_executor::<crate::workflow::runner::SharedEventBuffer>,
-                unused_child_executor::<io::Sink>,
+                RuntimeProviderResponseInput {
+                    step_context,
+                    sampling_state: &mut sampling_state,
+                    io: RuntimeProviderResponseIo {
+                        events: &mut events,
+                        sink: &mut sink,
+                        conversation: &mut conversation,
+                        history_writer: None,
+                        cost_tracker: &mut cost_tracker,
+                        background_workflows: &mut background_workflows,
+                    },
+                },
+                RuntimeProviderResponseExecutors {
+                    child_executor: unused_child_executor::<Vec<u8>>,
+                    workflow_child_executor: unused_child_executor::<
+                        crate::workflow::runner::SharedEventBuffer,
+                    >,
+                    batch_child_executor: unused_child_executor::<io::Sink>,
+                },
             )
             .expect("handle provider response");
 
@@ -1143,9 +1146,13 @@ mod tests {
                         background_workflows: &mut background_workflows,
                     },
                 },
-                unused_child_executor::<Vec<u8>>,
-                unused_child_executor::<crate::workflow::runner::SharedEventBuffer>,
-                unused_child_executor::<io::Sink>,
+                RuntimeProviderResponseExecutors {
+                    child_executor: unused_child_executor::<Vec<u8>>,
+                    workflow_child_executor: unused_child_executor::<
+                        crate::workflow::runner::SharedEventBuffer,
+                    >,
+                    batch_child_executor: unused_child_executor::<io::Sink>,
+                },
             )
             .expect("handle provider cycle response");
 
