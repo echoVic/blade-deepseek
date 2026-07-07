@@ -47,6 +47,7 @@ pub struct TaskRecord {
     pub agent_type: Option<String>,
     pub tool: Option<String>,
     pub pending_tool_call: Option<PendingToolCallSummary>,
+    pub pending_tool_approval_response: Option<bool>,
     pub workflow_run_id: Option<String>,
     pub phase_count: Option<usize>,
     pub workflow_progress: Option<WorkflowTaskProgress>,
@@ -191,6 +192,7 @@ impl TaskRegistry {
             agent_type: None,
             tool: None,
             pending_tool_call: None,
+            pending_tool_approval_response: None,
             workflow_run_id: Some(workflow_run_id.clone()),
             phase_count: Some(phase_count),
             workflow_progress: None,
@@ -241,6 +243,7 @@ impl TaskRegistry {
             agent_type,
             tool: None,
             pending_tool_call: None,
+            pending_tool_approval_response: None,
             workflow_run_id: None,
             phase_count: None,
             workflow_progress: None,
@@ -291,6 +294,7 @@ impl TaskRegistry {
             agent_type: Some("main-session".to_string()),
             tool: None,
             pending_tool_call: None,
+            pending_tool_approval_response: None,
             workflow_run_id: None,
             phase_count: None,
             workflow_progress: None,
@@ -341,6 +345,7 @@ impl TaskRegistry {
             agent_type: None,
             tool: None,
             pending_tool_call: None,
+            pending_tool_approval_response: None,
             workflow_run_id: None,
             phase_count: None,
             workflow_progress: None,
@@ -644,10 +649,38 @@ impl TaskRegistry {
             record.error = None;
             record.tool = tool;
             record.pending_tool_call = pending_tool_call;
+            record.pending_tool_approval_response = None;
             record.worker_pid = None;
             record.control.pause.store(false, Ordering::Release);
             Ok(())
         })
+    }
+
+    pub fn submit_pending_tool_approval_response(
+        &self,
+        id: &str,
+        approved: bool,
+    ) -> Result<(), String> {
+        self.update_task(id, |record| {
+            if record.status != TaskStatus::ApprovalRequired || record.pending_tool_call.is_none() {
+                return Err(format!(
+                    "cannot submit approval response without pending approval_required tool for task '{}'",
+                    record.id
+                ));
+            }
+            record.pending_tool_approval_response = Some(approved);
+            Ok(())
+        })
+    }
+
+    pub fn take_pending_tool_approval_response(&self, id: &str) -> Result<Option<bool>, String> {
+        self.with_tasks(|tasks| {
+            let record = tasks
+                .get_mut(id)
+                .ok_or_else(|| format!("task '{id}' not found"))?;
+            Ok(record.pending_tool_approval_response.take())
+        })
+        .map_err(|_| "task registry lock poisoned".to_string())?
     }
 
     pub fn stop(&self, id: &str, summary: String) -> Result<(), String> {
@@ -883,6 +916,7 @@ impl PersistedTaskRecord {
             agent_type: self.agent_type,
             tool: self.tool,
             pending_tool_call: self.pending_tool_call,
+            pending_tool_approval_response: None,
             workflow_run_id: self.workflow_run_id,
             phase_count: self.phase_count,
             workflow_progress: self.workflow_progress,
@@ -1343,6 +1377,70 @@ mod tests {
         assert_eq!(pending_tool.name, "task_list");
         assert_eq!(pending_tool.action, ActionKind::Read);
         assert_eq!(pending_tool.arguments, "{}");
+    }
+
+    #[test]
+    fn registry_records_pending_tool_approval_response_once() {
+        use orca_core::approval_types::ActionKind;
+        use orca_core::task_types::PendingToolCallSummary;
+
+        let registry = TaskRegistry::new("session-1".to_string());
+        let task = registry.create_main_session("Needs approval".to_string());
+
+        registry.mark_running(&task.id).unwrap();
+        registry.mark_backgrounded(&task.id).unwrap();
+        registry
+            .approval_required_for_pending_tool(
+                &task.id,
+                "approval_required".to_string(),
+                Some(PendingToolCallSummary {
+                    id: "mock-tool-1".to_string(),
+                    name: "task_list".to_string(),
+                    action: ActionKind::Read,
+                    target: None,
+                    arguments: "{}".to_string(),
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(
+            registry
+                .take_pending_tool_approval_response(&task.id)
+                .unwrap(),
+            None
+        );
+
+        registry
+            .submit_pending_tool_approval_response(&task.id, true)
+            .unwrap();
+
+        assert_eq!(
+            registry
+                .take_pending_tool_approval_response(&task.id)
+                .unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            registry
+                .take_pending_tool_approval_response(&task.id)
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn registry_rejects_approval_response_without_pending_tool() {
+        let registry = TaskRegistry::new("session-1".to_string());
+        let task = registry.create_main_session("No pending tool".to_string());
+
+        registry.mark_running(&task.id).unwrap();
+        registry.mark_backgrounded(&task.id).unwrap();
+
+        let error = registry
+            .submit_pending_tool_approval_response(&task.id, true)
+            .expect_err("approval response should require pending tool approval");
+
+        assert!(error.contains("approval_required"), "{error}");
     }
 
     #[test]
