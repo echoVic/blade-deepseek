@@ -1468,6 +1468,8 @@ mod tests {
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let router_source = std::fs::read_to_string(manifest_dir.join("src/server/router.rs"))
             .expect("server router source");
+        let server_source =
+            std::fs::read_to_string(manifest_dir.join("src/server.rs")).expect("server source");
         let processor_source =
             std::fs::read_to_string(manifest_dir.join("src/server/processors/turn.rs"))
                 .expect("server turn processor source");
@@ -1493,6 +1495,19 @@ mod tests {
         assert!(
             processor_source.contains("fn dispatch_control_operation"),
             "server turn processor must expose control dispatch inside the router module"
+        );
+        assert!(
+            !server_source.contains("fn run_turn_control"),
+            "server.rs must not own turn control handler behavior"
+        );
+        assert!(
+            processor_source.contains("fn run_turn_control"),
+            "server turn processor must own turn control handler behavior"
+        );
+        assert!(
+            processor_source.contains("ServerEvent::TurnControlled")
+                && processor_source.contains("ServerEvent::ItemStarted"),
+            "server turn processor must own turn-control event emission"
         );
     }
 
