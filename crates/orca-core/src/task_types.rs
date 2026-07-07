@@ -13,6 +13,7 @@ pub enum TaskStatus {
     Stopped,
     Completed,
     Failed,
+    ApprovalRequired,
     Cancelled,
 }
 

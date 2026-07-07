@@ -746,7 +746,10 @@ fn workflow_gauge_ratio(status: TaskStatus, tick: u64) -> f64 {
     match status {
         TaskStatus::Completed => 1.0,
         TaskStatus::Failed | TaskStatus::Cancelled => 1.0,
-        TaskStatus::Queued | TaskStatus::Paused | TaskStatus::Stopped => 0.0,
+        TaskStatus::Queued
+        | TaskStatus::Paused
+        | TaskStatus::Stopped
+        | TaskStatus::ApprovalRequired => 0.0,
         TaskStatus::Running | TaskStatus::Stopping => {
             // Triangle wave in [0.15, 0.85] so the bar visibly breathes.
             let period = 20u64;
@@ -765,6 +768,7 @@ fn workflow_gauge_label(status: TaskStatus) -> String {
     match status {
         TaskStatus::Completed => "done".to_string(),
         TaskStatus::Failed => "failed".to_string(),
+        TaskStatus::ApprovalRequired => "approval required".to_string(),
         TaskStatus::Cancelled => "cancelled".to_string(),
         TaskStatus::Queued => "queued".to_string(),
         TaskStatus::Paused => "paused".to_string(),
@@ -1529,6 +1533,7 @@ fn task_status_label(status: TaskStatus) -> &'static str {
         TaskStatus::Stopped => "stopped",
         TaskStatus::Completed => "completed",
         TaskStatus::Failed => "failed",
+        TaskStatus::ApprovalRequired => "approval required",
         TaskStatus::Cancelled => "cancelled",
     }
 }
@@ -1538,6 +1543,7 @@ fn task_status_color(status: TaskStatus, theme: &Theme) -> Color {
         TaskStatus::Running | TaskStatus::Stopping => theme.warning,
         TaskStatus::Completed => theme.success,
         TaskStatus::Failed | TaskStatus::Cancelled => theme.error,
+        TaskStatus::ApprovalRequired => theme.warning,
         TaskStatus::Queued | TaskStatus::Paused | TaskStatus::Stopped => theme.muted,
     }
 }

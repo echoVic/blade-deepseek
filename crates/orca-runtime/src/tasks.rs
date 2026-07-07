@@ -587,6 +587,21 @@ impl TaskRegistry {
         })
     }
 
+    pub fn approval_required(&self, id: &str, summary: String) -> Result<(), String> {
+        self.update_task(id, |record| {
+            record.status = TaskStatus::ApprovalRequired;
+            if record.started_at_ms.is_none() {
+                record.started_at_ms = Some(now_ms());
+            }
+            record.completed_at_ms = Some(now_ms());
+            record.result = Some(summary);
+            record.error = None;
+            record.worker_pid = None;
+            record.control.pause.store(false, Ordering::Release);
+            Ok(())
+        })
+    }
+
     pub fn stop(&self, id: &str, summary: String) -> Result<(), String> {
         self.update_task(id, |record| {
             record.status = TaskStatus::Stopped;
@@ -901,7 +916,11 @@ fn now_ms() -> i64 {
 fn is_terminal(status: TaskStatus) -> bool {
     matches!(
         status,
-        TaskStatus::Stopped | TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
+        TaskStatus::Stopped
+            | TaskStatus::Completed
+            | TaskStatus::Failed
+            | TaskStatus::ApprovalRequired
+            | TaskStatus::Cancelled
     )
 }
 
@@ -1217,6 +1236,26 @@ mod tests {
         assert_eq!(list[0].task_type, TaskType::MainSession);
         assert_eq!(list[0].status, TaskStatus::Running);
         assert!(list[0].is_backgrounded);
+    }
+
+    #[test]
+    fn registry_marks_backgrounded_main_session_approval_required() {
+        let registry = TaskRegistry::new("session-1".to_string());
+        let task = registry.create_main_session("Needs a tool".to_string());
+
+        registry.mark_running(&task.id).unwrap();
+        registry.mark_backgrounded(&task.id).unwrap();
+        registry
+            .approval_required(&task.id, "approval_required".to_string())
+            .unwrap();
+
+        let record = registry.get(&task.id).unwrap();
+        assert_eq!(record.task_type, TaskType::MainSession);
+        assert_eq!(record.status, TaskStatus::ApprovalRequired);
+        assert!(record.is_backgrounded);
+        assert_eq!(record.result.as_deref(), Some("approval_required"));
+        assert_eq!(record.error, None);
+        assert!(record.completed_at_ms.is_some());
     }
 
     #[test]

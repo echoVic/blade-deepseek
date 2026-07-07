@@ -458,6 +458,7 @@ fn task_status_label(status: TaskStatus) -> &'static str {
         TaskStatus::Stopped => "stopped",
         TaskStatus::Completed => "completed",
         TaskStatus::Failed => "failed",
+        TaskStatus::ApprovalRequired => "approval_required",
         TaskStatus::Cancelled => "cancelled",
     }
 }

@@ -193,7 +193,7 @@ fn provider_response_status(response: &ProviderResponse) -> &'static str {
             .iter()
             .any(|step| matches!(step, ProviderStep::ToolCall(_)))
     {
-        return "failed";
+        return "approval_required";
     }
     if response
         .steps
@@ -222,10 +222,10 @@ fn spawn_background_provider_completion(
             }
         }
 
-        let result = if status == "success" {
-            task_registry.complete(&task_id, status.to_string())
-        } else {
-            task_registry.fail(&task_id, status.to_string())
+        let result = match status {
+            "success" => task_registry.complete(&task_id, status.to_string()),
+            "approval_required" => task_registry.approval_required(&task_id, status.to_string()),
+            _ => task_registry.fail(&task_id, status.to_string()),
         };
         if result.is_ok() {
             let mut events = EventFactory::new(run_id);
