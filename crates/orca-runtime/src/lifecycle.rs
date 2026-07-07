@@ -169,6 +169,7 @@ pub(crate) struct RuntimeTurnExecution<'a> {
 #[derive(Clone, Copy, Default)]
 pub(crate) struct RuntimeTurnInteractionState<'a> {
     permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
+    user_input_handler: Option<&'a dyn RuntimeUserInputHandler>,
 }
 
 #[derive(Clone)]
@@ -836,6 +837,16 @@ impl<'a> AgentLoopContext<'a> {
         self
     }
 
+    pub(crate) fn with_user_input_handler(
+        mut self,
+        user_input_handler: Option<&'a dyn RuntimeUserInputHandler>,
+    ) -> Self {
+        self.turn_interactions = self
+            .turn_interactions
+            .with_user_input_handler(user_input_handler);
+        self
+    }
+
     #[cfg(test)]
     pub(crate) fn turn_interactions(&self) -> RuntimeTurnInteractionState<'a> {
         self.turn_interactions
@@ -947,6 +958,7 @@ impl<'a> RuntimeTurnInteractionState<'a> {
     pub(crate) fn new() -> Self {
         Self {
             permission_handler: None,
+            user_input_handler: None,
         }
     }
 
@@ -962,6 +974,18 @@ impl<'a> RuntimeTurnInteractionState<'a> {
         &self,
     ) -> Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)> {
         self.permission_handler
+    }
+
+    pub(crate) fn with_user_input_handler(
+        mut self,
+        user_input_handler: Option<&'a dyn RuntimeUserInputHandler>,
+    ) -> Self {
+        self.user_input_handler = user_input_handler;
+        self
+    }
+
+    pub(crate) fn user_input_handler(&self) -> Option<&'a dyn RuntimeUserInputHandler> {
+        self.user_input_handler
     }
 }
 

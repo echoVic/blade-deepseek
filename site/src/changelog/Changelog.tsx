@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.186":
+        "Runtime request_user_input handling now shares RuntimeTurnInteractionState with permission requests. ThreadTurnRequest can carry a runtime user-input handler, the provider/tool cycle passes it through RuntimeStepSnapshot and ToolExecutionContext, and RuntimeToolRouter treats request_user_input as a runtime special dispatch instead of a normal tool fallback.",
       "v0.1.185":
         "Runtime turn-scoped interaction handlers now flow through RuntimeTurnInteractionState. AgentLoopContext, runtime_turn_loop, and runtime_turn_iteration carry the permission-request handler through one grouped boundary, preserving current approval behavior while preparing request-user-input and other interaction waiters to share the same turn-owned surface.",
       "v0.1.184":
@@ -398,6 +400,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.186":
+        "Runtime request_user_input 现在和 permission request 共用 RuntimeTurnInteractionState。ThreadTurnRequest 可以携带 runtime user-input handler，provider/tool cycle 会通过 RuntimeStepSnapshot 和 ToolExecutionContext 继续传递它，RuntimeToolRouter 也会把 request_user_input 当成 runtime special dispatch，而不是落回普通工具占位失败。",
       "v0.1.185":
         "Runtime turn 级交互处理器现在流经 RuntimeTurnInteractionState。AgentLoopContext、runtime_turn_loop 和 runtime_turn_iteration 会通过一个 grouped boundary 传递 permission-request handler，保持现有审批行为不变，同时为后续 request_user_input 和其他交互等待状态共用同一个 turn-owned surface 做准备。",
       "v0.1.184":

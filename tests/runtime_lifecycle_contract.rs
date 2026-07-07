@@ -1829,6 +1829,10 @@ fn tool_actor_context_classifies_runtime_special_tool_dispatch() {
         RuntimeSpecialToolDispatch::RequestPermissions
     );
     assert_eq!(
+        context.classify_dispatch(&tool_request(ToolName::RequestUserInput)),
+        RuntimeSpecialToolDispatch::RequestUserInput
+    );
+    assert_eq!(
         context.classify_dispatch(&tool_request(ToolName::WorkflowReadMessages)),
         RuntimeSpecialToolDispatch::WorkflowIpc
     );

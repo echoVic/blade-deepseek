@@ -14,8 +14,8 @@ use crate::extension::RuntimeExtensionStores;
 use crate::hooks::HookRunner;
 use crate::instructions::ProjectInstructions;
 use crate::lifecycle::{
-    RuntimePermissionRequestHandler, RuntimeToolActorContext, RuntimeWorkflowIpc,
-    TurnPermissionOverlay,
+    RuntimePermissionRequestHandler, RuntimeToolActorContext, RuntimeUserInputHandler,
+    RuntimeWorkflowIpc, TurnPermissionOverlay,
 };
 use crate::memory::MemoryBlock;
 use crate::runtime_normal_tool::RuntimeNormalToolInvocation;
@@ -48,6 +48,7 @@ pub(crate) struct RuntimeToolInvocationContext<'a, W: io::Write> {
     pub(crate) workflow_ipc: Option<&'a WorkflowIpcContext>,
     pub(crate) permission_overlay: &'a mut TurnPermissionOverlay,
     pub(crate) permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
+    pub(crate) user_input_handler: Option<&'a dyn RuntimeUserInputHandler>,
     pub(crate) extension_stores: Option<RuntimeExtensionStores<'a>>,
     pub(crate) child_executor: ChildAgentExecutor<W>,
     pub(crate) workflow_child_executor: ChildAgentExecutor<SharedEventBuffer>,
@@ -85,6 +86,7 @@ impl<'a> RuntimeToolRouter<'a> {
             workflow_ipc,
             permission_overlay,
             permission_handler,
+            user_input_handler,
             extension_stores,
             child_executor,
             workflow_child_executor,
@@ -171,6 +173,17 @@ impl<'a> RuntimeToolRouter<'a> {
                     self.runtime.permission_overlay(),
                 );
                 Ok(result)
+            }
+            RuntimeSpecialToolDispatch::RequestUserInput => {
+                let Some(user_input_handler) = user_input_handler else {
+                    return Ok(tool_types::ToolResult::failed(
+                        execution_request,
+                        "request_user_input requires a runtime user input handler",
+                        None,
+                    ));
+                };
+                self.runtime
+                    .execute_user_input_tool(execution_request, user_input_handler)
             }
             RuntimeSpecialToolDispatch::WorkflowIpc => Ok(self.runtime.execute_workflow_ipc_tool(
                 execution_request,

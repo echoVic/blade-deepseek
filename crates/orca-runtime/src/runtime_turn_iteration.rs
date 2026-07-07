@@ -149,6 +149,7 @@ impl RuntimeTurnIterationStep {
                 background_workflows: input.background_workflows,
                 workflow_ipc: input.workflow_ipc,
                 permission_handler: input.turn_interactions.permission_handler(),
+                user_input_handler: input.turn_interactions.user_input_handler(),
                 steer_handle: input.steer_handle,
             },
             child_executor,

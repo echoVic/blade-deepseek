@@ -19,6 +19,7 @@ use crate::hooks::{HookRunner, conversation_with_hook_context};
 use crate::instructions::ProjectInstructions;
 use crate::lifecycle::{
     AgentLoopResult, RuntimePermissionRequestHandler, RuntimeTaskActor, RuntimeTurnStartError,
+    RuntimeUserInputHandler,
 };
 use crate::memory::{self, MemoryBlock};
 use crate::runtime_conversation_bootstrap::RuntimePreparedConversation;
@@ -77,6 +78,7 @@ pub(crate) struct RuntimeProviderCycleInput<'a, 'runtime, W: io::Write> {
     pub(crate) background_workflows: &'a mut Vec<BackgroundWorkflowRun>,
     pub(crate) workflow_ipc: Option<&'a WorkflowIpcContext>,
     pub(crate) permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
+    pub(crate) user_input_handler: Option<&'a dyn RuntimeUserInputHandler>,
     pub(crate) steer_handle: Option<&'a crate::lifecycle::ThreadSteerHandle>,
 }
 
@@ -561,6 +563,7 @@ impl RuntimeTurnProviderCycleStep {
             input.task_registry,
             input.workflow_ipc,
             input.permission_handler,
+            input.user_input_handler,
         );
         let response_input = kernel.provider_response_input(
             step_context,
@@ -1019,6 +1022,7 @@ mod tests {
             &task_registry,
             None,
             None,
+            None,
         );
 
         let outcome = RuntimeProviderResponseStep::new()
@@ -1088,6 +1092,7 @@ mod tests {
             &hooks,
             &cancel,
             &task_registry,
+            None,
             None,
             None,
         );

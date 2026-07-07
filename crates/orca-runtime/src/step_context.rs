@@ -12,7 +12,9 @@ use orca_mcp::McpRegistry;
 use crate::extension::RuntimeExtensionContext;
 use crate::hooks::HookRunner;
 use crate::instructions::ProjectInstructions;
-use crate::lifecycle::{RuntimePermissionRequestHandler, TurnPermissionOverlay};
+use crate::lifecycle::{
+    RuntimePermissionRequestHandler, RuntimeUserInputHandler, TurnPermissionOverlay,
+};
 use crate::memory::MemoryBlock;
 use crate::session::{record_plan_state_for_agent, record_tool_result_for_agent};
 use crate::tasks::TaskRegistry;
@@ -36,6 +38,7 @@ pub(crate) struct RuntimeStepSnapshot<'a> {
     pub(crate) task_registry: &'a TaskRegistry,
     pub(crate) workflow_ipc: Option<&'a WorkflowIpcContext>,
     pub(crate) permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
+    pub(crate) user_input_handler: Option<&'a dyn RuntimeUserInputHandler>,
 }
 
 #[derive(Clone, Copy)]
@@ -179,6 +182,7 @@ impl<'a> RuntimeStepSnapshot<'a> {
         task_registry: &'a TaskRegistry,
         workflow_ipc: Option<&'a WorkflowIpcContext>,
         permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
+        user_input_handler: Option<&'a dyn RuntimeUserInputHandler>,
     ) -> Self {
         Self {
             config,
@@ -195,6 +199,7 @@ impl<'a> RuntimeStepSnapshot<'a> {
             task_registry,
             workflow_ipc,
             permission_handler,
+            user_input_handler,
         }
     }
 }
@@ -216,6 +221,7 @@ impl<'a> RuntimeStepContext<'a> {
         task_registry: &'a TaskRegistry,
         workflow_ipc: Option<&'a WorkflowIpcContext>,
         permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
+        user_input_handler: Option<&'a dyn RuntimeUserInputHandler>,
     ) -> Self {
         Self {
             snapshot: RuntimeStepSnapshot::new(
@@ -233,6 +239,7 @@ impl<'a> RuntimeStepContext<'a> {
                 task_registry,
                 workflow_ipc,
                 permission_handler,
+                user_input_handler,
             ),
             extensions: None,
         }

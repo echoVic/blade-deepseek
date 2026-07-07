@@ -610,6 +610,11 @@ mod tests {
             lifecycle_source.contains("turn_interactions: RuntimeTurnInteractionState<'a>"),
             "AgentLoopContext must carry turn-scoped interaction handlers through one grouped field"
         );
+        assert!(
+            lifecycle_source
+                .contains("user_input_handler: Option<&'a dyn RuntimeUserInputHandler>"),
+            "RuntimeTurnInteractionState must carry request_user_input handlers with other turn-scoped interactions"
+        );
         let agent_loop_context_struct = lifecycle_source
             .split("pub(crate) struct AgentLoopContext<'a> {")
             .nth(1)

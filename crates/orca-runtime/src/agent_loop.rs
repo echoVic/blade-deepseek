@@ -22,6 +22,7 @@ use orca_core::event_sink::EventSink;
 #[cfg(test)]
 use crate::lifecycle::{
     RuntimePermissionRequestHandler, RuntimeTurnInteractionState, RuntimeTurnState,
+    RuntimeUserInputHandler, RuntimeUserInputRequest,
 };
 
 const DEFAULT_MAX_TURNS: u32 = 128;
@@ -472,12 +473,22 @@ mod tests {
     }
 
     struct TestPermissionHandler;
+    struct TestUserInputHandler;
 
     impl RuntimePermissionRequestHandler for TestPermissionHandler {
         fn request_permissions(
             &self,
             _request: &crate::lifecycle::RuntimePermissionRequest,
         ) -> io::Result<crate::lifecycle::RuntimePermissionResponse> {
+            unreachable!("test only checks handler routing identity")
+        }
+    }
+
+    impl RuntimeUserInputHandler for TestUserInputHandler {
+        fn request_user_input(
+            &self,
+            _request: &RuntimeUserInputRequest,
+        ) -> io::Result<Option<String>> {
             unreachable!("test only checks handler routing identity")
         }
     }
@@ -496,19 +507,41 @@ mod tests {
     }
 
     #[test]
+    fn runtime_turn_interaction_state_groups_user_input_handler() {
+        let handler = TestUserInputHandler;
+        let interactions =
+            RuntimeTurnInteractionState::new().with_user_input_handler(Some(&handler));
+
+        let resolved = interactions
+            .user_input_handler()
+            .expect("user input handler");
+        let expected: &dyn RuntimeUserInputHandler = &handler;
+        assert!(std::ptr::eq(resolved, expected));
+    }
+
+    #[test]
     fn agent_loop_context_exposes_runtime_turn_interactions() {
         let cwd = PathBuf::from("/tmp/orca-agent-loop-interactions");
         let subagent_type = SubagentType::General;
         let handler = TestPermissionHandler;
+        let user_input_handler = TestUserInputHandler;
 
         let context = AgentLoopContext::new(&cwd, "inspect repo", 0, true, &subagent_type)
-            .with_permission_handler(Some(&handler));
+            .with_permission_handler(Some(&handler))
+            .with_user_input_handler(Some(&user_input_handler));
 
         let resolved = context
             .turn_interactions()
             .permission_handler()
             .expect("permission handler");
         let expected: &(dyn RuntimePermissionRequestHandler + Send + Sync) = &handler;
+        assert!(std::ptr::eq(resolved, expected));
+
+        let resolved = context
+            .turn_interactions()
+            .user_input_handler()
+            .expect("user input handler");
+        let expected: &dyn RuntimeUserInputHandler = &user_input_handler;
         assert!(std::ptr::eq(resolved, expected));
     }
 

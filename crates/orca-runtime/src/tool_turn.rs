@@ -15,7 +15,7 @@ use crate::cost::CostTracker;
 use crate::extension::RuntimeExtensionContext;
 use crate::hooks::HookRunner;
 use crate::instructions::ProjectInstructions;
-use crate::lifecycle::RuntimePermissionRequestHandler;
+use crate::lifecycle::{RuntimePermissionRequestHandler, RuntimeUserInputHandler};
 use crate::memory::MemoryBlock;
 #[cfg(test)]
 use crate::runtime_readonly_tool_turn::record_readonly_batch_results;
@@ -82,6 +82,7 @@ pub(crate) struct RuntimeNormalToolTurnContext<'a, W: io::Write> {
     pub(crate) background_workflows: &'a mut Vec<BackgroundWorkflowRun>,
     pub(crate) workflow_ipc: Option<&'a WorkflowIpcContext>,
     pub(crate) permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
+    pub(crate) user_input_handler: Option<&'a dyn RuntimeUserInputHandler>,
     pub(crate) extensions: Option<RuntimeExtensionContext<'a>>,
     pub(crate) child_executor: ChildAgentExecutor<W>,
     pub(crate) workflow_child_executor: ChildAgentExecutor<SharedEventBuffer>,
@@ -140,6 +141,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
     let task_registry = step_snapshot.task_registry;
     let workflow_ipc = step_snapshot.workflow_ipc;
     let permission_handler = step_snapshot.permission_handler;
+    let user_input_handler = step_snapshot.user_input_handler;
     while let Some(tool_request) = sampling_state.current_tool_request(tool_requests) {
         if let Some(result) = reject_disallowed_child_tool(
             tool_request,
@@ -242,6 +244,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
             background_workflows,
             workflow_ipc,
             permission_handler,
+            user_input_handler,
             extensions,
             child_executor,
             workflow_child_executor,
@@ -282,6 +285,7 @@ pub(crate) fn run_normal_tool_turn<W: io::Write>(
         background_workflows,
         workflow_ipc,
         permission_handler,
+        user_input_handler,
         extensions,
         child_executor,
         workflow_child_executor,
@@ -296,7 +300,8 @@ pub(crate) fn run_normal_tool_turn<W: io::Write>(
             workflow_ipc,
         )
         .with_permission_overlay(sampling_state.permission_overlay_mut())
-        .with_permission_handler(permission_handler);
+        .with_permission_handler(permission_handler)
+        .with_user_input_handler(user_input_handler);
     if let Some(extensions) = extensions {
         execution_context =
             execution_context.with_extensions(extensions.registry(), extensions.stores());
@@ -657,6 +662,7 @@ mod tests {
             background_workflows: &mut background_workflows,
             workflow_ipc: None,
             permission_handler: None,
+            user_input_handler: None,
             extensions: None,
             child_executor: unused_child_executor,
             workflow_child_executor: unused_child_executor,
@@ -766,6 +772,7 @@ mod tests {
             &task_registry,
             None,
             None,
+            None,
         );
 
         let outcome = run_tool_turns(RuntimeToolTurnsContext {
@@ -844,6 +851,7 @@ mod tests {
             &hooks,
             &cancel,
             &task_registry,
+            None,
             None,
             None,
         );

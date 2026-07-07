@@ -4,14 +4,21 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-07-07
-Current baseline: v0.1.185 groups turn-scoped interaction handlers behind a
-named `RuntimeTurnInteractionState`. `AgentLoopContext`, `runtime_turn_loop`,
-and `runtime_turn_iteration` now carry the permission-request handler through
-that grouped turn interaction boundary before provider/tool dispatch needs it,
+Current baseline: v0.1.186 routes `request_user_input` through the same
+turn-scoped interaction boundary as permission requests. `RuntimeTurnInteractionState`
+now carries both the permission handler and the runtime user-input handler,
+`ThreadTurnRequest` can install a user-input handler for a turn, and
+`runtime_turn_iteration`, `RuntimeStepSnapshot`, `ToolExecutionContext`, and
+`RuntimeToolRouter` pass that handler to the point where `request_user_input`
+is dispatched as a runtime special tool instead of a normal-tool fallback.
+Earlier v0.1.185 grouped turn-scoped interaction handlers behind a named
+`RuntimeTurnInteractionState`. `AgentLoopContext`, `runtime_turn_loop`, and
+`runtime_turn_iteration` carry the permission-request handler through that
+grouped turn interaction boundary before provider/tool dispatch needs it,
 leaving the existing approval and permission behavior unchanged while making
-room for later request-user-input, elicitation, and dynamic-tool waiters to
-share the same turn-owned interaction surface. Earlier v0.1.184 gave provider
-and tool-dispatch steps a named request-scoped runtime snapshot.
+room for later elicitation and dynamic-tool waiters to share the same
+turn-owned interaction surface. Earlier v0.1.184 gave provider and
+tool-dispatch steps a named request-scoped runtime snapshot.
 `RuntimeStepSnapshot` now owns the stable per-request runtime inputs that had
 been spread across `RuntimeStepContext`, while `RuntimeStepContext` carries that
 snapshot plus the kernel-bound extension context. Provider final-response

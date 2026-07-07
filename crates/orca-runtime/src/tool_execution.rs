@@ -20,7 +20,7 @@ use crate::hooks::{HookOutcome, HookRunner};
 use crate::instructions::ProjectInstructions;
 use crate::lifecycle::{
     RuntimeApprovalDecision, RuntimeConfigApprovalHandler, RuntimePermissionRequestHandler,
-    RuntimeTaskActor, RuntimeToolActorContext, TurnPermissionOverlay,
+    RuntimeTaskActor, RuntimeToolActorContext, RuntimeUserInputHandler, TurnPermissionOverlay,
 };
 use crate::memory::MemoryBlock;
 use crate::tasks::TaskRegistry;
@@ -51,6 +51,7 @@ pub(crate) struct ToolExecutionContext<'a> {
     workflow_ipc: Option<&'a WorkflowIpcContext>,
     permission_overlay: Option<&'a mut TurnPermissionOverlay>,
     permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
+    user_input_handler: Option<&'a dyn RuntimeUserInputHandler>,
     extension_registry: Option<&'a ExtensionRegistry>,
     extension_stores: Option<RuntimeExtensionStores<'a>>,
 }
@@ -97,6 +98,7 @@ impl<'a> ToolExecutionContext<'a> {
             workflow_ipc: None,
             permission_overlay: None,
             permission_handler: None,
+            user_input_handler: None,
             extension_registry: None,
             extension_stores: None,
         }
@@ -129,6 +131,14 @@ impl<'a> ToolExecutionContext<'a> {
         permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
     ) -> Self {
         self.permission_handler = permission_handler;
+        self
+    }
+
+    pub(crate) fn with_user_input_handler(
+        mut self,
+        user_input_handler: Option<&'a dyn RuntimeUserInputHandler>,
+    ) -> Self {
+        self.user_input_handler = user_input_handler;
         self
     }
 
@@ -321,6 +331,7 @@ impl ToolExecutionActor {
             workflow_ipc,
             permission_overlay,
             permission_handler,
+            user_input_handler,
             extension_registry,
             extension_stores,
         } = context;
@@ -408,6 +419,7 @@ impl ToolExecutionActor {
                 workflow_ipc,
                 permission_overlay,
                 permission_handler,
+                user_input_handler,
                 extension_stores,
                 child_executor,
                 workflow_child_executor,
@@ -662,7 +674,9 @@ mod tests {
     };
     use crate::hooks::HookRunner;
     use crate::instructions::ProjectInstructions;
-    use crate::lifecycle::TurnPermissionOverlay;
+    use crate::lifecycle::{
+        RuntimeUserInputHandler, RuntimeUserInputRequest, TurnPermissionOverlay,
+    };
     use crate::memory::MemoryBlock;
     use crate::tasks::TaskRegistry;
 
@@ -828,5 +842,77 @@ mod tests {
                 "finish:thread-1:turn-1:read-file:Completed"
             ]
         );
+    }
+
+    #[test]
+    fn tool_execution_routes_request_user_input_through_turn_interaction_handler() {
+        struct AnswerHandler;
+
+        impl RuntimeUserInputHandler for AnswerHandler {
+            fn request_user_input(
+                &self,
+                request: &RuntimeUserInputRequest,
+            ) -> io::Result<Option<String>> {
+                assert_eq!(request.id, "ask");
+                assert_eq!(request.question, "Continue?");
+                assert_eq!(request.choices, vec!["yes".to_string(), "no".to_string()]);
+                Ok(Some("yes".to_string()))
+            }
+        }
+
+        let config = config_with_permission_rules(PermissionRules::default());
+        let mut actor = ToolExecutionActor::new("tool-user-input-run", 128);
+        let mut events = EventFactory::new("tool-user-input-run".to_string());
+        let mut output = Vec::new();
+        let mut sink = EventSink::new(&mut output, OutputFormat::Jsonl);
+        let cwd = std::env::current_dir().expect("cwd");
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let mcp_registry = McpRegistry::default();
+        let hooks = HookRunner::new(Vec::new());
+        let mut cost_tracker = CostTracker::new(None);
+        let cancel = orca_core::cancel::CancelToken::new();
+        let task_registry = TaskRegistry::new_for_cwd("tool-user-input-run".to_string(), &cwd);
+        let mut background_workflows = Vec::new();
+        let mut permission_overlay = TurnPermissionOverlay::default();
+        let handler = AnswerHandler;
+        let request = ToolRequest {
+            id: "ask".to_string(),
+            name: ToolName::RequestUserInput,
+            action: ActionKind::Read,
+            target: Some("Continue?".to_string()),
+            raw_arguments: Some(
+                serde_json::json!({
+                    "question": "Continue?",
+                    "choices": ["yes", "no"]
+                })
+                .to_string(),
+            ),
+        };
+
+        let (_status, result) = actor
+            .execute(
+                &config,
+                &mut events,
+                &mut sink,
+                &request,
+                ToolExecutionContext::new(&cwd, 0, true, &policy_for_tool_execution(&config))
+                    .with_services(&instructions, &memory, &mcp_registry, &hooks)
+                    .with_runtime(
+                        &mut cost_tracker,
+                        &cancel,
+                        &task_registry,
+                        &mut background_workflows,
+                        None,
+                    )
+                    .with_permission_overlay(&mut permission_overlay)
+                    .with_user_input_handler(Some(&handler)),
+                unused_child_executor,
+                unused_child_executor,
+            )
+            .expect("tool execution");
+
+        assert_eq!(result.status, ToolStatus::Completed);
+        assert_eq!(result.output.as_deref(), Some("yes"));
     }
 }

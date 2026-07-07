@@ -27,7 +27,8 @@ use crate::instructions::ProjectInstructions;
 #[cfg(test)]
 use crate::lifecycle::RuntimeTaskKind;
 use crate::lifecycle::{
-    AgentLoopContext, RuntimePermissionRequestHandler, RuntimeSessionLifecycle, ThreadSteerHandle,
+    AgentLoopContext, RuntimePermissionRequestHandler, RuntimeSessionLifecycle,
+    RuntimeUserInputHandler, ThreadSteerHandle,
 };
 use crate::session::{
     AgentConversationContext, InteractiveSession, InteractiveSessionRuntimeParts,
@@ -97,6 +98,7 @@ pub struct ThreadTurnRequest {
     emit_session_completed: bool,
     steer_handle: Option<ThreadSteerHandle>,
     permission_handler: Option<Arc<dyn RuntimePermissionRequestHandler + Send + Sync>>,
+    user_input_handler: Option<Arc<dyn RuntimeUserInputHandler>>,
 }
 
 impl<'a> ThreadTurnExecutor<'a> {
@@ -265,6 +267,7 @@ impl ThreadTurnRequest {
             emit_session_completed: true,
             steer_handle: None,
             permission_handler: None,
+            user_input_handler: None,
         }
     }
 
@@ -308,6 +311,11 @@ impl ThreadTurnRequest {
         self
     }
 
+    pub fn with_user_input_handler(mut self, handler: Arc<dyn RuntimeUserInputHandler>) -> Self {
+        self.user_input_handler = Some(handler);
+        self
+    }
+
     pub fn steer_handle(&self) -> Option<&ThreadSteerHandle> {
         self.steer_handle.as_ref()
     }
@@ -316,6 +324,10 @@ impl ThreadTurnRequest {
         &self,
     ) -> Option<&(dyn RuntimePermissionRequestHandler + Send + Sync)> {
         self.permission_handler.as_deref()
+    }
+
+    pub fn user_input_handler(&self) -> Option<&dyn RuntimeUserInputHandler> {
+        self.user_input_handler.as_deref()
     }
 }
 
@@ -522,7 +534,8 @@ fn run_thread_turn_inner_with_events<W: io::Write>(
             loop_context
                 .with_execution(&mut background_workflows, None, Some(lifecycle))
                 .with_steer_handle(request.steer_handle())
-                .with_permission_handler(request.permission_handler()),
+                .with_permission_handler(request.permission_handler())
+                .with_user_input_handler(request.user_input_handler()),
             events,
             &mut sink,
             AgentConversationContext::new()
@@ -573,7 +586,8 @@ fn run_thread_turn_inner_with_events<W: io::Write>(
         loop_context
             .with_execution(&mut execution.background_workflows, None, Some(lifecycle))
             .with_steer_handle(request.steer_handle())
-            .with_permission_handler(request.permission_handler()),
+            .with_permission_handler(request.permission_handler())
+            .with_user_input_handler(request.user_input_handler()),
         &mut execution.events,
         &mut execution.sink,
         AgentConversationContext::new()
@@ -735,7 +749,10 @@ mod tests {
     use crate::agent_loop::execute_child_agent_loop;
     use crate::hooks::HookOutcome;
     use crate::hooks::conversation_with_hook_context;
-    use crate::lifecycle::{RuntimeTaskStatus, RuntimeToolActorContext};
+    use crate::lifecycle::{
+        RuntimeTaskStatus, RuntimeToolActorContext, RuntimeUserInputHandler,
+        RuntimeUserInputRequest,
+    };
     use crate::memory::MemoryBlock;
     use crate::subagent_execution::{collect_subagent_batch, should_run_subagent_batch};
     use crate::tool_execution::{
@@ -747,6 +764,7 @@ mod tests {
     use orca_core::approval_types::{ActionKind, ApprovalMode};
     use orca_core::config::{HistoryMode, OutputFormat, ProviderKind};
     use orca_core::conversation::Conversation;
+    use orca_core::conversation::Message;
     use orca_core::model::ModelSelection;
     use orca_core::subagent_config::SubagentConfig;
 
@@ -808,6 +826,44 @@ mod tests {
             target: Some("target".to_string()),
             raw_arguments: None,
         }
+    }
+
+    #[test]
+    fn thread_turn_request_routes_user_input_handler_through_agent_loop() {
+        struct AnswerHandler;
+
+        impl RuntimeUserInputHandler for AnswerHandler {
+            fn request_user_input(
+                &self,
+                request: &RuntimeUserInputRequest,
+            ) -> io::Result<Option<String>> {
+                assert_eq!(request.question, "Continue?");
+                Ok(Some("yes".to_string()))
+            }
+        }
+
+        let mut config = config(SubagentConfig::default());
+        config.output_format = OutputFormat::Jsonl;
+        config.approval_mode = ApprovalMode::FullAuto;
+        let mut thread = RuntimeThread::start(&config, "user input turn").expect("thread");
+        let request = ThreadTurnRequest::new("ask Continue?")
+            .with_user_input_handler(Arc::new(AnswerHandler));
+
+        let status = thread
+            .run_request(&config, &request, Vec::new())
+            .expect("run request");
+
+        assert_eq!(status, RunStatus::Success);
+        assert!(
+            thread
+                .session()
+                .conversation()
+                .messages
+                .iter()
+                .any(|message| {
+                    matches!(message, Message::Tool { content, .. } if content == "yes")
+                })
+        );
     }
 
     #[test]
@@ -1330,6 +1386,7 @@ mod tests {
                 workflow_ipc: None,
                 permission_overlay: &mut permission_overlay,
                 permission_handler: None,
+                user_input_handler: None,
                 extension_stores: None,
                 child_executor: execute_child_agent_loop,
                 workflow_child_executor: execute_child_agent_loop,
