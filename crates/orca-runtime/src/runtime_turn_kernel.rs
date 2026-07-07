@@ -1,5 +1,7 @@
 use std::io;
+use std::sync::Arc;
 
+use orca_core::cancel::CancelToken;
 use orca_core::conversation::Conversation;
 use orca_core::event_schema::EventFactory;
 use orca_core::event_sink::EventSink;
@@ -8,9 +10,12 @@ use crate::cost::CostTracker;
 use crate::extension::{
     ExtensionData, ExtensionRegistry, RuntimeExtensionContext, RuntimeExtensionStores,
 };
+use crate::lifecycle::{RuntimeTurnExtensionState, RuntimeTurnLoopRuntime, RuntimeTurnLoopState};
 use crate::provider_turn::RuntimeProviderResponseInput;
+use crate::runtime_directive::RuntimeDirectiveState;
 use crate::runtime_state::RuntimeTurnReducer;
 use crate::step_context::{RuntimeSamplingRequestState, RuntimeStepContext};
+use crate::tasks::TaskRegistry;
 use crate::thread_store::SessionWriter;
 use crate::workflow_execution::BackgroundWorkflowRun;
 
@@ -78,6 +83,30 @@ impl<'a> RuntimeTurnKernel<'a> {
             history_writer,
             cost_tracker,
             background_workflows,
+        }
+    }
+
+    pub(crate) fn turn_loop_state(
+        directive_state: RuntimeDirectiveState,
+        cost_tracker: &'a mut CostTracker,
+        cancel: &'a CancelToken,
+        task_registry: &'a TaskRegistry,
+        extension_registry: ExtensionRegistry,
+        thread_extensions: Arc<ExtensionData>,
+        turn_extensions: ExtensionData,
+    ) -> RuntimeTurnLoopState<'a> {
+        RuntimeTurnLoopState {
+            directive_state,
+            runtime: RuntimeTurnLoopRuntime {
+                cost_tracker,
+                cancel,
+                task_registry,
+                extensions: RuntimeTurnExtensionState::new(
+                    extension_registry,
+                    thread_extensions,
+                    turn_extensions,
+                ),
+            },
         }
     }
 

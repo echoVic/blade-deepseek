@@ -4,7 +4,12 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-07-07
-Current baseline: v0.1.180 lets `RuntimeTurnKernel` assemble the
+Current baseline: v0.1.181 lets `RuntimeTurnKernel` assemble the
+lifecycle-owned `RuntimeTurnLoopState` that carries directive state, mutable
+runtime refs, and scoped extension state into the turn loop. `RuntimeTurnState`
+no longer expands loop runtime and extension-state fields itself, preserving
+behavior while moving the Codex-style turn-state handoff through the named
+kernel boundary. Earlier v0.1.180 let `RuntimeTurnKernel` assemble the
 provider-response input object that carries the bound `RuntimeStepContext`,
 kernel-owned sampling state, event/sink refs, conversation/history refs, cost
 tracker, and background workflow handles. Provider response handling no longer

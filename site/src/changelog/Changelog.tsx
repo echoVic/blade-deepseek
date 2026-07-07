@@ -55,6 +55,8 @@ const copy = {
       readNotes: "Release notes",
     },
     summaries: {
+      "v0.1.181":
+        "RuntimeTurnKernel now assembles the lifecycle-owned RuntimeTurnLoopState. RuntimeTurnState no longer expands loop runtime and extension-state fields itself, continuing the turn-state consolidation started around provider response handling.",
       "v0.1.180":
         "RuntimeTurnKernel now assembles the provider-response input object itself. Provider response handling no longer exposes kernel-owned sampling state or step-context binding as separate fields, tightening the turn-state handoff while preserving behavior.",
       "v0.1.179":
@@ -388,6 +390,8 @@ const copy = {
       readNotes: "查看发布说明",
     },
     summaries: {
+      "v0.1.181":
+        "RuntimeTurnKernel 现在会组装 lifecycle-owned RuntimeTurnLoopState。RuntimeTurnState 不再自行展开 loop runtime 和 extension-state 字段，延续 provider response handling 周边的 turn-state 收口。",
       "v0.1.180":
         "RuntimeTurnKernel 现在会自己组装 provider-response input 对象。Provider response handling 不再把 kernel-owned sampling state 或 step-context binding 作为独立字段暴露出来，在不改变行为的前提下继续收紧 turn-state handoff。",
       "v0.1.179":

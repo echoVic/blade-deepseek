@@ -34,6 +34,7 @@ use crate::runtime_normal_tool::{
     RuntimeNormalToolInvocation, execute_runtime_normal_tool_invocation,
 };
 use crate::runtime_state::RuntimeTurnReducer;
+use crate::runtime_turn_kernel::RuntimeTurnKernel;
 use crate::tasks::TaskRegistry;
 use crate::tool_invocation::AgentToolPolicyContext;
 use crate::workflow::ipc::WorkflowIpcContext;
@@ -992,19 +993,15 @@ impl<'a> RuntimeTurnState<'a> {
     }
 
     pub(crate) fn into_loop_state(self) -> RuntimeTurnLoopState<'a> {
-        RuntimeTurnLoopState {
-            directive_state: self.directive_state,
-            runtime: RuntimeTurnLoopRuntime {
-                cost_tracker: self.cost_tracker,
-                cancel: self.cancel,
-                task_registry: self.task_registry,
-                extensions: RuntimeTurnExtensionState {
-                    extension_registry: self.extension_registry,
-                    thread_extensions: self.thread_extensions,
-                    turn_extensions: self.turn_extensions,
-                },
-            },
-        }
+        RuntimeTurnKernel::turn_loop_state(
+            self.directive_state,
+            self.cost_tracker,
+            self.cancel,
+            self.task_registry,
+            self.extension_registry,
+            self.thread_extensions,
+            self.turn_extensions,
+        )
     }
 
     #[cfg(test)]
@@ -1039,6 +1036,18 @@ impl<'a> RuntimeTurnState<'a> {
 }
 
 impl RuntimeTurnExtensionState {
+    pub(crate) fn new(
+        extension_registry: ExtensionRegistry,
+        thread_extensions: Arc<ExtensionData>,
+        turn_extensions: ExtensionData,
+    ) -> Self {
+        Self {
+            extension_registry,
+            thread_extensions,
+            turn_extensions,
+        }
+    }
+
     pub(crate) fn extension_context(&self) -> RuntimeExtensionContext<'_> {
         RuntimeTurnState::extension_context_from_parts(
             &self.extension_registry,

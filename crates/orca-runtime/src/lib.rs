@@ -709,6 +709,42 @@ mod tests {
     }
 
     #[test]
+    fn runtime_turn_kernel_assembles_turn_loop_state() {
+        let kernel_source = include_str!("runtime_turn_kernel.rs");
+        let lifecycle_source = include_str!("lifecycle.rs");
+        let lifecycle_runtime_source = lifecycle_source
+            .split("\n#[cfg(test)]")
+            .next()
+            .expect("lifecycle runtime source");
+        let into_loop_state_source = lifecycle_runtime_source
+            .split("pub(crate) fn into_loop_state")
+            .nth(1)
+            .and_then(|source| source.split("\n    #[cfg(test)]").next())
+            .expect("RuntimeTurnState::into_loop_state source");
+
+        assert!(
+            kernel_source.contains("pub(crate) fn turn_loop_state("),
+            "RuntimeTurnKernel must expose a turn-loop state assembly helper"
+        );
+        assert!(
+            kernel_source.contains("RuntimeTurnLoopState {"),
+            "RuntimeTurnKernel must assemble RuntimeTurnLoopState"
+        );
+        assert!(
+            lifecycle_runtime_source.contains("RuntimeTurnKernel::turn_loop_state("),
+            "RuntimeTurnState must ask RuntimeTurnKernel to assemble turn-loop state"
+        );
+        assert!(
+            !into_loop_state_source.contains("RuntimeTurnLoopState {"),
+            "RuntimeTurnState must not assemble loop state by expanding kernel-owned runtime parts"
+        );
+        assert!(
+            !into_loop_state_source.contains("RuntimeTurnExtensionState {"),
+            "RuntimeTurnState must not assemble extension state outside RuntimeTurnKernel"
+        );
+    }
+
+    #[test]
     fn turn_loop_iteration_and_provider_contexts_group_runtime_extensions() {
         let lifecycle_source = include_str!("lifecycle.rs");
         let runtime_turn_loop_source = include_str!("runtime_turn_loop.rs");
