@@ -28,7 +28,7 @@ pub fn new_run_id() -> String {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
         .unwrap_or_default();
-    format!("run-{nanos}")
+    format!("run-{nanos}-{}", uuid::Uuid::new_v4())
 }
 
 pub struct InteractiveSession {
