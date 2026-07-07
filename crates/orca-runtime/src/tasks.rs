@@ -940,9 +940,10 @@ fn write_json_pretty<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
         .and_then(|name| name.to_str())
         .unwrap_or("tasks");
     let temp_path = path.with_file_name(format!(
-        ".{file_name}.tmp-{}-{}",
+        ".{file_name}.tmp-{}-{}-{}",
         std::process::id(),
-        now_ms()
+        now_ms(),
+        uuid::Uuid::new_v4()
     ));
     fs::write(&temp_path, content)?;
     fs::rename(&temp_path, path).inspect_err(|_| {
