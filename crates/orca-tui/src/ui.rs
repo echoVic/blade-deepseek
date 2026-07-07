@@ -788,6 +788,9 @@ fn task_detail_label(task: &BackgroundTaskSummary) -> String {
     match task.task_type {
         TaskType::Workflow => workflow_progress_label(task),
         TaskType::Subagent => subagent_progress_label(task),
+        TaskType::MainSession if task.is_backgrounded => {
+            format!("backgrounded • {}", elapsed_label(task))
+        }
         TaskType::MainSession | TaskType::Shell | TaskType::Monitor => elapsed_label(task),
     }
 }
@@ -3118,6 +3121,7 @@ mod tests {
             id: "task-1".to_string(),
             task_type: TaskType::Workflow,
             status: TaskStatus::Running,
+            is_backgrounded: false,
             description: "Audit".to_string(),
             created_at_ms: 1_000,
             started_at_ms: Some(1_000),
@@ -3164,6 +3168,7 @@ mod tests {
             id: "task-subagent".to_string(),
             task_type: TaskType::Subagent,
             status: TaskStatus::Running,
+            is_backgrounded: false,
             description: "inspect auth".to_string(),
             command: None,
             agent_type: Some("general".to_string()),
@@ -3223,6 +3228,7 @@ mod tests {
             id: "task-workflow".to_string(),
             task_type: TaskType::Workflow,
             status: TaskStatus::Completed,
+            is_backgrounded: false,
             description: "Audit".to_string(),
             command: None,
             agent_type: None,
@@ -3352,6 +3358,7 @@ mod tests {
             id: "task-main".to_string(),
             task_type: TaskType::MainSession,
             status: TaskStatus::Completed,
+            is_backgrounded: false,
             description: "Summarize architecture".to_string(),
             created_at_ms: 1_000,
             started_at_ms: Some(1_000),
@@ -3380,6 +3387,40 @@ mod tests {
         assert_eq!(task_detail_label(&task), "elapsed 3s");
     }
 
+    #[test]
+    fn workflow_panel_labels_backgrounded_main_session_tasks() {
+        let task = BackgroundTaskSummary {
+            id: "task-main".to_string(),
+            task_type: TaskType::MainSession,
+            status: TaskStatus::Running,
+            is_backgrounded: true,
+            description: "Summarize architecture".to_string(),
+            created_at_ms: 1_000,
+            started_at_ms: Some(1_000),
+            completed_at_ms: None,
+            command: None,
+            agent_type: Some("main-session".to_string()),
+            server: None,
+            tool: None,
+            name: None,
+            workflow_run_id: None,
+            phase_count: None,
+            workflow_progress: None,
+            workflow_phases: Vec::new(),
+            workflow_agents: Vec::new(),
+            workflow_script_path: None,
+            workflow_launch_input: None,
+            workflow_final_summary: None,
+            workflow_failure_count: 0,
+            usage: None,
+            subagent_current_activity: None,
+            subagent_turn: None,
+            last_activity_at_ms: Some(4_000),
+        };
+
+        assert!(task_detail_label(&task).starts_with("backgrounded • elapsed "));
+    }
+
     fn workflow_task_for_agent_dashboard(
         workflow_name: &str,
         call_suffix: &str,
@@ -3389,6 +3430,7 @@ mod tests {
             id: format!("task-{workflow_name}"),
             task_type: TaskType::Workflow,
             status: TaskStatus::Running,
+            is_backgrounded: false,
             description: workflow_name.to_string(),
             command: None,
             agent_type: None,

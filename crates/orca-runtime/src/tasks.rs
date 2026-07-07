@@ -38,6 +38,7 @@ pub struct TaskRecord {
     pub id: String,
     pub task_type: TaskType,
     pub status: TaskStatus,
+    pub is_backgrounded: bool,
     pub description: String,
     pub created_at_ms: i64,
     pub started_at_ms: Option<i64>,
@@ -81,6 +82,8 @@ struct PersistedTaskRecord {
     id: String,
     task_type: TaskType,
     status: TaskStatus,
+    #[serde(default)]
+    is_backgrounded: bool,
     description: String,
     created_at_ms: i64,
     started_at_ms: Option<i64>,
@@ -173,6 +176,7 @@ impl TaskRegistry {
             id: id.clone(),
             task_type: TaskType::Workflow,
             status: TaskStatus::Queued,
+            is_backgrounded: false,
             description,
             created_at_ms,
             started_at_ms: None,
@@ -220,6 +224,7 @@ impl TaskRegistry {
             id: id.clone(),
             task_type: TaskType::Subagent,
             status: TaskStatus::Queued,
+            is_backgrounded: false,
             description,
             created_at_ms,
             started_at_ms: None,
@@ -267,6 +272,7 @@ impl TaskRegistry {
             id: id.clone(),
             task_type: TaskType::MainSession,
             status: TaskStatus::Queued,
+            is_backgrounded: false,
             description,
             created_at_ms,
             started_at_ms: None,
@@ -314,6 +320,7 @@ impl TaskRegistry {
             id: id.clone(),
             task_type: TaskType::Shell,
             status: TaskStatus::Queued,
+            is_backgrounded: false,
             description,
             created_at_ms,
             started_at_ms: None,
@@ -359,6 +366,7 @@ impl TaskRegistry {
                         id: record.id.clone(),
                         task_type: record.task_type,
                         status: record.status,
+                        is_backgrounded: record.is_backgrounded,
                         description: record.description.clone(),
                         created_at_ms: record.created_at_ms,
                         started_at_ms: record.started_at_ms,
@@ -500,6 +508,21 @@ impl TaskRegistry {
             }
             record.completed_at_ms = None;
             record.control.pause.store(false, Ordering::Release);
+            Ok(())
+        })
+    }
+
+    pub fn mark_backgrounded(&self, id: &str) -> Result<(), String> {
+        self.update_task(id, |record| {
+            if record.task_type != TaskType::MainSession {
+                return Err("mark_backgrounded requires a main session task".to_string());
+            }
+            if record.status != TaskStatus::Running {
+                return Err(task_state_error("mark_backgrounded", record.status));
+            }
+
+            record.is_backgrounded = true;
+            record.last_activity_at_ms = Some(now_ms());
             Ok(())
         })
     }
@@ -788,6 +811,7 @@ impl PersistedTaskRecord {
             id: self.id,
             task_type: self.task_type,
             status: self.status,
+            is_backgrounded: self.is_backgrounded,
             description: self.description,
             created_at_ms: self.created_at_ms,
             started_at_ms: self.started_at_ms,
@@ -828,6 +852,7 @@ impl From<&TaskRecord> for PersistedTaskRecord {
             id: record.id.clone(),
             task_type: record.task_type,
             status: record.status,
+            is_backgrounded: record.is_backgrounded,
             description: record.description.clone(),
             created_at_ms: record.created_at_ms,
             started_at_ms: record.started_at_ms,
@@ -1177,6 +1202,21 @@ mod tests {
         assert!(list[0].created_at_ms > 0);
         assert_eq!(list[0].started_at_ms, None);
         assert_eq!(list[0].completed_at_ms, None);
+    }
+
+    #[test]
+    fn registry_marks_running_main_session_backgrounded() {
+        let registry = TaskRegistry::new("session-1".to_string());
+        let task = registry.create_main_session("Long analysis".to_string());
+
+        registry.mark_running(&task.id).unwrap();
+        registry.mark_backgrounded(&task.id).unwrap();
+
+        let list = registry.list();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].task_type, TaskType::MainSession);
+        assert_eq!(list[0].status, TaskStatus::Running);
+        assert!(list[0].is_backgrounded);
     }
 
     #[test]

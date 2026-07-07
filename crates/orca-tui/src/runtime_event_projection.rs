@@ -602,6 +602,7 @@ mod tests {
             id: "task-1".to_string(),
             task_type: orca_core::task_types::TaskType::Workflow,
             status: orca_core::task_types::TaskStatus::Running,
+            is_backgrounded: false,
             description: "demo workflow".to_string(),
             created_at_ms: 10,
             started_at_ms: Some(20),

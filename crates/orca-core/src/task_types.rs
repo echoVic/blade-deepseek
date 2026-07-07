@@ -81,6 +81,8 @@ pub struct BackgroundTaskSummary {
     #[serde(rename = "type")]
     pub task_type: TaskType,
     pub status: TaskStatus,
+    #[serde(default)]
+    pub is_backgrounded: bool,
     pub description: String,
     pub created_at_ms: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
