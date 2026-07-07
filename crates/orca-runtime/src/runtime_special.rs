@@ -342,11 +342,19 @@ impl RuntimeToolActorContext {
                 None,
             );
         }
-        if let Err(error) = task_registry.request_stop(task_id) {
+        if record.status == TaskStatus::ApprovalRequired {
+            if let Err(error) = task_registry.stop(task_id, "Task stopped".to_string()) {
+                return ToolResult::failed(request, error, None);
+            }
+        } else if let Err(error) = task_registry.request_stop(task_id) {
             return ToolResult::failed(request, error, None);
         }
         let output = json!({
-            "message": "Task stop requested",
+            "message": if record.status == TaskStatus::ApprovalRequired {
+                "Task stopped"
+            } else {
+                "Task stop requested"
+            },
             "task_id": record.id,
             "task_type": task_type_label(record.task_type),
             "command": record.command,
@@ -523,6 +531,7 @@ fn workflow_draft_script_arg(request: &ToolRequest) -> io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use orca_core::tool_types::ToolStatus;
 
     #[test]
     fn task_summary_json_marks_backgrounded_main_sessions() {
@@ -560,5 +569,36 @@ mod tests {
         assert_eq!(summary["task_type"], "main_session");
         assert_eq!(summary["status"], "running");
         assert_eq!(summary["isBackgrounded"], true);
+    }
+
+    #[test]
+    fn task_stop_stops_approval_required_background_main_session() {
+        let registry = TaskRegistry::new("session-1".to_string());
+        let task = registry.create_main_session("waiting for approval".to_string());
+        registry.mark_running(&task.id).unwrap();
+        registry.mark_backgrounded(&task.id).unwrap();
+        registry
+            .approval_required_for_tool(
+                &task.id,
+                "approval_required".to_string(),
+                Some("task_list".to_string()),
+            )
+            .unwrap();
+        let request = ToolRequest {
+            id: "call-stop".to_string(),
+            name: ToolName::TaskStop,
+            action: orca_core::approval_types::ActionKind::Write,
+            target: None,
+            raw_arguments: Some(format!(r#"{{"task_id":"{}"}}"#, task.id)),
+        };
+        let mut context = RuntimeToolActorContext::new("test-run", 8);
+
+        let result = context.execute_task_stop_tool(&request, &registry);
+
+        assert_eq!(result.status, ToolStatus::Completed, "{:?}", result.error);
+        let stopped = registry.get(&task.id).unwrap();
+        assert_eq!(stopped.status, TaskStatus::Stopped);
+        assert_eq!(stopped.result.as_deref(), Some("Task stopped"));
+        assert_eq!(stopped.error, None);
     }
 }

@@ -1707,6 +1707,81 @@ mod tests {
     }
 
     #[test]
+    fn tui_task_stop_can_clear_approval_required_background_main_session() {
+        let config = full_auto_config();
+        let (event_tx, event_rx) = mpsc::channel();
+        let (_action_tx, action_rx) = mpsc::channel();
+        let cancel = CancelToken::new();
+        let mut session =
+            TuiConversationSession::new_with_preloaded(&config, "main session stop", None)
+                .expect("session");
+        let task = session
+            .runtime_session()
+            .task_registry()
+            .create_main_session("background approval".to_string());
+        session
+            .runtime_session()
+            .task_registry()
+            .mark_running(&task.id)
+            .unwrap();
+        session
+            .runtime_session()
+            .task_registry()
+            .mark_backgrounded(&task.id)
+            .unwrap();
+        session
+            .runtime_session()
+            .task_registry()
+            .approval_required_for_tool(
+                &task.id,
+                "approval_required".to_string(),
+                Some("task_list".to_string()),
+            )
+            .unwrap();
+
+        let status = run_agent_for_tui(
+            &config,
+            &mut session,
+            &format!("task_stop {}", task.id),
+            &event_tx,
+            &action_rx,
+            &cancel,
+            false,
+        );
+
+        assert_eq!(status, "success");
+        let stopped_task = session
+            .runtime_session()
+            .task_registry()
+            .get(&task.id)
+            .unwrap();
+        assert_eq!(stopped_task.status, TaskStatus::Stopped);
+        assert_eq!(stopped_task.result.as_deref(), Some("Task stopped"));
+
+        let events = event_rx.try_iter().collect::<Vec<_>>();
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                TuiEvent::ToolCompleted { name, status, output, .. }
+                if name == "task_stop"
+                    && status == "completed"
+                    && output.contains("Task stopped")
+            )
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                TuiEvent::WorkflowTasksUpdated { tasks }
+                if tasks.iter().any(|task| {
+                    task.task_type == TaskType::MainSession
+                        && task.status == TaskStatus::Stopped
+                        && task.description == "background approval"
+                })
+            )
+        }));
+    }
+
+    #[test]
     fn tui_tool_schema_exposes_goal_tool_only_for_goal_turns() {
         let config = config();
         let mut session =
