@@ -118,6 +118,30 @@ fn start_main_session_task_for_tui(
     task.id
 }
 
+fn poll_background_current_turn_for_tui(
+    session: &TuiConversationSession,
+    event_tx: &Sender<TuiEvent>,
+    events: &mut EventFactory,
+    action_rx: &Receiver<UserAction>,
+    task_id: &str,
+    is_backgrounded: &mut bool,
+) {
+    if *is_backgrounded {
+        return;
+    }
+
+    let Ok(action) = action_rx.try_recv() else {
+        return;
+    };
+
+    if matches!(action, UserAction::BackgroundCurrentTurn)
+        && session.task_registry().mark_backgrounded(task_id).is_ok()
+    {
+        *is_backgrounded = true;
+        send_workflow_tasks_updated_for_tui(event_tx, events, &session.task_registry().list());
+    }
+}
+
 fn finish_main_session_task_for_tui(
     session: &mut TuiConversationSession,
     event_tx: &Sender<TuiEvent>,
@@ -439,6 +463,15 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
     );
     let main_session_task_id =
         start_main_session_task_for_tui(session, event_tx, &mut runtime_events, prompt);
+    let mut main_session_backgrounded = false;
+    poll_background_current_turn_for_tui(
+        session,
+        event_tx,
+        &mut runtime_events,
+        action_rx,
+        &main_session_task_id,
+        &mut main_session_backgrounded,
+    );
 
     loop {
         turn += 1;
@@ -538,13 +571,37 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
             cancel,
             &mut |step| match step {
                 ProviderStep::ReasoningDelta(text) => {
+                    poll_background_current_turn_for_tui(
+                        session,
+                        &tx,
+                        &mut stream_events,
+                        action_rx,
+                        &main_session_task_id,
+                        &mut main_session_backgrounded,
+                    );
                     send_runtime_event_as_tui(&tx, stream_events.assistant_reasoning_delta(text));
                 }
                 ProviderStep::MessageDelta(text) => {
+                    poll_background_current_turn_for_tui(
+                        session,
+                        &tx,
+                        &mut stream_events,
+                        action_rx,
+                        &main_session_task_id,
+                        &mut main_session_backgrounded,
+                    );
                     emitted_message_delta = true;
                     send_runtime_event_as_tui(&tx, stream_events.assistant_message_delta(text));
                 }
                 ProviderStep::ToolCallProgress(progress) => {
+                    poll_background_current_turn_for_tui(
+                        session,
+                        &tx,
+                        &mut stream_events,
+                        action_rx,
+                        &main_session_task_id,
+                        &mut main_session_backgrounded,
+                    );
                     send_runtime_event_as_tui(&tx, stream_events.tool_call_progress(progress));
                 }
                 _ => {}
@@ -1313,6 +1370,53 @@ mod tests {
                     task.task_type == TaskType::MainSession
                         && task.status == TaskStatus::Completed
                         && task.description == "mock_silent_final"
+                })
+            )
+        }));
+    }
+
+    #[test]
+    fn tui_background_current_turn_marks_main_session_task() {
+        let config = config();
+        let (event_tx, event_rx) = mpsc::channel();
+        let (action_tx, action_rx) = mpsc::channel();
+        let cancel = CancelToken::new();
+        let mut session =
+            TuiConversationSession::new_with_preloaded(&config, "background turn", None)
+                .expect("session");
+
+        action_tx
+            .send(UserAction::BackgroundCurrentTurn)
+            .expect("send background action");
+        let status = run_agent_for_tui(
+            &config,
+            &mut session,
+            "mock_silent_final",
+            &event_tx,
+            &action_rx,
+            &cancel,
+            false,
+        );
+
+        assert_eq!(status, "success");
+        let main_task = session
+            .runtime_session()
+            .task_registry()
+            .list()
+            .into_iter()
+            .find(|task| task.task_type == TaskType::MainSession)
+            .expect("main session task");
+        assert!(main_task.is_backgrounded);
+
+        let events = event_rx.try_iter().collect::<Vec<_>>();
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                TuiEvent::WorkflowTasksUpdated { tasks }
+                if tasks.iter().any(|task| {
+                    task.task_type == TaskType::MainSession
+                        && task.status == TaskStatus::Running
+                        && task.is_backgrounded
                 })
             )
         }));

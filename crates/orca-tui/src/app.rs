@@ -942,7 +942,7 @@ mod tests {
     }
 
     #[test]
-    fn running_background_shortcut_dispatches_action_without_cancelling() {
+    fn running_background_shortcut_dispatches_action_and_returns_to_idle_without_cancelling() {
         let (mut state, action_rx) = test_state();
         state.status = AppStatus::Running;
         let action_tx = state.event_tx.clone();
@@ -960,7 +960,7 @@ mod tests {
             Ok(UserAction::BackgroundCurrentTurn)
         ));
         assert!(!cancel.is_cancelled());
-        assert_eq!(state.status, AppStatus::Running);
+        assert_eq!(state.status, AppStatus::Idle);
     }
 
     #[test]
@@ -2189,6 +2189,7 @@ fn handle_running_shortcut(
     match shortcut {
         RunningShortcut::BackgroundCurrentTurn => {
             let _ = action_tx.send(UserAction::BackgroundCurrentTurn);
+            state.set_status(AppStatus::Idle);
         }
         RunningShortcut::Interrupt => {
             cancel_token.cancel();
