@@ -103,6 +103,7 @@ pub(crate) struct AgentLoopContext<'a> {
     pub(crate) turn_execution: Option<RuntimeTurnExecution<'a>>,
     pub(crate) turn_interactions: RuntimeTurnInteractionState<'a>,
     pub(crate) steer_handle: Option<&'a ThreadSteerHandle>,
+    pub(crate) initial_response: Option<ProviderResponse>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -711,6 +712,7 @@ impl<'a> AgentLoopContext<'a> {
             turn_execution: None,
             turn_interactions: RuntimeTurnInteractionState::new(),
             steer_handle: None,
+            initial_response: None,
         }
     }
 
@@ -825,6 +827,16 @@ impl<'a> AgentLoopContext<'a> {
     pub(crate) fn with_steer_handle(mut self, steer_handle: Option<&'a ThreadSteerHandle>) -> Self {
         self.steer_handle = steer_handle;
         self
+    }
+
+    pub(crate) fn with_initial_response(mut self, response: ProviderResponse) -> Self {
+        self.initial_response = Some(response);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn initial_response(&self) -> Option<&ProviderResponse> {
+        self.initial_response.as_ref()
     }
 
     pub(crate) fn with_permission_handler(

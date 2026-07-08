@@ -49,6 +49,7 @@ pub(crate) fn run_agent_loop(
         turn_execution,
         turn_interactions,
         steer_handle,
+        initial_response,
     } = loop_context;
     let RuntimeTurnDeps {
         instructions,
@@ -106,7 +107,7 @@ pub(crate) fn run_agent_loop(
             prepared_conversation: &mut prepared_conversation,
             prompt,
             subagent_type,
-            initial_response: None,
+            initial_response,
             loop_state,
             steer_handle,
             config,
@@ -186,6 +187,7 @@ mod tests {
     use crate::lifecycle::RuntimeTaskKind;
     use crate::memory::MemoryBlock;
     use orca_core::cancel::CancelToken;
+    use orca_core::provider_types::{ProviderResponse, ProviderStep};
     use orca_core::subagent_types::SubagentType;
     use orca_mcp::McpRegistry;
     use std::path::PathBuf;
@@ -217,6 +219,30 @@ mod tests {
         assert_eq!(config.subagent_depth(), 1);
         assert!(config.emit_deltas());
         assert_eq!(config.subagent_type(), &SubagentType::General);
+    }
+
+    #[test]
+    fn agent_loop_context_carries_initial_provider_response() {
+        let cwd = PathBuf::from("/tmp/orca-agent-loop-continuation");
+        let subagent_type = SubagentType::General;
+        let response = ProviderResponse {
+            steps: vec![ProviderStep::MessageDelta("continued".to_string())],
+            assistant_content: Some("continued".to_string()),
+            assistant_reasoning: None,
+            tool_calls: Vec::new(),
+            usage: None,
+        };
+
+        let context = AgentLoopContext::new(&cwd, "inspect repo", 1, true, &subagent_type)
+            .with_initial_response(response);
+
+        assert_eq!(
+            context
+                .initial_response()
+                .as_ref()
+                .and_then(|response| response.assistant_content.as_deref()),
+            Some("continued")
+        );
     }
 
     #[test]
