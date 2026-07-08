@@ -2,7 +2,6 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::io::{self, Write};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -39,8 +38,7 @@ use crate::types::{TuiEvent, UserAction};
 
 pub(crate) const DEFAULT_MAX_TURNS: u32 = 128;
 
-pub(crate) type PendingWorkflowNotifications =
-    Arc<Mutex<VecDeque<crate::types::PendingWorkflowNotification>>>;
+pub(crate) type PendingWorkflowNotifications = crate::types::PendingWorkflowNotificationQueue;
 
 enum ProviderStreamEvent {
     Step(ProviderStep),
@@ -1503,8 +1501,7 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
 fn take_pending_workflow_notification(
     pending_workflow_notifications: Option<&PendingWorkflowNotifications>,
 ) -> Option<String> {
-    pending_workflow_notifications
-        .and_then(|queue| queue.lock().ok()?.pop_front().map(|n| n.prompt))
+    pending_workflow_notifications.and_then(PendingWorkflowNotifications::pop_prompt)
 }
 
 fn record_tui_goal_tool_finish(
@@ -1541,7 +1538,6 @@ mod tests {
     use std::collections::VecDeque;
     use std::path::Path;
     use std::sync::mpsc;
-    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     use orca_core::approval_types::ApprovalMode;
@@ -2281,13 +2277,14 @@ mod tests {
         let (event_tx, event_rx) = mpsc::channel();
         let (_action_tx, action_rx) = mpsc::channel();
         let cancel = CancelToken::new();
-        let pending_notifications = Arc::new(Mutex::new(VecDeque::from([
-            crate::types::PendingWorkflowNotification {
+        let pending_notifications = PendingWorkflowNotifications::new();
+        assert!(
+            pending_notifications.push_unique(crate::types::PendingWorkflowNotification {
                 id: "notification-1".to_string(),
                 prompt: "<task-notification><status>failed</status></task-notification>"
                     .to_string(),
-            },
-        ])));
+            })
+        );
         let mut session = TuiConversationSession::new_with_preloaded(&config, "task_list", None)
             .expect("session");
         let pending_actions = RefCell::new(VecDeque::new());
@@ -2309,7 +2306,7 @@ mod tests {
             result.next_prompt.as_deref(),
             Some("<task-notification><status>failed</status></task-notification>")
         );
-        assert!(pending_notifications.lock().unwrap().is_empty());
+        assert!(pending_notifications.is_empty());
         assert!(event_rx.try_iter().any(|event| {
             matches!(event, TuiEvent::SessionCompleted { status } if status == "success")
         }));
@@ -2323,7 +2320,7 @@ mod tests {
         let (event_tx, _event_rx) = mpsc::channel();
         let (_action_tx, action_rx) = mpsc::channel();
         let cancel = CancelToken::new();
-        let pending_notifications = Arc::new(Mutex::new(VecDeque::new()));
+        let pending_notifications = PendingWorkflowNotifications::new();
         let mut session = TuiConversationSession::new_with_preloaded(&config, "task_list", None)
             .expect("session");
         let pending_actions = RefCell::new(VecDeque::new());

@@ -73,7 +73,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
     let (event_tx, event_rx) = mpsc::channel::<TuiEvent>();
     let (action_tx, action_rx) = mpsc::channel::<UserAction>();
     let pending_workflow_notifications: bridge::PendingWorkflowNotifications =
-        Arc::new(Mutex::new(VecDeque::new()));
+        bridge::PendingWorkflowNotifications::new();
 
     let model_name = config.model.display_name().to_string();
 
@@ -168,7 +168,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
     let agent_event_tx = event_tx.clone();
     let cancel_token = CancelToken::new();
     let agent_cancel = cancel_token.clone();
-    let agent_workflow_notifications = Arc::clone(&pending_workflow_notifications);
+    let agent_workflow_notifications = pending_workflow_notifications.clone();
 
     let _agent_handle = std::thread::spawn(move || {
         agent_loop_thread(
@@ -789,16 +789,11 @@ fn queue_workflow_terminal_notification(
     if !batch_injection_enabled {
         return None;
     }
-    if let TuiEvent::WorkflowNotification { id, prompt, .. } = event
-        && let Ok(mut queue) = pending_notifications.lock()
-    {
-        let queued = crate::types::push_pending_workflow_notification_unique(
-            &mut queue,
-            crate::types::PendingWorkflowNotification {
-                id: id.clone(),
-                prompt: prompt.clone(),
-            },
-        );
+    if let TuiEvent::WorkflowNotification { id, prompt, .. } = event {
+        let queued = pending_notifications.push_unique(crate::types::PendingWorkflowNotification {
+            id: id.clone(),
+            prompt: prompt.clone(),
+        });
         if queued {
             return Some(id.clone());
         }
@@ -820,11 +815,7 @@ fn drain_pending_workflow_notifications(
     state: &mut AppState,
     pending_notifications: &bridge::PendingWorkflowNotifications,
 ) {
-    if let Ok(mut queue) = pending_notifications.lock() {
-        while let Some(notification) = queue.pop_front() {
-            state.pending_workflow_notifications.push_back(notification);
-        }
-    }
+    pending_notifications.drain_into(&mut state.pending_workflow_notifications);
 }
 
 fn is_workflow_notification_turn_boundary(event: &TuiEvent) -> bool {
@@ -1429,7 +1420,7 @@ mod tests {
     }
 
     fn test_pending_workflow_notifications() -> bridge::PendingWorkflowNotifications {
-        Arc::new(Mutex::new(VecDeque::new()))
+        bridge::PendingWorkflowNotifications::new()
     }
 
     #[test]
@@ -2467,19 +2458,18 @@ mod tests {
         let (mut state, _rx) = test_state();
         let (action_tx, action_rx) = mpsc::channel();
         let queue = test_pending_workflow_notifications();
-        queue
-            .lock()
-            .unwrap()
-            .push_back(crate::types::PendingWorkflowNotification {
+        assert!(
+            queue.push_unique(crate::types::PendingWorkflowNotification {
                 id: "notification-1".to_string(),
                 prompt: "<task-notification>failed</task-notification>".to_string(),
-            });
+            })
+        );
         state.status = AppStatus::Running;
 
         drain_pending_workflow_notifications(&mut state, &queue);
         submit_pending_workflow_notification(&mut state, &action_tx, false);
 
-        assert!(queue.lock().unwrap().is_empty());
+        assert!(queue.is_empty());
         assert!(state.pending_workflow_notifications.is_empty());
         assert_eq!(state.status, AppStatus::Running);
         assert!(matches!(
@@ -2502,7 +2492,7 @@ mod tests {
             true,
         );
         assert_eq!(queued.as_deref(), Some("notification-1"));
-        let notification = queue.lock().unwrap().pop_front().expect("notification");
+        let notification = queue.pop_front().expect("notification");
         assert_eq!(notification.id, "notification-1");
         assert_eq!(
             notification.prompt,
@@ -2520,7 +2510,7 @@ mod tests {
             true,
         );
         assert_eq!(queued.as_deref(), Some("notification-2"));
-        let notification = queue.lock().unwrap().pop_front().expect("notification");
+        let notification = queue.pop_front().expect("notification");
         assert_eq!(notification.id, "notification-2");
         assert_eq!(
             notification.prompt,
@@ -2538,7 +2528,7 @@ mod tests {
             false,
         );
         assert!(queued.is_none());
-        assert!(queue.lock().unwrap().is_empty());
+        assert!(queue.is_empty());
     }
 
     #[test]
@@ -2556,7 +2546,7 @@ mod tests {
             Some("notification-1")
         );
         assert!(queue_workflow_terminal_notification(&event, &queue, true).is_none());
-        assert_eq!(queue.lock().unwrap().len(), 1);
+        assert_eq!(queue.len(), 1);
     }
 
     #[test]

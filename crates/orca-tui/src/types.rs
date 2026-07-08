@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use orca_core::approval_types::ApprovalMode;
@@ -26,7 +27,62 @@ pub struct PendingWorkflowNotification {
     pub prompt: String,
 }
 
-pub fn push_pending_workflow_notification_unique(
+#[derive(Debug, Clone, Default)]
+pub struct PendingWorkflowNotificationQueue {
+    inner: Arc<Mutex<VecDeque<PendingWorkflowNotification>>>,
+}
+
+impl PendingWorkflowNotificationQueue {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn push_unique(&self, notification: PendingWorkflowNotification) -> bool {
+        let Ok(mut queue) = self.inner.lock() else {
+            return false;
+        };
+        push_pending_workflow_notification_unique(&mut queue, notification)
+    }
+
+    pub fn drain_into(&self, target: &mut VecDeque<PendingWorkflowNotification>) {
+        let Ok(mut queue) = self.inner.lock() else {
+            return;
+        };
+        while let Some(notification) = queue.pop_front() {
+            target.push_back(notification);
+        }
+    }
+
+    pub fn pop_prompt(&self) -> Option<String> {
+        self.inner
+            .lock()
+            .ok()?
+            .pop_front()
+            .map(|notification| notification.prompt)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner
+            .lock()
+            .map(|queue| queue.is_empty())
+            .unwrap_or(true)
+    }
+
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.inner
+            .lock()
+            .map(|queue| queue.len())
+            .unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    pub fn pop_front(&self) -> Option<PendingWorkflowNotification> {
+        self.inner.lock().ok()?.pop_front()
+    }
+}
+
+fn push_pending_workflow_notification_unique(
     queue: &mut VecDeque<PendingWorkflowNotification>,
     notification: PendingWorkflowNotification,
 ) -> bool {
@@ -2688,6 +2744,35 @@ mod tests {
             })
             .count();
         assert_eq!(workflow_messages, 1);
+    }
+
+    #[test]
+    fn pending_workflow_notification_queue_owns_unique_drain_and_prompt_pop() {
+        let queue = PendingWorkflowNotificationQueue::new();
+        assert!(queue.push_unique(PendingWorkflowNotification {
+            id: "notification-1".to_string(),
+            prompt: "<task-notification>one</task-notification>".to_string(),
+        }));
+        assert!(!queue.push_unique(PendingWorkflowNotification {
+            id: "notification-1".to_string(),
+            prompt: "<task-notification>duplicate</task-notification>".to_string(),
+        }));
+
+        let mut pending = VecDeque::new();
+        queue.drain_into(&mut pending);
+        assert!(queue.is_empty());
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, "notification-1");
+
+        assert!(queue.push_unique(PendingWorkflowNotification {
+            id: "notification-2".to_string(),
+            prompt: "<task-notification>two</task-notification>".to_string(),
+        }));
+        assert_eq!(
+            queue.pop_prompt().as_deref(),
+            Some("<task-notification>two</task-notification>")
+        );
+        assert!(queue.pop_prompt().is_none());
     }
 
     #[test]

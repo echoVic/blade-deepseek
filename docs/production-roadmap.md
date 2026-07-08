@@ -247,7 +247,10 @@ copied into Orca.
    batch-boundary reconciliation no longer identifies pending continuations by
    prompt text; both AppState and batch-boundary queues now reject duplicate
    notification ids before creating duplicate model continuations or user-visible
-   notices. Next, move the same id discipline into remaining turn/item
+   notices. The cross-thread TUI notification queue is now a focused
+   `PendingWorkflowNotificationQueue` boundary instead of an exposed
+   `Arc<Mutex<VecDeque<_>>>`, so queue insert/drain/pop behavior stays behind
+   named methods. Next, move the same id discipline into remaining turn/item
    continuations and workflow notification ownership so continuations stop
    depending on separate ad hoc task fields plus TUI-local queues.
 3. **P2: Frozen per-turn context boundary.** Continue shrinking wide call
