@@ -1982,6 +1982,61 @@ mod tests {
     }
 
     #[test]
+    fn workflow_notification_first_turn_uses_notification_label_for_session_title() {
+        with_orca_home(|_| {
+            let config = Arc::new(Mutex::new(test_config(HistoryMode::Record)));
+            let preloaded = Arc::new(Mutex::new(None));
+            let (event_tx, event_rx) = mpsc::channel();
+            let (action_tx, action_rx) = mpsc::channel();
+            let cancel = CancelToken::new();
+
+            let handle = std::thread::spawn({
+                let config = Arc::clone(&config);
+                let preloaded = Arc::clone(&preloaded);
+                let cancel = cancel.clone();
+                move || {
+                    agent_loop_thread(
+                        config,
+                        preloaded,
+                        event_tx,
+                        action_rx,
+                        cancel,
+                        test_pending_workflow_notifications(),
+                    )
+                }
+            });
+
+            action_tx
+                .send(UserAction::SubmitWorkflowNotification {
+                    id: "notification-1".to_string(),
+                    prompt: "<task-notification>mock_history_echo</task-notification>".to_string(),
+                })
+                .unwrap();
+
+            loop {
+                let event = event_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                if matching_task_update(event, |task| {
+                    task.task_type == orca_core::task_types::TaskType::MainSession
+                })
+                .is_some()
+                {
+                    break;
+                }
+            }
+
+            action_tx.send(UserAction::Cancel).unwrap();
+            handle.join().unwrap();
+
+            let transcript = history::load_session("latest").expect("latest session");
+            assert_eq!(
+                transcript.meta.title,
+                "Workflow notification notification-1"
+            );
+            assert!(!transcript.meta.title.contains("<task-notification>"));
+        });
+    }
+
+    #[test]
     fn backgrounded_agent_loop_does_not_complete_unexecuted_tool_calls() {
         with_orca_home(|_| {
             let config = Arc::new(Mutex::new(test_config(HistoryMode::Record)));
@@ -4183,6 +4238,16 @@ impl SubmittedTurn {
             SubmittedTurnSource::WorkflowNotification => Ok(self.prompt.clone()),
         }
     }
+
+    fn title_seed(&self, model_prompt: &str) -> String {
+        match self.source {
+            SubmittedTurnSource::User => model_prompt.to_string(),
+            SubmittedTurnSource::WorkflowNotification => self
+                .task_description
+                .clone()
+                .unwrap_or_else(|| model_prompt.to_string()),
+        }
+    }
 }
 
 fn workflow_notification_task_label(id: &str) -> String {
@@ -4216,8 +4281,10 @@ fn handle_submitted_turn_for_tui(
     };
     if session.is_none() {
         let transcript = preloaded.lock().unwrap().take();
+        let title_seed = submitted_turn.title_seed(&prompt);
         *session =
-            match bridge::TuiConversationSession::new_with_preloaded(&cfg, &prompt, transcript) {
+            match bridge::TuiConversationSession::new_with_preloaded(&cfg, &title_seed, transcript)
+            {
                 Ok(session) => Some(session),
                 Err(error) => {
                     let _ = event_tx.send(TuiEvent::Error(format!(
