@@ -3430,7 +3430,9 @@ enabled = true
             assert!(
                 permission_request["reason"]
                     .as_str()
-                    .is_some_and(|reason| reason.contains("sandbox denied")),
+                    .is_some_and(|reason| reason.contains(
+                        "command/exec attempted filesystem write outside the current sandbox"
+                    )),
                 "permission request should explain sandbox denial: {permission_request:?}"
             );
             assert!(

@@ -283,7 +283,12 @@ The deeper July 9 reference pass changes the next refactor order:
    streaming drains route filesystem retry decisions through the policy, and
    non-streaming command/exec network, filesystem, and pathless sandbox retry
    prompts now get their permission profile and reason text from that same
-   policy before the server registers the pending request.
+   policy before the server registers the pending request. The shared request
+   construction is now promoted into `RuntimePermissionPolicy`, so bash and
+   command/exec use one actor-scoped owner for network block, filesystem write,
+   and pathless unsandboxed retry permission requests. Next mirror Codex more
+   directly by adding command-origin/rejection metadata to exec policy decisions
+   instead of returning only prompt text.
 4. **P2: Turn MCP elicitation and dynamic waits into pending interactions.**
    Package 3's MCP elicitation queue is the useful reference here: request id,
    server name, mode, abort signal, completion notification, and hook-driven

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
@@ -8,14 +8,10 @@ use orca_core::task_types::TaskStatus;
 use orca_core::tool_types::{ToolOutputTruncation, ToolRequest, ToolResult};
 
 use crate::extension::RuntimeExtensionStores;
-use crate::lifecycle::{
-    RuntimePermissionRequest, RuntimePermissionRequestHandler, TurnPermissionOverlay,
-};
+use crate::lifecycle::{RuntimePermissionRequestHandler, TurnPermissionOverlay};
 use crate::network_proxy::{RuntimeNetworkBlockReport, RuntimeNetworkPolicy, RuntimeNetworkProxy};
-use crate::protocol::{
-    PermissionResponseDecision, RequestFileSystemPermissions, RequestNetworkPermissions,
-    RequestPermissionProfile, RequestShellPermissions,
-};
+use crate::protocol::PermissionResponseDecision;
+use crate::runtime_permission::{RuntimePermissionOrigin, RuntimePermissionPolicy};
 use crate::runtime_state::RuntimeTurnReducer;
 use crate::sandbox_denial::{
     SandboxDenialDiagnostic, diagnose_sandbox_denial,
@@ -113,8 +109,11 @@ pub(crate) fn execute_bash_with_shell_session(
         network_block,
     } = result;
     if let Some(block) = network_block
-        && let Some(permission_request) =
-            RuntimeBashPermissionPolicy::network_block_request(&request.id, &block)
+        && let Some(permission_request) = RuntimePermissionPolicy::network_block_request(
+            &request.id,
+            RuntimePermissionOrigin::Bash,
+            &block,
+        )
         && let Some(permission_handler) = permission_handler
     {
         let reducer = RuntimeTurnReducer::from_extension_stores(extension_stores);
@@ -152,9 +151,11 @@ pub(crate) fn execute_bash_with_shell_session(
             cwd,
             &diagnostic,
             &sandbox.denied_writable_roots,
-        ) && let Some(permission_request) =
-            RuntimeBashPermissionPolicy::filesystem_write_request(&request.id, &diagnostic)
-            && let Some(permission_handler) = permission_handler
+        ) && let Some(permission_request) = RuntimePermissionPolicy::filesystem_write_request(
+            &request.id,
+            RuntimePermissionOrigin::Bash,
+            &diagnostic,
+        ) && let Some(permission_handler) = permission_handler
         {
             let reducer = RuntimeTurnReducer::from_extension_stores(extension_stores);
             let response = match reducer.request_permission(
@@ -194,9 +195,11 @@ pub(crate) fn execute_bash_with_shell_session(
             .with_sandbox_diagnostic(cwd)
             .into_tool_result(request, output_truncation, cancel, task_registry);
         }
-        if let Some(permission_request) =
-            RuntimeBashPermissionPolicy::unsandboxed_shell_request(&request.id, &diagnostic)
-            && let Some(permission_handler) = permission_handler
+        if let Some(permission_request) = RuntimePermissionPolicy::unsandboxed_shell_request(
+            &request.id,
+            RuntimePermissionOrigin::Bash,
+            &diagnostic,
+        ) && let Some(permission_handler) = permission_handler
         {
             let reducer = RuntimeTurnReducer::from_extension_stores(extension_stores);
             let response = match reducer.request_permission(
@@ -276,81 +279,6 @@ struct RuntimeBashOnceContext<'a> {
     shell_timeout_secs: u64,
     task_registry: &'a TaskRegistry,
     cancel: Option<&'a CancelToken>,
-}
-
-struct RuntimeBashPermissionPolicy;
-
-impl RuntimeBashPermissionPolicy {
-    fn network_block_request(
-        request_id: &str,
-        block: &RuntimeNetworkBlockReport,
-    ) -> Option<RuntimePermissionRequest> {
-        if block.error == "blocked-by-denylist" {
-            return None;
-        }
-
-        let mut domains = HashMap::new();
-        domains.insert(block.host.clone(), PermissionProfileNetworkAccess::Allow);
-        Some(RuntimePermissionRequest {
-            id: request_id.to_string(),
-            reason: Some(format!(
-                "bash attempted network access to {} ({})",
-                block.host, block.error
-            )),
-            permissions: RequestPermissionProfile {
-                file_system: None,
-                network: Some(RequestNetworkPermissions {
-                    enabled: None,
-                    domains,
-                }),
-                shell: None,
-            },
-        })
-    }
-
-    fn filesystem_write_request(
-        request_id: &str,
-        diagnostic: &SandboxDenialDiagnostic,
-    ) -> Option<RuntimePermissionRequest> {
-        let write_root = diagnostic.suggested_write_root.as_ref()?.clone();
-        Some(RuntimePermissionRequest {
-            id: request_id.to_string(),
-            reason: Some(format!(
-                "bash attempted filesystem write outside the current sandbox: {}",
-                write_root.display()
-            )),
-            permissions: RequestPermissionProfile {
-                file_system: Some(RequestFileSystemPermissions {
-                    read: None,
-                    write: Some(vec![write_root]),
-                    entries: None,
-                }),
-                network: None,
-                shell: None,
-            },
-        })
-    }
-
-    fn unsandboxed_shell_request(
-        request_id: &str,
-        diagnostic: &SandboxDenialDiagnostic,
-    ) -> Option<RuntimePermissionRequest> {
-        if diagnostic.suggested_write_root.is_some() {
-            return None;
-        }
-
-        Some(RuntimePermissionRequest {
-            id: request_id.to_string(),
-            reason: Some(
-                "bash needs to re-run without the filesystem sandbox because the sandbox denied access but did not report a filesystem path to grant".to_string(),
-            ),
-            permissions: RequestPermissionProfile {
-                file_system: None,
-                network: None,
-                shell: Some(RequestShellPermissions { unsandboxed: true }),
-            },
-        })
-    }
 }
 
 impl BashShellOutput {
@@ -567,111 +495,5 @@ fn execute_bash_once(context: RuntimeBashOnceContext<'_>) -> BashShellOutput {
     BashShellOutput {
         output,
         task_id: Some(handle.task_id),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::path::PathBuf;
-
-    use orca_core::config::PermissionProfileNetworkAccess;
-
-    use super::RuntimeBashPermissionPolicy;
-    use crate::network_proxy::RuntimeNetworkBlockReport;
-    use crate::sandbox_denial::SandboxDenialDiagnostic;
-
-    #[test]
-    fn runtime_bash_permission_policy_skips_denylist_network_blocks() {
-        let block = RuntimeNetworkBlockReport {
-            host: "blocked.orca.invalid".to_string(),
-            error: "blocked-by-denylist",
-        };
-
-        assert!(RuntimeBashPermissionPolicy::network_block_request("tool-1", &block).is_none());
-    }
-
-    #[test]
-    fn runtime_bash_permission_policy_requests_allow_for_network_policy_blocks() {
-        let block = RuntimeNetworkBlockReport {
-            host: "api.example.com".to_string(),
-            error: "blocked-by-allowlist",
-        };
-
-        let request = RuntimeBashPermissionPolicy::network_block_request("tool-1", &block)
-            .expect("network permission request");
-
-        assert_eq!(request.id, "tool-1");
-        assert_eq!(
-            request
-                .permissions
-                .network
-                .as_ref()
-                .and_then(|network| network.domains.get("api.example.com")),
-            Some(&PermissionProfileNetworkAccess::Allow)
-        );
-        assert!(request.permissions.file_system.is_none());
-        assert!(request.permissions.shell.is_none());
-        assert_eq!(
-            request.reason.as_deref(),
-            Some("bash attempted network access to api.example.com (blocked-by-allowlist)")
-        );
-    }
-
-    #[test]
-    fn runtime_bash_permission_policy_requests_filesystem_write_root() {
-        let diagnostic = SandboxDenialDiagnostic {
-            denied_path: Some(PathBuf::from("/repo/.git/index.lock")),
-            suggested_write_root: Some(PathBuf::from("/repo/.git")),
-            message: "sandbox denied filesystem access".to_string(),
-        };
-
-        let request = RuntimeBashPermissionPolicy::filesystem_write_request("tool-1", &diagnostic)
-            .expect("filesystem permission request");
-
-        assert_eq!(request.id, "tool-1");
-        assert_eq!(
-            request
-                .permissions
-                .file_system
-                .as_ref()
-                .and_then(|file_system| file_system.write.as_ref()),
-            Some(&vec![PathBuf::from("/repo/.git")])
-        );
-        assert!(request.permissions.network.is_none());
-        assert!(request.permissions.shell.is_none());
-        assert_eq!(
-            request.reason.as_deref(),
-            Some("bash attempted filesystem write outside the current sandbox: /repo/.git")
-        );
-    }
-
-    #[test]
-    fn runtime_bash_permission_policy_requests_unsandboxed_shell_when_no_root_is_available() {
-        let diagnostic = SandboxDenialDiagnostic {
-            denied_path: None,
-            suggested_write_root: None,
-            message: "sandbox denied filesystem access".to_string(),
-        };
-
-        let request = RuntimeBashPermissionPolicy::unsandboxed_shell_request("tool-1", &diagnostic)
-            .expect("unsandboxed permission request");
-
-        assert_eq!(request.id, "tool-1");
-        assert!(request.permissions.file_system.is_none());
-        assert!(request.permissions.network.is_none());
-        assert_eq!(
-            request
-                .permissions
-                .shell
-                .as_ref()
-                .map(|shell| shell.unsandboxed),
-            Some(true)
-        );
-        assert_eq!(
-            request.reason.as_deref(),
-            Some(
-                "bash needs to re-run without the filesystem sandbox because the sandbox denied access but did not report a filesystem path to grant"
-            )
-        );
     }
 }

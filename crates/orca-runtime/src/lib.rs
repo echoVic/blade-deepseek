@@ -1647,6 +1647,9 @@ mod tests {
         let manager_source =
             std::fs::read_to_string(manifest_dir.join("src/server/command_exec_manager.rs"))
                 .expect("server command exec manager source");
+        let runtime_permission_source =
+            std::fs::read_to_string(manifest_dir.join("src/runtime_permission.rs"))
+                .expect("runtime permission source");
 
         assert!(
             server_source.contains("mod command_exec_manager;"),
@@ -1697,8 +1700,12 @@ mod tests {
                 "server.rs must not construct command exec permission request profiles with {request_constructor}"
             );
             assert!(
-                manager_source.contains(request_constructor),
-                "server/command_exec_manager.rs must construct command exec permission request profiles with {request_constructor}"
+                !manager_source.contains(request_constructor),
+                "server/command_exec_manager.rs must not construct command exec permission request profiles with {request_constructor}"
+            );
+            assert!(
+                runtime_permission_source.contains(request_constructor),
+                "runtime_permission.rs must construct command exec permission request profiles with {request_constructor}"
             );
         }
     }
@@ -2281,6 +2288,12 @@ mod tests {
             "pub struct RuntimePermissionRequest",
             "pub struct RuntimePermissionResponse",
             "pub trait RuntimePermissionRequestHandler",
+            "pub(crate) enum RuntimePermissionOrigin",
+            "pub(crate) struct RuntimePermissionPolicy",
+            "pub(crate) fn network_block_request(",
+            "pub(crate) fn filesystem_write_request(",
+            "pub(crate) fn unsandboxed_shell_request(",
+            "pub(crate) fn sandbox_denial_request(",
             "pub(crate) struct AllowRequestedPermissions",
             "pub struct TurnPermissionOverlay",
             "impl TurnPermissionOverlay",
@@ -3236,12 +3249,12 @@ mod tests {
         for marker in [
             "struct RuntimeBashSandboxContext",
             "struct RuntimeBashOnceContext",
-            "struct RuntimeBashPermissionPolicy",
             "fn execute_bash_with_sandbox(context: RuntimeBashSandboxContext",
             "fn execute_bash_once(context: RuntimeBashOnceContext",
-            "RuntimeBashPermissionPolicy::network_block_request(",
-            "RuntimeBashPermissionPolicy::filesystem_write_request(",
-            "RuntimeBashPermissionPolicy::unsandboxed_shell_request(",
+            "RuntimePermissionPolicy::network_block_request(",
+            "RuntimePermissionPolicy::filesystem_write_request(",
+            "RuntimePermissionPolicy::unsandboxed_shell_request(",
+            "RuntimePermissionOrigin::Bash",
         ] {
             assert!(
                 runtime_bash_source.contains(marker),

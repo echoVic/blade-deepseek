@@ -13,10 +13,10 @@ use super::PendingCommandExecPermissionRequest;
 use super::{cap_text, capped_delta, capped_utf8_len};
 use crate::network_proxy::{RuntimeNetworkBlockReport, RuntimeNetworkProxy};
 use crate::protocol::{self, ServerEvent};
-use crate::sandbox_denial::{
-    SandboxDenialDiagnostic, diagnose_sandbox_denial,
-    should_request_filesystem_permission_with_denied_roots,
+use crate::runtime_permission::{
+    RuntimePermissionOrigin, RuntimePermissionPolicy, RuntimePermissionRequest,
 };
+use crate::sandbox_denial::{SandboxDenialDiagnostic, diagnose_sandbox_denial};
 use crate::shell_session::RuntimeShellSessionManager;
 
 pub(super) struct CommandExecProcess {
@@ -70,6 +70,15 @@ pub(super) struct CommandExecPermissionPrompt {
     pub(super) permissions: protocol::RequestPermissionProfile,
 }
 
+impl From<RuntimePermissionRequest> for CommandExecPermissionPrompt {
+    fn from(request: RuntimePermissionRequest) -> Self {
+        Self {
+            reason: request.reason.unwrap_or_default(),
+            permissions: request.permissions,
+        }
+    }
+}
+
 pub(super) struct CommandExecPermissionPolicy;
 
 impl CommandExecPermissionPolicy {
@@ -84,59 +93,23 @@ impl CommandExecPermissionPolicy {
     pub(super) fn network_block_prompt(
         block: &RuntimeNetworkBlockReport,
     ) -> Option<CommandExecPermissionPrompt> {
-        if block.error == "blocked-by-denylist" {
-            return None;
-        }
-
-        let mut domains = HashMap::new();
-        domains.insert(
-            block.host.clone(),
-            orca_core::config::PermissionProfileNetworkAccess::Allow,
-        );
-        Some(CommandExecPermissionPrompt {
-            reason: format!(
-                "command/exec attempted network access to {} ({})",
-                block.host, block.error
-            ),
-            permissions: protocol::RequestPermissionProfile {
-                file_system: None,
-                network: Some(protocol::RequestNetworkPermissions {
-                    enabled: None,
-                    domains,
-                }),
-                shell: None,
-            },
-        })
+        RuntimePermissionPolicy::network_block_request(
+            "command-exec",
+            RuntimePermissionOrigin::CommandExec,
+            block,
+        )
+        .map(CommandExecPermissionPrompt::from)
     }
 
     pub(super) fn sandbox_denial_prompt(
         diagnostic: &SandboxDenialDiagnostic,
     ) -> CommandExecPermissionPrompt {
-        match diagnostic.suggested_write_root.clone() {
-            Some(write_root) => CommandExecPermissionPrompt {
-                reason: diagnostic.message.clone(),
-                permissions: protocol::RequestPermissionProfile {
-                    file_system: Some(protocol::RequestFileSystemPermissions {
-                        read: None,
-                        write: Some(vec![write_root]),
-                        entries: None,
-                    }),
-                    network: None,
-                    shell: None,
-                },
-            },
-            None => CommandExecPermissionPrompt {
-                reason: format!(
-                    "{}; command/exec needs to re-run without the filesystem sandbox because no filesystem path was reported",
-                    diagnostic.message
-                ),
-                permissions: protocol::RequestPermissionProfile {
-                    file_system: None,
-                    network: None,
-                    shell: Some(protocol::RequestShellPermissions { unsandboxed: true }),
-                },
-            },
-        }
+        RuntimePermissionPolicy::sandbox_denial_request(
+            "command-exec",
+            RuntimePermissionOrigin::CommandExec,
+            diagnostic,
+        )
+        .into()
     }
 
     pub(super) fn should_request_filesystem_retry(
@@ -144,11 +117,11 @@ impl CommandExecPermissionPolicy {
         diagnostic: &SandboxDenialDiagnostic,
         denied_writable_roots: &[PathBuf],
     ) -> bool {
-        should_request_filesystem_permission_with_denied_roots(
+        RuntimePermissionPolicy::should_request_filesystem_retry(
             cwd,
             diagnostic,
             denied_writable_roots,
-        ) || diagnostic.suggested_write_root.is_none()
+        )
     }
 }
 
@@ -733,7 +706,10 @@ mod tests {
 
         let prompt = CommandExecPermissionPolicy::sandbox_denial_prompt(&diagnostic);
 
-        assert_eq!(prompt.reason, "sandbox denied filesystem access");
+        assert_eq!(
+            prompt.reason,
+            "command/exec attempted filesystem write outside the current sandbox: /repo/.git"
+        );
         assert_eq!(
             prompt
                 .permissions
