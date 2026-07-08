@@ -20,6 +20,7 @@ mod mention_menu_actions;
 mod running_actions;
 mod runtime_event_projection;
 mod runtime_interaction_adapter;
+mod session_picker_actions;
 pub mod shortcuts;
 mod slash_command_actions;
 mod slash_menu_actions;
@@ -693,6 +694,45 @@ mod tests {
         assert!(
             !app.contains("Approval mode switched to"),
             "app should use approval_mode_actions instead of formatting mode notices inline"
+        );
+    }
+
+    #[test]
+    fn tui_session_picker_actions_are_owned_by_dedicated_module() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let session_picker_actions =
+            std::fs::read_to_string(format!("{manifest_dir}/src/session_picker_actions.rs"))
+                .expect("session_picker_actions module should exist");
+        assert!(
+            session_picker_actions.contains("pub(crate) fn handle_session_picker_key"),
+            "session_picker_actions should own session picker key handling"
+        );
+        assert!(
+            session_picker_actions.contains("fn resume_selected_session"),
+            "session_picker_actions should own selected session resume mechanics"
+        );
+        assert!(
+            session_picker_actions.contains("HistoryMode::Resume"),
+            "session_picker_actions should own history mode resume updates"
+        );
+        assert!(
+            session_picker_actions.contains("Resumed saved conversation."),
+            "session_picker_actions should own the resume confirmation notice"
+        );
+        assert!(
+            session_picker_actions.contains("preloaded_transcript"),
+            "session_picker_actions should own preloaded transcript storage"
+        );
+
+        let app = std::fs::read_to_string(format!("{manifest_dir}/src/app.rs"))
+            .expect("app source should be readable");
+        assert!(
+            !app.contains("state.session_query_push(c)"),
+            "app should use session_picker_actions instead of editing picker query inline"
+        );
+        assert!(
+            !app.contains("history::load_session(&session_id)"),
+            "app should use session_picker_actions instead of loading selected sessions inline"
         );
     }
 

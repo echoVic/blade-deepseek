@@ -418,6 +418,10 @@ copied into Orca.
    Approval mode cycling now lives in a focused TUI approval mode action
    module, keeping Shift+Tab mode transitions, shared config updates, status
    cell updates, and user-visible notices out of the app event loop.
+   Session picker key handling now lives in a focused TUI session picker action
+   module, covering picker navigation/search, selected-session resume config
+   updates, transcript projection, preloaded transcript storage, and terminal
+   cleanup after resume.
    Runtime task summaries now also expose terminal `result`/`error` fields so
    the selected task row can show completion output or failure details in the
    panel. The

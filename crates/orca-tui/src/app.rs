@@ -44,6 +44,7 @@ use crate::idle_navigation_actions::handle_idle_navigation_shortcut;
 use crate::idle_submit_actions::handle_idle_submit;
 use crate::mention_menu_actions::handle_mention_menu_key;
 use crate::running_actions::handle_running_shortcut;
+use crate::session_picker_actions::handle_session_picker_key;
 use crate::shortcuts::{
     IdleShortcut, RunningShortcut, global_shortcut, idle_shortcut, running_shortcut,
 };
@@ -387,59 +388,14 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                 }
 
                 if state.status == AppStatus::SessionPicker {
-                    match key.code {
-                        KeyCode::Up => state.select_previous_session(),
-                        KeyCode::Down => state.select_next_session(),
-                        KeyCode::Backspace => state.session_query_pop(),
-                        KeyCode::Char(c) => state.session_query_push(c),
-                        KeyCode::Enter => {
-                            if let Some(session_id) = state.selected_session_id() {
-                                config.history_mode = HistoryMode::Resume(session_id.clone());
-                                if let Ok(mut cfg) = shared_config.lock() {
-                                    cfg.history_mode = HistoryMode::Resume(session_id.clone());
-                                }
-                                if let Ok(transcript) = history::load_session(&session_id) {
-                                    state.messages.clear();
-                                    state.flushed_count = 0;
-                                    state.scroll_offset = 0;
-                                    state.auto_scroll = true;
-                                    for message in &transcript.messages {
-                                        if let Some(chat_message) =
-                                            chat_message_from_history(message.clone())
-                                        {
-                                            state.messages.push(chat_message);
-                                        }
-                                    }
-                                    if let Some((explanation, plan)) = &transcript.plan {
-                                        state.current_plan =
-                                            Some((explanation.clone(), plan.clone()));
-                                    } else {
-                                        state.current_plan = None;
-                                    }
-                                    state.messages.push(ChatMessage::System(
-                                        "Resumed saved conversation.".to_string(),
-                                    ));
-                                    // A resumed transcript is entirely past turns; freeze
-                                    // it so the live suffix starts empty for the next turn.
-                                    state.finalized_count = state.messages.len();
-                                    if let Ok(mut preloaded) = preloaded_transcript.lock() {
-                                        *preloaded = Some(transcript);
-                                    }
-                                    // Without the alternate screen, the old frame remains in the
-                                    // terminal's normal buffer. Clear it so the resumed session
-                                    // redraws on a clean terminal.
-                                    clear_terminal_scrollback(&mut terminal)?;
-                                }
-                                state.set_status(AppStatus::Idle);
-                            }
-                        }
-                        KeyCode::Esc => {
-                            state.set_status(AppStatus::Idle);
-                            state.session_picker_sessions.clear();
-                            state.session_picker_query.clear();
-                        }
-                        _ => {}
-                    }
+                    handle_session_picker_key(
+                        key,
+                        &mut state,
+                        &mut config,
+                        &shared_config,
+                        &preloaded_transcript,
+                        || clear_terminal_scrollback(&mut terminal),
+                    )?;
                     continue;
                 }
 
@@ -3763,7 +3719,7 @@ fn agent_loop_thread(
     }
 }
 
-fn chat_message_from_history(message: Message) -> Option<ChatMessage> {
+pub(crate) fn chat_message_from_history(message: Message) -> Option<ChatMessage> {
     match message {
         Message::System { .. } => None,
         Message::User { content, .. } => Some(ChatMessage::User(content)),
