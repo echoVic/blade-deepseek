@@ -1,0 +1,45 @@
+.gitignore
+  s_d8062c4d6ce7c5::t_56194f0d6c2e96 5
+site/changelog/index.html
+  s_d8062c4d6ce7c5::t_12e4e6692736b9 44-49
+site/deepseek-coding-agent/index.html
+  s_d8062c4d6ce7c5::t_b2835b951f5a88 1-114
+site/github/index.html
+  s_d8062c4d6ce7c5::t_f493affdfc090f 1-113
+site/index.html
+  s_d8062c4d6ce7c5::t_4d4691d363cda2 11,24,37,75
+site/mcp/index.html
+  s_d8062c4d6ce7c5::t_3a3def5cf3af35 1-113
+site/public/sitemap.xml
+  s_d8062c4d6ce7c5::t_79b0eb5669ec30 15-38
+site/scripts/check-seo.mjs
+  s_d8062c4d6ce7c5::t_5b72544ceec854 1,6-31,90-92,118-123,162,169-203
+site/src/changelog/Changelog.tsx
+  s_d8062c4d6ce7c5::t_d46523374bd3b2 57-77,433-453,847-862
+site/src/shared.ts
+  s_d8062c4d6ce7c5::t_8b4de598cb08bb 842-845
+site/src/styles.css
+  s_d8062c4d6ce7c5::t_8f669f0fc685eb 746,985-1043,1517-1520,1538
+site/terminal-coding-agent/index.html
+  s_d8062c4d6ce7c5::t_4a2076457595eb 1-124
+site/vite.config.ts
+  s_d8062c4d6ce7c5::t_778fc106c6c9de 16-19
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "68f36bc696a09e47417a3bf1ae587b54a5bcba93",
+  "prompts": {},
+  "sessions": {
+    "s_d8062c4d6ce7c5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f4046-6285-7060-ac6a-250a211536d8",
+        "model": "unknown"
+      },
+      "human_author": "echoVic <137844255@qq.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
