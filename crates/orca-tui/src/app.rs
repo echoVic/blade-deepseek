@@ -42,6 +42,7 @@ use crate::input_event_actions::{handle_mouse_event, handle_paste_event};
 use crate::key_event_actions::{KeyEventFlow, handle_key_event_preflight};
 use crate::mention_menu_actions::handle_mention_menu_key;
 use crate::running_actions::handle_running_shortcut;
+use crate::runtime_event_actions::handle_runtime_event;
 use crate::session_picker_actions::handle_session_picker_key;
 use crate::setup_actions::{SetupFlow, handle_setup_key};
 use crate::shortcuts::{IdleShortcut, RunningShortcut, idle_shortcut, running_shortcut};
@@ -418,48 +419,15 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
         }
 
         while let Ok(tui_event) = event_rx.try_recv() {
-            // Auto-approve tools the user chose to "always allow" this session,
-            // so a repeat request is granted without re-prompting.
-            if let TuiEvent::ApprovalNeeded {
-                id, tool, target, ..
-            } = &tui_event
-                && state.approval_is_allowlisted(tool, target.as_deref())
-            {
-                let _ = action_tx.send(UserAction::Approve {
-                    id: id.clone(),
-                    approved: true,
-                });
-                state.enter_running();
-                continue;
-            }
-            let backtracked_prompt = match &tui_event {
-                TuiEvent::Backtracked { prompt } => Some(prompt.clone()),
-                _ => None,
-            };
-            let workflow_notification_turn_boundary =
-                is_workflow_notification_turn_boundary(&tui_event);
-            let batch_queued_workflow_notification_id = queue_workflow_terminal_notification(
-                &tui_event,
+            handle_runtime_event(
+                tui_event,
+                &mut state,
+                &action_tx,
                 &pending_workflow_notifications,
-                state.status == AppStatus::Running,
+                &mut textarea,
+                &mut vim_state,
+                &theme,
             );
-            state.update(tui_event);
-            if let Some(id) = batch_queued_workflow_notification_id {
-                remove_pending_workflow_notification_by_id(&mut state, &id);
-            }
-            if let Some(prompt) = backtracked_prompt {
-                vim_state.reset_insert(&mut textarea, &theme);
-                textarea = make_textarea_with_text(&prompt, &vim_state, &theme);
-            }
-            if workflow_notification_turn_boundary {
-                drain_pending_workflow_notifications(&mut state, &pending_workflow_notifications);
-                submit_pending_workflow_notification(&mut state, &action_tx, false);
-            } else {
-                submit_pending_workflow_notification(&mut state, &action_tx, true);
-            }
-            if state.auto_scroll {
-                state.scroll_to_bottom();
-            }
         }
 
         terminal.draw(|f| ui::render(f, &mut state, &textarea, &theme))?;

@@ -20,6 +20,7 @@ mod input_event_actions;
 mod key_event_actions;
 mod mention_menu_actions;
 mod running_actions;
+mod runtime_event_actions;
 mod runtime_event_projection;
 mod runtime_interaction_adapter;
 mod session_picker_actions;
@@ -748,6 +749,53 @@ mod tests {
         assert!(
             !app.contains("state.panel_mode == PanelMode::Workflows"),
             "app should use key_event_actions instead of closing the workflow panel inline"
+        );
+    }
+
+    #[test]
+    fn tui_runtime_event_actions_are_owned_by_dedicated_module() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let runtime_event_actions =
+            std::fs::read_to_string(format!("{manifest_dir}/src/runtime_event_actions.rs"))
+                .expect("runtime_event_actions module should exist");
+        assert!(
+            runtime_event_actions.contains("pub(crate) fn handle_runtime_event"),
+            "runtime_event_actions should own TUI runtime event handling"
+        );
+        assert!(
+            runtime_event_actions.contains("approval_is_allowlisted"),
+            "runtime_event_actions should own allowlisted auto-approval handling"
+        );
+        assert!(
+            runtime_event_actions.contains("TuiEvent::Backtracked"),
+            "runtime_event_actions should own backtracked prompt restoration"
+        );
+        assert!(
+            runtime_event_actions.contains("queue_workflow_terminal_notification"),
+            "runtime_event_actions should own workflow notification batch queue routing"
+        );
+        assert!(
+            runtime_event_actions.contains("state.update(tui_event)"),
+            "runtime_event_actions should own the state update boundary"
+        );
+        assert!(
+            runtime_event_actions.contains("submit_pending_workflow_notification"),
+            "runtime_event_actions should own pending workflow notification submission"
+        );
+
+        let app = std::fs::read_to_string(format!("{manifest_dir}/src/app.rs"))
+            .expect("app source should be readable");
+        assert!(
+            !app.contains("approval_is_allowlisted"),
+            "app should use runtime_event_actions instead of auto-approving inline"
+        );
+        assert!(
+            !app.contains("state.update(tui_event)"),
+            "app should use runtime_event_actions instead of applying runtime events inline"
+        );
+        assert!(
+            !app.contains("let batch_queued_workflow_notification_id"),
+            "app should use runtime_event_actions instead of queueing workflow terminal events inline"
         );
     }
 

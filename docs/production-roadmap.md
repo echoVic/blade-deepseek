@@ -433,6 +433,10 @@ copied into Orca.
    keeping press/repeat filtering, global shortcut routing, shortcut overlay
    dismissal, approval-mode cycling, and workflow-panel escape handling out of
    the app event loop.
+   Runtime event draining now lives in a focused TUI runtime event action
+   module, keeping allowlisted auto-approval, backtracked prompt restoration,
+   workflow-notification batch routing, state updates, and auto-scroll follow
+   handling out of the app event loop.
    Runtime task summaries now also expose terminal `result`/`error` fields so
    the selected task row can show completion output or failure details in the
    panel. The
