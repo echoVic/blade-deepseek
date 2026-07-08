@@ -996,8 +996,21 @@ impl AppState {
                     self.suppress_background_main_session_output = true;
                     self.set_status(AppStatus::Idle);
                 }
-                self.workflow_panel.tasks = tasks;
-                if self.workflow_panel.selected >= self.workflow_panel.tasks.len() {
+                let selected_task_id = self
+                    .workflow_panel
+                    .tasks
+                    .get(self.workflow_panel.selected)
+                    .map(|task| task.id.clone());
+                self.workflow_panel.tasks = sort_workflow_tasks_for_panel(tasks);
+                if let Some(selected_task_id) = selected_task_id
+                    && let Some(index) = self
+                        .workflow_panel
+                        .tasks
+                        .iter()
+                        .position(|task| task.id == selected_task_id)
+                {
+                    self.workflow_panel.selected = index;
+                } else if self.workflow_panel.selected >= self.workflow_panel.tasks.len() {
                     self.workflow_panel.selected =
                         self.workflow_panel.tasks.len().saturating_sub(1);
                 }
@@ -1302,6 +1315,40 @@ impl ChatMessage {
             }
         }
     }
+}
+
+fn sort_workflow_tasks_for_panel(
+    mut tasks: Vec<BackgroundTaskSummary>,
+) -> Vec<BackgroundTaskSummary> {
+    tasks.sort_by(|left, right| {
+        workflow_task_panel_group(left)
+            .cmp(&workflow_task_panel_group(right))
+            .then_with(|| workflow_task_activity_ms(right).cmp(&workflow_task_activity_ms(left)))
+            .then_with(|| right.created_at_ms.cmp(&left.created_at_ms))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    tasks
+}
+
+fn workflow_task_panel_group(task: &BackgroundTaskSummary) -> u8 {
+    match task.status {
+        orca_core::task_types::TaskStatus::ApprovalRequired => 0,
+        orca_core::task_types::TaskStatus::Queued
+        | orca_core::task_types::TaskStatus::Running
+        | orca_core::task_types::TaskStatus::Paused
+        | orca_core::task_types::TaskStatus::Stopping => 1,
+        orca_core::task_types::TaskStatus::Stopped
+        | orca_core::task_types::TaskStatus::Completed
+        | orca_core::task_types::TaskStatus::Failed
+        | orca_core::task_types::TaskStatus::Cancelled => 2,
+    }
+}
+
+fn workflow_task_activity_ms(task: &BackgroundTaskSummary) -> i64 {
+    task.last_activity_at_ms
+        .or(task.completed_at_ms)
+        .or(task.started_at_ms)
+        .unwrap_or(task.created_at_ms)
 }
 
 fn push_subagent_activity_tail(tail: &mut Vec<String>, activity: &str) {
@@ -2407,6 +2454,63 @@ mod tests {
             state.messages.last(),
             Some(ChatMessage::System(message)) if message.contains("Workflow completed. audit: done")
         ));
+    }
+
+    #[test]
+    fn workflow_task_updates_sort_actionable_active_then_recent_terminal_tasks() {
+        let mut state = state();
+        let mut completed = workflow_task_summary("task-completed", "completed");
+        completed.status = TaskStatus::Completed;
+        completed.completed_at_ms = Some(9_000);
+        completed.last_activity_at_ms = Some(9_000);
+
+        let mut running = workflow_task_summary("task-running", "running");
+        running.status = TaskStatus::Running;
+        running.last_activity_at_ms = Some(5_000);
+
+        let mut approval = workflow_task_summary("task-approval", "approval");
+        approval.task_type = TaskType::MainSession;
+        approval.status = TaskStatus::ApprovalRequired;
+        approval.is_backgrounded = true;
+        approval.last_activity_at_ms = Some(1_000);
+
+        state.update(TuiEvent::WorkflowTasksUpdated {
+            tasks: vec![completed, running, approval],
+        });
+
+        assert_eq!(
+            state
+                .workflow_panel
+                .tasks
+                .iter()
+                .map(|task| task.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["task-approval", "task-running", "task-completed"]
+        );
+    }
+
+    #[test]
+    fn workflow_task_updates_preserve_selected_task_id_after_sorting() {
+        let mut state = state();
+        let mut running = workflow_task_summary("task-running", "running");
+        running.status = TaskStatus::Running;
+        running.last_activity_at_ms = Some(5_000);
+        let mut completed = workflow_task_summary("task-completed", "completed");
+        completed.status = TaskStatus::Completed;
+        completed.completed_at_ms = Some(9_000);
+        completed.last_activity_at_ms = Some(9_000);
+        state.workflow_panel.tasks = vec![running.clone(), completed.clone()];
+        state.workflow_panel.selected = 1;
+
+        running.last_activity_at_ms = Some(10_000);
+        state.update(TuiEvent::WorkflowTasksUpdated {
+            tasks: vec![completed, running],
+        });
+
+        assert_eq!(
+            state.workflow_panel.tasks[state.workflow_panel.selected].id,
+            "task-completed"
+        );
     }
 
     #[test]

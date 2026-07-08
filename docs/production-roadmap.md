@@ -308,6 +308,9 @@ copied into Orca.
    closing so TUI users can discover task controls in-place. Selected task
    result/error details now render as bounded multi-line summaries, keeping
    longer terminal output readable without letting one task consume the panel.
+   Task refreshes now sort the panel by attention priority (approval-required,
+   active, then terminal with recent activity first) while preserving the
+   selected task by id across refreshes.
 
 ### P0: Session Runtime Unification
 
