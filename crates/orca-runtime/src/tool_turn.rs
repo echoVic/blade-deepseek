@@ -87,8 +87,7 @@ pub(crate) struct RuntimeNormalToolTurnContext<'a, W: io::Write> {
     pub(crate) permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
     pub(crate) user_input_handler: Option<&'a dyn RuntimeUserInputHandler>,
     pub(crate) extensions: Option<RuntimeExtensionContext<'a>>,
-    pub(crate) child_executor: ChildAgentExecutor<W>,
-    pub(crate) workflow_child_executor: ChildAgentExecutor<SharedEventBuffer>,
+    pub(crate) executors: RuntimeNormalToolTurnExecutors<W>,
 }
 
 pub(crate) struct RuntimeNormalToolTurnIo<'a, W: io::Write> {
@@ -98,6 +97,11 @@ pub(crate) struct RuntimeNormalToolTurnIo<'a, W: io::Write> {
     pub(crate) history_writer: Option<&'a mut SessionWriter>,
     pub(crate) cost_tracker: &'a mut CostTracker,
     pub(crate) background_workflows: &'a mut Vec<BackgroundWorkflowRun>,
+}
+
+pub(crate) struct RuntimeNormalToolTurnExecutors<W: io::Write> {
+    pub(crate) child_executor: ChildAgentExecutor<W>,
+    pub(crate) workflow_child_executor: ChildAgentExecutor<SharedEventBuffer>,
 }
 
 impl ToolTurnOutcome {
@@ -267,8 +271,10 @@ pub(crate) fn run_tool_turns<W: io::Write>(
             permission_handler,
             user_input_handler,
             extensions,
-            child_executor,
-            workflow_child_executor,
+            executors: RuntimeNormalToolTurnExecutors {
+                child_executor,
+                workflow_child_executor,
+            },
         })? {
             ToolTurnOutcome::Continue => {}
             ToolTurnOutcome::Return { status, error } => {
@@ -303,9 +309,12 @@ pub(crate) fn run_normal_tool_turn<W: io::Write>(
         permission_handler,
         user_input_handler,
         extensions,
+        executors,
+    } = context;
+    let RuntimeNormalToolTurnExecutors {
         child_executor,
         workflow_child_executor,
-    } = context;
+    } = executors;
     let RuntimeNormalToolTurnIo {
         events,
         sink,
@@ -690,8 +699,10 @@ mod tests {
             permission_handler: None,
             user_input_handler: None,
             extensions: None,
-            child_executor: unused_child_executor,
-            workflow_child_executor: unused_child_executor,
+            executors: RuntimeNormalToolTurnExecutors {
+                child_executor: unused_child_executor,
+                workflow_child_executor: unused_child_executor,
+            },
         })
         .expect("run normal tool turn");
 

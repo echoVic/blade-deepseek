@@ -3042,6 +3042,14 @@ mod tests {
             "RuntimeNormalToolTurnContext must carry normal tool-turn I/O refs through one named field"
         );
         assert!(
+            tool_turn_source.contains("pub(crate) struct RuntimeNormalToolTurnExecutors"),
+            "tool_turn must group normal tool-turn executors into RuntimeNormalToolTurnExecutors"
+        );
+        assert!(
+            tool_turn_source.contains("executors: RuntimeNormalToolTurnExecutors<W>"),
+            "RuntimeNormalToolTurnContext must carry normal tool-turn executors through one named field"
+        );
+        assert!(
             !tool_turn_source.contains("run_normal_tool_turn(\n            config,"),
             "run_tool_turns must not call run_normal_tool_turn with the old long argument list"
         );
@@ -3070,8 +3078,6 @@ mod tests {
             "task_registry:",
             "workflow_ipc:",
             "permission_handler:",
-            "child_executor:",
-            "workflow_child_executor:",
         ] {
             assert!(
                 normal_context.contains(field_name),
@@ -3085,10 +3091,12 @@ mod tests {
             "history_writer:",
             "cost_tracker:",
             "background_workflows:",
+            "child_executor:",
+            "workflow_child_executor:",
         ] {
             assert!(
                 !normal_context.contains(field_name),
-                "RuntimeNormalToolTurnContext must not expose I/O field {field_name} outside RuntimeNormalToolTurnIo"
+                "RuntimeNormalToolTurnContext must not expose grouped field {field_name} directly"
             );
         }
     }
