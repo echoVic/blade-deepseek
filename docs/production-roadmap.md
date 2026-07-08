@@ -267,9 +267,11 @@ The deeper July 9 reference pass changes the next refactor order:
    network permission prompts while preserving denylist blocks as final
    diagnostics, converting sandbox write denials into filesystem grants, and
    converting pathless sandbox denials into unsandboxed shell retry prompts.
-   `CommandExecPermissionPolicy` now starts the same cleanup for the
-   command/exec streaming path by owning the filesystem retry decision before
-   the manager returns pending permission work to the server.
+   `CommandExecPermissionPolicy` now starts the same cleanup for command/exec:
+   streaming drains route filesystem retry decisions through the policy, and
+   non-streaming command/exec network, filesystem, and pathless sandbox retry
+   prompts now get their permission profile and reason text from that same
+   policy before the server registers the pending request.
 4. **P2: Turn MCP elicitation and dynamic waits into pending interactions.**
    Package 3's MCP elicitation queue is the useful reference here: request id,
    server name, mode, abort signal, completion notification, and hook-driven

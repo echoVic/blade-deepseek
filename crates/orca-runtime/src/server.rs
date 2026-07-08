@@ -22,10 +22,7 @@ use walkdir::WalkDir;
 use crate::lifecycle::{RuntimePermissionResponse, ThreadSteerHandle};
 use crate::network_proxy::{RuntimeNetworkBlockReport, RuntimeNetworkPolicy, RuntimeNetworkProxy};
 use crate::protocol::{self, ClientOp, ServerEvent, Submission};
-use crate::sandbox_denial::{
-    SandboxDenialDiagnostic, diagnose_sandbox_denial,
-    should_request_filesystem_permission_with_denied_roots,
-};
+use crate::sandbox_denial::{SandboxDenialDiagnostic, diagnose_sandbox_denial};
 use crate::server_runtime::{
     PermissionProfileOverride, ServerRequestWriter, ServerThreadRuntime, thread_item_to_json,
     thread_run_config, thread_turn_to_json,
@@ -37,7 +34,8 @@ use crate::thread_store::{
 };
 use active_turn_manager::{ActiveTurnControl, ActiveTurnHandle, ActiveTurnManager};
 use command_exec_manager::{
-    CommandExecDrainOutcome, CommandExecManager, CommandExecProcess, CommandExecProcessSnapshot,
+    CommandExecDrainOutcome, CommandExecManager, CommandExecPermissionPolicy, CommandExecProcess,
+    CommandExecProcessSnapshot,
 };
 use orca_core::config::{
     DEFAULT_PERMISSION_PROFILE_GLOB_SCAN_MAX_DEPTH, HistoryMode, OutputFormat, RunConfig,
@@ -1142,23 +1140,18 @@ fn run_command_exec<W: Write>(
     };
     if let (Some(request), Some(blocked_hosts)) =
         (command_permission_request.clone(), retry_block_receiver)
-        && let Some(block) = command_exec_network_permission_block(blocked_hosts)
+        && let Some(block) = CommandExecPermissionPolicy::network_permission_block(blocked_hosts)
     {
         return request_command_exec_network_permission(state, request, block, writer);
     }
     if let Some(diagnostic) = diagnose_sandbox_denial(&cwd, &output.stdout, &output.stderr) {
-        if should_request_filesystem_permission_with_denied_roots(
+        if CommandExecPermissionPolicy::should_request_filesystem_retry(
             &cwd,
             &diagnostic,
             &denied_writable_directories,
         ) && let Some(request) = command_permission_request
         {
             return request_command_exec_file_system_permission(state, request, diagnostic, writer);
-        }
-        if diagnostic.suggested_write_root.is_none()
-            && let Some(request) = command_permission_request
-        {
-            return request_command_exec_unsandboxed_permission(state, request, diagnostic, writer);
         }
         append_sandbox_diagnostic_to_stderr(&mut output.stderr, &diagnostic);
     }
@@ -1184,43 +1177,15 @@ fn run_command_exec<W: Write>(
     )
 }
 
-fn command_exec_network_permission_block(
-    blocked_hosts: mpsc::Receiver<RuntimeNetworkBlockReport>,
-) -> Option<RuntimeNetworkBlockReport> {
-    blocked_hosts
-        .try_iter()
-        .find(|block| block.error != "blocked-by-denylist")
-}
-
 fn request_command_exec_network_permission<W: Write>(
     state: &mut ServerState,
     request: PendingCommandExecPermissionRequest,
     block: RuntimeNetworkBlockReport,
     writer: &mut W,
 ) -> io::Result<()> {
-    let mut domains = HashMap::new();
-    domains.insert(
-        block.host.clone(),
-        orca_core::config::PermissionProfileNetworkAccess::Allow,
-    );
-    let permissions = protocol::RequestPermissionProfile {
-        file_system: None,
-        network: Some(protocol::RequestNetworkPermissions {
-            enabled: None,
-            domains,
-        }),
-        shell: None,
-    };
-    request_command_exec_permission(
-        state,
-        request,
-        format!(
-            "command/exec attempted network access to {} ({})",
-            block.host, block.error
-        ),
-        permissions,
-        writer,
-    )
+    let prompt = CommandExecPermissionPolicy::network_block_prompt(&block)
+        .expect("denylist command/exec network blocks are filtered before prompting");
+    request_command_exec_permission(state, request, prompt.reason, prompt.permissions, writer)
 }
 
 fn request_command_exec_file_system_permission<W: Write>(
@@ -1229,42 +1194,8 @@ fn request_command_exec_file_system_permission<W: Write>(
     diagnostic: SandboxDenialDiagnostic,
     writer: &mut W,
 ) -> io::Result<()> {
-    let Some(write_root) = diagnostic.suggested_write_root.clone() else {
-        return request_command_exec_unsandboxed_permission(state, request, diagnostic, writer);
-    };
-    let permissions = protocol::RequestPermissionProfile {
-        file_system: Some(protocol::RequestFileSystemPermissions {
-            read: None,
-            write: Some(vec![write_root]),
-            entries: None,
-        }),
-        network: None,
-        shell: None,
-    };
-    request_command_exec_permission(state, request, diagnostic.message, permissions, writer)
-}
-
-fn request_command_exec_unsandboxed_permission<W: Write>(
-    state: &mut ServerState,
-    request: PendingCommandExecPermissionRequest,
-    diagnostic: SandboxDenialDiagnostic,
-    writer: &mut W,
-) -> io::Result<()> {
-    let permissions = protocol::RequestPermissionProfile {
-        file_system: None,
-        network: None,
-        shell: Some(protocol::RequestShellPermissions { unsandboxed: true }),
-    };
-    request_command_exec_permission(
-        state,
-        request,
-        format!(
-            "{}; command/exec needs to re-run without the filesystem sandbox because no filesystem path was reported",
-            diagnostic.message
-        ),
-        permissions,
-        writer,
-    )
+    let prompt = CommandExecPermissionPolicy::sandbox_denial_prompt(&diagnostic);
+    request_command_exec_permission(state, request, prompt.reason, prompt.permissions, writer)
 }
 
 fn request_command_exec_permission<W: Write>(

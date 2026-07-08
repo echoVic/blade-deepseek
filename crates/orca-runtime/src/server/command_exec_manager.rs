@@ -9,10 +9,8 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use serde_json::Value;
 
-use super::{
-    PendingCommandExecPermissionRequest, cap_text, capped_delta, capped_utf8_len,
-    command_exec_network_permission_block,
-};
+use super::PendingCommandExecPermissionRequest;
+use super::{cap_text, capped_delta, capped_utf8_len};
 use crate::network_proxy::{RuntimeNetworkBlockReport, RuntimeNetworkProxy};
 use crate::protocol::{self, ServerEvent};
 use crate::sandbox_denial::{
@@ -67,10 +65,81 @@ pub(super) enum CommandExecDrainOutcome {
     },
 }
 
-struct CommandExecPermissionPolicy;
+pub(super) struct CommandExecPermissionPrompt {
+    pub(super) reason: String,
+    pub(super) permissions: protocol::RequestPermissionProfile,
+}
+
+pub(super) struct CommandExecPermissionPolicy;
 
 impl CommandExecPermissionPolicy {
-    fn should_request_filesystem_retry(
+    pub(super) fn network_permission_block(
+        blocked_hosts: mpsc::Receiver<RuntimeNetworkBlockReport>,
+    ) -> Option<RuntimeNetworkBlockReport> {
+        blocked_hosts
+            .try_iter()
+            .find(|block| Self::network_block_prompt(block).is_some())
+    }
+
+    pub(super) fn network_block_prompt(
+        block: &RuntimeNetworkBlockReport,
+    ) -> Option<CommandExecPermissionPrompt> {
+        if block.error == "blocked-by-denylist" {
+            return None;
+        }
+
+        let mut domains = HashMap::new();
+        domains.insert(
+            block.host.clone(),
+            orca_core::config::PermissionProfileNetworkAccess::Allow,
+        );
+        Some(CommandExecPermissionPrompt {
+            reason: format!(
+                "command/exec attempted network access to {} ({})",
+                block.host, block.error
+            ),
+            permissions: protocol::RequestPermissionProfile {
+                file_system: None,
+                network: Some(protocol::RequestNetworkPermissions {
+                    enabled: None,
+                    domains,
+                }),
+                shell: None,
+            },
+        })
+    }
+
+    pub(super) fn sandbox_denial_prompt(
+        diagnostic: &SandboxDenialDiagnostic,
+    ) -> CommandExecPermissionPrompt {
+        match diagnostic.suggested_write_root.clone() {
+            Some(write_root) => CommandExecPermissionPrompt {
+                reason: diagnostic.message.clone(),
+                permissions: protocol::RequestPermissionProfile {
+                    file_system: Some(protocol::RequestFileSystemPermissions {
+                        read: None,
+                        write: Some(vec![write_root]),
+                        entries: None,
+                    }),
+                    network: None,
+                    shell: None,
+                },
+            },
+            None => CommandExecPermissionPrompt {
+                reason: format!(
+                    "{}; command/exec needs to re-run without the filesystem sandbox because no filesystem path was reported",
+                    diagnostic.message
+                ),
+                permissions: protocol::RequestPermissionProfile {
+                    file_system: None,
+                    network: None,
+                    shell: Some(protocol::RequestShellPermissions { unsandboxed: true }),
+                },
+            },
+        }
+    }
+
+    pub(super) fn should_request_filesystem_retry(
         cwd: &std::path::Path,
         diagnostic: &SandboxDenialDiagnostic,
         denied_writable_roots: &[PathBuf],
@@ -427,7 +496,7 @@ impl CommandExecManager {
                     };
                     if let Some(block) = process
                         .network_permission_blocks
-                        .and_then(command_exec_network_permission_block)
+                        .and_then(CommandExecPermissionPolicy::network_permission_block)
                     {
                         let request = process.permission_request.expect(
                             "command/exec process with network block reporter has retry request",
@@ -575,6 +644,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::CommandExecPermissionPolicy;
+    use crate::network_proxy::RuntimeNetworkBlockReport;
     use crate::sandbox_denial::SandboxDenialDiagnostic;
 
     #[test]
@@ -615,6 +685,86 @@ mod tests {
                 &diagnostic,
                 &[PathBuf::from("/repo/.git")]
             )
+        );
+    }
+
+    #[test]
+    fn command_exec_permission_policy_builds_network_prompt_for_allowlist_block() {
+        let block = RuntimeNetworkBlockReport {
+            host: "api.orca.invalid".to_string(),
+            error: "blocked-by-allowlist",
+        };
+
+        let prompt =
+            CommandExecPermissionPolicy::network_block_prompt(&block).expect("prompt request");
+
+        assert_eq!(
+            prompt.reason,
+            "command/exec attempted network access to api.orca.invalid (blocked-by-allowlist)"
+        );
+        assert_eq!(
+            prompt
+                .permissions
+                .network
+                .expect("network permissions")
+                .domains
+                .get("api.orca.invalid"),
+            Some(&orca_core::config::PermissionProfileNetworkAccess::Allow)
+        );
+    }
+
+    #[test]
+    fn command_exec_permission_policy_does_not_prompt_for_denylist_block() {
+        let block = RuntimeNetworkBlockReport {
+            host: "blocked.orca.invalid".to_string(),
+            error: "blocked-by-denylist",
+        };
+
+        assert!(CommandExecPermissionPolicy::network_block_prompt(&block).is_none());
+    }
+
+    #[test]
+    fn command_exec_permission_policy_builds_filesystem_prompt_for_write_root() {
+        let diagnostic = SandboxDenialDiagnostic {
+            denied_path: Some(PathBuf::from("/repo/.git/index.lock")),
+            suggested_write_root: Some(PathBuf::from("/repo/.git")),
+            message: "sandbox denied filesystem access".to_string(),
+        };
+
+        let prompt = CommandExecPermissionPolicy::sandbox_denial_prompt(&diagnostic);
+
+        assert_eq!(prompt.reason, "sandbox denied filesystem access");
+        assert_eq!(
+            prompt
+                .permissions
+                .file_system
+                .expect("file system permissions")
+                .write,
+            Some(vec![PathBuf::from("/repo/.git")])
+        );
+    }
+
+    #[test]
+    fn command_exec_permission_policy_builds_unsandboxed_prompt_for_pathless_denial() {
+        let diagnostic = SandboxDenialDiagnostic {
+            denied_path: None,
+            suggested_write_root: None,
+            message: "sandbox denied filesystem access".to_string(),
+        };
+
+        let prompt = CommandExecPermissionPolicy::sandbox_denial_prompt(&diagnostic);
+
+        assert!(
+            prompt.reason.contains("without the filesystem sandbox"),
+            "unsandboxed retry prompt should explain why the sandbox cannot be amended: {}",
+            prompt.reason
+        );
+        assert!(
+            prompt
+                .permissions
+                .shell
+                .expect("shell permissions")
+                .unsandboxed
         );
     }
 }

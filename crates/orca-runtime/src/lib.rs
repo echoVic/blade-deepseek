@@ -1656,6 +1656,7 @@ mod tests {
             "struct CommandExecProcess",
             "struct CommandExecManager",
             "struct CommandExecPermissionPolicy",
+            "struct CommandExecPermissionPrompt",
             "enum CommandExecDrainOutcome",
         ] {
             assert!(
@@ -1676,6 +1677,30 @@ mod tests {
                 .contains("CommandExecPermissionPolicy::should_request_filesystem_retry("),
             "server/command_exec_manager.rs must route permission retry decisions through CommandExecPermissionPolicy"
         );
+        for method_name in [
+            "network_permission_block",
+            "network_block_prompt",
+            "sandbox_denial_prompt",
+        ] {
+            assert!(
+                manager_source.contains(method_name),
+                "server/command_exec_manager.rs must own command exec permission policy method {method_name}"
+            );
+        }
+        for request_constructor in [
+            "RequestNetworkPermissions {",
+            "RequestFileSystemPermissions {",
+            "RequestShellPermissions {",
+        ] {
+            assert!(
+                !server_source.contains(request_constructor),
+                "server.rs must not construct command exec permission request profiles with {request_constructor}"
+            );
+            assert!(
+                manager_source.contains(request_constructor),
+                "server/command_exec_manager.rs must construct command exec permission request profiles with {request_constructor}"
+            );
+        }
     }
 
     #[test]
