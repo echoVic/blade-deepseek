@@ -48,16 +48,20 @@ pub(crate) enum ToolTurnOutcome {
 pub(crate) struct RuntimeToolTurnsContext<'a, W: io::Write> {
     pub(crate) step_context: RuntimeStepContext<'a>,
     pub(crate) sampling_state: &'a mut RuntimeSamplingRequestState,
+    pub(crate) io: RuntimeToolTurnsIo<'a, W>,
+    pub(crate) tool_requests: &'a [ToolRequest],
+    pub(crate) child_executor: ChildAgentExecutor<W>,
+    pub(crate) workflow_child_executor: ChildAgentExecutor<SharedEventBuffer>,
+    pub(crate) batch_child_executor: ChildAgentExecutor<io::Sink>,
+}
+
+pub(crate) struct RuntimeToolTurnsIo<'a, W: io::Write> {
     pub(crate) events: &'a mut EventFactory,
     pub(crate) sink: &'a mut EventSink<W>,
     pub(crate) conversation: &'a mut Conversation,
     pub(crate) history_writer: Option<&'a mut SessionWriter>,
-    pub(crate) tool_requests: &'a [ToolRequest],
     pub(crate) cost_tracker: &'a mut CostTracker,
     pub(crate) background_workflows: &'a mut Vec<BackgroundWorkflowRun>,
-    pub(crate) child_executor: ChildAgentExecutor<W>,
-    pub(crate) workflow_child_executor: ChildAgentExecutor<SharedEventBuffer>,
-    pub(crate) batch_child_executor: ChildAgentExecutor<io::Sink>,
 }
 
 pub(crate) struct RuntimeNormalToolTurnContext<'a, W: io::Write> {
@@ -115,17 +119,20 @@ pub(crate) fn run_tool_turns<W: io::Write>(
     let RuntimeToolTurnsContext {
         step_context,
         sampling_state,
-        events,
-        sink,
-        conversation,
-        mut history_writer,
+        io,
         tool_requests,
-        cost_tracker,
-        background_workflows,
         child_executor,
         workflow_child_executor,
         batch_child_executor,
     } = context;
+    let RuntimeToolTurnsIo {
+        events,
+        sink,
+        conversation,
+        mut history_writer,
+        cost_tracker,
+        background_workflows,
+    } = io;
     let (step_snapshot, extensions) = step_context.into_parts();
     let config = step_snapshot.config;
     let cwd = step_snapshot.turn_context.cwd;
@@ -779,13 +786,15 @@ mod tests {
         let outcome = run_tool_turns(RuntimeToolTurnsContext {
             step_context,
             sampling_state: &mut sampling_state,
-            events: &mut events,
-            sink: &mut sink,
-            conversation: &mut conversation,
-            history_writer: None,
+            io: RuntimeToolTurnsIo {
+                events: &mut events,
+                sink: &mut sink,
+                conversation: &mut conversation,
+                history_writer: None,
+                cost_tracker: &mut cost_tracker,
+                background_workflows: &mut background_workflows,
+            },
             tool_requests: &[request],
-            cost_tracker: &mut cost_tracker,
-            background_workflows: &mut background_workflows,
             child_executor: unused_child_executor::<Vec<u8>>,
             workflow_child_executor: unused_child_executor::<SharedEventBuffer>,
             batch_child_executor: unused_child_executor::<io::Sink>,
@@ -861,13 +870,15 @@ mod tests {
         let outcome = run_tool_turns(RuntimeToolTurnsContext {
             step_context,
             sampling_state: &mut sampling_state,
-            events: &mut events,
-            sink: &mut sink,
-            conversation: &mut conversation,
-            history_writer: None,
+            io: RuntimeToolTurnsIo {
+                events: &mut events,
+                sink: &mut sink,
+                conversation: &mut conversation,
+                history_writer: None,
+                cost_tracker: &mut cost_tracker,
+                background_workflows: &mut background_workflows,
+            },
             tool_requests: &[request],
-            cost_tracker: &mut cost_tracker,
-            background_workflows: &mut background_workflows,
             child_executor: unused_child_executor::<Vec<u8>>,
             workflow_child_executor: unused_child_executor::<SharedEventBuffer>,
             batch_child_executor: unused_child_executor::<io::Sink>,

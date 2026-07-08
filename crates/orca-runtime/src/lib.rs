@@ -3185,25 +3185,39 @@ mod tests {
             "provider response must pass tool-turn dispatch inputs as one grouped context"
         );
         assert!(
+            tool_turn_source.contains("pub(crate) struct RuntimeToolTurnsIo"),
+            "tool_turn must group dispatch-loop I/O refs into RuntimeToolTurnsIo"
+        );
+        assert!(
+            tool_turn_source.contains("io: RuntimeToolTurnsIo<'a, W>"),
+            "RuntimeToolTurnsContext must carry tool-turn I/O refs through one named field"
+        );
+        assert!(
             !provider_turn_source.contains("run_tool_turns(\n            step_context,"),
             "provider response must not call run_tool_turns with the old long argument list"
         );
+        let tool_turn_context = tool_turn_source
+            .split("pub(crate) struct RuntimeToolTurnsContext")
+            .nth(1)
+            .and_then(|source| source.split("pub(crate) struct RuntimeToolTurnsIo").next())
+            .expect("RuntimeToolTurnsContext source");
+        for field_name in ["step_context:", "tool_requests:", "child_executor:"] {
+            assert!(
+                tool_turn_context.contains(field_name),
+                "RuntimeToolTurnsContext must carry tool-turn dispatch field {field_name}"
+            );
+        }
         for field_name in [
-            "step_context:",
             "events:",
             "sink:",
             "conversation:",
             "history_writer:",
-            "tool_requests:",
             "cost_tracker:",
             "background_workflows:",
-            "child_executor:",
-            "workflow_child_executor:",
-            "batch_child_executor:",
         ] {
             assert!(
-                tool_turn_source.contains(field_name),
-                "RuntimeToolTurnsContext must carry tool-turn dispatch field {field_name}"
+                !tool_turn_context.contains(field_name),
+                "RuntimeToolTurnsContext must not expose I/O field {field_name} outside RuntimeToolTurnsIo"
             );
         }
     }

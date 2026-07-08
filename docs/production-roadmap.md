@@ -357,7 +357,10 @@ copied into Orca.
    carries `RuntimeTurnContext`, so budget-warning hooks, compaction events, and
    compaction history persistence no longer receive a second flattened cwd/delta
    copy. `RuntimeSteerInput` now also carries `RuntimeTurnContext`, so steer
-   draining no longer receives a separate steer-handle copy.
+   draining no longer receives a separate steer-handle copy. `RuntimeToolTurnsContext`
+   now carries tool-turn I/O refs through `RuntimeToolTurnsIo`, keeping tool
+   dispatch state distinct from event, transcript, cost, and workflow mutation
+   refs.
    Iteration stages now keep lifecycle-owned `RuntimeTurnLoopIterationState`
    grouped instead of unpacking runtime system messages, model overrides,
    cost/cancel/task refs, and extension refs into the iteration input. Keep

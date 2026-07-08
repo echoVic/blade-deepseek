@@ -42,7 +42,9 @@ use crate::step_context::{
 use crate::tasks::TaskRegistry;
 use crate::thread_store::SessionWriter;
 use crate::tool_invocation::{AgentToolPolicyContext, tool_requests_from_provider_steps};
-use crate::tool_turn::{RuntimeToolTurnsContext, ToolTurnOutcome, run_tool_turns};
+use crate::tool_turn::{
+    RuntimeToolTurnsContext, RuntimeToolTurnsIo, ToolTurnOutcome, run_tool_turns,
+};
 use crate::workflow::runner::SharedEventBuffer;
 use crate::workflow_execution::BackgroundWorkflowRun;
 
@@ -473,13 +475,15 @@ impl RuntimeProviderResponseStep {
         match run_tool_turns(RuntimeToolTurnsContext {
             step_context,
             sampling_state,
-            events,
-            sink,
-            conversation,
-            history_writer: history_writer.as_deref_mut(),
+            io: RuntimeToolTurnsIo {
+                events,
+                sink,
+                conversation,
+                history_writer: history_writer.as_deref_mut(),
+                cost_tracker,
+                background_workflows,
+            },
             tool_requests: &tool_requests,
-            cost_tracker,
-            background_workflows,
             child_executor,
             workflow_child_executor,
             batch_child_executor,
