@@ -1969,6 +1969,36 @@ mod tests {
     }
 
     #[test]
+    fn runtime_turn_continuation_is_owned_by_turn_config() {
+        let lifecycle_source = include_str!("lifecycle.rs");
+        let agent_loop_context = lifecycle_source
+            .split("pub(crate) struct AgentLoopContext")
+            .nth(1)
+            .and_then(|source| source.split("#[derive(Clone").next())
+            .expect("AgentLoopContext source");
+        let turn_config_source = lifecycle_source
+            .split("pub(crate) struct RuntimeTurnConfig")
+            .nth(1)
+            .and_then(|source| source.split("#[derive(Clone").next())
+            .expect("RuntimeTurnConfig source");
+
+        assert!(
+            !agent_loop_context.contains("continuation: Option<RuntimeTurnContinuation>"),
+            "AgentLoopContext must not carry turn continuation outside the frozen turn config"
+        );
+        assert!(
+            turn_config_source.contains("continuation: Option<RuntimeTurnContinuation>"),
+            "RuntimeTurnConfig must own the turn continuation with the other immutable turn inputs"
+        );
+        assert!(
+            lifecycle_source.contains("impl<'a> RuntimeTurnConfig<'a>")
+                && lifecycle_source.contains("pub(crate) fn with_continuation(")
+                && lifecycle_source.contains("pub(crate) fn continuation("),
+            "RuntimeTurnConfig must expose continuation construction and read access"
+        );
+    }
+
+    #[test]
     fn runtime_lifecycle_state_machine_is_owned_by_runtime_lifecycle_module() {
         let lib_source = include_str!("lib.rs");
         let lifecycle_source = include_str!("lifecycle.rs");

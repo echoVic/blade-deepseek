@@ -104,16 +104,16 @@ pub(crate) struct AgentLoopContext<'a> {
     pub(crate) turn_execution: Option<RuntimeTurnExecution<'a>>,
     pub(crate) turn_interactions: RuntimeTurnInteractionState<'a>,
     pub(crate) steer_handle: Option<&'a ThreadSteerHandle>,
-    pub(crate) continuation: Option<RuntimeTurnContinuation>,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct RuntimeTurnConfig<'a> {
     pub(crate) cwd: &'a Path,
     pub(crate) prompt: &'a str,
     pub(crate) subagent_depth: u32,
     pub(crate) emit_deltas: bool,
     pub(crate) subagent_type: &'a SubagentType,
+    pub(crate) continuation: Option<RuntimeTurnContinuation>,
 }
 
 #[derive(Clone, Copy)]
@@ -713,13 +713,12 @@ impl<'a> AgentLoopContext<'a> {
             turn_execution: None,
             turn_interactions: RuntimeTurnInteractionState::new(),
             steer_handle: None,
-            continuation: None,
         }
     }
 
     #[cfg(test)]
     pub(crate) fn turn_config(&self) -> RuntimeTurnConfig<'a> {
-        self.turn_config
+        self.turn_config.clone()
     }
 
     pub fn with_services(
@@ -832,26 +831,26 @@ impl<'a> AgentLoopContext<'a> {
 
     #[allow(dead_code)]
     pub(crate) fn with_initial_response(mut self, response: ProviderResponse) -> Self {
-        self.continuation = Some(RuntimeTurnContinuation::from_response(response));
+        self.turn_config = self
+            .turn_config
+            .with_continuation(RuntimeTurnContinuation::from_response(response));
         self
     }
 
     #[allow(dead_code)]
     pub(crate) fn with_turn_continuation(mut self, continuation: RuntimeTurnContinuation) -> Self {
-        self.continuation = Some(continuation);
+        self.turn_config = self.turn_config.with_continuation(continuation);
         self
     }
 
     #[cfg(test)]
     pub(crate) fn initial_response(&self) -> Option<&ProviderResponse> {
-        self.continuation
-            .as_ref()
-            .map(|continuation| &continuation.response)
+        self.turn_config.initial_response()
     }
 
     #[cfg(test)]
     pub(crate) fn continuation(&self) -> Option<&RuntimeTurnContinuation> {
-        self.continuation.as_ref()
+        self.turn_config.continuation()
     }
 
     pub(crate) fn with_permission_handler(
@@ -916,7 +915,25 @@ impl<'a> RuntimeTurnConfig<'a> {
             subagent_depth,
             emit_deltas,
             subagent_type,
+            continuation: None,
         }
+    }
+
+    pub(crate) fn with_continuation(mut self, continuation: RuntimeTurnContinuation) -> Self {
+        self.continuation = Some(continuation);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn continuation(&self) -> Option<&RuntimeTurnContinuation> {
+        self.continuation.as_ref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn initial_response(&self) -> Option<&ProviderResponse> {
+        self.continuation
+            .as_ref()
+            .map(|continuation| &continuation.response)
     }
 
     #[cfg(test)]

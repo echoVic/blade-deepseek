@@ -243,8 +243,11 @@ copied into Orca.
    separate ad hoc task fields plus TUI-local queues.
 3. **P2: Frozen per-turn context boundary.** Continue shrinking wide call
    surfaces into `RuntimeTurnConfig`, `RuntimeTurnDeps`,
-   `RuntimeTurnState`, and request snapshots. Keep borrowing package 3's
-   explicit loop-local `State` idea, but avoid a single giant context object.
+   `RuntimeTurnState`, and request snapshots. Runtime turn continuations now
+   live with the other immutable turn inputs inside `RuntimeTurnConfig`, so
+   `AgentLoopContext` no longer carries continuation as a separate ad hoc
+   field. Keep borrowing package 3's explicit loop-local `State` idea, but
+   avoid a single giant context object.
 4. **P3: Protocolized task/thread/interactive status.** Push background task,
    approval-needed, needs-input, foregrounded/backgrounded, and completed
    status through runtime protocol events so TUI, server, and future app
