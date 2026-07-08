@@ -78,11 +78,16 @@ impl RuntimePendingInteractionStore {
     pub fn insert(
         &self,
         record: RuntimePendingInteractionRecord,
-    ) -> Option<RuntimePendingInteractionRecord> {
-        self.pending
+    ) -> Result<(), RuntimePendingInteractionRecord> {
+        let mut pending = self
+            .pending
             .lock()
-            .expect("pending interaction store poisoned")
-            .insert(record.id.clone(), record)
+            .expect("pending interaction store poisoned");
+        if pending.contains_key(&record.id) {
+            return Err(record);
+        }
+        pending.insert(record.id.clone(), record);
+        Ok(())
     }
 
     pub fn get(&self, id: &str) -> Option<RuntimePendingInteractionRecord> {
@@ -216,10 +221,30 @@ mod tests {
         let record = RuntimePendingInteractionRecord::from_user_input(&request);
 
         assert!(store.is_empty());
-        assert!(store.insert(record.clone()).is_none());
+        assert!(store.insert(record.clone()).is_ok());
         assert_eq!(store.get("input-1"), Some(record.clone()));
         assert_eq!(store.list(), vec![record.clone()]);
         assert_eq!(store.remove("input-1"), Some(record));
         assert!(store.is_empty());
+    }
+
+    #[test]
+    fn pending_interaction_store_rejects_duplicate_request_id_without_overwriting() {
+        let store = RuntimePendingInteractionStore::default();
+        let first = RuntimePendingInteractionRecord::from_user_input(&RuntimeUserInputRequest {
+            id: "input-1".to_string(),
+            question: "First?".to_string(),
+            choices: Vec::new(),
+        });
+        let duplicate =
+            RuntimePendingInteractionRecord::from_user_input(&RuntimeUserInputRequest {
+                id: "input-1".to_string(),
+                question: "Second?".to_string(),
+                choices: Vec::new(),
+            });
+
+        assert!(store.insert(first.clone()).is_ok());
+        assert_eq!(store.insert(duplicate.clone()), Err(duplicate));
+        assert_eq!(store.get("input-1"), Some(first));
     }
 }

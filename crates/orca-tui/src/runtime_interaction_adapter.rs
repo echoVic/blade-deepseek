@@ -388,7 +388,7 @@ fn insert_pending_interaction(
     record: RuntimePendingInteractionRecord,
 ) {
     if let Some(store) = store {
-        store.insert(record);
+        let _ = store.insert(record);
     }
 }
 

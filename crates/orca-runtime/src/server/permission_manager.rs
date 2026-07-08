@@ -67,6 +67,12 @@ impl PendingPermissionManager {
         request: PendingCommandExecPermissionRequest,
     ) -> io::Result<()> {
         let mut pending = self.pending.lock().map_err(lock_error)?;
+        if pending.contains_key(&request_id) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("duplicate pending permission request id: {request_id}"),
+            ));
+        }
         pending.insert(
             request_id,
             PendingPermissionRequest::CommandExec {
@@ -87,6 +93,12 @@ impl PendingPermissionManager {
         request: PendingPermissionRequest,
     ) -> io::Result<()> {
         let mut pending = self.pending.lock().map_err(lock_error)?;
+        if pending.contains_key(&request_id) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("duplicate pending permission request id: {request_id}"),
+            ));
+        }
         pending.insert(request_id, request);
         Ok(())
     }
@@ -159,5 +171,48 @@ impl<W: Write + Send + 'static> RuntimePermissionRequestHandler
         receiver
             .recv()
             .map_err(|_| io::Error::other("permission response channel closed"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pending_permission_manager_rejects_duplicate_runtime_request_id_without_overwriting() {
+        let manager = PendingPermissionManager::default();
+        let (first_sender, _first_receiver) = mpsc::channel();
+        let (second_sender, _second_receiver) = mpsc::channel();
+
+        manager
+            .insert_runtime(
+                "permission-turn-1-ask".to_string(),
+                PendingPermissionRequest::Runtime {
+                    sender: first_sender,
+                    thread_id: "thread-1".to_string(),
+                    runtime_workspace_roots: vec![PathBuf::from("/repo")],
+                },
+            )
+            .expect("insert first request");
+        assert!(
+            manager
+                .insert_runtime(
+                    "permission-turn-1-ask".to_string(),
+                    PendingPermissionRequest::Runtime {
+                        sender: second_sender,
+                        thread_id: "thread-2".to_string(),
+                        runtime_workspace_roots: vec![PathBuf::from("/other")],
+                    },
+                )
+                .is_err(),
+            "duplicate pending request ids must not replace the original waiter"
+        );
+
+        let pending = manager
+            .remove("permission-turn-1-ask")
+            .expect("remove pending")
+            .expect("original request still pending");
+        assert_eq!(pending.thread_id(), "thread-1");
+        assert_eq!(pending.runtime_workspace_roots(), &[PathBuf::from("/repo")]);
     }
 }
