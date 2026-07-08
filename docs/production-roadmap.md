@@ -224,10 +224,56 @@ verified before the next phase starts.
 
 The July 2026 Codex and package 3 reference pass ranks the remaining
 architecture work as follows. Codex is the stronger reference for ownership:
-core `SessionTask` implementations run turns against a frozen `TurnContext`,
-while the TUI mostly replays protocol state. Package 3 is useful for product
-surface and pending-request UX, but its broad `ToolUseContext` should not be
-copied into Orca.
+core thread/session code runs turns against a frozen `TurnContext` plus
+request-scoped `StepContext`, with dedicated owners for thread management,
+compaction, exec policy, MCP runtime, skills, connectors, and protocol item
+projection. Package 3 is useful for product surface and pending-request UX:
+its task panel, bridge activity summaries, permission update destinations, and
+MCP elicitation queue are good interaction references, but its broad
+`ToolUseContext` and app-state-coupled orchestration should not be copied into
+Orca.
+
+The deeper July 9 reference pass changes the next refactor order:
+
+1. **P0: Stop treating call-surface grouping as the main work once the current
+   tool-turn context family is finished.** The normal, subagent batch, and
+   readonly tool-turn contexts now follow the request/I/O/services/runtime
+   grouping pattern. Further mechanical grouping should only happen when it
+   unlocks a real owner boundary.
+2. **P1: Promote compaction into a first-class runtime policy/task boundary.**
+   Codex separates context-window accounting, token-budget reminders, pre/post
+   compaction hooks, initial-context injection, retry metadata, and compaction
+   telemetry. Orca currently has a lifecycle-owned `RuntimeCompactionStep`, but
+   compaction remains a mostly synchronous summary-and-persist operation. The
+   next useful slice is a `RuntimeCompactionPolicy` / `RuntimeCompactionTask`
+   split that reports reason, trigger, before/after counts, retry decision, and
+   history persistence through one boundary.
+3. **P1: Move exec/permission evaluation toward a dedicated policy manager.**
+   Codex keeps mutable exec policy in an `ExecPolicyManager` with parsed rules,
+   command-origin lowering, prompt rejection reasons, and serialized updates.
+   Orca already has permission profiles, turn/session grants, network proxy
+   enforcement, and glob-based permission rules; the next architecture gain is
+   to put rule matching, stricter rejection reasons, and future automatic
+   network-block prompts behind a runtime policy owner instead of continuing to
+   spread that logic across bash, command/exec, approval, and protocol paths.
+4. **P2: Turn MCP elicitation and dynamic waits into pending interactions.**
+   Package 3's MCP elicitation queue is the useful reference here: request id,
+   server name, mode, abort signal, completion notification, and hook-driven
+   auto-response are all explicit. Orca's pending interaction store already
+   covers approvals, `request_permissions`, and `request_user_input`; adding
+   MCP elicitation or other dynamic waiters should reuse that runtime store
+   rather than creating a TUI-local queue.
+5. **P2: Make skills/plugins a manifest-backed capability source only after
+   policy and protocol owners are stable.** Codex's skills, connectors, and
+   plugin managers are valuable, but adopting them before compaction, exec
+   policy, MCP waits, and item projection settle would widen the surface too
+   early. Keep Markdown skills stable; add manifests when plugin-provided
+   tools can flow through the same policy, pending-interaction, and projection
+   paths as built-ins, MCP, and TOML tools.
+6. **P3: Borrow package-3 UX polish through runtime summaries, not app-state
+   coupling.** Activity summaries, tool verbs, selected task details,
+   permission destinations, and bridge-style remote status are worth copying
+   only when the source of truth is Orca runtime task/thread/protocol state.
 
 1. **P0: Runtime-owned background approval continuation execution.** Done on
    current main: the TUI now resumes approved background turns by converting the
