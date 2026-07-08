@@ -1299,7 +1299,13 @@ mod tests {
         let marker = harness.workspace.path().join(".git/escalation-marker");
         let request = bash_request(&format!("printf granted > {}", marker.display()));
         let denied = git_denied_result(&request, harness.workspace.path());
-        harness.action_tx.send(UserAction::Approve(true)).unwrap();
+        harness
+            .action_tx
+            .send(UserAction::Approve {
+                id: "approval-bash-1-sandbox".to_string(),
+                approved: true,
+            })
+            .unwrap();
 
         let result = harness.run(ApprovalMode::Suggest, &request, denied);
 
@@ -1321,7 +1327,13 @@ mod tests {
         let marker = harness.workspace.path().join(".git/escalation-marker");
         let request = bash_request(&format!("printf granted > {}", marker.display()));
         let denied = git_denied_result(&request, harness.workspace.path());
-        harness.action_tx.send(UserAction::Approve(false)).unwrap();
+        harness
+            .action_tx
+            .send(UserAction::Approve {
+                id: "approval-bash-1-sandbox".to_string(),
+                approved: false,
+            })
+            .unwrap();
 
         let result = harness.run(ApprovalMode::Suggest, &request, denied);
 
@@ -1357,7 +1369,13 @@ mod tests {
         let marker = harness.workspace.path().join(".git/escalation-marker");
         let request = bash_request(&format!("printf granted > {}", marker.display()));
         let denied = git_denied_result(&request, harness.workspace.path());
-        harness.action_tx.send(UserAction::Approve(true)).unwrap();
+        harness
+            .action_tx
+            .send(UserAction::Approve {
+                id: "approval-bash-1-sandbox".to_string(),
+                approved: true,
+            })
+            .unwrap();
         let mut overlay = TurnPermissionOverlay::default();
 
         let result =
@@ -1385,8 +1403,20 @@ mod tests {
             "touch {} 2>/dev/null || {{ printf %s\\\\n \"fatal: could not read Username for 'https://github.com': Operation not permitted\" >&2; exit 128; }}",
             marker.display()
         ));
-        harness.action_tx.send(UserAction::Approve(true)).unwrap();
-        harness.action_tx.send(UserAction::Approve(true)).unwrap();
+        harness
+            .action_tx
+            .send(UserAction::Approve {
+                id: "approval-bash-1".to_string(),
+                approved: true,
+            })
+            .unwrap();
+        harness
+            .action_tx
+            .send(UserAction::Approve {
+                id: "approval-bash-1-unsandboxed".to_string(),
+                approved: true,
+            })
+            .unwrap();
         let config = config(ApprovalMode::Suggest);
         let policy = ApprovalPolicy::new(ApprovalMode::Suggest);
         let mut overlay = TurnPermissionOverlay::default();
@@ -1446,7 +1476,13 @@ mod tests {
                 .to_string(),
             ),
         };
-        harness.action_tx.send(UserAction::Approve(true)).unwrap();
+        harness
+            .action_tx
+            .send(UserAction::Approve {
+                id: "perm-1".to_string(),
+                approved: true,
+            })
+            .unwrap();
         let config = config(ApprovalMode::Suggest);
         let policy = ApprovalPolicy::new(ApprovalMode::Suggest);
         let mut overlay = TurnPermissionOverlay::default();
@@ -1502,7 +1538,13 @@ mod tests {
                 .to_string(),
             ),
         };
-        harness.action_tx.send(UserAction::Approve(false)).unwrap();
+        harness
+            .action_tx
+            .send(UserAction::Approve {
+                id: "perm-1".to_string(),
+                approved: false,
+            })
+            .unwrap();
         let config = config(ApprovalMode::Suggest);
         let policy = ApprovalPolicy::new(ApprovalMode::Suggest);
         let mut overlay = TurnPermissionOverlay::default();
@@ -1593,7 +1635,10 @@ mod tests {
         );
 
         action_tx
-            .send(UserAction::RespondToUserInput("yes".to_string()))
+            .send(UserAction::RespondToUserInput {
+                id: "ask-1".to_string(),
+                answer: "yes".to_string(),
+            })
             .expect("send answer");
         let (should_stop, result, _) = handle.join().expect("executor thread");
 

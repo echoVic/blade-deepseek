@@ -571,7 +571,12 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                                 if state.status == AppStatus::WaitingUserInput {
                                     state.enter_running();
                                     state.scroll_to_bottom();
-                                    let _ = action_tx.send(UserAction::RespondToUserInput(text));
+                                    if let Some(id) = state.pending_user_input_id.take() {
+                                        let _ = action_tx.send(UserAction::RespondToUserInput {
+                                            id,
+                                            answer: text,
+                                        });
+                                    }
                                 } else {
                                     state.record_prompt(text.clone());
                                     state.messages.push(ChatMessage::User(text.clone()));
@@ -695,10 +700,15 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
         while let Ok(tui_event) = event_rx.try_recv() {
             // Auto-approve tools the user chose to "always allow" this session,
             // so a repeat request is granted without re-prompting.
-            if let TuiEvent::ApprovalNeeded { tool, target, .. } = &tui_event
+            if let TuiEvent::ApprovalNeeded {
+                id, tool, target, ..
+            } = &tui_event
                 && state.approval_is_allowlisted(tool, target.as_deref())
             {
-                let _ = action_tx.send(UserAction::Approve(true));
+                let _ = action_tx.send(UserAction::Approve {
+                    id: id.clone(),
+                    approved: true,
+                });
                 state.enter_running();
                 continue;
             }
@@ -973,6 +983,7 @@ mod tests {
         let (mut state, rx) = test_state();
         let action_tx = state.event_tx.clone();
         state.approval_dialog = Some(crate::types::ApprovalDialog {
+            id: "approval-background".to_string(),
             tool: "task_list".to_string(),
             target: None,
             background_task_id: Some("task-approval".to_string()),
@@ -990,6 +1001,28 @@ mod tests {
                 if task_id == "task-approval" && approved
         ));
         assert_eq!(state.status, AppStatus::Idle);
+        assert!(state.approval_dialog.is_none());
+    }
+
+    #[test]
+    fn foreground_approval_resolution_sends_runtime_interaction_id() {
+        let (mut state, rx) = test_state();
+        let action_tx = state.event_tx.clone();
+        state.update(TuiEvent::ApprovalNeeded {
+            id: "approval-foreground".to_string(),
+            tool: "bash".to_string(),
+            target: Some("cargo test".to_string()),
+            preview: None,
+        });
+
+        resolve_approval_option(&mut state, &action_tx, ApprovalOption::Once);
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(UserAction::Approve { id, approved })
+                if id == "approval-foreground" && approved
+        ));
+        assert_eq!(state.status, AppStatus::Running);
         assert!(state.approval_dialog.is_none());
     }
 
@@ -2010,10 +2043,15 @@ mod tests {
                         saw_tool_requested = true;
                         break;
                     }
-                    Ok(TuiEvent::ApprovalNeeded { tool, .. }) => {
+                    Ok(TuiEvent::ApprovalNeeded { id, tool, .. }) => {
                         saw_second_approval = true;
                         seen.push(format!("approval: {tool}"));
-                        action_tx.send(UserAction::Approve(false)).unwrap();
+                        action_tx
+                            .send(UserAction::Approve {
+                                id,
+                                approved: false,
+                            })
+                            .unwrap();
                         break;
                     }
                     Ok(event) => seen.push(format!("{event:?}")),
@@ -2905,7 +2943,14 @@ fn resolve_approval(state: &mut AppState, action_tx: &mpsc::Sender<UserAction>, 
         let _ = action_tx.send(UserAction::ResolveBackgroundApproval { task_id, approved });
         state.set_status(AppStatus::Idle);
     } else {
-        let _ = action_tx.send(UserAction::Approve(approved));
+        let Some(id) = state
+            .approval_dialog
+            .as_ref()
+            .map(|dialog| dialog.id.clone())
+        else {
+            return;
+        };
+        let _ = action_tx.send(UserAction::Approve { id, approved });
         if approved {
             state.enter_running();
         } else {
@@ -3742,7 +3787,7 @@ fn agent_loop_thread(
                 }
             }
             Ok(UserAction::Cancel) | Err(_) => break,
-            Ok(UserAction::Approve(_) | UserAction::RespondToUserInput(_)) => {}
+            Ok(UserAction::Approve { .. } | UserAction::RespondToUserInput { .. }) => {}
         }
     }
 }

@@ -48,7 +48,10 @@ impl RuntimeApprovalHandler for TuiApprovalHandler<'_> {
     ) -> std::io::Result<ApprovalResolution> {
         let allowed = loop {
             match self.action_rx.recv() {
-                Ok(UserAction::Approve(value)) => break value,
+                Ok(UserAction::Approve { id, approved }) if id == approval.id => break approved,
+                Ok(action @ UserAction::Approve { .. }) => {
+                    self.pending_actions.borrow_mut().push_back(action)
+                }
                 Ok(UserAction::Interrupt) | Ok(UserAction::Cancel) | Err(_) => break false,
                 Ok(action) => self.pending_actions.borrow_mut().push_back(action),
             }
@@ -244,7 +247,10 @@ impl RuntimePermissionRequestHandler for TuiPermissionRequestHandler<'_> {
             .send(approval_event_from_pending_interaction(&pending));
         let allowed = loop {
             match self.action_rx.recv() {
-                Ok(UserAction::Approve(value)) => break value,
+                Ok(UserAction::Approve { id, approved }) if id == request.id => break approved,
+                Ok(action @ UserAction::Approve { .. }) => {
+                    self.pending_actions.borrow_mut().push_back(action)
+                }
                 Ok(UserAction::Interrupt) | Ok(UserAction::Cancel) | Err(_) => break false,
                 Ok(action) => self.pending_actions.borrow_mut().push_back(action),
             }
@@ -362,7 +368,12 @@ impl RuntimeUserInputHandler for TuiUserInputHandler<'_> {
 
         let response = loop {
             match self.action_rx.recv() {
-                Ok(UserAction::RespondToUserInput(answer)) => break Ok(Some(answer)),
+                Ok(UserAction::RespondToUserInput { id, answer }) if id == request.id => {
+                    break Ok(Some(answer));
+                }
+                Ok(action @ UserAction::RespondToUserInput { .. }) => {
+                    self.pending_actions.borrow_mut().push_back(action)
+                }
                 Ok(UserAction::Interrupt) | Ok(UserAction::Cancel) | Err(_) => break Ok(None),
                 Ok(action) => self.pending_actions.borrow_mut().push_back(action),
             }
@@ -421,7 +432,10 @@ mod tests {
     fn tui_approval_handler_resolves_approve_action_through_runtime_context() {
         let (action_tx, action_rx) = mpsc::channel();
         action_tx
-            .send(UserAction::Approve(true))
+            .send(UserAction::Approve {
+                id: "approval-1".to_string(),
+                approved: true,
+            })
             .expect("send approval");
         let pending_actions = RefCell::new(VecDeque::new());
         let handler = TuiApprovalHandler::new(&action_rx, &pending_actions);
@@ -461,7 +475,10 @@ mod tests {
             .send(UserAction::Submit("next prompt".to_string()))
             .expect("send queued submit");
         action_tx
-            .send(UserAction::Approve(true))
+            .send(UserAction::Approve {
+                id: "approval-1".to_string(),
+                approved: true,
+            })
             .expect("send approval");
         let pending_actions = RefCell::new(VecDeque::new());
         let handler = TuiApprovalHandler::new(&action_rx, &pending_actions);
@@ -493,6 +510,54 @@ mod tests {
         assert!(matches!(
             pending_actions.borrow_mut().pop_front(),
             Some(UserAction::Submit(prompt)) if prompt == "next prompt"
+        ));
+    }
+
+    #[test]
+    fn tui_approval_handler_resolves_only_matching_runtime_interaction_id() {
+        let (action_tx, action_rx) = mpsc::channel();
+        action_tx
+            .send(UserAction::Approve {
+                id: "approval-other".to_string(),
+                approved: false,
+            })
+            .expect("send unrelated approval");
+        action_tx
+            .send(UserAction::Approve {
+                id: "approval-1".to_string(),
+                approved: true,
+            })
+            .expect("send matching approval");
+        let pending_actions = RefCell::new(VecDeque::new());
+        let handler = TuiApprovalHandler::new(&action_rx, &pending_actions);
+        let mut context = RuntimeToolActorContext::new("tui-approval", 2);
+        let approval = orca_core::approval_types::ApprovalRequest {
+            id: "approval-1".to_string(),
+            action: orca_core::approval_types::ActionKind::Shell,
+            description: "bash requested shell".to_string(),
+            tool: Some("bash".to_string()),
+            target: Some("echo hi".to_string()),
+            preview: Some("$ echo hi".to_string()),
+        };
+        let request = tool_types::ToolRequest {
+            id: "bash".to_string(),
+            name: tool_types::ToolName::Bash,
+            action: orca_core::approval_types::ActionKind::Shell,
+            target: Some("echo hi".to_string()),
+            raw_arguments: Some(serde_json::json!({ "command": "echo hi" }).to_string()),
+        };
+
+        let resolution = context
+            .resolve_interactive_tool_approval(&handler, &approval, &request)
+            .expect("approval resolution");
+
+        assert_eq!(
+            resolution.decision,
+            orca_core::approval_types::ApprovalDecision::Allow
+        );
+        assert!(matches!(
+            pending_actions.borrow_mut().pop_front(),
+            Some(UserAction::Approve { id, approved: false }) if id == "approval-other"
         ));
     }
 
@@ -536,7 +601,10 @@ mod tests {
         let (event_tx, event_rx) = mpsc::channel();
         let (action_tx, action_rx) = mpsc::channel();
         action_tx
-            .send(UserAction::RespondToUserInput("yes".to_string()))
+            .send(UserAction::RespondToUserInput {
+                id: "ask".to_string(),
+                answer: "yes".to_string(),
+            })
             .expect("send answer");
         let pending_actions = RefCell::new(VecDeque::new());
         let handler = TuiUserInputHandler::new(&event_tx, &action_rx, &pending_actions);
@@ -607,7 +675,10 @@ mod tests {
         );
 
         action_tx
-            .send(UserAction::RespondToUserInput("yes".to_string()))
+            .send(UserAction::RespondToUserInput {
+                id: "ask".to_string(),
+                answer: "yes".to_string(),
+            })
             .expect("send answer");
         let result = handle.join().expect("user input thread");
 
@@ -623,7 +694,10 @@ mod tests {
             .send(UserAction::Submit("next prompt".to_string()))
             .expect("send queued submit");
         action_tx
-            .send(UserAction::RespondToUserInput("yes".to_string()))
+            .send(UserAction::RespondToUserInput {
+                id: "ask".to_string(),
+                answer: "yes".to_string(),
+            })
             .expect("send answer");
         let pending_actions = RefCell::new(VecDeque::new());
         let handler = TuiUserInputHandler::new(&event_tx, &action_rx, &pending_actions);
@@ -644,6 +718,45 @@ mod tests {
         assert!(matches!(
             pending_actions.borrow_mut().pop_front(),
             Some(UserAction::Submit(prompt)) if prompt == "next prompt"
+        ));
+    }
+
+    #[test]
+    fn tui_user_input_handler_resolves_only_matching_runtime_interaction_id() {
+        let (event_tx, _event_rx) = mpsc::channel();
+        let (action_tx, action_rx) = mpsc::channel();
+        action_tx
+            .send(UserAction::RespondToUserInput {
+                id: "ask-other".to_string(),
+                answer: "wrong".to_string(),
+            })
+            .expect("send unrelated answer");
+        action_tx
+            .send(UserAction::RespondToUserInput {
+                id: "ask".to_string(),
+                answer: "yes".to_string(),
+            })
+            .expect("send matching answer");
+        let pending_actions = RefCell::new(VecDeque::new());
+        let handler = TuiUserInputHandler::new(&event_tx, &action_rx, &pending_actions);
+        let mut context = RuntimeToolActorContext::new("tui-user-input", 2);
+        let request = tool_types::ToolRequest {
+            id: "ask".to_string(),
+            name: tool_types::ToolName::RequestUserInput,
+            action: orca_core::approval_types::ActionKind::Read,
+            target: None,
+            raw_arguments: Some(serde_json::json!({ "question": "Continue?" }).to_string()),
+        };
+
+        let result = context
+            .execute_user_input_tool(&request, &handler)
+            .expect("user input result");
+
+        assert_eq!(result.status, tool_types::ToolStatus::Completed);
+        assert_eq!(result.output.as_deref(), Some("yes"));
+        assert!(matches!(
+            pending_actions.borrow_mut().pop_front(),
+            Some(UserAction::RespondToUserInput { id, answer }) if id == "ask-other" && answer == "wrong"
         ));
     }
 
@@ -705,11 +818,49 @@ mod tests {
         );
 
         action_tx
-            .send(UserAction::Approve(true))
+            .send(UserAction::Approve {
+                id: "permission-1".to_string(),
+                approved: true,
+            })
             .expect("send approval");
         let response = handle.join().expect("permission thread");
 
         assert_eq!(response.decision, PermissionResponseDecision::Allow);
         assert!(store.is_empty());
+    }
+
+    #[test]
+    fn tui_permission_handler_resolves_only_matching_runtime_interaction_id() {
+        let (event_tx, _event_rx) = mpsc::channel();
+        let (action_tx, action_rx) = mpsc::channel();
+        action_tx
+            .send(UserAction::Approve {
+                id: "permission-other".to_string(),
+                approved: false,
+            })
+            .expect("send unrelated approval");
+        action_tx
+            .send(UserAction::Approve {
+                id: "permission-1".to_string(),
+                approved: true,
+            })
+            .expect("send matching approval");
+        let pending_actions = RefCell::new(VecDeque::new());
+        let handler = TuiPermissionRequestHandler::new(&event_tx, &action_rx, &pending_actions);
+        let request = RuntimePermissionRequest {
+            id: "permission-1".to_string(),
+            reason: Some("need write".to_string()),
+            permissions: Default::default(),
+        };
+
+        let response = handler
+            .request_permissions(&request)
+            .expect("permission response");
+
+        assert_eq!(response.decision, PermissionResponseDecision::Allow);
+        assert!(matches!(
+            pending_actions.borrow_mut().pop_front(),
+            Some(UserAction::Approve { id, approved: false }) if id == "permission-other"
+        ));
     }
 }

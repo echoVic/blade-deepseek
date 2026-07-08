@@ -2524,7 +2524,10 @@ mod tests {
         let (event_tx, event_rx) = mpsc::channel();
         let (action_tx, action_rx) = mpsc::channel();
         action_tx
-            .send(UserAction::Approve(true))
+            .send(UserAction::Approve {
+                id: "approval-bash".to_string(),
+                approved: true,
+            })
             .expect("send approval");
         let pending_actions = RefCell::new(VecDeque::new());
         let request = tool_types::ToolRequest {
@@ -2694,10 +2697,13 @@ mod tests {
         let responder = std::thread::spawn(move || {
             loop {
                 match event_rx.recv().expect("event") {
-                    TuiEvent::UserInputRequested { question, .. } => {
+                    TuiEvent::UserInputRequested { id, question, .. } => {
                         assert_eq!(question, "Continue?");
                         action_tx
-                            .send(UserAction::RespondToUserInput("yes".to_string()))
+                            .send(UserAction::RespondToUserInput {
+                                id,
+                                answer: "yes".to_string(),
+                            })
                             .expect("send answer");
                         break;
                     }

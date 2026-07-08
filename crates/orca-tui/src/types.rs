@@ -126,9 +126,9 @@ pub enum UserAction {
     GoalClear,
     GoalPause,
     GoalResume,
-    Approve(bool),
+    Approve { id: String, approved: bool },
     ResolveBackgroundApproval { task_id: String, approved: bool },
-    RespondToUserInput(String),
+    RespondToUserInput { id: String, answer: String },
     Backtrack,
     BackgroundCurrentTurn,
     Interrupt,
@@ -228,6 +228,7 @@ impl ApprovalOption {
 
 #[derive(Debug, Clone)]
 pub struct ApprovalDialog {
+    pub id: String,
     pub tool: String,
     pub target: Option<String>,
     pub background_task_id: Option<String>,
@@ -336,6 +337,7 @@ pub struct AppState {
     #[allow(dead_code)]
     pub event_tx: mpsc::Sender<UserAction>,
     pub approval_dialog: Option<ApprovalDialog>,
+    pub pending_user_input_id: Option<String>,
     /// Tool / "tool\u{0}target" keys the user chose to always allow this
     /// session. Checked when a new approval arrives so the dialog is skipped.
     pub approval_allowlist: std::collections::HashSet<String>,
@@ -389,6 +391,7 @@ impl AppState {
             cwd,
             event_tx,
             approval_dialog: None,
+            pending_user_input_id: None,
             approval_allowlist: std::collections::HashSet::new(),
             setup_step: 0,
             show_shortcuts: false,
@@ -523,6 +526,7 @@ impl AppState {
             return false;
         };
 
+        let id = pending_tool_call.id.clone();
         let tool = pending_tool_call.name.clone();
         let target = pending_tool_call.target.clone();
         let background_task_id = task.id.clone();
@@ -530,6 +534,7 @@ impl AppState {
         let options = ApprovalDialog::options_for(&tool, target.as_deref());
         self.set_status(AppStatus::WaitingApproval);
         self.approval_dialog = Some(ApprovalDialog {
+            id,
             tool,
             target,
             background_task_id: Some(background_task_id),
@@ -1006,14 +1011,15 @@ impl AppState {
                     .push(ChatMessage::System(format!("Workflow {status}. {summary}")));
             }
             TuiEvent::ApprovalNeeded {
+                id,
                 tool,
                 target,
                 preview,
-                ..
             } => {
                 self.set_status(AppStatus::WaitingApproval);
                 let options = ApprovalDialog::options_for(&tool, target.as_deref());
                 self.approval_dialog = Some(ApprovalDialog {
+                    id,
                     tool,
                     target,
                     background_task_id: None,
@@ -1023,9 +1029,12 @@ impl AppState {
                 });
             }
             TuiEvent::UserInputRequested {
-                question, choices, ..
+                id,
+                question,
+                choices,
             } => {
                 self.set_status(AppStatus::WaitingUserInput);
+                self.pending_user_input_id = Some(id);
                 let mut message = question;
                 if !choices.is_empty() {
                     message.push_str("\nChoices: ");
@@ -1490,9 +1499,23 @@ mod tests {
             preview: Some("@@ token.rs @@\n- a\n+ b".to_string()),
         });
         let dialog = state.approval_dialog.expect("dialog present");
+        assert_eq!(dialog.id, "approval-1");
         assert_eq!(dialog.options.len(), 4);
         assert!(dialog.diff.is_some());
         assert_eq!(dialog.current(), ApprovalOption::Once);
+    }
+
+    #[test]
+    fn user_input_requested_event_tracks_pending_runtime_interaction_id() {
+        let mut state = state();
+        state.update(TuiEvent::UserInputRequested {
+            id: "ask-1".to_string(),
+            question: "Continue?".to_string(),
+            choices: vec!["yes".to_string(), "no".to_string()],
+        });
+
+        assert_eq!(state.status, AppStatus::WaitingUserInput);
+        assert_eq!(state.pending_user_input_id.as_deref(), Some("ask-1"));
     }
 
     #[test]
