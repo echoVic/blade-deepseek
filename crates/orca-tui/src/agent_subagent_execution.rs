@@ -17,6 +17,7 @@ use orca_runtime::cost::CostTracker;
 use orca_runtime::hooks::HookRunner;
 use orca_runtime::instructions::ProjectInstructions;
 use orca_runtime::memory::MemoryBlock;
+use orca_runtime::runtime_pending_interaction::RuntimePendingInteractionStore;
 use orca_runtime::subagent::{self, SubagentMode};
 use orca_runtime::tasks::TaskRegistry;
 
@@ -224,6 +225,7 @@ pub(crate) fn execute_subagent_for_tui(
     event_tx: &Sender<TuiEvent>,
     action_rx: &Receiver<UserAction>,
     pending_actions: &RefCell<VecDeque<UserAction>>,
+    pending_interactions: Option<RuntimePendingInteractionStore>,
     subagent_depth: u32,
     instructions: &ProjectInstructions,
     memory: &MemoryBlock,
@@ -288,6 +290,7 @@ pub(crate) fn execute_subagent_for_tui(
         event_tx,
         action_rx,
         pending_actions,
+        pending_interactions,
         subagent_depth + 1,
         &subagent_type,
         instructions,
@@ -560,6 +563,7 @@ fn run_child_agent_for_tui(
     event_tx: &Sender<TuiEvent>,
     action_rx: &Receiver<UserAction>,
     pending_actions: &RefCell<VecDeque<UserAction>>,
+    pending_interactions: Option<RuntimePendingInteractionStore>,
     subagent_depth: u32,
     subagent_type: &SubagentType,
     instructions: &ProjectInstructions,
@@ -574,6 +578,7 @@ fn run_child_agent_for_tui(
         event_tx,
         action_rx,
         pending_actions,
+        pending_interactions,
         subagent_depth,
         subagent_type,
         instructions,
@@ -592,6 +597,7 @@ fn run_child_agent_for_tui_observed(
     event_tx: &Sender<TuiEvent>,
     action_rx: &Receiver<UserAction>,
     pending_actions: &RefCell<VecDeque<UserAction>>,
+    pending_interactions: Option<RuntimePendingInteractionStore>,
     subagent_depth: u32,
     subagent_type: &SubagentType,
     instructions: &ProjectInstructions,
@@ -625,6 +631,7 @@ fn run_child_agent_for_tui_observed(
                     event_tx,
                     action_rx,
                     pending_actions,
+                    pending_interactions.clone(),
                     request.depth,
                     None,
                     None,
@@ -768,6 +775,7 @@ pub(crate) fn run_child_agent_for_tui_silent(
         &event_tx,
         &action_rx,
         &pending_actions,
+        None,
         subagent_depth,
         subagent_type,
         instructions,

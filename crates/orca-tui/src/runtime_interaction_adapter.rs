@@ -11,7 +11,9 @@ use orca_runtime::lifecycle::{
     RuntimeUserInputHandler, RuntimeUserInputRequest,
 };
 use orca_runtime::protocol::{PermissionGrantScope, PermissionResponseDecision};
-use orca_runtime::runtime_pending_interaction::RuntimePendingInteractionRecord;
+use orca_runtime::runtime_pending_interaction::{
+    RuntimePendingInteractionRecord, RuntimePendingInteractionStore,
+};
 use orca_runtime::tool_invocation::{ToolInvocation, approval_request_for_invocation};
 
 use crate::types::{TuiEvent, UserAction};
@@ -75,6 +77,7 @@ pub(crate) fn resolve_tui_tool_approval(
     event_tx: &Sender<TuiEvent>,
     action_rx: &Receiver<UserAction>,
     pending_actions: &RefCell<VecDeque<UserAction>>,
+    pending_interactions: Option<&RuntimePendingInteractionStore>,
 ) -> TuiToolApprovalOutcome {
     let Some(approval) = approval_request_for_invocation(invocation) else {
         return TuiToolApprovalOutcome::Continue;
@@ -94,6 +97,7 @@ pub(crate) fn resolve_tui_tool_approval(
             approval.preview = build_approval_preview(tool_request);
             let pending =
                 RuntimePendingInteractionRecord::from_tool_approval(&approval, tool_request);
+            insert_pending_interaction(pending_interactions, pending.clone());
             let _ = event_tx.send(approval_event_from_pending_interaction(&pending));
 
             let handler = TuiApprovalHandler::new(action_rx, pending_actions);
@@ -104,6 +108,7 @@ pub(crate) fn resolve_tui_tool_approval(
                     decision: ApprovalDecision::Deny,
                     reason: format!("interactive approval failed: {error}"),
                 });
+            remove_pending_interaction(pending_interactions, &approval.id);
 
             if resolution.decision == ApprovalDecision::Deny {
                 TuiToolApprovalOutcome::Denied(tool_types::ToolResult::denied(
@@ -177,6 +182,7 @@ pub(crate) struct TuiPermissionRequestHandler<'a> {
     tool: String,
     target: Option<String>,
     preview: Option<String>,
+    pending_interactions: Option<RuntimePendingInteractionStore>,
 }
 
 impl<'a> TuiPermissionRequestHandler<'a> {
@@ -192,6 +198,7 @@ impl<'a> TuiPermissionRequestHandler<'a> {
             tool: "request_permissions".to_string(),
             target: None,
             preview: None,
+            pending_interactions: None,
         }
     }
 
@@ -204,6 +211,14 @@ impl<'a> TuiPermissionRequestHandler<'a> {
         self.tool = tool.into();
         self.target = target;
         self.preview = preview;
+        self
+    }
+
+    pub(crate) fn with_pending_interactions(
+        mut self,
+        store: RuntimePendingInteractionStore,
+    ) -> Self {
+        self.pending_interactions = Some(store);
         self
     }
 }
@@ -223,6 +238,7 @@ impl RuntimePermissionRequestHandler for TuiPermissionRequestHandler<'_> {
             self.target.clone(),
             Some(preview),
         );
+        insert_pending_interaction(self.pending_interactions.as_ref(), pending.clone());
         let _ = self
             .event_tx
             .send(approval_event_from_pending_interaction(&pending));
@@ -233,6 +249,7 @@ impl RuntimePermissionRequestHandler for TuiPermissionRequestHandler<'_> {
                 Ok(action) => self.pending_actions.borrow_mut().push_back(action),
             }
         };
+        remove_pending_interaction(self.pending_interactions.as_ref(), &request.id);
         Ok(RuntimePermissionResponse {
             decision: if allowed {
                 PermissionResponseDecision::Allow
@@ -306,6 +323,7 @@ pub(crate) struct TuiUserInputHandler<'a> {
     event_tx: &'a Sender<TuiEvent>,
     action_rx: &'a Receiver<UserAction>,
     pending_actions: &'a RefCell<VecDeque<UserAction>>,
+    pending_interactions: Option<RuntimePendingInteractionStore>,
 }
 
 impl<'a> TuiUserInputHandler<'a> {
@@ -318,7 +336,16 @@ impl<'a> TuiUserInputHandler<'a> {
             event_tx,
             action_rx,
             pending_actions,
+            pending_interactions: None,
         }
+    }
+
+    pub(crate) fn with_pending_interactions(
+        mut self,
+        store: RuntimePendingInteractionStore,
+    ) -> Self {
+        self.pending_interactions = Some(store);
+        self
     }
 }
 
@@ -328,17 +355,35 @@ impl RuntimeUserInputHandler for TuiUserInputHandler<'_> {
         request: &RuntimeUserInputRequest,
     ) -> std::io::Result<Option<String>> {
         let pending = RuntimePendingInteractionRecord::from_user_input(request);
+        insert_pending_interaction(self.pending_interactions.as_ref(), pending.clone());
         let _ = self
             .event_tx
             .send(user_input_event_from_pending_interaction(&pending));
 
-        loop {
+        let response = loop {
             match self.action_rx.recv() {
-                Ok(UserAction::RespondToUserInput(answer)) => return Ok(Some(answer)),
-                Ok(UserAction::Interrupt) | Ok(UserAction::Cancel) | Err(_) => return Ok(None),
+                Ok(UserAction::RespondToUserInput(answer)) => break Ok(Some(answer)),
+                Ok(UserAction::Interrupt) | Ok(UserAction::Cancel) | Err(_) => break Ok(None),
                 Ok(action) => self.pending_actions.borrow_mut().push_back(action),
             }
-        }
+        };
+        remove_pending_interaction(self.pending_interactions.as_ref(), &request.id);
+        response
+    }
+}
+
+fn insert_pending_interaction(
+    store: Option<&RuntimePendingInteractionStore>,
+    record: RuntimePendingInteractionRecord,
+) {
+    if let Some(store) = store {
+        store.insert(record);
+    }
+}
+
+fn remove_pending_interaction(store: Option<&RuntimePendingInteractionStore>, id: &str) {
+    if let Some(store) = store {
+        store.remove(id);
     }
 }
 
@@ -366,6 +411,9 @@ mod tests {
     use std::sync::mpsc;
 
     use orca_runtime::lifecycle::RuntimeToolActorContext;
+    use orca_runtime::runtime_pending_interaction::{
+        RuntimePendingInteractionKind, RuntimePendingInteractionStore,
+    };
 
     use super::*;
 
@@ -526,6 +574,48 @@ mod tests {
     }
 
     #[test]
+    fn tui_user_input_handler_tracks_runtime_pending_interaction_until_answered() {
+        let (event_tx, event_rx) = mpsc::channel();
+        let (action_tx, action_rx) = mpsc::channel();
+        let store = RuntimePendingInteractionStore::default();
+        let request = tool_types::ToolRequest {
+            id: "ask".to_string(),
+            name: tool_types::ToolName::RequestUserInput,
+            action: orca_core::approval_types::ActionKind::Read,
+            target: None,
+            raw_arguments: Some(serde_json::json!({ "question": "Continue?" }).to_string()),
+        };
+        let worker_store = store.clone();
+
+        let handle = std::thread::spawn(move || {
+            let pending_actions = RefCell::new(VecDeque::new());
+            let handler = TuiUserInputHandler::new(&event_tx, &action_rx, &pending_actions)
+                .with_pending_interactions(worker_store);
+            let mut context = RuntimeToolActorContext::new("tui-user-input", 2);
+            context
+                .execute_user_input_tool(&request, &handler)
+                .expect("user input result")
+        });
+        let prompt = event_rx.recv().expect("user input prompt");
+        assert!(matches!(
+            prompt,
+            TuiEvent::UserInputRequested { id, .. } if id == "ask"
+        ));
+        assert_eq!(
+            store.get("ask").map(|record| record.kind),
+            Some(RuntimePendingInteractionKind::UserInput)
+        );
+
+        action_tx
+            .send(UserAction::RespondToUserInput("yes".to_string()))
+            .expect("send answer");
+        let result = handle.join().expect("user input thread");
+
+        assert_eq!(result.status, tool_types::ToolStatus::Completed);
+        assert!(store.is_empty());
+    }
+
+    #[test]
     fn tui_user_input_handler_preserves_queued_app_actions() {
         let (event_tx, _event_rx) = mpsc::channel();
         let (action_tx, action_rx) = mpsc::channel();
@@ -582,5 +672,44 @@ mod tests {
             result.error.as_deref(),
             Some("user input request cancelled")
         );
+    }
+
+    #[test]
+    fn tui_permission_handler_tracks_runtime_pending_interaction_until_resolved() {
+        let (event_tx, event_rx) = mpsc::channel();
+        let (action_tx, action_rx) = mpsc::channel();
+        let store = RuntimePendingInteractionStore::default();
+        let request = RuntimePermissionRequest {
+            id: "permission-1".to_string(),
+            reason: Some("need write".to_string()),
+            permissions: Default::default(),
+        };
+        let worker_store = store.clone();
+
+        let handle = std::thread::spawn(move || {
+            let pending_actions = RefCell::new(VecDeque::new());
+            let handler = TuiPermissionRequestHandler::new(&event_tx, &action_rx, &pending_actions)
+                .with_pending_interactions(worker_store);
+            handler
+                .request_permissions(&request)
+                .expect("permission response")
+        });
+        let prompt = event_rx.recv().expect("approval prompt");
+        assert!(matches!(
+            prompt,
+            TuiEvent::ApprovalNeeded { id, .. } if id == "permission-1"
+        ));
+        assert_eq!(
+            store.get("permission-1").map(|record| record.kind),
+            Some(RuntimePendingInteractionKind::PermissionRequest)
+        );
+
+        action_tx
+            .send(UserAction::Approve(true))
+            .expect("send approval");
+        let response = handle.join().expect("permission thread");
+
+        assert_eq!(response.decision, PermissionResponseDecision::Allow);
+        assert!(store.is_empty());
     }
 }

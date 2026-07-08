@@ -2042,6 +2042,7 @@ mod tests {
         for marker in [
             "pub enum RuntimePendingInteractionKind",
             "pub struct RuntimePendingInteractionRecord",
+            "pub struct RuntimePendingInteractionStore",
             "pub fn from_tool_approval",
             "pub fn from_permission_request",
             "pub fn from_user_input",

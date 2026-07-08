@@ -224,10 +224,12 @@ copied into Orca.
    focused `RuntimePendingInteractionRecord` shape for tool approvals,
    `request_permissions`, and `request_user_input`, and the TUI interaction
    adapter projects those runtime records into existing dialogs/prompts instead
-   of hand-building separate payloads. Next, move pending interaction storage
-   and response routing behind request/turn/item ids so approval and user-input
-   continuations stop depending on separate ad hoc task fields plus TUI-local
-   queues.
+   of hand-building separate payloads. Runtime also owns the shared pending
+   interaction store, and the TUI session passes that store through tool
+   approvals, `request_permissions`, `request_user_input`, and child-agent tool
+   paths. Next, move response routing behind request/turn/item ids so approval
+   and user-input continuations stop depending on separate ad hoc task fields
+   plus TUI-local queues.
 3. **P2: Frozen per-turn context boundary.** Continue shrinking wide call
    surfaces into `RuntimeTurnConfig`, `RuntimeTurnDeps`,
    `RuntimeTurnState`, and request snapshots. Keep borrowing package 3's

@@ -18,6 +18,7 @@ use orca_runtime::hooks::HookRunner;
 use orca_runtime::instructions::ProjectInstructions;
 use orca_runtime::lifecycle::{RuntimeTaskKind, RuntimeTurnRunner};
 use orca_runtime::memory::MemoryBlock;
+use orca_runtime::runtime_pending_interaction::RuntimePendingInteractionStore;
 use orca_runtime::tasks::TaskRegistry;
 use orca_runtime::thread::RuntimeThread;
 
@@ -25,6 +26,7 @@ use crate::types::TuiTaskLifecycle;
 
 pub struct TuiConversationSession {
     runtime: RuntimeThread,
+    pending_interactions: RuntimePendingInteractionStore,
 }
 
 impl TuiConversationSession {
@@ -34,7 +36,10 @@ impl TuiConversationSession {
         preloaded: Option<history::SessionTranscript>,
     ) -> std::io::Result<Self> {
         let runtime = RuntimeThread::start_with_preloaded(config, prompt_for_title, preloaded)?;
-        Ok(Self { runtime })
+        Ok(Self {
+            runtime,
+            pending_interactions: RuntimePendingInteractionStore::default(),
+        })
     }
 
     pub fn runtime_session(&self) -> &orca_runtime::session::InteractiveSession {
@@ -75,6 +80,10 @@ impl TuiConversationSession {
 
     pub(crate) fn task_registry(&self) -> &TaskRegistry {
         self.runtime.session().task_registry()
+    }
+
+    pub(crate) fn pending_interactions(&self) -> RuntimePendingInteractionStore {
+        self.pending_interactions.clone()
     }
 
     pub(crate) fn append_message(&mut self, message: &orca_core::conversation::Message) {

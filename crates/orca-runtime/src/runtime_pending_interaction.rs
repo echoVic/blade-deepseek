@@ -1,5 +1,7 @@
 use orca_core::approval_types::ApprovalRequest;
 use orca_core::tool_types::ToolRequest;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use crate::lifecycle::{RuntimePermissionRequest, RuntimeUserInputRequest};
 
@@ -64,6 +66,57 @@ impl RuntimePendingInteractionRecord {
             question: Some(request.question.clone()),
             choices: request.choices.clone(),
         }
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct RuntimePendingInteractionStore {
+    pending: Arc<Mutex<HashMap<String, RuntimePendingInteractionRecord>>>,
+}
+
+impl RuntimePendingInteractionStore {
+    pub fn insert(
+        &self,
+        record: RuntimePendingInteractionRecord,
+    ) -> Option<RuntimePendingInteractionRecord> {
+        self.pending
+            .lock()
+            .expect("pending interaction store poisoned")
+            .insert(record.id.clone(), record)
+    }
+
+    pub fn get(&self, id: &str) -> Option<RuntimePendingInteractionRecord> {
+        self.pending
+            .lock()
+            .expect("pending interaction store poisoned")
+            .get(id)
+            .cloned()
+    }
+
+    pub fn remove(&self, id: &str) -> Option<RuntimePendingInteractionRecord> {
+        self.pending
+            .lock()
+            .expect("pending interaction store poisoned")
+            .remove(id)
+    }
+
+    pub fn list(&self) -> Vec<RuntimePendingInteractionRecord> {
+        let mut records = self
+            .pending
+            .lock()
+            .expect("pending interaction store poisoned")
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        records.sort_by(|left, right| left.id.cmp(&right.id));
+        records
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.pending
+            .lock()
+            .expect("pending interaction store poisoned")
+            .is_empty()
     }
 }
 
@@ -150,5 +203,23 @@ mod tests {
         assert_eq!(record.kind, RuntimePendingInteractionKind::UserInput);
         assert_eq!(record.question.as_deref(), Some("Choose?"));
         assert_eq!(record.choices, vec!["A".to_string(), "B".to_string()]);
+    }
+
+    #[test]
+    fn pending_interaction_store_tracks_records_by_request_id() {
+        let store = RuntimePendingInteractionStore::default();
+        let request = RuntimeUserInputRequest {
+            id: "input-1".to_string(),
+            question: "Choose?".to_string(),
+            choices: Vec::new(),
+        };
+        let record = RuntimePendingInteractionRecord::from_user_input(&request);
+
+        assert!(store.is_empty());
+        assert!(store.insert(record.clone()).is_none());
+        assert_eq!(store.get("input-1"), Some(record.clone()));
+        assert_eq!(store.list(), vec![record.clone()]);
+        assert_eq!(store.remove("input-1"), Some(record));
+        assert!(store.is_empty());
     }
 }

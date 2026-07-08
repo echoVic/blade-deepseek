@@ -23,6 +23,7 @@ use orca_runtime::protocol::{
     PermissionResponseDecision, RequestFileSystemPermissions, RequestNetworkPermissions,
     RequestPermissionProfile, RequestShellPermissions,
 };
+use orca_runtime::runtime_pending_interaction::RuntimePendingInteractionStore;
 use orca_runtime::tasks::TaskRegistry;
 use orca_runtime::tool_invocation::prepare_tool_invocation;
 
@@ -125,6 +126,7 @@ pub(crate) fn execute_tool_for_tui(
     event_tx: &Sender<TuiEvent>,
     action_rx: &Receiver<UserAction>,
     pending_actions: &RefCell<VecDeque<UserAction>>,
+    pending_interactions: Option<RuntimePendingInteractionStore>,
     subagent_depth: u32,
     session_id: Option<&str>,
     thread_extensions: Option<Arc<orca_runtime::extension::ExtensionData>>,
@@ -144,6 +146,7 @@ pub(crate) fn execute_tool_for_tui(
         event_tx,
         action_rx,
         pending_actions,
+        pending_interactions,
         subagent_depth,
         session_id,
         thread_extensions,
@@ -166,6 +169,7 @@ fn execute_tool_for_tui_inner(
     event_tx: &Sender<TuiEvent>,
     action_rx: &Receiver<UserAction>,
     pending_actions: &RefCell<VecDeque<UserAction>>,
+    pending_interactions: Option<RuntimePendingInteractionStore>,
     subagent_depth: u32,
     session_id: Option<&str>,
     thread_extensions: Option<Arc<orca_runtime::extension::ExtensionData>>,
@@ -198,6 +202,7 @@ fn execute_tool_for_tui_inner(
             event_tx,
             action_rx,
             pending_actions,
+            pending_interactions.as_ref(),
         )
     {
         send_tool_requested_for_tui(event_tx, &mut events, tool_request);
@@ -214,6 +219,7 @@ fn execute_tool_for_tui_inner(
             event_tx,
             action_rx,
             pending_actions,
+            pending_interactions.clone(),
             subagent_depth,
             instructions,
             memory,
@@ -289,6 +295,7 @@ fn execute_tool_for_tui_inner(
                         event_tx,
                         action_rx,
                         pending_actions,
+                        pending_interactions.as_ref(),
                         &mut on_output,
                     )
                 }
@@ -298,8 +305,10 @@ fn execute_tool_for_tui_inner(
                 if config.approval_mode == orca_core::approval_types::ApprovalMode::FullAuto {
                     runtime_context.execute_request_permissions_tool(execution_request)
                 } else {
-                    let handler =
-                        TuiPermissionRequestHandler::new(event_tx, action_rx, pending_actions);
+                    let handler = with_pending_interactions(
+                        TuiPermissionRequestHandler::new(event_tx, action_rx, pending_actions),
+                        pending_interactions.as_ref(),
+                    );
                     runtime_context
                         .execute_request_permissions_tool_with_handler(execution_request, &handler)
                 };
@@ -311,6 +320,7 @@ fn execute_tool_for_tui_inner(
                 event_tx,
                 action_rx,
                 pending_actions,
+                pending_interactions.as_ref(),
             )
         } else if execution_request.name == tool_types::ToolName::WorkflowDraft {
             let Some(task_registry) = task_registry else {
@@ -579,6 +589,7 @@ fn resolve_tui_permission_escalation(
     event_tx: &Sender<TuiEvent>,
     action_rx: &Receiver<UserAction>,
     pending_actions: &RefCell<VecDeque<UserAction>>,
+    pending_interactions: Option<&RuntimePendingInteractionStore>,
 ) -> std::io::Result<bool> {
     let resolution = policy.resolve_for_tool(
         approval,
@@ -596,6 +607,7 @@ fn resolve_tui_permission_escalation(
                     approval.target.clone(),
                     approval.preview.clone(),
                 );
+            let handler = with_pending_interactions(handler, pending_interactions);
             permission_overlay.request_and_merge(&handler, permission_request)?
         }
     };
@@ -609,6 +621,7 @@ fn execute_tui_bash_with_escalations(
     event_tx: &Sender<TuiEvent>,
     action_rx: &Receiver<UserAction>,
     pending_actions: &RefCell<VecDeque<UserAction>>,
+    pending_interactions: Option<&RuntimePendingInteractionStore>,
     on_output: &mut dyn FnMut(&str),
 ) -> tool_types::ToolResult {
     let (result, network_block) = run_tui_bash(&context, context.additional_roots, on_output);
@@ -654,6 +667,7 @@ fn execute_tui_bash_with_escalations(
             event_tx,
             action_rx,
             pending_actions,
+            pending_interactions,
         ) {
             Ok(allowed) => allowed,
             Err(error) => {
@@ -680,6 +694,7 @@ fn execute_tui_bash_with_escalations(
         event_tx,
         action_rx,
         pending_actions,
+        pending_interactions,
         context.cancel,
         &mut |retry| match retry {
             TuiBashRetry::WriteRoots(granted) => {
@@ -899,6 +914,7 @@ pub(crate) fn escalate_sandbox_denied_bash_for_tui(
     event_tx: &Sender<TuiEvent>,
     action_rx: &Receiver<UserAction>,
     pending_actions: &RefCell<VecDeque<UserAction>>,
+    pending_interactions: Option<&RuntimePendingInteractionStore>,
     cancel: &CancelToken,
     retry: &mut dyn FnMut(TuiBashRetry) -> tool_types::ToolResult,
 ) -> tool_types::ToolResult {
@@ -960,6 +976,7 @@ pub(crate) fn escalate_sandbox_denied_bash_for_tui(
             event_tx,
             action_rx,
             pending_actions,
+            pending_interactions,
         ) {
             Ok(allowed) => allowed,
             Err(error) => {
@@ -1019,6 +1036,7 @@ pub(crate) fn escalate_sandbox_denied_bash_for_tui(
         event_tx,
         action_rx,
         pending_actions,
+        pending_interactions,
     ) {
         Ok(allowed) => allowed,
         Err(error) => {
@@ -1068,12 +1086,27 @@ fn execute_user_input_request_for_tui(
     event_tx: &Sender<TuiEvent>,
     action_rx: &Receiver<UserAction>,
     pending_actions: &RefCell<VecDeque<UserAction>>,
+    pending_interactions: Option<&RuntimePendingInteractionStore>,
 ) -> tool_types::ToolResult {
-    let handler = TuiUserInputHandler::new(event_tx, action_rx, pending_actions);
+    let handler = match pending_interactions {
+        Some(store) => TuiUserInputHandler::new(event_tx, action_rx, pending_actions)
+            .with_pending_interactions(store.clone()),
+        None => TuiUserInputHandler::new(event_tx, action_rx, pending_actions),
+    };
     let mut runtime_context = RuntimeToolActorContext::new("tui-user-input", DEFAULT_MAX_TURNS);
     match runtime_context.execute_user_input_tool(request, &handler) {
         Ok(result) => result,
         Err(error) => tool_types::ToolResult::failed(request, error.to_string(), None),
+    }
+}
+
+fn with_pending_interactions<'a>(
+    handler: TuiPermissionRequestHandler<'a>,
+    pending_interactions: Option<&RuntimePendingInteractionStore>,
+) -> TuiPermissionRequestHandler<'a> {
+    match pending_interactions {
+        Some(store) => handler.with_pending_interactions(store.clone()),
+        None => handler,
     }
 }
 
@@ -1221,6 +1254,7 @@ mod tests {
                 &self.event_tx,
                 &self.action_rx,
                 &self.pending_actions,
+                None,
                 &cancel,
                 &mut |retry| match retry {
                     TuiBashRetry::WriteRoots(granted) => {
@@ -1364,6 +1398,7 @@ mod tests {
             &harness.event_tx,
             &harness.action_rx,
             &harness.pending_actions,
+            None,
             0,
             None,
             None,
@@ -1423,6 +1458,7 @@ mod tests {
             &harness.event_tx,
             &harness.action_rx,
             &harness.pending_actions,
+            None,
             0,
             None,
             None,
@@ -1478,6 +1514,7 @@ mod tests {
             &harness.event_tx,
             &harness.action_rx,
             &harness.pending_actions,
+            None,
             0,
             None,
             None,
@@ -1493,6 +1530,77 @@ mod tests {
 
         assert_ne!(result.status, ToolStatus::Completed);
         assert!(overlay.additional_working_directories().is_empty());
+    }
+
+    #[test]
+    fn execute_tool_for_tui_tracks_runtime_pending_user_input_until_answered() {
+        let config = config(ApprovalMode::Suggest);
+        let cwd = config.cwd.clone().unwrap_or_else(|| PathBuf::from("."));
+        let (event_tx, event_rx) = mpsc::channel();
+        let (action_tx, action_rx) = mpsc::channel();
+        let store = RuntimePendingInteractionStore::default();
+        let request = tool_types::ToolRequest {
+            id: "ask-1".to_string(),
+            name: ToolName::RequestUserInput,
+            action: ActionKind::Read,
+            target: None,
+            raw_arguments: Some(serde_json::json!({ "question": "Continue?" }).to_string()),
+        };
+        let worker_store = store.clone();
+
+        let handle = std::thread::spawn(move || {
+            let pending_actions = RefCell::new(VecDeque::new());
+            let mut overlay = TurnPermissionOverlay::default();
+            execute_tool_for_tui(
+                &config,
+                &cwd,
+                &request,
+                &event_tx,
+                &action_rx,
+                &pending_actions,
+                Some(worker_store),
+                0,
+                None,
+                None,
+                &ApprovalPolicy::new(ApprovalMode::Suggest),
+                &ProjectInstructions::default(),
+                &MemoryBlock::default(),
+                &McpRegistry::default(),
+                &orca_runtime::hooks::HookRunner::default(),
+                None,
+                &mut overlay,
+                &CancelToken::new(),
+            )
+        });
+
+        let prompt = loop {
+            let event = event_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("user input prompt");
+            if matches!(event, TuiEvent::UserInputRequested { .. }) {
+                break event;
+            }
+        };
+        assert!(matches!(
+            prompt,
+            TuiEvent::UserInputRequested { id, .. } if id == "ask-1"
+        ));
+        assert_eq!(
+            store.get("ask-1").map(|record| record.kind),
+            Some(
+                orca_runtime::runtime_pending_interaction::RuntimePendingInteractionKind::UserInput
+            )
+        );
+
+        action_tx
+            .send(UserAction::RespondToUserInput("yes".to_string()))
+            .expect("send answer");
+        let (should_stop, result, _) = handle.join().expect("executor thread");
+
+        assert!(!should_stop);
+        assert_eq!(result.status, ToolStatus::Completed);
+        assert_eq!(result.output.as_deref(), Some("yes"));
+        assert!(store.is_empty());
     }
 
     fn seatbelt_available_for_tests() -> bool {
@@ -1528,6 +1636,7 @@ mod tests {
             &harness.event_tx,
             &harness.action_rx,
             &harness.pending_actions,
+            None,
             0,
             None,
             None,
@@ -1567,6 +1676,7 @@ mod tests {
             &harness.event_tx,
             &harness.action_rx,
             &harness.pending_actions,
+            None,
             0,
             None,
             None,
