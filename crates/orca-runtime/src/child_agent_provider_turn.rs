@@ -7,6 +7,7 @@ use orca_core::event_schema::{EventFactory, RunStatus};
 use orca_core::event_sink::EventSink;
 use orca_core::model::ModelRouteContext;
 use orca_core::provider_types::{ProviderResponse, ProviderStep};
+use orca_core::subagent_types::SubagentType;
 use orca_provider::ProviderConfig;
 
 use crate::child_agent_loop_setup::ChildAgentLoopSetup;
@@ -16,6 +17,7 @@ use crate::child_agent_types::{
 use crate::compaction::RuntimeCompactionStep;
 use crate::cost::CostTracker;
 use crate::hooks::{HookContext, HookRunner, conversation_with_hook_context};
+use crate::lifecycle::RuntimeTurnContext;
 
 #[derive(Debug)]
 pub enum ChildAgentProviderErrorDecision {
@@ -181,12 +183,12 @@ pub fn compact_child_agent_conversation_if_needed(
 ) -> io::Result<bool> {
     let mut events = EventFactory::new("child-agent-compaction".to_string());
     let mut sink = EventSink::new(io::sink(), config.output_format);
+    let subagent_type = SubagentType::General;
     let mut compaction = RuntimeCompactionStep::new(
         config.provider,
         &setup.context_config,
         &setup.provider_config,
-        cwd,
-        false,
+        RuntimeTurnContext::new(cwd, "", 0, false, &subagent_type),
         hooks,
         &mut events,
         &mut sink,
@@ -213,12 +215,12 @@ pub fn handle_child_agent_provider_error(
     if orca_provider::context::is_prompt_too_long_error(&error) && !setup.reactive_compacted {
         let mut events = EventFactory::new("child-agent-compaction".to_string());
         let mut sink = EventSink::new(io::sink(), config.output_format);
+        let subagent_type = SubagentType::General;
         let mut compaction = RuntimeCompactionStep::new(
             config.provider,
             &setup.context_config,
             &setup.provider_config,
-            cwd,
-            false,
+            RuntimeTurnContext::new(cwd, "", 0, false, &subagent_type),
             hooks,
             &mut events,
             &mut sink,

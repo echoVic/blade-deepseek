@@ -51,22 +51,13 @@ impl RuntimeTurnOpeningStep {
         mut input: RuntimeTurnOpeningInput<'_, '_, W>,
     ) -> io::Result<RuntimeTurnOpeningResult> {
         let turn_context = input.turn_context.clone();
-        let RuntimeTurnContext {
-            cwd,
-            prompt: _,
-            subagent_depth: _,
-            emit_deltas,
-            subagent_type: _,
-            continuation: _,
-            steer_handle,
-        } = input.turn_context;
+        let steer_handle = turn_context.steer_handle;
 
         RuntimeCompactionStep::new(
             input.provider,
             input.context_config,
             input.provider_config,
-            cwd,
-            emit_deltas,
+            turn_context.clone(),
             input.hooks,
             input.events,
             input.sink,

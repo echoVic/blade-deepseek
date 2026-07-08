@@ -3931,6 +3931,21 @@ mod tests {
             compaction_source.contains("impl<'a, W: io::Write> RuntimeCompactionStep<'a, W>"),
             "compaction module must own runtime compaction step behavior"
         );
+        assert!(
+            compaction_source.contains("turn_context: RuntimeTurnContext<'a>"),
+            "RuntimeCompactionStep must carry immutable turn refs through RuntimeTurnContext"
+        );
+        let compaction_step_struct = compaction_source
+            .split("struct RuntimeCompactionStep")
+            .nth(1)
+            .and_then(|source| source.split("impl<'a, W: io::Write>").next())
+            .expect("RuntimeCompactionStep source");
+        for marker in ["cwd: &'a Path", "emit_deltas: bool"] {
+            assert!(
+                !compaction_step_struct.contains(marker),
+                "RuntimeCompactionStep must not duplicate turn-entry field {marker}"
+            );
+        }
 
         for marker in [
             "HookEvent::OnBudgetWarning",

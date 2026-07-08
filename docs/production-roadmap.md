@@ -353,7 +353,10 @@ copied into Orca.
    context, so model routing no longer duplicates the turn's subagent type or
    delta-emission flag. `RuntimeTurnStartInput` now follows the same boundary,
    so turn-start prompt selection and start-event emission read prompt and
-   delta policy from `RuntimeTurnContext`.
+   delta policy from `RuntimeTurnContext`. `RuntimeCompactionStep` now also
+   carries `RuntimeTurnContext`, so budget-warning hooks, compaction events, and
+   compaction history persistence no longer receive a second flattened cwd/delta
+   copy.
    Iteration stages now keep lifecycle-owned `RuntimeTurnLoopIterationState`
    grouped instead of unpacking runtime system messages, model overrides,
    cost/cancel/task refs, and extension refs into the iteration input. Keep

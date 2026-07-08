@@ -1,5 +1,4 @@
 use std::io;
-use std::path::Path;
 
 use orca_core::event_schema::EventFactory;
 use orca_core::event_sink::EventSink;
@@ -7,6 +6,7 @@ use orca_core::hook_types::HookEvent;
 use orca_provider::{ProviderConfig, context};
 
 use crate::hooks::{HookContext, HookRunner, conversation_with_hook_context};
+use crate::lifecycle::RuntimeTurnContext;
 use crate::thread_store::SessionWriter;
 use orca_core::conversation::Conversation;
 
@@ -14,8 +14,7 @@ pub(crate) struct RuntimeCompactionStep<'a, W: io::Write> {
     provider: orca_core::config::ProviderKind,
     context_config: &'a context::ContextConfig,
     provider_config: &'a ProviderConfig,
-    cwd: &'a Path,
-    emit_deltas: bool,
+    turn_context: RuntimeTurnContext<'a>,
     hooks: &'a HookRunner,
     events: &'a mut EventFactory,
     sink: &'a mut EventSink<W>,
@@ -27,8 +26,7 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
         provider: orca_core::config::ProviderKind,
         context_config: &'a context::ContextConfig,
         provider_config: &'a ProviderConfig,
-        cwd: &'a Path,
-        emit_deltas: bool,
+        turn_context: RuntimeTurnContext<'a>,
         hooks: &'a HookRunner,
         events: &'a mut EventFactory,
         sink: &'a mut EventSink<W>,
@@ -38,8 +36,7 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
             provider,
             context_config,
             provider_config,
-            cwd,
-            emit_deltas,
+            turn_context,
             hooks,
             events,
             sink,
@@ -70,7 +67,7 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
     }
 
     pub(crate) fn emit_error(&mut self, error: &str) -> io::Result<()> {
-        if self.emit_deltas {
+        if self.turn_context.emit_deltas {
             self.sink.emit(&self.events.error(error))?;
         }
         Ok(())
@@ -81,7 +78,7 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
         match self.hooks.run(
             HookEvent::OnBudgetWarning,
             HookContext {
-                cwd: &self.cwd.display().to_string(),
+                cwd: &self.turn_context.cwd.display().to_string(),
                 session_status: None,
                 tool_request: None,
                 tool_result: None,
@@ -93,7 +90,7 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
             Ok(outcome) if !outcome.injected_context.is_empty() => {
                 *conversation = conversation_with_hook_context(conversation, &outcome);
             }
-            Err(error) if self.emit_deltas => {
+            Err(error) if self.turn_context.emit_deltas => {
                 self.sink.emit(
                     &self
                         .events
@@ -103,13 +100,13 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
             _ => {}
         }
 
-        if self.emit_deltas {
+        if self.turn_context.emit_deltas {
             self.run_compaction_hook(HookEvent::PreCompact, before_messages, None)?;
         }
 
         let after_messages = self.compact_and_persist(conversation)?;
 
-        if self.emit_deltas {
+        if self.turn_context.emit_deltas {
             self.run_compaction_hook(
                 HookEvent::PostCompact,
                 before_messages,
@@ -130,7 +127,7 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
         );
         *conversation = compaction.conversation;
         let after_messages = conversation.messages.len();
-        if self.emit_deltas
+        if self.turn_context.emit_deltas
             && let Some(writer) = self.history_writer.as_deref_mut()
         {
             writer.append_compaction(before_messages, after_messages)?;
@@ -155,7 +152,7 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
         if let Err(error) = self.hooks.run(
             event,
             HookContext {
-                cwd: &self.cwd.display().to_string(),
+                cwd: &self.turn_context.cwd.display().to_string(),
                 session_status: None,
                 tool_request: None,
                 tool_result: None,

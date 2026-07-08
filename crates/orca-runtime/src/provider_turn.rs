@@ -10,6 +10,8 @@ use orca_core::event_schema::{EventFactory, RunStatus};
 use orca_core::event_sink::EventSink;
 use orca_core::provider_types::{ProviderResponse, ProviderStep};
 #[cfg(test)]
+use orca_core::subagent_types::SubagentType;
+#[cfg(test)]
 use orca_mcp::McpRegistry;
 use orca_provider::{ProviderConfig, context};
 
@@ -528,7 +530,6 @@ impl RuntimeTurnProviderCycleStep {
     ) -> io::Result<RuntimeTurnProviderCycleResult> {
         let capabilities = input.capabilities;
         let turn_context = input.turn_context.clone();
-        let cwd = turn_context.cwd;
         let emit_deltas = turn_context.emit_deltas;
         let continuation = input.continuation.take();
         let preapproved_tool_call_id = continuation
@@ -581,8 +582,7 @@ impl RuntimeTurnProviderCycleStep {
                     input.provider,
                     input.context_config,
                     input.base_provider_config,
-                    cwd,
-                    emit_deltas,
+                    turn_context.clone(),
                     capabilities.hooks,
                     input.events,
                     input.sink,
@@ -814,12 +814,12 @@ mod tests {
         let mut output = Vec::new();
         let mut sink = EventSink::new(&mut output, OutputFormat::Jsonl);
         let cwd = Path::new(".");
+        let subagent_type = SubagentType::General;
         let mut compaction = RuntimeCompactionStep::new(
             ProviderKind::DeepSeek,
             &context_config,
             &provider_config,
-            cwd,
-            true,
+            RuntimeTurnContext::new(cwd, "", 0, true, &subagent_type),
             &hooks,
             &mut events,
             &mut sink,
@@ -964,12 +964,12 @@ mod tests {
         let mut output = Vec::new();
         let mut sink = EventSink::new(&mut output, OutputFormat::Jsonl);
         let cwd = Path::new(".");
+        let subagent_type = SubagentType::General;
         let mut compaction = RuntimeCompactionStep::new(
             ProviderKind::DeepSeek,
             &context_config,
             &provider_config,
-            cwd,
-            true,
+            RuntimeTurnContext::new(cwd, "", 0, true, &subagent_type),
             &hooks,
             &mut events,
             &mut sink,
