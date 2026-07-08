@@ -8,6 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use orca_core::cancel::CancelToken;
 use orca_core::cost_types::UsageTotals;
+use orca_core::provider_types::{ProviderResponse, ProviderStep};
 use orca_core::task_types::{
     BackgroundTaskSummary, PendingToolCallSummary, TaskStatus, TaskType, WorkflowAgentTaskSummary,
     WorkflowPhaseTaskSummary, WorkflowTaskProgress,
@@ -48,6 +49,7 @@ pub struct TaskRecord {
     pub tool: Option<String>,
     pub pending_tool_call: Option<PendingToolCallSummary>,
     pub pending_tool_approval_response: Option<bool>,
+    pub pending_provider_response: Option<ProviderResponse>,
     pub workflow_run_id: Option<String>,
     pub phase_count: Option<usize>,
     pub workflow_progress: Option<WorkflowTaskProgress>,
@@ -193,6 +195,7 @@ impl TaskRegistry {
             tool: None,
             pending_tool_call: None,
             pending_tool_approval_response: None,
+            pending_provider_response: None,
             workflow_run_id: Some(workflow_run_id.clone()),
             phase_count: Some(phase_count),
             workflow_progress: None,
@@ -244,6 +247,7 @@ impl TaskRegistry {
             tool: None,
             pending_tool_call: None,
             pending_tool_approval_response: None,
+            pending_provider_response: None,
             workflow_run_id: None,
             phase_count: None,
             workflow_progress: None,
@@ -295,6 +299,7 @@ impl TaskRegistry {
             tool: None,
             pending_tool_call: None,
             pending_tool_approval_response: None,
+            pending_provider_response: None,
             workflow_run_id: None,
             phase_count: None,
             workflow_progress: None,
@@ -346,6 +351,7 @@ impl TaskRegistry {
             tool: None,
             pending_tool_call: None,
             pending_tool_approval_response: None,
+            pending_provider_response: None,
             workflow_run_id: None,
             phase_count: None,
             workflow_progress: None,
@@ -576,6 +582,10 @@ impl TaskRegistry {
             record.result = Some(result);
             record.error = None;
             record.usage = usage;
+            record.tool = None;
+            record.pending_tool_call = None;
+            record.pending_tool_approval_response = None;
+            record.pending_provider_response = None;
             record.worker_pid = None;
             record.control.pause.store(false, Ordering::Release);
             Ok(())
@@ -601,6 +611,10 @@ impl TaskRegistry {
             record.error = Some(error);
             record.result = None;
             record.usage = usage;
+            record.tool = None;
+            record.pending_tool_call = None;
+            record.pending_tool_approval_response = None;
+            record.pending_provider_response = None;
             record.worker_pid = None;
             record.control.pause.store(false, Ordering::Release);
             Ok(())
@@ -632,12 +646,48 @@ impl TaskRegistry {
         self.approval_required_with_pending_tool(id, summary, tool, pending_tool_call)
     }
 
+    pub fn approval_required_for_pending_provider_response(
+        &self,
+        id: &str,
+        summary: String,
+        response: ProviderResponse,
+    ) -> Result<(), String> {
+        let pending_tool_call = pending_tool_call_from_provider_response(&response);
+        let tool = pending_tool_call
+            .as_ref()
+            .map(|pending_tool_call| pending_tool_call.name.clone());
+        self.approval_required_with_pending_provider_response(
+            id,
+            summary,
+            tool,
+            pending_tool_call,
+            Some(response),
+        )
+    }
+
     fn approval_required_with_pending_tool(
         &self,
         id: &str,
         summary: String,
         tool: Option<String>,
         pending_tool_call: Option<PendingToolCallSummary>,
+    ) -> Result<(), String> {
+        self.approval_required_with_pending_provider_response(
+            id,
+            summary,
+            tool,
+            pending_tool_call,
+            None,
+        )
+    }
+
+    fn approval_required_with_pending_provider_response(
+        &self,
+        id: &str,
+        summary: String,
+        tool: Option<String>,
+        pending_tool_call: Option<PendingToolCallSummary>,
+        pending_provider_response: Option<ProviderResponse>,
     ) -> Result<(), String> {
         self.update_task(id, |record| {
             record.status = TaskStatus::ApprovalRequired;
@@ -650,6 +700,7 @@ impl TaskRegistry {
             record.tool = tool;
             record.pending_tool_call = pending_tool_call;
             record.pending_tool_approval_response = None;
+            record.pending_provider_response = pending_provider_response;
             record.worker_pid = None;
             record.control.pause.store(false, Ordering::Release);
             Ok(())
@@ -683,6 +734,43 @@ impl TaskRegistry {
         .map_err(|_| "task registry lock poisoned".to_string())?
     }
 
+    pub fn take_approved_pending_provider_response(
+        &self,
+        id: &str,
+    ) -> Result<Option<ProviderResponse>, String> {
+        self.with_tasks(|tasks| {
+            let record = tasks
+                .get_mut(id)
+                .ok_or_else(|| format!("task '{id}' not found"))?;
+            if record.status != TaskStatus::ApprovalRequired
+                || record.pending_tool_approval_response != Some(true)
+            {
+                return Ok(None);
+            }
+
+            let Some(response) = record.pending_provider_response.take() else {
+                return Ok(None);
+            };
+
+            record.status = TaskStatus::Running;
+            if record.started_at_ms.is_none() {
+                record.started_at_ms = Some(now_ms());
+            }
+            record.completed_at_ms = None;
+            record.result = None;
+            record.error = None;
+            record.tool = None;
+            record.pending_tool_call = None;
+            record.pending_tool_approval_response = None;
+            record.worker_pid = None;
+            record.last_activity_at_ms = Some(now_ms());
+            record.control.pause.store(false, Ordering::Release);
+            self.persist_current_session(tasks)?;
+            Ok(Some(response))
+        })
+        .map_err(|_| "task registry lock poisoned".to_string())?
+    }
+
     pub fn finish_denied_pending_tool_approval(&self, id: &str) -> Result<bool, String> {
         let mut consumed = false;
         self.update_task(id, |record| {
@@ -703,6 +791,7 @@ impl TaskRegistry {
             record.tool = None;
             record.pending_tool_call = None;
             record.pending_tool_approval_response = None;
+            record.pending_provider_response = None;
             record.worker_pid = None;
             record.control.pause.store(false, Ordering::Release);
             consumed = true;
@@ -720,6 +809,10 @@ impl TaskRegistry {
             record.completed_at_ms = Some(now_ms());
             record.result = Some(summary);
             record.error = None;
+            record.tool = None;
+            record.pending_tool_call = None;
+            record.pending_tool_approval_response = None;
+            record.pending_provider_response = None;
             record.worker_pid = None;
             record.control.pause.store(false, Ordering::Release);
             Ok(())
@@ -945,6 +1038,7 @@ impl PersistedTaskRecord {
             tool: self.tool,
             pending_tool_call: self.pending_tool_call,
             pending_tool_approval_response: None,
+            pending_provider_response: None,
             workflow_run_id: self.workflow_run_id,
             phase_count: self.phase_count,
             workflow_progress: self.workflow_progress,
@@ -1036,6 +1130,39 @@ fn is_terminal(status: TaskStatus) -> bool {
             | TaskStatus::ApprovalRequired
             | TaskStatus::Cancelled
     )
+}
+
+fn pending_tool_call_from_provider_response(
+    response: &ProviderResponse,
+) -> Option<PendingToolCallSummary> {
+    response
+        .steps
+        .iter()
+        .find_map(|step| match step {
+            ProviderStep::ToolCall(request) => Some(PendingToolCallSummary {
+                id: request.id.clone(),
+                name: request.name.as_str().to_string(),
+                action: request.action,
+                target: request.target.clone(),
+                arguments: request
+                    .raw_arguments
+                    .clone()
+                    .unwrap_or_else(|| "{}".to_string()),
+            }),
+            _ => None,
+        })
+        .or_else(|| {
+            response
+                .tool_calls
+                .first()
+                .map(|tool_call| PendingToolCallSummary {
+                    id: tool_call.id.clone(),
+                    name: tool_call.function_name.clone(),
+                    action: orca_core::approval_types::ActionKind::Read,
+                    target: None,
+                    arguments: tool_call.arguments.clone(),
+                })
+        })
 }
 
 fn mark_interrupted_if_active(record: &mut TaskRecord) -> bool {
@@ -1504,6 +1631,83 @@ mod tests {
             !registry
                 .finish_denied_pending_tool_approval(&task.id)
                 .unwrap()
+        );
+    }
+
+    #[test]
+    fn registry_takes_approved_pending_provider_response() {
+        use orca_core::approval_types::ActionKind;
+        use orca_core::provider_types::{ProviderResponse, ProviderStep};
+        use orca_core::tool_types::{ToolName, ToolRequest};
+
+        let registry = TaskRegistry::new("session-1".to_string());
+        let task = registry.create_main_session("Needs approval".to_string());
+        let tool_request = ToolRequest {
+            id: "mock-tool-1".to_string(),
+            name: ToolName::TaskList,
+            action: ActionKind::Read,
+            target: None,
+            raw_arguments: Some("{}".to_string()),
+        };
+        let response = ProviderResponse {
+            steps: vec![ProviderStep::ToolCall(tool_request.clone())],
+            assistant_content: Some("I need to inspect tasks.".to_string()),
+            assistant_reasoning: Some("Need task_list.".to_string()),
+            tool_calls: Vec::new(),
+            usage: None,
+        };
+
+        registry.mark_running(&task.id).unwrap();
+        registry.mark_backgrounded(&task.id).unwrap();
+        registry
+            .approval_required_for_pending_provider_response(
+                &task.id,
+                "approval_required".to_string(),
+                response,
+            )
+            .unwrap();
+
+        let pending = registry.get(&task.id).unwrap();
+        assert_eq!(pending.status, TaskStatus::ApprovalRequired);
+        assert_eq!(
+            pending.pending_tool_call.as_ref().unwrap().id,
+            "mock-tool-1"
+        );
+        assert!(
+            registry
+                .take_approved_pending_provider_response(&task.id)
+                .unwrap()
+                .is_none()
+        );
+
+        registry
+            .submit_pending_tool_approval_response(&task.id, true)
+            .unwrap();
+
+        let approved = registry
+            .take_approved_pending_provider_response(&task.id)
+            .unwrap()
+            .expect("approved provider response");
+        assert_eq!(
+            approved.assistant_content.as_deref(),
+            Some("I need to inspect tasks.")
+        );
+        assert_eq!(approved.steps.len(), 1);
+
+        let record = registry.get(&task.id).unwrap();
+        assert_eq!(record.status, TaskStatus::Running);
+        assert_eq!(record.result, None);
+        assert_eq!(record.error, None);
+        assert_eq!(record.tool, None);
+        assert_eq!(record.pending_tool_call, None);
+        assert_eq!(record.pending_tool_approval_response, None);
+        assert_eq!(record.completed_at_ms, None);
+
+        assert!(
+            registry
+                .take_approved_pending_provider_response(&task.id)
+                .unwrap()
+                .is_none()
         );
     }
 

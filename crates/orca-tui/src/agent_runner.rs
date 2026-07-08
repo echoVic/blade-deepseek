@@ -249,10 +249,14 @@ fn spawn_background_provider_completion(
     thread::spawn(move || {
         let mut status = "failed";
         let mut pending_tool_call = None;
+        let mut pending_provider_response = None;
         while let Ok(event) = provider_rx.recv() {
             if let ProviderStreamEvent::Done(response) = event {
                 status = provider_response_status(&response);
                 pending_tool_call = provider_response_pending_tool_call(&response);
+                if status == "approval_required" {
+                    pending_provider_response = Some(response);
+                }
                 break;
             }
         }
@@ -262,11 +266,18 @@ fn spawn_background_provider_completion(
 
         let result = match status {
             "success" => task_registry.complete(&task_id, status.to_string()),
-            "approval_required" => task_registry.approval_required_for_pending_tool(
-                &task_id,
-                status.to_string(),
-                pending_tool_call.clone(),
-            ),
+            "approval_required" => match pending_provider_response {
+                Some(response) => task_registry.approval_required_for_pending_provider_response(
+                    &task_id,
+                    status.to_string(),
+                    response,
+                ),
+                None => task_registry.approval_required_for_pending_tool(
+                    &task_id,
+                    status.to_string(),
+                    pending_tool_call.clone(),
+                ),
+            },
             _ => task_registry.fail(&task_id, status.to_string()),
         };
         if result.is_ok() {
@@ -2245,6 +2256,68 @@ mod tests {
             canonical_action_for_tool(&request, &registry, &[]),
             orca_core::approval_types::ActionKind::Shell
         );
+    }
+
+    #[test]
+    fn background_provider_completion_stores_pending_provider_response_for_approval() {
+        let registry = TaskRegistry::new("session-background-response".to_string());
+        let task = registry.create_main_session("Needs approval".to_string());
+        registry.mark_running(&task.id).unwrap();
+        registry.mark_backgrounded(&task.id).unwrap();
+
+        let (event_tx, event_rx) = mpsc::channel();
+        let (provider_tx, provider_rx) = mpsc::channel();
+        let tool_request = tool_types::ToolRequest {
+            id: "mock-tool-1".to_string(),
+            name: tool_types::ToolName::TaskList,
+            action: orca_core::approval_types::ActionKind::Read,
+            target: None,
+            raw_arguments: Some("{}".to_string()),
+        };
+        spawn_background_provider_completion(
+            provider_rx,
+            registry.clone(),
+            event_tx,
+            "run-background-response".to_string(),
+            task.id.clone(),
+        );
+        provider_tx
+            .send(ProviderStreamEvent::Done(ProviderResponse {
+                steps: vec![ProviderStep::ToolCall(tool_request)],
+                assistant_content: Some("I need task_list.".to_string()),
+                assistant_reasoning: Some("Need task state.".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+            }))
+            .unwrap();
+
+        loop {
+            match event_rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+                TuiEvent::WorkflowTasksUpdated { tasks }
+                    if tasks.iter().any(|task| {
+                        task.status == orca_core::task_types::TaskStatus::ApprovalRequired
+                            && task.pending_tool_call.is_some()
+                    }) =>
+                {
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        registry
+            .submit_pending_tool_approval_response(&task.id, true)
+            .unwrap();
+        let response = registry
+            .take_approved_pending_provider_response(&task.id)
+            .unwrap()
+            .expect("pending provider response");
+
+        assert_eq!(
+            response.assistant_content.as_deref(),
+            Some("I need task_list.")
+        );
+        assert_eq!(response.steps.len(), 1);
     }
 
     #[test]

@@ -40,6 +40,7 @@ pub enum ProviderStep {
     Error(String),
 }
 
+#[derive(Clone, Debug)]
 pub struct ProviderResponse {
     pub steps: Vec<ProviderStep>,
     pub assistant_content: Option<String>,
