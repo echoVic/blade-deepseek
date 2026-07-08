@@ -670,6 +670,10 @@ mod tests {
             provider_turn_source.contains("capabilities: RuntimeStepCapabilitySnapshot<'a>"),
             "RuntimeProviderCycleInput must carry request capability refs through one named field"
         );
+        assert!(
+            provider_turn_source.contains("turn_context: RuntimeTurnContext<'a>"),
+            "RuntimeProviderCycleInput must carry immutable turn refs through RuntimeTurnContext"
+        );
 
         let provider_cycle_input_struct = provider_turn_source
             .split("pub(crate) struct RuntimeProviderCycleInput")
@@ -688,10 +692,13 @@ mod tests {
             "workflow_ipc",
             "permission_handler",
             "user_input_handler",
+            "cwd",
+            "emit_deltas",
+            "steer_handle",
         ] {
             assert!(
                 !provider_cycle_input_struct.contains(&format!("pub(crate) {field_name}:")),
-                "RuntimeProviderCycleInput must not expose capability field {field_name} outside RuntimeStepCapabilitySnapshot"
+                "RuntimeProviderCycleInput must not expose grouped field {field_name} outside its named context"
             );
         }
 

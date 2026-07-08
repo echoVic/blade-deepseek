@@ -341,7 +341,9 @@ copied into Orca.
    `RuntimeStepSnapshot` now also keeps those immutable turn inputs behind the
    same lifecycle-owned `RuntimeTurnContext`, so provider-response and tool-turn
    paths no longer read cwd, depth, or delta flags from a second flattened
-   snapshot shape.
+   snapshot shape. `RuntimeProviderCycleInput` now follows the same boundary,
+   handing provider-cycle steps cwd, delta emission, and steering through
+   `RuntimeTurnContext` instead of duplicating those turn-entry refs.
    Iteration stages now keep lifecycle-owned `RuntimeTurnLoopIterationState`
    grouped instead of unpacking runtime system messages, model overrides,
    cost/cancel/task refs, and extension refs into the iteration input. Keep

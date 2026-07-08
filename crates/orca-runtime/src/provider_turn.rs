@@ -1,4 +1,5 @@
 use std::io;
+#[cfg(test)]
 use std::path::Path;
 
 use orca_approval::ApprovalPolicy;
@@ -64,10 +65,8 @@ pub(crate) struct RuntimeProviderCycleInput<'a, 'runtime, W: io::Write> {
     pub(crate) turn_context: RuntimeTurnContext<'a>,
     pub(crate) turn_provider_config: &'a ProviderConfig,
     pub(crate) runtime_system_messages: &'a [String],
-    pub(crate) cwd: &'a Path,
     pub(crate) context_config: &'a context::ContextConfig,
     pub(crate) base_provider_config: &'a ProviderConfig,
-    pub(crate) emit_deltas: bool,
     pub(crate) capabilities: RuntimeStepCapabilitySnapshot<'a>,
     pub(crate) cost_tracker: &'a mut CostTracker,
     pub(crate) max_budget_usd: Option<f64>,
@@ -79,7 +78,6 @@ pub(crate) struct RuntimeProviderCycleInput<'a, 'runtime, W: io::Write> {
     pub(crate) policy: &'a ApprovalPolicy,
     pub(crate) extensions: RuntimeExtensionContext<'a>,
     pub(crate) background_workflows: &'a mut Vec<BackgroundWorkflowRun>,
-    pub(crate) steer_handle: Option<&'a crate::lifecycle::ThreadSteerHandle>,
 }
 
 pub(crate) struct RuntimeProviderTurnInput<'a, 'runtime, W: io::Write> {
@@ -528,7 +526,11 @@ impl RuntimeTurnProviderCycleStep {
         batch_child_executor: ChildAgentExecutor<io::Sink>,
     ) -> io::Result<RuntimeTurnProviderCycleResult> {
         let capabilities = input.capabilities;
-        let cwd_display = input.cwd.display().to_string();
+        let turn_context = input.turn_context.clone();
+        let cwd = turn_context.cwd;
+        let emit_deltas = turn_context.emit_deltas;
+        let steer_handle = turn_context.steer_handle;
+        let cwd_display = cwd.display().to_string();
         let continuation = input.continuation.take();
         let preapproved_tool_call_id = continuation
             .as_ref()
@@ -545,11 +547,11 @@ impl RuntimeTurnProviderCycleStep {
                     runtime_system_messages: input.runtime_system_messages,
                     provider_config: input.turn_provider_config,
                     cwd: &cwd_display,
-                    emit_deltas: input.emit_deltas,
+                    emit_deltas,
                     hooks: capabilities.hooks,
                     cancel: capabilities.cancel,
                     max_budget_usd: input.max_budget_usd,
-                    steer_handle: input.steer_handle,
+                    steer_handle,
                     io: RuntimeProviderTurnIo {
                         conversation,
                         cost_tracker: input.cost_tracker,
@@ -564,7 +566,7 @@ impl RuntimeTurnProviderCycleStep {
                     provider_turn,
                     input.events,
                     input.sink,
-                    input.emit_deltas,
+                    emit_deltas,
                 )?,
             ) {
                 RuntimeProviderTurnResultResult::Response(response) => response,
@@ -582,8 +584,8 @@ impl RuntimeTurnProviderCycleStep {
                     input.provider,
                     input.context_config,
                     input.base_provider_config,
-                    input.cwd,
-                    input.emit_deltas,
+                    cwd,
+                    emit_deltas,
                     capabilities.hooks,
                     input.events,
                     input.sink,
@@ -608,7 +610,7 @@ impl RuntimeTurnProviderCycleStep {
         let step_context =
             RuntimeStepContext::from_snapshot(RuntimeStepSnapshot::new_with_capabilities(
                 input.config,
-                input.turn_context,
+                turn_context,
                 input.tool_policy,
                 input.policy,
                 capabilities,
@@ -1265,10 +1267,8 @@ mod tests {
                     ),
                     turn_provider_config: &provider_config,
                     runtime_system_messages: &[],
-                    cwd: cwd.path(),
                     context_config: &context_config,
                     base_provider_config: &provider_config,
-                    emit_deltas: true,
                     capabilities: RuntimeStepCapabilitySnapshot::new(
                         &instructions,
                         &memory,
@@ -1290,7 +1290,6 @@ mod tests {
                     policy: &policy,
                     extensions: extension_state.extension_context(),
                     background_workflows: &mut background_workflows,
-                    steer_handle: None,
                 },
                 unused_child_executor::<Vec<u8>>,
                 unused_child_executor::<crate::workflow::runner::SharedEventBuffer>,

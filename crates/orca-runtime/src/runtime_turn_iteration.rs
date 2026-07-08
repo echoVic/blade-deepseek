@@ -103,10 +103,8 @@ impl RuntimeTurnIterationStep {
                 turn_context,
                 turn_provider_config: &turn_provider_config,
                 runtime_system_messages: input.loop_state.runtime_system_messages,
-                cwd,
                 context_config: input.provider_context.context_config,
                 base_provider_config: input.provider_context.provider_config,
-                emit_deltas,
                 capabilities: RuntimeStepCapabilitySnapshot::new(
                     input.deps.instructions,
                     input.deps.memory,
@@ -128,7 +126,6 @@ impl RuntimeTurnIterationStep {
                 policy: input.policy.approval_policy,
                 extensions: input.loop_state.extensions,
                 background_workflows: input.workflow.background_workflows,
-                steer_handle,
             },
             child_executor,
             workflow_child_executor,
