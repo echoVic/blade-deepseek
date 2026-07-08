@@ -78,9 +78,7 @@ pub(crate) struct RuntimeNormalToolTurnContext<'a, W: io::Write> {
     pub(crate) emit_deltas: bool,
     pub(crate) policy: &'a ApprovalPolicy,
     pub(crate) services: RuntimeNormalToolTurnServices<'a>,
-    pub(crate) cancel: &'a CancelToken,
-    pub(crate) task_registry: &'a TaskRegistry,
-    pub(crate) workflow_ipc: Option<&'a WorkflowIpcContext>,
+    pub(crate) runtime: RuntimeNormalToolTurnRuntime<'a>,
     pub(crate) permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
     pub(crate) user_input_handler: Option<&'a dyn RuntimeUserInputHandler>,
     pub(crate) extensions: Option<RuntimeExtensionContext<'a>>,
@@ -106,6 +104,12 @@ pub(crate) struct RuntimeNormalToolTurnServices<'a> {
     pub(crate) memory: &'a MemoryBlock,
     pub(crate) mcp_registry: &'a McpRegistry,
     pub(crate) hooks: &'a HookRunner,
+}
+
+pub(crate) struct RuntimeNormalToolTurnRuntime<'a> {
+    pub(crate) cancel: &'a CancelToken,
+    pub(crate) task_registry: &'a TaskRegistry,
+    pub(crate) workflow_ipc: Option<&'a WorkflowIpcContext>,
 }
 
 impl ToolTurnOutcome {
@@ -271,9 +275,11 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                 mcp_registry,
                 hooks,
             },
-            cancel,
-            task_registry,
-            workflow_ipc,
+            runtime: RuntimeNormalToolTurnRuntime {
+                cancel,
+                task_registry,
+                workflow_ipc,
+            },
             permission_handler,
             user_input_handler,
             extensions,
@@ -306,9 +312,7 @@ pub(crate) fn run_normal_tool_turn<W: io::Write>(
         emit_deltas,
         policy,
         services,
-        cancel,
-        task_registry,
-        workflow_ipc,
+        runtime,
         permission_handler,
         user_input_handler,
         extensions,
@@ -332,6 +336,11 @@ pub(crate) fn run_normal_tool_turn<W: io::Write>(
         mcp_registry,
         hooks,
     } = services;
+    let RuntimeNormalToolTurnRuntime {
+        cancel,
+        task_registry,
+        workflow_ipc,
+    } = runtime;
     let mut execution_context = ToolExecutionContext::new(cwd, subagent_depth, emit_deltas, policy)
         .with_services(instructions, memory, mcp_registry, hooks)
         .with_runtime(
@@ -704,9 +713,11 @@ mod tests {
                 mcp_registry: &registry,
                 hooks: &hooks,
             },
-            cancel: &cancel,
-            task_registry: &task_registry,
-            workflow_ipc: None,
+            runtime: RuntimeNormalToolTurnRuntime {
+                cancel: &cancel,
+                task_registry: &task_registry,
+                workflow_ipc: None,
+            },
             permission_handler: None,
             user_input_handler: None,
             extensions: None,

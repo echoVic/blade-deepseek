@@ -3058,6 +3058,14 @@ mod tests {
             "RuntimeNormalToolTurnContext must carry normal tool-turn services through one named field"
         );
         assert!(
+            tool_turn_source.contains("pub(crate) struct RuntimeNormalToolTurnRuntime"),
+            "tool_turn must group normal tool-turn runtime refs into RuntimeNormalToolTurnRuntime"
+        );
+        assert!(
+            tool_turn_source.contains("runtime: RuntimeNormalToolTurnRuntime<'a>"),
+            "RuntimeNormalToolTurnContext must carry normal tool-turn runtime refs through one named field"
+        );
+        assert!(
             !tool_turn_source.contains("run_normal_tool_turn(\n            config,"),
             "run_tool_turns must not call run_normal_tool_turn with the old long argument list"
         );
@@ -3078,9 +3086,6 @@ mod tests {
             "subagent_depth:",
             "emit_deltas:",
             "policy:",
-            "cancel:",
-            "task_registry:",
-            "workflow_ipc:",
             "permission_handler:",
         ] {
             assert!(
@@ -3101,6 +3106,9 @@ mod tests {
             "memory:",
             "mcp_registry:",
             "hooks:",
+            "cancel:",
+            "task_registry:",
+            "workflow_ipc:",
         ] {
             assert!(
                 !normal_context.contains(field_name),

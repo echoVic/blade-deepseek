@@ -372,6 +372,9 @@ copied into Orca.
    `RuntimeNormalToolTurnContext` now carries instructions, memory, MCP
    registry, and hooks through `RuntimeNormalToolTurnServices`, matching the
    downstream tool-execution services boundary.
+   `RuntimeNormalToolTurnContext` now carries cancel, task registry, and
+   workflow IPC refs through `RuntimeNormalToolTurnRuntime`, matching the
+   downstream tool-execution runtime boundary.
    Iteration stages now keep lifecycle-owned `RuntimeTurnLoopIterationState`
    grouped instead of unpacking runtime system messages, model overrides,
    cost/cancel/task refs, and extension refs into the iteration input. Keep
