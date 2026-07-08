@@ -122,8 +122,17 @@ mod tests {
             "submitted_turn should keep prompt/source state inside SubmittedTurnKind"
         );
         assert!(
-            submitted_turn.contains("pub(crate) struct SubmittedTurnPresentation"),
+            submitted_turn.contains("struct SubmittedTurnPresentation"),
             "submitted_turn should own TUI submitted-turn presentation metadata"
+        );
+        assert!(
+            !submitted_turn.contains("pub(crate) struct SubmittedTurnPresentation"),
+            "SubmittedTurnPresentation should stay private behind SubmittedTurn accessors"
+        );
+        assert!(
+            submitted_turn.contains("pub(crate) fn task_label(&self) -> Option<&str>")
+                && submitted_turn.contains("pub(crate) fn is_backtrack_target(&self) -> bool"),
+            "submitted_turn should expose presentation policy through SubmittedTurn methods"
         );
 
         let app = std::fs::read_to_string(format!("{manifest_dir}/src/app.rs"))

@@ -291,11 +291,12 @@ copied into Orca.
    turn identity; the goal loop now reads that policy through submitted-turn
    accessors instead of reaching into presentation fields. That boundary now
    lives in a focused `submitted_turn` module instead of the app event loop
-   file. Turn results now expose a typed `TuiAgentTurnContinuation` boundary
-   instead of a
-   workflow-notification-specific result field, so workflow follow-ups are one
-   continuation variant and future continuation kinds do not need more parallel
-   ad hoc result slots. Approved background turns also cross from the TUI
+   file, and its presentation metadata type is private behind the submitted-turn
+   accessors. Turn results now expose a typed `TuiAgentTurnContinuation`
+   boundary instead of a workflow-notification-specific result field, so
+   workflow follow-ups are one continuation variant and future continuation
+   kinds do not need more parallel ad hoc result slots. Approved background
+   turns also cross from the TUI
    approval handler into the continuation runner as a typed
    `TuiBackgroundTurnContinuationRequest`, so the runner no longer exposes a
    naked task id as its continuation boundary and denied approvals do not

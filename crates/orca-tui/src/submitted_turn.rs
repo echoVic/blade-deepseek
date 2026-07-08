@@ -7,7 +7,7 @@ enum SubmittedTurnKind {
     WorkflowNotification(PendingWorkflowNotification),
 }
 
-pub(crate) struct SubmittedTurnPresentation {
+struct SubmittedTurnPresentation {
     task_label: Option<String>,
     backtrack_target: bool,
 }
