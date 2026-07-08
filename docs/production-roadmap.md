@@ -395,6 +395,10 @@ copied into Orca.
    Slash command execution now lives in a focused TUI slash command action
    module, so direct command submission and menu completion share one
    configuration/state mutation boundary.
+   Slash menu candidate refresh, menu key handling, selected command dispatch,
+   and model/reasoning submenu flow now live in a focused TUI slash menu action
+   module, leaving the app loop to route input events rather than own menu
+   mechanics.
    Runtime task summaries now also expose terminal `result`/`error` fields so
    the selected task row can show completion output or failure details in the
    panel. The

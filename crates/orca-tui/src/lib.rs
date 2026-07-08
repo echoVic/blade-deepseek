@@ -16,6 +16,7 @@ mod runtime_event_projection;
 mod runtime_interaction_adapter;
 pub mod shortcuts;
 mod slash_command_actions;
+mod slash_menu_actions;
 mod submitted_turn;
 pub mod theme;
 pub mod types;
@@ -385,6 +386,41 @@ mod tests {
         assert!(
             !app.contains("\nfn parse_approval_mode("),
             "app should use the slash_command_actions module instead of defining mode parsing inline"
+        );
+    }
+
+    #[test]
+    fn tui_slash_menu_actions_are_owned_by_dedicated_module() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let slash_menu_actions =
+            std::fs::read_to_string(format!("{manifest_dir}/src/slash_menu_actions.rs"))
+                .expect("slash_menu_actions module should exist");
+        assert!(
+            slash_menu_actions.contains("pub(crate) fn update_slash_menu"),
+            "slash_menu_actions should own slash menu candidate refresh"
+        );
+        assert!(
+            slash_menu_actions.contains("pub(crate) fn handle_slash_menu_key"),
+            "slash_menu_actions should own slash menu key handling"
+        );
+        assert!(
+            slash_menu_actions.contains("fn select_slash_menu_command"),
+            "slash_menu_actions should own selected slash menu command dispatch"
+        );
+
+        let app = std::fs::read_to_string(format!("{manifest_dir}/src/app.rs"))
+            .expect("app source should be readable");
+        assert!(
+            !app.contains("\nfn update_slash_menu("),
+            "app should use the slash_menu_actions module instead of defining slash refresh inline"
+        );
+        assert!(
+            !app.contains("\nfn handle_slash_menu_key("),
+            "app should use the slash_menu_actions module instead of defining slash key handling inline"
+        );
+        assert!(
+            !app.contains("\nfn select_slash_menu_command("),
+            "app should use the slash_menu_actions module instead of defining slash selection inline"
         );
     }
 
