@@ -372,7 +372,9 @@ fn spawn_background_provider_completion(
         };
         if result.is_ok() {
             let mut events = EventFactory::new(run_id);
-            send_workflow_tasks_updated_for_tui(&event_tx, &mut events, &task_registry.list());
+            if let Some(updated_task) = task_summary_for_tui(&task_registry, &task_id) {
+                send_task_status_updated_for_tui(&event_tx, &mut events, &updated_task);
+            }
         }
         let _ = event_tx.send(TuiEvent::Notice(background_completion_notice(
             status,
