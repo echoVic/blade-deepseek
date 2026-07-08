@@ -4747,11 +4747,12 @@ mod tests {
         for marker in [
             "struct RuntimeTurnStartStep",
             "struct RuntimeTurnStartResultStep",
+            "struct RuntimeTurnStartInput",
             "struct RuntimeTurnStartStepOutput",
             "enum RuntimeTurnStartResult",
             "impl RuntimeTurnStartStep",
             "impl RuntimeTurnStartResultStep",
-            "actor.start_turn(",
+            ".start_turn(",
             "started_turn.into_event()",
             "AgentLoopResult::failure(",
             "error.status",
@@ -4760,6 +4761,25 @@ mod tests {
             assert!(
                 runtime_turn_start_source.contains(marker),
                 "runtime_turn_start must own runtime turn-start detail {marker}"
+            );
+        }
+        assert!(
+            runtime_turn_start_source.contains("turn_context: RuntimeTurnContext<'a>"),
+            "RuntimeTurnStartInput must carry immutable turn refs through RuntimeTurnContext"
+        );
+        let runtime_turn_start_input = runtime_turn_start_source
+            .split("struct RuntimeTurnStartInput")
+            .nth(1)
+            .and_then(|source| {
+                source
+                    .split("pub(crate) struct RuntimeTurnStartStepOutput")
+                    .next()
+            })
+            .expect("RuntimeTurnStartInput source");
+        for marker in ["prompt: &'a str", "emit_deltas: bool"] {
+            assert!(
+                !runtime_turn_start_input.contains(marker),
+                "RuntimeTurnStartInput must not duplicate turn-entry field {marker}"
             );
         }
     }

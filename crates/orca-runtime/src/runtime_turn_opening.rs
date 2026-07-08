@@ -14,7 +14,7 @@ use crate::lifecycle::{AgentLoopResult, RuntimeTaskActor, RuntimeTurnContext};
 use crate::runtime_model_route::{RuntimeModelRouteInput, RuntimeModelRouteStep};
 use crate::runtime_steer::{RuntimeSteerInput, RuntimeSteerStep};
 use crate::runtime_turn_start::{
-    RuntimeTurnStartResult, RuntimeTurnStartResultStep, RuntimeTurnStartStep,
+    RuntimeTurnStartInput, RuntimeTurnStartResult, RuntimeTurnStartResultStep, RuntimeTurnStartStep,
 };
 use crate::thread_store::SessionWriter;
 
@@ -53,7 +53,7 @@ impl RuntimeTurnOpeningStep {
         let turn_context = input.turn_context.clone();
         let RuntimeTurnContext {
             cwd,
-            prompt,
+            prompt: _,
             subagent_depth: _,
             emit_deltas,
             subagent_type: _,
@@ -75,11 +75,12 @@ impl RuntimeTurnOpeningStep {
         .compact_if_needed(input.conversation)?;
 
         match RuntimeTurnStartResultStep::new().fold(RuntimeTurnStartStep::new().start(
-            input.actor,
-            input.events,
-            input.sink,
-            prompt,
-            emit_deltas,
+            RuntimeTurnStartInput {
+                actor: input.actor,
+                events: input.events,
+                sink: input.sink,
+                turn_context: turn_context.clone(),
+            },
         )?) {
             RuntimeTurnStartResult::Return(result) => {
                 return Ok(RuntimeTurnOpeningResult::Return(result));

@@ -1309,8 +1309,8 @@ mod tests {
     };
     use crate::runtime_turn_setup::RuntimeTurnSetupStep;
     use crate::runtime_turn_start::{
-        RuntimeTurnStartResult, RuntimeTurnStartResultStep, RuntimeTurnStartStep,
-        RuntimeTurnStartStepOutput,
+        RuntimeTurnStartInput, RuntimeTurnStartResult, RuntimeTurnStartResultStep,
+        RuntimeTurnStartStep, RuntimeTurnStartStepOutput,
     };
     use crate::tool_invocation::AgentToolPolicyContext;
     use orca_provider::context;
@@ -1415,9 +1415,17 @@ mod tests {
         let mut events = EventFactory::new("turn-start-step".to_string());
         let mut output = Vec::new();
         let mut sink = EventSink::new(&mut output, OutputFormat::Jsonl);
+        let subagent_type = SubagentType::General;
+        let cwd = Path::new(".");
+        let turn_context = RuntimeTurnContext::new(cwd, "hello", 3, true, &subagent_type);
 
         let result = RuntimeTurnStartStep::new()
-            .start(&mut actor, &mut events, &mut sink, "hello", true)
+            .start(RuntimeTurnStartInput {
+                actor: &mut actor,
+                events: &mut events,
+                sink: &mut sink,
+                turn_context,
+            })
             .expect("start turn");
 
         assert!(result.error.is_none());

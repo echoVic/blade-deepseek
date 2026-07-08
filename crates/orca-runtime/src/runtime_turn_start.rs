@@ -3,10 +3,19 @@ use std::io;
 use orca_core::event_schema::EventFactory;
 use orca_core::event_sink::EventSink;
 
-use crate::lifecycle::{AgentLoopResult, RuntimeTaskActor, RuntimeTurnStartError};
+use crate::lifecycle::{
+    AgentLoopResult, RuntimeTaskActor, RuntimeTurnContext, RuntimeTurnStartError,
+};
 
 pub(crate) struct RuntimeTurnStartStep;
 pub(crate) struct RuntimeTurnStartResultStep;
+
+pub(crate) struct RuntimeTurnStartInput<'a, 'runtime, W: io::Write> {
+    pub(crate) actor: &'a mut RuntimeTaskActor<'runtime>,
+    pub(crate) events: &'a mut EventFactory,
+    pub(crate) sink: &'a mut EventSink<W>,
+    pub(crate) turn_context: RuntimeTurnContext<'a>,
+}
 
 pub(crate) struct RuntimeTurnStartStepOutput {
     pub(crate) error: Option<RuntimeTurnStartError>,
@@ -24,13 +33,20 @@ impl RuntimeTurnStartStep {
 
     pub(crate) fn start<W: io::Write>(
         &mut self,
-        actor: &mut RuntimeTaskActor<'_>,
-        events: &mut EventFactory,
-        sink: &mut EventSink<W>,
-        prompt: &str,
-        emit_deltas: bool,
+        input: RuntimeTurnStartInput<'_, '_, W>,
     ) -> io::Result<RuntimeTurnStartStepOutput> {
-        let turn_prompt = if actor
+        let RuntimeTurnContext {
+            cwd: _,
+            prompt,
+            subagent_depth: _,
+            emit_deltas,
+            subagent_type: _,
+            continuation: _,
+            steer_handle: _,
+        } = input.turn_context;
+
+        let turn_prompt = if input
+            .actor
             .active_task()
             .map(|task| task.current_turn())
             .unwrap_or(0)
@@ -40,17 +56,20 @@ impl RuntimeTurnStartStep {
         } else {
             None
         };
-        let started_turn = match actor.start_turn(events, turn_prompt, emit_deltas) {
+        let started_turn = match input
+            .actor
+            .start_turn(input.events, turn_prompt, emit_deltas)
+        {
             Ok(started_turn) => started_turn,
             Err(error) => {
                 if emit_deltas {
-                    sink.emit(&events.error(&error.message))?;
+                    input.sink.emit(&input.events.error(&error.message))?;
                 }
                 return Ok(RuntimeTurnStartStepOutput { error: Some(error) });
             }
         };
         if let Some(event) = started_turn.into_event() {
-            sink.emit(&event)?;
+            input.sink.emit(&event)?;
         }
         Ok(RuntimeTurnStartStepOutput { error: None })
     }

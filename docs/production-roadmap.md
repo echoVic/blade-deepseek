@@ -351,7 +351,9 @@ copied into Orca.
    compaction, turn-start, model-route, and steering setup on the same immutable
    turn-entry boundary. `RuntimeModelRouteInput` now also routes through that
    context, so model routing no longer duplicates the turn's subagent type or
-   delta-emission flag.
+   delta-emission flag. `RuntimeTurnStartInput` now follows the same boundary,
+   so turn-start prompt selection and start-event emission read prompt and
+   delta policy from `RuntimeTurnContext`.
    Iteration stages now keep lifecycle-owned `RuntimeTurnLoopIterationState`
    grouped instead of unpacking runtime system messages, model overrides,
    cost/cancel/task refs, and extension refs into the iteration input. Keep
