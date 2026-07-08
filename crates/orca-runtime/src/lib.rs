@@ -1655,6 +1655,7 @@ mod tests {
         for type_name in [
             "struct CommandExecProcess",
             "struct CommandExecManager",
+            "struct CommandExecPermissionPolicy",
             "enum CommandExecDrainOutcome",
         ] {
             assert!(
@@ -1669,6 +1670,11 @@ mod tests {
         assert!(
             manager_source.contains("impl CommandExecManager"),
             "server/command_exec_manager.rs must own command exec manager behavior"
+        );
+        assert!(
+            manager_source
+                .contains("CommandExecPermissionPolicy::should_request_filesystem_retry("),
+            "server/command_exec_manager.rs must route permission retry decisions through CommandExecPermissionPolicy"
         );
     }
 

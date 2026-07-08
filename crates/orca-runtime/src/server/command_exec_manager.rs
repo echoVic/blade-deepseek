@@ -67,6 +67,22 @@ pub(super) enum CommandExecDrainOutcome {
     },
 }
 
+struct CommandExecPermissionPolicy;
+
+impl CommandExecPermissionPolicy {
+    fn should_request_filesystem_retry(
+        cwd: &std::path::Path,
+        diagnostic: &SandboxDenialDiagnostic,
+        denied_writable_roots: &[PathBuf],
+    ) -> bool {
+        should_request_filesystem_permission_with_denied_roots(
+            cwd,
+            diagnostic,
+            denied_writable_roots,
+        ) || diagnostic.suggested_write_root.is_none()
+    }
+}
+
 impl CommandExecManager {
     pub(super) fn insert(
         &mut self,
@@ -424,14 +440,11 @@ impl CommandExecManager {
                     if let Some(diagnostic) =
                         diagnose_sandbox_denial(&process.cwd, &output.stdout, &output.stderr)
                     {
-                        let should_request_permission =
-                            should_request_filesystem_permission_with_denied_roots(
-                                &process.cwd,
-                                &diagnostic,
-                                &process.denied_writable_roots,
-                            ) || diagnostic.suggested_write_root.is_none();
-                        if should_request_permission
-                            && let Some(request) = process.permission_request
+                        if CommandExecPermissionPolicy::should_request_filesystem_retry(
+                            &process.cwd,
+                            &diagnostic,
+                            &process.denied_writable_roots,
+                        ) && let Some(request) = process.permission_request
                         {
                             return Ok(CommandExecDrainOutcome::FileSystemPermissionRequired {
                                 request,
@@ -554,5 +567,54 @@ impl CommandExecManager {
             };
             let _ = manager.kill(&shell_id);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::CommandExecPermissionPolicy;
+    use crate::sandbox_denial::SandboxDenialDiagnostic;
+
+    #[test]
+    fn command_exec_permission_policy_requests_pathless_sandbox_retry() {
+        let diagnostic = SandboxDenialDiagnostic {
+            denied_path: None,
+            suggested_write_root: None,
+            message: "sandbox denied filesystem access".to_string(),
+        };
+
+        assert!(
+            CommandExecPermissionPolicy::should_request_filesystem_retry(
+                &PathBuf::from("/repo"),
+                &diagnostic,
+                &[]
+            )
+        );
+    }
+
+    #[test]
+    fn command_exec_permission_policy_requests_write_root_unless_denied() {
+        let diagnostic = SandboxDenialDiagnostic {
+            denied_path: Some(PathBuf::from("/repo/.git/index.lock")),
+            suggested_write_root: Some(PathBuf::from("/repo/.git")),
+            message: "sandbox denied filesystem access".to_string(),
+        };
+
+        assert!(
+            CommandExecPermissionPolicy::should_request_filesystem_retry(
+                &PathBuf::from("/repo/worktree"),
+                &diagnostic,
+                &[]
+            )
+        );
+        assert!(
+            !CommandExecPermissionPolicy::should_request_filesystem_retry(
+                &PathBuf::from("/repo/worktree"),
+                &diagnostic,
+                &[PathBuf::from("/repo/.git")]
+            )
+        );
     }
 }
