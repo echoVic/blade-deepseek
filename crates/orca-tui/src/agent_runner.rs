@@ -340,12 +340,20 @@ fn spawn_background_provider_completion(
         let mut status = "failed";
         let mut pending_tool_call = None;
         let mut pending_provider_response = None;
+        let mut buffered_steps = Vec::new();
         let mut events = EventFactory::new(run_id);
         while let Ok(event) = provider_rx.recv() {
             match event {
                 ProviderStreamEvent::Step(step) => {
                     if background_task_is_foregrounded(&task_registry, &task_id) {
+                        forward_foregrounded_background_steps(
+                            &event_tx,
+                            &mut events,
+                            &mut buffered_steps,
+                        );
                         forward_foregrounded_background_step(&event_tx, &mut events, &step);
+                    } else if background_step_is_tui_visible(&step) {
+                        buffered_steps.push(step);
                     }
                 }
                 ProviderStreamEvent::Done(response) => {
@@ -385,6 +393,7 @@ fn spawn_background_provider_completion(
             }
         }
         if foregrounded {
+            forward_foregrounded_background_steps(&event_tx, &mut events, &mut buffered_steps);
             send_session_completed_status_for_tui(&event_tx, &mut events, status);
         } else {
             let _ = event_tx.send(TuiEvent::Notice(background_completion_notice(
@@ -404,6 +413,25 @@ fn background_task_is_foregrounded(
             && task.status == TaskStatus::Running
             && !task.is_backgrounded
     })
+}
+
+fn background_step_is_tui_visible(step: &ProviderStep) -> bool {
+    matches!(
+        step,
+        ProviderStep::ReasoningDelta(_)
+            | ProviderStep::MessageDelta(_)
+            | ProviderStep::ToolCallProgress(_)
+    )
+}
+
+fn forward_foregrounded_background_steps(
+    event_tx: &Sender<TuiEvent>,
+    events: &mut EventFactory,
+    steps: &mut Vec<ProviderStep>,
+) {
+    for step in steps.drain(..) {
+        forward_foregrounded_background_step(event_tx, events, &step);
+    }
 }
 
 fn forward_foregrounded_background_step(
@@ -2618,13 +2646,8 @@ mod tests {
             )))
             .unwrap();
 
-        let visible_delta = loop {
-            match event_rx.recv_timeout(Duration::from_secs(2)).unwrap() {
-                TuiEvent::MessageDelta(text) => break text,
-                _ => {}
-            }
-        };
-        assert_eq!(visible_delta, "now visible");
+        let visible_deltas = collect_message_deltas(&event_rx, 2);
+        assert_eq!(visible_deltas, vec!["still hidden", "now visible"]);
 
         provider_tx
             .send(ProviderStreamEvent::Done(ProviderResponse {
@@ -2642,6 +2665,55 @@ mod tests {
             }
         };
         assert_eq!(completed_status, "success");
+    }
+
+    #[test]
+    fn foregrounded_background_completion_replays_buffered_message_deltas() {
+        let registry = TaskRegistry::new("session-background-replay".to_string());
+        let task = registry.create_main_session("Long answer".to_string());
+        registry.mark_running(&task.id).unwrap();
+        registry.mark_backgrounded(&task.id).unwrap();
+
+        let (event_tx, event_rx) = mpsc::channel();
+        let (provider_tx, provider_rx) = mpsc::channel();
+        spawn_background_provider_completion(
+            provider_rx,
+            registry.clone(),
+            event_tx,
+            "run-background-replay".to_string(),
+            task.id.clone(),
+        );
+        provider_tx
+            .send(ProviderStreamEvent::Step(ProviderStep::MessageDelta(
+                "buffered while hidden".to_string(),
+            )))
+            .unwrap();
+        assert!(event_rx.recv_timeout(Duration::from_millis(100)).is_err());
+
+        registry.mark_foregrounded(&task.id).unwrap();
+        provider_tx
+            .send(ProviderStreamEvent::Done(ProviderResponse {
+                steps: Vec::new(),
+                assistant_content: Some("buffered while hidden".to_string()),
+                assistant_reasoning: None,
+                tool_calls: Vec::new(),
+                usage: None,
+            }))
+            .unwrap();
+
+        let replayed_delta = collect_message_deltas(&event_rx, 1);
+        assert_eq!(replayed_delta, vec!["buffered while hidden"]);
+    }
+
+    fn collect_message_deltas(event_rx: &mpsc::Receiver<TuiEvent>, count: usize) -> Vec<String> {
+        let mut deltas = Vec::new();
+        while deltas.len() < count {
+            match event_rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+                TuiEvent::MessageDelta(text) => deltas.push(text),
+                _ => {}
+            }
+        }
+        deltas
     }
 
     #[test]
