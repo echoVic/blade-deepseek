@@ -286,9 +286,13 @@ The deeper July 9 reference pass changes the next refactor order:
    policy before the server registers the pending request. The shared request
    construction is now promoted into `RuntimePermissionPolicy`, so bash and
    command/exec use one actor-scoped owner for network block, filesystem write,
-   and pathless unsandboxed retry permission requests. Next mirror Codex more
-   directly by adding command-origin/rejection metadata to exec policy decisions
-   instead of returning only prompt text.
+   and pathless unsandboxed retry permission requests. The prompt-decision
+   slice is also seeded: `RuntimePermissionPolicy` now decides whether
+   `request_permissions` should auto-allow, prompt via a runtime handler, or
+   reject with an explicit reason, preventing non-full-auto runtime paths from
+   silently granting permissions when no handler exists. Next mirror Codex more
+   directly by adding command-origin metadata to exec policy decisions instead
+   of returning only prompt text.
 4. **P2: Turn MCP elicitation and dynamic waits into pending interactions.**
    Package 3's MCP elicitation queue is the useful reference here: request id,
    server name, mode, abort signal, completion notification, and hook-driven

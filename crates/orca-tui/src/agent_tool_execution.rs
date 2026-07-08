@@ -312,17 +312,15 @@ fn execute_tool_for_tui_inner(
                 }
             }
         } else if execution_request.name == tool_types::ToolName::RequestPermissions {
-            let result =
-                if config.approval_mode == orca_core::approval_types::ApprovalMode::FullAuto {
-                    runtime_context.execute_request_permissions_tool(execution_request)
-                } else {
-                    let handler = with_pending_interactions(
-                        TuiPermissionRequestHandler::new(event_tx, action_rx, pending_actions),
-                        pending_interactions.as_ref(),
-                    );
-                    runtime_context
-                        .execute_request_permissions_tool_with_handler(execution_request, &handler)
-                };
+            let handler = with_pending_interactions(
+                TuiPermissionRequestHandler::new(event_tx, action_rx, pending_actions),
+                pending_interactions.as_ref(),
+            );
+            let result = runtime_context.execute_request_permissions_tool_with_policy(
+                execution_request,
+                config.approval_mode,
+                Some(&handler),
+            );
             permission_overlay.merge(runtime_context.permission_overlay());
             result
         } else if execution_request.name == tool_types::ToolName::RequestUserInput {

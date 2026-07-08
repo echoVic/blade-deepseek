@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
 
+use orca_core::approval_types::ApprovalMode;
 use orca_core::config::PermissionProfileNetworkAccess;
 
 use crate::network_proxy::RuntimeNetworkBlockReport;
@@ -36,6 +37,13 @@ pub trait RuntimePermissionRequestHandler {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimePermissionPromptDecision {
+    AutoAllow,
+    Prompt,
+    Reject { reason: &'static str },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RuntimePermissionOrigin {
     Bash,
     CommandExec,
@@ -53,6 +61,21 @@ impl RuntimePermissionOrigin {
 pub(crate) struct RuntimePermissionPolicy;
 
 impl RuntimePermissionPolicy {
+    pub(crate) fn decide_request_permissions_prompt(
+        approval_mode: ApprovalMode,
+        handler_available: bool,
+    ) -> RuntimePermissionPromptDecision {
+        if approval_mode == ApprovalMode::FullAuto {
+            return RuntimePermissionPromptDecision::AutoAllow;
+        }
+        if handler_available {
+            return RuntimePermissionPromptDecision::Prompt;
+        }
+        RuntimePermissionPromptDecision::Reject {
+            reason: "request_permissions requires a runtime permission handler unless approval mode is full-auto",
+        }
+    }
+
     pub(crate) fn network_block_request(
         request_id: &str,
         origin: RuntimePermissionOrigin,
@@ -266,10 +289,15 @@ impl TurnPermissionOverlay {
 mod tests {
     use std::path::PathBuf;
 
+    use orca_core::approval_types::ApprovalMode;
+
     use crate::network_proxy::RuntimeNetworkBlockReport;
     use crate::sandbox_denial::SandboxDenialDiagnostic;
 
-    use super::{RuntimePermissionOrigin, RuntimePermissionPolicy, TurnPermissionOverlay};
+    use super::{
+        RuntimePermissionOrigin, RuntimePermissionPolicy, RuntimePermissionPromptDecision,
+        TurnPermissionOverlay,
+    };
 
     #[test]
     fn preapproved_tool_call_id_is_consumed_once_for_exact_match_only() {
@@ -387,6 +415,30 @@ mod tests {
             Some(
                 "command/exec needs to re-run without the filesystem sandbox because the sandbox denied access but did not report a filesystem path to grant"
             )
+        );
+    }
+
+    #[test]
+    fn runtime_permission_policy_decides_request_permissions_prompt_gate() {
+        assert_eq!(
+            RuntimePermissionPolicy::decide_request_permissions_prompt(
+                ApprovalMode::FullAuto,
+                false
+            ),
+            RuntimePermissionPromptDecision::AutoAllow
+        );
+        assert_eq!(
+            RuntimePermissionPolicy::decide_request_permissions_prompt(ApprovalMode::Suggest, true),
+            RuntimePermissionPromptDecision::Prompt
+        );
+        assert_eq!(
+            RuntimePermissionPolicy::decide_request_permissions_prompt(
+                ApprovalMode::AutoEdit,
+                false
+            ),
+            RuntimePermissionPromptDecision::Reject {
+                reason: "request_permissions requires a runtime permission handler unless approval mode is full-auto",
+            }
         );
     }
 }

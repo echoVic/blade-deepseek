@@ -1,6 +1,7 @@
 use std::io;
 use std::path::Path;
 
+use orca_core::approval_types::ApprovalMode;
 use orca_core::task_types::{BackgroundTaskSummary, TaskStatus, TaskType};
 use orca_core::tool_types::{ToolName, ToolRequest, ToolResult};
 use serde::Deserialize;
@@ -12,6 +13,7 @@ use crate::lifecycle::{
     RuntimeSubagentStatusLookup, RuntimeToolActorContext, RuntimeUsageTotals, RuntimeWorkflowIpc,
 };
 use crate::protocol::{PermissionGrantScope, PermissionResponseDecision, RequestPermissionProfile};
+use crate::runtime_permission::{RuntimePermissionPolicy, RuntimePermissionPromptDecision};
 use crate::runtime_state::RuntimeTurnReducer;
 use crate::tasks::TaskRegistry;
 use crate::workflow::WorkflowDraftStore;
@@ -155,6 +157,30 @@ impl RuntimeToolActorContext {
         })
         .to_string();
         ToolResult::completed(request, output, false)
+    }
+
+    pub fn execute_request_permissions_tool_with_policy(
+        &mut self,
+        request: &ToolRequest,
+        approval_mode: ApprovalMode,
+        handler: Option<&dyn RuntimePermissionRequestHandler>,
+    ) -> ToolResult {
+        match RuntimePermissionPolicy::decide_request_permissions_prompt(
+            approval_mode,
+            handler.is_some(),
+        ) {
+            RuntimePermissionPromptDecision::AutoAllow => {
+                self.execute_request_permissions_tool(request)
+            }
+            RuntimePermissionPromptDecision::Prompt => self
+                .execute_request_permissions_tool_with_handler(
+                    request,
+                    handler.expect("prompt decision requires a permission handler"),
+                ),
+            RuntimePermissionPromptDecision::Reject { reason } => {
+                ToolResult::denied(request, reason)
+            }
+        }
     }
 
     pub fn execute_workflow_ipc_tool(
@@ -534,8 +560,9 @@ fn workflow_draft_script_arg(request: &ToolRequest) -> io::Result<String> {
 mod tests {
     use super::*;
     use orca_core::approval_types::ActionKind;
+    use orca_core::approval_types::ApprovalMode;
     use orca_core::task_types::PendingToolCallSummary;
-    use orca_core::tool_types::ToolStatus;
+    use orca_core::tool_types::{ToolRequest, ToolStatus};
 
     #[test]
     fn task_summary_json_marks_backgrounded_main_sessions() {
@@ -618,5 +645,46 @@ mod tests {
         assert_eq!(stopped.status, TaskStatus::Stopped);
         assert_eq!(stopped.result.as_deref(), Some("Task stopped"));
         assert_eq!(stopped.error, None);
+    }
+
+    #[test]
+    fn request_permissions_without_handler_is_rejected_outside_full_auto() {
+        let request = ToolRequest {
+            id: "permission-1".to_string(),
+            name: ToolName::RequestPermissions,
+            action: ActionKind::Write,
+            target: None,
+            raw_arguments: Some(
+                serde_json::json!({
+                    "reason": "need workspace write",
+                    "permissions": {
+                        "fileSystem": { "write": ["/tmp/orca-write"], "read": null },
+                        "network": null
+                    }
+                })
+                .to_string(),
+            ),
+        };
+        let mut context = RuntimeToolActorContext::new("test-run", 8);
+
+        let result = context.execute_request_permissions_tool_with_policy(
+            &request,
+            ApprovalMode::Suggest,
+            None,
+        );
+
+        assert_eq!(result.status, ToolStatus::Denied);
+        assert_eq!(
+            result.error.as_deref(),
+            Some(
+                "request_permissions requires a runtime permission handler unless approval mode is full-auto"
+            )
+        );
+        assert!(
+            context
+                .permission_overlay()
+                .additional_working_directories()
+                .is_empty()
+        );
     }
 }

@@ -152,15 +152,12 @@ impl<'a> RuntimeToolRouter<'a> {
                 .runtime
                 .execute_task_stop_tool(execution_request, task_registry)),
             RuntimeSpecialToolDispatch::RequestPermissions => {
-                let result = if let Some(permission_handler) = permission_handler {
-                    self.runtime.execute_request_permissions_tool_with_handler(
-                        execution_request,
-                        permission_handler,
-                    )
-                } else {
-                    self.runtime
-                        .execute_request_permissions_tool(execution_request)
-                };
+                let result = self.runtime.execute_request_permissions_tool_with_policy(
+                    execution_request,
+                    config.approval_mode,
+                    permission_handler
+                        .map(|handler| handler as &dyn RuntimePermissionRequestHandler),
+                );
                 let extension_stores = extension_stores.unwrap_or_else(|| {
                     RuntimeExtensionStores::new(
                         &self.runtime.thread_extensions,
