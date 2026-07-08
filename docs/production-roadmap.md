@@ -383,6 +383,9 @@ copied into Orca.
    workflows panel key handler now also lives in a focused TUI panel action
    module, so task selection, approval opening, stop dispatch, and foreground
    dispatch are grouped with the panel UX instead of the app event loop.
+   Running-state shortcuts now also execute through a focused TUI running
+   action module, keeping background-current-turn, interrupt, and live-scroll
+   behavior grouped with the running UX instead of the app event loop.
    Runtime task summaries now also expose terminal `result`/`error` fields so
    the selected task row can show completion output or failure details in the
    panel. The

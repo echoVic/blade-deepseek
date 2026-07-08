@@ -9,6 +9,7 @@ mod background_tasks;
 pub mod bridge;
 pub mod commands;
 pub mod diff;
+mod running_actions;
 mod runtime_event_projection;
 mod runtime_interaction_adapter;
 pub mod shortcuts;
@@ -244,6 +245,30 @@ mod tests {
         assert!(
             !app.contains("\nfn selected_foregroundable_task("),
             "app should not own workflow task foreground eligibility"
+        );
+    }
+
+    #[test]
+    fn tui_running_actions_are_owned_by_dedicated_module() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let running_actions =
+            std::fs::read_to_string(format!("{manifest_dir}/src/running_actions.rs"))
+                .expect("running_actions module should exist");
+        assert!(
+            running_actions.contains("pub(crate) fn handle_running_shortcut"),
+            "running_actions should own running-state shortcut execution"
+        );
+        assert!(
+            running_actions.contains("RunningShortcut::BackgroundCurrentTurn")
+                && running_actions.contains("RunningShortcut::Interrupt"),
+            "running_actions should dispatch background and interrupt actions"
+        );
+
+        let app = std::fs::read_to_string(format!("{manifest_dir}/src/app.rs"))
+            .expect("app source should be readable");
+        assert!(
+            !app.contains("\nfn handle_running_shortcut("),
+            "app should use the running_actions module instead of defining running shortcut execution inline"
         );
     }
 
