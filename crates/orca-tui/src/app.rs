@@ -14,7 +14,7 @@ use crossterm::event::{
 use crossterm::terminal;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use tui_textarea::{CursorMove, Input, TextArea};
+use tui_textarea::{Input, TextArea};
 
 use orca_core::approval_types::ApprovalMode;
 use orca_core::cancel::CancelToken;
@@ -32,6 +32,9 @@ use crate::background_tasks::{
 };
 use crate::bridge;
 use crate::commands::{self, GoalSlashCommand, SlashCommand};
+use crate::composer_textarea::{
+    insert_pasted_text, make_setup_textarea, make_textarea, make_textarea_with_text, textarea_text,
+};
 use crate::running_actions::handle_running_shortcut;
 use crate::shortcuts::{
     ApprovalShortcut, GlobalShortcut, IdleShortcut, RunningShortcut, approval_shortcut,
@@ -3482,56 +3485,6 @@ fn select_slash_menu_command(
             *textarea = make_textarea(vim_state, theme);
         }
     }
-}
-
-fn make_textarea<'a>(vim_state: &VimState, theme: &Theme) -> TextArea<'a> {
-    let mut textarea = TextArea::default();
-    configure_textarea(&mut textarea, vim_state, theme);
-    textarea
-}
-
-fn make_textarea_with_text<'a>(text: &str, vim_state: &VimState, theme: &Theme) -> TextArea<'a> {
-    let lines: Vec<String> = if text.is_empty() {
-        vec![String::new()]
-    } else {
-        text.lines().map(str::to_string).collect()
-    };
-    let mut textarea = TextArea::from(lines);
-    configure_textarea(&mut textarea, vim_state, theme);
-    textarea.move_cursor(CursorMove::Bottom);
-    textarea.move_cursor(CursorMove::End);
-    textarea
-}
-
-fn configure_textarea(textarea: &mut TextArea, vim_state: &VimState, theme: &Theme) {
-    textarea.set_placeholder_text("Type a message... (Enter send, Alt+Enter newline)");
-    textarea.set_cursor_line_style(ratatui::style::Style::default());
-    vim_state.configure_block(textarea, theme);
-}
-
-fn textarea_text(textarea: &TextArea) -> String {
-    textarea.lines().join("\n")
-}
-
-fn insert_pasted_text(textarea: &mut TextArea, pasted: &str) -> bool {
-    if pasted.is_empty() {
-        return false;
-    }
-    textarea.insert_str(pasted)
-}
-
-fn make_setup_textarea<'a>(theme: &Theme) -> TextArea<'a> {
-    let mut textarea = TextArea::default();
-    textarea.set_placeholder_text("sk-...");
-    textarea.set_cursor_line_style(ratatui::style::Style::default());
-    textarea.set_mask_char('*');
-    textarea.set_block(
-        ratatui::widgets::Block::default()
-            .borders(ratatui::widgets::Borders::ALL)
-            .title(" API Key ")
-            .border_style(ratatui::style::Style::default().fg(theme.border)),
-    );
-    textarea
 }
 
 fn ensure_tui_session(

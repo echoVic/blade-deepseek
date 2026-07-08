@@ -8,6 +8,7 @@ mod background_approval;
 mod background_tasks;
 pub mod bridge;
 pub mod commands;
+mod composer_textarea;
 pub mod diff;
 mod running_actions;
 mod runtime_event_projection;
@@ -269,6 +270,57 @@ mod tests {
         assert!(
             !app.contains("\nfn handle_running_shortcut("),
             "app should use the running_actions module instead of defining running shortcut execution inline"
+        );
+    }
+
+    #[test]
+    fn tui_composer_textarea_is_owned_by_dedicated_module() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let composer_textarea =
+            std::fs::read_to_string(format!("{manifest_dir}/src/composer_textarea.rs"))
+                .expect("composer_textarea module should exist");
+        assert!(
+            composer_textarea.contains("pub(crate) fn make_textarea"),
+            "composer_textarea should own normal composer construction"
+        );
+        assert!(
+            composer_textarea.contains("pub(crate) fn make_textarea_with_text"),
+            "composer_textarea should own prefilled composer construction"
+        );
+        assert!(
+            composer_textarea.contains("pub(crate) fn textarea_text"),
+            "composer_textarea should own composer text extraction"
+        );
+        assert!(
+            composer_textarea.contains("pub(crate) fn insert_pasted_text"),
+            "composer_textarea should own paste insertion behavior"
+        );
+        assert!(
+            composer_textarea.contains("pub(crate) fn make_setup_textarea"),
+            "composer_textarea should own setup composer construction"
+        );
+
+        let app = std::fs::read_to_string(format!("{manifest_dir}/src/app.rs"))
+            .expect("app source should be readable");
+        assert!(
+            !app.contains("\nfn make_textarea<"),
+            "app should use the composer_textarea module instead of defining normal composer construction inline"
+        );
+        assert!(
+            !app.contains("\nfn make_textarea_with_text<"),
+            "app should use the composer_textarea module instead of defining prefilled composer construction inline"
+        );
+        assert!(
+            !app.contains("\nfn textarea_text("),
+            "app should use the composer_textarea module instead of defining text extraction inline"
+        );
+        assert!(
+            !app.contains("\nfn insert_pasted_text("),
+            "app should use the composer_textarea module instead of defining paste behavior inline"
+        );
+        assert!(
+            !app.contains("\nfn make_setup_textarea<"),
+            "app should use the composer_textarea module instead of defining setup composer construction inline"
         );
     }
 

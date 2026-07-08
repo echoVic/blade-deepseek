@@ -386,6 +386,9 @@ copied into Orca.
    Running-state shortcuts now also execute through a focused TUI running
    action module, keeping background-current-turn, interrupt, and live-scroll
    behavior grouped with the running UX instead of the app event loop.
+   Composer textarea construction, prefilled text restoration, text extraction,
+   setup input masking, and paste insertion now live in a focused TUI composer
+   module, giving slash/mention/menu input flows one shared input boundary.
    Runtime task summaries now also expose terminal `result`/`error` fields so
    the selected task row can show completion output or failure details in the
    panel. The
