@@ -1,11 +1,9 @@
 use std::io;
 
-use orca_core::cancel::CancelToken;
-
 use crate::agent_child::ChildAgentExecutor;
-use crate::cost::CostTracker;
-use crate::extension::RuntimeExtensionContext;
-use crate::lifecycle::{AgentLoopResult, RuntimeTaskActor, RuntimeTurnDeps};
+use crate::lifecycle::{
+    AgentLoopResult, RuntimeTaskActor, RuntimeTurnDeps, RuntimeTurnLoopIterationState,
+};
 use crate::provider_turn::{
     RuntimeProviderCycleInput, RuntimeTurnProviderCycleResult, RuntimeTurnProviderCycleStep,
 };
@@ -18,7 +16,6 @@ use crate::runtime_turn_opening::{
     RuntimeTurnOpeningInput, RuntimeTurnOpeningResult, RuntimeTurnOpeningStep,
 };
 use crate::step_context::RuntimeStepCapabilitySnapshot;
-use crate::tasks::TaskRegistry;
 use crate::workflow::runner::SharedEventBuffer;
 
 pub(crate) struct RuntimeTurnIterationStep {
@@ -29,17 +26,12 @@ pub(crate) struct RuntimeTurnIterationStep {
 pub(crate) struct RuntimeTurnIterationInput<'a, 'runtime, W: io::Write> {
     pub(crate) actor: &'a mut RuntimeTaskActor<'runtime>,
     pub(crate) provider_context: RuntimeTurnProviderContext<'a>,
-    pub(crate) runtime_system_messages: &'a [String],
     pub(crate) request: RuntimeTurnRequestContext<'a>,
     pub(crate) deps: RuntimeTurnDeps<'a>,
     pub(crate) output: RuntimeTurnOutputContext<'a, 'a, W>,
     pub(crate) prepared_conversation: &'a mut RuntimePreparedConversation<'runtime>,
-    pub(crate) model_override: Option<&'a str>,
-    pub(crate) cost_tracker: &'a mut CostTracker,
-    pub(crate) cancel: &'a CancelToken,
+    pub(crate) loop_state: RuntimeTurnLoopIterationState<'a>,
     pub(crate) policy: RuntimeTurnPolicyContext<'a>,
-    pub(crate) task_registry: &'a TaskRegistry,
-    pub(crate) extensions: RuntimeExtensionContext<'a>,
     pub(crate) workflow: RuntimeTurnWorkflowContext<'a, 'a>,
 }
 
@@ -80,8 +72,8 @@ impl RuntimeTurnIterationStep {
                 prompt: input.request.prompt,
                 model: input.provider_context.model,
                 subagent_type: input.request.subagent_type,
-                model_override: input.model_override,
-                cost_tracker: input.cost_tracker,
+                model_override: input.loop_state.model_override,
+                cost_tracker: input.loop_state.cost_tracker,
                 steer_handle: input.request.steer_handle,
             })? {
                 RuntimeTurnOpeningResult::Continue { provider_config } => provider_config,
@@ -97,7 +89,7 @@ impl RuntimeTurnIterationStep {
                 provider: input.provider_context.provider,
                 continuation: input.request.continuation,
                 turn_provider_config: &turn_provider_config,
-                runtime_system_messages: input.runtime_system_messages,
+                runtime_system_messages: input.loop_state.runtime_system_messages,
                 cwd: input.request.cwd,
                 context_config: input.provider_context.context_config,
                 base_provider_config: input.provider_context.provider_config,
@@ -107,13 +99,13 @@ impl RuntimeTurnIterationStep {
                     input.deps.memory,
                     input.deps.mcp_registry,
                     input.deps.hooks,
-                    input.cancel,
-                    input.task_registry,
+                    input.loop_state.cancel,
+                    input.loop_state.task_registry,
                     input.workflow.workflow_ipc,
                     input.deps.turn_interactions.permission_handler(),
                     input.deps.turn_interactions.user_input_handler(),
                 ),
-                cost_tracker: input.cost_tracker,
+                cost_tracker: input.loop_state.cost_tracker,
                 max_budget_usd: input.provider_context.max_budget_usd,
                 events: input.output.events,
                 sink: input.output.sink,
@@ -122,7 +114,7 @@ impl RuntimeTurnIterationStep {
                 tool_policy: input.policy.tool_policy,
                 subagent_depth: input.request.subagent_depth,
                 policy: input.policy.approval_policy,
-                extensions: input.extensions,
+                extensions: input.loop_state.extensions,
                 background_workflows: input.workflow.background_workflows,
                 steer_handle: input.request.steer_handle,
             },

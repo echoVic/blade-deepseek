@@ -122,6 +122,11 @@ impl<'a, 'runtime, W: io::Write> RuntimeTurnLoopInput<'a, 'runtime, W> {
         &'iter mut self,
     ) -> RuntimeTurnIterationInput<'iter, 'runtime, W> {
         let loop_state = self.loop_state.iteration_state(self.policy.tool_policy);
+        let policy = RuntimeTurnPolicyContext::new(
+            self.policy.config,
+            loop_state.tool_policy,
+            self.policy.approval_policy,
+        );
         RuntimeTurnIterationInput {
             actor: &mut *self.actor,
             provider_context: RuntimeTurnProviderContext::new(
@@ -131,21 +136,12 @@ impl<'a, 'runtime, W: io::Write> RuntimeTurnLoopInput<'a, 'runtime, W> {
                 self.provider_context.model,
                 self.provider_context.max_budget_usd,
             ),
-            runtime_system_messages: loop_state.runtime_system_messages,
             request: self.request.for_iteration(),
             deps: self.deps,
             output: RuntimeTurnOutputContext::new(&mut *self.output.events, &mut *self.output.sink),
             prepared_conversation: &mut *self.prepared_conversation,
-            model_override: loop_state.model_override,
-            cost_tracker: loop_state.cost_tracker,
-            cancel: loop_state.cancel,
-            policy: RuntimeTurnPolicyContext::new(
-                self.policy.config,
-                loop_state.tool_policy,
-                self.policy.approval_policy,
-            ),
-            task_registry: loop_state.task_registry,
-            extensions: loop_state.extensions,
+            loop_state,
+            policy,
             workflow: RuntimeTurnWorkflowContext::new(
                 &mut *self.workflow.background_workflows,
                 self.workflow.workflow_ipc,

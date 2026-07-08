@@ -263,7 +263,10 @@ copied into Orca.
    pass injected services through `RuntimeTurnDeps` instead of repeating hooks,
    instruction, memory, MCP, and interaction fields. Turn-loop policy/config
    refs now pass through `RuntimeTurnPolicyContext` instead of repeating run
-   config, directive-resolved tool policy, and approval policy fields. Keep
+   config, directive-resolved tool policy, and approval policy fields.
+   Iteration stages now keep lifecycle-owned `RuntimeTurnLoopIterationState`
+   grouped instead of unpacking runtime system messages, model overrides,
+   cost/cancel/task refs, and extension refs into the iteration input. Keep
    borrowing package 3's explicit loop-local `State` idea, but avoid a single
    giant context object.
 4. **P3: Protocolized task/thread/interactive status.** Push background task,

@@ -1203,14 +1203,26 @@ mod tests {
             "lifecycle must derive grouped extension context from loop runtime state"
         );
 
+        assert!(
+            lifecycle_source.contains("extensions: RuntimeExtensionContext"),
+            "lifecycle iteration state must carry runtime extensions as one grouped context"
+        );
+        assert!(
+            runtime_turn_iteration_source.contains("loop_state: RuntimeTurnLoopIterationState"),
+            "runtime_turn_iteration must receive grouped lifecycle iteration state"
+        );
+        assert!(
+            runtime_turn_iteration_source.contains("extensions: input.loop_state.extensions"),
+            "runtime_turn_iteration must route grouped extensions from lifecycle iteration state"
+        );
+        assert!(
+            provider_turn_source.contains("extensions: RuntimeExtensionContext"),
+            "provider_turn must carry runtime extensions as one grouped context"
+        );
         for (module_name, source) in [
             ("runtime_turn_iteration", runtime_turn_iteration_source),
             ("provider_turn", provider_turn_source),
         ] {
-            assert!(
-                source.contains("extensions: RuntimeExtensionContext"),
-                "{module_name} must carry runtime extensions as one grouped context"
-            );
             assert!(
                 !source.contains("thread_extensions: &'a ExtensionData"),
                 "{module_name} must not expose thread extension refs as a parallel input field"
@@ -5483,6 +5495,38 @@ mod tests {
                     "turn-loop inputs must not expose policy field {field_name} outside RuntimeTurnPolicyContext"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn runtime_turn_iteration_input_uses_loop_iteration_state() {
+        let runtime_turn_iteration_source = include_str!("runtime_turn_iteration.rs");
+        let turn_iteration_input = runtime_turn_iteration_source
+            .split("pub(crate) struct RuntimeTurnIterationInput")
+            .nth(1)
+            .and_then(|source| {
+                source
+                    .split("pub(crate) enum RuntimeTurnIterationResult")
+                    .next()
+            })
+            .expect("RuntimeTurnIterationInput source");
+
+        assert!(
+            turn_iteration_input.contains("loop_state: RuntimeTurnLoopIterationState"),
+            "turn iteration input must keep lifecycle-owned iteration state grouped"
+        );
+        for field_name in [
+            "runtime_system_messages: &'a [String]",
+            "model_override: Option<&'a str>",
+            "cost_tracker: &'a mut CostTracker",
+            "cancel: &'a CancelToken",
+            "task_registry: &'a TaskRegistry",
+            "extensions: RuntimeExtensionContext",
+        ] {
+            assert!(
+                !turn_iteration_input.contains(field_name),
+                "turn iteration input must not expose lifecycle iteration field {field_name}"
+            );
         }
     }
 
