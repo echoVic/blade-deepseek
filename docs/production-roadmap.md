@@ -296,11 +296,14 @@ copied into Orca.
    boundary instead of a workflow-notification-specific result field, so
    workflow follow-ups are one continuation variant and future continuation
    kinds do not need more parallel ad hoc result slots. Approved background
-   turns also cross from the TUI
-   approval handler into the continuation runner as a typed
-   `TuiBackgroundTurnContinuationRequest`, so the runner no longer exposes a
-   naked task id as its continuation boundary and denied approvals do not
-   manufacture continuation requests. Next, move the same id discipline into
+   turns also cross from the TUI approval handler into the continuation runner
+   as a typed `TuiBackgroundTurnContinuationRequest`, so the runner no longer
+   exposes a naked task id as its continuation boundary and denied approvals do
+   not manufacture continuation requests. The TUI background approval response
+   submission path now also lives in a focused module, keeping request-id
+   matching, denied-task finishing, task-list refreshes, and typed continuation
+   request creation behind one named boundary instead of embedding that state
+   transition in the app event loop. Next, move the same id discipline into
    remaining turn/item continuation ownership so continuations stop depending on
    separate ad hoc task fields plus TUI-local queues.
 3. **P2: Frozen per-turn context boundary.** Continue shrinking wide call
