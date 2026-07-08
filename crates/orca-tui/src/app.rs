@@ -2101,6 +2101,39 @@ mod tests {
     }
 
     #[test]
+    fn submitted_turn_kind_owns_prompt_source_state() {
+        let source = include_str!("app.rs");
+        let kind_start = source
+            .rfind("enum SubmittedTurnKind {")
+            .expect("SubmittedTurnKind enum");
+        let submitted_turn_start = source
+            .rfind("struct SubmittedTurn {")
+            .expect("SubmittedTurn struct");
+        let submitted_turn_section = &source[submitted_turn_start..];
+        let struct_body = submitted_turn_section
+            .split("}")
+            .next()
+            .expect("SubmittedTurn struct body");
+
+        assert!(
+            kind_start < submitted_turn_start,
+            "submitted-turn kind should be declared before SubmittedTurn"
+        );
+        assert!(
+            struct_body.contains("kind: SubmittedTurnKind"),
+            "SubmittedTurn should store a single kind that owns the prompt/source data"
+        );
+        assert!(
+            !struct_body.contains("prompt: String"),
+            "prompt text should live inside SubmittedTurnKind variants"
+        );
+        assert!(
+            !struct_body.contains("source: SubmittedTurnSource"),
+            "source state should live inside SubmittedTurnKind variants"
+        );
+    }
+
+    #[test]
     fn backgrounded_agent_loop_does_not_complete_unexecuted_tool_calls() {
         with_orca_home(|_| {
             let config = Arc::new(Mutex::new(test_config(HistoryMode::Record)));
@@ -4034,7 +4067,7 @@ fn run_goal_turns_for_tui(
         }
         let before_usage = session.usage_totals();
         let started_at = std::time::Instant::now();
-        let prompt = submitted_turn.prompt.clone();
+        let prompt = submitted_turn.prompt().to_string();
         let turn_result = bridge::run_agent_for_tui_with_notification_queue(
             config,
             session,
@@ -4265,10 +4298,9 @@ fn recv_next_user_action(
     action_rx.recv()
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SubmittedTurnSource {
-    User,
-    WorkflowNotification,
+enum SubmittedTurnKind {
+    User(String),
+    WorkflowNotification(crate::types::PendingWorkflowNotification),
 }
 
 struct SubmittedTurnPresentation {
@@ -4293,40 +4325,46 @@ impl SubmittedTurnPresentation {
 }
 
 struct SubmittedTurn {
-    prompt: String,
-    source: SubmittedTurnSource,
+    kind: SubmittedTurnKind,
     presentation: SubmittedTurnPresentation,
 }
 
 impl SubmittedTurn {
     fn user(prompt: String) -> Self {
         Self {
-            prompt,
-            source: SubmittedTurnSource::User,
+            kind: SubmittedTurnKind::User(prompt),
             presentation: SubmittedTurnPresentation::user(),
         }
     }
 
     fn workflow_notification(notification: crate::types::PendingWorkflowNotification) -> Self {
-        let id = notification.id;
+        let id = notification.id.clone();
         Self {
-            prompt: notification.prompt,
-            source: SubmittedTurnSource::WorkflowNotification,
+            kind: SubmittedTurnKind::WorkflowNotification(notification),
             presentation: SubmittedTurnPresentation::workflow_notification(&id),
         }
     }
 
+    fn prompt(&self) -> &str {
+        match &self.kind {
+            SubmittedTurnKind::User(prompt) => prompt,
+            SubmittedTurnKind::WorkflowNotification(notification) => &notification.prompt,
+        }
+    }
+
     fn prompt_for_model(&self, cwd: &std::path::Path) -> Result<String, String> {
-        match self.source {
-            SubmittedTurnSource::User => mentions::expand_file_mentions(&self.prompt, cwd),
-            SubmittedTurnSource::WorkflowNotification => Ok(self.prompt.clone()),
+        match &self.kind {
+            SubmittedTurnKind::User(prompt) => mentions::expand_file_mentions(prompt, cwd),
+            SubmittedTurnKind::WorkflowNotification(notification) => {
+                Ok(notification.prompt.clone())
+            }
         }
     }
 
     fn title_seed(&self, model_prompt: &str) -> String {
-        match self.source {
-            SubmittedTurnSource::User => model_prompt.to_string(),
-            SubmittedTurnSource::WorkflowNotification => self
+        match &self.kind {
+            SubmittedTurnKind::User(_) => model_prompt.to_string(),
+            SubmittedTurnKind::WorkflowNotification(_) => self
                 .presentation
                 .task_label
                 .clone()
@@ -4335,7 +4373,13 @@ impl SubmittedTurn {
     }
 
     fn with_model_prompt(mut self, prompt: String) -> Self {
-        self.prompt = prompt;
+        self.kind = match self.kind {
+            SubmittedTurnKind::User(_) => SubmittedTurnKind::User(prompt),
+            SubmittedTurnKind::WorkflowNotification(mut notification) => {
+                notification.prompt = prompt;
+                SubmittedTurnKind::WorkflowNotification(notification)
+            }
+        };
         self
     }
 }
