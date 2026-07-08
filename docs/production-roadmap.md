@@ -3,8 +3,15 @@
 > Goal: evolve Orca into a production-grade DeepSeek-native agent runtime.
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
-Last updated: 2026-07-07
-Current baseline: v0.1.191 makes `RuntimeProviderResponseStep` consume the
+Last updated: 2026-07-08
+Current baseline: current main after v0.1.191 owns the approved background
+provider-response continuation envelope in `orca-runtime`: the runtime consumes
+the pending provider response from `TaskRegistry` and derives the single
+preapproved tool-call id before the TUI resumes a backgrounded turn. The TUI
+still owns the follow-on provider/tool loop, so the next architecture slice is
+to make runtime provider-cycle execution accept an already-returned
+`ProviderResponse` as the first continuation step. Earlier v0.1.191 makes
+`RuntimeProviderResponseStep` consume the
 named `RuntimeProviderResponseInput` directly and carries child-agent executors
 through `RuntimeProviderResponseExecutors`. Provider final-message handling and
 tool-turn dispatch now keep one response handoff instead of re-expanding the
@@ -180,7 +187,7 @@ working baseline used to prioritize the next patch releases.
 | Memory | Manual `/remember` plus optional project extraction | Codex memories extension | Partial |
 | Persistent goals | `/goal` with persisted state plus goal-scoped `get_goal`, `create_goal`, and narrow `update_goal` | Codex goal extension | Implemented |
 | Workflows | JavaScript workflow DSL, generated drafts, edit/save/run controls, reusable workflow commands, task state, notifications, runtime status events, evidence-bound reports, and worktree-isolated/recoverable agent runs | Codex/Claude workflow orchestration concepts | Implemented |
-| Runtime lifecycle | Headless, server-mode, and TUI agent runs now seed an agent task lifecycle through a runtime turn runner; `RuntimeThread` groups runtime-owned interactive session state with lifecycle state, and server-mode `ServerThread`, the headless controller, and the TUI conversation-session wrapper now keep long-lived agent state behind `RuntimeThread` instead of directly assembling session/lifecycle/executor pieces; workflow runs, sync/async subagent boundaries, workflow child agents, and shell tool calls also carry task metadata; tool approval/hooks/normal fallback now share a runtime tool actor context, while workflow, subagent, task, permission, workflow IPC, and normal-tool dispatch route through `RuntimeToolRouter`; server stdio decoding now delegates operation dispatch through a focused router boundary, with synchronous thread query/metadata, turn-control, shell session, command/exec compatibility, permission response, and submit-family dispatch moved into focused processor modules; command/exec active process state now lives in a focused server manager module; runtime-special tool classification and small executors now live in `runtime_special.rs` | Codex `Session -> Task -> Turn`, app-server request processors | Seeded; deeper TUI loop delegation still open |
+| Runtime lifecycle | Headless, server-mode, and TUI agent runs now seed an agent task lifecycle through a runtime turn runner; `RuntimeThread` groups runtime-owned interactive session state with lifecycle state, and server-mode `ServerThread`, the headless controller, and the TUI conversation-session wrapper now keep long-lived agent state behind `RuntimeThread` instead of directly assembling session/lifecycle/executor pieces; workflow runs, sync/async subagent boundaries, workflow child agents, and shell tool calls also carry task metadata; tool approval/hooks/normal fallback now share a runtime tool actor context, while workflow, subagent, task, permission, workflow IPC, and normal-tool dispatch route through `RuntimeToolRouter`; server stdio decoding now delegates operation dispatch through a focused router boundary, with synchronous thread query/metadata, turn-control, shell session, command/exec compatibility, permission response, and submit-family dispatch moved into focused processor modules; command/exec active process state now lives in a focused server manager module; runtime-special tool classification and small executors now live in `runtime_special.rs`; approved background provider-response continuations are now consumed through `orca_runtime::background_turn`, including the single preapproved tool-call id that must not prompt again | Codex `Session -> Task -> Turn`, app-server request processors; package 3 pending permission maps | Seeded; deeper TUI loop delegation still open |
 | TUI | Markdown-ish rendering, themes, Vim mode, diff preview, slash commands, workflow panel, elapsed timers, and clearer approval dialogs | Codex/Claude richer terminal UX | Partial |
 | History | JSONL transcripts, resume/fork/search/archive/compress with a dedicated `SessionStore` boundary | Codex thread store with queryable metadata | Partial |
 | Release | GitHub release + npm alias distribution scripts, retrying post-publish GitHub/npm/npm-exec verification, and a reusable real API e2e release gate | Codex npm/native release model | Implemented |
@@ -192,6 +199,45 @@ working baseline used to prioritize the next patch releases.
 
 The next work should land as independent patch releases. Each release must be
 verified before the next phase starts.
+
+### Current Refactor Priorities
+
+The July 2026 Codex and package 3 reference pass ranks the remaining
+architecture work as follows. Codex is the stronger reference for ownership:
+core `SessionTask` implementations run turns against a frozen `TurnContext`,
+while the TUI mostly replays protocol state. Package 3 is useful for product
+surface and pending-request UX, but its broad `ToolUseContext` should not be
+copied into Orca.
+
+1. **P0: Runtime-owned background approval continuation execution.** The runtime
+   now owns the approved continuation envelope, but TUI still loops over
+   provider responses and tool execution after approval. Add a runtime-owned
+   continuation input that lets `RuntimeTurnProviderCycleStep` skip the first
+   provider call and handle the stored `ProviderResponse` through the same
+   provider-error, response, tool-turn, and terminal folding path as foreground
+   turns. This is the highest TUI-user fix because it removes duplicated
+   continuation semantics from the renderer.
+2. **P1: Typed `RuntimeTurnContinuation` and pending interactive request
+   boundary.** Codex tracks pending interactive replay by request/turn/item ids,
+   and package 3 keeps `pendingPermissionRequests` keyed by request id. Orca
+   should make pending approval and user-input continuations first-class runtime
+   records instead of separate ad hoc task fields plus TUI-local queues.
+3. **P2: Frozen per-turn context boundary.** Continue shrinking wide call
+   surfaces into `RuntimeTurnConfig`, `RuntimeTurnDeps`,
+   `RuntimeTurnState`, and request snapshots. Keep borrowing package 3's
+   explicit loop-local `State` idea, but avoid a single giant context object.
+4. **P3: Protocolized task/thread/interactive status.** Push background task,
+   approval-needed, needs-input, foregrounded/backgrounded, and completed
+   status through runtime protocol events so TUI, server, and future app
+   clients stop inferring state from surface-specific structs.
+5. **P4: Persistence policy for pending background continuations.** Current
+   pending provider responses are in-memory task fields. Decide whether restart
+   should replay a pending approval request, fail it cleanly, or persist a
+   compact continuation record.
+6. **P5: Package-3-style task UX polish.** Borrow the visible task panel ideas:
+   sorted task list, detail view, foreground/stop actions, and notifications.
+   Keep implementation behind Orca runtime task/protocol types rather than
+   importing package 3's UI-state coupling.
 
 ### P0: Session Runtime Unification
 

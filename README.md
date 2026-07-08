@@ -172,6 +172,10 @@ then `~/.orca/workflows/`. Project workflows win over user workflows.
 Workflow tool calls launch background tasks and return task metadata immediately;
 the final workflow report is delivered back into the active TUI session as a
 task notification.
+If a backgrounded TUI turn pauses for tool approval, approving it from the
+workflow/tasks panel continues the stored provider response. The originally
+approved tool call is not prompted again; later approval-requiring tools still
+follow the active approval policy.
 
 Workflow scripts are JavaScript modules beginning with:
 
