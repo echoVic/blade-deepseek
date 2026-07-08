@@ -389,6 +389,9 @@ copied into Orca.
    Composer textarea construction, prefilled text restoration, text extraction,
    setup input masking, and paste insertion now live in a focused TUI composer
    module, giving slash/mention/menu input flows one shared input boundary.
+   Mention candidate refresh and mention menu key handling now live in a
+   focused TUI mention action module, keeping @file completion state changes out
+   of the app event loop.
    Runtime task summaries now also expose terminal `result`/`error` fields so
    the selected task row can show completion output or failure details in the
    panel. The

@@ -10,6 +10,7 @@ pub mod bridge;
 pub mod commands;
 mod composer_textarea;
 pub mod diff;
+mod mention_menu_actions;
 mod running_actions;
 mod runtime_event_projection;
 mod runtime_interaction_adapter;
@@ -321,6 +322,33 @@ mod tests {
         assert!(
             !app.contains("\nfn make_setup_textarea<"),
             "app should use the composer_textarea module instead of defining setup composer construction inline"
+        );
+    }
+
+    #[test]
+    fn tui_mention_menu_actions_are_owned_by_dedicated_module() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let mention_menu_actions =
+            std::fs::read_to_string(format!("{manifest_dir}/src/mention_menu_actions.rs"))
+                .expect("mention_menu_actions module should exist");
+        assert!(
+            mention_menu_actions.contains("pub(crate) fn update_mention_candidates"),
+            "mention_menu_actions should own mention candidate refresh"
+        );
+        assert!(
+            mention_menu_actions.contains("pub(crate) fn handle_mention_menu_key"),
+            "mention_menu_actions should own mention menu key handling"
+        );
+
+        let app = std::fs::read_to_string(format!("{manifest_dir}/src/app.rs"))
+            .expect("app source should be readable");
+        assert!(
+            !app.contains("\nfn update_mention_candidates("),
+            "app should use the mention_menu_actions module instead of defining mention refresh inline"
+        );
+        assert!(
+            !app.contains("\nfn handle_mention_menu_key("),
+            "app should use the mention_menu_actions module instead of defining mention key handling inline"
         );
     }
 
