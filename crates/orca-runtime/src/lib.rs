@@ -3201,6 +3201,8 @@ mod tests {
             "fn execute_bash_with_sandbox(context: RuntimeBashSandboxContext",
             "fn execute_bash_once(context: RuntimeBashOnceContext",
             "RuntimeBashPermissionPolicy::network_block_request(",
+            "RuntimeBashPermissionPolicy::filesystem_write_request(",
+            "RuntimeBashPermissionPolicy::unsandboxed_shell_request(",
         ] {
             assert!(
                 runtime_bash_source.contains(marker),

@@ -152,27 +152,10 @@ pub(crate) fn execute_bash_with_shell_session(
             cwd,
             &diagnostic,
             &sandbox.denied_writable_roots,
-        ) && let (Some(permission_handler), Some(write_root)) = (
-            permission_handler,
-            diagnostic.suggested_write_root.as_ref().cloned(),
-        ) {
-            let permissions = RequestPermissionProfile {
-                file_system: Some(RequestFileSystemPermissions {
-                    read: None,
-                    write: Some(vec![write_root.clone()]),
-                    entries: None,
-                }),
-                network: None,
-                shell: None,
-            };
-            let permission_request = RuntimePermissionRequest {
-                id: request.id.clone(),
-                reason: Some(format!(
-                    "bash attempted filesystem write outside the current sandbox: {}",
-                    write_root.display()
-                )),
-                permissions,
-            };
+        ) && let Some(permission_request) =
+            RuntimeBashPermissionPolicy::filesystem_write_request(&request.id, &diagnostic)
+            && let Some(permission_handler) = permission_handler
+        {
             let reducer = RuntimeTurnReducer::from_extension_stores(extension_stores);
             let response = match reducer.request_permission(
                 permission_overlay,
@@ -211,21 +194,10 @@ pub(crate) fn execute_bash_with_shell_session(
             .with_sandbox_diagnostic(cwd)
             .into_tool_result(request, output_truncation, cancel, task_registry);
         }
-        if let Some(permission_handler) = permission_handler
-            && diagnostic.suggested_write_root.is_none()
+        if let Some(permission_request) =
+            RuntimeBashPermissionPolicy::unsandboxed_shell_request(&request.id, &diagnostic)
+            && let Some(permission_handler) = permission_handler
         {
-            let permissions = RequestPermissionProfile {
-                file_system: None,
-                network: None,
-                shell: Some(RequestShellPermissions { unsandboxed: true }),
-            };
-            let permission_request = RuntimePermissionRequest {
-                id: request.id.clone(),
-                reason: Some(
-                    "bash needs to re-run without the filesystem sandbox because the sandbox denied access but did not report a filesystem path to grant".to_string(),
-                ),
-                permissions,
-            };
             let reducer = RuntimeTurnReducer::from_extension_stores(extension_stores);
             let response = match reducer.request_permission(
                 permission_overlay,
@@ -332,6 +304,50 @@ impl RuntimeBashPermissionPolicy {
                     domains,
                 }),
                 shell: None,
+            },
+        })
+    }
+
+    fn filesystem_write_request(
+        request_id: &str,
+        diagnostic: &SandboxDenialDiagnostic,
+    ) -> Option<RuntimePermissionRequest> {
+        let write_root = diagnostic.suggested_write_root.as_ref()?.clone();
+        Some(RuntimePermissionRequest {
+            id: request_id.to_string(),
+            reason: Some(format!(
+                "bash attempted filesystem write outside the current sandbox: {}",
+                write_root.display()
+            )),
+            permissions: RequestPermissionProfile {
+                file_system: Some(RequestFileSystemPermissions {
+                    read: None,
+                    write: Some(vec![write_root]),
+                    entries: None,
+                }),
+                network: None,
+                shell: None,
+            },
+        })
+    }
+
+    fn unsandboxed_shell_request(
+        request_id: &str,
+        diagnostic: &SandboxDenialDiagnostic,
+    ) -> Option<RuntimePermissionRequest> {
+        if diagnostic.suggested_write_root.is_some() {
+            return None;
+        }
+
+        Some(RuntimePermissionRequest {
+            id: request_id.to_string(),
+            reason: Some(
+                "bash needs to re-run without the filesystem sandbox because the sandbox denied access but did not report a filesystem path to grant".to_string(),
+            ),
+            permissions: RequestPermissionProfile {
+                file_system: None,
+                network: None,
+                shell: Some(RequestShellPermissions { unsandboxed: true }),
             },
         })
     }
@@ -556,10 +572,13 @@ fn execute_bash_once(context: RuntimeBashOnceContext<'_>) -> BashShellOutput {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use orca_core::config::PermissionProfileNetworkAccess;
 
     use super::RuntimeBashPermissionPolicy;
     use crate::network_proxy::RuntimeNetworkBlockReport;
+    use crate::sandbox_denial::SandboxDenialDiagnostic;
 
     #[test]
     fn runtime_bash_permission_policy_skips_denylist_network_blocks() {
@@ -595,6 +614,64 @@ mod tests {
         assert_eq!(
             request.reason.as_deref(),
             Some("bash attempted network access to api.example.com (blocked-by-allowlist)")
+        );
+    }
+
+    #[test]
+    fn runtime_bash_permission_policy_requests_filesystem_write_root() {
+        let diagnostic = SandboxDenialDiagnostic {
+            denied_path: Some(PathBuf::from("/repo/.git/index.lock")),
+            suggested_write_root: Some(PathBuf::from("/repo/.git")),
+            message: "sandbox denied filesystem access".to_string(),
+        };
+
+        let request = RuntimeBashPermissionPolicy::filesystem_write_request("tool-1", &diagnostic)
+            .expect("filesystem permission request");
+
+        assert_eq!(request.id, "tool-1");
+        assert_eq!(
+            request
+                .permissions
+                .file_system
+                .as_ref()
+                .and_then(|file_system| file_system.write.as_ref()),
+            Some(&vec![PathBuf::from("/repo/.git")])
+        );
+        assert!(request.permissions.network.is_none());
+        assert!(request.permissions.shell.is_none());
+        assert_eq!(
+            request.reason.as_deref(),
+            Some("bash attempted filesystem write outside the current sandbox: /repo/.git")
+        );
+    }
+
+    #[test]
+    fn runtime_bash_permission_policy_requests_unsandboxed_shell_when_no_root_is_available() {
+        let diagnostic = SandboxDenialDiagnostic {
+            denied_path: None,
+            suggested_write_root: None,
+            message: "sandbox denied filesystem access".to_string(),
+        };
+
+        let request = RuntimeBashPermissionPolicy::unsandboxed_shell_request("tool-1", &diagnostic)
+            .expect("unsandboxed permission request");
+
+        assert_eq!(request.id, "tool-1");
+        assert!(request.permissions.file_system.is_none());
+        assert!(request.permissions.network.is_none());
+        assert_eq!(
+            request
+                .permissions
+                .shell
+                .as_ref()
+                .map(|shell| shell.unsandboxed),
+            Some(true)
+        );
+        assert_eq!(
+            request.reason.as_deref(),
+            Some(
+                "bash needs to re-run without the filesystem sandbox because the sandbox denied access but did not report a filesystem path to grant"
+            )
         );
     }
 }
