@@ -43,6 +43,42 @@ pub(crate) enum SubagentBatchRecordOutcome {
     },
 }
 
+pub(crate) struct RuntimeSubagentBatchToolTurnContext<'a, W: io::Write> {
+    pub(crate) request: RuntimeSubagentBatchToolTurnRequest<'a>,
+    pub(crate) io: RuntimeSubagentBatchToolTurnIo<'a, W>,
+    pub(crate) services: RuntimeSubagentBatchToolTurnServices<'a>,
+    pub(crate) runtime: RuntimeSubagentBatchToolTurnRuntime<'a>,
+    pub(crate) child_executor: ChildAgentExecutor<io::Sink>,
+}
+
+pub(crate) struct RuntimeSubagentBatchToolTurnRequest<'a> {
+    pub(crate) config: &'a RunConfig,
+    pub(crate) cwd: &'a Path,
+    pub(crate) tool_requests: &'a [tool_types::ToolRequest],
+    pub(crate) subagent_depth: u32,
+    pub(crate) emit_deltas: bool,
+}
+
+pub(crate) struct RuntimeSubagentBatchToolTurnIo<'a, W: io::Write> {
+    pub(crate) events: &'a mut EventFactory,
+    pub(crate) sink: &'a mut EventSink<W>,
+    pub(crate) conversation: &'a mut Conversation,
+    pub(crate) history_writer: Option<&'a mut SessionWriter>,
+    pub(crate) cost_tracker: &'a mut CostTracker,
+}
+
+pub(crate) struct RuntimeSubagentBatchToolTurnServices<'a> {
+    pub(crate) instructions: &'a ProjectInstructions,
+    pub(crate) memory: &'a MemoryBlock,
+    pub(crate) mcp_registry: &'a McpRegistry,
+    pub(crate) hooks: &'a HookRunner,
+}
+
+pub(crate) struct RuntimeSubagentBatchToolTurnRuntime<'a> {
+    pub(crate) cancel: &'a CancelToken,
+    pub(crate) workflow_ipc: Option<&'a WorkflowIpcContext>,
+}
+
 #[derive(Clone, Debug)]
 struct SubagentExecutionResult {
     tool_request: tool_types::ToolRequest,
@@ -109,26 +145,40 @@ pub(crate) fn record_subagent_batch_results(
     Ok(SubagentBatchRecordOutcome::Continue)
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn run_subagent_batch_tool_turn(
-    config: &RunConfig,
-    cwd: &Path,
-    events: &mut EventFactory,
-    sink: &mut EventSink<impl io::Write>,
-    conversation: &mut Conversation,
-    history_writer: Option<&mut SessionWriter>,
-    tool_requests: &[tool_types::ToolRequest],
-    subagent_depth: u32,
-    emit_deltas: bool,
-    instructions: &ProjectInstructions,
-    memory: &MemoryBlock,
-    mcp_registry: &McpRegistry,
-    hooks: &HookRunner,
-    cost_tracker: &mut CostTracker,
-    cancel: &CancelToken,
-    workflow_ipc: Option<&WorkflowIpcContext>,
-    child_executor: ChildAgentExecutor<io::Sink>,
+pub(crate) fn run_subagent_batch_tool_turn<W: io::Write>(
+    context: RuntimeSubagentBatchToolTurnContext<'_, W>,
 ) -> io::Result<ToolTurnOutcome> {
+    let RuntimeSubagentBatchToolTurnContext {
+        request,
+        io,
+        services,
+        runtime,
+        child_executor,
+    } = context;
+    let RuntimeSubagentBatchToolTurnRequest {
+        config,
+        cwd,
+        tool_requests,
+        subagent_depth,
+        emit_deltas,
+    } = request;
+    let RuntimeSubagentBatchToolTurnIo {
+        events,
+        sink,
+        conversation,
+        history_writer,
+        cost_tracker,
+    } = io;
+    let RuntimeSubagentBatchToolTurnServices {
+        instructions,
+        memory,
+        mcp_registry,
+        hooks,
+    } = services;
+    let RuntimeSubagentBatchToolTurnRuntime {
+        cancel,
+        workflow_ipc,
+    } = runtime;
     let results = execute_subagent_batch(
         config,
         cwd,
@@ -817,26 +867,35 @@ mod tests {
         let cancel = CancelToken::new();
         let mut conversation = orca_core::conversation::Conversation::new();
 
-        let outcome = super::run_subagent_batch_tool_turn(
-            &config,
-            cwd.path(),
-            &mut events,
-            &mut sink,
-            &mut conversation,
-            None,
-            &requests,
-            0,
-            true,
-            &instructions,
-            &memory,
-            &mcp_registry,
-            &hooks,
-            &mut cost_tracker,
-            &cancel,
-            None,
-            fake_child_executor::<std::io::Sink>,
-        )
-        .expect("run subagent batch tool turn");
+        let outcome =
+            super::run_subagent_batch_tool_turn(super::RuntimeSubagentBatchToolTurnContext {
+                request: super::RuntimeSubagentBatchToolTurnRequest {
+                    config: &config,
+                    cwd: cwd.path(),
+                    tool_requests: &requests,
+                    subagent_depth: 0,
+                    emit_deltas: true,
+                },
+                io: super::RuntimeSubagentBatchToolTurnIo {
+                    events: &mut events,
+                    sink: &mut sink,
+                    conversation: &mut conversation,
+                    history_writer: None,
+                    cost_tracker: &mut cost_tracker,
+                },
+                services: super::RuntimeSubagentBatchToolTurnServices {
+                    instructions: &instructions,
+                    memory: &memory,
+                    mcp_registry: &mcp_registry,
+                    hooks: &hooks,
+                },
+                runtime: super::RuntimeSubagentBatchToolTurnRuntime {
+                    cancel: &cancel,
+                    workflow_ipc: None,
+                },
+                child_executor: fake_child_executor::<std::io::Sink>,
+            })
+            .expect("run subagent batch tool turn");
 
         assert!(matches!(outcome, ToolTurnOutcome::Continue));
         assert_eq!(conversation.messages.len(), 2);

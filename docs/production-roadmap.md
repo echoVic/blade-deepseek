@@ -383,6 +383,10 @@ copied into Orca.
    subagent depth, delta policy, and approval policy through
    `RuntimeNormalToolTurnRequest`, leaving the context to compose named request,
    I/O, service, runtime, interaction, extension, and executor surfaces.
+   Subagent batch tool-turn execution now enters
+   `run_subagent_batch_tool_turn` through `RuntimeSubagentBatchToolTurnContext`
+   and its request, I/O, service, and runtime groups, so the TUI-shared
+   subagent batch path no longer exposes a long runner argument list.
    Iteration stages now keep lifecycle-owned `RuntimeTurnLoopIterationState`
    grouped instead of unpacking runtime system messages, model overrides,
    cost/cancel/task refs, and extension refs into the iteration input. Keep

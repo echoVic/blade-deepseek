@@ -3522,6 +3522,7 @@ mod tests {
     fn subagent_batch_tool_turn_runner_is_owned_by_subagent_execution_module() {
         let agent_loop_source = include_str!("agent_loop.rs");
         let subagent_execution_source = include_str!("subagent_execution.rs");
+        let tool_turn_source = include_str!("tool_turn.rs");
 
         for marker in [
             "execute_subagent_batch(",
@@ -3544,6 +3545,27 @@ mod tests {
         assert!(
             subagent_execution_source.contains("pub(crate) fn run_subagent_batch_tool_turn"),
             "subagent_execution must expose subagent batch tool-turn runner"
+        );
+        assert!(
+            subagent_execution_source.contains("context: RuntimeSubagentBatchToolTurnContext<"),
+            "subagent batch tool-turn runner must take a grouped runtime context"
+        );
+        for marker in [
+            "pub(crate) struct RuntimeSubagentBatchToolTurnContext",
+            "pub(crate) struct RuntimeSubagentBatchToolTurnRequest",
+            "pub(crate) struct RuntimeSubagentBatchToolTurnIo",
+            "pub(crate) struct RuntimeSubagentBatchToolTurnServices",
+            "pub(crate) struct RuntimeSubagentBatchToolTurnRuntime",
+        ] {
+            assert!(
+                subagent_execution_source.contains(marker),
+                "subagent_execution must expose grouped subagent batch boundary {marker}"
+            );
+        }
+        assert!(
+            tool_turn_source
+                .contains("run_subagent_batch_tool_turn(RuntimeSubagentBatchToolTurnContext"),
+            "tool_turn must pass subagent batch inputs as one grouped context"
         );
         assert!(
             subagent_execution_source.contains("execute_subagent_batch"),

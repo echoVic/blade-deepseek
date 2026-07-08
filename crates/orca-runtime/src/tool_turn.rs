@@ -27,7 +27,10 @@ use crate::step_context::{
     RuntimeSamplingRequestState, RuntimeStepContext, RuntimeToolResultRecordOutcome,
 };
 use crate::subagent_execution::{
-    collect_subagent_batch, run_subagent_batch_tool_turn, should_run_subagent_batch,
+    RuntimeSubagentBatchToolTurnContext, RuntimeSubagentBatchToolTurnIo,
+    RuntimeSubagentBatchToolTurnRequest, RuntimeSubagentBatchToolTurnRuntime,
+    RuntimeSubagentBatchToolTurnServices, collect_subagent_batch, run_subagent_batch_tool_turn,
+    should_run_subagent_batch,
 };
 use crate::tasks::TaskRegistry;
 use crate::thread_store::SessionWriter;
@@ -203,25 +206,33 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                 sampling_state.tool_dispatch_window(tool_requests, |tool_requests, start_index| {
                     collect_subagent_batch(config, tool_requests, start_index)
                 });
-            match run_subagent_batch_tool_turn(
-                config,
-                cwd,
-                events,
-                sink,
-                conversation,
-                history_writer.as_deref_mut(),
-                dispatch_window.tool_requests(),
-                subagent_depth,
-                emit_deltas,
-                instructions,
-                memory,
-                mcp_registry,
-                hooks,
-                cost_tracker,
-                cancel,
-                workflow_ipc,
-                batch_child_executor,
-            )? {
+            match run_subagent_batch_tool_turn(RuntimeSubagentBatchToolTurnContext {
+                request: RuntimeSubagentBatchToolTurnRequest {
+                    config,
+                    cwd,
+                    tool_requests: dispatch_window.tool_requests(),
+                    subagent_depth,
+                    emit_deltas,
+                },
+                io: RuntimeSubagentBatchToolTurnIo {
+                    events,
+                    sink,
+                    conversation,
+                    history_writer: history_writer.as_deref_mut(),
+                    cost_tracker,
+                },
+                services: RuntimeSubagentBatchToolTurnServices {
+                    instructions,
+                    memory,
+                    mcp_registry,
+                    hooks,
+                },
+                runtime: RuntimeSubagentBatchToolTurnRuntime {
+                    cancel,
+                    workflow_ipc,
+                },
+                child_executor: batch_child_executor,
+            })? {
                 ToolTurnOutcome::Continue => {}
                 ToolTurnOutcome::Return { status, error } => {
                     return Ok(ToolTurnOutcome::Return { status, error });
