@@ -79,8 +79,7 @@ pub(crate) struct RuntimeNormalToolTurnContext<'a, W: io::Write> {
     pub(crate) policy: &'a ApprovalPolicy,
     pub(crate) services: RuntimeNormalToolTurnServices<'a>,
     pub(crate) runtime: RuntimeNormalToolTurnRuntime<'a>,
-    pub(crate) permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
-    pub(crate) user_input_handler: Option<&'a dyn RuntimeUserInputHandler>,
+    pub(crate) interactions: RuntimeNormalToolTurnInteractions<'a>,
     pub(crate) extensions: Option<RuntimeExtensionContext<'a>>,
     pub(crate) executors: RuntimeNormalToolTurnExecutors<W>,
 }
@@ -110,6 +109,11 @@ pub(crate) struct RuntimeNormalToolTurnRuntime<'a> {
     pub(crate) cancel: &'a CancelToken,
     pub(crate) task_registry: &'a TaskRegistry,
     pub(crate) workflow_ipc: Option<&'a WorkflowIpcContext>,
+}
+
+pub(crate) struct RuntimeNormalToolTurnInteractions<'a> {
+    pub(crate) permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
+    pub(crate) user_input_handler: Option<&'a dyn RuntimeUserInputHandler>,
 }
 
 impl ToolTurnOutcome {
@@ -280,8 +284,10 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                 task_registry,
                 workflow_ipc,
             },
-            permission_handler,
-            user_input_handler,
+            interactions: RuntimeNormalToolTurnInteractions {
+                permission_handler,
+                user_input_handler,
+            },
             extensions,
             executors: RuntimeNormalToolTurnExecutors {
                 child_executor,
@@ -313,8 +319,7 @@ pub(crate) fn run_normal_tool_turn<W: io::Write>(
         policy,
         services,
         runtime,
-        permission_handler,
-        user_input_handler,
+        interactions,
         extensions,
         executors,
     } = context;
@@ -341,6 +346,10 @@ pub(crate) fn run_normal_tool_turn<W: io::Write>(
         task_registry,
         workflow_ipc,
     } = runtime;
+    let RuntimeNormalToolTurnInteractions {
+        permission_handler,
+        user_input_handler,
+    } = interactions;
     let mut execution_context = ToolExecutionContext::new(cwd, subagent_depth, emit_deltas, policy)
         .with_services(instructions, memory, mcp_registry, hooks)
         .with_runtime(
@@ -718,8 +727,10 @@ mod tests {
                 task_registry: &task_registry,
                 workflow_ipc: None,
             },
-            permission_handler: None,
-            user_input_handler: None,
+            interactions: RuntimeNormalToolTurnInteractions {
+                permission_handler: None,
+                user_input_handler: None,
+            },
             extensions: None,
             executors: RuntimeNormalToolTurnExecutors {
                 child_executor: unused_child_executor,
