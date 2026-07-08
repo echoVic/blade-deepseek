@@ -4865,6 +4865,31 @@ mod tests {
             "runtime_turn_opening must own grouped runtime turn opening input"
         );
         assert!(
+            runtime_turn_opening_source.contains("turn_context: RuntimeTurnContext<'a>"),
+            "RuntimeTurnOpeningInput must carry immutable turn refs through RuntimeTurnContext"
+        );
+        let runtime_turn_opening_input = runtime_turn_opening_source
+            .split("struct RuntimeTurnOpeningInput")
+            .nth(1)
+            .and_then(|source| {
+                source
+                    .split("pub(crate) enum RuntimeTurnOpeningResult")
+                    .next()
+            })
+            .expect("RuntimeTurnOpeningInput source");
+        for marker in [
+            "cwd: &'a Path",
+            "emit_deltas: bool",
+            "prompt: &'a str",
+            "subagent_type: &'a SubagentType",
+            "steer_handle: Option<&'a ThreadSteerHandle>",
+        ] {
+            assert!(
+                !runtime_turn_opening_input.contains(marker),
+                "RuntimeTurnOpeningInput must not duplicate turn-entry field {marker}"
+            );
+        }
+        assert!(
             runtime_turn_opening_source.contains("impl RuntimeTurnOpeningStep"),
             "runtime_turn_opening must own runtime turn opening step behavior"
         );

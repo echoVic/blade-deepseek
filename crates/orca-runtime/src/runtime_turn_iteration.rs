@@ -2,8 +2,7 @@ use std::io;
 
 use crate::agent_child::ChildAgentExecutor;
 use crate::lifecycle::{
-    AgentLoopResult, RuntimeTaskActor, RuntimeTurnContext, RuntimeTurnDeps,
-    RuntimeTurnLoopIterationState,
+    AgentLoopResult, RuntimeTaskActor, RuntimeTurnDeps, RuntimeTurnLoopIterationState,
 };
 use crate::provider_turn::{
     RuntimeProviderCycleInput, RuntimeTurnProviderCycleResult, RuntimeTurnProviderCycleStep,
@@ -57,15 +56,7 @@ impl RuntimeTurnIterationStep {
         batch_child_executor: ChildAgentExecutor<io::Sink>,
     ) -> io::Result<RuntimeTurnIterationResult> {
         let turn_context = input.request.turn_context;
-        let RuntimeTurnContext {
-            cwd,
-            prompt,
-            subagent_depth: _,
-            emit_deltas,
-            subagent_type,
-            continuation,
-            steer_handle,
-        } = turn_context.clone();
+        let continuation = turn_context.continuation.clone();
 
         let turn_provider_config = {
             let (conversation, history_writer) = input.prepared_conversation.parts_mut();
@@ -74,19 +65,15 @@ impl RuntimeTurnIterationStep {
                 provider: input.provider_context.provider,
                 context_config: input.provider_context.context_config,
                 provider_config: input.provider_context.provider_config,
-                cwd,
-                emit_deltas,
+                turn_context: turn_context.clone(),
                 hooks: input.deps.hooks,
                 events: input.output.events,
                 sink: input.output.sink,
                 conversation,
                 history_writer,
-                prompt,
                 model: input.provider_context.model,
-                subagent_type,
                 model_override: input.loop_state.model_override,
                 cost_tracker: input.loop_state.cost_tracker,
-                steer_handle,
             })? {
                 RuntimeTurnOpeningResult::Continue { provider_config } => provider_config,
                 RuntimeTurnOpeningResult::Return(result) => {

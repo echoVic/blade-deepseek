@@ -346,7 +346,10 @@ copied into Orca.
    `RuntimeTurnContext` instead of duplicating those turn-entry refs.
    `RuntimeProviderTurnInput` now also consumes that turn context directly, so
    provider-call hook, streaming-delta, and steering setup no longer receive a
-   second flattened copy of the same turn-entry data.
+   second flattened copy of the same turn-entry data. `RuntimeTurnOpeningInput`
+   now also consumes the lifecycle-owned `RuntimeTurnContext`, keeping
+   compaction, turn-start, model-route, and steering setup on the same immutable
+   turn-entry boundary.
    Iteration stages now keep lifecycle-owned `RuntimeTurnLoopIterationState`
    grouped instead of unpacking runtime system messages, model overrides,
    cost/cancel/task refs, and extension refs into the iteration input. Keep

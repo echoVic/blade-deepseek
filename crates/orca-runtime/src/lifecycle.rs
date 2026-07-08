@@ -1451,6 +1451,7 @@ mod tests {
         let model = ModelSelection::parse(None).expect("model");
         let subagent_type = SubagentType::General;
         let cwd = Path::new(".");
+        let turn_context = RuntimeTurnContext::new(cwd, "hello", 3, true, &subagent_type);
 
         let result = RuntimeTurnOpeningStep::new()
             .open(RuntimeTurnOpeningInput {
@@ -1458,19 +1459,15 @@ mod tests {
                 provider: ProviderKind::DeepSeek,
                 context_config: &context_config,
                 provider_config: &provider_config,
-                cwd,
-                emit_deltas: true,
+                turn_context,
                 hooks: &hooks,
                 events: &mut events,
                 sink: &mut sink,
                 conversation: &mut conversation,
                 history_writer: None,
-                prompt: "hello",
                 model: &model,
-                subagent_type: &subagent_type,
                 model_override: None,
                 cost_tracker: &mut cost_tracker,
-                steer_handle: None,
             })
             .expect("open turn");
 
