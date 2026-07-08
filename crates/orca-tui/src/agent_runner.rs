@@ -46,26 +46,31 @@ enum ProviderStreamEvent {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum TuiAgentTurnContinuation {
+    WorkflowNotification(PendingWorkflowNotification),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TuiAgentTurnResult {
     pub(crate) status: String,
-    pub(crate) next_workflow_notification: Option<PendingWorkflowNotification>,
+    pub(crate) continuation: Option<TuiAgentTurnContinuation>,
 }
 
 impl TuiAgentTurnResult {
     fn new(status: impl Into<String>) -> Self {
         Self {
             status: status.into(),
-            next_workflow_notification: None,
+            continuation: None,
         }
     }
 
-    fn with_next_workflow_notification(
+    fn with_continuation(
         status: impl Into<String>,
-        next_workflow_notification: PendingWorkflowNotification,
+        continuation: TuiAgentTurnContinuation,
     ) -> Self {
         Self {
             status: status.into(),
-            next_workflow_notification: Some(next_workflow_notification),
+            continuation: Some(continuation),
         }
     }
 }
@@ -539,7 +544,7 @@ pub(crate) fn continue_approved_background_turn_for_tui(
     let status = status.as_str();
 
     if status == "success"
-        && let Some(next_workflow_notification) =
+        && let Some(notification) =
             take_pending_workflow_notification(pending_workflow_notifications)
     {
         send_session_completed_for_tui(
@@ -555,9 +560,9 @@ pub(crate) fn continue_approved_background_turn_for_tui(
             "success",
         );
         session.complete("success");
-        return TuiAgentTurnResult::with_next_workflow_notification(
+        return TuiAgentTurnResult::with_continuation(
             "success",
-            next_workflow_notification,
+            TuiAgentTurnContinuation::WorkflowNotification(notification),
         );
     }
 
@@ -1497,7 +1502,7 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
             }
             index += 1;
         }
-        if let Some(next_workflow_notification) =
+        if let Some(notification) =
             take_pending_workflow_notification(pending_workflow_notifications)
         {
             send_session_completed_for_tui(
@@ -1513,9 +1518,9 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
                 "success",
             );
             session.complete("success");
-            return TuiAgentTurnResult::with_next_workflow_notification(
+            return TuiAgentTurnResult::with_continuation(
                 "success",
-                next_workflow_notification,
+                TuiAgentTurnContinuation::WorkflowNotification(notification),
             );
         }
     }
@@ -2293,6 +2298,28 @@ mod tests {
     }
 
     #[test]
+    fn tui_agent_turn_result_owns_typed_continuation_boundary() {
+        let source = include_str!("agent_runner.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source before tests");
+
+        assert!(
+            production.contains("pub(crate) enum TuiAgentTurnContinuation"),
+            "turn results should name continuation intent with a typed boundary"
+        );
+        assert!(
+            production.contains("pub(crate) continuation: Option<TuiAgentTurnContinuation>"),
+            "turn results should expose a generic continuation slot"
+        );
+        assert!(
+            !production.contains("next_workflow_notification"),
+            "workflow notifications should be one continuation variant, not the result field"
+        );
+    }
+
+    #[test]
     fn failed_workflow_notification_is_returned_after_tool_batch_boundary() {
         let temp = tempfile::tempdir().unwrap();
         let mut config = full_auto_config();
@@ -2329,9 +2356,13 @@ mod tests {
         assert_eq!(result.status, "success");
         assert_eq!(
             result
-                .next_workflow_notification
+                .continuation
                 .as_ref()
-                .map(|notification| (notification.id.as_str(), notification.prompt.as_str())),
+                .map(|continuation| match continuation {
+                    TuiAgentTurnContinuation::WorkflowNotification(notification) => {
+                        (notification.id.as_str(), notification.prompt.as_str())
+                    }
+                }),
             Some((
                 "notification-1",
                 "<task-notification><status>failed</status></task-notification>"
@@ -2371,7 +2402,7 @@ mod tests {
         );
 
         assert_eq!(result.status, "success");
-        assert!(result.next_workflow_notification.is_none());
+        assert!(result.continuation.is_none());
     }
 
     #[test]

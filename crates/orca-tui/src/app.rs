@@ -4046,15 +4046,17 @@ fn run_goal_turns_for_tui(
             }
             break;
         }
-        if let Some(next_workflow_notification) = turn_result.next_workflow_notification {
+        if let Some(continuation) = turn_result.continuation {
             // Workflow failure notifications are diagnostic follow-ups for the turn that just
             // finished, so they do not consume goal-continuation quota or wait for the next
             // goal-status poll.
-            submitted_turn = SubmittedTurn::workflow_notification(
-                next_workflow_notification.id,
-                next_workflow_notification.prompt,
-            );
-            continue;
+            match continuation {
+                bridge::TuiAgentTurnContinuation::WorkflowNotification(notification) => {
+                    submitted_turn =
+                        SubmittedTurn::workflow_notification(notification.id, notification.prompt);
+                    continue;
+                }
+            }
         }
         if session.has_active_workflows() {
             let _ = event_tx.send(TuiEvent::Notice(
@@ -4532,13 +4534,19 @@ fn agent_loop_thread(
                         &cancel,
                         Some(&pending_workflow_notifications),
                     );
-                    if let Some(notification) = result.next_workflow_notification {
-                        pending_actions.borrow_mut().push_front(
-                            UserAction::SubmitWorkflowNotification {
-                                id: notification.id,
-                                prompt: notification.prompt,
-                            },
-                        );
+                    if let Some(continuation) = result.continuation {
+                        match continuation {
+                            bridge::TuiAgentTurnContinuation::WorkflowNotification(
+                                notification,
+                            ) => {
+                                pending_actions.borrow_mut().push_front(
+                                    UserAction::SubmitWorkflowNotification {
+                                        id: notification.id,
+                                        prompt: notification.prompt,
+                                    },
+                                );
+                            }
+                        }
                     }
                 }
             }

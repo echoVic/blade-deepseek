@@ -282,8 +282,11 @@ copied into Orca.
    user's last backtrack target. That submitted-turn value now enters the TUI
    goal-turn loop as one boundary object, with `SubmittedTurnPresentation`
    owning the task label and backtrack policy that had been passed as parallel
-   fields. Next, move the same id discipline into remaining turn/item
-   continuations and workflow notification ownership so continuations stop
+   fields. Turn results now expose a typed `TuiAgentTurnContinuation` boundary
+   instead of a workflow-notification-specific result field, so workflow
+   follow-ups are one continuation variant and future continuation kinds do not
+   need more parallel ad hoc result slots. Next, move the same id discipline
+   into remaining turn/item continuation ownership so continuations stop
    depending on separate ad hoc task fields plus TUI-local queues.
 3. **P2: Frozen per-turn context boundary.** Continue shrinking wide call
    surfaces into `RuntimeTurnConfig`, `RuntimeTurnDeps`,
