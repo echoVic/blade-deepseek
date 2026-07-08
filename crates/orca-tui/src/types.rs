@@ -129,6 +129,7 @@ pub enum UserAction {
     Approve { id: String, approved: bool },
     ResolveBackgroundApproval { task_id: String, approved: bool },
     StopTask { task_id: String },
+    ForegroundTask { task_id: String },
     RespondToUserInput { id: String, answer: String },
     Backtrack,
     BackgroundCurrentTurn,
@@ -988,12 +989,14 @@ impl AppState {
                 }
             }
             TuiEvent::WorkflowTasksUpdated { tasks } => {
-                if tasks.iter().any(|task| {
+                let has_backgrounded_running_main_session = tasks.iter().any(|task| {
                     task.task_type == orca_core::task_types::TaskType::MainSession
                         && task.status == orca_core::task_types::TaskStatus::Running
                         && task.is_backgrounded
-                }) {
-                    self.suppress_background_main_session_output = true;
+                });
+                self.suppress_background_main_session_output =
+                    has_backgrounded_running_main_session;
+                if has_backgrounded_running_main_session {
                     self.set_status(AppStatus::Idle);
                 }
                 let selected_task_id = self
@@ -2570,6 +2573,20 @@ mod tests {
             state.messages.last(),
             Some(ChatMessage::Assistant(text)) if text == "visible foreground output"
         ));
+    }
+
+    #[test]
+    fn foregrounded_main_session_task_update_clears_output_suppression() {
+        let mut state = state();
+        state.suppress_background_main_session_output = true;
+
+        let mut task = workflow_task_summary("task-main", "foregrounded");
+        task.task_type = TaskType::MainSession;
+        task.status = TaskStatus::Running;
+        task.is_backgrounded = false;
+        state.update(TuiEvent::WorkflowTasksUpdated { tasks: vec![task] });
+
+        assert!(!state.suppress_background_main_session_output);
     }
 
     #[test]

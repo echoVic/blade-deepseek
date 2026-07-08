@@ -310,7 +310,10 @@ copied into Orca.
    longer terminal output readable without letting one task consume the panel.
    Task refreshes now sort the panel by attention priority (approval-required,
    active, then terminal with recent activity first) while preserving the
-   selected task by id across refreshes.
+   selected task by id across refreshes. Backgrounded running main-session
+   tasks can now be returned to the foreground from the panel with `f`, clearing
+   foreground-output suppression and refreshing the task list through
+   `TaskRegistry`.
 
 ### P0: Session Runtime Unification
 

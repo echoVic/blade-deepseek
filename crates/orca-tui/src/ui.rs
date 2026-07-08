@@ -617,6 +617,12 @@ fn workflow_panel_action_hint<'a>(
     if selected_task.is_some_and(is_stoppable_task) {
         spans.push(Span::styled(" · s stop", Style::default().fg(theme.muted)));
     }
+    if selected_task.is_some_and(is_foregroundable_task) {
+        spans.push(Span::styled(
+            " · f foreground",
+            Style::default().fg(theme.muted),
+        ));
+    }
     spans.push(Span::styled(
         " · Esc close",
         Style::default().fg(theme.muted),
@@ -636,6 +642,12 @@ fn is_stoppable_task(task: &BackgroundTaskSummary) -> bool {
         task.status,
         TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled | TaskStatus::Stopped
     )
+}
+
+fn is_foregroundable_task(task: &BackgroundTaskSummary) -> bool {
+    task.task_type == TaskType::MainSession
+        && task.status == TaskStatus::Running
+        && task.is_backgrounded
 }
 
 fn render_agents_panel(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) {
@@ -3851,6 +3863,54 @@ mod tests {
         assert!(rendered.contains("↑↓ select"));
         assert!(!rendered.contains("s stop"));
         assert!(rendered.contains("Esc close"));
+    }
+
+    #[test]
+    fn workflows_panel_renders_foreground_action_hint_for_backgrounded_main_session() {
+        let mut state = test_state();
+        state.panel_mode = PanelMode::Workflows;
+        state.workflow_panel.tasks = vec![BackgroundTaskSummary {
+            id: "task-main".to_string(),
+            task_type: TaskType::MainSession,
+            status: TaskStatus::Running,
+            is_backgrounded: true,
+            description: "Long answer".to_string(),
+            created_at_ms: 1_000,
+            started_at_ms: Some(1_000),
+            completed_at_ms: None,
+            command: None,
+            agent_type: Some("main-session".to_string()),
+            server: None,
+            tool: None,
+            pending_tool_call: None,
+            name: None,
+            workflow_run_id: None,
+            phase_count: None,
+            workflow_progress: None,
+            workflow_phases: Vec::new(),
+            workflow_agents: Vec::new(),
+            workflow_script_path: None,
+            workflow_launch_input: None,
+            workflow_final_summary: None,
+            workflow_failure_count: 0,
+            usage: None,
+            subagent_current_activity: None,
+            subagent_turn: None,
+            last_activity_at_ms: Some(4_000),
+            result: None,
+            error: None,
+        }];
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let textarea = TextArea::default();
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 12))
+            .expect("test backend");
+
+        terminal
+            .draw(|frame| render(frame, &mut state, &textarea, &theme))
+            .expect("draw");
+        let rendered = format!("{:?}", terminal.backend().buffer());
+
+        assert!(rendered.contains("f foreground"));
     }
 
     #[test]

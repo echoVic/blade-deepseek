@@ -580,6 +580,24 @@ impl TaskRegistry {
         })
     }
 
+    pub fn mark_foregrounded(&self, id: &str) -> Result<(), String> {
+        self.update_task(id, |record| {
+            if record.task_type != TaskType::MainSession {
+                return Err("mark_foregrounded requires a main session task".to_string());
+            }
+            if record.status != TaskStatus::Running {
+                return Err(task_state_error("mark_foregrounded", record.status));
+            }
+            if !record.is_backgrounded {
+                return Err("mark_foregrounded requires a backgrounded task".to_string());
+            }
+
+            record.is_backgrounded = false;
+            record.last_activity_at_ms = Some(now_ms());
+            Ok(())
+        })
+    }
+
     pub fn mark_worker_spawned(&self, id: &str, pid: u32) -> Result<(), String> {
         self.update_task(id, |record| {
             if is_terminal(record.status) {
@@ -2229,6 +2247,21 @@ mod tests {
         let running = registry.get(&task.id).unwrap();
         assert_eq!(running.status, TaskStatus::Running);
         assert!(!running.control.pause.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn registry_marks_backgrounded_main_session_foregrounded() {
+        let registry = TaskRegistry::new("session-1".to_string());
+        let task = registry.create_main_session("long prompt".to_string());
+        registry.mark_running(&task.id).unwrap();
+        registry.mark_backgrounded(&task.id).unwrap();
+
+        registry.mark_foregrounded(&task.id).unwrap();
+
+        let record = registry.get(&task.id).unwrap();
+        assert_eq!(record.status, TaskStatus::Running);
+        assert!(!record.is_backgrounded);
+        assert!(record.last_activity_at_ms.is_some());
     }
 
     #[test]

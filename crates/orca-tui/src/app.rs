@@ -1016,6 +1016,28 @@ mod tests {
     }
 
     #[test]
+    fn workflows_panel_f_key_handles_selected_backgrounded_main_session() {
+        let (mut state, rx) = test_state();
+        let mut task = workflow_task("task-main", "backgrounded");
+        task.task_type = orca_core::task_types::TaskType::MainSession;
+        task.status = orca_core::task_types::TaskStatus::Running;
+        task.is_backgrounded = true;
+        state.show_workflows();
+        state.workflow_panel.tasks = vec![task];
+
+        let action_tx = state.event_tx.clone();
+        assert!(handle_workflows_panel_key(
+            KeyCode::Char('f'),
+            &mut state,
+            &action_tx
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(UserAction::ForegroundTask { task_id }) if task_id == "task-main"
+        ));
+    }
+
+    #[test]
     fn background_approval_resolution_sends_task_scoped_action() {
         let (mut state, rx) = test_state();
         let action_tx = state.event_tx.clone();
@@ -1305,6 +1327,33 @@ mod tests {
                 if tasks.len() == 1
                     && tasks[0].status == orca_core::task_types::TaskStatus::Stopped
                     && tasks[0].pending_tool_call.is_none()
+        ));
+    }
+
+    #[test]
+    fn foreground_task_for_tui_marks_backgrounded_task_and_refreshes_tasks() {
+        let registry = orca_runtime::tasks::TaskRegistry::new("session-1".to_string());
+        let task = registry.create_main_session("Long answer".to_string());
+        registry.mark_running(&task.id).unwrap();
+        registry.mark_backgrounded(&task.id).unwrap();
+        let (event_tx, event_rx) = mpsc::channel();
+
+        assert!(foreground_task_for_tui(
+            Some(&registry),
+            &task.id,
+            &event_tx
+        ));
+
+        let record = registry.get(&task.id).unwrap();
+        assert!(!record.is_backgrounded);
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(TuiEvent::WorkflowTasksUpdated { tasks })
+                if tasks.len() == 1 && !tasks[0].is_backgrounded
+        ));
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(TuiEvent::Notice(message)) if message.contains("returned to foreground")
         ));
     }
 
@@ -3229,6 +3278,15 @@ fn handle_workflows_panel_key(
             });
             true
         }
+        KeyCode::Char('f') => {
+            let Some(task) = selected_foregroundable_task(state) else {
+                return false;
+            };
+            let _ = action_tx.send(UserAction::ForegroundTask {
+                task_id: task.id.clone(),
+            });
+            true
+        }
         _ => false,
     }
 }
@@ -3241,6 +3299,22 @@ fn selected_stoppable_task(
         .tasks
         .get(state.workflow_panel.selected)?;
     if is_terminal_task_status(task.status) {
+        return None;
+    }
+    Some(task)
+}
+
+fn selected_foregroundable_task(
+    state: &AppState,
+) -> Option<&orca_core::task_types::BackgroundTaskSummary> {
+    let task = state
+        .workflow_panel
+        .tasks
+        .get(state.workflow_panel.selected)?;
+    if task.task_type != orca_core::task_types::TaskType::MainSession
+        || task.status != orca_core::task_types::TaskStatus::Running
+        || !task.is_backgrounded
+    {
         return None;
     }
     Some(task)
@@ -3398,6 +3472,35 @@ fn stop_task_for_tui(
             });
             let _ = event_tx.send(TuiEvent::Notice(format!(
                 "Task stop requested for {task_id}."
+            )));
+            true
+        }
+        Err(error) => {
+            let _ = event_tx.send(TuiEvent::Error(error));
+            false
+        }
+    }
+}
+
+fn foreground_task_for_tui(
+    task_registry: Option<&orca_runtime::tasks::TaskRegistry>,
+    task_id: &str,
+    event_tx: &mpsc::Sender<TuiEvent>,
+) -> bool {
+    let Some(task_registry) = task_registry else {
+        let _ = event_tx.send(TuiEvent::Error(
+            "cannot foreground task before a session exists".to_string(),
+        ));
+        return false;
+    };
+
+    match task_registry.mark_foregrounded(task_id) {
+        Ok(()) => {
+            let _ = event_tx.send(TuiEvent::WorkflowTasksUpdated {
+                tasks: task_registry.list(),
+            });
+            let _ = event_tx.send(TuiEvent::Notice(format!(
+                "Task {task_id} returned to foreground."
             )));
             true
         }
@@ -3984,6 +4087,13 @@ fn agent_loop_thread(
             Ok(UserAction::BackgroundCurrentTurn) => {}
             Ok(UserAction::StopTask { task_id }) => {
                 stop_task_for_tui(
+                    session.as_ref().map(|session| session.task_registry()),
+                    &task_id,
+                    &event_tx,
+                );
+            }
+            Ok(UserAction::ForegroundTask { task_id }) => {
+                foreground_task_for_tui(
                     session.as_ref().map(|session| session.task_registry()),
                     &task_id,
                     &event_tx,
