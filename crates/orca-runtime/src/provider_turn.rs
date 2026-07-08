@@ -85,12 +85,10 @@ pub(crate) struct RuntimeProviderTurnInput<'a, 'runtime, W: io::Write> {
     pub(crate) provider: ProviderKind,
     pub(crate) runtime_system_messages: &'a [String],
     pub(crate) provider_config: &'a ProviderConfig,
-    pub(crate) cwd: &'a str,
-    pub(crate) emit_deltas: bool,
+    pub(crate) turn_context: RuntimeTurnContext<'a>,
     pub(crate) hooks: &'a HookRunner,
     pub(crate) cancel: &'a CancelToken,
     pub(crate) max_budget_usd: Option<f64>,
-    pub(crate) steer_handle: Option<&'a crate::lifecycle::ThreadSteerHandle>,
     pub(crate) io: RuntimeProviderTurnIo<'a, W>,
 }
 
@@ -312,20 +310,23 @@ impl RuntimeProviderTurnStep {
             sink,
             mut history_writer,
         } = input.io;
+        let cwd_display = input.turn_context.cwd.display().to_string();
+        let emit_deltas = input.turn_context.emit_deltas;
+        let steer_handle = input.turn_context.steer_handle;
         let pre_model_outcome = match input.actor.run_pre_model_hook_with_cancel(
             input.hooks,
-            input.cwd,
+            &cwd_display,
             Some(input.cancel),
         ) {
             Ok(outcome) => outcome,
             Err(error) => return Ok(RuntimeProviderTurnOutput::terminal(error)),
         };
         if input.cancel.is_cancelled() {
-            return cancelled_provider_turn(input.emit_deltas, events, sink);
+            return cancelled_provider_turn(emit_deltas, events, sink);
         }
 
         RuntimeSteerStep::new().apply(RuntimeSteerInput {
-            steer_handle: input.steer_handle,
+            steer_handle,
             conversation,
             history_writer: history_writer.as_deref_mut(),
         })?;
@@ -339,23 +340,23 @@ impl RuntimeProviderTurnStep {
             &model_conversation,
             input.provider_config,
             input.cancel,
-            &mut |step| emit_provider_delta(step, input.emit_deltas, events, sink),
+            &mut |step| emit_provider_delta(step, emit_deltas, events, sink),
         );
         if input.cancel.is_cancelled() {
-            return cancelled_provider_turn(input.emit_deltas, events, sink);
+            return cancelled_provider_turn(emit_deltas, events, sink);
         }
 
         if let Some(warning) = input.actor.run_post_model_hook_with_cancel(
             input.hooks,
-            input.cwd,
+            &cwd_display,
             response.usage.as_ref(),
             Some(input.cancel),
-        ) && input.emit_deltas
+        ) && emit_deltas
         {
             sink.emit(&events.error(&warning))?;
         }
         if input.cancel.is_cancelled() {
-            return cancelled_provider_turn(input.emit_deltas, events, sink);
+            return cancelled_provider_turn(emit_deltas, events, sink);
         }
 
         if let Some(usage) = response.usage
@@ -366,7 +367,7 @@ impl RuntimeProviderTurnStep {
                 .record_usage(usage, cost_tracker, input.max_budget_usd)
             {
                 Ok(totals) => {
-                    if input.emit_deltas {
+                    if emit_deltas {
                         sink.emit(&events.usage_updated(totals))?;
                         if let Some(writer) = history_writer.as_deref_mut() {
                             writer.append_usage(totals)?;
@@ -529,8 +530,6 @@ impl RuntimeTurnProviderCycleStep {
         let turn_context = input.turn_context.clone();
         let cwd = turn_context.cwd;
         let emit_deltas = turn_context.emit_deltas;
-        let steer_handle = turn_context.steer_handle;
-        let cwd_display = cwd.display().to_string();
         let continuation = input.continuation.take();
         let preapproved_tool_call_id = continuation
             .as_ref()
@@ -546,12 +545,10 @@ impl RuntimeTurnProviderCycleStep {
                     provider: input.provider,
                     runtime_system_messages: input.runtime_system_messages,
                     provider_config: input.turn_provider_config,
-                    cwd: &cwd_display,
-                    emit_deltas,
+                    turn_context: turn_context.clone(),
                     hooks: capabilities.hooks,
                     cancel: capabilities.cancel,
                     max_budget_usd: input.max_budget_usd,
-                    steer_handle,
                     io: RuntimeProviderTurnIo {
                         conversation,
                         cost_tracker: input.cost_tracker,
@@ -903,12 +900,16 @@ mod tests {
                 provider: ProviderKind::Mock,
                 runtime_system_messages: runtime_system_messages.as_slice(),
                 provider_config: &provider_config,
-                cwd: ".",
-                emit_deltas: true,
+                turn_context: RuntimeTurnContext::new(
+                    Path::new("."),
+                    "mock_system_echo",
+                    0,
+                    true,
+                    &orca_core::subagent_types::SubagentType::General,
+                ),
                 hooks: &hooks,
                 cancel: &cancel,
                 max_budget_usd: None,
-                steer_handle: None,
                 io: RuntimeProviderTurnIo {
                     conversation: &mut conversation,
                     cost_tracker: &mut cost_tracker,

@@ -344,6 +344,9 @@ copied into Orca.
    snapshot shape. `RuntimeProviderCycleInput` now follows the same boundary,
    handing provider-cycle steps cwd, delta emission, and steering through
    `RuntimeTurnContext` instead of duplicating those turn-entry refs.
+   `RuntimeProviderTurnInput` now also consumes that turn context directly, so
+   provider-call hook, streaming-delta, and steering setup no longer receive a
+   second flattened copy of the same turn-entry data.
    Iteration stages now keep lifecycle-owned `RuntimeTurnLoopIterationState`
    grouped instead of unpacking runtime system messages, model overrides,
    cost/cancel/task refs, and extension refs into the iteration input. Keep

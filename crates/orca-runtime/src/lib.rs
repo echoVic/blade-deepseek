@@ -1124,6 +1124,10 @@ mod tests {
             "RuntimeProviderTurnInput must carry provider-turn I/O refs through one named field"
         );
         assert!(
+            provider_turn_source.contains("turn_context: RuntimeTurnContext<'a>"),
+            "RuntimeProviderTurnInput must carry immutable turn refs through RuntimeTurnContext"
+        );
+        assert!(
             provider_turn_runtime_source.contains(
                 "pub(crate) fn run<W: io::Write>(\n        &mut self,\n        input: RuntimeProviderTurnInput<'_, '_, W>,"
             ),
@@ -1143,10 +1147,13 @@ mod tests {
             "conversation",
             "history_writer",
             "cost_tracker",
+            "cwd",
+            "emit_deltas",
+            "steer_handle",
         ] {
             assert!(
                 !provider_turn_input_struct.contains(&format!("pub(crate) {field_name}:")),
-                "RuntimeProviderTurnInput must not expose provider-turn I/O field {field_name} outside RuntimeProviderTurnIo"
+                "RuntimeProviderTurnInput must not expose grouped field {field_name} outside its named context"
             );
         }
 
