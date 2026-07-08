@@ -415,6 +415,9 @@ copied into Orca.
    Approval dialog key handling now lives in a focused TUI approval dialog
    action module, covering direct numeric/legacy option keys, selection
    movement, confirmation, and approve/deny shortcut resolution.
+   Approval mode cycling now lives in a focused TUI approval mode action
+   module, keeping Shift+Tab mode transitions, shared config updates, status
+   cell updates, and user-visible notices out of the app event loop.
    Runtime task summaries now also expose terminal `result`/`error` fields so
    the selected task row can show completion output or failure details in the
    panel. The

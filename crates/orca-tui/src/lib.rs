@@ -5,6 +5,7 @@ mod agent_workflow_execution;
 pub mod app;
 mod approval_actions;
 mod approval_dialog_actions;
+mod approval_mode_actions;
 mod background_approval;
 mod background_tasks;
 pub mod bridge;
@@ -657,6 +658,41 @@ mod tests {
         assert!(
             !app.contains("ApprovalShortcut::Confirm"),
             "app should use approval_dialog_actions instead of confirming dialog selection inline"
+        );
+    }
+
+    #[test]
+    fn tui_approval_mode_actions_are_owned_by_dedicated_module() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let approval_mode_actions =
+            std::fs::read_to_string(format!("{manifest_dir}/src/approval_mode_actions.rs"))
+                .expect("approval_mode_actions module should exist");
+        assert!(
+            approval_mode_actions.contains("pub(crate) fn cycle_approval_mode"),
+            "approval_mode_actions should own Shift+Tab approval mode cycling"
+        );
+        assert!(
+            approval_mode_actions.contains("config.approval_mode.next()"),
+            "approval_mode_actions should own the approval mode cycle"
+        );
+        assert!(
+            approval_mode_actions.contains("shared_config"),
+            "approval_mode_actions should update the shared runtime config"
+        );
+        assert!(
+            approval_mode_actions.contains("Approval mode switched to"),
+            "approval_mode_actions should own the user-visible mode switch notice"
+        );
+
+        let app = std::fs::read_to_string(format!("{manifest_dir}/src/app.rs"))
+            .expect("app source should be readable");
+        assert!(
+            !app.contains("config.approval_mode.next()"),
+            "app should use approval_mode_actions instead of cycling approval mode inline"
+        );
+        assert!(
+            !app.contains("Approval mode switched to"),
+            "app should use approval_mode_actions instead of formatting mode notices inline"
         );
     }
 

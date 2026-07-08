@@ -25,6 +25,7 @@ use orca_core::model::ModelSelection;
 use orca_runtime::history;
 
 use crate::approval_dialog_actions::handle_approval_dialog_key;
+use crate::approval_mode_actions::cycle_approval_mode;
 use crate::background_approval::submit_background_approval_response_for_tui;
 use crate::background_tasks::{
     foreground_task_for_tui, notify_recovered_background_approvals_for_tui, stop_task_for_tui,
@@ -306,17 +307,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                         AppStatus::Idle | AppStatus::Running | AppStatus::WaitingUserInput
                     )
                 {
-                    let next = config.approval_mode.next();
-                    config.approval_mode = next;
-                    if let Ok(mut cfg) = shared_config.lock() {
-                        cfg.approval_mode = next;
-                    }
-                    state.approval_mode = next;
-                    state.messages.push(ChatMessage::System(format!(
-                        "Approval mode switched to {}.",
-                        next.as_str()
-                    )));
-                    state.scroll_to_bottom();
+                    cycle_approval_mode(&mut config, &shared_config, &mut state);
                     continue;
                 }
 
