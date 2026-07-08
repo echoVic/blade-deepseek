@@ -7,10 +7,12 @@ Last updated: 2026-07-08
 Current baseline: current main after v0.1.191 owns the approved background
 provider-response continuation envelope in `orca-runtime`: the runtime consumes
 the pending provider response from `TaskRegistry` and derives the single
-preapproved tool-call id before the TUI resumes a backgrounded turn. The TUI
-still owns the follow-on provider/tool loop, so the next architecture slice is
-to make runtime provider-cycle execution accept an already-returned
-`ProviderResponse` as the first continuation step. Earlier v0.1.191 makes
+preapproved tool-call id before the TUI resumes a backgrounded turn. Runtime
+provider-cycle and turn-loop inputs can now accept an already-returned
+`ProviderResponse` as the first continuation step and consume it once before
+normal provider calls resume. The TUI still owns the follow-on renderer-aware
+provider/tool loop, so the next architecture slice is to lift that continuation
+entrypoint into the agent-loop/TUI bridge boundary. Earlier v0.1.191 makes
 `RuntimeProviderResponseStep` consume the
 named `RuntimeProviderResponseInput` directly and carries child-agent executors
 through `RuntimeProviderResponseExecutors`. Provider final-message handling and
@@ -210,13 +212,13 @@ surface and pending-request UX, but its broad `ToolUseContext` should not be
 copied into Orca.
 
 1. **P0: Runtime-owned background approval continuation execution.** The runtime
-   now owns the approved continuation envelope, but TUI still loops over
-   provider responses and tool execution after approval. Add a runtime-owned
-   continuation input that lets `RuntimeTurnProviderCycleStep` skip the first
-   provider call and handle the stored `ProviderResponse` through the same
-   provider-error, response, tool-turn, and terminal folding path as foreground
-   turns. This is the highest TUI-user fix because it removes duplicated
-   continuation semantics from the renderer.
+   now owns the approved continuation envelope and the provider-cycle/turn-loop
+   input can skip the first provider call, handling the stored
+   `ProviderResponse` through the same provider-error, response, tool-turn, and
+   terminal folding path as foreground turns. The remaining work is to expose
+   that continuation input at the agent-loop/TUI bridge boundary and retire the
+   renderer-owned background continuation loop. This is the highest TUI-user
+   fix because it removes duplicated continuation semantics from the renderer.
 2. **P1: Typed `RuntimeTurnContinuation` and pending interactive request
    boundary.** Codex tracks pending interactive replay by request/turn/item ids,
    and package 3 keeps `pendingPermissionRequests` keyed by request id. Orca
