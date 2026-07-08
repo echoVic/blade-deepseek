@@ -1011,23 +1011,34 @@ impl AppState {
                 }
             }
             TuiEvent::WorkflowTasksUpdated { tasks } => {
-                let has_backgrounded_running_main_session = tasks.iter().any(|task| {
-                    task.task_type == orca_core::task_types::TaskType::MainSession
-                        && task.status == orca_core::task_types::TaskStatus::Running
-                        && task.is_backgrounded
-                });
+                let was_suppressing_background_output =
+                    self.suppress_background_main_session_output;
+                let has_backgrounded_running_main_session =
+                    tasks.iter().any(is_backgrounded_running_main_session);
                 self.suppress_background_main_session_output =
                     has_backgrounded_running_main_session;
                 if has_backgrounded_running_main_session {
                     self.set_status(AppStatus::Idle);
                 }
+                let should_reveal_background_task =
+                    has_backgrounded_running_main_session && !was_suppressing_background_output;
                 let selected_task_id = self
                     .workflow_panel
                     .tasks
                     .get(self.workflow_panel.selected)
                     .map(|task| task.id.clone());
                 self.workflow_panel.tasks = sort_workflow_tasks_for_panel(tasks);
-                if let Some(selected_task_id) = selected_task_id
+                if should_reveal_background_task {
+                    self.panel_mode = PanelMode::Workflows;
+                    if let Some(index) = self
+                        .workflow_panel
+                        .tasks
+                        .iter()
+                        .position(is_backgrounded_running_main_session)
+                    {
+                        self.workflow_panel.selected = index;
+                    }
+                } else if let Some(selected_task_id) = selected_task_id
                     && let Some(index) = self
                         .workflow_panel
                         .tasks
@@ -1356,6 +1367,12 @@ fn sort_workflow_tasks_for_panel(
             .then_with(|| left.id.cmp(&right.id))
     });
     tasks
+}
+
+fn is_backgrounded_running_main_session(task: &BackgroundTaskSummary) -> bool {
+    task.task_type == orca_core::task_types::TaskType::MainSession
+        && task.status == orca_core::task_types::TaskStatus::Running
+        && task.is_backgrounded
 }
 
 fn workflow_task_panel_group(task: &BackgroundTaskSummary) -> u8 {
@@ -2601,6 +2618,45 @@ mod tests {
         assert_eq!(
             state.workflow_panel.tasks[state.workflow_panel.selected].id,
             "task-completed"
+        );
+    }
+
+    #[test]
+    fn backgrounded_main_session_update_reveals_and_selects_task_panel_once() {
+        let mut state = state();
+        let mut backgrounded = workflow_task_summary("task-main", "backgrounded");
+        backgrounded.task_type = TaskType::MainSession;
+        backgrounded.status = TaskStatus::Running;
+        backgrounded.is_backgrounded = true;
+        backgrounded.last_activity_at_ms = Some(8_000);
+        let mut workflow = workflow_task_summary("task-workflow", "workflow");
+        workflow.status = TaskStatus::Running;
+        workflow.last_activity_at_ms = Some(9_000);
+
+        state.update(TuiEvent::WorkflowTasksUpdated {
+            tasks: vec![workflow.clone(), backgrounded.clone()],
+        });
+
+        assert_eq!(state.panel_mode, PanelMode::Workflows);
+        assert_eq!(
+            state.workflow_panel.tasks[state.workflow_panel.selected].id,
+            "task-main"
+        );
+
+        state.workflow_panel.selected = state
+            .workflow_panel
+            .tasks
+            .iter()
+            .position(|task| task.id == "task-workflow")
+            .expect("workflow task remains visible");
+        backgrounded.last_activity_at_ms = Some(10_000);
+        state.update(TuiEvent::WorkflowTasksUpdated {
+            tasks: vec![workflow, backgrounded],
+        });
+
+        assert_eq!(
+            state.workflow_panel.tasks[state.workflow_panel.selected].id,
+            "task-workflow"
         );
     }
 

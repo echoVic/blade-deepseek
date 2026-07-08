@@ -316,7 +316,10 @@ copied into Orca.
    `TaskRegistry`; the detached background provider worker now replays buffered
    visible reasoning/message/tool-progress deltas generated while hidden,
    forwards future deltas after foregrounding, and emits the normal foreground
-   session-completed event when that turn finishes.
+   session-completed event when that turn finishes. When a main-session turn is
+   first backgrounded, the TUI now opens the task panel and selects that
+   backgrounded session once, making the foreground/stop controls discoverable
+   without stealing selection on later refreshes.
 
 ### P0: Session Runtime Unification
 
