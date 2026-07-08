@@ -255,7 +255,9 @@ copied into Orca.
    now pass through `RuntimeTurnOutputContext` instead of parallel
    `EventFactory`/`EventSink` fields. Turn-loop provider/model refs now pass
    through `RuntimeTurnProviderContext` instead of parallel provider,
-   provider-config, model, and budget fields. Keep borrowing package 3's
+   provider-config, model, and budget fields, and immutable request inputs now
+   pass through `RuntimeTurnRequestContext` instead of parallel cwd, prompt,
+   continuation, steering, and subagent fields. Keep borrowing package 3's
    explicit loop-local `State` idea, but avoid a single giant context object.
 4. **P3: Protocolized task/thread/interactive status.** Push background task,
    approval-needed, needs-input, foregrounded/backgrounded, and completed

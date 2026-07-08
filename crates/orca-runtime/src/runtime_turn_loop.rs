@@ -50,6 +50,16 @@ pub(crate) struct RuntimeTurnProviderContext<'a> {
     pub(crate) max_budget_usd: Option<f64>,
 }
 
+pub(crate) struct RuntimeTurnRequestContext<'a> {
+    pub(crate) cwd: &'a Path,
+    pub(crate) emit_deltas: bool,
+    pub(crate) prompt: &'a str,
+    pub(crate) subagent_type: &'a SubagentType,
+    pub(crate) continuation: Option<RuntimeTurnContinuation>,
+    pub(crate) steer_handle: Option<&'a ThreadSteerHandle>,
+    pub(crate) subagent_depth: u32,
+}
+
 pub(crate) struct RuntimeAgentTurnLoopInput<'a, 'runtime, W: io::Write> {
     pub(crate) actor: &'a mut RuntimeTaskActor<'runtime>,
     pub(crate) context_config: &'a context::ContextConfig,
@@ -78,19 +88,13 @@ pub(crate) struct RuntimeAgentTurnLoopInput<'a, 'runtime, W: io::Write> {
 pub(crate) struct RuntimeTurnLoopInput<'a, 'runtime, W: io::Write> {
     pub(crate) actor: &'a mut RuntimeTaskActor<'runtime>,
     pub(crate) provider_context: RuntimeTurnProviderContext<'a>,
-    pub(crate) cwd: &'a Path,
-    pub(crate) emit_deltas: bool,
+    pub(crate) request: RuntimeTurnRequestContext<'a>,
     pub(crate) hooks: &'a HookRunner,
     pub(crate) output: RuntimeTurnOutputContext<'a, 'a, W>,
     pub(crate) prepared_conversation: &'a mut RuntimePreparedConversation<'runtime>,
-    pub(crate) prompt: &'a str,
-    pub(crate) subagent_type: &'a SubagentType,
-    pub(crate) continuation: Option<RuntimeTurnContinuation>,
     pub(crate) loop_state: RuntimeTurnLoopState<'a>,
-    pub(crate) steer_handle: Option<&'a ThreadSteerHandle>,
     pub(crate) config: &'a RunConfig,
     pub(crate) tool_policy: AgentToolPolicyContext<'a>,
-    pub(crate) subagent_depth: u32,
     pub(crate) policy: &'a ApprovalPolicy,
     pub(crate) instructions: &'a ProjectInstructions,
     pub(crate) memory: &'a MemoryBlock,
@@ -110,19 +114,13 @@ impl<'a, 'runtime, W: io::Write> RuntimeTurnLoopInput<'a, 'runtime, W> {
     pub(crate) fn new(
         actor: &'a mut RuntimeTaskActor<'runtime>,
         provider_context: RuntimeTurnProviderContext<'a>,
-        cwd: &'a Path,
-        emit_deltas: bool,
+        request: RuntimeTurnRequestContext<'a>,
         hooks: &'a HookRunner,
         output: RuntimeTurnOutputContext<'a, 'a, W>,
         prepared_conversation: &'a mut RuntimePreparedConversation<'runtime>,
-        prompt: &'a str,
-        subagent_type: &'a SubagentType,
-        continuation: Option<RuntimeTurnContinuation>,
         loop_state: RuntimeTurnLoopState<'a>,
-        steer_handle: Option<&'a ThreadSteerHandle>,
         config: &'a RunConfig,
         tool_policy: AgentToolPolicyContext<'a>,
-        subagent_depth: u32,
         policy: &'a ApprovalPolicy,
         instructions: &'a ProjectInstructions,
         memory: &'a MemoryBlock,
@@ -133,19 +131,13 @@ impl<'a, 'runtime, W: io::Write> RuntimeTurnLoopInput<'a, 'runtime, W> {
         Self {
             actor,
             provider_context,
-            cwd,
-            emit_deltas,
+            request,
             hooks,
             output,
             prepared_conversation,
-            prompt,
-            subagent_type,
-            continuation,
             loop_state,
-            steer_handle,
             config,
             tool_policy,
-            subagent_depth,
             policy,
             instructions,
             memory,
@@ -169,21 +161,15 @@ impl<'a, 'runtime, W: io::Write> RuntimeTurnLoopInput<'a, 'runtime, W> {
                 self.provider_context.max_budget_usd,
             ),
             runtime_system_messages: loop_state.runtime_system_messages,
-            cwd: self.cwd,
-            emit_deltas: self.emit_deltas,
+            request: self.request.for_iteration(),
             hooks: self.hooks,
             output: RuntimeTurnOutputContext::new(&mut *self.output.events, &mut *self.output.sink),
             prepared_conversation: &mut *self.prepared_conversation,
-            prompt: self.prompt,
-            subagent_type: self.subagent_type,
-            continuation: self.continuation.take(),
             model_override: loop_state.model_override,
             cost_tracker: loop_state.cost_tracker,
-            steer_handle: self.steer_handle,
             cancel: loop_state.cancel,
             config: self.config,
             tool_policy: loop_state.tool_policy,
-            subagent_depth: self.subagent_depth,
             policy: self.policy,
             instructions: self.instructions,
             memory: self.memory,
@@ -231,6 +217,40 @@ impl<'a> RuntimeTurnProviderContext<'a> {
             provider_config,
             model,
             max_budget_usd,
+        }
+    }
+}
+
+impl<'a> RuntimeTurnRequestContext<'a> {
+    pub(crate) fn new(
+        cwd: &'a Path,
+        emit_deltas: bool,
+        prompt: &'a str,
+        subagent_type: &'a SubagentType,
+        continuation: Option<RuntimeTurnContinuation>,
+        steer_handle: Option<&'a ThreadSteerHandle>,
+        subagent_depth: u32,
+    ) -> Self {
+        Self {
+            cwd,
+            emit_deltas,
+            prompt,
+            subagent_type,
+            continuation,
+            steer_handle,
+            subagent_depth,
+        }
+    }
+
+    fn for_iteration(&mut self) -> Self {
+        Self {
+            cwd: self.cwd,
+            emit_deltas: self.emit_deltas,
+            prompt: self.prompt,
+            subagent_type: self.subagent_type,
+            continuation: self.continuation.take(),
+            steer_handle: self.steer_handle,
+            subagent_depth: self.subagent_depth,
         }
     }
 }
@@ -296,19 +316,21 @@ impl<'a, 'runtime, W: io::Write> RuntimeAgentTurnLoopInput<'a, 'runtime, W> {
                 &self.config.model,
                 self.config.max_budget_usd,
             ),
-            self.cwd,
-            self.emit_deltas,
+            RuntimeTurnRequestContext::new(
+                self.cwd,
+                self.emit_deltas,
+                self.prompt,
+                self.subagent_type,
+                self.continuation,
+                self.steer_handle,
+                self.subagent_depth,
+            ),
             self.hooks,
             self.output,
             self.prepared_conversation,
-            self.prompt,
-            self.subagent_type,
-            self.continuation,
             self.loop_state,
-            self.steer_handle,
             self.config,
             self.tool_policy,
-            self.subagent_depth,
             self.policy,
             self.instructions,
             self.memory,
@@ -446,19 +468,21 @@ mod tests {
                 &config.model,
                 None,
             ),
-            continuation: Some(continuation),
-            cwd: cwd.path(),
-            emit_deltas: true,
+            request: RuntimeTurnRequestContext::new(
+                cwd.path(),
+                true,
+                "continue",
+                &subagent_type,
+                Some(continuation),
+                None,
+                0,
+            ),
             hooks: &hooks,
             output: RuntimeTurnOutputContext::new(&mut events, &mut sink),
             prepared_conversation: &mut prepared_conversation,
-            prompt: "continue",
-            subagent_type: &subagent_type,
             loop_state,
-            steer_handle: None,
             config: &config,
             tool_policy: AgentToolPolicyContext::unrestricted(),
-            subagent_depth: 0,
             policy: &policy,
             instructions: &instructions,
             memory: &memory,
@@ -471,6 +495,7 @@ mod tests {
             let first_iteration = input.iteration_input();
             assert_eq!(
                 first_iteration
+                    .request
                     .continuation
                     .as_ref()
                     .and_then(|continuation| continuation.response.assistant_content.as_deref()),
@@ -478,6 +503,7 @@ mod tests {
             );
             assert_eq!(
                 first_iteration
+                    .request
                     .continuation
                     .as_ref()
                     .and_then(|continuation| continuation.preapproved_tool_call_id()),
@@ -486,7 +512,7 @@ mod tests {
         }
         {
             let second_iteration = input.iteration_input();
-            assert!(second_iteration.continuation.is_none());
+            assert!(second_iteration.request.continuation.is_none());
         }
     }
 }
