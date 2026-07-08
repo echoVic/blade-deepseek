@@ -4810,6 +4810,21 @@ mod tests {
                 "runtime_model_route must own runtime model-route detail {marker}"
             );
         }
+        assert!(
+            runtime_model_route_source.contains("turn_context: RuntimeTurnContext<'a>"),
+            "RuntimeModelRouteInput must carry immutable turn refs through RuntimeTurnContext"
+        );
+        let runtime_model_route_input = runtime_model_route_source
+            .split("struct RuntimeModelRouteInput")
+            .nth(1)
+            .and_then(|source| source.split("impl RuntimeModelRouteStep").next())
+            .expect("RuntimeModelRouteInput source");
+        for marker in ["subagent_type: &'a SubagentType", "emit_deltas: bool"] {
+            assert!(
+                !runtime_model_route_input.contains(marker),
+                "RuntimeModelRouteInput must not duplicate turn-entry field {marker}"
+            );
+        }
     }
 
     #[test]

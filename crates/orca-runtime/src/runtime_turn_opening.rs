@@ -50,12 +50,13 @@ impl RuntimeTurnOpeningStep {
         &mut self,
         mut input: RuntimeTurnOpeningInput<'_, '_, W>,
     ) -> io::Result<RuntimeTurnOpeningResult> {
+        let turn_context = input.turn_context.clone();
         let RuntimeTurnContext {
             cwd,
             prompt,
             subagent_depth: _,
             emit_deltas,
-            subagent_type,
+            subagent_type: _,
             continuation: _,
             steer_handle,
         } = input.turn_context;
@@ -90,13 +91,12 @@ impl RuntimeTurnOpeningStep {
             .route(RuntimeModelRouteInput {
                 actor: input.actor,
                 model: input.model,
-                subagent_type,
+                turn_context,
                 model_override: input.model_override,
                 provider_config: input.provider_config,
                 cost_tracker: input.cost_tracker,
                 events: input.events,
                 sink: input.sink,
-                emit_deltas,
             })?
             .provider_config;
 

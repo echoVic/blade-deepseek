@@ -1505,18 +1505,19 @@ mod tests {
         let mut cost_tracker = CostTracker::new(None);
         let model = ModelSelection::parse(None).expect("model");
         let subagent_type = SubagentType::General;
+        let cwd = Path::new(".");
+        let turn_context = RuntimeTurnContext::new(cwd, "", 3, true, &subagent_type);
 
         let result = RuntimeModelRouteStep::new()
             .route(RuntimeModelRouteInput {
                 actor: &mut actor,
                 model: &model,
-                subagent_type: &subagent_type,
+                turn_context,
                 model_override: None,
                 provider_config: &provider_config,
                 cost_tracker: &mut cost_tracker,
                 events: &mut events,
                 sink: &mut sink,
-                emit_deltas: true,
             })
             .expect("route model");
 
@@ -1550,6 +1551,8 @@ mod tests {
         let mut cost_tracker = CostTracker::new(None);
         let model = ModelSelection::parse(None).expect("model");
         let subagent_type = SubagentType::General;
+        let cwd = Path::new(".");
+        let turn_context = RuntimeTurnContext::new(cwd, "", 3, true, &subagent_type);
         let mut directive_state = RuntimeDirectiveState::default();
         directive_state.apply(RuntimeDirective::SwitchModel {
             model: orca_core::model::FLASH_MODEL.to_string(),
@@ -1560,13 +1563,12 @@ mod tests {
             .route(RuntimeModelRouteInput {
                 actor: &mut actor,
                 model: &model,
-                subagent_type: &subagent_type,
+                turn_context,
                 model_override: directive_state.model_override(),
                 provider_config: &provider_config,
                 cost_tracker: &mut cost_tracker,
                 events: &mut events,
                 sink: &mut sink,
-                emit_deltas: true,
             })
             .expect("route model");
 
