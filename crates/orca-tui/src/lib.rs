@@ -650,6 +650,12 @@ mod tests {
             !app.contains("\nfn select_slash_menu_command("),
             "app should use the slash_menu_actions module instead of defining slash selection inline"
         );
+        assert!(
+            !app.contains(
+                "use crate::slash_menu_actions::{REASONING_SUBMENU_TITLE, handle_slash_menu_key};"
+            ),
+            "app tests should reference slash_menu_actions explicitly instead of keeping main-module imports"
+        );
     }
 
     #[test]

@@ -35,7 +35,6 @@ use crate::composer_textarea::{
 use crate::input_event_actions::{handle_mouse_event, handle_paste_event};
 use crate::key_event_actions::{KeyEventFlow, handle_key_event_preflight};
 use crate::runtime_event_actions::handle_runtime_event;
-use crate::slash_menu_actions::{REASONING_SUBMENU_TITLE, handle_slash_menu_key};
 use crate::status_key_actions::{StatusKeyFlow, handle_status_key};
 use crate::submitted_turn::SubmittedTurn;
 use crate::theme::Theme;
@@ -2450,7 +2449,7 @@ mod tests {
                 _ => unreachable!(),
             };
 
-            assert!(handle_slash_menu_key(
+            assert!(crate::slash_menu_actions::handle_slash_menu_key(
                 &event,
                 key,
                 &mut state,
@@ -2501,7 +2500,7 @@ mod tests {
             _ => unreachable!(),
         };
 
-        assert!(handle_slash_menu_key(
+        assert!(crate::slash_menu_actions::handle_slash_menu_key(
             &event,
             key,
             &mut state,
@@ -2552,7 +2551,7 @@ mod tests {
                 Event::Key(key) => *key,
                 _ => unreachable!(),
             };
-            assert!(handle_slash_menu_key(
+            assert!(crate::slash_menu_actions::handle_slash_menu_key(
                 &event,
                 &key,
                 state,
@@ -2573,7 +2572,10 @@ mod tests {
             .as_ref()
             .and_then(|menu| menu.sub_menu.as_ref())
             .expect("reasoning submenu should open");
-        assert_eq!(sub.title, REASONING_SUBMENU_TITLE);
+        assert_eq!(
+            sub.title,
+            crate::slash_menu_actions::REASONING_SUBMENU_TITLE
+        );
         assert_eq!(sub.context.as_deref(), Some("deepseek-v4-pro"));
         assert!(sub.items[sub.selected].starts_with("max"));
         assert_eq!(state.model_name, "auto", "not applied yet");
