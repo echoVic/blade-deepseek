@@ -472,16 +472,32 @@ fn background_completion_notice(status: &str, pending_tool: Option<&str>) -> Str
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TuiBackgroundTurnContinuationRequest {
+    task_id: String,
+}
+
+impl TuiBackgroundTurnContinuationRequest {
+    pub(crate) fn new(task_id: String) -> Self {
+        Self { task_id }
+    }
+
+    fn task_id(&self) -> &str {
+        &self.task_id
+    }
+}
+
 pub(crate) fn continue_approved_background_turn_for_tui(
     config: &RunConfig,
     session: &mut TuiConversationSession,
-    task_id: &str,
+    continuation: &TuiBackgroundTurnContinuationRequest,
     event_tx: &Sender<TuiEvent>,
     _action_rx: &Receiver<UserAction>,
     _pending_actions: &RefCell<VecDeque<UserAction>>,
     cancel: &CancelToken,
     pending_workflow_notifications: Option<&PendingWorkflowNotifications>,
 ) -> TuiAgentTurnResult {
+    let task_id = continuation.task_id();
     let runtime_continuation =
         match orca_runtime::background_turn::take_approved_background_turn_continuation(
             session.task_registry(),
@@ -2316,6 +2332,36 @@ mod tests {
         assert!(
             !production.contains("next_workflow_notification"),
             "workflow notifications should be one continuation variant, not the result field"
+        );
+    }
+
+    #[test]
+    fn approved_background_turn_runner_takes_typed_continuation_request() {
+        let source = include_str!("agent_runner.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source before tests");
+        let runner = production
+            .split("pub(crate) fn continue_approved_background_turn_for_tui(")
+            .nth(1)
+            .expect("background continuation runner");
+        let runner_signature = runner
+            .split(") -> TuiAgentTurnResult")
+            .next()
+            .expect("background continuation runner signature");
+
+        assert!(
+            production.contains("pub(crate) struct TuiBackgroundTurnContinuationRequest"),
+            "background continuations should cross the TUI runner boundary as a typed request"
+        );
+        assert!(
+            runner_signature.contains("continuation: &TuiBackgroundTurnContinuationRequest"),
+            "runner should take the typed continuation request"
+        );
+        assert!(
+            !runner_signature.contains("task_id: &str"),
+            "runner should not expose a naked task id in the continuation boundary"
         );
     }
 

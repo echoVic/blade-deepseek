@@ -1,5 +1,5 @@
 pub(crate) use crate::agent_runner::{
-    PendingWorkflowNotifications, TuiAgentTurnContinuation,
+    PendingWorkflowNotifications, TuiAgentTurnContinuation, TuiBackgroundTurnContinuationRequest,
     continue_approved_background_turn_for_tui, run_agent_for_tui_with_notification_queue,
 };
 pub use crate::agent_runner::{launch_saved_workflow_for_tui, run_agent_for_tui};

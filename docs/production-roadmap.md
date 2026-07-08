@@ -285,9 +285,13 @@ copied into Orca.
    fields. Turn results now expose a typed `TuiAgentTurnContinuation` boundary
    instead of a workflow-notification-specific result field, so workflow
    follow-ups are one continuation variant and future continuation kinds do not
-   need more parallel ad hoc result slots. Next, move the same id discipline
-   into remaining turn/item continuation ownership so continuations stop
-   depending on separate ad hoc task fields plus TUI-local queues.
+   need more parallel ad hoc result slots. Approved background turns also cross
+   from the TUI approval handler into the continuation runner as a typed
+   `TuiBackgroundTurnContinuationRequest`, so the runner no longer exposes a
+   naked task id as its continuation boundary and denied approvals do not
+   manufacture continuation requests. Next, move the same id discipline into
+   remaining turn/item continuation ownership so continuations stop depending on
+   separate ad hoc task fields plus TUI-local queues.
 3. **P2: Frozen per-turn context boundary.** Continue shrinking wide call
    surfaces into `RuntimeTurnConfig`, `RuntimeTurnDeps`,
    `RuntimeTurnState`, and request snapshots. Runtime turn continuations now

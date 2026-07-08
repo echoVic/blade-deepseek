@@ -1260,13 +1260,14 @@ mod tests {
             .unwrap();
         let (event_tx, event_rx) = mpsc::channel();
 
-        submit_background_approval_response_for_tui(
+        let continuation_request = submit_background_approval_response_for_tui(
             Some(&registry),
             "mock-tool-1",
             false,
             &event_tx,
         );
 
+        assert!(continuation_request.is_none());
         let record = registry.get(&task.id).unwrap();
         assert_eq!(record.status, orca_core::task_types::TaskStatus::Stopped);
         assert_eq!(record.pending_tool_call, None);
@@ -3692,7 +3693,7 @@ fn submit_background_approval_response_for_tui(
     approval_id: &str,
     approved: bool,
     event_tx: &mpsc::Sender<TuiEvent>,
-) -> Option<String> {
+) -> Option<bridge::TuiBackgroundTurnContinuationRequest> {
     let Some(task_registry) = task_registry else {
         let _ = event_tx.send(TuiEvent::Error(
             "cannot resolve background approval before a session exists".to_string(),
@@ -3715,7 +3716,11 @@ fn submit_background_approval_response_for_tui(
             let _ = event_tx.send(TuiEvent::Notice(format!(
                 "Background approval {decision} for {task_id}."
             )));
-            Some(task_id)
+            if approved {
+                Some(bridge::TuiBackgroundTurnContinuationRequest::new(task_id))
+            } else {
+                None
+            }
         }
         Err(error) => {
             let _ = event_tx.send(TuiEvent::Error(error));
@@ -4513,21 +4518,21 @@ fn agent_loop_thread(
                 );
             }
             Ok(UserAction::ResolveBackgroundApproval { id, approved }) => {
-                let submitted_task_id = submit_background_approval_response_for_tui(
+                let continuation_request = submit_background_approval_response_for_tui(
                     session.as_ref().map(|session| session.task_registry()),
                     &id,
                     approved,
                     &event_tx,
                 );
                 if approved
-                    && let Some(task_id) = submitted_task_id
+                    && let Some(continuation_request) = continuation_request
                     && let Some(session) = session.as_mut()
                 {
                     let cfg = config.lock().unwrap().clone();
                     let result = bridge::continue_approved_background_turn_for_tui(
                         &cfg,
                         session,
-                        &task_id,
+                        &continuation_request,
                         &event_tx,
                         &action_rx,
                         &pending_actions,
