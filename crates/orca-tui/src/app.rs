@@ -1868,6 +1868,72 @@ mod tests {
     }
 
     #[test]
+    fn workflow_notification_submit_bypasses_user_file_mention_expansion() {
+        with_orca_home(|_| {
+            let temp = tempfile::tempdir().unwrap();
+            let workspace = temp.path().join("workspace");
+            std::fs::create_dir(&workspace).unwrap();
+            std::fs::write(temp.path().join("outside.txt"), "outside").unwrap();
+
+            let mut cfg = test_config(HistoryMode::Record);
+            cfg.cwd = Some(workspace);
+            let config = Arc::new(Mutex::new(cfg));
+            let preloaded = Arc::new(Mutex::new(None));
+            let (event_tx, event_rx) = mpsc::channel();
+            let (action_tx, action_rx) = mpsc::channel();
+            let cancel = CancelToken::new();
+
+            let handle = std::thread::spawn({
+                let config = Arc::clone(&config);
+                let preloaded = Arc::clone(&preloaded);
+                let cancel = cancel.clone();
+                move || {
+                    agent_loop_thread(
+                        config,
+                        preloaded,
+                        event_tx,
+                        action_rx,
+                        cancel,
+                        test_pending_workflow_notifications(),
+                    )
+                }
+            });
+
+            action_tx
+                .send(UserAction::SubmitWorkflowNotification {
+                    id: "notification-1".to_string(),
+                    prompt: "mock_history_echo\nread @../outside.txt".to_string(),
+                })
+                .unwrap();
+
+            let mut saw_history_echo = false;
+            let mut unexpected_error = None;
+            for _ in 0..10 {
+                match event_rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+                    TuiEvent::MessageDelta(text) if text.contains("Mock history users:") => {
+                        saw_history_echo = true;
+                        break;
+                    }
+                    TuiEvent::Error(message) => {
+                        unexpected_error = Some(message);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+
+            action_tx.send(UserAction::Cancel).unwrap();
+            handle.join().unwrap();
+
+            assert_eq!(unexpected_error, None);
+            assert!(
+                saw_history_echo,
+                "workflow notifications should not be preprocessed as user-authored @file mentions"
+            );
+        });
+    }
+
+    #[test]
     fn backgrounded_agent_loop_does_not_complete_unexecuted_tool_calls() {
         with_orca_home(|_| {
             let config = Arc::new(Mutex::new(test_config(HistoryMode::Record)));
@@ -4017,6 +4083,102 @@ fn recv_next_user_action(
     action_rx.recv()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubmittedTurnSource {
+    User,
+    WorkflowNotification,
+}
+
+struct SubmittedTurn {
+    prompt: String,
+    source: SubmittedTurnSource,
+}
+
+impl SubmittedTurn {
+    fn user(prompt: String) -> Self {
+        Self {
+            prompt,
+            source: SubmittedTurnSource::User,
+        }
+    }
+
+    fn workflow_notification(prompt: String) -> Self {
+        Self {
+            prompt,
+            source: SubmittedTurnSource::WorkflowNotification,
+        }
+    }
+
+    fn prompt_for_model(self, cwd: &std::path::Path) -> Result<String, String> {
+        match self.source {
+            SubmittedTurnSource::User => mentions::expand_file_mentions(&self.prompt, cwd),
+            SubmittedTurnSource::WorkflowNotification => Ok(self.prompt),
+        }
+    }
+}
+
+fn handle_submitted_turn_for_tui(
+    submitted_turn: SubmittedTurn,
+    config: &Arc<Mutex<RunConfig>>,
+    preloaded: &Arc<Mutex<Option<history::SessionTranscript>>>,
+    session: &mut Option<bridge::TuiConversationSession>,
+    pending_pinned_context: &mut Vec<String>,
+    event_tx: &mpsc::Sender<TuiEvent>,
+    action_rx: &mpsc::Receiver<UserAction>,
+    pending_actions: &RefCell<VecDeque<UserAction>>,
+    cancel: &CancelToken,
+    pending_workflow_notifications: &bridge::PendingWorkflowNotifications,
+) {
+    cancel.reset();
+    let cfg = config.lock().unwrap().clone();
+    let cwd = cfg
+        .cwd
+        .clone()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let prompt = match submitted_turn.prompt_for_model(&cwd) {
+        Ok(prompt) => prompt,
+        Err(error) => {
+            let _ = event_tx.send(TuiEvent::Error(error));
+            return;
+        }
+    };
+    if session.is_none() {
+        let transcript = preloaded.lock().unwrap().take();
+        *session =
+            match bridge::TuiConversationSession::new_with_preloaded(&cfg, &prompt, transcript) {
+                Ok(session) => Some(session),
+                Err(error) => {
+                    let _ = event_tx.send(TuiEvent::Error(format!(
+                        "failed to initialize conversation history: {error}"
+                    )));
+                    return;
+                }
+            };
+        if let Some(session) = session.as_ref() {
+            notify_recovered_background_approvals_for_tui(session.task_registry(), event_tx);
+        }
+    }
+    if let Some(session) = session.as_mut() {
+        for context in pending_pinned_context.drain(..) {
+            session.add_pinned_context(context);
+        }
+    }
+    run_goal_turns_for_tui(
+        &cfg,
+        session.as_mut().expect("session initialized"),
+        &prompt,
+        event_tx,
+        action_rx,
+        pending_actions,
+        cancel,
+        0,
+        pending_workflow_notifications,
+    );
+    if cfg.desktop_notifications {
+        let _ = orca_runtime::notify::notify("Orca", "Task completed");
+    }
+}
+
 fn agent_loop_thread(
     config: Arc<Mutex<RunConfig>>,
     preloaded: Arc<Mutex<Option<history::SessionTranscript>>>,
@@ -4031,61 +4193,33 @@ fn agent_loop_thread(
 
     loop {
         match recv_next_user_action(&action_rx, &pending_actions) {
-            Ok(
-                UserAction::Submit(prompt) | UserAction::SubmitWorkflowNotification { prompt, .. },
-            ) => {
-                cancel.reset();
-                let cfg = config.lock().unwrap().clone();
-                let cwd = cfg
-                    .cwd
-                    .clone()
-                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-                let prompt = match mentions::expand_file_mentions(&prompt, &cwd) {
-                    Ok(prompt) => prompt,
-                    Err(error) => {
-                        let _ = event_tx.send(TuiEvent::Error(error));
-                        continue;
-                    }
-                };
-                if session.is_none() {
-                    let transcript = preloaded.lock().unwrap().take();
-                    session = match bridge::TuiConversationSession::new_with_preloaded(
-                        &cfg, &prompt, transcript,
-                    ) {
-                        Ok(session) => Some(session),
-                        Err(error) => {
-                            let _ = event_tx.send(TuiEvent::Error(format!(
-                                "failed to initialize conversation history: {error}"
-                            )));
-                            continue;
-                        }
-                    };
-                    if let Some(session) = session.as_ref() {
-                        notify_recovered_background_approvals_for_tui(
-                            session.task_registry(),
-                            &event_tx,
-                        );
-                    }
-                }
-                if let Some(session) = session.as_mut() {
-                    for context in pending_pinned_context.drain(..) {
-                        session.add_pinned_context(context);
-                    }
-                }
-                run_goal_turns_for_tui(
-                    &cfg,
-                    session.as_mut().expect("session initialized"),
-                    &prompt,
+            Ok(UserAction::Submit(prompt)) => {
+                handle_submitted_turn_for_tui(
+                    SubmittedTurn::user(prompt),
+                    &config,
+                    &preloaded,
+                    &mut session,
+                    &mut pending_pinned_context,
                     &event_tx,
                     &action_rx,
                     &pending_actions,
                     &cancel,
-                    0,
                     &pending_workflow_notifications,
                 );
-                if cfg.desktop_notifications {
-                    let _ = orca_runtime::notify::notify("Orca", "Task completed");
-                }
+            }
+            Ok(UserAction::SubmitWorkflowNotification { prompt, .. }) => {
+                handle_submitted_turn_for_tui(
+                    SubmittedTurn::workflow_notification(prompt),
+                    &config,
+                    &preloaded,
+                    &mut session,
+                    &mut pending_pinned_context,
+                    &event_tx,
+                    &action_rx,
+                    &pending_actions,
+                    &cancel,
+                    &pending_workflow_notifications,
+                );
             }
             Ok(UserAction::RunWorkflow { name, args }) => {
                 cancel.reset();

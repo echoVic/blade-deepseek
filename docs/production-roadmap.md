@@ -18,7 +18,11 @@ continuations and projects runtime JSONL events back into TUI events, retiring
 the renderer-owned preapproved provider/tool loop. The follow-on TUI
 notification slice now preserves workflow terminal notification ids across the
 pending queue, action channel, and turn-result continuation boundary instead of
-recasting queued workflow continuations as plain user prompts. Earlier v0.1.191 makes
+recasting queued workflow continuations as plain user prompts. The TUI agent
+loop now also routes submitted turns through a named source boundary: human
+submits still get user-authored `@file` mention expansion, while workflow
+notification continuations are forwarded as typed follow-ups without user
+prompt preprocessing. Earlier v0.1.191 makes
 `RuntimeProviderResponseStep` consume the
 named `RuntimeProviderResponseInput` directly and carries child-agent executors
 through `RuntimeProviderResponseExecutors`. Provider final-message handling and
@@ -256,10 +260,14 @@ copied into Orca.
    named methods. Queued workflow continuations also keep their notification id
    when they cross the TUI action channel or return from a turn-result
    continuation; human prompts remain plain `Submit` actions, while workflow
-   follow-ups use a typed notification action/result. Next, move the same id
-   discipline into remaining turn/item continuations and workflow notification
-   ownership so continuations stop depending on separate ad hoc task fields plus
-   TUI-local queues.
+   follow-ups use a typed notification action/result. The TUI agent loop now
+   applies prompt preprocessing through a named submitted-turn source boundary,
+   so `@file` mention expansion remains user-input behavior and workflow
+   notifications are not dropped because generated notification text happens to
+   look like a local file mention. Next, move the same id discipline into
+   remaining turn/item continuations and workflow notification ownership so
+   continuations stop depending on separate ad hoc task fields plus TUI-local
+   queues.
 3. **P2: Frozen per-turn context boundary.** Continue shrinking wide call
    surfaces into `RuntimeTurnConfig`, `RuntimeTurnDeps`,
    `RuntimeTurnState`, and request snapshots. Runtime turn continuations now
