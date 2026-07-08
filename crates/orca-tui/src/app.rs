@@ -2037,6 +2037,40 @@ mod tests {
     }
 
     #[test]
+    fn submitted_turn_boundary_owns_goal_loop_presentation_inputs() {
+        let source = include_str!("app.rs");
+        let goal_loop_start = source
+            .rfind("fn run_goal_turns_for_tui(")
+            .expect("goal loop function");
+        let agent_loop_start = source
+            .rfind("fn agent_loop_thread(")
+            .expect("agent loop function");
+        let goal_loop_section = &source[goal_loop_start..agent_loop_start];
+
+        assert!(
+            goal_loop_section.contains("fn run_goal_turns_for_tui(\n")
+                && goal_loop_section.contains("    submitted_turn: SubmittedTurn,\n"),
+            "goal loop entry should receive the typed submitted-turn boundary"
+        );
+        assert!(
+            !goal_loop_section.contains("initial_task_description"),
+            "task labels should stay inside SubmittedTurn presentation metadata"
+        );
+        assert!(
+            !goal_loop_section.contains("initial_backtrack_target"),
+            "backtrack policy should stay inside SubmittedTurn presentation metadata"
+        );
+        assert!(
+            goal_loop_section.contains("submitted_turn.presentation.task_label.as_deref()"),
+            "goal loop should read the task label through SubmittedTurnPresentation"
+        );
+        assert!(
+            goal_loop_section.contains("submitted_turn.presentation.backtrack_target"),
+            "goal loop should read backtrack policy through SubmittedTurnPresentation"
+        );
+    }
+
+    #[test]
     fn backgrounded_agent_loop_does_not_complete_unexecuted_tool_calls() {
         with_orca_home(|_| {
             let config = Arc::new(Mutex::new(test_config(HistoryMode::Record)));
@@ -3936,9 +3970,7 @@ fn goal_continuation_prompt(objective: &str, continuation: usize) -> String {
 fn run_goal_turns_for_tui(
     config: &RunConfig,
     session: &mut bridge::TuiConversationSession,
-    initial_prompt: &str,
-    initial_task_description: Option<String>,
-    initial_backtrack_target: bool,
+    submitted_turn: SubmittedTurn,
     event_tx: &mpsc::Sender<TuiEvent>,
     action_rx: &mpsc::Receiver<UserAction>,
     pending_actions: &RefCell<VecDeque<UserAction>>,
@@ -3953,9 +3985,7 @@ fn run_goal_turns_for_tui(
         return;
     };
 
-    let mut prompt = initial_prompt.to_string();
-    let mut task_description = initial_task_description;
-    let mut backtrack_target = initial_backtrack_target;
+    let mut submitted_turn = submitted_turn;
     let mut continuation = starting_continuation;
     loop {
         if let Ok(Some(goal)) = orca_runtime::goals::GoalStore::load_default().get(&session_id)
@@ -3967,6 +3997,7 @@ fn run_goal_turns_for_tui(
         }
         let before_usage = session.usage_totals();
         let started_at = std::time::Instant::now();
+        let prompt = submitted_turn.prompt.clone();
         let turn_result = bridge::run_agent_for_tui_with_notification_queue(
             config,
             session,
@@ -3976,8 +4007,8 @@ fn run_goal_turns_for_tui(
             pending_actions,
             cancel,
             true,
-            task_description.as_deref(),
-            backtrack_target,
+            submitted_turn.presentation.task_label.as_deref(),
+            submitted_turn.presentation.backtrack_target,
             Some(pending_workflow_notifications),
         );
         let status = turn_result.status;
@@ -4019,11 +4050,10 @@ fn run_goal_turns_for_tui(
             // Workflow failure notifications are diagnostic follow-ups for the turn that just
             // finished, so they do not consume goal-continuation quota or wait for the next
             // goal-status poll.
-            task_description = Some(workflow_notification_task_label(
-                &next_workflow_notification.id,
-            ));
-            backtrack_target = false;
-            prompt = next_workflow_notification.prompt;
+            submitted_turn = SubmittedTurn::workflow_notification(
+                next_workflow_notification.id,
+                next_workflow_notification.prompt,
+            );
             continue;
         }
         if session.has_active_workflows() {
@@ -4061,9 +4091,8 @@ fn run_goal_turns_for_tui(
             ));
             break;
         }
-        prompt = goal_continuation_prompt(&goal.objective, continuation);
-        task_description = None;
-        backtrack_target = true;
+        submitted_turn =
+            SubmittedTurn::user(goal_continuation_prompt(&goal.objective, continuation));
     }
 }
 
@@ -4177,9 +4206,7 @@ fn resume_latest_active_goal_for_tui(
         run_goal_turns_for_tui(
             &cfg,
             session,
-            &prompt,
-            None,
-            true,
+            SubmittedTurn::user(prompt),
             event_tx,
             action_rx,
             pending_actions,
@@ -4206,11 +4233,31 @@ enum SubmittedTurnSource {
     WorkflowNotification,
 }
 
+struct SubmittedTurnPresentation {
+    task_label: Option<String>,
+    backtrack_target: bool,
+}
+
+impl SubmittedTurnPresentation {
+    fn user() -> Self {
+        Self {
+            task_label: None,
+            backtrack_target: true,
+        }
+    }
+
+    fn workflow_notification(id: &str) -> Self {
+        Self {
+            task_label: Some(workflow_notification_task_label(id)),
+            backtrack_target: false,
+        }
+    }
+}
+
 struct SubmittedTurn {
     prompt: String,
     source: SubmittedTurnSource,
-    task_description: Option<String>,
-    backtrack_target: bool,
+    presentation: SubmittedTurnPresentation,
 }
 
 impl SubmittedTurn {
@@ -4218,8 +4265,7 @@ impl SubmittedTurn {
         Self {
             prompt,
             source: SubmittedTurnSource::User,
-            task_description: None,
-            backtrack_target: true,
+            presentation: SubmittedTurnPresentation::user(),
         }
     }
 
@@ -4227,8 +4273,7 @@ impl SubmittedTurn {
         Self {
             prompt,
             source: SubmittedTurnSource::WorkflowNotification,
-            task_description: Some(workflow_notification_task_label(&id)),
-            backtrack_target: false,
+            presentation: SubmittedTurnPresentation::workflow_notification(&id),
         }
     }
 
@@ -4243,10 +4288,16 @@ impl SubmittedTurn {
         match self.source {
             SubmittedTurnSource::User => model_prompt.to_string(),
             SubmittedTurnSource::WorkflowNotification => self
-                .task_description
+                .presentation
+                .task_label
                 .clone()
                 .unwrap_or_else(|| model_prompt.to_string()),
         }
+    }
+
+    fn with_model_prompt(mut self, prompt: String) -> Self {
+        self.prompt = prompt;
+        self
     }
 }
 
@@ -4305,9 +4356,7 @@ fn handle_submitted_turn_for_tui(
     run_goal_turns_for_tui(
         &cfg,
         session.as_mut().expect("session initialized"),
-        &prompt,
-        submitted_turn.task_description,
-        submitted_turn.backtrack_target,
+        submitted_turn.with_model_prompt(prompt),
         event_tx,
         action_rx,
         pending_actions,
@@ -4550,9 +4599,7 @@ fn agent_loop_thread(
                             run_goal_turns_for_tui(
                                 &cfg,
                                 session,
-                                &objective,
-                                None,
-                                true,
+                                SubmittedTurn::user(objective),
                                 &event_tx,
                                 &action_rx,
                                 &pending_actions,
@@ -4655,9 +4702,7 @@ fn agent_loop_thread(
                         run_goal_turns_for_tui(
                             &cfg,
                             session,
-                            &prompt,
-                            None,
-                            true,
+                            SubmittedTurn::user(prompt),
                             &event_tx,
                             &action_rx,
                             &pending_actions,
