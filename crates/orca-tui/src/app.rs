@@ -38,13 +38,13 @@ use crate::composer_input_actions::{
 use crate::composer_textarea::{
     insert_pasted_text, make_setup_textarea, make_textarea, make_textarea_with_text, textarea_text,
 };
+use crate::idle_submit_actions::handle_idle_submit;
 use crate::mention_menu_actions::handle_mention_menu_key;
 use crate::running_actions::handle_running_shortcut;
 use crate::shortcuts::{
     ApprovalShortcut, GlobalShortcut, IdleShortcut, RunningShortcut, approval_shortcut,
     global_shortcut, idle_shortcut, running_shortcut,
 };
-use crate::slash_command_actions::{SlashOutcome, handle_slash_command};
 use crate::slash_menu_actions::{REASONING_SUBMENU_TITLE, handle_slash_menu_key};
 use crate::submitted_turn::SubmittedTurn;
 use crate::theme::Theme;
@@ -570,44 +570,15 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
 
                     match idle_shortcut(*key) {
                         Some(IdleShortcut::Submit) => {
-                            state.slash_menu = None;
-                            let lines: Vec<String> = textarea.lines().to_vec();
-                            let text = lines.join("\n").trim().to_string();
-                            if !text.is_empty() {
-                                if let Some(outcome) = handle_slash_command(
-                                    &text,
-                                    &mut config,
-                                    &shared_config,
-                                    &mut state,
-                                    &action_tx,
-                                ) {
-                                    match outcome {
-                                        SlashOutcome::Continue => {
-                                            vim_state.reset_insert(&mut textarea, &theme);
-                                            textarea = make_textarea(&vim_state, &theme);
-                                            continue;
-                                        }
-                                    }
-                                }
-                                if state.status == AppStatus::WaitingUserInput {
-                                    state.enter_running();
-                                    state.scroll_to_bottom();
-                                    if let Some(id) = state.pending_user_input_id.take() {
-                                        let _ = action_tx.send(UserAction::RespondToUserInput {
-                                            id,
-                                            answer: text,
-                                        });
-                                    }
-                                } else {
-                                    state.record_prompt(text.clone());
-                                    state.messages.push(ChatMessage::User(text.clone()));
-                                    state.enter_running();
-                                    state.scroll_to_bottom();
-                                    let _ = action_tx.send(UserAction::Submit(text));
-                                }
-                                vim_state.reset_insert(&mut textarea, &theme);
-                                textarea = make_textarea(&vim_state, &theme);
-                            }
+                            handle_idle_submit(
+                                &mut textarea,
+                                &mut vim_state,
+                                &theme,
+                                &mut state,
+                                &mut config,
+                                &shared_config,
+                                &action_tx,
+                            );
                         }
                         Some(IdleShortcut::Newline) => {
                             insert_composer_newline(&mut textarea, &mut state);
@@ -798,6 +769,7 @@ fn clear_terminal_scrollback(terminal: &mut InlineTerminal) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::slash_command_actions::handle_slash_command;
     use orca_core::config::{
         ModelRuntimeConfig, OutputFormat, ProviderKind, ThemeName, ToolConfig, WorkflowConfig,
     };

@@ -11,6 +11,7 @@ pub mod commands;
 mod composer_input_actions;
 mod composer_textarea;
 pub mod diff;
+mod idle_submit_actions;
 mod mention_menu_actions;
 mod running_actions;
 mod runtime_event_projection;
@@ -368,6 +369,45 @@ mod tests {
         assert!(
             !app.contains(".history_next("),
             "app should use the composer_input_actions module instead of recalling next history inline"
+        );
+    }
+
+    #[test]
+    fn tui_idle_submit_actions_are_owned_by_dedicated_module() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let idle_submit_actions =
+            std::fs::read_to_string(format!("{manifest_dir}/src/idle_submit_actions.rs"))
+                .expect("idle_submit_actions module should exist");
+        assert!(
+            idle_submit_actions.contains("pub(crate) fn handle_idle_submit"),
+            "idle_submit_actions should own idle Enter submit handling"
+        );
+        assert!(
+            idle_submit_actions.contains("fn reset_composer_after_submit"),
+            "idle_submit_actions should own composer reset after submit"
+        );
+        assert!(
+            idle_submit_actions.contains("UserAction::RespondToUserInput"),
+            "idle_submit_actions should own user-input answer submission"
+        );
+        assert!(
+            idle_submit_actions.contains("UserAction::Submit"),
+            "idle_submit_actions should own normal prompt submission"
+        );
+
+        let app = std::fs::read_to_string(format!("{manifest_dir}/src/app.rs"))
+            .expect("app source should be readable");
+        assert!(
+            !app.contains("state.record_prompt(text.clone())"),
+            "app should use idle_submit_actions instead of recording submitted prompts inline"
+        );
+        assert!(
+            !app.contains("answer: text"),
+            "app should use idle_submit_actions instead of sending user-input answers inline"
+        );
+        assert!(
+            !app.contains("UserAction::Submit(text)"),
+            "app should use idle_submit_actions instead of sending normal prompt submissions inline"
         );
     }
 

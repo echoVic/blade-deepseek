@@ -402,6 +402,10 @@ copied into Orca.
    Composer input editing now lives in a focused TUI composer input action
    module, covering slash/mention refresh after edits, newline handling,
    history recall, Tab file mention completion, and plain key input.
+   Idle submit handling now also lives in a focused TUI idle submit action
+   module, covering slash-command short-circuit submission, pending
+   user-input answers, normal prompt submission, prompt-history recording, and
+   composer reset after accepted submissions.
    Runtime task summaries now also expose terminal `result`/`error` fields so
    the selected task row can show completion output or failure details in the
    panel. The
