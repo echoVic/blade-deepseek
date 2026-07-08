@@ -4,7 +4,7 @@ use crate::agent_child::{ChildAgentRequest, ChildAgentResult, ChildAgentRuntime}
 use crate::cost::CostTracker;
 use crate::lifecycle::{
     AgentLoopContext, AgentLoopResult, RuntimeSessionLifecycle, RuntimeTaskActor,
-    RuntimeTurnConfig, RuntimeTurnDeps, RuntimeTurnExecution,
+    RuntimeTurnConfig, RuntimeTurnExecution,
 };
 use crate::runtime_conversation_bootstrap::RuntimeConversationBootstrapStep;
 use crate::runtime_turn_loop::{
@@ -52,13 +52,7 @@ pub(crate) fn run_agent_loop(
         turn_state,
         turn_execution,
     } = loop_context;
-    let RuntimeTurnDeps {
-        instructions,
-        memory,
-        mcp_registry,
-        hooks,
-        turn_interactions,
-    } = turn_deps.expect("agent loop turn deps");
+    let turn_deps = turn_deps.expect("agent loop turn deps");
     let turn_state = turn_state.expect("agent loop turn state");
     let loop_state = turn_state.into_loop_state();
     let RuntimeTurnExecution {
@@ -72,7 +66,7 @@ pub(crate) fn run_agent_loop(
         subagent_depth,
         subagent_type,
         loop_state.tool_policy(tool_policy),
-        mcp_registry,
+        turn_deps.mcp_registry,
     );
     let ctx_config = setup.context_config;
     let policy = setup.policy;
@@ -84,9 +78,9 @@ pub(crate) fn run_agent_loop(
         prompt,
         subagent_depth,
         subagent_type,
-        instructions,
+        turn_deps.instructions,
         config.approval_mode,
-        memory,
+        turn_deps.memory,
         emit_deltas,
     )?;
 
@@ -115,18 +109,14 @@ pub(crate) fn run_agent_loop(
                 steer_handle,
                 subagent_depth,
             ),
-            hooks,
+            deps: turn_deps,
             output: RuntimeTurnOutputContext::new(events, sink),
             prepared_conversation: &mut prepared_conversation,
             loop_state,
             config,
             tool_policy,
             policy: &policy,
-            instructions,
-            memory,
-            mcp_registry,
             workflow: RuntimeTurnWorkflowContext::new(background_workflows, workflow_ipc),
-            turn_interactions,
         },
         RuntimeTurnLoopExecutors::new(
             execute_child_agent_loop,
@@ -191,7 +181,7 @@ mod tests {
     use super::*;
     use crate::hooks::HookRunner;
     use crate::instructions::ProjectInstructions;
-    use crate::lifecycle::RuntimeTaskKind;
+    use crate::lifecycle::{RuntimeTaskKind, RuntimeTurnDeps};
     use crate::memory::MemoryBlock;
     use orca_core::cancel::CancelToken;
     use orca_core::provider_types::{ProviderResponse, ProviderStep};

@@ -7,18 +7,13 @@ use orca_core::event_schema::EventFactory;
 use orca_core::event_sink::EventSink;
 use orca_core::model::ModelSelection;
 use orca_core::subagent_types::SubagentType;
-use orca_mcp::McpRegistry;
 use orca_provider::{ProviderConfig, context};
 
 use crate::agent_child::ChildAgentExecutor;
 use crate::background_turn::RuntimeTurnContinuation;
-use crate::hooks::HookRunner;
-use crate::instructions::ProjectInstructions;
 use crate::lifecycle::{
-    AgentLoopResult, RuntimeTaskActor, RuntimeTurnInteractionState, RuntimeTurnLoopState,
-    ThreadSteerHandle,
+    AgentLoopResult, RuntimeTaskActor, RuntimeTurnDeps, RuntimeTurnLoopState, ThreadSteerHandle,
 };
-use crate::memory::MemoryBlock;
 use crate::runtime_conversation_bootstrap::RuntimePreparedConversation;
 use crate::runtime_turn_iteration::{
     RuntimeTurnIterationInput, RuntimeTurnIterationResult, RuntimeTurnIterationStep,
@@ -64,36 +59,28 @@ pub(crate) struct RuntimeAgentTurnLoopInput<'a, 'runtime, W: io::Write> {
     pub(crate) actor: &'a mut RuntimeTaskActor<'runtime>,
     pub(crate) provider_context: RuntimeTurnProviderContext<'a>,
     pub(crate) request: RuntimeTurnRequestContext<'a>,
-    pub(crate) hooks: &'a HookRunner,
+    pub(crate) deps: RuntimeTurnDeps<'a>,
     pub(crate) output: RuntimeTurnOutputContext<'a, 'a, W>,
     pub(crate) prepared_conversation: &'a mut RuntimePreparedConversation<'runtime>,
     pub(crate) loop_state: RuntimeTurnLoopState<'a>,
     pub(crate) config: &'a RunConfig,
     pub(crate) tool_policy: AgentToolPolicyContext<'a>,
     pub(crate) policy: &'a ApprovalPolicy,
-    pub(crate) instructions: &'a ProjectInstructions,
-    pub(crate) memory: &'a MemoryBlock,
-    pub(crate) mcp_registry: &'a McpRegistry,
     pub(crate) workflow: RuntimeTurnWorkflowContext<'a, 'a>,
-    pub(crate) turn_interactions: RuntimeTurnInteractionState<'a>,
 }
 
 pub(crate) struct RuntimeTurnLoopInput<'a, 'runtime, W: io::Write> {
     pub(crate) actor: &'a mut RuntimeTaskActor<'runtime>,
     pub(crate) provider_context: RuntimeTurnProviderContext<'a>,
     pub(crate) request: RuntimeTurnRequestContext<'a>,
-    pub(crate) hooks: &'a HookRunner,
+    pub(crate) deps: RuntimeTurnDeps<'a>,
     pub(crate) output: RuntimeTurnOutputContext<'a, 'a, W>,
     pub(crate) prepared_conversation: &'a mut RuntimePreparedConversation<'runtime>,
     pub(crate) loop_state: RuntimeTurnLoopState<'a>,
     pub(crate) config: &'a RunConfig,
     pub(crate) tool_policy: AgentToolPolicyContext<'a>,
     pub(crate) policy: &'a ApprovalPolicy,
-    pub(crate) instructions: &'a ProjectInstructions,
-    pub(crate) memory: &'a MemoryBlock,
-    pub(crate) mcp_registry: &'a McpRegistry,
     pub(crate) workflow: RuntimeTurnWorkflowContext<'a, 'a>,
-    pub(crate) turn_interactions: RuntimeTurnInteractionState<'a>,
 }
 
 pub(crate) struct RuntimeTurnLoopExecutors<W: io::Write> {
@@ -108,35 +95,27 @@ impl<'a, 'runtime, W: io::Write> RuntimeTurnLoopInput<'a, 'runtime, W> {
         actor: &'a mut RuntimeTaskActor<'runtime>,
         provider_context: RuntimeTurnProviderContext<'a>,
         request: RuntimeTurnRequestContext<'a>,
-        hooks: &'a HookRunner,
+        deps: RuntimeTurnDeps<'a>,
         output: RuntimeTurnOutputContext<'a, 'a, W>,
         prepared_conversation: &'a mut RuntimePreparedConversation<'runtime>,
         loop_state: RuntimeTurnLoopState<'a>,
         config: &'a RunConfig,
         tool_policy: AgentToolPolicyContext<'a>,
         policy: &'a ApprovalPolicy,
-        instructions: &'a ProjectInstructions,
-        memory: &'a MemoryBlock,
-        mcp_registry: &'a McpRegistry,
         workflow: RuntimeTurnWorkflowContext<'a, 'a>,
-        turn_interactions: RuntimeTurnInteractionState<'a>,
     ) -> Self {
         Self {
             actor,
             provider_context,
             request,
-            hooks,
+            deps,
             output,
             prepared_conversation,
             loop_state,
             config,
             tool_policy,
             policy,
-            instructions,
-            memory,
-            mcp_registry,
             workflow,
-            turn_interactions,
         }
     }
 
@@ -155,7 +134,7 @@ impl<'a, 'runtime, W: io::Write> RuntimeTurnLoopInput<'a, 'runtime, W> {
             ),
             runtime_system_messages: loop_state.runtime_system_messages,
             request: self.request.for_iteration(),
-            hooks: self.hooks,
+            deps: self.deps,
             output: RuntimeTurnOutputContext::new(&mut *self.output.events, &mut *self.output.sink),
             prepared_conversation: &mut *self.prepared_conversation,
             model_override: loop_state.model_override,
@@ -164,16 +143,12 @@ impl<'a, 'runtime, W: io::Write> RuntimeTurnLoopInput<'a, 'runtime, W> {
             config: self.config,
             tool_policy: loop_state.tool_policy,
             policy: self.policy,
-            instructions: self.instructions,
-            memory: self.memory,
-            mcp_registry: self.mcp_registry,
             task_registry: loop_state.task_registry,
             extensions: loop_state.extensions,
             workflow: RuntimeTurnWorkflowContext::new(
                 &mut *self.workflow.background_workflows,
                 self.workflow.workflow_ipc,
             ),
-            turn_interactions: self.turn_interactions,
         }
     }
 }
@@ -304,18 +279,14 @@ impl<'a, 'runtime, W: io::Write> RuntimeAgentTurnLoopInput<'a, 'runtime, W> {
             self.actor,
             self.provider_context,
             self.request,
-            self.hooks,
+            self.deps,
             self.output,
             self.prepared_conversation,
             self.loop_state,
             self.config,
             self.tool_policy,
             self.policy,
-            self.instructions,
-            self.memory,
-            self.mcp_registry,
             self.workflow,
-            self.turn_interactions,
         )
     }
 }
@@ -338,7 +309,10 @@ mod tests {
     use orca_mcp::McpRegistry;
 
     use crate::cost::CostTracker;
-    use crate::lifecycle::{RuntimeSessionLifecycle, RuntimeTurnState};
+    use crate::hooks::HookRunner;
+    use crate::instructions::ProjectInstructions;
+    use crate::lifecycle::{RuntimeSessionLifecycle, RuntimeTurnDeps, RuntimeTurnState};
+    use crate::memory::MemoryBlock;
     use crate::runtime_conversation_bootstrap::RuntimeConversationBootstrapStep;
     use crate::session::AgentConversationContext;
     use crate::tasks::TaskRegistry;
@@ -456,18 +430,14 @@ mod tests {
                 None,
                 0,
             ),
-            hooks: &hooks,
+            deps: RuntimeTurnDeps::new(&instructions, &memory, &mcp_registry, &hooks),
             output: RuntimeTurnOutputContext::new(&mut events, &mut sink),
             prepared_conversation: &mut prepared_conversation,
             loop_state,
             config: &config,
             tool_policy: AgentToolPolicyContext::unrestricted(),
             policy: &policy,
-            instructions: &instructions,
-            memory: &memory,
-            mcp_registry: &mcp_registry,
             workflow: RuntimeTurnWorkflowContext::new(&mut background_workflows, None),
-            turn_interactions: RuntimeTurnInteractionState::new(),
         };
 
         {

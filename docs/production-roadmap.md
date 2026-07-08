@@ -259,8 +259,11 @@ copied into Orca.
    pass through `RuntimeTurnRequestContext` instead of parallel cwd, prompt,
    continuation, steering, and subagent fields. `RuntimeAgentTurnLoopInput`
    now enters the loop through those same provider/request contexts instead of
-   rebuilding parallel fields at the loop boundary. Keep borrowing package 3's
-   explicit loop-local `State` idea, but avoid a single giant context object.
+   rebuilding parallel fields at the loop boundary, and turn-loop stages now
+   pass injected services through `RuntimeTurnDeps` instead of repeating hooks,
+   instruction, memory, MCP, and interaction fields. Keep borrowing package
+   3's explicit loop-local `State` idea, but avoid a single giant context
+   object.
 4. **P3: Protocolized task/thread/interactive status.** Push background task,
    approval-needed, needs-input, foregrounded/backgrounded, and completed
    status through runtime protocol events so TUI, server, and future app

@@ -708,6 +708,7 @@ mod tests {
         let lifecycle_source = include_str!("lifecycle.rs");
         let agent_loop_source = include_str!("agent_loop.rs");
         let runtime_turn_loop_source = include_str!("runtime_turn_loop.rs");
+        let runtime_turn_iteration_source = include_str!("runtime_turn_iteration.rs");
 
         assert!(
             lifecycle_source.contains("pub(crate) struct RuntimeTurnInteractionState"),
@@ -750,12 +751,16 @@ mod tests {
             "RuntimeTurnDeps must own turn interaction handlers with other injected turn services"
         );
         assert!(
-            agent_loop_source.contains("turn_interactions"),
-            "agent_loop must route turn-scoped interaction handlers through RuntimeTurnInteractionState"
+            agent_loop_source.contains("turn_deps"),
+            "agent_loop must route turn-scoped interaction handlers through RuntimeTurnDeps"
         );
         assert!(
-            runtime_turn_loop_source.contains("turn_interactions"),
-            "runtime_turn_loop must pass interaction handlers through the grouped turn interaction state"
+            runtime_turn_loop_source.contains("deps: RuntimeTurnDeps"),
+            "runtime_turn_loop must pass RuntimeTurnDeps through turn-loop inputs"
+        );
+        assert!(
+            runtime_turn_iteration_source.contains("deps.turn_interactions"),
+            "runtime_turn_iteration must read interaction handlers through RuntimeTurnDeps"
         );
     }
 
@@ -5368,6 +5373,62 @@ mod tests {
                 !agent_turn_loop_input.contains(field_name),
                 "agent turn-loop input must not expose field {field_name} outside grouped turn contexts"
             );
+        }
+    }
+
+    #[test]
+    fn runtime_turn_loop_inputs_use_runtime_turn_deps() {
+        let runtime_turn_loop_source = include_str!("runtime_turn_loop.rs");
+        let runtime_turn_iteration_source = include_str!("runtime_turn_iteration.rs");
+        let agent_turn_loop_input = runtime_turn_loop_source
+            .split("pub(crate) struct RuntimeAgentTurnLoopInput")
+            .nth(1)
+            .and_then(|source| {
+                source
+                    .split("pub(crate) struct RuntimeTurnLoopInput")
+                    .next()
+            })
+            .expect("RuntimeAgentTurnLoopInput source");
+        let turn_loop_input = runtime_turn_loop_source
+            .split("pub(crate) struct RuntimeTurnLoopInput")
+            .nth(1)
+            .and_then(|source| {
+                source
+                    .split("pub(crate) struct RuntimeTurnLoopExecutors")
+                    .next()
+            })
+            .expect("RuntimeTurnLoopInput source");
+        let turn_iteration_input = runtime_turn_iteration_source
+            .split("pub(crate) struct RuntimeTurnIterationInput")
+            .nth(1)
+            .and_then(|source| {
+                source
+                    .split("pub(crate) enum RuntimeTurnIterationResult")
+                    .next()
+            })
+            .expect("RuntimeTurnIterationInput source");
+
+        assert!(
+            runtime_turn_loop_source.contains("RuntimeTurnDeps"),
+            "runtime_turn_loop must route turn-scoped services through RuntimeTurnDeps"
+        );
+        for source in [agent_turn_loop_input, turn_loop_input, turn_iteration_input] {
+            assert!(
+                source.contains("deps: RuntimeTurnDeps"),
+                "turn-loop inputs must pass injected turn services through RuntimeTurnDeps"
+            );
+            for field_name in [
+                "hooks: &'a HookRunner",
+                "instructions: &'a ProjectInstructions",
+                "memory: &'a MemoryBlock",
+                "mcp_registry: &'a McpRegistry",
+                "turn_interactions: RuntimeTurnInteractionState",
+            ] {
+                assert!(
+                    !source.contains(field_name),
+                    "turn-loop inputs must not expose dependency field {field_name} outside RuntimeTurnDeps"
+                );
+            }
         }
     }
 

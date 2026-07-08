@@ -3,15 +3,11 @@ use std::io;
 use orca_approval::ApprovalPolicy;
 use orca_core::cancel::CancelToken;
 use orca_core::config::RunConfig;
-use orca_mcp::McpRegistry;
 
 use crate::agent_child::ChildAgentExecutor;
 use crate::cost::CostTracker;
 use crate::extension::RuntimeExtensionContext;
-use crate::hooks::HookRunner;
-use crate::instructions::ProjectInstructions;
-use crate::lifecycle::{AgentLoopResult, RuntimeTaskActor, RuntimeTurnInteractionState};
-use crate::memory::MemoryBlock;
+use crate::lifecycle::{AgentLoopResult, RuntimeTaskActor, RuntimeTurnDeps};
 use crate::provider_turn::{
     RuntimeProviderCycleInput, RuntimeTurnProviderCycleResult, RuntimeTurnProviderCycleStep,
 };
@@ -38,7 +34,7 @@ pub(crate) struct RuntimeTurnIterationInput<'a, 'runtime, W: io::Write> {
     pub(crate) provider_context: RuntimeTurnProviderContext<'a>,
     pub(crate) runtime_system_messages: &'a [String],
     pub(crate) request: RuntimeTurnRequestContext<'a>,
-    pub(crate) hooks: &'a HookRunner,
+    pub(crate) deps: RuntimeTurnDeps<'a>,
     pub(crate) output: RuntimeTurnOutputContext<'a, 'a, W>,
     pub(crate) prepared_conversation: &'a mut RuntimePreparedConversation<'runtime>,
     pub(crate) model_override: Option<&'a str>,
@@ -47,13 +43,9 @@ pub(crate) struct RuntimeTurnIterationInput<'a, 'runtime, W: io::Write> {
     pub(crate) config: &'a RunConfig,
     pub(crate) tool_policy: AgentToolPolicyContext<'a>,
     pub(crate) policy: &'a ApprovalPolicy,
-    pub(crate) instructions: &'a ProjectInstructions,
-    pub(crate) memory: &'a MemoryBlock,
-    pub(crate) mcp_registry: &'a McpRegistry,
     pub(crate) task_registry: &'a TaskRegistry,
     pub(crate) extensions: RuntimeExtensionContext<'a>,
     pub(crate) workflow: RuntimeTurnWorkflowContext<'a, 'a>,
-    pub(crate) turn_interactions: RuntimeTurnInteractionState<'a>,
 }
 
 pub(crate) enum RuntimeTurnIterationResult {
@@ -85,7 +77,7 @@ impl RuntimeTurnIterationStep {
                 provider_config: input.provider_context.provider_config,
                 cwd: input.request.cwd,
                 emit_deltas: input.request.emit_deltas,
-                hooks: input.hooks,
+                hooks: input.deps.hooks,
                 events: input.output.events,
                 sink: input.output.sink,
                 conversation,
@@ -116,15 +108,15 @@ impl RuntimeTurnIterationStep {
                 base_provider_config: input.provider_context.provider_config,
                 emit_deltas: input.request.emit_deltas,
                 capabilities: RuntimeStepCapabilitySnapshot::new(
-                    input.instructions,
-                    input.memory,
-                    input.mcp_registry,
-                    input.hooks,
+                    input.deps.instructions,
+                    input.deps.memory,
+                    input.deps.mcp_registry,
+                    input.deps.hooks,
                     input.cancel,
                     input.task_registry,
                     input.workflow.workflow_ipc,
-                    input.turn_interactions.permission_handler(),
-                    input.turn_interactions.user_input_handler(),
+                    input.deps.turn_interactions.permission_handler(),
+                    input.deps.turn_interactions.user_input_handler(),
                 ),
                 cost_tracker: input.cost_tracker,
                 max_budget_usd: input.provider_context.max_budget_usd,
