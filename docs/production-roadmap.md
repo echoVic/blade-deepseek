@@ -285,10 +285,14 @@ copied into Orca.
    refreshes.
    Server protocol event mapping also preserves that single-task status event
    as `task_status_updated` for non-TUI clients.
-5. **P4: Persistence policy for pending background continuations.** Current
-   pending provider responses are in-memory task fields. Decide whether restart
-   should replay a pending approval request, fail it cleanly, or persist a
-   compact continuation record.
+5. **P4: Persistence policy for pending background continuations.** Seeded:
+   approval-required background main-session tasks now persist a compact
+   provider-response continuation record through `TaskRegistry`, so a restarted
+   TUI session can recover the pending tool approval, accept the approval
+   response, and resume through the runtime-owned continuation path instead of
+   losing the provider response. Next, surface clearer resume messaging for
+   recovered approval-required tasks and decide whether old/invalid continuation
+   records should expire or fail closed.
 6. **P5: Package-3-style task UX polish.** Borrow the visible task panel ideas:
    sorted task list, detail view, foreground/stop actions, and notifications.
    Keep implementation behind Orca runtime task/protocol types rather than

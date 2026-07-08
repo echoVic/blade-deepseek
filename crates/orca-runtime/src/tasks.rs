@@ -7,12 +7,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use orca_core::cancel::CancelToken;
+use orca_core::conversation::RawToolCall;
 use orca_core::cost_types::UsageTotals;
-use orca_core::provider_types::{ProviderResponse, ProviderStep};
+use orca_core::provider_types::{ProviderResponse, ProviderStep, ToolCallProgress, Usage};
 use orca_core::task_types::{
     BackgroundTaskSummary, PendingToolCallSummary, TaskStatus, TaskType, WorkflowAgentTaskSummary,
     WorkflowPhaseTaskSummary, WorkflowTaskProgress,
 };
+use orca_core::tool_types::ToolRequest;
 use orca_core::workflow_types::WorkflowInput;
 use serde::{Deserialize, Serialize};
 
@@ -99,6 +101,8 @@ struct PersistedTaskRecord {
     tool: Option<String>,
     #[serde(default)]
     pending_tool_call: Option<PendingToolCallSummary>,
+    #[serde(default)]
+    pending_provider_response: Option<PersistedProviderResponse>,
     workflow_run_id: Option<String>,
     phase_count: Option<usize>,
     workflow_progress: Option<WorkflowTaskProgress>,
@@ -127,6 +131,27 @@ struct PersistedTaskRecord {
     worker_pid: Option<u32>,
     #[serde(default)]
     command: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct PersistedProviderResponse {
+    #[serde(default)]
+    steps: Vec<PersistedProviderStep>,
+    assistant_content: Option<String>,
+    assistant_reasoning: Option<String>,
+    #[serde(default)]
+    tool_calls: Vec<RawToolCall>,
+    usage: Option<Usage>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
+enum PersistedProviderStep {
+    ReasoningDelta(String),
+    MessageDelta(String),
+    ToolCallProgress(ToolCallProgress),
+    ToolCall(ToolRequest),
+    Error(String),
 }
 
 impl TaskRegistry {
@@ -1038,7 +1063,9 @@ impl PersistedTaskRecord {
             tool: self.tool,
             pending_tool_call: self.pending_tool_call,
             pending_tool_approval_response: None,
-            pending_provider_response: None,
+            pending_provider_response: self
+                .pending_provider_response
+                .map(PersistedProviderResponse::into_provider_response),
             workflow_run_id: self.workflow_run_id,
             phase_count: self.phase_count,
             workflow_progress: self.workflow_progress,
@@ -1082,6 +1109,10 @@ impl From<&TaskRecord> for PersistedTaskRecord {
             agent_type: record.agent_type.clone(),
             tool: record.tool.clone(),
             pending_tool_call: record.pending_tool_call.clone(),
+            pending_provider_response: record
+                .pending_provider_response
+                .as_ref()
+                .map(PersistedProviderResponse::from),
             workflow_run_id: record.workflow_run_id.clone(),
             phase_count: record.phase_count,
             workflow_progress: record.workflow_progress,
@@ -1099,6 +1130,63 @@ impl From<&TaskRecord> for PersistedTaskRecord {
             error: record.error.clone(),
             worker_pid: record.worker_pid,
             command: record.command.clone(),
+        }
+    }
+}
+
+impl PersistedProviderResponse {
+    fn into_provider_response(self) -> ProviderResponse {
+        ProviderResponse {
+            steps: self
+                .steps
+                .into_iter()
+                .map(PersistedProviderStep::into_provider_step)
+                .collect(),
+            assistant_content: self.assistant_content,
+            assistant_reasoning: self.assistant_reasoning,
+            tool_calls: self.tool_calls,
+            usage: self.usage,
+        }
+    }
+}
+
+impl From<&ProviderResponse> for PersistedProviderResponse {
+    fn from(response: &ProviderResponse) -> Self {
+        Self {
+            steps: response
+                .steps
+                .iter()
+                .filter_map(PersistedProviderStep::from_provider_step)
+                .collect(),
+            assistant_content: response.assistant_content.clone(),
+            assistant_reasoning: response.assistant_reasoning.clone(),
+            tool_calls: response.tool_calls.clone(),
+            usage: response.usage,
+        }
+    }
+}
+
+impl PersistedProviderStep {
+    fn from_provider_step(step: &ProviderStep) -> Option<Self> {
+        match step {
+            ProviderStep::ReasoningDelta(delta) => Some(Self::ReasoningDelta(delta.clone())),
+            ProviderStep::MessageDelta(delta) => Some(Self::MessageDelta(delta.clone())),
+            ProviderStep::ToolCallProgress(progress) => {
+                Some(Self::ToolCallProgress(progress.clone()))
+            }
+            ProviderStep::ToolCall(request) => Some(Self::ToolCall(request.clone())),
+            ProviderStep::ReplayState(_) => None,
+            ProviderStep::Error(error) => Some(Self::Error(error.clone())),
+        }
+    }
+
+    fn into_provider_step(self) -> ProviderStep {
+        match self {
+            Self::ReasoningDelta(delta) => ProviderStep::ReasoningDelta(delta),
+            Self::MessageDelta(delta) => ProviderStep::MessageDelta(delta),
+            Self::ToolCallProgress(progress) => ProviderStep::ToolCallProgress(progress),
+            Self::ToolCall(request) => ProviderStep::ToolCall(request),
+            Self::Error(error) => ProviderStep::Error(error),
         }
     }
 }
@@ -1764,6 +1852,71 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn persistent_registry_restores_pending_provider_response_for_background_continuation() {
+        use crate::background_turn::take_approved_background_turn_continuation;
+        use orca_core::approval_types::ActionKind;
+        use orca_core::provider_types::{ProviderResponse, ProviderStep};
+        use orca_core::tool_types::{ToolName, ToolRequest};
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("tasks");
+        let registry = TaskRegistry::new_persistent("session-1".to_string(), root.clone()).unwrap();
+        let task = registry.create_main_session("Needs approval".to_string());
+        let tool_request = ToolRequest {
+            id: "mock-tool-1".to_string(),
+            name: ToolName::TaskList,
+            action: ActionKind::Read,
+            target: None,
+            raw_arguments: Some("{}".to_string()),
+        };
+
+        registry.mark_running(&task.id).unwrap();
+        registry.mark_backgrounded(&task.id).unwrap();
+        registry
+            .approval_required_for_pending_provider_response(
+                &task.id,
+                "approval_required".to_string(),
+                ProviderResponse {
+                    steps: vec![ProviderStep::ToolCall(tool_request)],
+                    assistant_content: Some("I need to inspect tasks.".to_string()),
+                    assistant_reasoning: Some("Need task_list.".to_string()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                },
+            )
+            .unwrap();
+        drop(registry);
+
+        let reloaded = TaskRegistry::new_persistent("session-1".to_string(), root).unwrap();
+        let pending = reloaded.get(&task.id).expect("persistent task record");
+        assert_eq!(pending.status, TaskStatus::ApprovalRequired);
+        assert_eq!(
+            pending
+                .pending_tool_call
+                .as_ref()
+                .map(|tool| tool.id.as_str()),
+            Some("mock-tool-1")
+        );
+
+        reloaded
+            .submit_pending_tool_approval_response(&task.id, true)
+            .unwrap();
+        let continuation = take_approved_background_turn_continuation(&reloaded, &task.id)
+            .unwrap()
+            .expect("approved background continuation after reload");
+
+        assert_eq!(
+            continuation.preapproved_tool_call_id.as_deref(),
+            Some("mock-tool-1")
+        );
+        assert_eq!(
+            continuation.response.assistant_content.as_deref(),
+            Some("I need to inspect tasks.")
+        );
+        assert_eq!(continuation.response.steps.len(), 1);
     }
 
     #[test]
