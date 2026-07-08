@@ -412,6 +412,9 @@ copied into Orca.
    Global TUI shortcuts now live in a focused global action module, keeping
    Ctrl-C interrupt/exit flow, shortcut overlay toggling, transcript top/bottom
    scrolling, and clear-screen terminal cleanup out of the app event loop.
+   Approval dialog key handling now lives in a focused TUI approval dialog
+   action module, covering direct numeric/legacy option keys, selection
+   movement, confirmation, and approve/deny shortcut resolution.
    Runtime task summaries now also expose terminal `result`/`error` fields so
    the selected task row can show completion output or failure details in the
    panel. The

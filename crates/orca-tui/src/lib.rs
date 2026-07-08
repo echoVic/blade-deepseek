@@ -4,6 +4,7 @@ mod agent_tool_execution;
 mod agent_workflow_execution;
 pub mod app;
 mod approval_actions;
+mod approval_dialog_actions;
 mod background_approval;
 mod background_tasks;
 pub mod bridge;
@@ -617,6 +618,45 @@ mod tests {
         assert!(
             !app.contains("\nfn resolve_approval("),
             "app should use the approval_actions module instead of defining approval action dispatch inline"
+        );
+    }
+
+    #[test]
+    fn tui_approval_dialog_actions_are_owned_by_dedicated_module() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let approval_dialog_actions =
+            std::fs::read_to_string(format!("{manifest_dir}/src/approval_dialog_actions.rs"))
+                .expect("approval_dialog_actions module should exist");
+        assert!(
+            approval_dialog_actions.contains("pub(crate) fn handle_approval_dialog_key"),
+            "approval_dialog_actions should own approval dialog key handling"
+        );
+        assert!(
+            approval_dialog_actions.contains("option_for_key"),
+            "approval_dialog_actions should own direct numeric and legacy option keys"
+        );
+        assert!(
+            approval_dialog_actions.contains("ApprovalShortcut::ToggleSelection"),
+            "approval_dialog_actions should own dialog selection movement"
+        );
+        assert!(
+            approval_dialog_actions.contains("resolve_approval_option"),
+            "approval_dialog_actions should resolve selected approval options"
+        );
+
+        let app = std::fs::read_to_string(format!("{manifest_dir}/src/app.rs"))
+            .expect("app source should be readable");
+        assert!(
+            !app.contains("option_for_key(c)"),
+            "app should use approval_dialog_actions instead of resolving direct approval keys inline"
+        );
+        assert!(
+            !app.contains("ApprovalShortcut::ToggleSelection"),
+            "app should use approval_dialog_actions instead of moving dialog selection inline"
+        );
+        assert!(
+            !app.contains("ApprovalShortcut::Confirm"),
+            "app should use approval_dialog_actions instead of confirming dialog selection inline"
         );
     }
 

@@ -24,7 +24,7 @@ use orca_core::conversation::Message;
 use orca_core::model::ModelSelection;
 use orca_runtime::history;
 
-use crate::approval_actions::resolve_approval_option;
+use crate::approval_dialog_actions::handle_approval_dialog_key;
 use crate::background_approval::submit_background_approval_response_for_tui;
 use crate::background_tasks::{
     foreground_task_for_tui, notify_recovered_background_approvals_for_tui, stop_task_for_tui,
@@ -44,15 +44,14 @@ use crate::idle_submit_actions::handle_idle_submit;
 use crate::mention_menu_actions::handle_mention_menu_key;
 use crate::running_actions::handle_running_shortcut;
 use crate::shortcuts::{
-    ApprovalShortcut, IdleShortcut, RunningShortcut, approval_shortcut, global_shortcut,
-    idle_shortcut, running_shortcut,
+    IdleShortcut, RunningShortcut, global_shortcut, idle_shortcut, running_shortcut,
 };
 use crate::slash_menu_actions::{REASONING_SUBMENU_TITLE, handle_slash_menu_key};
 use crate::submitted_turn::SubmittedTurn;
 use crate::theme::Theme;
 use crate::types::{
-    AppState, AppStatus, ApprovalOption, ChatMessage, PanelMode, SlashMenu, SlashMenuItem, SubMenu,
-    TuiEvent, UserAction,
+    AppState, AppStatus, ChatMessage, PanelMode, SlashMenu, SlashMenuItem, SubMenu, TuiEvent,
+    UserAction,
 };
 use crate::ui;
 use crate::vim::VimState;
@@ -455,48 +454,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
 
                 // Approval dialog: 4-option selection + direct-key shortcuts.
                 if state.status == AppStatus::WaitingApproval {
-                    // Direct option keys (1/2/3/4 and legacy y/A/a/n) resolve immediately.
-                    if let KeyCode::Char(c) = key.code
-                        && let Some(option) = state
-                            .approval_dialog
-                            .as_ref()
-                            .and_then(|d| d.option_for_key(c))
-                    {
-                        resolve_approval_option(&mut state, &action_tx, option);
-                        continue;
-                    }
-                    match approval_shortcut(*key) {
-                        Some(ApprovalShortcut::SelectAllow) => {
-                            if let Some(dialog) = &mut state.approval_dialog {
-                                dialog.selected = dialog.selected.saturating_sub(1);
-                            }
-                        }
-                        Some(ApprovalShortcut::SelectDeny) => {
-                            if let Some(dialog) = &mut state.approval_dialog {
-                                let last = dialog.options.len().saturating_sub(1);
-                                dialog.selected = (dialog.selected + 1).min(last);
-                            }
-                        }
-                        Some(ApprovalShortcut::ToggleSelection) => {
-                            if let Some(dialog) = &mut state.approval_dialog {
-                                let len = dialog.options.len().max(1);
-                                dialog.selected = (dialog.selected + 1) % len;
-                            }
-                        }
-                        Some(ApprovalShortcut::Confirm) => {
-                            let option = state.approval_dialog.as_ref().map(|d| d.current());
-                            if let Some(option) = option {
-                                resolve_approval_option(&mut state, &action_tx, option);
-                            }
-                        }
-                        Some(ApprovalShortcut::Approve) => {
-                            resolve_approval_option(&mut state, &action_tx, ApprovalOption::Once);
-                        }
-                        Some(ApprovalShortcut::Deny) => {
-                            resolve_approval_option(&mut state, &action_tx, ApprovalOption::Deny);
-                        }
-                        None => {}
-                    }
+                    handle_approval_dialog_key(key, &mut state, &action_tx);
                     continue;
                 }
 
@@ -710,7 +668,9 @@ fn clear_terminal_scrollback(terminal: &mut InlineTerminal) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::approval_actions::resolve_approval_option;
     use crate::slash_command_actions::handle_slash_command;
+    use crate::types::ApprovalOption;
     use orca_core::config::{
         ModelRuntimeConfig, OutputFormat, ProviderKind, ThemeName, ToolConfig, WorkflowConfig,
     };
