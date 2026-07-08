@@ -299,7 +299,9 @@ copied into Orca.
 6. **P5: Package-3-style task UX polish.** Borrow the visible task panel ideas:
    sorted task list, detail view, foreground/stop actions, and notifications.
    Keep implementation behind Orca runtime task/protocol types rather than
-   importing package 3's UI-state coupling.
+   importing package 3's UI-state coupling. Seeded: the TUI task panel can now
+   request a stop for the selected non-terminal task through the runtime
+   `TaskRegistry`, refreshing the panel after the status changes.
 
 ### P0: Session Runtime Unification
 

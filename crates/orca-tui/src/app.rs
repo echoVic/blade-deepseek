@@ -543,7 +543,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                         }
                     }
 
-                    if handle_workflows_panel_key(key.code, &mut state) {
+                    if handle_workflows_panel_key(key.code, &mut state, &action_tx) {
                         continue;
                     }
 
@@ -947,10 +947,20 @@ mod tests {
             workflow_task("task-2", "repair"),
         ];
 
-        assert!(handle_workflows_panel_key(KeyCode::Down, &mut state));
+        let action_tx = state.event_tx.clone();
+
+        assert!(handle_workflows_panel_key(
+            KeyCode::Down,
+            &mut state,
+            &action_tx
+        ));
         assert_eq!(state.workflow_panel.selected, 1);
 
-        assert!(handle_workflows_panel_key(KeyCode::Up, &mut state));
+        assert!(handle_workflows_panel_key(
+            KeyCode::Up,
+            &mut state,
+            &action_tx
+        ));
         assert_eq!(state.workflow_panel.selected, 0);
     }
 
@@ -971,11 +981,36 @@ mod tests {
         state.show_workflows();
         state.workflow_panel.tasks = vec![task];
 
-        assert!(handle_workflows_panel_key(KeyCode::Enter, &mut state));
+        let action_tx = state.event_tx.clone();
+        assert!(handle_workflows_panel_key(
+            KeyCode::Enter,
+            &mut state,
+            &action_tx
+        ));
 
         let dialog = state.approval_dialog.as_ref().expect("approval dialog");
         assert_eq!(dialog.background_task_id.as_deref(), Some("task-approval"));
         assert_eq!(state.status, AppStatus::WaitingApproval);
+    }
+
+    #[test]
+    fn workflows_panel_s_key_handles_selected_running_task() {
+        let (mut state, rx) = test_state();
+        let mut task = workflow_task("task-running", "running");
+        task.status = orca_core::task_types::TaskStatus::Running;
+        state.show_workflows();
+        state.workflow_panel.tasks = vec![task];
+
+        let action_tx = state.event_tx.clone();
+        assert!(handle_workflows_panel_key(
+            KeyCode::Char('s'),
+            &mut state,
+            &action_tx
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(UserAction::StopTask { task_id }) if task_id == "task-running"
+        ));
     }
 
     #[test]
@@ -1205,6 +1240,69 @@ mod tests {
             event_rx.try_recv(),
             Ok(TuiEvent::Notice(message))
                 if message.contains("Background approval denied")
+        ));
+    }
+
+    #[test]
+    fn stop_task_for_tui_requests_stop_and_refreshes_tasks() {
+        let registry = orca_runtime::tasks::TaskRegistry::new("session-1".to_string());
+        let task = registry.create_main_session("Running in background".to_string());
+        registry.mark_running(&task.id).unwrap();
+        registry.mark_backgrounded(&task.id).unwrap();
+        let (event_tx, event_rx) = mpsc::channel();
+
+        assert!(stop_task_for_tui(Some(&registry), &task.id, &event_tx));
+
+        let record = registry.get(&task.id).unwrap();
+        assert_eq!(record.status, orca_core::task_types::TaskStatus::Stopping);
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(TuiEvent::WorkflowTasksUpdated { tasks })
+                if tasks.len() == 1
+                    && tasks[0].status == orca_core::task_types::TaskStatus::Stopping
+        ));
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(TuiEvent::Notice(message))
+                if message.contains("Task stop requested")
+                    && message.contains(&task.id)
+        ));
+    }
+
+    #[test]
+    fn stop_task_for_tui_stops_approval_required_task_immediately() {
+        let registry = orca_runtime::tasks::TaskRegistry::new("session-1".to_string());
+        let task = registry.create_main_session("Needs approval".to_string());
+        registry.mark_running(&task.id).unwrap();
+        registry.mark_backgrounded(&task.id).unwrap();
+        registry
+            .approval_required_for_pending_tool(
+                &task.id,
+                "approval_required".to_string(),
+                Some(orca_core::task_types::PendingToolCallSummary {
+                    id: "mock-tool-1".to_string(),
+                    name: "task_list".to_string(),
+                    action: orca_core::approval_types::ActionKind::Read,
+                    target: None,
+                    arguments: "{}".to_string(),
+                }),
+            )
+            .unwrap();
+        let (event_tx, event_rx) = mpsc::channel();
+
+        assert!(stop_task_for_tui(Some(&registry), &task.id, &event_tx));
+
+        let record = registry.get(&task.id).unwrap();
+        assert_eq!(record.status, orca_core::task_types::TaskStatus::Stopped);
+        assert_eq!(record.result.as_deref(), Some("Task stopped"));
+        assert_eq!(record.pending_tool_call, None);
+        assert_eq!(record.pending_tool_approval_response, None);
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(TuiEvent::WorkflowTasksUpdated { tasks })
+                if tasks.len() == 1
+                    && tasks[0].status == orca_core::task_types::TaskStatus::Stopped
+                    && tasks[0].pending_tool_call.is_none()
         ));
     }
 
@@ -3101,7 +3199,11 @@ fn resolve_approval(state: &mut AppState, action_tx: &mpsc::Sender<UserAction>, 
     state.approval_dialog = None;
 }
 
-fn handle_workflows_panel_key(key_code: KeyCode, state: &mut AppState) -> bool {
+fn handle_workflows_panel_key(
+    key_code: KeyCode,
+    state: &mut AppState,
+    action_tx: &mpsc::Sender<UserAction>,
+) -> bool {
     if state.panel_mode != PanelMode::Workflows {
         return false;
     }
@@ -3116,8 +3218,40 @@ fn handle_workflows_panel_key(key_code: KeyCode, state: &mut AppState) -> bool {
             true
         }
         KeyCode::Enter => state.open_selected_background_approval_dialog(),
+        KeyCode::Char('s') => {
+            let Some(task) = selected_stoppable_task(state) else {
+                return false;
+            };
+            let _ = action_tx.send(UserAction::StopTask {
+                task_id: task.id.clone(),
+            });
+            true
+        }
         _ => false,
     }
+}
+
+fn selected_stoppable_task(
+    state: &AppState,
+) -> Option<&orca_core::task_types::BackgroundTaskSummary> {
+    let task = state
+        .workflow_panel
+        .tasks
+        .get(state.workflow_panel.selected)?;
+    if is_terminal_task_status(task.status) {
+        return None;
+    }
+    Some(task)
+}
+
+fn is_terminal_task_status(status: orca_core::task_types::TaskStatus) -> bool {
+    matches!(
+        status,
+        orca_core::task_types::TaskStatus::Completed
+            | orca_core::task_types::TaskStatus::Failed
+            | orca_core::task_types::TaskStatus::Cancelled
+            | orca_core::task_types::TaskStatus::Stopped
+    )
 }
 
 fn handle_running_shortcut(
@@ -3223,6 +3357,66 @@ fn submit_background_approval_response_for_tui(
             let _ = event_tx.send(TuiEvent::Error(error));
             false
         }
+    }
+}
+
+fn stop_task_for_tui(
+    task_registry: Option<&orca_runtime::tasks::TaskRegistry>,
+    task_id: &str,
+    event_tx: &mpsc::Sender<TuiEvent>,
+) -> bool {
+    let Some(task_registry) = task_registry else {
+        let _ = event_tx.send(TuiEvent::Error(
+            "cannot stop task before a session exists".to_string(),
+        ));
+        return false;
+    };
+    let Some(task) = task_registry.get(task_id) else {
+        let _ = event_tx.send(TuiEvent::Error(format!("task '{task_id}' not found")));
+        return false;
+    };
+    if is_terminal_task_status(task.status) {
+        let _ = event_tx.send(TuiEvent::Error(format!(
+            "task '{task_id}' is already {}",
+            task_status_error_label(task.status)
+        )));
+        return false;
+    }
+
+    let stop_result = if task.status == orca_core::task_types::TaskStatus::ApprovalRequired {
+        task_registry.stop(task_id, "Task stopped".to_string())
+    } else {
+        task_registry.request_stop(task_id)
+    };
+
+    match stop_result {
+        Ok(()) => {
+            let _ = event_tx.send(TuiEvent::WorkflowTasksUpdated {
+                tasks: task_registry.list(),
+            });
+            let _ = event_tx.send(TuiEvent::Notice(format!(
+                "Task stop requested for {task_id}."
+            )));
+            true
+        }
+        Err(error) => {
+            let _ = event_tx.send(TuiEvent::Error(error));
+            false
+        }
+    }
+}
+
+fn task_status_error_label(status: orca_core::task_types::TaskStatus) -> &'static str {
+    match status {
+        orca_core::task_types::TaskStatus::Queued => "queued",
+        orca_core::task_types::TaskStatus::Running => "running",
+        orca_core::task_types::TaskStatus::ApprovalRequired => "approval_required",
+        orca_core::task_types::TaskStatus::Paused => "paused",
+        orca_core::task_types::TaskStatus::Stopping => "stopping",
+        orca_core::task_types::TaskStatus::Completed => "completed",
+        orca_core::task_types::TaskStatus::Failed => "failed",
+        orca_core::task_types::TaskStatus::Cancelled => "cancelled",
+        orca_core::task_types::TaskStatus::Stopped => "stopped",
     }
 }
 
@@ -3786,6 +3980,13 @@ fn agent_loop_thread(
                 }
             }
             Ok(UserAction::BackgroundCurrentTurn) => {}
+            Ok(UserAction::StopTask { task_id }) => {
+                stop_task_for_tui(
+                    session.as_ref().map(|session| session.task_registry()),
+                    &task_id,
+                    &event_tx,
+                );
+            }
             Ok(UserAction::ResolveBackgroundApproval { task_id, approved }) => {
                 let submitted = submit_background_approval_response_for_tui(
                     session.as_ref().map(|session| session.task_registry()),
