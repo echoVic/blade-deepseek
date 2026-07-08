@@ -1022,6 +1022,11 @@ impl AppState {
                 }
                 let should_reveal_background_task =
                     has_backgrounded_running_main_session && !was_suppressing_background_output;
+                let selected_was_backgrounded_main_session = self
+                    .workflow_panel
+                    .tasks
+                    .get(self.workflow_panel.selected)
+                    .is_some_and(is_backgrounded_running_main_session);
                 let selected_task_id = self
                     .workflow_panel
                     .tasks
@@ -1045,7 +1050,12 @@ impl AppState {
                         .iter()
                         .position(|task| task.id == selected_task_id)
                 {
+                    let selected_is_now_foregrounded = selected_was_backgrounded_main_session
+                        && is_foregrounded_running_main_session(&self.workflow_panel.tasks[index]);
                     self.workflow_panel.selected = index;
+                    if selected_is_now_foregrounded && self.panel_mode == PanelMode::Workflows {
+                        self.panel_mode = PanelMode::Conversation;
+                    }
                 } else if self.workflow_panel.selected >= self.workflow_panel.tasks.len() {
                     self.workflow_panel.selected =
                         self.workflow_panel.tasks.len().saturating_sub(1);
@@ -1373,6 +1383,12 @@ fn is_backgrounded_running_main_session(task: &BackgroundTaskSummary) -> bool {
     task.task_type == orca_core::task_types::TaskType::MainSession
         && task.status == orca_core::task_types::TaskStatus::Running
         && task.is_backgrounded
+}
+
+fn is_foregrounded_running_main_session(task: &BackgroundTaskSummary) -> bool {
+    task.task_type == orca_core::task_types::TaskType::MainSession
+        && task.status == orca_core::task_types::TaskStatus::Running
+        && !task.is_backgrounded
 }
 
 fn workflow_task_panel_group(task: &BackgroundTaskSummary) -> u8 {
@@ -2730,6 +2746,30 @@ mod tests {
         task.is_backgrounded = false;
         state.update(TuiEvent::WorkflowTasksUpdated { tasks: vec![task] });
 
+        assert!(!state.suppress_background_main_session_output);
+    }
+
+    #[test]
+    fn foregrounded_selected_main_session_returns_to_conversation_panel() {
+        let mut state = state();
+        state.panel_mode = PanelMode::Workflows;
+        state.suppress_background_main_session_output = true;
+
+        let mut selected = workflow_task_summary("task-main", "selected");
+        selected.task_type = TaskType::MainSession;
+        selected.status = TaskStatus::Running;
+        selected.is_backgrounded = true;
+        let mut other = workflow_task_summary("task-other", "other");
+        other.status = TaskStatus::Running;
+        state.workflow_panel.tasks = vec![selected.clone(), other.clone()];
+        state.workflow_panel.selected = 0;
+
+        selected.is_backgrounded = false;
+        state.update(TuiEvent::WorkflowTasksUpdated {
+            tasks: vec![selected, other],
+        });
+
+        assert_eq!(state.panel_mode, PanelMode::Conversation);
         assert!(!state.suppress_background_main_session_output);
     }
 

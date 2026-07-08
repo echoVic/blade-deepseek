@@ -319,7 +319,9 @@ copied into Orca.
    session-completed event when that turn finishes. When a main-session turn is
    first backgrounded, the TUI now opens the task panel and selects that
    backgrounded session once, making the foreground/stop controls discoverable
-   without stealing selection on later refreshes.
+   without stealing selection on later refreshes. When that selected
+   backgrounded session is returned to the foreground, the TUI closes the task
+   panel so replayed and future assistant output is visible immediately.
 
 ### P0: Session Runtime Unification
 
