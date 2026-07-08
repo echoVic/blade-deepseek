@@ -13,6 +13,10 @@ export default defineConfig({
       input: {
         main: resolve(root, "index.html"),
         changelog: resolve(root, "changelog/index.html"),
+        terminalCodingAgent: resolve(root, "terminal-coding-agent/index.html"),
+        deepseekCodingAgent: resolve(root, "deepseek-coding-agent/index.html"),
+        githubWorkflows: resolve(root, "github/index.html"),
+        mcp: resolve(root, "mcp/index.html"),
       },
     },
   },

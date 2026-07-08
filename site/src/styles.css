@@ -743,6 +743,7 @@ pre {
 .features,
 .quick-start,
 .use-cases,
+.search-paths,
 .capabilities,
 .comparison,
 .workflow,
@@ -979,6 +980,65 @@ pre {
   color: var(--muted);
   font-size: 0.9rem;
   line-height: 1.6;
+}
+
+/* search-intent landing paths */
+.search-path-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 16px;
+}
+
+.search-path-grid a {
+  min-width: 0;
+  padding: 22px;
+  border: 1px solid var(--border-soft);
+  border-radius: 14px;
+  background:
+    linear-gradient(
+      180deg,
+      color-mix(in oklch, var(--accent-2) 7%, transparent),
+      transparent 58%
+    ),
+    var(--surface);
+  transition: border-color 0.18s, transform 0.18s;
+}
+
+.search-path-grid a:hover {
+  border-color: color-mix(in oklch, var(--accent-2) 44%, transparent);
+  transform: translateY(-2px);
+}
+
+.search-path-grid h3 {
+  margin-bottom: 8px;
+}
+
+.search-path-grid p {
+  margin-bottom: 18px;
+  color: var(--muted);
+  font-size: 0.9rem;
+  line-height: 1.6;
+}
+
+.search-path-grid span {
+  color: var(--accent-2);
+  font-family: var(--font-mono);
+  font-size: 0.74rem;
+}
+
+.crawler-links {
+  width: min(var(--container), calc(100% - 40px));
+  margin: 0 auto;
+  padding: 12px 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  color: var(--muted);
+  font-size: 0.84rem;
+}
+
+.crawler-links a:hover {
+  color: var(--accent);
 }
 
 /* comparison */
@@ -1454,6 +1514,10 @@ footer a:hover {
   .install-repeat {
     grid-template-columns: minmax(0, 1fr);
   }
+
+  .search-path-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
 }
 
 @media (max-width: 860px) {
@@ -1471,6 +1535,7 @@ footer a:hover {
   .feature-grid,
   .quick-grid,
   .use-case-grid,
+  .search-path-grid,
   .comparison-grid,
   .faq-list {
     grid-template-columns: 1fr;

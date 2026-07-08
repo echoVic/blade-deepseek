@@ -839,6 +839,10 @@ export const links = {
   telegram: "https://t.me/+11No1w5ZbTMyZTQ1",
   home: "/",
   changelog: "/changelog/",
+  terminalCodingAgent: "/terminal-coding-agent/",
+  deepseekCodingAgent: "/deepseek-coding-agent/",
+  githubWorkflows: "/github/",
+  mcp: "/mcp/",
 } as const;
 
 export function detectInitialLocale(): Locale {

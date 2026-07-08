@@ -54,6 +54,27 @@ const copy = {
       latestLabel: "latest",
       readNotes: "Release notes",
     },
+    related: {
+      eyebrow: "Guides",
+      title: "Follow the release history into the main workflows.",
+      links: [
+        {
+          title: "Terminal coding agent",
+          body: "Use Orca as a local terminal coding agent for verifier-gated repository work.",
+          href: links.terminalCodingAgent,
+        },
+        {
+          title: "DeepSeek coding agent",
+          body: "See how DeepSeek-native reasoning, prefix cache behavior, and local history fit together.",
+          href: links.deepseekCodingAgent,
+        },
+        {
+          title: "GitHub workflows",
+          body: "Apply Orca to issue triage, pull-request prep, release checks, and codebase archaeology.",
+          href: links.githubWorkflows,
+        },
+      ],
+    },
     summaries: {
       "v0.1.191":
         "RuntimeProviderResponseStep now consumes RuntimeProviderResponseInput directly instead of flattening the response handoff. Child-agent executors travel through RuntimeProviderResponseExecutors, so provider final-message and tool-turn dispatch keep one named response boundary while behavior stays unchanged.",
@@ -408,6 +429,27 @@ const copy = {
         "版本遵循 semver；每条记录都链接到 GitHub Release 的完整说明，含校验命令、breaking change 与迁移提示。",
       latestLabel: "最新",
       readNotes: "查看发布说明",
+    },
+    related: {
+      eyebrow: "相关指南",
+      title: "从更新记录继续了解主要工作流。",
+      links: [
+        {
+          title: "Terminal coding agent",
+          body: "把 Orca 作为本地终端代码智能体，用 verifier-gated 流程处理真实仓库任务。",
+          href: links.terminalCodingAgent,
+        },
+        {
+          title: "DeepSeek coding agent",
+          body: "了解 DeepSeek 原生推理、前缀缓存行为和本地历史如何协同。",
+          href: links.deepseekCodingAgent,
+        },
+        {
+          title: "GitHub workflows",
+          body: "把 Orca 用在 issue triage、PR 准备、发布检查和代码库考古上。",
+          href: links.githubWorkflows,
+        },
+      ],
     },
     summaries: {
       "v0.1.191":
@@ -800,6 +842,22 @@ function Changelog() {
         <p className="eyebrow">{t.header.eyebrow}</p>
         <h1>{t.header.title}</h1>
         <p className="subtitle">{t.header.subtitle}</p>
+      </section>
+
+      <section className="search-paths" aria-labelledby="changelog-guides-heading">
+        <div className="section-heading">
+          <p className="eyebrow">{t.related.eyebrow}</p>
+          <h2 id="changelog-guides-heading">{t.related.title}</h2>
+        </div>
+        <div className="search-path-grid">
+          {t.related.links.map((link) => (
+            <a href={link.href} key={link.href}>
+              <h3>{link.title}</h3>
+              <p>{link.body}</p>
+              <span>{link.href}</span>
+            </a>
+          ))}
+        </div>
       </section>
 
       <section className="changelog-page" aria-labelledby="changelog-heading">

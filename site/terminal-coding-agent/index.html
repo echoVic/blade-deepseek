@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="en" dir="ltr">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="robots" content="index, follow" />
+    <meta name="theme-color" content="#111827" />
+    <meta name="color-scheme" content="dark" />
+    <meta
+      name="description"
+      content="Orca is a DeepSeek-native terminal coding agent for local repository work, long-context fixes, tool use, approvals, and verifier-gated automation."
+    />
+    <link rel="canonical" href="https://orcaagent.dev/terminal-coding-agent/" />
+    <link rel="icon" type="image/svg+xml" href="/orca-icon.svg" />
+    <link rel="apple-touch-icon" href="/orca-icon.svg" />
+    <link rel="stylesheet" href="/src/styles.css" />
+    <meta property="og:type" content="article" />
+    <meta property="og:site_name" content="Orca" />
+    <meta property="og:title" content="Terminal coding agent for DeepSeek" />
+    <meta
+      property="og:description"
+      content="Use Orca as a local terminal coding agent for DeepSeek-powered code edits, command execution, persistent goals, and resumable history."
+    />
+    <meta property="og:url" content="https://orcaagent.dev/terminal-coding-agent/" />
+    <meta property="og:image" content="https://orcaagent.dev/orca-social.png" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content="Orca terminal coding agent product preview" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="Terminal coding agent for DeepSeek" />
+    <meta
+      name="twitter:description"
+      content="Use Orca as a local terminal coding agent for DeepSeek-powered code edits, command execution, persistent goals, and resumable history."
+    />
+    <meta name="twitter:image" content="https://orcaagent.dev/orca-social.png" />
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "TechArticle",
+        "headline": "Terminal coding agent for DeepSeek",
+        "description": "Orca is a terminal coding agent for local DeepSeek-native coding workflows.",
+        "url": "https://orcaagent.dev/terminal-coding-agent/",
+        "publisher": {
+          "@type": "Organization",
+          "name": "Orca",
+          "url": "https://orcaagent.dev/"
+        }
+      }
+    </script>
+    <title>Terminal coding agent for DeepSeek</title>
+  </head>
+  <body>
+    <main>
+      <header class="nav">
+        <a class="brand" href="/" aria-label="Orca home">
+          <img class="brand-mark" src="/orca-icon.svg" alt="" aria-hidden="true" />
+          <span>Orca</span>
+        </a>
+        <div class="nav-actions">
+          <nav aria-label="Page navigation">
+            <a href="/">Home</a>
+            <a href="/deepseek-coding-agent/">DeepSeek</a>
+            <a href="/github/">GitHub</a>
+            <a href="/mcp/">MCP</a>
+            <a class="nav-cta" href="https://github.com/echoVic/blade-deepseek" rel="noreferrer">GitHub</a>
+          </nav>
+        </div>
+      </header>
+
+      <section class="hero" id="top">
+        <div class="hero-copy">
+          <span class="pill"><span class="dot"></span>orca terminal</span>
+          <h1>A DeepSeek-native terminal coding agent.</h1>
+          <p class="subtitle">
+            Orca is a local terminal coding agent for developers who want code edits,
+            shell commands, verifier runs, persistent goals, and resumable history in one
+            terminal-first orca agent workflow.
+          </p>
+          <div class="actions">
+            <a class="primary" href="/#install">Install Orca</a>
+            <a class="secondary" href="https://github.com/echoVic/blade-deepseek" rel="noreferrer">View source</a>
+          </div>
+        </div>
+        <div class="terminal" aria-label="Orca terminal workflow">
+          <div class="terminal-bar">
+            <span></span><span></span><span></span>
+            <span class="terminal-title">orca · terminal coding agent</span>
+          </div>
+          <div class="tui-status">
+            <span><span class="accent">orca</span> <span class="dim">deepseek-v4-pro</span></span>
+            <span class="tui-ctx">context ███████░░░ 70%</span>
+          </div>
+          <div class="tui-body" aria-hidden="true">
+            <div class="tb tb-user"><span class="who">you ›</span> fix the failing release test</div>
+            <div class="tb tb-tool"><div class="th"><span class="ic"></span>grep <span class="arg">"releaseVersion"</span></div></div>
+            <div class="tb tb-approve">approval · edit site/src/shared.ts <span class="chip">policy checked</span></div>
+            <div class="tb tb-ok">✓ verifier passed · npm run check:seo</div>
+          </div>
+        </div>
+      </section>
+
+      <section class="features" aria-labelledby="terminal-agent-heading">
+        <div class="section-heading">
+          <p class="eyebrow">Why it fits</p>
+          <h2 id="terminal-agent-heading">Orca keeps the coding loop inside your terminal.</h2>
+        </div>
+        <div class="feature-grid">
+          <article>
+            <h3>Local repository work</h3>
+            <p>Search, read, edit, and verify files without moving code through a separate chat window.</p>
+          </article>
+          <article>
+            <h3>Approval-aware tools</h3>
+            <p>Reads can move quickly, while edits, shell commands, network calls, MCP tools, and subagents follow policy.</p>
+          </article>
+          <article>
+            <h3>Long-running tasks</h3>
+            <p>Persistent goals and resumable JSONL history help long refactors continue across turns and restarts.</p>
+          </article>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>

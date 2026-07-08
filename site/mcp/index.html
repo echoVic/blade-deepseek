@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en" dir="ltr">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="robots" content="index, follow" />
+    <meta name="theme-color" content="#111827" />
+    <meta name="color-scheme" content="dark" />
+    <meta
+      name="description"
+      content="Orca MCP tools let local DeepSeek coding workflows call external tool servers through the same spec-driven tools and approval-aware contracts as built-in tools."
+    />
+    <link rel="canonical" href="https://orcaagent.dev/mcp/" />
+    <link rel="icon" type="image/svg+xml" href="/orca-icon.svg" />
+    <link rel="apple-touch-icon" href="/orca-icon.svg" />
+    <link rel="stylesheet" href="/src/styles.css" />
+    <meta property="og:type" content="article" />
+    <meta property="og:site_name" content="Orca" />
+    <meta property="og:title" content="Orca MCP tools" />
+    <meta
+      property="og:description"
+      content="Connect Orca MCP tools to local DeepSeek coding workflows with spec-driven tools, approvals, and resumable transcripts."
+    />
+    <meta property="og:url" content="https://orcaagent.dev/mcp/" />
+    <meta property="og:image" content="https://orcaagent.dev/orca-social.png" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content="Orca terminal coding agent product preview" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="Orca MCP tools" />
+    <meta
+      name="twitter:description"
+      content="Connect Orca MCP tools to local DeepSeek coding workflows with spec-driven tools, approvals, and resumable transcripts."
+    />
+    <meta name="twitter:image" content="https://orcaagent.dev/orca-social.png" />
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "TechArticle",
+        "headline": "Orca MCP tools",
+        "description": "Orca can use MCP tools through the same spec-driven and approval-aware tool contracts as built-in tools.",
+        "url": "https://orcaagent.dev/mcp/",
+        "publisher": {
+          "@type": "Organization",
+          "name": "Orca",
+          "url": "https://orcaagent.dev/"
+        }
+      }
+    </script>
+    <title>Orca MCP tools</title>
+  </head>
+  <body>
+    <main>
+      <header class="nav">
+        <a class="brand" href="/" aria-label="Orca home">
+          <img class="brand-mark" src="/orca-icon.svg" alt="" aria-hidden="true" />
+          <span>Orca</span>
+        </a>
+        <div class="nav-actions">
+          <nav aria-label="Page navigation">
+            <a href="/">Home</a>
+            <a href="/terminal-coding-agent/">Terminal</a>
+            <a href="/deepseek-coding-agent/">DeepSeek</a>
+            <a href="/github/">GitHub</a>
+            <a class="nav-cta" href="/#install">Install</a>
+          </nav>
+        </div>
+      </header>
+
+      <section class="hero" id="top">
+        <div class="hero-copy">
+          <span class="pill"><span class="dot"></span>orca mcp</span>
+          <h1>MCP tools inside an approval-aware coding loop.</h1>
+          <p class="subtitle">
+            Orca MCP tools extend the local coding agent with external tool servers
+            while preserving spec-driven tools, approval policies, sandbox behavior,
+            and resumable transcripts.
+          </p>
+          <div class="actions">
+            <a class="primary" href="/#install">Install Orca</a>
+            <a class="secondary" href="/terminal-coding-agent/">Terminal workflow</a>
+          </div>
+        </div>
+        <div class="code-panel">
+          <pre><code>mcp__github__search_issues
+mcp__docs__read_page
+mcp__browser__screenshot</code></pre>
+        </div>
+      </section>
+
+      <section class="features" aria-labelledby="mcp-tools-heading">
+        <div class="section-heading">
+          <p class="eyebrow">Tool contract</p>
+          <h2 id="mcp-tools-heading">MCP fits the same tool model as the rest of Orca.</h2>
+        </div>
+        <div class="feature-grid">
+          <article>
+            <h3>Spec-driven tools</h3>
+            <p>MCP, built-in, and external tools share one model-visible contract instead of scattered ad-hoc prompts.</p>
+          </article>
+          <article>
+            <h3>Approval policies</h3>
+            <p>Tool capabilities determine whether calls run directly, ask for approval, or stay blocked by policy.</p>
+          </article>
+          <article>
+            <h3>Auditable results</h3>
+            <p>Tool requests, outputs, approvals, and failures stay in the local JSONL transcript for later review.</p>
+          </article>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>

@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en" dir="ltr">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="robots" content="index, follow" />
+    <meta name="theme-color" content="#111827" />
+    <meta name="color-scheme" content="dark" />
+    <meta
+      name="description"
+      content="Use Orca for GitHub workflows: issue triage, pull-request preparation, repository archaeology, release checks, and verifier-gated automation."
+    />
+    <link rel="canonical" href="https://orcaagent.dev/github/" />
+    <link rel="icon" type="image/svg+xml" href="/orca-icon.svg" />
+    <link rel="apple-touch-icon" href="/orca-icon.svg" />
+    <link rel="stylesheet" href="/src/styles.css" />
+    <meta property="og:type" content="article" />
+    <meta property="og:site_name" content="Orca" />
+    <meta property="og:title" content="Orca GitHub coding workflows" />
+    <meta
+      property="og:description"
+      content="Run orca github tasks for issues, PRs, release checks, repository search, and verifier-gated automation from your terminal."
+    />
+    <meta property="og:url" content="https://orcaagent.dev/github/" />
+    <meta property="og:image" content="https://orcaagent.dev/orca-social.png" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content="Orca terminal coding agent product preview" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="Orca GitHub coding workflows" />
+    <meta
+      name="twitter:description"
+      content="Run orca github tasks for issues, PRs, release checks, repository search, and verifier-gated automation from your terminal."
+    />
+    <meta name="twitter:image" content="https://orcaagent.dev/orca-social.png" />
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "TechArticle",
+        "headline": "Orca GitHub coding workflows",
+        "description": "Use Orca for GitHub workflows including pull requests, issues, release checks, and repository analysis.",
+        "url": "https://orcaagent.dev/github/",
+        "publisher": {
+          "@type": "Organization",
+          "name": "Orca",
+          "url": "https://orcaagent.dev/"
+        }
+      }
+    </script>
+    <title>Orca GitHub coding workflows</title>
+  </head>
+  <body>
+    <main>
+      <header class="nav">
+        <a class="brand" href="/" aria-label="Orca home">
+          <img class="brand-mark" src="/orca-icon.svg" alt="" aria-hidden="true" />
+          <span>Orca</span>
+        </a>
+        <div class="nav-actions">
+          <nav aria-label="Page navigation">
+            <a href="/">Home</a>
+            <a href="/terminal-coding-agent/">Terminal</a>
+            <a href="/deepseek-coding-agent/">DeepSeek</a>
+            <a href="/mcp/">MCP</a>
+            <a class="nav-cta" href="https://github.com/echoVic/blade-deepseek" rel="noreferrer">GitHub</a>
+          </nav>
+        </div>
+      </header>
+
+      <section class="hero" id="top">
+        <div class="hero-copy">
+          <span class="pill"><span class="dot"></span>orca github</span>
+          <h1>GitHub workflows from a local coding agent.</h1>
+          <p class="subtitle">
+            Orca helps with GitHub workflows without hiding the repository state:
+            inspect issues, prepare pull requests, run release checks, search code,
+            and keep verifier-gated evidence in the transcript.
+          </p>
+          <div class="actions">
+            <a class="primary" href="https://github.com/echoVic/blade-deepseek" rel="noreferrer">Open GitHub</a>
+            <a class="secondary" href="/#install">Install Orca</a>
+          </div>
+        </div>
+        <div class="code-panel">
+          <pre><code>orca exec "review this PR and run npm test"
+orca exec "prepare release notes from git log" --verifier "cargo test"
+orca exec "find why the CI workflow started failing"</code></pre>
+        </div>
+      </section>
+
+      <section class="features" aria-labelledby="github-workflows-heading">
+        <div class="section-heading">
+          <p class="eyebrow">Repository loop</p>
+          <h2 id="github-workflows-heading">Built for evidence-first repository work.</h2>
+        </div>
+        <div class="feature-grid">
+          <article>
+            <h3>Pull-request prep</h3>
+            <p>Ask Orca to inspect diffs, update docs, run verifiers, and summarize the change for review.</p>
+          </article>
+          <article>
+            <h3>Issue triage</h3>
+            <p>Trace reports through the real codebase, then keep file paths, commands, and findings in one transcript.</p>
+          </article>
+          <article>
+            <h3>Release checks</h3>
+            <p>Combine GitHub releases, local commands, changelog updates, and verifier-gated automation before shipping.</p>
+          </article>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>

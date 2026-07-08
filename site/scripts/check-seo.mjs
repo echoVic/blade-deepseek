@@ -1,8 +1,34 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 
 const root = new URL("..", import.meta.url);
 const canonicalUrl = "https://orcaagent.dev/";
 const changelogUrl = "https://orcaagent.dev/changelog/";
+const intentPages = [
+  {
+    path: "terminal-coding-agent/",
+    url: "https://orcaagent.dev/terminal-coding-agent/",
+    title: "Terminal coding agent for DeepSeek",
+    terms: ["orca terminal", "terminal coding agent", "orca agent"],
+  },
+  {
+    path: "deepseek-coding-agent/",
+    url: "https://orcaagent.dev/deepseek-coding-agent/",
+    title: "DeepSeek coding agent",
+    terms: ["deepseek orca", "DeepSeek coding agent", "DeepSeek-native"],
+  },
+  {
+    path: "github/",
+    url: "https://orcaagent.dev/github/",
+    title: "Orca GitHub coding workflows",
+    terms: ["orca github", "GitHub workflows", "verifier-gated"],
+  },
+  {
+    path: "mcp/",
+    url: "https://orcaagent.dev/mcp/",
+    title: "Orca MCP tools",
+    terms: ["orca mcp", "MCP tools", "spec-driven tools"],
+  },
+];
 const indexHtml = readFileSync(new URL("index.html", root), "utf8");
 const changelogHtml = readFileSync(new URL("changelog/index.html", root), "utf8");
 const sharedSource = readFileSync(new URL("src/shared.ts", root), "utf8");
@@ -61,6 +87,9 @@ check(robotsTxt.includes(`Sitemap: ${canonicalUrl}sitemap.xml`), "robots.txt mis
 check(sitemapXml.includes("<urlset"), "sitemap.xml missing urlset");
 check(sitemapXml.includes(`<loc>${canonicalUrl}</loc>`), "sitemap.xml missing canonical loc");
 check(sitemapXml.includes(`<loc>${changelogUrl}</loc>`), "sitemap.xml missing changelog loc");
+for (const page of intentPages) {
+  check(sitemapXml.includes(`<loc>${page.url}</loc>`), `sitemap.xml missing ${page.url}`);
+}
 check(
   sitemapXml.includes(`<lastmod>${latestDate}</lastmod>`),
   "sitemap.xml lastmod must match the latest release date",
@@ -85,6 +114,12 @@ check(
 check(
   /releases\.map/.test(changelogSource),
   "Changelog component must render releases list",
+);
+check(
+  changelogHtml.includes("Terminal coding agent") &&
+    changelogHtml.includes("DeepSeek coding agent") &&
+    changelogHtml.includes("GitHub workflows"),
+  "Changelog page must link to search-intent landing pages",
 );
 
 check(socialPng.subarray(1, 4).toString("ascii") === "PNG", "Social image is not a PNG");
@@ -124,10 +159,46 @@ const requiredHomepageSource = [
   ['code: ["orca"]', "Quick start must launch the interactive TUI with orca"],
   ["guides you through the DeepSeek API key", "Quick start must describe guided key setup"],
   ["进入交互式终端", "Chinese quick start must describe entering the interactive terminal"],
+  ["terminal coding agent", "Homepage missing terminal coding agent phrase"],
 ];
 
 for (const [needle, message] of requiredHomepageSource) {
   check(appSource.includes(needle), message);
+}
+
+const forbiddenHomepageSource = [
+  ["searchPathsTitle", "Homepage must not own a search-intent module"],
+  ["search-paths", "Homepage must not render the search-intent section"],
+  ["Explore orca terminal", "Homepage must not expose SEO query cards"],
+];
+
+for (const [needle, message] of forbiddenHomepageSource) {
+  check(!appSource.includes(needle), message);
+}
+
+const viteConfig = readFileSync(new URL("vite.config.ts", root), "utf8");
+for (const page of intentPages) {
+  const pageUrl = new URL(page.path, root);
+  const htmlPath = new URL("index.html", pageUrl);
+  check(existsSync(htmlPath), `Missing landing page at ${page.path}index.html`);
+  check(
+    viteConfig.includes(`${page.path}index.html`),
+    `Vite build input missing ${page.path}index.html`,
+  );
+
+  if (existsSync(htmlPath)) {
+    const html = readFileSync(htmlPath, "utf8");
+    check(
+      html.includes(`<link rel="canonical" href="${page.url}" />`),
+      `${page.path} missing canonical URL`,
+    );
+    check(html.includes(`<title>${page.title}</title>`), `${page.path} missing title`);
+    check(html.includes('<meta name="robots" content="index, follow" />'), `${page.path} noindex`);
+    check(html.includes('"@type": "TechArticle"'), `${page.path} missing TechArticle schema`);
+    for (const term of page.terms) {
+      check(html.includes(term), `${page.path} missing search term: ${term}`);
+    }
+  }
 }
 
 const jsonLdBlocks = [
