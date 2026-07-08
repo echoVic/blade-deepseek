@@ -44,12 +44,12 @@ pub(crate) fn run_agent_loop(
                 emit_deltas,
                 subagent_type,
                 continuation,
+                steer_handle,
             },
         turn_deps,
         turn_state,
         turn_execution,
         turn_interactions,
-        steer_handle,
     } = loop_context;
     let RuntimeTurnDeps {
         instructions,

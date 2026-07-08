@@ -1999,6 +1999,36 @@ mod tests {
     }
 
     #[test]
+    fn runtime_turn_steer_handle_is_owned_by_turn_config() {
+        let lifecycle_source = include_str!("lifecycle.rs");
+        let agent_loop_context = lifecycle_source
+            .split("pub(crate) struct AgentLoopContext")
+            .nth(1)
+            .and_then(|source| source.split("#[derive(Clone").next())
+            .expect("AgentLoopContext source");
+        let turn_config_source = lifecycle_source
+            .split("pub(crate) struct RuntimeTurnConfig")
+            .nth(1)
+            .and_then(|source| source.split("#[derive(Clone").next())
+            .expect("RuntimeTurnConfig source");
+
+        assert!(
+            !agent_loop_context.contains("steer_handle: Option<&'a ThreadSteerHandle>"),
+            "AgentLoopContext must not carry steer handles outside the frozen turn config"
+        );
+        assert!(
+            turn_config_source.contains("steer_handle: Option<&'a ThreadSteerHandle>"),
+            "RuntimeTurnConfig must own steer handles with the other immutable turn inputs"
+        );
+        assert!(
+            lifecycle_source.contains("impl<'a> RuntimeTurnConfig<'a>")
+                && lifecycle_source.contains("pub(crate) fn with_steer_handle(")
+                && lifecycle_source.contains("pub(crate) fn steer_handle("),
+            "RuntimeTurnConfig must expose steer handle construction and read access"
+        );
+    }
+
+    #[test]
     fn runtime_lifecycle_state_machine_is_owned_by_runtime_lifecycle_module() {
         let lib_source = include_str!("lib.rs");
         let lifecycle_source = include_str!("lifecycle.rs");

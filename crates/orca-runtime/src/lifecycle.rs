@@ -103,7 +103,6 @@ pub(crate) struct AgentLoopContext<'a> {
     pub(crate) turn_state: Option<RuntimeTurnState<'a>>,
     pub(crate) turn_execution: Option<RuntimeTurnExecution<'a>>,
     pub(crate) turn_interactions: RuntimeTurnInteractionState<'a>,
-    pub(crate) steer_handle: Option<&'a ThreadSteerHandle>,
 }
 
 #[derive(Clone, Debug)]
@@ -114,6 +113,7 @@ pub(crate) struct RuntimeTurnConfig<'a> {
     pub(crate) emit_deltas: bool,
     pub(crate) subagent_type: &'a SubagentType,
     pub(crate) continuation: Option<RuntimeTurnContinuation>,
+    pub(crate) steer_handle: Option<&'a ThreadSteerHandle>,
 }
 
 #[derive(Clone, Copy)]
@@ -712,7 +712,6 @@ impl<'a> AgentLoopContext<'a> {
             turn_state: None,
             turn_execution: None,
             turn_interactions: RuntimeTurnInteractionState::new(),
-            steer_handle: None,
         }
     }
 
@@ -825,7 +824,7 @@ impl<'a> AgentLoopContext<'a> {
     }
 
     pub(crate) fn with_steer_handle(mut self, steer_handle: Option<&'a ThreadSteerHandle>) -> Self {
-        self.steer_handle = steer_handle;
+        self.turn_config = self.turn_config.with_steer_handle(steer_handle);
         self
     }
 
@@ -916,6 +915,7 @@ impl<'a> RuntimeTurnConfig<'a> {
             emit_deltas,
             subagent_type,
             continuation: None,
+            steer_handle: None,
         }
     }
 
@@ -924,9 +924,20 @@ impl<'a> RuntimeTurnConfig<'a> {
         self
     }
 
+    pub(crate) fn with_steer_handle(mut self, steer_handle: Option<&'a ThreadSteerHandle>) -> Self {
+        self.steer_handle = steer_handle;
+        self
+    }
+
     #[cfg(test)]
     pub(crate) fn continuation(&self) -> Option<&RuntimeTurnContinuation> {
         self.continuation.as_ref()
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn steer_handle(&self) -> Option<&'a ThreadSteerHandle> {
+        self.steer_handle
     }
 
     #[cfg(test)]
