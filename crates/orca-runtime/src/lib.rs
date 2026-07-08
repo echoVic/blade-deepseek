@@ -5197,6 +5197,46 @@ mod tests {
     }
 
     #[test]
+    fn runtime_turn_output_refs_are_grouped_for_turn_loop() {
+        let runtime_turn_loop_source = include_str!("runtime_turn_loop.rs");
+        let runtime_turn_iteration_source = include_str!("runtime_turn_iteration.rs");
+        let turn_loop_input = runtime_turn_loop_source
+            .split("pub(crate) struct RuntimeTurnLoopInput")
+            .nth(1)
+            .and_then(|source| {
+                source
+                    .split("pub(crate) struct RuntimeTurnLoopExecutors")
+                    .next()
+            })
+            .expect("RuntimeTurnLoopInput source");
+        let turn_iteration_input = runtime_turn_iteration_source
+            .split("pub(crate) struct RuntimeTurnIterationInput")
+            .nth(1)
+            .and_then(|source| {
+                source
+                    .split("pub(crate) enum RuntimeTurnIterationResult")
+                    .next()
+            })
+            .expect("RuntimeTurnIterationInput source");
+
+        assert!(
+            runtime_turn_loop_source.contains("pub(crate) struct RuntimeTurnOutputContext"),
+            "runtime_turn_loop must own a named output context for event emission refs"
+        );
+        for source in [turn_loop_input, turn_iteration_input] {
+            assert!(
+                source.contains("output: RuntimeTurnOutputContext"),
+                "turn-loop inputs must pass event output refs through RuntimeTurnOutputContext"
+            );
+            assert!(
+                !source.contains("events: &'a mut EventFactory")
+                    && !source.contains("sink: &'a mut EventSink<W>"),
+                "turn-loop inputs must not expose events and sink as parallel fields"
+            );
+        }
+    }
+
+    #[test]
     fn runtime_turn_loop_state_resolves_runtime_directive_policy() {
         let agent_loop_source = include_str!("agent_loop.rs");
         let agent_loop_runtime_source = agent_loop_source

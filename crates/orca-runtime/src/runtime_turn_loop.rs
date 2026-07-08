@@ -37,6 +37,11 @@ pub(crate) struct RuntimeTurnWorkflowContext<'background, 'ipc> {
     pub(crate) workflow_ipc: Option<&'ipc WorkflowIpcContext>,
 }
 
+pub(crate) struct RuntimeTurnOutputContext<'events, 'sink, W: io::Write> {
+    pub(crate) events: &'events mut EventFactory,
+    pub(crate) sink: &'sink mut EventSink<W>,
+}
+
 pub(crate) struct RuntimeAgentTurnLoopInput<'a, 'runtime, W: io::Write> {
     pub(crate) actor: &'a mut RuntimeTaskActor<'runtime>,
     pub(crate) context_config: &'a context::ContextConfig,
@@ -44,8 +49,7 @@ pub(crate) struct RuntimeAgentTurnLoopInput<'a, 'runtime, W: io::Write> {
     pub(crate) cwd: &'a Path,
     pub(crate) emit_deltas: bool,
     pub(crate) hooks: &'a HookRunner,
-    pub(crate) events: &'a mut EventFactory,
-    pub(crate) sink: &'a mut EventSink<W>,
+    pub(crate) output: RuntimeTurnOutputContext<'a, 'a, W>,
     pub(crate) prepared_conversation: &'a mut RuntimePreparedConversation<'runtime>,
     pub(crate) prompt: &'a str,
     pub(crate) subagent_type: &'a SubagentType,
@@ -71,8 +75,7 @@ pub(crate) struct RuntimeTurnLoopInput<'a, 'runtime, W: io::Write> {
     pub(crate) cwd: &'a Path,
     pub(crate) emit_deltas: bool,
     pub(crate) hooks: &'a HookRunner,
-    pub(crate) events: &'a mut EventFactory,
-    pub(crate) sink: &'a mut EventSink<W>,
+    pub(crate) output: RuntimeTurnOutputContext<'a, 'a, W>,
     pub(crate) prepared_conversation: &'a mut RuntimePreparedConversation<'runtime>,
     pub(crate) prompt: &'a str,
     pub(crate) model: &'a ModelSelection,
@@ -108,8 +111,7 @@ impl<'a, 'runtime, W: io::Write> RuntimeTurnLoopInput<'a, 'runtime, W> {
         cwd: &'a Path,
         emit_deltas: bool,
         hooks: &'a HookRunner,
-        events: &'a mut EventFactory,
-        sink: &'a mut EventSink<W>,
+        output: RuntimeTurnOutputContext<'a, 'a, W>,
         prepared_conversation: &'a mut RuntimePreparedConversation<'runtime>,
         prompt: &'a str,
         model: &'a ModelSelection,
@@ -136,8 +138,7 @@ impl<'a, 'runtime, W: io::Write> RuntimeTurnLoopInput<'a, 'runtime, W> {
             cwd,
             emit_deltas,
             hooks,
-            events,
-            sink,
+            output,
             prepared_conversation,
             prompt,
             model,
@@ -171,8 +172,7 @@ impl<'a, 'runtime, W: io::Write> RuntimeTurnLoopInput<'a, 'runtime, W> {
             cwd: self.cwd,
             emit_deltas: self.emit_deltas,
             hooks: self.hooks,
-            events: &mut *self.events,
-            sink: &mut *self.sink,
+            output: RuntimeTurnOutputContext::new(&mut *self.output.events, &mut *self.output.sink),
             prepared_conversation: &mut *self.prepared_conversation,
             prompt: self.prompt,
             model: self.model,
@@ -210,6 +210,12 @@ impl<'background, 'ipc> RuntimeTurnWorkflowContext<'background, 'ipc> {
             background_workflows,
             workflow_ipc,
         }
+    }
+}
+
+impl<'events, 'sink, W: io::Write> RuntimeTurnOutputContext<'events, 'sink, W> {
+    pub(crate) fn new(events: &'events mut EventFactory, sink: &'sink mut EventSink<W>) -> Self {
+        Self { events, sink }
     }
 }
 
@@ -273,8 +279,7 @@ impl<'a, 'runtime, W: io::Write> RuntimeAgentTurnLoopInput<'a, 'runtime, W> {
             self.cwd,
             self.emit_deltas,
             self.hooks,
-            self.events,
-            self.sink,
+            self.output,
             self.prepared_conversation,
             self.prompt,
             &self.config.model,
@@ -423,8 +428,7 @@ mod tests {
             cwd: cwd.path(),
             emit_deltas: true,
             hooks: &hooks,
-            events: &mut events,
-            sink: &mut sink,
+            output: RuntimeTurnOutputContext::new(&mut events, &mut sink),
             prepared_conversation: &mut prepared_conversation,
             prompt: "continue",
             model: &config.model,

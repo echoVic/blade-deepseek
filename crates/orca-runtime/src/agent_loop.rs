@@ -9,7 +9,7 @@ use crate::lifecycle::{
 use crate::runtime_conversation_bootstrap::RuntimeConversationBootstrapStep;
 use crate::runtime_turn_loop::{
     RuntimeAgentTurnLoopInput, RuntimeTurnLoopExecutors, RuntimeTurnLoopStep,
-    RuntimeTurnWorkflowContext, run_agent_turn_loop,
+    RuntimeTurnOutputContext, RuntimeTurnWorkflowContext, run_agent_turn_loop,
 };
 use crate::runtime_turn_setup::RuntimeTurnSetupStep;
 use crate::session::AgentConversationContext;
@@ -103,8 +103,7 @@ pub(crate) fn run_agent_loop(
             cwd,
             emit_deltas,
             hooks,
-            events,
-            sink,
+            output: RuntimeTurnOutputContext::new(events, sink),
             prepared_conversation: &mut prepared_conversation,
             prompt,
             subagent_type,

@@ -4,8 +4,6 @@ use std::path::Path;
 use orca_approval::ApprovalPolicy;
 use orca_core::cancel::CancelToken;
 use orca_core::config::{ProviderKind, RunConfig};
-use orca_core::event_schema::EventFactory;
-use orca_core::event_sink::EventSink;
 use orca_core::model::ModelSelection;
 use orca_core::subagent_types::SubagentType;
 use orca_mcp::McpRegistry;
@@ -25,7 +23,7 @@ use crate::provider_turn::{
     RuntimeProviderCycleInput, RuntimeTurnProviderCycleResult, RuntimeTurnProviderCycleStep,
 };
 use crate::runtime_conversation_bootstrap::RuntimePreparedConversation;
-use crate::runtime_turn_loop::RuntimeTurnWorkflowContext;
+use crate::runtime_turn_loop::{RuntimeTurnOutputContext, RuntimeTurnWorkflowContext};
 use crate::runtime_turn_opening::{
     RuntimeTurnOpeningInput, RuntimeTurnOpeningResult, RuntimeTurnOpeningStep,
 };
@@ -48,8 +46,7 @@ pub(crate) struct RuntimeTurnIterationInput<'a, 'runtime, W: io::Write> {
     pub(crate) cwd: &'a Path,
     pub(crate) emit_deltas: bool,
     pub(crate) hooks: &'a HookRunner,
-    pub(crate) events: &'a mut EventFactory,
-    pub(crate) sink: &'a mut EventSink<W>,
+    pub(crate) output: RuntimeTurnOutputContext<'a, 'a, W>,
     pub(crate) prepared_conversation: &'a mut RuntimePreparedConversation<'runtime>,
     pub(crate) prompt: &'a str,
     pub(crate) model: &'a ModelSelection,
@@ -103,8 +100,8 @@ impl RuntimeTurnIterationStep {
                 cwd: input.cwd,
                 emit_deltas: input.emit_deltas,
                 hooks: input.hooks,
-                events: input.events,
-                sink: input.sink,
+                events: input.output.events,
+                sink: input.output.sink,
                 conversation,
                 history_writer,
                 prompt: input.prompt,
@@ -145,8 +142,8 @@ impl RuntimeTurnIterationStep {
                 ),
                 cost_tracker: input.cost_tracker,
                 max_budget_usd: input.max_budget_usd,
-                events: input.events,
-                sink: input.sink,
+                events: input.output.events,
+                sink: input.output.sink,
                 conversation: input.prepared_conversation,
                 config: input.config,
                 tool_policy: input.tool_policy,
