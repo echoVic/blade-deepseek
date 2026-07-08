@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use crossterm::ExecutableCommand;
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event, KeyCode, KeyEventKind, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    Event, KeyCode, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
     PushKeyboardEnhancementFlags,
 };
 use crossterm::terminal;
@@ -24,7 +24,6 @@ use orca_core::model::ModelSelection;
 use orca_runtime::history;
 
 use crate::approval_dialog_actions::handle_approval_dialog_key;
-use crate::approval_mode_actions::cycle_approval_mode;
 use crate::background_approval::submit_background_approval_response_for_tui;
 use crate::background_tasks::{
     foreground_task_for_tui, notify_recovered_background_approvals_for_tui, stop_task_for_tui,
@@ -37,23 +36,20 @@ use crate::composer_input_actions::{
 use crate::composer_textarea::{
     insert_pasted_text, make_setup_textarea, make_textarea, make_textarea_with_text, textarea_text,
 };
-use crate::global_actions::{GlobalShortcutFlow, handle_global_shortcut};
 use crate::idle_navigation_actions::handle_idle_navigation_shortcut;
 use crate::idle_submit_actions::handle_idle_submit;
 use crate::input_event_actions::{handle_mouse_event, handle_paste_event};
+use crate::key_event_actions::{KeyEventFlow, handle_key_event_preflight};
 use crate::mention_menu_actions::handle_mention_menu_key;
 use crate::running_actions::handle_running_shortcut;
 use crate::session_picker_actions::handle_session_picker_key;
 use crate::setup_actions::{SetupFlow, handle_setup_key};
-use crate::shortcuts::{
-    IdleShortcut, RunningShortcut, global_shortcut, idle_shortcut, running_shortcut,
-};
+use crate::shortcuts::{IdleShortcut, RunningShortcut, idle_shortcut, running_shortcut};
 use crate::slash_menu_actions::{REASONING_SUBMENU_TITLE, handle_slash_menu_key};
 use crate::submitted_turn::SubmittedTurn;
 use crate::theme::Theme;
 use crate::types::{
-    AppState, AppStatus, ChatMessage, PanelMode, SlashMenu, SlashMenuItem, SubMenu, TuiEvent,
-    UserAction,
+    AppState, AppStatus, ChatMessage, SlashMenu, SlashMenuItem, SubMenu, TuiEvent, UserAction,
 };
 use crate::ui;
 use crate::vim::VimState;
@@ -248,51 +244,21 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
             }
 
             if let Event::Key(key) = &ev {
-                if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
-                    continue;
-                }
-
-                if let Some(shortcut) = global_shortcut(*key) {
-                    match handle_global_shortcut(
-                        shortcut,
-                        &mut state,
-                        &action_tx,
-                        &cancel_token,
-                        || clear_terminal_scrollback(&mut terminal),
-                    )? {
-                        GlobalShortcutFlow::Continue => {
-                            continue;
-                        }
-                        GlobalShortcutFlow::Exit(code) => {
-                            exit_code = code;
-                            break;
-                        }
+                match handle_key_event_preflight(
+                    *key,
+                    &mut state,
+                    &mut config,
+                    &shared_config,
+                    &action_tx,
+                    &cancel_token,
+                    || clear_terminal_scrollback(&mut terminal),
+                )? {
+                    KeyEventFlow::Continue => continue,
+                    KeyEventFlow::Exit(code) => {
+                        exit_code = code;
+                        break;
                     }
-                }
-
-                if state.show_shortcuts && key.code == KeyCode::Esc {
-                    state.show_shortcuts = false;
-                    continue;
-                }
-
-                // Shift+Tab cycles the approval mode. Skipped while an approval dialog is open,
-                // where BackTab moves the dialog selection instead.
-                if key.code == KeyCode::BackTab
-                    && matches!(
-                        state.status,
-                        AppStatus::Idle | AppStatus::Running | AppStatus::WaitingUserInput
-                    )
-                {
-                    cycle_approval_mode(&mut config, &shared_config, &mut state);
-                    continue;
-                }
-
-                if state.status == AppStatus::Idle
-                    && state.panel_mode == PanelMode::Workflows
-                    && key.code == KeyCode::Esc
-                {
-                    state.show_conversation();
-                    continue;
+                    KeyEventFlow::Unhandled => {}
                 }
 
                 // Setup mode: step-by-step

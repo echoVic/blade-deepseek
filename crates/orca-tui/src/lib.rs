@@ -17,6 +17,7 @@ mod global_actions;
 mod idle_navigation_actions;
 mod idle_submit_actions;
 mod input_event_actions;
+mod key_event_actions;
 mod mention_menu_actions;
 mod running_actions;
 mod runtime_event_projection;
@@ -696,6 +697,57 @@ mod tests {
         assert!(
             !app.contains("Approval mode switched to"),
             "app should use approval_mode_actions instead of formatting mode notices inline"
+        );
+    }
+
+    #[test]
+    fn tui_key_event_actions_are_owned_by_dedicated_module() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let key_event_actions =
+            std::fs::read_to_string(format!("{manifest_dir}/src/key_event_actions.rs"))
+                .expect("key_event_actions module should exist");
+        assert!(
+            key_event_actions.contains("pub(crate) enum KeyEventFlow"),
+            "key_event_actions should expose the key preflight flow"
+        );
+        assert!(
+            key_event_actions.contains("pub(crate) fn handle_key_event_preflight"),
+            "key_event_actions should own key preflight handling"
+        );
+        assert!(
+            key_event_actions.contains("KeyEventKind::Press | KeyEventKind::Repeat"),
+            "key_event_actions should own press/repeat filtering"
+        );
+        assert!(
+            key_event_actions.contains("handle_global_shortcut"),
+            "key_event_actions should route global shortcuts"
+        );
+        assert!(
+            key_event_actions.contains("cycle_approval_mode"),
+            "key_event_actions should own Shift+Tab approval mode routing"
+        );
+        assert!(
+            key_event_actions.contains("show_conversation"),
+            "key_event_actions should own workflow panel escape routing"
+        );
+
+        let app = std::fs::read_to_string(format!("{manifest_dir}/src/app.rs"))
+            .expect("app source should be readable");
+        assert!(
+            !app.contains("KeyEventKind::Press | KeyEventKind::Repeat"),
+            "app should use key_event_actions instead of filtering key kinds inline"
+        );
+        assert!(
+            !app.contains("state.show_shortcuts && key.code == KeyCode::Esc"),
+            "app should use key_event_actions instead of dismissing the shortcut overlay inline"
+        );
+        assert!(
+            !app.contains("key.code == KeyCode::BackTab"),
+            "app should use key_event_actions instead of routing approval mode cycling inline"
+        );
+        assert!(
+            !app.contains("state.panel_mode == PanelMode::Workflows"),
+            "app should use key_event_actions instead of closing the workflow panel inline"
         );
     }
 

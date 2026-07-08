@@ -429,6 +429,10 @@ copied into Orca.
    Bracketed paste and mouse transcript scrolling now live in a focused TUI
    input event action module, keeping paste insertion/menu refresh and
    mouse-wheel transcript scrolling grace checks out of the app event loop.
+   Key event preflight now lives in a focused TUI key event action module,
+   keeping press/repeat filtering, global shortcut routing, shortcut overlay
+   dismissal, approval-mode cycling, and workflow-panel escape handling out of
+   the app event loop.
    Runtime task summaries now also expose terminal `result`/`error` fields so
    the selected task row can show completion output or failure details in the
    panel. The
