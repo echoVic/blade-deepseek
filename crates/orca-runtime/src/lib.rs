@@ -3330,6 +3330,56 @@ mod tests {
             "runtime_readonly_tool_turn must expose readonly tool-turn runner"
         );
         assert!(
+            readonly_source.contains("pub(crate) struct RuntimeReadonlyToolTurnRequest"),
+            "runtime_readonly_tool_turn must group readonly request refs"
+        );
+        assert!(
+            readonly_source.contains("pub(crate) struct RuntimeReadonlyToolTurnIo"),
+            "runtime_readonly_tool_turn must group readonly I/O refs"
+        );
+        assert!(
+            readonly_source.contains("pub(crate) struct RuntimeReadonlyToolTurnServices"),
+            "runtime_readonly_tool_turn must group readonly service refs"
+        );
+        assert!(
+            readonly_source.contains("request: RuntimeReadonlyToolTurnRequest<'a>"),
+            "RuntimeReadonlyToolTurnContext must carry readonly request refs through one named field"
+        );
+        assert!(
+            readonly_source.contains("io: RuntimeReadonlyToolTurnIo<'a, W>"),
+            "RuntimeReadonlyToolTurnContext must carry readonly I/O refs through one named field"
+        );
+        assert!(
+            readonly_source.contains("services: RuntimeReadonlyToolTurnServices<'a>"),
+            "RuntimeReadonlyToolTurnContext must carry readonly service refs through one named field"
+        );
+        let readonly_context = readonly_source
+            .split("pub(crate) struct RuntimeReadonlyToolTurnContext")
+            .nth(1)
+            .and_then(|source| {
+                source
+                    .split("pub(crate) struct RuntimeReadonlyToolTurnRequest")
+                    .next()
+            })
+            .expect("RuntimeReadonlyToolTurnContext source");
+        for field_name in [
+            "cwd:",
+            "events:",
+            "sink:",
+            "conversation:",
+            "history_writer:",
+            "tool_requests:",
+            "emit_deltas:",
+            "mcp_registry:",
+            "hooks:",
+            "output_truncation:",
+        ] {
+            assert!(
+                !readonly_context.contains(field_name),
+                "RuntimeReadonlyToolTurnContext must not expose grouped field {field_name} directly"
+            );
+        }
+        assert!(
             readonly_source.contains("execute_readonly_batch"),
             "runtime_readonly_tool_turn must compose readonly batch execution"
         );

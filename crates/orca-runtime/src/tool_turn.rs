@@ -20,7 +20,8 @@ use crate::memory::MemoryBlock;
 #[cfg(test)]
 use crate::runtime_readonly_tool_turn::record_readonly_batch_results;
 use crate::runtime_readonly_tool_turn::{
-    RuntimeReadonlyToolTurnContext, collect_readonly_batch, run_readonly_tool_turn,
+    RuntimeReadonlyToolTurnContext, RuntimeReadonlyToolTurnIo, RuntimeReadonlyToolTurnRequest,
+    RuntimeReadonlyToolTurnServices, collect_readonly_batch, run_readonly_tool_turn,
     should_run_readonly_batch,
 };
 use crate::step_context::{
@@ -252,16 +253,22 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                     )
                 });
             match run_readonly_tool_turn(RuntimeReadonlyToolTurnContext {
-                cwd,
-                events,
-                sink,
-                conversation,
-                history_writer: history_writer.as_deref_mut(),
-                tool_requests: dispatch_window.tool_requests(),
-                emit_deltas,
-                mcp_registry,
-                hooks,
-                output_truncation: config.tools.output_truncation,
+                request: RuntimeReadonlyToolTurnRequest {
+                    cwd,
+                    tool_requests: dispatch_window.tool_requests(),
+                    emit_deltas,
+                    output_truncation: config.tools.output_truncation,
+                },
+                io: RuntimeReadonlyToolTurnIo {
+                    events,
+                    sink,
+                    conversation,
+                    history_writer: history_writer.as_deref_mut(),
+                },
+                services: RuntimeReadonlyToolTurnServices {
+                    mcp_registry,
+                    hooks,
+                },
             })? {
                 ToolTurnOutcome::Continue => {}
                 ToolTurnOutcome::Return { status, error } => {
@@ -795,16 +802,22 @@ mod tests {
         let hooks = HookRunner::default();
 
         let outcome = run_readonly_tool_turn(RuntimeReadonlyToolTurnContext {
-            cwd: cwd.path(),
-            events: &mut events,
-            sink: &mut sink,
-            conversation: &mut conversation,
-            history_writer: None,
-            tool_requests: &requests,
-            emit_deltas: false,
-            mcp_registry: &registry,
-            hooks: &hooks,
-            output_truncation: ToolConfig::default().output_truncation,
+            request: RuntimeReadonlyToolTurnRequest {
+                cwd: cwd.path(),
+                tool_requests: &requests,
+                emit_deltas: false,
+                output_truncation: ToolConfig::default().output_truncation,
+            },
+            io: RuntimeReadonlyToolTurnIo {
+                events: &mut events,
+                sink: &mut sink,
+                conversation: &mut conversation,
+                history_writer: None,
+            },
+            services: RuntimeReadonlyToolTurnServices {
+                mcp_registry: &registry,
+                hooks: &hooks,
+            },
         })
         .expect("run readonly tool turn");
 

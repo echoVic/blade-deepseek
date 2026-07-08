@@ -387,6 +387,10 @@ copied into Orca.
    `run_subagent_batch_tool_turn` through `RuntimeSubagentBatchToolTurnContext`
    and its request, I/O, service, and runtime groups, so the TUI-shared
    subagent batch path no longer exposes a long runner argument list.
+   Readonly tool-turn execution now carries its request, I/O, and service refs
+   through `RuntimeReadonlyToolTurnRequest`, `RuntimeReadonlyToolTurnIo`, and
+   `RuntimeReadonlyToolTurnServices`, matching the normal and subagent batch
+   context pattern on the TUI-shared dispatch path.
    Iteration stages now keep lifecycle-owned `RuntimeTurnLoopIterationState`
    grouped instead of unpacking runtime system messages, model overrides,
    cost/cancel/task refs, and extension refs into the iteration input. Keep

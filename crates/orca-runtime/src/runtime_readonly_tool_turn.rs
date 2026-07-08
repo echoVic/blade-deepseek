@@ -28,16 +28,28 @@ pub(crate) struct RuntimeReadonlyBatchContext<'a, W: io::Write> {
 }
 
 pub(crate) struct RuntimeReadonlyToolTurnContext<'a, W: io::Write> {
+    pub(crate) request: RuntimeReadonlyToolTurnRequest<'a>,
+    pub(crate) io: RuntimeReadonlyToolTurnIo<'a, W>,
+    pub(crate) services: RuntimeReadonlyToolTurnServices<'a>,
+}
+
+pub(crate) struct RuntimeReadonlyToolTurnRequest<'a> {
     pub(crate) cwd: &'a Path,
+    pub(crate) tool_requests: &'a [ToolRequest],
+    pub(crate) emit_deltas: bool,
+    pub(crate) output_truncation: ToolOutputTruncation,
+}
+
+pub(crate) struct RuntimeReadonlyToolTurnIo<'a, W: io::Write> {
     pub(crate) events: &'a mut EventFactory,
     pub(crate) sink: &'a mut EventSink<W>,
     pub(crate) conversation: &'a mut Conversation,
     pub(crate) history_writer: Option<&'a mut SessionWriter>,
-    pub(crate) tool_requests: &'a [ToolRequest],
-    pub(crate) emit_deltas: bool,
+}
+
+pub(crate) struct RuntimeReadonlyToolTurnServices<'a> {
     pub(crate) mcp_registry: &'a McpRegistry,
     pub(crate) hooks: &'a HookRunner,
-    pub(crate) output_truncation: ToolOutputTruncation,
 }
 
 pub(crate) fn execute_readonly_batch<W: io::Write>(
@@ -164,17 +176,26 @@ pub(crate) fn run_readonly_tool_turn<W: io::Write>(
     context: RuntimeReadonlyToolTurnContext<'_, W>,
 ) -> io::Result<ToolTurnOutcome> {
     let RuntimeReadonlyToolTurnContext {
+        request,
+        io,
+        services,
+    } = context;
+    let RuntimeReadonlyToolTurnRequest {
         cwd,
+        tool_requests,
+        emit_deltas,
+        output_truncation,
+    } = request;
+    let RuntimeReadonlyToolTurnIo {
         events,
         sink,
         conversation,
         history_writer,
-        tool_requests,
-        emit_deltas,
+    } = io;
+    let RuntimeReadonlyToolTurnServices {
         mcp_registry,
         hooks,
-        output_truncation,
-    } = context;
+    } = services;
     let results = execute_readonly_batch(RuntimeReadonlyBatchContext {
         cwd,
         events,
