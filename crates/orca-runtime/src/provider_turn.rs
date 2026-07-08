@@ -17,7 +17,10 @@ use orca_provider::{ProviderConfig, context};
 
 use crate::agent_child::ChildAgentExecutor;
 use crate::background_turn::RuntimeTurnContinuation;
-use crate::compaction::RuntimeCompactionStep;
+use crate::compaction::{
+    RuntimeCompactionPolicy, RuntimeCompactionRetryDecision, RuntimeCompactionRetryState,
+    RuntimeCompactionStep,
+};
 use crate::cost::CostTracker;
 use crate::extension::RuntimeExtensionContext;
 use crate::hooks::{HookRunner, conversation_with_hook_context};
@@ -51,7 +54,7 @@ use crate::workflow_execution::BackgroundWorkflowRun;
 
 pub(crate) struct RuntimeProviderErrorResultStep;
 pub(crate) struct RuntimeProviderErrorStep {
-    reactive_compacted: bool,
+    compaction_retry: RuntimeCompactionRetryState,
 }
 pub(crate) struct RuntimeProviderTurnResultStep;
 pub(crate) struct RuntimeProviderTurnResultResultStep;
@@ -205,7 +208,7 @@ impl RuntimeProviderErrorResultStep {
 impl RuntimeProviderErrorStep {
     pub(crate) fn new() -> Self {
         Self {
-            reactive_compacted: false,
+            compaction_retry: RuntimeCompactionRetryState::default(),
         }
     }
 
@@ -219,14 +222,14 @@ impl RuntimeProviderErrorStep {
             response,
             compaction,
             conversation,
-            self.reactive_compacted,
+            &self.compaction_retry,
         )? {
             RuntimeProviderErrorOutcome::ContinueAfterCompaction => {
-                self.reactive_compacted = true;
+                self.compaction_retry.record_prompt_too_long_retry();
                 Ok(RuntimeProviderErrorStepOutcome::ContinueAfterCompaction)
             }
             RuntimeProviderErrorOutcome::Failed(message) => {
-                self.reactive_compacted = false;
+                self.compaction_retry.reset();
                 Ok(RuntimeProviderErrorStepOutcome::Failed(
                     RuntimeTurnStartError {
                         status: RunStatus::Failed,
@@ -235,7 +238,7 @@ impl RuntimeProviderErrorStep {
                 ))
             }
             RuntimeProviderErrorOutcome::NoError => {
-                self.reactive_compacted = false;
+                self.compaction_retry.reset();
                 Ok(RuntimeProviderErrorStepOutcome::NoError)
             }
         }
@@ -243,12 +246,12 @@ impl RuntimeProviderErrorStep {
 
     #[cfg(test)]
     fn mark_reactive_compacted_for_test(&mut self) {
-        self.reactive_compacted = true;
+        self.compaction_retry.record_prompt_too_long_retry();
     }
 
     #[cfg(test)]
     fn reactive_compacted_for_test(&self) -> bool {
-        self.reactive_compacted
+        self.compaction_retry.has_prompt_too_long_retry()
     }
 }
 
@@ -390,7 +393,7 @@ impl RuntimeProviderTurnStep {
         response: &ProviderResponse,
         compaction: &mut RuntimeCompactionStep<'_, W>,
         conversation: &mut Conversation,
-        reactive_compacted: bool,
+        compaction_retry: &RuntimeCompactionRetryState,
     ) -> io::Result<RuntimeProviderErrorOutcome> {
         let provider_error = response.steps.iter().find_map(|step| match step {
             ProviderStep::Error(message) => Some(message.clone()),
@@ -401,13 +404,16 @@ impl RuntimeProviderTurnStep {
             return Ok(RuntimeProviderErrorOutcome::NoError);
         };
 
-        if context::is_prompt_too_long_error(&error) && !reactive_compacted {
-            compaction.compact_after_prompt_too_long(conversation)?;
-            return Ok(RuntimeProviderErrorOutcome::ContinueAfterCompaction);
+        match RuntimeCompactionPolicy::decide_for_provider_error(&error, compaction_retry) {
+            RuntimeCompactionRetryDecision::CompactAndRetry { trigger, reason: _ } => {
+                compaction.compact_after_provider_error_retry(conversation, trigger)?;
+                Ok(RuntimeProviderErrorOutcome::ContinueAfterCompaction)
+            }
+            RuntimeCompactionRetryDecision::SurfaceError => {
+                compaction.emit_error(&error)?;
+                Ok(RuntimeProviderErrorOutcome::Failed(error))
+            }
         }
-
-        compaction.emit_error(&error)?;
-        Ok(RuntimeProviderErrorOutcome::Failed(error))
     }
 }
 
@@ -834,7 +840,12 @@ mod tests {
         let mut conversation = Conversation::new();
 
         let outcome = RuntimeProviderTurnStep::new()
-            .handle_provider_error(&response, &mut compaction, &mut conversation, false)
+            .handle_provider_error(
+                &response,
+                &mut compaction,
+                &mut conversation,
+                &RuntimeCompactionRetryState::default(),
+            )
             .expect("provider error handling succeeds");
 
         match outcome {

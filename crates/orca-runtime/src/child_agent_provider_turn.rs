@@ -14,7 +14,9 @@ use crate::child_agent_loop_setup::ChildAgentLoopSetup;
 use crate::child_agent_types::{
     ChildAgentActivity, ChildAgentActivityObserver, ChildAgentRequest, ChildAgentResult,
 };
-use crate::compaction::RuntimeCompactionStep;
+use crate::compaction::{
+    RuntimeCompactionPolicy, RuntimeCompactionRetryDecision, RuntimeCompactionStep,
+};
 use crate::cost::CostTracker;
 use crate::hooks::{HookContext, HookRunner, conversation_with_hook_context};
 use crate::lifecycle::RuntimeTurnContext;
@@ -208,34 +210,35 @@ pub fn handle_child_agent_provider_error(
         ProviderStep::Error(message) => Some(message.clone()),
         _ => None,
     }) else {
-        setup.reactive_compacted = false;
+        setup.compaction_retry.reset();
         return Ok(None);
     };
 
-    if orca_provider::context::is_prompt_too_long_error(&error) && !setup.reactive_compacted {
-        let mut events = EventFactory::new("child-agent-compaction".to_string());
-        let mut sink = EventSink::new(io::sink(), config.output_format);
-        let subagent_type = SubagentType::General;
-        let mut compaction = RuntimeCompactionStep::new(
-            config.provider,
-            &setup.context_config,
-            &setup.provider_config,
-            RuntimeTurnContext::new(cwd, "", 0, false, &subagent_type),
-            hooks,
-            &mut events,
-            &mut sink,
-            None,
-        );
-        compaction.compact_after_prompt_too_long(&mut setup.conversation)?;
-        setup.reactive_compacted = true;
-        return Ok(Some(ChildAgentProviderErrorDecision::RetryAfterCompaction));
+    match RuntimeCompactionPolicy::decide_for_provider_error(&error, &setup.compaction_retry) {
+        RuntimeCompactionRetryDecision::CompactAndRetry { trigger, reason: _ } => {
+            let mut events = EventFactory::new("child-agent-compaction".to_string());
+            let mut sink = EventSink::new(io::sink(), config.output_format);
+            let subagent_type = SubagentType::General;
+            let mut compaction = RuntimeCompactionStep::new(
+                config.provider,
+                &setup.context_config,
+                &setup.provider_config,
+                RuntimeTurnContext::new(cwd, "", 0, false, &subagent_type),
+                hooks,
+                &mut events,
+                &mut sink,
+                None,
+            );
+            compaction.compact_after_provider_error_retry(&mut setup.conversation, trigger)?;
+            setup.compaction_retry.record_prompt_too_long_retry();
+            Ok(Some(ChildAgentProviderErrorDecision::RetryAfterCompaction))
+        }
+        RuntimeCompactionRetryDecision::SurfaceError => Ok(Some(
+            ChildAgentProviderErrorDecision::Fail(ChildAgentResult {
+                status: RunStatus::Failed,
+                final_message: None,
+                error: Some(error),
+            }),
+        )),
     }
-
-    Ok(Some(ChildAgentProviderErrorDecision::Fail(
-        ChildAgentResult {
-            status: RunStatus::Failed,
-            final_message: None,
-            error: Some(error),
-        },
-    )))
 }

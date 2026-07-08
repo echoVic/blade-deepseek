@@ -11,6 +11,7 @@ use orca_provider::tool_schema::deepseek_tools_schema_for_type_with_mcp_and_exte
 
 use crate::agent_common;
 use crate::child_agent_types::{ChildAgentRequest, ChildAgentResult};
+use crate::compaction::RuntimeCompactionRetryState;
 use crate::instructions::ProjectInstructions;
 use crate::memory::MemoryBlock;
 
@@ -23,7 +24,7 @@ pub struct ChildAgentLoopSetup {
     pub conversation: Conversation,
     pub policy: ApprovalPolicy,
     pub(crate) turn: u32,
-    pub(crate) reactive_compacted: bool,
+    pub(crate) compaction_retry: RuntimeCompactionRetryState,
 }
 
 pub enum ChildAgentTurnBudget {
@@ -77,7 +78,7 @@ pub fn prepare_child_agent_loop(
         conversation,
         policy,
         turn: 0,
-        reactive_compacted: false,
+        compaction_retry: RuntimeCompactionRetryState::default(),
     }
 }
 

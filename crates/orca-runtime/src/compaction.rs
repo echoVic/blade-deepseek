@@ -60,6 +60,35 @@ pub(crate) struct RuntimeCompactionDetails {
     pub(crate) status_text: &'static str,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct RuntimeCompactionRetryState {
+    prompt_too_long_retried: bool,
+}
+
+impl RuntimeCompactionRetryState {
+    pub(crate) fn record_prompt_too_long_retry(&mut self) {
+        self.prompt_too_long_retried = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_prompt_too_long_retry(&self) -> bool {
+        self.prompt_too_long_retried
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.prompt_too_long_retried = false;
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeCompactionRetryDecision {
+    CompactAndRetry {
+        trigger: RuntimeCompactionTrigger,
+        reason: RuntimeCompactionReason,
+    },
+    SurfaceError,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RuntimeCompactionOutcome {
     trigger: RuntimeCompactionTrigger,
@@ -158,6 +187,20 @@ impl<'a> RuntimeCompactionPolicy<'a> {
             None
         }
     }
+
+    pub(crate) fn decide_for_provider_error(
+        error: &str,
+        retry_state: &RuntimeCompactionRetryState,
+    ) -> RuntimeCompactionRetryDecision {
+        if context::is_prompt_too_long_error(error) && !retry_state.prompt_too_long_retried {
+            RuntimeCompactionRetryDecision::CompactAndRetry {
+                trigger: RuntimeCompactionTrigger::PromptTooLong,
+                reason: RuntimeCompactionReason::PromptTooLongRecovery,
+            }
+        } else {
+            RuntimeCompactionRetryDecision::SurfaceError
+        }
+    }
 }
 
 pub(crate) struct RuntimeCompactionTask {
@@ -241,11 +284,12 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
         Ok(true)
     }
 
-    pub(crate) fn compact_after_prompt_too_long(
+    pub(crate) fn compact_after_provider_error_retry(
         &mut self,
         conversation: &mut Conversation,
+        trigger: RuntimeCompactionTrigger,
     ) -> io::Result<()> {
-        self.compact_and_persist(conversation, RuntimeCompactionTrigger::PromptTooLong)?;
+        self.compact_and_persist(conversation, trigger)?;
         Ok(())
     }
 
@@ -467,5 +511,41 @@ mod tests {
             details.status_text,
             "compacted context after prompt-too-long"
         );
+    }
+
+    #[test]
+    fn compaction_policy_decides_prompt_too_long_retry_once() {
+        let mut retry_state = RuntimeCompactionRetryState::default();
+        let decision = RuntimeCompactionPolicy::decide_for_provider_error(
+            "DeepSeek provider error: prompt_too_long: context length exceeded",
+            &retry_state,
+        );
+
+        assert_eq!(
+            decision,
+            RuntimeCompactionRetryDecision::CompactAndRetry {
+                trigger: RuntimeCompactionTrigger::PromptTooLong,
+                reason: RuntimeCompactionReason::PromptTooLongRecovery,
+            }
+        );
+
+        retry_state.record_prompt_too_long_retry();
+        let decision = RuntimeCompactionPolicy::decide_for_provider_error(
+            "DeepSeek provider error: prompt_too_long: context length exceeded",
+            &retry_state,
+        );
+
+        assert_eq!(decision, RuntimeCompactionRetryDecision::SurfaceError);
+    }
+
+    #[test]
+    fn compaction_policy_surfaces_non_context_errors() {
+        let retry_state = RuntimeCompactionRetryState::default();
+        let decision = RuntimeCompactionPolicy::decide_for_provider_error(
+            "DeepSeek provider error: quota exhausted",
+            &retry_state,
+        );
+
+        assert_eq!(decision, RuntimeCompactionRetryDecision::SurfaceError);
     }
 }

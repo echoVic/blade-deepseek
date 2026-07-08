@@ -254,7 +254,11 @@ The deeper July 9 reference pass changes the next refactor order:
    recovery should advance through named transitions such as collapse-drain retry
    and reactive compact retry, but Orca should keep those decisions inside the
    runtime compaction boundary instead of coupling them to the broad query loop.
-   Next extend that boundary with retry decisions and event/TUI projection.
+   The retry decision slice is now seeded: provider and child-agent
+   prompt-too-long recovery both carry `RuntimeCompactionRetryState` and ask
+   `RuntimeCompactionPolicy` whether to compact and retry or surface the error,
+   leaving provider code to execute a decision instead of reclassifying context
+   errors. Next extend that boundary with event/TUI projection.
 3. **P1: Move exec/permission evaluation toward a dedicated policy manager.**
    Codex keeps mutable exec policy in an `ExecPolicyManager` with parsed rules,
    command-origin lowering, prompt rejection reasons, and serialized updates.

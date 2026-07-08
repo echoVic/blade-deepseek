@@ -143,7 +143,7 @@ fn prepare_child_agent_loop_builds_provider_conversation_and_policy() {
     ));
     assert!(format!("{:?}", setup.policy).contains("Suggest"));
     assert_eq!(setup.turn, 0);
-    assert!(!setup.reactive_compacted);
+    assert!(!setup.compaction_retry.has_prompt_too_long_retry());
 }
 
 #[test]
@@ -513,7 +513,7 @@ fn handle_child_agent_provider_error_retries_prompt_too_long_once() {
         decision,
         ChildAgentProviderErrorDecision::RetryAfterCompaction
     ));
-    assert!(setup.reactive_compacted);
+    assert!(setup.compaction_retry.has_prompt_too_long_retry());
     assert!(setup.conversation.messages.len() < before_messages);
 
     let decision = handle_child_agent_provider_error(

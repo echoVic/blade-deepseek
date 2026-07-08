@@ -2420,7 +2420,6 @@ mod tests {
         for marker in [
             "conversation_with_hook_context",
             "RuntimeCompactionStep::new",
-            "is_prompt_too_long_error",
             "PreModelCall",
             "PostModelCall",
         ] {
@@ -2433,6 +2432,15 @@ mod tests {
                 "agent_child facade must delegate provider-turn behavior detail {marker}"
             );
         }
+        assert!(
+            child_provider_turn_source
+                .contains("RuntimeCompactionPolicy::decide_for_provider_error("),
+            "child_agent_provider_turn must delegate provider-error retry decisions to compaction policy"
+        );
+        assert!(
+            !child_provider_turn_source.contains("context::is_prompt_too_long_error"),
+            "child_agent_provider_turn must not classify prompt-too-long errors directly"
+        );
 
         assert!(
             agent_child_source.contains("pub use crate::child_agent_provider_turn::"),
@@ -4235,7 +4243,7 @@ mod tests {
             .nth(1)
             .and_then(|source| {
                 source
-                    .split("pub(crate) fn compact_after_prompt_too_long")
+                    .split("pub(crate) fn compact_after_provider_error_retry")
                     .next()
             })
             .expect("compact_if_needed source");
@@ -4288,7 +4296,6 @@ mod tests {
             "provider_replay_updated",
             "ProviderStep::ReplayState",
             "ProviderStep::Error",
-            "is_prompt_too_long_error",
             "compaction.emit_error(",
             "append_usage(",
         ] {
@@ -5309,8 +5316,24 @@ mod tests {
             "provider_turn must own runtime provider-error result step behavior"
         );
         assert!(
-            provider_turn_source.contains("reactive_compacted"),
-            "provider_turn must own reactive compaction loop state"
+            provider_turn_source.contains("RuntimeCompactionRetryState"),
+            "provider_turn must carry runtime-owned compaction retry state"
+        );
+        assert!(
+            provider_turn_source.contains("compaction_retry"),
+            "provider_turn must keep provider-error retry state behind a named compaction boundary"
+        );
+        assert!(
+            provider_turn_source.contains("RuntimeCompactionPolicy::decide_for_provider_error("),
+            "provider_turn must delegate provider-error retry decisions to compaction policy"
+        );
+        assert!(
+            !provider_turn_source.contains("context::is_prompt_too_long_error"),
+            "provider_turn must not classify prompt-too-long errors directly"
+        );
+        assert!(
+            !provider_turn_source.contains("&& !reactive_compacted"),
+            "provider_turn must not inline prompt-too-long retry guard logic"
         );
         assert!(
             provider_turn_source.contains("handle_provider_error("),
