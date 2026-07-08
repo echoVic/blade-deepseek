@@ -245,9 +245,10 @@ The deeper July 9 reference pass changes the next refactor order:
    compaction hooks, initial-context injection, retry metadata, and compaction
    telemetry. Orca currently has a lifecycle-owned `RuntimeCompactionStep`, but
    compaction remains a mostly synchronous summary-and-persist operation. The
-   next useful slice is a `RuntimeCompactionPolicy` / `RuntimeCompactionTask`
-   split that reports reason, trigger, before/after counts, retry decision, and
-   history persistence through one boundary.
+   first slice is now seeded: `RuntimeCompactionPolicy` maps context pressure to
+   explicit soft/hard triggers, and `RuntimeCompactionTask` records trigger plus
+   before/after message counts before summary-state persistence. Next extend
+   that boundary with retry decisions, compaction reasons, and telemetry.
 3. **P1: Move exec/permission evaluation toward a dedicated policy manager.**
    Codex keeps mutable exec policy in an `ExecPolicyManager` with parsed rules,
    command-origin lowering, prompt rejection reasons, and serialized updates.

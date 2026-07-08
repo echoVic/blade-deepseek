@@ -4135,6 +4135,59 @@ mod tests {
     }
 
     #[test]
+    fn runtime_compaction_policy_and_task_are_owned_by_compaction_module() {
+        let compaction_source = include_str!("compaction.rs");
+
+        assert!(
+            compaction_source.contains("struct RuntimeCompactionPolicy"),
+            "compaction module must own a runtime compaction policy boundary"
+        );
+        assert!(
+            compaction_source.contains("enum RuntimeCompactionTrigger"),
+            "compaction module must name compaction triggers explicitly"
+        );
+        assert!(
+            compaction_source.contains("struct RuntimeCompactionTask"),
+            "compaction module must own a runtime compaction task boundary"
+        );
+        assert!(
+            compaction_source.contains("fn decide("),
+            "RuntimeCompactionPolicy must expose a decision method"
+        );
+        assert!(
+            compaction_source.contains("RuntimeCompactionTask::start("),
+            "compaction execution must start a task before compacting"
+        );
+        assert!(
+            compaction_source.contains("task.finish("),
+            "compaction execution must finish the task with after-message counts"
+        );
+        assert!(
+            compaction_source.contains("task.should_persist_summary_state("),
+            "summary persistence must be routed through the compaction task boundary"
+        );
+
+        let compact_if_needed = compaction_source
+            .split("fn compact_if_needed")
+            .nth(1)
+            .and_then(|source| {
+                source
+                    .split("pub(crate) fn compact_after_prompt_too_long")
+                    .next()
+            })
+            .expect("compact_if_needed source");
+        assert!(
+            compact_if_needed.contains(".decide("),
+            "compact_if_needed must delegate trigger selection to RuntimeCompactionPolicy"
+        );
+        assert!(
+            !compact_if_needed.contains("should_soft_compact")
+                && !compact_if_needed.contains("should_hard_compact"),
+            "compact_if_needed must not inspect raw pressure booleans directly"
+        );
+    }
+
+    #[test]
     fn runtime_provider_turn_step_is_owned_by_provider_turn_module() {
         let agent_loop_source = include_str!("agent_loop.rs");
         let lifecycle_source = include_str!("lifecycle.rs");

@@ -10,6 +10,89 @@ use crate::lifecycle::RuntimeTurnContext;
 use crate::thread_store::SessionWriter;
 use orca_core::conversation::Conversation;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeCompactionTrigger {
+    SoftLimit,
+    HardLimit,
+    PromptTooLong,
+}
+
+pub(crate) struct RuntimeCompactionPolicy<'a> {
+    context_config: &'a context::ContextConfig,
+    provider_config: &'a ProviderConfig,
+}
+
+impl<'a> RuntimeCompactionPolicy<'a> {
+    pub(crate) fn new(
+        context_config: &'a context::ContextConfig,
+        provider_config: &'a ProviderConfig,
+    ) -> Self {
+        Self {
+            context_config,
+            provider_config,
+        }
+    }
+
+    pub(crate) fn decide(&self, conversation: &Conversation) -> Option<RuntimeCompactionTrigger> {
+        let pressure =
+            context::context_pressure(conversation, self.context_config, self.provider_config);
+        Self::decide_for_pressure(pressure)
+    }
+
+    pub(crate) fn decide_for_pressure(
+        pressure: context::ContextPressure,
+    ) -> Option<RuntimeCompactionTrigger> {
+        if pressure.should_hard_compact {
+            Some(RuntimeCompactionTrigger::HardLimit)
+        } else if pressure.should_soft_compact {
+            Some(RuntimeCompactionTrigger::SoftLimit)
+        } else {
+            None
+        }
+    }
+}
+
+pub(crate) struct RuntimeCompactionTask {
+    trigger: RuntimeCompactionTrigger,
+    before_messages: usize,
+    after_messages: Option<usize>,
+}
+
+impl RuntimeCompactionTask {
+    pub(crate) fn start(trigger: RuntimeCompactionTrigger, before_messages: usize) -> Self {
+        Self {
+            trigger,
+            before_messages,
+            after_messages: None,
+        }
+    }
+
+    pub(crate) fn finish(&mut self, after_messages: usize) {
+        self.after_messages = Some(after_messages);
+    }
+
+    pub(crate) fn trigger(&self) -> RuntimeCompactionTrigger {
+        self.trigger
+    }
+
+    pub(crate) fn before_messages(&self) -> usize {
+        self.before_messages
+    }
+
+    pub(crate) fn should_persist_summary_state(&self, emit_deltas: bool) -> bool {
+        match self.trigger() {
+            RuntimeCompactionTrigger::SoftLimit
+            | RuntimeCompactionTrigger::HardLimit
+            | RuntimeCompactionTrigger::PromptTooLong => emit_deltas,
+        }
+    }
+
+    pub(crate) fn after_messages(&self) -> usize {
+        self.after_messages
+            .expect("runtime compaction task must finish before persistence")
+    }
+}
+
 pub(crate) struct RuntimeCompactionStep<'a, W: io::Write> {
     provider: orca_core::config::ProviderKind,
     context_config: &'a context::ContextConfig,
@@ -48,13 +131,11 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
         &mut self,
         conversation: &mut Conversation,
     ) -> io::Result<bool> {
-        let pressure =
-            context::context_pressure(conversation, self.context_config, self.provider_config);
-        if !pressure.should_soft_compact && !pressure.should_hard_compact {
+        let policy = RuntimeCompactionPolicy::new(self.context_config, self.provider_config);
+        let Some(trigger) = policy.decide(conversation) else {
             return Ok(false);
-        }
-
-        self.compact_with_budget_hooks(conversation)?;
+        };
+        self.compact_with_budget_hooks(conversation, trigger)?;
         Ok(true)
     }
 
@@ -62,7 +143,7 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
         &mut self,
         conversation: &mut Conversation,
     ) -> io::Result<()> {
-        self.compact_and_persist(conversation)?;
+        self.compact_and_persist(conversation, RuntimeCompactionTrigger::PromptTooLong)?;
         Ok(())
     }
 
@@ -73,7 +154,11 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
         Ok(())
     }
 
-    fn compact_with_budget_hooks(&mut self, conversation: &mut Conversation) -> io::Result<()> {
+    fn compact_with_budget_hooks(
+        &mut self,
+        conversation: &mut Conversation,
+        trigger: RuntimeCompactionTrigger,
+    ) -> io::Result<()> {
         let before_messages = conversation.messages.len();
         match self.hooks.run(
             HookEvent::OnBudgetWarning,
@@ -104,7 +189,7 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
             self.run_compaction_hook(HookEvent::PreCompact, before_messages, None)?;
         }
 
-        let after_messages = self.compact_and_persist(conversation)?;
+        let after_messages = self.compact_and_persist(conversation, trigger)?;
 
         if self.turn_context.emit_deltas {
             self.run_compaction_hook(
@@ -117,8 +202,13 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
         Ok(())
     }
 
-    fn compact_and_persist(&mut self, conversation: &mut Conversation) -> io::Result<usize> {
+    fn compact_and_persist(
+        &mut self,
+        conversation: &mut Conversation,
+        trigger: RuntimeCompactionTrigger,
+    ) -> io::Result<usize> {
         let before_messages = conversation.messages.len();
+        let mut task = RuntimeCompactionTask::start(trigger, before_messages);
         let compaction = context::compact_with_summary(
             self.provider,
             conversation,
@@ -127,14 +217,15 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
         );
         *conversation = compaction.conversation;
         let after_messages = conversation.messages.len();
-        if self.turn_context.emit_deltas
+        task.finish(after_messages);
+        if task.should_persist_summary_state(self.turn_context.emit_deltas)
             && let Some(writer) = self.history_writer.as_deref_mut()
         {
-            writer.append_compaction(before_messages, after_messages)?;
+            writer.append_compaction(task.before_messages(), task.after_messages())?;
             if let context::CompactionKind::RemoteSummary(summary) = compaction.kind {
                 writer.append_summary_state(
-                    before_messages,
-                    after_messages,
+                    task.before_messages(),
+                    task.after_messages(),
                     summary,
                     &conversation.summary,
                 )?;
@@ -168,5 +259,59 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
             )?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compaction_policy_maps_pressure_to_trigger() {
+        let below = context::ContextPressure {
+            wire_tokens: 8,
+            effective_limit: 20,
+            soft_limit: 10,
+            should_soft_compact: false,
+            should_hard_compact: false,
+        };
+        let soft = context::ContextPressure {
+            wire_tokens: 12,
+            effective_limit: 20,
+            soft_limit: 10,
+            should_soft_compact: true,
+            should_hard_compact: false,
+        };
+        let hard = context::ContextPressure {
+            wire_tokens: 24,
+            effective_limit: 20,
+            soft_limit: 10,
+            should_soft_compact: true,
+            should_hard_compact: true,
+        };
+
+        assert_eq!(RuntimeCompactionPolicy::decide_for_pressure(below), None);
+        assert_eq!(
+            RuntimeCompactionPolicy::decide_for_pressure(soft),
+            Some(RuntimeCompactionTrigger::SoftLimit)
+        );
+        assert_eq!(
+            RuntimeCompactionPolicy::decide_for_pressure(hard),
+            Some(RuntimeCompactionTrigger::HardLimit)
+        );
+    }
+
+    #[test]
+    fn compaction_task_records_trigger_and_message_counts() {
+        let mut task = RuntimeCompactionTask::start(RuntimeCompactionTrigger::PromptTooLong, 11);
+
+        assert_eq!(task.trigger(), RuntimeCompactionTrigger::PromptTooLong);
+        assert_eq!(task.before_messages(), 11);
+
+        task.finish(4);
+
+        assert_eq!(task.after_messages(), 4);
+        assert!(task.should_persist_summary_state(true));
+        assert!(!task.should_persist_summary_state(false));
     }
 }
