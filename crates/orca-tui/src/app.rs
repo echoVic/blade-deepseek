@@ -1027,6 +1027,147 @@ mod tests {
     }
 
     #[test]
+    fn recovered_background_approval_notifies_tui_user() {
+        let registry = orca_runtime::tasks::TaskRegistry::new("session-1".to_string());
+        let task = registry.create_main_session("Needs approval".to_string());
+        registry.mark_running(&task.id).unwrap();
+        registry.mark_backgrounded(&task.id).unwrap();
+        registry
+            .approval_required_for_pending_tool(
+                &task.id,
+                "approval_required".to_string(),
+                Some(orca_core::task_types::PendingToolCallSummary {
+                    id: "mock-tool-1".to_string(),
+                    name: "task_list".to_string(),
+                    action: orca_core::approval_types::ActionKind::Read,
+                    target: None,
+                    arguments: "{}".to_string(),
+                }),
+            )
+            .unwrap();
+        let (event_tx, event_rx) = mpsc::channel();
+
+        assert_eq!(
+            notify_recovered_background_approvals_for_tui(&registry, &event_tx),
+            1
+        );
+
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(TuiEvent::WorkflowTasksUpdated { tasks })
+                if tasks.len() == 1
+                    && tasks[0].id == task.id
+                    && tasks[0].status == orca_core::task_types::TaskStatus::ApprovalRequired
+        ));
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(TuiEvent::Notice(message))
+                if message.contains("Recovered background session")
+                    && message.contains("task_list")
+                    && message.contains("waiting for approval")
+        ));
+    }
+
+    #[test]
+    fn resumed_session_announces_recovered_background_approval_on_first_submit() {
+        with_orca_home(|home| {
+            let session_id = "resume-background-approval-session";
+            let registry = orca_runtime::tasks::TaskRegistry::new_persistent(
+                session_id.to_string(),
+                home.join("task-sessions"),
+            )
+            .unwrap();
+            let task = registry.create_main_session("Needs approval".to_string());
+            let task_id = task.id.clone();
+            registry.mark_running(&task.id).unwrap();
+            registry.mark_backgrounded(&task.id).unwrap();
+            registry
+                .approval_required_for_pending_tool(
+                    &task.id,
+                    "approval_required".to_string(),
+                    Some(orca_core::task_types::PendingToolCallSummary {
+                        id: "mock-tool-1".to_string(),
+                        name: "task_list".to_string(),
+                        action: orca_core::approval_types::ActionKind::Read,
+                        target: None,
+                        arguments: "{}".to_string(),
+                    }),
+                )
+                .unwrap();
+            drop(registry);
+
+            let config = Arc::new(Mutex::new(test_config(HistoryMode::Resume(
+                session_id.to_string(),
+            ))));
+            let mut transcript = transcript(session_id);
+            transcript.path = home.join("resume-background-approval.jsonl");
+            std::fs::write(&transcript.path, "").unwrap();
+            let preloaded = Arc::new(Mutex::new(Some(transcript)));
+            let (event_tx, event_rx) = mpsc::channel();
+            let (action_tx, action_rx) = mpsc::channel();
+            let cancel = CancelToken::new();
+
+            let handle = std::thread::spawn({
+                let config = Arc::clone(&config);
+                let preloaded = Arc::clone(&preloaded);
+                let cancel = cancel.clone();
+                move || {
+                    agent_loop_thread(
+                        config,
+                        preloaded,
+                        event_tx,
+                        action_rx,
+                        cancel,
+                        test_pending_workflow_notifications(),
+                    )
+                }
+            });
+
+            action_tx
+                .send(UserAction::Submit("hello".to_string()))
+                .unwrap();
+
+            let mut saw_task_refresh = false;
+            let mut saw_notice = false;
+            let mut seen = Vec::new();
+            for _ in 0..20 {
+                match event_rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+                    TuiEvent::WorkflowTasksUpdated { tasks } => {
+                        saw_task_refresh |= tasks.into_iter().any(|task| {
+                            task.id == task_id
+                                && task.status
+                                    == orca_core::task_types::TaskStatus::ApprovalRequired
+                                && task.is_backgrounded
+                        });
+                    }
+                    TuiEvent::Notice(message)
+                        if message.contains("Recovered background session")
+                            && message.contains("task_list") =>
+                    {
+                        saw_notice = true;
+                    }
+                    event => seen.push(format!("{event:?}")),
+                }
+                if saw_task_refresh && saw_notice {
+                    break;
+                }
+            }
+
+            action_tx.send(UserAction::Cancel).unwrap();
+            handle.join().unwrap();
+
+            assert!(
+                saw_task_refresh,
+                "missing recovered task refresh; saw {seen:?}"
+            );
+            assert!(
+                saw_notice,
+                "missing recovered approval notice; saw {seen:?}"
+            );
+        });
+    }
+
+    #[test]
     fn background_approval_action_denial_stops_task_and_refreshes_tasks() {
         let registry = orca_runtime::tasks::TaskRegistry::new("session-1".to_string());
         let task = registry.create_main_session("Needs approval".to_string());
@@ -3085,6 +3226,47 @@ fn submit_background_approval_response_for_tui(
     }
 }
 
+fn notify_recovered_background_approvals_for_tui(
+    task_registry: &orca_runtime::tasks::TaskRegistry,
+    event_tx: &mpsc::Sender<TuiEvent>,
+) -> usize {
+    let tasks = task_registry.list();
+    let recovered_tools = tasks
+        .iter()
+        .filter(|task| {
+            task.task_type == orca_core::task_types::TaskType::MainSession
+                && task.is_backgrounded
+                && task.status == orca_core::task_types::TaskStatus::ApprovalRequired
+                && task.pending_tool_call.is_some()
+        })
+        .filter_map(|task| {
+            task.pending_tool_call
+                .as_ref()
+                .map(|pending_tool| pending_tool.name.clone())
+        })
+        .collect::<Vec<_>>();
+
+    if recovered_tools.is_empty() {
+        return 0;
+    }
+
+    let count = recovered_tools.len();
+    let _ = event_tx.send(TuiEvent::WorkflowTasksUpdated { tasks });
+    let summary = if count == 1 {
+        format!(
+            "Recovered background session waiting for approval for {}.",
+            recovered_tools[0]
+        )
+    } else {
+        format!(
+            "Recovered {count} background sessions waiting for approval: {}.",
+            recovered_tools.join(", ")
+        )
+    };
+    let _ = event_tx.send(TuiEvent::Notice(summary));
+    count
+}
+
 fn ensure_tui_session(
     session: &mut Option<bridge::TuiConversationSession>,
     config: &Arc<Mutex<RunConfig>>,
@@ -3108,6 +3290,9 @@ fn ensure_tui_session(
                 None
             }
         };
+        if let Some(session) = session.as_ref() {
+            notify_recovered_background_approvals_for_tui(session.task_registry(), event_tx);
+        }
     }
     match session.as_ref().and_then(|session| session.session_id()) {
         Some(session_id) => Some(session_id.to_string()),
@@ -3414,6 +3599,9 @@ fn resume_latest_active_goal_for_tui(
     };
 
     *session = Some(resumed);
+    if let Some(session) = session.as_ref() {
+        notify_recovered_background_approvals_for_tui(session.task_registry(), event_tx);
+    }
     let _ = event_tx.send(TuiEvent::GoalUpdated(active_goal.clone()));
     let _ = event_tx.send(TuiEvent::Notice(
         "Resumed latest active goal in a restored session.".to_string(),
@@ -3486,6 +3674,12 @@ fn agent_loop_thread(
                             continue;
                         }
                     };
+                    if let Some(session) = session.as_ref() {
+                        notify_recovered_background_approvals_for_tui(
+                            session.task_registry(),
+                            &event_tx,
+                        );
+                    }
                 }
                 if let Some(session) = session.as_mut() {
                     for context in pending_pinned_context.drain(..) {
@@ -3524,6 +3718,12 @@ fn agent_loop_thread(
                             continue;
                         }
                     };
+                    if let Some(session) = session.as_ref() {
+                        notify_recovered_background_approvals_for_tui(
+                            session.task_registry(),
+                            &event_tx,
+                        );
+                    }
                 }
                 if let Some(session) = session.as_ref() {
                     bridge::launch_saved_workflow_for_tui(

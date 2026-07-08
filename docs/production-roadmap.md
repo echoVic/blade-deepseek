@@ -290,8 +290,9 @@ copied into Orca.
    provider-response continuation record through `TaskRegistry`, so a restarted
    TUI session can recover the pending tool approval, accept the approval
    response, and resume through the runtime-owned continuation path instead of
-   losing the provider response. Next, surface clearer resume messaging for
-   recovered approval-required tasks and decide whether old/invalid continuation
+   losing the provider response. TUI session initialization now also refreshes
+   recovered approval-required background tasks and emits a user-visible notice
+   naming the pending tool. Next, decide whether old/invalid continuation
    records should expire or fail closed.
 6. **P5: Package-3-style task UX polish.** Borrow the visible task panel ideas:
    sorted task list, detail view, foreground/stop actions, and notifications.
