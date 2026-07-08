@@ -253,8 +253,10 @@ copied into Orca.
    workflow refs now pass through `RuntimeTurnWorkflowContext` instead of
    parallel background-workflow and workflow-IPC fields, and event output refs
    now pass through `RuntimeTurnOutputContext` instead of parallel
-   `EventFactory`/`EventSink` fields. Keep borrowing package 3's explicit
-   loop-local `State` idea, but avoid a single giant context object.
+   `EventFactory`/`EventSink` fields. Turn-loop provider/model refs now pass
+   through `RuntimeTurnProviderContext` instead of parallel provider,
+   provider-config, model, and budget fields. Keep borrowing package 3's
+   explicit loop-local `State` idea, but avoid a single giant context object.
 4. **P3: Protocolized task/thread/interactive status.** Push background task,
    approval-needed, needs-input, foregrounded/backgrounded, and completed
    status through runtime protocol events so TUI, server, and future app

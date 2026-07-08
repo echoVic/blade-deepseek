@@ -5237,6 +5237,53 @@ mod tests {
     }
 
     #[test]
+    fn runtime_turn_provider_refs_are_grouped_for_turn_loop() {
+        let runtime_turn_loop_source = include_str!("runtime_turn_loop.rs");
+        let runtime_turn_iteration_source = include_str!("runtime_turn_iteration.rs");
+        let turn_loop_input = runtime_turn_loop_source
+            .split("pub(crate) struct RuntimeTurnLoopInput")
+            .nth(1)
+            .and_then(|source| {
+                source
+                    .split("pub(crate) struct RuntimeTurnLoopExecutors")
+                    .next()
+            })
+            .expect("RuntimeTurnLoopInput source");
+        let turn_iteration_input = runtime_turn_iteration_source
+            .split("pub(crate) struct RuntimeTurnIterationInput")
+            .nth(1)
+            .and_then(|source| {
+                source
+                    .split("pub(crate) enum RuntimeTurnIterationResult")
+                    .next()
+            })
+            .expect("RuntimeTurnIterationInput source");
+
+        assert!(
+            runtime_turn_loop_source.contains("pub(crate) struct RuntimeTurnProviderContext"),
+            "runtime_turn_loop must own a named provider context for turn-loop model refs"
+        );
+        for source in [turn_loop_input, turn_iteration_input] {
+            assert!(
+                source.contains("provider_context: RuntimeTurnProviderContext"),
+                "turn-loop inputs must pass model provider refs through RuntimeTurnProviderContext"
+            );
+            for field_name in [
+                "provider: ProviderKind",
+                "context_config: &'a context::ContextConfig",
+                "provider_config: &'a ProviderConfig",
+                "model: &'a ModelSelection",
+                "max_budget_usd: Option<f64>",
+            ] {
+                assert!(
+                    !source.contains(field_name),
+                    "turn-loop inputs must not expose provider field {field_name} outside RuntimeTurnProviderContext"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn runtime_turn_loop_state_resolves_runtime_directive_policy() {
         let agent_loop_source = include_str!("agent_loop.rs");
         let agent_loop_runtime_source = agent_loop_source

@@ -42,6 +42,14 @@ pub(crate) struct RuntimeTurnOutputContext<'events, 'sink, W: io::Write> {
     pub(crate) sink: &'sink mut EventSink<W>,
 }
 
+pub(crate) struct RuntimeTurnProviderContext<'a> {
+    pub(crate) provider: ProviderKind,
+    pub(crate) context_config: &'a context::ContextConfig,
+    pub(crate) provider_config: &'a ProviderConfig,
+    pub(crate) model: &'a ModelSelection,
+    pub(crate) max_budget_usd: Option<f64>,
+}
+
 pub(crate) struct RuntimeAgentTurnLoopInput<'a, 'runtime, W: io::Write> {
     pub(crate) actor: &'a mut RuntimeTaskActor<'runtime>,
     pub(crate) context_config: &'a context::ContextConfig,
@@ -69,21 +77,17 @@ pub(crate) struct RuntimeAgentTurnLoopInput<'a, 'runtime, W: io::Write> {
 
 pub(crate) struct RuntimeTurnLoopInput<'a, 'runtime, W: io::Write> {
     pub(crate) actor: &'a mut RuntimeTaskActor<'runtime>,
-    pub(crate) provider: ProviderKind,
-    pub(crate) context_config: &'a context::ContextConfig,
-    pub(crate) provider_config: &'a ProviderConfig,
+    pub(crate) provider_context: RuntimeTurnProviderContext<'a>,
     pub(crate) cwd: &'a Path,
     pub(crate) emit_deltas: bool,
     pub(crate) hooks: &'a HookRunner,
     pub(crate) output: RuntimeTurnOutputContext<'a, 'a, W>,
     pub(crate) prepared_conversation: &'a mut RuntimePreparedConversation<'runtime>,
     pub(crate) prompt: &'a str,
-    pub(crate) model: &'a ModelSelection,
     pub(crate) subagent_type: &'a SubagentType,
     pub(crate) continuation: Option<RuntimeTurnContinuation>,
     pub(crate) loop_state: RuntimeTurnLoopState<'a>,
     pub(crate) steer_handle: Option<&'a ThreadSteerHandle>,
-    pub(crate) max_budget_usd: Option<f64>,
     pub(crate) config: &'a RunConfig,
     pub(crate) tool_policy: AgentToolPolicyContext<'a>,
     pub(crate) subagent_depth: u32,
@@ -105,21 +109,17 @@ impl<'a, 'runtime, W: io::Write> RuntimeTurnLoopInput<'a, 'runtime, W> {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         actor: &'a mut RuntimeTaskActor<'runtime>,
-        provider: ProviderKind,
-        context_config: &'a context::ContextConfig,
-        provider_config: &'a ProviderConfig,
+        provider_context: RuntimeTurnProviderContext<'a>,
         cwd: &'a Path,
         emit_deltas: bool,
         hooks: &'a HookRunner,
         output: RuntimeTurnOutputContext<'a, 'a, W>,
         prepared_conversation: &'a mut RuntimePreparedConversation<'runtime>,
         prompt: &'a str,
-        model: &'a ModelSelection,
         subagent_type: &'a SubagentType,
         continuation: Option<RuntimeTurnContinuation>,
         loop_state: RuntimeTurnLoopState<'a>,
         steer_handle: Option<&'a ThreadSteerHandle>,
-        max_budget_usd: Option<f64>,
         config: &'a RunConfig,
         tool_policy: AgentToolPolicyContext<'a>,
         subagent_depth: u32,
@@ -132,21 +132,17 @@ impl<'a, 'runtime, W: io::Write> RuntimeTurnLoopInput<'a, 'runtime, W> {
     ) -> Self {
         Self {
             actor,
-            provider,
-            context_config,
-            provider_config,
+            provider_context,
             cwd,
             emit_deltas,
             hooks,
             output,
             prepared_conversation,
             prompt,
-            model,
             subagent_type,
             continuation,
             loop_state,
             steer_handle,
-            max_budget_usd,
             config,
             tool_policy,
             subagent_depth,
@@ -165,9 +161,13 @@ impl<'a, 'runtime, W: io::Write> RuntimeTurnLoopInput<'a, 'runtime, W> {
         let loop_state = self.loop_state.iteration_state(self.tool_policy);
         RuntimeTurnIterationInput {
             actor: &mut *self.actor,
-            provider: self.provider,
-            context_config: self.context_config,
-            provider_config: self.provider_config,
+            provider_context: RuntimeTurnProviderContext::new(
+                self.provider_context.provider,
+                self.provider_context.context_config,
+                self.provider_context.provider_config,
+                self.provider_context.model,
+                self.provider_context.max_budget_usd,
+            ),
             runtime_system_messages: loop_state.runtime_system_messages,
             cwd: self.cwd,
             emit_deltas: self.emit_deltas,
@@ -175,14 +175,12 @@ impl<'a, 'runtime, W: io::Write> RuntimeTurnLoopInput<'a, 'runtime, W> {
             output: RuntimeTurnOutputContext::new(&mut *self.output.events, &mut *self.output.sink),
             prepared_conversation: &mut *self.prepared_conversation,
             prompt: self.prompt,
-            model: self.model,
             subagent_type: self.subagent_type,
             continuation: self.continuation.take(),
             model_override: loop_state.model_override,
             cost_tracker: loop_state.cost_tracker,
             steer_handle: self.steer_handle,
             cancel: loop_state.cancel,
-            max_budget_usd: self.max_budget_usd,
             config: self.config,
             tool_policy: loop_state.tool_policy,
             subagent_depth: self.subagent_depth,
@@ -216,6 +214,24 @@ impl<'background, 'ipc> RuntimeTurnWorkflowContext<'background, 'ipc> {
 impl<'events, 'sink, W: io::Write> RuntimeTurnOutputContext<'events, 'sink, W> {
     pub(crate) fn new(events: &'events mut EventFactory, sink: &'sink mut EventSink<W>) -> Self {
         Self { events, sink }
+    }
+}
+
+impl<'a> RuntimeTurnProviderContext<'a> {
+    pub(crate) fn new(
+        provider: ProviderKind,
+        context_config: &'a context::ContextConfig,
+        provider_config: &'a ProviderConfig,
+        model: &'a ModelSelection,
+        max_budget_usd: Option<f64>,
+    ) -> Self {
+        Self {
+            provider,
+            context_config,
+            provider_config,
+            model,
+            max_budget_usd,
+        }
     }
 }
 
@@ -273,21 +289,23 @@ impl<'a, 'runtime, W: io::Write> RuntimeAgentTurnLoopInput<'a, 'runtime, W> {
     fn into_turn_loop_input(self) -> RuntimeTurnLoopInput<'a, 'runtime, W> {
         RuntimeTurnLoopInput::new(
             self.actor,
-            self.config.provider,
-            self.context_config,
-            self.provider_config,
+            RuntimeTurnProviderContext::new(
+                self.config.provider,
+                self.context_config,
+                self.provider_config,
+                &self.config.model,
+                self.config.max_budget_usd,
+            ),
             self.cwd,
             self.emit_deltas,
             self.hooks,
             self.output,
             self.prepared_conversation,
             self.prompt,
-            &self.config.model,
             self.subagent_type,
             self.continuation,
             self.loop_state,
             self.steer_handle,
-            self.config.max_budget_usd,
             self.config,
             self.tool_policy,
             self.subagent_depth,
@@ -421,21 +439,23 @@ mod tests {
         };
         let mut input = RuntimeTurnLoopInput {
             actor: &mut actor,
-            provider: ProviderKind::DeepSeek,
+            provider_context: RuntimeTurnProviderContext::new(
+                ProviderKind::DeepSeek,
+                &context_config,
+                &provider_config,
+                &config.model,
+                None,
+            ),
             continuation: Some(continuation),
-            context_config: &context_config,
-            provider_config: &provider_config,
             cwd: cwd.path(),
             emit_deltas: true,
             hooks: &hooks,
             output: RuntimeTurnOutputContext::new(&mut events, &mut sink),
             prepared_conversation: &mut prepared_conversation,
             prompt: "continue",
-            model: &config.model,
             subagent_type: &subagent_type,
             loop_state,
             steer_handle: None,
-            max_budget_usd: None,
             config: &config,
             tool_policy: AgentToolPolicyContext::unrestricted(),
             subagent_depth: 0,
