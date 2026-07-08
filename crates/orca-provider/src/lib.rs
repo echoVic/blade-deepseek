@@ -91,6 +91,17 @@ pub fn call_streaming(
 ) -> ProviderResponse {
     match kind {
         ProviderKind::Mock => {
+            if conversation
+                .messages
+                .iter()
+                .any(|m| matches!(m, Message::Tool { .. }))
+            {
+                let response = mock_call(conversation);
+                for step in &response.steps {
+                    on_step(step);
+                }
+                return response;
+            }
             if let Some((delay_ms, tool_prompt)) = mock_stream_tool_delay_ms(conversation) {
                 let started =
                     ProviderStep::MessageDelta("Mock slow tool stream started.".to_string());
@@ -1432,5 +1443,51 @@ mod tests {
             Some(ProviderStep::ToolCall(request)) if request.name == ToolName::TaskList
         ));
         assert!(response.assistant_content.is_none());
+    }
+
+    #[test]
+    fn mock_stream_tool_delay_ms_completes_after_tool_result() {
+        let mut conversation = Conversation::new();
+        conversation.add_user("mock_stream_tool_delay_ms 25 task_list".to_string());
+        conversation.add_assistant(
+            None,
+            None,
+            vec![RawToolCall {
+                id: "mock-tool-1".to_string(),
+                function_name: "task_list".to_string(),
+                arguments: "{}".to_string(),
+            }],
+        );
+        conversation.add_tool_result("mock-tool-1".to_string(), "{\"tasks\":[]}".to_string());
+        let config = ProviderConfig {
+            api_key: None,
+            base_url: None,
+            model: None,
+            reasoning_effort: ReasoningEffort::Max,
+            tools_override: None,
+            mcp_registry: None,
+            external_tools: Vec::new(),
+        };
+        let cancel = CancelToken::new();
+        let mut deltas = Vec::new();
+
+        let response = call_streaming(
+            ProviderKind::Mock,
+            &conversation,
+            &config,
+            &cancel,
+            &mut |step| {
+                if let ProviderStep::MessageDelta(text) = step {
+                    deltas.push(text.clone());
+                }
+            },
+        );
+
+        assert_eq!(deltas, vec!["Mock completed after tool execution."]);
+        assert!(response.tool_calls.is_empty());
+        assert_eq!(
+            response.assistant_content.as_deref(),
+            Some("Mock completed after tool execution.")
+        );
     }
 }

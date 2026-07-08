@@ -1819,6 +1819,118 @@ mod tests {
     }
 
     #[test]
+    fn approved_background_tool_call_executes_and_completes_session() {
+        with_orca_home(|_| {
+            let config = Arc::new(Mutex::new(test_config(HistoryMode::Record)));
+            let preloaded = Arc::new(Mutex::new(None));
+            let (event_tx, event_rx) = mpsc::channel();
+            let (action_tx, action_rx) = mpsc::channel();
+            let cancel = CancelToken::new();
+
+            let handle = std::thread::spawn({
+                let config = Arc::clone(&config);
+                let preloaded = Arc::clone(&preloaded);
+                let cancel = cancel.clone();
+                move || {
+                    agent_loop_thread(
+                        config,
+                        preloaded,
+                        event_tx,
+                        action_rx,
+                        cancel,
+                        test_pending_workflow_notifications(),
+                    )
+                }
+            });
+
+            action_tx
+                .send(UserAction::Submit(
+                    "mock_stream_tool_delay_ms 250 task_list".to_string(),
+                ))
+                .unwrap();
+
+            loop {
+                match event_rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+                    TuiEvent::MessageDelta(text)
+                        if text.contains("Mock slow tool stream started.") =>
+                    {
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+
+            action_tx.send(UserAction::BackgroundCurrentTurn).unwrap();
+
+            let task_id = loop {
+                match event_rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+                    TuiEvent::WorkflowTasksUpdated { tasks } => {
+                        if let Some(task) = tasks.into_iter().find(|task| {
+                            task.task_type == orca_core::task_types::TaskType::MainSession
+                                && task.is_backgrounded
+                                && task.status
+                                    == orca_core::task_types::TaskStatus::ApprovalRequired
+                        }) {
+                            break task.id;
+                        }
+                    }
+                    _ => {}
+                }
+            };
+
+            action_tx
+                .send(UserAction::ResolveBackgroundApproval {
+                    task_id: task_id.clone(),
+                    approved: true,
+                })
+                .unwrap();
+
+            let mut saw_completion_message = false;
+            let mut saw_completed_task = false;
+            let mut seen = Vec::new();
+            for _ in 0..40 {
+                match event_rx.recv_timeout(Duration::from_secs(2)) {
+                    Ok(TuiEvent::MessageDelta(text)) => {
+                        if text.contains("Mock completed after tool execution.") {
+                            saw_completion_message = true;
+                        }
+                        seen.push(format!("delta: {text}"));
+                    }
+                    Ok(TuiEvent::WorkflowTasksUpdated { tasks }) => {
+                        saw_completed_task |= tasks.into_iter().any(|task| {
+                            task.id == task_id
+                                && task.status == orca_core::task_types::TaskStatus::Completed
+                        });
+                    }
+                    Ok(event) => seen.push(format!("{event:?}")),
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        seen.push("timeout".to_string());
+                        break;
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        panic!("agent event channel disconnected before background continuation")
+                    }
+                }
+                if saw_completion_message && saw_completed_task {
+                    break;
+                }
+            }
+
+            action_tx.send(UserAction::Cancel).unwrap();
+            handle.join().unwrap();
+
+            assert!(
+                saw_completion_message,
+                "approved background tool call should continue the model loop; saw {seen:?}"
+            );
+            assert!(
+                saw_completed_task,
+                "approved background tool call should complete the background task; saw {seen:?}"
+            );
+        });
+    }
+
+    #[test]
     fn idle_app_submits_pending_workflow_notification() {
         let (mut state, _rx) = test_state();
         let (action_tx, action_rx) = mpsc::channel();
@@ -2785,12 +2897,12 @@ fn submit_background_approval_response_for_tui(
     task_id: &str,
     approved: bool,
     event_tx: &mpsc::Sender<TuiEvent>,
-) {
+) -> bool {
     let Some(task_registry) = task_registry else {
         let _ = event_tx.send(TuiEvent::Error(
             "cannot resolve background approval before a session exists".to_string(),
         ));
-        return;
+        return false;
     };
 
     match task_registry.submit_pending_tool_approval_response(task_id, approved) {
@@ -2799,7 +2911,7 @@ fn submit_background_approval_response_for_tui(
                 && let Err(error) = task_registry.finish_denied_pending_tool_approval(task_id)
             {
                 let _ = event_tx.send(TuiEvent::Error(error));
-                return;
+                return false;
             }
             let _ = event_tx.send(TuiEvent::WorkflowTasksUpdated {
                 tasks: task_registry.list(),
@@ -2808,9 +2920,11 @@ fn submit_background_approval_response_for_tui(
             let _ = event_tx.send(TuiEvent::Notice(format!(
                 "Background approval {decision} for {task_id}."
             )));
+            true
         }
         Err(error) => {
             let _ = event_tx.send(TuiEvent::Error(error));
+            false
         }
     }
 }
@@ -3317,12 +3431,33 @@ fn agent_loop_thread(
             }
             Ok(UserAction::BackgroundCurrentTurn) => {}
             Ok(UserAction::ResolveBackgroundApproval { task_id, approved }) => {
-                submit_background_approval_response_for_tui(
+                let submitted = submit_background_approval_response_for_tui(
                     session.as_ref().map(|session| session.task_registry()),
                     &task_id,
                     approved,
                     &event_tx,
                 );
+                if approved
+                    && submitted
+                    && let Some(session) = session.as_mut()
+                {
+                    let cfg = config.lock().unwrap().clone();
+                    let result = bridge::continue_approved_background_turn_for_tui(
+                        &cfg,
+                        session,
+                        &task_id,
+                        &event_tx,
+                        &action_rx,
+                        &pending_actions,
+                        &cancel,
+                        Some(&pending_workflow_notifications),
+                    );
+                    if let Some(next_prompt) = result.next_prompt {
+                        pending_actions
+                            .borrow_mut()
+                            .push_front(UserAction::Submit(next_prompt));
+                    }
+                }
             }
             Ok(UserAction::GoalShow) => {
                 let session_id = session
