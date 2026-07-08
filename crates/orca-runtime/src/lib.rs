@@ -3034,17 +3034,30 @@ mod tests {
             "run_tool_turns must pass normal tool-turn inputs as one grouped context"
         );
         assert!(
+            tool_turn_source.contains("pub(crate) struct RuntimeNormalToolTurnIo"),
+            "tool_turn must group normal tool-turn I/O refs into RuntimeNormalToolTurnIo"
+        );
+        assert!(
+            tool_turn_source.contains("io: RuntimeNormalToolTurnIo<'a, W>"),
+            "RuntimeNormalToolTurnContext must carry normal tool-turn I/O refs through one named field"
+        );
+        assert!(
             !tool_turn_source.contains("run_normal_tool_turn(\n            config,"),
             "run_tool_turns must not call run_normal_tool_turn with the old long argument list"
         );
+        let normal_context = tool_turn_source
+            .split("pub(crate) struct RuntimeNormalToolTurnContext")
+            .nth(1)
+            .and_then(|source| {
+                source
+                    .split("pub(crate) struct RuntimeNormalToolTurnIo")
+                    .next()
+            })
+            .expect("RuntimeNormalToolTurnContext source");
         for field_name in [
             "sampling_state:",
             "config:",
             "cwd:",
-            "events:",
-            "sink:",
-            "conversation:",
-            "history_writer:",
             "tool_request:",
             "subagent_depth:",
             "emit_deltas:",
@@ -3053,18 +3066,29 @@ mod tests {
             "memory:",
             "mcp_registry:",
             "hooks:",
-            "cost_tracker:",
             "cancel:",
             "task_registry:",
-            "background_workflows:",
             "workflow_ipc:",
             "permission_handler:",
             "child_executor:",
             "workflow_child_executor:",
         ] {
             assert!(
-                tool_turn_source.contains(field_name),
+                normal_context.contains(field_name),
                 "RuntimeNormalToolTurnContext must carry normal tool-turn field {field_name}"
+            );
+        }
+        for field_name in [
+            "events:",
+            "sink:",
+            "conversation:",
+            "history_writer:",
+            "cost_tracker:",
+            "background_workflows:",
+        ] {
+            assert!(
+                !normal_context.contains(field_name),
+                "RuntimeNormalToolTurnContext must not expose I/O field {field_name} outside RuntimeNormalToolTurnIo"
             );
         }
     }

@@ -363,6 +363,9 @@ copied into Orca.
    refs. `RuntimeToolTurnsContext` now also carries child-agent dispatch
    executors through `RuntimeToolTurnsExecutors`, keeping normal, workflow, and
    batch child execution handles distinct from dispatch state and I/O.
+   `RuntimeNormalToolTurnContext` now also carries normal tool execution I/O refs
+   through `RuntimeNormalToolTurnIo`, keeping its execution snapshot distinct
+   from event, transcript, cost, and workflow mutation refs.
    Iteration stages now keep lifecycle-owned `RuntimeTurnLoopIterationState`
    grouped instead of unpacking runtime system messages, model overrides,
    cost/cancel/task refs, and extension refs into the iteration input. Keep
