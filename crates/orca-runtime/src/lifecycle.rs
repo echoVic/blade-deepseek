@@ -41,6 +41,7 @@ use crate::tool_invocation::AgentToolPolicyContext;
 use crate::workflow::ipc::WorkflowIpcContext;
 use crate::workflow_execution::BackgroundWorkflowRun;
 
+pub(crate) use crate::runtime_approval::RuntimeToolApprovalPolicy;
 pub use crate::runtime_approval::{
     RuntimeApprovalDecision, RuntimeApprovalHandler, RuntimeConfigApprovalHandler,
 };

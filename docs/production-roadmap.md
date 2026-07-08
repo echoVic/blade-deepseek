@@ -259,6 +259,10 @@ The deeper July 9 reference pass changes the next refactor order:
    to put rule matching, stricter rejection reasons, and future automatic
    network-block prompts behind a runtime policy owner instead of continuing to
    spread that logic across bash, command/exec, approval, and protocol paths.
+   The first slice is now seeded with `RuntimeToolApprovalPolicy`, which owns
+   preapproved tool-call consumption, permission-rule resolution, and strict
+   auto-review downgrades before the tool execution gate handles events and
+   interactive prompts.
 4. **P2: Turn MCP elicitation and dynamic waits into pending interactions.**
    Package 3's MCP elicitation queue is the useful reference here: request id,
    server name, mode, abort signal, completion notification, and hook-driven

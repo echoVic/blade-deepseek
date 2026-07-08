@@ -2274,6 +2274,7 @@ mod tests {
     fn runtime_approval_boundary_is_owned_by_runtime_approval_module() {
         let lib_source = include_str!("lib.rs");
         let lifecycle_source = include_str!("lifecycle.rs");
+        let tool_execution_source = include_str!("tool_execution.rs");
         let runtime_approval_source =
             std::fs::read_to_string("src/runtime_approval.rs").expect("runtime approval source");
 
@@ -2286,6 +2287,7 @@ mod tests {
             "pub enum RuntimeApprovalDecision",
             "pub trait RuntimeApprovalHandler",
             "pub struct RuntimeConfigApprovalHandler",
+            "pub(crate) struct RuntimeToolApprovalPolicy",
             "impl RuntimeApprovalHandler for RuntimeConfigApprovalHandler",
         ] {
             assert!(
@@ -2301,6 +2303,15 @@ mod tests {
         assert!(
             lifecycle_source.contains("pub use crate::runtime_approval::"),
             "lifecycle must preserve existing public imports by re-exporting runtime approval types"
+        );
+        assert!(
+            lifecycle_source
+                .contains("pub(crate) use crate::runtime_approval::RuntimeToolApprovalPolicy;"),
+            "lifecycle must re-export the internal tool approval policy owner for runtime callers"
+        );
+        assert!(
+            tool_execution_source.contains("RuntimeToolApprovalPolicy::new("),
+            "tool execution approval gates must route policy decisions through RuntimeToolApprovalPolicy"
         );
     }
 

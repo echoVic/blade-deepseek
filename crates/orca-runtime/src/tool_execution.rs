@@ -20,7 +20,8 @@ use crate::hooks::{HookOutcome, HookRunner};
 use crate::instructions::ProjectInstructions;
 use crate::lifecycle::{
     RuntimeApprovalDecision, RuntimeConfigApprovalHandler, RuntimePermissionRequestHandler,
-    RuntimeTaskActor, RuntimeToolActorContext, RuntimeUserInputHandler, TurnPermissionOverlay,
+    RuntimeTaskActor, RuntimeToolActorContext, RuntimeToolApprovalPolicy, RuntimeUserInputHandler,
+    TurnPermissionOverlay,
 };
 use crate::memory::MemoryBlock;
 use crate::tasks::TaskRegistry;
@@ -272,16 +273,6 @@ impl ToolExecutionActor {
         self.runtime.active_task()
     }
 
-    fn resolve_tool_approval(
-        &mut self,
-        policy: &ApprovalPolicy,
-        approval: Option<orca_core::approval_types::ApprovalRequest>,
-        request: &tool_types::ToolRequest,
-    ) -> RuntimeApprovalDecision {
-        self.runtime
-            .resolve_tool_approval(policy, approval, request)
-    }
-
     fn run_pre_tool_hook(
         &mut self,
         hooks: &HookRunner,
@@ -479,22 +470,8 @@ impl ToolExecutionActor {
         if let Some(approval) = approval_request_for_invocation(invocation)
             && agent_common::requires_approval(approval.action)
         {
-            let preapproved = permission_overlay.consume_preapproved_tool_call_id(&tool_request.id);
-            let mut approval_decision = if preapproved {
-                RuntimeApprovalDecision::Allowed(orca_core::approval_types::ApprovalResolution {
-                    id: approval.id.clone(),
-                    decision: ApprovalDecision::Allow,
-                    reason: "approved background continuation".to_string(),
-                })
-            } else {
-                self.resolve_tool_approval(policy, Some(approval.clone()), tool_request)
-            };
-            if !preapproved
-                && permission_overlay.strict_auto_review()
-                && matches!(approval_decision, RuntimeApprovalDecision::Allowed(_))
-            {
-                approval_decision = RuntimeApprovalDecision::Ask(approval.clone());
-            }
+            let approval_decision = RuntimeToolApprovalPolicy::new(policy, permission_overlay)
+                .resolve(approval.clone(), tool_request);
             if emit_deltas {
                 sink.emit(&events.approval_requested(&approval))?;
             }
