@@ -1,0 +1,75 @@
+crates/orca-core/src/config/file.rs
+  s_c7ddd3a6128230::t_1d7fba4ec3abf0 778,783
+crates/orca-core/src/config/mod.rs
+  s_c7ddd3a6128230::t_7208fee938a429 77-78,86,532,549,585-589,604,627,648-652,712,744
+crates/orca-core/src/conversation.rs
+  s_c7ddd3a6128230::t_aac7eb95860369 84,92,97-99,182-187
+crates/orca-provider/src/context.rs
+  s_c7ddd3a6128230::t_2c1e853e78f3ab 1-2,14-15,44,54,64-66,78-89,95,108,113-121,128,203-223,333-334,1149-1151,1155-1163,1182-1241,1303,1347,1354-1372,1395-1434,1444,1479,1511,1539,1571-1609,1617,1630,1640,1653,1694,1740,1780,1817,1862,1911,1966,2007,2059,2091,2122,2156,2180,2258,2284
+crates/orca-provider/src/deepseek_http.rs
+  s_c7ddd3a6128230::t_287dbadcf67775 521,545,846-861
+crates/orca-runtime/src/child_agent_tests.rs
+  s_c7ddd3a6128230::t_7ab53f628a4e9f 384-433
+crates/orca-runtime/src/compaction.rs
+  s_c7ddd3a6128230::t_883349064bd9d8 54-56
+crates/orca-runtime/src/history.rs
+  s_c7ddd3a6128230::t_76eed688b33976 737,756-784
+crates/orca-runtime/src/lifecycle.rs
+  s_c7ddd3a6128230::t_ad08f57d31570f 1594
+crates/orca-runtime/src/server.rs
+  s_c7ddd3a6128230::t_968340e206a739 3383-3387,3481-3485,3518-3523,3594-3598,3630-3635,3698-3702,3721-3726,3782-3786,6450-6509
+crates/orca-runtime/src/session.rs
+  s_c7ddd3a6128230::t_4b6cfc54b87de7 26-27,190-194,811-861
+crates/orca-runtime/src/thread_store/types.rs
+  s_c7ddd3a6128230::t_3d30f3edfd5538 77
+crates/orca-runtime/src/thread_store/writer.rs
+  s_c7ddd3a6128230::t_f964a95c820e87 139,145,175
+crates/orca-tools/src/glob.rs
+  s_c7ddd3a6128230::t_4273cdde7bbff0 16-17,29,51,79-85,133,136-137,164-170,183-224,355-428
+crates/orca-tools/src/grep.rs
+  s_c7ddd3a6128230::t_51b4fa7a0b49f2 5-15,18-19,22-23,27,46-51,69-118,149-213
+crates/orca-tools/src/read_file.rs
+  s_c7ddd3a6128230::t_cdb08a3a9f73fa 4-5,10-16,18-20,26-31,47-70,102-143
+crates/orca-tools/src/registry.rs
+  s_c7ddd3a6128230::t_896560025e2a66 430-439,442-443,474-483,523-532,535-536
+crates/orca-tui/src/agent_runner.rs
+  s_c7ddd3a6128230::t_91fb6af3d69f7a 853,857-859,862-866,869-870
+crates/orca-tui/src/app.rs
+  s_c7ddd3a6128230::t_08e019891edfc7 468,473,1384
+crates/orca-tui/src/shortcuts.rs
+  s_c7ddd3a6128230::t_19ecaad90aabe3 417-418,422,425-429
+crates/orca-tui/src/types.rs
+  s_c7ddd3a6128230::t_4514a965366b1d 101,147,210-218,227-230,274,292-298,458,1101-1103,1511-1573,1583
+crates/orca-tui/src/ui.rs
+  s_c7ddd3a6128230::t_1197c0ca26c4d8 400,402-403,2010,2093-2095,2310,3043-3078,3289-3301
+docs/superpowers/plans/2026-07-08-context-stability.md
+  s_c7ddd3a6128230::t_cfd6eb8b59eb15 1-570
+tests/fixtures/session_stuck_2026_07_08.min.jsonl
+  s_c7ddd3a6128230::t_8c45cf668beb95 1-3
+tests/runtime_lifecycle_contract.rs
+  s_c7ddd3a6128230::t_e1383e994a1e4b 5-6,35,48-120
+tests/session_server_contract.rs
+  s_c7ddd3a6128230::t_6317aa67fe7027 4549-4553,4555-4561,4572,4762-4763,4783,4792-4811,4813,4818,4821,4827,4845-4846,4866,4875-4893,4895,4900,4903,4909,4921-4922,4942,4951,4962-4966,4982-4991,4993-4998,5008
+tests/shell_session_contract.rs
+  s_c7ddd3a6128230::t_41dbc780a1036e 94-97,103-105,118
+tests/workflow_types_contract.rs
+  s_c7ddd3a6128230::t_98c23ee5ff676b 85,91
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "2e7b5c3ab63bd308d2e82b98db0143bdf7fd3fc4",
+  "prompts": {},
+  "sessions": {
+    "s_c7ddd3a6128230": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f40d6-d0c2-7ff3-b43b-319e54a75bb6",
+        "model": "unknown"
+      },
+      "human_author": "echoVic <137844255@qq.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
