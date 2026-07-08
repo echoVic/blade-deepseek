@@ -38,6 +38,7 @@ use crate::composer_input_actions::{
 use crate::composer_textarea::{
     insert_pasted_text, make_setup_textarea, make_textarea, make_textarea_with_text, textarea_text,
 };
+use crate::idle_navigation_actions::handle_idle_navigation_shortcut;
 use crate::idle_submit_actions::handle_idle_submit;
 use crate::mention_menu_actions::handle_mention_menu_key;
 use crate::running_actions::handle_running_shortcut;
@@ -603,55 +604,27 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                                 &theme,
                             );
                         }
-                        Some(IdleShortcut::ScrollUp) => {
-                            if textarea.lines().len() > 1 {
-                                textarea.input(Input::from(ev));
-                            } else {
-                                state.scroll_up(1);
-                            }
-                        }
-                        Some(IdleShortcut::ScrollDown) => {
-                            if textarea.lines().len() > 1 {
-                                textarea.input(Input::from(ev));
-                            } else {
-                                state.scroll_down(1);
-                            }
-                        }
-                        Some(IdleShortcut::PageUp) => {
-                            let page = state.visible_height.saturating_sub(2);
-                            state.scroll_up(page);
-                        }
-                        Some(IdleShortcut::PageDown) => {
-                            let page = state.visible_height.saturating_sub(2);
-                            state.scroll_down(page);
-                        }
-                        Some(IdleShortcut::HalfPageUp) => {
-                            let page = state.visible_height / 2;
-                            state.scroll_up(page);
-                        }
-                        Some(IdleShortcut::HalfPageDown) => {
-                            let page = state.visible_height / 2;
-                            state.scroll_down(page);
-                        }
-                        Some(IdleShortcut::Backtrack) => {
-                            let _ = action_tx.send(UserAction::Backtrack);
-                        }
-                        Some(IdleShortcut::ExpandToolOutput) => {
-                            if textarea_text(&textarea).trim().is_empty()
-                                && state.toggle_latest_tool_output()
-                            {
-                                state.scroll_to_bottom();
-                            } else {
-                                apply_composer_key_input(
-                                    &ev,
-                                    key,
-                                    &mut state,
-                                    &config,
-                                    &mut textarea,
-                                    &mut vim_state,
-                                    &theme,
-                                );
-                            }
+                        Some(
+                            shortcut @ (IdleShortcut::ScrollUp
+                            | IdleShortcut::ScrollDown
+                            | IdleShortcut::PageUp
+                            | IdleShortcut::PageDown
+                            | IdleShortcut::HalfPageUp
+                            | IdleShortcut::HalfPageDown
+                            | IdleShortcut::Backtrack
+                            | IdleShortcut::ExpandToolOutput),
+                        ) => {
+                            handle_idle_navigation_shortcut(
+                                shortcut,
+                                &ev,
+                                key,
+                                &mut state,
+                                &config,
+                                &mut textarea,
+                                &mut vim_state,
+                                &theme,
+                                &action_tx,
+                            );
                         }
                         None => {
                             apply_composer_key_input(

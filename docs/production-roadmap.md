@@ -406,6 +406,9 @@ copied into Orca.
    module, covering slash-command short-circuit submission, pending
    user-input answers, normal prompt submission, prompt-history recording, and
    composer reset after accepted submissions.
+   Idle navigation/control shortcuts now live in a focused TUI idle navigation
+   action module, covering scroll/page movement, backtrack dispatch, and
+   expand-latest-tool-output fallback into normal composer editing.
    Runtime task summaries now also expose terminal `result`/`error` fields so
    the selected task row can show completion output or failure details in the
    panel. The
