@@ -95,6 +95,25 @@ mod tests {
     }
 
     #[test]
+    fn approved_background_continuation_is_owned_by_runtime() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let runner = std::fs::read_to_string(format!("{manifest_dir}/src/agent_runner.rs"))
+            .expect("TUI agent runner source should be readable");
+        assert!(
+            runner.contains("take_approved_background_turn_continuation"),
+            "agent_runner should ask runtime for approved background turn continuations"
+        );
+        assert!(
+            !runner.contains(".take_approved_pending_provider_response("),
+            "agent_runner should not directly consume pending provider responses from TaskRegistry"
+        );
+        assert!(
+            !runner.contains("fn provider_response_first_tool_call_id"),
+            "agent_runner should not derive preapproved tool call ids; runtime owns that boundary"
+        );
+    }
+
+    #[test]
     fn tui_agent_tool_execution_is_owned_by_dedicated_module() {
         let manifest_dir = env!("CARGO_MANIFEST_DIR");
         let execution =

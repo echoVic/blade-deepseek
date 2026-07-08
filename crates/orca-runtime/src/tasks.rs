@@ -1712,6 +1712,61 @@ mod tests {
     }
 
     #[test]
+    fn runtime_continuation_takes_approved_provider_response_with_preapproved_tool_id() {
+        use crate::background_turn::take_approved_background_turn_continuation;
+        use orca_core::approval_types::ActionKind;
+        use orca_core::provider_types::{ProviderResponse, ProviderStep};
+        use orca_core::tool_types::{ToolName, ToolRequest};
+
+        let registry = TaskRegistry::new("session-1".to_string());
+        let task = registry.create_main_session("Needs approval".to_string());
+        let tool_request = ToolRequest {
+            id: "mock-tool-1".to_string(),
+            name: ToolName::TaskList,
+            action: ActionKind::Read,
+            target: None,
+            raw_arguments: Some("{}".to_string()),
+        };
+
+        registry.mark_running(&task.id).unwrap();
+        registry.mark_backgrounded(&task.id).unwrap();
+        registry
+            .approval_required_for_pending_provider_response(
+                &task.id,
+                "approval_required".to_string(),
+                ProviderResponse {
+                    steps: vec![ProviderStep::ToolCall(tool_request)],
+                    assistant_content: Some("I need to inspect tasks.".to_string()),
+                    assistant_reasoning: Some("Need task_list.".to_string()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                },
+            )
+            .unwrap();
+        registry
+            .submit_pending_tool_approval_response(&task.id, true)
+            .unwrap();
+
+        let continuation = take_approved_background_turn_continuation(&registry, &task.id)
+            .unwrap()
+            .expect("approved background continuation");
+
+        assert_eq!(
+            continuation.preapproved_tool_call_id.as_deref(),
+            Some("mock-tool-1")
+        );
+        assert_eq!(
+            continuation.response.assistant_content.as_deref(),
+            Some("I need to inspect tasks.")
+        );
+        assert!(
+            take_approved_background_turn_continuation(&registry, &task.id)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn registry_rejects_approval_response_without_pending_tool() {
         let registry = TaskRegistry::new("session-1".to_string());
         let task = registry.create_main_session("No pending tool".to_string());

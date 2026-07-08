@@ -241,22 +241,6 @@ fn provider_response_pending_tool_call(
         })
 }
 
-fn provider_response_first_tool_call_id(response: &ProviderResponse) -> Option<String> {
-    response
-        .steps
-        .iter()
-        .find_map(|step| match step {
-            ProviderStep::ToolCall(request) => Some(request.id.clone()),
-            _ => None,
-        })
-        .or_else(|| {
-            response
-                .tool_calls
-                .first()
-                .map(|tool_call| tool_call.id.clone())
-        })
-}
-
 fn spawn_background_provider_completion(
     provider_rx: Receiver<ProviderStreamEvent>,
     task_registry: orca_runtime::tasks::TaskRegistry,
@@ -331,22 +315,23 @@ pub(crate) fn continue_approved_background_turn_for_tui(
     cancel: &CancelToken,
     pending_workflow_notifications: Option<&PendingWorkflowNotifications>,
 ) -> TuiAgentTurnResult {
-    let response = match session
-        .task_registry()
-        .take_approved_pending_provider_response(task_id)
-    {
-        Ok(Some(response)) => response,
-        Ok(None) => {
-            let _ = event_tx.send(TuiEvent::Error(format!(
-                "background task {task_id} has no approved provider response to continue"
-            )));
-            return TuiAgentTurnResult::new("failed");
-        }
-        Err(error) => {
-            let _ = event_tx.send(TuiEvent::Error(error));
-            return TuiAgentTurnResult::new("failed");
-        }
-    };
+    let continuation =
+        match orca_runtime::background_turn::take_approved_background_turn_continuation(
+            session.task_registry(),
+            task_id,
+        ) {
+            Ok(Some(continuation)) => continuation,
+            Ok(None) => {
+                let _ = event_tx.send(TuiEvent::Error(format!(
+                    "background task {task_id} has no approved provider response to continue"
+                )));
+                return TuiAgentTurnResult::new("failed");
+            }
+            Err(error) => {
+                let _ = event_tx.send(TuiEvent::Error(error));
+                return TuiAgentTurnResult::new("failed");
+            }
+        };
 
     let cwd = config
         .cwd
@@ -382,8 +367,8 @@ pub(crate) fn continue_approved_background_turn_for_tui(
     let policy = ApprovalPolicy::new(config.approval_mode)
         .with_permission_rules(config.permission_rules.clone());
     let mut permission_overlay = orca_runtime::lifecycle::TurnPermissionOverlay::default();
-    let mut preapproved_tool_call_id = provider_response_first_tool_call_id(&response);
-    let mut next_response = Some(response);
+    let mut preapproved_tool_call_id = continuation.preapproved_tool_call_id;
+    let mut next_response = Some(continuation.response);
     let mut turn = 0;
 
     loop {
@@ -2645,16 +2630,22 @@ mod tests {
         registry
             .submit_pending_tool_approval_response(&task.id, true)
             .unwrap();
-        let response = registry
-            .take_approved_pending_provider_response(&task.id)
+        let continuation =
+            orca_runtime::background_turn::take_approved_background_turn_continuation(
+                &registry, &task.id,
+            )
             .unwrap()
-            .expect("pending provider response");
+            .expect("approved background continuation");
 
         assert_eq!(
-            response.assistant_content.as_deref(),
+            continuation.response.assistant_content.as_deref(),
             Some("I need task_list.")
         );
-        assert_eq!(response.steps.len(), 1);
+        assert_eq!(
+            continuation.preapproved_tool_call_id.as_deref(),
+            Some("mock-tool-1")
+        );
+        assert_eq!(continuation.response.steps.len(), 1);
     }
 
     #[test]

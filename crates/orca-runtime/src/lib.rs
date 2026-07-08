@@ -2,6 +2,7 @@ pub mod agent_child;
 pub mod agent_common;
 pub mod agent_loop;
 pub mod approval_resolution;
+pub mod background_turn;
 mod child_agent_entrypoints;
 mod child_agent_loop_runner;
 mod child_agent_loop_setup;
