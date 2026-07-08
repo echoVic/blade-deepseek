@@ -303,7 +303,9 @@ copied into Orca.
    request a stop for the selected non-terminal task through the runtime
    `TaskRegistry`, refreshing the panel after the status changes. Runtime task
    summaries now also expose terminal `result`/`error` fields so the selected
-   task row can show completion output or failure details in the panel.
+   task row can show completion output or failure details in the panel. The
+   panel now renders contextual action hints for selection, approval, stop, and
+   closing so TUI users can discover task controls in-place.
 
 ### P0: Session Runtime Unification
 
