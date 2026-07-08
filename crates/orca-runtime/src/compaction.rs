@@ -17,6 +17,63 @@ pub(crate) enum RuntimeCompactionTrigger {
     PromptTooLong,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeCompactionStrategy {
+    LocalTruncation,
+    RemoteSummary,
+}
+
+impl RuntimeCompactionStrategy {
+    pub(crate) fn from_compaction_kind(kind: &context::CompactionKind) -> Self {
+        match kind {
+            context::CompactionKind::LocalTruncation => Self::LocalTruncation,
+            context::CompactionKind::RemoteSummary(_) => Self::RemoteSummary,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RuntimeCompactionOutcome {
+    trigger: RuntimeCompactionTrigger,
+    before_messages: usize,
+    after_messages: usize,
+    strategy: RuntimeCompactionStrategy,
+}
+
+impl RuntimeCompactionOutcome {
+    pub(crate) fn trigger(&self) -> RuntimeCompactionTrigger {
+        self.trigger
+    }
+
+    pub(crate) fn before_messages(&self) -> usize {
+        self.before_messages
+    }
+
+    pub(crate) fn after_messages(&self) -> usize {
+        self.after_messages
+    }
+
+    pub(crate) fn strategy(&self) -> RuntimeCompactionStrategy {
+        self.strategy
+    }
+
+    pub(crate) fn should_persist_summary_state(&self, emit_deltas: bool) -> bool {
+        if !emit_deltas {
+            return false;
+        }
+
+        match (self.trigger(), self.strategy()) {
+            (
+                RuntimeCompactionTrigger::SoftLimit
+                | RuntimeCompactionTrigger::HardLimit
+                | RuntimeCompactionTrigger::PromptTooLong,
+                RuntimeCompactionStrategy::LocalTruncation
+                | RuntimeCompactionStrategy::RemoteSummary,
+            ) => true,
+        }
+    }
+}
+
 pub(crate) struct RuntimeCompactionPolicy<'a> {
     context_config: &'a context::ContextConfig,
     provider_config: &'a ProviderConfig,
@@ -55,7 +112,6 @@ impl<'a> RuntimeCompactionPolicy<'a> {
 pub(crate) struct RuntimeCompactionTask {
     trigger: RuntimeCompactionTrigger,
     before_messages: usize,
-    after_messages: Option<usize>,
 }
 
 impl RuntimeCompactionTask {
@@ -63,12 +119,20 @@ impl RuntimeCompactionTask {
         Self {
             trigger,
             before_messages,
-            after_messages: None,
         }
     }
 
-    pub(crate) fn finish(&mut self, after_messages: usize) {
-        self.after_messages = Some(after_messages);
+    pub(crate) fn finish(
+        &self,
+        after_messages: usize,
+        kind: &context::CompactionKind,
+    ) -> RuntimeCompactionOutcome {
+        RuntimeCompactionOutcome {
+            trigger: self.trigger(),
+            before_messages: self.before_messages(),
+            after_messages,
+            strategy: RuntimeCompactionStrategy::from_compaction_kind(kind),
+        }
     }
 
     pub(crate) fn trigger(&self) -> RuntimeCompactionTrigger {
@@ -77,19 +141,6 @@ impl RuntimeCompactionTask {
 
     pub(crate) fn before_messages(&self) -> usize {
         self.before_messages
-    }
-
-    pub(crate) fn should_persist_summary_state(&self, emit_deltas: bool) -> bool {
-        match self.trigger() {
-            RuntimeCompactionTrigger::SoftLimit
-            | RuntimeCompactionTrigger::HardLimit
-            | RuntimeCompactionTrigger::PromptTooLong => emit_deltas,
-        }
-    }
-
-    pub(crate) fn after_messages(&self) -> usize {
-        self.after_messages
-            .expect("runtime compaction task must finish before persistence")
     }
 }
 
@@ -208,7 +259,7 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
         trigger: RuntimeCompactionTrigger,
     ) -> io::Result<usize> {
         let before_messages = conversation.messages.len();
-        let mut task = RuntimeCompactionTask::start(trigger, before_messages);
+        let task = RuntimeCompactionTask::start(trigger, before_messages);
         let compaction = context::compact_with_summary(
             self.provider,
             conversation,
@@ -217,15 +268,15 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
         );
         *conversation = compaction.conversation;
         let after_messages = conversation.messages.len();
-        task.finish(after_messages);
-        if task.should_persist_summary_state(self.turn_context.emit_deltas)
+        let outcome = task.finish(after_messages, &compaction.kind);
+        if outcome.should_persist_summary_state(self.turn_context.emit_deltas)
             && let Some(writer) = self.history_writer.as_deref_mut()
         {
-            writer.append_compaction(task.before_messages(), task.after_messages())?;
+            writer.append_compaction(outcome.before_messages(), outcome.after_messages())?;
             if let context::CompactionKind::RemoteSummary(summary) = compaction.kind {
                 writer.append_summary_state(
-                    task.before_messages(),
-                    task.after_messages(),
+                    outcome.before_messages(),
+                    outcome.after_messages(),
                     summary,
                     &conversation.summary,
                 )?;
@@ -303,15 +354,35 @@ mod tests {
 
     #[test]
     fn compaction_task_records_trigger_and_message_counts() {
-        let mut task = RuntimeCompactionTask::start(RuntimeCompactionTrigger::PromptTooLong, 11);
+        let task = RuntimeCompactionTask::start(RuntimeCompactionTrigger::PromptTooLong, 11);
 
         assert_eq!(task.trigger(), RuntimeCompactionTrigger::PromptTooLong);
         assert_eq!(task.before_messages(), 11);
 
-        task.finish(4);
+        let outcome = task.finish(4, &context::CompactionKind::LocalTruncation);
 
-        assert_eq!(task.after_messages(), 4);
-        assert!(task.should_persist_summary_state(true));
-        assert!(!task.should_persist_summary_state(false));
+        assert_eq!(outcome.trigger(), RuntimeCompactionTrigger::PromptTooLong);
+        assert_eq!(outcome.before_messages(), 11);
+        assert_eq!(outcome.after_messages(), 4);
+        assert_eq!(
+            outcome.strategy(),
+            RuntimeCompactionStrategy::LocalTruncation
+        );
+        assert!(outcome.should_persist_summary_state(true));
+        assert!(!outcome.should_persist_summary_state(false));
+    }
+
+    #[test]
+    fn compaction_outcome_records_remote_summary_strategy() {
+        let task = RuntimeCompactionTask::start(RuntimeCompactionTrigger::HardLimit, 9);
+        let outcome = task.finish(
+            3,
+            &context::CompactionKind::RemoteSummary("summary".to_string()),
+        );
+
+        assert_eq!(outcome.trigger(), RuntimeCompactionTrigger::HardLimit);
+        assert_eq!(outcome.before_messages(), 9);
+        assert_eq!(outcome.after_messages(), 3);
+        assert_eq!(outcome.strategy(), RuntimeCompactionStrategy::RemoteSummary);
     }
 }

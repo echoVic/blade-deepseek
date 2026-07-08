@@ -247,7 +247,9 @@ The deeper July 9 reference pass changes the next refactor order:
    compaction remains a mostly synchronous summary-and-persist operation. The
    first slice is now seeded: `RuntimeCompactionPolicy` maps context pressure to
    explicit soft/hard triggers, and `RuntimeCompactionTask` records trigger plus
-   before/after message counts before summary-state persistence. Next extend
+   before/after message counts before summary-state persistence. The task now
+   finishes into `RuntimeCompactionOutcome`, which records local truncation vs
+   remote-summary strategy for later event and telemetry projection. Next extend
    that boundary with retry decisions, compaction reasons, and telemetry.
 3. **P1: Move exec/permission evaluation toward a dedicated policy manager.**
    Codex keeps mutable exec policy in an `ExecPolicyManager` with parsed rules,

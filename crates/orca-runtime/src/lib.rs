@@ -4135,7 +4135,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_compaction_policy_and_task_are_owned_by_compaction_module() {
+    fn runtime_compaction_policy_task_and_outcome_are_owned_by_compaction_module() {
         let compaction_source = include_str!("compaction.rs");
 
         assert!(
@@ -4151,6 +4151,10 @@ mod tests {
             "compaction module must own a runtime compaction task boundary"
         );
         assert!(
+            compaction_source.contains("struct RuntimeCompactionOutcome"),
+            "compaction module must own a runtime compaction outcome boundary"
+        );
+        assert!(
             compaction_source.contains("fn decide("),
             "RuntimeCompactionPolicy must expose a decision method"
         );
@@ -4163,8 +4167,8 @@ mod tests {
             "compaction execution must finish the task with after-message counts"
         );
         assert!(
-            compaction_source.contains("task.should_persist_summary_state("),
-            "summary persistence must be routed through the compaction task boundary"
+            compaction_source.contains("outcome.should_persist_summary_state("),
+            "summary persistence must be routed through the compaction outcome boundary"
         );
 
         let compact_if_needed = compaction_source
