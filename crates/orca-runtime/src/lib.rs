@@ -1977,7 +1977,7 @@ mod tests {
         let lifecycle_source = include_str!("lifecycle.rs");
 
         for type_name in [
-            "RuntimeTurnConfig",
+            "RuntimeTurnContext",
             "RuntimeTurnDeps",
             "RuntimeTurnState",
             "RuntimeTurnExecution",
@@ -1999,65 +1999,70 @@ mod tests {
                 "lifecycle must own runtime turn context behavior {type_name}"
             );
         }
+
+        assert!(
+            !lifecycle_source.contains("struct RuntimeTurnConfig"),
+            "immutable per-turn inputs should use the Codex-style RuntimeTurnContext boundary name"
+        );
     }
 
     #[test]
-    fn runtime_turn_continuation_is_owned_by_turn_config() {
+    fn runtime_turn_continuation_is_owned_by_turn_context() {
         let lifecycle_source = include_str!("lifecycle.rs");
         let agent_loop_context = lifecycle_source
             .split("pub(crate) struct AgentLoopContext")
             .nth(1)
             .and_then(|source| source.split("#[derive(Clone").next())
             .expect("AgentLoopContext source");
-        let turn_config_source = lifecycle_source
-            .split("pub(crate) struct RuntimeTurnConfig")
+        let turn_context_source = lifecycle_source
+            .split("pub(crate) struct RuntimeTurnContext")
             .nth(1)
             .and_then(|source| source.split("#[derive(Clone").next())
-            .expect("RuntimeTurnConfig source");
+            .expect("RuntimeTurnContext source");
 
         assert!(
             !agent_loop_context.contains("continuation: Option<RuntimeTurnContinuation>"),
-            "AgentLoopContext must not carry turn continuation outside the frozen turn config"
+            "AgentLoopContext must not carry turn continuation outside the frozen turn context"
         );
         assert!(
-            turn_config_source.contains("continuation: Option<RuntimeTurnContinuation>"),
-            "RuntimeTurnConfig must own the turn continuation with the other immutable turn inputs"
+            turn_context_source.contains("continuation: Option<RuntimeTurnContinuation>"),
+            "RuntimeTurnContext must own the turn continuation with the other immutable turn inputs"
         );
         assert!(
-            lifecycle_source.contains("impl<'a> RuntimeTurnConfig<'a>")
+            lifecycle_source.contains("impl<'a> RuntimeTurnContext<'a>")
                 && lifecycle_source.contains("pub(crate) fn with_continuation(")
                 && lifecycle_source.contains("pub(crate) fn continuation("),
-            "RuntimeTurnConfig must expose continuation construction and read access"
+            "RuntimeTurnContext must expose continuation construction and read access"
         );
     }
 
     #[test]
-    fn runtime_turn_steer_handle_is_owned_by_turn_config() {
+    fn runtime_turn_steer_handle_is_owned_by_turn_context() {
         let lifecycle_source = include_str!("lifecycle.rs");
         let agent_loop_context = lifecycle_source
             .split("pub(crate) struct AgentLoopContext")
             .nth(1)
             .and_then(|source| source.split("#[derive(Clone").next())
             .expect("AgentLoopContext source");
-        let turn_config_source = lifecycle_source
-            .split("pub(crate) struct RuntimeTurnConfig")
+        let turn_context_source = lifecycle_source
+            .split("pub(crate) struct RuntimeTurnContext")
             .nth(1)
             .and_then(|source| source.split("#[derive(Clone").next())
-            .expect("RuntimeTurnConfig source");
+            .expect("RuntimeTurnContext source");
 
         assert!(
             !agent_loop_context.contains("steer_handle: Option<&'a ThreadSteerHandle>"),
-            "AgentLoopContext must not carry steer handles outside the frozen turn config"
+            "AgentLoopContext must not carry steer handles outside the frozen turn context"
         );
         assert!(
-            turn_config_source.contains("steer_handle: Option<&'a ThreadSteerHandle>"),
-            "RuntimeTurnConfig must own steer handles with the other immutable turn inputs"
+            turn_context_source.contains("steer_handle: Option<&'a ThreadSteerHandle>"),
+            "RuntimeTurnContext must own steer handles with the other immutable turn inputs"
         );
         assert!(
-            lifecycle_source.contains("impl<'a> RuntimeTurnConfig<'a>")
+            lifecycle_source.contains("impl<'a> RuntimeTurnContext<'a>")
                 && lifecycle_source.contains("pub(crate) fn with_steer_handle(")
                 && lifecycle_source.contains("pub(crate) fn steer_handle("),
-            "RuntimeTurnConfig must expose steer handle construction and read access"
+            "RuntimeTurnContext must expose steer handle construction and read access"
         );
     }
 

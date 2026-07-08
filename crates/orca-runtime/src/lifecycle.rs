@@ -98,14 +98,14 @@ pub struct ThreadSteerHandle {
 }
 
 pub(crate) struct AgentLoopContext<'a> {
-    pub(crate) turn_config: RuntimeTurnConfig<'a>,
+    pub(crate) turn_context: RuntimeTurnContext<'a>,
     pub(crate) turn_deps: Option<RuntimeTurnDeps<'a>>,
     pub(crate) turn_state: Option<RuntimeTurnState<'a>>,
     pub(crate) turn_execution: Option<RuntimeTurnExecution<'a>>,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct RuntimeTurnConfig<'a> {
+pub(crate) struct RuntimeTurnContext<'a> {
     pub(crate) cwd: &'a Path,
     pub(crate) prompt: &'a str,
     pub(crate) subagent_depth: u32,
@@ -701,7 +701,7 @@ impl<'a> AgentLoopContext<'a> {
         subagent_type: &'a SubagentType,
     ) -> Self {
         Self {
-            turn_config: RuntimeTurnConfig::new(
+            turn_context: RuntimeTurnContext::new(
                 cwd,
                 prompt,
                 subagent_depth,
@@ -715,8 +715,8 @@ impl<'a> AgentLoopContext<'a> {
     }
 
     #[cfg(test)]
-    pub(crate) fn turn_config(&self) -> RuntimeTurnConfig<'a> {
-        self.turn_config.clone()
+    pub(crate) fn turn_context(&self) -> RuntimeTurnContext<'a> {
+        self.turn_context.clone()
     }
 
     pub fn with_services(
@@ -823,32 +823,32 @@ impl<'a> AgentLoopContext<'a> {
     }
 
     pub(crate) fn with_steer_handle(mut self, steer_handle: Option<&'a ThreadSteerHandle>) -> Self {
-        self.turn_config = self.turn_config.with_steer_handle(steer_handle);
+        self.turn_context = self.turn_context.with_steer_handle(steer_handle);
         self
     }
 
     #[allow(dead_code)]
     pub(crate) fn with_initial_response(mut self, response: ProviderResponse) -> Self {
-        self.turn_config = self
-            .turn_config
+        self.turn_context = self
+            .turn_context
             .with_continuation(RuntimeTurnContinuation::from_response(response));
         self
     }
 
     #[allow(dead_code)]
     pub(crate) fn with_turn_continuation(mut self, continuation: RuntimeTurnContinuation) -> Self {
-        self.turn_config = self.turn_config.with_continuation(continuation);
+        self.turn_context = self.turn_context.with_continuation(continuation);
         self
     }
 
     #[cfg(test)]
     pub(crate) fn initial_response(&self) -> Option<&ProviderResponse> {
-        self.turn_config.initial_response()
+        self.turn_context.initial_response()
     }
 
     #[cfg(test)]
     pub(crate) fn continuation(&self) -> Option<&RuntimeTurnContinuation> {
-        self.turn_config.continuation()
+        self.turn_context.continuation()
     }
 
     pub(crate) fn with_permission_handler(
@@ -903,7 +903,7 @@ impl<'a> AgentLoopContext<'a> {
     }
 }
 
-impl<'a> RuntimeTurnConfig<'a> {
+impl<'a> RuntimeTurnContext<'a> {
     pub(crate) fn new(
         cwd: &'a Path,
         prompt: &'a str,

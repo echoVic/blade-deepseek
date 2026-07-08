@@ -4,7 +4,7 @@ use crate::agent_child::{ChildAgentRequest, ChildAgentResult, ChildAgentRuntime}
 use crate::cost::CostTracker;
 use crate::lifecycle::{
     AgentLoopContext, AgentLoopResult, RuntimeSessionLifecycle, RuntimeTaskActor,
-    RuntimeTurnConfig, RuntimeTurnExecution,
+    RuntimeTurnContext, RuntimeTurnExecution,
 };
 use crate::runtime_conversation_bootstrap::RuntimeConversationBootstrapStep;
 use crate::runtime_turn_loop::{
@@ -38,8 +38,8 @@ pub(crate) fn run_agent_loop(
     tool_policy: AgentToolPolicyContext<'_>,
 ) -> io::Result<AgentLoopResult> {
     let AgentLoopContext {
-        turn_config:
-            RuntimeTurnConfig {
+        turn_context:
+            RuntimeTurnContext {
                 cwd,
                 prompt,
                 subagent_depth,
@@ -188,32 +188,32 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn runtime_turn_config_snapshots_agent_loop_entry_values() {
-        let cwd = PathBuf::from("/tmp/orca-runtime-turn-config");
+    fn runtime_turn_context_snapshots_agent_loop_entry_values() {
+        let cwd = PathBuf::from("/tmp/orca-runtime-turn-context");
         let subagent_type = SubagentType::General;
 
-        let config = RuntimeTurnConfig::new(&cwd, "inspect repo", 2, false, &subagent_type);
+        let context = RuntimeTurnContext::new(&cwd, "inspect repo", 2, false, &subagent_type);
 
-        assert_eq!(config.cwd(), cwd.as_path());
-        assert_eq!(config.prompt(), "inspect repo");
-        assert_eq!(config.subagent_depth(), 2);
-        assert!(!config.emit_deltas());
-        assert_eq!(config.subagent_type(), &SubagentType::General);
+        assert_eq!(context.cwd(), cwd.as_path());
+        assert_eq!(context.prompt(), "inspect repo");
+        assert_eq!(context.subagent_depth(), 2);
+        assert!(!context.emit_deltas());
+        assert_eq!(context.subagent_type(), &SubagentType::General);
     }
 
     #[test]
-    fn agent_loop_context_exposes_runtime_turn_config() {
-        let cwd = PathBuf::from("/tmp/orca-agent-loop-config");
+    fn agent_loop_context_exposes_runtime_turn_context() {
+        let cwd = PathBuf::from("/tmp/orca-agent-loop-context");
         let subagent_type = SubagentType::General;
 
-        let context = AgentLoopContext::new(&cwd, "inspect repo", 1, true, &subagent_type);
+        let agent_context = AgentLoopContext::new(&cwd, "inspect repo", 1, true, &subagent_type);
 
-        let config = context.turn_config();
-        assert_eq!(config.cwd(), cwd.as_path());
-        assert_eq!(config.prompt(), "inspect repo");
-        assert_eq!(config.subagent_depth(), 1);
-        assert!(config.emit_deltas());
-        assert_eq!(config.subagent_type(), &SubagentType::General);
+        let context = agent_context.turn_context();
+        assert_eq!(context.cwd(), cwd.as_path());
+        assert_eq!(context.prompt(), "inspect repo");
+        assert_eq!(context.subagent_depth(), 1);
+        assert!(context.emit_deltas());
+        assert_eq!(context.subagent_type(), &SubagentType::General);
     }
 
     #[test]
