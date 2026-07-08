@@ -379,6 +379,10 @@ copied into Orca.
    handlers through `RuntimeNormalToolTurnInteractions`, keeping lifecycle
    interaction hooks distinct from execution snapshot, services, runtime refs,
    and executors.
+   `RuntimeNormalToolTurnContext` now carries config, cwd, tool request,
+   subagent depth, delta policy, and approval policy through
+   `RuntimeNormalToolTurnRequest`, leaving the context to compose named request,
+   I/O, service, runtime, interaction, extension, and executor surfaces.
    Iteration stages now keep lifecycle-owned `RuntimeTurnLoopIterationState`
    grouped instead of unpacking runtime system messages, model overrides,
    cost/cancel/task refs, and extension refs into the iteration input. Keep

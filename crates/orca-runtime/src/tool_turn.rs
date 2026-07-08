@@ -70,18 +70,22 @@ pub(crate) struct RuntimeToolTurnsExecutors<W: io::Write> {
 
 pub(crate) struct RuntimeNormalToolTurnContext<'a, W: io::Write> {
     pub(crate) sampling_state: &'a mut RuntimeSamplingRequestState,
-    pub(crate) config: &'a RunConfig,
-    pub(crate) cwd: &'a Path,
+    pub(crate) request: RuntimeNormalToolTurnRequest<'a>,
     pub(crate) io: RuntimeNormalToolTurnIo<'a, W>,
-    pub(crate) tool_request: &'a ToolRequest,
-    pub(crate) subagent_depth: u32,
-    pub(crate) emit_deltas: bool,
-    pub(crate) policy: &'a ApprovalPolicy,
     pub(crate) services: RuntimeNormalToolTurnServices<'a>,
     pub(crate) runtime: RuntimeNormalToolTurnRuntime<'a>,
     pub(crate) interactions: RuntimeNormalToolTurnInteractions<'a>,
     pub(crate) extensions: Option<RuntimeExtensionContext<'a>>,
     pub(crate) executors: RuntimeNormalToolTurnExecutors<W>,
+}
+
+pub(crate) struct RuntimeNormalToolTurnRequest<'a> {
+    pub(crate) config: &'a RunConfig,
+    pub(crate) cwd: &'a Path,
+    pub(crate) tool_request: &'a ToolRequest,
+    pub(crate) subagent_depth: u32,
+    pub(crate) emit_deltas: bool,
+    pub(crate) policy: &'a ApprovalPolicy,
 }
 
 pub(crate) struct RuntimeNormalToolTurnIo<'a, W: io::Write> {
@@ -259,8 +263,14 @@ pub(crate) fn run_tool_turns<W: io::Write>(
 
         match run_normal_tool_turn(RuntimeNormalToolTurnContext {
             sampling_state,
-            config,
-            cwd,
+            request: RuntimeNormalToolTurnRequest {
+                config,
+                cwd,
+                tool_request,
+                subagent_depth,
+                emit_deltas,
+                policy,
+            },
             io: RuntimeNormalToolTurnIo {
                 events,
                 sink,
@@ -269,10 +279,6 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                 cost_tracker,
                 background_workflows,
             },
-            tool_request,
-            subagent_depth,
-            emit_deltas,
-            policy,
             services: RuntimeNormalToolTurnServices {
                 instructions,
                 memory,
@@ -310,19 +316,22 @@ pub(crate) fn run_normal_tool_turn<W: io::Write>(
 ) -> io::Result<ToolTurnOutcome> {
     let RuntimeNormalToolTurnContext {
         sampling_state,
-        config,
-        cwd,
+        request,
         io,
-        tool_request,
-        subagent_depth,
-        emit_deltas,
-        policy,
         services,
         runtime,
         interactions,
         extensions,
         executors,
     } = context;
+    let RuntimeNormalToolTurnRequest {
+        config,
+        cwd,
+        tool_request,
+        subagent_depth,
+        emit_deltas,
+        policy,
+    } = request;
     let RuntimeNormalToolTurnExecutors {
         child_executor,
         workflow_child_executor,
@@ -702,8 +711,14 @@ mod tests {
 
         let outcome = run_normal_tool_turn(RuntimeNormalToolTurnContext {
             sampling_state: &mut sampling_state,
-            config: &config,
-            cwd: cwd.path(),
+            request: RuntimeNormalToolTurnRequest {
+                config: &config,
+                cwd: cwd.path(),
+                tool_request: &request,
+                subagent_depth: 0,
+                emit_deltas: false,
+                policy: &policy,
+            },
             io: RuntimeNormalToolTurnIo {
                 events: &mut events,
                 sink: &mut sink,
@@ -712,10 +727,6 @@ mod tests {
                 cost_tracker: &mut cost_tracker,
                 background_workflows: &mut background_workflows,
             },
-            tool_request: &request,
-            subagent_depth: 0,
-            emit_deltas: false,
-            policy: &policy,
             services: RuntimeNormalToolTurnServices {
                 instructions: &instructions,
                 memory: &memory,

@@ -3074,6 +3074,14 @@ mod tests {
             "RuntimeNormalToolTurnContext must carry normal tool-turn interaction handlers through one named field"
         );
         assert!(
+            tool_turn_source.contains("pub(crate) struct RuntimeNormalToolTurnRequest"),
+            "tool_turn must group normal tool-turn request snapshot refs into RuntimeNormalToolTurnRequest"
+        );
+        assert!(
+            tool_turn_source.contains("request: RuntimeNormalToolTurnRequest<'a>"),
+            "RuntimeNormalToolTurnContext must carry normal tool-turn request snapshot refs through one named field"
+        );
+        assert!(
             !tool_turn_source.contains("run_normal_tool_turn(\n            config,"),
             "run_tool_turns must not call run_normal_tool_turn with the old long argument list"
         );
@@ -3082,19 +3090,11 @@ mod tests {
             .nth(1)
             .and_then(|source| {
                 source
-                    .split("pub(crate) struct RuntimeNormalToolTurnIo")
+                    .split("pub(crate) struct RuntimeNormalToolTurnRequest")
                     .next()
             })
             .expect("RuntimeNormalToolTurnContext source");
-        for field_name in [
-            "sampling_state:",
-            "config:",
-            "cwd:",
-            "tool_request:",
-            "subagent_depth:",
-            "emit_deltas:",
-            "policy:",
-        ] {
+        for field_name in ["sampling_state:"] {
             assert!(
                 normal_context.contains(field_name),
                 "RuntimeNormalToolTurnContext must carry normal tool-turn field {field_name}"
@@ -3118,6 +3118,12 @@ mod tests {
             "workflow_ipc:",
             "permission_handler:",
             "user_input_handler:",
+            "config:",
+            "cwd:",
+            "tool_request:",
+            "subagent_depth:",
+            "emit_deltas:",
+            "policy:",
         ] {
             assert!(
                 !normal_context.contains(field_name),
