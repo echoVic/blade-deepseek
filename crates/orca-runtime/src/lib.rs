@@ -5333,6 +5333,45 @@ mod tests {
     }
 
     #[test]
+    fn runtime_agent_turn_loop_input_uses_grouped_turn_contexts() {
+        let runtime_turn_loop_source = include_str!("runtime_turn_loop.rs");
+        let agent_turn_loop_input = runtime_turn_loop_source
+            .split("pub(crate) struct RuntimeAgentTurnLoopInput")
+            .nth(1)
+            .and_then(|source| {
+                source
+                    .split("pub(crate) struct RuntimeTurnLoopInput")
+                    .next()
+            })
+            .expect("RuntimeAgentTurnLoopInput source");
+
+        assert!(
+            agent_turn_loop_input.contains("provider_context: RuntimeTurnProviderContext"),
+            "agent turn-loop input must enter the loop with grouped provider refs"
+        );
+        assert!(
+            agent_turn_loop_input.contains("request: RuntimeTurnRequestContext"),
+            "agent turn-loop input must enter the loop with grouped immutable turn inputs"
+        );
+        for field_name in [
+            "context_config: &'a context::ContextConfig",
+            "provider_config: &'a ProviderConfig",
+            "cwd: &'a Path",
+            "emit_deltas: bool",
+            "prompt: &'a str",
+            "subagent_type: &'a SubagentType",
+            "continuation: Option<RuntimeTurnContinuation>",
+            "steer_handle: Option<&'a ThreadSteerHandle>",
+            "subagent_depth: u32",
+        ] {
+            assert!(
+                !agent_turn_loop_input.contains(field_name),
+                "agent turn-loop input must not expose field {field_name} outside grouped turn contexts"
+            );
+        }
+    }
+
+    #[test]
     fn runtime_turn_loop_state_resolves_runtime_directive_policy() {
         let agent_loop_source = include_str!("agent_loop.rs");
         let agent_loop_runtime_source = agent_loop_source

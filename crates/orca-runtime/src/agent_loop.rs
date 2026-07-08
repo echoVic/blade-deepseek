@@ -9,7 +9,8 @@ use crate::lifecycle::{
 use crate::runtime_conversation_bootstrap::RuntimeConversationBootstrapStep;
 use crate::runtime_turn_loop::{
     RuntimeAgentTurnLoopInput, RuntimeTurnLoopExecutors, RuntimeTurnLoopStep,
-    RuntimeTurnOutputContext, RuntimeTurnWorkflowContext, run_agent_turn_loop,
+    RuntimeTurnOutputContext, RuntimeTurnProviderContext, RuntimeTurnRequestContext,
+    RuntimeTurnWorkflowContext, run_agent_turn_loop,
 };
 use crate::runtime_turn_setup::RuntimeTurnSetupStep;
 use crate::session::AgentConversationContext;
@@ -98,21 +99,28 @@ pub(crate) fn run_agent_loop(
         &mut turn_loop_step,
         RuntimeAgentTurnLoopInput {
             actor: &mut actor,
-            context_config: &ctx_config,
-            provider_config: &provider_config,
-            cwd,
-            emit_deltas,
+            provider_context: RuntimeTurnProviderContext::new(
+                config.provider,
+                &ctx_config,
+                &provider_config,
+                &config.model,
+                config.max_budget_usd,
+            ),
+            request: RuntimeTurnRequestContext::new(
+                cwd,
+                emit_deltas,
+                prompt,
+                subagent_type,
+                continuation,
+                steer_handle,
+                subagent_depth,
+            ),
             hooks,
             output: RuntimeTurnOutputContext::new(events, sink),
             prepared_conversation: &mut prepared_conversation,
-            prompt,
-            subagent_type,
-            continuation,
             loop_state,
-            steer_handle,
             config,
             tool_policy,
-            subagent_depth,
             policy: &policy,
             instructions,
             memory,
