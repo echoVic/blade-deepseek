@@ -233,9 +233,11 @@ copied into Orca.
    `permission/respond` submissions that omit `requestId`, keeping cross-surface
    permission responses tied to a concrete pending request. Runtime and server
    pending-request maps now reject duplicate ids instead of silently replacing
-   an existing waiter. Next, move the same id discipline into remaining
-   turn/item continuations so continuations stop depending on separate ad hoc
-   task fields plus TUI-local queues.
+   an existing waiter, and TUI interaction adapters now fail before prompting
+   when a duplicate pending id would otherwise create an unrouteable second
+   dialog. Next, move the same id discipline into remaining turn/item
+   continuations so continuations stop depending on separate ad hoc task fields
+   plus TUI-local queues.
 3. **P2: Frozen per-turn context boundary.** Continue shrinking wide call
    surfaces into `RuntimeTurnConfig`, `RuntimeTurnDeps`,
    `RuntimeTurnState`, and request snapshots. Keep borrowing package 3's

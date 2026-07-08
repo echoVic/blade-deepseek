@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::collections::VecDeque;
+use std::io;
 use std::sync::mpsc::{Receiver, Sender};
 
 use orca_approval::ApprovalPolicy;
@@ -100,7 +101,12 @@ pub(crate) fn resolve_tui_tool_approval(
             approval.preview = build_approval_preview(tool_request);
             let pending =
                 RuntimePendingInteractionRecord::from_tool_approval(&approval, tool_request);
-            insert_pending_interaction(pending_interactions, pending.clone());
+            if let Err(error) = insert_pending_interaction(pending_interactions, pending.clone()) {
+                return TuiToolApprovalOutcome::Denied(tool_types::ToolResult::denied(
+                    tool_request,
+                    error.to_string(),
+                ));
+            }
             let _ = event_tx.send(approval_event_from_pending_interaction(&pending));
 
             let handler = TuiApprovalHandler::new(action_rx, pending_actions);
@@ -241,7 +247,7 @@ impl RuntimePermissionRequestHandler for TuiPermissionRequestHandler<'_> {
             self.target.clone(),
             Some(preview),
         );
-        insert_pending_interaction(self.pending_interactions.as_ref(), pending.clone());
+        insert_pending_interaction(self.pending_interactions.as_ref(), pending.clone())?;
         let _ = self
             .event_tx
             .send(approval_event_from_pending_interaction(&pending));
@@ -361,7 +367,7 @@ impl RuntimeUserInputHandler for TuiUserInputHandler<'_> {
         request: &RuntimeUserInputRequest,
     ) -> std::io::Result<Option<String>> {
         let pending = RuntimePendingInteractionRecord::from_user_input(request);
-        insert_pending_interaction(self.pending_interactions.as_ref(), pending.clone());
+        insert_pending_interaction(self.pending_interactions.as_ref(), pending.clone())?;
         let _ = self
             .event_tx
             .send(user_input_event_from_pending_interaction(&pending));
@@ -386,10 +392,17 @@ impl RuntimeUserInputHandler for TuiUserInputHandler<'_> {
 fn insert_pending_interaction(
     store: Option<&RuntimePendingInteractionStore>,
     record: RuntimePendingInteractionRecord,
-) {
+) -> io::Result<()> {
     if let Some(store) = store {
-        let _ = store.insert(record);
+        let id = record.id.clone();
+        store.insert(record).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("duplicate pending interaction id: {id}"),
+            )
+        })?;
     }
+    Ok(())
 }
 
 fn remove_pending_interaction(store: Option<&RuntimePendingInteractionStore>, id: &str) {
@@ -562,6 +575,64 @@ mod tests {
     }
 
     #[test]
+    fn tui_tool_approval_rejects_duplicate_pending_interaction_id_before_prompting() {
+        let (event_tx, event_rx) = mpsc::channel();
+        let (action_tx, action_rx) = mpsc::channel();
+        action_tx
+            .send(UserAction::Approve {
+                id: "approval-bash-1".to_string(),
+                approved: true,
+            })
+            .expect("send approval");
+        let pending_actions = RefCell::new(VecDeque::new());
+        let store = RuntimePendingInteractionStore::default();
+        let approval = orca_core::approval_types::ApprovalRequest {
+            id: "approval-bash-1".to_string(),
+            action: orca_core::approval_types::ActionKind::Shell,
+            description: "bash requested shell".to_string(),
+            tool: Some("bash".to_string()),
+            target: Some("echo existing".to_string()),
+            preview: Some("$ echo existing".to_string()),
+        };
+        let request = tool_types::ToolRequest {
+            id: "bash-1".to_string(),
+            name: tool_types::ToolName::Bash,
+            action: orca_core::approval_types::ActionKind::Shell,
+            target: Some("echo duplicate".to_string()),
+            raw_arguments: Some(serde_json::json!({ "command": "echo duplicate" }).to_string()),
+        };
+        let first = RuntimePendingInteractionRecord::from_tool_approval(&approval, &request);
+        store.insert(first.clone()).expect("seed pending");
+        let invocation = ToolInvocation {
+            requested: request.clone(),
+            effective: request.clone(),
+            action: Some(orca_core::approval_types::ActionKind::Shell),
+        };
+        let mut context = RuntimeToolActorContext::new("tui-approval", 2);
+
+        let outcome = resolve_tui_tool_approval(
+            &invocation,
+            &request,
+            &ApprovalPolicy::new(orca_core::approval_types::ApprovalMode::Suggest),
+            &mut context,
+            &event_tx,
+            &action_rx,
+            &pending_actions,
+            Some(&store),
+        );
+
+        let TuiToolApprovalOutcome::Denied(result) = outcome else {
+            panic!("duplicate pending id should deny before prompting");
+        };
+        assert_eq!(result.status, tool_types::ToolStatus::Denied);
+        assert!(result.error.as_deref().is_some_and(|error| {
+            error.contains("duplicate pending interaction id: approval-bash-1")
+        }));
+        assert_eq!(store.get("approval-bash-1"), Some(first));
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    #[test]
     fn tui_approval_handler_maps_cancel_to_runtime_denial() {
         let (action_tx, action_rx) = mpsc::channel();
         action_tx.send(UserAction::Cancel).expect("send cancel");
@@ -684,6 +755,39 @@ mod tests {
 
         assert_eq!(result.status, tool_types::ToolStatus::Completed);
         assert!(store.is_empty());
+    }
+
+    #[test]
+    fn tui_user_input_handler_rejects_duplicate_pending_interaction_id_before_waiting() {
+        let (event_tx, event_rx) = mpsc::channel();
+        let (action_tx, action_rx) = mpsc::channel();
+        action_tx.send(UserAction::Cancel).expect("send cancel");
+        let store = RuntimePendingInteractionStore::default();
+        let first = RuntimePendingInteractionRecord::from_user_input(&RuntimeUserInputRequest {
+            id: "ask".to_string(),
+            question: "Existing?".to_string(),
+            choices: Vec::new(),
+        });
+        store.insert(first.clone()).expect("seed pending");
+        let pending_actions = RefCell::new(VecDeque::new());
+        let handler = TuiUserInputHandler::new(&event_tx, &action_rx, &pending_actions)
+            .with_pending_interactions(store.clone());
+        let mut context = RuntimeToolActorContext::new("tui-user-input", 2);
+        let request = tool_types::ToolRequest {
+            id: "ask".to_string(),
+            name: tool_types::ToolName::RequestUserInput,
+            action: orca_core::approval_types::ActionKind::Read,
+            target: None,
+            raw_arguments: Some(serde_json::json!({ "question": "Duplicate?" }).to_string()),
+        };
+
+        let error = context
+            .execute_user_input_tool(&request, &handler)
+            .expect_err("duplicate pending id should fail before waiting");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(store.get("ask"), Some(first));
+        assert!(event_rx.try_recv().is_err());
     }
 
     #[test]
@@ -827,6 +931,37 @@ mod tests {
 
         assert_eq!(response.decision, PermissionResponseDecision::Allow);
         assert!(store.is_empty());
+    }
+
+    #[test]
+    fn tui_permission_handler_rejects_duplicate_pending_interaction_id_before_waiting() {
+        let (event_tx, event_rx) = mpsc::channel();
+        let (action_tx, action_rx) = mpsc::channel();
+        action_tx.send(UserAction::Cancel).expect("send cancel");
+        let store = RuntimePendingInteractionStore::default();
+        let request = RuntimePermissionRequest {
+            id: "permission-1".to_string(),
+            reason: Some("need write".to_string()),
+            permissions: Default::default(),
+        };
+        let first = RuntimePendingInteractionRecord::from_permission_request(
+            &request,
+            "request_permissions",
+            None,
+            Some("existing".to_string()),
+        );
+        store.insert(first.clone()).expect("seed pending");
+        let pending_actions = RefCell::new(VecDeque::new());
+        let handler = TuiPermissionRequestHandler::new(&event_tx, &action_rx, &pending_actions)
+            .with_pending_interactions(store.clone());
+
+        let error = handler
+            .request_permissions(&request)
+            .expect_err("duplicate pending id should fail before waiting");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(store.get("permission-1"), Some(first));
+        assert!(event_rx.try_recv().is_err());
     }
 
     #[test]
