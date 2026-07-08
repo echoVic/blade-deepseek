@@ -11,6 +11,7 @@ pub mod commands;
 mod composer_input_actions;
 mod composer_textarea;
 pub mod diff;
+mod global_actions;
 mod idle_navigation_actions;
 mod idle_submit_actions;
 mod mention_menu_actions;
@@ -276,6 +277,45 @@ mod tests {
         assert!(
             !app.contains("\nfn handle_running_shortcut("),
             "app should use the running_actions module instead of defining running shortcut execution inline"
+        );
+    }
+
+    #[test]
+    fn tui_global_actions_are_owned_by_dedicated_module() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let global_actions =
+            std::fs::read_to_string(format!("{manifest_dir}/src/global_actions.rs"))
+                .expect("global_actions module should exist");
+        assert!(
+            global_actions.contains("pub(crate) fn handle_global_shortcut"),
+            "global_actions should own global shortcut handling"
+        );
+        assert!(
+            global_actions.contains("GlobalShortcutFlow::Exit(130)"),
+            "global_actions should own double-Ctrl-C exit flow"
+        );
+        assert!(
+            global_actions.contains("UserAction::Interrupt"),
+            "global_actions should own running interrupt dispatch"
+        );
+        assert!(
+            global_actions.contains("clear_terminal"),
+            "global_actions should own clear-screen terminal callback"
+        );
+
+        let app = std::fs::read_to_string(format!("{manifest_dir}/src/app.rs"))
+            .expect("app source should be readable");
+        assert!(
+            !app.contains("GlobalShortcut::Cancel =>"),
+            "app should use global_actions instead of matching cancel inline"
+        );
+        assert!(
+            !app.contains("GlobalShortcut::ClearScreen =>"),
+            "app should use global_actions instead of matching clear-screen inline"
+        );
+        assert!(
+            !app.contains("state.toggle_shortcuts();"),
+            "app should use global_actions instead of toggling shortcuts inline"
         );
     }
 

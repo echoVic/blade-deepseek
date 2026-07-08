@@ -38,13 +38,14 @@ use crate::composer_input_actions::{
 use crate::composer_textarea::{
     insert_pasted_text, make_setup_textarea, make_textarea, make_textarea_with_text, textarea_text,
 };
+use crate::global_actions::{GlobalShortcutFlow, handle_global_shortcut};
 use crate::idle_navigation_actions::handle_idle_navigation_shortcut;
 use crate::idle_submit_actions::handle_idle_submit;
 use crate::mention_menu_actions::handle_mention_menu_key;
 use crate::running_actions::handle_running_shortcut;
 use crate::shortcuts::{
-    ApprovalShortcut, GlobalShortcut, IdleShortcut, RunningShortcut, approval_shortcut,
-    global_shortcut, idle_shortcut, running_shortcut,
+    ApprovalShortcut, IdleShortcut, RunningShortcut, approval_shortcut, global_shortcut,
+    idle_shortcut, running_shortcut,
 };
 use crate::slash_menu_actions::{REASONING_SUBMENU_TITLE, handle_slash_menu_key};
 use crate::submitted_turn::SubmittedTurn;
@@ -276,52 +277,19 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                 }
 
                 if let Some(shortcut) = global_shortcut(*key) {
-                    match shortcut {
-                        GlobalShortcut::Cancel => {
-                            if state.status == AppStatus::Running {
-                                cancel_token.cancel();
-                                let _ = action_tx.send(UserAction::Interrupt);
-                                continue;
-                            }
-                            let now = Instant::now();
-                            if state
-                                .last_ctrl_c
-                                .is_some_and(|t| now.duration_since(t) < Duration::from_secs(2))
-                            {
-                                let _ = action_tx.send(UserAction::Cancel);
-                                exit_code = 130;
-                                break;
-                            }
-                            state.last_ctrl_c = Some(now);
-                            state
-                                .messages
-                                .push(ChatMessage::System("Press Ctrl+C again to quit.".into()));
-                            state.scroll_to_bottom();
+                    match handle_global_shortcut(
+                        shortcut,
+                        &mut state,
+                        &action_tx,
+                        &cancel_token,
+                        || clear_terminal_scrollback(&mut terminal),
+                    )? {
+                        GlobalShortcutFlow::Continue => {
                             continue;
                         }
-                        GlobalShortcut::ToggleShortcuts => {
-                            state.toggle_shortcuts();
-                            continue;
-                        }
-                        GlobalShortcut::ScrollBottom => {
-                            state.scroll_to_bottom();
-                            continue;
-                        }
-                        GlobalShortcut::ScrollTop => {
-                            state.scroll_to_top();
-                            continue;
-                        }
-                        GlobalShortcut::ClearScreen => {
-                            state.messages.clear();
-                            state.finalized_count = 0;
-                            state.flushed_count = 0;
-                            state.scroll_offset = 0;
-                            state.auto_scroll = true;
-                            // Wipe terminal contents as well as the in-memory transcript.
-                            // Without the alternate screen, previous frames live in the
-                            // terminal's normal buffer even after `messages` is cleared.
-                            clear_terminal_scrollback(&mut terminal)?;
-                            continue;
+                        GlobalShortcutFlow::Exit(code) => {
+                            exit_code = code;
+                            break;
                         }
                     }
                 }

@@ -409,6 +409,9 @@ copied into Orca.
    Idle navigation/control shortcuts now live in a focused TUI idle navigation
    action module, covering scroll/page movement, backtrack dispatch, and
    expand-latest-tool-output fallback into normal composer editing.
+   Global TUI shortcuts now live in a focused global action module, keeping
+   Ctrl-C interrupt/exit flow, shortcut overlay toggling, transcript top/bottom
+   scrolling, and clear-screen terminal cleanup out of the app event loop.
    Runtime task summaries now also expose terminal `result`/`error` fields so
    the selected task row can show completion output or failure details in the
    panel. The
