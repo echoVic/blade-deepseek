@@ -18,6 +18,7 @@ pub mod types;
 pub mod ui;
 pub mod vim;
 mod workflow_notifications;
+mod workflow_panel_actions;
 
 pub use app::run_tui;
 
@@ -208,6 +209,41 @@ mod tests {
         assert!(
             !app.contains("\nfn notify_recovered_background_approvals_for_tui("),
             "app should use the background_tasks module instead of defining recovery notifications inline"
+        );
+    }
+
+    #[test]
+    fn tui_workflow_panel_actions_are_owned_by_dedicated_module() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let workflow_panel_actions =
+            std::fs::read_to_string(format!("{manifest_dir}/src/workflow_panel_actions.rs"))
+                .expect("workflow_panel_actions module should exist");
+        assert!(
+            workflow_panel_actions.contains("pub(crate) fn handle_workflows_panel_key"),
+            "workflow_panel_actions should own workflow panel key handling"
+        );
+        assert!(
+            workflow_panel_actions.contains("fn selected_stoppable_task("),
+            "workflow_panel_actions should keep stop eligibility local to panel actions"
+        );
+        assert!(
+            workflow_panel_actions.contains("fn selected_foregroundable_task("),
+            "workflow_panel_actions should keep foreground eligibility local to panel actions"
+        );
+
+        let app = std::fs::read_to_string(format!("{manifest_dir}/src/app.rs"))
+            .expect("app source should be readable");
+        assert!(
+            !app.contains("\nfn handle_workflows_panel_key("),
+            "app should use the workflow_panel_actions module instead of defining panel key handling inline"
+        );
+        assert!(
+            !app.contains("\nfn selected_stoppable_task("),
+            "app should not own workflow task stop eligibility"
+        );
+        assert!(
+            !app.contains("\nfn selected_foregroundable_task("),
+            "app should not own workflow task foreground eligibility"
         );
     }
 

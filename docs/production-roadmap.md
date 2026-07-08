@@ -379,7 +379,10 @@ copied into Orca.
    `TaskRegistry`, refreshing the panel after the status changes. Stop,
    foreground, and recovered-background-approval task actions now live in a
    focused TUI background task module, keeping package 3-style task controls
-   behind Orca runtime task summaries instead of app-loop state mutation.
+   behind Orca runtime task summaries instead of app-loop state mutation. The
+   workflows panel key handler now also lives in a focused TUI panel action
+   module, so task selection, approval opening, stop dispatch, and foreground
+   dispatch are grouped with the panel UX instead of the app event loop.
    Runtime task summaries now also expose terminal `result`/`error` fields so
    the selected task row can show completion output or failure details in the
    panel. The

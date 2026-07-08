@@ -28,8 +28,7 @@ use orca_runtime::mentions;
 use crate::approval_actions::resolve_approval_option;
 use crate::background_approval::submit_background_approval_response_for_tui;
 use crate::background_tasks::{
-    foreground_task_for_tui, is_terminal_task_status,
-    notify_recovered_background_approvals_for_tui, stop_task_for_tui,
+    foreground_task_for_tui, notify_recovered_background_approvals_for_tui, stop_task_for_tui,
 };
 use crate::bridge;
 use crate::commands::{self, GoalSlashCommand, SlashCommand};
@@ -50,6 +49,7 @@ use crate::workflow_notifications::{
     queue_workflow_terminal_notification, remove_pending_workflow_notification_by_id,
     submit_pending_workflow_notification,
 };
+use crate::workflow_panel_actions::handle_workflows_panel_key;
 
 pub fn run_tui(config: RunConfig) -> i32 {
     match run_tui_inner(config) {
@@ -3531,76 +3531,6 @@ fn make_setup_textarea<'a>(theme: &Theme) -> TextArea<'a> {
             .border_style(ratatui::style::Style::default().fg(theme.border)),
     );
     textarea
-}
-
-fn handle_workflows_panel_key(
-    key_code: KeyCode,
-    state: &mut AppState,
-    action_tx: &mpsc::Sender<UserAction>,
-) -> bool {
-    if state.panel_mode != PanelMode::Workflows {
-        return false;
-    }
-
-    match key_code {
-        KeyCode::Up => {
-            state.select_previous_workflow_task();
-            true
-        }
-        KeyCode::Down => {
-            state.select_next_workflow_task();
-            true
-        }
-        KeyCode::Enter => state.open_selected_background_approval_dialog(),
-        KeyCode::Char('s') => {
-            let Some(task) = selected_stoppable_task(state) else {
-                return false;
-            };
-            let _ = action_tx.send(UserAction::StopTask {
-                task_id: task.id.clone(),
-            });
-            true
-        }
-        KeyCode::Char('f') => {
-            let Some(task) = selected_foregroundable_task(state) else {
-                return false;
-            };
-            let _ = action_tx.send(UserAction::ForegroundTask {
-                task_id: task.id.clone(),
-            });
-            true
-        }
-        _ => false,
-    }
-}
-
-fn selected_stoppable_task(
-    state: &AppState,
-) -> Option<&orca_core::task_types::BackgroundTaskSummary> {
-    let task = state
-        .workflow_panel
-        .tasks
-        .get(state.workflow_panel.selected)?;
-    if is_terminal_task_status(task.status) {
-        return None;
-    }
-    Some(task)
-}
-
-fn selected_foregroundable_task(
-    state: &AppState,
-) -> Option<&orca_core::task_types::BackgroundTaskSummary> {
-    let task = state
-        .workflow_panel
-        .tasks
-        .get(state.workflow_panel.selected)?;
-    if task.task_type != orca_core::task_types::TaskType::MainSession
-        || task.status != orca_core::task_types::TaskStatus::Running
-        || !task.is_backgrounded
-    {
-        return None;
-    }
-    Some(task)
 }
 
 fn handle_running_shortcut(
