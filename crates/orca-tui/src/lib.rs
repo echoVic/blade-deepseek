@@ -16,6 +16,7 @@ pub mod diff;
 mod global_actions;
 mod idle_navigation_actions;
 mod idle_submit_actions;
+mod input_event_actions;
 mod mention_menu_actions;
 mod running_actions;
 mod runtime_event_projection;
@@ -772,6 +773,45 @@ mod tests {
         assert!(
             !app.contains("state.setup_step = 2"),
             "app should use setup_actions instead of advancing setup completion inline"
+        );
+    }
+
+    #[test]
+    fn tui_input_event_actions_are_owned_by_dedicated_module() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let input_event_actions =
+            std::fs::read_to_string(format!("{manifest_dir}/src/input_event_actions.rs"))
+                .expect("input_event_actions module should exist");
+        assert!(
+            input_event_actions.contains("pub(crate) fn handle_paste_event"),
+            "input_event_actions should own bracketed paste handling"
+        );
+        assert!(
+            input_event_actions.contains("pub(crate) fn handle_mouse_event"),
+            "input_event_actions should own mouse event handling"
+        );
+        assert!(
+            input_event_actions.contains("insert_pasted_text"),
+            "input_event_actions should own paste insertion into the composer"
+        );
+        assert!(
+            input_event_actions.contains("refresh_input_menus"),
+            "input_event_actions should refresh slash and mention menus after paste"
+        );
+        assert!(
+            input_event_actions.contains("accepts_mouse_scroll_at"),
+            "input_event_actions should own transcript mouse scroll grace checks"
+        );
+
+        let app = std::fs::read_to_string(format!("{manifest_dir}/src/app.rs"))
+            .expect("app source should be readable");
+        assert!(
+            !app.contains("Event::Paste(pasted)"),
+            "app should use input_event_actions instead of matching paste events inline"
+        );
+        assert!(
+            !app.contains("MouseEventKind::ScrollUp"),
+            "app should use input_event_actions instead of matching mouse scroll inline"
         );
     }
 

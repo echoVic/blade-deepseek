@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 use crossterm::ExecutableCommand;
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event, KeyCode, KeyEventKind, KeyboardEnhancementFlags, MouseEventKind,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    Event, KeyCode, KeyEventKind, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use crossterm::terminal;
 use ratatui::Terminal;
@@ -32,8 +32,7 @@ use crate::background_tasks::{
 use crate::bridge;
 use crate::commands;
 use crate::composer_input_actions::{
-    apply_composer_key_input, insert_composer_newline, recall_next_history,
-    recall_previous_history, refresh_input_menus,
+    apply_composer_key_input, insert_composer_newline, recall_next_history, recall_previous_history,
 };
 use crate::composer_textarea::{
     insert_pasted_text, make_setup_textarea, make_textarea, make_textarea_with_text, textarea_text,
@@ -41,6 +40,7 @@ use crate::composer_textarea::{
 use crate::global_actions::{GlobalShortcutFlow, handle_global_shortcut};
 use crate::idle_navigation_actions::handle_idle_navigation_shortcut;
 use crate::idle_submit_actions::handle_idle_submit;
+use crate::input_event_actions::{handle_mouse_event, handle_paste_event};
 use crate::mention_menu_actions::handle_mention_menu_key;
 use crate::running_actions::handle_running_shortcut;
 use crate::session_picker_actions::handle_session_picker_key;
@@ -239,36 +239,11 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
         if event::poll(Duration::from_millis(50))? {
             let ev = event::read()?;
 
-            if let Event::Paste(pasted) = &ev {
-                match state.status {
-                    AppStatus::Setup if state.setup_step == 1 => {
-                        insert_pasted_text(&mut textarea, pasted);
-                    }
-                    AppStatus::Idle | AppStatus::WaitingUserInput => {
-                        if insert_pasted_text(&mut textarea, pasted) {
-                            state.reset_history_navigation();
-                            refresh_input_menus(&textarea, &mut state, &config);
-                        }
-                    }
-                    _ => {}
-                }
+            if handle_paste_event(&ev, &mut state, &config, &mut textarea) {
                 continue;
             }
 
-            // Mouse wheel scrolls the conversation transcript. Other mouse events (clicks,
-            // drags) are ignored — text selection/copy is handled by the terminal via
-            // modifier-drag, which bypasses our capture. Scrolling only applies to the
-            // conversation view; the panel dashboards have their own keyboard navigation.
-            if let Event::Mouse(mouse) = &ev {
-                if state.panel_mode == PanelMode::Conversation {
-                    if state.accepts_mouse_scroll_at(Instant::now()) {
-                        match mouse.kind {
-                            MouseEventKind::ScrollUp => state.scroll_up(3),
-                            MouseEventKind::ScrollDown => state.scroll_down(3),
-                            _ => {}
-                        }
-                    }
-                }
+            if handle_mouse_event(&ev, &mut state, Instant::now()) {
                 continue;
             }
 

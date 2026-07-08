@@ -426,6 +426,9 @@ copied into Orca.
    covering setup-step transitions, API key persistence/config propagation,
    masked setup input editing, completion exit flow, and optional initial
    prompt submission after setup.
+   Bracketed paste and mouse transcript scrolling now live in a focused TUI
+   input event action module, keeping paste insertion/menu refresh and
+   mouse-wheel transcript scrolling grace checks out of the app event loop.
    Runtime task summaries now also expose terminal `result`/`error` fields so
    the selected task row can show completion output or failure details in the
    panel. The
