@@ -75,6 +75,9 @@ pub enum TuiEvent {
     WorkflowTasksUpdated {
         tasks: Vec<BackgroundTaskSummary>,
     },
+    WorkflowTaskUpdated {
+        task: BackgroundTaskSummary,
+    },
     WorkflowNotification {
         prompt: String,
         status: String,
@@ -1010,75 +1013,15 @@ impl AppState {
                     }
                 }
             }
-            TuiEvent::WorkflowTasksUpdated { tasks } => {
-                let was_suppressing_background_output =
-                    self.suppress_background_main_session_output;
-                let has_backgrounded_running_main_session =
-                    tasks.iter().any(is_backgrounded_running_main_session);
-                let had_backgrounded_approval_main_session = self
-                    .workflow_panel
-                    .tasks
-                    .iter()
-                    .any(is_backgrounded_approval_main_session);
-                let has_backgrounded_approval_main_session =
-                    tasks.iter().any(is_backgrounded_approval_main_session);
-                self.suppress_background_main_session_output =
-                    has_backgrounded_running_main_session;
-                if has_backgrounded_running_main_session {
-                    self.set_status(AppStatus::Idle);
+            TuiEvent::WorkflowTasksUpdated { tasks } => self.apply_workflow_tasks_update(tasks),
+            TuiEvent::WorkflowTaskUpdated { task } => {
+                let mut tasks = self.workflow_panel.tasks.clone();
+                if let Some(existing) = tasks.iter_mut().find(|existing| existing.id == task.id) {
+                    *existing = task;
+                } else {
+                    tasks.push(task);
                 }
-                let should_reveal_background_task =
-                    has_backgrounded_running_main_session && !was_suppressing_background_output;
-                let should_reveal_background_approval = has_backgrounded_approval_main_session
-                    && !had_backgrounded_approval_main_session;
-                let selected_was_backgrounded_main_session = self
-                    .workflow_panel
-                    .tasks
-                    .get(self.workflow_panel.selected)
-                    .is_some_and(is_backgrounded_running_main_session);
-                let selected_task_id = self
-                    .workflow_panel
-                    .tasks
-                    .get(self.workflow_panel.selected)
-                    .map(|task| task.id.clone());
-                self.workflow_panel.tasks = sort_workflow_tasks_for_panel(tasks);
-                if should_reveal_background_approval {
-                    self.panel_mode = PanelMode::Workflows;
-                    if let Some(index) = self
-                        .workflow_panel
-                        .tasks
-                        .iter()
-                        .position(is_backgrounded_approval_main_session)
-                    {
-                        self.workflow_panel.selected = index;
-                    }
-                } else if should_reveal_background_task {
-                    self.panel_mode = PanelMode::Workflows;
-                    if let Some(index) = self
-                        .workflow_panel
-                        .tasks
-                        .iter()
-                        .position(is_backgrounded_running_main_session)
-                    {
-                        self.workflow_panel.selected = index;
-                    }
-                } else if let Some(selected_task_id) = selected_task_id
-                    && let Some(index) = self
-                        .workflow_panel
-                        .tasks
-                        .iter()
-                        .position(|task| task.id == selected_task_id)
-                {
-                    let selected_is_now_foregrounded = selected_was_backgrounded_main_session
-                        && is_foregrounded_running_main_session(&self.workflow_panel.tasks[index]);
-                    self.workflow_panel.selected = index;
-                    if selected_is_now_foregrounded && self.panel_mode == PanelMode::Workflows {
-                        self.panel_mode = PanelMode::Conversation;
-                    }
-                } else if self.workflow_panel.selected >= self.workflow_panel.tasks.len() {
-                    self.workflow_panel.selected =
-                        self.workflow_panel.tasks.len().saturating_sub(1);
-                }
+                self.apply_workflow_tasks_update(tasks);
             }
             TuiEvent::WorkflowNotification {
                 prompt,
@@ -1258,6 +1201,74 @@ impl AppState {
             .flushed_count
             .saturating_sub(removed_before_flushed)
             .min(self.messages.len());
+    }
+
+    fn apply_workflow_tasks_update(&mut self, tasks: Vec<BackgroundTaskSummary>) {
+        let was_suppressing_background_output = self.suppress_background_main_session_output;
+        let has_backgrounded_running_main_session =
+            tasks.iter().any(is_backgrounded_running_main_session);
+        let had_backgrounded_approval_main_session = self
+            .workflow_panel
+            .tasks
+            .iter()
+            .any(is_backgrounded_approval_main_session);
+        let has_backgrounded_approval_main_session =
+            tasks.iter().any(is_backgrounded_approval_main_session);
+        self.suppress_background_main_session_output = has_backgrounded_running_main_session;
+        if has_backgrounded_running_main_session {
+            self.set_status(AppStatus::Idle);
+        }
+        let should_reveal_background_task =
+            has_backgrounded_running_main_session && !was_suppressing_background_output;
+        let should_reveal_background_approval =
+            has_backgrounded_approval_main_session && !had_backgrounded_approval_main_session;
+        let selected_was_backgrounded_main_session = self
+            .workflow_panel
+            .tasks
+            .get(self.workflow_panel.selected)
+            .is_some_and(is_backgrounded_running_main_session);
+        let selected_task_id = self
+            .workflow_panel
+            .tasks
+            .get(self.workflow_panel.selected)
+            .map(|task| task.id.clone());
+        self.workflow_panel.tasks = sort_workflow_tasks_for_panel(tasks);
+        if should_reveal_background_approval {
+            self.panel_mode = PanelMode::Workflows;
+            if let Some(index) = self
+                .workflow_panel
+                .tasks
+                .iter()
+                .position(is_backgrounded_approval_main_session)
+            {
+                self.workflow_panel.selected = index;
+            }
+        } else if should_reveal_background_task {
+            self.panel_mode = PanelMode::Workflows;
+            if let Some(index) = self
+                .workflow_panel
+                .tasks
+                .iter()
+                .position(is_backgrounded_running_main_session)
+            {
+                self.workflow_panel.selected = index;
+            }
+        } else if let Some(selected_task_id) = selected_task_id
+            && let Some(index) = self
+                .workflow_panel
+                .tasks
+                .iter()
+                .position(|task| task.id == selected_task_id)
+        {
+            let selected_is_now_foregrounded = selected_was_backgrounded_main_session
+                && is_foregrounded_running_main_session(&self.workflow_panel.tasks[index]);
+            self.workflow_panel.selected = index;
+            if selected_is_now_foregrounded && self.panel_mode == PanelMode::Workflows {
+                self.panel_mode = PanelMode::Conversation;
+            }
+        } else if self.workflow_panel.selected >= self.workflow_panel.tasks.len() {
+            self.workflow_panel.selected = self.workflow_panel.tasks.len().saturating_sub(1);
+        }
     }
 
     /// Whether the message at `index` will never change again, so it is safe to flush
@@ -2657,6 +2668,44 @@ mod tests {
             tasks: vec![completed, running],
         });
 
+        assert_eq!(
+            state.workflow_panel.tasks[state.workflow_panel.selected].id,
+            "task-completed"
+        );
+    }
+
+    #[test]
+    fn single_task_status_updates_merge_without_dropping_other_panel_tasks() {
+        let mut state = state();
+        let mut running = workflow_task_summary("task-running", "running");
+        running.status = TaskStatus::Running;
+        running.last_activity_at_ms = Some(5_000);
+        let mut completed = workflow_task_summary("task-completed", "completed");
+        completed.status = TaskStatus::Completed;
+        completed.completed_at_ms = Some(9_000);
+        completed.last_activity_at_ms = Some(9_000);
+        state.update(TuiEvent::WorkflowTasksUpdated {
+            tasks: vec![running.clone(), completed.clone()],
+        });
+        state.workflow_panel.selected = state
+            .workflow_panel
+            .tasks
+            .iter()
+            .position(|task| task.id == "task-completed")
+            .expect("completed task remains visible");
+
+        running.last_activity_at_ms = Some(10_000);
+        state.update(TuiEvent::WorkflowTaskUpdated { task: running });
+
+        assert_eq!(
+            state
+                .workflow_panel
+                .tasks
+                .iter()
+                .map(|task| task.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["task-running", "task-completed"]
+        );
         assert_eq!(
             state.workflow_panel.tasks[state.workflow_panel.selected].id,
             "task-completed"

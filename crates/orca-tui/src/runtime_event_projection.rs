@@ -161,8 +161,8 @@ pub(crate) fn tui_event_from_runtime_event(event: &EventEnvelope) -> Option<TuiE
         EventType::WorkflowTasksUpdated => Some(TuiEvent::WorkflowTasksUpdated {
             tasks: serde_json::from_value(event.payload["tasks"].clone()).ok()?,
         }),
-        EventType::TaskStatusUpdated => Some(TuiEvent::WorkflowTasksUpdated {
-            tasks: vec![serde_json::from_value(event.payload["task"].clone()).ok()?],
+        EventType::TaskStatusUpdated => Some(TuiEvent::WorkflowTaskUpdated {
+            task: serde_json::from_value(event.payload["task"].clone()).ok()?,
         }),
         EventType::WorkflowResumed => Some(TuiEvent::Notice(format!(
             "Workflow resumed: {}",
@@ -662,7 +662,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_task_status_event_maps_to_tui_tasks_updated() {
+    fn runtime_task_status_event_maps_to_tui_task_updated() {
         let mut events = EventFactory::new("tui-runtime-adapter".to_string());
         let task = orca_core::task_types::BackgroundTaskSummary {
             id: "main-session-1".to_string(),
@@ -700,15 +700,14 @@ mod tests {
             .expect("task status updated event");
 
         match tui_event {
-            TuiEvent::WorkflowTasksUpdated { tasks } => {
-                assert_eq!(tasks.len(), 1);
-                assert_eq!(tasks[0].id, "main-session-1");
+            TuiEvent::WorkflowTaskUpdated { task } => {
+                assert_eq!(task.id, "main-session-1");
                 assert_eq!(
-                    tasks[0].status,
+                    task.status,
                     orca_core::task_types::TaskStatus::ApprovalRequired
                 );
-                assert!(tasks[0].is_backgrounded);
-                assert_eq!(tasks[0].tool.as_deref(), Some("shell"));
+                assert!(task.is_backgrounded);
+                assert_eq!(task.tool.as_deref(), Some("shell"));
             }
             other => panic!("expected task status updated event, got {other:?}"),
         }

@@ -906,6 +906,17 @@ mod tests {
         )
     }
 
+    fn matching_task_update(
+        event: TuiEvent,
+        predicate: impl Fn(&orca_core::task_types::BackgroundTaskSummary) -> bool,
+    ) -> Option<orca_core::task_types::BackgroundTaskSummary> {
+        match event {
+            TuiEvent::WorkflowTasksUpdated { tasks } => tasks.into_iter().find(predicate),
+            TuiEvent::WorkflowTaskUpdated { task } if predicate(&task) => Some(task),
+            _ => None,
+        }
+    }
+
     fn workflow_task(id: &str, name: &str) -> orca_core::task_types::BackgroundTaskSummary {
         orca_core::task_types::BackgroundTaskSummary {
             id: id.to_string(),
@@ -1894,17 +1905,13 @@ mod tests {
             action_tx.send(UserAction::BackgroundCurrentTurn).unwrap();
 
             let status = loop {
-                match event_rx.recv_timeout(Duration::from_secs(2)).unwrap() {
-                    TuiEvent::WorkflowTasksUpdated { tasks } => {
-                        if let Some(task) = tasks.into_iter().find(|task| {
-                            task.task_type == orca_core::task_types::TaskType::MainSession
-                                && task.is_backgrounded
-                                && task.status != orca_core::task_types::TaskStatus::Running
-                        }) {
-                            break task.status;
-                        }
-                    }
-                    _ => {}
+                let event = event_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                if let Some(task) = matching_task_update(event, |task| {
+                    task.task_type == orca_core::task_types::TaskType::MainSession
+                        && task.is_backgrounded
+                        && task.status != orca_core::task_types::TaskStatus::Running
+                }) {
+                    break task.status;
                 }
             };
 
@@ -1964,17 +1971,13 @@ mod tests {
             action_tx.send(UserAction::BackgroundCurrentTurn).unwrap();
 
             let status = loop {
-                match event_rx.recv_timeout(Duration::from_secs(2)).unwrap() {
-                    TuiEvent::WorkflowTasksUpdated { tasks } => {
-                        if let Some(task) = tasks.into_iter().find(|task| {
-                            task.task_type == orca_core::task_types::TaskType::MainSession
-                                && task.is_backgrounded
-                                && task.status != orca_core::task_types::TaskStatus::Running
-                        }) {
-                            break task.status;
-                        }
-                    }
-                    _ => {}
+                let event = event_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                if let Some(task) = matching_task_update(event, |task| {
+                    task.task_type == orca_core::task_types::TaskType::MainSession
+                        && task.is_backgrounded
+                        && task.status != orca_core::task_types::TaskStatus::Running
+                }) {
+                    break task.status;
                 }
             };
 
@@ -2034,18 +2037,13 @@ mod tests {
             action_tx.send(UserAction::BackgroundCurrentTurn).unwrap();
 
             let pending_tool = loop {
-                match event_rx.recv_timeout(Duration::from_secs(2)).unwrap() {
-                    TuiEvent::WorkflowTasksUpdated { tasks } => {
-                        if let Some(task) = tasks.into_iter().find(|task| {
-                            task.task_type == orca_core::task_types::TaskType::MainSession
-                                && task.is_backgrounded
-                                && task.status
-                                    == orca_core::task_types::TaskStatus::ApprovalRequired
-                        }) {
-                            break task.pending_tool_call;
-                        }
-                    }
-                    _ => {}
+                let event = event_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                if let Some(task) = matching_task_update(event, |task| {
+                    task.task_type == orca_core::task_types::TaskType::MainSession
+                        && task.is_backgrounded
+                        && task.status == orca_core::task_types::TaskStatus::ApprovalRequired
+                }) {
+                    break task.pending_tool_call;
                 }
             };
 
@@ -2128,6 +2126,11 @@ mod tests {
                             .collect::<Vec<_>>();
                         seen.push(format!("tasks: {}", statuses.join(",")));
                     }
+                    TuiEvent::WorkflowTaskUpdated { task }
+                        if task.task_type == orca_core::task_types::TaskType::MainSession =>
+                    {
+                        seen.push(format!("task: {:?}", task.status));
+                    }
                     event => seen.push(format!("{event:?}")),
                 }
             }
@@ -2187,18 +2190,13 @@ mod tests {
             action_tx.send(UserAction::BackgroundCurrentTurn).unwrap();
 
             let task_id = loop {
-                match event_rx.recv_timeout(Duration::from_secs(2)).unwrap() {
-                    TuiEvent::WorkflowTasksUpdated { tasks } => {
-                        if let Some(task) = tasks.into_iter().find(|task| {
-                            task.task_type == orca_core::task_types::TaskType::MainSession
-                                && task.is_backgrounded
-                                && task.status
-                                    == orca_core::task_types::TaskStatus::ApprovalRequired
-                        }) {
-                            break task.id;
-                        }
-                    }
-                    _ => {}
+                let event = event_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                if let Some(task) = matching_task_update(event, |task| {
+                    task.task_type == orca_core::task_types::TaskType::MainSession
+                        && task.is_backgrounded
+                        && task.status == orca_core::task_types::TaskStatus::ApprovalRequired
+                }) {
+                    break task.id;
                 }
             };
 
@@ -2225,6 +2223,12 @@ mod tests {
                             task.id == task_id
                                 && task.status == orca_core::task_types::TaskStatus::Completed
                         });
+                    }
+                    Ok(TuiEvent::WorkflowTaskUpdated { task })
+                        if task.id == task_id
+                            && task.status == orca_core::task_types::TaskStatus::Completed =>
+                    {
+                        saw_completed_task = true;
                     }
                     Ok(event) => seen.push(format!("{event:?}")),
                     Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -2299,22 +2303,17 @@ mod tests {
             action_tx.send(UserAction::BackgroundCurrentTurn).unwrap();
 
             let task_id = loop {
-                match event_rx.recv_timeout(Duration::from_secs(2)).unwrap() {
-                    TuiEvent::WorkflowTasksUpdated { tasks } => {
-                        if let Some(task) = tasks.into_iter().find(|task| {
-                            task.task_type == orca_core::task_types::TaskType::MainSession
-                                && task.is_backgrounded
-                                && task.status
-                                    == orca_core::task_types::TaskStatus::ApprovalRequired
-                                && task
-                                    .pending_tool_call
-                                    .as_ref()
-                                    .is_some_and(|tool| tool.name == "mcp__broken__tool")
-                        }) {
-                            break task.id;
-                        }
-                    }
-                    _ => {}
+                let event = event_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                if let Some(task) = matching_task_update(event, |task| {
+                    task.task_type == orca_core::task_types::TaskType::MainSession
+                        && task.is_backgrounded
+                        && task.status == orca_core::task_types::TaskStatus::ApprovalRequired
+                        && task
+                            .pending_tool_call
+                            .as_ref()
+                            .is_some_and(|tool| tool.name == "mcp__broken__tool")
+                }) {
+                    break task.id;
                 }
             };
 

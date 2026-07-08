@@ -1546,7 +1546,7 @@ mod tests {
     use orca_core::config::{HistoryMode, OutputFormat, ProviderKind, RunConfig};
     use orca_core::event_schema::RunStatus;
     use orca_core::model::ModelSelection;
-    use orca_core::task_types::{TaskStatus, TaskType};
+    use orca_core::task_types::{BackgroundTaskSummary, TaskStatus, TaskType};
     use orca_runtime::workflow::host::WorkflowHost;
 
     fn config() -> RunConfig {
@@ -1610,6 +1610,17 @@ mod tests {
         RunConfig {
             approval_mode: ApprovalMode::FullAuto,
             ..config()
+        }
+    }
+
+    fn task_update_matches(
+        event: &TuiEvent,
+        predicate: impl Fn(&BackgroundTaskSummary) -> bool,
+    ) -> bool {
+        match event {
+            TuiEvent::WorkflowTasksUpdated { tasks } => tasks.iter().any(predicate),
+            TuiEvent::WorkflowTaskUpdated { task } => predicate(task),
+            _ => false,
         }
     }
 
@@ -1812,6 +1823,11 @@ mod tests {
                     .iter()
                     .find(|task| task.task_type == TaskType::MainSession)
                     .map(|task| task.id.as_str()),
+                TuiEvent::WorkflowTaskUpdated { task }
+                    if task.task_type == TaskType::MainSession =>
+                {
+                    Some(task.id.as_str())
+                }
                 _ => None,
             })
             .expect("main session task update");
@@ -1864,28 +1880,24 @@ mod tests {
         assert!(main_tasks[0].completed_at_ms.is_some());
 
         let events = event_rx.try_iter().collect::<Vec<_>>();
-        assert!(events.iter().any(|event| {
-            matches!(
-                event,
-                TuiEvent::WorkflowTasksUpdated { tasks }
-                if tasks.iter().any(|task| {
+        assert!(
+            events
+                .iter()
+                .any(|event| task_update_matches(event, |task| {
                     task.task_type == TaskType::MainSession
                         && task.status == TaskStatus::Running
                         && task.description == "mock_silent_final"
-                })
-            )
-        }));
-        assert!(events.iter().any(|event| {
-            matches!(
-                event,
-                TuiEvent::WorkflowTasksUpdated { tasks }
-                if tasks.iter().any(|task| {
+                }))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| task_update_matches(event, |task| {
                     task.task_type == TaskType::MainSession
                         && task.status == TaskStatus::Completed
                         && task.description == "mock_silent_final"
-                })
-            )
-        }));
+                }))
+        );
     }
 
     #[test]
@@ -1922,17 +1934,15 @@ mod tests {
         assert!(main_task.is_backgrounded);
 
         let events = event_rx.try_iter().collect::<Vec<_>>();
-        assert!(events.iter().any(|event| {
-            matches!(
-                event,
-                TuiEvent::WorkflowTasksUpdated { tasks }
-                if tasks.iter().any(|task| {
+        assert!(
+            events
+                .iter()
+                .any(|event| task_update_matches(event, |task| {
                     task.task_type == TaskType::MainSession
                         && task.status == TaskStatus::Running
                         && task.is_backgrounded
-                })
-            )
-        }));
+                }))
+        );
     }
 
     #[test]
@@ -2017,17 +2027,15 @@ mod tests {
                     && output.contains("Task stop requested")
             )
         }));
-        assert!(events.iter().any(|event| {
-            matches!(
-                event,
-                TuiEvent::WorkflowTasksUpdated { tasks }
-                if tasks.iter().any(|task| {
+        assert!(
+            events
+                .iter()
+                .any(|event| task_update_matches(event, |task| {
                     task.task_type == TaskType::MainSession
                         && task.status == TaskStatus::Stopped
                         && task.description == "task_stop_main_session"
-                })
-            )
-        }));
+                }))
+        );
     }
 
     #[test]
@@ -2092,17 +2100,15 @@ mod tests {
                     && output.contains("Task stopped")
             )
         }));
-        assert!(events.iter().any(|event| {
-            matches!(
-                event,
-                TuiEvent::WorkflowTasksUpdated { tasks }
-                if tasks.iter().any(|task| {
+        assert!(
+            events
+                .iter()
+                .any(|event| task_update_matches(event, |task| {
                     task.task_type == TaskType::MainSession
                         && task.status == TaskStatus::Stopped
                         && task.description == "background approval"
-                })
-            )
-        }));
+                }))
+        );
     }
 
     #[test]
@@ -2583,8 +2589,8 @@ mod tests {
 
         loop {
             match event_rx.recv_timeout(Duration::from_secs(2)).unwrap() {
-                TuiEvent::WorkflowTasksUpdated { tasks }
-                    if tasks.iter().any(|task| {
+                event
+                    if task_update_matches(&event, |task| {
                         task.status == orca_core::task_types::TaskStatus::ApprovalRequired
                             && task.pending_tool_call.is_some()
                     }) =>
@@ -3147,10 +3153,12 @@ mod tests {
             tasks[0].status,
             orca_core::task_types::TaskStatus::Completed
         );
-        assert!(event_rx.try_iter().any(|event| {
-            matches!(event, TuiEvent::WorkflowTasksUpdated { tasks }
-                if tasks.iter().any(|task| task.description == "sync progress child"))
-        }));
+        assert!(
+            event_rx
+                .try_iter()
+                .any(|event| task_update_matches(&event, |task| task.description
+                    == "sync progress child"))
+        );
     }
 
     #[test]

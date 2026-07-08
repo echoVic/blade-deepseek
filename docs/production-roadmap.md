@@ -284,7 +284,9 @@ copied into Orca.
    polling keeps the aggregate workflow task-list event for full-list progress
    refreshes.
    Server protocol event mapping also preserves that single-task status event
-   as `task_status_updated` for non-TUI clients.
+   as `task_status_updated` for non-TUI clients. The TUI projection now keeps
+   that path as a single-task update and merges it into the panel by task id, so
+   one status event cannot drop unrelated visible tasks.
 5. **P4: Persistence policy for pending background continuations.** Seeded:
    approval-required background main-session tasks now persist a compact
    provider-response continuation record through `TaskRegistry`, so a restarted
