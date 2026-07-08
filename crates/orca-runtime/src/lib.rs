@@ -3197,8 +3197,10 @@ mod tests {
         for marker in [
             "struct RuntimeBashSandboxContext",
             "struct RuntimeBashOnceContext",
+            "struct RuntimeBashPermissionPolicy",
             "fn execute_bash_with_sandbox(context: RuntimeBashSandboxContext",
             "fn execute_bash_once(context: RuntimeBashOnceContext",
+            "RuntimeBashPermissionPolicy::network_block_request(",
         ] {
             assert!(
                 runtime_bash_source.contains(marker),

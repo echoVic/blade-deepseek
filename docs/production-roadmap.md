@@ -262,7 +262,10 @@ The deeper July 9 reference pass changes the next refactor order:
    The first slice is now seeded with `RuntimeToolApprovalPolicy`, which owns
    preapproved tool-call consumption, permission-rule resolution, and strict
    auto-review downgrades before the tool execution gate handles events and
-   interactive prompts.
+   interactive prompts. `RuntimeBashPermissionPolicy` now also owns the first
+   bash-side escalation decision: converting network proxy blocks into
+   requestable network permission prompts while preserving denylist blocks as
+   final diagnostics.
 4. **P2: Turn MCP elicitation and dynamic waits into pending interactions.**
    Package 3's MCP elicitation queue is the useful reference here: request id,
    server name, mode, abort signal, completion notification, and hook-driven

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
@@ -113,27 +113,10 @@ pub(crate) fn execute_bash_with_shell_session(
         network_block,
     } = result;
     if let Some(block) = network_block
-        && block.error != "blocked-by-denylist"
+        && let Some(permission_request) =
+            RuntimeBashPermissionPolicy::network_block_request(&request.id, &block)
         && let Some(permission_handler) = permission_handler
     {
-        let mut domains = std::collections::HashMap::new();
-        domains.insert(block.host.clone(), PermissionProfileNetworkAccess::Allow);
-        let permissions = RequestPermissionProfile {
-            file_system: None,
-            network: Some(RequestNetworkPermissions {
-                enabled: None,
-                domains,
-            }),
-            shell: None,
-        };
-        let permission_request = RuntimePermissionRequest {
-            id: request.id.clone(),
-            reason: Some(format!(
-                "bash attempted network access to {} ({})",
-                block.host, block.error
-            )),
-            permissions,
-        };
         let reducer = RuntimeTurnReducer::from_extension_stores(extension_stores);
         let response = match reducer.request_permission(
             permission_overlay,
@@ -321,6 +304,37 @@ struct RuntimeBashOnceContext<'a> {
     shell_timeout_secs: u64,
     task_registry: &'a TaskRegistry,
     cancel: Option<&'a CancelToken>,
+}
+
+struct RuntimeBashPermissionPolicy;
+
+impl RuntimeBashPermissionPolicy {
+    fn network_block_request(
+        request_id: &str,
+        block: &RuntimeNetworkBlockReport,
+    ) -> Option<RuntimePermissionRequest> {
+        if block.error == "blocked-by-denylist" {
+            return None;
+        }
+
+        let mut domains = HashMap::new();
+        domains.insert(block.host.clone(), PermissionProfileNetworkAccess::Allow);
+        Some(RuntimePermissionRequest {
+            id: request_id.to_string(),
+            reason: Some(format!(
+                "bash attempted network access to {} ({})",
+                block.host, block.error
+            )),
+            permissions: RequestPermissionProfile {
+                file_system: None,
+                network: Some(RequestNetworkPermissions {
+                    enabled: None,
+                    domains,
+                }),
+                shell: None,
+            },
+        })
+    }
 }
 
 impl BashShellOutput {
@@ -537,5 +551,50 @@ fn execute_bash_once(context: RuntimeBashOnceContext<'_>) -> BashShellOutput {
     BashShellOutput {
         output,
         task_id: Some(handle.task_id),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use orca_core::config::PermissionProfileNetworkAccess;
+
+    use super::RuntimeBashPermissionPolicy;
+    use crate::network_proxy::RuntimeNetworkBlockReport;
+
+    #[test]
+    fn runtime_bash_permission_policy_skips_denylist_network_blocks() {
+        let block = RuntimeNetworkBlockReport {
+            host: "blocked.orca.invalid".to_string(),
+            error: "blocked-by-denylist",
+        };
+
+        assert!(RuntimeBashPermissionPolicy::network_block_request("tool-1", &block).is_none());
+    }
+
+    #[test]
+    fn runtime_bash_permission_policy_requests_allow_for_network_policy_blocks() {
+        let block = RuntimeNetworkBlockReport {
+            host: "api.example.com".to_string(),
+            error: "blocked-by-allowlist",
+        };
+
+        let request = RuntimeBashPermissionPolicy::network_block_request("tool-1", &block)
+            .expect("network permission request");
+
+        assert_eq!(request.id, "tool-1");
+        assert_eq!(
+            request
+                .permissions
+                .network
+                .as_ref()
+                .and_then(|network| network.domains.get("api.example.com")),
+            Some(&PermissionProfileNetworkAccess::Allow)
+        );
+        assert!(request.permissions.file_system.is_none());
+        assert!(request.permissions.shell.is_none());
+        assert_eq!(
+            request.reason.as_deref(),
+            Some("bash attempted network access to api.example.com (blocked-by-allowlist)")
+        );
     }
 }
