@@ -131,7 +131,7 @@ pub enum UserAction {
     GoalPause,
     GoalResume,
     Approve { id: String, approved: bool },
-    ResolveBackgroundApproval { task_id: String, approved: bool },
+    ResolveBackgroundApproval { id: String, approved: bool },
     StopTask { task_id: String },
     ForegroundTask { task_id: String },
     RespondToUserInput { id: String, answer: String },

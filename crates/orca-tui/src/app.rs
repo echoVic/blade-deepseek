@@ -1049,7 +1049,7 @@ mod tests {
     }
 
     #[test]
-    fn background_approval_resolution_sends_task_scoped_action() {
+    fn background_approval_resolution_sends_request_scoped_action() {
         let (mut state, rx) = test_state();
         let action_tx = state.event_tx.clone();
         state.approval_dialog = Some(crate::types::ApprovalDialog {
@@ -1067,8 +1067,8 @@ mod tests {
 
         assert!(matches!(
             rx.try_recv(),
-            Ok(UserAction::ResolveBackgroundApproval { task_id, approved })
-                if task_id == "task-approval" && approved
+            Ok(UserAction::ResolveBackgroundApproval { id, approved })
+                if id == "approval-background" && approved
         ));
         assert_eq!(state.status, AppStatus::Idle);
         assert!(state.approval_dialog.is_none());
@@ -1258,7 +1258,12 @@ mod tests {
             .unwrap();
         let (event_tx, event_rx) = mpsc::channel();
 
-        submit_background_approval_response_for_tui(Some(&registry), &task.id, false, &event_tx);
+        submit_background_approval_response_for_tui(
+            Some(&registry),
+            "mock-tool-1",
+            false,
+            &event_tx,
+        );
 
         let record = registry.get(&task.id).unwrap();
         assert_eq!(record.status, orca_core::task_types::TaskStatus::Stopped);
@@ -2189,20 +2194,26 @@ mod tests {
 
             action_tx.send(UserAction::BackgroundCurrentTurn).unwrap();
 
-            let task_id = loop {
+            let (task_id, approval_id) = loop {
                 let event = event_rx.recv_timeout(Duration::from_secs(2)).unwrap();
                 if let Some(task) = matching_task_update(event, |task| {
                     task.task_type == orca_core::task_types::TaskType::MainSession
                         && task.is_backgrounded
                         && task.status == orca_core::task_types::TaskStatus::ApprovalRequired
                 }) {
-                    break task.id;
+                    let approval_id = task
+                        .pending_tool_call
+                        .as_ref()
+                        .expect("pending tool call")
+                        .id
+                        .clone();
+                    break (task.id, approval_id);
                 }
             };
 
             action_tx
                 .send(UserAction::ResolveBackgroundApproval {
-                    task_id: task_id.clone(),
+                    id: approval_id,
                     approved: true,
                 })
                 .unwrap();
@@ -2302,7 +2313,7 @@ mod tests {
 
             action_tx.send(UserAction::BackgroundCurrentTurn).unwrap();
 
-            let task_id = loop {
+            let approval_id = loop {
                 let event = event_rx.recv_timeout(Duration::from_secs(2)).unwrap();
                 if let Some(task) = matching_task_update(event, |task| {
                     task.task_type == orca_core::task_types::TaskType::MainSession
@@ -2313,13 +2324,18 @@ mod tests {
                             .as_ref()
                             .is_some_and(|tool| tool.name == "mcp__broken__tool")
                 }) {
-                    break task.id;
+                    break task
+                        .pending_tool_call
+                        .as_ref()
+                        .expect("pending tool call")
+                        .id
+                        .clone();
                 }
             };
 
             action_tx
                 .send(UserAction::ResolveBackgroundApproval {
-                    task_id,
+                    id: approval_id,
                     approved: true,
                 })
                 .unwrap();
@@ -3225,12 +3241,20 @@ fn make_setup_textarea<'a>(theme: &Theme) -> TextArea<'a> {
 }
 
 fn resolve_approval(state: &mut AppState, action_tx: &mpsc::Sender<UserAction>, approved: bool) {
-    if let Some(task_id) = state
+    if state
         .approval_dialog
         .as_ref()
-        .and_then(|dialog| dialog.background_task_id.clone())
+        .and_then(|dialog| dialog.background_task_id.as_ref())
+        .is_some()
     {
-        let _ = action_tx.send(UserAction::ResolveBackgroundApproval { task_id, approved });
+        let Some(id) = state
+            .approval_dialog
+            .as_ref()
+            .map(|dialog| dialog.id.clone())
+        else {
+            return;
+        };
+        let _ = action_tx.send(UserAction::ResolveBackgroundApproval { id, approved });
         state.set_status(AppStatus::Idle);
     } else {
         let Some(id) = state
@@ -3401,24 +3425,24 @@ fn resolve_approval_option(
 
 fn submit_background_approval_response_for_tui(
     task_registry: Option<&orca_runtime::tasks::TaskRegistry>,
-    task_id: &str,
+    approval_id: &str,
     approved: bool,
     event_tx: &mpsc::Sender<TuiEvent>,
-) -> bool {
+) -> Option<String> {
     let Some(task_registry) = task_registry else {
         let _ = event_tx.send(TuiEvent::Error(
             "cannot resolve background approval before a session exists".to_string(),
         ));
-        return false;
+        return None;
     };
 
-    match task_registry.submit_pending_tool_approval_response(task_id, approved) {
-        Ok(()) => {
+    match task_registry.submit_pending_tool_approval_response_by_request_id(approval_id, approved) {
+        Ok(task_id) => {
             if !approved
-                && let Err(error) = task_registry.finish_denied_pending_tool_approval(task_id)
+                && let Err(error) = task_registry.finish_denied_pending_tool_approval(&task_id)
             {
                 let _ = event_tx.send(TuiEvent::Error(error));
-                return false;
+                return None;
             }
             let _ = event_tx.send(TuiEvent::WorkflowTasksUpdated {
                 tasks: task_registry.list(),
@@ -3427,11 +3451,11 @@ fn submit_background_approval_response_for_tui(
             let _ = event_tx.send(TuiEvent::Notice(format!(
                 "Background approval {decision} for {task_id}."
             )));
-            true
+            Some(task_id)
         }
         Err(error) => {
             let _ = event_tx.send(TuiEvent::Error(error));
-            false
+            None
         }
     }
 }
@@ -4099,15 +4123,15 @@ fn agent_loop_thread(
                     &event_tx,
                 );
             }
-            Ok(UserAction::ResolveBackgroundApproval { task_id, approved }) => {
-                let submitted = submit_background_approval_response_for_tui(
+            Ok(UserAction::ResolveBackgroundApproval { id, approved }) => {
+                let submitted_task_id = submit_background_approval_response_for_tui(
                     session.as_ref().map(|session| session.task_registry()),
-                    &task_id,
+                    &id,
                     approved,
                     &event_tx,
                 );
                 if approved
-                    && submitted
+                    && let Some(task_id) = submitted_task_id
                     && let Some(session) = session.as_mut()
                 {
                     let cfg = config.lock().unwrap().clone();

@@ -238,9 +238,13 @@ copied into Orca.
    dialog. Server-mode `request_user_input` now follows the same Codex/package
    3-style pending map: the runtime emits `user_input_request`, clients answer
    with `user_input/respond` plus `requestId`, and the server resolves only the
-   matching waiter with `user_input_resolved`. Next, move the same id discipline
-   into remaining turn/item continuations so continuations stop depending on
-   separate ad hoc task fields plus TUI-local queues.
+   matching waiter with `user_input_resolved`. Background main-session approval
+   actions now also carry the pending tool approval request id through the TUI
+   action channel; the runtime task registry validates that id, rejects
+   duplicate responses, and returns the owning task id only after the request
+   has been matched. Next, move the same id discipline into remaining
+   turn/item continuations and workflow notifications so continuations stop
+   depending on separate ad hoc task fields plus TUI-local queues.
 3. **P2: Frozen per-turn context boundary.** Continue shrinking wide call
    surfaces into `RuntimeTurnConfig`, `RuntimeTurnDeps`,
    `RuntimeTurnState`, and request snapshots. Runtime turn continuations now

@@ -769,6 +769,44 @@ impl TaskRegistry {
         })
     }
 
+    pub fn submit_pending_tool_approval_response_by_request_id(
+        &self,
+        request_id: &str,
+        approved: bool,
+    ) -> Result<String, String> {
+        self.with_tasks(|tasks| {
+            let mut matching_task_ids = tasks
+                .iter()
+                .filter(|(_, record)| {
+                    record.status == TaskStatus::ApprovalRequired
+                        && record
+                            .pending_tool_call
+                            .as_ref()
+                            .is_some_and(|pending_tool_call| pending_tool_call.id == request_id)
+                })
+                .map(|(task_id, _)| task_id.clone());
+            let Some(task_id) = matching_task_ids.next() else {
+                return Err(format!("pending approval request '{request_id}' not found"));
+            };
+            if matching_task_ids.next().is_some() {
+                return Err(format!(
+                    "pending approval request '{request_id}' matched multiple tasks"
+                ));
+            }
+            let record = tasks
+                .get_mut(&task_id)
+                .ok_or_else(|| format!("task '{task_id}' not found"))?;
+            if record.pending_tool_approval_response.is_some() {
+                return Err(format!(
+                    "pending approval request '{request_id}' already has a response"
+                ));
+            }
+            record.pending_tool_approval_response = Some(approved);
+            Ok(task_id)
+        })
+        .map_err(|_| "task registry lock poisoned".to_string())?
+    }
+
     pub fn take_pending_tool_approval_response(&self, id: &str) -> Result<Option<bool>, String> {
         self.with_tasks(|tasks| {
             let record = tasks
@@ -1729,6 +1767,48 @@ mod tests {
                 .take_pending_tool_approval_response(&task.id)
                 .unwrap(),
             None
+        );
+    }
+
+    #[test]
+    fn registry_records_pending_tool_approval_response_by_request_id() {
+        use orca_core::approval_types::ActionKind;
+        use orca_core::task_types::PendingToolCallSummary;
+
+        let registry = TaskRegistry::new("session-1".to_string());
+        let task = registry.create_main_session("Needs approval".to_string());
+
+        registry.mark_running(&task.id).unwrap();
+        registry.mark_backgrounded(&task.id).unwrap();
+        registry
+            .approval_required_for_pending_tool(
+                &task.id,
+                "approval_required".to_string(),
+                Some(PendingToolCallSummary {
+                    id: "approval-request-1".to_string(),
+                    name: "task_list".to_string(),
+                    action: ActionKind::Read,
+                    target: None,
+                    arguments: "{}".to_string(),
+                }),
+            )
+            .unwrap();
+
+        let resolved_task_id = registry
+            .submit_pending_tool_approval_response_by_request_id("approval-request-1", true)
+            .unwrap();
+
+        assert_eq!(resolved_task_id, task.id);
+        assert!(
+            registry
+                .submit_pending_tool_approval_response_by_request_id("approval-request-1", false)
+                .is_err()
+        );
+        assert_eq!(
+            registry
+                .take_pending_tool_approval_response(&task.id)
+                .unwrap(),
+            Some(true)
         );
     }
 
