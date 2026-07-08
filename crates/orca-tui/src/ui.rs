@@ -709,14 +709,25 @@ fn workflow_phase_detail_rows(
         .collect()
 }
 
+const TASK_DETAIL_MAX_LINES: usize = 3;
+const TASK_DETAIL_MAX_CHARS: usize = 120;
+
 fn workflow_metadata_row_count(task: &BackgroundTaskSummary) -> u16 {
     u16::from(task.workflow_run_id.is_some())
         + u16::from(task.workflow_script_path.is_some())
         + u16::from(task.workflow_launch_input.is_some())
         + u16::from(task.workflow_failure_count > 0)
         + u16::from(task.workflow_final_summary.is_some())
-        + u16::from(task.result.is_some())
-        + u16::from(task.error.is_some())
+        + task
+            .result
+            .as_deref()
+            .map(task_detail_line_count)
+            .unwrap_or_default() as u16
+        + task
+            .error
+            .as_deref()
+            .map(task_detail_line_count)
+            .unwrap_or_default() as u16
 }
 
 fn workflow_metadata_rows<'a>(task: &BackgroundTaskSummary, theme: &Theme) -> Vec<Line<'a>> {
@@ -758,18 +769,64 @@ fn workflow_metadata_rows<'a>(task: &BackgroundTaskSummary, theme: &Theme) -> Ve
         ]));
     }
     if let Some(result) = &task.result {
-        rows.push(Line::from(vec![
-            Span::styled("    result ", Style::default().fg(theme.success)),
-            Span::styled(clamp_label(result, 120), Style::default().fg(theme.text)),
-        ]));
+        rows.extend(task_detail_text_rows(
+            "result",
+            result,
+            Style::default().fg(theme.success),
+            Style::default().fg(theme.text),
+        ));
     }
     if let Some(error) = &task.error {
-        rows.push(Line::from(vec![
-            Span::styled("    error ", Style::default().fg(theme.error)),
-            Span::styled(clamp_label(error, 120), Style::default().fg(theme.error)),
-        ]));
+        rows.extend(task_detail_text_rows(
+            "error",
+            error,
+            Style::default().fg(theme.error),
+            Style::default().fg(theme.error),
+        ));
     }
     rows
+}
+
+fn task_detail_line_count(text: &str) -> usize {
+    text.lines().count().max(1).min(TASK_DETAIL_MAX_LINES)
+}
+
+fn task_detail_text_rows<'a>(
+    label: &str,
+    text: &str,
+    label_style: Style,
+    text_style: Style,
+) -> Vec<Line<'a>> {
+    let mut lines = text.lines().collect::<Vec<_>>();
+    if lines.is_empty() {
+        lines.push("");
+    }
+    let truncated = lines.len() > TASK_DETAIL_MAX_LINES;
+    lines.truncate(TASK_DETAIL_MAX_LINES);
+
+    let prefix = format!("    {label} ");
+    let continuation_prefix = " ".repeat(prefix.chars().count());
+    let last_index = lines.len().saturating_sub(1);
+
+    lines
+        .into_iter()
+        .enumerate()
+        .map(|(index, line)| {
+            let prefix_text = if index == 0 {
+                prefix.clone()
+            } else {
+                continuation_prefix.clone()
+            };
+            let mut detail = clamp_label(line, TASK_DETAIL_MAX_CHARS);
+            if truncated && index == last_index && !detail.ends_with('…') {
+                detail.push('…');
+            }
+            Line::from(vec![
+                Span::styled(prefix_text, label_style),
+                Span::styled(detail, text_style),
+            ])
+        })
+        .collect()
 }
 
 fn workflow_launch_input_label(input: &orca_core::workflow_types::WorkflowInput) -> String {
@@ -3596,6 +3653,95 @@ mod tests {
 
         assert!(rendered.contains("error"));
         assert!(rendered.contains("model timed out"));
+    }
+
+    #[test]
+    fn workflows_panel_renders_selected_task_multiline_error_detail() {
+        let mut state = test_state();
+        state.panel_mode = PanelMode::Workflows;
+        state.workflow_panel.tasks = vec![BackgroundTaskSummary {
+            id: "task-main".to_string(),
+            task_type: TaskType::MainSession,
+            status: TaskStatus::Failed,
+            is_backgrounded: true,
+            description: "Summarize architecture".to_string(),
+            created_at_ms: 1_000,
+            started_at_ms: Some(1_000),
+            completed_at_ms: Some(4_000),
+            command: None,
+            agent_type: Some("main-session".to_string()),
+            server: None,
+            tool: None,
+            pending_tool_call: None,
+            name: None,
+            workflow_run_id: None,
+            phase_count: None,
+            workflow_progress: None,
+            workflow_phases: Vec::new(),
+            workflow_agents: Vec::new(),
+            workflow_script_path: None,
+            workflow_launch_input: None,
+            workflow_final_summary: None,
+            workflow_failure_count: 0,
+            usage: None,
+            subagent_current_activity: None,
+            subagent_turn: None,
+            last_activity_at_ms: Some(4_000),
+            result: None,
+            error: Some("first failure\nsecond failure\nthird failure\nfourth failure".to_string()),
+        }];
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let textarea = TextArea::default();
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 14))
+            .expect("test backend");
+
+        terminal
+            .draw(|frame| render(frame, &mut state, &textarea, &theme))
+            .expect("draw");
+        let rendered = format!("{:?}", terminal.backend().buffer());
+
+        assert!(rendered.contains("error"));
+        assert!(rendered.contains("first failure"));
+        assert!(rendered.contains("second failure"));
+        assert!(rendered.contains("third failure"));
+        assert!(!rendered.contains("fourth failure"));
+    }
+
+    #[test]
+    fn workflow_metadata_row_count_counts_bounded_task_detail_rows() {
+        let task = BackgroundTaskSummary {
+            id: "task-main".to_string(),
+            task_type: TaskType::MainSession,
+            status: TaskStatus::Completed,
+            is_backgrounded: true,
+            description: "Summarize architecture".to_string(),
+            created_at_ms: 1_000,
+            started_at_ms: Some(1_000),
+            completed_at_ms: Some(4_000),
+            command: None,
+            agent_type: Some("main-session".to_string()),
+            server: None,
+            tool: None,
+            pending_tool_call: None,
+            name: None,
+            workflow_run_id: None,
+            phase_count: None,
+            workflow_progress: None,
+            workflow_phases: Vec::new(),
+            workflow_agents: Vec::new(),
+            workflow_script_path: None,
+            workflow_launch_input: None,
+            workflow_final_summary: None,
+            workflow_failure_count: 0,
+            usage: None,
+            subagent_current_activity: None,
+            subagent_turn: None,
+            last_activity_at_ms: Some(4_000),
+            result: Some("line one\nline two\nline three\nline four".to_string()),
+            error: None,
+        };
+
+        assert_eq!(workflow_metadata_row_count(&task), 3);
     }
 
     #[test]

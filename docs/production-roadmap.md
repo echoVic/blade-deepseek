@@ -305,7 +305,9 @@ copied into Orca.
    summaries now also expose terminal `result`/`error` fields so the selected
    task row can show completion output or failure details in the panel. The
    panel now renders contextual action hints for selection, approval, stop, and
-   closing so TUI users can discover task controls in-place.
+   closing so TUI users can discover task controls in-place. Selected task
+   result/error details now render as bounded multi-line summaries, keeping
+   longer terminal output readable without letting one task consume the panel.
 
 ### P0: Session Runtime Unification
 
