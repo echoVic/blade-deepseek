@@ -31,6 +31,7 @@ use crate::shortcuts::{
     ApprovalShortcut, GlobalShortcut, IdleShortcut, RunningShortcut, approval_shortcut,
     global_shortcut, idle_shortcut, running_shortcut,
 };
+use crate::submitted_turn::SubmittedTurn;
 use crate::theme::Theme;
 use crate::types::{
     AppState, AppStatus, ApprovalOption, ChatMessage, PanelMode, SlashMenu, SlashMenuItem, SubMenu,
@@ -2078,20 +2079,19 @@ mod tests {
 
     #[test]
     fn submitted_turn_workflow_notification_carries_notification_boundary() {
-        let source = include_str!("app.rs");
-        let struct_start = source
-            .rfind("struct SubmittedTurn {")
-            .expect("SubmittedTurn struct");
-        let submitted_turn_section = &source[struct_start..];
-        let impl_start = submitted_turn_section
+        let source = std::fs::read_to_string(format!(
+            "{}/src/submitted_turn.rs",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .expect("submitted_turn source should be readable");
+        let impl_start = source
             .find("impl SubmittedTurn {")
             .expect("SubmittedTurn impl");
-        let submitted_turn_impl = &submitted_turn_section[impl_start..];
+        let submitted_turn_impl = &source[impl_start..];
 
         assert!(
-            submitted_turn_impl.contains(
-                "fn workflow_notification(notification: crate::types::PendingWorkflowNotification)"
-            ),
+            submitted_turn_impl
+                .contains("fn workflow_notification(notification: PendingWorkflowNotification)"),
             "workflow notification submitted turns should carry the typed notification boundary"
         );
         assert!(
@@ -2102,7 +2102,11 @@ mod tests {
 
     #[test]
     fn submitted_turn_kind_owns_prompt_source_state() {
-        let source = include_str!("app.rs");
+        let source = std::fs::read_to_string(format!(
+            "{}/src/submitted_turn.rs",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .expect("submitted_turn source should be readable");
         let kind_start = source
             .rfind("enum SubmittedTurnKind {")
             .expect("SubmittedTurnKind enum");
@@ -4296,96 +4300,6 @@ fn recv_next_user_action(
         return Ok(action);
     }
     action_rx.recv()
-}
-
-enum SubmittedTurnKind {
-    User(String),
-    WorkflowNotification(crate::types::PendingWorkflowNotification),
-}
-
-struct SubmittedTurnPresentation {
-    task_label: Option<String>,
-    backtrack_target: bool,
-}
-
-impl SubmittedTurnPresentation {
-    fn user() -> Self {
-        Self {
-            task_label: None,
-            backtrack_target: true,
-        }
-    }
-
-    fn workflow_notification(id: &str) -> Self {
-        Self {
-            task_label: Some(workflow_notification_task_label(id)),
-            backtrack_target: false,
-        }
-    }
-}
-
-struct SubmittedTurn {
-    kind: SubmittedTurnKind,
-    presentation: SubmittedTurnPresentation,
-}
-
-impl SubmittedTurn {
-    fn user(prompt: String) -> Self {
-        Self {
-            kind: SubmittedTurnKind::User(prompt),
-            presentation: SubmittedTurnPresentation::user(),
-        }
-    }
-
-    fn workflow_notification(notification: crate::types::PendingWorkflowNotification) -> Self {
-        let id = notification.id.clone();
-        Self {
-            kind: SubmittedTurnKind::WorkflowNotification(notification),
-            presentation: SubmittedTurnPresentation::workflow_notification(&id),
-        }
-    }
-
-    fn prompt(&self) -> &str {
-        match &self.kind {
-            SubmittedTurnKind::User(prompt) => prompt,
-            SubmittedTurnKind::WorkflowNotification(notification) => &notification.prompt,
-        }
-    }
-
-    fn prompt_for_model(&self, cwd: &std::path::Path) -> Result<String, String> {
-        match &self.kind {
-            SubmittedTurnKind::User(prompt) => mentions::expand_file_mentions(prompt, cwd),
-            SubmittedTurnKind::WorkflowNotification(notification) => {
-                Ok(notification.prompt.clone())
-            }
-        }
-    }
-
-    fn title_seed(&self, model_prompt: &str) -> String {
-        match &self.kind {
-            SubmittedTurnKind::User(_) => model_prompt.to_string(),
-            SubmittedTurnKind::WorkflowNotification(_) => self
-                .presentation
-                .task_label
-                .clone()
-                .unwrap_or_else(|| model_prompt.to_string()),
-        }
-    }
-
-    fn with_model_prompt(mut self, prompt: String) -> Self {
-        self.kind = match self.kind {
-            SubmittedTurnKind::User(_) => SubmittedTurnKind::User(prompt),
-            SubmittedTurnKind::WorkflowNotification(mut notification) => {
-                notification.prompt = prompt;
-                SubmittedTurnKind::WorkflowNotification(notification)
-            }
-        };
-        self
-    }
-}
-
-fn workflow_notification_task_label(id: &str) -> String {
-    format!("Workflow notification {id}")
 }
 
 fn handle_submitted_turn_for_tui(

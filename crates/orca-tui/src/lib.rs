@@ -9,6 +9,7 @@ pub mod diff;
 mod runtime_event_projection;
 mod runtime_interaction_adapter;
 pub mod shortcuts;
+mod submitted_turn;
 pub mod theme;
 pub mod types;
 pub mod ui;
@@ -103,6 +104,37 @@ mod tests {
         assert!(
             !bridge.contains("pub fn run_agent_for_tui"),
             "bridge should not own the TUI agent turn loop"
+        );
+    }
+
+    #[test]
+    fn tui_submitted_turn_is_owned_by_dedicated_module() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let submitted_turn =
+            std::fs::read_to_string(format!("{manifest_dir}/src/submitted_turn.rs"))
+                .expect("submitted_turn module should exist");
+        assert!(
+            submitted_turn.contains("pub(crate) struct SubmittedTurn"),
+            "submitted_turn should own the submitted-turn boundary"
+        );
+        assert!(
+            submitted_turn.contains("enum SubmittedTurnKind"),
+            "submitted_turn should keep prompt/source state inside SubmittedTurnKind"
+        );
+        assert!(
+            submitted_turn.contains("pub(crate) struct SubmittedTurnPresentation"),
+            "submitted_turn should own TUI submitted-turn presentation metadata"
+        );
+
+        let app = std::fs::read_to_string(format!("{manifest_dir}/src/app.rs"))
+            .expect("app source should be readable");
+        assert!(
+            !app.contains("\nstruct SubmittedTurn {"),
+            "app should use the submitted_turn module instead of defining the boundary inline"
+        );
+        assert!(
+            !app.contains("\nenum SubmittedTurnKind {"),
+            "app should not own submitted-turn prompt/source variants"
         );
     }
 
