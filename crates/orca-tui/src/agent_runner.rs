@@ -834,6 +834,7 @@ pub fn run_agent_for_tui(
         cancel,
         allow_goal_tools,
         None,
+        true,
         None,
     )
     .status
@@ -849,6 +850,7 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
     cancel: &CancelToken,
     allow_goal_tools: bool,
     task_description: Option<&str>,
+    backtrack_target: bool,
     pending_workflow_notifications: Option<&PendingWorkflowNotifications>,
 ) -> TuiAgentTurnResult {
     let cwd = config
@@ -880,7 +882,13 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
         .with_permission_rules(config.permission_rules.clone());
     let mut permission_overlay = orca_runtime::lifecycle::TurnPermissionOverlay::default();
     session.replace_skill_context(agent_common::explicit_skill_context(&cwd, prompt));
-    session.conversation_mut().add_user(prompt.to_string());
+    if backtrack_target {
+        session.conversation_mut().add_user(prompt.to_string());
+    } else {
+        session
+            .conversation_mut()
+            .add_user_pinned(prompt.to_string());
+    }
     if let Some(message) = session.conversation().messages.last().cloned() {
         session.append_message(&message);
     }
@@ -2314,6 +2322,7 @@ mod tests {
             &cancel,
             false,
             None,
+            true,
             Some(&pending_notifications),
         );
 
@@ -2357,6 +2366,7 @@ mod tests {
             &cancel,
             false,
             None,
+            true,
             Some(&pending_notifications),
         );
 
@@ -2913,6 +2923,45 @@ mod tests {
         let echoed = echoed.unwrap_or_default();
         assert!(echoed.contains("first prompt | mock_history_echo"));
         assert!(!echoed.contains("second prompt"));
+    }
+
+    #[test]
+    fn tui_workflow_notification_turn_is_not_backtrack_target() {
+        let config = config();
+        let (event_tx, _event_rx) = mpsc::channel();
+        let (_action_tx, action_rx) = mpsc::channel();
+        let cancel = CancelToken::new();
+        let mut session =
+            TuiConversationSession::new_with_preloaded(&config, "first", None).expect("session");
+        let pending_actions = RefCell::new(VecDeque::new());
+
+        run_agent_for_tui(
+            &config,
+            &mut session,
+            "first prompt",
+            &event_tx,
+            &action_rx,
+            &cancel,
+            false,
+        );
+        run_agent_for_tui_with_notification_queue(
+            &config,
+            &mut session,
+            "<task-notification>mock_history_echo</task-notification>",
+            &event_tx,
+            &action_rx,
+            &pending_actions,
+            &cancel,
+            false,
+            Some("Workflow notification notification-1"),
+            false,
+            None,
+        );
+
+        assert_eq!(
+            session.backtrack_last_user(),
+            Some("first prompt".to_string())
+        );
     }
 
     #[test]

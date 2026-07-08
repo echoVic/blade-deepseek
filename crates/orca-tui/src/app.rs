@@ -3883,6 +3883,7 @@ fn run_goal_turns_for_tui(
     session: &mut bridge::TuiConversationSession,
     initial_prompt: &str,
     initial_task_description: Option<String>,
+    initial_backtrack_target: bool,
     event_tx: &mpsc::Sender<TuiEvent>,
     action_rx: &mpsc::Receiver<UserAction>,
     pending_actions: &RefCell<VecDeque<UserAction>>,
@@ -3899,6 +3900,7 @@ fn run_goal_turns_for_tui(
 
     let mut prompt = initial_prompt.to_string();
     let mut task_description = initial_task_description;
+    let mut backtrack_target = initial_backtrack_target;
     let mut continuation = starting_continuation;
     loop {
         if let Ok(Some(goal)) = orca_runtime::goals::GoalStore::load_default().get(&session_id)
@@ -3920,6 +3922,7 @@ fn run_goal_turns_for_tui(
             cancel,
             true,
             task_description.as_deref(),
+            backtrack_target,
             Some(pending_workflow_notifications),
         );
         let status = turn_result.status;
@@ -3964,6 +3967,7 @@ fn run_goal_turns_for_tui(
             task_description = Some(workflow_notification_task_label(
                 &next_workflow_notification.id,
             ));
+            backtrack_target = false;
             prompt = next_workflow_notification.prompt;
             continue;
         }
@@ -4004,6 +4008,7 @@ fn run_goal_turns_for_tui(
         }
         prompt = goal_continuation_prompt(&goal.objective, continuation);
         task_description = None;
+        backtrack_target = true;
     }
 }
 
@@ -4119,6 +4124,7 @@ fn resume_latest_active_goal_for_tui(
             session,
             &prompt,
             None,
+            true,
             event_tx,
             action_rx,
             pending_actions,
@@ -4149,6 +4155,7 @@ struct SubmittedTurn {
     prompt: String,
     source: SubmittedTurnSource,
     task_description: Option<String>,
+    backtrack_target: bool,
 }
 
 impl SubmittedTurn {
@@ -4157,6 +4164,7 @@ impl SubmittedTurn {
             prompt,
             source: SubmittedTurnSource::User,
             task_description: None,
+            backtrack_target: true,
         }
     }
 
@@ -4165,6 +4173,7 @@ impl SubmittedTurn {
             prompt,
             source: SubmittedTurnSource::WorkflowNotification,
             task_description: Some(workflow_notification_task_label(&id)),
+            backtrack_target: false,
         }
     }
 
@@ -4231,6 +4240,7 @@ fn handle_submitted_turn_for_tui(
         session.as_mut().expect("session initialized"),
         &prompt,
         submitted_turn.task_description,
+        submitted_turn.backtrack_target,
         event_tx,
         action_rx,
         pending_actions,
@@ -4475,6 +4485,7 @@ fn agent_loop_thread(
                                 session,
                                 &objective,
                                 None,
+                                true,
                                 &event_tx,
                                 &action_rx,
                                 &pending_actions,
@@ -4579,6 +4590,7 @@ fn agent_loop_thread(
                             session,
                             &prompt,
                             None,
+                            true,
                             &event_tx,
                             &action_rx,
                             &pending_actions,

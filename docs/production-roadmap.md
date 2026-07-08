@@ -24,7 +24,9 @@ submits still get user-authored `@file` mention expansion, while workflow
 notification continuations are forwarded as typed follow-ups without user
 prompt preprocessing; the same source boundary now also supplies the TUI task
 label, so workflow follow-up turns show a stable notification label instead of
-raw notification payload text. Earlier v0.1.191 makes
+raw notification payload text, and records workflow follow-ups as
+non-backtrackable context so the TUI backtrack command still targets the user's
+last real submit. Earlier v0.1.191 makes
 `RuntimeProviderResponseStep` consume the
 named `RuntimeProviderResponseInput` directly and carries child-agent executors
 through `RuntimeProviderResponseExecutors`. Provider final-message handling and
@@ -269,9 +271,11 @@ copied into Orca.
    look like a local file mention. That source boundary also carries the TUI
    task description for workflow follow-up turns, keeping the workflows panel
    focused on a stable notification label instead of raw XML/diagnostic payload
-   text. Next, move the same id discipline into remaining turn/item
-   continuations and workflow notification ownership so continuations stop
-   depending on separate ad hoc task fields plus TUI-local queues.
+   text. Workflow follow-up turns remain model-visible user-role context, but
+   are no longer treated as the user's last backtrack target. Next, move the
+   same id discipline into remaining turn/item continuations and workflow
+   notification ownership so continuations stop depending on separate ad hoc
+   task fields plus TUI-local queues.
 3. **P2: Frozen per-turn context boundary.** Continue shrinking wide call
    surfaces into `RuntimeTurnConfig`, `RuntimeTurnDeps`,
    `RuntimeTurnState`, and request snapshots. Runtime turn continuations now

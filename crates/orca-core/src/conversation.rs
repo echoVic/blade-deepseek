@@ -259,7 +259,7 @@ impl Conversation {
         let index = self
             .messages
             .iter()
-            .rposition(|message| matches!(message, Message::User { .. }))?;
+            .rposition(|message| matches!(message, Message::User { pinned: false, .. }))?;
         let prompt = match &self.messages[index] {
             Message::User { content, .. } => content.clone(),
             _ => unreachable!("rposition only matches user messages"),
@@ -470,6 +470,19 @@ mod tests {
         assert_eq!(conv.backtrack_last_user(), Some("second".to_string()));
         assert_eq!(conv.messages.len(), 3);
         assert_eq!(conv.last_user_message(), Some("first"));
+    }
+
+    #[test]
+    fn backtrack_last_user_skips_pinned_user_context() {
+        let mut conv = Conversation::new();
+        conv.add_system("sys".to_string());
+        conv.add_user("first".to_string());
+        conv.add_assistant(Some("reply".to_string()), None, vec![]);
+        conv.add_user_pinned("workflow notification".to_string());
+        conv.add_assistant(Some("notification reply".to_string()), None, vec![]);
+
+        assert_eq!(conv.backtrack_last_user(), Some("first".to_string()));
+        assert_eq!(conv.messages.len(), 1);
     }
 
     /// DeepSeek prefix cache requires that a normal turn only *appends* to the
