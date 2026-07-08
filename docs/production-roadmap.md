@@ -229,9 +229,11 @@ copied into Orca.
    approvals, `request_permissions`, `request_user_input`, and child-agent tool
    paths. TUI approval and user-input responses now carry the runtime
    interaction id back through the action channel, so handlers resolve only the
-   matching pending request. Next, move the same id discipline into the
-   cross-surface turn/item protocol so continuations stop depending on separate
-   ad hoc task fields plus TUI-local queues.
+   matching pending request. The server protocol now also rejects
+   `permission/respond` submissions that omit `requestId`, keeping cross-surface
+   permission responses tied to a concrete pending request. Next, move the same
+   id discipline into remaining turn/item continuations so continuations stop
+   depending on separate ad hoc task fields plus TUI-local queues.
 3. **P2: Frozen per-turn context boundary.** Continue shrinking wide call
    surfaces into `RuntimeTurnConfig`, `RuntimeTurnDeps`,
    `RuntimeTurnState`, and request snapshots. Keep borrowing package 3's

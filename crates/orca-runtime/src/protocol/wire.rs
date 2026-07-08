@@ -603,12 +603,19 @@ impl Submission {
             }),
             (_, Some("permission/respond")) => {
                 let params = wire.params.as_ref();
+                let Some(request_id) = params
+                    .and_then(|params| params.request_id.clone())
+                    .filter(|request_id| !request_id.is_empty())
+                else {
+                    return Err(DecodeError {
+                        id: wire.id,
+                        message: "permission/respond params.requestId is required".to_string(),
+                    });
+                };
                 Ok(Self {
                     id: wire.id,
                     op: ClientOp::PermissionRespond {
-                        request_id: params
-                            .and_then(|params| params.request_id.clone())
-                            .unwrap_or_default(),
+                        request_id,
                         decision: params
                             .and_then(|params| params.decision)
                             .unwrap_or(PermissionResponseDecision::Deny),
@@ -1736,6 +1743,20 @@ mod tests {
                 },
                 strict_auto_review: false,
             }
+        );
+    }
+
+    #[test]
+    fn submission_rejects_permission_response_without_request_id() {
+        let error = Submission::decode(
+            r#"{"id":"perm-response","method":"permission/respond","params":{"decision":"allow","scope":"turn","permissions":{"fileSystem":{"write":["/tmp/extra"],"read":null},"network":null}}}"#,
+        )
+        .expect_err("permission/respond must include requestId");
+
+        assert_eq!(error.id, Value::from("perm-response"));
+        assert_eq!(
+            error.message,
+            "permission/respond params.requestId is required"
         );
     }
 
