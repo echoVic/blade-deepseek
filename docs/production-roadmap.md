@@ -313,7 +313,9 @@ copied into Orca.
    selected task by id across refreshes. Backgrounded running main-session
    tasks can now be returned to the foreground from the panel with `f`, clearing
    foreground-output suppression and refreshing the task list through
-   `TaskRegistry`.
+   `TaskRegistry`; the detached background provider worker now also forwards
+   future reasoning/message/tool-progress deltas after foregrounding and emits
+   the normal foreground session-completed event when that turn finishes.
 
 ### P0: Session Runtime Unification
 

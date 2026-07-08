@@ -14,7 +14,7 @@ use orca_core::hook_types::HookEvent;
 use orca_core::model::ModelRouteContext;
 use orca_core::provider_types::{ProviderResponse, ProviderStep};
 use orca_core::subagent_types::SubagentType;
-use orca_core::task_types::{BackgroundTaskSummary, PendingToolCallSummary};
+use orca_core::task_types::{BackgroundTaskSummary, PendingToolCallSummary, TaskStatus, TaskType};
 use orca_core::tool_types;
 use orca_core::workflow_types::WorkflowInput;
 use orca_mcp::McpRegistry;
@@ -340,19 +340,28 @@ fn spawn_background_provider_completion(
         let mut status = "failed";
         let mut pending_tool_call = None;
         let mut pending_provider_response = None;
+        let mut events = EventFactory::new(run_id);
         while let Ok(event) = provider_rx.recv() {
-            if let ProviderStreamEvent::Done(response) = event {
-                status = provider_response_status(&response);
-                pending_tool_call = provider_response_pending_tool_call(&response);
-                if status == "approval_required" {
-                    pending_provider_response = Some(response);
+            match event {
+                ProviderStreamEvent::Step(step) => {
+                    if background_task_is_foregrounded(&task_registry, &task_id) {
+                        forward_foregrounded_background_step(&event_tx, &mut events, &step);
+                    }
                 }
-                break;
+                ProviderStreamEvent::Done(response) => {
+                    status = provider_response_status(&response);
+                    pending_tool_call = provider_response_pending_tool_call(&response);
+                    if status == "approval_required" {
+                        pending_provider_response = Some(response);
+                    }
+                    break;
+                }
             }
         }
         let pending_tool_name = pending_tool_call
             .as_ref()
             .map(|pending_tool_call| pending_tool_call.name.as_str());
+        let foregrounded = background_task_is_foregrounded(&task_registry, &task_id);
 
         let result = match status {
             "success" => task_registry.complete(&task_id, status.to_string()),
@@ -371,16 +380,49 @@ fn spawn_background_provider_completion(
             _ => task_registry.fail(&task_id, status.to_string()),
         };
         if result.is_ok() {
-            let mut events = EventFactory::new(run_id);
             if let Some(updated_task) = task_summary_for_tui(&task_registry, &task_id) {
                 send_task_status_updated_for_tui(&event_tx, &mut events, &updated_task);
             }
         }
-        let _ = event_tx.send(TuiEvent::Notice(background_completion_notice(
-            status,
-            pending_tool_name,
-        )));
+        if foregrounded {
+            send_session_completed_status_for_tui(&event_tx, &mut events, status);
+        } else {
+            let _ = event_tx.send(TuiEvent::Notice(background_completion_notice(
+                status,
+                pending_tool_name,
+            )));
+        }
     });
+}
+
+fn background_task_is_foregrounded(
+    task_registry: &orca_runtime::tasks::TaskRegistry,
+    task_id: &str,
+) -> bool {
+    task_registry.get(task_id).is_some_and(|task| {
+        task.task_type == TaskType::MainSession
+            && task.status == TaskStatus::Running
+            && !task.is_backgrounded
+    })
+}
+
+fn forward_foregrounded_background_step(
+    event_tx: &Sender<TuiEvent>,
+    events: &mut EventFactory,
+    step: &ProviderStep,
+) {
+    match step {
+        ProviderStep::ReasoningDelta(text) => {
+            send_runtime_event_as_tui(event_tx, events.assistant_reasoning_delta(text));
+        }
+        ProviderStep::MessageDelta(text) => {
+            send_runtime_event_as_tui(event_tx, events.assistant_message_delta(text));
+        }
+        ProviderStep::ToolCallProgress(progress) => {
+            send_runtime_event_as_tui(event_tx, events.tool_call_progress(progress));
+        }
+        _ => {}
+    }
 }
 
 fn background_completion_notice(status: &str, pending_tool: Option<&str>) -> String {
@@ -2544,6 +2586,62 @@ mod tests {
             Some("mock-tool-1")
         );
         assert_eq!(continuation.response.steps.len(), 1);
+    }
+
+    #[test]
+    fn foregrounded_background_provider_completion_forwards_future_message_deltas() {
+        let registry = TaskRegistry::new("session-background-foreground".to_string());
+        let task = registry.create_main_session("Long answer".to_string());
+        registry.mark_running(&task.id).unwrap();
+        registry.mark_backgrounded(&task.id).unwrap();
+
+        let (event_tx, event_rx) = mpsc::channel();
+        let (provider_tx, provider_rx) = mpsc::channel();
+        spawn_background_provider_completion(
+            provider_rx,
+            registry.clone(),
+            event_tx,
+            "run-background-foreground".to_string(),
+            task.id.clone(),
+        );
+        provider_tx
+            .send(ProviderStreamEvent::Step(ProviderStep::MessageDelta(
+                "still hidden".to_string(),
+            )))
+            .unwrap();
+        assert!(event_rx.recv_timeout(Duration::from_millis(100)).is_err());
+
+        registry.mark_foregrounded(&task.id).unwrap();
+        provider_tx
+            .send(ProviderStreamEvent::Step(ProviderStep::MessageDelta(
+                "now visible".to_string(),
+            )))
+            .unwrap();
+
+        let visible_delta = loop {
+            match event_rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+                TuiEvent::MessageDelta(text) => break text,
+                _ => {}
+            }
+        };
+        assert_eq!(visible_delta, "now visible");
+
+        provider_tx
+            .send(ProviderStreamEvent::Done(ProviderResponse {
+                steps: Vec::new(),
+                assistant_content: Some("now visible".to_string()),
+                assistant_reasoning: None,
+                tool_calls: Vec::new(),
+                usage: None,
+            }))
+            .unwrap();
+        let completed_status = loop {
+            match event_rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+                TuiEvent::SessionCompleted { status } => break status,
+                _ => {}
+            }
+        };
+        assert_eq!(completed_status, "success");
     }
 
     #[test]
