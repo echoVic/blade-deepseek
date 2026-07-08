@@ -26,6 +26,17 @@ pub struct PendingWorkflowNotification {
     pub prompt: String,
 }
 
+pub fn push_pending_workflow_notification_unique(
+    queue: &mut VecDeque<PendingWorkflowNotification>,
+    notification: PendingWorkflowNotification,
+) -> bool {
+    if queue.iter().any(|pending| pending.id == notification.id) {
+        return false;
+    }
+    queue.push_back(notification);
+    true
+}
+
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub enum TuiEvent {
@@ -579,6 +590,16 @@ impl AppState {
         true
     }
 
+    fn push_pending_workflow_notification(
+        &mut self,
+        notification: PendingWorkflowNotification,
+    ) -> bool {
+        push_pending_workflow_notification_unique(
+            &mut self.pending_workflow_notifications,
+            notification,
+        )
+    }
+
     pub fn show_conversation(&mut self) {
         self.panel_mode = PanelMode::Conversation;
     }
@@ -1036,10 +1057,12 @@ impl AppState {
                 status,
                 summary,
             } => {
-                self.pending_workflow_notifications
-                    .push_back(PendingWorkflowNotification { id, prompt });
-                self.messages
-                    .push(ChatMessage::System(format!("Workflow {status}. {summary}")));
+                if self
+                    .push_pending_workflow_notification(PendingWorkflowNotification { id, prompt })
+                {
+                    self.messages
+                        .push(ChatMessage::System(format!("Workflow {status}. {summary}")));
+                }
             }
             TuiEvent::ApprovalNeeded {
                 id,
@@ -2630,6 +2653,41 @@ mod tests {
             state.messages.last(),
             Some(ChatMessage::System(message)) if message.contains("Workflow completed. audit: done")
         ));
+    }
+
+    #[test]
+    fn duplicate_workflow_notification_id_is_not_queued_twice() {
+        let mut state = state();
+
+        state.update(TuiEvent::WorkflowNotification {
+            id: "workflow-run-1:task-1:tool-1".to_string(),
+            prompt: "<task-notification>done</task-notification>".to_string(),
+            status: "completed".to_string(),
+            summary: "audit: done".to_string(),
+        });
+        state.update(TuiEvent::WorkflowNotification {
+            id: "workflow-run-1:task-1:tool-1".to_string(),
+            prompt: "<task-notification>done again</task-notification>".to_string(),
+            status: "completed".to_string(),
+            summary: "audit: done again".to_string(),
+        });
+
+        assert_eq!(state.pending_workflow_notifications.len(), 1);
+        assert_eq!(
+            state.pending_workflow_notifications[0].prompt,
+            "<task-notification>done</task-notification>"
+        );
+        let workflow_messages = state
+            .messages
+            .iter()
+            .filter(|message| {
+                matches!(
+                    message,
+                    ChatMessage::System(text) if text.starts_with("Workflow completed.")
+                )
+            })
+            .count();
+        assert_eq!(workflow_messages, 1);
     }
 
     #[test]

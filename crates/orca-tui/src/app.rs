@@ -792,11 +792,16 @@ fn queue_workflow_terminal_notification(
     if let TuiEvent::WorkflowNotification { id, prompt, .. } = event
         && let Ok(mut queue) = pending_notifications.lock()
     {
-        queue.push_back(crate::types::PendingWorkflowNotification {
-            id: id.clone(),
-            prompt: prompt.clone(),
-        });
-        return Some(id.clone());
+        let queued = crate::types::push_pending_workflow_notification_unique(
+            &mut queue,
+            crate::types::PendingWorkflowNotification {
+                id: id.clone(),
+                prompt: prompt.clone(),
+            },
+        );
+        if queued {
+            return Some(id.clone());
+        }
     }
     None
 }
@@ -2534,6 +2539,24 @@ mod tests {
         );
         assert!(queued.is_none());
         assert!(queue.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn terminal_workflow_notifications_skip_duplicate_batch_queue_id() {
+        let queue = test_pending_workflow_notifications();
+        let event = TuiEvent::WorkflowNotification {
+            id: "notification-1".to_string(),
+            prompt: "<task-notification>done</task-notification>".to_string(),
+            status: "completed".to_string(),
+            summary: "done".to_string(),
+        };
+
+        assert_eq!(
+            queue_workflow_terminal_notification(&event, &queue, true).as_deref(),
+            Some("notification-1")
+        );
+        assert!(queue_workflow_terminal_notification(&event, &queue, true).is_none());
+        assert_eq!(queue.lock().unwrap().len(), 1);
     }
 
     #[test]
