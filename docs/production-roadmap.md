@@ -3,7 +3,7 @@
 > Goal: evolve Orca into a production-grade DeepSeek-native agent runtime.
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
-Last updated: 2026-07-08
+Last updated: 2026-07-09
 Current baseline: current main after v0.1.191 and the follow-on TUI bridge
 slice owns approved background provider-response continuation execution in
 `orca-runtime`: the runtime consumes the pending provider response from
@@ -249,8 +249,12 @@ The deeper July 9 reference pass changes the next refactor order:
    explicit soft/hard triggers, and `RuntimeCompactionTask` records trigger plus
    before/after message counts before summary-state persistence. The task now
    finishes into `RuntimeCompactionOutcome`, which records local truncation vs
-   remote-summary strategy for later event and telemetry projection. Next extend
-   that boundary with retry decisions, compaction reasons, and telemetry.
+   remote-summary strategy plus structured reason/details data for later status
+   and telemetry projection. Package 3 reinforces the next shape: prompt-too-long
+   recovery should advance through named transitions such as collapse-drain retry
+   and reactive compact retry, but Orca should keep those decisions inside the
+   runtime compaction boundary instead of coupling them to the broad query loop.
+   Next extend that boundary with retry decisions and event/TUI projection.
 3. **P1: Move exec/permission evaluation toward a dedicated policy manager.**
    Codex keeps mutable exec policy in an `ExecPolicyManager` with parsed rules,
    command-origin lowering, prompt rejection reasons, and serialized updates.

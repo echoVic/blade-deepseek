@@ -4201,6 +4201,14 @@ mod tests {
             "compaction module must own a runtime compaction outcome boundary"
         );
         assert!(
+            compaction_source.contains("enum RuntimeCompactionReason"),
+            "compaction module must name runtime compaction reasons explicitly"
+        );
+        assert!(
+            compaction_source.contains("struct RuntimeCompactionDetails"),
+            "compaction module must own runtime compaction details for telemetry/status projection"
+        );
+        assert!(
             compaction_source.contains("fn decide("),
             "RuntimeCompactionPolicy must expose a decision method"
         );
@@ -4215,6 +4223,11 @@ mod tests {
         assert!(
             compaction_source.contains("outcome.should_persist_summary_state("),
             "summary persistence must be routed through the compaction outcome boundary"
+        );
+        assert!(
+            compaction_source.contains("outcome.details()")
+                || compaction_source.contains("pub(crate) fn details(&self)"),
+            "RuntimeCompactionOutcome must expose structured details for future event projection"
         );
 
         let compact_if_needed = compaction_source

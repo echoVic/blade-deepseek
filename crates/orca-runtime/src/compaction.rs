@@ -23,6 +23,23 @@ pub(crate) enum RuntimeCompactionStrategy {
     RemoteSummary,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeCompactionReason {
+    ApproachingContextLimit,
+    ExceededContextLimit,
+    PromptTooLongRecovery,
+}
+
+impl RuntimeCompactionReason {
+    pub(crate) fn status_text(&self) -> &'static str {
+        match self {
+            Self::ApproachingContextLimit => "compacted context near token limit",
+            Self::ExceededContextLimit => "compacted context at token limit",
+            Self::PromptTooLongRecovery => "compacted context after prompt-too-long",
+        }
+    }
+}
+
 impl RuntimeCompactionStrategy {
     pub(crate) fn from_compaction_kind(kind: &context::CompactionKind) -> Self {
         match kind {
@@ -30,6 +47,17 @@ impl RuntimeCompactionStrategy {
             context::CompactionKind::RemoteSummary(_) => Self::RemoteSummary,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RuntimeCompactionDetails {
+    pub(crate) trigger: RuntimeCompactionTrigger,
+    pub(crate) reason: RuntimeCompactionReason,
+    pub(crate) strategy: RuntimeCompactionStrategy,
+    pub(crate) before_messages: usize,
+    pub(crate) after_messages: usize,
+    pub(crate) collapsed_messages: usize,
+    pub(crate) status_text: &'static str,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -55,6 +83,29 @@ impl RuntimeCompactionOutcome {
 
     pub(crate) fn strategy(&self) -> RuntimeCompactionStrategy {
         self.strategy
+    }
+
+    pub(crate) fn reason(&self) -> RuntimeCompactionReason {
+        match self.trigger() {
+            RuntimeCompactionTrigger::SoftLimit => RuntimeCompactionReason::ApproachingContextLimit,
+            RuntimeCompactionTrigger::HardLimit => RuntimeCompactionReason::ExceededContextLimit,
+            RuntimeCompactionTrigger::PromptTooLong => {
+                RuntimeCompactionReason::PromptTooLongRecovery
+            }
+        }
+    }
+
+    pub(crate) fn details(&self) -> RuntimeCompactionDetails {
+        let reason = self.reason();
+        RuntimeCompactionDetails {
+            trigger: self.trigger(),
+            reason,
+            strategy: self.strategy(),
+            before_messages: self.before_messages(),
+            after_messages: self.after_messages(),
+            collapsed_messages: self.before_messages().saturating_sub(self.after_messages()),
+            status_text: reason.status_text(),
+        }
     }
 
     pub(crate) fn should_persist_summary_state(&self, emit_deltas: bool) -> bool {
@@ -269,14 +320,17 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
         *conversation = compaction.conversation;
         let after_messages = conversation.messages.len();
         let outcome = task.finish(after_messages, &compaction.kind);
+        let details = outcome.details();
         if outcome.should_persist_summary_state(self.turn_context.emit_deltas)
             && let Some(writer) = self.history_writer.as_deref_mut()
         {
-            writer.append_compaction(outcome.before_messages(), outcome.after_messages())?;
-            if let context::CompactionKind::RemoteSummary(summary) = compaction.kind {
+            writer.append_compaction(details.before_messages, details.after_messages)?;
+            if details.strategy == RuntimeCompactionStrategy::RemoteSummary
+                && let context::CompactionKind::RemoteSummary(summary) = compaction.kind
+            {
                 writer.append_summary_state(
-                    outcome.before_messages(),
-                    outcome.after_messages(),
+                    details.before_messages,
+                    details.after_messages,
                     summary,
                     &conversation.summary,
                 )?;
@@ -384,5 +438,34 @@ mod tests {
         assert_eq!(outcome.before_messages(), 9);
         assert_eq!(outcome.after_messages(), 3);
         assert_eq!(outcome.strategy(), RuntimeCompactionStrategy::RemoteSummary);
+    }
+
+    #[test]
+    fn compaction_outcome_exposes_reason_and_details() {
+        let task = RuntimeCompactionTask::start(RuntimeCompactionTrigger::PromptTooLong, 12);
+        let outcome = task.finish(
+            5,
+            &context::CompactionKind::RemoteSummary("summary".to_string()),
+        );
+
+        assert_eq!(
+            outcome.reason(),
+            RuntimeCompactionReason::PromptTooLongRecovery
+        );
+
+        let details = outcome.details();
+        assert_eq!(details.trigger, RuntimeCompactionTrigger::PromptTooLong);
+        assert_eq!(
+            details.reason,
+            RuntimeCompactionReason::PromptTooLongRecovery
+        );
+        assert_eq!(details.strategy, RuntimeCompactionStrategy::RemoteSummary);
+        assert_eq!(details.before_messages, 12);
+        assert_eq!(details.after_messages, 5);
+        assert_eq!(details.collapsed_messages, 7);
+        assert_eq!(
+            details.status_text,
+            "compacted context after prompt-too-long"
+        );
     }
 }
