@@ -1,0 +1,205 @@
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
+
+use orca_core::approval_types::ApprovalMode;
+use orca_core::config::RunConfig;
+use orca_core::model::ModelSelection;
+use orca_runtime::history;
+
+use crate::commands::{self, GoalSlashCommand, SlashCommand};
+use crate::types::{AppState, ChatMessage, UserAction};
+
+pub(crate) enum SlashOutcome {
+    Continue,
+}
+
+pub(crate) fn handle_slash_command(
+    text: &str,
+    config: &mut RunConfig,
+    shared_config: &Arc<Mutex<RunConfig>>,
+    state: &mut AppState,
+    action_tx: &mpsc::Sender<UserAction>,
+) -> Option<SlashOutcome> {
+    let cwd = config
+        .cwd
+        .as_deref()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let command = commands::parse_with_cwd(text, &cwd)?;
+    match command {
+        SlashCommand::Model(Some(model)) => match commands::validate_model(&model) {
+            Ok(()) => {
+                config.model = ModelSelection::from_unchecked(Some(model.clone()));
+                if let Ok(mut cfg) = shared_config.lock() {
+                    cfg.model = ModelSelection::from_unchecked(Some(model.clone()));
+                }
+                state.model_name = model.clone();
+                state
+                    .messages
+                    .push(ChatMessage::System(format!("Model switched to {model}.")));
+                let _ = action_tx.send(UserAction::SetModel(model));
+            }
+            Err(error) => state.messages.push(ChatMessage::Error(error)),
+        },
+        SlashCommand::Model(None) => {
+            state.messages.push(ChatMessage::System(format!(
+                "Current model: {} (reasoning effort: {}). Use the /model menu to change both.",
+                state.model_name,
+                state.reasoning_effort.as_str()
+            )));
+        }
+        SlashCommand::Cost => {
+            state.messages.push(ChatMessage::System(format!(
+                "Session usage: {} input, {} output, {} cache tokens, estimated ${:.6}.",
+                state.usage.input_tokens,
+                state.usage.output_tokens,
+                state.usage.cache_tokens,
+                state.usage.estimated_cost_usd
+            )));
+        }
+        SlashCommand::ConfigShow => {
+            state
+                .messages
+                .push(ChatMessage::System(orca_core::config::format_config_show(
+                    config,
+                )));
+        }
+        SlashCommand::Mode(Some(mode)) => match parse_approval_mode(&mode) {
+            Some(approval_mode) => {
+                config.approval_mode = approval_mode;
+                if let Ok(mut cfg) = shared_config.lock() {
+                    cfg.approval_mode = approval_mode;
+                }
+                state.approval_mode = approval_mode;
+                state.messages.push(ChatMessage::System(format!(
+                    "Approval mode switched to {mode}."
+                )));
+            }
+            None => state.messages.push(ChatMessage::Error(
+                "unsupported mode. Use suggest, auto-edit, full-auto, or plan.".to_string(),
+            )),
+        },
+        SlashCommand::Mode(None) => {
+            state.messages.push(ChatMessage::System(format!(
+                "Current mode: {}",
+                config.approval_mode.as_str()
+            )));
+        }
+        SlashCommand::Plan(arg) => match arg.as_deref() {
+            Some("off") => {
+                config.approval_mode = ApprovalMode::Suggest;
+                if let Ok(mut cfg) = shared_config.lock() {
+                    cfg.approval_mode = ApprovalMode::Suggest;
+                }
+                state.approval_mode = ApprovalMode::Suggest;
+                state
+                    .messages
+                    .push(ChatMessage::System("Plan mode disabled.".to_string()));
+            }
+            None => {
+                config.approval_mode = ApprovalMode::Plan;
+                if let Ok(mut cfg) = shared_config.lock() {
+                    cfg.approval_mode = ApprovalMode::Plan;
+                }
+                state.approval_mode = ApprovalMode::Plan;
+                state
+                    .messages
+                    .push(ChatMessage::System("Plan mode enabled.".to_string()));
+            }
+            Some(_) => state.messages.push(ChatMessage::Error(
+                "unsupported plan command. Use /plan or /plan off.".to_string(),
+            )),
+        },
+        SlashCommand::Goal(goal_command) => {
+            let action = match goal_command {
+                GoalSlashCommand::Show => UserAction::GoalShow,
+                GoalSlashCommand::Set(objective) => UserAction::GoalSet(objective),
+                GoalSlashCommand::Edit(objective) => UserAction::GoalEdit(objective),
+                GoalSlashCommand::Clear => UserAction::GoalClear,
+                GoalSlashCommand::Pause => UserAction::GoalPause,
+                GoalSlashCommand::Resume => UserAction::GoalResume,
+            };
+            state.enter_running();
+            let _ = action_tx.send(action);
+        }
+        SlashCommand::WorkflowList => {
+            state.show_workflows();
+        }
+        SlashCommand::WorkflowRun { name, args } => {
+            state.enter_running();
+            let _ = action_tx.send(UserAction::RunWorkflow { name, args });
+        }
+        SlashCommand::AgentDashboard => {
+            state.show_agents();
+        }
+        SlashCommand::Remember(note) => {
+            let remembered_note = note
+                .strip_prefix("project:")
+                .map(str::trim)
+                .unwrap_or(note.as_str())
+                .to_string();
+            let result = if let Some(project_note) = note.strip_prefix("project:") {
+                let cwd = config
+                    .cwd
+                    .clone()
+                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+                orca_runtime::memory::remember_project(&cwd, project_note)
+            } else {
+                orca_runtime::memory::remember_user(&note)
+            };
+            match &result {
+                Ok(path) => state.messages.push(ChatMessage::System(format!(
+                    "Remembered in {}.",
+                    path.display()
+                ))),
+                Err(error) => state
+                    .messages
+                    .push(ChatMessage::Error(format!("failed to remember: {error}"))),
+            }
+            if result.is_ok() {
+                let _ = action_tx.send(UserAction::Remember(remembered_note));
+            }
+        }
+        SlashCommand::Compact => {
+            state.enter_running();
+            let _ = action_tx.send(UserAction::Compact);
+        }
+        SlashCommand::History => match history::list_sessions(10) {
+            Ok(sessions) if sessions.is_empty() => state
+                .messages
+                .push(ChatMessage::System("No saved sessions.".to_string())),
+            Ok(sessions) => {
+                let summary = sessions
+                    .into_iter()
+                    .map(|session| {
+                        format!(
+                            "{}  {}  {}",
+                            session.session_id,
+                            session.updated_at.format("%Y-%m-%d %H:%M"),
+                            session.title
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                state
+                    .messages
+                    .push(ChatMessage::System(format!("Recent sessions:\n{summary}")));
+            }
+            Err(error) => state.messages.push(ChatMessage::Error(format!(
+                "failed to list history: {error}"
+            ))),
+        },
+    }
+    state.scroll_to_bottom();
+    Some(SlashOutcome::Continue)
+}
+
+pub(crate) fn parse_approval_mode(mode: &str) -> Option<ApprovalMode> {
+    match mode {
+        "suggest" => Some(ApprovalMode::Suggest),
+        "auto-edit" => Some(ApprovalMode::AutoEdit),
+        "full-auto" => Some(ApprovalMode::FullAuto),
+        "plan" => Some(ApprovalMode::Plan),
+        _ => None,
+    }
+}

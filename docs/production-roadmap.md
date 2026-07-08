@@ -392,6 +392,9 @@ copied into Orca.
    Mention candidate refresh and mention menu key handling now live in a
    focused TUI mention action module, keeping @file completion state changes out
    of the app event loop.
+   Slash command execution now lives in a focused TUI slash command action
+   module, so direct command submission and menu completion share one
+   configuration/state mutation boundary.
    Runtime task summaries now also expose terminal `result`/`error` fields so
    the selected task row can show completion output or failure details in the
    panel. The

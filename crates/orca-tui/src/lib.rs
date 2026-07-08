@@ -15,6 +15,7 @@ mod running_actions;
 mod runtime_event_projection;
 mod runtime_interaction_adapter;
 pub mod shortcuts;
+mod slash_command_actions;
 mod submitted_turn;
 pub mod theme;
 pub mod types;
@@ -349,6 +350,41 @@ mod tests {
         assert!(
             !app.contains("\nfn handle_mention_menu_key("),
             "app should use the mention_menu_actions module instead of defining mention key handling inline"
+        );
+    }
+
+    #[test]
+    fn tui_slash_command_actions_are_owned_by_dedicated_module() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let slash_command_actions =
+            std::fs::read_to_string(format!("{manifest_dir}/src/slash_command_actions.rs"))
+                .expect("slash_command_actions module should exist");
+        assert!(
+            slash_command_actions.contains("pub(crate) fn handle_slash_command"),
+            "slash_command_actions should own slash command execution"
+        );
+        assert!(
+            slash_command_actions.contains("pub(crate) enum SlashOutcome"),
+            "slash_command_actions should own the slash execution outcome"
+        );
+        assert!(
+            slash_command_actions.contains("pub(crate) fn parse_approval_mode"),
+            "slash_command_actions should own slash approval mode parsing"
+        );
+
+        let app = std::fs::read_to_string(format!("{manifest_dir}/src/app.rs"))
+            .expect("app source should be readable");
+        assert!(
+            !app.contains("\nfn handle_slash_command("),
+            "app should use the slash_command_actions module instead of defining slash execution inline"
+        );
+        assert!(
+            !app.contains("\nenum SlashOutcome"),
+            "app should use the slash_command_actions module instead of defining slash outcomes inline"
+        );
+        assert!(
+            !app.contains("\nfn parse_approval_mode("),
+            "app should use the slash_command_actions module instead of defining mode parsing inline"
         );
     }
 
