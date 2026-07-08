@@ -180,6 +180,21 @@ pub(crate) fn send_workflow_tasks_updated_for_tui(
     send_runtime_event_as_tui(event_tx, events.workflow_tasks_updated(tasks));
 }
 
+pub(crate) fn send_task_status_updated_for_tui(
+    event_tx: &Sender<TuiEvent>,
+    events: &mut EventFactory,
+    task: &BackgroundTaskSummary,
+) {
+    send_runtime_event_as_tui(event_tx, events.task_status_updated(task));
+}
+
+pub(crate) fn task_summary_for_tui(
+    registry: &orca_runtime::tasks::TaskRegistry,
+    task_id: &str,
+) -> Option<BackgroundTaskSummary> {
+    registry.list().into_iter().find(|task| task.id == task_id)
+}
+
 fn start_main_session_task_for_tui(
     session: &mut TuiConversationSession,
     event_tx: &Sender<TuiEvent>,
@@ -191,7 +206,9 @@ fn start_main_session_task_for_tui(
         .create_main_session(prompt.to_string());
     let _ = session.task_registry().mark_running(&task.id);
     session.start_agent_lifecycle_task_with_id(&task.id);
-    send_workflow_tasks_updated_for_tui(event_tx, events, &session.task_registry().list());
+    if let Some(task) = task_summary_for_tui(session.task_registry(), &task.id) {
+        send_task_status_updated_for_tui(event_tx, events, &task);
+    }
     task.id
 }
 
@@ -230,7 +247,9 @@ fn poll_background_current_turn_for_tui(
 
     if should_background && session.task_registry().mark_backgrounded(task_id).is_ok() {
         *is_backgrounded = true;
-        send_workflow_tasks_updated_for_tui(event_tx, events, &session.task_registry().list());
+        if let Some(backgrounded_task) = task_summary_for_tui(session.task_registry(), task_id) {
+            send_task_status_updated_for_tui(event_tx, events, &backgrounded_task);
+        }
     }
 }
 
@@ -493,7 +512,9 @@ fn finish_main_session_task_for_tui(
             .fail_with_usage(task_id, status.to_string(), usage),
     };
     if result.is_ok() {
-        send_workflow_tasks_updated_for_tui(event_tx, events, &session.task_registry().list());
+        if let Some(finished_task) = task_summary_for_tui(session.task_registry(), task_id) {
+            send_task_status_updated_for_tui(event_tx, events, &finished_task);
+        }
     }
     session.finish_agent_lifecycle_task(run_status_for_tui_status(status));
 }

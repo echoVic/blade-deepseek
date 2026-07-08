@@ -87,6 +87,8 @@ pub enum EventType {
     WorkflowResultAvailable,
     #[serde(rename = "workflow.tasks.updated")]
     WorkflowTasksUpdated,
+    #[serde(rename = "task.status.updated")]
+    TaskStatusUpdated,
     #[serde(rename = "verification.started")]
     VerificationStarted,
     #[serde(rename = "verification.completed")]
@@ -602,6 +604,15 @@ impl EventFactory {
         )
     }
 
+    pub fn task_status_updated(&mut self, task: &BackgroundTaskSummary) -> EventEnvelope {
+        self.make(
+            EventType::TaskStatusUpdated,
+            json!({
+                "task": task
+            }),
+        )
+    }
+
     pub fn verification_started(&mut self, command: &str) -> EventEnvelope {
         self.make(
             EventType::VerificationStarted,
@@ -880,6 +891,49 @@ mod tests {
             event.payload["tasks"][0]["workflowProgress"]["completedAgents"],
             2
         );
+    }
+
+    #[test]
+    fn task_status_updated_payload_includes_single_task_summary() {
+        let mut f = EventFactory::new("run-1".to_string());
+        let task = BackgroundTaskSummary {
+            id: "main-session-1".to_string(),
+            task_type: TaskType::MainSession,
+            status: TaskStatus::ApprovalRequired,
+            is_backgrounded: true,
+            description: "background turn".to_string(),
+            created_at_ms: 10,
+            started_at_ms: Some(20),
+            completed_at_ms: None,
+            command: None,
+            agent_type: None,
+            server: None,
+            tool: Some("shell".to_string()),
+            pending_tool_call: None,
+            name: None,
+            workflow_run_id: None,
+            phase_count: None,
+            workflow_progress: None,
+            workflow_phases: Vec::new(),
+            workflow_agents: Vec::new(),
+            workflow_script_path: None,
+            workflow_launch_input: None,
+            workflow_final_summary: None,
+            workflow_failure_count: 0,
+            usage: None,
+            subagent_current_activity: None,
+            subagent_turn: None,
+            last_activity_at_ms: Some(30),
+        };
+
+        let event = f.task_status_updated(&task);
+
+        assert_eq!(event.event_type, EventType::TaskStatusUpdated);
+        assert_eq!(event.payload["task"]["id"], "main-session-1");
+        assert_eq!(event.payload["task"]["type"], "main_session");
+        assert_eq!(event.payload["task"]["status"], "approval_required");
+        assert_eq!(event.payload["task"]["isBackgrounded"], true);
+        assert_eq!(event.payload["task"]["tool"], "shell");
     }
 
     #[test]

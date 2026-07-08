@@ -28,8 +28,8 @@ use orca_runtime::tasks::TaskRegistry;
 use orca_runtime::tool_invocation::prepare_tool_invocation;
 
 use crate::agent_runner::{
-    DEFAULT_MAX_TURNS, send_runtime_event_as_tui, send_tool_completed_for_tui,
-    send_tool_requested_for_tui,
+    DEFAULT_MAX_TURNS, send_runtime_event_as_tui, send_task_status_updated_for_tui,
+    send_tool_completed_for_tui, send_tool_requested_for_tui, task_summary_for_tui,
 };
 use crate::agent_subagent_execution::{execute_subagent_for_tui, execute_subagent_status_for_tui};
 use crate::agent_workflow_execution::{
@@ -116,6 +116,17 @@ pub(crate) fn execute_readonly_batch_for_tui(
     }
 
     results
+}
+
+fn task_stop_target_id(request: &tool_types::ToolRequest) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(request.raw_arguments.as_deref()?).ok()?;
+    value
+        .get("task_id")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| value.get("shell_id").and_then(serde_json::Value::as_str))
+        .map(str::trim)
+        .filter(|task_id| !task_id.is_empty())
+        .map(str::to_string)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -407,9 +418,22 @@ fn execute_tool_for_tui_inner(
                     None,
                 );
             };
+            let target_task_id = task_stop_target_id(execution_request);
             let mut runtime_context =
                 RuntimeToolActorContext::new("tui-task-stop", DEFAULT_MAX_TURNS);
-            runtime_context.execute_task_stop_tool(execution_request, task_registry)
+            let result = runtime_context.execute_task_stop_tool(execution_request, task_registry);
+            if result.status == tool_types::ToolStatus::Completed
+                && let Some(task_id) = target_task_id
+                && let Some(task) = task_summary_for_tui(task_registry, &task_id)
+            {
+                let mut events = EventFactory::new(
+                    session_id
+                        .map(str::to_string)
+                        .unwrap_or_else(|| "tui-task-stop".to_string()),
+                );
+                send_task_status_updated_for_tui(event_tx, &mut events, &task);
+            }
+            result
         } else if matches!(
             execution_request.name,
             tool_types::ToolName::GetGoal

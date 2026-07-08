@@ -138,6 +138,36 @@ mod tests {
     }
 
     #[test]
+    fn tui_main_session_task_status_uses_runtime_task_status_event() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let runner = std::fs::read_to_string(format!("{manifest_dir}/src/agent_runner.rs"))
+            .expect("TUI agent runner source should be readable");
+
+        assert!(
+            runner.contains("fn send_task_status_updated_for_tui"),
+            "agent_runner should expose a single-task runtime status event helper"
+        );
+        assert!(
+            runner.contains("events.task_status_updated(task)"),
+            "TUI task status helper must emit task.status.updated runtime events"
+        );
+        assert!(
+            runner.contains("send_task_status_updated_for_tui(event_tx, events, &task);"),
+            "main session task start should announce the concrete task status event"
+        );
+        assert!(
+            runner.contains(
+                "send_task_status_updated_for_tui(event_tx, events, &backgrounded_task);"
+            ),
+            "backgrounding a main session should announce the concrete task status event"
+        );
+        assert!(
+            runner.contains("send_task_status_updated_for_tui(event_tx, events, &finished_task);"),
+            "main session completion should announce the concrete task status event"
+        );
+    }
+
+    #[test]
     fn tui_agent_tool_execution_is_owned_by_dedicated_module() {
         let manifest_dir = env!("CARGO_MANIFEST_DIR");
         let execution =
