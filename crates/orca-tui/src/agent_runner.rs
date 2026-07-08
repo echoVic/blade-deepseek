@@ -29,7 +29,9 @@ use orca_runtime::runtime_state::{RuntimeToolFinish, RuntimeTurnReducer};
 use crate::agent_subagent_execution::{
     collect_subagent_batch, execute_subagent_batch_for_tui, should_run_subagent_batch,
 };
-use crate::agent_tool_execution::{execute_readonly_batch_for_tui, execute_tool_for_tui};
+use crate::agent_tool_execution::{
+    execute_preapproved_tool_for_tui, execute_readonly_batch_for_tui, execute_tool_for_tui,
+};
 use crate::agent_workflow_execution::execute_workflow_for_tui;
 use crate::bridge::TuiConversationSession;
 use crate::runtime_event_projection::tui_event_from_runtime_event;
@@ -239,6 +241,22 @@ fn provider_response_pending_tool_call(
         })
 }
 
+fn provider_response_first_tool_call_id(response: &ProviderResponse) -> Option<String> {
+    response
+        .steps
+        .iter()
+        .find_map(|step| match step {
+            ProviderStep::ToolCall(request) => Some(request.id.clone()),
+            _ => None,
+        })
+        .or_else(|| {
+            response
+                .tool_calls
+                .first()
+                .map(|tool_call| tool_call.id.clone())
+        })
+}
+
 fn spawn_background_provider_completion(
     provider_rx: Receiver<ProviderStreamEvent>,
     task_registry: orca_runtime::tasks::TaskRegistry,
@@ -364,6 +382,7 @@ pub(crate) fn continue_approved_background_turn_for_tui(
     let policy = ApprovalPolicy::new(config.approval_mode)
         .with_permission_rules(config.permission_rules.clone());
     let mut permission_overlay = orca_runtime::lifecycle::TurnPermissionOverlay::default();
+    let mut preapproved_tool_call_id = provider_response_first_tool_call_id(&response);
     let mut next_response = Some(response);
     let mut turn = 0;
 
@@ -523,25 +542,51 @@ pub(crate) fn continue_approved_background_turn_for_tui(
             .collect();
 
         for tool_request in tool_requests {
-            let (should_stop, result, child_cost) = execute_tool_for_tui(
-                config,
-                &cwd,
-                &tool_request,
-                event_tx,
-                action_rx,
-                pending_actions,
-                0,
-                session.session_id(),
-                Some(session.thread_extensions_handle()),
-                &policy,
-                session.instructions(),
-                session.memory(),
-                session.mcp_registry(),
-                session.hooks(),
-                Some(session.task_registry()),
-                &mut permission_overlay,
-                cancel,
-            );
+            let (should_stop, result, child_cost) = if preapproved_tool_call_id.as_deref()
+                == Some(tool_request.id.as_str())
+            {
+                let preapproved_tool_call_id = preapproved_tool_call_id.take().unwrap_or_default();
+                execute_preapproved_tool_for_tui(
+                    config,
+                    &cwd,
+                    &tool_request,
+                    event_tx,
+                    action_rx,
+                    pending_actions,
+                    0,
+                    session.session_id(),
+                    Some(session.thread_extensions_handle()),
+                    &policy,
+                    session.instructions(),
+                    session.memory(),
+                    session.mcp_registry(),
+                    session.hooks(),
+                    Some(session.task_registry()),
+                    &mut permission_overlay,
+                    cancel,
+                    &preapproved_tool_call_id,
+                )
+            } else {
+                execute_tool_for_tui(
+                    config,
+                    &cwd,
+                    &tool_request,
+                    event_tx,
+                    action_rx,
+                    pending_actions,
+                    0,
+                    session.session_id(),
+                    Some(session.thread_extensions_handle()),
+                    &policy,
+                    session.instructions(),
+                    session.memory(),
+                    session.mcp_registry(),
+                    session.hooks(),
+                    Some(session.task_registry()),
+                    &mut permission_overlay,
+                    cancel,
+                )
+            };
 
             if let Some(cost) = child_cost {
                 session.cost_tracker_mut().merge(&cost);

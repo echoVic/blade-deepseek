@@ -1931,6 +1931,117 @@ mod tests {
     }
 
     #[test]
+    fn approved_background_tool_call_does_not_prompt_again_for_same_tool() {
+        with_orca_home(|_| {
+            let config = Arc::new(Mutex::new(test_config(HistoryMode::Record)));
+            let preloaded = Arc::new(Mutex::new(None));
+            let (event_tx, event_rx) = mpsc::channel();
+            let (action_tx, action_rx) = mpsc::channel();
+            let cancel = CancelToken::new();
+
+            let handle = std::thread::spawn({
+                let config = Arc::clone(&config);
+                let preloaded = Arc::clone(&preloaded);
+                let cancel = cancel.clone();
+                move || {
+                    agent_loop_thread(
+                        config,
+                        preloaded,
+                        event_tx,
+                        action_rx,
+                        cancel,
+                        test_pending_workflow_notifications(),
+                    )
+                }
+            });
+
+            action_tx
+                .send(UserAction::Submit(
+                    "mock_stream_tool_delay_ms 250 mcp__broken__tool".to_string(),
+                ))
+                .unwrap();
+
+            loop {
+                match event_rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+                    TuiEvent::MessageDelta(text)
+                        if text.contains("Mock slow tool stream started.") =>
+                    {
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+
+            action_tx.send(UserAction::BackgroundCurrentTurn).unwrap();
+
+            let task_id = loop {
+                match event_rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+                    TuiEvent::WorkflowTasksUpdated { tasks } => {
+                        if let Some(task) = tasks.into_iter().find(|task| {
+                            task.task_type == orca_core::task_types::TaskType::MainSession
+                                && task.is_backgrounded
+                                && task.status
+                                    == orca_core::task_types::TaskStatus::ApprovalRequired
+                                && task
+                                    .pending_tool_call
+                                    .as_ref()
+                                    .is_some_and(|tool| tool.name == "mcp__broken__tool")
+                        }) {
+                            break task.id;
+                        }
+                    }
+                    _ => {}
+                }
+            };
+
+            action_tx
+                .send(UserAction::ResolveBackgroundApproval {
+                    task_id,
+                    approved: true,
+                })
+                .unwrap();
+
+            let mut saw_tool_requested = false;
+            let mut saw_second_approval = false;
+            let mut seen = Vec::new();
+            for _ in 0..20 {
+                match event_rx.recv_timeout(Duration::from_secs(2)) {
+                    Ok(TuiEvent::ToolRequested { name, .. }) if name == "mcp__broken__tool" => {
+                        saw_tool_requested = true;
+                        break;
+                    }
+                    Ok(TuiEvent::ApprovalNeeded { tool, .. }) => {
+                        saw_second_approval = true;
+                        seen.push(format!("approval: {tool}"));
+                        action_tx.send(UserAction::Approve(false)).unwrap();
+                        break;
+                    }
+                    Ok(event) => seen.push(format!("{event:?}")),
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        seen.push("timeout".to_string());
+                        break;
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        panic!("agent event channel disconnected before background tool execution")
+                    }
+                }
+            }
+
+            action_tx.send(UserAction::Cancel).unwrap();
+            handle.join().unwrap();
+
+            assert!(
+                saw_tool_requested,
+                "approved background tool should execute without a second approval; saw {seen:?}"
+            );
+            assert!(
+                !saw_second_approval,
+                "approved background tool should not prompt again for the same call"
+            );
+        });
+    }
+
+    #[test]
     fn idle_app_submits_pending_workflow_notification() {
         let (mut state, _rx) = test_state();
         let (action_tx, action_rx) = mpsc::channel();
