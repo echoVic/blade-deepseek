@@ -29,6 +29,7 @@ mod setup_actions;
 pub mod shortcuts;
 mod slash_command_actions;
 mod slash_menu_actions;
+mod status_key_actions;
 mod submitted_turn;
 pub mod theme;
 pub mod types;
@@ -797,6 +798,61 @@ mod tests {
         assert!(
             !app.contains("state.panel_mode == PanelMode::Workflows"),
             "app should use key_event_actions instead of closing the workflow panel inline"
+        );
+    }
+
+    #[test]
+    fn tui_status_key_actions_are_owned_by_dedicated_module() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let status_key_actions =
+            std::fs::read_to_string(format!("{manifest_dir}/src/status_key_actions.rs"))
+                .expect("status_key_actions module should exist");
+        assert!(
+            status_key_actions.contains("pub(crate) enum StatusKeyFlow"),
+            "status_key_actions should expose key routing flow"
+        );
+        assert!(
+            status_key_actions.contains("pub(crate) fn handle_status_key"),
+            "status_key_actions should own status-specific key routing"
+        );
+        assert!(
+            status_key_actions.contains("handle_setup_key"),
+            "status_key_actions should route setup keys"
+        );
+        assert!(
+            status_key_actions.contains("handle_session_picker_key"),
+            "status_key_actions should route session picker keys"
+        );
+        assert!(
+            status_key_actions.contains("handle_approval_dialog_key"),
+            "status_key_actions should route approval dialog keys"
+        );
+        assert!(
+            status_key_actions.contains("handle_idle_key"),
+            "status_key_actions should route idle and user-input keys"
+        );
+        assert!(
+            status_key_actions.contains("handle_running_shortcut"),
+            "status_key_actions should route running shortcuts"
+        );
+
+        let app = std::fs::read_to_string(format!("{manifest_dir}/src/app.rs"))
+            .expect("app source should be readable");
+        assert!(
+            !app.contains("state.status == AppStatus::SessionPicker"),
+            "app should use status_key_actions instead of routing session picker keys inline"
+        );
+        assert!(
+            !app.contains("state.status == AppStatus::WaitingApproval"),
+            "app should use status_key_actions instead of routing approval dialog keys inline"
+        );
+        assert!(
+            !app.contains("state.status == AppStatus::Running"),
+            "app should use status_key_actions instead of routing running keys inline"
+        );
+        assert!(
+            !app.contains("matches!(state.status, AppStatus::Idle | AppStatus::WaitingUserInput)"),
+            "app should use status_key_actions instead of routing idle keys inline"
         );
     }
 

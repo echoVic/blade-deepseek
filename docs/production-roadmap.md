@@ -441,6 +441,9 @@ copied into Orca.
    slash menu, mention menu, workflow panel, idle shortcut, history recall,
    navigation, submit, and composer fallback dispatch out of the app event
    loop.
+   Status-specific key routing now lives in a focused TUI status key action
+   module, keeping setup, session picker, approval dialog, idle/user-input, and
+   running shortcut dispatch out of the app event loop.
    Runtime task summaries now also expose terminal `result`/`error` fields so
    the selected task row can show completion output or failure details in the
    panel. The

@@ -23,7 +23,6 @@ use orca_core::conversation::Message;
 use orca_core::model::ModelSelection;
 use orca_runtime::history;
 
-use crate::approval_dialog_actions::handle_approval_dialog_key;
 use crate::background_approval::submit_background_approval_response_for_tui;
 use crate::background_tasks::{
     foreground_task_for_tui, notify_recovered_background_approvals_for_tui, stop_task_for_tui,
@@ -33,15 +32,13 @@ use crate::commands;
 use crate::composer_textarea::{
     insert_pasted_text, make_setup_textarea, make_textarea, make_textarea_with_text, textarea_text,
 };
-use crate::idle_key_actions::handle_idle_key;
 use crate::input_event_actions::{handle_mouse_event, handle_paste_event};
 use crate::key_event_actions::{KeyEventFlow, handle_key_event_preflight};
 use crate::running_actions::handle_running_shortcut;
 use crate::runtime_event_actions::handle_runtime_event;
-use crate::session_picker_actions::handle_session_picker_key;
-use crate::setup_actions::{SetupFlow, handle_setup_key};
-use crate::shortcuts::{RunningShortcut, running_shortcut};
+use crate::shortcuts::RunningShortcut;
 use crate::slash_menu_actions::{REASONING_SUBMENU_TITLE, handle_slash_menu_key};
+use crate::status_key_actions::{StatusKeyFlow, handle_status_key};
 use crate::submitted_turn::SubmittedTurn;
 use crate::theme::Theme;
 use crate::types::{
@@ -257,64 +254,25 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                     KeyEventFlow::Unhandled => {}
                 }
 
-                // Setup mode: step-by-step
-                if state.status == AppStatus::Setup {
-                    match handle_setup_key(
-                        &ev,
-                        key,
-                        &mut state,
-                        &mut config,
-                        &shared_config,
-                        &action_tx,
-                        &mut textarea,
-                        &vim_state,
-                        &theme,
-                        initial_prompt.clone(),
-                    )? {
-                        SetupFlow::Continue => {
-                            continue;
-                        }
-                        SetupFlow::Exit(code) => {
-                            exit_code = code;
-                            break;
-                        }
-                    }
-                }
-
-                if state.status == AppStatus::SessionPicker {
-                    handle_session_picker_key(
-                        key,
-                        &mut state,
-                        &mut config,
-                        &shared_config,
-                        &preloaded_transcript,
-                        || clear_terminal_scrollback(&mut terminal),
-                    )?;
-                    continue;
-                }
-
-                // Approval dialog: 4-option selection + direct-key shortcuts.
-                if state.status == AppStatus::WaitingApproval {
-                    handle_approval_dialog_key(key, &mut state, &action_tx);
-                    continue;
-                }
-
-                // Normal Idle mode input
-                if matches!(state.status, AppStatus::Idle | AppStatus::WaitingUserInput) {
-                    handle_idle_key(
-                        &ev,
-                        key,
-                        &mut state,
-                        &mut config,
-                        &shared_config,
-                        &action_tx,
-                        &mut textarea,
-                        &mut vim_state,
-                        &theme,
-                    );
-                } else if state.status == AppStatus::Running {
-                    if let Some(shortcut) = running_shortcut(*key) {
-                        handle_running_shortcut(shortcut, &mut state, &action_tx, &cancel_token);
+                match handle_status_key(
+                    &ev,
+                    key,
+                    &mut state,
+                    &mut config,
+                    &shared_config,
+                    &action_tx,
+                    &cancel_token,
+                    &preloaded_transcript,
+                    &mut textarea,
+                    &mut vim_state,
+                    &theme,
+                    initial_prompt.clone(),
+                    || clear_terminal_scrollback(&mut terminal),
+                )? {
+                    StatusKeyFlow::Continue => continue,
+                    StatusKeyFlow::Exit(code) => {
+                        exit_code = code;
+                        break;
                     }
                 }
             }
