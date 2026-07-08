@@ -53,12 +53,8 @@ impl PendingWorkflowNotificationQueue {
         }
     }
 
-    pub fn pop_prompt(&self) -> Option<String> {
-        self.inner
-            .lock()
-            .ok()?
-            .pop_front()
-            .map(|notification| notification.prompt)
+    pub fn pop_notification(&self) -> Option<PendingWorkflowNotification> {
+        self.inner.lock().ok()?.pop_front()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -194,6 +190,7 @@ pub enum TuiEvent {
 #[derive(Debug, Clone)]
 pub enum UserAction {
     Submit(String),
+    SubmitWorkflowNotification { id: String, prompt: String },
     RunWorkflow { name: String, args: Option<String> },
     SetModel(String),
     Remember(String),
@@ -2747,7 +2744,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_workflow_notification_queue_owns_unique_drain_and_prompt_pop() {
+    fn pending_workflow_notification_queue_owns_unique_drain_and_notification_pop() {
         let queue = PendingWorkflowNotificationQueue::new();
         assert!(queue.push_unique(PendingWorkflowNotification {
             id: "notification-1".to_string(),
@@ -2769,10 +2766,16 @@ mod tests {
             prompt: "<task-notification>two</task-notification>".to_string(),
         }));
         assert_eq!(
-            queue.pop_prompt().as_deref(),
-            Some("<task-notification>two</task-notification>")
+            queue
+                .pop_notification()
+                .as_ref()
+                .map(|notification| (notification.id.as_str(), notification.prompt.as_str())),
+            Some((
+                "notification-2",
+                "<task-notification>two</task-notification>"
+            ))
         );
-        assert!(queue.pop_prompt().is_none());
+        assert!(queue.pop_notification().is_none());
     }
 
     #[test]

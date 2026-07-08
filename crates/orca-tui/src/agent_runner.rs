@@ -34,7 +34,7 @@ use crate::agent_tool_execution::{execute_readonly_batch_for_tui, execute_tool_f
 use crate::agent_workflow_execution::execute_workflow_for_tui;
 use crate::bridge::TuiConversationSession;
 use crate::runtime_event_projection::tui_event_from_runtime_event;
-use crate::types::{TuiEvent, UserAction};
+use crate::types::{PendingWorkflowNotification, TuiEvent, UserAction};
 
 pub(crate) const DEFAULT_MAX_TURNS: u32 = 128;
 
@@ -48,21 +48,24 @@ enum ProviderStreamEvent {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TuiAgentTurnResult {
     pub(crate) status: String,
-    pub(crate) next_prompt: Option<String>,
+    pub(crate) next_workflow_notification: Option<PendingWorkflowNotification>,
 }
 
 impl TuiAgentTurnResult {
     fn new(status: impl Into<String>) -> Self {
         Self {
             status: status.into(),
-            next_prompt: None,
+            next_workflow_notification: None,
         }
     }
 
-    fn with_next_prompt(status: impl Into<String>, next_prompt: String) -> Self {
+    fn with_next_workflow_notification(
+        status: impl Into<String>,
+        next_workflow_notification: PendingWorkflowNotification,
+    ) -> Self {
         Self {
             status: status.into(),
-            next_prompt: Some(next_prompt),
+            next_workflow_notification: Some(next_workflow_notification),
         }
     }
 }
@@ -536,7 +539,7 @@ pub(crate) fn continue_approved_background_turn_for_tui(
     let status = status.as_str();
 
     if status == "success"
-        && let Some(next_prompt) =
+        && let Some(next_workflow_notification) =
             take_pending_workflow_notification(pending_workflow_notifications)
     {
         send_session_completed_for_tui(
@@ -552,7 +555,10 @@ pub(crate) fn continue_approved_background_turn_for_tui(
             "success",
         );
         session.complete("success");
-        return TuiAgentTurnResult::with_next_prompt("success", next_prompt);
+        return TuiAgentTurnResult::with_next_workflow_notification(
+            "success",
+            next_workflow_notification,
+        );
     }
 
     send_session_completed_status_for_tui(event_tx, &mut runtime_events, status);
@@ -1477,7 +1483,7 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
             }
             index += 1;
         }
-        if let Some(next_prompt) =
+        if let Some(next_workflow_notification) =
             take_pending_workflow_notification(pending_workflow_notifications)
         {
             send_session_completed_for_tui(
@@ -1493,15 +1499,18 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
                 "success",
             );
             session.complete("success");
-            return TuiAgentTurnResult::with_next_prompt("success", next_prompt);
+            return TuiAgentTurnResult::with_next_workflow_notification(
+                "success",
+                next_workflow_notification,
+            );
         }
     }
 }
 
 fn take_pending_workflow_notification(
     pending_workflow_notifications: Option<&PendingWorkflowNotifications>,
-) -> Option<String> {
-    pending_workflow_notifications.and_then(PendingWorkflowNotifications::pop_prompt)
+) -> Option<PendingWorkflowNotification> {
+    pending_workflow_notifications.and_then(PendingWorkflowNotifications::pop_notification)
 }
 
 fn record_tui_goal_tool_finish(
@@ -2303,8 +2312,14 @@ mod tests {
 
         assert_eq!(result.status, "success");
         assert_eq!(
-            result.next_prompt.as_deref(),
-            Some("<task-notification><status>failed</status></task-notification>")
+            result
+                .next_workflow_notification
+                .as_ref()
+                .map(|notification| (notification.id.as_str(), notification.prompt.as_str())),
+            Some((
+                "notification-1",
+                "<task-notification><status>failed</status></task-notification>"
+            ))
         );
         assert!(pending_notifications.is_empty());
         assert!(event_rx.try_iter().any(|event| {
@@ -2338,7 +2353,7 @@ mod tests {
         );
 
         assert_eq!(result.status, "success");
-        assert!(result.next_prompt.is_none());
+        assert!(result.next_workflow_notification.is_none());
     }
 
     #[test]

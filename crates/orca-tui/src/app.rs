@@ -777,7 +777,10 @@ fn submit_pending_workflow_notification(
     if let Some(notification) = state.pending_workflow_notifications.pop_front() {
         state.enter_running();
         state.scroll_to_bottom();
-        let _ = action_tx.send(UserAction::Submit(notification.prompt));
+        let _ = action_tx.send(UserAction::SubmitWorkflowNotification {
+            id: notification.id,
+            prompt: notification.prompt,
+        });
     }
 }
 
@@ -2400,7 +2403,8 @@ mod tests {
         assert_eq!(state.status, AppStatus::Running);
         assert!(matches!(
             action_rx.try_recv(),
-            Ok(UserAction::Submit(prompt)) if prompt == "<task-notification>done</task-notification>"
+            Ok(UserAction::SubmitWorkflowNotification { id, prompt })
+                if id == "notification-1" && prompt == "<task-notification>done</task-notification>"
         ));
     }
 
@@ -2449,7 +2453,8 @@ mod tests {
         assert_eq!(state.status, AppStatus::Running);
         assert!(matches!(
             action_rx.try_recv(),
-            Ok(UserAction::Submit(prompt)) if prompt == "<task-notification>failed</task-notification>"
+            Ok(UserAction::SubmitWorkflowNotification { id, prompt })
+                if id == "notification-1" && prompt == "<task-notification>failed</task-notification>"
         ));
     }
 
@@ -2474,7 +2479,8 @@ mod tests {
         assert_eq!(state.status, AppStatus::Running);
         assert!(matches!(
             action_rx.try_recv(),
-            Ok(UserAction::Submit(prompt)) if prompt == "<task-notification>failed</task-notification>"
+            Ok(UserAction::SubmitWorkflowNotification { id, prompt })
+                if id == "notification-1" && prompt == "<task-notification>failed</task-notification>"
         ));
     }
 
@@ -3834,11 +3840,11 @@ fn run_goal_turns_for_tui(
             }
             break;
         }
-        if let Some(next_prompt) = turn_result.next_prompt {
+        if let Some(next_workflow_notification) = turn_result.next_workflow_notification {
             // Workflow failure notifications are diagnostic follow-ups for the turn that just
             // finished, so they do not consume goal-continuation quota or wait for the next
             // goal-status poll.
-            prompt = next_prompt;
+            prompt = next_workflow_notification.prompt;
             continue;
         }
         if session.has_active_workflows() {
@@ -4025,7 +4031,9 @@ fn agent_loop_thread(
 
     loop {
         match recv_next_user_action(&action_rx, &pending_actions) {
-            Ok(UserAction::Submit(prompt)) => {
+            Ok(
+                UserAction::Submit(prompt) | UserAction::SubmitWorkflowNotification { prompt, .. },
+            ) => {
                 cancel.reset();
                 let cfg = config.lock().unwrap().clone();
                 let cwd = cfg
@@ -4200,10 +4208,13 @@ fn agent_loop_thread(
                         &cancel,
                         Some(&pending_workflow_notifications),
                     );
-                    if let Some(next_prompt) = result.next_prompt {
-                        pending_actions
-                            .borrow_mut()
-                            .push_front(UserAction::Submit(next_prompt));
+                    if let Some(notification) = result.next_workflow_notification {
+                        pending_actions.borrow_mut().push_front(
+                            UserAction::SubmitWorkflowNotification {
+                                id: notification.id,
+                                prompt: notification.prompt,
+                            },
+                        );
                     }
                 }
             }

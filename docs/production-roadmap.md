@@ -15,7 +15,10 @@ turn permission overlay with the preapproved tool-call id, and the approval gate
 consumes that id exactly once for the matching tool call. The TUI bridge now
 converts approved background continuations into runtime `ThreadTurnRequest`
 continuations and projects runtime JSONL events back into TUI events, retiring
-the renderer-owned preapproved provider/tool loop. Earlier v0.1.191 makes
+the renderer-owned preapproved provider/tool loop. The follow-on TUI
+notification slice now preserves workflow terminal notification ids across the
+pending queue, action channel, and turn-result continuation boundary instead of
+recasting queued workflow continuations as plain user prompts. Earlier v0.1.191 makes
 `RuntimeProviderResponseStep` consume the
 named `RuntimeProviderResponseInput` directly and carries child-agent executors
 through `RuntimeProviderResponseExecutors`. Provider final-message handling and
@@ -250,9 +253,13 @@ copied into Orca.
    notices. The cross-thread TUI notification queue is now a focused
    `PendingWorkflowNotificationQueue` boundary instead of an exposed
    `Arc<Mutex<VecDeque<_>>>`, so queue insert/drain/pop behavior stays behind
-   named methods. Next, move the same id discipline into remaining turn/item
-   continuations and workflow notification ownership so continuations stop
-   depending on separate ad hoc task fields plus TUI-local queues.
+   named methods. Queued workflow continuations also keep their notification id
+   when they cross the TUI action channel or return from a turn-result
+   continuation; human prompts remain plain `Submit` actions, while workflow
+   follow-ups use a typed notification action/result. Next, move the same id
+   discipline into remaining turn/item continuations and workflow notification
+   ownership so continuations stop depending on separate ad hoc task fields plus
+   TUI-local queues.
 3. **P2: Frozen per-turn context boundary.** Continue shrinking wide call
    surfaces into `RuntimeTurnConfig`, `RuntimeTurnDeps`,
    `RuntimeTurnState`, and request snapshots. Runtime turn continuations now
