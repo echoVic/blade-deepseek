@@ -277,7 +277,8 @@ copied into Orca.
    main-session task start/background/finish and background provider-completion
    updates, plus approved background-turn continuation refreshes, route through
    it instead of borrowing the workflow task-list event for each one-task status
-   change.
+   change. TUI subagent task creation, progress, and terminal status updates
+   now use the same single-task event path.
    Server protocol event mapping also preserves that single-task status event
    as `task_status_updated` for non-TUI clients.
 5. **P4: Persistence policy for pending background continuations.** Current

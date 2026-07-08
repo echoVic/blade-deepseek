@@ -285,6 +285,27 @@ mod tests {
     }
 
     #[test]
+    fn tui_subagent_task_status_uses_runtime_task_status_event() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let subagent =
+            std::fs::read_to_string(format!("{manifest_dir}/src/agent_subagent_execution.rs"))
+                .expect("TUI agent subagent execution module should exist");
+
+        assert!(
+            subagent.contains("send_task_status_updated_for_tui"),
+            "subagent task status should announce concrete task status runtime events"
+        );
+        assert!(
+            subagent.contains("task_summary_for_tui"),
+            "subagent task status should load the concrete task summary before notifying"
+        );
+        assert!(
+            !subagent.contains("send_workflow_tasks_updated_for_tui"),
+            "subagent task status should not borrow the workflow task-list event"
+        );
+    }
+
+    #[test]
     fn tui_subagent_results_use_runtime_child_agent_result() {
         let manifest_dir = env!("CARGO_MANIFEST_DIR");
         let runner = std::fs::read_to_string(format!("{manifest_dir}/src/agent_runner.rs"))

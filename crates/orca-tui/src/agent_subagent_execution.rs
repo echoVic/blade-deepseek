@@ -23,10 +23,21 @@ use orca_runtime::tasks::TaskRegistry;
 
 use crate::agent_runner::{
     send_subagent_completed_for_tui, send_subagent_started_for_tui,
-    send_workflow_tasks_updated_for_tui,
+    send_task_status_updated_for_tui, task_summary_for_tui,
 };
 use crate::agent_tool_execution::execute_tool_for_tui;
 use crate::types::{TuiEvent, UserAction};
+
+fn send_subagent_task_status_for_tui(
+    event_tx: &Sender<TuiEvent>,
+    events: &mut EventFactory,
+    registry: &TaskRegistry,
+    task_id: &str,
+) {
+    if let Some(task) = task_summary_for_tui(registry, task_id) {
+        send_task_status_updated_for_tui(event_tx, events, &task);
+    }
+}
 
 pub(crate) fn should_run_subagent_batch(
     config: &RunConfig,
@@ -104,7 +115,7 @@ pub(crate) fn execute_subagent_batch_for_tui(
             let task = registry.create_subagent(description.clone(), agent_type);
             let _ = registry.mark_running(&task.id);
             let mut task_events = EventFactory::new(task.id.clone());
-            send_workflow_tasks_updated_for_tui(event_tx, &mut task_events, &registry.list());
+            send_subagent_task_status_for_tui(event_tx, &mut task_events, registry, &task.id);
             task.id
         });
         let child_config = config.clone();
@@ -162,10 +173,11 @@ pub(crate) fn execute_subagent_batch_for_tui(
                         None,
                     );
                     let mut task_events = EventFactory::new(task_id.to_string());
-                    send_workflow_tasks_updated_for_tui(
+                    send_subagent_task_status_for_tui(
                         event_tx,
                         &mut task_events,
-                        &registry.list(),
+                        registry,
+                        task_id,
                     );
                 }
                 send_subagent_completed_for_tui(
@@ -199,7 +211,7 @@ pub(crate) fn execute_subagent_batch_for_tui(
                 let _ = registry.fail_with_usage(task_id, error, usage);
             }
             let mut task_events = EventFactory::new(task_id.to_string());
-            send_workflow_tasks_updated_for_tui(event_tx, &mut task_events, &registry.list());
+            send_subagent_task_status_for_tui(event_tx, &mut task_events, registry, task_id);
         }
 
         let (should_stop, result, cost_tracker) = child_result_to_tui_tool_result(
@@ -423,11 +435,16 @@ fn launch_async_subagent_for_tui(
             );
             let _ = child_registry.fail_with_usage(&thread_agent_id, error, usage);
         }
-        send_workflow_tasks_updated_for_tui(&child_event_tx, &mut events, &child_registry.list());
+        send_subagent_task_status_for_tui(
+            &child_event_tx,
+            &mut events,
+            &child_registry,
+            &thread_agent_id,
+        );
     });
 
     let mut events = EventFactory::new(agent_id.clone());
-    send_workflow_tasks_updated_for_tui(event_tx, &mut events, &task_registry.list());
+    send_subagent_task_status_for_tui(event_tx, &mut events, task_registry, &agent_id);
     tool_types::ToolResult::completed(
         tool_request,
         serde_json::json!({
@@ -700,7 +717,7 @@ fn make_subagent_progress_observer(
         if let (Some(registry), Some(task_id)) = (&registry, &registry_task_id) {
             update_registry_from_subagent_progress(registry, task_id, &progress);
             let mut progress_events = EventFactory::new(task_id.clone());
-            send_workflow_tasks_updated_for_tui(&event_tx, &mut progress_events, &registry.list());
+            send_subagent_task_status_for_tui(&event_tx, &mut progress_events, registry, task_id);
         }
         let _ = event_tx.send(progress);
     })
