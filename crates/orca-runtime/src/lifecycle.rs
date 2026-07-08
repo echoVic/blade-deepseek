@@ -102,7 +102,6 @@ pub(crate) struct AgentLoopContext<'a> {
     pub(crate) turn_deps: Option<RuntimeTurnDeps<'a>>,
     pub(crate) turn_state: Option<RuntimeTurnState<'a>>,
     pub(crate) turn_execution: Option<RuntimeTurnExecution<'a>>,
-    pub(crate) turn_interactions: RuntimeTurnInteractionState<'a>,
 }
 
 #[derive(Clone, Debug)]
@@ -122,6 +121,7 @@ pub(crate) struct RuntimeTurnDeps<'a> {
     pub(crate) memory: &'a MemoryBlock,
     pub(crate) mcp_registry: &'a McpRegistry,
     pub(crate) hooks: &'a HookRunner,
+    pub(crate) turn_interactions: RuntimeTurnInteractionState<'a>,
 }
 
 pub(crate) struct RuntimeTurnState<'a> {
@@ -711,7 +711,6 @@ impl<'a> AgentLoopContext<'a> {
             turn_deps: None,
             turn_state: None,
             turn_execution: None,
-            turn_interactions: RuntimeTurnInteractionState::new(),
         }
     }
 
@@ -856,9 +855,11 @@ impl<'a> AgentLoopContext<'a> {
         mut self,
         permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
     ) -> Self {
-        self.turn_interactions = self
-            .turn_interactions
-            .with_permission_handler(permission_handler);
+        self.turn_deps = Some(
+            self.turn_deps
+                .expect("agent loop turn deps")
+                .with_permission_handler(permission_handler),
+        );
         self
     }
 
@@ -866,15 +867,17 @@ impl<'a> AgentLoopContext<'a> {
         mut self,
         user_input_handler: Option<&'a dyn RuntimeUserInputHandler>,
     ) -> Self {
-        self.turn_interactions = self
-            .turn_interactions
-            .with_user_input_handler(user_input_handler);
+        self.turn_deps = Some(
+            self.turn_deps
+                .expect("agent loop turn deps")
+                .with_user_input_handler(user_input_handler),
+        );
         self
     }
 
     #[cfg(test)]
     pub(crate) fn turn_interactions(&self) -> RuntimeTurnInteractionState<'a> {
-        self.turn_interactions
+        self.turn_deps().turn_interactions()
     }
 
     #[cfg(test)]
@@ -985,6 +988,7 @@ impl<'a> RuntimeTurnDeps<'a> {
             memory,
             mcp_registry,
             hooks,
+            turn_interactions: RuntimeTurnInteractionState::new(),
         }
     }
 
@@ -1006,6 +1010,31 @@ impl<'a> RuntimeTurnDeps<'a> {
     #[cfg(test)]
     pub(crate) fn hooks(&self) -> &'a HookRunner {
         self.hooks
+    }
+
+    pub(crate) fn with_permission_handler(
+        mut self,
+        permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
+    ) -> Self {
+        self.turn_interactions = self
+            .turn_interactions
+            .with_permission_handler(permission_handler);
+        self
+    }
+
+    pub(crate) fn with_user_input_handler(
+        mut self,
+        user_input_handler: Option<&'a dyn RuntimeUserInputHandler>,
+    ) -> Self {
+        self.turn_interactions = self
+            .turn_interactions
+            .with_user_input_handler(user_input_handler);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn turn_interactions(&self) -> RuntimeTurnInteractionState<'a> {
+        self.turn_interactions
     }
 }
 

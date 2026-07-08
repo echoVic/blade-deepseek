@@ -247,8 +247,11 @@ copied into Orca.
    live with the other immutable turn inputs inside `RuntimeTurnConfig`, and
    runtime steering handles now enter the turn through the same config
    boundary, so `AgentLoopContext` no longer carries either as a separate ad
-   hoc field. Keep borrowing package 3's explicit loop-local `State` idea, but
-   avoid a single giant context object.
+   hoc field. Turn-scoped permission and user-input handlers now live with the
+   other injected services in `RuntimeTurnDeps`, keeping TUI interaction
+   routing on the same dependency boundary as server/headless turns. Keep
+   borrowing package 3's explicit loop-local `State` idea, but avoid a single
+   giant context object.
 4. **P3: Protocolized task/thread/interactive status.** Push background task,
    approval-needed, needs-input, foregrounded/backgrounded, and completed
    status through runtime protocol events so TUI, server, and future app

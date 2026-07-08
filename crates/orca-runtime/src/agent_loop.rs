@@ -49,13 +49,13 @@ pub(crate) fn run_agent_loop(
         turn_deps,
         turn_state,
         turn_execution,
-        turn_interactions,
     } = loop_context;
     let RuntimeTurnDeps {
         instructions,
         memory,
         mcp_registry,
         hooks,
+        turn_interactions,
     } = turn_deps.expect("agent loop turn deps");
     let turn_state = turn_state.expect("agent loop turn state");
     let loop_state = turn_state.into_loop_state();
@@ -579,8 +579,13 @@ mod tests {
         let subagent_type = SubagentType::General;
         let handler = TestPermissionHandler;
         let user_input_handler = TestUserInputHandler;
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let registry = McpRegistry::default();
+        let hooks = HookRunner::default();
 
         let context = AgentLoopContext::new(&cwd, "inspect repo", 0, true, &subagent_type)
+            .with_services(&instructions, &memory, &registry, &hooks)
             .with_permission_handler(Some(&handler))
             .with_user_input_handler(Some(&user_input_handler));
 

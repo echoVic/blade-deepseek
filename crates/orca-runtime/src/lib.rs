@@ -715,7 +715,7 @@ mod tests {
         );
         assert!(
             lifecycle_source.contains("turn_interactions: RuntimeTurnInteractionState<'a>"),
-            "AgentLoopContext must carry turn-scoped interaction handlers through one grouped field"
+            "RuntimeTurnDeps must carry turn-scoped interaction handlers through one grouped field"
         );
         assert!(
             lifecycle_source
@@ -732,6 +732,22 @@ mod tests {
         assert!(
             !agent_loop_context_struct.contains("permission_handler:"),
             "AgentLoopContext must not expose permission_handler as a parallel top-level field"
+        );
+        assert!(
+            !agent_loop_context_struct
+                .contains("turn_interactions: RuntimeTurnInteractionState<'a>"),
+            "AgentLoopContext must not carry turn interaction handlers outside RuntimeTurnDeps"
+        );
+        let turn_deps_struct = lifecycle_source
+            .split("pub(crate) struct RuntimeTurnDeps<'a> {")
+            .nth(1)
+            .expect("RuntimeTurnDeps struct body")
+            .split("}")
+            .next()
+            .expect("RuntimeTurnDeps struct end");
+        assert!(
+            turn_deps_struct.contains("turn_interactions: RuntimeTurnInteractionState<'a>"),
+            "RuntimeTurnDeps must own turn interaction handlers with other injected turn services"
         );
         assert!(
             agent_loop_source.contains("turn_interactions"),
