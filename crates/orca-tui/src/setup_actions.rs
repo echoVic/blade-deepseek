@@ -1,0 +1,85 @@
+use std::io;
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
+
+use crossterm::event::{Event, KeyCode, KeyEvent};
+use tui_textarea::{Input, TextArea};
+
+use orca_core::config::RunConfig;
+use orca_core::config::file::save_api_key;
+
+use crate::composer_textarea::{make_setup_textarea, make_textarea};
+use crate::theme::Theme;
+use crate::types::{AppState, AppStatus, ChatMessage, UserAction};
+use crate::vim::VimState;
+
+pub(crate) enum SetupFlow {
+    Continue,
+    Exit(i32),
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn handle_setup_key(
+    ev: &Event,
+    key: &KeyEvent,
+    state: &mut AppState,
+    config: &mut RunConfig,
+    shared_config: &Arc<Mutex<RunConfig>>,
+    action_tx: &mpsc::Sender<UserAction>,
+    textarea: &mut TextArea,
+    vim_state: &VimState,
+    theme: &Theme,
+    initial_prompt: Option<String>,
+) -> io::Result<SetupFlow> {
+    match state.setup_step {
+        0 => match key.code {
+            KeyCode::Enter => {
+                state.setup_step = 1;
+                *textarea = make_setup_textarea(theme);
+            }
+            KeyCode::Esc => {
+                return Ok(SetupFlow::Exit(0));
+            }
+            _ => {}
+        },
+        1 => match key.code {
+            KeyCode::Enter => {
+                let lines: Vec<String> = textarea.lines().to_vec();
+                let key_input = lines.join("").trim().to_string();
+                if !key_input.is_empty() {
+                    save_api_key(&key_input);
+                    config.api_key = Some(key_input.clone());
+                    if let Ok(mut cfg) = shared_config.lock() {
+                        cfg.api_key = Some(key_input);
+                    }
+                    state.setup_step = 2;
+                }
+            }
+            KeyCode::Esc => {
+                return Ok(SetupFlow::Exit(0));
+            }
+            _ => {
+                textarea.input(Input::from(ev.clone()));
+            }
+        },
+        2 => match key.code {
+            KeyCode::Enter => {
+                state.set_status(AppStatus::Idle);
+                state.setup_step = 0;
+                *textarea = make_textarea(vim_state, theme);
+
+                if let Some(prompt) = initial_prompt {
+                    state.messages.push(ChatMessage::User(prompt.clone()));
+                    state.enter_running();
+                    let _ = action_tx.send(UserAction::Submit(prompt));
+                }
+            }
+            KeyCode::Esc => {
+                return Ok(SetupFlow::Exit(0));
+            }
+            _ => {}
+        },
+        _ => {}
+    }
+    Ok(SetupFlow::Continue)
+}

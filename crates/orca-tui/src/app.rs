@@ -14,11 +14,10 @@ use crossterm::event::{
 use crossterm::terminal;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use tui_textarea::{Input, TextArea};
+use tui_textarea::TextArea;
 
 use orca_core::approval_types::ApprovalMode;
 use orca_core::cancel::CancelToken;
-use orca_core::config::file::save_api_key;
 use orca_core::config::{HistoryMode, RunConfig};
 use orca_core::conversation::Message;
 use orca_core::model::ModelSelection;
@@ -45,6 +44,7 @@ use crate::idle_submit_actions::handle_idle_submit;
 use crate::mention_menu_actions::handle_mention_menu_key;
 use crate::running_actions::handle_running_shortcut;
 use crate::session_picker_actions::handle_session_picker_key;
+use crate::setup_actions::{SetupFlow, handle_setup_key};
 use crate::shortcuts::{
     IdleShortcut, RunningShortcut, global_shortcut, idle_shortcut, running_shortcut,
 };
@@ -322,69 +322,26 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
 
                 // Setup mode: step-by-step
                 if state.status == AppStatus::Setup {
-                    match state.setup_step {
-                        0 => {
-                            // Welcome screen — Enter to continue, Esc to quit
-                            match key.code {
-                                KeyCode::Enter => {
-                                    state.setup_step = 1;
-                                    textarea = make_setup_textarea(&theme);
-                                }
-                                KeyCode::Esc => {
-                                    exit_code = 0;
-                                    break;
-                                }
-                                _ => {}
-                            }
+                    match handle_setup_key(
+                        &ev,
+                        key,
+                        &mut state,
+                        &mut config,
+                        &shared_config,
+                        &action_tx,
+                        &mut textarea,
+                        &vim_state,
+                        &theme,
+                        initial_prompt.clone(),
+                    )? {
+                        SetupFlow::Continue => {
+                            continue;
                         }
-                        1 => {
-                            // API key input
-                            match key.code {
-                                KeyCode::Enter => {
-                                    let lines: Vec<String> = textarea.lines().to_vec();
-                                    let key_input = lines.join("").trim().to_string();
-                                    if !key_input.is_empty() {
-                                        save_api_key(&key_input);
-                                        config.api_key = Some(key_input.clone());
-                                        if let Ok(mut cfg) = shared_config.lock() {
-                                            cfg.api_key = Some(key_input);
-                                        }
-                                        state.setup_step = 2;
-                                    }
-                                }
-                                KeyCode::Esc => {
-                                    exit_code = 0;
-                                    break;
-                                }
-                                _ => {
-                                    textarea.input(Input::from(ev));
-                                }
-                            }
+                        SetupFlow::Exit(code) => {
+                            exit_code = code;
+                            break;
                         }
-                        2 => {
-                            // Completion screen — Enter to start
-                            match key.code {
-                                KeyCode::Enter => {
-                                    state.set_status(AppStatus::Idle);
-                                    state.setup_step = 0;
-                                    textarea = make_textarea(&vim_state, &theme);
-
-                                    if let Some(prompt) = initial_prompt.clone() {
-                                        state.messages.push(ChatMessage::User(prompt.clone()));
-                                        state.enter_running();
-                                        let _ = action_tx.send(UserAction::Submit(prompt));
-                                    }
-                                }
-                                KeyCode::Esc => {
-                                    exit_code = 0;
-                                    break;
-                                }
-                                _ => {}
-                            }
-                        }
-                        _ => {}
                     }
-                    continue;
                 }
 
                 if state.status == AppStatus::SessionPicker {

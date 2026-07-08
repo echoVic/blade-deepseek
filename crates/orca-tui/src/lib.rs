@@ -21,6 +21,7 @@ mod running_actions;
 mod runtime_event_projection;
 mod runtime_interaction_adapter;
 mod session_picker_actions;
+mod setup_actions;
 pub mod shortcuts;
 mod slash_command_actions;
 mod slash_menu_actions;
@@ -733,6 +734,44 @@ mod tests {
         assert!(
             !app.contains("history::load_session(&session_id)"),
             "app should use session_picker_actions instead of loading selected sessions inline"
+        );
+    }
+
+    #[test]
+    fn tui_setup_actions_are_owned_by_dedicated_module() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let setup_actions = std::fs::read_to_string(format!("{manifest_dir}/src/setup_actions.rs"))
+            .expect("setup_actions module should exist");
+        assert!(
+            setup_actions.contains("pub(crate) fn handle_setup_key"),
+            "setup_actions should own setup-mode key handling"
+        );
+        assert!(
+            setup_actions.contains("save_api_key"),
+            "setup_actions should own API key persistence"
+        );
+        assert!(
+            setup_actions.contains("config.api_key = Some"),
+            "setup_actions should update run config API key"
+        );
+        assert!(
+            setup_actions.contains("UserAction::Submit"),
+            "setup_actions should own initial prompt submission after setup"
+        );
+        assert!(
+            setup_actions.contains("make_setup_textarea"),
+            "setup_actions should own transition into API-key input"
+        );
+
+        let app = std::fs::read_to_string(format!("{manifest_dir}/src/app.rs"))
+            .expect("app source should be readable");
+        assert!(
+            !app.contains("save_api_key(&key_input)"),
+            "app should use setup_actions instead of saving API keys inline"
+        );
+        assert!(
+            !app.contains("state.setup_step = 2"),
+            "app should use setup_actions instead of advancing setup completion inline"
         );
     }
 

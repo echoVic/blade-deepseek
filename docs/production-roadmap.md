@@ -422,6 +422,10 @@ copied into Orca.
    module, covering picker navigation/search, selected-session resume config
    updates, transcript projection, preloaded transcript storage, and terminal
    cleanup after resume.
+   First-run setup key handling now lives in a focused TUI setup action module,
+   covering setup-step transitions, API key persistence/config propagation,
+   masked setup input editing, completion exit flow, and optional initial
+   prompt submission after setup.
    Runtime task summaries now also expose terminal `result`/`error` fields so
    the selected task row can show completion output or failure details in the
    panel. The
