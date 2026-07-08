@@ -1934,6 +1934,54 @@ mod tests {
     }
 
     #[test]
+    fn workflow_notification_submit_uses_notification_task_label() {
+        with_orca_home(|_| {
+            let config = Arc::new(Mutex::new(test_config(HistoryMode::Record)));
+            let preloaded = Arc::new(Mutex::new(None));
+            let (event_tx, event_rx) = mpsc::channel();
+            let (action_tx, action_rx) = mpsc::channel();
+            let cancel = CancelToken::new();
+
+            let handle = std::thread::spawn({
+                let config = Arc::clone(&config);
+                let preloaded = Arc::clone(&preloaded);
+                let cancel = cancel.clone();
+                move || {
+                    agent_loop_thread(
+                        config,
+                        preloaded,
+                        event_tx,
+                        action_rx,
+                        cancel,
+                        test_pending_workflow_notifications(),
+                    )
+                }
+            });
+
+            action_tx
+                .send(UserAction::SubmitWorkflowNotification {
+                    id: "notification-1".to_string(),
+                    prompt: "<task-notification>mock_history_echo</task-notification>".to_string(),
+                })
+                .unwrap();
+
+            let task = loop {
+                let event = event_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                if let Some(task) = matching_task_update(event, |task| {
+                    task.task_type == orca_core::task_types::TaskType::MainSession
+                }) {
+                    break task;
+                }
+            };
+
+            action_tx.send(UserAction::Cancel).unwrap();
+            handle.join().unwrap();
+
+            assert_eq!(task.description, "Workflow notification notification-1");
+        });
+    }
+
+    #[test]
     fn backgrounded_agent_loop_does_not_complete_unexecuted_tool_calls() {
         with_orca_home(|_| {
             let config = Arc::new(Mutex::new(test_config(HistoryMode::Record)));
@@ -3834,6 +3882,7 @@ fn run_goal_turns_for_tui(
     config: &RunConfig,
     session: &mut bridge::TuiConversationSession,
     initial_prompt: &str,
+    initial_task_description: Option<String>,
     event_tx: &mpsc::Sender<TuiEvent>,
     action_rx: &mpsc::Receiver<UserAction>,
     pending_actions: &RefCell<VecDeque<UserAction>>,
@@ -3849,6 +3898,7 @@ fn run_goal_turns_for_tui(
     };
 
     let mut prompt = initial_prompt.to_string();
+    let mut task_description = initial_task_description;
     let mut continuation = starting_continuation;
     loop {
         if let Ok(Some(goal)) = orca_runtime::goals::GoalStore::load_default().get(&session_id)
@@ -3869,6 +3919,7 @@ fn run_goal_turns_for_tui(
             pending_actions,
             cancel,
             true,
+            task_description.as_deref(),
             Some(pending_workflow_notifications),
         );
         let status = turn_result.status;
@@ -3910,6 +3961,9 @@ fn run_goal_turns_for_tui(
             // Workflow failure notifications are diagnostic follow-ups for the turn that just
             // finished, so they do not consume goal-continuation quota or wait for the next
             // goal-status poll.
+            task_description = Some(workflow_notification_task_label(
+                &next_workflow_notification.id,
+            ));
             prompt = next_workflow_notification.prompt;
             continue;
         }
@@ -3949,6 +4003,7 @@ fn run_goal_turns_for_tui(
             break;
         }
         prompt = goal_continuation_prompt(&goal.objective, continuation);
+        task_description = None;
     }
 }
 
@@ -4063,6 +4118,7 @@ fn resume_latest_active_goal_for_tui(
             &cfg,
             session,
             &prompt,
+            None,
             event_tx,
             action_rx,
             pending_actions,
@@ -4092,6 +4148,7 @@ enum SubmittedTurnSource {
 struct SubmittedTurn {
     prompt: String,
     source: SubmittedTurnSource,
+    task_description: Option<String>,
 }
 
 impl SubmittedTurn {
@@ -4099,22 +4156,28 @@ impl SubmittedTurn {
         Self {
             prompt,
             source: SubmittedTurnSource::User,
+            task_description: None,
         }
     }
 
-    fn workflow_notification(prompt: String) -> Self {
+    fn workflow_notification(id: String, prompt: String) -> Self {
         Self {
             prompt,
             source: SubmittedTurnSource::WorkflowNotification,
+            task_description: Some(workflow_notification_task_label(&id)),
         }
     }
 
-    fn prompt_for_model(self, cwd: &std::path::Path) -> Result<String, String> {
+    fn prompt_for_model(&self, cwd: &std::path::Path) -> Result<String, String> {
         match self.source {
             SubmittedTurnSource::User => mentions::expand_file_mentions(&self.prompt, cwd),
-            SubmittedTurnSource::WorkflowNotification => Ok(self.prompt),
+            SubmittedTurnSource::WorkflowNotification => Ok(self.prompt.clone()),
         }
     }
+}
+
+fn workflow_notification_task_label(id: &str) -> String {
+    format!("Workflow notification {id}")
 }
 
 fn handle_submitted_turn_for_tui(
@@ -4167,6 +4230,7 @@ fn handle_submitted_turn_for_tui(
         &cfg,
         session.as_mut().expect("session initialized"),
         &prompt,
+        submitted_turn.task_description,
         event_tx,
         action_rx,
         pending_actions,
@@ -4207,9 +4271,9 @@ fn agent_loop_thread(
                     &pending_workflow_notifications,
                 );
             }
-            Ok(UserAction::SubmitWorkflowNotification { prompt, .. }) => {
+            Ok(UserAction::SubmitWorkflowNotification { id, prompt }) => {
                 handle_submitted_turn_for_tui(
-                    SubmittedTurn::workflow_notification(prompt),
+                    SubmittedTurn::workflow_notification(id, prompt),
                     &config,
                     &preloaded,
                     &mut session,
@@ -4410,6 +4474,7 @@ fn agent_loop_thread(
                                 &cfg,
                                 session,
                                 &objective,
+                                None,
                                 &event_tx,
                                 &action_rx,
                                 &pending_actions,
@@ -4513,6 +4578,7 @@ fn agent_loop_thread(
                             &cfg,
                             session,
                             &prompt,
+                            None,
                             &event_tx,
                             &action_rx,
                             &pending_actions,

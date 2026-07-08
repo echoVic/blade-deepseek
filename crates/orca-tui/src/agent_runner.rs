@@ -834,6 +834,7 @@ pub fn run_agent_for_tui(
         cancel,
         allow_goal_tools,
         None,
+        None,
     )
     .status
 }
@@ -847,6 +848,7 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
     pending_actions: &RefCell<VecDeque<UserAction>>,
     cancel: &CancelToken,
     allow_goal_tools: bool,
+    task_description: Option<&str>,
     pending_workflow_notifications: Option<&PendingWorkflowNotifications>,
 ) -> TuiAgentTurnResult {
     let cwd = config
@@ -891,8 +893,12 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
             .unwrap_or("tui-agent-session")
             .to_string(),
     );
-    let main_session_task_id =
-        start_main_session_task_for_tui(session, event_tx, &mut runtime_events, prompt);
+    let main_session_task_id = start_main_session_task_for_tui(
+        session,
+        event_tx,
+        &mut runtime_events,
+        task_description.unwrap_or(prompt),
+    );
     let mut main_session_backgrounded = false;
     poll_background_current_turn_for_tui(
         session,
@@ -2307,6 +2313,7 @@ mod tests {
             &pending_actions,
             &cancel,
             false,
+            None,
             Some(&pending_notifications),
         );
 
@@ -2349,6 +2356,7 @@ mod tests {
             &pending_actions,
             &cancel,
             false,
+            None,
             Some(&pending_notifications),
         );
 
