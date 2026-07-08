@@ -5332,6 +5332,29 @@ mod tests {
             runtime_turn_loop_source.contains("pub(crate) struct RuntimeTurnRequestContext"),
             "runtime_turn_loop must own a named request context for immutable turn inputs"
         );
+        let request_context = runtime_turn_loop_source
+            .split("pub(crate) struct RuntimeTurnRequestContext")
+            .nth(1)
+            .and_then(|source| source.split("#[derive(Clone, Copy)]").next())
+            .expect("RuntimeTurnRequestContext source");
+        assert!(
+            request_context.contains("turn_context: RuntimeTurnContext"),
+            "RuntimeTurnRequestContext must wrap the lifecycle-owned immutable turn context"
+        );
+        for field_name in [
+            "cwd: &'a Path",
+            "emit_deltas: bool",
+            "prompt: &'a str",
+            "subagent_type: &'a SubagentType",
+            "continuation: Option<RuntimeTurnContinuation>",
+            "steer_handle: Option<&'a ThreadSteerHandle>",
+            "subagent_depth: u32",
+        ] {
+            assert!(
+                !request_context.contains(field_name),
+                "RuntimeTurnRequestContext must not duplicate turn context field {field_name}"
+            );
+        }
         for source in [turn_loop_input, turn_iteration_input] {
             assert!(
                 source.contains("request: RuntimeTurnRequestContext"),

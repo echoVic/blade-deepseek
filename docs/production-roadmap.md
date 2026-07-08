@@ -329,7 +329,8 @@ copied into Orca.
    `EventFactory`/`EventSink` fields. Turn-loop provider/model refs now pass
    through `RuntimeTurnProviderContext` instead of parallel provider,
    provider-config, model, and budget fields, and immutable request inputs now
-   pass through `RuntimeTurnRequestContext` instead of parallel cwd, prompt,
+   enter the turn loop as the lifecycle-owned `RuntimeTurnContext` wrapped by
+   `RuntimeTurnRequestContext` instead of re-expanding cwd, prompt,
    continuation, steering, and subagent fields. `RuntimeAgentTurnLoopInput`
    now enters the loop through those same provider/request contexts instead of
    rebuilding parallel fields at the loop boundary, and turn-loop stages now

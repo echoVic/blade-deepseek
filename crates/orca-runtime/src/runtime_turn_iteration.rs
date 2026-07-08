@@ -2,7 +2,8 @@ use std::io;
 
 use crate::agent_child::ChildAgentExecutor;
 use crate::lifecycle::{
-    AgentLoopResult, RuntimeTaskActor, RuntimeTurnDeps, RuntimeTurnLoopIterationState,
+    AgentLoopResult, RuntimeTaskActor, RuntimeTurnContext, RuntimeTurnDeps,
+    RuntimeTurnLoopIterationState,
 };
 use crate::provider_turn::{
     RuntimeProviderCycleInput, RuntimeTurnProviderCycleResult, RuntimeTurnProviderCycleStep,
@@ -55,6 +56,16 @@ impl RuntimeTurnIterationStep {
         workflow_child_executor: ChildAgentExecutor<SharedEventBuffer>,
         batch_child_executor: ChildAgentExecutor<io::Sink>,
     ) -> io::Result<RuntimeTurnIterationResult> {
+        let RuntimeTurnContext {
+            cwd,
+            prompt,
+            subagent_depth,
+            emit_deltas,
+            subagent_type,
+            continuation,
+            steer_handle,
+        } = input.request.turn_context;
+
         let turn_provider_config = {
             let (conversation, history_writer) = input.prepared_conversation.parts_mut();
             match self.opening_step.open(RuntimeTurnOpeningInput {
@@ -62,19 +73,19 @@ impl RuntimeTurnIterationStep {
                 provider: input.provider_context.provider,
                 context_config: input.provider_context.context_config,
                 provider_config: input.provider_context.provider_config,
-                cwd: input.request.cwd,
-                emit_deltas: input.request.emit_deltas,
+                cwd,
+                emit_deltas,
                 hooks: input.deps.hooks,
                 events: input.output.events,
                 sink: input.output.sink,
                 conversation,
                 history_writer,
-                prompt: input.request.prompt,
+                prompt,
                 model: input.provider_context.model,
-                subagent_type: input.request.subagent_type,
+                subagent_type,
                 model_override: input.loop_state.model_override,
                 cost_tracker: input.loop_state.cost_tracker,
-                steer_handle: input.request.steer_handle,
+                steer_handle,
             })? {
                 RuntimeTurnOpeningResult::Continue { provider_config } => provider_config,
                 RuntimeTurnOpeningResult::Return(result) => {
@@ -87,13 +98,13 @@ impl RuntimeTurnIterationStep {
             RuntimeProviderCycleInput {
                 actor: input.actor,
                 provider: input.provider_context.provider,
-                continuation: input.request.continuation,
+                continuation,
                 turn_provider_config: &turn_provider_config,
                 runtime_system_messages: input.loop_state.runtime_system_messages,
-                cwd: input.request.cwd,
+                cwd,
                 context_config: input.provider_context.context_config,
                 base_provider_config: input.provider_context.provider_config,
-                emit_deltas: input.request.emit_deltas,
+                emit_deltas,
                 capabilities: RuntimeStepCapabilitySnapshot::new(
                     input.deps.instructions,
                     input.deps.memory,
@@ -112,11 +123,11 @@ impl RuntimeTurnIterationStep {
                 conversation: input.prepared_conversation,
                 config: input.policy.config,
                 tool_policy: input.policy.tool_policy,
-                subagent_depth: input.request.subagent_depth,
+                subagent_depth,
                 policy: input.policy.approval_policy,
                 extensions: input.loop_state.extensions,
                 background_workflows: input.workflow.background_workflows,
-                steer_handle: input.request.steer_handle,
+                steer_handle,
             },
             child_executor,
             workflow_child_executor,

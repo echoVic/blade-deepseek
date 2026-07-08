@@ -38,20 +38,19 @@ pub(crate) fn run_agent_loop(
     tool_policy: AgentToolPolicyContext<'_>,
 ) -> io::Result<AgentLoopResult> {
     let AgentLoopContext {
-        turn_context:
-            RuntimeTurnContext {
-                cwd,
-                prompt,
-                subagent_depth,
-                emit_deltas,
-                subagent_type,
-                continuation,
-                steer_handle,
-            },
+        turn_context,
         turn_deps,
         turn_state,
         turn_execution,
     } = loop_context;
+    let RuntimeTurnContext {
+        cwd,
+        prompt,
+        subagent_depth,
+        emit_deltas,
+        subagent_type,
+        ..
+    } = turn_context.clone();
     let turn_deps = turn_deps.expect("agent loop turn deps");
     let turn_state = turn_state.expect("agent loop turn state");
     let loop_state = turn_state.into_loop_state();
@@ -100,15 +99,7 @@ pub(crate) fn run_agent_loop(
                 &config.model,
                 config.max_budget_usd,
             ),
-            request: RuntimeTurnRequestContext::new(
-                cwd,
-                emit_deltas,
-                prompt,
-                subagent_type,
-                continuation,
-                steer_handle,
-                subagent_depth,
-            ),
+            request: RuntimeTurnRequestContext::new(turn_context),
             deps: turn_deps,
             output: RuntimeTurnOutputContext::new(events, sink),
             prepared_conversation: &mut prepared_conversation,

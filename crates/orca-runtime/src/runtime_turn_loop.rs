@@ -1,18 +1,15 @@
 use std::io;
-use std::path::Path;
 
 use orca_approval::ApprovalPolicy;
 use orca_core::config::{ProviderKind, RunConfig};
 use orca_core::event_schema::EventFactory;
 use orca_core::event_sink::EventSink;
 use orca_core::model::ModelSelection;
-use orca_core::subagent_types::SubagentType;
 use orca_provider::{ProviderConfig, context};
 
 use crate::agent_child::ChildAgentExecutor;
-use crate::background_turn::RuntimeTurnContinuation;
 use crate::lifecycle::{
-    AgentLoopResult, RuntimeTaskActor, RuntimeTurnDeps, RuntimeTurnLoopState, ThreadSteerHandle,
+    AgentLoopResult, RuntimeTaskActor, RuntimeTurnContext, RuntimeTurnDeps, RuntimeTurnLoopState,
 };
 use crate::runtime_conversation_bootstrap::RuntimePreparedConversation;
 use crate::runtime_turn_iteration::{
@@ -46,13 +43,7 @@ pub(crate) struct RuntimeTurnProviderContext<'a> {
 }
 
 pub(crate) struct RuntimeTurnRequestContext<'a> {
-    pub(crate) cwd: &'a Path,
-    pub(crate) emit_deltas: bool,
-    pub(crate) prompt: &'a str,
-    pub(crate) subagent_type: &'a SubagentType,
-    pub(crate) continuation: Option<RuntimeTurnContinuation>,
-    pub(crate) steer_handle: Option<&'a ThreadSteerHandle>,
-    pub(crate) subagent_depth: u32,
+    pub(crate) turn_context: RuntimeTurnContext<'a>,
 }
 
 #[derive(Clone, Copy)]
@@ -187,36 +178,21 @@ impl<'a> RuntimeTurnProviderContext<'a> {
 }
 
 impl<'a> RuntimeTurnRequestContext<'a> {
-    pub(crate) fn new(
-        cwd: &'a Path,
-        emit_deltas: bool,
-        prompt: &'a str,
-        subagent_type: &'a SubagentType,
-        continuation: Option<RuntimeTurnContinuation>,
-        steer_handle: Option<&'a ThreadSteerHandle>,
-        subagent_depth: u32,
-    ) -> Self {
-        Self {
-            cwd,
-            emit_deltas,
-            prompt,
-            subagent_type,
-            continuation,
-            steer_handle,
-            subagent_depth,
-        }
+    pub(crate) fn new(turn_context: RuntimeTurnContext<'a>) -> Self {
+        Self { turn_context }
     }
 
     fn for_iteration(&mut self) -> Self {
-        Self {
-            cwd: self.cwd,
-            emit_deltas: self.emit_deltas,
-            prompt: self.prompt,
-            subagent_type: self.subagent_type,
-            continuation: self.continuation.take(),
-            steer_handle: self.steer_handle,
-            subagent_depth: self.subagent_depth,
-        }
+        let turn_context = RuntimeTurnContext {
+            cwd: self.turn_context.cwd,
+            prompt: self.turn_context.prompt,
+            subagent_depth: self.turn_context.subagent_depth,
+            emit_deltas: self.turn_context.emit_deltas,
+            subagent_type: self.turn_context.subagent_type,
+            continuation: self.turn_context.continuation.take(),
+            steer_handle: self.turn_context.steer_handle,
+        };
+        Self { turn_context }
     }
 }
 
@@ -315,6 +291,7 @@ mod tests {
     use orca_core::model::ModelSelection;
     use orca_core::provider_types::{ProviderResponse, ProviderStep};
     use orca_core::subagent_config::SubagentConfig;
+    use orca_core::subagent_types::SubagentType;
     use orca_mcp::McpRegistry;
 
     use crate::cost::CostTracker;
@@ -431,13 +408,8 @@ mod tests {
                 None,
             ),
             request: RuntimeTurnRequestContext::new(
-                cwd.path(),
-                true,
-                "continue",
-                &subagent_type,
-                Some(continuation),
-                None,
-                0,
+                RuntimeTurnContext::new(cwd.path(), "continue", 0, true, &subagent_type)
+                    .with_continuation(continuation),
             ),
             deps: RuntimeTurnDeps::new(&instructions, &memory, &mcp_registry, &hooks),
             output: RuntimeTurnOutputContext::new(&mut events, &mut sink),
@@ -456,6 +428,7 @@ mod tests {
             assert_eq!(
                 first_iteration
                     .request
+                    .turn_context
                     .continuation
                     .as_ref()
                     .and_then(|continuation| continuation.response.assistant_content.as_deref()),
@@ -464,6 +437,7 @@ mod tests {
             assert_eq!(
                 first_iteration
                     .request
+                    .turn_context
                     .continuation
                     .as_ref()
                     .and_then(|continuation| continuation.preapproved_tool_call_id()),
@@ -472,7 +446,7 @@ mod tests {
         }
         {
             let second_iteration = input.iteration_input();
-            assert!(second_iteration.request.continuation.is_none());
+            assert!(second_iteration.request.turn_context.continuation.is_none());
         }
     }
 }
