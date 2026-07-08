@@ -56,15 +56,16 @@ impl RuntimeTurnIterationStep {
         workflow_child_executor: ChildAgentExecutor<SharedEventBuffer>,
         batch_child_executor: ChildAgentExecutor<io::Sink>,
     ) -> io::Result<RuntimeTurnIterationResult> {
+        let turn_context = input.request.turn_context;
         let RuntimeTurnContext {
             cwd,
             prompt,
-            subagent_depth,
+            subagent_depth: _,
             emit_deltas,
             subagent_type,
             continuation,
             steer_handle,
-        } = input.request.turn_context;
+        } = turn_context.clone();
 
         let turn_provider_config = {
             let (conversation, history_writer) = input.prepared_conversation.parts_mut();
@@ -99,6 +100,7 @@ impl RuntimeTurnIterationStep {
                 actor: input.actor,
                 provider: input.provider_context.provider,
                 continuation,
+                turn_context,
                 turn_provider_config: &turn_provider_config,
                 runtime_system_messages: input.loop_state.runtime_system_messages,
                 cwd,
@@ -123,7 +125,6 @@ impl RuntimeTurnIterationStep {
                 conversation: input.prepared_conversation,
                 config: input.policy.config,
                 tool_policy: input.policy.tool_policy,
-                subagent_depth,
                 policy: input.policy.approval_policy,
                 extensions: input.loop_state.extensions,
                 background_workflows: input.workflow.background_workflows,

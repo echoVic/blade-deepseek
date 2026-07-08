@@ -338,6 +338,10 @@ copied into Orca.
    instruction, memory, MCP, and interaction fields. Turn-loop policy/config
    refs now pass through `RuntimeTurnPolicyContext` instead of repeating run
    config, directive-resolved tool policy, and approval policy fields.
+   `RuntimeStepSnapshot` now also keeps those immutable turn inputs behind the
+   same lifecycle-owned `RuntimeTurnContext`, so provider-response and tool-turn
+   paths no longer read cwd, depth, or delta flags from a second flattened
+   snapshot shape.
    Iteration stages now keep lifecycle-owned `RuntimeTurnLoopIterationState`
    grouped instead of unpacking runtime system messages, model overrides,
    cost/cancel/task refs, and extension refs into the iteration input. Keep

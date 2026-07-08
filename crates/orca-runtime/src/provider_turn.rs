@@ -20,7 +20,9 @@ use crate::extension::RuntimeExtensionContext;
 use crate::hooks::{HookRunner, conversation_with_hook_context};
 #[cfg(test)]
 use crate::instructions::ProjectInstructions;
-use crate::lifecycle::{AgentLoopResult, RuntimeTaskActor, RuntimeTurnStartError};
+use crate::lifecycle::{
+    AgentLoopResult, RuntimeTaskActor, RuntimeTurnContext, RuntimeTurnStartError,
+};
 use crate::memory;
 #[cfg(test)]
 use crate::memory::MemoryBlock;
@@ -59,6 +61,7 @@ pub(crate) struct RuntimeProviderCycleInput<'a, 'runtime, W: io::Write> {
     pub(crate) actor: &'a mut RuntimeTaskActor<'runtime>,
     pub(crate) provider: ProviderKind,
     pub(crate) continuation: Option<RuntimeTurnContinuation>,
+    pub(crate) turn_context: RuntimeTurnContext<'a>,
     pub(crate) turn_provider_config: &'a ProviderConfig,
     pub(crate) runtime_system_messages: &'a [String],
     pub(crate) cwd: &'a Path,
@@ -73,7 +76,6 @@ pub(crate) struct RuntimeProviderCycleInput<'a, 'runtime, W: io::Write> {
     pub(crate) conversation: &'a mut RuntimePreparedConversation<'runtime>,
     pub(crate) config: &'a RunConfig,
     pub(crate) tool_policy: AgentToolPolicyContext<'a>,
-    pub(crate) subagent_depth: u32,
     pub(crate) policy: &'a ApprovalPolicy,
     pub(crate) extensions: RuntimeExtensionContext<'a>,
     pub(crate) background_workflows: &'a mut Vec<BackgroundWorkflowRun>,
@@ -444,12 +446,12 @@ impl RuntimeProviderResponseStep {
                 response.assistant_content,
                 response.assistant_reasoning,
                 vec![],
-                step_snapshot.emit_deltas,
+                step_snapshot.turn_context.emit_deltas,
             )?;
-            if step_snapshot.emit_deltas && step_snapshot.config.auto_memory {
+            if step_snapshot.turn_context.emit_deltas && step_snapshot.config.auto_memory {
                 memory::extract_project_memory_after_final_response(
                     step_snapshot.config,
-                    step_snapshot.cwd,
+                    step_snapshot.turn_context.cwd,
                     &conversation.messages,
                     events,
                     sink,
@@ -464,7 +466,7 @@ impl RuntimeProviderResponseStep {
             response.assistant_content,
             response.assistant_reasoning,
             response.tool_calls.clone(),
-            step_snapshot.emit_deltas,
+            step_snapshot.turn_context.emit_deltas,
         )?;
 
         let tool_requests = tool_requests_from_provider_steps(&response.steps);
@@ -606,10 +608,8 @@ impl RuntimeTurnProviderCycleStep {
         let step_context =
             RuntimeStepContext::from_snapshot(RuntimeStepSnapshot::new_with_capabilities(
                 input.config,
-                input.cwd,
+                input.turn_context,
                 input.tool_policy,
-                input.subagent_depth,
-                input.emit_deltas,
                 input.policy,
                 capabilities,
             ));
@@ -1256,6 +1256,13 @@ mod tests {
                     actor: &mut actor,
                     provider: ProviderKind::DeepSeek,
                     continuation: Some(RuntimeTurnContinuation::from_response(response)),
+                    turn_context: RuntimeTurnContext::new(
+                        cwd.path(),
+                        "continue",
+                        0,
+                        true,
+                        &orca_core::subagent_types::SubagentType::General,
+                    ),
                     turn_provider_config: &provider_config,
                     runtime_system_messages: &[],
                     cwd: cwd.path(),
@@ -1280,7 +1287,6 @@ mod tests {
                     conversation: &mut prepared_conversation,
                     config: &config,
                     tool_policy: AgentToolPolicyContext::unrestricted(),
-                    subagent_depth: 0,
                     policy: &policy,
                     extensions: extension_state.extension_context(),
                     background_workflows: &mut background_workflows,

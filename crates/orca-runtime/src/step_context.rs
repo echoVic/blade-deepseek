@@ -1,4 +1,5 @@
 use std::io;
+#[cfg(test)]
 use std::path::Path;
 
 use orca_approval::ApprovalPolicy;
@@ -13,7 +14,8 @@ use crate::extension::RuntimeExtensionContext;
 use crate::hooks::HookRunner;
 use crate::instructions::ProjectInstructions;
 use crate::lifecycle::{
-    RuntimePermissionRequestHandler, RuntimeUserInputHandler, TurnPermissionOverlay,
+    RuntimePermissionRequestHandler, RuntimeTurnContext, RuntimeUserInputHandler,
+    TurnPermissionOverlay,
 };
 use crate::memory::MemoryBlock;
 use crate::session::{record_plan_state_for_agent, record_tool_result_for_agent};
@@ -35,18 +37,16 @@ pub(crate) struct RuntimeStepCapabilitySnapshot<'a> {
     pub(crate) user_input_handler: Option<&'a dyn RuntimeUserInputHandler>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct RuntimeStepSnapshot<'a> {
     pub(crate) config: &'a RunConfig,
-    pub(crate) cwd: &'a Path,
+    pub(crate) turn_context: RuntimeTurnContext<'a>,
     pub(crate) tool_policy: AgentToolPolicyContext<'a>,
-    pub(crate) subagent_depth: u32,
-    pub(crate) emit_deltas: bool,
     pub(crate) policy: &'a ApprovalPolicy,
     pub(crate) capabilities: RuntimeStepCapabilitySnapshot<'a>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct RuntimeStepContext<'a> {
     pub(crate) snapshot: RuntimeStepSnapshot<'a>,
     pub(crate) extensions: Option<RuntimeExtensionContext<'a>>,
@@ -190,12 +190,12 @@ impl<'a> RuntimeStepSnapshot<'a> {
         permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
         user_input_handler: Option<&'a dyn RuntimeUserInputHandler>,
     ) -> Self {
+        static GENERAL_SUBAGENT_TYPE: orca_core::subagent_types::SubagentType =
+            orca_core::subagent_types::SubagentType::General;
         Self::new_with_capabilities(
             config,
-            cwd,
+            RuntimeTurnContext::new(cwd, "", subagent_depth, emit_deltas, &GENERAL_SUBAGENT_TYPE),
             tool_policy,
-            subagent_depth,
-            emit_deltas,
             policy,
             RuntimeStepCapabilitySnapshot::new(
                 instructions,
@@ -213,19 +213,15 @@ impl<'a> RuntimeStepSnapshot<'a> {
 
     pub(crate) fn new_with_capabilities(
         config: &'a RunConfig,
-        cwd: &'a Path,
+        turn_context: RuntimeTurnContext<'a>,
         tool_policy: AgentToolPolicyContext<'a>,
-        subagent_depth: u32,
-        emit_deltas: bool,
         policy: &'a ApprovalPolicy,
         capabilities: RuntimeStepCapabilitySnapshot<'a>,
     ) -> Self {
         Self {
             config,
-            cwd,
+            turn_context,
             tool_policy,
-            subagent_depth,
-            emit_deltas,
             policy,
             capabilities,
         }
@@ -313,7 +309,7 @@ impl<'a> RuntimeStepContext<'a> {
     }
 
     pub(crate) fn snapshot(&self) -> RuntimeStepSnapshot<'a> {
-        self.snapshot
+        self.snapshot.clone()
     }
 
     pub(crate) fn into_parts(

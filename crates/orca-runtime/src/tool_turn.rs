@@ -128,10 +128,10 @@ pub(crate) fn run_tool_turns<W: io::Write>(
     } = context;
     let (step_snapshot, extensions) = step_context.into_parts();
     let config = step_snapshot.config;
-    let cwd = step_snapshot.cwd;
+    let cwd = step_snapshot.turn_context.cwd;
     let tool_policy = step_snapshot.tool_policy;
-    let subagent_depth = step_snapshot.subagent_depth;
-    let emit_deltas = step_snapshot.emit_deltas;
+    let subagent_depth = step_snapshot.turn_context.subagent_depth;
+    let emit_deltas = step_snapshot.turn_context.emit_deltas;
     let policy = step_snapshot.policy;
     let capabilities = step_snapshot.capabilities();
     let instructions = capabilities.instructions;

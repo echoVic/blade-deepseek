@@ -612,6 +612,10 @@ mod tests {
             "RuntimeStepSnapshot must carry runtime capability refs through one named field"
         );
         assert!(
+            step_context_source.contains("turn_context: RuntimeTurnContext<'a>"),
+            "RuntimeStepSnapshot must carry immutable turn inputs through RuntimeTurnContext"
+        );
+        assert!(
             step_context_source.contains("pub(crate) fn capabilities(&self)"),
             "RuntimeStepSnapshot must expose runtime capability refs through an accessor"
         );
@@ -633,10 +637,13 @@ mod tests {
             "workflow_ipc",
             "permission_handler",
             "user_input_handler",
+            "cwd",
+            "subagent_depth",
+            "emit_deltas",
         ] {
             assert!(
                 !runtime_step_snapshot_struct.contains(&format!("pub(crate) {field_name}:")),
-                "RuntimeStepSnapshot must not expose capability field {field_name} outside RuntimeStepCapabilitySnapshot"
+                "RuntimeStepSnapshot must not expose grouped field {field_name} outside its named context"
             );
         }
 
