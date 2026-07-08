@@ -307,8 +307,11 @@ copied into Orca.
    cross-thread pending notification draining, pending notification submission,
    and by-id removal now also live in a focused TUI workflow notification
    module, so the app event loop coordinates notification turn boundaries
-   without owning the pending-continuation queue mechanics. Next, move the same
-   id discipline into
+   without owning the pending-continuation queue mechanics. Foreground and
+   background approval option resolution now also lives in a focused TUI
+   approval action module, keeping session allowlist updates and request-id
+   action dispatch out of the app event loop while preserving the runtime
+   pending-interaction ids. Next, move the same id discipline into
    remaining turn/item continuation ownership so continuations stop depending on
    separate ad hoc task fields plus TUI-local queues.
 3. **P2: Frozen per-turn context boundary.** Continue shrinking wide call

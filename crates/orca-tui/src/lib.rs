@@ -3,6 +3,7 @@ mod agent_subagent_execution;
 mod agent_tool_execution;
 mod agent_workflow_execution;
 pub mod app;
+mod approval_actions;
 mod background_approval;
 mod background_tasks;
 pub mod bridge;
@@ -207,6 +208,38 @@ mod tests {
         assert!(
             !app.contains("\nfn notify_recovered_background_approvals_for_tui("),
             "app should use the background_tasks module instead of defining recovery notifications inline"
+        );
+    }
+
+    #[test]
+    fn tui_approval_actions_are_owned_by_dedicated_module() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let approval_actions =
+            std::fs::read_to_string(format!("{manifest_dir}/src/approval_actions.rs"))
+                .expect("approval_actions module should exist");
+        assert!(
+            approval_actions.contains("pub(crate) fn resolve_approval_option"),
+            "approval_actions should own TUI approval option resolution"
+        );
+        assert!(
+            approval_actions.contains("fn resolve_approval("),
+            "approval_actions should keep the raw approve/deny action dispatch private"
+        );
+        assert!(
+            approval_actions.contains("ApprovalOption::AlwaysTool")
+                && approval_actions.contains("ApprovalOption::AlwaysTarget"),
+            "approval_actions should own approval allowlist updates for persistent choices"
+        );
+
+        let app = std::fs::read_to_string(format!("{manifest_dir}/src/app.rs"))
+            .expect("app source should be readable");
+        assert!(
+            !app.contains("\nfn resolve_approval_option("),
+            "app should use the approval_actions module instead of defining approval option resolution inline"
+        );
+        assert!(
+            !app.contains("\nfn resolve_approval("),
+            "app should use the approval_actions module instead of defining approval action dispatch inline"
         );
     }
 

@@ -25,6 +25,7 @@ use orca_core::model::ModelSelection;
 use orca_runtime::history;
 use orca_runtime::mentions;
 
+use crate::approval_actions::resolve_approval_option;
 use crate::background_approval::submit_background_approval_response_for_tui;
 use crate::background_tasks::{
     foreground_task_for_tui, is_terminal_task_status,
@@ -3532,40 +3533,6 @@ fn make_setup_textarea<'a>(theme: &Theme) -> TextArea<'a> {
     textarea
 }
 
-fn resolve_approval(state: &mut AppState, action_tx: &mpsc::Sender<UserAction>, approved: bool) {
-    if state
-        .approval_dialog
-        .as_ref()
-        .and_then(|dialog| dialog.background_task_id.as_ref())
-        .is_some()
-    {
-        let Some(id) = state
-            .approval_dialog
-            .as_ref()
-            .map(|dialog| dialog.id.clone())
-        else {
-            return;
-        };
-        let _ = action_tx.send(UserAction::ResolveBackgroundApproval { id, approved });
-        state.set_status(AppStatus::Idle);
-    } else {
-        let Some(id) = state
-            .approval_dialog
-            .as_ref()
-            .map(|dialog| dialog.id.clone())
-        else {
-            return;
-        };
-        let _ = action_tx.send(UserAction::Approve { id, approved });
-        if approved {
-            state.enter_running();
-        } else {
-            state.set_status(AppStatus::Idle);
-        }
-    }
-    state.approval_dialog = None;
-}
-
 fn handle_workflows_panel_key(
     key_code: KeyCode,
     state: &mut AppState,
@@ -3674,35 +3641,6 @@ fn handle_running_shortcut(
             state.scroll_down(page);
         }
     }
-}
-
-/// Resolve the approval dialog by the chosen option. The "always allow"
-/// options record a session allowlist entry so later matching approvals are
-/// auto-granted (see the ApprovalNeeded handling in the event loop). The wire
-/// protocol stays a simple allow/deny bool.
-fn resolve_approval_option(
-    state: &mut AppState,
-    action_tx: &mpsc::Sender<UserAction>,
-    option: ApprovalOption,
-) {
-    if let Some(dialog) = &state.approval_dialog {
-        match option {
-            ApprovalOption::AlwaysTool => {
-                state
-                    .approval_allowlist
-                    .insert(AppState::approval_key_tool(&dialog.tool));
-            }
-            ApprovalOption::AlwaysTarget => {
-                if let Some(target) = &dialog.target {
-                    state
-                        .approval_allowlist
-                        .insert(AppState::approval_key_target(&dialog.tool, target));
-                }
-            }
-            ApprovalOption::Once | ApprovalOption::Deny => {}
-        }
-    }
-    resolve_approval(state, action_tx, option.is_approve());
 }
 
 fn ensure_tui_session(
