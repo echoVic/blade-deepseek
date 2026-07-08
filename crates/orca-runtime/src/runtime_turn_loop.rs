@@ -55,6 +55,13 @@ pub(crate) struct RuntimeTurnRequestContext<'a> {
     pub(crate) subagent_depth: u32,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct RuntimeTurnPolicyContext<'a> {
+    pub(crate) config: &'a RunConfig,
+    pub(crate) tool_policy: AgentToolPolicyContext<'a>,
+    pub(crate) approval_policy: &'a ApprovalPolicy,
+}
+
 pub(crate) struct RuntimeAgentTurnLoopInput<'a, 'runtime, W: io::Write> {
     pub(crate) actor: &'a mut RuntimeTaskActor<'runtime>,
     pub(crate) provider_context: RuntimeTurnProviderContext<'a>,
@@ -63,9 +70,7 @@ pub(crate) struct RuntimeAgentTurnLoopInput<'a, 'runtime, W: io::Write> {
     pub(crate) output: RuntimeTurnOutputContext<'a, 'a, W>,
     pub(crate) prepared_conversation: &'a mut RuntimePreparedConversation<'runtime>,
     pub(crate) loop_state: RuntimeTurnLoopState<'a>,
-    pub(crate) config: &'a RunConfig,
-    pub(crate) tool_policy: AgentToolPolicyContext<'a>,
-    pub(crate) policy: &'a ApprovalPolicy,
+    pub(crate) policy: RuntimeTurnPolicyContext<'a>,
     pub(crate) workflow: RuntimeTurnWorkflowContext<'a, 'a>,
 }
 
@@ -77,9 +82,7 @@ pub(crate) struct RuntimeTurnLoopInput<'a, 'runtime, W: io::Write> {
     pub(crate) output: RuntimeTurnOutputContext<'a, 'a, W>,
     pub(crate) prepared_conversation: &'a mut RuntimePreparedConversation<'runtime>,
     pub(crate) loop_state: RuntimeTurnLoopState<'a>,
-    pub(crate) config: &'a RunConfig,
-    pub(crate) tool_policy: AgentToolPolicyContext<'a>,
-    pub(crate) policy: &'a ApprovalPolicy,
+    pub(crate) policy: RuntimeTurnPolicyContext<'a>,
     pub(crate) workflow: RuntimeTurnWorkflowContext<'a, 'a>,
 }
 
@@ -99,9 +102,7 @@ impl<'a, 'runtime, W: io::Write> RuntimeTurnLoopInput<'a, 'runtime, W> {
         output: RuntimeTurnOutputContext<'a, 'a, W>,
         prepared_conversation: &'a mut RuntimePreparedConversation<'runtime>,
         loop_state: RuntimeTurnLoopState<'a>,
-        config: &'a RunConfig,
-        tool_policy: AgentToolPolicyContext<'a>,
-        policy: &'a ApprovalPolicy,
+        policy: RuntimeTurnPolicyContext<'a>,
         workflow: RuntimeTurnWorkflowContext<'a, 'a>,
     ) -> Self {
         Self {
@@ -112,8 +113,6 @@ impl<'a, 'runtime, W: io::Write> RuntimeTurnLoopInput<'a, 'runtime, W> {
             output,
             prepared_conversation,
             loop_state,
-            config,
-            tool_policy,
             policy,
             workflow,
         }
@@ -122,7 +121,7 @@ impl<'a, 'runtime, W: io::Write> RuntimeTurnLoopInput<'a, 'runtime, W> {
     pub(crate) fn iteration_input<'iter>(
         &'iter mut self,
     ) -> RuntimeTurnIterationInput<'iter, 'runtime, W> {
-        let loop_state = self.loop_state.iteration_state(self.tool_policy);
+        let loop_state = self.loop_state.iteration_state(self.policy.tool_policy);
         RuntimeTurnIterationInput {
             actor: &mut *self.actor,
             provider_context: RuntimeTurnProviderContext::new(
@@ -140,9 +139,11 @@ impl<'a, 'runtime, W: io::Write> RuntimeTurnLoopInput<'a, 'runtime, W> {
             model_override: loop_state.model_override,
             cost_tracker: loop_state.cost_tracker,
             cancel: loop_state.cancel,
-            config: self.config,
-            tool_policy: loop_state.tool_policy,
-            policy: self.policy,
+            policy: RuntimeTurnPolicyContext::new(
+                self.policy.config,
+                loop_state.tool_policy,
+                self.policy.approval_policy,
+            ),
             task_registry: loop_state.task_registry,
             extensions: loop_state.extensions,
             workflow: RuntimeTurnWorkflowContext::new(
@@ -223,6 +224,20 @@ impl<'a> RuntimeTurnRequestContext<'a> {
     }
 }
 
+impl<'a> RuntimeTurnPolicyContext<'a> {
+    pub(crate) fn new(
+        config: &'a RunConfig,
+        tool_policy: AgentToolPolicyContext<'a>,
+        approval_policy: &'a ApprovalPolicy,
+    ) -> Self {
+        Self {
+            config,
+            tool_policy,
+            approval_policy,
+        }
+    }
+}
+
 impl<W: io::Write> RuntimeTurnLoopExecutors<W> {
     pub(crate) fn new(
         child_executor: ChildAgentExecutor<W>,
@@ -283,8 +298,6 @@ impl<'a, 'runtime, W: io::Write> RuntimeAgentTurnLoopInput<'a, 'runtime, W> {
             self.output,
             self.prepared_conversation,
             self.loop_state,
-            self.config,
-            self.tool_policy,
             self.policy,
             self.workflow,
         )
@@ -434,9 +447,11 @@ mod tests {
             output: RuntimeTurnOutputContext::new(&mut events, &mut sink),
             prepared_conversation: &mut prepared_conversation,
             loop_state,
-            config: &config,
-            tool_policy: AgentToolPolicyContext::unrestricted(),
-            policy: &policy,
+            policy: RuntimeTurnPolicyContext::new(
+                &config,
+                AgentToolPolicyContext::unrestricted(),
+                &policy,
+            ),
             workflow: RuntimeTurnWorkflowContext::new(&mut background_workflows, None),
         };
 

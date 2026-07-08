@@ -1,8 +1,6 @@
 use std::io;
 
-use orca_approval::ApprovalPolicy;
 use orca_core::cancel::CancelToken;
-use orca_core::config::RunConfig;
 
 use crate::agent_child::ChildAgentExecutor;
 use crate::cost::CostTracker;
@@ -13,15 +11,14 @@ use crate::provider_turn::{
 };
 use crate::runtime_conversation_bootstrap::RuntimePreparedConversation;
 use crate::runtime_turn_loop::{
-    RuntimeTurnOutputContext, RuntimeTurnProviderContext, RuntimeTurnRequestContext,
-    RuntimeTurnWorkflowContext,
+    RuntimeTurnOutputContext, RuntimeTurnPolicyContext, RuntimeTurnProviderContext,
+    RuntimeTurnRequestContext, RuntimeTurnWorkflowContext,
 };
 use crate::runtime_turn_opening::{
     RuntimeTurnOpeningInput, RuntimeTurnOpeningResult, RuntimeTurnOpeningStep,
 };
 use crate::step_context::RuntimeStepCapabilitySnapshot;
 use crate::tasks::TaskRegistry;
-use crate::tool_invocation::AgentToolPolicyContext;
 use crate::workflow::runner::SharedEventBuffer;
 
 pub(crate) struct RuntimeTurnIterationStep {
@@ -40,9 +37,7 @@ pub(crate) struct RuntimeTurnIterationInput<'a, 'runtime, W: io::Write> {
     pub(crate) model_override: Option<&'a str>,
     pub(crate) cost_tracker: &'a mut CostTracker,
     pub(crate) cancel: &'a CancelToken,
-    pub(crate) config: &'a RunConfig,
-    pub(crate) tool_policy: AgentToolPolicyContext<'a>,
-    pub(crate) policy: &'a ApprovalPolicy,
+    pub(crate) policy: RuntimeTurnPolicyContext<'a>,
     pub(crate) task_registry: &'a TaskRegistry,
     pub(crate) extensions: RuntimeExtensionContext<'a>,
     pub(crate) workflow: RuntimeTurnWorkflowContext<'a, 'a>,
@@ -123,10 +118,10 @@ impl RuntimeTurnIterationStep {
                 events: input.output.events,
                 sink: input.output.sink,
                 conversation: input.prepared_conversation,
-                config: input.config,
-                tool_policy: input.tool_policy,
+                config: input.policy.config,
+                tool_policy: input.policy.tool_policy,
                 subagent_depth: input.request.subagent_depth,
-                policy: input.policy,
+                policy: input.policy.approval_policy,
                 extensions: input.extensions,
                 background_workflows: input.workflow.background_workflows,
                 steer_handle: input.request.steer_handle,

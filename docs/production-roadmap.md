@@ -261,9 +261,11 @@ copied into Orca.
    now enters the loop through those same provider/request contexts instead of
    rebuilding parallel fields at the loop boundary, and turn-loop stages now
    pass injected services through `RuntimeTurnDeps` instead of repeating hooks,
-   instruction, memory, MCP, and interaction fields. Keep borrowing package
-   3's explicit loop-local `State` idea, but avoid a single giant context
-   object.
+   instruction, memory, MCP, and interaction fields. Turn-loop policy/config
+   refs now pass through `RuntimeTurnPolicyContext` instead of repeating run
+   config, directive-resolved tool policy, and approval policy fields. Keep
+   borrowing package 3's explicit loop-local `State` idea, but avoid a single
+   giant context object.
 4. **P3: Protocolized task/thread/interactive status.** Push background task,
    approval-needed, needs-input, foregrounded/backgrounded, and completed
    status through runtime protocol events so TUI, server, and future app

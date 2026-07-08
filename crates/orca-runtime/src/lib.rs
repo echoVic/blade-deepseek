@@ -5433,6 +5433,60 @@ mod tests {
     }
 
     #[test]
+    fn runtime_turn_loop_inputs_use_runtime_turn_policy_context() {
+        let runtime_turn_loop_source = include_str!("runtime_turn_loop.rs");
+        let runtime_turn_iteration_source = include_str!("runtime_turn_iteration.rs");
+        let agent_turn_loop_input = runtime_turn_loop_source
+            .split("pub(crate) struct RuntimeAgentTurnLoopInput")
+            .nth(1)
+            .and_then(|source| {
+                source
+                    .split("pub(crate) struct RuntimeTurnLoopInput")
+                    .next()
+            })
+            .expect("RuntimeAgentTurnLoopInput source");
+        let turn_loop_input = runtime_turn_loop_source
+            .split("pub(crate) struct RuntimeTurnLoopInput")
+            .nth(1)
+            .and_then(|source| {
+                source
+                    .split("pub(crate) struct RuntimeTurnLoopExecutors")
+                    .next()
+            })
+            .expect("RuntimeTurnLoopInput source");
+        let turn_iteration_input = runtime_turn_iteration_source
+            .split("pub(crate) struct RuntimeTurnIterationInput")
+            .nth(1)
+            .and_then(|source| {
+                source
+                    .split("pub(crate) enum RuntimeTurnIterationResult")
+                    .next()
+            })
+            .expect("RuntimeTurnIterationInput source");
+
+        assert!(
+            runtime_turn_loop_source.contains("pub(crate) struct RuntimeTurnPolicyContext"),
+            "runtime_turn_loop must define an explicit policy context for turn-loop stages"
+        );
+        for source in [agent_turn_loop_input, turn_loop_input, turn_iteration_input] {
+            assert!(
+                source.contains("policy: RuntimeTurnPolicyContext"),
+                "turn-loop inputs must group config and approval policy refs through RuntimeTurnPolicyContext"
+            );
+            for field_name in [
+                "config: &'a RunConfig",
+                "tool_policy: AgentToolPolicyContext",
+                "policy: &'a ApprovalPolicy",
+            ] {
+                assert!(
+                    !source.contains(field_name),
+                    "turn-loop inputs must not expose policy field {field_name} outside RuntimeTurnPolicyContext"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn runtime_turn_loop_state_resolves_runtime_directive_policy() {
         let agent_loop_source = include_str!("agent_loop.rs");
         let agent_loop_runtime_source = agent_loop_source
@@ -5461,7 +5515,7 @@ mod tests {
             "runtime_turn_loop must consume the lifecycle-owned loop state"
         );
         assert!(
-            runtime_turn_loop_source.contains("iteration_state(self.tool_policy)"),
+            runtime_turn_loop_source.contains(".iteration_state(self.policy.tool_policy)"),
             "runtime_turn_loop must request directive-resolved iteration state at the iteration boundary"
         );
         assert!(
