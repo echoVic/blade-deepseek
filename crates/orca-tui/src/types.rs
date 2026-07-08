@@ -190,7 +190,7 @@ pub enum TuiEvent {
 #[derive(Debug, Clone)]
 pub enum UserAction {
     Submit(String),
-    SubmitWorkflowNotification { id: String, prompt: String },
+    SubmitWorkflowNotification(PendingWorkflowNotification),
     RunWorkflow { name: String, args: Option<String> },
     SetModel(String),
     Remember(String),
@@ -1628,6 +1628,27 @@ mod tests {
             result: None,
             error: None,
         }
+    }
+
+    #[test]
+    fn workflow_notification_action_carries_notification_boundary() {
+        let source = include_str!("types.rs");
+        let user_action = source
+            .split("pub enum UserAction {")
+            .nth(1)
+            .expect("UserAction enum")
+            .split("pub enum ApprovalOption")
+            .next()
+            .expect("UserAction enum body");
+
+        assert!(
+            user_action.contains("SubmitWorkflowNotification(PendingWorkflowNotification)"),
+            "workflow notification actions should carry the typed notification boundary"
+        );
+        assert!(
+            !user_action.contains("SubmitWorkflowNotification { id: String, prompt: String }"),
+            "workflow notification actions should not split notification id and prompt"
+        );
     }
 
     #[test]

@@ -777,10 +777,7 @@ fn submit_pending_workflow_notification(
     if let Some(notification) = state.pending_workflow_notifications.pop_front() {
         state.enter_running();
         state.scroll_to_bottom();
-        let _ = action_tx.send(UserAction::SubmitWorkflowNotification {
-            id: notification.id,
-            prompt: notification.prompt,
-        });
+        let _ = action_tx.send(UserAction::SubmitWorkflowNotification(notification));
     }
 }
 
@@ -1901,10 +1898,12 @@ mod tests {
             });
 
             action_tx
-                .send(UserAction::SubmitWorkflowNotification {
-                    id: "notification-1".to_string(),
-                    prompt: "mock_history_echo\nread @../outside.txt".to_string(),
-                })
+                .send(UserAction::SubmitWorkflowNotification(
+                    crate::types::PendingWorkflowNotification {
+                        id: "notification-1".to_string(),
+                        prompt: "mock_history_echo\nread @../outside.txt".to_string(),
+                    },
+                ))
                 .unwrap();
 
             let mut saw_history_echo = false;
@@ -1960,10 +1959,13 @@ mod tests {
             });
 
             action_tx
-                .send(UserAction::SubmitWorkflowNotification {
-                    id: "notification-1".to_string(),
-                    prompt: "<task-notification>mock_history_echo</task-notification>".to_string(),
-                })
+                .send(UserAction::SubmitWorkflowNotification(
+                    crate::types::PendingWorkflowNotification {
+                        id: "notification-1".to_string(),
+                        prompt: "<task-notification>mock_history_echo</task-notification>"
+                            .to_string(),
+                    },
+                ))
                 .unwrap();
 
             let task = loop {
@@ -2008,10 +2010,13 @@ mod tests {
             });
 
             action_tx
-                .send(UserAction::SubmitWorkflowNotification {
-                    id: "notification-1".to_string(),
-                    prompt: "<task-notification>mock_history_echo</task-notification>".to_string(),
-                })
+                .send(UserAction::SubmitWorkflowNotification(
+                    crate::types::PendingWorkflowNotification {
+                        id: "notification-1".to_string(),
+                        prompt: "<task-notification>mock_history_echo</task-notification>"
+                            .to_string(),
+                    },
+                ))
                 .unwrap();
 
             loop {
@@ -2607,8 +2612,9 @@ mod tests {
         assert_eq!(state.status, AppStatus::Running);
         assert!(matches!(
             action_rx.try_recv(),
-            Ok(UserAction::SubmitWorkflowNotification { id, prompt })
-                if id == "notification-1" && prompt == "<task-notification>done</task-notification>"
+            Ok(UserAction::SubmitWorkflowNotification(notification))
+                if notification.id == "notification-1"
+                    && notification.prompt == "<task-notification>done</task-notification>"
         ));
     }
 
@@ -2657,8 +2663,9 @@ mod tests {
         assert_eq!(state.status, AppStatus::Running);
         assert!(matches!(
             action_rx.try_recv(),
-            Ok(UserAction::SubmitWorkflowNotification { id, prompt })
-                if id == "notification-1" && prompt == "<task-notification>failed</task-notification>"
+            Ok(UserAction::SubmitWorkflowNotification(notification))
+                if notification.id == "notification-1"
+                    && notification.prompt == "<task-notification>failed</task-notification>"
         ));
     }
 
@@ -2683,8 +2690,9 @@ mod tests {
         assert_eq!(state.status, AppStatus::Running);
         assert!(matches!(
             action_rx.try_recv(),
-            Ok(UserAction::SubmitWorkflowNotification { id, prompt })
-                if id == "notification-1" && prompt == "<task-notification>failed</task-notification>"
+            Ok(UserAction::SubmitWorkflowNotification(notification))
+                if notification.id == "notification-1"
+                    && notification.prompt == "<task-notification>failed</task-notification>"
         ));
     }
 
@@ -4404,9 +4412,9 @@ fn agent_loop_thread(
                     &pending_workflow_notifications,
                 );
             }
-            Ok(UserAction::SubmitWorkflowNotification { id, prompt }) => {
+            Ok(UserAction::SubmitWorkflowNotification(notification)) => {
                 handle_submitted_turn_for_tui(
-                    SubmittedTurn::workflow_notification(id, prompt),
+                    SubmittedTurn::workflow_notification(notification.id, notification.prompt),
                     &config,
                     &preloaded,
                     &mut session,
@@ -4545,10 +4553,7 @@ fn agent_loop_thread(
                                 notification,
                             ) => {
                                 pending_actions.borrow_mut().push_front(
-                                    UserAction::SubmitWorkflowNotification {
-                                        id: notification.id,
-                                        prompt: notification.prompt,
-                                    },
+                                    UserAction::SubmitWorkflowNotification(notification),
                                 );
                             }
                         }

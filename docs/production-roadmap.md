@@ -268,16 +268,18 @@ copied into Orca.
    named methods. Queued workflow continuations also keep their notification id
    when they cross the TUI action channel or return from a turn-result
    continuation; human prompts remain plain `Submit` actions, while workflow
-   follow-ups use a typed notification action/result. The TUI agent loop now
-   applies prompt preprocessing through a named submitted-turn source boundary,
-   so `@file` mention expansion remains user-input behavior and workflow
-   notifications are not dropped because generated notification text happens to
-   look like a local file mention. That source boundary also carries the TUI
-   task description for workflow follow-up turns, keeping the workflows panel
-   focused on a stable notification label instead of raw XML/diagnostic payload
-   text. The same submitted-turn boundary now also gives first-turn workflow
-   notification sessions a stable title seed, so recorded history/search does
-   not name the thread after raw notification XML. Workflow follow-up turns
+   follow-ups use a typed notification action/result. The workflow-notification
+   action channel now carries `PendingWorkflowNotification` directly instead of
+   splitting the id and prompt into separate action fields. The TUI agent loop
+   now applies prompt preprocessing through a named submitted-turn source
+   boundary, so `@file` mention expansion remains user-input behavior and
+   workflow notifications are not dropped because generated notification text
+   happens to look like a local file mention. That source boundary also carries
+   the TUI task description for workflow follow-up turns, keeping the workflows
+   panel focused on a stable notification label instead of raw XML/diagnostic
+   payload text. The same submitted-turn boundary now also gives first-turn
+   workflow notification sessions a stable title seed, so recorded history/search
+   does not name the thread after raw notification XML. Workflow follow-up turns
    remain model-visible user-role context, but are no longer treated as the
    user's last backtrack target. That submitted-turn value now enters the TUI
    goal-turn loop as one boundary object, with `SubmittedTurnPresentation`
