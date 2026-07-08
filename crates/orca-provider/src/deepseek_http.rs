@@ -518,7 +518,7 @@ pub(crate) fn conversation_to_api_messages(conversation: &Conversation) -> Vec<A
             },
             Message::Assistant {
                 content,
-                reasoning_content,
+                reasoning_content: _,
                 tool_calls,
                 ..
             } => {
@@ -542,7 +542,7 @@ pub(crate) fn conversation_to_api_messages(conversation: &Conversation) -> Vec<A
                 ApiMessage {
                     role: "assistant".to_string(),
                     content: content.clone(),
-                    reasoning_content: reasoning_content.clone(),
+                    reasoning_content: None,
                     tool_calls: api_tool_calls,
                     tool_call_id: None,
                 }
@@ -841,6 +841,22 @@ mod tests {
 
         let messages = conversation_to_api_messages(&conv);
         assert_eq!(messages[1].content.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn api_replay_omits_stale_reasoning_content() {
+        let mut conv = Conversation::new();
+        conv.add_user("first".to_string());
+        conv.add_assistant(
+            Some("done".to_string()),
+            Some("private thinking".to_string()),
+            vec![],
+        );
+        conv.add_user("next".to_string());
+
+        let messages = conversation_to_api_messages(&conv);
+
+        assert!(messages.iter().all(|m| m.reasoning_content.is_none()));
     }
 
     #[test]

@@ -81,6 +81,7 @@ impl Message {
 
 #[derive(Clone, Debug, Default)]
 pub struct VolatileContext {
+    pub runtime: Option<String>,
     pub plan: Option<String>,
     pub goal: Option<String>,
     pub skill: Option<String>,
@@ -88,11 +89,14 @@ pub struct VolatileContext {
 
 impl VolatileContext {
     pub fn is_empty(&self) -> bool {
-        self.plan.is_none() && self.goal.is_none() && self.skill.is_none()
+        self.runtime.is_none() && self.plan.is_none() && self.goal.is_none() && self.skill.is_none()
     }
 
     pub fn render(&self) -> String {
         let mut parts = Vec::new();
+        if let Some(runtime) = &self.runtime {
+            parts.push(runtime.as_str());
+        }
         if let Some(goal) = &self.goal {
             parts.push(goal.as_str());
         }
@@ -173,6 +177,12 @@ impl Conversation {
 
     pub fn replace_goal_state(&mut self, content: String) {
         self.volatile.goal = Some(format!("[Goal state]\n{content}"));
+    }
+
+    pub fn replace_runtime_context(&mut self, content: Option<String>) {
+        self.volatile.runtime = content
+            .filter(|text| !text.trim().is_empty())
+            .map(|text| format!("[Runtime context]\n{text}"));
     }
 
     pub fn replace_skill_context(&mut self, content: Option<String>) {

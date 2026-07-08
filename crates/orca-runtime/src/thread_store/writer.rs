@@ -136,12 +136,13 @@ pub(crate) fn read_transcript(path: &Path) -> io::Result<SessionTranscript> {
     let mut summaries = Vec::new();
     let mut usage = None;
     let mut last_plan: Option<(Option<String>, Vec<PlanItem>)> = None;
+    let mut completion_status = None;
 
     for record in records {
         match record {
             SessionRecord::Meta(m) => meta = Some(m),
             SessionRecord::Message { message } => messages.push(message.into()),
-            SessionRecord::Completed { .. } => {}
+            SessionRecord::Completed { status, .. } => completion_status = Some(status),
             SessionRecord::ContextCollapsed(record) => compactions.push(record),
             SessionRecord::ContextSummary(record) => summaries.push(record),
             SessionRecord::Usage(record) => usage = Some(record),
@@ -171,6 +172,7 @@ pub(crate) fn read_transcript(path: &Path) -> io::Result<SessionTranscript> {
         summaries,
         usage,
         plan: last_plan,
+        completion_status,
         path: path.to_path_buf(),
     })
 }

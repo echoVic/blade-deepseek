@@ -427,9 +427,20 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
                     "path": {
                         "type": "string",
                         "description": "File path relative to workspace root"
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "1-based line number to start reading from. Use for large files."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Number of lines to read. Use with offset for large files."
                     }
                 },
-                "required": ["path"]
+                "required": ["path"],
+                "additionalProperties": false
             }),
             CapabilitySet::read_only_fs(),
             ToolExposure::Direct,
@@ -460,6 +471,16 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
                 "path": {
                     "type": "string",
                     "description": "Directory to search in (default: '.')"
+                },
+                "head_limit": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Maximum number of paths to return. Defaults to 500. Use 0 for unlimited."
+                },
+                "offset": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Zero-based result offset for pagination."
                 }
             },
             "oneOf": [
@@ -499,9 +520,20 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
                     "path": {
                         "type": "string",
                         "description": "Directory or file to search in (default: '.')"
+                    },
+                    "head_limit": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Maximum number of matches to return. Defaults to 250. Use 0 for unlimited."
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Zero-based result offset for pagination."
                     }
                 },
-                "required": ["pattern"]
+                "required": ["pattern"],
+                "additionalProperties": false
             }),
             CapabilitySet::new(vec![ToolCapability::FsSearch]),
             ToolExposure::Direct,

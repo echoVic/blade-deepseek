@@ -74,6 +74,8 @@ pub struct ModelRuntimeConfig {
     pub context_window: Option<usize>,
     #[serde(default)]
     pub auto_compact_token_limit: Option<usize>,
+    #[serde(default)]
+    pub soft_compact_token_limit: Option<usize>,
 }
 
 impl ModelRuntimeConfig {
@@ -81,6 +83,7 @@ impl ModelRuntimeConfig {
         Self {
             context_window: self.context_window.map(|value| value.max(1)),
             auto_compact_token_limit: self.auto_compact_token_limit.map(|value| value.max(1)),
+            soft_compact_token_limit: self.soft_compact_token_limit.map(|value| value.max(1)),
         }
     }
 }
@@ -526,6 +529,7 @@ pub fn format_config_show(config: &RunConfig) -> String {
             "reasoning_effort = \"{}\"\n",
             "model_context_window = \"{}\"\n",
             "model_auto_compact_token_limit = \"{}\"\n",
+            "model_soft_compact_token_limit = \"{}\"\n",
             "cwd = \"{}\"\n",
             "verifier = \"{}\"\n",
             "max_budget_usd = \"{}\"\n",
@@ -542,6 +546,7 @@ pub fn format_config_show(config: &RunConfig) -> String {
             "history = \"{}\"\n",
             "context_window = \"{}\"\n",
             "auto_compact_token_limit = \"{}\"\n",
+            "soft_compact_token_limit = \"{}\"\n",
             "tool_output_truncation = \"{}\"\n",
             "workflow_agents = \"{}\"\n",
             "\n",
@@ -577,6 +582,11 @@ pub fn format_config_show(config: &RunConfig) -> String {
             .auto_compact_token_limit
             .map(|value| value.to_string())
             .unwrap_or_else(|| "<default>".to_string()),
+        config
+            .model_runtime
+            .soft_compact_token_limit
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "<default>".to_string()),
         cwd,
         verifier,
         max_budget,
@@ -591,6 +601,7 @@ pub fn format_config_show(config: &RunConfig) -> String {
         runtime.history,
         runtime.context_window,
         runtime.auto_compact_token_limit,
+        runtime.soft_compact_token_limit,
         runtime.tool_output_truncation,
         runtime.workflow_agents,
         config.tools.max_read_parallel,
@@ -613,6 +624,7 @@ struct RuntimeSummary {
     history: &'static str,
     context_window: String,
     auto_compact_token_limit: String,
+    soft_compact_token_limit: String,
     tool_output_truncation: String,
     workflow_agents: String,
 }
@@ -631,6 +643,11 @@ fn runtime_summary(config: &RunConfig) -> RuntimeSummary {
         auto_compact_token_limit: config
             .model_runtime
             .auto_compact_token_limit
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "<model-default>".to_string()),
+        soft_compact_token_limit: config
+            .model_runtime
+            .soft_compact_token_limit
             .map(|value| value.to_string())
             .unwrap_or_else(|| "<model-default>".to_string()),
         tool_output_truncation: config.tools.output_truncation.to_string(),
@@ -692,6 +709,7 @@ mod tests {
             model_runtime: ModelRuntimeConfig {
                 context_window: Some(128_000),
                 auto_compact_token_limit: Some(96_000),
+                soft_compact_token_limit: Some(64_000),
             },
             reasoning_effort: ReasoningEffort::Max,
             api_key: Some("sk-secret".to_string()),
@@ -723,6 +741,7 @@ mod tests {
         assert!(shown.contains("reasoning_effort = \"max\""));
         assert!(shown.contains("model_context_window = \"128000\""));
         assert!(shown.contains("model_auto_compact_token_limit = \"96000\""));
+        assert!(shown.contains("model_soft_compact_token_limit = \"64000\""));
         assert!(shown.contains("mode = \"full-auto\""));
         assert!(shown.contains("[runtime]"));
         assert!(shown.contains("filesystem = \"workspace-write\""));

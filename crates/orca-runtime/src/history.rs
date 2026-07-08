@@ -734,6 +734,7 @@ mod tests {
             summaries: Vec::new(),
             usage: None,
             plan: None,
+            completion_status: None,
             path: cwd.join("bad-tool-boundary.jsonl"),
         };
 
@@ -750,6 +751,35 @@ mod tests {
             message,
             Message::User { content, .. } if content == "continue after failed turn"
         )));
+    }
+
+    #[test]
+    fn load_session_preserves_latest_completion_status() {
+        let _guard = lock_test_env();
+        let home = tempfile::tempdir().expect("temp home");
+        let previous = std::env::var_os(ORCA_HOME_ENV);
+        unsafe {
+            std::env::set_var(ORCA_HOME_ENV, home.path());
+        }
+
+        let result = (|| {
+            let cwd = std::env::current_dir()?;
+            let mut writer = SessionWriter::start(&cwd, "mock", None, "interrupted turn")?;
+            writer.complete("interrupted")?;
+            let transcript = load_session("latest")?;
+
+            assert_eq!(transcript.completion_status.as_deref(), Some("interrupted"));
+            Ok::<(), io::Error>(())
+        })();
+
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var(ORCA_HOME_ENV, previous);
+            } else {
+                std::env::remove_var(ORCA_HOME_ENV);
+            }
+        }
+        result.expect("completion status restored from history");
     }
 
     #[test]

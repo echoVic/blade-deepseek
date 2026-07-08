@@ -91,12 +91,18 @@ fn shell_session_applies_environment_overrides_and_unsets() {
 #[test]
 fn shell_session_kill_stops_running_task_and_collects_partial_output() {
     let temp = tempfile::tempdir().expect("tempdir");
+    let started_marker = temp.path().join("shell-kill-started");
+    let release_marker = temp.path().join("shell-kill-release");
+    let started_marker_arg = started_marker.to_str().expect("started marker path");
+    let release_marker_arg = release_marker.to_str().expect("release marker path");
     let tasks = TaskRegistry::new("session-shell".to_string());
     let mut sessions = RuntimeShellSessionManager::new(tasks.clone());
 
     let handle = sessions
         .spawn(ShellSessionCommand {
-            command: "printf started; sleep 30; printf done".to_string(),
+            command: format!(
+                "printf started; : > {started_marker_arg:?}; while [ ! -e {release_marker_arg:?} ]; do sleep 0.05; done; printf done"
+            ),
             cwd: temp.path().to_path_buf(),
             additional_readable_directories: Vec::new(),
             additional_working_directories: Vec::new(),
@@ -109,7 +115,7 @@ fn shell_session_kill_stops_running_task_and_collects_partial_output() {
         })
         .expect("spawn shell session");
 
-    std::thread::sleep(Duration::from_millis(150));
+    wait_for_path(&started_marker);
     let output = sessions.kill(&handle.id).expect("kill shell session");
 
     assert!(output.stdout.contains("started"));

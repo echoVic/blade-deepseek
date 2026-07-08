@@ -2,8 +2,8 @@ use orca_approval::ApprovalPolicy;
 use orca_core::approval_rules::PermissionRules;
 use orca_core::approval_types::{ActionKind, ApprovalDecision, ApprovalMode, ApprovalRequest};
 use orca_core::config::{
-    HistoryMode, OutputFormat, PermissionProfileNetworkAccess, ProviderKind, RunConfig, ThemeName,
-    ToolConfig, WorkflowConfig,
+    HistoryMode, ModelRuntimeConfig, OutputFormat, PermissionProfileNetworkAccess, ProviderKind,
+    RunConfig, ThemeName, ToolConfig, WorkflowConfig,
 };
 use orca_core::conversation::Conversation;
 use orca_core::event_schema::{EventFactory, RunStatus};
@@ -32,6 +32,7 @@ use orca_runtime::protocol::{
 };
 use orca_runtime::tasks::TaskRegistry;
 use serde_json::Value;
+use tempfile::tempdir;
 
 #[test]
 fn agent_loop_module_does_not_depend_on_controller() {
@@ -42,6 +43,79 @@ fn agent_loop_module_does_not_depend_on_controller() {
         !agent_loop.contains("crate::controller"),
         "agent_loop must own child-agent execution instead of delegating back to controller"
     );
+}
+
+#[test]
+fn reported_session_triggers_soft_compaction() {
+    let fixture = include_str!("fixtures/session_stuck_2026_07_08.min.jsonl");
+    let records = fixture
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("fixture jsonl line"))
+        .collect::<Vec<_>>();
+    assert_eq!(records.len(), 3);
+    assert_eq!(records[0]["type"], "session.usage");
+    assert_eq!(records[1]["type"], "conversation.message");
+    assert_eq!(records[2]["type"], "conversation.message");
+
+    let read_arguments = records[1]["message"]["tool_calls"][0]["arguments"]
+        .as_str()
+        .expect("read_file arguments");
+    let read_args: Value = serde_json::from_str(read_arguments).expect("read args json");
+    assert_eq!(read_args["path"], "lib/meta.ts");
+    assert_eq!(read_args["offset"], 175);
+    assert_eq!(read_args["limit"], 70);
+
+    let cwd = tempdir().expect("temp workspace");
+    std::fs::create_dir_all(cwd.path().join("lib")).expect("create lib dir");
+    let contents = (1..=250)
+        .map(|line| format!("line {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(cwd.path().join("lib/meta.ts"), contents).expect("write synthetic file");
+    let read_request = ToolRequest {
+        id: "call_read".to_string(),
+        name: ToolName::ReadFile,
+        action: ActionKind::Read,
+        target: Some("lib/meta.ts".to_string()),
+        raw_arguments: Some(read_arguments.to_string()),
+    };
+
+    let read_result = orca_tools::read_file::execute(&read_request, cwd.path(), 100_000);
+    let read_output = read_result.output.as_deref().expect("read output");
+    let read_lines = read_output.lines().collect::<Vec<_>>();
+    assert_eq!(read_lines.len(), 70);
+    assert_eq!(read_lines[0], "175: line 175");
+    assert_eq!(read_lines[69], "244: line 244");
+
+    let mut with_reasoning = Conversation::new();
+    with_reasoning.add_user("first".to_string());
+    with_reasoning.add_assistant(
+        Some("done".to_string()),
+        Some("private reasoning ".repeat(20_000)),
+        vec![],
+    );
+    with_reasoning.add_user("next".to_string());
+    let mut without_reasoning = Conversation::new();
+    without_reasoning.add_user("first".to_string());
+    without_reasoning.add_assistant(Some("done".to_string()), None, vec![]);
+    without_reasoning.add_user("next".to_string());
+    assert_eq!(
+        orca_provider::context::conversation_tokens(&with_reasoning),
+        orca_provider::context::conversation_tokens(&without_reasoning)
+    );
+
+    let runtime = ModelRuntimeConfig {
+        context_window: Some(1_000_000),
+        auto_compact_token_limit: None,
+        soft_compact_token_limit: Some(96_000),
+    };
+    let context_config =
+        orca_provider::context::ContextConfig::for_model_with_runtime(Some(PRO_MODEL), &runtime);
+    let pressure = orca_provider::context::context_pressure_for_tokens(120_000, &context_config);
+    assert_eq!(pressure.soft_limit, 96_000);
+    assert!(pressure.effective_limit > 790_000);
+    assert!(pressure.should_soft_compact);
+    assert!(!pressure.should_hard_compact);
 }
 
 #[test]

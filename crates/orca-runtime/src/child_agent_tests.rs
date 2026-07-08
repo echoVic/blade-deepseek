@@ -406,6 +406,56 @@ fn compact_child_agent_conversation_uses_runtime_compaction_step() {
 }
 
 #[test]
+fn compact_child_agent_conversation_uses_soft_compaction_limit() {
+    let request = ChildAgentRequest::new(
+        "inspect repo".to_string(),
+        SubagentType::General,
+        None,
+        2,
+        false,
+    );
+    let instructions = ProjectInstructions::default();
+    let memory = MemoryBlock::default();
+    let mut runtime_config = config(None);
+    runtime_config.model_runtime.context_window = Some(1_000_000);
+    runtime_config.model_runtime.auto_compact_token_limit = None;
+    runtime_config.model_runtime.soft_compact_token_limit = Some(64);
+    let mut setup = prepare_child_agent_loop(
+        &runtime_config,
+        &request,
+        std::env::temp_dir().as_path(),
+        &instructions,
+        &memory,
+    );
+    for index in 0..20 {
+        setup.conversation.add_user(format!(
+            "child message {index}: {}",
+            "important context ".repeat(20)
+        ));
+        setup.conversation.add_assistant(
+            Some(format!(
+                "child answer {index}: {}",
+                "detailed response ".repeat(20)
+            )),
+            None,
+            vec![],
+        );
+    }
+    let before_messages = setup.conversation.messages.len();
+
+    let compacted = compact_child_agent_conversation_if_needed(
+        &runtime_config,
+        &mut setup,
+        std::env::temp_dir().as_path(),
+        &HookRunner::default(),
+    )
+    .expect("child compaction should not fail");
+
+    assert!(compacted);
+    assert!(setup.conversation.messages.len() < before_messages);
+}
+
+#[test]
 fn handle_child_agent_provider_error_retries_prompt_too_long_once() {
     let request = ChildAgentRequest::new(
         "inspect repo".to_string(),

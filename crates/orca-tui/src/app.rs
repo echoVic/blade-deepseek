@@ -465,12 +465,12 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
 
                 // Approval dialog: 4-option selection + direct-key shortcuts.
                 if state.status == AppStatus::WaitingApproval {
-                    // Direct option keys (y / a / A / n) resolve immediately.
+                    // Direct option keys (1/2/3/4 and legacy y/A/a/n) resolve immediately.
                     if let KeyCode::Char(c) = key.code
                         && let Some(option) = state
                             .approval_dialog
                             .as_ref()
-                            .and_then(|d| d.options.iter().copied().find(|o| o.key() == c))
+                            .and_then(|d| d.option_for_key(c))
                     {
                         resolve_approval_option(&mut state, &action_tx, option);
                         continue;
@@ -1381,6 +1381,7 @@ mod tests {
             summaries: Vec::new(),
             usage: None,
             plan: None,
+            completion_status: None,
             path: std::path::PathBuf::from("/tmp/resumed-goal.jsonl"),
         }
     }

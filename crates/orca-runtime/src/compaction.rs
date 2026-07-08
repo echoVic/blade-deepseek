@@ -51,8 +51,9 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
         &mut self,
         conversation: &mut Conversation,
     ) -> io::Result<bool> {
-        if !context::needs_compaction_wire(conversation, self.context_config, self.provider_config)
-        {
+        let pressure =
+            context::context_pressure(conversation, self.context_config, self.provider_config);
+        if !pressure.should_soft_compact && !pressure.should_hard_compact {
             return Ok(false);
         }
 

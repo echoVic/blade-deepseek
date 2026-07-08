@@ -1,3 +1,5 @@
+use std::collections::{HashMap, HashSet};
+
 use orca_core::config::{ModelRuntimeConfig, ProviderKind};
 use orca_core::conversation::{Conversation, Message, SummaryState, normalize_tool_boundaries};
 use orca_core::provider_types::ProviderStep;
@@ -9,6 +11,8 @@ const DEFAULT_MAX_TOKENS: usize = 1_000_000;
 const COMPACTION_THRESHOLD: f64 = 0.80;
 const RESERVED_FOR_RESPONSE: usize = 4096;
 const STALE_TOOL_OUTPUT_BYTES: usize = 2048;
+const DEFAULT_SOFT_COMPACT_TOKEN_LIMIT: usize = 96_000;
+const RECENT_TOOL_RESULTS_TO_KEEP: usize = 6;
 
 // Hysteresis: compaction triggers at effective_limit but compresses the kept
 // window down to this fraction so the next turn still has headroom before the
@@ -37,6 +41,7 @@ pub struct ContextConfig {
     pub compaction_threshold: f64,
     pub reserved_for_response: usize,
     pub auto_compact_token_limit: Option<usize>,
+    pub soft_compact_token_limit: Option<usize>,
 }
 
 impl ContextConfig {
@@ -46,6 +51,7 @@ impl ContextConfig {
             compaction_threshold: COMPACTION_THRESHOLD,
             reserved_for_response: RESERVED_FOR_RESPONSE,
             auto_compact_token_limit: None,
+            soft_compact_token_limit: Some(DEFAULT_SOFT_COMPACT_TOKEN_LIMIT),
         }
     }
 
@@ -55,6 +61,9 @@ impl ContextConfig {
             config.max_tokens = context_window.max(1);
         }
         config.auto_compact_token_limit = runtime.auto_compact_token_limit;
+        if let Some(limit) = runtime.soft_compact_token_limit {
+            config.soft_compact_token_limit = Some(limit);
+        }
         config
     }
 
@@ -66,13 +75,24 @@ impl ContextConfig {
         ((self.max_tokens as f64 * threshold) as usize).saturating_sub(self.reserved_for_response)
     }
 
-    /// Hysteresis target: when compaction triggers at `effective_limit()`, we
+    pub fn soft_limit(&self) -> usize {
+        let effective = self.effective_limit();
+        if effective == 0 {
+            return 0;
+        }
+        self.soft_compact_token_limit
+            .unwrap_or(effective)
+            .min(effective)
+            .max(1)
+    }
+
+    /// Hysteresis target: when compaction triggers at the soft window, we
     /// compress the kept window down to a smaller window so the next turn has
     /// real headroom before the next trigger. Without this, every turn lands
     /// just under the limit and next turn's wire prompt almost always re-fires
     /// compaction (the "compaction storm" pathology).
     pub fn target_compaction_limit(&self) -> usize {
-        let limit = self.effective_limit();
+        let limit = self.soft_limit();
         let scaled = ((limit as f64) * COMPACTION_TARGET_FRACTION) as usize;
         scaled.max(1).min(limit)
     }
@@ -85,8 +105,18 @@ impl Default for ContextConfig {
             compaction_threshold: COMPACTION_THRESHOLD,
             reserved_for_response: RESERVED_FOR_RESPONSE,
             auto_compact_token_limit: None,
+            soft_compact_token_limit: Some(DEFAULT_SOFT_COMPACT_TOKEN_LIMIT),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ContextPressure {
+    pub wire_tokens: usize,
+    pub effective_limit: usize,
+    pub soft_limit: usize,
+    pub should_soft_compact: bool,
+    pub should_hard_compact: bool,
 }
 
 pub fn message_tokens_with_counter(msg: &Message, counter: &impl TokenCounter) -> usize {
@@ -95,16 +125,13 @@ pub fn message_tokens_with_counter(msg: &Message, counter: &impl TokenCounter) -
         Message::User { content, .. } => counter.count_text(content) + 4,
         Message::Assistant {
             content,
-            reasoning_content,
+            reasoning_content: _,
             tool_calls,
             ..
         } => {
             let mut tokens = 4;
             if let Some(c) = content {
                 tokens += counter.count_text(c);
-            }
-            if let Some(r) = reasoning_content {
-                tokens += counter.count_text(r);
             }
             for tc in tool_calls {
                 tokens += counter.count_text(&tc.function_name);
@@ -171,6 +198,27 @@ pub fn needs_compaction_wire(
     provider_config: &ProviderConfig,
 ) -> bool {
     wire_equivalent_tokens(conversation, provider_config) > config.effective_limit()
+}
+
+pub fn context_pressure(
+    conversation: &Conversation,
+    config: &ContextConfig,
+    provider_config: &ProviderConfig,
+) -> ContextPressure {
+    let wire_tokens = wire_equivalent_tokens(conversation, provider_config);
+    context_pressure_for_tokens(wire_tokens, config)
+}
+
+pub fn context_pressure_for_tokens(wire_tokens: usize, config: &ContextConfig) -> ContextPressure {
+    let effective_limit = config.effective_limit();
+    let soft_limit = config.soft_limit();
+    ContextPressure {
+        wire_tokens,
+        effective_limit,
+        soft_limit,
+        should_soft_compact: wire_tokens > soft_limit,
+        should_hard_compact: wire_tokens > effective_limit,
+    }
 }
 
 fn wire_equivalent_tokens_with_counter(
@@ -282,7 +330,8 @@ pub fn compact_with_summary(
     // when the prompt the provider will actually receive (messages +
     // injected summary + volatile overlay + tool schema JSON) is back under
     // the limit, otherwise the next turn re-enters the storm.
-    if !needs_compaction_wire(&micro_compacted, context_config, provider_config) {
+    let pressure = context_pressure(&micro_compacted, context_config, provider_config);
+    if !pressure.should_soft_compact && !pressure.should_hard_compact {
         return CompactionResult {
             conversation: micro_compacted,
             kind: CompactionKind::LocalTruncation,
@@ -1097,9 +1146,21 @@ fn micro_compact_stale_tool_outputs(conversation: &Conversation) -> Conversation
         .iter()
         .rposition(|message| matches!(message, Message::User { .. }))
         .unwrap_or(conversation.messages.len());
+    let compactable_tool_calls = compactable_tool_call_ids(conversation);
+    let count_compacted_tool_indexes =
+        old_tool_result_indexes_to_clear(conversation, last_user_index, &compactable_tool_calls);
 
     for (index, message) in conversation.messages.iter().enumerate() {
         let compacted = match message {
+            Message::Tool {
+                tool_call_id,
+                content,
+                pinned,
+            } if count_compacted_tool_indexes.contains(&index) => Message::Tool {
+                tool_call_id: tool_call_id.clone(),
+                content: cleared_tool_result_output(tool_call_id, content),
+                pinned: false,
+            },
             Message::Tool {
                 tool_call_id,
                 content,
@@ -1116,6 +1177,66 @@ fn micro_compact_stale_tool_outputs(conversation: &Conversation) -> Conversation
         result.messages.push(compacted);
     }
     result
+}
+
+fn compactable_tool_call_ids(conversation: &Conversation) -> HashSet<String> {
+    let mut ids = HashSet::new();
+    for message in &conversation.messages {
+        if let Message::Assistant { tool_calls, .. } = message {
+            for tool_call in tool_calls {
+                if is_count_compactable_tool(&tool_call.function_name) {
+                    ids.insert(tool_call.id.clone());
+                }
+            }
+        }
+    }
+    ids
+}
+
+fn old_tool_result_indexes_to_clear(
+    conversation: &Conversation,
+    last_user_index: usize,
+    compactable_tool_calls: &HashSet<String>,
+) -> HashSet<usize> {
+    let mut seen_by_tool = HashMap::<String, Vec<usize>>::new();
+    for (index, message) in conversation.messages.iter().enumerate() {
+        if let Message::Tool {
+            tool_call_id,
+            pinned,
+            ..
+        } = message
+        {
+            if index >= last_user_index || *pinned || !compactable_tool_calls.contains(tool_call_id)
+            {
+                continue;
+            }
+            seen_by_tool
+                .entry(tool_call_id.clone())
+                .or_default()
+                .push(index);
+        }
+    }
+
+    let mut all_indexes = seen_by_tool.into_values().flatten().collect::<Vec<_>>();
+    all_indexes.sort_unstable();
+    let clear_count = all_indexes
+        .len()
+        .saturating_sub(RECENT_TOOL_RESULTS_TO_KEEP);
+    all_indexes.into_iter().take(clear_count).collect()
+}
+
+fn is_count_compactable_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "read_file" | "grep" | "glob" | "list_files" | "bash" | "web_search"
+    ) || name.starts_with("mcp__")
+}
+
+fn cleared_tool_result_output(tool_call_id: &str, content: &str) -> String {
+    format!(
+        "[old tool result content cleared; original_bytes={}; tool_call_id={tool_call_id}]",
+        content.len()
+    )
 }
 
 fn micro_compact_tool_output(content: &str) -> String {
@@ -1179,6 +1300,7 @@ mod tests {
             compaction_threshold: 1.0,
             reserved_for_response: 0,
             auto_compact_token_limit: Some(100),
+            soft_compact_token_limit: None,
         };
         let provider_config = ProviderConfig {
             api_key: None,
@@ -1222,12 +1344,32 @@ mod tests {
         let runtime = ModelRuntimeConfig {
             context_window: Some(128_000),
             auto_compact_token_limit: Some(96_000),
+            soft_compact_token_limit: Some(64_000),
         };
 
         let config = ContextConfig::for_model_with_runtime(Some("deepseek-v4-pro"), &runtime);
 
         assert_eq!(config.max_tokens, 128_000);
         assert_eq!(config.effective_limit(), 96_000);
+        assert_eq!(config.soft_limit(), 64_000);
+    }
+
+    #[test]
+    fn pressure_triggers_soft_limit_before_model_limit() {
+        let config = ContextConfig {
+            max_tokens: 1_000_000,
+            compaction_threshold: 0.80,
+            reserved_for_response: 4096,
+            auto_compact_token_limit: None,
+            soft_compact_token_limit: Some(96_000),
+        };
+
+        let pressure = context_pressure_for_tokens(120_000, &config);
+
+        assert_eq!(pressure.wire_tokens, 120_000);
+        assert_eq!(pressure.soft_limit, 96_000);
+        assert!(pressure.should_soft_compact);
+        assert!(!pressure.should_hard_compact);
     }
 
     #[test]
@@ -1251,6 +1393,46 @@ mod tests {
     }
 
     #[test]
+    fn stale_reasoning_does_not_count_toward_context_budget() {
+        let mut with_reasoning = Conversation::new();
+        with_reasoning.add_user("question".to_string());
+        with_reasoning.add_assistant(
+            Some("answer".to_string()),
+            Some("private reasoning".to_string()),
+            vec![],
+        );
+        with_reasoning.add_user("follow up".to_string());
+
+        let mut without_reasoning = Conversation::new();
+        without_reasoning.add_user("question".to_string());
+        without_reasoning.add_assistant(Some("answer".to_string()), None, vec![]);
+        without_reasoning.add_user("follow up".to_string());
+
+        let provider_config = ProviderConfig {
+            api_key: None,
+            base_url: None,
+            model: None,
+            reasoning_effort: orca_core::config::ReasoningEffort::Max,
+            tools_override: Some(Vec::new()),
+            mcp_registry: None,
+            external_tools: Vec::new(),
+        };
+
+        assert_eq!(
+            conversation_tokens_with_counter(&with_reasoning, &FixedCounter),
+            conversation_tokens_with_counter(&without_reasoning, &FixedCounter)
+        );
+        assert_eq!(
+            wire_equivalent_tokens_with_counter(&with_reasoning, &provider_config, &FixedCounter),
+            wire_equivalent_tokens_with_counter(
+                &without_reasoning,
+                &provider_config,
+                &FixedCounter
+            )
+        );
+    }
+
+    #[test]
     fn no_message_is_annotated_with_a_context_budget_hint() {
         // Budget/remaining context is local observability only; it must never be
         // injected into upstream messages, which would break DeepSeek prefix cache.
@@ -1259,6 +1441,7 @@ mod tests {
             compaction_threshold: 1.0,
             reserved_for_response: 0,
             auto_compact_token_limit: Some(42),
+            soft_compact_token_limit: None,
         };
 
         let mut conv = Conversation::new();
@@ -1293,6 +1476,7 @@ mod tests {
             compaction_threshold: 1.0,
             reserved_for_response: 0,
             auto_compact_token_limit: None,
+            soft_compact_token_limit: None,
         };
         // budget = 60 tokens
 
@@ -1324,6 +1508,7 @@ mod tests {
             compaction_threshold: 1.0,
             reserved_for_response: 0,
             auto_compact_token_limit: None,
+            soft_compact_token_limit: None,
         };
 
         let mut conv = Conversation::new();
@@ -1351,6 +1536,7 @@ mod tests {
             compaction_threshold: 1.0,
             reserved_for_response: 0,
             auto_compact_token_limit: None,
+            soft_compact_token_limit: None,
         };
 
         let mut conv = Conversation::new();
@@ -1383,12 +1569,52 @@ mod tests {
     }
 
     #[test]
+    fn micro_compacts_old_tool_results_by_count_even_when_outputs_are_small() {
+        let mut conv = Conversation::new();
+        conv.add_system("system".to_string());
+        conv.add_user("inspect files".to_string());
+        for index in 0..10 {
+            let tool_call_id = format!("call_{index}");
+            conv.add_assistant(
+                None,
+                None,
+                vec![RawToolCall {
+                    id: tool_call_id.clone(),
+                    function_name: "read_file".to_string(),
+                    arguments: format!(r#"{{"path":"file_{index}.rs"}}"#),
+                }],
+            );
+            conv.add_tool_result(tool_call_id, format!("small tool result {index}"));
+        }
+        conv.add_user("continue".to_string());
+
+        let compacted = micro_compact_stale_tool_outputs(&conv);
+        let tool_outputs = compacted
+            .messages
+            .iter()
+            .filter_map(|message| match message {
+                Message::Tool { content, .. } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(tool_outputs.len(), 10);
+        for output in &tool_outputs[..4] {
+            assert!(output.starts_with("[old tool result content cleared;"));
+        }
+        for (index, output) in tool_outputs[4..].iter().enumerate() {
+            assert_eq!(*output, format!("small tool result {}", index + 4));
+        }
+    }
+
+    #[test]
     fn effective_limit_does_not_underflow_when_reserved_exceeds_threshold() {
         let config = ContextConfig {
             max_tokens: 100,
             compaction_threshold: 0.5,
             reserved_for_response: 9999,
             auto_compact_token_limit: None,
+            soft_compact_token_limit: None,
         };
         // 100 * 0.5 = 50, saturating_sub(9999) = 0 (not panic)
         assert_eq!(config.effective_limit(), 0);
@@ -1401,6 +1627,7 @@ mod tests {
             compaction_threshold: 0.0,
             reserved_for_response: 0,
             auto_compact_token_limit: None,
+            soft_compact_token_limit: None,
         };
         // 0.0 clamped to 0.1 → 1000 * 0.1 = 100
         assert_eq!(below.effective_limit(), 100);
@@ -1410,6 +1637,7 @@ mod tests {
             compaction_threshold: 2.0,
             reserved_for_response: 0,
             auto_compact_token_limit: None,
+            soft_compact_token_limit: None,
         };
         // 2.0 clamped to 1.0 → 1000 * 1.0 = 1000
         assert_eq!(above.effective_limit(), 1000);
@@ -1422,6 +1650,7 @@ mod tests {
             compaction_threshold: 1.0,
             reserved_for_response: 0,
             auto_compact_token_limit: None,
+            soft_compact_token_limit: None,
         };
 
         let mut conv = Conversation::new();
@@ -1462,6 +1691,7 @@ mod tests {
             compaction_threshold: 1.0,
             reserved_for_response: 0,
             auto_compact_token_limit: None,
+            soft_compact_token_limit: None,
         };
 
         let mut conv = Conversation::new();
@@ -1507,6 +1737,7 @@ mod tests {
             compaction_threshold: 1.0,
             reserved_for_response: 0,
             auto_compact_token_limit: None,
+            soft_compact_token_limit: None,
         };
         let provider_config = ProviderConfig {
             api_key: None,
@@ -1546,6 +1777,7 @@ mod tests {
             compaction_threshold: 1.0,
             reserved_for_response: 0,
             auto_compact_token_limit: None,
+            soft_compact_token_limit: None,
         };
         let provider_config = ProviderConfig {
             api_key: None,
@@ -1582,6 +1814,7 @@ mod tests {
             compaction_threshold: 1.0,
             reserved_for_response: 0,
             auto_compact_token_limit: Some(1_000),
+            soft_compact_token_limit: None,
         };
         let provider_config = ProviderConfig {
             api_key: None,
@@ -1626,6 +1859,7 @@ mod tests {
             compaction_threshold: 1.0,
             reserved_for_response: 0,
             auto_compact_token_limit: Some(18_000),
+            soft_compact_token_limit: None,
         };
         let provider_config = ProviderConfig {
             api_key: None,
@@ -1674,6 +1908,7 @@ mod tests {
             compaction_threshold: 1.0,
             reserved_for_response: 0,
             auto_compact_token_limit: Some(effective_limit),
+            soft_compact_token_limit: None,
         };
         let provider_config = ProviderConfig {
             api_key: None,
@@ -1728,6 +1963,7 @@ mod tests {
             compaction_threshold: 1.0,
             reserved_for_response: 0,
             auto_compact_token_limit: None,
+            soft_compact_token_limit: None,
         };
 
         let mut conv = Conversation::new();
@@ -1768,6 +2004,7 @@ mod tests {
             compaction_threshold: 1.0,
             reserved_for_response: 0,
             auto_compact_token_limit: Some(452),
+            soft_compact_token_limit: None,
         };
 
         let mut conv = Conversation::new();
@@ -1819,6 +2056,7 @@ mod tests {
             compaction_threshold: 1.0,
             reserved_for_response: 0,
             auto_compact_token_limit: None,
+            soft_compact_token_limit: None,
         };
 
         let mut conv = Conversation::new();
@@ -1850,6 +2088,7 @@ mod tests {
             compaction_threshold: 1.0,
             reserved_for_response: 0,
             auto_compact_token_limit: Some(1_000),
+            soft_compact_token_limit: None,
         };
 
         let mut conv = Conversation::new();
@@ -1880,6 +2119,7 @@ mod tests {
             compaction_threshold: 1.0,
             reserved_for_response: 0,
             auto_compact_token_limit: Some(1_000),
+            soft_compact_token_limit: None,
         };
 
         let mut conv = Conversation::new();
@@ -1913,6 +2153,7 @@ mod tests {
             compaction_threshold: 1.0,
             reserved_for_response: 0,
             auto_compact_token_limit: None,
+            soft_compact_token_limit: None,
         };
 
         let mut conv = Conversation::new();
@@ -1936,6 +2177,7 @@ mod tests {
             compaction_threshold: 1.0,
             reserved_for_response: 0,
             auto_compact_token_limit: Some(1_000),
+            soft_compact_token_limit: None,
         };
 
         let mut conv = Conversation::new();
@@ -2013,6 +2255,7 @@ mod tests {
             compaction_threshold: 1.0,
             reserved_for_response: 0,
             auto_compact_token_limit: None,
+            soft_compact_token_limit: None,
         };
 
         let mut conv = Conversation::new();
@@ -2038,6 +2281,7 @@ mod tests {
             compaction_threshold: 1.0,
             reserved_for_response: 0,
             auto_compact_token_limit: None,
+            soft_compact_token_limit: None,
         };
 
         let mut conv = Conversation::new();

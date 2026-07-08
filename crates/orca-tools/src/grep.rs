@@ -2,22 +2,29 @@ use std::path::Path;
 use std::process::Command;
 
 use orca_core::tool_types::{ToolRequest, ToolResult, ToolResultKind, truncate_output};
+use serde::Deserialize;
+
+const DEFAULT_GREP_HEAD_LIMIT: usize = 250;
+
+#[derive(Default, Deserialize)]
+struct GrepArgs {
+    pattern: Option<String>,
+    path: Option<String>,
+    head_limit: Option<usize>,
+    offset: Option<usize>,
+}
 
 pub fn execute(request: &ToolRequest, cwd: &Path, max_bytes: usize) -> ToolResult {
-    let Some(pattern) = request
+    let args = parse_args(request);
+    let pattern = args.pattern.as_deref().or(request
         .target
         .as_deref()
-        .filter(|target| !target.is_empty())
-    else {
+        .filter(|target| !target.is_empty()));
+    let Some(pattern) = pattern else {
         return ToolResult::failed(request, "grep pattern is required", None);
     };
 
-    let search_path = request
-        .raw_arguments
-        .as_deref()
-        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
-        .and_then(|args| args["path"].as_str().map(String::from))
-        .unwrap_or_else(|| ".".to_string());
+    let search_path = args.path.unwrap_or_else(|| ".".to_string());
 
     if !cwd.join(&search_path).exists() {
         return ToolResult::completed_kind(
@@ -36,6 +43,12 @@ pub fn execute(request: &ToolRequest, cwd: &Path, max_bytes: usize) -> ToolResul
     match output {
         Ok(output) if output.status.success() => {
             let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let stdout = paginate_output(
+                stdout.lines().map(String::from).collect::<Vec<_>>(),
+                args.offset.unwrap_or(0),
+                args.head_limit,
+                DEFAULT_GREP_HEAD_LIMIT,
+            );
             let (stdout, truncated) = truncate_output(stdout, max_bytes);
             ToolResult::completed(request, stdout, truncated)
         }
@@ -51,6 +64,56 @@ pub fn execute(request: &ToolRequest, cwd: &Path, max_bytes: usize) -> ToolResul
         }
         Err(error) => ToolResult::failed(request, format!("failed to run rg: {error}"), None),
     }
+}
+
+fn parse_args(request: &ToolRequest) -> GrepArgs {
+    request
+        .raw_arguments
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<GrepArgs>(raw).ok())
+        .unwrap_or_default()
+}
+
+fn paginate_output(
+    lines: Vec<String>,
+    offset: usize,
+    head_limit: Option<usize>,
+    default_limit: usize,
+) -> String {
+    if head_limit == Some(0) {
+        return lines.get(offset..).unwrap_or_default().to_vec().join("\n");
+    }
+
+    let total = lines.len();
+    let limit = head_limit.unwrap_or(default_limit);
+    let page = lines
+        .iter()
+        .skip(offset)
+        .take(limit)
+        .cloned()
+        .collect::<Vec<_>>();
+    let next_offset = (total.saturating_sub(offset) > limit).then_some(offset + limit);
+
+    let mut output = page.join("\n");
+    if let Some(next_offset) = next_offset {
+        let notice = if offset == 0 {
+            format!("[Showing first {limit} results; use offset={next_offset} to continue]")
+        } else {
+            let end = next_offset.min(total);
+            format!(
+                "[Showing results {}-{} of {total}; use offset={next_offset} to continue]",
+                offset + 1,
+                end
+            )
+        };
+        if output.is_empty() {
+            output = notice;
+        } else {
+            output.push('\n');
+            output.push_str(&notice);
+        }
+    }
+    output
 }
 
 #[cfg(test)]
@@ -81,6 +144,71 @@ mod tests {
         assert_eq!(result.kind, ToolResultKind::NoMatches);
         assert_eq!(result.output.as_deref(), Some("(no matches)"));
         assert_eq!(result.error, None);
+    }
+
+    #[test]
+    fn grep_defaults_to_first_250_results() {
+        let cwd = temp_dir("grep-default-page");
+        fs::create_dir_all(&cwd).expect("create temp workspace");
+        let contents = (0..300)
+            .map(|index| format!("needle {index:03}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(cwd.join("notes.txt"), contents).expect("write fixture");
+        let request = ToolRequest {
+            id: "grep-1".to_string(),
+            name: ToolName::Grep,
+            action: ActionKind::Read,
+            target: Some("needle".to_string()),
+            raw_arguments: Some(r#"{"pattern":"needle","path":"notes.txt"}"#.to_string()),
+        };
+
+        let result = execute(&request, &cwd, 100_000);
+        let output = result.output.as_deref().expect("grep output");
+        let lines = output.lines().collect::<Vec<_>>();
+
+        assert_eq!(result.status, ToolStatus::Completed);
+        assert_eq!(lines.len(), 251);
+        assert!(lines[0].contains("needle 000"));
+        assert!(lines[249].contains("needle 249"));
+        assert_eq!(
+            lines[250],
+            "[Showing first 250 results; use offset=250 to continue]"
+        );
+    }
+
+    #[test]
+    fn grep_respects_explicit_offset_and_head_limit() {
+        let cwd = temp_dir("grep-offset-page");
+        fs::create_dir_all(&cwd).expect("create temp workspace");
+        let contents = (0..300)
+            .map(|index| format!("needle {index:03}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(cwd.join("notes.txt"), contents).expect("write fixture");
+        let request = ToolRequest {
+            id: "grep-1".to_string(),
+            name: ToolName::Grep,
+            action: ActionKind::Read,
+            target: Some("needle".to_string()),
+            raw_arguments: Some(
+                r#"{"pattern":"needle","path":"notes.txt","head_limit":10,"offset":250}"#
+                    .to_string(),
+            ),
+        };
+
+        let result = execute(&request, &cwd, 100_000);
+        let output = result.output.as_deref().expect("grep output");
+        let lines = output.lines().collect::<Vec<_>>();
+
+        assert_eq!(result.status, ToolStatus::Completed);
+        assert_eq!(lines.len(), 11);
+        assert!(lines[0].contains("needle 250"));
+        assert!(lines[9].contains("needle 259"));
+        assert_eq!(
+            lines[10],
+            "[Showing results 251-260 of 300; use offset=260 to continue]"
+        );
     }
 
     fn temp_dir(prefix: &str) -> std::path::PathBuf {

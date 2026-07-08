@@ -23,6 +23,8 @@ use crate::thread_store::{
     SessionMeta, SessionStore, SessionTranscript, SessionWriter, ThreadStore,
 };
 
+const INTERRUPTED_RESUME_HINT: &str = "Previous turn was interrupted; existing workspace edits remain. Inspect git diff before continuing.";
+
 pub fn new_run_id() -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -185,6 +187,11 @@ pub(crate) fn bootstrap_agent_conversation(
         conversation.add_system(system_prompt);
         conversation
     };
+    if resumed.and_then(|transcript| transcript.completion_status.as_deref()) == Some("interrupted")
+        && prompt.trim() != "/exit"
+    {
+        conversation.replace_runtime_context(Some(INTERRUPTED_RESUME_HINT.to_string()));
+    }
     conversation.replace_skill_context(agent_common::explicit_skill_context(cwd, prompt));
     conversation.add_user(prompt.to_string());
     conversation
@@ -797,6 +804,57 @@ mod tests {
                         orca_core::conversation::Message::User { content, .. }
                             if content == "previous"
                     ))
+            );
+        });
+    }
+
+    #[test]
+    fn interrupted_resume_adds_runtime_worktree_hint() {
+        with_orca_home(|home| {
+            let mut writer = history::SessionWriter::start(
+                home,
+                "mock",
+                Some("auto".to_string()),
+                "interrupted",
+            )
+            .expect("writer");
+            writer.complete("interrupted").expect("complete");
+            let transcript = history::load_session("latest").expect("transcript");
+
+            let conversation = bootstrap_agent_conversation(
+                Some(&transcript),
+                "sys".to_string(),
+                home,
+                "continue",
+            );
+
+            assert!(conversation.volatile.render().contains(
+                "Previous turn was interrupted; existing workspace edits remain. Inspect git diff before continuing."
+            ));
+        });
+    }
+
+    #[test]
+    fn interrupted_resume_exit_does_not_add_runtime_worktree_hint() {
+        with_orca_home(|home| {
+            let mut writer = history::SessionWriter::start(
+                home,
+                "mock",
+                Some("auto".to_string()),
+                "interrupted",
+            )
+            .expect("writer");
+            writer.complete("interrupted").expect("complete");
+            let transcript = history::load_session("latest").expect("transcript");
+
+            let conversation =
+                bootstrap_agent_conversation(Some(&transcript), "sys".to_string(), home, "/exit");
+
+            assert!(
+                !conversation
+                    .volatile
+                    .render()
+                    .contains("Previous turn was interrupted; existing workspace edits remain.")
             );
         });
     }

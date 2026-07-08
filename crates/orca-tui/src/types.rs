@@ -98,6 +98,7 @@ pub enum TuiEvent {
         used_tokens: usize,
         limit_tokens: usize,
     },
+    CompactionStarted,
     SessionCompleted {
         status: String,
     },
@@ -143,6 +144,7 @@ pub enum AppStatus {
     SessionPicker,
     Idle,
     Running,
+    Compacting,
     WaitingApproval,
     WaitingUserInput,
 }
@@ -206,11 +208,24 @@ pub enum ApprovalOption {
 impl ApprovalOption {
     pub fn key(self) -> char {
         match self {
+            ApprovalOption::Once => '1',
+            ApprovalOption::AlwaysTarget => '2',
+            ApprovalOption::AlwaysTool => '3',
+            ApprovalOption::Deny => '4',
+        }
+    }
+
+    pub fn legacy_key(self) -> char {
+        match self {
             ApprovalOption::Once => 'y',
             ApprovalOption::AlwaysTool => 'a',
             ApprovalOption::AlwaysTarget => 'A',
             ApprovalOption::Deny => 'n',
         }
+    }
+
+    pub fn matches_key(self, key: char) -> bool {
+        key == self.key() || key == self.legacy_key()
     }
 
     pub fn label(self) -> &'static str {
@@ -255,8 +270,8 @@ impl ApprovalDialog {
         if show_always_target {
             vec![
                 ApprovalOption::Once,
-                ApprovalOption::AlwaysTool,
                 ApprovalOption::AlwaysTarget,
+                ApprovalOption::AlwaysTool,
                 ApprovalOption::Deny,
             ]
         } else {
@@ -273,6 +288,13 @@ impl ApprovalDialog {
             .get(self.selected)
             .copied()
             .unwrap_or(ApprovalOption::Deny)
+    }
+
+    pub fn option_for_key(&self, key: char) -> Option<ApprovalOption> {
+        self.options
+            .iter()
+            .copied()
+            .find(|option| option.matches_key(key))
     }
 }
 
@@ -433,7 +455,7 @@ impl AppState {
             self.enter_running();
         } else if matches!(
             status,
-            AppStatus::WaitingApproval | AppStatus::WaitingUserInput
+            AppStatus::Compacting | AppStatus::WaitingApproval | AppStatus::WaitingUserInput
         ) {
             self.status = status;
         } else {
@@ -1076,6 +1098,9 @@ impl AppState {
                 self.context_used_tokens = used_tokens;
                 self.context_limit_tokens = limit_tokens;
             }
+            TuiEvent::CompactionStarted => {
+                self.set_status(AppStatus::Compacting);
+            }
             TuiEvent::SessionCompleted { status } => {
                 let was_backgrounded = self.suppress_background_main_session_output;
                 self.suppress_background_main_session_output = false;
@@ -1484,6 +1509,69 @@ mod tests {
     }
 
     #[test]
+    fn approval_options_have_numeric_primary_keys_and_legacy_shortcuts() {
+        assert_eq!(ApprovalOption::Once.key(), '1');
+        assert_eq!(ApprovalOption::AlwaysTarget.key(), '2');
+        assert_eq!(ApprovalOption::AlwaysTool.key(), '3');
+        assert_eq!(ApprovalOption::Deny.key(), '4');
+
+        assert!(ApprovalOption::Once.matches_key('1'));
+        assert!(ApprovalOption::Once.matches_key('y'));
+        assert!(ApprovalOption::AlwaysTarget.matches_key('2'));
+        assert!(ApprovalOption::AlwaysTarget.matches_key('A'));
+        assert!(ApprovalOption::AlwaysTool.matches_key('3'));
+        assert!(ApprovalOption::AlwaysTool.matches_key('a'));
+        assert!(ApprovalOption::Deny.matches_key('4'));
+        assert!(ApprovalOption::Deny.matches_key('n'));
+
+        assert!(!ApprovalOption::AlwaysTarget.matches_key('a'));
+        assert!(!ApprovalOption::AlwaysTool.matches_key('A'));
+    }
+
+    #[test]
+    fn approval_dialog_resolves_numeric_and_legacy_keys_by_visible_options() {
+        let dialog = ApprovalDialog {
+            id: "approval-1".to_string(),
+            tool: "edit".to_string(),
+            target: Some("src/main.rs".to_string()),
+            background_task_id: None,
+            selected: 0,
+            options: ApprovalDialog::options_for("edit", Some("src/main.rs")),
+            diff: None,
+        };
+
+        assert_eq!(dialog.option_for_key('1'), Some(ApprovalOption::Once));
+        assert_eq!(
+            dialog.option_for_key('2'),
+            Some(ApprovalOption::AlwaysTarget)
+        );
+        assert_eq!(dialog.option_for_key('3'), Some(ApprovalOption::AlwaysTool));
+        assert_eq!(dialog.option_for_key('4'), Some(ApprovalOption::Deny));
+        assert_eq!(dialog.option_for_key('y'), Some(ApprovalOption::Once));
+        assert_eq!(
+            dialog.option_for_key('A'),
+            Some(ApprovalOption::AlwaysTarget)
+        );
+        assert_eq!(dialog.option_for_key('a'), Some(ApprovalOption::AlwaysTool));
+        assert_eq!(dialog.option_for_key('n'), Some(ApprovalOption::Deny));
+
+        let dynamic = ApprovalDialog {
+            id: "approval-2".to_string(),
+            tool: "web_search".to_string(),
+            target: Some("query".to_string()),
+            background_task_id: None,
+            selected: 0,
+            options: ApprovalDialog::options_for("web_search", Some("query")),
+            diff: None,
+        };
+        assert_eq!(dynamic.option_for_key('2'), None);
+        assert_eq!(
+            dynamic.option_for_key('3'),
+            Some(ApprovalOption::AlwaysTool)
+        );
+    }
+
+    #[test]
     fn approval_dialog_has_four_options_with_target_and_three_without() {
         // Static-target tool (like read_file) shows AlwaysTarget option.
         let with_target = ApprovalDialog::options_for("read_file", Some("src/auth/token.rs"));
@@ -1491,8 +1579,8 @@ mod tests {
             with_target,
             vec![
                 ApprovalOption::Once,
-                ApprovalOption::AlwaysTool,
                 ApprovalOption::AlwaysTarget,
+                ApprovalOption::AlwaysTool,
                 ApprovalOption::Deny,
             ]
         );

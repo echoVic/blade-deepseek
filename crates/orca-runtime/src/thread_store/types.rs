@@ -74,6 +74,7 @@ pub struct SessionTranscript {
     pub summaries: Vec<ContextSummaryRecord>,
     pub usage: Option<UsageTotals>,
     pub plan: Option<(Option<String>, Vec<PlanItem>)>,
+    pub completion_status: Option<String>,
     pub path: PathBuf,
 }
 

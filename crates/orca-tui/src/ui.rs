@@ -397,8 +397,10 @@ fn approval_dialog_height(dialog: &crate::types::ApprovalDialog) -> u16 {
         .map(|diff| diff.lines().count() > 12)
         .unwrap_or(false);
     let diff_h = diff_lines + u16::from(diff_truncated);
+    let diff_spacing = u16::from(dialog.diff.is_some());
     let option_count = dialog.options.len() as u16;
-    (3 + diff_h + option_count + 3).max(8)
+    let content_height = 3 + diff_h + diff_spacing + option_count + 2;
+    (content_height + 2).max(8)
 }
 
 /// Render the transcript messages into `area` with no border. While `auto_scroll` is on
@@ -2005,6 +2007,7 @@ fn activity_line(state: &AppState, theme: &Theme) -> Option<(String, ratatui::st
                 .unwrap_or_else(|| "0s".to_string());
             Some((format!("● running {elapsed}"), theme.warning))
         }
+        AppStatus::Compacting => Some(("● Compacting context...".to_string(), theme.warning)),
         AppStatus::WaitingApproval => Some(("● approval".to_string(), theme.approval)),
         AppStatus::WaitingUserInput => Some(("● input".to_string(), theme.approval)),
     }
@@ -2087,7 +2090,9 @@ fn render_shortcuts(frame: &mut Frame, state: &AppState, theme: &Theme) {
 fn active_shortcut_scopes(state: &AppState) -> Vec<ShortcutScope> {
     match state.status {
         AppStatus::Idle => vec![ShortcutScope::Global, ShortcutScope::Idle],
-        AppStatus::Running => vec![ShortcutScope::Global, ShortcutScope::Running],
+        AppStatus::Running | AppStatus::Compacting => {
+            vec![ShortcutScope::Global, ShortcutScope::Running]
+        }
         AppStatus::WaitingApproval => vec![ShortcutScope::Global, ShortcutScope::Approval],
         AppStatus::WaitingUserInput => vec![ShortcutScope::Global, ShortcutScope::Idle],
         AppStatus::Setup | AppStatus::SessionPicker => vec![ShortcutScope::Global],
@@ -2302,7 +2307,7 @@ fn render_approval_dialog(frame: &mut Frame, state: &AppState, theme: &Theme) {
 
     content.push(Line::from(""));
     content.push(Line::from(Span::styled(
-        "  ↑↓ select · Enter confirm · y/a/A/n direct",
+        "  ↑↓ select · Enter · 1/2/3/4 · legacy y/A/a/n",
         Style::default().fg(theme.muted),
     )));
 
@@ -3036,6 +3041,42 @@ mod tests {
     }
 
     #[test]
+    fn waiting_approval_renders_numeric_shortcuts_in_semantic_order() {
+        let mut state = test_state();
+        state.update(TuiEvent::ApprovalNeeded {
+            id: "approval-1".to_string(),
+            tool: "edit".to_string(),
+            target: Some("src/main.rs".to_string()),
+            preview: None,
+        });
+
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let textarea = TextArea::default();
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30))
+            .expect("test backend");
+
+        terminal
+            .draw(|frame| render(frame, &mut state, &textarea, &theme))
+            .expect("draw");
+        let rendered = format!("{:?}", terminal.backend().buffer());
+
+        let once = rendered.find("[1] allow this once").expect("once option");
+        let exact = rendered
+            .find("[2] always allow this exact call")
+            .expect("exact-call option");
+        let tool = rendered
+            .find("[3] always allow \"edit\"")
+            .expect("tool-wide option");
+        let deny = rendered.find("[4] deny").expect("deny option");
+
+        assert!(once < exact);
+        assert!(exact < tool);
+        assert!(tool < deny);
+        assert!(rendered.contains("1/2/3/4"));
+        assert!(rendered.contains("legacy y/A/a/n"));
+    }
+
+    #[test]
     fn live_pane_honours_scroll_offset_when_content_overflows() {
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
 
@@ -3242,6 +3283,19 @@ mod tests {
 
         let (text, color) = activity_line(&state, &theme).expect("running shows an activity line");
         assert_eq!(text, "● running 1m 05s");
+        assert_eq!(color, theme.warning);
+    }
+
+    #[test]
+    fn compacting_activity_line_shows_context_status() {
+        let mut state = test_state();
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        state.status = AppStatus::Compacting;
+
+        let (text, color) =
+            activity_line(&state, &theme).expect("compacting shows an activity line");
+
+        assert_eq!(text, "● Compacting context...");
         assert_eq!(color, theme.warning);
     }
 

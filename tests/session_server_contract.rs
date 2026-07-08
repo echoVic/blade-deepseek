@@ -4534,11 +4534,6 @@ fn server_mode_command_exec_streams_output_and_accepts_write() {
     let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
     let started = read_until_event(&mut stdout, "cmd", "command_exec_started");
     assert_eq!(started["processId"], "pipe-1");
-    let initial_events = read_command_exec_output_until(&mut stdout, "pipe-1", |stdout, stderr| {
-        stdout.contains("out-start\n") && stderr.contains("err-start\n")
-    });
-    assert_command_exec_delta_seen(&initial_events, "stdout", "out-start\n");
-    assert_command_exec_delta_seen(&initial_events, "stderr", "err-start\n");
 
     {
         let stdin = child.stdin.as_mut().expect("server stdin");
@@ -4551,9 +4546,19 @@ fn server_mode_command_exec_streams_output_and_accepts_write() {
         stdin.flush().expect("flush command/exec/write");
     }
 
-    let write_ack = read_until_event(&mut stdout, "cmd-write", "command_exec_written");
+    let mut completion_events =
+        read_events_until_event(&mut stdout, "cmd-write", "command_exec_written");
+    let write_ack = completion_events
+        .last()
+        .expect("command_exec_written event");
     assert_eq!(write_ack["processId"], "pipe-1");
-    let completion_events = read_events_until_event(&mut stdout, "cmd", "command_exec_completed");
+    completion_events.extend(read_events_until_event(
+        &mut stdout,
+        "cmd",
+        "command_exec_completed",
+    ));
+    assert_command_exec_delta_seen(&completion_events, "stdout", "out-start\n");
+    assert_command_exec_delta_seen(&completion_events, "stderr", "err-start\n");
     assert_command_exec_delta_seen(&completion_events, "stdout", "out:hello\n");
     assert_command_exec_delta_seen(&completion_events, "stderr", "err:hello\n");
     let completed = completion_events
@@ -4564,6 +4569,7 @@ fn server_mode_command_exec_streams_output_and_accepts_write() {
     assert_eq!(completed["stdout"], "");
     assert_eq!(completed["stderr"], "");
 
+    drop(child.stdin.take());
     let output = child.wait_with_output().expect("wait for server");
     assert_eq!(output.status.code(), Some(0));
     assert!(output.stderr.is_empty());
@@ -4753,6 +4759,8 @@ fn server_mode_command_exec_read_caps_streaming_output() {
 #[test]
 fn server_mode_command_exec_streaming_respects_output_cap() {
     let workspace = tempdir().expect("workspace");
+    let started_marker = workspace.path().join("stream-cap-started");
+    let started_marker_arg = started_marker.to_str().expect("started marker path");
     let mut child = orca_command()
         .args([
             "--mode",
@@ -4772,7 +4780,7 @@ fn server_mode_command_exec_streaming_respects_output_cap() {
         let stdin = child.stdin.as_mut().expect("server stdin");
         writeln!(
             stdin,
-            r#"{{"id":"cmd","method":"command/exec","params":{{"command":["sh","-lc","printf 'abcdefghij'; sleep 30"],"processId":"stream-cap-1","streamStdoutStderr":true,"outputBytesCap":5}}}}"#
+            r#"{{"id":"cmd","method":"command/exec","params":{{"command":["sh","-lc","printf 'abcdefghij'; : > \"$1\"; sleep 30","sh","{started_marker_arg}"],"processId":"stream-cap-1","streamStdoutStderr":true,"outputBytesCap":5}}}}"#
         )
         .expect("write command/exec");
         stdin.flush().expect("flush command/exec");
@@ -4781,29 +4789,7 @@ fn server_mode_command_exec_streaming_respects_output_cap() {
     let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
     let started = read_until_event(&mut stdout, "cmd", "command_exec_started");
     assert_eq!(started["processId"], "stream-cap-1");
-    let capped_events =
-        read_command_exec_output_until(&mut stdout, "stream-cap-1", |stdout, _stderr| {
-            stdout.contains("abcde")
-        });
-    assert_command_exec_delta_seen(&capped_events, "stdout", "abcde");
-    assert_command_exec_output_delta_notification_seen(&capped_events, "stdout", "stream-cap-1");
-    assert!(
-        capped_events.iter().any(|event| {
-            event["event"] == "command_exec_output_delta"
-                && event["stream"] == "stdout"
-                && event["capReached"] == true
-        }),
-        "missing capReached stdout delta: {capped_events:?}"
-    );
-    assert!(
-        !capped_events.iter().any(|event| {
-            event["event"] == "command_exec_output_delta"
-                && event["delta"]
-                    .as_str()
-                    .is_some_and(|delta| delta.contains("f"))
-        }),
-        "streaming output exceeded cap: {capped_events:?}"
-    );
+    wait_for_path(&started_marker);
 
     {
         let stdin = child.stdin.as_mut().expect("server stdin");
@@ -4814,9 +4800,32 @@ fn server_mode_command_exec_streaming_respects_output_cap() {
         .expect("write command/exec/terminate");
         stdin.flush().expect("flush command/exec/terminate");
     }
-    read_until_event(&mut stdout, "cmd-kill", "command_exec_terminated");
+    let mut events = read_events_until_event(&mut stdout, "cmd-kill", "command_exec_terminated");
     drop(child.stdin.take());
-    let events = read_events_until_event(&mut stdout, "cmd", "command_exec_completed");
+    events.extend(read_events_until_event(
+        &mut stdout,
+        "cmd",
+        "command_exec_completed",
+    ));
+    assert_command_exec_delta_seen(&events, "stdout", "abcde");
+    assert_command_exec_output_delta_notification_seen(&events, "stdout", "stream-cap-1");
+    assert!(
+        events.iter().any(|event| {
+            event["event"] == "command_exec_output_delta"
+                && event["stream"] == "stdout"
+                && event["capReached"] == true
+        }),
+        "missing capReached stdout delta: {events:?}"
+    );
+    assert!(
+        !events.iter().any(|event| {
+            event["event"] == "command_exec_output_delta"
+                && event["delta"]
+                    .as_str()
+                    .is_some_and(|delta| delta.contains("f"))
+        }),
+        "streaming output exceeded cap: {events:?}"
+    );
     let completed = events
         .iter()
         .find(|event| event["event"] == "command_exec_completed")
@@ -4833,6 +4842,8 @@ fn server_mode_command_exec_streaming_respects_output_cap() {
 #[test]
 fn server_mode_command_exec_caps_streaming_output_by_bytes() {
     let workspace = tempdir().expect("workspace");
+    let started_marker = workspace.path().join("stream-byte-cap-started");
+    let started_marker_arg = started_marker.to_str().expect("started marker path");
     let mut child = orca_command()
         .args([
             "--mode",
@@ -4852,7 +4863,7 @@ fn server_mode_command_exec_caps_streaming_output_by_bytes() {
         let stdin = child.stdin.as_mut().expect("server stdin");
         writeln!(
             stdin,
-            r#"{{"id":"cmd","method":"command/exec","params":{{"command":["sh","-lc","printf 'ééé'; sleep 30"],"processId":"stream-byte-cap-1","streamStdoutStderr":true,"outputBytesCap":5}}}}"#
+            r#"{{"id":"cmd","method":"command/exec","params":{{"command":["sh","-lc","printf 'ééé'; : > \"$1\"; sleep 30","sh","{started_marker_arg}"],"processId":"stream-byte-cap-1","streamStdoutStderr":true,"outputBytesCap":5}}}}"#
         )
         .expect("write command/exec");
         stdin.flush().expect("flush command/exec");
@@ -4861,28 +4872,7 @@ fn server_mode_command_exec_caps_streaming_output_by_bytes() {
     let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
     let started = read_until_event(&mut stdout, "cmd", "command_exec_started");
     assert_eq!(started["processId"], "stream-byte-cap-1");
-    let capped_events =
-        read_command_exec_output_until(&mut stdout, "stream-byte-cap-1", |stdout, _stderr| {
-            stdout.contains("éé")
-        });
-    assert_command_exec_delta_seen(&capped_events, "stdout", "éé");
-    assert!(
-        capped_events.iter().any(|event| {
-            event["event"] == "command_exec_output_delta"
-                && event["stream"] == "stdout"
-                && event["capReached"] == true
-        }),
-        "missing capReached stdout delta: {capped_events:?}"
-    );
-    assert!(
-        !capped_events.iter().any(|event| {
-            event["event"] == "command_exec_output_delta"
-                && event["delta"]
-                    .as_str()
-                    .is_some_and(|delta| delta.contains("ééé"))
-        }),
-        "streaming output exceeded byte cap: {capped_events:?}"
-    );
+    wait_for_path(&started_marker);
 
     {
         let stdin = child.stdin.as_mut().expect("server stdin");
@@ -4893,9 +4883,31 @@ fn server_mode_command_exec_caps_streaming_output_by_bytes() {
         .expect("write command/exec/terminate");
         stdin.flush().expect("flush command/exec/terminate");
     }
-    read_until_event(&mut stdout, "cmd-kill", "command_exec_terminated");
+    let mut events = read_events_until_event(&mut stdout, "cmd-kill", "command_exec_terminated");
     drop(child.stdin.take());
-    read_events_until_event(&mut stdout, "cmd", "command_exec_completed");
+    events.extend(read_events_until_event(
+        &mut stdout,
+        "cmd",
+        "command_exec_completed",
+    ));
+    assert_command_exec_delta_seen(&events, "stdout", "éé");
+    assert!(
+        events.iter().any(|event| {
+            event["event"] == "command_exec_output_delta"
+                && event["stream"] == "stdout"
+                && event["capReached"] == true
+        }),
+        "missing capReached stdout delta: {events:?}"
+    );
+    assert!(
+        !events.iter().any(|event| {
+            event["event"] == "command_exec_output_delta"
+                && event["delta"]
+                    .as_str()
+                    .is_some_and(|delta| delta.contains("ééé"))
+        }),
+        "streaming output exceeded byte cap: {events:?}"
+    );
 
     let output = child.wait_with_output().expect("wait for server");
     assert_eq!(output.status.code(), Some(0));
@@ -4906,6 +4918,8 @@ fn server_mode_command_exec_caps_streaming_output_by_bytes() {
 #[test]
 fn server_mode_command_exec_tty_supports_initial_size_and_resize() {
     let workspace = tempdir().expect("workspace");
+    let started_marker = workspace.path().join("tty-size-started");
+    let started_marker_arg = started_marker.to_str().expect("started marker path");
     let mut child = orca_command()
         .args([
             "--mode",
@@ -4925,7 +4939,7 @@ fn server_mode_command_exec_tty_supports_initial_size_and_resize() {
         let stdin = child.stdin.as_mut().expect("server stdin");
         writeln!(
             stdin,
-            r#"{{"id":"cmd","method":"command/exec","params":{{"command":["python3","-c","import fcntl,termios,struct,sys; data=fcntl.ioctl(sys.stdin.fileno(), termios.TIOCGWINSZ, struct.pack('HHHH',0,0,0,0)); rows,cols,_,_=struct.unpack('HHHH', data); print(f'start:{{rows}} {{cols}}', flush=True); sys.stdin.readline(); data=fcntl.ioctl(sys.stdin.fileno(), termios.TIOCGWINSZ, struct.pack('HHHH',0,0,0,0)); rows,cols,_,_=struct.unpack('HHHH', data); print(f'after:{{rows}} {{cols}}', flush=True)"],"processId":"tty-size-1","tty":true,"size":{{"rows":31,"cols":101}}}}}}"#
+            r#"{{"id":"cmd","method":"command/exec","params":{{"command":["python3","-c","import fcntl,termios,struct,sys,pathlib; data=fcntl.ioctl(sys.stdin.fileno(), termios.TIOCGWINSZ, struct.pack('HHHH',0,0,0,0)); rows,cols,_,_=struct.unpack('HHHH', data); print(f'start:{{rows}} {{cols}}', flush=True); pathlib.Path(sys.argv[1]).write_text('started'); sys.stdin.readline(); data=fcntl.ioctl(sys.stdin.fileno(), termios.TIOCGWINSZ, struct.pack('HHHH',0,0,0,0)); rows,cols,_,_=struct.unpack('HHHH', data); print(f'after:{{rows}} {{cols}}', flush=True)","{started_marker_arg}"],"processId":"tty-size-1","tty":true,"size":{{"rows":31,"cols":101}}}}}}"#
         )
         .expect("write command/exec");
         stdin.flush().expect("flush command/exec");
@@ -4934,11 +4948,7 @@ fn server_mode_command_exec_tty_supports_initial_size_and_resize() {
     let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
     let started = read_until_event(&mut stdout, "cmd", "command_exec_started");
     assert_eq!(started["processId"], "tty-size-1");
-    let initial_events =
-        read_command_exec_output_until(&mut stdout, "tty-size-1", |stdout, _stderr| {
-            stdout.contains("start:31 101")
-        });
-    assert_command_exec_delta_seen(&initial_events, "stdout", "start:31 101");
+    wait_for_path(&started_marker);
 
     {
         let stdin = child.stdin.as_mut().expect("server stdin");
@@ -4949,7 +4959,11 @@ fn server_mode_command_exec_tty_supports_initial_size_and_resize() {
         .expect("write command/exec/resize");
         stdin.flush().expect("flush command/exec/resize");
     }
-    let resize_ack = read_until_event(&mut stdout, "cmd-resize", "command_exec_resized");
+    let mut completion_events =
+        read_events_until_event(&mut stdout, "cmd-resize", "command_exec_resized");
+    let resize_ack = completion_events
+        .last()
+        .expect("command_exec_resized event");
     assert_eq!(resize_ack["processId"], "tty-size-1");
     assert_eq!(resize_ack["rows"], 45);
     assert_eq!(resize_ack["cols"], 132);
@@ -4965,9 +4979,23 @@ fn server_mode_command_exec_tty_supports_initial_size_and_resize() {
         stdin.flush().expect("flush command/exec/write");
     }
 
-    let write_ack = read_until_event(&mut stdout, "cmd-write", "command_exec_written");
+    completion_events.extend(read_events_until_event(
+        &mut stdout,
+        "cmd-write",
+        "command_exec_written",
+    ));
+    let write_ack = completion_events
+        .iter()
+        .rev()
+        .find(|event| event["id"] == "cmd-write" && event["event"] == "command_exec_written")
+        .expect("command_exec_written event");
     assert_eq!(write_ack["processId"], "tty-size-1");
-    let completion_events = read_events_until_event(&mut stdout, "cmd", "command_exec_completed");
+    completion_events.extend(read_events_until_event(
+        &mut stdout,
+        "cmd",
+        "command_exec_completed",
+    ));
+    assert_command_exec_delta_seen(&completion_events, "stdout", "start:31 101");
     assert_command_exec_delta_seen(&completion_events, "stdout", "after:45 132");
     let completed = completion_events
         .iter()
@@ -4977,6 +5005,7 @@ fn server_mode_command_exec_tty_supports_initial_size_and_resize() {
     assert_eq!(completed["stdout"], "");
     assert_eq!(completed["stderr"], "");
 
+    drop(child.stdin.take());
     let output = child.wait_with_output().expect("wait for server");
     assert_eq!(output.status.code(), Some(0));
     assert!(output.stderr.is_empty());

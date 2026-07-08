@@ -414,13 +414,18 @@ pub const SHORTCUT_HINTS: &[ShortcutHint] = &[
     },
     ShortcutHint {
         scope: ShortcutScope::Approval,
-        keys: "y/a",
-        action: "allow",
+        keys: "1/2/3",
+        action: "allow options",
     },
     ShortcutHint {
         scope: ShortcutScope::Approval,
-        keys: "n/d",
+        keys: "4",
         action: "deny",
+    },
+    ShortcutHint {
+        scope: ShortcutScope::Approval,
+        keys: "y/A/a/n",
+        action: "legacy direct keys",
     },
 ];
 

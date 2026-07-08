@@ -850,17 +850,24 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
             return TuiAgentTurnResult::new("budget_exhausted");
         }
 
-        if orca_provider::context::needs_compaction_wire(
+        let pressure = orca_provider::context::context_pressure(
             session.conversation(),
             &ctx_config,
             &provider_config,
-        ) {
+        );
+        if pressure.should_soft_compact || pressure.should_hard_compact {
+            let _ = event_tx.send(TuiEvent::CompactionStarted);
             session.compact(config, &cwd);
         }
+        let pressure = orca_provider::context::context_pressure(
+            session.conversation(),
+            &ctx_config,
+            &provider_config,
+        );
 
         let _ = event_tx.send(TuiEvent::ContextUpdated {
-            used_tokens: orca_provider::context::conversation_tokens(session.conversation()),
-            limit_tokens: ctx_config.effective_limit(),
+            used_tokens: pressure.wire_tokens,
+            limit_tokens: pressure.soft_limit,
         });
 
         let (turn, task) = session.next_turn_lifecycle();

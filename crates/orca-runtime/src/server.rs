@@ -3380,7 +3380,11 @@ enabled = true
             );
             handle_line(&server_config, &mut state, &request, Arc::clone(&writer))
                 .expect("command exec");
-            let events = parse_jsonl(&writer.lock().expect("writer").clone());
+            let events = drain_until_command_exec_permission_request(
+                &mut state,
+                &writer,
+                Duration::from_secs(6),
+            );
             let permission_request = events
                 .iter()
                 .find(|event| event["event"] == "permission_request")
@@ -3474,7 +3478,11 @@ enabled = true
             );
             handle_line(&server_config, &mut state, &request, Arc::clone(&writer))
                 .expect("command exec");
-            let events = parse_jsonl(&writer.lock().expect("writer").clone());
+            let events = drain_until_command_exec_permission_request(
+                &mut state,
+                &writer,
+                Duration::from_secs(6),
+            );
             let permission_request = events
                 .iter()
                 .find(|event| event["event"] == "permission_request")
@@ -3507,6 +3515,12 @@ enabled = true
             );
             handle_line(&server_config, &mut state, &response, Arc::clone(&writer))
                 .expect("permission response");
+            drain_command_exec_processes_with_timeout(
+                &mut state,
+                &mut *writer.lock().expect("writer"),
+                Duration::from_secs(2),
+            )
+            .expect("drain retried process");
             let events = parse_jsonl(&writer.lock().expect("writer").clone());
             let completed = events
                 .iter()
@@ -3577,7 +3591,11 @@ enabled = true
             );
             handle_line(&server_config, &mut state, &request, Arc::clone(&writer))
                 .expect("command exec");
-            let events = parse_jsonl(&writer.lock().expect("writer").clone());
+            let events = drain_until_command_exec_permission_request(
+                &mut state,
+                &writer,
+                Duration::from_secs(6),
+            );
             let permission_request = events
                 .iter()
                 .find(|event| event["event"] == "permission_request")
@@ -3609,6 +3627,12 @@ enabled = true
             );
             handle_line(&server_config, &mut state, &response, Arc::clone(&writer))
                 .expect("permission response");
+            drain_command_exec_processes_with_timeout(
+                &mut state,
+                &mut *writer.lock().expect("writer"),
+                Duration::from_secs(2),
+            )
+            .expect("drain retried process");
             let events = parse_jsonl(&writer.lock().expect("writer").clone());
             let completed = events
                 .iter()
@@ -3671,7 +3695,11 @@ enabled = true
             );
             handle_line(&server_config, &mut state, &request, Arc::clone(&writer))
                 .expect("command exec");
-            let events = parse_jsonl(&writer.lock().expect("writer").clone());
+            let events = drain_until_command_exec_permission_request(
+                &mut state,
+                &writer,
+                Duration::from_secs(6),
+            );
             let permission_request = events
                 .iter()
                 .find(|event| event["event"] == "permission_request")
@@ -3690,6 +3718,12 @@ enabled = true
             );
             handle_line(&server_config, &mut state, &response, Arc::clone(&writer))
                 .expect("permission response");
+            drain_command_exec_processes_with_timeout(
+                &mut state,
+                &mut *writer.lock().expect("writer"),
+                Duration::from_secs(2),
+            )
+            .expect("drain retried process");
             let events = parse_jsonl(&writer.lock().expect("writer").clone());
             let completed = events
                 .iter()
@@ -3745,7 +3779,11 @@ enabled = true
             );
             handle_line(&server_config, &mut state, &request, Arc::clone(&writer))
                 .expect("command exec");
-            let events = parse_jsonl(&writer.lock().expect("writer").clone());
+            let events = drain_until_command_exec_permission_request(
+                &mut state,
+                &writer,
+                Duration::from_secs(2),
+            );
             assert!(
                 events.iter().any(|event| {
                     event["event"] == "command_exec_started" && event["processId"] == "fs-stream-1"
@@ -6407,6 +6445,66 @@ enabled = true
             .lines()
             .map(|line| serde_json::from_str(line).expect("valid jsonl line"))
             .collect()
+    }
+
+    fn drain_until_command_exec_permission_request(
+        state: &mut ServerState,
+        writer: &Arc<Mutex<Vec<u8>>>,
+        timeout: Duration,
+    ) -> Vec<Value> {
+        let deadline = std::time::Instant::now()
+            .checked_add(timeout)
+            .unwrap_or_else(std::time::Instant::now);
+        loop {
+            let events = parse_jsonl(&writer.lock().expect("writer").clone());
+            if events
+                .iter()
+                .any(|event| event["event"] == "permission_request")
+            {
+                return events;
+            }
+            let drain_outcome = {
+                let mut output = writer.lock().expect("writer");
+                drain_command_exec_processes_until_output_or_timeout(
+                    state,
+                    &mut *output,
+                    Duration::from_millis(100),
+                )
+                .expect("drain command/exec process")
+            };
+            match drain_outcome {
+                CommandExecDrainOutcome::NetworkPermissionRequired { request, block } => {
+                    let mut output = writer.lock().expect("writer");
+                    request_command_exec_network_permission(state, request, block, &mut *output)
+                        .expect("request network permission");
+                }
+                CommandExecDrainOutcome::FileSystemPermissionRequired {
+                    request,
+                    diagnostic,
+                } => {
+                    let mut output = writer.lock().expect("writer");
+                    request_command_exec_file_system_permission(
+                        state,
+                        request,
+                        diagnostic,
+                        &mut *output,
+                    )
+                    .expect("request file-system permission");
+                }
+                CommandExecDrainOutcome::Drained => {}
+            }
+            let events = parse_jsonl(&writer.lock().expect("writer").clone());
+            if events
+                .iter()
+                .any(|event| event["event"] == "permission_request")
+            {
+                return events;
+            }
+            if std::time::Instant::now() >= deadline {
+                return events;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     fn wait_for_event(

@@ -13,6 +13,8 @@ struct GlobArgs {
     query: Option<String>,
     mode: Option<GlobMode>,
     path: Option<String>,
+    head_limit: Option<usize>,
+    offset: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -24,6 +26,7 @@ enum GlobMode {
 
 const MAX_FUZZY_VISITS: usize = 10_000;
 const MAX_FUZZY_MATCHES: usize = 200;
+const DEFAULT_GLOB_HEAD_LIMIT: usize = 500;
 
 pub fn execute(request: &ToolRequest, cwd: &Path, max_bytes: usize) -> ToolResult {
     let args = match parse_args(request) {
@@ -45,7 +48,7 @@ pub fn execute(request: &ToolRequest, cwd: &Path, max_bytes: usize) -> ToolResul
     }
 
     if matches!(args.mode, Some(GlobMode::Fuzzy)) {
-        return execute_fuzzy(request, cwd, &search_root, &args.query, max_bytes);
+        return execute_fuzzy(request, cwd, &search_root, &args, max_bytes);
     }
 
     let pattern = args
@@ -73,7 +76,13 @@ pub fn execute(request: &ToolRequest, cwd: &Path, max_bytes: usize) -> ToolResul
         );
     }
 
-    let (output, truncated) = truncate_output(matches.join("\n"), max_bytes);
+    let output = paginate_output(
+        matches,
+        args.offset.unwrap_or(0),
+        args.head_limit,
+        DEFAULT_GLOB_HEAD_LIMIT,
+    );
+    let (output, truncated) = truncate_output(output, max_bytes);
     ToolResult::completed_kind(
         request,
         output,
@@ -121,10 +130,11 @@ fn execute_fuzzy(
     request: &ToolRequest,
     cwd: &Path,
     search_root: &Path,
-    query: &Option<String>,
+    args: &GlobArgs,
     max_bytes: usize,
 ) -> ToolResult {
-    let query = query
+    let query = args
+        .query
         .as_deref()
         .expect("fuzzy mode requires parsed query")
         .trim();
@@ -151,7 +161,13 @@ fn execute_fuzzy(
             ToolResultKind::NoMatches,
         );
     }
-    let (output, truncated) = truncate_output(matches.join("\n"), max_bytes);
+    let output = paginate_output(
+        matches,
+        args.offset.unwrap_or(0),
+        args.head_limit,
+        DEFAULT_GLOB_HEAD_LIMIT,
+    );
+    let (output, truncated) = truncate_output(output, max_bytes);
     ToolResult::completed_kind(
         request,
         output,
@@ -162,6 +178,48 @@ fn execute_fuzzy(
             ToolResultKind::Success
         },
     )
+}
+
+fn paginate_output(
+    lines: Vec<String>,
+    offset: usize,
+    head_limit: Option<usize>,
+    default_limit: usize,
+) -> String {
+    if head_limit == Some(0) {
+        return lines.get(offset..).unwrap_or_default().to_vec().join("\n");
+    }
+
+    let total = lines.len();
+    let limit = head_limit.unwrap_or(default_limit);
+    let page = lines
+        .iter()
+        .skip(offset)
+        .take(limit)
+        .cloned()
+        .collect::<Vec<_>>();
+    let next_offset = (total.saturating_sub(offset) > limit).then_some(offset + limit);
+
+    let mut output = page.join("\n");
+    if let Some(next_offset) = next_offset {
+        let notice = if offset == 0 {
+            format!("[Showing first {limit} results; use offset={next_offset} to continue]")
+        } else {
+            let end = next_offset.min(total);
+            format!(
+                "[Showing results {}-{} of {total}; use offset={next_offset} to continue]",
+                offset + 1,
+                end
+            )
+        };
+        if output.is_empty() {
+            output = notice;
+        } else {
+            output.push('\n');
+            output.push_str(&notice);
+        }
+    }
+    output
 }
 
 fn build_matcher(pattern: &str) -> Result<globset::GlobSet, String> {
@@ -293,6 +351,80 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[test]
+    fn glob_defaults_to_first_500_results() {
+        let cwd = tempdir().expect("temp workspace");
+        let files_dir = cwd.path().join("files");
+        fs::create_dir_all(&files_dir).expect("create files dir");
+        for index in 0..520 {
+            fs::write(files_dir.join(format!("{index:03}.txt")), "hello").expect("write match");
+        }
+        let request = ToolRequest {
+            id: "glob-page".to_string(),
+            name: ToolName::Glob,
+            action: ActionKind::Read,
+            target: None,
+            raw_arguments: Some(
+                serde_json::json!({
+                    "pattern": "*.txt",
+                    "path": "files"
+                })
+                .to_string(),
+            ),
+        };
+
+        let result = execute(&request, cwd.path(), 100_000);
+        let output = result.output.as_deref().expect("glob output");
+        let lines = output.lines().collect::<Vec<_>>();
+
+        assert_eq!(result.status, ToolStatus::Completed);
+        assert_eq!(lines.len(), 501);
+        assert_eq!(lines[0], "files/000.txt");
+        assert_eq!(lines[499], "files/499.txt");
+        assert_eq!(
+            lines[500],
+            "[Showing first 500 results; use offset=500 to continue]"
+        );
+    }
+
+    #[test]
+    fn glob_respects_explicit_offset_and_head_limit() {
+        let cwd = tempdir().expect("temp workspace");
+        let files_dir = cwd.path().join("files");
+        fs::create_dir_all(&files_dir).expect("create files dir");
+        for index in 0..520 {
+            fs::write(files_dir.join(format!("{index:03}.txt")), "hello").expect("write match");
+        }
+        let request = ToolRequest {
+            id: "glob-page".to_string(),
+            name: ToolName::Glob,
+            action: ActionKind::Read,
+            target: None,
+            raw_arguments: Some(
+                serde_json::json!({
+                    "pattern": "*.txt",
+                    "path": "files",
+                    "head_limit": 10,
+                    "offset": 500
+                })
+                .to_string(),
+            ),
+        };
+
+        let result = execute(&request, cwd.path(), 100_000);
+        let output = result.output.as_deref().expect("glob output");
+        let lines = output.lines().collect::<Vec<_>>();
+
+        assert_eq!(result.status, ToolStatus::Completed);
+        assert_eq!(lines.len(), 11);
+        assert_eq!(lines[0], "files/500.txt");
+        assert_eq!(lines[9], "files/509.txt");
+        assert_eq!(
+            lines[10],
+            "[Showing results 501-510 of 520; use offset=510 to continue]"
+        );
+    }
 
     #[test]
     fn fuzzy_mode_returns_ranked_relative_matches() {

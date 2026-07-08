@@ -1591,6 +1591,7 @@ mod tests {
         config.model_runtime = ModelRuntimeConfig {
             context_window: Some(128_000),
             auto_compact_token_limit: Some(96_000),
+            soft_compact_token_limit: None,
         };
         let mcp_registry = McpRegistry::default();
 
