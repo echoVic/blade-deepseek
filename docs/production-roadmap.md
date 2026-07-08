@@ -292,8 +292,10 @@ copied into Orca.
    response, and resume through the runtime-owned continuation path instead of
    losing the provider response. TUI session initialization now also refreshes
    recovered approval-required background tasks and emits a user-visible notice
-   naming the pending tool. Next, decide whether old/invalid continuation
-   records should expire or fail closed.
+   naming the pending tool. Invalid or future-incompatible continuation records
+   now fail closed at task-registry load time: the affected background task is
+   marked failed, pending approval state is cleared, and the sanitized record is
+   written back instead of blocking the whole session restore.
 6. **P5: Package-3-style task UX polish.** Borrow the visible task panel ideas:
    sorted task list, detail view, foreground/stop actions, and notifications.
    Keep implementation behind Orca runtime task/protocol types rather than

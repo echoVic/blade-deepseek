@@ -102,7 +102,7 @@ struct PersistedTaskRecord {
     #[serde(default)]
     pending_tool_call: Option<PendingToolCallSummary>,
     #[serde(default)]
-    pending_provider_response: Option<PersistedProviderResponse>,
+    pending_provider_response: Option<serde_json::Value>,
     workflow_run_id: Option<String>,
     phase_count: Option<usize>,
     workflow_progress: Option<WorkflowTaskProgress>,
@@ -973,11 +973,20 @@ impl TaskPersistence {
         if !path.exists() {
             return Ok(HashMap::new());
         }
-        let records: HashMap<String, PersistedTaskRecord> = read_json(&path)?;
-        Ok(records
+        let persisted: HashMap<String, PersistedTaskRecord> = read_json(&path)?;
+        let mut changed = false;
+        let records = persisted
             .into_iter()
-            .map(|(id, record)| (id, TaskRecord::from_persisted(record)))
-            .collect())
+            .map(|(id, record)| {
+                let (record, record_changed) = TaskRecord::from_persisted(record);
+                changed |= record_changed;
+                (id, record)
+            })
+            .collect::<HashMap<_, _>>();
+        if changed {
+            self.write_session_records(session_id, &records)?;
+        }
+        Ok(records)
     }
 
     fn write_session_records(
@@ -1048,8 +1057,13 @@ impl RuntimeSubagentStatusLookup for TaskRegistry {
 }
 
 impl PersistedTaskRecord {
-    fn into_task_record(self) -> TaskRecord {
-        TaskRecord {
+    fn into_task_record(self) -> (TaskRecord, bool) {
+        let mut changed = false;
+        let pending_provider_response = self
+            .pending_provider_response
+            .map(|value| serde_json::from_value::<PersistedProviderResponse>(value))
+            .transpose();
+        let mut record = TaskRecord {
             id: self.id,
             task_type: self.task_type,
             status: self.status,
@@ -1063,9 +1077,7 @@ impl PersistedTaskRecord {
             tool: self.tool,
             pending_tool_call: self.pending_tool_call,
             pending_tool_approval_response: None,
-            pending_provider_response: self
-                .pending_provider_response
-                .map(PersistedProviderResponse::into_provider_response),
+            pending_provider_response: None,
             workflow_run_id: self.workflow_run_id,
             phase_count: self.phase_count,
             workflow_progress: self.workflow_progress,
@@ -1084,12 +1096,23 @@ impl PersistedTaskRecord {
             worker_pid: self.worker_pid,
             command: self.command,
             control: new_task_control(),
+        };
+        match pending_provider_response {
+            Ok(Some(response)) => {
+                record.pending_provider_response = Some(response.into_provider_response());
+            }
+            Ok(None) => {}
+            Err(error) => {
+                fail_invalid_pending_provider_response(&mut record, &error);
+                changed = true;
+            }
         }
+        (record, changed)
     }
 }
 
 impl TaskRecord {
-    fn from_persisted(record: PersistedTaskRecord) -> Self {
+    fn from_persisted(record: PersistedTaskRecord) -> (Self, bool) {
         record.into_task_record()
     }
 }
@@ -1109,10 +1132,9 @@ impl From<&TaskRecord> for PersistedTaskRecord {
             agent_type: record.agent_type.clone(),
             tool: record.tool.clone(),
             pending_tool_call: record.pending_tool_call.clone(),
-            pending_provider_response: record
-                .pending_provider_response
-                .as_ref()
-                .map(PersistedProviderResponse::from),
+            pending_provider_response: record.pending_provider_response.as_ref().and_then(
+                |response| serde_json::to_value(PersistedProviderResponse::from(response)).ok(),
+            ),
             workflow_run_id: record.workflow_run_id.clone(),
             phase_count: record.phase_count,
             workflow_progress: record.workflow_progress,
@@ -1189,6 +1211,25 @@ impl PersistedProviderStep {
             Self::Error(error) => ProviderStep::Error(error),
         }
     }
+}
+
+fn fail_invalid_pending_provider_response(record: &mut TaskRecord, error: &serde_json::Error) {
+    record.status = TaskStatus::Failed;
+    if record.started_at_ms.is_none() {
+        record.started_at_ms = Some(now_ms());
+    }
+    record.completed_at_ms = Some(now_ms());
+    record.result = None;
+    record.error = Some(format!(
+        "invalid pending provider response; background continuation failed closed: {error}"
+    ));
+    record.tool = None;
+    record.pending_tool_call = None;
+    record.pending_tool_approval_response = None;
+    record.pending_provider_response = None;
+    record.worker_pid = None;
+    record.control.cancel.cancel();
+    record.control.pause.store(false, Ordering::Release);
 }
 
 fn new_task_control() -> TaskControl {
@@ -1917,6 +1958,71 @@ mod tests {
             Some("I need to inspect tasks.")
         );
         assert_eq!(continuation.response.steps.len(), 1);
+    }
+
+    #[test]
+    fn persistent_registry_fails_closed_invalid_pending_provider_response() {
+        use orca_core::approval_types::ActionKind;
+        use orca_core::provider_types::{ProviderResponse, ProviderStep};
+        use orca_core::tool_types::{ToolName, ToolRequest};
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("tasks");
+        let registry = TaskRegistry::new_persistent("session-1".to_string(), root.clone()).unwrap();
+        let task = registry.create_main_session("Needs approval".to_string());
+        let tool_request = ToolRequest {
+            id: "mock-tool-1".to_string(),
+            name: ToolName::TaskList,
+            action: ActionKind::Read,
+            target: None,
+            raw_arguments: Some("{}".to_string()),
+        };
+
+        registry.mark_running(&task.id).unwrap();
+        registry.mark_backgrounded(&task.id).unwrap();
+        registry
+            .approval_required_for_pending_provider_response(
+                &task.id,
+                "approval_required".to_string(),
+                ProviderResponse {
+                    steps: vec![ProviderStep::ToolCall(tool_request)],
+                    assistant_content: Some("I need to inspect tasks.".to_string()),
+                    assistant_reasoning: Some("Need task_list.".to_string()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                },
+            )
+            .unwrap();
+        drop(registry);
+
+        let tasks_path = root.join("session-1").join("tasks.json");
+        let mut tasks: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&tasks_path).unwrap()).unwrap();
+        tasks[&task.id]["pending_provider_response"]["steps"][0]["type"] =
+            serde_json::Value::String("future_step".to_string());
+        std::fs::write(&tasks_path, serde_json::to_string_pretty(&tasks).unwrap()).unwrap();
+
+        let reloaded = TaskRegistry::new_persistent("session-1".to_string(), root)
+            .expect("invalid pending continuation should not prevent registry recovery");
+        let recovered = reloaded.get(&task.id).expect("recovered task record");
+
+        assert_eq!(recovered.status, TaskStatus::Failed);
+        assert_eq!(recovered.pending_tool_call, None);
+        assert_eq!(recovered.pending_tool_approval_response, None);
+        assert!(recovered.pending_provider_response.is_none());
+        assert!(recovered.completed_at_ms.is_some());
+        assert!(
+            recovered
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("invalid pending provider response")),
+            "expected invalid continuation error, got {:?}",
+            recovered.error
+        );
+        let rewritten: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&tasks_path).unwrap()).unwrap();
+        assert_eq!(rewritten[&task.id]["status"], serde_json::json!("failed"));
+        assert!(rewritten[&task.id]["pending_provider_response"].is_null());
     }
 
     #[test]
