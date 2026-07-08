@@ -30,22 +30,17 @@ use crate::background_tasks::{
 };
 use crate::bridge;
 use crate::commands;
-use crate::composer_input_actions::{
-    apply_composer_key_input, insert_composer_newline, recall_next_history, recall_previous_history,
-};
 use crate::composer_textarea::{
     insert_pasted_text, make_setup_textarea, make_textarea, make_textarea_with_text, textarea_text,
 };
-use crate::idle_navigation_actions::handle_idle_navigation_shortcut;
-use crate::idle_submit_actions::handle_idle_submit;
+use crate::idle_key_actions::handle_idle_key;
 use crate::input_event_actions::{handle_mouse_event, handle_paste_event};
 use crate::key_event_actions::{KeyEventFlow, handle_key_event_preflight};
-use crate::mention_menu_actions::handle_mention_menu_key;
 use crate::running_actions::handle_running_shortcut;
 use crate::runtime_event_actions::handle_runtime_event;
 use crate::session_picker_actions::handle_session_picker_key;
 use crate::setup_actions::{SetupFlow, handle_setup_key};
-use crate::shortcuts::{IdleShortcut, RunningShortcut, idle_shortcut, running_shortcut};
+use crate::shortcuts::{RunningShortcut, running_shortcut};
 use crate::slash_menu_actions::{REASONING_SUBMENU_TITLE, handle_slash_menu_key};
 use crate::submitted_turn::SubmittedTurn;
 use crate::theme::Theme;
@@ -306,110 +301,17 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
 
                 // Normal Idle mode input
                 if matches!(state.status, AppStatus::Idle | AppStatus::WaitingUserInput) {
-                    // Handle slash menu if open
-                    if state.slash_menu.is_some() {
-                        if handle_slash_menu_key(
-                            &ev,
-                            key,
-                            &mut state,
-                            &mut config,
-                            &shared_config,
-                            &action_tx,
-                            &mut textarea,
-                            &vim_state,
-                            &theme,
-                        ) {
-                            continue;
-                        }
-                    }
-
-                    if !state.mention_candidates.is_empty() {
-                        if handle_mention_menu_key(
-                            &ev,
-                            key,
-                            &mut state,
-                            &config,
-                            &mut textarea,
-                            &vim_state,
-                            &theme,
-                        ) {
-                            continue;
-                        }
-                    }
-
-                    if handle_workflows_panel_key(key.code, &mut state, &action_tx) {
-                        continue;
-                    }
-
-                    match idle_shortcut(*key) {
-                        Some(IdleShortcut::Submit) => {
-                            handle_idle_submit(
-                                &mut textarea,
-                                &mut vim_state,
-                                &theme,
-                                &mut state,
-                                &mut config,
-                                &shared_config,
-                                &action_tx,
-                            );
-                        }
-                        Some(IdleShortcut::Newline) => {
-                            insert_composer_newline(&mut textarea, &mut state);
-                        }
-                        Some(IdleShortcut::HistoryPrevious) => {
-                            recall_previous_history(
-                                &ev,
-                                key,
-                                &mut state,
-                                &mut textarea,
-                                &vim_state,
-                                &theme,
-                            );
-                        }
-                        Some(IdleShortcut::HistoryNext) => {
-                            recall_next_history(
-                                &ev,
-                                key,
-                                &mut state,
-                                &mut textarea,
-                                &vim_state,
-                                &theme,
-                            );
-                        }
-                        Some(
-                            shortcut @ (IdleShortcut::ScrollUp
-                            | IdleShortcut::ScrollDown
-                            | IdleShortcut::PageUp
-                            | IdleShortcut::PageDown
-                            | IdleShortcut::HalfPageUp
-                            | IdleShortcut::HalfPageDown
-                            | IdleShortcut::Backtrack
-                            | IdleShortcut::ExpandToolOutput),
-                        ) => {
-                            handle_idle_navigation_shortcut(
-                                shortcut,
-                                &ev,
-                                key,
-                                &mut state,
-                                &config,
-                                &mut textarea,
-                                &mut vim_state,
-                                &theme,
-                                &action_tx,
-                            );
-                        }
-                        None => {
-                            apply_composer_key_input(
-                                &ev,
-                                key,
-                                &mut state,
-                                &config,
-                                &mut textarea,
-                                &mut vim_state,
-                                &theme,
-                            );
-                        }
-                    }
+                    handle_idle_key(
+                        &ev,
+                        key,
+                        &mut state,
+                        &mut config,
+                        &shared_config,
+                        &action_tx,
+                        &mut textarea,
+                        &mut vim_state,
+                        &theme,
+                    );
                 } else if state.status == AppStatus::Running {
                     if let Some(shortcut) = running_shortcut(*key) {
                         handle_running_shortcut(shortcut, &mut state, &action_tx, &cancel_token);

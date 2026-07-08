@@ -14,6 +14,7 @@ mod composer_input_actions;
 mod composer_textarea;
 pub mod diff;
 mod global_actions;
+mod idle_key_actions;
 mod idle_navigation_actions;
 mod idle_submit_actions;
 mod input_event_actions;
@@ -456,6 +457,53 @@ mod tests {
         assert!(
             !app.contains("UserAction::Submit(text)"),
             "app should use idle_submit_actions instead of sending normal prompt submissions inline"
+        );
+    }
+
+    #[test]
+    fn tui_idle_key_actions_are_owned_by_dedicated_module() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let idle_key_actions =
+            std::fs::read_to_string(format!("{manifest_dir}/src/idle_key_actions.rs"))
+                .expect("idle_key_actions module should exist");
+        assert!(
+            idle_key_actions.contains("pub(crate) fn handle_idle_key"),
+            "idle_key_actions should own idle key routing"
+        );
+        assert!(
+            idle_key_actions.contains("handle_slash_menu_key"),
+            "idle_key_actions should route slash menu input before composer input"
+        );
+        assert!(
+            idle_key_actions.contains("handle_mention_menu_key"),
+            "idle_key_actions should route mention menu input before composer input"
+        );
+        assert!(
+            idle_key_actions.contains("handle_workflows_panel_key"),
+            "idle_key_actions should route workflows panel keys"
+        );
+        assert!(
+            idle_key_actions.contains("idle_shortcut"),
+            "idle_key_actions should own idle shortcut dispatch"
+        );
+        assert!(
+            idle_key_actions.contains("apply_composer_key_input"),
+            "idle_key_actions should fall back to composer input"
+        );
+
+        let app = std::fs::read_to_string(format!("{manifest_dir}/src/app.rs"))
+            .expect("app source should be readable");
+        assert!(
+            !app.contains("match idle_shortcut(*key)"),
+            "app should use idle_key_actions instead of matching idle shortcuts inline"
+        );
+        assert!(
+            !app.contains("state.slash_menu.is_some()"),
+            "app should use idle_key_actions instead of routing slash menu input inline"
+        );
+        assert!(
+            !app.contains("!state.mention_candidates.is_empty()"),
+            "app should use idle_key_actions instead of routing mention menu input inline"
         );
     }
 

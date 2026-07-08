@@ -437,6 +437,10 @@ copied into Orca.
    module, keeping allowlisted auto-approval, backtracked prompt restoration,
    workflow-notification batch routing, state updates, and auto-scroll follow
    handling out of the app event loop.
+   Idle key routing now lives in a focused TUI idle key action module, keeping
+   slash menu, mention menu, workflow panel, idle shortcut, history recall,
+   navigation, submit, and composer fallback dispatch out of the app event
+   loop.
    Runtime task summaries now also expose terminal `result`/`error` fields so
    the selected task row can show completion output or failure details in the
    panel. The
