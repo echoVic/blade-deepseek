@@ -275,8 +275,9 @@ copied into Orca.
    clients stop inferring state from surface-specific structs. The runtime
    event schema now has a single-task `task.status.updated` event, and TUI
    main-session task start/background/finish and background provider-completion
-   updates route through it instead of borrowing the workflow task-list event
-   for each one-task status change.
+   updates, plus approved background-turn continuation refreshes, route through
+   it instead of borrowing the workflow task-list event for each one-task status
+   change.
    Server protocol event mapping also preserves that single-task status event
    as `task_status_updated` for non-TUI clients.
 5. **P4: Persistence policy for pending background continuations.** Current

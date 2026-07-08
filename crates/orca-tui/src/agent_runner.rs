@@ -429,11 +429,9 @@ pub(crate) fn continue_approved_background_turn_for_tui(
             .unwrap_or("tui-agent-session")
             .to_string(),
     );
-    send_workflow_tasks_updated_for_tui(
-        event_tx,
-        &mut runtime_events,
-        &session.task_registry().list(),
-    );
+    if let Some(continued_task) = task_summary_for_tui(session.task_registry(), task_id) {
+        send_task_status_updated_for_tui(event_tx, &mut runtime_events, &continued_task);
+    }
 
     let mut continuation_config = config.clone();
     continuation_config.output_format = OutputFormat::Jsonl;

@@ -171,6 +171,12 @@ mod tests {
             ),
             "background provider completion should announce the concrete task status event"
         );
+        assert!(
+            runner.contains(
+                "send_task_status_updated_for_tui(event_tx, &mut runtime_events, &continued_task);"
+            ),
+            "approved background turn continuation should announce the concrete task status event"
+        );
     }
 
     #[test]
