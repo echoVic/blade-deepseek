@@ -10,6 +10,7 @@ mod command_exec_manager;
 mod permission_manager;
 mod router;
 mod shell_manager;
+mod user_input_manager;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -46,6 +47,7 @@ use permission_manager::{
     ServerPermissionRequestHandler,
 };
 use shell_manager::ServerShellManager;
+use user_input_manager::{PendingUserInputManager, ServerUserInputRequestHandler};
 
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
@@ -89,6 +91,7 @@ struct ServerState {
     command_exec: CommandExecManager,
     active_turns: ActiveTurnManager,
     pending_permissions: PendingPermissionManager,
+    pending_user_inputs: PendingUserInputManager,
 }
 
 impl ServerState {
@@ -343,6 +346,41 @@ fn run_permission_respond<W: Write>(
             )
         }
     }
+}
+
+fn run_user_input_respond<W: Write>(
+    state: &mut ServerState,
+    request_id: &str,
+    answer: Option<String>,
+    id: Value,
+    writer: &mut W,
+) -> io::Result<()> {
+    let pending = state.pending_user_inputs.remove(request_id)?;
+    let Some(pending) = pending else {
+        return protocol::write_server_event(
+            writer,
+            &id,
+            ServerEvent::error(format!("unknown user input request: {request_id}")),
+        );
+    };
+    protocol::write_server_event(
+        writer,
+        &id,
+        ServerEvent::UserInputResolved {
+            request_id: json!(request_id),
+            answered: json!(answer.is_some()),
+        },
+    )?;
+    if pending.sender.send(answer).is_err() {
+        return protocol::write_server_event(
+            writer,
+            &id,
+            ServerEvent::error(format!(
+                "user input request is no longer active: {request_id}"
+            )),
+        );
+    }
+    Ok(())
 }
 
 struct PersistedSessionPermissionGrant {
@@ -2491,6 +2529,13 @@ fn run_thread_submit_async<W: Write + Send + 'static>(
         active_turn_id.clone(),
         runtime_workspace_roots,
     ));
+    let user_input_handler = Arc::new(ServerUserInputRequestHandler::new(
+        Arc::clone(&writer),
+        state.pending_user_inputs.clone(),
+        id.clone(),
+        thread_id.clone(),
+        active_turn_id.clone(),
+    ));
     let handle = thread::spawn(move || {
         let mut writer = SharedServerRequestWriter::new(id.clone(), Arc::clone(&writer_for_thread));
         let status = thread_state.run_turn_with_permissions_cancel_and_permission_handler(
@@ -2501,6 +2546,7 @@ fn run_thread_submit_async<W: Write + Send + 'static>(
             cancel,
             steer_handle,
             permission_handler,
+            user_input_handler,
         );
         let _ = writer.flush_remaining();
         if let Err(error) = status {
@@ -6218,6 +6264,108 @@ enabled = true
         });
     }
 
+    #[test]
+    fn user_input_response_with_unknown_request_id_reports_error() {
+        let server_config = ServerConfig {
+            run_config: test_run_config(),
+        };
+        let mut state = ServerState::default();
+        let mut output = Vec::new();
+
+        handle_line_for_test(
+            &server_config,
+            &mut state,
+            r#"{"id":"input-response","method":"user_input/respond","params":{"requestId":"missing-input","answer":"ship it"}}"#,
+            &mut output,
+        )
+        .expect("user input response");
+
+        let events = parse_jsonl(&output);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["id"], "input-response");
+        assert_eq!(events[0]["event"], "error");
+        assert_eq!(
+            events[0]["message"],
+            "unknown user input request: missing-input"
+        );
+    }
+
+    #[test]
+    fn turn_user_input_request_waits_for_protocol_response() {
+        with_orca_home(|home| {
+            let mut config = test_run_config();
+            config.cwd = Some(home.to_path_buf());
+            let server_config = ServerConfig { run_config: config };
+            let mut state = ServerState::default();
+            let writer = Arc::new(Mutex::new(Vec::new()));
+
+            handle_line(
+                &server_config,
+                &mut state,
+                r#"{"id":"thread","method":"thread/start","params":{}}"#,
+                Arc::clone(&writer),
+            )
+            .expect("thread start");
+            let thread_id = parse_jsonl(&writer.lock().expect("writer").clone())
+                .into_iter()
+                .find(|event| event["event"] == "thread_started")
+                .and_then(|event| event["threadId"].as_str().map(ToString::to_string))
+                .expect("thread id");
+
+            handle_line(
+                &server_config,
+                &mut state,
+                &format!(
+                    r#"{{"id":"turn","method":"turn/start","params":{{"threadId":"{thread_id}","input":[{{"type":"text","text":"ask Continue?"}}]}}}}"#
+                ),
+                Arc::clone(&writer),
+            )
+            .expect("turn start");
+
+            let request = wait_for_event(&writer, Duration::from_secs(2), |event| {
+                event["event"] == "user_input_request"
+            })
+            .expect("user input request");
+            let request_id = request["requestId"]
+                .as_str()
+                .expect("request id")
+                .to_string();
+            assert_eq!(request["threadId"], thread_id);
+            assert!(
+                request["question"]
+                    .as_str()
+                    .is_some_and(|question| question == "Continue?")
+            );
+            assert_eq!(request["choices"], json!(["yes", "no"]));
+
+            handle_line(
+                &server_config,
+                &mut state,
+                &format!(
+                    r#"{{"id":"input-response","method":"user_input/respond","params":{{"requestId":"{request_id}","answer":"yes"}}}}"#
+                ),
+                Arc::clone(&writer),
+            )
+            .expect("user input response");
+            state.join_active_turns();
+
+            let events = parse_jsonl(&writer.lock().expect("writer").clone());
+            let resolved = events
+                .iter()
+                .find(|event| event["event"] == "user_input_resolved")
+                .expect("user input resolved");
+            assert_eq!(resolved["id"], "input-response");
+            assert_eq!(resolved["requestId"], request_id);
+            assert_eq!(resolved["answered"], true);
+            assert!(
+                events
+                    .iter()
+                    .any(|event| event["event"] == "turn_completed"),
+                "turn should complete after user input response: {events:?}"
+            );
+        });
+    }
+
     fn test_run_config() -> RunConfig {
         RunConfig {
             app_version: "0.0.0-test".to_string(),
@@ -6259,6 +6407,26 @@ enabled = true
             .lines()
             .map(|line| serde_json::from_str(line).expect("valid jsonl line"))
             .collect()
+    }
+
+    fn wait_for_event(
+        writer: &Arc<Mutex<Vec<u8>>>,
+        timeout: Duration,
+        mut predicate: impl FnMut(&Value) -> bool,
+    ) -> Option<Value> {
+        let deadline = std::time::Instant::now()
+            .checked_add(timeout)
+            .unwrap_or_else(std::time::Instant::now);
+        loop {
+            let events = parse_jsonl(&writer.lock().expect("writer").clone());
+            if let Some(event) = events.into_iter().find(|event| predicate(event)) {
+                return Some(event);
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     fn handle_thread_list_until_event(

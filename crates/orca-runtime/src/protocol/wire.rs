@@ -107,6 +107,10 @@ pub enum ClientOp {
         permissions: RequestPermissionProfile,
         strict_auto_review: bool,
     },
+    UserInputRespond {
+        request_id: String,
+        answer: Option<String>,
+    },
     ShellStart {
         thread_id: Option<String>,
         command: String,
@@ -258,6 +262,8 @@ pub(super) struct WireParams {
     pub(super) rows: Option<u16>,
     #[serde(default)]
     pub(super) input: Option<WireInputParam>,
+    #[serde(default)]
+    pub(super) answer: Option<String>,
     #[serde(rename = "timeoutMs", default)]
     pub(super) timeout_ms: Option<i64>,
     #[serde(rename = "streamStdin", default)]
@@ -627,6 +633,25 @@ impl Submission {
                         strict_auto_review: params
                             .map(|params| params.strict_auto_review)
                             .unwrap_or(false),
+                    },
+                })
+            }
+            (_, Some("user_input/respond")) => {
+                let params = wire.params.as_ref();
+                let Some(request_id) = params
+                    .and_then(|params| params.request_id.clone())
+                    .filter(|request_id| !request_id.is_empty())
+                else {
+                    return Err(DecodeError {
+                        id: wire.id,
+                        message: "user_input/respond params.requestId is required".to_string(),
+                    });
+                };
+                Ok(Self {
+                    id: wire.id,
+                    op: ClientOp::UserInputRespond {
+                        request_id,
+                        answer: params.and_then(|params| params.answer.clone()),
                     },
                 })
             }
@@ -1757,6 +1782,37 @@ mod tests {
         assert_eq!(
             error.message,
             "permission/respond params.requestId is required"
+        );
+    }
+
+    #[test]
+    fn submission_decodes_user_input_response_wire_shape() {
+        let submission = Submission::decode(
+            r#"{"id":"input-response","method":"user_input/respond","params":{"requestId":"input-turn-1-ask","answer":"ship it"}}"#,
+        )
+        .expect("user_input/respond submission");
+
+        assert_eq!(submission.id, Value::from("input-response"));
+        assert_eq!(
+            submission.op,
+            ClientOp::UserInputRespond {
+                request_id: "input-turn-1-ask".to_string(),
+                answer: Some("ship it".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn submission_rejects_user_input_response_without_request_id() {
+        let error = Submission::decode(
+            r#"{"id":"input-response","method":"user_input/respond","params":{"answer":"ship it"}}"#,
+        )
+        .expect_err("user_input/respond must include requestId");
+
+        assert_eq!(error.id, Value::from("input-response"));
+        assert_eq!(
+            error.message,
+            "user_input/respond params.requestId is required"
         );
     }
 

@@ -11,7 +11,9 @@ use orca_core::{
 use serde_json::Value;
 
 use crate::controller::ThreadTurnRequest;
-use crate::lifecycle::{RuntimePermissionRequestHandler, RuntimeTaskKind, ThreadSteerHandle};
+use crate::lifecycle::{
+    RuntimePermissionRequestHandler, RuntimeTaskKind, RuntimeUserInputHandler, ThreadSteerHandle,
+};
 use crate::protocol;
 use crate::runtime_event_projector::RuntimeEventProjector;
 use crate::thread::RuntimeThread;
@@ -303,6 +305,7 @@ impl ServerThread {
         cancel: CancelToken,
         steer_handle: ThreadSteerHandle,
         permission_handler: Arc<dyn RuntimePermissionRequestHandler + Send + Sync>,
+        user_input_handler: Arc<dyn RuntimeUserInputHandler + Send + Sync>,
     ) -> io::Result<RunStatus> {
         let mut run_config = thread_run_config(config);
         run_config.prompt = prompt.to_string();
@@ -324,7 +327,8 @@ impl ServerThread {
         let request = ThreadTurnRequest::new(prompt)
             .with_wait_for_background_workflows(false)
             .with_steer_handle(steer_handle)
-            .with_permission_handler(permission_handler);
+            .with_permission_handler(permission_handler)
+            .with_threaded_user_input_handler(user_input_handler);
         self.thread
             .run_request_with_cancel(&run_config, &request, writer, cancel)
     }

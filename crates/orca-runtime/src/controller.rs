@@ -321,6 +321,14 @@ impl ThreadTurnRequest {
         self
     }
 
+    pub fn with_threaded_user_input_handler(
+        mut self,
+        handler: Arc<dyn RuntimeUserInputHandler + Send + Sync>,
+    ) -> Self {
+        self.user_input_handler = Some(handler);
+        self
+    }
+
     pub fn with_continuation(mut self, continuation: RuntimeTurnContinuation) -> Self {
         self.continuation = Some(continuation);
         self

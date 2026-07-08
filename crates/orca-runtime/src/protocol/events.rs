@@ -226,6 +226,21 @@ pub enum ServerEvent {
         #[serde(rename = "strictAutoReview")]
         strict_auto_review: Value,
     },
+    UserInputRequest {
+        #[serde(rename = "requestId")]
+        request_id: Value,
+        #[serde(rename = "threadId")]
+        thread_id: Value,
+        #[serde(rename = "turnId")]
+        turn_id: Value,
+        question: Value,
+        choices: Value,
+    },
+    UserInputResolved {
+        #[serde(rename = "requestId")]
+        request_id: Value,
+        answered: Value,
+    },
     TurnPlanUpdated {
         #[serde(rename = "threadId")]
         thread_id: Value,

@@ -4,3 +4,4 @@ pub(super) mod shell;
 pub(super) mod submit;
 pub(super) mod thread;
 pub(super) mod turn;
+pub(super) mod user_input;

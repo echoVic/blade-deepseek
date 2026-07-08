@@ -1691,6 +1691,40 @@ mod tests {
     }
 
     #[test]
+    fn server_user_input_manager_is_owned_by_user_input_manager_module() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let server_source =
+            std::fs::read_to_string(manifest_dir.join("src/server.rs")).expect("server source");
+        let manager_source =
+            std::fs::read_to_string(manifest_dir.join("src/server/user_input_manager.rs"))
+                .expect("server user input manager source");
+
+        assert!(
+            server_source.contains("mod user_input_manager;"),
+            "server must declare the user input manager module"
+        );
+        for type_name in [
+            "struct PendingUserInputRequest",
+            "struct PendingUserInputManager",
+            "struct ServerUserInputRequestHandler",
+        ] {
+            assert!(
+                !server_source.contains(type_name),
+                "server.rs must not own {type_name}"
+            );
+            assert!(
+                manager_source.contains(type_name),
+                "server/user_input_manager.rs must own {type_name}"
+            );
+        }
+        assert!(
+            manager_source.contains("RuntimeUserInputHandler")
+                && manager_source.contains("for ServerUserInputRequestHandler"),
+            "server/user_input_manager.rs must own runtime user-input request handling"
+        );
+    }
+
+    #[test]
     fn server_shell_manager_is_owned_by_shell_manager_module() {
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let server_source =
@@ -1772,6 +1806,33 @@ mod tests {
         assert!(
             processor_source.contains("fn dispatch_permission_operation"),
             "server permission processor must expose permission dispatch inside the router module"
+        );
+    }
+
+    #[test]
+    fn server_user_input_dispatch_is_owned_by_user_input_processor() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let router_source = std::fs::read_to_string(manifest_dir.join("src/server/router.rs"))
+            .expect("server router source");
+        let processor_source =
+            std::fs::read_to_string(manifest_dir.join("src/server/processors/user_input.rs"))
+                .expect("server user input processor source");
+
+        assert!(
+            router_source.contains("user_input::dispatch_user_input_operation("),
+            "server router must delegate user-input operations to the user-input processor"
+        );
+        assert!(
+            !router_source.contains("ClientOp::UserInputRespond"),
+            "server router must not own UserInputRespond dispatch details"
+        );
+        assert!(
+            processor_source.contains("ClientOp::UserInputRespond"),
+            "server user-input processor must own UserInputRespond dispatch details"
+        );
+        assert!(
+            processor_source.contains("fn dispatch_user_input_operation"),
+            "server user-input processor must expose user-input dispatch inside the router module"
         );
     }
 
