@@ -2534,6 +2534,23 @@ mod tests {
     }
 
     #[test]
+    fn maps_runtime_task_status_update_to_protocol_shape() {
+        let event = map_runtime_event_line(
+            r#"{"type":"task.status.updated","payload":{"task":{"id":"main-session-1","type":"main_session","status":"approval_required","isBackgrounded":true,"description":"background turn","createdAtMs":10,"startedAtMs":20,"tool":"shell"}}}"#,
+        )
+        .expect("task status event");
+        let value = legacy_json_event(Value::from("task-update-1"), event);
+
+        assert_eq!(value["id"], "task-update-1");
+        assert_eq!(value["event"], "task_status_updated");
+        assert_eq!(value["task"]["id"], "main-session-1");
+        assert_eq!(value["task"]["type"], "main_session");
+        assert_eq!(value["task"]["status"], "approval_required");
+        assert_eq!(value["task"]["isBackgrounded"], true);
+        assert_eq!(value["task"]["tool"], "shell");
+    }
+
+    #[test]
     fn maps_runtime_workflow_lifecycle_events_to_protocol_shape() {
         let cases = [
             (

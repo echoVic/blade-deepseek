@@ -65,6 +65,9 @@ pub enum ServerEvent {
         turn: Value,
         task: Value,
     },
+    TaskStatusUpdated {
+        task: Value,
+    },
     ReasoningDelta {
         text: Value,
     },
@@ -425,6 +428,9 @@ pub fn map_runtime_event_line(line: &str) -> Option<ServerEvent> {
     match event["type"].as_str()? {
         "turn.started" => Some(ServerEvent::TurnStarted {
             turn: payload["turn"].clone(),
+            task: payload["task"].clone(),
+        }),
+        "task.status.updated" => Some(ServerEvent::TaskStatusUpdated {
             task: payload["task"].clone(),
         }),
         "assistant.reasoning.delta" => Some(ServerEvent::ReasoningDelta {

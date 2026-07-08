@@ -276,6 +276,8 @@ copied into Orca.
    event schema now has a single-task `task.status.updated` event, and TUI
    main-session task start/background/finish updates route through it instead
    of borrowing the workflow task-list event for each one-task status change.
+   Server protocol event mapping also preserves that single-task status event
+   as `task_status_updated` for non-TUI clients.
 5. **P4: Persistence policy for pending background continuations.** Current
    pending provider responses are in-memory task fields. Decide whether restart
    should replay a pending approval request, fail it cleanly, or persist a
