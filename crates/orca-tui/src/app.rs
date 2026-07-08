@@ -994,7 +994,7 @@ mod tests {
     }
 
     #[test]
-    fn background_approval_action_records_registry_response_and_refreshes_tasks() {
+    fn background_approval_action_denial_stops_task_and_refreshes_tasks() {
         let registry = orca_runtime::tasks::TaskRegistry::new("session-1".to_string());
         let task = registry.create_main_session("Needs approval".to_string());
         registry.mark_running(&task.id).unwrap();
@@ -1016,15 +1016,16 @@ mod tests {
 
         submit_background_approval_response_for_tui(Some(&registry), &task.id, false, &event_tx);
 
-        assert_eq!(
-            registry
-                .take_pending_tool_approval_response(&task.id)
-                .unwrap(),
-            Some(false)
-        );
+        let record = registry.get(&task.id).unwrap();
+        assert_eq!(record.status, orca_core::task_types::TaskStatus::Stopped);
+        assert_eq!(record.pending_tool_call, None);
+        assert_eq!(record.pending_tool_approval_response, None);
         assert!(matches!(
             event_rx.try_recv(),
-            Ok(TuiEvent::WorkflowTasksUpdated { tasks }) if tasks.len() == 1
+            Ok(TuiEvent::WorkflowTasksUpdated { tasks })
+                if tasks.len() == 1
+                    && tasks[0].status == orca_core::task_types::TaskStatus::Stopped
+                    && tasks[0].pending_tool_call.is_none()
         ));
         assert!(matches!(
             event_rx.try_recv(),
@@ -2794,6 +2795,12 @@ fn submit_background_approval_response_for_tui(
 
     match task_registry.submit_pending_tool_approval_response(task_id, approved) {
         Ok(()) => {
+            if !approved
+                && let Err(error) = task_registry.finish_denied_pending_tool_approval(task_id)
+            {
+                let _ = event_tx.send(TuiEvent::Error(error));
+                return;
+            }
             let _ = event_tx.send(TuiEvent::WorkflowTasksUpdated {
                 tasks: task_registry.list(),
             });

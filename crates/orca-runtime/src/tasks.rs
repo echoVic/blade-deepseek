@@ -683,6 +683,34 @@ impl TaskRegistry {
         .map_err(|_| "task registry lock poisoned".to_string())?
     }
 
+    pub fn finish_denied_pending_tool_approval(&self, id: &str) -> Result<bool, String> {
+        let mut consumed = false;
+        self.update_task(id, |record| {
+            if record.status != TaskStatus::ApprovalRequired
+                || record.pending_tool_call.is_none()
+                || record.pending_tool_approval_response != Some(false)
+            {
+                return Ok(());
+            }
+
+            record.status = TaskStatus::Stopped;
+            if record.started_at_ms.is_none() {
+                record.started_at_ms = Some(now_ms());
+            }
+            record.completed_at_ms = Some(now_ms());
+            record.result = Some("Approval denied".to_string());
+            record.error = None;
+            record.tool = None;
+            record.pending_tool_call = None;
+            record.pending_tool_approval_response = None;
+            record.worker_pid = None;
+            record.control.pause.store(false, Ordering::Release);
+            consumed = true;
+            Ok(())
+        })?;
+        Ok(consumed)
+    }
+
     pub fn stop(&self, id: &str, summary: String) -> Result<(), String> {
         self.update_task(id, |record| {
             record.status = TaskStatus::Stopped;
@@ -1425,6 +1453,57 @@ mod tests {
                 .take_pending_tool_approval_response(&task.id)
                 .unwrap(),
             None
+        );
+    }
+
+    #[test]
+    fn registry_finishes_denied_pending_tool_approval() {
+        use orca_core::approval_types::ActionKind;
+        use orca_core::task_types::PendingToolCallSummary;
+
+        let registry = TaskRegistry::new("session-1".to_string());
+        let task = registry.create_main_session("Needs approval".to_string());
+
+        registry.mark_running(&task.id).unwrap();
+        registry.mark_backgrounded(&task.id).unwrap();
+        registry.mark_worker_spawned(&task.id, 42).unwrap();
+        registry
+            .approval_required_for_pending_tool(
+                &task.id,
+                "approval_required".to_string(),
+                Some(PendingToolCallSummary {
+                    id: "mock-tool-1".to_string(),
+                    name: "task_list".to_string(),
+                    action: ActionKind::Read,
+                    target: None,
+                    arguments: "{}".to_string(),
+                }),
+            )
+            .unwrap();
+        registry
+            .submit_pending_tool_approval_response(&task.id, false)
+            .unwrap();
+
+        assert!(
+            registry
+                .finish_denied_pending_tool_approval(&task.id)
+                .unwrap()
+        );
+
+        let record = registry.get(&task.id).unwrap();
+        assert_eq!(record.status, TaskStatus::Stopped);
+        assert_eq!(record.result.as_deref(), Some("Approval denied"));
+        assert_eq!(record.error, None);
+        assert_eq!(record.tool, None);
+        assert_eq!(record.pending_tool_call, None);
+        assert_eq!(record.pending_tool_approval_response, None);
+        assert_eq!(record.worker_pid, None);
+        assert!(record.completed_at_ms.is_some());
+
+        assert!(
+            !registry
+                .finish_denied_pending_tool_approval(&task.id)
+                .unwrap()
         );
     }
 
