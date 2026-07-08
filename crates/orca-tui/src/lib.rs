@@ -111,6 +111,18 @@ mod tests {
             !runner.contains("fn provider_response_first_tool_call_id"),
             "agent_runner should not derive preapproved tool call ids; runtime owns that boundary"
         );
+        assert!(
+            runner.contains("into_runtime_turn_continuation"),
+            "agent_runner should convert approved background continuations into runtime turn continuations"
+        );
+        assert!(
+            runner.contains("with_continuation"),
+            "agent_runner should resume approved background turns through a runtime ThreadTurnRequest continuation"
+        );
+        assert!(
+            !runner.contains("execute_preapproved_tool_for_tui"),
+            "approved background continuation should not use a renderer-owned preapproved tool loop"
+        );
     }
 
     #[test]

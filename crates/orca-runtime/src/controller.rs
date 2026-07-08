@@ -16,6 +16,7 @@ use orca_tools;
 
 use crate::agent_common;
 use crate::agent_loop::run_agent_loop;
+use crate::background_turn::RuntimeTurnContinuation;
 #[cfg(test)]
 use crate::cost::CostTracker;
 use crate::extension::ExtensionData;
@@ -99,6 +100,7 @@ pub struct ThreadTurnRequest {
     steer_handle: Option<ThreadSteerHandle>,
     permission_handler: Option<Arc<dyn RuntimePermissionRequestHandler + Send + Sync>>,
     user_input_handler: Option<Arc<dyn RuntimeUserInputHandler>>,
+    continuation: Option<RuntimeTurnContinuation>,
 }
 
 impl<'a> ThreadTurnExecutor<'a> {
@@ -191,14 +193,16 @@ impl<'a> ThreadTurnContext<'a> {
         let cwd = config.cwd.clone().unwrap_or(std::env::current_dir()?);
         let prompt = request.prompt().to_string();
         let mut parts = session.runtime_parts();
-        parts
-            .conversation
-            .replace_skill_context(agent_common::explicit_skill_context(&cwd, &prompt));
-        parts.conversation.add_user(prompt.clone());
-        if let Some(writer) = parts.writer.as_deref_mut()
-            && let Some(message) = parts.conversation.messages.last()
-        {
-            writer.append_message(message)?;
+        if request.continuation().is_none() {
+            parts
+                .conversation
+                .replace_skill_context(agent_common::explicit_skill_context(&cwd, &prompt));
+            parts.conversation.add_user(prompt.clone());
+            if let Some(writer) = parts.writer.as_deref_mut()
+                && let Some(message) = parts.conversation.messages.last()
+            {
+                writer.append_message(message)?;
+            }
         }
 
         Ok(Self { cwd, prompt, parts })
@@ -268,6 +272,7 @@ impl ThreadTurnRequest {
             steer_handle: None,
             permission_handler: None,
             user_input_handler: None,
+            continuation: None,
         }
     }
 
@@ -316,6 +321,11 @@ impl ThreadTurnRequest {
         self
     }
 
+    pub fn with_continuation(mut self, continuation: RuntimeTurnContinuation) -> Self {
+        self.continuation = Some(continuation);
+        self
+    }
+
     pub fn steer_handle(&self) -> Option<&ThreadSteerHandle> {
         self.steer_handle.as_ref()
     }
@@ -328,6 +338,10 @@ impl ThreadTurnRequest {
 
     pub fn user_input_handler(&self) -> Option<&dyn RuntimeUserInputHandler> {
         self.user_input_handler.as_deref()
+    }
+
+    pub fn continuation(&self) -> Option<&RuntimeTurnContinuation> {
+        self.continuation.as_ref()
     }
 }
 
@@ -529,6 +543,11 @@ fn run_thread_turn_inner_with_events<W: io::Write>(
         } else {
             loop_context.with_runtime(parts.cost_tracker, &cancel_ref, parts.task_registry)
         };
+        let loop_context = if let Some(continuation) = request.continuation().cloned() {
+            loop_context.with_turn_continuation(continuation)
+        } else {
+            loop_context
+        };
         let result = run_agent_loop(
             config,
             loop_context
@@ -580,6 +599,11 @@ fn run_thread_turn_inner_with_events<W: io::Write>(
         )
     } else {
         loop_context.with_runtime(parts.cost_tracker, &execution.cancel, parts.task_registry)
+    };
+    let loop_context = if let Some(continuation) = request.continuation().cloned() {
+        loop_context.with_turn_continuation(continuation)
+    } else {
+        loop_context
     };
     let result = run_agent_loop(
         config,
@@ -863,6 +887,47 @@ mod tests {
                 .any(|message| {
                     matches!(message, Message::Tool { content, .. } if content == "yes")
                 })
+        );
+    }
+
+    #[test]
+    fn thread_turn_request_continuation_does_not_append_user_prompt() {
+        let mut config = config(SubagentConfig::default());
+        config.output_format = OutputFormat::Jsonl;
+        let mut thread = RuntimeThread::start(&config, "continuation turn").expect("thread");
+        let response = orca_core::provider_types::ProviderResponse {
+            steps: vec![orca_core::provider_types::ProviderStep::MessageDelta(
+                "continued".to_string(),
+            )],
+            assistant_content: Some("continued".to_string()),
+            assistant_reasoning: None,
+            tool_calls: Vec::new(),
+            usage: None,
+        };
+        let request = ThreadTurnRequest::new("resume marker").with_continuation(
+            crate::background_turn::RuntimeTurnContinuation::from_response(response),
+        );
+
+        let status = thread
+            .run_request(&config, &request, Vec::new())
+            .expect("run continuation request");
+
+        assert_eq!(status, RunStatus::Success);
+        assert!(
+            thread
+                .session()
+                .conversation()
+                .messages
+                .iter()
+                .all(|message| {
+                    !matches!(message, Message::User { content, .. } if content == "resume marker")
+                }),
+            "continuation requests must not append a fresh user prompt"
+        );
+        assert!(
+            thread.session().conversation().messages.iter().any(|message| {
+                matches!(message, Message::Assistant { content, .. } if content.as_deref() == Some("continued"))
+            })
         );
     }
 

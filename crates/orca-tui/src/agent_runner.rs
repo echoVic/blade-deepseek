@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::collections::VecDeque;
+use std::io::{self, Write};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -7,8 +8,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use orca_approval::ApprovalPolicy;
 use orca_core::cancel::CancelToken;
-use orca_core::config::RunConfig;
-use orca_core::event_schema::{EventEnvelope, EventFactory};
+use orca_core::config::{OutputFormat, RunConfig};
+use orca_core::event_schema::{EVENT_SCHEMA_VERSION, EventEnvelope, EventFactory, EventType};
 use orca_core::hook_types::HookEvent;
 use orca_core::model::ModelRouteContext;
 use orca_core::provider_types::{ProviderResponse, ProviderStep};
@@ -22,6 +23,7 @@ use orca_provider::tool_schema::{
     deepseek_goal_tools_schema_with_mcp_and_external, deepseek_tools_schema_with_mcp_and_external,
 };
 use orca_runtime::agent_common;
+use orca_runtime::controller::ThreadTurnRequest;
 use orca_runtime::hooks::{HookContext, conversation_with_hook_context};
 use orca_runtime::memory;
 use orca_runtime::runtime_state::{RuntimeToolFinish, RuntimeTurnReducer};
@@ -29,9 +31,7 @@ use orca_runtime::runtime_state::{RuntimeToolFinish, RuntimeTurnReducer};
 use crate::agent_subagent_execution::{
     collect_subagent_batch, execute_subagent_batch_for_tui, should_run_subagent_batch,
 };
-use crate::agent_tool_execution::{
-    execute_preapproved_tool_for_tui, execute_readonly_batch_for_tui, execute_tool_for_tui,
-};
+use crate::agent_tool_execution::{execute_readonly_batch_for_tui, execute_tool_for_tui};
 use crate::agent_workflow_execution::execute_workflow_for_tui;
 use crate::bridge::TuiConversationSession;
 use crate::runtime_event_projection::tui_event_from_runtime_event;
@@ -100,6 +100,75 @@ fn send_session_completed_status_for_tui(
 pub(crate) fn send_runtime_event_as_tui(event_tx: &Sender<TuiEvent>, event: EventEnvelope) {
     if let Some(event) = tui_event_from_runtime_event(&event) {
         let _ = event_tx.send(event);
+    }
+}
+
+struct TuiRuntimeEventWriter {
+    event_tx: Sender<TuiEvent>,
+    buffer: Vec<u8>,
+}
+
+impl TuiRuntimeEventWriter {
+    fn new(event_tx: Sender<TuiEvent>) -> Self {
+        Self {
+            event_tx,
+            buffer: Vec::new(),
+        }
+    }
+
+    fn drain_complete_lines(&mut self) -> io::Result<()> {
+        while let Some(newline) = self.buffer.iter().position(|byte| *byte == b'\n') {
+            let mut line: Vec<u8> = self.buffer.drain(..=newline).collect();
+            if line.ends_with(b"\n") {
+                line.pop();
+            }
+            if line.ends_with(b"\r") {
+                line.pop();
+            }
+            if line.is_empty() {
+                continue;
+            }
+            let parsed: TuiRuntimeEventEnvelope =
+                serde_json::from_slice(&line).map_err(io::Error::other)?;
+            let envelope = parsed.into_event_envelope();
+            send_runtime_event_as_tui(&self.event_tx, envelope);
+        }
+        Ok(())
+    }
+}
+
+impl Write for TuiRuntimeEventWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.buffer.extend_from_slice(buf);
+        self.drain_complete_lines()?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct TuiRuntimeEventEnvelope {
+    run_id: String,
+    seq: u64,
+    timestamp_ms: u128,
+    #[serde(rename = "type")]
+    event_type: EventType,
+    payload: serde_json::Value,
+}
+
+impl TuiRuntimeEventEnvelope {
+    fn into_event_envelope(self) -> EventEnvelope {
+        EventEnvelope {
+            version: EVENT_SCHEMA_VERSION,
+            run_id: self.run_id,
+            seq: self.seq,
+            timestamp_ms: self.timestamp_ms,
+            event_type: self.event_type,
+            payload: self.payload,
+        }
     }
 }
 
@@ -310,17 +379,17 @@ pub(crate) fn continue_approved_background_turn_for_tui(
     session: &mut TuiConversationSession,
     task_id: &str,
     event_tx: &Sender<TuiEvent>,
-    action_rx: &Receiver<UserAction>,
-    pending_actions: &RefCell<VecDeque<UserAction>>,
+    _action_rx: &Receiver<UserAction>,
+    _pending_actions: &RefCell<VecDeque<UserAction>>,
     cancel: &CancelToken,
     pending_workflow_notifications: Option<&PendingWorkflowNotifications>,
 ) -> TuiAgentTurnResult {
-    let continuation =
+    let runtime_continuation =
         match orca_runtime::background_turn::take_approved_background_turn_continuation(
             session.task_registry(),
             task_id,
         ) {
-            Ok(Some(continuation)) => continuation,
+            Ok(Some(continuation)) => continuation.into_runtime_turn_continuation(),
             Ok(None) => {
                 let _ = event_tx.send(TuiEvent::Error(format!(
                     "background task {task_id} has no approved provider response to continue"
@@ -333,10 +402,6 @@ pub(crate) fn continue_approved_background_turn_for_tui(
             }
         };
 
-    let cwd = config
-        .cwd
-        .clone()
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
     let mut runtime_events = EventFactory::new(
         session
             .session_id()
@@ -349,105 +414,21 @@ pub(crate) fn continue_approved_background_turn_for_tui(
         &session.task_registry().list(),
     );
 
-    let tools_override = tui_tools_schema(session.mcp_registry(), &config.external_tools, true);
-    let provider_config = ProviderConfig {
-        api_key: config.api_key.clone(),
-        base_url: config.base_url.clone(),
-        model: Some(orca_core::model::FLASH_MODEL.to_string()),
-        reasoning_effort: config.reasoning_effort,
-        tools_override: Some(tools_override),
-        mcp_registry: Some(session.mcp_registry().clone()),
-        external_tools: config.external_tools.clone(),
-    };
-    let budget_model = config.model.as_option();
-    let ctx_config = orca_provider::context::ContextConfig::for_model_with_runtime(
-        budget_model.as_deref(),
-        &config.model_runtime,
-    );
-    let policy = ApprovalPolicy::new(config.approval_mode)
-        .with_permission_rules(config.permission_rules.clone());
-    let mut permission_overlay = orca_runtime::lifecycle::TurnPermissionOverlay::default();
-    let mut preapproved_tool_call_id = continuation.preapproved_tool_call_id;
-    let mut next_response = Some(continuation.response);
-    let mut turn = 0;
-
-    loop {
-        turn += 1;
-        if turn > DEFAULT_MAX_TURNS {
-            send_error_for_tui(event_tx, &mut runtime_events, "max turns exhausted");
-            send_session_completed_for_tui(
-                event_tx,
-                &mut runtime_events,
-                orca_core::event_schema::RunStatus::BudgetExhausted,
-            );
-            finish_main_session_task_for_tui(
-                session,
-                event_tx,
-                &mut runtime_events,
-                task_id,
-                "budget_exhausted",
-            );
-            session.complete("budget_exhausted");
-            return TuiAgentTurnResult::new("budget_exhausted");
-        }
-
-        if orca_provider::context::needs_compaction_wire(
-            session.conversation(),
-            &ctx_config,
-            &provider_config,
-        ) {
-            session.compact(config, &cwd);
-        }
-
-        let mut emitted_message_delta = false;
-        let response = if let Some(response) = next_response.take() {
-            response
-        } else {
-            let route_decision = config.model.route(ModelRouteContext {
-                subagent_type: &SubagentType::General,
-                subagent_model: None,
-            });
-            session
-                .cost_tracker_mut()
-                .set_model(Some(&route_decision.actual_model));
-            let mut turn_provider_config = provider_config.clone();
-            turn_provider_config.model = Some(route_decision.actual_model);
-            let mut stream_events = EventFactory::new(runtime_events.run_id().to_string());
-            orca_provider::call_streaming(
-                config.provider,
-                session.conversation(),
-                &turn_provider_config,
-                cancel,
-                &mut |step| match step {
-                    ProviderStep::ReasoningDelta(text) => {
-                        send_runtime_event_as_tui(
-                            event_tx,
-                            stream_events.assistant_reasoning_delta(text),
-                        );
-                    }
-                    ProviderStep::MessageDelta(text) => {
-                        emitted_message_delta = true;
-                        send_runtime_event_as_tui(
-                            event_tx,
-                            stream_events.assistant_message_delta(text),
-                        );
-                    }
-                    ProviderStep::ToolCallProgress(progress) => {
-                        send_runtime_event_as_tui(
-                            event_tx,
-                            stream_events.tool_call_progress(progress),
-                        );
-                    }
-                    _ => {}
-                },
-            )
-        };
-
-        if let Some(error) = response.steps.iter().find_map(|step| match step {
-            ProviderStep::Error(message) => Some(message.clone()),
-            _ => None,
-        }) {
-            send_error_for_tui(event_tx, &mut runtime_events, &error);
+    let mut continuation_config = config.clone();
+    continuation_config.output_format = OutputFormat::Jsonl;
+    let request = ThreadTurnRequest::new("")
+        .with_continuation(runtime_continuation)
+        .with_session_completed_event(false);
+    let writer = TuiRuntimeEventWriter::new(event_tx.clone());
+    let status = match session.run_request_with_cancel_for_tui(
+        &continuation_config,
+        &request,
+        writer,
+        cancel.clone(),
+    ) {
+        Ok(status) => status,
+        Err(error) => {
+            send_error_for_tui(event_tx, &mut runtime_events, &error.to_string());
             send_session_completed_for_tui(
                 event_tx,
                 &mut runtime_events,
@@ -463,166 +444,33 @@ pub(crate) fn continue_approved_background_turn_for_tui(
             session.complete("failed");
             return TuiAgentTurnResult::new("failed");
         }
+    };
+    let status = status.as_str();
 
-        if let Some(usage) = response.usage
-            && !usage.is_empty()
-        {
-            let totals = session.cost_tracker_mut().add_usage(usage);
-            send_runtime_event_as_tui(event_tx, runtime_events.usage_updated(totals));
-            if let Some(writer) = session.writer_mut() {
-                let _ = writer.append_usage(totals);
-            }
-        }
-
-        if response.tool_calls.is_empty() {
-            if !emitted_message_delta
-                && let Some(content) = response.assistant_content.as_deref()
-                && !content.is_empty()
-            {
-                send_runtime_event_as_tui(
-                    event_tx,
-                    runtime_events.assistant_message_delta(content),
-                );
-            }
-            session.conversation_mut().add_assistant(
-                response.assistant_content,
-                response.assistant_reasoning,
-                vec![],
-            );
-            if let Some(message) = session.conversation().messages.last().cloned() {
-                session.append_message(&message);
-            }
-            send_session_completed_for_tui(
-                event_tx,
-                &mut runtime_events,
-                orca_core::event_schema::RunStatus::Success,
-            );
-            finish_main_session_task_for_tui(
-                session,
-                event_tx,
-                &mut runtime_events,
-                task_id,
-                "success",
-            );
-            session.complete("success");
-            return TuiAgentTurnResult::new("success");
-        }
-
-        session.conversation_mut().add_assistant(
-            response.assistant_content,
-            response.assistant_reasoning,
-            response.tool_calls.clone(),
-        );
-        if let Some(message) = session.conversation().messages.last().cloned() {
-            session.append_message(&message);
-        }
-
-        let tool_requests: Vec<tool_types::ToolRequest> = response
-            .steps
-            .iter()
-            .filter_map(|step| match step {
-                ProviderStep::ToolCall(tool_request) => Some(tool_request.clone()),
-                _ => None,
-            })
-            .collect();
-
-        for tool_request in tool_requests {
-            let (should_stop, result, child_cost) = if preapproved_tool_call_id.as_deref()
-                == Some(tool_request.id.as_str())
-            {
-                let preapproved_tool_call_id = preapproved_tool_call_id.take().unwrap_or_default();
-                execute_preapproved_tool_for_tui(
-                    config,
-                    &cwd,
-                    &tool_request,
-                    event_tx,
-                    action_rx,
-                    pending_actions,
-                    0,
-                    session.session_id(),
-                    Some(session.thread_extensions_handle()),
-                    &policy,
-                    session.instructions(),
-                    session.memory(),
-                    session.mcp_registry(),
-                    session.hooks(),
-                    Some(session.task_registry()),
-                    &mut permission_overlay,
-                    cancel,
-                    &preapproved_tool_call_id,
-                )
-            } else {
-                execute_tool_for_tui(
-                    config,
-                    &cwd,
-                    &tool_request,
-                    event_tx,
-                    action_rx,
-                    pending_actions,
-                    0,
-                    session.session_id(),
-                    Some(session.thread_extensions_handle()),
-                    &policy,
-                    session.instructions(),
-                    session.memory(),
-                    session.mcp_registry(),
-                    session.hooks(),
-                    Some(session.task_registry()),
-                    &mut permission_overlay,
-                    cancel,
-                )
-            };
-
-            if let Some(cost) = child_cost {
-                session.cost_tracker_mut().merge(&cost);
-            }
-
-            let result_content = agent_common::format_tool_result_for_model(&result);
-            session
-                .conversation_mut()
-                .add_tool_result(tool_request.id.clone(), result_content);
-            if let Some(message) = session.conversation().messages.last().cloned() {
-                session.append_message(&message);
-            }
-
-            if should_stop {
-                let status = if matches!(result.status, tool_types::ToolStatus::Denied) {
-                    "approval_required"
-                } else {
-                    "failed"
-                };
-                send_session_completed_status_for_tui(event_tx, &mut runtime_events, status);
-                finish_main_session_task_for_tui(
-                    session,
-                    event_tx,
-                    &mut runtime_events,
-                    task_id,
-                    status,
-                );
-                session.complete(status);
-                return TuiAgentTurnResult::new(status);
-            }
-        }
-
-        if let Some(next_prompt) =
+    if status == "success"
+        && let Some(next_prompt) =
             take_pending_workflow_notification(pending_workflow_notifications)
-        {
-            send_session_completed_for_tui(
-                event_tx,
-                &mut runtime_events,
-                orca_core::event_schema::RunStatus::Success,
-            );
-            finish_main_session_task_for_tui(
-                session,
-                event_tx,
-                &mut runtime_events,
-                task_id,
-                "success",
-            );
-            session.complete("success");
-            return TuiAgentTurnResult::with_next_prompt("success", next_prompt);
-        }
+    {
+        send_session_completed_for_tui(
+            event_tx,
+            &mut runtime_events,
+            orca_core::event_schema::RunStatus::Success,
+        );
+        finish_main_session_task_for_tui(
+            session,
+            event_tx,
+            &mut runtime_events,
+            task_id,
+            "success",
+        );
+        session.complete("success");
+        return TuiAgentTurnResult::with_next_prompt("success", next_prompt);
     }
+
+    send_session_completed_status_for_tui(event_tx, &mut runtime_events, status);
+    finish_main_session_task_for_tui(session, event_tx, &mut runtime_events, task_id, status);
+    session.complete(status);
+    TuiAgentTurnResult::new(status)
 }
 
 fn finish_main_session_task_for_tui(
@@ -1635,6 +1483,27 @@ mod tests {
             update_check: false,
             desktop_notifications: false,
             auto_memory: false,
+        }
+    }
+
+    #[test]
+    fn tui_runtime_event_writer_buffers_partial_jsonl_events() {
+        let (event_tx, event_rx) = mpsc::channel();
+        let mut writer = TuiRuntimeEventWriter::new(event_tx);
+        let mut events = EventFactory::new("run-partial".to_string());
+        let line = serde_json::to_string(&events.assistant_message_delta("hello")).unwrap() + "\n";
+        let split_at = line.len() / 2;
+
+        std::io::Write::write_all(&mut writer, &line.as_bytes()[..split_at])
+            .expect("partial write");
+        assert!(event_rx.try_recv().is_err());
+
+        std::io::Write::write_all(&mut writer, &line.as_bytes()[split_at..])
+            .expect("complete write");
+
+        match event_rx.recv_timeout(Duration::from_secs(1)).unwrap() {
+            TuiEvent::MessageDelta(text) => assert_eq!(text, "hello"),
+            event => panic!("expected message delta, got {event:?}"),
         }
     }
 

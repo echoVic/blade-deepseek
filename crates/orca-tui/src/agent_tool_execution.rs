@@ -155,50 +155,6 @@ pub(crate) fn execute_tool_for_tui(
         task_registry,
         permission_overlay,
         cancel,
-        None,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn execute_preapproved_tool_for_tui(
-    config: &RunConfig,
-    cwd: &Path,
-    tool_request: &tool_types::ToolRequest,
-    event_tx: &Sender<TuiEvent>,
-    action_rx: &Receiver<UserAction>,
-    pending_actions: &RefCell<VecDeque<UserAction>>,
-    subagent_depth: u32,
-    session_id: Option<&str>,
-    thread_extensions: Option<Arc<orca_runtime::extension::ExtensionData>>,
-    policy: &ApprovalPolicy,
-    instructions: &ProjectInstructions,
-    memory: &MemoryBlock,
-    mcp_registry: &McpRegistry,
-    hooks: &HookRunner,
-    task_registry: Option<&TaskRegistry>,
-    permission_overlay: &mut TurnPermissionOverlay,
-    cancel: &CancelToken,
-    preapproved_tool_call_id: &str,
-) -> (bool, tool_types::ToolResult, Option<CostTracker>) {
-    execute_tool_for_tui_inner(
-        config,
-        cwd,
-        tool_request,
-        event_tx,
-        action_rx,
-        pending_actions,
-        subagent_depth,
-        session_id,
-        thread_extensions,
-        policy,
-        instructions,
-        memory,
-        mcp_registry,
-        hooks,
-        task_registry,
-        permission_overlay,
-        cancel,
-        Some(preapproved_tool_call_id),
     )
 }
 
@@ -221,7 +177,6 @@ fn execute_tool_for_tui_inner(
     task_registry: Option<&TaskRegistry>,
     permission_overlay: &mut TurnPermissionOverlay,
     cancel: &CancelToken,
-    preapproved_tool_call_id: Option<&str>,
 ) -> (bool, tool_types::ToolResult, Option<CostTracker>) {
     let invocation = prepare_tool_invocation(tool_request, subagent_depth, mcp_registry, config);
     let mut events = EventFactory::new(
@@ -235,7 +190,6 @@ fn execute_tool_for_tui_inner(
     // handler asks the user); gating it behind the generic tool approval
     // would double-prompt for the same decision.
     if tool_request.name != tool_types::ToolName::RequestPermissions
-        && preapproved_tool_call_id != Some(tool_request.id.as_str())
         && let TuiToolApprovalOutcome::Denied(result) = resolve_tui_tool_approval(
             &invocation,
             tool_request,

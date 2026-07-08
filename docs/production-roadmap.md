@@ -4,18 +4,18 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-07-08
-Current baseline: current main after v0.1.191 owns the approved background
-provider-response continuation envelope in `orca-runtime`: the runtime consumes
-the pending provider response from `TaskRegistry` and derives the single
-preapproved tool-call id before the TUI resumes a backgrounded turn. Runtime
-provider-cycle, turn-loop, and agent-loop inputs now carry a typed
-`RuntimeTurnContinuation` instead of a bare `ProviderResponse`; the provider
-cycle consumes the continuation once, seeds the turn permission overlay with the
-preapproved tool-call id, and the approval gate consumes that id exactly once
-for the matching tool call. The TUI still owns the follow-on renderer-aware
-provider/tool loop, so the next architecture slice is to wire the approved
-background continuation through the TUI bridge instead of the renderer-owned
-loop. Earlier v0.1.191 makes
+Current baseline: current main after v0.1.191 and the follow-on TUI bridge
+slice owns approved background provider-response continuation execution in
+`orca-runtime`: the runtime consumes the pending provider response from
+`TaskRegistry` and derives the single preapproved tool-call id before the TUI
+resumes a backgrounded turn. Runtime provider-cycle, turn-loop, and agent-loop
+inputs carry a typed `RuntimeTurnContinuation` instead of a bare
+`ProviderResponse`; the provider cycle consumes the continuation once, seeds the
+turn permission overlay with the preapproved tool-call id, and the approval gate
+consumes that id exactly once for the matching tool call. The TUI bridge now
+converts approved background continuations into runtime `ThreadTurnRequest`
+continuations and projects runtime JSONL events back into TUI events, retiring
+the renderer-owned preapproved provider/tool loop. Earlier v0.1.191 makes
 `RuntimeProviderResponseStep` consume the
 named `RuntimeProviderResponseInput` directly and carries child-agent executors
 through `RuntimeProviderResponseExecutors`. Provider final-message handling and
@@ -214,15 +214,12 @@ while the TUI mostly replays protocol state. Package 3 is useful for product
 surface and pending-request UX, but its broad `ToolUseContext` should not be
 copied into Orca.
 
-1. **P0: Runtime-owned background approval continuation execution.** The runtime
-   now owns the approved continuation envelope and typed
-   `RuntimeTurnContinuation`, including one-shot preapproval for the exact
-   backgrounded tool call. The provider-cycle/turn-loop input can skip the first
-   provider call, handle the stored response through the foreground provider
-   path, and avoid prompting again for the already approved tool. The remaining
-   work is to wire the TUI bridge to this context and retire the renderer-owned
-   background continuation loop. This is the highest TUI-user fix because it
-   removes duplicated continuation semantics from the renderer.
+1. **P0: Runtime-owned background approval continuation execution.** Done on
+   current main: the TUI now resumes approved background turns by converting the
+   stored provider response into a typed runtime continuation and running a
+   `ThreadTurnRequest` through the runtime bridge. The renderer-owned
+   preapproved provider/tool loop has been removed, and the TUI only projects
+   runtime events plus final task status.
 2. **P1: Pending interactive request boundary.** Codex tracks pending
    interactive replay by request/turn/item ids, and package 3 keeps
    `pendingPermissionRequests` keyed by request id. Orca should make pending

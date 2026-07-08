@@ -6,10 +6,12 @@ pub use crate::agent_runner::{launch_saved_workflow_for_tui, run_agent_for_tui};
 
 use std::path::Path;
 
+use orca_core::cancel::CancelToken;
 use orca_core::config::RunConfig;
 use orca_core::cost_types::UsageTotals;
 use orca_core::event_schema::RunStatus;
 use orca_mcp::McpRegistry;
+use orca_runtime::controller::ThreadTurnRequest;
 use orca_runtime::cost::CostTracker;
 use orca_runtime::history;
 use orca_runtime::hooks::HookRunner;
@@ -109,6 +111,17 @@ impl TuiConversationSession {
 
     pub fn usage_totals(&self) -> UsageTotals {
         self.runtime.session().usage_totals()
+    }
+
+    pub(crate) fn run_request_with_cancel_for_tui<W: std::io::Write>(
+        &mut self,
+        config: &RunConfig,
+        request: &ThreadTurnRequest,
+        writer: W,
+        cancel: CancelToken,
+    ) -> std::io::Result<RunStatus> {
+        self.runtime
+            .run_request_with_cancel(config, request, writer, cancel)
     }
 
     pub fn has_active_workflows(&self) -> bool {
