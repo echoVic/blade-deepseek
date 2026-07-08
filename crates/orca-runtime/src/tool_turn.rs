@@ -50,9 +50,7 @@ pub(crate) struct RuntimeToolTurnsContext<'a, W: io::Write> {
     pub(crate) sampling_state: &'a mut RuntimeSamplingRequestState,
     pub(crate) io: RuntimeToolTurnsIo<'a, W>,
     pub(crate) tool_requests: &'a [ToolRequest],
-    pub(crate) child_executor: ChildAgentExecutor<W>,
-    pub(crate) workflow_child_executor: ChildAgentExecutor<SharedEventBuffer>,
-    pub(crate) batch_child_executor: ChildAgentExecutor<io::Sink>,
+    pub(crate) executors: RuntimeToolTurnsExecutors<W>,
 }
 
 pub(crate) struct RuntimeToolTurnsIo<'a, W: io::Write> {
@@ -62,6 +60,12 @@ pub(crate) struct RuntimeToolTurnsIo<'a, W: io::Write> {
     pub(crate) history_writer: Option<&'a mut SessionWriter>,
     pub(crate) cost_tracker: &'a mut CostTracker,
     pub(crate) background_workflows: &'a mut Vec<BackgroundWorkflowRun>,
+}
+
+pub(crate) struct RuntimeToolTurnsExecutors<W: io::Write> {
+    pub(crate) child_executor: ChildAgentExecutor<W>,
+    pub(crate) workflow_child_executor: ChildAgentExecutor<SharedEventBuffer>,
+    pub(crate) batch_child_executor: ChildAgentExecutor<io::Sink>,
 }
 
 pub(crate) struct RuntimeNormalToolTurnContext<'a, W: io::Write> {
@@ -121,10 +125,13 @@ pub(crate) fn run_tool_turns<W: io::Write>(
         sampling_state,
         io,
         tool_requests,
+        executors,
+    } = context;
+    let RuntimeToolTurnsExecutors {
         child_executor,
         workflow_child_executor,
         batch_child_executor,
-    } = context;
+    } = executors;
     let RuntimeToolTurnsIo {
         events,
         sink,
@@ -795,9 +802,11 @@ mod tests {
                 background_workflows: &mut background_workflows,
             },
             tool_requests: &[request],
-            child_executor: unused_child_executor::<Vec<u8>>,
-            workflow_child_executor: unused_child_executor::<SharedEventBuffer>,
-            batch_child_executor: unused_child_executor::<io::Sink>,
+            executors: RuntimeToolTurnsExecutors {
+                child_executor: unused_child_executor::<Vec<u8>>,
+                workflow_child_executor: unused_child_executor::<SharedEventBuffer>,
+                batch_child_executor: unused_child_executor::<io::Sink>,
+            },
         })
         .expect("run tool turns");
 
@@ -879,9 +888,11 @@ mod tests {
                 background_workflows: &mut background_workflows,
             },
             tool_requests: &[request],
-            child_executor: unused_child_executor::<Vec<u8>>,
-            workflow_child_executor: unused_child_executor::<SharedEventBuffer>,
-            batch_child_executor: unused_child_executor::<io::Sink>,
+            executors: RuntimeToolTurnsExecutors {
+                child_executor: unused_child_executor::<Vec<u8>>,
+                workflow_child_executor: unused_child_executor::<SharedEventBuffer>,
+                batch_child_executor: unused_child_executor::<io::Sink>,
+            },
         })
         .expect("run tool turns");
 

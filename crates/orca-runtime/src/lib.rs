@@ -3193,6 +3193,14 @@ mod tests {
             "RuntimeToolTurnsContext must carry tool-turn I/O refs through one named field"
         );
         assert!(
+            tool_turn_source.contains("pub(crate) struct RuntimeToolTurnsExecutors"),
+            "tool_turn must group child-agent dispatch executors into RuntimeToolTurnsExecutors"
+        );
+        assert!(
+            tool_turn_source.contains("executors: RuntimeToolTurnsExecutors<W>"),
+            "RuntimeToolTurnsContext must carry child-agent dispatch executors through one named field"
+        );
+        assert!(
             !provider_turn_source.contains("run_tool_turns(\n            step_context,"),
             "provider response must not call run_tool_turns with the old long argument list"
         );
@@ -3201,7 +3209,7 @@ mod tests {
             .nth(1)
             .and_then(|source| source.split("pub(crate) struct RuntimeToolTurnsIo").next())
             .expect("RuntimeToolTurnsContext source");
-        for field_name in ["step_context:", "tool_requests:", "child_executor:"] {
+        for field_name in ["step_context:", "tool_requests:"] {
             assert!(
                 tool_turn_context.contains(field_name),
                 "RuntimeToolTurnsContext must carry tool-turn dispatch field {field_name}"
@@ -3214,10 +3222,13 @@ mod tests {
             "history_writer:",
             "cost_tracker:",
             "background_workflows:",
+            "child_executor:",
+            "workflow_child_executor:",
+            "batch_child_executor:",
         ] {
             assert!(
                 !tool_turn_context.contains(field_name),
-                "RuntimeToolTurnsContext must not expose I/O field {field_name} outside RuntimeToolTurnsIo"
+                "RuntimeToolTurnsContext must not expose grouped field {field_name} directly"
             );
         }
     }

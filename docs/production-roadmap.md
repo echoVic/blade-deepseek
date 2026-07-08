@@ -360,7 +360,9 @@ copied into Orca.
    draining no longer receives a separate steer-handle copy. `RuntimeToolTurnsContext`
    now carries tool-turn I/O refs through `RuntimeToolTurnsIo`, keeping tool
    dispatch state distinct from event, transcript, cost, and workflow mutation
-   refs.
+   refs. `RuntimeToolTurnsContext` now also carries child-agent dispatch
+   executors through `RuntimeToolTurnsExecutors`, keeping normal, workflow, and
+   batch child execution handles distinct from dispatch state and I/O.
    Iteration stages now keep lifecycle-owned `RuntimeTurnLoopIterationState`
    grouped instead of unpacking runtime system messages, model overrides,
    cost/cancel/task refs, and extension refs into the iteration input. Keep

@@ -43,7 +43,8 @@ use crate::tasks::TaskRegistry;
 use crate::thread_store::SessionWriter;
 use crate::tool_invocation::{AgentToolPolicyContext, tool_requests_from_provider_steps};
 use crate::tool_turn::{
-    RuntimeToolTurnsContext, RuntimeToolTurnsIo, ToolTurnOutcome, run_tool_turns,
+    RuntimeToolTurnsContext, RuntimeToolTurnsExecutors, RuntimeToolTurnsIo, ToolTurnOutcome,
+    run_tool_turns,
 };
 use crate::workflow::runner::SharedEventBuffer;
 use crate::workflow_execution::BackgroundWorkflowRun;
@@ -484,9 +485,11 @@ impl RuntimeProviderResponseStep {
                 background_workflows,
             },
             tool_requests: &tool_requests,
-            child_executor,
-            workflow_child_executor,
-            batch_child_executor,
+            executors: RuntimeToolTurnsExecutors {
+                child_executor,
+                workflow_child_executor,
+                batch_child_executor,
+            },
         })? {
             ToolTurnOutcome::Continue => Ok(RuntimeProviderResponseOutcome::Continue),
             ToolTurnOutcome::Return { status, error } => {
