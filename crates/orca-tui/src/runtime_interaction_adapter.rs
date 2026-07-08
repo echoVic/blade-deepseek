@@ -11,6 +11,7 @@ use orca_runtime::lifecycle::{
     RuntimeUserInputHandler, RuntimeUserInputRequest,
 };
 use orca_runtime::protocol::{PermissionGrantScope, PermissionResponseDecision};
+use orca_runtime::runtime_pending_interaction::RuntimePendingInteractionRecord;
 use orca_runtime::tool_invocation::{ToolInvocation, approval_request_for_invocation};
 
 use crate::types::{TuiEvent, UserAction};
@@ -91,12 +92,9 @@ pub(crate) fn resolve_tui_tool_approval(
         RuntimeApprovalDecision::Ask(approval) => {
             let mut approval = approval.clone();
             approval.preview = build_approval_preview(tool_request);
-            let _ = event_tx.send(TuiEvent::ApprovalNeeded {
-                id: approval.id.clone(),
-                tool: approval.tool.clone().unwrap_or_default(),
-                target: approval.target.clone(),
-                preview: approval.preview.clone(),
-            });
+            let pending =
+                RuntimePendingInteractionRecord::from_tool_approval(&approval, tool_request);
+            let _ = event_tx.send(approval_event_from_pending_interaction(&pending));
 
             let handler = TuiApprovalHandler::new(action_rx, pending_actions);
             let resolution = runtime_context
@@ -219,12 +217,15 @@ impl RuntimePermissionRequestHandler for TuiPermissionRequestHandler<'_> {
             .preview
             .clone()
             .unwrap_or_else(|| describe_permission_request(request));
-        let _ = self.event_tx.send(TuiEvent::ApprovalNeeded {
-            id: request.id.clone(),
-            tool: self.tool.clone(),
-            target: self.target.clone().or_else(|| request.reason.clone()),
-            preview: Some(preview),
-        });
+        let pending = RuntimePendingInteractionRecord::from_permission_request(
+            request,
+            self.tool.clone(),
+            self.target.clone(),
+            Some(preview),
+        );
+        let _ = self
+            .event_tx
+            .send(approval_event_from_pending_interaction(&pending));
         let allowed = loop {
             match self.action_rx.recv() {
                 Ok(UserAction::Approve(value)) => break value,
@@ -326,11 +327,10 @@ impl RuntimeUserInputHandler for TuiUserInputHandler<'_> {
         &self,
         request: &RuntimeUserInputRequest,
     ) -> std::io::Result<Option<String>> {
-        let _ = self.event_tx.send(TuiEvent::UserInputRequested {
-            id: request.id.clone(),
-            question: request.question.clone(),
-            choices: request.choices.clone(),
-        });
+        let pending = RuntimePendingInteractionRecord::from_user_input(request);
+        let _ = self
+            .event_tx
+            .send(user_input_event_from_pending_interaction(&pending));
 
         loop {
             match self.action_rx.recv() {
@@ -339,6 +339,23 @@ impl RuntimeUserInputHandler for TuiUserInputHandler<'_> {
                 Ok(action) => self.pending_actions.borrow_mut().push_back(action),
             }
         }
+    }
+}
+
+fn approval_event_from_pending_interaction(record: &RuntimePendingInteractionRecord) -> TuiEvent {
+    TuiEvent::ApprovalNeeded {
+        id: record.id.clone(),
+        tool: record.tool.clone().unwrap_or_default(),
+        target: record.target.clone(),
+        preview: record.preview.clone(),
+    }
+}
+
+fn user_input_event_from_pending_interaction(record: &RuntimePendingInteractionRecord) -> TuiEvent {
+    TuiEvent::UserInputRequested {
+        id: record.id.clone(),
+        question: record.question.clone().unwrap_or_default(),
+        choices: record.choices.clone(),
     }
 }
 

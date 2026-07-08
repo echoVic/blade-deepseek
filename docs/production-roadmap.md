@@ -220,11 +220,14 @@ copied into Orca.
    `ThreadTurnRequest` through the runtime bridge. The renderer-owned
    preapproved provider/tool loop has been removed, and the TUI only projects
    runtime events plus final task status.
-2. **P1: Pending interactive request boundary.** Codex tracks pending
-   interactive replay by request/turn/item ids, and package 3 keeps
-   `pendingPermissionRequests` keyed by request id. Orca should make pending
-   approval and user-input continuations first-class runtime records instead of
-   separate ad hoc task fields plus TUI-local queues.
+2. **P1: Pending interactive request boundary.** Seeded: runtime now owns a
+   focused `RuntimePendingInteractionRecord` shape for tool approvals,
+   `request_permissions`, and `request_user_input`, and the TUI interaction
+   adapter projects those runtime records into existing dialogs/prompts instead
+   of hand-building separate payloads. Next, move pending interaction storage
+   and response routing behind request/turn/item ids so approval and user-input
+   continuations stop depending on separate ad hoc task fields plus TUI-local
+   queues.
 3. **P2: Frozen per-turn context boundary.** Continue shrinking wide call
    surfaces into `RuntimeTurnConfig`, `RuntimeTurnDeps`,
    `RuntimeTurnState`, and request snapshots. Keep borrowing package 3's

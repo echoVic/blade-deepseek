@@ -35,6 +35,7 @@ pub(crate) mod runtime_event_projector;
 mod runtime_lifecycle;
 mod runtime_model_route;
 mod runtime_normal_tool;
+pub mod runtime_pending_interaction;
 pub(crate) mod runtime_permission;
 pub(crate) mod runtime_readonly_tool_turn;
 pub(crate) mod runtime_special;
@@ -2026,6 +2027,30 @@ mod tests {
             lifecycle_source.contains("pub use crate::runtime_user_input::"),
             "lifecycle must preserve existing public imports by re-exporting runtime user-input types"
         );
+    }
+
+    #[test]
+    fn runtime_pending_interaction_boundary_is_owned_by_focused_module() {
+        let lib_source = include_str!("lib.rs");
+        let pending_source = std::fs::read_to_string("src/runtime_pending_interaction.rs")
+            .expect("runtime pending interaction source");
+
+        assert!(
+            lib_source.contains("pub mod runtime_pending_interaction;"),
+            "runtime crate must declare a focused runtime_pending_interaction module"
+        );
+        for marker in [
+            "pub enum RuntimePendingInteractionKind",
+            "pub struct RuntimePendingInteractionRecord",
+            "pub fn from_tool_approval",
+            "pub fn from_permission_request",
+            "pub fn from_user_input",
+        ] {
+            assert!(
+                pending_source.contains(marker),
+                "runtime_pending_interaction must own pending interaction detail {marker}"
+            );
+        }
     }
 
     #[test]

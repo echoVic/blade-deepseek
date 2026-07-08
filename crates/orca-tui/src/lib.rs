@@ -55,6 +55,18 @@ mod tests {
             adapter.contains("pub(crate) fn resolve_tui_tool_approval"),
             "runtime_interaction_adapter should own the TUI tool approval gate"
         );
+        assert!(
+            adapter.contains("RuntimePendingInteractionRecord"),
+            "runtime_interaction_adapter should project runtime-owned pending interaction records"
+        );
+        assert!(
+            adapter.contains("fn approval_event_from_pending_interaction"),
+            "runtime_interaction_adapter should map runtime pending approval records into TUI events"
+        );
+        assert!(
+            adapter.contains("fn user_input_event_from_pending_interaction"),
+            "runtime_interaction_adapter should map runtime pending user-input records into TUI events"
+        );
 
         let bridge = std::fs::read_to_string(format!("{manifest_dir}/src/bridge.rs"))
             .expect("bridge source should be readable");
