@@ -1015,6 +1015,13 @@ impl AppState {
                     self.suppress_background_main_session_output;
                 let has_backgrounded_running_main_session =
                     tasks.iter().any(is_backgrounded_running_main_session);
+                let had_backgrounded_approval_main_session = self
+                    .workflow_panel
+                    .tasks
+                    .iter()
+                    .any(is_backgrounded_approval_main_session);
+                let has_backgrounded_approval_main_session =
+                    tasks.iter().any(is_backgrounded_approval_main_session);
                 self.suppress_background_main_session_output =
                     has_backgrounded_running_main_session;
                 if has_backgrounded_running_main_session {
@@ -1022,6 +1029,8 @@ impl AppState {
                 }
                 let should_reveal_background_task =
                     has_backgrounded_running_main_session && !was_suppressing_background_output;
+                let should_reveal_background_approval = has_backgrounded_approval_main_session
+                    && !had_backgrounded_approval_main_session;
                 let selected_was_backgrounded_main_session = self
                     .workflow_panel
                     .tasks
@@ -1033,7 +1042,17 @@ impl AppState {
                     .get(self.workflow_panel.selected)
                     .map(|task| task.id.clone());
                 self.workflow_panel.tasks = sort_workflow_tasks_for_panel(tasks);
-                if should_reveal_background_task {
+                if should_reveal_background_approval {
+                    self.panel_mode = PanelMode::Workflows;
+                    if let Some(index) = self
+                        .workflow_panel
+                        .tasks
+                        .iter()
+                        .position(is_backgrounded_approval_main_session)
+                    {
+                        self.workflow_panel.selected = index;
+                    }
+                } else if should_reveal_background_task {
                     self.panel_mode = PanelMode::Workflows;
                     if let Some(index) = self
                         .workflow_panel
@@ -1383,6 +1402,13 @@ fn is_backgrounded_running_main_session(task: &BackgroundTaskSummary) -> bool {
     task.task_type == orca_core::task_types::TaskType::MainSession
         && task.status == orca_core::task_types::TaskStatus::Running
         && task.is_backgrounded
+}
+
+fn is_backgrounded_approval_main_session(task: &BackgroundTaskSummary) -> bool {
+    task.task_type == orca_core::task_types::TaskType::MainSession
+        && task.status == orca_core::task_types::TaskStatus::ApprovalRequired
+        && task.is_backgrounded
+        && task.pending_tool_call.is_some()
 }
 
 fn is_foregrounded_running_main_session(task: &BackgroundTaskSummary) -> bool {
@@ -2668,6 +2694,52 @@ mod tests {
         backgrounded.last_activity_at_ms = Some(10_000);
         state.update(TuiEvent::WorkflowTasksUpdated {
             tasks: vec![workflow, backgrounded],
+        });
+
+        assert_eq!(
+            state.workflow_panel.tasks[state.workflow_panel.selected].id,
+            "task-workflow"
+        );
+    }
+
+    #[test]
+    fn backgrounded_approval_update_reveals_and_selects_task_panel_once() {
+        let mut state = state();
+        let mut approval = workflow_task_summary("task-approval", "approval");
+        approval.task_type = TaskType::MainSession;
+        approval.status = TaskStatus::ApprovalRequired;
+        approval.is_backgrounded = true;
+        approval.pending_tool_call = Some(orca_core::task_types::PendingToolCallSummary {
+            id: "approval-1".to_string(),
+            name: "task_list".to_string(),
+            action: orca_core::approval_types::ActionKind::Read,
+            target: None,
+            arguments: "{}".to_string(),
+        });
+        approval.last_activity_at_ms = Some(8_000);
+        let mut workflow = workflow_task_summary("task-workflow", "workflow");
+        workflow.status = TaskStatus::Running;
+        workflow.last_activity_at_ms = Some(9_000);
+
+        state.update(TuiEvent::WorkflowTasksUpdated {
+            tasks: vec![workflow.clone(), approval.clone()],
+        });
+
+        assert_eq!(state.panel_mode, PanelMode::Workflows);
+        assert_eq!(
+            state.workflow_panel.tasks[state.workflow_panel.selected].id,
+            "task-approval"
+        );
+
+        state.workflow_panel.selected = state
+            .workflow_panel
+            .tasks
+            .iter()
+            .position(|task| task.id == "task-workflow")
+            .expect("workflow task remains visible");
+        approval.last_activity_at_ms = Some(10_000);
+        state.update(TuiEvent::WorkflowTasksUpdated {
+            tasks: vec![workflow, approval],
         });
 
         assert_eq!(

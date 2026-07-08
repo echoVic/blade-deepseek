@@ -322,6 +322,9 @@ copied into Orca.
    without stealing selection on later refreshes. When that selected
    backgrounded session is returned to the foreground, the TUI closes the task
    panel so replayed and future assistant output is visible immediately.
+   Backgrounded main-session approvals now also reveal and select their task
+   once, so an approval wait is visible without clobbering later manual
+   selection.
 
 ### P0: Session Runtime Unification
 
