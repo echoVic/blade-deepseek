@@ -287,6 +287,14 @@ mod tests {
             !app.contains("\nfn handle_running_shortcut("),
             "app should use the running_actions module instead of defining running shortcut execution inline"
         );
+        assert!(
+            !app.contains("use crate::running_actions::handle_running_shortcut;"),
+            "app tests should reference running_actions explicitly instead of keeping a main-module import"
+        );
+        assert!(
+            !app.contains("use crate::shortcuts::RunningShortcut;"),
+            "app tests should reference RunningShortcut explicitly instead of keeping a main-module import"
+        );
     }
 
     #[test]

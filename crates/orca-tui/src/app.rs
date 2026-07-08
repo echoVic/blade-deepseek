@@ -34,9 +34,7 @@ use crate::composer_textarea::{
 };
 use crate::input_event_actions::{handle_mouse_event, handle_paste_event};
 use crate::key_event_actions::{KeyEventFlow, handle_key_event_preflight};
-use crate::running_actions::handle_running_shortcut;
 use crate::runtime_event_actions::handle_runtime_event;
-use crate::shortcuts::RunningShortcut;
 use crate::slash_menu_actions::{REASONING_SUBMENU_TITLE, handle_slash_menu_key};
 use crate::status_key_actions::{StatusKeyFlow, handle_status_key};
 use crate::submitted_turn::SubmittedTurn;
@@ -926,8 +924,8 @@ mod tests {
         let action_tx = state.event_tx.clone();
         let cancel = CancelToken::new();
 
-        handle_running_shortcut(
-            RunningShortcut::BackgroundCurrentTurn,
+        crate::running_actions::handle_running_shortcut(
+            crate::shortcuts::RunningShortcut::BackgroundCurrentTurn,
             &mut state,
             &action_tx,
             &cancel,
