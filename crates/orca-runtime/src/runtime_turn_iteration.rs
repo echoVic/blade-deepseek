@@ -7,6 +7,7 @@ use orca_core::config::{ProviderKind, RunConfig};
 use orca_core::event_schema::EventFactory;
 use orca_core::event_sink::EventSink;
 use orca_core::model::ModelSelection;
+use orca_core::provider_types::ProviderResponse;
 use orca_core::subagent_types::SubagentType;
 use orca_mcp::McpRegistry;
 use orca_provider::{ProviderConfig, context};
@@ -54,6 +55,7 @@ pub(crate) struct RuntimeTurnIterationInput<'a, 'runtime, W: io::Write> {
     pub(crate) prompt: &'a str,
     pub(crate) model: &'a ModelSelection,
     pub(crate) subagent_type: &'a SubagentType,
+    pub(crate) initial_response: Option<ProviderResponse>,
     pub(crate) model_override: Option<&'a str>,
     pub(crate) cost_tracker: &'a mut CostTracker,
     pub(crate) steer_handle: Option<&'a ThreadSteerHandle>,
@@ -125,7 +127,7 @@ impl RuntimeTurnIterationStep {
             RuntimeProviderCycleInput {
                 actor: input.actor,
                 provider: input.provider,
-                initial_response: None,
+                initial_response: input.initial_response,
                 turn_provider_config: &turn_provider_config,
                 runtime_system_messages: input.runtime_system_messages,
                 cwd: input.cwd,

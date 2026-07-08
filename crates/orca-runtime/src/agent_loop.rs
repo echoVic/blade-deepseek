@@ -106,6 +106,7 @@ pub(crate) fn run_agent_loop(
             prepared_conversation: &mut prepared_conversation,
             prompt,
             subagent_type,
+            initial_response: None,
             loop_state,
             steer_handle,
             config,

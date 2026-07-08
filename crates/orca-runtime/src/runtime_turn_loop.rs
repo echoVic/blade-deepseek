@@ -6,6 +6,7 @@ use orca_core::config::{ProviderKind, RunConfig};
 use orca_core::event_schema::EventFactory;
 use orca_core::event_sink::EventSink;
 use orca_core::model::ModelSelection;
+use orca_core::provider_types::ProviderResponse;
 use orca_core::subagent_types::SubagentType;
 use orca_mcp::McpRegistry;
 use orca_provider::{ProviderConfig, context};
@@ -43,6 +44,7 @@ pub(crate) struct RuntimeAgentTurnLoopInput<'a, 'runtime, W: io::Write> {
     pub(crate) prepared_conversation: &'a mut RuntimePreparedConversation<'runtime>,
     pub(crate) prompt: &'a str,
     pub(crate) subagent_type: &'a SubagentType,
+    pub(crate) initial_response: Option<ProviderResponse>,
     pub(crate) loop_state: RuntimeTurnLoopState<'a>,
     pub(crate) steer_handle: Option<&'a ThreadSteerHandle>,
     pub(crate) config: &'a RunConfig,
@@ -71,6 +73,7 @@ pub(crate) struct RuntimeTurnLoopInput<'a, 'runtime, W: io::Write> {
     pub(crate) prompt: &'a str,
     pub(crate) model: &'a ModelSelection,
     pub(crate) subagent_type: &'a SubagentType,
+    pub(crate) initial_response: Option<ProviderResponse>,
     pub(crate) loop_state: RuntimeTurnLoopState<'a>,
     pub(crate) steer_handle: Option<&'a ThreadSteerHandle>,
     pub(crate) max_budget_usd: Option<f64>,
@@ -108,6 +111,7 @@ impl<'a, 'runtime, W: io::Write> RuntimeTurnLoopInput<'a, 'runtime, W> {
         prompt: &'a str,
         model: &'a ModelSelection,
         subagent_type: &'a SubagentType,
+        initial_response: Option<ProviderResponse>,
         loop_state: RuntimeTurnLoopState<'a>,
         steer_handle: Option<&'a ThreadSteerHandle>,
         max_budget_usd: Option<f64>,
@@ -136,6 +140,7 @@ impl<'a, 'runtime, W: io::Write> RuntimeTurnLoopInput<'a, 'runtime, W> {
             prompt,
             model,
             subagent_type,
+            initial_response,
             loop_state,
             steer_handle,
             max_budget_usd,
@@ -171,6 +176,7 @@ impl<'a, 'runtime, W: io::Write> RuntimeTurnLoopInput<'a, 'runtime, W> {
             prompt: self.prompt,
             model: self.model,
             subagent_type: self.subagent_type,
+            initial_response: self.initial_response.take(),
             model_override: loop_state.model_override,
             cost_tracker: loop_state.cost_tracker,
             steer_handle: self.steer_handle,
@@ -258,6 +264,7 @@ impl<'a, 'runtime, W: io::Write> RuntimeAgentTurnLoopInput<'a, 'runtime, W> {
             self.prompt,
             &self.config.model,
             self.subagent_type,
+            self.initial_response,
             self.loop_state,
             self.steer_handle,
             self.config.max_budget_usd,
@@ -272,5 +279,166 @@ impl<'a, 'runtime, W: io::Write> RuntimeAgentTurnLoopInput<'a, 'runtime, W> {
             self.workflow_ipc,
             self.turn_interactions,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use orca_core::approval_types::ApprovalMode;
+    use orca_core::config::{
+        HistoryMode, OutputFormat, ProviderKind, RunConfig, ThemeName, ToolConfig, WorkflowConfig,
+    };
+    use orca_core::conversation::Conversation;
+    use orca_core::event_sink::EventSink;
+    use orca_core::external_config::ExternalToolConfig;
+    use orca_core::hook_types::HookConfig;
+    use orca_core::mcp_types::McpServerConfig;
+    use orca_core::model::ModelSelection;
+    use orca_core::provider_types::{ProviderResponse, ProviderStep};
+    use orca_core::subagent_config::SubagentConfig;
+    use orca_mcp::McpRegistry;
+
+    use crate::cost::CostTracker;
+    use crate::lifecycle::{RuntimeSessionLifecycle, RuntimeTurnState};
+    use crate::runtime_conversation_bootstrap::RuntimeConversationBootstrapStep;
+    use crate::session::AgentConversationContext;
+    use crate::tasks::TaskRegistry;
+    use crate::tool_execution::policy_for_tool_execution;
+
+    fn config() -> RunConfig {
+        RunConfig {
+            app_version: "0.0.0-test".to_string(),
+            prompt: String::new(),
+            cwd: None,
+            output_format: OutputFormat::Text,
+            approval_mode: ApprovalMode::Suggest,
+            provider: ProviderKind::Mock,
+            verifier: None,
+            model: ModelSelection::parse(None).unwrap(),
+            model_runtime: Default::default(),
+            reasoning_effort: orca_core::config::ReasoningEffort::Max,
+            api_key: None,
+            base_url: None,
+            history_mode: HistoryMode::Disabled,
+            show_session_picker: false,
+            active_permission_profile: None,
+            permission_profiles: Default::default(),
+            runtime_workspace_roots: None,
+            permission_rules: Default::default(),
+            additional_working_directories: Vec::new(),
+            max_budget_usd: None,
+            mcp_servers: Vec::<McpServerConfig>::new(),
+            external_tools: Vec::<ExternalToolConfig>::new(),
+            hooks: Vec::<HookConfig>::new(),
+            subagents: SubagentConfig::default(),
+            tools: ToolConfig::default(),
+            workflows: WorkflowConfig::default(),
+            theme: ThemeName::Dark,
+            vim_mode: false,
+            update_check: false,
+            desktop_notifications: false,
+            auto_memory: false,
+        }
+    }
+
+    #[test]
+    fn turn_loop_input_passes_initial_response_to_first_iteration_only() {
+        let config = config();
+        let cwd = tempfile::tempdir().expect("cwd");
+        let context_config = context::ContextConfig::for_model_with_runtime(
+            Some("deepseek-chat"),
+            &config.model_runtime,
+        );
+        let provider_config = ProviderConfig {
+            api_key: None,
+            base_url: None,
+            model: Some(orca_core::model::PRO_MODEL.to_string()),
+            reasoning_effort: orca_core::config::ReasoningEffort::Max,
+            tools_override: Some(Vec::new()),
+            mcp_registry: None,
+            external_tools: Vec::new(),
+        };
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let mcp_registry = McpRegistry::default();
+        let hooks = HookRunner::default();
+        let policy = policy_for_tool_execution(&config);
+        let subagent_type = SubagentType::General;
+        let cancel = orca_core::cancel::CancelToken::new();
+        let task_registry = TaskRegistry::new("turn-loop-continuation".to_string());
+        let mut cost_tracker = CostTracker::new(None);
+        let loop_state =
+            RuntimeTurnState::new(&mut cost_tracker, &cancel, &task_registry).into_loop_state();
+        let mut lifecycle = RuntimeSessionLifecycle::new("turn-loop-continuation");
+        let mut actor = RuntimeTaskActor::new(&mut lifecycle, 3);
+        let mut events = EventFactory::new("turn-loop-continuation".to_string());
+        let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+        let mut conversation = Conversation::new();
+        let mut prepared_conversation = RuntimeConversationBootstrapStep::new()
+            .prepare(
+                AgentConversationContext::new().with_conversation(Some(&mut conversation)),
+                cwd.path(),
+                "continue",
+                0,
+                &subagent_type,
+                &instructions,
+                config.approval_mode,
+                &memory,
+                true,
+            )
+            .expect("prepare conversation");
+        let mut background_workflows = Vec::new();
+        let response = ProviderResponse {
+            steps: vec![ProviderStep::MessageDelta("continued".to_string())],
+            assistant_content: Some("continued".to_string()),
+            assistant_reasoning: None,
+            tool_calls: Vec::new(),
+            usage: None,
+        };
+        let mut input = RuntimeTurnLoopInput {
+            actor: &mut actor,
+            provider: ProviderKind::DeepSeek,
+            initial_response: Some(response),
+            context_config: &context_config,
+            provider_config: &provider_config,
+            cwd: cwd.path(),
+            emit_deltas: true,
+            hooks: &hooks,
+            events: &mut events,
+            sink: &mut sink,
+            prepared_conversation: &mut prepared_conversation,
+            prompt: "continue",
+            model: &config.model,
+            subagent_type: &subagent_type,
+            loop_state,
+            steer_handle: None,
+            max_budget_usd: None,
+            config: &config,
+            tool_policy: AgentToolPolicyContext::unrestricted(),
+            subagent_depth: 0,
+            policy: &policy,
+            instructions: &instructions,
+            memory: &memory,
+            mcp_registry: &mcp_registry,
+            background_workflows: &mut background_workflows,
+            workflow_ipc: None,
+            turn_interactions: RuntimeTurnInteractionState::new(),
+        };
+
+        {
+            let first_iteration = input.iteration_input();
+            assert_eq!(
+                first_iteration
+                    .initial_response
+                    .as_ref()
+                    .and_then(|response| response.assistant_content.as_deref()),
+                Some("continued")
+            );
+        }
+        {
+            let second_iteration = input.iteration_input();
+            assert!(second_iteration.initial_response.is_none());
+        }
     }
 }
