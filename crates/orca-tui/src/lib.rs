@@ -31,6 +31,7 @@ mod slash_command_actions;
 mod slash_menu_actions;
 mod status_key_actions;
 mod submitted_turn;
+mod terminal_lifecycle;
 pub mod theme;
 pub mod types;
 pub mod ui;
@@ -294,6 +295,57 @@ mod tests {
         assert!(
             !app.contains("use crate::shortcuts::RunningShortcut;"),
             "app tests should reference RunningShortcut explicitly instead of keeping a main-module import"
+        );
+    }
+
+    #[test]
+    fn tui_terminal_lifecycle_is_owned_by_guard_module() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let terminal_lifecycle =
+            std::fs::read_to_string(format!("{manifest_dir}/src/terminal_lifecycle.rs"))
+                .expect("terminal_lifecycle module should exist");
+        assert!(
+            terminal_lifecycle.contains("pub(crate) struct TerminalCleanup"),
+            "terminal_lifecycle should expose a cleanup guard"
+        );
+        assert!(
+            terminal_lifecycle.contains("impl Drop for TerminalCleanup"),
+            "terminal_lifecycle should clean up on early returns and errors"
+        );
+        assert!(
+            terminal_lifecycle.contains("PopKeyboardEnhancementFlags"),
+            "terminal_lifecycle should restore keyboard enhancement state"
+        );
+        assert!(
+            terminal_lifecycle.contains("DisableBracketedPaste"),
+            "terminal_lifecycle should disable bracketed paste"
+        );
+        assert!(
+            terminal_lifecycle.contains("DisableMouseCapture"),
+            "terminal_lifecycle should disable mouse capture"
+        );
+        assert!(
+            terminal_lifecycle.contains("terminal::disable_raw_mode"),
+            "terminal_lifecycle should restore raw mode"
+        );
+
+        let app = std::fs::read_to_string(format!("{manifest_dir}/src/app.rs"))
+            .expect("app source should be readable");
+        assert!(
+            !app.contains("DisableBracketedPaste"),
+            "app should use terminal_lifecycle instead of disabling bracketed paste inline"
+        );
+        assert!(
+            !app.contains("DisableMouseCapture"),
+            "app should use terminal_lifecycle instead of disabling mouse capture inline"
+        );
+        assert!(
+            !app.contains("PopKeyboardEnhancementFlags"),
+            "app should use terminal_lifecycle instead of popping keyboard enhancement inline"
+        );
+        assert!(
+            !app.contains("terminal::disable_raw_mode()?"),
+            "app should use terminal_lifecycle instead of restoring raw mode inline"
         );
     }
 

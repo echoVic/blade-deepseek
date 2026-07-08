@@ -444,6 +444,10 @@ copied into Orca.
    Status-specific key routing now lives in a focused TUI status key action
    module, keeping setup, session picker, approval dialog, idle/user-input, and
    running shortcut dispatch out of the app event loop.
+   Terminal lifecycle cleanup now lives behind a focused TUI cleanup guard,
+   ensuring keyboard enhancement, bracketed paste, mouse capture, cursor
+   visibility, and raw mode are restored even when the app exits through an
+   early error path.
    Runtime task summaries now also expose terminal `result`/`error` fields so
    the selected task row can show completion output or failure details in the
    panel. The

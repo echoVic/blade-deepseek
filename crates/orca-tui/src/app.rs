@@ -7,8 +7,7 @@ use std::time::{Duration, Instant};
 
 use crossterm::ExecutableCommand;
 use crossterm::event::{
-    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event, KeyCode, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    self, EnableBracketedPaste, EnableMouseCapture, Event, KeyCode, KeyboardEnhancementFlags,
     PushKeyboardEnhancementFlags,
 };
 use crossterm::terminal;
@@ -37,6 +36,7 @@ use crate::key_event_actions::{KeyEventFlow, handle_key_event_preflight};
 use crate::runtime_event_actions::handle_runtime_event;
 use crate::status_key_actions::{StatusKeyFlow, handle_status_key};
 use crate::submitted_turn::SubmittedTurn;
+use crate::terminal_lifecycle::TerminalCleanup;
 use crate::theme::Theme;
 use crate::types::{
     AppState, AppStatus, ChatMessage, SlashMenu, SlashMenuItem, SubMenu, TuiEvent, UserAction,
@@ -62,22 +62,25 @@ pub fn run_tui(config: RunConfig) -> i32 {
 
 fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
     terminal::enable_raw_mode()?;
+    let mut terminal_cleanup = TerminalCleanup::raw_mode_enabled();
     let mut stdout = io::stdout();
     // No alt-screen, so the terminal keeps its normal scrollback buffer. We DO enable mouse
     // capture so the wheel scrolls the conversation in-app; copying is done with the terminal's
     // modifier-drag (Shift/Option+drag on most terminals), which bypasses mouse capture.
     // stdout.execute(EnterAlternateScreen)?;
-    let mouse_captured = stdout.execute(EnableMouseCapture).is_ok();
-    let bracketed_paste = stdout.execute(EnableBracketedPaste).is_ok();
+    terminal_cleanup.set_mouse_captured(stdout.execute(EnableMouseCapture).is_ok());
+    terminal_cleanup.set_bracketed_paste(stdout.execute(EnableBracketedPaste).is_ok());
     // Kitty keyboard protocol: push enhancement AFTER entering alternate screen,
     // otherwise the terminal may reset the keyboard state stack on screen switch.
-    let kbd_enhanced = stdout
-        .execute(PushKeyboardEnhancementFlags(
-            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
-                | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS,
-        ))
-        .is_ok();
+    terminal_cleanup.set_keyboard_enhanced(
+        stdout
+            .execute(PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                    | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS,
+            ))
+            .is_ok(),
+    );
 
     let backend = CrosstermBackend::new(stdout);
 
@@ -290,23 +293,11 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
         terminal.draw(|f| ui::render(f, &mut state, &textarea, &theme))?;
     }
 
-    // Cleanup: pop keyboard enhancement, disable bracketed paste
-    if kbd_enhanced {
-        let _ = io::stdout().execute(PopKeyboardEnhancementFlags);
-    }
-    if bracketed_paste {
-        let _ = io::stdout().execute(DisableBracketedPaste);
-    }
-    if mouse_captured {
-        let _ = io::stdout().execute(DisableMouseCapture);
-    }
     // No alternate screen to leave.
     // io::stdout().execute(LeaveAlternateScreen)?;
     // Leave the cursor on a fresh line below the final frame so the shell prompt returns cleanly.
     drop(terminal);
-    let _ = io::stdout().execute(crossterm::cursor::Show);
-    terminal::disable_raw_mode()?;
-    println!();
+    terminal_cleanup.finish();
 
     Ok(exit_code)
 }
