@@ -2068,12 +2068,16 @@ mod tests {
             "backtrack policy should stay inside SubmittedTurn presentation metadata"
         );
         assert!(
-            goal_loop_section.contains("submitted_turn.presentation.task_label.as_deref()"),
-            "goal loop should read the task label through SubmittedTurnPresentation"
+            goal_loop_section.contains("submitted_turn.task_label()"),
+            "goal loop should read the task label through the submitted-turn boundary"
         );
         assert!(
-            goal_loop_section.contains("submitted_turn.presentation.backtrack_target"),
-            "goal loop should read backtrack policy through SubmittedTurnPresentation"
+            goal_loop_section.contains("submitted_turn.is_backtrack_target()"),
+            "goal loop should read backtrack policy through the submitted-turn boundary"
+        );
+        assert!(
+            !goal_loop_section.contains(".presentation."),
+            "goal loop should not reach into SubmittedTurnPresentation internals"
         );
     }
 
@@ -4081,8 +4085,8 @@ fn run_goal_turns_for_tui(
             pending_actions,
             cancel,
             true,
-            submitted_turn.presentation.task_label.as_deref(),
-            submitted_turn.presentation.backtrack_target,
+            submitted_turn.task_label(),
+            submitted_turn.is_backtrack_target(),
             Some(pending_workflow_notifications),
         );
         let status = turn_result.status;

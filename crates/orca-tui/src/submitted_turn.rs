@@ -8,8 +8,8 @@ enum SubmittedTurnKind {
 }
 
 pub(crate) struct SubmittedTurnPresentation {
-    pub(crate) task_label: Option<String>,
-    pub(crate) backtrack_target: bool,
+    task_label: Option<String>,
+    backtrack_target: bool,
 }
 
 impl SubmittedTurnPresentation {
@@ -30,7 +30,7 @@ impl SubmittedTurnPresentation {
 
 pub(crate) struct SubmittedTurn {
     kind: SubmittedTurnKind,
-    pub(crate) presentation: SubmittedTurnPresentation,
+    presentation: SubmittedTurnPresentation,
 }
 
 impl SubmittedTurn {
@@ -54,6 +54,14 @@ impl SubmittedTurn {
             SubmittedTurnKind::User(prompt) => prompt,
             SubmittedTurnKind::WorkflowNotification(notification) => &notification.prompt,
         }
+    }
+
+    pub(crate) fn task_label(&self) -> Option<&str> {
+        self.presentation.task_label.as_deref()
+    }
+
+    pub(crate) fn is_backtrack_target(&self) -> bool {
+        self.presentation.backtrack_target
     }
 
     pub(crate) fn prompt_for_model(&self, cwd: &std::path::Path) -> Result<String, String> {
