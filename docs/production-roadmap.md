@@ -368,9 +368,13 @@ copied into Orca.
    Keep implementation behind Orca runtime task/protocol types rather than
    importing package 3's UI-state coupling. Seeded: the TUI task panel can now
    request a stop for the selected non-terminal task through the runtime
-   `TaskRegistry`, refreshing the panel after the status changes. Runtime task
-   summaries now also expose terminal `result`/`error` fields so the selected
-   task row can show completion output or failure details in the panel. The
+   `TaskRegistry`, refreshing the panel after the status changes. Stop,
+   foreground, and recovered-background-approval task actions now live in a
+   focused TUI background task module, keeping package 3-style task controls
+   behind Orca runtime task summaries instead of app-loop state mutation.
+   Runtime task summaries now also expose terminal `result`/`error` fields so
+   the selected task row can show completion output or failure details in the
+   panel. The
    panel now renders contextual action hints for selection, approval, stop, and
    closing so TUI users can discover task controls in-place. Selected task
    result/error details now render as bounded multi-line summaries, keeping

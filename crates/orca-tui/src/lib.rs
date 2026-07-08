@@ -4,6 +4,7 @@ mod agent_tool_execution;
 mod agent_workflow_execution;
 pub mod app;
 mod background_approval;
+mod background_tasks;
 pub mod bridge;
 pub mod commands;
 pub mod diff;
@@ -169,6 +170,42 @@ mod tests {
         assert!(
             !app.contains("\nfn submit_background_approval_response_for_tui("),
             "app should use the background_approval module instead of defining approval submission inline"
+        );
+    }
+
+    #[test]
+    fn tui_background_task_actions_are_owned_by_dedicated_module() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let background_tasks =
+            std::fs::read_to_string(format!("{manifest_dir}/src/background_tasks.rs"))
+                .expect("background_tasks module should exist");
+        assert!(
+            background_tasks.contains("pub(crate) fn stop_task_for_tui"),
+            "background_tasks should own TUI task stop execution"
+        );
+        assert!(
+            background_tasks.contains("pub(crate) fn foreground_task_for_tui"),
+            "background_tasks should own TUI task foreground execution"
+        );
+        assert!(
+            background_tasks
+                .contains("pub(crate) fn notify_recovered_background_approvals_for_tui"),
+            "background_tasks should own recovered background approval notifications"
+        );
+
+        let app = std::fs::read_to_string(format!("{manifest_dir}/src/app.rs"))
+            .expect("app source should be readable");
+        assert!(
+            !app.contains("\nfn stop_task_for_tui("),
+            "app should use the background_tasks module instead of defining stop execution inline"
+        );
+        assert!(
+            !app.contains("\nfn foreground_task_for_tui("),
+            "app should use the background_tasks module instead of defining foreground execution inline"
+        );
+        assert!(
+            !app.contains("\nfn notify_recovered_background_approvals_for_tui("),
+            "app should use the background_tasks module instead of defining recovery notifications inline"
         );
     }
 
