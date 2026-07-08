@@ -44,6 +44,11 @@ use crate::types::{
 };
 use crate::ui;
 use crate::vim::VimState;
+use crate::workflow_notifications::{
+    drain_pending_workflow_notifications, is_workflow_notification_turn_boundary,
+    queue_workflow_terminal_notification, remove_pending_workflow_notification_by_id,
+    submit_pending_workflow_notification,
+};
 
 pub fn run_tui(config: RunConfig) -> i32 {
     match run_tui_inner(config) {
@@ -770,62 +775,6 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
     println!();
 
     Ok(exit_code)
-}
-
-fn submit_pending_workflow_notification(
-    state: &mut AppState,
-    action_tx: &mpsc::Sender<UserAction>,
-    require_idle: bool,
-) {
-    if require_idle && state.status != AppStatus::Idle {
-        return;
-    }
-    if let Some(notification) = state.pending_workflow_notifications.pop_front() {
-        state.enter_running();
-        state.scroll_to_bottom();
-        let _ = action_tx.send(UserAction::SubmitWorkflowNotification(notification));
-    }
-}
-
-fn queue_workflow_terminal_notification(
-    event: &TuiEvent,
-    pending_notifications: &bridge::PendingWorkflowNotifications,
-    batch_injection_enabled: bool,
-) -> Option<String> {
-    if !batch_injection_enabled {
-        return None;
-    }
-    if let TuiEvent::WorkflowNotification { id, prompt, .. } = event {
-        let queued = pending_notifications.push_unique(crate::types::PendingWorkflowNotification {
-            id: id.clone(),
-            prompt: prompt.clone(),
-        });
-        if queued {
-            return Some(id.clone());
-        }
-    }
-    None
-}
-
-fn remove_pending_workflow_notification_by_id(state: &mut AppState, id: &str) {
-    if let Some(index) = state
-        .pending_workflow_notifications
-        .iter()
-        .position(|pending| pending.id == id)
-    {
-        state.pending_workflow_notifications.remove(index);
-    }
-}
-
-fn drain_pending_workflow_notifications(
-    state: &mut AppState,
-    pending_notifications: &bridge::PendingWorkflowNotifications,
-) {
-    pending_notifications.drain_into(&mut state.pending_workflow_notifications);
-}
-
-fn is_workflow_notification_turn_boundary(event: &TuiEvent) -> bool {
-    matches!(event, TuiEvent::SessionCompleted { .. })
 }
 
 fn shorten_home(path: &str) -> String {

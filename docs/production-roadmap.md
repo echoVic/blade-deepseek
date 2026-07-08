@@ -303,7 +303,12 @@ copied into Orca.
    submission path now also lives in a focused module, keeping request-id
    matching, denied-task finishing, task-list refreshes, and typed continuation
    request creation behind one named boundary instead of embedding that state
-   transition in the app event loop. Next, move the same id discipline into
+   transition in the app event loop. Workflow terminal notification queueing,
+   cross-thread pending notification draining, pending notification submission,
+   and by-id removal now also live in a focused TUI workflow notification
+   module, so the app event loop coordinates notification turn boundaries
+   without owning the pending-continuation queue mechanics. Next, move the same
+   id discipline into
    remaining turn/item continuation ownership so continuations stop depending on
    separate ad hoc task fields plus TUI-local queues.
 3. **P2: Frozen per-turn context boundary.** Continue shrinking wide call

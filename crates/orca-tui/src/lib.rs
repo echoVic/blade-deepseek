@@ -16,6 +16,7 @@ pub mod theme;
 pub mod types;
 pub mod ui;
 pub mod vim;
+mod workflow_notifications;
 
 pub use app::run_tui;
 
@@ -206,6 +207,54 @@ mod tests {
         assert!(
             !app.contains("\nfn notify_recovered_background_approvals_for_tui("),
             "app should use the background_tasks module instead of defining recovery notifications inline"
+        );
+    }
+
+    #[test]
+    fn tui_workflow_notifications_are_owned_by_dedicated_module() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let workflow_notifications =
+            std::fs::read_to_string(format!("{manifest_dir}/src/workflow_notifications.rs"))
+                .expect("workflow_notifications module should exist");
+        assert!(
+            workflow_notifications.contains("pub(crate) fn submit_pending_workflow_notification"),
+            "workflow_notifications should own pending notification submission"
+        );
+        assert!(
+            workflow_notifications.contains("pub(crate) fn queue_workflow_terminal_notification"),
+            "workflow_notifications should own terminal notification queueing"
+        );
+        assert!(
+            workflow_notifications
+                .contains("pub(crate) fn remove_pending_workflow_notification_by_id"),
+            "workflow_notifications should own pending notification removal by id"
+        );
+        assert!(
+            workflow_notifications.contains("pub(crate) fn drain_pending_workflow_notifications"),
+            "workflow_notifications should own cross-thread notification draining"
+        );
+        assert!(
+            workflow_notifications.contains("pub(crate) fn is_workflow_notification_turn_boundary"),
+            "workflow_notifications should own workflow notification turn-boundary detection"
+        );
+
+        let app = std::fs::read_to_string(format!("{manifest_dir}/src/app.rs"))
+            .expect("app source should be readable");
+        assert!(
+            !app.contains("\nfn submit_pending_workflow_notification("),
+            "app should use the workflow_notifications module instead of defining pending notification submission inline"
+        );
+        assert!(
+            !app.contains("\nfn queue_workflow_terminal_notification("),
+            "app should use the workflow_notifications module instead of defining terminal notification queueing inline"
+        );
+        assert!(
+            !app.contains("\nfn remove_pending_workflow_notification_by_id("),
+            "app should use the workflow_notifications module instead of defining notification removal inline"
+        );
+        assert!(
+            !app.contains("\nfn drain_pending_workflow_notifications("),
+            "app should use the workflow_notifications module instead of defining notification draining inline"
         );
     }
 
