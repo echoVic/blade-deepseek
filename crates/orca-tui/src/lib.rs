@@ -253,6 +253,35 @@ mod tests {
     }
 
     #[test]
+    fn tui_workflow_task_status_uses_runtime_task_status_event() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let workflow =
+            std::fs::read_to_string(format!("{manifest_dir}/src/agent_workflow_execution.rs"))
+                .expect("TUI agent workflow execution module should exist");
+
+        assert!(
+            workflow.contains("fn send_workflow_task_status_for_tui"),
+            "workflow execution should centralize single-task status announcements"
+        );
+        assert!(
+            workflow.contains("send_task_status_updated_for_tui"),
+            "workflow task status should announce concrete task status runtime events"
+        );
+        assert!(
+            workflow.contains("task_summary_for_tui"),
+            "workflow task status should load the concrete task summary before notifying"
+        );
+        assert!(
+            workflow.contains("send_task_status_updated_for_tui(event_tx, events, &task);"),
+            "workflow task status helper must emit task.status.updated runtime events"
+        );
+        assert!(
+            workflow.contains("send_workflow_tasks_updated_for_tui"),
+            "workflow progress refreshes should keep the aggregate workflow task-list event"
+        );
+    }
+
+    #[test]
     fn tui_agent_subagent_execution_is_owned_by_dedicated_module() {
         let manifest_dir = env!("CARGO_MANIFEST_DIR");
         let subagent =

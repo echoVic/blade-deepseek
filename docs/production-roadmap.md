@@ -278,7 +278,11 @@ copied into Orca.
    updates, plus approved background-turn continuation refreshes, route through
    it instead of borrowing the workflow task-list event for each one-task status
    change. TUI subagent task creation, progress, and terminal status updates
-   now use the same single-task event path.
+   now use the same single-task event path. Workflow launch/startup terminal
+   updates and background terminal updates now also use that single-task event
+   path when a concrete workflow task id is known, while workflow progress
+   polling keeps the aggregate workflow task-list event for full-list progress
+   refreshes.
    Server protocol event mapping also preserves that single-task status event
    as `task_status_updated` for non-TUI clients.
 5. **P4: Persistence policy for pending background continuations.** Current

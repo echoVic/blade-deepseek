@@ -15,13 +15,24 @@ use orca_runtime::workflow::{
 use serde::Deserialize;
 
 use crate::agent_runner::{
-    WorkflowNotificationPayload, send_workflow_notification_for_tui,
-    send_workflow_tasks_updated_for_tui,
+    WorkflowNotificationPayload, send_task_status_updated_for_tui,
+    send_workflow_notification_for_tui, send_workflow_tasks_updated_for_tui, task_summary_for_tui,
 };
 use crate::types::TuiEvent;
 
 const WORKFLOW_STARTUP_HEALTH_CHECK_POLLS: usize = 2;
 const WORKFLOW_STARTUP_HEALTH_CHECK_INTERVAL: Duration = Duration::from_millis(300);
+
+fn send_workflow_task_status_for_tui(
+    event_tx: &Sender<TuiEvent>,
+    events: &mut EventFactory,
+    registry: &TaskRegistry,
+    task_id: &str,
+) {
+    if let Some(task) = task_summary_for_tui(registry, task_id) {
+        send_task_status_updated_for_tui(event_tx, events, &task);
+    }
+}
 
 pub(crate) fn execute_workflow_draft_for_tui(
     config: &RunConfig,
@@ -99,14 +110,15 @@ pub(crate) fn execute_workflow_draft_action_for_tui(
             let workflow_name = launch.workflow_name.clone();
             let tool_use_id = request.id.clone();
             let mut task_events = EventFactory::new(run_id.clone());
-            send_workflow_tasks_updated_for_tui(event_tx, &mut task_events, &task_registry.list());
+            send_workflow_task_status_for_tui(event_tx, &mut task_events, task_registry, &task_id);
             let launch = match wait_for_workflow_startup(launch) {
                 WorkflowStartupStatus::StillRunning(launch) => launch,
                 WorkflowStartupStatus::Completed(result) => {
-                    send_workflow_tasks_updated_for_tui(
+                    send_workflow_task_status_for_tui(
                         event_tx,
                         &mut task_events,
-                        &task_registry.list(),
+                        task_registry,
+                        &task_id,
                     );
                     return completed_workflow_draft_action_result(
                         request,
@@ -116,10 +128,11 @@ pub(crate) fn execute_workflow_draft_action_for_tui(
                     );
                 }
                 WorkflowStartupStatus::Failed { error } => {
-                    send_workflow_tasks_updated_for_tui(
+                    send_workflow_task_status_for_tui(
                         event_tx,
                         &mut task_events,
-                        &task_registry.list(),
+                        task_registry,
+                        &task_id,
                     );
                     return tool_types::ToolResult::failed(request, error, None);
                 }
@@ -153,10 +166,11 @@ pub(crate) fn execute_workflow_draft_action_for_tui(
                         "workflow thread panicked".to_string(),
                     ),
                 };
-                send_workflow_tasks_updated_for_tui(
+                send_workflow_task_status_for_tui(
                     &notify_tx,
                     &mut events,
-                    &notify_registry.list(),
+                    &notify_registry,
+                    &task_id,
                 );
                 send_workflow_notification_for_tui(
                     &notify_tx,
@@ -309,15 +323,15 @@ pub(crate) fn execute_workflow_for_tui(
         Err(error) => return tool_types::ToolResult::failed(request, error.to_string(), None),
     };
     let mut task_events = EventFactory::new(run_id.clone());
-    send_workflow_tasks_updated_for_tui(event_tx, &mut task_events, &task_registry.list());
+    send_workflow_task_status_for_tui(event_tx, &mut task_events, task_registry, &task_id);
     let launch = match wait_for_workflow_startup(launch) {
         WorkflowStartupStatus::StillRunning(launch) => launch,
         WorkflowStartupStatus::Completed(result) => {
-            send_workflow_tasks_updated_for_tui(event_tx, &mut task_events, &task_registry.list());
+            send_workflow_task_status_for_tui(event_tx, &mut task_events, task_registry, &task_id);
             return completed_workflow_result(request, result);
         }
         WorkflowStartupStatus::Failed { error } => {
-            send_workflow_tasks_updated_for_tui(event_tx, &mut task_events, &task_registry.list());
+            send_workflow_task_status_for_tui(event_tx, &mut task_events, task_registry, &task_id);
             return tool_types::ToolResult::failed(request, error, None);
         }
     };
@@ -339,7 +353,7 @@ pub(crate) fn execute_workflow_for_tui(
                 "workflow thread panicked".to_string(),
             ),
         };
-        send_workflow_tasks_updated_for_tui(&notify_tx, &mut events, &notify_registry.list());
+        send_workflow_task_status_for_tui(&notify_tx, &mut events, &notify_registry, &task_id);
         send_workflow_notification_for_tui(
             &notify_tx,
             &mut events,
