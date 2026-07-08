@@ -637,6 +637,8 @@ mod tests {
             subagent_current_activity: None,
             subagent_turn: None,
             last_activity_at_ms: None,
+            result: None,
+            error: None,
         };
 
         let tui_event = tui_event_from_runtime_event(&events.workflow_tasks_updated(&[task]))
@@ -690,6 +692,8 @@ mod tests {
             subagent_current_activity: None,
             subagent_turn: None,
             last_activity_at_ms: Some(30),
+            result: None,
+            error: None,
         };
 
         let tui_event = tui_event_from_runtime_event(&events.task_status_updated(&task))

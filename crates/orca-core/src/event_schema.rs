@@ -878,6 +878,8 @@ mod tests {
             subagent_current_activity: None,
             subagent_turn: None,
             last_activity_at_ms: None,
+            result: None,
+            error: None,
         };
 
         let event = f.workflow_tasks_updated(&[task]);
@@ -924,6 +926,8 @@ mod tests {
             subagent_current_activity: None,
             subagent_turn: None,
             last_activity_at_ms: Some(30),
+            result: None,
+            error: None,
         };
 
         let event = f.task_status_updated(&task);

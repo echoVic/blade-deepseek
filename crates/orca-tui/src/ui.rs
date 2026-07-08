@@ -670,6 +670,8 @@ fn workflow_metadata_row_count(task: &BackgroundTaskSummary) -> u16 {
         + u16::from(task.workflow_launch_input.is_some())
         + u16::from(task.workflow_failure_count > 0)
         + u16::from(task.workflow_final_summary.is_some())
+        + u16::from(task.result.is_some())
+        + u16::from(task.error.is_some())
 }
 
 fn workflow_metadata_rows<'a>(task: &BackgroundTaskSummary, theme: &Theme) -> Vec<Line<'a>> {
@@ -708,6 +710,18 @@ fn workflow_metadata_rows<'a>(task: &BackgroundTaskSummary, theme: &Theme) -> Ve
         rows.push(Line::from(vec![
             Span::styled("    final ", Style::default().fg(theme.muted)),
             Span::styled(summary.clone(), Style::default().fg(theme.text)),
+        ]));
+    }
+    if let Some(result) = &task.result {
+        rows.push(Line::from(vec![
+            Span::styled("    result ", Style::default().fg(theme.success)),
+            Span::styled(clamp_label(result, 120), Style::default().fg(theme.text)),
+        ]));
+    }
+    if let Some(error) = &task.error {
+        rows.push(Line::from(vec![
+            Span::styled("    error ", Style::default().fg(theme.error)),
+            Span::styled(clamp_label(error, 120), Style::default().fg(theme.error)),
         ]));
     }
     rows
@@ -3167,6 +3181,8 @@ mod tests {
             subagent_current_activity: None,
             subagent_turn: None,
             last_activity_at_ms: None,
+            result: None,
+            error: None,
         };
 
         assert_eq!(
@@ -3218,6 +3234,8 @@ mod tests {
             created_at_ms: 1_000,
             started_at_ms: Some(1_000),
             completed_at_ms: None,
+            result: None,
+            error: None,
         }];
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         let textarea = TextArea::default();
@@ -3298,6 +3316,8 @@ mod tests {
             created_at_ms: 1_000,
             started_at_ms: Some(1_000),
             completed_at_ms: Some(2_000),
+            result: None,
+            error: None,
         }];
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         let textarea = TextArea::default();
@@ -3399,6 +3419,8 @@ mod tests {
             subagent_current_activity: None,
             subagent_turn: None,
             last_activity_at_ms: Some(4_000),
+            result: None,
+            error: None,
         };
 
         assert_eq!(task_type_label(&task), "session");
@@ -3435,6 +3457,8 @@ mod tests {
             subagent_current_activity: None,
             subagent_turn: None,
             last_activity_at_ms: Some(4_000),
+            result: None,
+            error: None,
         };
 
         assert!(task_detail_label(&task).starts_with("backgrounded • elapsed "));
@@ -3470,12 +3494,112 @@ mod tests {
             subagent_current_activity: None,
             subagent_turn: None,
             last_activity_at_ms: Some(4_000),
+            result: None,
+            error: None,
         };
 
         assert_eq!(
             task_detail_label(&task),
             "waiting on task_list • backgrounded • elapsed 3s"
         );
+    }
+
+    #[test]
+    fn workflows_panel_renders_selected_task_error_detail() {
+        let mut state = test_state();
+        state.panel_mode = PanelMode::Workflows;
+        state.workflow_panel.tasks = vec![BackgroundTaskSummary {
+            id: "task-main".to_string(),
+            task_type: TaskType::MainSession,
+            status: TaskStatus::Failed,
+            is_backgrounded: true,
+            description: "Summarize architecture".to_string(),
+            created_at_ms: 1_000,
+            started_at_ms: Some(1_000),
+            completed_at_ms: Some(4_000),
+            command: None,
+            agent_type: Some("main-session".to_string()),
+            server: None,
+            tool: None,
+            pending_tool_call: None,
+            name: None,
+            workflow_run_id: None,
+            phase_count: None,
+            workflow_progress: None,
+            workflow_phases: Vec::new(),
+            workflow_agents: Vec::new(),
+            workflow_script_path: None,
+            workflow_launch_input: None,
+            workflow_final_summary: None,
+            workflow_failure_count: 0,
+            usage: None,
+            subagent_current_activity: None,
+            subagent_turn: None,
+            last_activity_at_ms: Some(4_000),
+            result: None,
+            error: Some("model timed out".to_string()),
+        }];
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let textarea = TextArea::default();
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 12))
+            .expect("test backend");
+
+        terminal
+            .draw(|frame| render(frame, &mut state, &textarea, &theme))
+            .expect("draw");
+        let rendered = format!("{:?}", terminal.backend().buffer());
+
+        assert!(rendered.contains("error"));
+        assert!(rendered.contains("model timed out"));
+    }
+
+    #[test]
+    fn workflows_panel_renders_selected_task_result_detail() {
+        let mut state = test_state();
+        state.panel_mode = PanelMode::Workflows;
+        state.workflow_panel.tasks = vec![BackgroundTaskSummary {
+            id: "task-main".to_string(),
+            task_type: TaskType::MainSession,
+            status: TaskStatus::Completed,
+            is_backgrounded: true,
+            description: "Summarize architecture".to_string(),
+            created_at_ms: 1_000,
+            started_at_ms: Some(1_000),
+            completed_at_ms: Some(4_000),
+            command: None,
+            agent_type: Some("main-session".to_string()),
+            server: None,
+            tool: None,
+            pending_tool_call: None,
+            name: None,
+            workflow_run_id: None,
+            phase_count: None,
+            workflow_progress: None,
+            workflow_phases: Vec::new(),
+            workflow_agents: Vec::new(),
+            workflow_script_path: None,
+            workflow_launch_input: None,
+            workflow_final_summary: None,
+            workflow_failure_count: 0,
+            usage: None,
+            subagent_current_activity: None,
+            subagent_turn: None,
+            last_activity_at_ms: Some(4_000),
+            result: Some("summary ready".to_string()),
+            error: None,
+        }];
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let textarea = TextArea::default();
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 12))
+            .expect("test backend");
+
+        terminal
+            .draw(|frame| render(frame, &mut state, &textarea, &theme))
+            .expect("draw");
+        let rendered = format!("{:?}", terminal.backend().buffer());
+
+        assert!(rendered.contains("result"));
+        assert!(rendered.contains("summary ready"));
     }
 
     fn workflow_task_for_agent_dashboard(
@@ -3529,6 +3653,8 @@ mod tests {
             created_at_ms: 1_000,
             started_at_ms: Some(1_000),
             completed_at_ms: None,
+            result: None,
+            error: None,
         }
     }
 

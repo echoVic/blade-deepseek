@@ -301,7 +301,9 @@ copied into Orca.
    Keep implementation behind Orca runtime task/protocol types rather than
    importing package 3's UI-state coupling. Seeded: the TUI task panel can now
    request a stop for the selected non-terminal task through the runtime
-   `TaskRegistry`, refreshing the panel after the status changes.
+   `TaskRegistry`, refreshing the panel after the status changes. Runtime task
+   summaries now also expose terminal `result`/`error` fields so the selected
+   task row can show completion output or failure details in the panel.
 
 ### P0: Session Runtime Unification
 

@@ -440,6 +440,8 @@ impl TaskRegistry {
                         subagent_current_activity: record.subagent_current_activity.clone(),
                         subagent_turn: record.subagent_turn,
                         last_activity_at_ms: record.last_activity_at_ms,
+                        result: record.result.clone(),
+                        error: record.error.clone(),
                     })
                     .collect::<Vec<_>>()
             })
@@ -2154,6 +2156,9 @@ mod tests {
         let record = registry.get(&task.id).unwrap();
         assert_eq!(record.status, TaskStatus::Completed);
         assert_eq!(record.result.as_deref(), Some("done"));
+        let summary = registry.list().into_iter().next().unwrap();
+        assert_eq!(summary.result.as_deref(), Some("done"));
+        assert_eq!(summary.error, None);
     }
 
     #[test]
@@ -2255,5 +2260,8 @@ mod tests {
         let record = registry.get(&task.id).unwrap();
         assert_eq!(record.status, TaskStatus::Failed);
         assert_eq!(record.error.as_deref(), Some("boom"));
+        let summary = registry.list().into_iter().next().unwrap();
+        assert_eq!(summary.result, None);
+        assert_eq!(summary.error.as_deref(), Some("boom"));
     }
 }

@@ -1395,6 +1395,8 @@ mod tests {
             subagent_current_activity: None,
             subagent_turn: None,
             last_activity_at_ms: None,
+            result: None,
+            error: None,
         }
     }
 
@@ -2281,6 +2283,8 @@ mod tests {
             subagent_current_activity: None,
             subagent_turn: None,
             last_activity_at_ms: None,
+            result: None,
+            error: None,
         }];
         state.workflow_panel.selected = 9;
 
@@ -2383,6 +2387,8 @@ mod tests {
                 subagent_current_activity: None,
                 subagent_turn: None,
                 last_activity_at_ms: None,
+                result: None,
+                error: None,
             }],
         });
         state.update(TuiEvent::WorkflowNotification {
@@ -2435,6 +2441,8 @@ mod tests {
                 subagent_current_activity: None,
                 subagent_turn: None,
                 last_activity_at_ms: None,
+                result: None,
+                error: None,
             }],
         });
 
@@ -2492,6 +2500,8 @@ mod tests {
                 subagent_current_activity: None,
                 subagent_turn: None,
                 last_activity_at_ms: None,
+                result: None,
+                error: None,
             }],
         });
 

@@ -140,4 +140,8 @@ pub struct BackgroundTaskSummary {
     pub subagent_turn: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_activity_at_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
