@@ -2752,6 +2752,19 @@ mod tests {
                 "runtime_steer must own runtime steer detail {marker}"
             );
         }
+        assert!(
+            runtime_steer_source.contains("turn_context: RuntimeTurnContext<'a>"),
+            "RuntimeSteerInput must carry immutable turn refs through RuntimeTurnContext"
+        );
+        let runtime_steer_input = runtime_steer_source
+            .split("struct RuntimeSteerInput")
+            .nth(1)
+            .and_then(|source| source.split("impl RuntimeSteerStep").next())
+            .expect("RuntimeSteerInput source");
+        assert!(
+            !runtime_steer_input.contains("steer_handle: Option<&'a ThreadSteerHandle>"),
+            "RuntimeSteerInput must not duplicate turn-entry steer_handle"
+        );
     }
 
     #[test]

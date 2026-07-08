@@ -314,7 +314,6 @@ impl RuntimeProviderTurnStep {
         } = input.io;
         let cwd_display = input.turn_context.cwd.display().to_string();
         let emit_deltas = input.turn_context.emit_deltas;
-        let steer_handle = input.turn_context.steer_handle;
         let pre_model_outcome = match input.actor.run_pre_model_hook_with_cancel(
             input.hooks,
             &cwd_display,
@@ -328,7 +327,7 @@ impl RuntimeProviderTurnStep {
         }
 
         RuntimeSteerStep::new().apply(RuntimeSteerInput {
-            steer_handle,
+            turn_context: input.turn_context.clone(),
             conversation,
             history_writer: history_writer.as_deref_mut(),
         })?;

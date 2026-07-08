@@ -51,7 +51,6 @@ impl RuntimeTurnOpeningStep {
         mut input: RuntimeTurnOpeningInput<'_, '_, W>,
     ) -> io::Result<RuntimeTurnOpeningResult> {
         let turn_context = input.turn_context.clone();
-        let steer_handle = turn_context.steer_handle;
 
         RuntimeCompactionStep::new(
             input.provider,
@@ -83,7 +82,7 @@ impl RuntimeTurnOpeningStep {
             .route(RuntimeModelRouteInput {
                 actor: input.actor,
                 model: input.model,
-                turn_context,
+                turn_context: turn_context.clone(),
                 model_override: input.model_override,
                 provider_config: input.provider_config,
                 cost_tracker: input.cost_tracker,
@@ -93,7 +92,7 @@ impl RuntimeTurnOpeningStep {
             .provider_config;
 
         RuntimeSteerStep::new().apply(RuntimeSteerInput {
-            steer_handle,
+            turn_context,
             conversation: input.conversation,
             history_writer: input.history_writer.as_deref_mut(),
         })?;

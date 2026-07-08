@@ -2,13 +2,13 @@ use std::io;
 
 use orca_core::conversation::Conversation;
 
-use crate::lifecycle::ThreadSteerHandle;
+use crate::lifecycle::RuntimeTurnContext;
 use crate::thread_store::SessionWriter;
 
 pub(crate) struct RuntimeSteerStep;
 
 pub(crate) struct RuntimeSteerInput<'a> {
-    pub(crate) steer_handle: Option<&'a ThreadSteerHandle>,
+    pub(crate) turn_context: RuntimeTurnContext<'a>,
     pub(crate) conversation: &'a mut Conversation,
     pub(crate) history_writer: Option<&'a mut SessionWriter>,
 }
@@ -19,7 +19,7 @@ impl RuntimeSteerStep {
     }
 
     pub(crate) fn apply(&mut self, mut input: RuntimeSteerInput<'_>) -> io::Result<usize> {
-        let Some(steer_handle) = input.steer_handle else {
+        let Some(steer_handle) = input.turn_context.steer_handle else {
             return Ok(0);
         };
 

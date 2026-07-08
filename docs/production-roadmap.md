@@ -356,7 +356,8 @@ copied into Orca.
    delta policy from `RuntimeTurnContext`. `RuntimeCompactionStep` now also
    carries `RuntimeTurnContext`, so budget-warning hooks, compaction events, and
    compaction history persistence no longer receive a second flattened cwd/delta
-   copy.
+   copy. `RuntimeSteerInput` now also carries `RuntimeTurnContext`, so steer
+   draining no longer receives a separate steer-handle copy.
    Iteration stages now keep lifecycle-owned `RuntimeTurnLoopIterationState`
    grouped instead of unpacking runtime system messages, model overrides,
    cost/cancel/task refs, and extension refs into the iteration input. Keep
