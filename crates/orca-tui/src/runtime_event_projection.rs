@@ -153,6 +153,7 @@ pub(crate) fn tui_event_from_runtime_event(event: &EventEnvelope) -> Option<TuiE
                 .and_then(|value| value.as_str())
                 .unwrap_or("workflow");
             Some(TuiEvent::WorkflowNotification {
+                id: notification.id(),
                 prompt: notification.to_prompt(),
                 status,
                 summary: format!("{workflow_name}: {summary}"),
@@ -268,6 +269,10 @@ struct WorkflowTerminalNotification {
 }
 
 impl WorkflowTerminalNotification {
+    fn id(&self) -> String {
+        format!("{}:{}:{}", self.run_id, self.task_id, self.tool_use_id)
+    }
+
     fn to_prompt(&self) -> String {
         format!(
             "<task-notification>\n<task-id>{}</task-id>\n<tool-use-id>{}</tool-use-id>\n<run-id>{}</run-id>\n<status>{}</status>\n<summary>{}</summary>\n</task-notification>\n\nA background workflow finished. Use this result to continue the current task.",
@@ -548,10 +553,12 @@ mod tests {
 
         match notification {
             TuiEvent::WorkflowNotification {
+                id,
                 prompt,
                 status,
                 summary,
             } => {
+                assert_eq!(id, "workflow-run-1:task-1:workflow-tool-1");
                 assert_eq!(status, "completed");
                 assert_eq!(summary, "mock-workflow: all phases passed");
                 assert!(prompt.contains("<task-id>task-1</task-id>"));

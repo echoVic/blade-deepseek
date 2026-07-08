@@ -718,14 +718,14 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
             };
             let workflow_notification_turn_boundary =
                 is_workflow_notification_turn_boundary(&tui_event);
-            let batch_queued_workflow_notification = queue_workflow_terminal_notification(
+            let batch_queued_workflow_notification_id = queue_workflow_terminal_notification(
                 &tui_event,
                 &pending_workflow_notifications,
                 state.status == AppStatus::Running,
             );
             state.update(tui_event);
-            if let Some(prompt) = batch_queued_workflow_notification {
-                remove_pending_workflow_notification(&mut state, &prompt);
+            if let Some(id) = batch_queued_workflow_notification_id {
+                remove_pending_workflow_notification_by_id(&mut state, &id);
             }
             if let Some(prompt) = backtracked_prompt {
                 vim_state.reset_insert(&mut textarea, &theme);
@@ -774,10 +774,10 @@ fn submit_pending_workflow_notification(
     if require_idle && state.status != AppStatus::Idle {
         return;
     }
-    if let Some(prompt) = state.pending_workflow_notifications.pop_front() {
+    if let Some(notification) = state.pending_workflow_notifications.pop_front() {
         state.enter_running();
         state.scroll_to_bottom();
-        let _ = action_tx.send(UserAction::Submit(prompt));
+        let _ = action_tx.send(UserAction::Submit(notification.prompt));
     }
 }
 
@@ -789,20 +789,23 @@ fn queue_workflow_terminal_notification(
     if !batch_injection_enabled {
         return None;
     }
-    if let TuiEvent::WorkflowNotification { prompt, .. } = event
+    if let TuiEvent::WorkflowNotification { id, prompt, .. } = event
         && let Ok(mut queue) = pending_notifications.lock()
     {
-        queue.push_back(prompt.clone());
-        return Some(prompt.clone());
+        queue.push_back(crate::types::PendingWorkflowNotification {
+            id: id.clone(),
+            prompt: prompt.clone(),
+        });
+        return Some(id.clone());
     }
     None
 }
 
-fn remove_pending_workflow_notification(state: &mut AppState, prompt: &str) {
+fn remove_pending_workflow_notification_by_id(state: &mut AppState, id: &str) {
     if let Some(index) = state
         .pending_workflow_notifications
         .iter()
-        .position(|pending| pending == prompt)
+        .position(|pending| pending.id == id)
     {
         state.pending_workflow_notifications.remove(index);
     }
@@ -813,8 +816,8 @@ fn drain_pending_workflow_notifications(
     pending_notifications: &bridge::PendingWorkflowNotifications,
 ) {
     if let Ok(mut queue) = pending_notifications.lock() {
-        while let Some(prompt) = queue.pop_front() {
-            state.pending_workflow_notifications.push_back(prompt);
+        while let Some(notification) = queue.pop_front() {
+            state.pending_workflow_notifications.push_back(notification);
         }
     }
 }
@@ -2391,7 +2394,10 @@ mod tests {
         let (action_tx, action_rx) = mpsc::channel();
         state
             .pending_workflow_notifications
-            .push_back("<task-notification>done</task-notification>".to_string());
+            .push_back(crate::types::PendingWorkflowNotification {
+                id: "notification-1".to_string(),
+                prompt: "<task-notification>done</task-notification>".to_string(),
+            });
 
         submit_pending_workflow_notification(&mut state, &action_tx, true);
 
@@ -2432,7 +2438,10 @@ mod tests {
         state.status = AppStatus::Running;
         state
             .pending_workflow_notifications
-            .push_back("<task-notification>failed</task-notification>".to_string());
+            .push_back(crate::types::PendingWorkflowNotification {
+                id: "notification-1".to_string(),
+                prompt: "<task-notification>failed</task-notification>".to_string(),
+            });
 
         assert!(is_workflow_notification_turn_boundary(
             &TuiEvent::SessionCompleted {
@@ -2456,7 +2465,10 @@ mod tests {
         queue
             .lock()
             .unwrap()
-            .push_back("<task-notification>failed</task-notification>".to_string());
+            .push_back(crate::types::PendingWorkflowNotification {
+                id: "notification-1".to_string(),
+                prompt: "<task-notification>failed</task-notification>".to_string(),
+            });
         state.status = AppStatus::Running;
 
         drain_pending_workflow_notifications(&mut state, &queue);
@@ -2476,6 +2488,7 @@ mod tests {
         let queue = test_pending_workflow_notifications();
         let queued = queue_workflow_terminal_notification(
             &TuiEvent::WorkflowNotification {
+                id: "notification-1".to_string(),
                 prompt: "<task-notification>done</task-notification>".to_string(),
                 status: "completed".to_string(),
                 summary: "done".to_string(),
@@ -2483,17 +2496,17 @@ mod tests {
             &queue,
             true,
         );
+        assert_eq!(queued.as_deref(), Some("notification-1"));
+        let notification = queue.lock().unwrap().pop_front().expect("notification");
+        assert_eq!(notification.id, "notification-1");
         assert_eq!(
-            queued.as_deref(),
-            Some("<task-notification>done</task-notification>")
-        );
-        assert_eq!(
-            queue.lock().unwrap().pop_front().as_deref(),
-            Some("<task-notification>done</task-notification>")
+            notification.prompt,
+            "<task-notification>done</task-notification>"
         );
 
         let queued = queue_workflow_terminal_notification(
             &TuiEvent::WorkflowNotification {
+                id: "notification-2".to_string(),
                 prompt: "<task-notification>failed</task-notification>".to_string(),
                 status: "failed".to_string(),
                 summary: "failed".to_string(),
@@ -2501,17 +2514,17 @@ mod tests {
             &queue,
             true,
         );
+        assert_eq!(queued.as_deref(), Some("notification-2"));
+        let notification = queue.lock().unwrap().pop_front().expect("notification");
+        assert_eq!(notification.id, "notification-2");
         assert_eq!(
-            queued.as_deref(),
-            Some("<task-notification>failed</task-notification>")
-        );
-        assert_eq!(
-            queue.lock().unwrap().pop_front().as_deref(),
-            Some("<task-notification>failed</task-notification>")
+            notification.prompt,
+            "<task-notification>failed</task-notification>"
         );
 
         let queued = queue_workflow_terminal_notification(
             &TuiEvent::WorkflowNotification {
+                id: "notification-3".to_string(),
                 prompt: "<task-notification>failed</task-notification>".to_string(),
                 status: "failed".to_string(),
                 summary: "failed".to_string(),
@@ -2524,28 +2537,57 @@ mod tests {
     }
 
     #[test]
-    fn batch_queued_workflow_notification_is_removed_from_ui_pending_queue() {
+    fn batch_queued_workflow_notification_is_removed_from_ui_pending_queue_by_id() {
         let (mut state, _rx) = test_state();
         state
             .pending_workflow_notifications
-            .push_back("<task-notification>completed</task-notification>".to_string());
+            .push_back(crate::types::PendingWorkflowNotification {
+                id: "notification-1".to_string(),
+                prompt: "<task-notification>completed</task-notification>".to_string(),
+            });
         state
             .pending_workflow_notifications
-            .push_back("<task-notification>failed</task-notification>".to_string());
+            .push_back(crate::types::PendingWorkflowNotification {
+                id: "notification-2".to_string(),
+                prompt: "<task-notification>failed</task-notification>".to_string(),
+            });
 
-        remove_pending_workflow_notification(
-            &mut state,
-            "<task-notification>failed</task-notification>",
-        );
+        remove_pending_workflow_notification_by_id(&mut state, "notification-2");
 
         assert_eq!(
             state
                 .pending_workflow_notifications
                 .iter()
-                .map(String::as_str)
+                .map(|notification| notification.prompt.as_str())
                 .collect::<Vec<_>>(),
             vec!["<task-notification>completed</task-notification>"]
         );
+    }
+
+    #[test]
+    fn batch_queued_workflow_notification_removal_uses_notification_id() {
+        let (mut state, _rx) = test_state();
+        state
+            .pending_workflow_notifications
+            .push_back(crate::types::PendingWorkflowNotification {
+                id: "workflow-run-1:tool-use-1".to_string(),
+                prompt: "<task-notification>same</task-notification>".to_string(),
+            });
+        state
+            .pending_workflow_notifications
+            .push_back(crate::types::PendingWorkflowNotification {
+                id: "workflow-run-2:tool-use-2".to_string(),
+                prompt: "<task-notification>same</task-notification>".to_string(),
+            });
+
+        remove_pending_workflow_notification_by_id(&mut state, "workflow-run-2:tool-use-2");
+
+        let pending = state
+            .pending_workflow_notifications
+            .iter()
+            .map(|notification| notification.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(pending, vec!["workflow-run-1:tool-use-1"]);
     }
 
     #[test]

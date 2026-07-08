@@ -242,8 +242,11 @@ copied into Orca.
    actions now also carry the pending tool approval request id through the TUI
    action channel; the runtime task registry validates that id, rejects
    duplicate responses, and returns the owning task id only after the request
-   has been matched. Next, move the same id discipline into remaining
-   turn/item continuations and workflow notifications so continuations stop
+   has been matched. Workflow terminal notifications now carry a stable
+   notification id derived from runtime workflow ids through the TUI queues, so
+   batch-boundary reconciliation no longer identifies pending continuations by
+   prompt text. Next, move the same id discipline into remaining turn/item
+   continuations and workflow notification ownership so continuations stop
    depending on separate ad hoc task fields plus TUI-local queues.
 3. **P2: Frozen per-turn context boundary.** Continue shrinking wide call
    surfaces into `RuntimeTurnConfig`, `RuntimeTurnDeps`,

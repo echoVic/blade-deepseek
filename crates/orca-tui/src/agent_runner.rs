@@ -39,7 +39,8 @@ use crate::types::{TuiEvent, UserAction};
 
 pub(crate) const DEFAULT_MAX_TURNS: u32 = 128;
 
-pub(crate) type PendingWorkflowNotifications = Arc<Mutex<VecDeque<String>>>;
+pub(crate) type PendingWorkflowNotifications =
+    Arc<Mutex<VecDeque<crate::types::PendingWorkflowNotification>>>;
 
 enum ProviderStreamEvent {
     Step(ProviderStep),
@@ -1502,7 +1503,8 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
 fn take_pending_workflow_notification(
     pending_workflow_notifications: Option<&PendingWorkflowNotifications>,
 ) -> Option<String> {
-    pending_workflow_notifications.and_then(|queue| queue.lock().ok()?.pop_front())
+    pending_workflow_notifications
+        .and_then(|queue| queue.lock().ok()?.pop_front().map(|n| n.prompt))
 }
 
 fn record_tui_goal_tool_finish(
@@ -2279,9 +2281,13 @@ mod tests {
         let (event_tx, event_rx) = mpsc::channel();
         let (_action_tx, action_rx) = mpsc::channel();
         let cancel = CancelToken::new();
-        let pending_notifications = Arc::new(Mutex::new(VecDeque::from([String::from(
-            "<task-notification><status>failed</status></task-notification>",
-        )])));
+        let pending_notifications = Arc::new(Mutex::new(VecDeque::from([
+            crate::types::PendingWorkflowNotification {
+                id: "notification-1".to_string(),
+                prompt: "<task-notification><status>failed</status></task-notification>"
+                    .to_string(),
+            },
+        ])));
         let mut session = TuiConversationSession::new_with_preloaded(&config, "task_list", None)
             .expect("session");
         let pending_actions = RefCell::new(VecDeque::new());
@@ -2418,7 +2424,7 @@ mod tests {
         assert!(events.iter().any(|event| {
             matches!(
                 event,
-                TuiEvent::WorkflowNotification { prompt, status, summary }
+                TuiEvent::WorkflowNotification { prompt, status, summary, .. }
                 if prompt.contains("<task-notification>")
                     && prompt.contains("<status>completed</status>")
                     && *status == "completed"

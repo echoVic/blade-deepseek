@@ -20,6 +20,12 @@ pub struct TuiTaskLifecycle {
     pub turn: u32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingWorkflowNotification {
+    pub id: String,
+    pub prompt: String,
+}
+
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub enum TuiEvent {
@@ -79,6 +85,7 @@ pub enum TuiEvent {
         task: BackgroundTaskSummary,
     },
     WorkflowNotification {
+        id: String,
         prompt: String,
         status: String,
         summary: String,
@@ -388,7 +395,7 @@ pub struct AppState {
     pub current_goal: Option<ThreadGoal>,
     pub panel_mode: PanelMode,
     pub workflow_panel: WorkflowPanelState,
-    pub pending_workflow_notifications: VecDeque<String>,
+    pub pending_workflow_notifications: VecDeque<PendingWorkflowNotification>,
     pub suppress_background_main_session_output: bool,
     pub tick: u64,
 }
@@ -1024,11 +1031,13 @@ impl AppState {
                 self.apply_workflow_tasks_update(tasks);
             }
             TuiEvent::WorkflowNotification {
+                id,
                 prompt,
                 status,
                 summary,
             } => {
-                self.pending_workflow_notifications.push_back(prompt);
+                self.pending_workflow_notifications
+                    .push_back(PendingWorkflowNotification { id, prompt });
                 self.messages
                     .push(ChatMessage::System(format!("Workflow {status}. {summary}")));
             }
@@ -2600,6 +2609,7 @@ mod tests {
             }],
         });
         state.update(TuiEvent::WorkflowNotification {
+            id: "notification-1".to_string(),
             prompt: "<task-notification>done</task-notification>".to_string(),
             status: "completed".to_string(),
             summary: "audit: done".to_string(),
@@ -2607,9 +2617,14 @@ mod tests {
 
         assert_eq!(state.workflow_panel.tasks.len(), 1);
         assert_eq!(state.workflow_panel.selected, 0);
+        let notification = state
+            .pending_workflow_notifications
+            .pop_front()
+            .expect("pending workflow notification");
+        assert_eq!(notification.id, "notification-1");
         assert_eq!(
-            state.pending_workflow_notifications.pop_front().as_deref(),
-            Some("<task-notification>done</task-notification>")
+            notification.prompt,
+            "<task-notification>done</task-notification>"
         );
         assert!(matches!(
             state.messages.last(),
