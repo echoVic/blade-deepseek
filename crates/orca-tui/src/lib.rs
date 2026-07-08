@@ -8,6 +8,7 @@ mod background_approval;
 mod background_tasks;
 pub mod bridge;
 pub mod commands;
+mod composer_input_actions;
 mod composer_textarea;
 pub mod diff;
 mod mention_menu_actions;
@@ -324,6 +325,49 @@ mod tests {
         assert!(
             !app.contains("\nfn make_setup_textarea<"),
             "app should use the composer_textarea module instead of defining setup composer construction inline"
+        );
+    }
+
+    #[test]
+    fn tui_composer_input_actions_are_owned_by_dedicated_module() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let composer_input_actions =
+            std::fs::read_to_string(format!("{manifest_dir}/src/composer_input_actions.rs"))
+                .expect("composer_input_actions module should exist");
+        assert!(
+            composer_input_actions.contains("pub(crate) fn refresh_input_menus"),
+            "composer_input_actions should own slash/mention refresh after composer edits"
+        );
+        assert!(
+            composer_input_actions.contains("pub(crate) fn insert_composer_newline"),
+            "composer_input_actions should own composer newline handling"
+        );
+        assert!(
+            composer_input_actions.contains("pub(crate) fn recall_previous_history"),
+            "composer_input_actions should own previous-history recall"
+        );
+        assert!(
+            composer_input_actions.contains("pub(crate) fn recall_next_history"),
+            "composer_input_actions should own next-history recall"
+        );
+        assert!(
+            composer_input_actions.contains("pub(crate) fn apply_composer_key_input"),
+            "composer_input_actions should own plain composer key input and file mention completion"
+        );
+
+        let app = std::fs::read_to_string(format!("{manifest_dir}/src/app.rs"))
+            .expect("app source should be readable");
+        assert!(
+            !app.contains("mentions::complete_file_mention"),
+            "app should use the composer_input_actions module instead of completing file mentions inline"
+        );
+        assert!(
+            !app.contains(".history_previous("),
+            "app should use the composer_input_actions module instead of recalling previous history inline"
+        );
+        assert!(
+            !app.contains(".history_next("),
+            "app should use the composer_input_actions module instead of recalling next history inline"
         );
     }
 

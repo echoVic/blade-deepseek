@@ -399,6 +399,9 @@ copied into Orca.
    and model/reasoning submenu flow now live in a focused TUI slash menu action
    module, leaving the app loop to route input events rather than own menu
    mechanics.
+   Composer input editing now lives in a focused TUI composer input action
+   module, covering slash/mention refresh after edits, newline handling,
+   history recall, Tab file mention completion, and plain key input.
    Runtime task summaries now also expose terminal `result`/`error` fields so
    the selected task row can show completion output or failure details in the
    panel. The

@@ -23,7 +23,6 @@ use orca_core::config::{HistoryMode, RunConfig};
 use orca_core::conversation::Message;
 use orca_core::model::ModelSelection;
 use orca_runtime::history;
-use orca_runtime::mentions;
 
 use crate::approval_actions::resolve_approval_option;
 use crate::background_approval::submit_background_approval_response_for_tui;
@@ -32,19 +31,21 @@ use crate::background_tasks::{
 };
 use crate::bridge;
 use crate::commands;
+use crate::composer_input_actions::{
+    apply_composer_key_input, insert_composer_newline, recall_next_history,
+    recall_previous_history, refresh_input_menus,
+};
 use crate::composer_textarea::{
     insert_pasted_text, make_setup_textarea, make_textarea, make_textarea_with_text, textarea_text,
 };
-use crate::mention_menu_actions::{handle_mention_menu_key, update_mention_candidates};
+use crate::mention_menu_actions::handle_mention_menu_key;
 use crate::running_actions::handle_running_shortcut;
 use crate::shortcuts::{
     ApprovalShortcut, GlobalShortcut, IdleShortcut, RunningShortcut, approval_shortcut,
     global_shortcut, idle_shortcut, running_shortcut,
 };
 use crate::slash_command_actions::{SlashOutcome, handle_slash_command};
-use crate::slash_menu_actions::{
-    REASONING_SUBMENU_TITLE, handle_slash_menu_key, update_slash_menu,
-};
+use crate::slash_menu_actions::{REASONING_SUBMENU_TITLE, handle_slash_menu_key};
 use crate::submitted_turn::SubmittedTurn;
 use crate::theme::Theme;
 use crate::types::{
@@ -243,8 +244,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                     AppStatus::Idle | AppStatus::WaitingUserInput => {
                         if insert_pasted_text(&mut textarea, pasted) {
                             state.reset_history_navigation();
-                            update_slash_menu(&textarea, &mut state, &config);
-                            update_mention_candidates(&textarea, &mut state, &config);
+                            refresh_input_menus(&textarea, &mut state, &config);
                         }
                     }
                     _ => {}
@@ -610,26 +610,27 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                             }
                         }
                         Some(IdleShortcut::Newline) => {
-                            textarea.insert_newline();
-                            state.reset_history_navigation();
+                            insert_composer_newline(&mut textarea, &mut state);
                         }
                         Some(IdleShortcut::HistoryPrevious) => {
-                            if key.code == KeyCode::Up && textarea.lines().len() > 1 {
-                                textarea.input(Input::from(ev));
-                            } else {
-                                let draft = textarea_text(&textarea);
-                                if let Some(history) = state.history_previous(draft) {
-                                    textarea =
-                                        make_textarea_with_text(&history, &vim_state, &theme);
-                                }
-                            }
+                            recall_previous_history(
+                                &ev,
+                                key,
+                                &mut state,
+                                &mut textarea,
+                                &vim_state,
+                                &theme,
+                            );
                         }
                         Some(IdleShortcut::HistoryNext) => {
-                            if key.code == KeyCode::Down && textarea.lines().len() > 1 {
-                                textarea.input(Input::from(ev));
-                            } else if let Some(history) = state.history_next() {
-                                textarea = make_textarea_with_text(&history, &vim_state, &theme);
-                            }
+                            recall_next_history(
+                                &ev,
+                                key,
+                                &mut state,
+                                &mut textarea,
+                                &vim_state,
+                                &theme,
+                            );
                         }
                         Some(IdleShortcut::ScrollUp) => {
                             if textarea.lines().len() > 1 {
@@ -670,44 +671,27 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                             {
                                 state.scroll_to_bottom();
                             } else {
-                                let changed = if vim_state.enabled {
-                                    vim_state.handle(Input::from(ev), &mut textarea, &theme)
-                                } else {
-                                    textarea.input(Input::from(ev))
-                                };
-                                if changed {
-                                    state.reset_history_navigation();
-                                    update_slash_menu(&textarea, &mut state, &config);
-                                    update_mention_candidates(&textarea, &mut state, &config);
-                                }
+                                apply_composer_key_input(
+                                    &ev,
+                                    key,
+                                    &mut state,
+                                    &config,
+                                    &mut textarea,
+                                    &mut vim_state,
+                                    &theme,
+                                );
                             }
                         }
                         None => {
-                            let changed = if key.code == KeyCode::Tab {
-                                let cwd = config
-                                    .cwd
-                                    .clone()
-                                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-                                let text = textarea_text(&textarea);
-                                if let Some(completed) =
-                                    mentions::complete_file_mention(&text, &cwd)
-                                {
-                                    textarea =
-                                        make_textarea_with_text(&completed, &vim_state, &theme);
-                                    true
-                                } else {
-                                    textarea.input(Input::from(ev))
-                                }
-                            } else if vim_state.enabled {
-                                vim_state.handle(Input::from(ev), &mut textarea, &theme)
-                            } else {
-                                textarea.input(Input::from(ev))
-                            };
-                            if changed {
-                                state.reset_history_navigation();
-                                update_slash_menu(&textarea, &mut state, &config);
-                                update_mention_candidates(&textarea, &mut state, &config);
-                            }
+                            apply_composer_key_input(
+                                &ev,
+                                key,
+                                &mut state,
+                                &config,
+                                &mut textarea,
+                                &mut vim_state,
+                                &theme,
+                            );
                         }
                     }
                 } else if state.status == AppStatus::Running {
