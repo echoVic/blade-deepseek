@@ -32,6 +32,11 @@ pub(crate) struct RuntimeTurnLoopStep {
     iteration_step: RuntimeTurnIterationStep,
 }
 
+pub(crate) struct RuntimeTurnWorkflowContext<'background, 'ipc> {
+    pub(crate) background_workflows: &'background mut Vec<BackgroundWorkflowRun>,
+    pub(crate) workflow_ipc: Option<&'ipc WorkflowIpcContext>,
+}
+
 pub(crate) struct RuntimeAgentTurnLoopInput<'a, 'runtime, W: io::Write> {
     pub(crate) actor: &'a mut RuntimeTaskActor<'runtime>,
     pub(crate) context_config: &'a context::ContextConfig,
@@ -54,8 +59,7 @@ pub(crate) struct RuntimeAgentTurnLoopInput<'a, 'runtime, W: io::Write> {
     pub(crate) instructions: &'a ProjectInstructions,
     pub(crate) memory: &'a MemoryBlock,
     pub(crate) mcp_registry: &'a McpRegistry,
-    pub(crate) background_workflows: &'a mut Vec<BackgroundWorkflowRun>,
-    pub(crate) workflow_ipc: Option<&'a WorkflowIpcContext>,
+    pub(crate) workflow: RuntimeTurnWorkflowContext<'a, 'a>,
     pub(crate) turn_interactions: RuntimeTurnInteractionState<'a>,
 }
 
@@ -84,8 +88,7 @@ pub(crate) struct RuntimeTurnLoopInput<'a, 'runtime, W: io::Write> {
     pub(crate) instructions: &'a ProjectInstructions,
     pub(crate) memory: &'a MemoryBlock,
     pub(crate) mcp_registry: &'a McpRegistry,
-    pub(crate) background_workflows: &'a mut Vec<BackgroundWorkflowRun>,
-    pub(crate) workflow_ipc: Option<&'a WorkflowIpcContext>,
+    pub(crate) workflow: RuntimeTurnWorkflowContext<'a, 'a>,
     pub(crate) turn_interactions: RuntimeTurnInteractionState<'a>,
 }
 
@@ -122,8 +125,7 @@ impl<'a, 'runtime, W: io::Write> RuntimeTurnLoopInput<'a, 'runtime, W> {
         instructions: &'a ProjectInstructions,
         memory: &'a MemoryBlock,
         mcp_registry: &'a McpRegistry,
-        background_workflows: &'a mut Vec<BackgroundWorkflowRun>,
-        workflow_ipc: Option<&'a WorkflowIpcContext>,
+        workflow: RuntimeTurnWorkflowContext<'a, 'a>,
         turn_interactions: RuntimeTurnInteractionState<'a>,
     ) -> Self {
         Self {
@@ -151,8 +153,7 @@ impl<'a, 'runtime, W: io::Write> RuntimeTurnLoopInput<'a, 'runtime, W> {
             instructions,
             memory,
             mcp_registry,
-            background_workflows,
-            workflow_ipc,
+            workflow,
             turn_interactions,
         }
     }
@@ -191,9 +192,23 @@ impl<'a, 'runtime, W: io::Write> RuntimeTurnLoopInput<'a, 'runtime, W> {
             mcp_registry: self.mcp_registry,
             task_registry: loop_state.task_registry,
             extensions: loop_state.extensions,
-            background_workflows: &mut *self.background_workflows,
-            workflow_ipc: self.workflow_ipc,
+            workflow: RuntimeTurnWorkflowContext::new(
+                &mut *self.workflow.background_workflows,
+                self.workflow.workflow_ipc,
+            ),
             turn_interactions: self.turn_interactions,
+        }
+    }
+}
+
+impl<'background, 'ipc> RuntimeTurnWorkflowContext<'background, 'ipc> {
+    pub(crate) fn new(
+        background_workflows: &'background mut Vec<BackgroundWorkflowRun>,
+        workflow_ipc: Option<&'ipc WorkflowIpcContext>,
+    ) -> Self {
+        Self {
+            background_workflows,
+            workflow_ipc,
         }
     }
 }
@@ -275,8 +290,7 @@ impl<'a, 'runtime, W: io::Write> RuntimeAgentTurnLoopInput<'a, 'runtime, W> {
             self.instructions,
             self.memory,
             self.mcp_registry,
-            self.background_workflows,
-            self.workflow_ipc,
+            self.workflow,
             self.turn_interactions,
         )
     }
@@ -425,8 +439,7 @@ mod tests {
             instructions: &instructions,
             memory: &memory,
             mcp_registry: &mcp_registry,
-            background_workflows: &mut background_workflows,
-            workflow_ipc: None,
+            workflow: RuntimeTurnWorkflowContext::new(&mut background_workflows, None),
             turn_interactions: RuntimeTurnInteractionState::new(),
         };
 

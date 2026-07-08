@@ -8,7 +8,8 @@ use crate::lifecycle::{
 };
 use crate::runtime_conversation_bootstrap::RuntimeConversationBootstrapStep;
 use crate::runtime_turn_loop::{
-    RuntimeAgentTurnLoopInput, RuntimeTurnLoopExecutors, RuntimeTurnLoopStep, run_agent_turn_loop,
+    RuntimeAgentTurnLoopInput, RuntimeTurnLoopExecutors, RuntimeTurnLoopStep,
+    RuntimeTurnWorkflowContext, run_agent_turn_loop,
 };
 use crate::runtime_turn_setup::RuntimeTurnSetupStep;
 use crate::session::AgentConversationContext;
@@ -117,8 +118,7 @@ pub(crate) fn run_agent_loop(
             instructions,
             memory,
             mcp_registry,
-            background_workflows,
-            workflow_ipc,
+            workflow: RuntimeTurnWorkflowContext::new(background_workflows, workflow_ipc),
             turn_interactions,
         },
         RuntimeTurnLoopExecutors::new(

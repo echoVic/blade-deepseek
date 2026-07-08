@@ -25,15 +25,14 @@ use crate::provider_turn::{
     RuntimeProviderCycleInput, RuntimeTurnProviderCycleResult, RuntimeTurnProviderCycleStep,
 };
 use crate::runtime_conversation_bootstrap::RuntimePreparedConversation;
+use crate::runtime_turn_loop::RuntimeTurnWorkflowContext;
 use crate::runtime_turn_opening::{
     RuntimeTurnOpeningInput, RuntimeTurnOpeningResult, RuntimeTurnOpeningStep,
 };
 use crate::step_context::RuntimeStepCapabilitySnapshot;
 use crate::tasks::TaskRegistry;
 use crate::tool_invocation::AgentToolPolicyContext;
-use crate::workflow::ipc::WorkflowIpcContext;
 use crate::workflow::runner::SharedEventBuffer;
-use crate::workflow_execution::BackgroundWorkflowRun;
 
 pub(crate) struct RuntimeTurnIterationStep {
     opening_step: RuntimeTurnOpeningStep,
@@ -70,8 +69,7 @@ pub(crate) struct RuntimeTurnIterationInput<'a, 'runtime, W: io::Write> {
     pub(crate) mcp_registry: &'a McpRegistry,
     pub(crate) task_registry: &'a TaskRegistry,
     pub(crate) extensions: RuntimeExtensionContext<'a>,
-    pub(crate) background_workflows: &'a mut Vec<BackgroundWorkflowRun>,
-    pub(crate) workflow_ipc: Option<&'a WorkflowIpcContext>,
+    pub(crate) workflow: RuntimeTurnWorkflowContext<'a, 'a>,
     pub(crate) turn_interactions: RuntimeTurnInteractionState<'a>,
 }
 
@@ -141,7 +139,7 @@ impl RuntimeTurnIterationStep {
                     input.hooks,
                     input.cancel,
                     input.task_registry,
-                    input.workflow_ipc,
+                    input.workflow.workflow_ipc,
                     input.turn_interactions.permission_handler(),
                     input.turn_interactions.user_input_handler(),
                 ),
@@ -155,7 +153,7 @@ impl RuntimeTurnIterationStep {
                 subagent_depth: input.subagent_depth,
                 policy: input.policy,
                 extensions: input.extensions,
-                background_workflows: input.background_workflows,
+                background_workflows: input.workflow.background_workflows,
                 steer_handle: input.steer_handle,
             },
             child_executor,
