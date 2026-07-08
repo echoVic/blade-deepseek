@@ -3685,7 +3685,7 @@ mod tests {
             "tool_request:",
             "invocation:",
             "policy:",
-            "strict_auto_review:",
+            "permission_overlay:",
             "emit_deltas:",
         ] {
             assert!(

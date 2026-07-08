@@ -42,6 +42,12 @@ impl<'a> RuntimeTurnKernel<'a> {
         )
     }
 
+    pub(crate) fn set_preapproved_tool_call_id(&mut self, id: Option<String>) {
+        self.sampling_state
+            .permission_overlay_mut()
+            .set_preapproved_tool_call_id(id);
+    }
+
     #[cfg(test)]
     pub(crate) fn bind_step_context(
         &self,

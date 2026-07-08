@@ -6,12 +6,12 @@ use orca_core::config::{ProviderKind, RunConfig};
 use orca_core::event_schema::EventFactory;
 use orca_core::event_sink::EventSink;
 use orca_core::model::ModelSelection;
-use orca_core::provider_types::ProviderResponse;
 use orca_core::subagent_types::SubagentType;
 use orca_mcp::McpRegistry;
 use orca_provider::{ProviderConfig, context};
 
 use crate::agent_child::ChildAgentExecutor;
+use crate::background_turn::RuntimeTurnContinuation;
 use crate::hooks::HookRunner;
 use crate::instructions::ProjectInstructions;
 use crate::lifecycle::{
@@ -44,7 +44,7 @@ pub(crate) struct RuntimeAgentTurnLoopInput<'a, 'runtime, W: io::Write> {
     pub(crate) prepared_conversation: &'a mut RuntimePreparedConversation<'runtime>,
     pub(crate) prompt: &'a str,
     pub(crate) subagent_type: &'a SubagentType,
-    pub(crate) initial_response: Option<ProviderResponse>,
+    pub(crate) continuation: Option<RuntimeTurnContinuation>,
     pub(crate) loop_state: RuntimeTurnLoopState<'a>,
     pub(crate) steer_handle: Option<&'a ThreadSteerHandle>,
     pub(crate) config: &'a RunConfig,
@@ -73,7 +73,7 @@ pub(crate) struct RuntimeTurnLoopInput<'a, 'runtime, W: io::Write> {
     pub(crate) prompt: &'a str,
     pub(crate) model: &'a ModelSelection,
     pub(crate) subagent_type: &'a SubagentType,
-    pub(crate) initial_response: Option<ProviderResponse>,
+    pub(crate) continuation: Option<RuntimeTurnContinuation>,
     pub(crate) loop_state: RuntimeTurnLoopState<'a>,
     pub(crate) steer_handle: Option<&'a ThreadSteerHandle>,
     pub(crate) max_budget_usd: Option<f64>,
@@ -111,7 +111,7 @@ impl<'a, 'runtime, W: io::Write> RuntimeTurnLoopInput<'a, 'runtime, W> {
         prompt: &'a str,
         model: &'a ModelSelection,
         subagent_type: &'a SubagentType,
-        initial_response: Option<ProviderResponse>,
+        continuation: Option<RuntimeTurnContinuation>,
         loop_state: RuntimeTurnLoopState<'a>,
         steer_handle: Option<&'a ThreadSteerHandle>,
         max_budget_usd: Option<f64>,
@@ -140,7 +140,7 @@ impl<'a, 'runtime, W: io::Write> RuntimeTurnLoopInput<'a, 'runtime, W> {
             prompt,
             model,
             subagent_type,
-            initial_response,
+            continuation,
             loop_state,
             steer_handle,
             max_budget_usd,
@@ -176,7 +176,7 @@ impl<'a, 'runtime, W: io::Write> RuntimeTurnLoopInput<'a, 'runtime, W> {
             prompt: self.prompt,
             model: self.model,
             subagent_type: self.subagent_type,
-            initial_response: self.initial_response.take(),
+            continuation: self.continuation.take(),
             model_override: loop_state.model_override,
             cost_tracker: loop_state.cost_tracker,
             steer_handle: self.steer_handle,
@@ -264,7 +264,7 @@ impl<'a, 'runtime, W: io::Write> RuntimeAgentTurnLoopInput<'a, 'runtime, W> {
             self.prompt,
             &self.config.model,
             self.subagent_type,
-            self.initial_response,
+            self.continuation,
             self.loop_state,
             self.steer_handle,
             self.config.max_budget_usd,
@@ -343,7 +343,7 @@ mod tests {
     }
 
     #[test]
-    fn turn_loop_input_passes_initial_response_to_first_iteration_only() {
+    fn turn_loop_input_passes_continuation_to_first_iteration_only() {
         let config = config();
         let cwd = tempfile::tempdir().expect("cwd");
         let context_config = context::ContextConfig::for_model_with_runtime(
@@ -396,10 +396,14 @@ mod tests {
             tool_calls: Vec::new(),
             usage: None,
         };
+        let continuation = crate::background_turn::RuntimeTurnContinuation {
+            response,
+            preapproved_tool_call_id: Some("tool-1".to_string()),
+        };
         let mut input = RuntimeTurnLoopInput {
             actor: &mut actor,
             provider: ProviderKind::DeepSeek,
-            initial_response: Some(response),
+            continuation: Some(continuation),
             context_config: &context_config,
             provider_config: &provider_config,
             cwd: cwd.path(),
@@ -430,15 +434,22 @@ mod tests {
             let first_iteration = input.iteration_input();
             assert_eq!(
                 first_iteration
-                    .initial_response
+                    .continuation
                     .as_ref()
-                    .and_then(|response| response.assistant_content.as_deref()),
+                    .and_then(|continuation| continuation.response.assistant_content.as_deref()),
                 Some("continued")
+            );
+            assert_eq!(
+                first_iteration
+                    .continuation
+                    .as_ref()
+                    .and_then(|continuation| continuation.preapproved_tool_call_id()),
+                Some("tool-1")
             );
         }
         {
             let second_iteration = input.iteration_input();
-            assert!(second_iteration.initial_response.is_none());
+            assert!(second_iteration.continuation.is_none());
         }
     }
 }

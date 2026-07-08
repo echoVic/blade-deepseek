@@ -20,6 +20,7 @@ use orca_mcp::McpRegistry;
 use orca_provider::ProviderConfig;
 use serde_json::Value;
 
+use crate::background_turn::RuntimeTurnContinuation;
 use crate::cost::CostTracker;
 use crate::extension::{
     ExtensionData, ExtensionRegistry, ExtensionRegistryBuilder, RuntimeExtensionContext,
@@ -103,7 +104,7 @@ pub(crate) struct AgentLoopContext<'a> {
     pub(crate) turn_execution: Option<RuntimeTurnExecution<'a>>,
     pub(crate) turn_interactions: RuntimeTurnInteractionState<'a>,
     pub(crate) steer_handle: Option<&'a ThreadSteerHandle>,
-    pub(crate) initial_response: Option<ProviderResponse>,
+    pub(crate) continuation: Option<RuntimeTurnContinuation>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -712,7 +713,7 @@ impl<'a> AgentLoopContext<'a> {
             turn_execution: None,
             turn_interactions: RuntimeTurnInteractionState::new(),
             steer_handle: None,
-            initial_response: None,
+            continuation: None,
         }
     }
 
@@ -829,14 +830,28 @@ impl<'a> AgentLoopContext<'a> {
         self
     }
 
+    #[allow(dead_code)]
     pub(crate) fn with_initial_response(mut self, response: ProviderResponse) -> Self {
-        self.initial_response = Some(response);
+        self.continuation = Some(RuntimeTurnContinuation::from_response(response));
+        self
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn with_turn_continuation(mut self, continuation: RuntimeTurnContinuation) -> Self {
+        self.continuation = Some(continuation);
         self
     }
 
     #[cfg(test)]
     pub(crate) fn initial_response(&self) -> Option<&ProviderResponse> {
-        self.initial_response.as_ref()
+        self.continuation
+            .as_ref()
+            .map(|continuation| &continuation.response)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn continuation(&self) -> Option<&RuntimeTurnContinuation> {
+        self.continuation.as_ref()
     }
 
     pub(crate) fn with_permission_handler(

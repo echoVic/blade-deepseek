@@ -47,6 +47,7 @@ pub struct TurnPermissionOverlay {
     network_domain_permissions:
         std::collections::HashMap<String, orca_core::config::PermissionProfileNetworkAccess>,
     strict_auto_review: bool,
+    preapproved_tool_call_id: Option<String>,
 }
 
 impl TurnPermissionOverlay {
@@ -62,6 +63,18 @@ impl TurnPermissionOverlay {
 
     pub fn strict_auto_review(&self) -> bool {
         self.strict_auto_review
+    }
+
+    pub(crate) fn set_preapproved_tool_call_id(&mut self, id: Option<String>) {
+        self.preapproved_tool_call_id = id;
+    }
+
+    pub(crate) fn consume_preapproved_tool_call_id(&mut self, id: &str) -> bool {
+        if self.preapproved_tool_call_id.as_deref() != Some(id) {
+            return false;
+        }
+        self.preapproved_tool_call_id = None;
+        true
     }
 
     pub fn merge(&mut self, other: &Self) {
@@ -116,5 +129,20 @@ impl TurnPermissionOverlay {
             }
         }
         self.merge_network_permissions(permissions);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TurnPermissionOverlay;
+
+    #[test]
+    fn preapproved_tool_call_id_is_consumed_once_for_exact_match_only() {
+        let mut overlay = TurnPermissionOverlay::default();
+        overlay.set_preapproved_tool_call_id(Some("tool-1".to_string()));
+
+        assert!(!overlay.consume_preapproved_tool_call_id("tool-2"));
+        assert!(overlay.consume_preapproved_tool_call_id("tool-1"));
+        assert!(!overlay.consume_preapproved_tool_call_id("tool-1"));
     }
 }

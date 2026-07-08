@@ -8,6 +8,34 @@ pub struct ApprovedBackgroundTurnContinuation {
     pub preapproved_tool_call_id: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+pub struct RuntimeTurnContinuation {
+    pub response: ProviderResponse,
+    pub preapproved_tool_call_id: Option<String>,
+}
+
+impl ApprovedBackgroundTurnContinuation {
+    pub fn into_runtime_turn_continuation(self) -> RuntimeTurnContinuation {
+        RuntimeTurnContinuation {
+            response: self.response,
+            preapproved_tool_call_id: self.preapproved_tool_call_id,
+        }
+    }
+}
+
+impl RuntimeTurnContinuation {
+    pub fn from_response(response: ProviderResponse) -> Self {
+        Self {
+            response,
+            preapproved_tool_call_id: None,
+        }
+    }
+
+    pub fn preapproved_tool_call_id(&self) -> Option<&str> {
+        self.preapproved_tool_call_id.as_deref()
+    }
+}
+
 pub fn take_approved_background_turn_continuation(
     task_registry: &TaskRegistry,
     task_id: &str,
@@ -36,4 +64,38 @@ fn provider_response_first_tool_call_id(response: &ProviderResponse) -> Option<S
                 .first()
                 .map(|tool_call| tool_call.id.clone())
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use orca_core::approval_types::ActionKind;
+    use orca_core::provider_types::{ProviderResponse, ProviderStep};
+    use orca_core::tool_types::{ToolName, ToolRequest};
+
+    use super::ApprovedBackgroundTurnContinuation;
+
+    #[test]
+    fn approved_background_continuation_converts_to_runtime_turn_continuation() {
+        let response = ProviderResponse {
+            steps: vec![ProviderStep::ToolCall(ToolRequest {
+                id: "shell-1".to_string(),
+                name: ToolName::Bash,
+                action: ActionKind::Shell,
+                target: Some("echo hi".to_string()),
+                raw_arguments: None,
+            })],
+            assistant_content: None,
+            assistant_reasoning: None,
+            tool_calls: Vec::new(),
+            usage: None,
+        };
+
+        let continuation = ApprovedBackgroundTurnContinuation {
+            response,
+            preapproved_tool_call_id: Some("shell-1".to_string()),
+        }
+        .into_runtime_turn_continuation();
+
+        assert_eq!(continuation.preapproved_tool_call_id(), Some("shell-1"));
+    }
 }

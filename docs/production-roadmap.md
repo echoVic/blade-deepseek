@@ -8,13 +8,14 @@ Current baseline: current main after v0.1.191 owns the approved background
 provider-response continuation envelope in `orca-runtime`: the runtime consumes
 the pending provider response from `TaskRegistry` and derives the single
 preapproved tool-call id before the TUI resumes a backgrounded turn. Runtime
-provider-cycle and turn-loop inputs can now accept an already-returned
-`ProviderResponse` as the first continuation step and consume it once before
-normal provider calls resume. `AgentLoopContext` can now carry that
-continuation response into the runtime loop. The TUI still owns the follow-on
-renderer-aware provider/tool loop, so the next architecture slice is to wire
-the approved background continuation through the TUI bridge instead of the
-renderer-owned loop. Earlier v0.1.191 makes
+provider-cycle, turn-loop, and agent-loop inputs now carry a typed
+`RuntimeTurnContinuation` instead of a bare `ProviderResponse`; the provider
+cycle consumes the continuation once, seeds the turn permission overlay with the
+preapproved tool-call id, and the approval gate consumes that id exactly once
+for the matching tool call. The TUI still owns the follow-on renderer-aware
+provider/tool loop, so the next architecture slice is to wire the approved
+background continuation through the TUI bridge instead of the renderer-owned
+loop. Earlier v0.1.191 makes
 `RuntimeProviderResponseStep` consume the
 named `RuntimeProviderResponseInput` directly and carries child-agent executors
 through `RuntimeProviderResponseExecutors`. Provider final-message handling and
@@ -191,7 +192,7 @@ working baseline used to prioritize the next patch releases.
 | Memory | Manual `/remember` plus optional project extraction | Codex memories extension | Partial |
 | Persistent goals | `/goal` with persisted state plus goal-scoped `get_goal`, `create_goal`, and narrow `update_goal` | Codex goal extension | Implemented |
 | Workflows | JavaScript workflow DSL, generated drafts, edit/save/run controls, reusable workflow commands, task state, notifications, runtime status events, evidence-bound reports, and worktree-isolated/recoverable agent runs | Codex/Claude workflow orchestration concepts | Implemented |
-| Runtime lifecycle | Headless, server-mode, and TUI agent runs now seed an agent task lifecycle through a runtime turn runner; `RuntimeThread` groups runtime-owned interactive session state with lifecycle state, and server-mode `ServerThread`, the headless controller, and the TUI conversation-session wrapper now keep long-lived agent state behind `RuntimeThread` instead of directly assembling session/lifecycle/executor pieces; workflow runs, sync/async subagent boundaries, workflow child agents, and shell tool calls also carry task metadata; tool approval/hooks/normal fallback now share a runtime tool actor context, while workflow, subagent, task, permission, workflow IPC, and normal-tool dispatch route through `RuntimeToolRouter`; server stdio decoding now delegates operation dispatch through a focused router boundary, with synchronous thread query/metadata, turn-control, shell session, command/exec compatibility, permission response, and submit-family dispatch moved into focused processor modules; command/exec active process state now lives in a focused server manager module; runtime-special tool classification and small executors now live in `runtime_special.rs`; approved background provider-response continuations are now consumed through `orca_runtime::background_turn`, including the single preapproved tool-call id that must not prompt again | Codex `Session -> Task -> Turn`, app-server request processors; package 3 pending permission maps | Seeded; deeper TUI loop delegation still open |
+| Runtime lifecycle | Headless, server-mode, and TUI agent runs now seed an agent task lifecycle through a runtime turn runner; `RuntimeThread` groups runtime-owned interactive session state with lifecycle state, and server-mode `ServerThread`, the headless controller, and the TUI conversation-session wrapper now keep long-lived agent state behind `RuntimeThread` instead of directly assembling session/lifecycle/executor pieces; workflow runs, sync/async subagent boundaries, workflow child agents, and shell tool calls also carry task metadata; tool approval/hooks/normal fallback now share a runtime tool actor context, while workflow, subagent, task, permission, workflow IPC, and normal-tool dispatch route through `RuntimeToolRouter`; server stdio decoding now delegates operation dispatch through a focused router boundary, with synchronous thread query/metadata, turn-control, shell session, command/exec compatibility, permission response, and submit-family dispatch moved into focused processor modules; command/exec active process state now lives in a focused server manager module; runtime-special tool classification and small executors now live in `runtime_special.rs`; approved background provider-response continuations now convert into typed `RuntimeTurnContinuation` values, and the runtime consumes the single preapproved tool-call id exactly once through the turn permission overlay | Codex `Session -> Task -> Turn`, app-server request processors; package 3 pending permission maps | Seeded; deeper TUI loop delegation still open |
 | TUI | Markdown-ish rendering, themes, Vim mode, diff preview, slash commands, workflow panel, elapsed timers, and clearer approval dialogs | Codex/Claude richer terminal UX | Partial |
 | History | JSONL transcripts, resume/fork/search/archive/compress with a dedicated `SessionStore` boundary | Codex thread store with queryable metadata | Partial |
 | Release | GitHub release + npm alias distribution scripts, retrying post-publish GitHub/npm/npm-exec verification, and a reusable real API e2e release gate | Codex npm/native release model | Implemented |
@@ -214,19 +215,19 @@ surface and pending-request UX, but its broad `ToolUseContext` should not be
 copied into Orca.
 
 1. **P0: Runtime-owned background approval continuation execution.** The runtime
-   now owns the approved continuation envelope and the provider-cycle/turn-loop
-   input can skip the first provider call, handling the stored
-   `ProviderResponse` through the same provider-error, response, tool-turn, and
-   terminal folding path as foreground turns. `AgentLoopContext` can now carry
-   that continuation into the runtime loop. The remaining work is to wire the
-   TUI bridge to this context and retire the renderer-owned background
-   continuation loop. This is the highest TUI-user fix because it removes
-   duplicated continuation semantics from the renderer.
-2. **P1: Typed `RuntimeTurnContinuation` and pending interactive request
-   boundary.** Codex tracks pending interactive replay by request/turn/item ids,
-   and package 3 keeps `pendingPermissionRequests` keyed by request id. Orca
-   should make pending approval and user-input continuations first-class runtime
-   records instead of separate ad hoc task fields plus TUI-local queues.
+   now owns the approved continuation envelope and typed
+   `RuntimeTurnContinuation`, including one-shot preapproval for the exact
+   backgrounded tool call. The provider-cycle/turn-loop input can skip the first
+   provider call, handle the stored response through the foreground provider
+   path, and avoid prompting again for the already approved tool. The remaining
+   work is to wire the TUI bridge to this context and retire the renderer-owned
+   background continuation loop. This is the highest TUI-user fix because it
+   removes duplicated continuation semantics from the renderer.
+2. **P1: Pending interactive request boundary.** Codex tracks pending
+   interactive replay by request/turn/item ids, and package 3 keeps
+   `pendingPermissionRequests` keyed by request id. Orca should make pending
+   approval and user-input continuations first-class runtime records instead of
+   separate ad hoc task fields plus TUI-local queues.
 3. **P2: Frozen per-turn context boundary.** Continue shrinking wide call
    surfaces into `RuntimeTurnConfig`, `RuntimeTurnDeps`,
    `RuntimeTurnState`, and request snapshots. Keep borrowing package 3's

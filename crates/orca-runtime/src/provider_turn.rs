@@ -13,6 +13,7 @@ use orca_mcp::McpRegistry;
 use orca_provider::{ProviderConfig, context};
 
 use crate::agent_child::ChildAgentExecutor;
+use crate::background_turn::RuntimeTurnContinuation;
 use crate::compaction::RuntimeCompactionStep;
 use crate::cost::CostTracker;
 use crate::extension::RuntimeExtensionContext;
@@ -57,7 +58,7 @@ pub(crate) struct RuntimeTurnProviderCycleStep {
 pub(crate) struct RuntimeProviderCycleInput<'a, 'runtime, W: io::Write> {
     pub(crate) actor: &'a mut RuntimeTaskActor<'runtime>,
     pub(crate) provider: ProviderKind,
-    pub(crate) initial_response: Option<ProviderResponse>,
+    pub(crate) continuation: Option<RuntimeTurnContinuation>,
     pub(crate) turn_provider_config: &'a ProviderConfig,
     pub(crate) runtime_system_messages: &'a [String],
     pub(crate) cwd: &'a Path,
@@ -526,8 +527,13 @@ impl RuntimeTurnProviderCycleStep {
     ) -> io::Result<RuntimeTurnProviderCycleResult> {
         let capabilities = input.capabilities;
         let cwd_display = input.cwd.display().to_string();
-        let response = if let Some(response) = input.initial_response.take() {
-            response
+        let continuation = input.continuation.take();
+        let preapproved_tool_call_id = continuation
+            .as_ref()
+            .and_then(RuntimeTurnContinuation::preapproved_tool_call_id)
+            .map(str::to_string);
+        let response = if let Some(continuation) = continuation {
+            continuation.response
         } else {
             let provider_turn = {
                 let (conversation, history_writer) = input.conversation.parts_mut();
@@ -596,6 +602,7 @@ impl RuntimeTurnProviderCycleStep {
 
         let (conversation, history_writer) = input.conversation.parts_mut();
         let mut kernel = RuntimeTurnKernel::from_extension_stores(input.extensions.stores());
+        kernel.set_preapproved_tool_call_id(preapproved_tool_call_id);
         let step_context =
             RuntimeStepContext::from_snapshot(RuntimeStepSnapshot::new_with_capabilities(
                 input.config,
@@ -1248,7 +1255,7 @@ mod tests {
                 RuntimeProviderCycleInput {
                     actor: &mut actor,
                     provider: ProviderKind::DeepSeek,
-                    initial_response: Some(response),
+                    continuation: Some(RuntimeTurnContinuation::from_response(response)),
                     turn_provider_config: &provider_config,
                     runtime_system_messages: &[],
                     cwd: cwd.path(),

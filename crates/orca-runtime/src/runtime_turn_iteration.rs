@@ -7,12 +7,12 @@ use orca_core::config::{ProviderKind, RunConfig};
 use orca_core::event_schema::EventFactory;
 use orca_core::event_sink::EventSink;
 use orca_core::model::ModelSelection;
-use orca_core::provider_types::ProviderResponse;
 use orca_core::subagent_types::SubagentType;
 use orca_mcp::McpRegistry;
 use orca_provider::{ProviderConfig, context};
 
 use crate::agent_child::ChildAgentExecutor;
+use crate::background_turn::RuntimeTurnContinuation;
 use crate::cost::CostTracker;
 use crate::extension::RuntimeExtensionContext;
 use crate::hooks::HookRunner;
@@ -55,7 +55,7 @@ pub(crate) struct RuntimeTurnIterationInput<'a, 'runtime, W: io::Write> {
     pub(crate) prompt: &'a str,
     pub(crate) model: &'a ModelSelection,
     pub(crate) subagent_type: &'a SubagentType,
-    pub(crate) initial_response: Option<ProviderResponse>,
+    pub(crate) continuation: Option<RuntimeTurnContinuation>,
     pub(crate) model_override: Option<&'a str>,
     pub(crate) cost_tracker: &'a mut CostTracker,
     pub(crate) steer_handle: Option<&'a ThreadSteerHandle>,
@@ -127,7 +127,7 @@ impl RuntimeTurnIterationStep {
             RuntimeProviderCycleInput {
                 actor: input.actor,
                 provider: input.provider,
-                initial_response: input.initial_response,
+                continuation: input.continuation,
                 turn_provider_config: &turn_provider_config,
                 runtime_system_messages: input.runtime_system_messages,
                 cwd: input.cwd,

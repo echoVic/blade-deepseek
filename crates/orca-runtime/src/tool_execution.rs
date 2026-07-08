@@ -63,7 +63,7 @@ pub(crate) struct ToolApprovalGateContext<'a, W: io::Write> {
     pub(crate) tool_request: &'a tool_types::ToolRequest,
     pub(crate) invocation: &'a ToolInvocation,
     pub(crate) policy: &'a ApprovalPolicy,
-    pub(crate) strict_auto_review: bool,
+    pub(crate) permission_overlay: &'a mut TurnPermissionOverlay,
     pub(crate) emit_deltas: bool,
 }
 
@@ -365,7 +365,7 @@ impl ToolExecutionActor {
             tool_request,
             invocation: &invocation,
             policy,
-            strict_auto_review: permission_overlay.strict_auto_review(),
+            permission_overlay,
             emit_deltas,
         })? {
             return Ok(outcome);
@@ -472,16 +472,25 @@ impl ToolExecutionActor {
             tool_request,
             invocation,
             policy,
-            strict_auto_review,
+            permission_overlay,
             emit_deltas,
         } = context;
 
         if let Some(approval) = approval_request_for_invocation(invocation)
             && agent_common::requires_approval(approval.action)
         {
-            let mut approval_decision =
-                self.resolve_tool_approval(policy, Some(approval.clone()), tool_request);
-            if strict_auto_review
+            let preapproved = permission_overlay.consume_preapproved_tool_call_id(&tool_request.id);
+            let mut approval_decision = if preapproved {
+                RuntimeApprovalDecision::Allowed(orca_core::approval_types::ApprovalResolution {
+                    id: approval.id.clone(),
+                    decision: ApprovalDecision::Allow,
+                    reason: "approved background continuation".to_string(),
+                })
+            } else {
+                self.resolve_tool_approval(policy, Some(approval.clone()), tool_request)
+            };
+            if !preapproved
+                && permission_overlay.strict_auto_review()
                 && matches!(approval_decision, RuntimeApprovalDecision::Allowed(_))
             {
                 approval_decision = RuntimeApprovalDecision::Ask(approval.clone());
@@ -665,7 +674,10 @@ mod tests {
     use orca_core::tool_types::{ToolName, ToolRequest, ToolStatus};
     use orca_mcp::McpRegistry;
 
-    use super::{ToolExecutionActor, ToolExecutionContext, policy_for_tool_execution};
+    use super::{
+        ToolApprovalGateContext, ToolExecutionActor, ToolExecutionContext,
+        policy_for_tool_execution,
+    };
     use crate::agent_child::{ChildAgentRequest, ChildAgentResult, ChildAgentRuntime};
     use crate::cost::CostTracker;
     use crate::extension::{
@@ -744,6 +756,43 @@ mod tests {
 
         assert_eq!(resolution.decision, ApprovalDecision::Deny);
         assert!(resolution.reason.contains("permission deny rule"));
+    }
+
+    #[test]
+    fn approval_gate_consumes_matching_preapproved_tool_call_once() {
+        let config = config_with_permission_rules(PermissionRules::default());
+        let mut events = EventFactory::new("preapproved-tool".to_string());
+        let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+        let request = ToolRequest {
+            id: "shell-1".to_string(),
+            name: ToolName::Bash,
+            action: ActionKind::Shell,
+            target: Some("echo hi".to_string()),
+            raw_arguments: None,
+        };
+        let registry = McpRegistry::default();
+        let invocation =
+            crate::tool_invocation::prepare_tool_invocation(&request, 0, &registry, &config);
+        let policy = policy_for_tool_execution(&config);
+        let mut overlay = TurnPermissionOverlay::default();
+        overlay.set_preapproved_tool_call_id(Some("shell-1".to_string()));
+        let mut actor = ToolExecutionActor::new(events.run_id().to_string(), 128);
+
+        let result = actor
+            .handle_approval(ToolApprovalGateContext {
+                config: &config,
+                events: &mut events,
+                sink: &mut sink,
+                tool_request: &request,
+                invocation: &invocation,
+                policy: &policy,
+                permission_overlay: &mut overlay,
+                emit_deltas: true,
+            })
+            .expect("approval gate");
+
+        assert!(result.is_none());
+        assert!(!overlay.consume_preapproved_tool_call_id("shell-1"));
     }
 
     #[test]

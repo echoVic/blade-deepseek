@@ -1322,6 +1322,7 @@ mod tests {
         let registry = McpRegistry::default();
         let invocation = prepare_tool_invocation(&request, 0, &registry, &config);
         let policy = ApprovalPolicy::new(ApprovalMode::FullAuto);
+        let mut permission_overlay = crate::lifecycle::TurnPermissionOverlay::default();
 
         let mut actor = ToolExecutionActor::new(events.run_id().to_string(), DEFAULT_MAX_TURNS);
         let result = actor
@@ -1332,7 +1333,7 @@ mod tests {
                 tool_request: &request,
                 invocation: &invocation,
                 policy: &policy,
-                strict_auto_review: false,
+                permission_overlay: &mut permission_overlay,
                 emit_deltas: true,
             })
             .unwrap();

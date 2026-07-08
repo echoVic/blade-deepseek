@@ -49,7 +49,7 @@ pub(crate) fn run_agent_loop(
         turn_execution,
         turn_interactions,
         steer_handle,
-        initial_response,
+        continuation,
     } = loop_context;
     let RuntimeTurnDeps {
         instructions,
@@ -107,7 +107,7 @@ pub(crate) fn run_agent_loop(
             prepared_conversation: &mut prepared_conversation,
             prompt,
             subagent_type,
-            initial_response,
+            continuation,
             loop_state,
             steer_handle,
             config,
@@ -242,6 +242,33 @@ mod tests {
                 .as_ref()
                 .and_then(|response| response.assistant_content.as_deref()),
             Some("continued")
+        );
+    }
+
+    #[test]
+    fn agent_loop_context_carries_runtime_turn_continuation() {
+        let cwd = PathBuf::from("/tmp/orca-agent-loop-runtime-continuation");
+        let subagent_type = SubagentType::General;
+        let response = ProviderResponse {
+            steps: vec![ProviderStep::MessageDelta("continued".to_string())],
+            assistant_content: Some("continued".to_string()),
+            assistant_reasoning: None,
+            tool_calls: Vec::new(),
+            usage: None,
+        };
+        let continuation = crate::background_turn::RuntimeTurnContinuation {
+            response,
+            preapproved_tool_call_id: Some("tool-1".to_string()),
+        };
+
+        let context = AgentLoopContext::new(&cwd, "inspect repo", 1, true, &subagent_type)
+            .with_turn_continuation(continuation);
+
+        assert_eq!(
+            context
+                .continuation()
+                .and_then(|continuation| continuation.preapproved_tool_call_id()),
+            Some("tool-1")
         );
     }
 
