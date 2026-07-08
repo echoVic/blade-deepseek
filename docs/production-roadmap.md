@@ -270,21 +270,23 @@ copied into Orca.
    continuation; human prompts remain plain `Submit` actions, while workflow
    follow-ups use a typed notification action/result. The workflow-notification
    action channel now carries `PendingWorkflowNotification` directly instead of
-   splitting the id and prompt into separate action fields. The TUI agent loop
-   now applies prompt preprocessing through a named submitted-turn source
-   boundary, so `@file` mention expansion remains user-input behavior and
-   workflow notifications are not dropped because generated notification text
-   happens to look like a local file mention. That source boundary also carries
-   the TUI task description for workflow follow-up turns, keeping the workflows
-   panel focused on a stable notification label instead of raw XML/diagnostic
-   payload text. The same submitted-turn boundary now also gives first-turn
-   workflow notification sessions a stable title seed, so recorded history/search
-   does not name the thread after raw notification XML. Workflow follow-up turns
-   remain model-visible user-role context, but are no longer treated as the
-   user's last backtrack target. That submitted-turn value now enters the TUI
-   goal-turn loop as one boundary object, with `SubmittedTurnPresentation`
-   owning the task label and backtrack policy that had been passed as parallel
-   fields. Turn results now expose a typed `TuiAgentTurnContinuation` boundary
+   splitting the id and prompt into separate action fields, and workflow
+   notifications enter `SubmittedTurn` through the same typed notification
+   boundary. The TUI agent loop now applies prompt preprocessing through a named
+   submitted-turn source boundary, so `@file` mention expansion remains
+   user-input behavior and workflow notifications are not dropped because
+   generated notification text happens to look like a local file mention. That
+   source boundary also carries the TUI task description for workflow follow-up
+   turns, keeping the workflows panel focused on a stable notification label
+   instead of raw XML/diagnostic payload text. The same submitted-turn boundary
+   now also gives first-turn workflow notification sessions a stable title seed,
+   so recorded history/search does not name the thread after raw notification
+   XML. Workflow follow-up turns remain model-visible user-role context, but are
+   no longer treated as the user's last backtrack target. That submitted-turn
+   value now enters the TUI goal-turn loop as one boundary object, with
+   `SubmittedTurnPresentation` owning the task label and backtrack policy that
+   had been passed as parallel fields. Turn results now expose a typed
+   `TuiAgentTurnContinuation` boundary
    instead of a workflow-notification-specific result field, so workflow
    follow-ups are one continuation variant and future continuation kinds do not
    need more parallel ad hoc result slots. Approved background turns also cross

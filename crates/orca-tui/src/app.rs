@@ -2077,6 +2077,30 @@ mod tests {
     }
 
     #[test]
+    fn submitted_turn_workflow_notification_carries_notification_boundary() {
+        let source = include_str!("app.rs");
+        let struct_start = source
+            .rfind("struct SubmittedTurn {")
+            .expect("SubmittedTurn struct");
+        let submitted_turn_section = &source[struct_start..];
+        let impl_start = submitted_turn_section
+            .find("impl SubmittedTurn {")
+            .expect("SubmittedTurn impl");
+        let submitted_turn_impl = &submitted_turn_section[impl_start..];
+
+        assert!(
+            submitted_turn_impl.contains(
+                "fn workflow_notification(notification: crate::types::PendingWorkflowNotification)"
+            ),
+            "workflow notification submitted turns should carry the typed notification boundary"
+        );
+        assert!(
+            !submitted_turn_impl.contains("fn workflow_notification(id: String, prompt: String)"),
+            "submitted turns should not split workflow notification id and prompt at construction"
+        );
+    }
+
+    #[test]
     fn backgrounded_agent_loop_does_not_complete_unexecuted_tool_calls() {
         with_orca_home(|_| {
             let config = Arc::new(Mutex::new(test_config(HistoryMode::Record)));
@@ -4065,8 +4089,7 @@ fn run_goal_turns_for_tui(
             // goal-status poll.
             match continuation {
                 bridge::TuiAgentTurnContinuation::WorkflowNotification(notification) => {
-                    submitted_turn =
-                        SubmittedTurn::workflow_notification(notification.id, notification.prompt);
+                    submitted_turn = SubmittedTurn::workflow_notification(notification);
                     continue;
                 }
             }
@@ -4284,9 +4307,10 @@ impl SubmittedTurn {
         }
     }
 
-    fn workflow_notification(id: String, prompt: String) -> Self {
+    fn workflow_notification(notification: crate::types::PendingWorkflowNotification) -> Self {
+        let id = notification.id;
         Self {
-            prompt,
+            prompt: notification.prompt,
             source: SubmittedTurnSource::WorkflowNotification,
             presentation: SubmittedTurnPresentation::workflow_notification(&id),
         }
@@ -4414,7 +4438,7 @@ fn agent_loop_thread(
             }
             Ok(UserAction::SubmitWorkflowNotification(notification)) => {
                 handle_submitted_turn_for_tui(
-                    SubmittedTurn::workflow_notification(notification.id, notification.prompt),
+                    SubmittedTurn::workflow_notification(notification),
                     &config,
                     &preloaded,
                     &mut session,
