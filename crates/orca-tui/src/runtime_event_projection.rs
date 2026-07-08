@@ -17,6 +17,10 @@ pub(crate) fn tui_event_from_runtime_event(event: &EventEnvelope) -> Option<TuiE
             cache_tokens: event.payload["cache_tokens"].as_u64().unwrap_or_default(),
             estimated_cost_usd: event.payload["estimated_cost_usd"].as_f64()?,
         })),
+        EventType::ContextCompacted => Some(TuiEvent::Compacted {
+            before_messages: event.payload["before_messages"].as_u64()? as usize,
+            after_messages: event.payload["after_messages"].as_u64()? as usize,
+        }),
         EventType::ModelRouted => Some(TuiEvent::Notice(format!(
             "Model routed to {} ({})",
             event.payload["actual_model"].as_str()?,
@@ -425,6 +429,32 @@ mod tests {
         assert!(
             matches!(completed, TuiEvent::SessionCompleted { status } if status == "budget_exhausted")
         );
+    }
+
+    #[test]
+    fn runtime_context_compacted_event_maps_to_tui_compacted() {
+        let mut events = EventFactory::new("tui-runtime-adapter".to_string());
+
+        let compacted = tui_event_from_runtime_event(&events.context_compacted(
+            "prompt_too_long_recovery",
+            "remote_summary",
+            12,
+            5,
+            7,
+            "compacted context after prompt-too-long",
+        ))
+        .expect("compaction event");
+
+        match compacted {
+            TuiEvent::Compacted {
+                before_messages,
+                after_messages,
+            } => {
+                assert_eq!(before_messages, 12);
+                assert_eq!(after_messages, 5);
+            }
+            other => panic!("expected compacted event, got {other:?}"),
+        }
     }
 
     #[test]

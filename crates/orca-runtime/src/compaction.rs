@@ -38,6 +38,14 @@ impl RuntimeCompactionReason {
             Self::PromptTooLongRecovery => "compacted context after prompt-too-long",
         }
     }
+
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            Self::ApproachingContextLimit => "approaching_context_limit",
+            Self::ExceededContextLimit => "exceeded_context_limit",
+            Self::PromptTooLongRecovery => "prompt_too_long_recovery",
+        }
+    }
 }
 
 impl RuntimeCompactionStrategy {
@@ -45,6 +53,13 @@ impl RuntimeCompactionStrategy {
         match kind {
             context::CompactionKind::LocalTruncation => Self::LocalTruncation,
             context::CompactionKind::RemoteSummary(_) => Self::RemoteSummary,
+        }
+    }
+
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            Self::LocalTruncation => "local_truncation",
+            Self::RemoteSummary => "remote_summary",
         }
     }
 }
@@ -365,6 +380,16 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
         let after_messages = conversation.messages.len();
         let outcome = task.finish(after_messages, &compaction.kind);
         let details = outcome.details();
+        if self.turn_context.emit_deltas {
+            self.sink.emit(&self.events.context_compacted(
+                details.reason.as_str(),
+                details.strategy.as_str(),
+                details.before_messages,
+                details.after_messages,
+                details.collapsed_messages,
+                details.status_text,
+            ))?;
+        }
         if outcome.should_persist_summary_state(self.turn_context.emit_deltas)
             && let Some(writer) = self.history_writer.as_deref_mut()
         {
@@ -547,5 +572,78 @@ mod tests {
         );
 
         assert_eq!(decision, RuntimeCompactionRetryDecision::SurfaceError);
+    }
+
+    #[test]
+    fn compaction_step_emits_context_compacted_event() {
+        let context_config = context::ContextConfig {
+            max_tokens: 100,
+            compaction_threshold: 1.0,
+            reserved_for_response: 0,
+            auto_compact_token_limit: Some(100),
+            soft_compact_token_limit: Some(40),
+        };
+        let provider_config = ProviderConfig {
+            api_key: None,
+            base_url: None,
+            model: None,
+            reasoning_effort: orca_core::config::ReasoningEffort::Max,
+            tools_override: Some(Vec::new()),
+            mcp_registry: None,
+            external_tools: Vec::new(),
+        };
+        let hooks = HookRunner::default();
+        let mut events = EventFactory::new("compaction-event-test".to_string());
+        let mut output = Vec::new();
+        let mut sink = EventSink::new(&mut output, orca_core::config::OutputFormat::Jsonl);
+        let cwd = std::path::Path::new(".");
+        let subagent_type = orca_core::subagent_types::SubagentType::General;
+        let mut conversation = Conversation::new();
+        conversation.add_system("system".to_string());
+        for index in 0..20 {
+            conversation.add_user(format!("user message {index}: {}", "context ".repeat(8)));
+            conversation.add_assistant(
+                Some(format!(
+                    "assistant message {index}: {}",
+                    "details ".repeat(8)
+                )),
+                None,
+                vec![],
+            );
+        }
+        let before_messages = conversation.messages.len();
+
+        RuntimeCompactionStep::new(
+            orca_core::config::ProviderKind::Mock,
+            &context_config,
+            &provider_config,
+            RuntimeTurnContext::new(cwd, "", 0, true, &subagent_type),
+            &hooks,
+            &mut events,
+            &mut sink,
+            None,
+        )
+        .compact_after_provider_error_retry(
+            &mut conversation,
+            RuntimeCompactionTrigger::PromptTooLong,
+        )
+        .expect("compaction should emit event");
+
+        drop(sink);
+        let output = String::from_utf8(output).expect("jsonl is utf8");
+        let compacted = output
+            .lines()
+            .find(|line| line.contains("\"type\":\"context.compacted\""))
+            .expect("context compacted event emitted");
+        let event: serde_json::Value =
+            serde_json::from_str(compacted).expect("event should be json");
+
+        assert_eq!(event["payload"]["before_messages"], before_messages);
+        assert_eq!(
+            event["payload"]["after_messages"],
+            conversation.messages.len()
+        );
+        assert_eq!(event["payload"]["reason"], "prompt_too_long_recovery");
+        assert_eq!(event["payload"]["strategy"], "remote_summary");
     }
 }

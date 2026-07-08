@@ -53,6 +53,14 @@ mod tests {
             projection.contains("pub(crate) fn tui_event_from_runtime_event"),
             "runtime_event_projection should export the TUI runtime event adapter"
         );
+        assert!(
+            projection.contains("EventType::ContextCompacted"),
+            "runtime_event_projection should map runtime context compaction events into TUI events"
+        );
+        assert!(
+            projection.contains("TuiEvent::Compacted"),
+            "runtime_event_projection should preserve compacted context notices for TUI users"
+        );
 
         let bridge = std::fs::read_to_string(format!("{manifest_dir}/src/bridge.rs"))
             .expect("bridge source should be readable");

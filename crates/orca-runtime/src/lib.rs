@@ -4237,6 +4237,10 @@ mod tests {
                 || compaction_source.contains("pub(crate) fn details(&self)"),
             "RuntimeCompactionOutcome must expose structured details for future event projection"
         );
+        assert!(
+            compaction_source.contains("events.context_compacted("),
+            "RuntimeCompactionStep must emit runtime context compaction events from outcome details"
+        );
 
         let compact_if_needed = compaction_source
             .split("fn compact_if_needed")

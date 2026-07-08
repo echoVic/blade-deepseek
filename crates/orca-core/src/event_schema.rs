@@ -39,6 +39,8 @@ pub enum EventType {
     ProviderReplayUpdated,
     #[serde(rename = "usage.updated")]
     UsageUpdated,
+    #[serde(rename = "context.compacted")]
+    ContextCompacted,
     #[serde(rename = "model.routed")]
     ModelRouted,
     #[serde(rename = "approval.requested")]
@@ -212,6 +214,28 @@ impl EventFactory {
                 "cache_tokens": usage.cache_tokens,
                 "total_tokens": usage.total_tokens(),
                 "estimated_cost_usd": usage.estimated_cost_usd
+            }),
+        )
+    }
+
+    pub fn context_compacted(
+        &mut self,
+        reason: &str,
+        strategy: &str,
+        before_messages: usize,
+        after_messages: usize,
+        collapsed_messages: usize,
+        status_text: &str,
+    ) -> EventEnvelope {
+        self.make(
+            EventType::ContextCompacted,
+            json!({
+                "reason": reason,
+                "strategy": strategy,
+                "before_messages": before_messages,
+                "after_messages": after_messages,
+                "collapsed_messages": collapsed_messages,
+                "status_text": status_text
             }),
         )
     }
@@ -938,6 +962,31 @@ mod tests {
         assert_eq!(event.payload["task"]["status"], "approval_required");
         assert_eq!(event.payload["task"]["isBackgrounded"], true);
         assert_eq!(event.payload["task"]["tool"], "shell");
+    }
+
+    #[test]
+    fn context_compacted_payload_includes_projection_details() {
+        let mut f = EventFactory::new("run-1".to_string());
+
+        let event = f.context_compacted(
+            "prompt_too_long_recovery",
+            "remote_summary",
+            12,
+            5,
+            7,
+            "compacted context after prompt-too-long",
+        );
+
+        assert_eq!(event.event_type, EventType::ContextCompacted);
+        assert_eq!(event.payload["reason"], "prompt_too_long_recovery");
+        assert_eq!(event.payload["strategy"], "remote_summary");
+        assert_eq!(event.payload["before_messages"], 12);
+        assert_eq!(event.payload["after_messages"], 5);
+        assert_eq!(event.payload["collapsed_messages"], 7);
+        assert_eq!(
+            event.payload["status_text"],
+            "compacted context after prompt-too-long"
+        );
     }
 
     #[test]

@@ -58,6 +58,14 @@ impl<W: Write> EventSink<W> {
                 let cost = event.payload["estimated_cost_usd"].as_f64().unwrap_or(0.0);
                 writeln!(self.writer, "usage: {total} tokens (${cost:.6})")
             }
+            EventType::ContextCompacted => {
+                let before = event.payload["before_messages"].as_u64().unwrap_or(0);
+                let after = event.payload["after_messages"].as_u64().unwrap_or(0);
+                writeln!(
+                    self.writer,
+                    "context compacted: {before} -> {after} messages"
+                )
+            }
             EventType::ApprovalRequested => writeln!(self.writer, "approval requested"),
             EventType::ApprovalResolved => writeln!(self.writer, "approval resolved"),
             EventType::ToolCallProgress => {

@@ -258,7 +258,11 @@ The deeper July 9 reference pass changes the next refactor order:
    prompt-too-long recovery both carry `RuntimeCompactionRetryState` and ask
    `RuntimeCompactionPolicy` whether to compact and retry or surface the error,
    leaving provider code to execute a decision instead of reclassifying context
-   errors. Next extend that boundary with event/TUI projection.
+   errors. The event/TUI projection slice is also seeded: successful runtime
+   compactions emit `context.compacted` from `RuntimeCompactionOutcome` details,
+   and the TUI runtime event adapter maps that event into the existing compacted
+   context notice/status path. Next enrich this with finer pre/post status
+   lifecycle if real TUI usage shows users need more than the compacted summary.
 3. **P1: Move exec/permission evaluation toward a dedicated policy manager.**
    Codex keeps mutable exec policy in an `ExecPolicyManager` with parsed rules,
    command-origin lowering, prompt rejection reasons, and serialized updates.
