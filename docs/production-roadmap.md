@@ -369,6 +369,9 @@ copied into Orca.
    `RuntimeNormalToolTurnContext` now carries normal and workflow child-agent
    executors through `RuntimeNormalToolTurnExecutors`, so executor handles no
    longer sit beside snapshot and policy refs as flat fields.
+   `RuntimeNormalToolTurnContext` now carries instructions, memory, MCP
+   registry, and hooks through `RuntimeNormalToolTurnServices`, matching the
+   downstream tool-execution services boundary.
    Iteration stages now keep lifecycle-owned `RuntimeTurnLoopIterationState`
    grouped instead of unpacking runtime system messages, model overrides,
    cost/cancel/task refs, and extension refs into the iteration input. Keep

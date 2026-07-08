@@ -77,10 +77,7 @@ pub(crate) struct RuntimeNormalToolTurnContext<'a, W: io::Write> {
     pub(crate) subagent_depth: u32,
     pub(crate) emit_deltas: bool,
     pub(crate) policy: &'a ApprovalPolicy,
-    pub(crate) instructions: &'a ProjectInstructions,
-    pub(crate) memory: &'a MemoryBlock,
-    pub(crate) mcp_registry: &'a McpRegistry,
-    pub(crate) hooks: &'a HookRunner,
+    pub(crate) services: RuntimeNormalToolTurnServices<'a>,
     pub(crate) cancel: &'a CancelToken,
     pub(crate) task_registry: &'a TaskRegistry,
     pub(crate) workflow_ipc: Option<&'a WorkflowIpcContext>,
@@ -102,6 +99,13 @@ pub(crate) struct RuntimeNormalToolTurnIo<'a, W: io::Write> {
 pub(crate) struct RuntimeNormalToolTurnExecutors<W: io::Write> {
     pub(crate) child_executor: ChildAgentExecutor<W>,
     pub(crate) workflow_child_executor: ChildAgentExecutor<SharedEventBuffer>,
+}
+
+pub(crate) struct RuntimeNormalToolTurnServices<'a> {
+    pub(crate) instructions: &'a ProjectInstructions,
+    pub(crate) memory: &'a MemoryBlock,
+    pub(crate) mcp_registry: &'a McpRegistry,
+    pub(crate) hooks: &'a HookRunner,
 }
 
 impl ToolTurnOutcome {
@@ -261,10 +265,12 @@ pub(crate) fn run_tool_turns<W: io::Write>(
             subagent_depth,
             emit_deltas,
             policy,
-            instructions,
-            memory,
-            mcp_registry,
-            hooks,
+            services: RuntimeNormalToolTurnServices {
+                instructions,
+                memory,
+                mcp_registry,
+                hooks,
+            },
             cancel,
             task_registry,
             workflow_ipc,
@@ -299,10 +305,7 @@ pub(crate) fn run_normal_tool_turn<W: io::Write>(
         subagent_depth,
         emit_deltas,
         policy,
-        instructions,
-        memory,
-        mcp_registry,
-        hooks,
+        services,
         cancel,
         task_registry,
         workflow_ipc,
@@ -323,6 +326,12 @@ pub(crate) fn run_normal_tool_turn<W: io::Write>(
         cost_tracker,
         background_workflows,
     } = io;
+    let RuntimeNormalToolTurnServices {
+        instructions,
+        memory,
+        mcp_registry,
+        hooks,
+    } = services;
     let mut execution_context = ToolExecutionContext::new(cwd, subagent_depth, emit_deltas, policy)
         .with_services(instructions, memory, mcp_registry, hooks)
         .with_runtime(
@@ -689,10 +698,12 @@ mod tests {
             subagent_depth: 0,
             emit_deltas: false,
             policy: &policy,
-            instructions: &instructions,
-            memory: &memory,
-            mcp_registry: &registry,
-            hooks: &hooks,
+            services: RuntimeNormalToolTurnServices {
+                instructions: &instructions,
+                memory: &memory,
+                mcp_registry: &registry,
+                hooks: &hooks,
+            },
             cancel: &cancel,
             task_registry: &task_registry,
             workflow_ipc: None,
