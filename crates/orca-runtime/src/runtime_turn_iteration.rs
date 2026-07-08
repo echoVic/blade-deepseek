@@ -125,6 +125,7 @@ impl RuntimeTurnIterationStep {
             RuntimeProviderCycleInput {
                 actor: input.actor,
                 provider: input.provider,
+                initial_response: None,
                 turn_provider_config: &turn_provider_config,
                 runtime_system_messages: input.runtime_system_messages,
                 cwd: input.cwd,

@@ -57,6 +57,7 @@ pub(crate) struct RuntimeTurnProviderCycleStep {
 pub(crate) struct RuntimeProviderCycleInput<'a, 'runtime, W: io::Write> {
     pub(crate) actor: &'a mut RuntimeTaskActor<'runtime>,
     pub(crate) provider: ProviderKind,
+    pub(crate) initial_response: Option<ProviderResponse>,
     pub(crate) turn_provider_config: &'a ProviderConfig,
     pub(crate) runtime_system_messages: &'a [String],
     pub(crate) cwd: &'a Path,
@@ -518,46 +519,50 @@ impl RuntimeTurnProviderCycleStep {
 
     pub(crate) fn run<W: io::Write>(
         &mut self,
-        input: RuntimeProviderCycleInput<'_, '_, W>,
+        mut input: RuntimeProviderCycleInput<'_, '_, W>,
         child_executor: ChildAgentExecutor<W>,
         workflow_child_executor: ChildAgentExecutor<SharedEventBuffer>,
         batch_child_executor: ChildAgentExecutor<io::Sink>,
     ) -> io::Result<RuntimeTurnProviderCycleResult> {
         let capabilities = input.capabilities;
         let cwd_display = input.cwd.display().to_string();
-        let provider_turn = {
-            let (conversation, history_writer) = input.conversation.parts_mut();
-            RuntimeProviderTurnStep::new().run(RuntimeProviderTurnInput {
-                actor: input.actor,
-                provider: input.provider,
-                runtime_system_messages: input.runtime_system_messages,
-                provider_config: input.turn_provider_config,
-                cwd: &cwd_display,
-                emit_deltas: input.emit_deltas,
-                hooks: capabilities.hooks,
-                cancel: capabilities.cancel,
-                max_budget_usd: input.max_budget_usd,
-                steer_handle: input.steer_handle,
-                io: RuntimeProviderTurnIo {
-                    conversation,
-                    cost_tracker: input.cost_tracker,
-                    events: input.events,
-                    sink: input.sink,
-                    history_writer,
-                },
-            })?
-        };
-        let response = match RuntimeProviderTurnResultResultStep::new().fold(
-            RuntimeProviderTurnResultStep::new().fold(
-                provider_turn,
-                input.events,
-                input.sink,
-                input.emit_deltas,
-            )?,
-        ) {
-            RuntimeProviderTurnResultResult::Response(response) => response,
-            RuntimeProviderTurnResultResult::Return(result) => {
-                return Ok(RuntimeTurnProviderCycleResult::Return(result));
+        let response = if let Some(response) = input.initial_response.take() {
+            response
+        } else {
+            let provider_turn = {
+                let (conversation, history_writer) = input.conversation.parts_mut();
+                RuntimeProviderTurnStep::new().run(RuntimeProviderTurnInput {
+                    actor: input.actor,
+                    provider: input.provider,
+                    runtime_system_messages: input.runtime_system_messages,
+                    provider_config: input.turn_provider_config,
+                    cwd: &cwd_display,
+                    emit_deltas: input.emit_deltas,
+                    hooks: capabilities.hooks,
+                    cancel: capabilities.cancel,
+                    max_budget_usd: input.max_budget_usd,
+                    steer_handle: input.steer_handle,
+                    io: RuntimeProviderTurnIo {
+                        conversation,
+                        cost_tracker: input.cost_tracker,
+                        events: input.events,
+                        sink: input.sink,
+                        history_writer,
+                    },
+                })?
+            };
+            match RuntimeProviderTurnResultResultStep::new().fold(
+                RuntimeProviderTurnResultStep::new().fold(
+                    provider_turn,
+                    input.events,
+                    input.sink,
+                    input.emit_deltas,
+                )?,
+            ) {
+                RuntimeProviderTurnResultResult::Response(response) => response,
+                RuntimeProviderTurnResultResult::Return(result) => {
+                    return Ok(RuntimeTurnProviderCycleResult::Return(result));
+                }
             }
         };
 
@@ -1171,6 +1176,130 @@ mod tests {
         assert!(
             matches!(&conversation.messages[0], Message::Assistant { content, tool_calls, .. }
                 if content.as_deref() == Some("done") && tool_calls.is_empty())
+        );
+    }
+
+    #[test]
+    fn provider_cycle_step_can_start_from_continuation_response_without_provider_call() {
+        let config = config();
+        let response = ProviderResponse {
+            steps: vec![ProviderStep::MessageDelta("continued".to_string())],
+            assistant_content: Some("continued".to_string()),
+            assistant_reasoning: None,
+            tool_calls: Vec::new(),
+            usage: None,
+        };
+        let runtime = ModelRuntimeConfig::default();
+        let context_config =
+            context::ContextConfig::for_model_with_runtime(Some("deepseek-chat"), &runtime);
+        let provider_config = ProviderConfig {
+            api_key: None,
+            base_url: None,
+            model: Some(orca_core::model::PRO_MODEL.to_string()),
+            reasoning_effort: orca_core::config::ReasoningEffort::Max,
+            tools_override: Some(Vec::new()),
+            mcp_registry: None,
+            external_tools: Vec::new(),
+        };
+        let cwd = tempfile::tempdir().expect("cwd");
+        let mut events = EventFactory::new("provider-cycle-continuation".to_string());
+        let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+        let mut conversation = Conversation::new();
+        conversation.add_user("continue".to_string());
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let mcp_registry = McpRegistry::default();
+        let hooks = HookRunner::default();
+        let mut cost_tracker = CostTracker::new(None);
+        let cancel = CancelToken::new();
+        let task_registry = TaskRegistry::new("provider-cycle-continuation".to_string());
+        let mut background_workflows = Vec::new();
+        let policy = policy_for_tool_execution(&config);
+        let extension_registry = crate::extension::ExtensionRegistry::default();
+        let thread_extensions = std::sync::Arc::new(crate::extension::ExtensionData::new("thread"));
+        let turn_extensions = std::sync::Arc::new(crate::extension::ExtensionData::new("turn"));
+        let extension_state = crate::lifecycle::RuntimeTurnExtensionState::new(
+            extension_registry,
+            thread_extensions,
+            turn_extensions,
+        );
+        let mut prepared_conversation =
+            crate::runtime_conversation_bootstrap::RuntimeConversationBootstrapStep::new()
+                .prepare(
+                    crate::session::AgentConversationContext::new()
+                        .with_conversation(Some(&mut conversation)),
+                    cwd.path(),
+                    "continue",
+                    0,
+                    &orca_core::subagent_types::SubagentType::General,
+                    &instructions,
+                    config.approval_mode,
+                    &memory,
+                    true,
+                )
+                .expect("prepare conversation");
+        let mut lifecycle = crate::runtime_lifecycle::RuntimeSessionLifecycle::new(
+            "provider-cycle-continuation".to_string(),
+        );
+        let mut actor = RuntimeTaskActor::new(&mut lifecycle, 3);
+
+        let result = RuntimeTurnProviderCycleStep::new()
+            .run(
+                RuntimeProviderCycleInput {
+                    actor: &mut actor,
+                    provider: ProviderKind::DeepSeek,
+                    initial_response: Some(response),
+                    turn_provider_config: &provider_config,
+                    runtime_system_messages: &[],
+                    cwd: cwd.path(),
+                    context_config: &context_config,
+                    base_provider_config: &provider_config,
+                    emit_deltas: true,
+                    capabilities: RuntimeStepCapabilitySnapshot::new(
+                        &instructions,
+                        &memory,
+                        &mcp_registry,
+                        &hooks,
+                        &cancel,
+                        &task_registry,
+                        None,
+                        None,
+                        None,
+                    ),
+                    cost_tracker: &mut cost_tracker,
+                    max_budget_usd: None,
+                    events: &mut events,
+                    sink: &mut sink,
+                    conversation: &mut prepared_conversation,
+                    config: &config,
+                    tool_policy: AgentToolPolicyContext::unrestricted(),
+                    subagent_depth: 0,
+                    policy: &policy,
+                    extensions: extension_state.extension_context(),
+                    background_workflows: &mut background_workflows,
+                    steer_handle: None,
+                },
+                unused_child_executor::<Vec<u8>>,
+                unused_child_executor::<crate::workflow::runner::SharedEventBuffer>,
+                unused_child_executor::<io::Sink>,
+            )
+            .expect("run provider cycle from continuation");
+
+        match result {
+            RuntimeTurnProviderCycleResult::Return(result) => {
+                assert_eq!(result.status, RunStatus::Success);
+                assert_eq!(result.final_message.as_deref(), Some("continued"));
+                assert_eq!(result.error, None);
+            }
+            RuntimeTurnProviderCycleResult::ContinueLoop
+            | RuntimeTurnProviderCycleResult::ContinueTurn => {
+                panic!("final continuation response should return agent-loop result")
+            }
+        }
+        let (conversation, _) = prepared_conversation.parts_mut();
+        assert!(
+            matches!(conversation.messages.last(), Some(Message::Assistant { content, .. })
+                if content.as_deref() == Some("continued"))
         );
     }
 
