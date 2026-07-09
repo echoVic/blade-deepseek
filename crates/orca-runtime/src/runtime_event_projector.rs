@@ -4,10 +4,10 @@ use serde_json::{Value, json};
 
 use crate::protocol::{self, ServerEvent};
 use crate::tool_item_projection::{
-    ProjectedTextItem, ProjectedTextItemKind, ProjectedToolCallCompletion, ProjectedToolCallItem,
-    file_change_completed_item, file_change_started_item, mcp_result_from_content, mcp_tool_parts,
-    parse_json_or_null, tool_error_object_from_value, tool_status_is_completed,
-    workflow_completed_item, workflow_started_item,
+    ProjectedFileChangeItem, ProjectedTextItem, ProjectedTextItemKind, ProjectedToolCallCompletion,
+    ProjectedToolCallItem, mcp_result_from_content, mcp_tool_parts, parse_json_or_null,
+    tool_error_object_from_value, tool_status_is_completed, workflow_completed_item,
+    workflow_started_item,
 };
 
 const PROPOSED_PLAN_OPEN: &str = "<proposed_plan>";
@@ -20,7 +20,7 @@ pub(crate) struct RuntimeEventProjector {
     plan_parser: ProposedPlanStreamParser,
     reasoning: Option<ProjectedTextItem>,
     tool_items: HashMap<String, ProjectedToolCallItem>,
-    file_change_items: HashMap<String, FileChangeItem>,
+    file_change_items: HashMap<String, ProjectedFileChangeItem>,
     workflow_items: HashMap<String, WorkflowItem>,
 }
 
@@ -276,16 +276,13 @@ impl RuntimeEventProjector {
         let tool_id = payload["id"].as_str().unwrap_or("tool-call").to_string();
         let target = payload["target"].as_str();
         let path = file_change_path(&tool, target);
-        let item = FileChangeItem {
-            id: format!("{tool_id}:file-change"),
-            path: path.clone(),
-            kind: kind.to_string(),
-        };
-        self.file_change_items.insert(tool_id, item.clone());
+        let item = ProjectedFileChangeItem::new(format!("{tool_id}:file-change"), path, kind);
+        let started_item = item.started_item(file_change_diff());
+        self.file_change_items.insert(tool_id, item);
         events.push(ServerEvent::ItemStarted {
             thread_id: Value::Null,
             turn_id: Value::Null,
-            item: file_change_started_item(item.id, item.path, item.kind, file_change_diff()),
+            item: started_item,
         });
     }
 
@@ -302,13 +299,7 @@ impl RuntimeEventProjector {
         events.push(ServerEvent::ItemCompleted {
             thread_id: Value::Null,
             turn_id: Value::Null,
-            item: file_change_completed_item(
-                item.id,
-                item.path,
-                item.kind,
-                file_change_status(payload),
-                file_change_diff(),
-            ),
+            item: item.completed_item(file_change_status(payload), file_change_diff()),
         });
     }
 
@@ -417,13 +408,6 @@ struct ProposedPlanStreamParser {
 enum ProposedPlanSegment {
     Agent(String),
     Plan(String),
-}
-
-#[derive(Clone, Debug)]
-struct FileChangeItem {
-    id: String,
-    path: Option<String>,
-    kind: String,
 }
 
 #[derive(Clone, Debug)]

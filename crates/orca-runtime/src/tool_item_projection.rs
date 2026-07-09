@@ -420,6 +420,35 @@ pub(crate) struct ProjectedFileChangeCompletion {
     diff: Value,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ProjectedFileChangeItem {
+    id: String,
+    path: Option<String>,
+    kind: String,
+}
+
+impl ProjectedFileChangeItem {
+    pub(crate) fn new(
+        id: impl Into<String>,
+        path: Option<impl Into<String>>,
+        kind: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            path: path.map(Into::into),
+            kind: kind.into(),
+        }
+    }
+
+    pub(crate) fn started_item(&self, diff: Value) -> Value {
+        file_change_started_item(self.id.clone(), self.path.clone(), self.kind.clone(), diff)
+    }
+
+    pub(crate) fn completed_item(self, status: Value, diff: Value) -> Value {
+        file_change_completed_item(self.id, self.path, self.kind, status, diff)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub(crate) struct ProjectedFileChange {
     path: Option<String>,
@@ -1401,6 +1430,31 @@ mod tests {
                 None::<String>,
                 "write",
                 Value::from("failed"),
+                Value::from("diff"),
+            )
+        );
+    }
+
+    #[test]
+    fn projected_file_change_item_serializes_current_lifecycle_shapes() {
+        let item = ProjectedFileChangeItem::new("call-7:file-change", Some("src/main.rs"), "edit");
+        assert_eq!(
+            item.started_item(Value::from("")),
+            file_change_started_item(
+                "call-7:file-change",
+                Some("src/main.rs"),
+                "edit",
+                Value::from(""),
+            )
+        );
+
+        assert_eq!(
+            item.completed_item(Value::from("completed"), Value::from("diff")),
+            file_change_completed_item(
+                "call-7:file-change",
+                Some("src/main.rs"),
+                "edit",
+                Value::from("completed"),
                 Value::from("diff"),
             )
         );
