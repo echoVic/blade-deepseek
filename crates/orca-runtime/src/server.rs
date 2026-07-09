@@ -1185,7 +1185,8 @@ fn request_command_exec_network_permission<W: Write>(
 ) -> io::Result<()> {
     let prompt = CommandExecPermissionPolicy::network_block_prompt(&block)
         .expect("denylist command/exec network blocks are filtered before prompting");
-    request_command_exec_permission(state, request, prompt.reason, prompt.permissions, writer)
+    let (_origin, _kind, reason, permissions) = prompt.into_request_parts();
+    request_command_exec_permission(state, request, reason, permissions, writer)
 }
 
 fn request_command_exec_file_system_permission<W: Write>(
@@ -1195,7 +1196,8 @@ fn request_command_exec_file_system_permission<W: Write>(
     writer: &mut W,
 ) -> io::Result<()> {
     let prompt = CommandExecPermissionPolicy::sandbox_denial_prompt(&diagnostic);
-    request_command_exec_permission(state, request, prompt.reason, prompt.permissions, writer)
+    let (_origin, _kind, reason, permissions) = prompt.into_request_parts();
+    request_command_exec_permission(state, request, reason, permissions, writer)
 }
 
 fn request_command_exec_permission<W: Write>(

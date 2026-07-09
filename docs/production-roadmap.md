@@ -290,9 +290,12 @@ The deeper July 9 reference pass changes the next refactor order:
    slice is also seeded: `RuntimePermissionPolicy` now decides whether
    `request_permissions` should auto-allow, prompt via a runtime handler, or
    reject with an explicit reason, preventing non-full-auto runtime paths from
-   silently granting permissions when no handler exists. Next mirror Codex more
-   directly by adding command-origin metadata to exec policy decisions instead
-   of returning only prompt text.
+   silently granting permissions when no handler exists. The command-origin
+   metadata slice is now started as well: runtime permission construction can
+   return a structured decision carrying origin plus request kind, and
+   command/exec preserves that metadata when adapting retry prompts. Next mirror
+   Codex more directly by using the same decision shape for bash and future
+   exec-policy rule evaluation instead of returning only prompt text.
 4. **P2: Turn MCP elicitation and dynamic waits into pending interactions.**
    Package 3's MCP elicitation queue is the useful reference here: request id,
    server name, mode, abort signal, completion notification, and hook-driven

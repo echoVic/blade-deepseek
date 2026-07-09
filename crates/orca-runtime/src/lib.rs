@@ -1681,6 +1681,21 @@ mod tests {
                 .contains("CommandExecPermissionPolicy::should_request_filesystem_retry("),
             "server/command_exec_manager.rs must route permission retry decisions through CommandExecPermissionPolicy"
         );
+        for marker in [
+            "RuntimePermissionDecision",
+            "RuntimePermissionRequestKind",
+            "impl From<RuntimePermissionDecision> for CommandExecPermissionPrompt",
+            "fn into_request_parts(",
+            "origin: decision.origin",
+            "kind: decision.kind",
+            "RuntimePermissionPolicy::network_block_decision(",
+            "RuntimePermissionPolicy::sandbox_denial_decision(",
+        ] {
+            assert!(
+                manager_source.contains(marker),
+                "server/command_exec_manager.rs must preserve structured permission metadata {marker}"
+            );
+        }
         for method_name in [
             "network_permission_block",
             "network_block_prompt",
@@ -2289,14 +2304,19 @@ mod tests {
             "pub struct RuntimePermissionRequest",
             "pub struct RuntimePermissionResponse",
             "pub trait RuntimePermissionRequestHandler",
+            "pub(crate) struct RuntimePermissionDecision",
             "pub(crate) enum RuntimePermissionPromptDecision",
             "pub(crate) enum RuntimePermissionOrigin",
+            "pub(crate) enum RuntimePermissionRequestKind",
             "pub(crate) struct RuntimePermissionPolicy",
             "pub(crate) fn decide_request_permissions_prompt(",
+            "pub(crate) fn network_block_decision(",
             "pub(crate) fn network_block_request(",
+            "pub(crate) fn filesystem_write_decision(",
             "pub(crate) fn filesystem_write_request(",
+            "pub(crate) fn unsandboxed_shell_decision(",
             "pub(crate) fn unsandboxed_shell_request(",
-            "pub(crate) fn sandbox_denial_request(",
+            "pub(crate) fn sandbox_denial_decision(",
             "pub(crate) struct AllowRequestedPermissions",
             "pub struct TurnPermissionOverlay",
             "impl TurnPermissionOverlay",

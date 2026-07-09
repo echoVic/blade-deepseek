@@ -14,7 +14,8 @@ use super::{cap_text, capped_delta, capped_utf8_len};
 use crate::network_proxy::{RuntimeNetworkBlockReport, RuntimeNetworkProxy};
 use crate::protocol::{self, ServerEvent};
 use crate::runtime_permission::{
-    RuntimePermissionOrigin, RuntimePermissionPolicy, RuntimePermissionRequest,
+    RuntimePermissionDecision, RuntimePermissionOrigin, RuntimePermissionPolicy,
+    RuntimePermissionRequestKind,
 };
 use crate::sandbox_denial::{SandboxDenialDiagnostic, diagnose_sandbox_denial};
 use crate::shell_session::RuntimeShellSessionManager;
@@ -66,16 +67,33 @@ pub(super) enum CommandExecDrainOutcome {
 }
 
 pub(super) struct CommandExecPermissionPrompt {
+    pub(super) origin: RuntimePermissionOrigin,
+    pub(super) kind: RuntimePermissionRequestKind,
     pub(super) reason: String,
     pub(super) permissions: protocol::RequestPermissionProfile,
 }
 
-impl From<RuntimePermissionRequest> for CommandExecPermissionPrompt {
-    fn from(request: RuntimePermissionRequest) -> Self {
+impl From<RuntimePermissionDecision> for CommandExecPermissionPrompt {
+    fn from(decision: RuntimePermissionDecision) -> Self {
         Self {
-            reason: request.reason.unwrap_or_default(),
-            permissions: request.permissions,
+            origin: decision.origin,
+            kind: decision.kind,
+            reason: decision.request.reason.unwrap_or_default(),
+            permissions: decision.request.permissions,
         }
+    }
+}
+
+impl CommandExecPermissionPrompt {
+    pub(super) fn into_request_parts(
+        self,
+    ) -> (
+        RuntimePermissionOrigin,
+        RuntimePermissionRequestKind,
+        String,
+        protocol::RequestPermissionProfile,
+    ) {
+        (self.origin, self.kind, self.reason, self.permissions)
     }
 }
 
@@ -93,7 +111,7 @@ impl CommandExecPermissionPolicy {
     pub(super) fn network_block_prompt(
         block: &RuntimeNetworkBlockReport,
     ) -> Option<CommandExecPermissionPrompt> {
-        RuntimePermissionPolicy::network_block_request(
+        RuntimePermissionPolicy::network_block_decision(
             "command-exec",
             RuntimePermissionOrigin::CommandExec,
             block,
@@ -104,7 +122,7 @@ impl CommandExecPermissionPolicy {
     pub(super) fn sandbox_denial_prompt(
         diagnostic: &SandboxDenialDiagnostic,
     ) -> CommandExecPermissionPrompt {
-        RuntimePermissionPolicy::sandbox_denial_request(
+        RuntimePermissionPolicy::sandbox_denial_decision(
             "command-exec",
             RuntimePermissionOrigin::CommandExec,
             diagnostic,
@@ -618,6 +636,7 @@ mod tests {
 
     use super::CommandExecPermissionPolicy;
     use crate::network_proxy::RuntimeNetworkBlockReport;
+    use crate::runtime_permission::{RuntimePermissionOrigin, RuntimePermissionRequestKind};
     use crate::sandbox_denial::SandboxDenialDiagnostic;
 
     #[test]
@@ -671,6 +690,8 @@ mod tests {
         let prompt =
             CommandExecPermissionPolicy::network_block_prompt(&block).expect("prompt request");
 
+        assert_eq!(prompt.origin, RuntimePermissionOrigin::CommandExec);
+        assert_eq!(prompt.kind, RuntimePermissionRequestKind::NetworkBlock);
         assert_eq!(
             prompt.reason,
             "command/exec attempted network access to api.orca.invalid (blocked-by-allowlist)"
@@ -706,6 +727,8 @@ mod tests {
 
         let prompt = CommandExecPermissionPolicy::sandbox_denial_prompt(&diagnostic);
 
+        assert_eq!(prompt.origin, RuntimePermissionOrigin::CommandExec);
+        assert_eq!(prompt.kind, RuntimePermissionRequestKind::FilesystemWrite);
         assert_eq!(
             prompt.reason,
             "command/exec attempted filesystem write outside the current sandbox: /repo/.git"
@@ -730,6 +753,11 @@ mod tests {
 
         let prompt = CommandExecPermissionPolicy::sandbox_denial_prompt(&diagnostic);
 
+        assert_eq!(prompt.origin, RuntimePermissionOrigin::CommandExec);
+        assert_eq!(
+            prompt.kind,
+            RuntimePermissionRequestKind::UnsandboxedShellRetry
+        );
         assert!(
             prompt.reason.contains("without the filesystem sandbox"),
             "unsandboxed retry prompt should explain why the sandbox cannot be amended: {}",

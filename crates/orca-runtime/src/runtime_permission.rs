@@ -58,6 +58,20 @@ impl RuntimePermissionOrigin {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimePermissionRequestKind {
+    NetworkBlock,
+    FilesystemWrite,
+    UnsandboxedShellRetry,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RuntimePermissionDecision {
+    pub(crate) origin: RuntimePermissionOrigin,
+    pub(crate) kind: RuntimePermissionRequestKind,
+    pub(crate) request: RuntimePermissionRequest,
+}
+
 pub(crate) struct RuntimePermissionPolicy;
 
 impl RuntimePermissionPolicy {
@@ -76,32 +90,73 @@ impl RuntimePermissionPolicy {
         }
     }
 
-    pub(crate) fn network_block_request(
+    pub(crate) fn network_block_decision(
         request_id: &str,
         origin: RuntimePermissionOrigin,
         block: &RuntimeNetworkBlockReport,
-    ) -> Option<RuntimePermissionRequest> {
+    ) -> Option<RuntimePermissionDecision> {
         if block.error == "blocked-by-denylist" {
             return None;
         }
 
         let mut domains = HashMap::new();
         domains.insert(block.host.clone(), PermissionProfileNetworkAccess::Allow);
-        Some(RuntimePermissionRequest {
-            id: request_id.to_string(),
-            reason: Some(format!(
-                "{} attempted network access to {} ({})",
-                origin.label(),
-                block.host,
-                block.error
-            )),
-            permissions: RequestPermissionProfile {
-                file_system: None,
-                network: Some(RequestNetworkPermissions {
-                    enabled: None,
-                    domains,
-                }),
-                shell: None,
+        Some(RuntimePermissionDecision {
+            origin,
+            kind: RuntimePermissionRequestKind::NetworkBlock,
+            request: RuntimePermissionRequest {
+                id: request_id.to_string(),
+                reason: Some(format!(
+                    "{} attempted network access to {} ({})",
+                    origin.label(),
+                    block.host,
+                    block.error
+                )),
+                permissions: RequestPermissionProfile {
+                    file_system: None,
+                    network: Some(RequestNetworkPermissions {
+                        enabled: None,
+                        domains,
+                    }),
+                    shell: None,
+                },
+            },
+        })
+    }
+
+    pub(crate) fn network_block_request(
+        request_id: &str,
+        origin: RuntimePermissionOrigin,
+        block: &RuntimeNetworkBlockReport,
+    ) -> Option<RuntimePermissionRequest> {
+        Self::network_block_decision(request_id, origin, block).map(|decision| decision.request)
+    }
+
+    pub(crate) fn filesystem_write_decision(
+        request_id: &str,
+        origin: RuntimePermissionOrigin,
+        diagnostic: &SandboxDenialDiagnostic,
+    ) -> Option<RuntimePermissionDecision> {
+        let write_root = diagnostic.suggested_write_root.as_ref()?.clone();
+        Some(RuntimePermissionDecision {
+            origin,
+            kind: RuntimePermissionRequestKind::FilesystemWrite,
+            request: RuntimePermissionRequest {
+                id: request_id.to_string(),
+                reason: Some(format!(
+                    "{} attempted filesystem write outside the current sandbox: {}",
+                    origin.label(),
+                    write_root.display()
+                )),
+                permissions: RequestPermissionProfile {
+                    file_system: Some(RequestFileSystemPermissions {
+                        read: None,
+                        write: Some(vec![write_root]),
+                        entries: None,
+                    }),
+                    network: None,
+                    shell: None,
+                },
             },
         })
     }
@@ -111,22 +166,33 @@ impl RuntimePermissionPolicy {
         origin: RuntimePermissionOrigin,
         diagnostic: &SandboxDenialDiagnostic,
     ) -> Option<RuntimePermissionRequest> {
-        let write_root = diagnostic.suggested_write_root.as_ref()?.clone();
-        Some(RuntimePermissionRequest {
-            id: request_id.to_string(),
-            reason: Some(format!(
-                "{} attempted filesystem write outside the current sandbox: {}",
-                origin.label(),
-                write_root.display()
-            )),
-            permissions: RequestPermissionProfile {
-                file_system: Some(RequestFileSystemPermissions {
-                    read: None,
-                    write: Some(vec![write_root]),
-                    entries: None,
-                }),
-                network: None,
-                shell: None,
+        Self::filesystem_write_decision(request_id, origin, diagnostic)
+            .map(|decision| decision.request)
+    }
+
+    pub(crate) fn unsandboxed_shell_decision(
+        request_id: &str,
+        origin: RuntimePermissionOrigin,
+        diagnostic: &SandboxDenialDiagnostic,
+    ) -> Option<RuntimePermissionDecision> {
+        if diagnostic.suggested_write_root.is_some() {
+            return None;
+        }
+
+        Some(RuntimePermissionDecision {
+            origin,
+            kind: RuntimePermissionRequestKind::UnsandboxedShellRetry,
+            request: RuntimePermissionRequest {
+                id: request_id.to_string(),
+                reason: Some(format!(
+                    "{} needs to re-run without the filesystem sandbox because the sandbox denied access but did not report a filesystem path to grant",
+                    origin.label()
+                )),
+                permissions: RequestPermissionProfile {
+                    file_system: None,
+                    network: None,
+                    shell: Some(RequestShellPermissions { unsandboxed: true }),
+                },
             },
         })
     }
@@ -136,31 +202,17 @@ impl RuntimePermissionPolicy {
         origin: RuntimePermissionOrigin,
         diagnostic: &SandboxDenialDiagnostic,
     ) -> Option<RuntimePermissionRequest> {
-        if diagnostic.suggested_write_root.is_some() {
-            return None;
-        }
-
-        Some(RuntimePermissionRequest {
-            id: request_id.to_string(),
-            reason: Some(format!(
-                "{} needs to re-run without the filesystem sandbox because the sandbox denied access but did not report a filesystem path to grant",
-                origin.label()
-            )),
-            permissions: RequestPermissionProfile {
-                file_system: None,
-                network: None,
-                shell: Some(RequestShellPermissions { unsandboxed: true }),
-            },
-        })
+        Self::unsandboxed_shell_decision(request_id, origin, diagnostic)
+            .map(|decision| decision.request)
     }
 
-    pub(crate) fn sandbox_denial_request(
+    pub(crate) fn sandbox_denial_decision(
         request_id: &str,
         origin: RuntimePermissionOrigin,
         diagnostic: &SandboxDenialDiagnostic,
-    ) -> RuntimePermissionRequest {
-        Self::filesystem_write_request(request_id, origin, diagnostic).unwrap_or_else(|| {
-            Self::unsandboxed_shell_request(request_id, origin, diagnostic)
+    ) -> RuntimePermissionDecision {
+        Self::filesystem_write_decision(request_id, origin, diagnostic).unwrap_or_else(|| {
+            Self::unsandboxed_shell_decision(request_id, origin, diagnostic)
                 .expect("pathless sandbox denial should request unsandboxed shell retry")
         })
     }
@@ -296,7 +348,7 @@ mod tests {
 
     use super::{
         RuntimePermissionOrigin, RuntimePermissionPolicy, RuntimePermissionPromptDecision,
-        TurnPermissionOverlay,
+        RuntimePermissionRequestKind, TurnPermissionOverlay,
     };
 
     #[test]
@@ -379,19 +431,25 @@ mod tests {
             message: "sandbox denied filesystem access".to_string(),
         };
 
-        let write_request = RuntimePermissionPolicy::sandbox_denial_request(
+        let write_decision = RuntimePermissionPolicy::sandbox_denial_decision(
             "permission-1",
             RuntimePermissionOrigin::Bash,
             &write_diagnostic,
         );
-        let unsandboxed_request = RuntimePermissionPolicy::sandbox_denial_request(
+        let unsandboxed_decision = RuntimePermissionPolicy::sandbox_denial_decision(
             "permission-2",
             RuntimePermissionOrigin::CommandExec,
             &pathless_diagnostic,
         );
 
+        assert_eq!(write_decision.origin, RuntimePermissionOrigin::Bash);
         assert_eq!(
-            write_request
+            write_decision.kind,
+            RuntimePermissionRequestKind::FilesystemWrite
+        );
+        assert_eq!(
+            write_decision
+                .request
                 .permissions
                 .file_system
                 .as_ref()
@@ -399,11 +457,20 @@ mod tests {
             Some(&vec![PathBuf::from("/repo/.git")])
         );
         assert_eq!(
-            write_request.reason.as_deref(),
+            write_decision.request.reason.as_deref(),
             Some("bash attempted filesystem write outside the current sandbox: /repo/.git")
         );
         assert_eq!(
-            unsandboxed_request
+            unsandboxed_decision.origin,
+            RuntimePermissionOrigin::CommandExec
+        );
+        assert_eq!(
+            unsandboxed_decision.kind,
+            RuntimePermissionRequestKind::UnsandboxedShellRetry
+        );
+        assert_eq!(
+            unsandboxed_decision
+                .request
                 .permissions
                 .shell
                 .as_ref()
@@ -411,7 +478,7 @@ mod tests {
             Some(true)
         );
         assert_eq!(
-            unsandboxed_request.reason.as_deref(),
+            unsandboxed_decision.request.reason.as_deref(),
             Some(
                 "command/exec needs to re-run without the filesystem sandbox because the sandbox denied access but did not report a filesystem path to grant"
             )
