@@ -225,13 +225,7 @@ pub(crate) fn command_execution_started_item(
     tool: impl Into<String>,
     command: Option<impl Into<String>>,
 ) -> Value {
-    json!({
-        "id": id.into(),
-        "type": "commandExecution",
-        "tool": tool.into(),
-        "command": command.map(Into::into),
-        "status": "in_progress",
-    })
+    ProjectedCommandExecutionThreadItem::started(id, tool, command).into_value()
 }
 
 pub(crate) fn command_execution_completed_item(
@@ -244,17 +238,86 @@ pub(crate) fn command_execution_completed_item(
     exit_code: Value,
     truncated: Value,
 ) -> Value {
-    json!({
-        "id": id.into(),
-        "type": "commandExecution",
-        "tool": tool.into(),
-        "command": command.map(Into::into),
-        "status": status,
-        "aggregatedOutput": aggregated_output,
-        "error": error,
-        "exitCode": exit_code,
-        "truncated": truncated,
+    ProjectedCommandExecutionThreadItem::completed(ProjectedCommandExecutionCompletion {
+        id: id.into(),
+        tool: tool.into(),
+        command: command.map(Into::into),
+        status,
+        aggregated_output,
+        error,
+        exit_code,
+        truncated,
     })
+    .into_value()
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ProjectedCommandExecutionCompletion {
+    id: String,
+    tool: String,
+    command: Option<String>,
+    status: Value,
+    aggregated_output: Value,
+    error: Value,
+    exit_code: Value,
+    truncated: Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(tag = "type")]
+pub(crate) enum ProjectedCommandExecutionThreadItem {
+    #[serde(rename = "commandExecution")]
+    Started {
+        id: String,
+        tool: String,
+        command: Option<String>,
+        status: String,
+    },
+    #[serde(rename = "commandExecution")]
+    Completed {
+        id: String,
+        tool: String,
+        command: Option<String>,
+        status: Value,
+        #[serde(rename = "aggregatedOutput")]
+        aggregated_output: Value,
+        error: Value,
+        #[serde(rename = "exitCode")]
+        exit_code: Value,
+        truncated: Value,
+    },
+}
+
+impl ProjectedCommandExecutionThreadItem {
+    pub(crate) fn started(
+        id: impl Into<String>,
+        tool: impl Into<String>,
+        command: Option<impl Into<String>>,
+    ) -> Self {
+        Self::Started {
+            id: id.into(),
+            tool: tool.into(),
+            command: command.map(Into::into),
+            status: "in_progress".to_string(),
+        }
+    }
+
+    pub(crate) fn completed(completion: ProjectedCommandExecutionCompletion) -> Self {
+        Self::Completed {
+            id: completion.id,
+            tool: completion.tool,
+            command: completion.command,
+            status: completion.status,
+            aggregated_output: completion.aggregated_output,
+            error: completion.error,
+            exit_code: completion.exit_code,
+            truncated: completion.truncated,
+        }
+    }
+
+    pub(crate) fn into_value(self) -> Value {
+        serde_json::to_value(self).expect("projected command execution thread item serializes")
+    }
 }
 
 pub(crate) fn persisted_command_execution_started_item(
@@ -1066,6 +1129,38 @@ mod tests {
         assert_eq!(item["error"], "command failed");
         assert_eq!(item["exitCode"], 101);
         assert_eq!(item["truncated"], true);
+    }
+
+    #[test]
+    fn projected_command_execution_thread_item_serializes_current_wire_shapes() {
+        assert_eq!(
+            ProjectedCommandExecutionThreadItem::started("tool-1", "bash", Some("cargo test"))
+                .into_value(),
+            command_execution_started_item("tool-1", "bash", Some("cargo test"))
+        );
+        assert_eq!(
+            ProjectedCommandExecutionThreadItem::completed(ProjectedCommandExecutionCompletion {
+                id: "tool-2".to_string(),
+                tool: "bash".to_string(),
+                command: Some("cargo test".to_string()),
+                status: Value::from("completed"),
+                aggregated_output: Value::from("ok"),
+                error: Value::Null,
+                exit_code: Value::from(0),
+                truncated: Value::Null,
+            })
+            .into_value(),
+            command_execution_completed_item(
+                "tool-2",
+                "bash",
+                Some("cargo test"),
+                Value::from("completed"),
+                Value::from("ok"),
+                Value::Null,
+                Value::from(0),
+                Value::Null,
+            )
+        );
     }
 
     #[test]

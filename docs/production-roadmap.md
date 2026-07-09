@@ -3,10 +3,10 @@
 > Goal: evolve Orca into a production-grade DeepSeek-native agent runtime.
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
-Last updated: 2026-07-09
+Last updated: 2026-07-10
 Current baseline: current main after v0.2.3 routes stdio MCP
 `elicitation/create` requests through the TUI pending-interaction path. The
-post-v0.2.3 P0 refactor line now has two narrow slices: the runtime tool
+post-v0.2.3 P0 refactor line now has several narrow slices: the runtime tool
 scheduler makes `runtime_tool_scheduler` own normal, readonly batch, and
 sync-subagent batch selection rules so mixed tool batches stop at
 non-concurrent boundaries, and the text item projection slice moves
@@ -15,7 +15,10 @@ agent-message, plan, and reasoning item lifecycle state into
 shape for the most visible transcript items. The follow-on typed text item slice
 keeps those same wire shapes but constructs agent-message, plan, and reasoning
 items through a focused typed projection enum first, giving the later
-Codex-style `ThreadItem` protocol migration a narrow tested entry point. A
+Codex-style `ThreadItem` protocol migration a narrow tested entry point. The
+same typed-protocol path now covers command execution transcript items too, so
+TUI command cards keep their existing wire shape while moving toward typed
+construction before shell streaming and task-control behavior evolve further. A
 server can now ask for URL/form
 input during an MCP tool call, the TUI projects that request as a visible
 waiting-input prompt keyed by the runtime interaction id, and Orca writes the
