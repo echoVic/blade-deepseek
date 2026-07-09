@@ -1637,6 +1637,30 @@ mod tests {
     }
 
     #[test]
+    fn user_message_item_projection_is_owned_by_tool_item_projection() {
+        let turn_processor_source = include_str!("server/processors/turn.rs");
+        let projection_source = include_str!("tool_item_projection.rs");
+
+        for marker in [
+            "pub(crate) enum ProjectedUserMessageThreadItem",
+            "pub(crate) fn user_message_item(",
+        ] {
+            assert!(
+                projection_source.contains(marker),
+                "tool_item_projection must own user-message item projection detail {marker}"
+            );
+        }
+        assert!(
+            turn_processor_source.contains("user_message_item("),
+            "turn processor must use shared user-message item projection"
+        );
+        assert!(
+            !turn_processor_source.contains("\"type\": \"user_message\""),
+            "turn processor must not hand-roll user-message item JSON"
+        );
+    }
+
+    #[test]
     fn server_thread_query_dispatch_is_owned_by_thread_processor() {
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let router_source = std::fs::read_to_string(manifest_dir.join("src/server/router.rs"))

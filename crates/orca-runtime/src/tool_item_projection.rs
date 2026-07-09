@@ -98,6 +98,7 @@ pub(crate) fn dynamic_tool_completed_item(
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(untagged)]
 pub(crate) enum ProjectedThreadItem {
+    UserMessage(ProjectedUserMessageThreadItem),
     Text(ProjectedTextThreadItem),
     CommandExecution(ProjectedCommandExecutionThreadItem),
     McpTool(ProjectedMcpToolThreadItem),
@@ -109,6 +110,12 @@ pub(crate) enum ProjectedThreadItem {
 impl ProjectedThreadItem {
     pub(crate) fn into_value(self) -> Value {
         serde_json::to_value(self).expect("projected thread item serializes")
+    }
+}
+
+impl From<ProjectedUserMessageThreadItem> for ProjectedThreadItem {
+    fn from(item: ProjectedUserMessageThreadItem) -> Self {
+        Self::UserMessage(item)
     }
 }
 
@@ -145,6 +152,22 @@ impl From<ProjectedFileChangeThreadItem> for ProjectedThreadItem {
 impl From<ProjectedWorkflowThreadItem> for ProjectedThreadItem {
     fn from(item: ProjectedWorkflowThreadItem) -> Self {
         Self::Workflow(item)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(tag = "type")]
+pub(crate) enum ProjectedUserMessageThreadItem {
+    #[serde(rename = "user_message")]
+    Started { role: &'static str, content: String },
+}
+
+impl ProjectedUserMessageThreadItem {
+    pub(crate) fn new(content: impl Into<String>) -> Self {
+        Self::Started {
+            role: "user",
+            content: content.into(),
+        }
     }
 }
 
@@ -657,6 +680,10 @@ pub(crate) fn plan_item(id: impl Into<String>, text: impl Into<String>) -> Value
 
 pub(crate) fn reasoning_item(id: impl Into<String>, summary: impl Into<String>) -> Value {
     ProjectedThreadItem::from(ProjectedTextThreadItem::reasoning(id, summary)).into_value()
+}
+
+pub(crate) fn user_message_item(content: impl Into<String>) -> Value {
+    ProjectedThreadItem::from(ProjectedUserMessageThreadItem::new(content)).into_value()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -1725,6 +1752,10 @@ mod tests {
 
     #[test]
     fn projected_thread_item_serializes_all_typed_transcript_shapes() {
+        assert_eq!(
+            ProjectedThreadItem::from(ProjectedUserMessageThreadItem::new("hello")).into_value(),
+            user_message_item("hello")
+        );
         assert_eq!(
             ProjectedThreadItem::from(ProjectedTextThreadItem::agent_message(
                 "item-agent-message-1",

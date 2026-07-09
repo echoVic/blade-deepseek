@@ -1,9 +1,10 @@
 use std::io;
 use std::sync::{Arc, Mutex};
 
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use super::super::*;
+use crate::tool_item_projection::user_message_item;
 
 pub(in crate::server::router) fn is_control_operation(op: &ClientOp) -> bool {
     matches!(
@@ -133,11 +134,7 @@ fn run_turn_control<W: Write + Send + 'static>(
             ServerEvent::ItemStarted {
                 thread_id: Value::from(thread_id),
                 turn_id: Value::from(turn_id.to_string()),
-                item: json!({
-                    "type": "user_message",
-                    "role": "user",
-                    "content": input,
-                }),
+                item: user_message_item(input),
             },
         )?;
     }
