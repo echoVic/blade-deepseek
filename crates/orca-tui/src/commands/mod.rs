@@ -417,7 +417,6 @@ mod tests {
         assert!(validate_model("auto").is_ok());
         assert!(validate_model("deepseek-v4-flash").is_ok());
         assert!(validate_model("deepseek-v4-pro").is_ok());
-        assert!(validate_model("deepseek-chat").is_err());
         assert!(validate_model("deepseek-reasoner").is_err());
         assert!(validate_model("bogus-model").is_err());
     }

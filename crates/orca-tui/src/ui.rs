@@ -1433,11 +1433,16 @@ fn render_plan_panel(frame: &mut Frame, area: Rect, state: &AppState, theme: &Th
         return;
     };
 
+    let (title, border_color) = if state.plan_update_failed {
+        (" Task Plan (last update failed — may be stale) ", theme.warning)
+    } else {
+        (" Task Plan ", theme.border)
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .title(" Task Plan ")
-        .border_style(Style::default().fg(theme.border));
+        .title(title)
+        .border_style(Style::default().fg(border_color));
 
     let inner = block.inner(area);
     frame.render_widget(block, area);

@@ -85,15 +85,40 @@ pub struct VolatileContext {
     pub plan: Option<String>,
     pub goal: Option<String>,
     pub skill: Option<String>,
+    /// Assistant turns since the pinned plan was last successfully updated.
+    /// Once this passes [`PLAN_REMINDER_AFTER_TURNS`] with open steps left,
+    /// `render` appends a reconciliation reminder. Guards against the model
+    /// finishing (or abandoning) work while the pinned plan silently goes
+    /// stale — e.g. after failed update_plan calls it never retried.
+    pub plan_age_turns: u32,
 }
+
+/// Assistant turns a plan with open steps may go without an update before the
+/// rendered context nudges the model to reconcile it.
+pub const PLAN_REMINDER_AFTER_TURNS: u32 = 10;
+
+const PLAN_REMINDER: &str = "[Plan reminder] The pinned plan above has open steps but has not been updated for a while. If steps were finished, call update_plan now with every step's current status. If the plan no longer matches the work, replace or clear it via update_plan. Do not announce completion while the plan still shows open steps.";
 
 impl VolatileContext {
     pub fn is_empty(&self) -> bool {
         self.runtime.is_none() && self.plan.is_none() && self.goal.is_none() && self.skill.is_none()
     }
 
+    pub fn note_assistant_turn(&mut self) {
+        if self.plan.is_some() {
+            self.plan_age_turns = self.plan_age_turns.saturating_add(1);
+        }
+    }
+
+    fn plan_reminder_due(&self) -> bool {
+        self.plan_age_turns >= PLAN_REMINDER_AFTER_TURNS
+            && self.plan.as_deref().is_some_and(|plan| {
+                plan.contains("[in_progress]") || plan.contains("[pending]")
+            })
+    }
+
     pub fn render(&self) -> String {
-        let mut parts = Vec::new();
+        let mut parts: Vec<&str> = Vec::new();
         if let Some(runtime) = &self.runtime {
             parts.push(runtime.as_str());
         }
@@ -102,6 +127,9 @@ impl VolatileContext {
         }
         if let Some(plan) = &self.plan {
             parts.push(plan.as_str());
+            if self.plan_reminder_due() {
+                parts.push(PLAN_REMINDER);
+            }
         }
         if let Some(skill) = &self.skill {
             parts.push(skill.as_str());
@@ -173,6 +201,7 @@ impl Conversation {
 
     pub fn replace_plan_state(&mut self, content: String) {
         self.volatile.plan = Some(content);
+        self.volatile.plan_age_turns = 0;
     }
 
     pub fn replace_goal_state(&mut self, content: String) {
@@ -232,6 +261,7 @@ impl Conversation {
         reasoning_content: Option<String>,
         tool_calls: Vec<RawToolCall>,
     ) {
+        self.volatile.note_assistant_turn();
         self.messages.push(Message::Assistant {
             content,
             reasoning_content,
@@ -582,6 +612,66 @@ mod tests {
 
         assert_eq!(render_prefix(&conv), snapshot);
         assert_eq!(conv.volatile.plan.as_deref(), Some("plan v3"));
+    }
+
+    #[test]
+    fn stale_plan_with_open_steps_gets_reminder_in_render() {
+        let mut conv = Conversation::new();
+        conv.replace_plan_state(
+            "[Pinned plan state]\n[completed] a\n[in_progress] b\n[pending] c".to_string(),
+        );
+
+        for _ in 0..PLAN_REMINDER_AFTER_TURNS - 1 {
+            conv.add_assistant(Some("working".to_string()), None, vec![]);
+        }
+        assert!(
+            !conv.volatile.render().contains("[Plan reminder]"),
+            "reminder must not fire before the threshold"
+        );
+
+        conv.add_assistant(Some("working".to_string()), None, vec![]);
+        assert!(
+            conv.volatile.render().contains("[Plan reminder]"),
+            "reminder must fire once the plan has gone stale"
+        );
+    }
+
+    #[test]
+    fn plan_update_resets_staleness_reminder() {
+        let mut conv = Conversation::new();
+        conv.replace_plan_state("[Pinned plan state]\n[pending] a".to_string());
+        for _ in 0..PLAN_REMINDER_AFTER_TURNS {
+            conv.add_assistant(None, None, vec![]);
+        }
+        assert!(conv.volatile.render().contains("[Plan reminder]"));
+
+        conv.replace_plan_state("[Pinned plan state]\n[in_progress] a".to_string());
+        assert!(
+            !conv.volatile.render().contains("[Plan reminder]"),
+            "a successful update must clear the reminder"
+        );
+    }
+
+    #[test]
+    fn fully_completed_plan_never_reminds() {
+        let mut conv = Conversation::new();
+        conv.replace_plan_state("[Pinned plan state]\n[completed] a\n[completed] b".to_string());
+        for _ in 0..PLAN_REMINDER_AFTER_TURNS * 2 {
+            conv.add_assistant(None, None, vec![]);
+        }
+        assert!(!conv.volatile.render().contains("[Plan reminder]"));
+    }
+
+    #[test]
+    fn assistant_turns_without_plan_do_not_accumulate_age() {
+        let mut conv = Conversation::new();
+        for _ in 0..PLAN_REMINDER_AFTER_TURNS * 2 {
+            conv.add_assistant(None, None, vec![]);
+        }
+        assert_eq!(conv.volatile.plan_age_turns, 0);
+
+        conv.replace_plan_state("[Pinned plan state]\n[pending] a".to_string());
+        assert!(!conv.volatile.render().contains("[Plan reminder]"));
     }
 
     #[test]

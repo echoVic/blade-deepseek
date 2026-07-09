@@ -345,7 +345,7 @@ mod tests {
         let config = config();
         let cwd = tempfile::tempdir().expect("cwd");
         let context_config = context::ContextConfig::for_model_with_runtime(
-            Some("deepseek-chat"),
+            Some(orca_core::model::FLASH_MODEL),
             &config.model_runtime,
         );
         let provider_config = ProviderConfig {

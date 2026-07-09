@@ -214,6 +214,13 @@ impl ToolRegistry {
     }
 }
 
+/// Tools whose input schemas fit the DeepSeek strict-mode JSON Schema subset
+/// (every object lists all properties as required once optional fields are made
+/// nullable, additionalProperties is false throughout, and no unsupported
+/// keywords such as oneOf/minLength/minItems are used). Providers opt these
+/// tools into strict function calling on endpoints that support it.
+pub const STRICT_MODE_TOOL_NAMES: &[&str] = &["update_plan"];
+
 pub fn validate_tool_request(registry: &ToolRegistry, request: &ToolRequest) -> Result<(), String> {
     let Some(resolved) = registry.resolve(request.name.as_str()) else {
         return Err(format!("unknown tool: {}", request.name.as_str()));
@@ -340,7 +347,10 @@ fn validate_object(path: &str, value: &Value, schema: &Value) -> Result<(), Stri
     if let Some(required) = schema.get("required").and_then(Value::as_array) {
         for field in required.iter().filter_map(Value::as_str) {
             if !object.contains_key(field) {
-                return Err(format!("{path}: missing required property \"{field}\""));
+                return Err(format!(
+                    "{path}: missing required property \"{field}\" (required: {})",
+                    property_name_list(required.iter().filter_map(Value::as_str))
+                ));
             }
         }
     }
@@ -350,7 +360,10 @@ fn validate_object(path: &str, value: &Value, schema: &Value) -> Result<(), Stri
     {
         for key in object.keys() {
             if !properties.contains_key(key) {
-                return Err(format!("{path}: unexpected property \"{key}\""));
+                return Err(format!(
+                    "{path}: unexpected property \"{key}\" (allowed: {})",
+                    property_name_list(properties.keys().map(String::as_str))
+                ));
             }
         }
     }
@@ -364,6 +377,16 @@ fn validate_object(path: &str, value: &Value, schema: &Value) -> Result<(), Stri
     }
 
     Ok(())
+}
+
+fn property_name_list<'a>(names: impl Iterator<Item = &'a str>) -> String {
+    let mut names: Vec<&str> = names.collect();
+    names.sort_unstable();
+    names
+        .iter()
+        .map(|name| format!("\"{name}\""))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn validate_array(path: &str, value: &Value, schema: &Value) -> Result<(), String> {
@@ -1070,7 +1093,7 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
                 "type": "object",
                 "properties": {
                     "explanation": {
-                        "type": "string",
+                        "anyOf": [{"type": "string"}, {"type": "null"}],
                         "description": "Optional short explanation for this plan update"
                     },
                     "plan": {
@@ -1880,6 +1903,49 @@ mod tests {
             result
                 .expect_err("oneOf should reject missing query")
                 .contains("expected exactly one oneOf schema to match"),
+        );
+    }
+
+    #[test]
+    fn update_plan_accepts_null_explanation() {
+        // DeepSeek strict mode forces `explanation` to always be emitted,
+        // sometimes as null; the base schema must accept that shape too.
+        let registry = default_tool_registry();
+        validate_tool_request(
+            registry,
+            &request(
+                ToolName::UpdatePlan,
+                r#"{"explanation":null,"plan":[{"step":"a","status":"pending"}]}"#,
+            ),
+        )
+        .expect("null explanation must validate");
+    }
+
+    #[test]
+    fn validation_errors_teach_allowed_and_required_properties() {
+        let registry = default_tool_registry();
+
+        let unexpected = validate_tool_request(
+            registry,
+            &request(
+                ToolName::UpdatePlan,
+                r#"{"plan":[{"status":"completed","step":"a","extra":true}]}"#,
+            ),
+        )
+        .expect_err("unexpected property must be rejected");
+        assert!(
+            unexpected.contains(r#"unexpected property "extra" (allowed: "status", "step")"#),
+            "error should list allowed properties: {unexpected}"
+        );
+
+        let missing = validate_tool_request(
+            registry,
+            &request(ToolName::UpdatePlan, r#"{"plan":[{"step":"a"}]}"#),
+        )
+        .expect_err("missing status must be rejected");
+        assert!(
+            missing.contains(r#"missing required property "status" (required: "status", "step")"#),
+            "error should list required properties: {missing}"
         );
     }
 

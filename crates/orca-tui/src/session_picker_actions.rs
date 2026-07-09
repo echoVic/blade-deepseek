@@ -77,6 +77,7 @@ where
         } else {
             state.current_plan = None;
         }
+        state.plan_update_failed = false;
         state.messages.push(ChatMessage::System(
             "Resumed saved conversation.".to_string(),
         ));

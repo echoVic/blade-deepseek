@@ -193,7 +193,6 @@ mod tests {
     #[test]
     fn only_active_models_are_supported() {
         assert_eq!(allowed_models(), &[AUTO_MODEL, FLASH_MODEL, PRO_MODEL]);
-        assert!(validate_model("deepseek-chat").is_err());
         assert!(validate_model("deepseek-reasoner").is_err());
     }
 

@@ -478,6 +478,9 @@ pub struct AppState {
     pub mention_candidates: Vec<String>,
     pub mention_selected: usize,
     pub current_plan: Option<(Option<String>, Vec<PlanItem>)>,
+    /// The most recent update_plan call failed, so `current_plan` may be
+    /// showing outdated statuses. Cleared by the next successful update.
+    pub plan_update_failed: bool,
     pub current_goal: Option<ThreadGoal>,
     pub panel_mode: PanelMode,
     pub workflow_panel: WorkflowPanelState,
@@ -530,6 +533,7 @@ impl AppState {
             mention_candidates: Vec::new(),
             mention_selected: 0,
             current_plan: None,
+            plan_update_failed: false,
             current_goal: None,
             panel_mode: PanelMode::Conversation,
             workflow_panel: WorkflowPanelState::default(),
@@ -967,7 +971,16 @@ impl AppState {
                 if self.suppress_background_main_session_output {
                     return;
                 }
-                if name == "subagent" || name == "update_plan" {
+                if name == "update_plan" {
+                    // update_plan renders through the pinned plan panel, not
+                    // the scrollback; a failed call means that panel is now
+                    // showing outdated statuses.
+                    if status != "completed" {
+                        self.plan_update_failed = true;
+                    }
+                    return;
+                }
+                if name == "subagent" {
                     return;
                 }
                 let updated = if let Some(ChatMessage::ToolCall {
@@ -1022,6 +1035,7 @@ impl AppState {
                 // The live plan is shown in the bottom panel during the turn. It is archived
                 // inline (and the panel cleared) when the turn completes, so we avoid pushing a
                 // message on every update to keep the scrollback clean.
+                self.plan_update_failed = false;
                 self.current_plan = if plan.is_empty() {
                     None
                 } else {
@@ -1298,6 +1312,7 @@ impl AppState {
     /// Move the live plan out of the bottom panel and into the scrollback as an archived
     /// checklist when a turn ends, so the panel stops occluding content once work is done.
     fn archive_current_plan(&mut self) {
+        self.plan_update_failed = false;
         if let Some((explanation, plan)) = self.current_plan.take()
             && !plan.is_empty()
         {
@@ -2105,6 +2120,72 @@ mod tests {
             }
             other => panic!("expected plan update message, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn failed_plan_update_marks_panel_stale_until_next_success() {
+        let mut state = state();
+
+        state.update(TuiEvent::PlanUpdated {
+            explanation: None,
+            plan: vec![PlanItem {
+                step: "Inspect".to_string(),
+                status: PlanStatus::InProgress,
+            }],
+        });
+        assert!(!state.plan_update_failed);
+
+        state.update(TuiEvent::ToolCompleted {
+            id: "tool-plan-2".to_string(),
+            name: "update_plan".to_string(),
+            status: "failed".to_string(),
+            output: "tool arguments failed schema validation".to_string(),
+            diff: None,
+            kind: Some("error".to_string()),
+        });
+        assert!(
+            state.plan_update_failed,
+            "failed update must mark the panel stale"
+        );
+        assert!(state.current_plan.is_some(), "the stale plan stays visible");
+
+        state.update(TuiEvent::PlanUpdated {
+            explanation: None,
+            plan: vec![PlanItem {
+                step: "Inspect".to_string(),
+                status: PlanStatus::Completed,
+            }],
+        });
+        assert!(
+            !state.plan_update_failed,
+            "a successful update clears the stale marker"
+        );
+    }
+
+    #[test]
+    fn turn_completion_clears_plan_stale_marker() {
+        let mut state = state();
+        state.update(TuiEvent::PlanUpdated {
+            explanation: None,
+            plan: vec![PlanItem {
+                step: "Inspect".to_string(),
+                status: PlanStatus::Pending,
+            }],
+        });
+        state.update(TuiEvent::ToolCompleted {
+            id: "tool-plan".to_string(),
+            name: "update_plan".to_string(),
+            status: "failed".to_string(),
+            output: "schema validation".to_string(),
+            diff: None,
+            kind: Some("error".to_string()),
+        });
+        assert!(state.plan_update_failed);
+
+        state.update(TuiEvent::SessionCompleted {
+            status: "success".to_string(),
+        });
+        assert!(!state.plan_update_failed);
     }
 
     #[test]

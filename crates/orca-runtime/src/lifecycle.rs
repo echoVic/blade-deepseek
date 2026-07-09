@@ -1453,7 +1453,7 @@ mod tests {
         };
         let runtime = ModelRuntimeConfig::default();
         let context_config =
-            context::ContextConfig::for_model_with_runtime(Some("deepseek-chat"), &runtime);
+            context::ContextConfig::for_model_with_runtime(Some(orca_core::model::FLASH_MODEL), &runtime);
         let hooks = HookRunner::default();
         let mut conversation = Conversation::new();
         let mut cost_tracker = CostTracker::new(None);

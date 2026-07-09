@@ -16,6 +16,76 @@ use crate::tool_schema::deepseek_tools_schema_with_mcp_and_external;
 const DEFAULT_BASE_URL: &str = "https://api.deepseek.com";
 const DEFAULT_MODEL: &str = "deepseek-v4-flash";
 
+/// DeepSeek strict function calling (Beta) is only served on the /beta endpoint.
+fn is_strict_capable_endpoint(base_url: &str) -> bool {
+    base_url.trim_end_matches('/').ends_with("/beta")
+}
+
+/// Returns a strict-mode copy of the tool list for beta endpoints: allowlisted
+/// tools get `strict: true` plus the schema shape strict mode demands (every
+/// object property listed in `required`; optional fields are already nullable
+/// in the base schemas). Returns None when the endpoint does not support strict
+/// mode or no tool qualified, so callers know whether a fallback retry without
+/// strict is meaningful. Public so real-API harnesses can probe the exact
+/// strict payload the provider sends.
+pub fn strict_tools_for_endpoint(tools: &[Value], base_url: &str) -> Option<Vec<Value>> {
+    if !is_strict_capable_endpoint(base_url) {
+        return None;
+    }
+    let mut strict_tools = tools.to_vec();
+    let mut changed = false;
+    for tool in &mut strict_tools {
+        let Some(function) = tool.get_mut("function").and_then(Value::as_object_mut) else {
+            continue;
+        };
+        let strict_capable = function
+            .get("name")
+            .and_then(Value::as_str)
+            .is_some_and(|name| registry::STRICT_MODE_TOOL_NAMES.contains(&name));
+        if !strict_capable {
+            continue;
+        }
+        if let Some(parameters) = function.get_mut("parameters") {
+            require_all_properties(parameters);
+        }
+        function.insert("strict".to_string(), Value::Bool(true));
+        changed = true;
+    }
+    changed.then_some(strict_tools)
+}
+
+/// Strict mode rejects object schemas whose `required` omits any property.
+fn require_all_properties(schema: &mut Value) {
+    let Some(object) = schema.as_object_mut() else {
+        return;
+    };
+    if let Some(properties) = object.get("properties").and_then(Value::as_object) {
+        let names: Vec<Value> = properties.keys().cloned().map(Value::String).collect();
+        object.insert("required".to_string(), Value::Array(names));
+    }
+    if let Some(properties) = object.get_mut("properties").and_then(Value::as_object_mut) {
+        for child in properties.values_mut() {
+            require_all_properties(child);
+        }
+    }
+    if let Some(items) = object.get_mut("items") {
+        require_all_properties(items);
+    }
+    for keyword in ["anyOf", "oneOf"] {
+        if let Some(branches) = object.get_mut(keyword).and_then(Value::as_array_mut) {
+            for branch in branches {
+                require_all_properties(branch);
+            }
+        }
+    }
+}
+
+/// The beta endpoint reports strict-schema rejections as HTTP 400; both retry
+/// helpers embed the status in their error strings.
+fn is_strict_schema_rejection(error: &str) -> bool {
+    error.contains("(400") || error.contains("400 Bad Request")
+}
+
 #[derive(Debug, Serialize)]
 struct ChatRequest {
     model: String,
@@ -177,21 +247,34 @@ fn request_chat_streaming(
             &config.external_tools,
         )
     });
+    let strict_tools = strict_tools_for_endpoint(&tools, base_url);
+    let strict_applied = strict_tools.is_some();
 
-    let request = ChatRequest {
+    let mut request = ChatRequest {
         model: model.to_string(),
         messages,
         stream: true,
         stream_options: Some(StreamOptions {
             include_usage: true,
         }),
-        tools: Some(tools),
+        tools: Some(strict_tools.unwrap_or_else(|| tools.clone())),
         reasoning_effort: Some(config.reasoning_effort),
     };
 
-    let response = crate::http_client::execute_streaming_with_retry(|client| {
+    let response = match crate::http_client::execute_streaming_with_retry(|client| {
         client.post(&url).bearer_auth(api_key).json(&request)
-    })?;
+    }) {
+        Ok(response) => response,
+        // Strict mode is Beta; if the server rejects the strict schema, retry
+        // once with the plain tool list rather than failing the whole turn.
+        Err(error) if strict_applied && is_strict_schema_rejection(&error) => {
+            request.tools = Some(tools);
+            crate::http_client::execute_streaming_with_retry(|client| {
+                client.post(&url).bearer_auth(api_key).json(&request)
+            })?
+        }
+        Err(error) => return Err(error),
+    };
 
     let mut steps = Vec::new();
 
@@ -319,21 +402,35 @@ fn request_chat(
             &config.external_tools,
         )
     });
+    let strict_tools = strict_tools_for_endpoint(&tools, base_url);
+    let strict_applied = strict_tools.is_some();
 
-    let request = ChatRequest {
+    let mut request = ChatRequest {
         model: model.to_string(),
         messages,
         stream: false,
         stream_options: None,
-        tools: Some(tools),
+        tools: Some(strict_tools.unwrap_or_else(|| tools.clone())),
         reasoning_effort: Some(config.reasoning_effort),
     };
 
-    let response = crate::http_client::execute_with_retry(|client| {
+    let response = match crate::http_client::execute_with_retry(|client| {
         client.post(&url).bearer_auth(api_key).json(&request)
-    })?
-    .json::<ChatResponse>()
-    .map_err(|error| format!("invalid response: {error}"))?;
+    }) {
+        Ok(response) => response,
+        // Strict mode is Beta; if the server rejects the strict schema, retry
+        // once with the plain tool list rather than failing the whole turn.
+        Err(error) if strict_applied && is_strict_schema_rejection(&error) => {
+            request.tools = Some(tools);
+            crate::http_client::execute_with_retry(|client| {
+                client.post(&url).bearer_auth(api_key).json(&request)
+            })?
+        }
+        Err(error) => return Err(error),
+    };
+    let response = response
+        .json::<ChatResponse>()
+        .map_err(|error| format!("invalid response: {error}"))?;
 
     let usage = response.usage.map(Usage::from);
     let choice = response
@@ -481,8 +578,21 @@ fn parse_tool_call(
         name,
         action,
         target,
-        raw_arguments: Some(tc.function.arguments.clone()),
+        raw_arguments: Some(normalized_raw_arguments(schema_name, &tc.function.arguments)),
     })
+}
+
+/// Rewrites known-recoverable argument shapes before schema validation sees them.
+/// DeepSeek has no strict-mode guarantee on the default endpoint and regularly
+/// emits `update_plan` items with boolean status flags, which would otherwise be
+/// rejected and silently strand the pinned plan state.
+fn normalized_raw_arguments(schema_name: &str, raw: &str) -> String {
+    if schema_name == "update_plan"
+        && let Some(normalized) = orca_tools::update_plan::normalize_raw_arguments(raw)
+    {
+        return normalized;
+    }
+    raw.to_string()
 }
 
 pub(crate) fn conversation_to_api_messages(conversation: &Conversation) -> Vec<ApiMessage> {
@@ -662,6 +772,96 @@ mod tests {
         let req = parse_tool_call(&tc, &[]).unwrap();
         assert_eq!(req.name, ToolName::ListFiles);
         assert_eq!(req.target.as_deref(), Some("."));
+    }
+
+    #[test]
+    fn parse_update_plan_normalizes_boolean_status_flags() {
+        // Both malformed shapes DeepSeek emits in the wild: flags without status
+        // and flags redundant with status. Normalized output must pass the same
+        // schema validation that runs before tool execution.
+        let tc = make_tc(
+            "update_plan",
+            r#"{"plan":[{"completed":true,"step":"a"},{"in_progress":true,"status":"in_progress","step":"b"}]}"#,
+        );
+        let req = parse_tool_call(&tc, &[]).unwrap();
+
+        let raw = req.raw_arguments.as_deref().unwrap();
+        let value: Value = serde_json::from_str(raw).unwrap();
+        assert_eq!(value["plan"][0]["status"], "completed");
+        assert!(value["plan"][0].get("completed").is_none());
+        assert_eq!(value["plan"][1]["status"], "in_progress");
+        assert!(value["plan"][1].get("in_progress").is_none());
+
+        let reg = registry::tool_registry_with_mcp_and_external(None, &[]);
+        registry::validate_tool_request(&reg, &req).expect("normalized args must validate");
+    }
+
+    #[test]
+    fn parse_update_plan_leaves_clean_arguments_untouched() {
+        let clean = r#"{"explanation":"x","plan":[{"step":"a","status":"pending"}]}"#;
+        let tc = make_tc("update_plan", clean);
+        let req = parse_tool_call(&tc, &[]).unwrap();
+        assert_eq!(req.raw_arguments.as_deref(), Some(clean));
+    }
+
+    #[test]
+    fn strict_tools_apply_only_on_beta_endpoint_to_allowlisted_tools() {
+        let tools = deepseek_tools_schema_with_mcp_and_external(None, &[]);
+
+        assert!(strict_tools_for_endpoint(&tools, "https://api.deepseek.com").is_none());
+        assert!(strict_tools_for_endpoint(&tools, DEFAULT_BASE_URL).is_none());
+
+        let strict = strict_tools_for_endpoint(&tools, "https://api.deepseek.com/beta")
+            .expect("beta endpoint must produce a strict tool list");
+        let update_plan = strict
+            .iter()
+            .find(|tool| {
+                tool.pointer("/function/name").and_then(Value::as_str) == Some("update_plan")
+            })
+            .expect("update_plan present");
+        assert_eq!(
+            update_plan.pointer("/function/strict"),
+            Some(&Value::Bool(true))
+        );
+        // Strict mode demands every property listed in required.
+        assert_eq!(
+            update_plan.pointer("/function/parameters/required"),
+            Some(&serde_json::json!(["explanation", "plan"]))
+        );
+
+        let bash = strict
+            .iter()
+            .find(|tool| tool.pointer("/function/name").and_then(Value::as_str) == Some("bash"))
+            .expect("bash present");
+        assert!(
+            bash.pointer("/function/strict").is_none(),
+            "non-allowlisted tools must stay non-strict"
+        );
+
+        // The original list must stay untouched for the fallback retry.
+        let original_update_plan = tools
+            .iter()
+            .find(|tool| {
+                tool.pointer("/function/name").and_then(Value::as_str) == Some("update_plan")
+            })
+            .expect("update_plan present");
+        assert!(original_update_plan.pointer("/function/strict").is_none());
+    }
+
+    #[test]
+    fn strict_rejection_detection_matches_retry_helper_error_strings() {
+        assert!(is_strict_schema_rejection(
+            "request error (400 Bad Request): invalid tools"
+        ));
+        assert!(is_strict_schema_rejection(
+            "request error: HTTP status client error (400 Bad Request) for url (https://api.deepseek.com/beta/chat/completions)"
+        ));
+        assert!(!is_strict_schema_rejection(
+            "max retries exceeded (last status: 500 Internal Server Error)"
+        ));
+        assert!(!is_strict_schema_rejection(
+            "request failed after 3 attempts: connection refused"
+        ));
     }
 
     #[test]

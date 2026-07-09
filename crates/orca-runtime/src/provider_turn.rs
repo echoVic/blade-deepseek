@@ -811,7 +811,7 @@ mod tests {
         };
         let runtime = ModelRuntimeConfig::default();
         let context_config =
-            context::ContextConfig::for_model_with_runtime(Some("deepseek-chat"), &runtime);
+            context::ContextConfig::for_model_with_runtime(Some(orca_core::model::FLASH_MODEL), &runtime);
         let provider_config = ProviderConfig {
             api_key: None,
             base_url: None,
@@ -966,7 +966,7 @@ mod tests {
         };
         let runtime = ModelRuntimeConfig::default();
         let context_config =
-            context::ContextConfig::for_model_with_runtime(Some("deepseek-chat"), &runtime);
+            context::ContextConfig::for_model_with_runtime(Some(orca_core::model::FLASH_MODEL), &runtime);
         let provider_config = ProviderConfig {
             api_key: None,
             base_url: None,
@@ -1218,7 +1218,7 @@ mod tests {
         };
         let runtime = ModelRuntimeConfig::default();
         let context_config =
-            context::ContextConfig::for_model_with_runtime(Some("deepseek-chat"), &runtime);
+            context::ContextConfig::for_model_with_runtime(Some(orca_core::model::FLASH_MODEL), &runtime);
         let provider_config = ProviderConfig {
             api_key: None,
             base_url: None,
