@@ -1,0 +1,41 @@
+crates/orca-provider/examples/reasoning_replay_realapi.rs
+  s_c08b9d3297e4c9::t_5260955ca32bcf 1-186
+crates/orca-provider/examples/update_plan_strict_realapi.rs
+  s_8dfe1d035fabb3::t_28a7c245a3967b 115-118,184-186,210-211
+crates/orca-provider/src/deepseek_http.rs
+  s_8dfe1d035fabb3::t_984c3a1d65d661 18-21,66-68,105-106,258,270,274-288,290-303,305-307,309-312,315-319,321-339,343-348,350-364,366-368,370-375,377-383,386,420,430,434-459,461-462,464,466-479,481-482,485,488-489,491-519,524-533,535-541,544-549,610-613,627-629,633-657,691,715-718,783-785,797-849,918-943,977-1008,1239-1285,1343,1350-1403
+crates/orca-provider/src/system_prompt.rs
+  s_8dfe1d035fabb3::t_a1ab9f43462f39 60,130,148-157
+crates/orca-tools/src/lib.rs
+  s_8dfe1d035fabb3::t_8dd22f2eb3b622 901-903,905,907
+crates/orca-tools/src/registry.rs
+  s_8dfe1d035fabb3::t_56d3272c114d36 222,482,486,490-493,497,501-504,508-511,515,1191,1903,1910-1911
+crates/orca-tools/src/update_goal.rs
+  s_8dfe1d035fabb3::t_d1993bfda9fb30 43-44,123-126,145-195,303-337
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "dfc8d4e2ee7c76761aaf384b498677757a18e8c7",
+  "prompts": {},
+  "sessions": {
+    "s_8dfe1d035fabb3": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f4690-356d-72b3-89ef-99218ec1fd6d",
+        "model": "unknown"
+      },
+      "human_author": "echoVic <137844255@qq.com>"
+    },
+    "s_c08b9d3297e4c9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "585a9efb-cf04-4231-aa30-ebab1b4a3e76",
+        "model": "unknown"
+      },
+      "human_author": "echoVic <137844255@qq.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
