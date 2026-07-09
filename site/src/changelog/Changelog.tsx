@@ -76,6 +76,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.8":
+        "Command/exec sandbox and permission-profile resolution now lives behind a focused server module instead of the generic server loop. TUI bash and server command/exec still share the same sandbox behavior and JSON wire shapes, while the permission-profile boundary is easier to test before future network, filesystem, and task-control changes.",
       "v0.2.7":
         "Core now owns the reusable thread-item projection types for user, persisted, assistant-message, proposed-plan, and reasoning transcript items. Runtime projection still emits the same TUI/server JSON, but live streams, active steer messages, and resumed history now share one typed item boundary before serialization, reducing drift in the transcript cards users see.",
       "v0.2.6":
@@ -468,6 +470,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.8":
+        "Command/exec sandbox 与 permission-profile resolution 现在归属到 focused server module，不再压在泛化的 server loop 里。TUI bash 和 server command/exec 仍然共享同一套 sandbox 行为与 JSON wire shape，但 permission-profile 边界更容易测试，为后续网络、文件系统和任务控制改动降低回归风险。",
       "v0.2.7":
         "Core 现在拥有 user、persisted、assistant-message、proposed-plan 和 reasoning transcript item 的可复用投影类型。Runtime projection 仍然输出相同的 TUI/server JSON，但 live stream、active steer message 与 resumed history 会先经过同一个 typed item 边界再序列化，减少用户看到的 transcript card 漂移。",
       "v0.2.6":
