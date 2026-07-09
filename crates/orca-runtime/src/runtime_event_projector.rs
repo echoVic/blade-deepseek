@@ -4,10 +4,10 @@ use serde_json::{Value, json};
 
 use crate::protocol::{self, ServerEvent};
 use crate::tool_item_projection::{
-    agent_message_item, command_execution_completed_item, command_execution_started_item,
-    dynamic_tool_completed_item, dynamic_tool_started_item, file_change_completed_item,
-    file_change_started_item, mcp_result_from_content, mcp_tool_completed_item, mcp_tool_parts,
-    mcp_tool_started_item, parse_json_or_null, plan_item, reasoning_item,
+    ProjectedTextItem, ProjectedTextItemKind, command_execution_completed_item,
+    command_execution_started_item, dynamic_tool_completed_item, dynamic_tool_started_item,
+    file_change_completed_item, file_change_started_item, mcp_result_from_content,
+    mcp_tool_completed_item, mcp_tool_parts, mcp_tool_started_item, parse_json_or_null,
     tool_error_object_from_value, tool_status_is_completed, workflow_completed_item,
     workflow_started_item,
 };
@@ -17,10 +17,10 @@ const PROPOSED_PLAN_CLOSE: &str = "</proposed_plan>";
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct RuntimeEventProjector {
-    agent_message: Option<AgentMessageItem>,
-    plan: Option<PlanItem>,
+    agent_message: Option<ProjectedTextItem>,
+    plan: Option<ProjectedTextItem>,
     plan_parser: ProposedPlanStreamParser,
-    reasoning: Option<ReasoningItem>,
+    reasoning: Option<ProjectedTextItem>,
     tool_items: HashMap<String, ToolCallItem>,
     file_change_items: HashMap<String, FileChangeItem>,
     workflow_items: HashMap<String, WorkflowItem>,
@@ -86,20 +86,21 @@ impl RuntimeEventProjector {
 
     fn project_reasoning_delta(&mut self, delta: &str, events: &mut Vec<ServerEvent>) {
         if self.reasoning.is_none() {
-            self.reasoning = Some(ReasoningItem {
-                id: "item-reasoning-1".to_string(),
-                summary: String::new(),
-            });
+            self.reasoning = Some(ProjectedTextItem::new(ProjectedTextItemKind::Reasoning));
             events.push(ServerEvent::ItemStarted {
                 thread_id: Value::Null,
                 turn_id: Value::Null,
-                item: reasoning_item("item-reasoning-1", ""),
+                item: self
+                    .reasoning
+                    .as_ref()
+                    .expect("reasoning item")
+                    .started_item(),
             });
         }
         if let Some(item) = &mut self.reasoning {
-            item.summary.push_str(delta);
+            item.push_delta(delta);
             events.push(ServerEvent::ItemReasoningDelta {
-                item_id: Value::from(item.id.clone()),
+                item_id: Value::from(item.id().to_string()),
                 delta: Value::from(delta.to_string()),
             });
         }
@@ -128,20 +129,21 @@ impl RuntimeEventProjector {
             return;
         }
         if self.agent_message.is_none() {
-            self.agent_message = Some(AgentMessageItem {
-                id: "item-agent-message-1".to_string(),
-                text: String::new(),
-            });
+            self.agent_message = Some(ProjectedTextItem::new(ProjectedTextItemKind::AgentMessage));
             events.push(ServerEvent::ItemStarted {
                 thread_id: Value::Null,
                 turn_id: Value::Null,
-                item: agent_message_item("item-agent-message-1", ""),
+                item: self
+                    .agent_message
+                    .as_ref()
+                    .expect("agent message item")
+                    .started_item(),
             });
         }
         if let Some(item) = &mut self.agent_message {
-            item.text.push_str(delta);
+            item.push_delta(delta);
             events.push(ServerEvent::ItemMessageDelta {
-                item_id: Value::from(item.id.clone()),
+                item_id: Value::from(item.id().to_string()),
                 delta: Value::from(delta.to_string()),
             });
         }
@@ -152,20 +154,17 @@ impl RuntimeEventProjector {
             return;
         }
         if self.plan.is_none() {
-            self.plan = Some(PlanItem {
-                id: "item-plan-1".to_string(),
-                text: String::new(),
-            });
+            self.plan = Some(ProjectedTextItem::new(ProjectedTextItemKind::Plan));
             events.push(ServerEvent::ItemStarted {
                 thread_id: Value::Null,
                 turn_id: Value::Null,
-                item: plan_item("item-plan-1", ""),
+                item: self.plan.as_ref().expect("plan item").started_item(),
             });
         }
         if let Some(item) = &mut self.plan {
-            item.text.push_str(delta);
+            item.push_delta(delta);
             events.push(ServerEvent::ItemPlanDelta {
-                item_id: Value::from(item.id.clone()),
+                item_id: Value::from(item.id().to_string()),
                 delta: Value::from(delta.to_string()),
             });
         }
@@ -176,21 +175,21 @@ impl RuntimeEventProjector {
             events.push(ServerEvent::ItemCompleted {
                 thread_id: Value::Null,
                 turn_id: Value::Null,
-                item: agent_message_item(item.id, item.text),
+                item: item.completed_item(),
             });
         }
         if let Some(item) = self.plan.take() {
             events.push(ServerEvent::ItemCompleted {
                 thread_id: Value::Null,
                 turn_id: Value::Null,
-                item: plan_item(item.id, item.text),
+                item: item.completed_item(),
             });
         }
         if let Some(item) = self.reasoning.take() {
             events.push(ServerEvent::ItemCompleted {
                 thread_id: Value::Null,
                 turn_id: Value::Null,
-                item: reasoning_item(item.id, item.summary),
+                item: item.completed_item(),
             });
         }
     }
@@ -457,24 +456,6 @@ struct ProposedPlanStreamParser {
 enum ProposedPlanSegment {
     Agent(String),
     Plan(String),
-}
-
-#[derive(Clone, Debug)]
-struct AgentMessageItem {
-    id: String,
-    text: String,
-}
-
-#[derive(Clone, Debug)]
-struct PlanItem {
-    id: String,
-    text: String,
-}
-
-#[derive(Clone, Debug)]
-struct ReasoningItem {
-    id: String,
-    summary: String,
 }
 
 #[derive(Clone, Debug)]

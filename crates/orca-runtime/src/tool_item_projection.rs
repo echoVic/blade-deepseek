@@ -131,6 +131,64 @@ pub(crate) fn reasoning_item(id: impl Into<String>, summary: impl Into<String>) 
     })
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProjectedTextItemKind {
+    AgentMessage,
+    Plan,
+    Reasoning,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProjectedTextItem {
+    kind: ProjectedTextItemKind,
+    id: &'static str,
+    text: String,
+}
+
+impl ProjectedTextItem {
+    pub(crate) fn new(kind: ProjectedTextItemKind) -> Self {
+        Self {
+            kind,
+            id: kind.id(),
+            text: String::new(),
+        }
+    }
+
+    pub(crate) fn id(&self) -> &str {
+        self.id
+    }
+
+    pub(crate) fn push_delta(&mut self, delta: &str) {
+        self.text.push_str(delta);
+    }
+
+    pub(crate) fn started_item(&self) -> Value {
+        self.kind.item(self.id, "")
+    }
+
+    pub(crate) fn completed_item(self) -> Value {
+        self.kind.item(self.id, self.text)
+    }
+}
+
+impl ProjectedTextItemKind {
+    fn id(self) -> &'static str {
+        match self {
+            Self::AgentMessage => "item-agent-message-1",
+            Self::Plan => "item-plan-1",
+            Self::Reasoning => "item-reasoning-1",
+        }
+    }
+
+    fn item(self, id: impl Into<String>, text: impl Into<String>) -> Value {
+        match self {
+            Self::AgentMessage => agent_message_item(id, text),
+            Self::Plan => plan_item(id, text),
+            Self::Reasoning => reasoning_item(id, text),
+        }
+    }
+}
+
 pub(crate) fn command_execution_started_item(
     id: impl Into<String>,
     tool: impl Into<String>,
@@ -863,6 +921,40 @@ mod tests {
         assert_eq!(started["content"], "");
         assert_eq!(completed["id"], "item-reasoning-1");
         assert_eq!(completed["type"], "reasoning");
+        assert_eq!(completed["summary"], "thinking");
+        assert_eq!(completed["content"], "");
+    }
+
+    #[test]
+    fn projected_text_item_accumulates_agent_message_lifecycle_shape() {
+        let mut item = ProjectedTextItem::new(ProjectedTextItemKind::AgentMessage);
+
+        assert_eq!(item.id(), "item-agent-message-1");
+        assert_eq!(item.started_item()["type"], "agent_message");
+        assert_eq!(item.started_item()["text"], "");
+
+        item.push_delta("hello ");
+        item.push_delta("world");
+        let completed = item.completed_item();
+
+        assert_eq!(completed["id"], "item-agent-message-1");
+        assert_eq!(completed["type"], "agent_message");
+        assert_eq!(completed["text"], "hello world");
+    }
+
+    #[test]
+    fn projected_text_item_accumulates_plan_and_reasoning_lifecycle_shapes() {
+        let mut plan = ProjectedTextItem::new(ProjectedTextItemKind::Plan);
+        plan.push_delta("1. inspect\n");
+        assert_eq!(plan.id(), "item-plan-1");
+        assert_eq!(plan.started_item()["type"], "plan");
+        assert_eq!(plan.completed_item()["text"], "1. inspect\n");
+
+        let mut reasoning = ProjectedTextItem::new(ProjectedTextItemKind::Reasoning);
+        reasoning.push_delta("thinking");
+        assert_eq!(reasoning.id(), "item-reasoning-1");
+        assert_eq!(reasoning.started_item()["type"], "reasoning");
+        let completed = reasoning.completed_item();
         assert_eq!(completed["summary"], "thinking");
         assert_eq!(completed["content"], "");
     }

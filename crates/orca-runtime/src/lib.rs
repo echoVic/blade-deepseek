@@ -1545,6 +1545,34 @@ mod tests {
     }
 
     #[test]
+    fn text_item_lifecycle_projection_is_owned_by_tool_item_projection() {
+        let projector_source = include_str!("runtime_event_projector.rs");
+        let projection_source = include_str!("tool_item_projection.rs");
+
+        for marker in [
+            "pub(crate) enum ProjectedTextItemKind",
+            "pub(crate) struct ProjectedTextItem",
+            "pub(crate) fn started_item(&self)",
+            "pub(crate) fn completed_item(self)",
+        ] {
+            assert!(
+                projection_source.contains(marker),
+                "tool_item_projection must own text item lifecycle detail {marker}"
+            );
+        }
+        for marker in [
+            "struct AgentMessageItem",
+            "struct PlanItem",
+            "struct ReasoningItem",
+        ] {
+            assert!(
+                !projector_source.contains(marker),
+                "runtime_event_projector must not own text item state {marker}"
+            );
+        }
+    }
+
+    #[test]
     fn server_thread_query_dispatch_is_owned_by_thread_processor() {
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let router_source = std::fs::read_to_string(manifest_dir.join("src/server/router.rs"))
