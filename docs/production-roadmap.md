@@ -4,8 +4,14 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-07-10
-Current baseline: current main after v0.2.3 routes stdio MCP
-`elicitation/create` requests through the TUI pending-interaction path. The
+Current baseline: current main after v0.2.4 makes TUI bash network-deny
+handling use the runtime permission evaluation path, so denylisted network
+blocks produce an explicit policy denial instead of disappearing as a
+non-promptable `Option::None` case. The same runtime policy path still produces
+requestable network grants for allowlist/private-policy blocks, preserving the
+TUI approval prompt flow while making final denials clearer for users and
+future server parity. Earlier v0.2.3 routed stdio MCP `elicitation/create`
+requests through the TUI pending-interaction path. The
 post-v0.2.3 P0 refactor line now has several narrow slices: the runtime tool
 scheduler makes `runtime_tool_scheduler` own normal, readonly batch, and
 sync-subagent batch selection rules so mixed tool batches stop at

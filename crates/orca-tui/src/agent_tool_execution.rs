@@ -21,7 +21,9 @@ use orca_runtime::lifecycle::{
 use orca_runtime::memory::MemoryBlock;
 use orca_runtime::protocol::PermissionResponseDecision;
 use orca_runtime::runtime_pending_interaction::RuntimePendingInteractionStore;
-use orca_runtime::runtime_permission::{RuntimePermissionOrigin, RuntimePermissionPolicy};
+use orca_runtime::runtime_permission::{
+    RuntimePermissionEvaluation, RuntimePermissionOrigin, RuntimePermissionPolicy,
+};
 use orca_runtime::tasks::TaskRegistry;
 use orca_runtime::tool_invocation::prepare_tool_invocation;
 
@@ -666,6 +668,16 @@ fn execute_tui_bash_with_escalations(
     // Network escalation (mirrors runtime_bash): a domain the proxy blocked
     // can be granted for the rest of the turn.
     if let Some(block) = network_block {
+        let permission_request = match RuntimePermissionPolicy::network_block_evaluation(
+            &format!("approval-{}-network", context.request.id),
+            RuntimePermissionOrigin::Bash,
+            &block,
+        ) {
+            RuntimePermissionEvaluation::Request(decision) => decision.into_request(),
+            RuntimePermissionEvaluation::Deny { reason, .. } => {
+                return tool_types::ToolResult::denied(context.request, reason);
+            }
+        };
         let approval = ApprovalRequest {
             id: format!("approval-{}-network", context.request.id),
             action: ActionKind::Network,
@@ -679,13 +691,6 @@ fn execute_tui_bash_with_escalations(
                 block.error
             )),
         };
-        let permission_request = RuntimePermissionPolicy::network_block_decision(
-            &approval.id,
-            RuntimePermissionOrigin::Bash,
-            &block,
-        )
-        .expect("denylist TUI bash network blocks are filtered before prompting")
-        .into_request();
         let allowed = match resolve_tui_permission_escalation(
             policy,
             permission_overlay,
@@ -916,11 +921,7 @@ fn run_tui_bash(
             }
         }
     }
-    let network_block = block_receiver.and_then(|receiver| {
-        receiver
-            .try_iter()
-            .find(|block| block.error != "blocked-by-denylist")
-    });
+    let network_block = block_receiver.and_then(|receiver| receiver.try_iter().next());
     (result, network_block)
 }
 

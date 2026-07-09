@@ -149,7 +149,8 @@ mod tests {
         for marker in [
             "RuntimePermissionPolicy",
             "RuntimePermissionOrigin::Bash",
-            "RuntimePermissionPolicy::network_block_decision(",
+            "RuntimePermissionPolicy::network_block_evaluation(",
+            "RuntimePermissionEvaluation::Deny",
             "RuntimePermissionPolicy::sandbox_denial_decision(",
         ] {
             assert!(

@@ -78,6 +78,16 @@ impl RuntimePermissionDecision {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RuntimePermissionEvaluation {
+    Request(RuntimePermissionDecision),
+    Deny {
+        origin: RuntimePermissionOrigin,
+        kind: RuntimePermissionRequestKind,
+        reason: String,
+    },
+}
+
 pub struct RuntimePermissionPolicy;
 
 impl RuntimePermissionPolicy {
@@ -101,13 +111,32 @@ impl RuntimePermissionPolicy {
         origin: RuntimePermissionOrigin,
         block: &RuntimeNetworkBlockReport,
     ) -> Option<RuntimePermissionDecision> {
+        match Self::network_block_evaluation(request_id, origin, block) {
+            RuntimePermissionEvaluation::Request(decision) => Some(decision),
+            RuntimePermissionEvaluation::Deny { .. } => None,
+        }
+    }
+
+    pub fn network_block_evaluation(
+        request_id: &str,
+        origin: RuntimePermissionOrigin,
+        block: &RuntimeNetworkBlockReport,
+    ) -> RuntimePermissionEvaluation {
         if block.error == "blocked-by-denylist" {
-            return None;
+            return RuntimePermissionEvaluation::Deny {
+                origin,
+                kind: RuntimePermissionRequestKind::NetworkBlock,
+                reason: format!(
+                    "{} network access to {} was denied by configured network policy",
+                    origin.label(),
+                    block.host
+                ),
+            };
         }
 
         let mut domains = HashMap::new();
         domains.insert(block.host.clone(), PermissionProfileNetworkAccess::Allow);
-        Some(RuntimePermissionDecision {
+        RuntimePermissionEvaluation::Request(RuntimePermissionDecision {
             origin,
             kind: RuntimePermissionRequestKind::NetworkBlock,
             request: RuntimePermissionRequest {
@@ -327,8 +356,8 @@ mod tests {
     use crate::sandbox_denial::SandboxDenialDiagnostic;
 
     use super::{
-        RuntimePermissionOrigin, RuntimePermissionPolicy, RuntimePermissionPromptDecision,
-        RuntimePermissionRequestKind, TurnPermissionOverlay,
+        RuntimePermissionEvaluation, RuntimePermissionOrigin, RuntimePermissionPolicy,
+        RuntimePermissionPromptDecision, RuntimePermissionRequestKind, TurnPermissionOverlay,
     };
 
     #[test]
@@ -355,6 +384,29 @@ mod tests {
                 &block,
             )
             .is_none()
+        );
+    }
+
+    #[test]
+    fn runtime_permission_policy_explains_final_network_denials() {
+        let block = RuntimeNetworkBlockReport {
+            host: "blocked.orca.invalid".to_string(),
+            error: "blocked-by-denylist",
+        };
+
+        assert_eq!(
+            RuntimePermissionPolicy::network_block_evaluation(
+                "permission-1",
+                RuntimePermissionOrigin::Bash,
+                &block,
+            ),
+            RuntimePermissionEvaluation::Deny {
+                origin: RuntimePermissionOrigin::Bash,
+                kind: RuntimePermissionRequestKind::NetworkBlock,
+                reason:
+                    "bash network access to blocked.orca.invalid was denied by configured network policy"
+                        .to_string(),
+            }
         );
     }
 

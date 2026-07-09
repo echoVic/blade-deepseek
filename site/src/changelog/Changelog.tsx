@@ -76,6 +76,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.4":
+        "TUI bash network-policy denials are now explicit. Runtime permission policy returns a structured Request or Deny evaluation for network blocks, so requestable hosts still open the normal approval flow while configured denylist blocks end as a clear denied tool result instead of being represented as a missing prompt.",
       "v0.2.3":
         "TUI MCP tool calls can now surface real stdio elicitation requests instead of silently dropping them. When an MCP server sends elicitation/create during a tool call, Orca projects the URL or form request through the runtime pending-interaction store, shows a TUI waiting-input prompt keyed by the runtime id, writes accept or decline back to the server, and then continues the original tool call.",
       "v0.2.2":
@@ -460,6 +462,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.4":
+        "TUI bash 的网络策略拒绝现在会明确显示。Runtime permission policy 会为 network block 返回结构化的 Request 或 Deny evaluation：可申请的 host 仍然走原来的审批流程，而配置为 denylist 的 host 会变成清晰的 denied tool result，不再只是一个缺失的 prompt。",
       "v0.2.3":
         "TUI MCP 工具调用现在能显示真实 stdio elicitation 请求，而不是静默丢掉。MCP server 在 tool call 中发送 elicitation/create 时，Orca 会把 URL 或表单请求投影到 runtime pending-interaction store，通过 runtime id 显示 TUI waiting-input prompt，把 accept 或 decline 写回 server，然后继续原来的工具调用。",
       "v0.2.2":
