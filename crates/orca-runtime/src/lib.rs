@@ -2297,9 +2297,12 @@ mod tests {
             "pub enum RuntimePendingInteractionKind",
             "pub struct RuntimePendingInteractionRecord",
             "pub struct RuntimePendingInteractionStore",
+            "pub struct RuntimeMcpElicitationRequest",
+            "pub struct RuntimeMcpElicitationRecord",
             "pub fn from_tool_approval",
             "pub fn from_permission_request",
             "pub fn from_user_input",
+            "pub fn from_mcp_elicitation",
         ] {
             assert!(
                 pending_source.contains(marker),

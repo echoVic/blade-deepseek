@@ -11,6 +11,60 @@ pub enum RuntimePendingInteractionKind {
     ToolApproval,
     PermissionRequest,
     UserInput,
+    McpElicitation,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RuntimeMcpElicitationMode {
+    Form,
+    Url,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeMcpElicitationRequest {
+    pub id: String,
+    pub server_name: String,
+    pub request_id: String,
+    pub mode: RuntimeMcpElicitationMode,
+    pub message: String,
+    pub url: Option<String>,
+    pub requested_schema_json: Option<String>,
+}
+
+impl RuntimeMcpElicitationRequest {
+    pub fn new(
+        server_name: impl Into<String>,
+        request_id: impl Into<String>,
+        mode: RuntimeMcpElicitationMode,
+        message: impl Into<String>,
+        url: Option<String>,
+        requested_schema_json: Option<String>,
+    ) -> Self {
+        let server_name = server_name.into();
+        let request_id = request_id.into();
+        Self {
+            id: mcp_elicitation_pending_id(&server_name, &request_id),
+            server_name,
+            request_id,
+            mode,
+            message: message.into(),
+            url,
+            requested_schema_json,
+        }
+    }
+}
+
+fn mcp_elicitation_pending_id(server_name: &str, request_id: &str) -> String {
+    format!("mcp_elicitation:{server_name}:{request_id}")
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeMcpElicitationRecord {
+    pub server_name: String,
+    pub request_id: String,
+    pub mode: RuntimeMcpElicitationMode,
+    pub url: Option<String>,
+    pub requested_schema_json: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -23,6 +77,7 @@ pub struct RuntimePendingInteractionRecord {
     pub preview: Option<String>,
     pub question: Option<String>,
     pub choices: Vec<String>,
+    pub mcp_elicitation: Option<RuntimeMcpElicitationRecord>,
 }
 
 impl RuntimePendingInteractionRecord {
@@ -39,6 +94,7 @@ impl RuntimePendingInteractionRecord {
             preview: approval.preview.clone(),
             question: None,
             choices: Vec::new(),
+            mcp_elicitation: None,
         }
     }
 
@@ -57,6 +113,7 @@ impl RuntimePendingInteractionRecord {
             preview,
             question: None,
             choices: Vec::new(),
+            mcp_elicitation: None,
         }
     }
 
@@ -70,6 +127,27 @@ impl RuntimePendingInteractionRecord {
             preview: None,
             question: Some(request.question.clone()),
             choices: request.choices.clone(),
+            mcp_elicitation: None,
+        }
+    }
+
+    pub fn from_mcp_elicitation(request: &RuntimeMcpElicitationRequest) -> Self {
+        Self {
+            id: request.id.clone(),
+            kind: RuntimePendingInteractionKind::McpElicitation,
+            permission_kind: None,
+            tool: Some("mcp_elicitation".to_string()),
+            target: Some(request.server_name.clone()),
+            preview: request.url.clone(),
+            question: Some(request.message.clone()),
+            choices: Vec::new(),
+            mcp_elicitation: Some(RuntimeMcpElicitationRecord {
+                server_name: request.server_name.clone(),
+                request_id: request.request_id.clone(),
+                mode: request.mode.clone(),
+                url: request.url.clone(),
+                requested_schema_json: request.requested_schema_json.clone(),
+            }),
         }
     }
 }
@@ -252,6 +330,85 @@ mod tests {
         assert_eq!(record.kind, RuntimePendingInteractionKind::UserInput);
         assert_eq!(record.question.as_deref(), Some("Choose?"));
         assert_eq!(record.choices, vec!["A".to_string(), "B".to_string()]);
+    }
+
+    #[test]
+    fn pending_interaction_record_describes_mcp_elicitation_request() {
+        let request = RuntimeMcpElicitationRequest {
+            id: "mcp-1".to_string(),
+            server_name: "github".to_string(),
+            request_id: "42".to_string(),
+            mode: RuntimeMcpElicitationMode::Url,
+            message: "Authorize GitHub".to_string(),
+            url: Some("https://github.com/login/device".to_string()),
+            requested_schema_json: Some(r#"{"type":"object"}"#.to_string()),
+        };
+
+        let record = RuntimePendingInteractionRecord::from_mcp_elicitation(&request);
+
+        assert_eq!(record.id, "mcp-1");
+        assert_eq!(record.kind, RuntimePendingInteractionKind::McpElicitation);
+        assert_eq!(record.question.as_deref(), Some("Authorize GitHub"));
+        let elicitation = record
+            .mcp_elicitation
+            .as_ref()
+            .expect("mcp elicitation detail is recorded");
+        assert_eq!(elicitation.server_name, "github");
+        assert_eq!(elicitation.request_id, "42");
+        assert_eq!(elicitation.mode, RuntimeMcpElicitationMode::Url);
+        assert_eq!(
+            elicitation.url.as_deref(),
+            Some("https://github.com/login/device")
+        );
+        assert_eq!(
+            elicitation.requested_schema_json.as_deref(),
+            Some(r#"{"type":"object"}"#)
+        );
+    }
+
+    #[test]
+    fn mcp_elicitation_request_uses_server_scoped_request_id_as_pending_id() {
+        let request = RuntimeMcpElicitationRequest::new(
+            "github",
+            "42",
+            RuntimeMcpElicitationMode::Form,
+            "Authorize GitHub",
+            None,
+            Some(r#"{"type":"object"}"#.to_string()),
+        );
+
+        assert_eq!(request.id, "mcp_elicitation:github:42");
+        assert_eq!(request.server_name, "github");
+        assert_eq!(request.request_id, "42");
+    }
+
+    #[test]
+    fn pending_interaction_store_rejects_duplicate_mcp_elicitation_id_without_overwriting() {
+        let store = RuntimePendingInteractionStore::default();
+        let first = RuntimePendingInteractionRecord::from_mcp_elicitation(
+            &RuntimeMcpElicitationRequest::new(
+                "github",
+                "42",
+                RuntimeMcpElicitationMode::Form,
+                "Authorize GitHub",
+                None,
+                None,
+            ),
+        );
+        let duplicate = RuntimePendingInteractionRecord::from_mcp_elicitation(
+            &RuntimeMcpElicitationRequest::new(
+                "github",
+                "42",
+                RuntimeMcpElicitationMode::Url,
+                "Open browser",
+                Some("https://github.com/login/device".to_string()),
+                None,
+            ),
+        );
+
+        assert!(store.insert(first.clone()).is_ok());
+        assert_eq!(store.insert(duplicate.clone()), Err(duplicate));
+        assert_eq!(store.get("mcp_elicitation:github:42"), Some(first));
     }
 
     #[test]

@@ -332,7 +332,13 @@ The deeper July 9 reference pass changes the next refactor order:
    auto-response are all explicit. Orca's pending interaction store already
    covers approvals, `request_permissions`, and `request_user_input`; adding
    MCP elicitation or other dynamic waiters should reuse that runtime store
-   rather than creating a TUI-local queue.
+   rather than creating a TUI-local queue. The first runtime boundary slice is
+   now seeded: `RuntimePendingInteractionRecord` has an `McpElicitation` kind,
+   carries server/request/mode/url/schema details, and builds stable
+   server-scoped ids so duplicate MCP waits are rejected before a TUI or server
+   surface can create an unrouteable second prompt. Next connect real MCP
+   elicitation requests to that runtime record and project them through the TUI
+   interaction adapter.
 5. **P2: Make skills/plugins a manifest-backed capability source only after
    policy and protocol owners are stable.** Codex's skills, connectors, and
    plugin managers are valuable, but adopting them before compaction, exec
