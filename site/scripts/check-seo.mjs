@@ -116,10 +116,14 @@ check(
   "Changelog component must render releases list",
 );
 check(
-  changelogHtml.includes("Terminal coding agent") &&
-    changelogHtml.includes("DeepSeek coding agent") &&
-    changelogHtml.includes("GitHub workflows"),
-  "Changelog page must link to search-intent landing pages",
+  changelogSource.includes("Terminal coding agent") &&
+    changelogSource.includes("DeepSeek coding agent") &&
+    changelogSource.includes("GitHub workflows"),
+  "Changelog React source must own search-intent guide links",
+);
+check(
+  !changelogHtml.includes("crawler-links"),
+  "Changelog template must not render root-level crawler links",
 );
 
 check(socialPng.subarray(1, 4).toString("ascii") === "PNG", "Social image is not a PNG");
