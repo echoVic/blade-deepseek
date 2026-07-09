@@ -1,0 +1,41 @@
+crates/orca-core/src/conversation.rs
+  s_c08b9d3297e4c9::t_7df8b196401e8d 88-93,96-101,107-119,121,130-132,204,264,617-676
+crates/orca-provider/examples/update_plan_strict_realapi.rs
+  s_c08b9d3297e4c9::t_46ed4cacf7ff9f 1-259
+crates/orca-provider/src/deepseek_http.rs
+  s_c08b9d3297e4c9::t_de0ef113cf6aac 19-88,250-251,253,260,264,266-277,405-406,408,413,417,419-433,581,585-597,777-866
+crates/orca-runtime/src/lifecycle.rs
+  s_c08b9d3297e4c9::t_8bc2a68c71a5a5 1456
+crates/orca-runtime/src/provider_turn.rs
+  s_c08b9d3297e4c9::t_fd598faaf7c626 814,969,1221
+crates/orca-runtime/src/runtime_turn_loop.rs
+  s_c08b9d3297e4c9::t_3be10b2a442f7c 348
+crates/orca-tools/src/registry.rs
+  s_c08b9d3297e4c9::t_ad1f9f94f60410 217-223,350-353,363-366,382-391,1096,1909-1951
+crates/orca-tools/src/update_plan.rs
+  s_c08b9d3297e4c9::t_0b87ad342fb305 3-9,23-26,30-84,231-310
+crates/orca-tui/src/session_picker_actions.rs
+  s_c08b9d3297e4c9::t_24a3c4485c5b80 80
+crates/orca-tui/src/types.rs
+  s_c08b9d3297e4c9::t_47c2e6be9bd02b 481-483,536,974-983,1038,1315,2125-2190
+crates/orca-tui/src/ui.rs
+  s_c08b9d3297e4c9::t_2ec83b1c51c71e 1436-1440,1444-1445
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "ba86bc135604e3a72be4975786ffe717c33ef6a1",
+  "prompts": {},
+  "sessions": {
+    "s_c08b9d3297e4c9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "585a9efb-cf04-4231-aa30-ebab1b4a3e76",
+        "model": "unknown"
+      },
+      "human_author": "echoVic <137844255@qq.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
