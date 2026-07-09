@@ -36,7 +36,7 @@ mod runtime_lifecycle;
 mod runtime_model_route;
 mod runtime_normal_tool;
 pub mod runtime_pending_interaction;
-pub(crate) mod runtime_permission;
+pub mod runtime_permission;
 pub(crate) mod runtime_readonly_tool_turn;
 pub(crate) mod runtime_special;
 pub mod runtime_state;
@@ -2296,24 +2296,24 @@ mod tests {
             .expect("runtime permission source");
 
         assert!(
-            lib_source.contains("pub(crate) mod runtime_permission;"),
-            "runtime crate must declare a focused runtime_permission module"
+            lib_source.contains("pub mod runtime_permission;"),
+            "runtime crate must declare a focused public runtime_permission module"
         );
 
         for marker in [
             "pub struct RuntimePermissionRequest",
             "pub struct RuntimePermissionResponse",
             "pub trait RuntimePermissionRequestHandler",
-            "pub(crate) struct RuntimePermissionDecision",
+            "pub struct RuntimePermissionDecision",
             "pub(crate) enum RuntimePermissionPromptDecision",
-            "pub(crate) enum RuntimePermissionOrigin",
-            "pub(crate) enum RuntimePermissionRequestKind",
-            "pub(crate) struct RuntimePermissionPolicy",
+            "pub enum RuntimePermissionOrigin",
+            "pub enum RuntimePermissionRequestKind",
+            "pub struct RuntimePermissionPolicy",
             "pub(crate) fn decide_request_permissions_prompt(",
-            "pub(crate) fn network_block_decision(",
-            "pub(crate) fn filesystem_write_decision(",
-            "pub(crate) fn unsandboxed_shell_decision(",
-            "pub(crate) fn sandbox_denial_decision(",
+            "pub fn network_block_decision(",
+            "pub fn filesystem_write_decision(",
+            "pub fn unsandboxed_shell_decision(",
+            "pub fn sandbox_denial_decision(",
             "pub(crate) struct AllowRequestedPermissions",
             "pub struct TurnPermissionOverlay",
             "impl TurnPermissionOverlay",

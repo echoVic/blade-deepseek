@@ -140,6 +140,26 @@ mod tests {
     }
 
     #[test]
+    fn tui_bash_permission_escalations_use_runtime_permission_policy() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let agent_tool_execution =
+            std::fs::read_to_string(format!("{manifest_dir}/src/agent_tool_execution.rs"))
+                .expect("agent_tool_execution source should be readable");
+
+        for marker in [
+            "RuntimePermissionPolicy",
+            "RuntimePermissionOrigin::Bash",
+            "RuntimePermissionPolicy::network_block_decision(",
+            "RuntimePermissionPolicy::sandbox_denial_decision(",
+        ] {
+            assert!(
+                agent_tool_execution.contains(marker),
+                "TUI bash permission escalations should share runtime permission policy marker: {marker}"
+            );
+        }
+    }
+
+    #[test]
     fn tui_submitted_turn_is_owned_by_dedicated_module() {
         let manifest_dir = env!("CARGO_MANIFEST_DIR");
         let submitted_turn =

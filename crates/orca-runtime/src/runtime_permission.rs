@@ -44,7 +44,7 @@ pub(crate) enum RuntimePermissionPromptDecision {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RuntimePermissionOrigin {
+pub enum RuntimePermissionOrigin {
     Bash,
     CommandExec,
 }
@@ -59,20 +59,26 @@ impl RuntimePermissionOrigin {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RuntimePermissionRequestKind {
+pub enum RuntimePermissionRequestKind {
     NetworkBlock,
     FilesystemWrite,
     UnsandboxedShellRetry,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RuntimePermissionDecision {
-    pub(crate) origin: RuntimePermissionOrigin,
-    pub(crate) kind: RuntimePermissionRequestKind,
-    pub(crate) request: RuntimePermissionRequest,
+pub struct RuntimePermissionDecision {
+    pub origin: RuntimePermissionOrigin,
+    pub kind: RuntimePermissionRequestKind,
+    pub request: RuntimePermissionRequest,
 }
 
-pub(crate) struct RuntimePermissionPolicy;
+impl RuntimePermissionDecision {
+    pub fn into_request(self) -> RuntimePermissionRequest {
+        self.request
+    }
+}
+
+pub struct RuntimePermissionPolicy;
 
 impl RuntimePermissionPolicy {
     pub(crate) fn decide_request_permissions_prompt(
@@ -90,7 +96,7 @@ impl RuntimePermissionPolicy {
         }
     }
 
-    pub(crate) fn network_block_decision(
+    pub fn network_block_decision(
         request_id: &str,
         origin: RuntimePermissionOrigin,
         block: &RuntimeNetworkBlockReport,
@@ -124,7 +130,7 @@ impl RuntimePermissionPolicy {
         })
     }
 
-    pub(crate) fn filesystem_write_decision(
+    pub fn filesystem_write_decision(
         request_id: &str,
         origin: RuntimePermissionOrigin,
         diagnostic: &SandboxDenialDiagnostic,
@@ -153,7 +159,7 @@ impl RuntimePermissionPolicy {
         })
     }
 
-    pub(crate) fn unsandboxed_shell_decision(
+    pub fn unsandboxed_shell_decision(
         request_id: &str,
         origin: RuntimePermissionOrigin,
         diagnostic: &SandboxDenialDiagnostic,
@@ -180,7 +186,7 @@ impl RuntimePermissionPolicy {
         })
     }
 
-    pub(crate) fn sandbox_denial_decision(
+    pub fn sandbox_denial_decision(
         request_id: &str,
         origin: RuntimePermissionOrigin,
         diagnostic: &SandboxDenialDiagnostic,

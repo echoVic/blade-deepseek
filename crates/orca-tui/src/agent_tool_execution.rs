@@ -19,11 +19,9 @@ use orca_runtime::lifecycle::{
     RuntimePermissionRequest, RuntimeToolActorContext, TurnPermissionOverlay,
 };
 use orca_runtime::memory::MemoryBlock;
-use orca_runtime::protocol::{
-    PermissionResponseDecision, RequestFileSystemPermissions, RequestNetworkPermissions,
-    RequestPermissionProfile, RequestShellPermissions,
-};
+use orca_runtime::protocol::PermissionResponseDecision;
 use orca_runtime::runtime_pending_interaction::RuntimePendingInteractionStore;
+use orca_runtime::runtime_permission::{RuntimePermissionOrigin, RuntimePermissionPolicy};
 use orca_runtime::tasks::TaskRegistry;
 use orca_runtime::tool_invocation::prepare_tool_invocation;
 
@@ -664,23 +662,13 @@ fn execute_tui_bash_with_escalations(
                 block.error
             )),
         };
-        let mut domains = std::collections::HashMap::new();
-        domains.insert(block.host.clone(), PermissionProfileNetworkAccess::Allow);
-        let permission_request = RuntimePermissionRequest {
-            id: approval.id.clone(),
-            reason: Some(format!(
-                "bash attempted network access to {} ({})",
-                block.host, block.error
-            )),
-            permissions: RequestPermissionProfile {
-                file_system: None,
-                network: Some(RequestNetworkPermissions {
-                    enabled: None,
-                    domains,
-                }),
-                shell: None,
-            },
-        };
+        let permission_request = RuntimePermissionPolicy::network_block_decision(
+            &approval.id,
+            RuntimePermissionOrigin::Bash,
+            &block,
+        )
+        .expect("denylist TUI bash network blocks are filtered before prompting")
+        .into_request();
         let allowed = match resolve_tui_permission_escalation(
             policy,
             permission_overlay,
@@ -974,22 +962,12 @@ pub(crate) fn escalate_sandbox_denied_bash_for_tui(
                 write_root.display()
             )),
         };
-        let permission_request = RuntimePermissionRequest {
-            id: approval.id.clone(),
-            reason: Some(format!(
-                "bash attempted filesystem write outside the current sandbox: {}",
-                write_root.display()
-            )),
-            permissions: RequestPermissionProfile {
-                file_system: Some(RequestFileSystemPermissions {
-                    read: None,
-                    write: Some(vec![write_root.clone()]),
-                    entries: None,
-                }),
-                network: None,
-                shell: None,
-            },
-        };
+        let permission_request = RuntimePermissionPolicy::sandbox_denial_decision(
+            &approval.id,
+            RuntimePermissionOrigin::Bash,
+            &diagnostic,
+        )
+        .into_request();
         let allowed = match resolve_tui_permission_escalation(
             policy,
             permission_overlay,
@@ -1039,17 +1017,12 @@ pub(crate) fn escalate_sandbox_denied_bash_for_tui(
             diagnostic.message
         )),
     };
-    let permission_request = RuntimePermissionRequest {
-        id: approval.id.clone(),
-        reason: Some(
-            "bash needs to re-run without the filesystem sandbox because the sandbox denied access but did not report a filesystem path to grant".to_string(),
-        ),
-        permissions: RequestPermissionProfile {
-            file_system: None,
-            network: None,
-            shell: Some(RequestShellPermissions { unsandboxed: true }),
-        },
-    };
+    let permission_request = RuntimePermissionPolicy::sandbox_denial_decision(
+        &approval.id,
+        RuntimePermissionOrigin::Bash,
+        &diagnostic,
+    )
+    .into_request();
     let allowed = match resolve_tui_permission_escalation(
         policy,
         permission_overlay,
