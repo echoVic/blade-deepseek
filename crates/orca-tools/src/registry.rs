@@ -12,7 +12,7 @@ use orca_core::tool_types::{
     CapabilitySet, MAX_TOOL_OUTPUT_BYTES, RendererHint, ResultSemantics, ToolCapability,
     ToolExposure, ToolName, ToolOutputTruncation, ToolRequest, ToolResult, ToolSpec,
 };
-use orca_mcp::McpRegistry;
+use orca_mcp::{McpElicitationHandler, McpRegistry};
 
 use crate::{
     bash, edit, external, git, glob, grep, list_files, read_file, skills, update_goal, update_plan,
@@ -64,6 +64,7 @@ pub struct ToolContext<'a> {
     pub shell_timeout: Duration,
     pub additional_working_directories: Vec<PathBuf>,
     pub mcp_registry: Option<&'a McpRegistry>,
+    pub mcp_elicitation_handler: Option<&'a dyn McpElicitationHandler>,
     pub should_cancel: Option<&'a dyn Fn() -> bool>,
 }
 
@@ -75,6 +76,7 @@ impl<'a> ToolContext<'a> {
             shell_timeout: Duration::from_secs(120),
             additional_working_directories: Vec::new(),
             mcp_registry: None,
+            mcp_elicitation_handler: None,
             should_cancel: None,
         }
     }
@@ -106,6 +108,11 @@ impl<'a> ToolContext<'a> {
 
     pub fn with_mcp(mut self, mcp_registry: &'a McpRegistry) -> Self {
         self.mcp_registry = Some(mcp_registry);
+        self
+    }
+
+    pub fn with_mcp_elicitation_handler(mut self, handler: &'a dyn McpElicitationHandler) -> Self {
+        self.mcp_elicitation_handler = Some(handler);
         self
     }
 
@@ -1800,7 +1807,9 @@ impl Tool for McpProxyTool {
             }
         };
 
-        let call_result = if ctx.should_cancel.is_some() {
+        let call_result = if let Some(handler) = ctx.mcp_elicitation_handler {
+            registry.call_tool_with_elicitation_handler(&tool_ref, arguments, Some(handler))
+        } else if ctx.should_cancel.is_some() {
             registry.call_tool_or_cancel(&tool_ref, arguments, &|| ctx.is_cancelled())
         } else {
             registry.call_tool(&tool_ref, arguments)

@@ -35,8 +35,8 @@ use crate::agent_workflow_execution::{
 };
 use crate::diff;
 use crate::runtime_interaction_adapter::{
-    AutoAllowPermissionRequests, TuiPermissionRequestHandler, TuiToolApprovalOutcome,
-    TuiUserInputHandler, resolve_tui_tool_approval,
+    AutoAllowPermissionRequests, TuiMcpElicitationHandler, TuiPermissionRequestHandler,
+    TuiToolApprovalOutcome, TuiUserInputHandler, resolve_tui_tool_approval,
 };
 use crate::types::{TuiEvent, UserAction};
 
@@ -499,6 +499,23 @@ fn execute_tool_for_tui_inner(
                     config.tools.shell_timeout_secs,
                 )
             })
+        } else if matches!(execution_request.name, tool_types::ToolName::Mcp(_)) {
+            let handler = match pending_interactions.as_ref() {
+                Some(store) => TuiMcpElicitationHandler::new(event_tx, action_rx, pending_actions)
+                    .with_pending_interactions(store.clone()),
+                None => TuiMcpElicitationHandler::new(event_tx, action_rx, pending_actions),
+            };
+            orca_tools::execute_with_mcp_external_roots_policy_or_cancel_and_elicitation(
+                execution_request,
+                cwd,
+                &additional_roots,
+                mcp_registry,
+                &config.external_tools,
+                config.tools.output_truncation,
+                config.tools.shell_timeout_secs,
+                Some(&handler),
+                || cancel.is_cancelled(),
+            )
         } else {
             orca_tools::execute_with_mcp_external_roots_policy_or_cancel(
                 execution_request,
@@ -1656,6 +1673,148 @@ mod tests {
         assert!(!should_stop);
         assert_eq!(result.status, ToolStatus::Completed);
         assert_eq!(result.output.as_deref(), Some("yes"));
+        assert!(store.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_tool_for_tui_routes_mcp_elicitation_through_pending_interactions() {
+        let workspace = TempDir::new().unwrap();
+        let server = workspace.path().join("elicitation_mcp_server.sh");
+        std::fs::write(
+            &server,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"elicits","version":"1"}}}\n'
+      ;;
+    *'"method":"notifications/initialized"'*)
+      ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"authorize","description":"needs user input","inputSchema":{"type":"object","properties":{},"required":[]}}]}}\n'
+      ;;
+    *'"method":"tools/call"'*)
+      printf '{"jsonrpc":"2.0","id":"prompt-1","method":"elicitation/create","params":{"message":"Authorize GitHub","url":"https://github.com/login/device","elicitationId":"device-flow"}}\n'
+      IFS= read -r response
+      case "$response" in
+        *'"id":"prompt-1"'*'"action":"accept"'*'"code":"1234"'*)
+          printf '{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"authorized"}],"isError":false}}\n'
+          ;;
+        *)
+          printf '{"jsonrpc":"2.0","id":3,"error":{"code":-32000,"message":"missing elicitation response"}}\n'
+          ;;
+      esac
+      ;;
+  esac
+done
+"#,
+        )
+        .expect("write MCP fixture");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&server).expect("metadata").permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&server, permissions).expect("chmod MCP fixture");
+        }
+        let mcp_registry =
+            orca_mcp::initialize_registry(&[orca_core::mcp_types::McpServerConfig {
+                name: "elicits".to_string(),
+                transport: orca_core::mcp_types::McpTransportKind::Stdio,
+                command: Some("/bin/sh".to_string()),
+                args: vec![server.to_string_lossy().into_owned()],
+                url: None,
+                env: Default::default(),
+                headers: Default::default(),
+                disabled: false,
+                startup_timeout_ms: Some(15_000),
+                tool_timeout_ms: Some(1000),
+            }]);
+        assert!(
+            mcp_registry.errors().is_empty(),
+            "{:?}",
+            mcp_registry.errors()
+        );
+        let config = config(ApprovalMode::FullAuto);
+        let request = tool_types::ToolRequest {
+            id: "mcp-1".to_string(),
+            name: ToolName::Mcp("mcp__elicits__authorize".to_string()),
+            action: ActionKind::Read,
+            target: None,
+            raw_arguments: Some(serde_json::json!({}).to_string()),
+        };
+        let (event_tx, event_rx) = mpsc::channel();
+        let (action_tx, action_rx) = mpsc::channel();
+        let store = RuntimePendingInteractionStore::default();
+        let worker_store = store.clone();
+
+        let handle = std::thread::spawn(move || {
+            let pending_actions = RefCell::new(VecDeque::new());
+            let mut overlay = TurnPermissionOverlay::default();
+            execute_tool_for_tui(
+                &config,
+                workspace.path(),
+                &request,
+                &event_tx,
+                &action_rx,
+                &pending_actions,
+                Some(worker_store),
+                0,
+                None,
+                None,
+                &ApprovalPolicy::new(ApprovalMode::FullAuto),
+                &ProjectInstructions::default(),
+                &MemoryBlock::default(),
+                &mcp_registry,
+                &orca_runtime::hooks::HookRunner::default(),
+                None,
+                &mut overlay,
+                &CancelToken::new(),
+            )
+        });
+
+        let prompt = loop {
+            let event = event_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("mcp elicitation prompt");
+            if matches!(event, TuiEvent::McpElicitationRequested { .. }) {
+                break event;
+            }
+        };
+        let request_id = match prompt {
+            TuiEvent::McpElicitationRequested {
+                id,
+                server_name,
+                message,
+                url,
+                ..
+            } => {
+                assert_eq!(server_name, "elicits");
+                assert_eq!(message, "Authorize GitHub");
+                assert_eq!(url.as_deref(), Some("https://github.com/login/device"));
+                id
+            }
+            other => panic!("unexpected event: {other:?}"),
+        };
+        assert_eq!(
+            store.get(&request_id).map(|record| record.kind),
+            Some(
+                orca_runtime::runtime_pending_interaction::RuntimePendingInteractionKind::McpElicitation
+            )
+        );
+        action_tx
+            .send(UserAction::RespondToMcpElicitation {
+                id: request_id,
+                accepted: true,
+                content_json: Some(serde_json::json!({"code":"1234"}).to_string()),
+            })
+            .expect("send mcp elicitation response");
+
+        let (should_stop, result, _) = handle.join().expect("executor thread");
+
+        assert!(!should_stop);
+        assert_eq!(result.status, ToolStatus::Completed, "{:?}", result.error);
+        assert_eq!(result.output.as_deref(), Some("authorized"));
         assert!(store.is_empty());
     }
 

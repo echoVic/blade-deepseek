@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use crate::transport::{self, McpTransport};
+use crate::transport::{self, McpElicitationHandler, McpTransport};
 use orca_core::mcp_types::{
     CallToolResult, McpContent, McpResource, McpResourceTemplate, McpServerConfig, McpTool,
     McpToolRef, ReadResourceResult, ResourceTemplatesListResult, ResourcesListResult,
@@ -329,7 +329,16 @@ impl McpRegistry {
         tool_ref: &McpToolRef,
         arguments: Value,
     ) -> Result<McpCallOutput, String> {
-        self.call_tool_inner(tool_ref, arguments)
+        self.call_tool_inner(tool_ref, arguments, None)
+    }
+
+    pub fn call_tool_with_elicitation_handler(
+        &self,
+        tool_ref: &McpToolRef,
+        arguments: Value,
+        handler: Option<&dyn McpElicitationHandler>,
+    ) -> Result<McpCallOutput, String> {
+        self.call_tool_inner(tool_ref, arguments, handler)
     }
 
     pub fn call_tool_or_cancel(
@@ -346,7 +355,7 @@ impl McpRegistry {
         let tool_ref = tool_ref.clone();
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(registry.call_tool_inner(&tool_ref, arguments));
+            let _ = tx.send(registry.call_tool_inner(&tool_ref, arguments, None));
         });
 
         loop {
@@ -600,13 +609,14 @@ impl McpRegistry {
         &self,
         tool_ref: &McpToolRef,
         arguments: Value,
+        elicitation_handler: Option<&dyn McpElicitationHandler>,
     ) -> Result<McpCallOutput, String> {
         let client = self
             .inner
             .clients
             .get(&tool_ref.server)
             .ok_or_else(|| format!("MCP server '{}' is not connected", tool_ref.server))?;
-        let result = client.call_tool(&tool_ref.tool, arguments)?;
+        let result = client.call_tool(&tool_ref.tool, arguments, elicitation_handler)?;
         let result: CallToolResult = serde_json::from_value(result)
             .map_err(|error| format!("invalid MCP tool result: {error}"))?;
         let output = result
@@ -830,8 +840,13 @@ impl McpRegistry {
 }
 
 impl McpClient {
-    fn call_tool(&self, name: &str, arguments: Value) -> Result<Value, String> {
-        match self.call_tool_once(name, arguments) {
+    fn call_tool(
+        &self,
+        name: &str,
+        arguments: Value,
+        elicitation_handler: Option<&dyn McpElicitationHandler>,
+    ) -> Result<Value, String> {
+        match self.call_tool_once(name, arguments, elicitation_handler) {
             Err(error) if should_reconnect_after_mcp_error(&error) => {
                 let _ = self.reconnect();
                 Err(error)
@@ -840,12 +855,17 @@ impl McpClient {
         }
     }
 
-    fn call_tool_once(&self, name: &str, arguments: Value) -> Result<Value, String> {
+    fn call_tool_once(
+        &self,
+        name: &str,
+        arguments: Value,
+        elicitation_handler: Option<&dyn McpElicitationHandler>,
+    ) -> Result<Value, String> {
         let transport = self
             .transport
             .lock()
             .map_err(|_| format!("MCP server '{}' transport lock poisoned", self.server_name))?;
-        transport.call_tool(name, arguments)
+        transport.call_tool_with_elicitation_handler(name, arguments, elicitation_handler)
     }
 
     fn list_resources(&self) -> Result<Value, String> {
@@ -931,7 +951,10 @@ fn sanitize_name(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::McpTransport;
+    use crate::transport::{
+        McpElicitationHandler, McpElicitationMode, McpElicitationRequest, McpElicitationResponse,
+        McpTransport,
+    };
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
@@ -1081,6 +1104,124 @@ mod tests {
 
         assert!(started.elapsed() < Duration::from_millis(750));
         assert_eq!(result.unwrap_err(), "MCP tool call cancelled");
+    }
+
+    #[test]
+    fn registry_call_tool_routes_elicitation_handler_to_transport() {
+        struct ElicitingTransport;
+
+        impl McpTransport for ElicitingTransport {
+            fn initialize(&self) -> Result<Value, String> {
+                Ok(serde_json::json!({"capabilities": {}}))
+            }
+
+            fn list_tools(&self) -> Result<Value, String> {
+                Ok(serde_json::json!({"tools": []}))
+            }
+
+            fn call_tool(&self, _name: &str, _arguments: Value) -> Result<Value, String> {
+                Err("handler-aware call expected".to_string())
+            }
+
+            fn call_tool_with_elicitation_handler(
+                &self,
+                _name: &str,
+                _arguments: Value,
+                handler: Option<&dyn McpElicitationHandler>,
+            ) -> Result<Value, String> {
+                let response = handler.expect("elicitation handler").handle_elicitation(
+                    McpElicitationRequest {
+                        server_name: "prompts".to_string(),
+                        id: "prompt-1".to_string(),
+                        mode: McpElicitationMode::Form,
+                        message: "Enter token".to_string(),
+                        url: None,
+                        requested_schema: Some(serde_json::json!({"type":"object"})),
+                    },
+                )?;
+                assert_eq!(
+                    response,
+                    McpElicitationResponse::accept(serde_json::json!({"token":"abc"}))
+                );
+                Ok(serde_json::json!({
+                    "content": [{"type": "text", "text": "accepted"}],
+                    "isError": false
+                }))
+            }
+
+            fn list_resources(&self) -> Result<Value, String> {
+                Ok(serde_json::json!({"resources": []}))
+            }
+
+            fn list_resource_templates(&self) -> Result<Value, String> {
+                Ok(serde_json::json!({"resourceTemplates": []}))
+            }
+
+            fn read_resource(&self, _uri: &str) -> Result<Value, String> {
+                Ok(serde_json::json!({"contents": []}))
+            }
+        }
+
+        struct AcceptingHandler;
+
+        impl McpElicitationHandler for AcceptingHandler {
+            fn handle_elicitation(
+                &self,
+                request: McpElicitationRequest,
+            ) -> Result<McpElicitationResponse, String> {
+                assert_eq!(request.message, "Enter token");
+                Ok(McpElicitationResponse::accept(
+                    serde_json::json!({"token":"abc"}),
+                ))
+            }
+        }
+
+        let tool = McpTool {
+            server: "prompts".to_string(),
+            name: "authorize".to_string(),
+            schema_name: "mcp__prompts__authorize".to_string(),
+            description: None,
+            input_schema: serde_json::json!({"type": "object"}),
+        };
+        let registry = McpRegistry {
+            inner: Arc::new(McpRegistryInner {
+                clients: HashMap::from([(
+                    "prompts".to_string(),
+                    Arc::new(McpClient {
+                        config: McpServerConfig {
+                            name: "prompts".to_string(),
+                            ..Default::default()
+                        },
+                        server_name: "prompts".to_string(),
+                        capabilities: McpServerCapabilities::default(),
+                        transport: Mutex::new(Box::new(ElicitingTransport)),
+                    }),
+                )]),
+                tools: vec![tool.clone()],
+                lookup: HashMap::from([(
+                    tool.schema_name.clone(),
+                    McpToolRef {
+                        server: tool.server,
+                        tool: tool.name,
+                        schema_name: tool.schema_name,
+                    },
+                )]),
+                errors: Vec::new(),
+            }),
+        };
+        let tool_ref = registry
+            .resolve_tool("mcp__prompts__authorize")
+            .expect("tool ref");
+
+        let result = registry
+            .call_tool_with_elicitation_handler(
+                &tool_ref,
+                serde_json::json!({}),
+                Some(&AcceptingHandler),
+            )
+            .expect("tool result");
+
+        assert_eq!(result.output, "accepted");
     }
 
     #[test]

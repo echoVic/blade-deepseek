@@ -339,9 +339,12 @@ The deeper July 9 reference pass changes the next refactor order:
    surface can create an unrouteable second prompt. The TUI interaction adapter
    can now project MCP elicitation records into a visible waiting-input state,
    preserve URL/form metadata, resolve only the matching runtime id, and clean
-   up the pending record on answer or cancel. Next connect real MCP transport
-   elicitation requests to that runtime/TUI path, then mirror the same id
-   discipline through server-mode responses.
+   up the pending record on answer or cancel. The stdio MCP transport and TUI
+   tool path now route real `elicitation/create` requests through that handler,
+   write accept/decline responses back to the server, and continue the original
+   tool call once the user answers. Next mirror the same id discipline through
+   server-mode responses and decide whether SSE needs an equivalent streaming
+   request channel before exposing it as parity.
 5. **P2: Make skills/plugins a manifest-backed capability source only after
    policy and protocol owners are stable.** Codex's skills, connectors, and
    plugin managers are valuable, but adopting them before compaction, exec

@@ -9,10 +9,57 @@ use serde_json::{Value, json};
 
 use orca_core::mcp_types::{McpServerConfig, McpTransportKind};
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum McpElicitationMode {
+    Form,
+    Url,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct McpElicitationRequest {
+    pub server_name: String,
+    pub id: String,
+    pub mode: McpElicitationMode,
+    pub message: String,
+    pub url: Option<String>,
+    pub requested_schema: Option<Value>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum McpElicitationResponse {
+    Accept { content: Value },
+    Decline,
+}
+
+impl McpElicitationResponse {
+    pub fn accept(content: Value) -> Self {
+        Self::Accept { content }
+    }
+
+    pub fn decline() -> Self {
+        Self::Decline
+    }
+}
+
+pub trait McpElicitationHandler {
+    fn handle_elicitation(
+        &self,
+        request: McpElicitationRequest,
+    ) -> Result<McpElicitationResponse, String>;
+}
+
 pub trait McpTransport: Send + Sync {
     fn initialize(&self) -> Result<Value, String>;
     fn list_tools(&self) -> Result<Value, String>;
     fn call_tool(&self, name: &str, arguments: Value) -> Result<Value, String>;
+    fn call_tool_with_elicitation_handler(
+        &self,
+        name: &str,
+        arguments: Value,
+        _handler: Option<&dyn McpElicitationHandler>,
+    ) -> Result<Value, String> {
+        self.call_tool(name, arguments)
+    }
     fn list_resources(&self) -> Result<Value, String>;
     fn list_resource_templates(&self) -> Result<Value, String>;
     fn read_resource(&self, uri: &str) -> Result<Value, String>;
@@ -26,6 +73,7 @@ pub fn connect(config: &McpServerConfig) -> Result<Box<dyn McpTransport>, String
 }
 
 struct StdioTransport {
+    server_name: String,
     state: Mutex<StdioState>,
     startup_timeout: Duration,
     tool_timeout: Duration,
@@ -88,6 +136,7 @@ impl StdioTransport {
         });
 
         Ok(Self {
+            server_name: config.name.clone(),
             state: Mutex::new(StdioState {
                 _child: child,
                 stdin,
@@ -113,16 +162,26 @@ impl McpTransport for StdioTransport {
                 }
             }),
             self.startup_timeout,
+            None,
         )?;
         self.notify("notifications/initialized", json!({}))?;
         Ok(result)
     }
 
     fn list_tools(&self) -> Result<Value, String> {
-        self.request_with_timeout("tools/list", json!({}), self.startup_timeout)
+        self.request_with_timeout("tools/list", json!({}), self.startup_timeout, None)
     }
 
     fn call_tool(&self, name: &str, arguments: Value) -> Result<Value, String> {
+        self.call_tool_with_elicitation_handler(name, arguments, None)
+    }
+
+    fn call_tool_with_elicitation_handler(
+        &self,
+        name: &str,
+        arguments: Value,
+        handler: Option<&dyn McpElicitationHandler>,
+    ) -> Result<Value, String> {
         self.request_with_timeout(
             "tools/call",
             json!({
@@ -130,15 +189,21 @@ impl McpTransport for StdioTransport {
                 "arguments": arguments
             }),
             self.tool_timeout,
+            handler,
         )
     }
 
     fn list_resources(&self) -> Result<Value, String> {
-        self.request_with_timeout("resources/list", json!({}), self.startup_timeout)
+        self.request_with_timeout("resources/list", json!({}), self.startup_timeout, None)
     }
 
     fn list_resource_templates(&self) -> Result<Value, String> {
-        self.request_with_timeout("resources/templates/list", json!({}), self.startup_timeout)
+        self.request_with_timeout(
+            "resources/templates/list",
+            json!({}),
+            self.startup_timeout,
+            None,
+        )
     }
 
     fn read_resource(&self, uri: &str) -> Result<Value, String> {
@@ -148,6 +213,7 @@ impl McpTransport for StdioTransport {
                 "uri": uri
             }),
             self.tool_timeout,
+            None,
         )
     }
 }
@@ -158,6 +224,7 @@ impl StdioTransport {
         method: &str,
         params: Value,
         timeout: Duration,
+        elicitation_handler: Option<&dyn McpElicitationHandler>,
     ) -> Result<Value, String> {
         let mut state = self
             .state
@@ -206,6 +273,15 @@ impl StdioTransport {
                     return Err("MCP stdio reader stopped before returning".to_string());
                 }
             };
+            if is_elicitation_create_request(&response) {
+                handle_elicitation_create_request(
+                    &self.server_name,
+                    &mut state.stdin,
+                    &response,
+                    elicitation_handler,
+                )?;
+                continue;
+            }
             if response.get("id").and_then(Value::as_u64) != Some(id) {
                 continue;
             }
@@ -232,6 +308,102 @@ impl StdioTransport {
                 "params": params
             }),
         )
+    }
+}
+
+fn is_elicitation_create_request(message: &Value) -> bool {
+    message.get("method").and_then(Value::as_str) == Some("elicitation/create")
+}
+
+fn handle_elicitation_create_request(
+    server_name: &str,
+    stdin: &mut ChildStdin,
+    message: &Value,
+    handler: Option<&dyn McpElicitationHandler>,
+) -> Result<(), String> {
+    let id = message
+        .get("id")
+        .cloned()
+        .ok_or_else(|| "MCP elicitation request missing id".to_string())?;
+    let request = mcp_elicitation_request_from_json(server_name, message)?;
+    let response = match handler {
+        Some(handler) => handler.handle_elicitation(request),
+        None => Ok(McpElicitationResponse::decline()),
+    };
+
+    let message = match response {
+        Ok(response) => json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": mcp_elicitation_response_to_json(response)
+        }),
+        Err(error) => json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {
+                "code": -32000,
+                "message": error
+            }
+        }),
+    };
+    write_json_line(stdin, &message)
+}
+
+fn mcp_elicitation_request_from_json(
+    server_name: &str,
+    message: &Value,
+) -> Result<McpElicitationRequest, String> {
+    let id = message
+        .get("id")
+        .map(json_rpc_id_to_string)
+        .ok_or_else(|| "MCP elicitation request missing id".to_string())?;
+    let params = message
+        .get("params")
+        .ok_or_else(|| "MCP elicitation request missing params".to_string())?;
+    let message = params
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let url = params
+        .get("url")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let requested_schema = params
+        .get("requestedSchema")
+        .or_else(|| params.get("requested_schema"))
+        .cloned();
+    let mode = if url.is_some() {
+        McpElicitationMode::Url
+    } else {
+        McpElicitationMode::Form
+    };
+    Ok(McpElicitationRequest {
+        server_name: server_name.to_string(),
+        id,
+        mode,
+        message,
+        url,
+        requested_schema,
+    })
+}
+
+fn json_rpc_id_to_string(id: &Value) -> String {
+    match id {
+        Value::String(value) => value.clone(),
+        _ => id.to_string(),
+    }
+}
+
+fn mcp_elicitation_response_to_json(response: McpElicitationResponse) -> Value {
+    match response {
+        McpElicitationResponse::Accept { content } => json!({
+            "action": "accept",
+            "content": content
+        }),
+        McpElicitationResponse::Decline => json!({
+            "action": "decline"
+        }),
     }
 }
 
@@ -441,7 +613,7 @@ mod tests {
     use std::fs;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex as StdMutex};
     use std::time::{Duration, Instant};
 
     const STDIO_TEST_STARTUP_TIMEOUT_MS: u64 = 15_000;
@@ -508,6 +680,112 @@ done
                 .unwrap_err()
                 .contains("MCP request 'tools/call' timed out after 100ms")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdio_tool_call_routes_elicitation_request_before_final_response() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let server = temp_dir.path().join("elicitation_mcp_server.sh");
+        fs::write(
+            &server,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"elicits","version":"1"}}}\n'
+      ;;
+    *'"method":"notifications/initialized"'*)
+      ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"authorize","description":"needs user input","inputSchema":{"type":"object","properties":{},"required":[]}}]}}\n'
+      ;;
+    *'"method":"tools/call"'*)
+      printf '{"jsonrpc":"2.0","id":"prompt-1","method":"elicitation/create","params":{"message":"Authorize GitHub","url":"https://github.com/login/device","elicitationId":"device-flow"}}\n'
+      IFS= read -r response
+      case "$response" in
+        *'"id":"prompt-1"'*'"action":"accept"'*'"code":"1234"'*)
+          printf '{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"authorized"}],"isError":false}}\n'
+          ;;
+        *)
+          printf '{"jsonrpc":"2.0","id":3,"error":{"code":-32000,"message":"missing elicitation response"}}\n'
+          ;;
+      esac
+      ;;
+  esac
+done
+"#,
+        )
+        .expect("write MCP fixture");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&server).expect("metadata").permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&server, permissions).expect("chmod MCP fixture");
+        }
+        let transport = connect(&McpServerConfig {
+            name: "elicits".to_string(),
+            transport: McpTransportKind::Stdio,
+            command: Some("/bin/sh".to_string()),
+            args: vec![server.to_string_lossy().into_owned()],
+            url: None,
+            env: Default::default(),
+            headers: Default::default(),
+            disabled: false,
+            startup_timeout_ms: Some(STDIO_TEST_STARTUP_TIMEOUT_MS),
+            tool_timeout_ms: Some(1000),
+        })
+        .expect("connect stdio MCP");
+        transport.initialize().expect("initialize MCP");
+        transport.list_tools().expect("list tools");
+        let handler = RecordingElicitationHandler::new(McpElicitationResponse::accept(
+            serde_json::json!({"code":"1234"}),
+        ));
+
+        let result = transport
+            .call_tool_with_elicitation_handler(
+                "authorize",
+                Value::Object(Default::default()),
+                Some(&handler),
+            )
+            .expect("tool result after elicitation");
+
+        assert_eq!(result["content"][0]["text"], "authorized");
+        assert_eq!(
+            handler.requests.lock().unwrap().as_slice(),
+            &[McpElicitationRequest {
+                server_name: "elicits".to_string(),
+                id: "prompt-1".to_string(),
+                mode: McpElicitationMode::Url,
+                message: "Authorize GitHub".to_string(),
+                url: Some("https://github.com/login/device".to_string()),
+                requested_schema: None,
+            }]
+        );
+    }
+
+    struct RecordingElicitationHandler {
+        response: McpElicitationResponse,
+        requests: StdMutex<Vec<McpElicitationRequest>>,
+    }
+
+    impl RecordingElicitationHandler {
+        fn new(response: McpElicitationResponse) -> Self {
+            Self {
+                response,
+                requests: StdMutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl McpElicitationHandler for RecordingElicitationHandler {
+        fn handle_elicitation(
+            &self,
+            request: McpElicitationRequest,
+        ) -> Result<McpElicitationResponse, String> {
+            self.requests.lock().unwrap().push(request);
+            Ok(self.response.clone())
+        }
     }
 
     #[test]

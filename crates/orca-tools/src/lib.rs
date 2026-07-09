@@ -4,7 +4,7 @@ use std::thread;
 use orca_core::approval_types::ActionKind;
 use orca_core::external_config::ExternalToolConfig;
 use orca_core::tool_types::{ToolName, ToolOutputTruncation, ToolRequest, ToolResult};
-use orca_mcp::McpRegistry;
+use orca_mcp::{McpElicitationHandler, McpRegistry};
 
 pub mod bash;
 pub mod edit;
@@ -101,6 +101,31 @@ pub fn execute_with_mcp_external_roots_policy_or_cancel(
     shell_timeout_secs: u64,
     should_cancel: impl Fn() -> bool,
 ) -> ToolResult {
+    execute_with_mcp_external_roots_policy_or_cancel_and_elicitation(
+        request,
+        cwd,
+        additional_roots,
+        mcp_registry,
+        external_tools,
+        output_truncation,
+        shell_timeout_secs,
+        None,
+        should_cancel,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn execute_with_mcp_external_roots_policy_or_cancel_and_elicitation(
+    request: &ToolRequest,
+    cwd: &Path,
+    additional_roots: &[PathBuf],
+    mcp_registry: &McpRegistry,
+    external_tools: &[ExternalToolConfig],
+    output_truncation: ToolOutputTruncation,
+    shell_timeout_secs: u64,
+    mcp_elicitation_handler: Option<&dyn McpElicitationHandler>,
+    should_cancel: impl Fn() -> bool,
+) -> ToolResult {
     let shell_timeout = std::time::Duration::from_secs(shell_timeout_secs.max(1));
     let should_cancel = &should_cancel as &dyn Fn() -> bool;
     if !tool_uses_mcp_registry(&request.name) {
@@ -123,12 +148,15 @@ pub fn execute_with_mcp_external_roots_policy_or_cancel(
     }
 
     let reg = registry::tool_registry_with_mcp_and_external(Some(mcp_registry), external_tools);
-    let ctx = registry::ToolContext::new(cwd)
+    let mut ctx = registry::ToolContext::new(cwd)
         .with_output_truncation(output_truncation)
         .with_shell_timeout(shell_timeout)
         .with_additional_working_directories(additional_roots.iter().cloned())
         .with_mcp(mcp_registry)
         .with_cancel(should_cancel);
+    if let Some(handler) = mcp_elicitation_handler {
+        ctx = ctx.with_mcp_elicitation_handler(handler);
+    }
     reg.execute(request, &ctx)
 }
 

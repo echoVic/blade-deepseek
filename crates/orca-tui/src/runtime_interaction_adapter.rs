@@ -6,6 +6,9 @@ use std::sync::mpsc::{Receiver, Sender};
 use orca_approval::ApprovalPolicy;
 use orca_core::approval_types::{ApprovalDecision, ApprovalRequest, ApprovalResolution};
 use orca_core::tool_types;
+use orca_mcp::{
+    McpElicitationHandler, McpElicitationMode, McpElicitationRequest, McpElicitationResponse,
+};
 use orca_runtime::lifecycle::{
     RuntimeApprovalDecision, RuntimeApprovalHandler, RuntimePermissionRequest,
     RuntimePermissionRequestHandler, RuntimePermissionResponse, RuntimeToolActorContext,
@@ -446,6 +449,41 @@ impl<'a> TuiMcpElicitationHandler<'a> {
         };
         remove_pending_interaction(self.pending_interactions.as_ref(), &request.id);
         response
+    }
+}
+
+impl McpElicitationHandler for TuiMcpElicitationHandler<'_> {
+    fn handle_elicitation(
+        &self,
+        request: McpElicitationRequest,
+    ) -> Result<McpElicitationResponse, String> {
+        let mode = match request.mode {
+            McpElicitationMode::Form => {
+                orca_runtime::runtime_pending_interaction::RuntimeMcpElicitationMode::Form
+            }
+            McpElicitationMode::Url => {
+                orca_runtime::runtime_pending_interaction::RuntimeMcpElicitationMode::Url
+            }
+        };
+        let runtime_request = RuntimeMcpElicitationRequest::new(
+            request.server_name,
+            request.id,
+            mode,
+            request.message,
+            request.url,
+            request.requested_schema.map(|schema| schema.to_string()),
+        );
+        let response = self
+            .request_mcp_elicitation(&runtime_request)
+            .map_err(|error| error.to_string())?;
+        match response {
+            Some(content) => {
+                let content = serde_json::from_str(&content)
+                    .map_err(|error| format!("invalid MCP elicitation response JSON: {error}"))?;
+                Ok(McpElicitationResponse::accept(content))
+            }
+            None => Ok(McpElicitationResponse::decline()),
+        }
     }
 }
 
