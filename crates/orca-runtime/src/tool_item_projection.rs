@@ -34,16 +34,7 @@ pub(crate) fn mcp_tool_started_item(
     tool: impl Into<String>,
     arguments: Value,
 ) -> Value {
-    json!({
-        "id": id.into(),
-        "type": "mcpToolCall",
-        "server": server.into(),
-        "tool": tool.into(),
-        "status": "in_progress",
-        "arguments": arguments,
-        "result": Value::Null,
-        "error": Value::Null,
-    })
+    ProjectedMcpToolThreadItem::started(id, server, tool, arguments).into_value()
 }
 
 pub(crate) fn dynamic_tool_started_item(
@@ -73,16 +64,16 @@ pub(crate) fn mcp_tool_completed_item(
     result: Value,
     error: Value,
 ) -> Value {
-    json!({
-        "id": id.into(),
-        "type": "mcpToolCall",
-        "server": server.into(),
-        "tool": tool.into(),
-        "status": status.into(),
-        "arguments": arguments,
-        "result": result,
-        "error": error,
+    ProjectedMcpToolThreadItem::completed(ProjectedMcpToolCompletion {
+        id: id.into(),
+        server: server.into(),
+        tool: tool.into(),
+        status: status.into(),
+        arguments,
+        result,
+        error,
     })
+    .into_value()
 }
 
 pub(crate) fn dynamic_tool_completed_item(
@@ -105,6 +96,77 @@ pub(crate) fn dynamic_tool_completed_item(
         "success": success,
         "error": error,
     })
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ProjectedMcpToolCompletion {
+    id: String,
+    server: String,
+    tool: String,
+    status: String,
+    arguments: Value,
+    result: Value,
+    error: Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(tag = "type")]
+pub(crate) enum ProjectedMcpToolThreadItem {
+    #[serde(rename = "mcpToolCall")]
+    Started {
+        id: String,
+        server: String,
+        tool: String,
+        status: String,
+        arguments: Value,
+        result: Value,
+        error: Value,
+    },
+    #[serde(rename = "mcpToolCall")]
+    Completed {
+        id: String,
+        server: String,
+        tool: String,
+        status: String,
+        arguments: Value,
+        result: Value,
+        error: Value,
+    },
+}
+
+impl ProjectedMcpToolThreadItem {
+    pub(crate) fn started(
+        id: impl Into<String>,
+        server: impl Into<String>,
+        tool: impl Into<String>,
+        arguments: Value,
+    ) -> Self {
+        Self::Started {
+            id: id.into(),
+            server: server.into(),
+            tool: tool.into(),
+            status: "in_progress".to_string(),
+            arguments,
+            result: Value::Null,
+            error: Value::Null,
+        }
+    }
+
+    pub(crate) fn completed(completion: ProjectedMcpToolCompletion) -> Self {
+        Self::Completed {
+            id: completion.id,
+            server: completion.server,
+            tool: completion.tool,
+            status: completion.status,
+            arguments: completion.arguments,
+            result: completion.result,
+            error: completion.error,
+        }
+    }
+
+    pub(crate) fn into_value(self) -> Value {
+        serde_json::to_value(self).expect("projected mcp tool thread item serializes")
+    }
 }
 
 pub(crate) fn agent_message_item(id: impl Into<String>, text: impl Into<String>) -> Value {
@@ -772,6 +834,41 @@ mod tests {
         assert!(item["result"].is_null());
         assert_eq!(item["error"]["message"], "timeout");
         assert_eq!(item["error"]["exitCode"], 124);
+    }
+
+    #[test]
+    fn projected_mcp_tool_thread_item_serializes_current_wire_shapes() {
+        assert_eq!(
+            ProjectedMcpToolThreadItem::started(
+                "call-1",
+                "server",
+                "search",
+                json!({ "q": "orca" })
+            )
+            .into_value(),
+            mcp_tool_started_item("call-1", "server", "search", json!({ "q": "orca" }))
+        );
+        assert_eq!(
+            ProjectedMcpToolThreadItem::completed(ProjectedMcpToolCompletion {
+                id: "call-4".to_string(),
+                server: "server".to_string(),
+                tool: "search".to_string(),
+                status: "failed".to_string(),
+                arguments: json!({ "q": "orca" }),
+                result: Value::Null,
+                error: tool_error_object("timeout", Some(124)),
+            })
+            .into_value(),
+            mcp_tool_completed_item(
+                "call-4",
+                "server",
+                "search",
+                "failed",
+                json!({ "q": "orca" }),
+                Value::Null,
+                tool_error_object("timeout", Some(124)),
+            )
+        );
     }
 
     #[test]
