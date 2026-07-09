@@ -29,11 +29,13 @@ event projector stores typed projection state instead of ad hoc tool item
 fields while preserving the same TUI card payloads. Realtime `fileChange`
 lifecycle state now follows the same pattern through `ProjectedFileChangeItem`,
 keeping edit/write cards typed before the projector emits the unchanged
-server/TUI payload. A server can now ask for URL/form input during an MCP tool
-call, the TUI projects that request as a visible waiting-input prompt keyed by
-the runtime interaction id, and Orca writes the accept/decline response back
-before continuing the original tool call. Earlier v0.2.2 hardened DeepSeek
-tool-call compatibility:
+server/TUI payload. Workflow lifecycle aggregation now also lives behind
+`ProjectedWorkflowItem`, so run/task/result state is typed before the projector
+emits the unchanged workflow card payload. A server can now ask for URL/form
+input during an MCP tool call, the TUI projects that request as a visible
+waiting-input prompt keyed by the runtime interaction id, and Orca writes the
+accept/decline response back before continuing the original tool call. Earlier
+v0.2.2 hardened DeepSeek tool-call compatibility:
 `update_goal` and `update_plan` normalize the status aliases and boolean status
 flags DeepSeek emits before validation, the `glob`/`update_goal` JSON Schemas
 gain nullable/`anyOf` support, tool validation errors now list the allowed and

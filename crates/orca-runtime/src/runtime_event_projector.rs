@@ -5,9 +5,8 @@ use serde_json::{Value, json};
 use crate::protocol::{self, ServerEvent};
 use crate::tool_item_projection::{
     ProjectedFileChangeItem, ProjectedTextItem, ProjectedTextItemKind, ProjectedToolCallCompletion,
-    ProjectedToolCallItem, mcp_result_from_content, mcp_tool_parts, parse_json_or_null,
-    tool_error_object_from_value, tool_status_is_completed, workflow_completed_item,
-    workflow_started_item,
+    ProjectedToolCallItem, ProjectedWorkflowItem, mcp_result_from_content, mcp_tool_parts,
+    parse_json_or_null, tool_error_object_from_value, tool_status_is_completed,
 };
 
 const PROPOSED_PLAN_OPEN: &str = "<proposed_plan>";
@@ -21,7 +20,7 @@ pub(crate) struct RuntimeEventProjector {
     reasoning: Option<ProjectedTextItem>,
     tool_items: HashMap<String, ProjectedToolCallItem>,
     file_change_items: HashMap<String, ProjectedFileChangeItem>,
-    workflow_items: HashMap<String, WorkflowItem>,
+    workflow_items: HashMap<String, ProjectedWorkflowItem>,
 }
 
 impl RuntimeEventProjector {
@@ -318,19 +317,18 @@ impl RuntimeEventProjector {
             .as_str()
             .unwrap_or("workflow")
             .to_string();
-        let item = WorkflowItem {
-            id: run_id.clone(),
-            task_id: task_id.clone(),
-            workflow_name: workflow_name.clone(),
-            task: payload["task"].clone(),
-            status: "running".to_string(),
-            result: Value::Null,
-        };
-        self.workflow_items.insert(run_id.clone(), item);
+        let item = ProjectedWorkflowItem::started(
+            run_id.clone(),
+            task_id,
+            workflow_name,
+            payload["task"].clone(),
+        );
+        let started_item = item.started_item();
+        self.workflow_items.insert(run_id, item);
         events.push(ServerEvent::ItemStarted {
             thread_id: Value::Null,
             turn_id: Value::Null,
-            item: workflow_started_item(run_id, task_id, workflow_name, payload["task"].clone()),
+            item: started_item,
         });
     }
 
@@ -338,9 +336,7 @@ impl RuntimeEventProjector {
         let payload = &runtime_event["payload"];
         let run_id = payload["runId"].as_str().unwrap_or("workflow-run");
         if let Some(item) = self.workflow_items.get_mut(run_id) {
-            item.result = payload["result"].clone();
-            item.task = payload["task"].clone();
-            item.status = "completed".to_string();
+            item.record_result(payload["result"].clone(), payload["task"].clone());
         }
     }
 
@@ -348,8 +344,7 @@ impl RuntimeEventProjector {
         let payload = &runtime_event["payload"];
         let run_id = payload["runId"].as_str().unwrap_or("workflow-run");
         if let Some(item) = self.workflow_items.get_mut(run_id) {
-            item.task = payload["task"].clone();
-            item.status = "completed".to_string();
+            item.record_completed(payload["task"].clone());
         }
     }
 
@@ -364,34 +359,18 @@ impl RuntimeEventProjector {
             .as_str()
             .unwrap_or("workflow-run")
             .to_string();
-        let fallback = WorkflowItem {
-            id: run_id,
-            task_id: payload["taskId"].as_str().unwrap_or_default().to_string(),
-            workflow_name: payload["workflowName"]
-                .as_str()
-                .unwrap_or("workflow")
-                .to_string(),
-            task: payload["task"].clone(),
-            status: status.to_string(),
-            result: Value::Null,
-        };
-        let mut item = self.workflow_items.remove(&fallback.id).unwrap_or(fallback);
-        if item.task.is_null() {
-            item.task = payload["task"].clone();
-        }
-        item.status = status.to_string();
+        let fallback = ProjectedWorkflowItem::started(
+            run_id.clone(),
+            payload["taskId"].as_str().unwrap_or_default(),
+            payload["workflowName"].as_str().unwrap_or("workflow"),
+            payload["task"].clone(),
+        );
+        let mut item = self.workflow_items.remove(&run_id).unwrap_or(fallback);
+        item.fill_task_if_missing(payload["task"].clone());
         events.push(ServerEvent::ItemCompleted {
             thread_id: Value::Null,
             turn_id: Value::Null,
-            item: workflow_completed_item(
-                item.id,
-                item.task_id,
-                item.workflow_name,
-                item.status,
-                item.result,
-                payload["error"].clone(),
-                item.task,
-            ),
+            item: item.completed_item(status, payload["error"].clone()),
         });
     }
 }
@@ -408,16 +387,6 @@ struct ProposedPlanStreamParser {
 enum ProposedPlanSegment {
     Agent(String),
     Plan(String),
-}
-
-#[derive(Clone, Debug)]
-struct WorkflowItem {
-    id: String,
-    task_id: String,
-    workflow_name: String,
-    task: Value,
-    status: String,
-    result: Value,
 }
 
 impl ProposedPlanStreamParser {

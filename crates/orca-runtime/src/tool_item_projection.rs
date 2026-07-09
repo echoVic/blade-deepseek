@@ -520,6 +520,72 @@ pub(crate) struct ProjectedWorkflowCompletion {
     task: Value,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ProjectedWorkflowItem {
+    id: String,
+    task_id: String,
+    workflow_name: String,
+    task: Value,
+    status: String,
+    result: Value,
+}
+
+impl ProjectedWorkflowItem {
+    pub(crate) fn started(
+        id: impl Into<String>,
+        task_id: impl Into<String>,
+        workflow_name: impl Into<String>,
+        task: Value,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            task_id: task_id.into(),
+            workflow_name: workflow_name.into(),
+            task,
+            status: "running".to_string(),
+            result: Value::Null,
+        }
+    }
+
+    pub(crate) fn started_item(&self) -> Value {
+        workflow_started_item(
+            self.id.clone(),
+            self.task_id.clone(),
+            self.workflow_name.clone(),
+            self.task.clone(),
+        )
+    }
+
+    pub(crate) fn record_result(&mut self, result: Value, task: Value) {
+        self.result = result;
+        self.task = task;
+        self.status = "completed".to_string();
+    }
+
+    pub(crate) fn record_completed(&mut self, task: Value) {
+        self.task = task;
+        self.status = "completed".to_string();
+    }
+
+    pub(crate) fn fill_task_if_missing(&mut self, task: Value) {
+        if self.task.is_null() {
+            self.task = task;
+        }
+    }
+
+    pub(crate) fn completed_item(self, status: impl Into<String>, error: Value) -> Value {
+        workflow_completed_item(
+            self.id,
+            self.task_id,
+            self.workflow_name,
+            status,
+            self.result,
+            error,
+            self.task,
+        )
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(tag = "type")]
 pub(crate) enum ProjectedWorkflowThreadItem {
@@ -1612,6 +1678,42 @@ mod tests {
             workflow_completed_item(
                 "workflow-run-4",
                 "workflow-task-4",
+                "audit",
+                "completed",
+                Value::from("ok"),
+                Value::Null,
+                json!({ "kind": "workflow", "status": "completed" }),
+            )
+        );
+    }
+
+    #[test]
+    fn projected_workflow_item_serializes_current_lifecycle_shapes() {
+        let mut item = ProjectedWorkflowItem::started(
+            "workflow-run-3",
+            "workflow-task-3",
+            "audit",
+            json!({ "kind": "workflow", "status": "running" }),
+        );
+        assert_eq!(
+            item.started_item(),
+            workflow_started_item(
+                "workflow-run-3",
+                "workflow-task-3",
+                "audit",
+                json!({ "kind": "workflow", "status": "running" }),
+            )
+        );
+
+        item.record_result(
+            Value::from("ok"),
+            json!({ "kind": "workflow", "status": "completed" }),
+        );
+        assert_eq!(
+            item.completed_item("completed", Value::Null),
+            workflow_completed_item(
+                "workflow-run-3",
+                "workflow-task-3",
                 "audit",
                 "completed",
                 Value::from("ok"),
