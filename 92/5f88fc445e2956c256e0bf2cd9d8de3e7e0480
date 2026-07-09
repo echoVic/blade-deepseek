@@ -1,0 +1,21 @@
+site/scripts/check-seo.mjs
+  s_59b3f762fe6ff5::t_a5986c6f3a379f 119-126
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "925f88fc445e2956c256e0bf2cd9d8de3e7e0480",
+  "prompts": {},
+  "sessions": {
+    "s_59b3f762fe6ff5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f3732-a38e-7e13-aa5d-189cff887d80",
+        "model": "unknown"
+      },
+      "human_author": "echoVic <137844255@qq.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
