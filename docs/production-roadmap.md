@@ -4,10 +4,16 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-07-10
-Current baseline: current main after v0.2.6 makes DeepSeek proposed-plan
-streams visible in the TUI as a dedicated scrollback message instead of leaking
+Current baseline: current main after v0.2.7 moves the reusable user,
+persisted, assistant-message, proposed-plan, and reasoning thread-item
+projection types into `orca-core`. Runtime projection still emits the same
+server/TUI JSON, but live TUI streams, active steer user messages, and resumed
+history/read/list views now pass through one typed item boundary before
+serialization, reducing drift between the transcript cards users see in fresh
+and resumed sessions. Earlier v0.2.6 made DeepSeek proposed-plan streams
+visible in the TUI as a dedicated scrollback message instead of leaking
 `<proposed_plan>` tags into ordinary assistant text. The server projection and
-TUI now share the same UTF-8-safe proposed-plan stream parser, so split tags,
+TUI share the same UTF-8-safe proposed-plan stream parser, so split tags,
 incomplete plan tags, and Chinese streaming text keep one tested behavior
 across local and server-facing transcript surfaces. Earlier v0.2.5 made server
 `command/exec` network-deny handling use the same runtime permission evaluation

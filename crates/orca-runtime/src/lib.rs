@@ -1545,19 +1545,27 @@ mod tests {
     }
 
     #[test]
-    fn text_item_lifecycle_projection_is_owned_by_tool_item_projection() {
+    fn text_item_lifecycle_projection_is_owned_by_core_thread_item_projection() {
         let projector_source = include_str!("runtime_event_projector.rs");
         let projection_source = include_str!("tool_item_projection.rs");
 
-        for marker in [
-            "pub(crate) enum ProjectedTextItemKind",
-            "pub(crate) struct ProjectedTextItem",
-            "pub(crate) fn started_item(&self)",
-            "pub(crate) fn completed_item(self)",
-        ] {
+        for marker in ["ProjectedTextItem", "ProjectedTextItemKind"] {
             assert!(
                 projection_source.contains(marker),
-                "tool_item_projection must own text item lifecycle detail {marker}"
+                "tool_item_projection should import shared core text item detail {marker}"
+            );
+        }
+        for marker in [
+            "pub(crate) enum ProjectedTextThreadItem",
+            "pub(crate) enum ProjectedTextItemKind",
+            "pub(crate) struct ProjectedTextItem",
+            "impl ProjectedTextThreadItem",
+            "impl ProjectedTextItem",
+            "impl ProjectedTextItemKind",
+        ] {
+            assert!(
+                !projection_source.contains(marker),
+                "tool_item_projection must not own text item lifecycle detail {marker}"
             );
         }
         for marker in [
@@ -1637,19 +1645,23 @@ mod tests {
     }
 
     #[test]
-    fn user_message_item_projection_is_owned_by_tool_item_projection() {
+    fn user_message_item_type_is_owned_by_core_thread_item_projection() {
         let turn_processor_source = include_str!("server/processors/turn.rs");
+        let core_projection_source = include_str!("../../orca-core/src/thread_item_projection.rs");
         let projection_source = include_str!("tool_item_projection.rs");
 
-        for marker in [
-            "pub(crate) enum ProjectedUserMessageThreadItem",
-            "pub(crate) fn user_message_item(",
-        ] {
-            assert!(
-                projection_source.contains(marker),
-                "tool_item_projection must own user-message item projection detail {marker}"
-            );
-        }
+        assert!(
+            core_projection_source.contains("pub enum ProjectedUserMessageThreadItem"),
+            "orca-core thread item projection must own user-message item type"
+        );
+        assert!(
+            !projection_source.contains("pub(crate) enum ProjectedUserMessageThreadItem"),
+            "tool_item_projection must not own user-message item type"
+        );
+        assert!(
+            projection_source.contains("pub(crate) fn user_message_item("),
+            "tool_item_projection must expose the user-message item projection helper"
+        );
         assert!(
             turn_processor_source.contains("user_message_item("),
             "turn processor must use shared user-message item projection"
@@ -1657,6 +1669,30 @@ mod tests {
         assert!(
             !turn_processor_source.contains("\"type\": \"user_message\""),
             "turn processor must not hand-roll user-message item JSON"
+        );
+    }
+
+    #[test]
+    fn persisted_message_item_type_is_owned_by_core_thread_item_projection() {
+        let thread_store_projection_source = include_str!("thread_store/projection.rs");
+        let core_projection_source = include_str!("../../orca-core/src/thread_item_projection.rs");
+        let projection_source = include_str!("tool_item_projection.rs");
+
+        assert!(
+            core_projection_source.contains("pub enum ProjectedPersistedMessageThreadItem"),
+            "orca-core thread item projection must own persisted-message item type"
+        );
+        assert!(
+            !projection_source.contains("pub(crate) enum ProjectedPersistedMessageThreadItem"),
+            "tool_item_projection must not own persisted-message item type"
+        );
+        assert!(
+            thread_store_projection_source.contains("ProjectedPersistedMessageThreadItem"),
+            "thread-store projection must construct persisted messages through the shared core item type"
+        );
+        assert!(
+            !thread_store_projection_source.contains("\"reasoningContent\""),
+            "thread-store projection must not hand-roll persisted assistant message JSON"
         );
     }
 

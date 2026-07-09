@@ -76,6 +76,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.7":
+        "Core now owns the reusable thread-item projection types for user, persisted, assistant-message, proposed-plan, and reasoning transcript items. Runtime projection still emits the same TUI/server JSON, but live streams, active steer messages, and resumed history now share one typed item boundary before serialization, reducing drift in the transcript cards users see.",
       "v0.2.6":
         "TUI proposed plans now render as their own scrollback message instead of leaking <proposed_plan> tags into assistant text. The server and TUI share one UTF-8-safe parser, so split tags and Chinese streaming text keep the same tested behavior across local TUI and server projection.",
       "v0.2.5":
@@ -466,6 +468,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.7":
+        "Core 现在拥有 user、persisted、assistant-message、proposed-plan 和 reasoning transcript item 的可复用投影类型。Runtime projection 仍然输出相同的 TUI/server JSON，但 live stream、active steer message 与 resumed history 会先经过同一个 typed item 边界再序列化，减少用户看到的 transcript card 漂移。",
       "v0.2.6":
         "TUI proposed plan 现在会作为独立的 scrollback 消息显示，不再把 <proposed_plan> 标签泄漏进普通 assistant 文本。Server 和 TUI 共用同一个 UTF-8 safe parser，所以拆分标签和中文流式文本在本地 TUI 与 server projection 中保持同一套经过测试的行为。",
       "v0.2.5":

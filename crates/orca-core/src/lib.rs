@@ -17,6 +17,7 @@ pub mod provider_types;
 pub mod subagent_config;
 pub mod subagent_types;
 pub mod task_types;
+pub mod thread_item_projection;
 pub mod tool_types;
 pub mod verification;
 pub mod workflow_types;
@@ -77,5 +78,26 @@ mod proposed_plan_tests {
                 "第000段:内容片全芯业型环训练力栈全首片闭\n\n".to_string()
             )]
         );
+    }
+}
+
+#[cfg(test)]
+mod thread_item_projection_tests {
+    use crate::thread_item_projection::{ProjectedTextItem, ProjectedTextItemKind};
+
+    #[test]
+    fn core_text_thread_item_lifecycle_serializes_existing_wire_shape() {
+        let mut item = ProjectedTextItem::new(ProjectedTextItemKind::Plan);
+
+        let started = item.started_item();
+        item.push_delta("1. inspect");
+        let completed = item.completed_item();
+
+        assert_eq!(started["id"], "item-plan-1");
+        assert_eq!(started["type"], "plan");
+        assert_eq!(started["text"], "");
+        assert_eq!(completed["id"], "item-plan-1");
+        assert_eq!(completed["type"], "plan");
+        assert_eq!(completed["text"], "1. inspect");
     }
 }

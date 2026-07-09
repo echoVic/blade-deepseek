@@ -1,3 +1,7 @@
+pub(crate) use orca_core::thread_item_projection::{
+    ProjectedPersistedMessageThreadItem, ProjectedTextItem, ProjectedTextItemKind,
+    ProjectedTextThreadItem, ProjectedUserMessageThreadItem,
+};
 use serde::Serialize;
 use serde_json::{Value, json};
 
@@ -162,88 +166,8 @@ impl From<ProjectedWorkflowThreadItem> for ProjectedThreadItem {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
-#[serde(tag = "type")]
-pub(crate) enum ProjectedUserMessageThreadItem {
-    #[serde(rename = "user_message")]
-    Started { role: &'static str, content: String },
-}
-
-impl ProjectedUserMessageThreadItem {
-    pub(crate) fn new(content: impl Into<String>) -> Self {
-        Self::Started {
-            role: "user",
-            content: content.into(),
-        }
-    }
-}
-
 pub(crate) fn persisted_message_thread_item(item: ProjectedPersistedMessageThreadItem) -> Value {
     ProjectedThreadItem::from(item).into_value()
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize)]
-#[serde(untagged)]
-pub(crate) enum ProjectedPersistedMessageThreadItem {
-    System {
-        role: &'static str,
-        content: String,
-    },
-    User {
-        role: &'static str,
-        content: String,
-    },
-    Assistant {
-        role: &'static str,
-        content: Option<String>,
-        #[serde(rename = "reasoningContent")]
-        reasoning_content: Option<String>,
-        #[serde(rename = "toolCalls")]
-        tool_calls: Vec<Value>,
-    },
-    Tool {
-        role: &'static str,
-        #[serde(rename = "toolCallId")]
-        tool_call_id: String,
-        content: String,
-    },
-}
-
-impl ProjectedPersistedMessageThreadItem {
-    pub(crate) fn system(content: impl Into<String>) -> Self {
-        Self::System {
-            role: "system",
-            content: content.into(),
-        }
-    }
-
-    pub(crate) fn user(content: impl Into<String>) -> Self {
-        Self::User {
-            role: "user",
-            content: content.into(),
-        }
-    }
-
-    pub(crate) fn assistant(
-        content: Option<String>,
-        reasoning_content: Option<String>,
-        tool_calls: Vec<Value>,
-    ) -> Self {
-        Self::Assistant {
-            role: "assistant",
-            content,
-            reasoning_content,
-            tool_calls,
-        }
-    }
-
-    pub(crate) fn tool(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
-        Self::Tool {
-            role: "tool",
-            tool_call_id: tool_call_id.into(),
-            content: content.into(),
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -745,122 +669,8 @@ impl ProjectedWorkflowThreadItem {
     }
 }
 
-pub(crate) fn agent_message_item(id: impl Into<String>, text: impl Into<String>) -> Value {
-    ProjectedThreadItem::from(ProjectedTextThreadItem::agent_message(id, text)).into_value()
-}
-
-pub(crate) fn plan_item(id: impl Into<String>, text: impl Into<String>) -> Value {
-    ProjectedThreadItem::from(ProjectedTextThreadItem::plan(id, text)).into_value()
-}
-
-pub(crate) fn reasoning_item(id: impl Into<String>, summary: impl Into<String>) -> Value {
-    ProjectedThreadItem::from(ProjectedTextThreadItem::reasoning(id, summary)).into_value()
-}
-
 pub(crate) fn user_message_item(content: impl Into<String>) -> Value {
     ProjectedThreadItem::from(ProjectedUserMessageThreadItem::new(content)).into_value()
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(tag = "type")]
-pub(crate) enum ProjectedTextThreadItem {
-    #[serde(rename = "agent_message")]
-    AgentMessage { id: String, text: String },
-    #[serde(rename = "plan")]
-    Plan { id: String, text: String },
-    #[serde(rename = "reasoning")]
-    Reasoning {
-        id: String,
-        summary: String,
-        content: String,
-    },
-}
-
-impl ProjectedTextThreadItem {
-    pub(crate) fn agent_message(id: impl Into<String>, text: impl Into<String>) -> Self {
-        Self::AgentMessage {
-            id: id.into(),
-            text: text.into(),
-        }
-    }
-
-    pub(crate) fn plan(id: impl Into<String>, text: impl Into<String>) -> Self {
-        Self::Plan {
-            id: id.into(),
-            text: text.into(),
-        }
-    }
-
-    pub(crate) fn reasoning(id: impl Into<String>, summary: impl Into<String>) -> Self {
-        Self::Reasoning {
-            id: id.into(),
-            summary: summary.into(),
-            content: String::new(),
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn into_value(self) -> Value {
-        serde_json::to_value(self).expect("projected text thread item serializes")
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ProjectedTextItemKind {
-    AgentMessage,
-    Plan,
-    Reasoning,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ProjectedTextItem {
-    kind: ProjectedTextItemKind,
-    id: &'static str,
-    text: String,
-}
-
-impl ProjectedTextItem {
-    pub(crate) fn new(kind: ProjectedTextItemKind) -> Self {
-        Self {
-            kind,
-            id: kind.id(),
-            text: String::new(),
-        }
-    }
-
-    pub(crate) fn id(&self) -> &str {
-        self.id
-    }
-
-    pub(crate) fn push_delta(&mut self, delta: &str) {
-        self.text.push_str(delta);
-    }
-
-    pub(crate) fn started_item(&self) -> Value {
-        self.kind.item(self.id, "")
-    }
-
-    pub(crate) fn completed_item(self) -> Value {
-        self.kind.item(self.id, self.text)
-    }
-}
-
-impl ProjectedTextItemKind {
-    fn id(self) -> &'static str {
-        match self {
-            Self::AgentMessage => "item-agent-message-1",
-            Self::Plan => "item-plan-1",
-            Self::Reasoning => "item-reasoning-1",
-        }
-    }
-
-    fn item(self, id: impl Into<String>, text: impl Into<String>) -> Value {
-        match self {
-            Self::AgentMessage => agent_message_item(id, text),
-            Self::Plan => plan_item(id, text),
-            Self::Reasoning => reasoning_item(id, text),
-        }
-    }
 }
 
 pub(crate) fn command_execution_started_item(
@@ -1886,7 +1696,7 @@ mod tests {
                 "hello",
             ))
             .into_value(),
-            agent_message_item("item-agent-message-1", "hello")
+            ProjectedTextThreadItem::agent_message("item-agent-message-1", "hello").into_value()
         );
         assert_eq!(
             ProjectedThreadItem::from(ProjectedCommandExecutionThreadItem::started(
@@ -2048,8 +1858,10 @@ mod tests {
 
     #[test]
     fn agent_message_item_projects_text_lifecycle_shape() {
-        let started = agent_message_item("item-agent-message-1", "");
-        let completed = agent_message_item("item-agent-message-1", "hello");
+        let started =
+            ProjectedTextThreadItem::agent_message("item-agent-message-1", "").into_value();
+        let completed =
+            ProjectedTextThreadItem::agent_message("item-agent-message-1", "hello").into_value();
 
         assert_eq!(started["id"], "item-agent-message-1");
         assert_eq!(started["type"], "agent_message");
@@ -2061,8 +1873,8 @@ mod tests {
 
     #[test]
     fn plan_item_projects_text_lifecycle_shape() {
-        let started = plan_item("item-plan-1", "");
-        let completed = plan_item("item-plan-1", "# Plan\n");
+        let started = ProjectedTextThreadItem::plan("item-plan-1", "").into_value();
+        let completed = ProjectedTextThreadItem::plan("item-plan-1", "# Plan\n").into_value();
 
         assert_eq!(started["id"], "item-plan-1");
         assert_eq!(started["type"], "plan");
@@ -2074,8 +1886,9 @@ mod tests {
 
     #[test]
     fn reasoning_item_projects_summary_lifecycle_shape() {
-        let started = reasoning_item("item-reasoning-1", "");
-        let completed = reasoning_item("item-reasoning-1", "thinking");
+        let started = ProjectedTextThreadItem::reasoning("item-reasoning-1", "").into_value();
+        let completed =
+            ProjectedTextThreadItem::reasoning("item-reasoning-1", "thinking").into_value();
 
         assert_eq!(started["id"], "item-reasoning-1");
         assert_eq!(started["type"], "reasoning");
@@ -2091,15 +1904,28 @@ mod tests {
     fn projected_text_thread_item_serializes_current_wire_shapes() {
         assert_eq!(
             ProjectedTextThreadItem::agent_message("item-agent-message-1", "hello").into_value(),
-            agent_message_item("item-agent-message-1", "hello")
+            json!({
+                "type": "agent_message",
+                "id": "item-agent-message-1",
+                "text": "hello",
+            })
         );
         assert_eq!(
             ProjectedTextThreadItem::plan("item-plan-1", "1. inspect").into_value(),
-            plan_item("item-plan-1", "1. inspect")
+            json!({
+                "type": "plan",
+                "id": "item-plan-1",
+                "text": "1. inspect",
+            })
         );
         assert_eq!(
             ProjectedTextThreadItem::reasoning("item-reasoning-1", "thinking").into_value(),
-            reasoning_item("item-reasoning-1", "thinking")
+            json!({
+                "type": "reasoning",
+                "id": "item-reasoning-1",
+                "summary": "thinking",
+                "content": "",
+            })
         );
     }
 
