@@ -76,6 +76,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.1":
+        "Server interactive responses now stay with their focused processors. permission/respond resolves pending permission grants inside the permission processor, user_input/respond resolves runtime user-input waiters inside the user-input processor, and ownership tests guard that the generic server module does not reclaim those response paths.",
       "v0.2.0":
         "Permission approval dialogs now name the requested risk directly. Network blocks, filesystem write grants, and unsandboxed shell retries keep their runtime permission kind through pending interactions, so the TUI modal can show Network Permission Required, Filesystem Permission Required, or Unsandboxed Shell Required instead of a generic approval title. request_permissions also reaches the runtime permission handler instead of being intercepted as an ordinary tool approval, making TUI and server permission grants more reliable.",
       "v0.1.191":
@@ -454,6 +456,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.1":
+        "Server 交互响应现在归属到各自的 focused processor。permission/respond 会在 permission processor 里解析 pending permission grant，user_input/respond 会在 user-input processor 里解析 runtime user-input waiter，并且 ownership tests 会防止这些响应路径重新退回泛化的 server 模块。",
       "v0.2.0":
         "权限审批弹窗现在会直接说清楚请求风险。Network block、filesystem write grant 和 unsandboxed shell retry 的 runtime permission kind 会穿过 pending interaction 传到 TUI，所以弹窗可以显示 Network Permission Required、Filesystem Permission Required 或 Unsandboxed Shell Required，而不是泛泛的 Approval Required。",
       "v0.1.191":

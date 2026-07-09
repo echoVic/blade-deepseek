@@ -4,15 +4,21 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-07-09
-Current baseline: current main after v0.2.0 starts the feature-release line
-with a TUI-visible permission approval improvement: runtime pending interaction
-records now preserve the permission request kind for network blocks,
-filesystem write grants, and unsandboxed shell retries, and the TUI approval
-modal uses that kind to show a risk-specific title instead of a generic
-approval title. The same v0.2.0 line also fixes the `request_permissions`
-runtime path so the tool bypasses the normal tool approval gate and reaches the
-runtime permission handler, letting TUI/server users approve session-scoped
-directory and network grants through the intended pending-permission flow.
+Current baseline: current main after v0.2.1 continues the Codex/package 3
+processor pass: `permission/respond` and `user_input/respond` now resolve their
+pending request ids inside focused server processors instead of the generic
+`server.rs` module. This keeps server-mode interactive responses aligned with
+Codex's request-processor ownership and package 3's request-id-driven pending
+permission flow, without changing wire event names or response semantics.
+Earlier v0.2.0 started the feature-release line with a TUI-visible permission
+approval improvement: runtime pending interaction records now preserve the
+permission request kind for network blocks, filesystem write grants, and
+unsandboxed shell retries, and the TUI approval modal uses that kind to show a
+risk-specific title instead of a generic approval title. The same v0.2.0 line
+also fixes the `request_permissions` runtime path so the tool bypasses the
+normal tool approval gate and reaches the runtime permission handler, letting
+TUI/server users approve session-scoped directory and network grants through the
+intended pending-permission flow.
 Earlier v0.1.191 and the follow-on TUI bridge slice own
 approved background provider-response continuation execution in `orca-runtime`:
 the runtime consumes the pending provider response from `TaskRegistry` and
@@ -354,7 +360,11 @@ The deeper July 9 reference pass changes the next refactor order:
    dialog. Server-mode `request_user_input` now follows the same Codex/package
    3-style pending map: the runtime emits `user_input_request`, clients answer
    with `user_input/respond` plus `requestId`, and the server resolves only the
-   matching waiter with `user_input_resolved`. Background main-session approval
+   matching waiter with `user_input_resolved`. The v0.2.1 server processor
+   slice keeps that response resolution owned by `server/processors/user_input.rs`
+   and keeps `permission/respond` resolution owned by
+   `server/processors/permission.rs`, so the generic server module no longer
+   owns interactive response handling. Background main-session approval
    actions now also carry the pending tool approval request id through the TUI
    action channel; the runtime task registry validates that id, rejects
    duplicate responses, and returns the owning task id only after the request

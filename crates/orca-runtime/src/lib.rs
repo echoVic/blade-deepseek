@@ -1895,6 +1895,8 @@ mod tests {
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let router_source = std::fs::read_to_string(manifest_dir.join("src/server/router.rs"))
             .expect("server router source");
+        let server_source =
+            std::fs::read_to_string(manifest_dir.join("src/server.rs")).expect("server source");
         let processor_source =
             std::fs::read_to_string(manifest_dir.join("src/server/processors/permission.rs"))
                 .expect("server permission processor source");
@@ -1915,6 +1917,14 @@ mod tests {
             processor_source.contains("fn dispatch_permission_operation"),
             "server permission processor must expose permission dispatch inside the router module"
         );
+        assert!(
+            !server_source.contains("fn run_permission_respond"),
+            "server.rs must not own permission response handling"
+        );
+        assert!(
+            processor_source.contains("fn run_permission_respond"),
+            "server permission processor must own permission response handling"
+        );
     }
 
     #[test]
@@ -1922,6 +1932,8 @@ mod tests {
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let router_source = std::fs::read_to_string(manifest_dir.join("src/server/router.rs"))
             .expect("server router source");
+        let server_source =
+            std::fs::read_to_string(manifest_dir.join("src/server.rs")).expect("server source");
         let processor_source =
             std::fs::read_to_string(manifest_dir.join("src/server/processors/user_input.rs"))
                 .expect("server user input processor source");
@@ -1941,6 +1953,14 @@ mod tests {
         assert!(
             processor_source.contains("fn dispatch_user_input_operation"),
             "server user-input processor must expose user-input dispatch inside the router module"
+        );
+        assert!(
+            !server_source.contains("fn run_user_input_respond"),
+            "server.rs must not own user-input response handling"
+        );
+        assert!(
+            processor_source.contains("fn run_user_input_respond"),
+            "server user-input processor must own user-input response handling"
         );
     }
 
