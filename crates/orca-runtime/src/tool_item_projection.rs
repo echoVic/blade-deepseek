@@ -34,7 +34,10 @@ pub(crate) fn mcp_tool_started_item(
     tool: impl Into<String>,
     arguments: Value,
 ) -> Value {
-    ProjectedMcpToolThreadItem::started(id, server, tool, arguments).into_value()
+    ProjectedThreadItem::from(ProjectedMcpToolThreadItem::started(
+        id, server, tool, arguments,
+    ))
+    .into_value()
 }
 
 pub(crate) fn dynamic_tool_started_item(
@@ -42,7 +45,8 @@ pub(crate) fn dynamic_tool_started_item(
     tool: impl Into<String>,
     arguments: Value,
 ) -> Value {
-    ProjectedDynamicToolThreadItem::started(id, tool, arguments).into_value()
+    ProjectedThreadItem::from(ProjectedDynamicToolThreadItem::started(id, tool, arguments))
+        .into_value()
 }
 
 pub(crate) fn mcp_tool_completed_item(
@@ -54,15 +58,17 @@ pub(crate) fn mcp_tool_completed_item(
     result: Value,
     error: Value,
 ) -> Value {
-    ProjectedMcpToolThreadItem::completed(ProjectedMcpToolCompletion {
-        id: id.into(),
-        server: server.into(),
-        tool: tool.into(),
-        status: status.into(),
-        arguments,
-        result,
-        error,
-    })
+    ProjectedThreadItem::from(ProjectedMcpToolThreadItem::completed(
+        ProjectedMcpToolCompletion {
+            id: id.into(),
+            server: server.into(),
+            tool: tool.into(),
+            status: status.into(),
+            arguments,
+            result,
+            error,
+        },
+    ))
     .into_value()
 }
 
@@ -75,16 +81,71 @@ pub(crate) fn dynamic_tool_completed_item(
     success: bool,
     error: Value,
 ) -> Value {
-    ProjectedDynamicToolThreadItem::completed(ProjectedDynamicToolCompletion {
-        id: id.into(),
-        tool: tool.into(),
-        status: status.into(),
-        arguments,
-        content_items,
-        success,
-        error,
-    })
+    ProjectedThreadItem::from(ProjectedDynamicToolThreadItem::completed(
+        ProjectedDynamicToolCompletion {
+            id: id.into(),
+            tool: tool.into(),
+            status: status.into(),
+            arguments,
+            content_items,
+            success,
+            error,
+        },
+    ))
     .into_value()
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(untagged)]
+pub(crate) enum ProjectedThreadItem {
+    Text(ProjectedTextThreadItem),
+    CommandExecution(ProjectedCommandExecutionThreadItem),
+    McpTool(ProjectedMcpToolThreadItem),
+    DynamicTool(ProjectedDynamicToolThreadItem),
+    FileChange(ProjectedFileChangeThreadItem),
+    Workflow(ProjectedWorkflowThreadItem),
+}
+
+impl ProjectedThreadItem {
+    pub(crate) fn into_value(self) -> Value {
+        serde_json::to_value(self).expect("projected thread item serializes")
+    }
+}
+
+impl From<ProjectedTextThreadItem> for ProjectedThreadItem {
+    fn from(item: ProjectedTextThreadItem) -> Self {
+        Self::Text(item)
+    }
+}
+
+impl From<ProjectedCommandExecutionThreadItem> for ProjectedThreadItem {
+    fn from(item: ProjectedCommandExecutionThreadItem) -> Self {
+        Self::CommandExecution(item)
+    }
+}
+
+impl From<ProjectedMcpToolThreadItem> for ProjectedThreadItem {
+    fn from(item: ProjectedMcpToolThreadItem) -> Self {
+        Self::McpTool(item)
+    }
+}
+
+impl From<ProjectedDynamicToolThreadItem> for ProjectedThreadItem {
+    fn from(item: ProjectedDynamicToolThreadItem) -> Self {
+        Self::DynamicTool(item)
+    }
+}
+
+impl From<ProjectedFileChangeThreadItem> for ProjectedThreadItem {
+    fn from(item: ProjectedFileChangeThreadItem) -> Self {
+        Self::FileChange(item)
+    }
+}
+
+impl From<ProjectedWorkflowThreadItem> for ProjectedThreadItem {
+    fn from(item: ProjectedWorkflowThreadItem) -> Self {
+        Self::Workflow(item)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -153,6 +214,7 @@ impl ProjectedMcpToolThreadItem {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn into_value(self) -> Value {
         serde_json::to_value(self).expect("projected mcp tool thread item serializes")
     }
@@ -229,6 +291,7 @@ impl ProjectedDynamicToolThreadItem {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn into_value(self) -> Value {
         serde_json::to_value(self).expect("projected dynamic tool thread item serializes")
     }
@@ -297,6 +360,7 @@ impl ProjectedFileChangeThreadItem {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn into_value(self) -> Value {
         serde_json::to_value(self).expect("projected file change thread item serializes")
     }
@@ -368,21 +432,22 @@ impl ProjectedWorkflowThreadItem {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn into_value(self) -> Value {
         serde_json::to_value(self).expect("projected workflow thread item serializes")
     }
 }
 
 pub(crate) fn agent_message_item(id: impl Into<String>, text: impl Into<String>) -> Value {
-    ProjectedTextThreadItem::agent_message(id, text).into_value()
+    ProjectedThreadItem::from(ProjectedTextThreadItem::agent_message(id, text)).into_value()
 }
 
 pub(crate) fn plan_item(id: impl Into<String>, text: impl Into<String>) -> Value {
-    ProjectedTextThreadItem::plan(id, text).into_value()
+    ProjectedThreadItem::from(ProjectedTextThreadItem::plan(id, text)).into_value()
 }
 
 pub(crate) fn reasoning_item(id: impl Into<String>, summary: impl Into<String>) -> Value {
-    ProjectedTextThreadItem::reasoning(id, summary).into_value()
+    ProjectedThreadItem::from(ProjectedTextThreadItem::reasoning(id, summary)).into_value()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -423,6 +488,7 @@ impl ProjectedTextThreadItem {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn into_value(self) -> Value {
         serde_json::to_value(self).expect("projected text thread item serializes")
     }
@@ -491,7 +557,10 @@ pub(crate) fn command_execution_started_item(
     tool: impl Into<String>,
     command: Option<impl Into<String>>,
 ) -> Value {
-    ProjectedCommandExecutionThreadItem::started(id, tool, command).into_value()
+    ProjectedThreadItem::from(ProjectedCommandExecutionThreadItem::started(
+        id, tool, command,
+    ))
+    .into_value()
 }
 
 pub(crate) fn command_execution_completed_item(
@@ -504,16 +573,18 @@ pub(crate) fn command_execution_completed_item(
     exit_code: Value,
     truncated: Value,
 ) -> Value {
-    ProjectedCommandExecutionThreadItem::completed(ProjectedCommandExecutionCompletion {
-        id: id.into(),
-        tool: tool.into(),
-        command: command.map(Into::into),
-        status,
-        aggregated_output,
-        error,
-        exit_code,
-        truncated,
-    })
+    ProjectedThreadItem::from(ProjectedCommandExecutionThreadItem::completed(
+        ProjectedCommandExecutionCompletion {
+            id: id.into(),
+            tool: tool.into(),
+            command: command.map(Into::into),
+            status,
+            aggregated_output,
+            error,
+            exit_code,
+            truncated,
+        },
+    ))
     .into_value()
 }
 
@@ -581,6 +652,7 @@ impl ProjectedCommandExecutionThreadItem {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn into_value(self) -> Value {
         serde_json::to_value(self).expect("projected command execution thread item serializes")
     }
@@ -631,7 +703,8 @@ pub(crate) fn file_change_started_item(
     kind: impl Into<String>,
     diff: Value,
 ) -> Value {
-    ProjectedFileChangeThreadItem::started(id, path, kind, diff).into_value()
+    ProjectedThreadItem::from(ProjectedFileChangeThreadItem::started(id, path, kind, diff))
+        .into_value()
 }
 
 pub(crate) fn file_change_completed_item(
@@ -641,13 +714,15 @@ pub(crate) fn file_change_completed_item(
     status: Value,
     diff: Value,
 ) -> Value {
-    ProjectedFileChangeThreadItem::completed(ProjectedFileChangeCompletion {
-        id: id.into(),
-        path: path.map(Into::into),
-        kind: kind.into(),
-        status,
-        diff,
-    })
+    ProjectedThreadItem::from(ProjectedFileChangeThreadItem::completed(
+        ProjectedFileChangeCompletion {
+            id: id.into(),
+            path: path.map(Into::into),
+            kind: kind.into(),
+            status,
+            diff,
+        },
+    ))
     .into_value()
 }
 
@@ -717,7 +792,13 @@ pub(crate) fn workflow_started_item(
     workflow_name: impl Into<String>,
     task: Value,
 ) -> Value {
-    ProjectedWorkflowThreadItem::started(id, task_id, workflow_name, task).into_value()
+    ProjectedThreadItem::from(ProjectedWorkflowThreadItem::started(
+        id,
+        task_id,
+        workflow_name,
+        task,
+    ))
+    .into_value()
 }
 
 pub(crate) fn workflow_completed_item(
@@ -729,15 +810,17 @@ pub(crate) fn workflow_completed_item(
     error: Value,
     task: Value,
 ) -> Value {
-    ProjectedWorkflowThreadItem::completed(ProjectedWorkflowCompletion {
-        id: id.into(),
-        task_id: task_id.into(),
-        workflow_name: workflow_name.into(),
-        status: status.into(),
-        result,
-        error,
-        task,
-    })
+    ProjectedThreadItem::from(ProjectedWorkflowThreadItem::completed(
+        ProjectedWorkflowCompletion {
+            id: id.into(),
+            task_id: task_id.into(),
+            workflow_name: workflow_name.into(),
+            status: status.into(),
+            result,
+            error,
+            task,
+        },
+    ))
     .into_value()
 }
 
@@ -1366,6 +1449,76 @@ mod tests {
                 Value::from("ok"),
                 Value::Null,
                 json!({ "kind": "workflow", "status": "completed" }),
+            )
+        );
+    }
+
+    #[test]
+    fn projected_thread_item_serializes_all_typed_transcript_shapes() {
+        assert_eq!(
+            ProjectedThreadItem::from(ProjectedTextThreadItem::agent_message(
+                "item-agent-message-1",
+                "hello",
+            ))
+            .into_value(),
+            agent_message_item("item-agent-message-1", "hello")
+        );
+        assert_eq!(
+            ProjectedThreadItem::from(ProjectedCommandExecutionThreadItem::started(
+                "tool-1",
+                "bash",
+                Some("cargo test"),
+            ))
+            .into_value(),
+            command_execution_started_item("tool-1", "bash", Some("cargo test"))
+        );
+        assert_eq!(
+            ProjectedThreadItem::from(ProjectedMcpToolThreadItem::started(
+                "call-1",
+                "server",
+                "search",
+                json!({ "q": "orca" }),
+            ))
+            .into_value(),
+            mcp_tool_started_item("call-1", "server", "search", json!({ "q": "orca" }))
+        );
+        assert_eq!(
+            ProjectedThreadItem::from(ProjectedDynamicToolThreadItem::started(
+                "call-2",
+                "deploy",
+                json!({ "env": "prod" }),
+            ))
+            .into_value(),
+            dynamic_tool_started_item("call-2", "deploy", json!({ "env": "prod" }))
+        );
+        assert_eq!(
+            ProjectedThreadItem::from(ProjectedFileChangeThreadItem::started(
+                "call-3:file-change",
+                Some("src/lib.rs"),
+                "edit",
+                Value::from(""),
+            ))
+            .into_value(),
+            file_change_started_item(
+                "call-3:file-change",
+                Some("src/lib.rs"),
+                "edit",
+                Value::from(""),
+            )
+        );
+        assert_eq!(
+            ProjectedThreadItem::from(ProjectedWorkflowThreadItem::started(
+                "workflow-run-5",
+                "workflow-task-5",
+                "audit",
+                json!({ "kind": "workflow", "status": "running" }),
+            ))
+            .into_value(),
+            workflow_started_item(
+                "workflow-run-5",
+                "workflow-task-5",
+                "audit",
+                json!({ "kind": "workflow", "status": "running" }),
             )
         );
     }
