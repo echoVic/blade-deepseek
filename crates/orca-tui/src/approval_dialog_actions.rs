@@ -3,7 +3,7 @@ use std::sync::mpsc;
 use crossterm::event::{KeyCode, KeyEvent};
 
 use crate::approval_actions::resolve_approval_option;
-use crate::shortcuts::{ApprovalShortcut, approval_shortcut};
+use crate::shortcuts::{ApprovalShortcut, ShortcutAction, ShortcutContext, resolve_shortcut};
 use crate::types::{AppState, ApprovalOption, UserAction};
 
 pub(crate) fn handle_approval_dialog_key(
@@ -21,25 +21,25 @@ pub(crate) fn handle_approval_dialog_key(
         return;
     }
 
-    match approval_shortcut(*key) {
-        Some(ApprovalShortcut::SelectAllow) => {
+    match resolve_shortcut(ShortcutContext::Approval, *key) {
+        Some(ShortcutAction::Approval(ApprovalShortcut::SelectAllow)) => {
             if let Some(dialog) = &mut state.approval_dialog {
                 dialog.selected = dialog.selected.saturating_sub(1);
             }
         }
-        Some(ApprovalShortcut::SelectDeny) => {
+        Some(ShortcutAction::Approval(ApprovalShortcut::SelectDeny)) => {
             if let Some(dialog) = &mut state.approval_dialog {
                 let last = dialog.options.len().saturating_sub(1);
                 dialog.selected = (dialog.selected + 1).min(last);
             }
         }
-        Some(ApprovalShortcut::ToggleSelection) => {
+        Some(ShortcutAction::Approval(ApprovalShortcut::ToggleSelection)) => {
             if let Some(dialog) = &mut state.approval_dialog {
                 let len = dialog.options.len().max(1);
                 dialog.selected = (dialog.selected + 1) % len;
             }
         }
-        Some(ApprovalShortcut::Confirm) => {
+        Some(ShortcutAction::Approval(ApprovalShortcut::Confirm)) => {
             let option = state
                 .approval_dialog
                 .as_ref()
@@ -48,12 +48,12 @@ pub(crate) fn handle_approval_dialog_key(
                 resolve_approval_option(state, action_tx, option);
             }
         }
-        Some(ApprovalShortcut::Approve) => {
+        Some(ShortcutAction::Approval(ApprovalShortcut::Approve)) => {
             resolve_approval_option(state, action_tx, ApprovalOption::Once);
         }
-        Some(ApprovalShortcut::Deny) => {
+        Some(ShortcutAction::Approval(ApprovalShortcut::Deny)) => {
             resolve_approval_option(state, action_tx, ApprovalOption::Deny);
         }
-        None => {}
+        Some(_) | None => {}
     }
 }

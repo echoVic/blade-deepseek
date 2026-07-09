@@ -14,7 +14,7 @@ use crate::idle_key_actions::handle_idle_key;
 use crate::running_actions::handle_running_shortcut;
 use crate::session_picker_actions::handle_session_picker_key;
 use crate::setup_actions::{SetupFlow, handle_setup_key};
-use crate::shortcuts::running_shortcut;
+use crate::shortcuts::{ShortcutAction, ShortcutContext, resolve_shortcut};
 use crate::theme::Theme;
 use crate::types::{AppState, AppStatus, UserAction};
 use crate::vim::VimState;
@@ -94,7 +94,8 @@ where
     }
 
     if state.status == AppStatus::Running
-        && let Some(shortcut) = running_shortcut(*key)
+        && let Some(ShortcutAction::Running(shortcut)) =
+            resolve_shortcut(ShortcutContext::Running, *key)
     {
         handle_running_shortcut(shortcut, state, action_tx, cancel_token);
     }

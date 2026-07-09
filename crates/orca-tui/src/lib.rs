@@ -596,8 +596,9 @@ mod tests {
             "idle_key_actions should route workflows panel keys"
         );
         assert!(
-            idle_key_actions.contains("idle_shortcut"),
-            "idle_key_actions should own idle shortcut dispatch"
+            idle_key_actions.contains("ShortcutContext::Idle")
+                && idle_key_actions.contains("resolve_shortcut"),
+            "idle_key_actions should route idle shortcut dispatch through the context resolver"
         );
         assert!(
             idle_key_actions.contains("apply_composer_key_input"),

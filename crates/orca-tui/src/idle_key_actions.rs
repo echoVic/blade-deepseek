@@ -12,7 +12,7 @@ use crate::composer_input_actions::{
 use crate::idle_navigation_actions::handle_idle_navigation_shortcut;
 use crate::idle_submit_actions::handle_idle_submit;
 use crate::mention_menu_actions::handle_mention_menu_key;
-use crate::shortcuts::{IdleShortcut, idle_shortcut};
+use crate::shortcuts::{IdleShortcut, ShortcutAction, ShortcutContext, resolve_shortcut};
 use crate::slash_menu_actions::handle_slash_menu_key;
 use crate::theme::Theme;
 use crate::types::{AppState, UserAction};
@@ -57,8 +57,8 @@ pub(crate) fn handle_idle_key(
         return;
     }
 
-    match idle_shortcut(*key) {
-        Some(IdleShortcut::Submit) => {
+    match resolve_shortcut(ShortcutContext::Idle, *key) {
+        Some(ShortcutAction::Idle(IdleShortcut::Submit)) => {
             handle_idle_submit(
                 textarea,
                 vim_state,
@@ -69,16 +69,16 @@ pub(crate) fn handle_idle_key(
                 action_tx,
             );
         }
-        Some(IdleShortcut::Newline) => {
+        Some(ShortcutAction::Idle(IdleShortcut::Newline)) => {
             insert_composer_newline(textarea, state);
         }
-        Some(IdleShortcut::HistoryPrevious) => {
+        Some(ShortcutAction::Idle(IdleShortcut::HistoryPrevious)) => {
             recall_previous_history(ev, key, state, textarea, vim_state, theme);
         }
-        Some(IdleShortcut::HistoryNext) => {
+        Some(ShortcutAction::Idle(IdleShortcut::HistoryNext)) => {
             recall_next_history(ev, key, state, textarea, vim_state, theme);
         }
-        Some(
+        Some(ShortcutAction::Idle(
             shortcut @ (IdleShortcut::ScrollUp
             | IdleShortcut::ScrollDown
             | IdleShortcut::PageUp
@@ -87,12 +87,12 @@ pub(crate) fn handle_idle_key(
             | IdleShortcut::HalfPageDown
             | IdleShortcut::Backtrack
             | IdleShortcut::ExpandToolOutput),
-        ) => {
+        )) => {
             handle_idle_navigation_shortcut(
                 shortcut, ev, key, state, config, textarea, vim_state, theme, action_tx,
             );
         }
-        None => {
+        Some(_) | None => {
             apply_composer_key_input(ev, key, state, config, textarea, vim_state, theme);
         }
     }

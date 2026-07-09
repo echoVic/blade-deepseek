@@ -18,6 +18,30 @@ pub struct ShortcutHint {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResolvedShortcutHint {
+    pub scope: ShortcutScope,
+    pub keys: &'static str,
+    pub action: &'static str,
+    pub has_registered_binding: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ShortcutContext {
+    Global,
+    Idle,
+    Running,
+    Approval,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ShortcutAction {
+    Global(GlobalShortcut),
+    Idle(IdleShortcut),
+    Running(RunningShortcut),
+    Approval(ApprovalShortcut),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct KeyBinding {
     key: KeyCode,
     modifiers: KeyModifiers,
@@ -85,192 +109,218 @@ pub enum ApprovalShortcut {
     Deny,
 }
 
+const GLOBAL_BINDINGS: &[(GlobalShortcut, KeyBinding)] = &[
+    (
+        GlobalShortcut::Cancel,
+        KeyBinding::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+    ),
+    (
+        GlobalShortcut::ToggleShortcuts,
+        KeyBinding::new(KeyCode::F(1), KeyModifiers::NONE),
+    ),
+    (
+        GlobalShortcut::ToggleShortcuts,
+        KeyBinding::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+    ),
+    (
+        GlobalShortcut::ScrollBottom,
+        KeyBinding::new(KeyCode::End, KeyModifiers::CONTROL),
+    ),
+    (
+        GlobalShortcut::ScrollTop,
+        KeyBinding::new(KeyCode::Home, KeyModifiers::CONTROL),
+    ),
+    (
+        GlobalShortcut::ClearScreen,
+        KeyBinding::new(KeyCode::Char('l'), KeyModifiers::CONTROL),
+    ),
+];
+
+const IDLE_BINDINGS: &[(IdleShortcut, KeyBinding)] = &[
+    (
+        IdleShortcut::Submit,
+        KeyBinding::new(KeyCode::Enter, KeyModifiers::NONE),
+    ),
+    (
+        IdleShortcut::Newline,
+        KeyBinding::new(KeyCode::Enter, KeyModifiers::SHIFT),
+    ),
+    (
+        IdleShortcut::Newline,
+        KeyBinding::new(KeyCode::Enter, KeyModifiers::ALT),
+    ),
+    (
+        IdleShortcut::Newline,
+        KeyBinding::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
+    ),
+    (
+        IdleShortcut::HistoryPrevious,
+        KeyBinding::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+    ),
+    (
+        IdleShortcut::HistoryNext,
+        KeyBinding::new(KeyCode::Char('n'), KeyModifiers::CONTROL),
+    ),
+    (
+        IdleShortcut::HistoryPrevious,
+        KeyBinding::new(KeyCode::Up, KeyModifiers::NONE),
+    ),
+    (
+        IdleShortcut::HistoryNext,
+        KeyBinding::new(KeyCode::Down, KeyModifiers::NONE),
+    ),
+    (
+        IdleShortcut::PageUp,
+        KeyBinding::new(KeyCode::PageUp, KeyModifiers::NONE),
+    ),
+    (
+        IdleShortcut::PageDown,
+        KeyBinding::new(KeyCode::PageDown, KeyModifiers::NONE),
+    ),
+    (
+        IdleShortcut::HalfPageUp,
+        KeyBinding::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+    ),
+    (
+        IdleShortcut::HalfPageDown,
+        KeyBinding::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+    ),
+    (
+        IdleShortcut::Backtrack,
+        KeyBinding::new(KeyCode::Esc, KeyModifiers::NONE),
+    ),
+    (
+        IdleShortcut::ExpandToolOutput,
+        KeyBinding::new(KeyCode::Char('e'), KeyModifiers::NONE),
+    ),
+];
+
+const RUNNING_BINDINGS: &[(RunningShortcut, KeyBinding)] = &[
+    (
+        RunningShortcut::BackgroundCurrentTurn,
+        KeyBinding::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
+    ),
+    (
+        RunningShortcut::Interrupt,
+        KeyBinding::new(KeyCode::Esc, KeyModifiers::NONE),
+    ),
+    (
+        RunningShortcut::Interrupt,
+        KeyBinding::new(KeyCode::Char('g'), KeyModifiers::CONTROL),
+    ),
+    (
+        RunningShortcut::ScrollUp,
+        KeyBinding::new(KeyCode::Up, KeyModifiers::NONE),
+    ),
+    (
+        RunningShortcut::ScrollDown,
+        KeyBinding::new(KeyCode::Down, KeyModifiers::NONE),
+    ),
+    (
+        RunningShortcut::PageUp,
+        KeyBinding::new(KeyCode::PageUp, KeyModifiers::NONE),
+    ),
+    (
+        RunningShortcut::PageDown,
+        KeyBinding::new(KeyCode::PageDown, KeyModifiers::NONE),
+    ),
+    (
+        RunningShortcut::HalfPageUp,
+        KeyBinding::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+    ),
+    (
+        RunningShortcut::HalfPageDown,
+        KeyBinding::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+    ),
+];
+
+const APPROVAL_BINDINGS: &[(ApprovalShortcut, KeyBinding)] = &[
+    (
+        ApprovalShortcut::SelectAllow,
+        KeyBinding::new(KeyCode::Up, KeyModifiers::NONE),
+    ),
+    (
+        ApprovalShortcut::SelectAllow,
+        KeyBinding::new(KeyCode::Char('k'), KeyModifiers::NONE),
+    ),
+    (
+        ApprovalShortcut::SelectDeny,
+        KeyBinding::new(KeyCode::Down, KeyModifiers::NONE),
+    ),
+    (
+        ApprovalShortcut::SelectDeny,
+        KeyBinding::new(KeyCode::Char('j'), KeyModifiers::NONE),
+    ),
+    (
+        ApprovalShortcut::ToggleSelection,
+        KeyBinding::new(KeyCode::Tab, KeyModifiers::NONE),
+    ),
+    (
+        ApprovalShortcut::ToggleSelection,
+        KeyBinding::new(KeyCode::BackTab, KeyModifiers::NONE),
+    ),
+    (
+        ApprovalShortcut::ToggleSelection,
+        KeyBinding::new(KeyCode::BackTab, KeyModifiers::SHIFT),
+    ),
+    (
+        ApprovalShortcut::Confirm,
+        KeyBinding::new(KeyCode::Enter, KeyModifiers::NONE),
+    ),
+    (
+        ApprovalShortcut::Approve,
+        KeyBinding::new(KeyCode::Char('y'), KeyModifiers::NONE),
+    ),
+    (
+        ApprovalShortcut::Approve,
+        KeyBinding::new(KeyCode::Char('a'), KeyModifiers::NONE),
+    ),
+    (
+        ApprovalShortcut::Deny,
+        KeyBinding::new(KeyCode::Char('n'), KeyModifiers::NONE),
+    ),
+    (
+        ApprovalShortcut::Deny,
+        KeyBinding::new(KeyCode::Char('d'), KeyModifiers::NONE),
+    ),
+];
+
+pub fn resolve_shortcut(context: ShortcutContext, event: KeyEvent) -> Option<ShortcutAction> {
+    if let Some(shortcut) = global_shortcut(event) {
+        return Some(ShortcutAction::Global(shortcut));
+    }
+
+    match context {
+        ShortcutContext::Global => None,
+        ShortcutContext::Idle => idle_shortcut(event).map(ShortcutAction::Idle),
+        ShortcutContext::Running => running_shortcut(event).map(ShortcutAction::Running),
+        ShortcutContext::Approval => approval_shortcut(event).map(ShortcutAction::Approval),
+    }
+}
+
 pub fn global_shortcut(event: KeyEvent) -> Option<GlobalShortcut> {
-    let bindings = [
-        (
-            GlobalShortcut::Cancel,
-            KeyBinding::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
-        ),
-        (
-            GlobalShortcut::ToggleShortcuts,
-            KeyBinding::new(KeyCode::F(1), KeyModifiers::NONE),
-        ),
-        (
-            GlobalShortcut::ToggleShortcuts,
-            KeyBinding::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
-        ),
-        (
-            GlobalShortcut::ScrollBottom,
-            KeyBinding::new(KeyCode::End, KeyModifiers::CONTROL),
-        ),
-        (
-            GlobalShortcut::ScrollTop,
-            KeyBinding::new(KeyCode::Home, KeyModifiers::CONTROL),
-        ),
-        (
-            GlobalShortcut::ClearScreen,
-            KeyBinding::new(KeyCode::Char('l'), KeyModifiers::CONTROL),
-        ),
-    ];
-    match_binding(event, &bindings)
+    match_binding(event, GLOBAL_BINDINGS)
 }
 
 pub fn idle_shortcut(event: KeyEvent) -> Option<IdleShortcut> {
-    let bindings = [
-        (
-            IdleShortcut::Submit,
-            KeyBinding::new(KeyCode::Enter, KeyModifiers::NONE),
-        ),
-        (
-            IdleShortcut::Newline,
-            KeyBinding::new(KeyCode::Enter, KeyModifiers::SHIFT),
-        ),
-        (
-            IdleShortcut::Newline,
-            KeyBinding::new(KeyCode::Enter, KeyModifiers::ALT),
-        ),
-        (
-            IdleShortcut::Newline,
-            KeyBinding::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
-        ),
-        (
-            IdleShortcut::HistoryPrevious,
-            KeyBinding::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
-        ),
-        (
-            IdleShortcut::HistoryNext,
-            KeyBinding::new(KeyCode::Char('n'), KeyModifiers::CONTROL),
-        ),
-        (
-            IdleShortcut::HistoryPrevious,
-            KeyBinding::new(KeyCode::Up, KeyModifiers::NONE),
-        ),
-        (
-            IdleShortcut::HistoryNext,
-            KeyBinding::new(KeyCode::Down, KeyModifiers::NONE),
-        ),
-        (
-            IdleShortcut::PageUp,
-            KeyBinding::new(KeyCode::PageUp, KeyModifiers::NONE),
-        ),
-        (
-            IdleShortcut::PageDown,
-            KeyBinding::new(KeyCode::PageDown, KeyModifiers::NONE),
-        ),
-        (
-            IdleShortcut::HalfPageUp,
-            KeyBinding::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
-        ),
-        (
-            IdleShortcut::HalfPageDown,
-            KeyBinding::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
-        ),
-        (
-            IdleShortcut::Backtrack,
-            KeyBinding::new(KeyCode::Esc, KeyModifiers::NONE),
-        ),
-        (
-            IdleShortcut::ExpandToolOutput,
-            KeyBinding::new(KeyCode::Char('e'), KeyModifiers::NONE),
-        ),
-    ];
-    match_binding(event, &bindings)
+    match_binding(event, IDLE_BINDINGS)
 }
 
 pub fn running_shortcut(event: KeyEvent) -> Option<RunningShortcut> {
-    let bindings = [
-        (
-            RunningShortcut::BackgroundCurrentTurn,
-            KeyBinding::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
-        ),
-        (
-            RunningShortcut::Interrupt,
-            KeyBinding::new(KeyCode::Esc, KeyModifiers::NONE),
-        ),
-        (
-            RunningShortcut::Interrupt,
-            KeyBinding::new(KeyCode::Char('g'), KeyModifiers::CONTROL),
-        ),
-        (
-            RunningShortcut::ScrollUp,
-            KeyBinding::new(KeyCode::Up, KeyModifiers::NONE),
-        ),
-        (
-            RunningShortcut::ScrollDown,
-            KeyBinding::new(KeyCode::Down, KeyModifiers::NONE),
-        ),
-        (
-            RunningShortcut::PageUp,
-            KeyBinding::new(KeyCode::PageUp, KeyModifiers::NONE),
-        ),
-        (
-            RunningShortcut::PageDown,
-            KeyBinding::new(KeyCode::PageDown, KeyModifiers::NONE),
-        ),
-        (
-            RunningShortcut::HalfPageUp,
-            KeyBinding::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
-        ),
-        (
-            RunningShortcut::HalfPageDown,
-            KeyBinding::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
-        ),
-    ];
-    match_binding(event, &bindings)
+    match_binding(event, RUNNING_BINDINGS)
 }
 
 pub fn approval_shortcut(event: KeyEvent) -> Option<ApprovalShortcut> {
-    let bindings = [
-        (
-            ApprovalShortcut::SelectAllow,
-            KeyBinding::new(KeyCode::Up, KeyModifiers::NONE),
-        ),
-        (
-            ApprovalShortcut::SelectAllow,
-            KeyBinding::new(KeyCode::Char('k'), KeyModifiers::NONE),
-        ),
-        (
-            ApprovalShortcut::SelectDeny,
-            KeyBinding::new(KeyCode::Down, KeyModifiers::NONE),
-        ),
-        (
-            ApprovalShortcut::SelectDeny,
-            KeyBinding::new(KeyCode::Char('j'), KeyModifiers::NONE),
-        ),
-        (
-            ApprovalShortcut::ToggleSelection,
-            KeyBinding::new(KeyCode::Tab, KeyModifiers::NONE),
-        ),
-        (
-            ApprovalShortcut::ToggleSelection,
-            KeyBinding::new(KeyCode::BackTab, KeyModifiers::NONE),
-        ),
-        (
-            ApprovalShortcut::ToggleSelection,
-            KeyBinding::new(KeyCode::BackTab, KeyModifiers::SHIFT),
-        ),
-        (
-            ApprovalShortcut::Confirm,
-            KeyBinding::new(KeyCode::Enter, KeyModifiers::NONE),
-        ),
-        (
-            ApprovalShortcut::Approve,
-            KeyBinding::new(KeyCode::Char('y'), KeyModifiers::NONE),
-        ),
-        (
-            ApprovalShortcut::Approve,
-            KeyBinding::new(KeyCode::Char('a'), KeyModifiers::NONE),
-        ),
-        (
-            ApprovalShortcut::Deny,
-            KeyBinding::new(KeyCode::Char('n'), KeyModifiers::NONE),
-        ),
-        (
-            ApprovalShortcut::Deny,
-            KeyBinding::new(KeyCode::Char('d'), KeyModifiers::NONE),
-        ),
-    ];
-    match_binding(event, &bindings)
+    match_binding(event, APPROVAL_BINDINGS)
+}
+
+pub fn shortcut_hints() -> impl Iterator<Item = ResolvedShortcutHint> {
+    SHORTCUT_HINTS.iter().map(|hint| ResolvedShortcutHint {
+        scope: hint.scope,
+        keys: hint.keys,
+        action: hint.action,
+        has_registered_binding: scope_has_registered_binding(hint.scope),
+    })
 }
 
 pub fn shortcut_lines(scopes: &[ShortcutScope]) -> Vec<Line<'static>> {
@@ -294,10 +344,7 @@ pub fn shortcut_lines(scopes: &[ShortcutScope]) -> Vec<Line<'static>> {
             title,
             Style::default().fg(Color::Cyan),
         )));
-        for hint in SHORTCUT_HINTS
-            .iter()
-            .filter(|hint| hint.scope == section_scope)
-        {
+        for hint in shortcut_hints().filter(|hint| hint.scope == section_scope) {
             lines.push(Line::from(vec![
                 Span::styled(
                     format!("  {:<18}", hint.keys),
@@ -429,6 +476,15 @@ pub const SHORTCUT_HINTS: &[ShortcutHint] = &[
     },
 ];
 
+fn scope_has_registered_binding(scope: ShortcutScope) -> bool {
+    match scope {
+        ShortcutScope::Global => !GLOBAL_BINDINGS.is_empty(),
+        ShortcutScope::Idle => !IDLE_BINDINGS.is_empty(),
+        ShortcutScope::Running => !RUNNING_BINDINGS.is_empty(),
+        ShortcutScope::Approval => !APPROVAL_BINDINGS.is_empty(),
+    }
+}
+
 fn match_binding<T: Copy>(event: KeyEvent, bindings: &[(T, KeyBinding)]) -> Option<T> {
     bindings
         .iter()
@@ -545,5 +601,49 @@ mod tests {
             running_shortcut(key(KeyCode::Char('b'), KeyModifiers::CONTROL)),
             Some(RunningShortcut::BackgroundCurrentTurn)
         );
+    }
+
+    #[test]
+    fn shortcut_resolver_prioritizes_global_bindings() {
+        assert_eq!(
+            resolve_shortcut(
+                ShortcutContext::Idle,
+                key(KeyCode::Char('k'), KeyModifiers::CONTROL)
+            ),
+            Some(ShortcutAction::Global(GlobalShortcut::ToggleShortcuts))
+        );
+    }
+
+    #[test]
+    fn shortcut_resolver_interprets_same_key_by_context() {
+        assert_eq!(
+            resolve_shortcut(ShortcutContext::Idle, key(KeyCode::Up, KeyModifiers::NONE)),
+            Some(ShortcutAction::Idle(IdleShortcut::HistoryPrevious))
+        );
+        assert_eq!(
+            resolve_shortcut(
+                ShortcutContext::Running,
+                key(KeyCode::Up, KeyModifiers::NONE)
+            ),
+            Some(ShortcutAction::Running(RunningShortcut::ScrollUp))
+        );
+        assert_eq!(
+            resolve_shortcut(
+                ShortcutContext::Approval,
+                key(KeyCode::Up, KeyModifiers::NONE)
+            ),
+            Some(ShortcutAction::Approval(ApprovalShortcut::SelectAllow))
+        );
+    }
+
+    #[test]
+    fn shortcut_hints_are_backed_by_registered_bindings() {
+        for hint in shortcut_hints() {
+            assert!(
+                hint.has_registered_binding,
+                "shortcut hint '{}' in {:?} must be backed by a resolver binding",
+                hint.keys, hint.scope
+            );
+        }
     }
 }

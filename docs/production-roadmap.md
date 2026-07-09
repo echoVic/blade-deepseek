@@ -4,9 +4,14 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-07-10
-Current baseline: current main after v0.2.10 makes TUI compacted-context
-notices explain the runtime compaction reason and strategy. Runtime
-`context.compacted` events now project their reason, strategy,
+Current baseline: current main after v0.2.11 routes TUI keyboard handling
+through a context-aware shortcut resolver. Global, composer, running-turn, and
+approval-dialog shortcuts keep their existing behavior, but the resolver,
+focused tests, and shortcut help rendering now share one binding boundary so
+future keymap, permission-dialog, and task-control changes can be verified
+without scattering more state-specific key checks. Earlier v0.2.10 makes TUI
+compacted-context notices explain the runtime compaction reason and strategy.
+Runtime `context.compacted` events now project their reason, strategy,
 collapsed-message count, and status text into the TUI so long DeepSeek sessions
 can distinguish near-limit compaction, hard-limit compaction, and
 prompt-too-long recovery instead of showing only a generic before/after message

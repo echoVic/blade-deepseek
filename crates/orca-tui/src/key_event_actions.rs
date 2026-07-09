@@ -8,7 +8,7 @@ use orca_core::config::RunConfig;
 
 use crate::approval_mode_actions::cycle_approval_mode;
 use crate::global_actions::{GlobalShortcutFlow, handle_global_shortcut};
-use crate::shortcuts::global_shortcut;
+use crate::shortcuts::{ShortcutAction, ShortcutContext, resolve_shortcut};
 use crate::types::{AppState, AppStatus, PanelMode, UserAction};
 
 pub(crate) enum KeyEventFlow {
@@ -33,7 +33,7 @@ where
         return Ok(KeyEventFlow::Continue);
     }
 
-    if let Some(shortcut) = global_shortcut(key) {
+    if let Some(ShortcutAction::Global(shortcut)) = resolve_shortcut(ShortcutContext::Global, key) {
         return match handle_global_shortcut(
             shortcut,
             state,

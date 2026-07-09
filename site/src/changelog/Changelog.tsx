@@ -76,6 +76,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.11":
+        "TUI keyboard handling now runs through a context-aware shortcut resolver. Global, composer, running-turn, and approval-dialog keys keep the same behavior, but the resolver, tests, and shortcut help path now share one binding boundary so future keymap and task-control changes are easier to verify.",
       "v0.2.10":
         "TUI compacted-context notices now keep the runtime compaction reason and strategy. Long DeepSeek sessions can show when Orca compacted near the token limit, at the hard limit, or after prompt-too-long recovery, including the collapsed message count, instead of only showing a generic before/after message total.",
       "v0.2.9":
@@ -474,6 +476,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.11":
+        "TUI 键盘处理现在走 context-aware shortcut resolver。Global、composer、running-turn 和 approval-dialog 快捷键行为保持不变，但 resolver、测试和快捷键帮助路径共享同一个绑定边界，后续 keymap 与任务控制改动会更容易验证。",
       "v0.2.10":
         "TUI 的 compacted-context notice 现在会保留 runtime compaction reason 与 strategy。长 DeepSeek 会话里，用户能看到 Orca 是接近 token limit、到达 hard limit，还是为了 prompt-too-long recovery 而压缩，并显示被折叠的消息数量，不再只有泛化的前后消息总数。",
       "v0.2.9":
