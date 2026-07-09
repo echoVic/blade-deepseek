@@ -8,6 +8,7 @@ use orca_core::approval_types::ApprovalMode;
 use orca_core::cost_types::UsageTotals;
 use orca_core::goal_types::ThreadGoal;
 use orca_core::plan_types::PlanItem;
+use orca_core::proposed_plan::{ProposedPlanSegment, ProposedPlanStreamParser};
 use orca_core::task_types::BackgroundTaskSummary;
 use orca_runtime::history::SessionSummary;
 use orca_runtime::runtime_pending_interaction::RuntimeMcpElicitationMode;
@@ -266,6 +267,7 @@ pub enum ChatMessage {
     User(String),
     Reasoning(String),
     Assistant(String),
+    ProposedPlan(String),
     ToolCall {
         id: String,
         name: String,
@@ -508,6 +510,7 @@ pub struct AppState {
     pub mention_candidates: Vec<String>,
     pub mention_selected: usize,
     pub current_plan: Option<(Option<String>, Vec<PlanItem>)>,
+    proposed_plan_parser: ProposedPlanStreamParser,
     /// The most recent update_plan call failed, so `current_plan` may be
     /// showing outdated statuses. Cleared by the next successful update.
     pub plan_update_failed: bool,
@@ -563,6 +566,7 @@ impl AppState {
             mention_candidates: Vec::new(),
             mention_selected: 0,
             current_plan: None,
+            proposed_plan_parser: ProposedPlanStreamParser::default(),
             plan_update_failed: false,
             current_goal: None,
             panel_mode: PanelMode::Conversation,
@@ -897,11 +901,7 @@ impl AppState {
                 if self.suppress_background_main_session_output {
                     return;
                 }
-                if let Some(ChatMessage::Assistant(existing)) = self.messages.last_mut() {
-                    existing.push_str(&text);
-                } else {
-                    self.messages.push(ChatMessage::Assistant(text));
-                }
+                self.handle_message_delta(&text);
             }
             TuiEvent::ToolRequested { id, name, target } => {
                 if self.suppress_background_main_session_output {
@@ -1288,6 +1288,7 @@ impl AppState {
                 let was_backgrounded = self.suppress_background_main_session_output;
                 self.suppress_background_main_session_output = false;
                 self.clear_receiving_tool_progress();
+                self.flush_proposed_plan_parser();
                 self.promote_trailing_reasoning();
                 self.archive_current_plan();
                 if was_backgrounded {
@@ -1363,6 +1364,47 @@ impl AppState {
             let text = text.clone();
             self.messages.pop();
             self.messages.push(ChatMessage::Assistant(text));
+        }
+    }
+
+    fn handle_message_delta(&mut self, text: &str) {
+        for segment in self.proposed_plan_parser.push(text) {
+            self.push_proposed_plan_segment(segment);
+        }
+    }
+
+    fn flush_proposed_plan_parser(&mut self) {
+        for segment in self.proposed_plan_parser.finish() {
+            self.push_proposed_plan_segment(segment);
+        }
+    }
+
+    fn push_proposed_plan_segment(&mut self, segment: ProposedPlanSegment) {
+        match segment {
+            ProposedPlanSegment::Agent(text) => self.push_assistant_delta(text),
+            ProposedPlanSegment::Plan(text) => self.push_proposed_plan_delta(text),
+        }
+    }
+
+    fn push_assistant_delta(&mut self, text: String) {
+        if text.is_empty() {
+            return;
+        }
+        if let Some(ChatMessage::Assistant(existing)) = self.messages.last_mut() {
+            existing.push_str(&text);
+        } else {
+            self.messages.push(ChatMessage::Assistant(text));
+        }
+    }
+
+    fn push_proposed_plan_delta(&mut self, text: String) {
+        if text.is_empty() {
+            return;
+        }
+        if let Some(ChatMessage::ProposedPlan(existing)) = self.messages.last_mut() {
+            existing.push_str(&text);
+        } else {
+            self.messages.push(ChatMessage::ProposedPlan(text));
         }
     }
 
@@ -1478,9 +1520,9 @@ impl AppState {
     /// - A finalized message (`index < finalized_count`) is frozen by definition.
     /// - A `ToolCall`/`Subagent` is settled once it leaves the `running` status; its
     ///   output/diff are then complete.
-    /// - A `Reasoning`/`Assistant` block grows via streaming deltas only while it is the
-    ///   last message, so it is settled once a newer message follows it, or once the turn
-    ///   ends (`turn_ended`).
+    /// - A `Reasoning`/`Assistant`/`ProposedPlan` block grows via streaming deltas only
+    ///   while it is the last message, so it is settled once a newer message follows it,
+    ///   or once the turn ends (`turn_ended`).
     /// - Everything else (`User`/`Error`/`System`/`PlanUpdate`) is immutable on arrival.
     fn message_is_settled(&self, index: usize, turn_ended: bool) -> bool {
         if index < self.finalized_count {
@@ -1491,7 +1533,9 @@ impl AppState {
             ChatMessage::ToolCall { status, .. } | ChatMessage::Subagent { status, .. } => {
                 !matches!(status.as_str(), "running" | "receiving")
             }
-            ChatMessage::Reasoning(_) | ChatMessage::Assistant(_) => turn_ended || !is_last,
+            ChatMessage::Reasoning(_)
+            | ChatMessage::Assistant(_)
+            | ChatMessage::ProposedPlan(_) => turn_ended || !is_last,
             ChatMessage::User(_)
             | ChatMessage::Error(_)
             | ChatMessage::System(_)
@@ -1542,6 +1586,7 @@ impl ChatMessage {
             ChatMessage::User(text)
             | ChatMessage::Reasoning(text)
             | ChatMessage::Assistant(text)
+            | ChatMessage::ProposedPlan(text)
             | ChatMessage::Error(text)
             | ChatMessage::System(text) => text.hash(state),
             ChatMessage::ToolCall {
@@ -2202,6 +2247,33 @@ mod tests {
                 assert_eq!(plan[1].step, "Patch");
             }
             other => panic!("expected plan update message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn proposed_plan_tags_stream_as_dedicated_tui_message() {
+        let mut state = state();
+
+        state.update(TuiEvent::MessageDelta("Intro\n<proposed".to_string()));
+        state.update(TuiEvent::MessageDelta(
+            "_plan>\n# Plan\n- inspect\n</proposed_plan>\nOutro".to_string(),
+        ));
+        state.update(TuiEvent::SessionCompleted {
+            status: "success".to_string(),
+        });
+
+        assert_eq!(state.messages.len(), 3);
+        match &state.messages[0] {
+            ChatMessage::Assistant(text) => assert_eq!(text, "Intro\n"),
+            other => panic!("expected assistant preface, got {other:?}"),
+        }
+        match &state.messages[1] {
+            ChatMessage::ProposedPlan(text) => assert_eq!(text, "# Plan\n- inspect\n"),
+            other => panic!("expected proposed plan, got {other:?}"),
+        }
+        match &state.messages[2] {
+            ChatMessage::Assistant(text) => assert_eq!(text, "\nOutro"),
+            other => panic!("expected assistant postscript, got {other:?}"),
         }
     }
 

@@ -1324,6 +1324,9 @@ fn append_message_lines(
             }
             lines.push(Line::from(""));
         }
+        ChatMessage::ProposedPlan(text) => {
+            append_proposed_plan_lines(lines, text, width, theme);
+        }
         ChatMessage::ToolCall {
             name,
             target,
@@ -1516,6 +1519,27 @@ fn append_archived_plan_lines(
         ]));
     }
 
+    lines.push(Line::from(""));
+}
+
+fn append_proposed_plan_lines(
+    lines: &mut Vec<Line<'static>>,
+    text: &str,
+    width: usize,
+    theme: &Theme,
+) {
+    lines.push(Line::from(vec![Span::styled(
+        "  Proposed Plan",
+        Style::default()
+            .fg(theme.approval)
+            .add_modifier(Modifier::BOLD),
+    )]));
+    for line in render_markdown(text, width.saturating_sub(2)) {
+        lines.push(Line::from(vec![
+            Span::styled("  ", Style::default().fg(theme.muted)),
+            Span::styled(line.to_string(), Style::default().fg(theme.text)),
+        ]));
+    }
     lines.push(Line::from(""));
 }
 

@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use orca_core::proposed_plan::{ProposedPlanSegment, ProposedPlanStreamParser};
 use serde_json::{Value, json};
 
 use crate::protocol::{self, ServerEvent};
@@ -8,9 +9,6 @@ use crate::tool_item_projection::{
     ProjectedToolCallItem, ProjectedWorkflowItem, mcp_result_from_content, mcp_tool_parts,
     parse_json_or_null, tool_error_object_from_value, tool_status_is_completed,
 };
-
-const PROPOSED_PLAN_OPEN: &str = "<proposed_plan>";
-const PROPOSED_PLAN_CLOSE: &str = "</proposed_plan>";
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct RuntimeEventProjector {
@@ -373,109 +371,6 @@ impl RuntimeEventProjector {
             item: item.completed_item(status, payload["error"].clone()),
         });
     }
-}
-
-#[derive(Clone, Debug, Default)]
-struct ProposedPlanStreamParser {
-    buffer: String,
-    in_plan: bool,
-    plan_buffer: String,
-    drop_leading_plan_newline: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum ProposedPlanSegment {
-    Agent(String),
-    Plan(String),
-}
-
-impl ProposedPlanStreamParser {
-    fn push(&mut self, delta: &str) -> Vec<ProposedPlanSegment> {
-        self.buffer.push_str(delta);
-        self.drain(false)
-    }
-
-    fn finish(&mut self) -> Vec<ProposedPlanSegment> {
-        self.drain(true)
-    }
-
-    fn drain(&mut self, finish: bool) -> Vec<ProposedPlanSegment> {
-        let mut out = Vec::new();
-        loop {
-            if self.in_plan {
-                if let Some(end) = self.buffer.find(PROPOSED_PLAN_CLOSE) {
-                    let plan_and_close: String = self
-                        .buffer
-                        .drain(..end + PROPOSED_PLAN_CLOSE.len())
-                        .collect();
-                    self.plan_buffer.push_str(&plan_and_close[..end]);
-                    let text = self.normalize_plan_text();
-                    if !text.is_empty() {
-                        out.push(ProposedPlanSegment::Plan(text));
-                    }
-                    self.in_plan = false;
-                    self.drop_leading_plan_newline = false;
-                    continue;
-                }
-                if finish {
-                    let text = format!("{PROPOSED_PLAN_OPEN}{}{}", self.plan_buffer, self.buffer);
-                    self.plan_buffer.clear();
-                    self.buffer.clear();
-                    self.in_plan = false;
-                    self.drop_leading_plan_newline = false;
-                    if !text.is_empty() {
-                        out.push(ProposedPlanSegment::Agent(text));
-                    }
-                } else if !self.buffer.is_empty() {
-                    self.plan_buffer.push_str(&self.buffer);
-                    self.buffer.clear();
-                }
-                break;
-            }
-
-            if let Some(start) = self.buffer.find(PROPOSED_PLAN_OPEN) {
-                if start > 0 {
-                    out.push(ProposedPlanSegment::Agent(self.buffer[..start].to_string()));
-                }
-                self.buffer.drain(..start + PROPOSED_PLAN_OPEN.len());
-                self.in_plan = true;
-                self.drop_leading_plan_newline = true;
-                continue;
-            }
-            let keep = if finish {
-                0
-            } else {
-                pending_open_tag_prefix_len(&self.buffer)
-            };
-            if self.buffer.len() > keep {
-                let take = self.buffer.len() - keep;
-                out.push(ProposedPlanSegment::Agent(
-                    self.buffer.drain(..take).collect(),
-                ));
-            }
-            break;
-        }
-        out
-    }
-
-    fn normalize_plan_text(&mut self) -> String {
-        let mut text = std::mem::take(&mut self.plan_buffer);
-        if self.drop_leading_plan_newline {
-            if let Some(stripped) = text.strip_prefix('\n') {
-                text = stripped.to_string();
-            }
-            self.drop_leading_plan_newline = false;
-        }
-        text
-    }
-}
-
-fn pending_open_tag_prefix_len(text: &str) -> usize {
-    let max = text.len().min(PROPOSED_PLAN_OPEN.len().saturating_sub(1));
-    (1..=max)
-        .rev()
-        .find(|&len| PROPOSED_PLAN_OPEN.starts_with(&text[text.len() - len..]))
-        .unwrap_or(0)
 }
 
 fn file_change_kind(tool: &str) -> Option<&'static str> {
