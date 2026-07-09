@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use crate::lifecycle::{RuntimePermissionRequest, RuntimeUserInputRequest};
+use crate::runtime_permission::RuntimePermissionRequestKind;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RuntimePendingInteractionKind {
@@ -16,6 +17,7 @@ pub enum RuntimePendingInteractionKind {
 pub struct RuntimePendingInteractionRecord {
     pub id: String,
     pub kind: RuntimePendingInteractionKind,
+    pub permission_kind: Option<RuntimePermissionRequestKind>,
     pub tool: Option<String>,
     pub target: Option<String>,
     pub preview: Option<String>,
@@ -28,6 +30,7 @@ impl RuntimePendingInteractionRecord {
         Self {
             id: approval.id.clone(),
             kind: RuntimePendingInteractionKind::ToolApproval,
+            permission_kind: None,
             tool: approval
                 .tool
                 .clone()
@@ -48,6 +51,7 @@ impl RuntimePendingInteractionRecord {
         Self {
             id: request.id.clone(),
             kind: RuntimePendingInteractionKind::PermissionRequest,
+            permission_kind: permission_kind_from_request(request),
             tool: Some(tool.into()),
             target: target.or_else(|| request.reason.clone()),
             preview,
@@ -60,6 +64,7 @@ impl RuntimePendingInteractionRecord {
         Self {
             id: request.id.clone(),
             kind: RuntimePendingInteractionKind::UserInput,
+            permission_kind: None,
             tool: None,
             target: None,
             preview: None,
@@ -67,6 +72,41 @@ impl RuntimePendingInteractionRecord {
             choices: request.choices.clone(),
         }
     }
+}
+
+fn permission_kind_from_request(
+    request: &RuntimePermissionRequest,
+) -> Option<RuntimePermissionRequestKind> {
+    if request
+        .permissions
+        .network
+        .as_ref()
+        .is_some_and(|network| network.enabled.is_some() || !network.domains.is_empty())
+    {
+        return Some(RuntimePermissionRequestKind::NetworkBlock);
+    }
+    if request
+        .permissions
+        .file_system
+        .as_ref()
+        .is_some_and(|file_system| {
+            file_system
+                .write
+                .as_ref()
+                .is_some_and(|roots| !roots.is_empty())
+        })
+    {
+        return Some(RuntimePermissionRequestKind::FilesystemWrite);
+    }
+    if request
+        .permissions
+        .shell
+        .as_ref()
+        .is_some_and(|shell| shell.unsandboxed)
+    {
+        return Some(RuntimePermissionRequestKind::UnsandboxedShellRetry);
+    }
+    None
 }
 
 #[derive(Clone, Default)]
@@ -192,6 +232,10 @@ mod tests {
         assert_eq!(record.tool.as_deref(), Some("request_permissions"));
         assert_eq!(record.target.as_deref(), Some("need repo write"));
         assert_eq!(record.preview.as_deref(), Some("+ write src"));
+        assert_eq!(
+            record.permission_kind,
+            Some(crate::runtime_permission::RuntimePermissionRequestKind::FilesystemWrite)
+        );
     }
 
     #[test]

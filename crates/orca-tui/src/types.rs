@@ -10,6 +10,7 @@ use orca_core::goal_types::ThreadGoal;
 use orca_core::plan_types::PlanItem;
 use orca_core::task_types::BackgroundTaskSummary;
 use orca_runtime::history::SessionSummary;
+use orca_runtime::runtime_permission::RuntimePermissionRequestKind;
 
 const SUBAGENT_ACTIVITY_TAIL_LIMIT: usize = 6;
 
@@ -158,6 +159,13 @@ pub enum TuiEvent {
         tool: String,
         target: Option<String>,
         preview: Option<String>,
+    },
+    PermissionApprovalNeeded {
+        id: String,
+        tool: String,
+        target: Option<String>,
+        preview: Option<String>,
+        permission_kind: RuntimePermissionRequestKind,
     },
     UserInputRequested {
         id: String,
@@ -322,6 +330,7 @@ pub struct ApprovalDialog {
     pub id: String,
     pub tool: String,
     pub target: Option<String>,
+    pub permission_kind: Option<RuntimePermissionRequestKind>,
     pub background_task_id: Option<String>,
     pub selected: usize,
     pub options: Vec<ApprovalOption>,
@@ -369,6 +378,19 @@ impl ApprovalDialog {
             .iter()
             .copied()
             .find(|option| option.matches_key(key))
+    }
+
+    pub fn title(&self) -> &'static str {
+        match self.permission_kind {
+            Some(RuntimePermissionRequestKind::NetworkBlock) => " Network Permission Required ",
+            Some(RuntimePermissionRequestKind::FilesystemWrite) => {
+                " Filesystem Permission Required "
+            }
+            Some(RuntimePermissionRequestKind::UnsandboxedShellRetry) => {
+                " Unsandboxed Shell Required "
+            }
+            None => " Approval Required ",
+        }
     }
 }
 
@@ -635,6 +657,7 @@ impl AppState {
             id,
             tool,
             target,
+            permission_kind: None,
             background_task_id: Some(background_task_id),
             selected: 0,
             options,
@@ -1129,6 +1152,27 @@ impl AppState {
                     id,
                     tool,
                     target,
+                    permission_kind: None,
+                    background_task_id: None,
+                    selected: 0,
+                    options,
+                    diff: preview,
+                });
+            }
+            TuiEvent::PermissionApprovalNeeded {
+                id,
+                tool,
+                target,
+                preview,
+                permission_kind,
+            } => {
+                self.set_status(AppStatus::WaitingApproval);
+                let options = ApprovalDialog::options_for(&tool, target.as_deref());
+                self.approval_dialog = Some(ApprovalDialog {
+                    id,
+                    tool,
+                    target,
+                    permission_kind: Some(permission_kind),
                     background_task_id: None,
                     selected: 0,
                     options,
@@ -1710,6 +1754,7 @@ mod tests {
             id: "approval-1".to_string(),
             tool: "edit".to_string(),
             target: Some("src/main.rs".to_string()),
+            permission_kind: None,
             background_task_id: None,
             selected: 0,
             options: ApprovalDialog::options_for("edit", Some("src/main.rs")),
@@ -1735,6 +1780,7 @@ mod tests {
             id: "approval-2".to_string(),
             tool: "web_search".to_string(),
             target: Some("query".to_string()),
+            permission_kind: None,
             background_task_id: None,
             selected: 0,
             options: ApprovalDialog::options_for("web_search", Some("query")),

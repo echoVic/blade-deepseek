@@ -538,6 +538,7 @@ mod tests {
             id: "approval-background".to_string(),
             tool: "task_list".to_string(),
             target: None,
+            permission_kind: None,
             background_task_id: Some("task-approval".to_string()),
             selected: 0,
             options: vec![ApprovalOption::Once, ApprovalOption::Deny],

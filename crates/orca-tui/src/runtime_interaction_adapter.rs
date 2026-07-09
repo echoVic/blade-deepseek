@@ -412,6 +412,16 @@ fn remove_pending_interaction(store: Option<&RuntimePendingInteractionStore>, id
 }
 
 fn approval_event_from_pending_interaction(record: &RuntimePendingInteractionRecord) -> TuiEvent {
+    if let Some(permission_kind) = record.permission_kind {
+        return TuiEvent::PermissionApprovalNeeded {
+            id: record.id.clone(),
+            tool: record.tool.clone().unwrap_or_default(),
+            target: record.target.clone(),
+            preview: record.preview.clone(),
+            permission_kind,
+        };
+    }
+
     TuiEvent::ApprovalNeeded {
         id: record.id.clone(),
         tool: record.tool.clone().unwrap_or_default(),
@@ -924,6 +934,62 @@ mod tests {
         action_tx
             .send(UserAction::Approve {
                 id: "permission-1".to_string(),
+                approved: true,
+            })
+            .expect("send approval");
+        let response = handle.join().expect("permission thread");
+
+        assert_eq!(response.decision, PermissionResponseDecision::Allow);
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn tui_permission_handler_projects_runtime_permission_kind() {
+        let (event_tx, event_rx) = mpsc::channel();
+        let (action_tx, action_rx) = mpsc::channel();
+        let store = RuntimePendingInteractionStore::default();
+        let mut domains = std::collections::HashMap::new();
+        domains.insert(
+            "api.orca.invalid".to_string(),
+            orca_core::config::PermissionProfileNetworkAccess::Allow,
+        );
+        let request = RuntimePermissionRequest {
+            id: "permission-network".to_string(),
+            reason: Some("bash attempted network access to api.orca.invalid".to_string()),
+            permissions: orca_runtime::protocol::RequestPermissionProfile {
+                file_system: None,
+                network: Some(orca_runtime::protocol::RequestNetworkPermissions {
+                    enabled: None,
+                    domains,
+                }),
+                shell: None,
+            },
+        };
+        let worker_store = store.clone();
+
+        let handle = std::thread::spawn(move || {
+            let pending_actions = RefCell::new(VecDeque::new());
+            let handler = TuiPermissionRequestHandler::new(&event_tx, &action_rx, &pending_actions)
+                .with_pending_interactions(worker_store);
+            handler
+                .request_permissions(&request)
+                .expect("permission response")
+        });
+        let prompt = event_rx.recv().expect("approval prompt");
+
+        assert!(matches!(
+            prompt,
+            TuiEvent::PermissionApprovalNeeded {
+                id,
+                permission_kind:
+                    orca_runtime::runtime_permission::RuntimePermissionRequestKind::NetworkBlock,
+                ..
+            } if id == "permission-network"
+        ));
+
+        action_tx
+            .send(UserAction::Approve {
+                id: "permission-network".to_string(),
                 approved: true,
             })
             .expect("send approval");

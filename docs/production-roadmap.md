@@ -4,12 +4,17 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-07-09
-Current baseline: current main after v0.1.191 and the follow-on TUI bridge
-slice owns approved background provider-response continuation execution in
-`orca-runtime`: the runtime consumes the pending provider response from
-`TaskRegistry` and derives the single preapproved tool-call id before the TUI
-resumes a backgrounded turn. Runtime provider-cycle, turn-loop, and agent-loop
-inputs carry a typed `RuntimeTurnContinuation` instead of a bare
+Current baseline: current main after v0.2.0 starts the feature-release line
+with a TUI-visible permission approval improvement: runtime pending interaction
+records now preserve the permission request kind for network blocks,
+filesystem write grants, and unsandboxed shell retries, and the TUI approval
+modal uses that kind to show a risk-specific title instead of a generic
+approval title. Earlier v0.1.191 and the follow-on TUI bridge slice own
+approved background provider-response continuation execution in `orca-runtime`:
+the runtime consumes the pending provider response from `TaskRegistry` and
+derives the single preapproved tool-call id before the TUI resumes a
+backgrounded turn. Runtime provider-cycle, turn-loop, and agent-loop inputs
+carry a typed `RuntimeTurnContinuation` instead of a bare
 `ProviderResponse`; the provider cycle consumes the continuation once, seeds the
 turn permission overlay with the preapproved tool-call id, and the approval gate
 consumes that id exactly once for the matching tool call. The TUI bridge now
@@ -296,7 +301,10 @@ The deeper July 9 reference pass changes the next refactor order:
    both bash and command/exec preserve that metadata when adapting retry
    prompts. The TUI bash path now consumes the same `RuntimePermissionPolicy`
    decision constructors for network, filesystem, and pathless unsandboxed
-   retries instead of hand-building separate permission requests. Next mirror
+   retries instead of hand-building separate permission requests. The
+   user-visible projection slice is now complete for TUI approvals: pending
+   permission interactions preserve network/filesystem/unsandboxed request
+   kinds, and approval dialogs show specific titles for those risks. Next mirror
    Codex more directly by using the same decision shape for future exec-policy
    rule evaluation instead of returning only prompt text.
 4. **P2: Turn MCP elicitation and dynamic waits into pending interactions.**

@@ -1283,7 +1283,12 @@ mod tests {
         fn approval_events(&self) -> Vec<TuiEvent> {
             self.event_rx
                 .try_iter()
-                .filter(|event| matches!(event, TuiEvent::ApprovalNeeded { .. }))
+                .filter(|event| {
+                    matches!(
+                        event,
+                        TuiEvent::ApprovalNeeded { .. } | TuiEvent::PermissionApprovalNeeded { .. }
+                    )
+                })
                 .collect()
         }
     }
@@ -1310,7 +1315,13 @@ mod tests {
         assert_eq!(approvals.len(), 1);
         assert!(approvals.iter().any(|event| matches!(
             event,
-            TuiEvent::ApprovalNeeded { tool, preview, .. }
+            TuiEvent::PermissionApprovalNeeded {
+                tool,
+                preview,
+                permission_kind:
+                    orca_runtime::runtime_permission::RuntimePermissionRequestKind::FilesystemWrite,
+                ..
+            }
             if tool == "bash"
                 && preview.as_deref().unwrap_or_default().contains(".git")
         )));
@@ -1443,7 +1454,12 @@ mod tests {
         assert!(
             approvals.iter().any(|event| matches!(
                 event,
-                TuiEvent::ApprovalNeeded { preview, .. }
+                TuiEvent::PermissionApprovalNeeded {
+                    preview,
+                    permission_kind:
+                        orca_runtime::runtime_permission::RuntimePermissionRequestKind::UnsandboxedShellRetry,
+                    ..
+                }
                     if preview
                         .as_deref()
                         .is_some_and(|preview| preview.contains("without the filesystem sandbox"))

@@ -76,6 +76,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.0":
+        "Permission approval dialogs now name the requested risk directly. Network blocks, filesystem write grants, and unsandboxed shell retries keep their runtime permission kind through pending interactions, so the TUI modal can show Network Permission Required, Filesystem Permission Required, or Unsandboxed Shell Required instead of a generic approval title.",
       "v0.1.191":
         "RuntimeProviderResponseStep now consumes RuntimeProviderResponseInput directly instead of flattening the response handoff. Child-agent executors travel through RuntimeProviderResponseExecutors, so provider final-message and tool-turn dispatch keep one named response boundary while behavior stays unchanged.",
       "v0.1.190":
@@ -452,6 +454,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.0":
+        "权限审批弹窗现在会直接说清楚请求风险。Network block、filesystem write grant 和 unsandboxed shell retry 的 runtime permission kind 会穿过 pending interaction 传到 TUI，所以弹窗可以显示 Network Permission Required、Filesystem Permission Required 或 Unsandboxed Shell Required，而不是泛泛的 Approval Required。",
       "v0.1.191":
         "RuntimeProviderResponseStep 现在直接消费 RuntimeProviderResponseInput，而不是把 response handoff 重新展开成长参数列表。Child-agent executors 会通过 RuntimeProviderResponseExecutors 传递，所以 provider final-message 与 tool-turn dispatch 继续共享一个命名 response 边界，行为保持不变。",
       "v0.1.190":

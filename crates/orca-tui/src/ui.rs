@@ -2314,7 +2314,7 @@ fn render_approval_dialog(frame: &mut Frame, state: &AppState, theme: &Theme) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .title(" Approval Required ")
+        .title(dialog.title())
         .border_style(Style::default().fg(theme.approval));
 
     let paragraph = Paragraph::new(content)
@@ -3074,6 +3074,32 @@ mod tests {
         assert!(tool < deny);
         assert!(rendered.contains("1/2/3/4"));
         assert!(rendered.contains("legacy y/A/a/n"));
+    }
+
+    #[test]
+    fn waiting_permission_approval_renders_specific_risk_title() {
+        let mut state = test_state();
+        state.update(TuiEvent::PermissionApprovalNeeded {
+            id: "approval-1".to_string(),
+            tool: "bash".to_string(),
+            target: Some("curl https://api.orca.invalid".to_string()),
+            preview: Some("bash attempted network access to api.orca.invalid".to_string()),
+            permission_kind:
+                orca_runtime::runtime_permission::RuntimePermissionRequestKind::NetworkBlock,
+        });
+
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let textarea = TextArea::default();
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30))
+            .expect("test backend");
+
+        terminal
+            .draw(|frame| render(frame, &mut state, &textarea, &theme))
+            .expect("draw");
+        let rendered = format!("{:?}", terminal.backend().buffer());
+
+        assert!(rendered.contains("Network Permission Required"));
+        assert!(!rendered.contains("Approval Required"));
     }
 
     #[test]
