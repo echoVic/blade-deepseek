@@ -76,6 +76,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.3":
+        "TUI MCP tool calls can now surface real stdio elicitation requests instead of silently dropping them. When an MCP server sends elicitation/create during a tool call, Orca projects the URL or form request through the runtime pending-interaction store, shows a TUI waiting-input prompt keyed by the runtime id, writes accept or decline back to the server, and then continues the original tool call.",
       "v0.2.2":
         "DeepSeek tool-call compatibility gets hardened. update_goal and update_plan normalize the status aliases and boolean status flags DeepSeek emits before validation, the glob and update_goal JSON Schemas support nullable/anyOf parameters, and tool validation errors now list the allowed and required properties. The system prompt stops inlining full tool schemas in favor of concise examples, and the line adds reasoning-content replay, a tool-count cap, and empty-response retry for DeepSeek turns.",
       "v0.2.1":
@@ -458,6 +460,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.3":
+        "TUI MCP 工具调用现在能显示真实 stdio elicitation 请求，而不是静默丢掉。MCP server 在 tool call 中发送 elicitation/create 时，Orca 会把 URL 或表单请求投影到 runtime pending-interaction store，通过 runtime id 显示 TUI waiting-input prompt，把 accept 或 decline 写回 server，然后继续原来的工具调用。",
       "v0.2.2":
         "DeepSeek 工具调用兼容性得到加固。update_goal 与 update_plan 会在校验前把 DeepSeek 生成的 status 别名和布尔状态标志归一化，glob 与 update_goal 的 JSON Schema 支持 nullable/anyOf 参数，工具校验错误也会列出允许和必填的属性。System prompt 不再内联完整工具 Schema，改为展示简洁示例，同时该版本为 DeepSeek turn 新增了 reasoning-content 重放、工具数量上限与空响应重试。",
       "v0.2.1":
