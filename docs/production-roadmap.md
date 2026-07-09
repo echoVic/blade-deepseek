@@ -17,14 +17,14 @@ keeps those same wire shapes but constructs agent-message, plan, and reasoning
 items through a focused typed projection enum first, giving the later
 Codex-style `ThreadItem` protocol migration a narrow tested entry point. The
 same typed-protocol path now covers command execution plus MCP, dynamic
-tool-call, and file-change transcript items too, so TUI command, external-tool,
-and edit/file-change cards keep their existing wire shapes while moving toward
-typed construction before shell streaming, tool-error diagnostics, and
-task-control behavior evolve further. A server can now ask for URL/form
-input during an MCP tool call, the TUI projects that request as a visible
-waiting-input prompt keyed by the runtime interaction id, and Orca writes the
-accept/decline response back before continuing the original tool call. Earlier
-v0.2.2 hardened DeepSeek tool-call compatibility:
+tool-call, file-change, and workflow transcript items too, so TUI command,
+external-tool, edit/file-change, and workflow cards keep their existing wire
+shapes while moving toward typed construction before shell streaming,
+tool-error diagnostics, and task-control behavior evolve further. A server can
+now ask for URL/form input during an MCP tool call, the TUI projects that
+request as a visible waiting-input prompt keyed by the runtime interaction id,
+and Orca writes the accept/decline response back before continuing the original
+tool call. Earlier v0.2.2 hardened DeepSeek tool-call compatibility:
 `update_goal` and `update_plan` normalize the status aliases and boolean status
 flags DeepSeek emits before validation, the `glob`/`update_goal` JSON Schemas
 gain nullable/`anyOf` support, tool validation errors now list the allowed and

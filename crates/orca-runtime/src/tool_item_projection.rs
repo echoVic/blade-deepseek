@@ -302,6 +302,77 @@ impl ProjectedFileChangeThreadItem {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ProjectedWorkflowCompletion {
+    id: String,
+    task_id: String,
+    workflow_name: String,
+    status: String,
+    result: Value,
+    error: Value,
+    task: Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(tag = "type")]
+pub(crate) enum ProjectedWorkflowThreadItem {
+    #[serde(rename = "workflow")]
+    Started {
+        id: String,
+        #[serde(rename = "workflowName")]
+        workflow_name: String,
+        #[serde(rename = "taskId")]
+        task_id: String,
+        status: String,
+        task: Value,
+    },
+    #[serde(rename = "workflow")]
+    Completed {
+        id: String,
+        #[serde(rename = "workflowName")]
+        workflow_name: String,
+        #[serde(rename = "taskId")]
+        task_id: String,
+        status: String,
+        result: Value,
+        error: Value,
+        task: Value,
+    },
+}
+
+impl ProjectedWorkflowThreadItem {
+    pub(crate) fn started(
+        id: impl Into<String>,
+        task_id: impl Into<String>,
+        workflow_name: impl Into<String>,
+        task: Value,
+    ) -> Self {
+        Self::Started {
+            id: id.into(),
+            workflow_name: workflow_name.into(),
+            task_id: task_id.into(),
+            status: "running".to_string(),
+            task,
+        }
+    }
+
+    pub(crate) fn completed(completion: ProjectedWorkflowCompletion) -> Self {
+        Self::Completed {
+            id: completion.id,
+            workflow_name: completion.workflow_name,
+            task_id: completion.task_id,
+            status: completion.status,
+            result: completion.result,
+            error: completion.error,
+            task: completion.task,
+        }
+    }
+
+    pub(crate) fn into_value(self) -> Value {
+        serde_json::to_value(self).expect("projected workflow thread item serializes")
+    }
+}
+
 pub(crate) fn agent_message_item(id: impl Into<String>, text: impl Into<String>) -> Value {
     ProjectedTextThreadItem::agent_message(id, text).into_value()
 }
@@ -646,14 +717,7 @@ pub(crate) fn workflow_started_item(
     workflow_name: impl Into<String>,
     task: Value,
 ) -> Value {
-    json!({
-        "id": id.into(),
-        "type": "workflow",
-        "workflowName": workflow_name.into(),
-        "taskId": task_id.into(),
-        "status": "running",
-        "task": task,
-    })
+    ProjectedWorkflowThreadItem::started(id, task_id, workflow_name, task).into_value()
 }
 
 pub(crate) fn workflow_completed_item(
@@ -665,16 +729,16 @@ pub(crate) fn workflow_completed_item(
     error: Value,
     task: Value,
 ) -> Value {
-    json!({
-        "id": id.into(),
-        "type": "workflow",
-        "workflowName": workflow_name.into(),
-        "taskId": task_id.into(),
-        "status": status.into(),
-        "result": result,
-        "error": error,
-        "task": task,
+    ProjectedWorkflowThreadItem::completed(ProjectedWorkflowCompletion {
+        id: id.into(),
+        task_id: task_id.into(),
+        workflow_name: workflow_name.into(),
+        status: status.into(),
+        result,
+        error,
+        task,
     })
+    .into_value()
 }
 
 pub(crate) fn tool_error_object(message: &str, exit_code: Option<i64>) -> Value {
@@ -1264,6 +1328,46 @@ mod tests {
         assert!(item["result"].is_null());
         assert_eq!(item["error"]["message"], "boom");
         assert_eq!(item["task"]["status"], "failed");
+    }
+
+    #[test]
+    fn projected_workflow_thread_item_serializes_current_wire_shapes() {
+        assert_eq!(
+            ProjectedWorkflowThreadItem::started(
+                "workflow-run-3",
+                "workflow-task-3",
+                "audit",
+                json!({ "kind": "workflow", "status": "running" }),
+            )
+            .into_value(),
+            workflow_started_item(
+                "workflow-run-3",
+                "workflow-task-3",
+                "audit",
+                json!({ "kind": "workflow", "status": "running" }),
+            )
+        );
+        assert_eq!(
+            ProjectedWorkflowThreadItem::completed(ProjectedWorkflowCompletion {
+                id: "workflow-run-4".to_string(),
+                task_id: "workflow-task-4".to_string(),
+                workflow_name: "audit".to_string(),
+                status: "completed".to_string(),
+                result: Value::from("ok"),
+                error: Value::Null,
+                task: json!({ "kind": "workflow", "status": "completed" }),
+            })
+            .into_value(),
+            workflow_completed_item(
+                "workflow-run-4",
+                "workflow-task-4",
+                "audit",
+                "completed",
+                Value::from("ok"),
+                Value::Null,
+                json!({ "kind": "workflow", "status": "completed" }),
+            )
+        );
     }
 
     #[test]
