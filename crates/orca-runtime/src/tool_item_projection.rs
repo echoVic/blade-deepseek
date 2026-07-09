@@ -42,17 +42,7 @@ pub(crate) fn dynamic_tool_started_item(
     tool: impl Into<String>,
     arguments: Value,
 ) -> Value {
-    json!({
-        "id": id.into(),
-        "type": "dynamicToolCall",
-        "namespace": Value::Null,
-        "tool": tool.into(),
-        "status": "in_progress",
-        "arguments": arguments,
-        "contentItems": Value::Null,
-        "success": Value::Null,
-        "error": Value::Null,
-    })
+    ProjectedDynamicToolThreadItem::started(id, tool, arguments).into_value()
 }
 
 pub(crate) fn mcp_tool_completed_item(
@@ -85,17 +75,16 @@ pub(crate) fn dynamic_tool_completed_item(
     success: bool,
     error: Value,
 ) -> Value {
-    json!({
-        "id": id.into(),
-        "type": "dynamicToolCall",
-        "namespace": Value::Null,
-        "tool": tool.into(),
-        "status": status.into(),
-        "arguments": arguments,
-        "contentItems": content_items,
-        "success": success,
-        "error": error,
+    ProjectedDynamicToolThreadItem::completed(ProjectedDynamicToolCompletion {
+        id: id.into(),
+        tool: tool.into(),
+        status: status.into(),
+        arguments,
+        content_items,
+        success,
+        error,
     })
+    .into_value()
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -166,6 +155,82 @@ impl ProjectedMcpToolThreadItem {
 
     pub(crate) fn into_value(self) -> Value {
         serde_json::to_value(self).expect("projected mcp tool thread item serializes")
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ProjectedDynamicToolCompletion {
+    id: String,
+    tool: String,
+    status: String,
+    arguments: Value,
+    content_items: Value,
+    success: bool,
+    error: Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(tag = "type")]
+pub(crate) enum ProjectedDynamicToolThreadItem {
+    #[serde(rename = "dynamicToolCall")]
+    Started {
+        id: String,
+        namespace: Value,
+        tool: String,
+        status: String,
+        arguments: Value,
+        #[serde(rename = "contentItems")]
+        content_items: Value,
+        success: Value,
+        error: Value,
+    },
+    #[serde(rename = "dynamicToolCall")]
+    Completed {
+        id: String,
+        namespace: Value,
+        tool: String,
+        status: String,
+        arguments: Value,
+        #[serde(rename = "contentItems")]
+        content_items: Value,
+        success: bool,
+        error: Value,
+    },
+}
+
+impl ProjectedDynamicToolThreadItem {
+    pub(crate) fn started(
+        id: impl Into<String>,
+        tool: impl Into<String>,
+        arguments: Value,
+    ) -> Self {
+        Self::Started {
+            id: id.into(),
+            namespace: Value::Null,
+            tool: tool.into(),
+            status: "in_progress".to_string(),
+            arguments,
+            content_items: Value::Null,
+            success: Value::Null,
+            error: Value::Null,
+        }
+    }
+
+    pub(crate) fn completed(completion: ProjectedDynamicToolCompletion) -> Self {
+        Self::Completed {
+            id: completion.id,
+            namespace: Value::Null,
+            tool: completion.tool,
+            status: completion.status,
+            arguments: completion.arguments,
+            content_items: completion.content_items,
+            success: completion.success,
+            error: completion.error,
+        }
+    }
+
+    pub(crate) fn into_value(self) -> Value {
+        serde_json::to_value(self).expect("projected dynamic tool thread item serializes")
     }
 }
 
@@ -913,6 +978,40 @@ mod tests {
         assert!(item["contentItems"].is_null());
         assert_eq!(item["success"], false);
         assert_eq!(item["error"]["message"], "policy denied");
+    }
+
+    #[test]
+    fn projected_dynamic_tool_thread_item_serializes_current_wire_shapes() {
+        assert_eq!(
+            ProjectedDynamicToolThreadItem::started(
+                "call-2",
+                "web_search",
+                json!({ "query": "orca" }),
+            )
+            .into_value(),
+            dynamic_tool_started_item("call-2", "web_search", json!({ "query": "orca" }))
+        );
+        assert_eq!(
+            ProjectedDynamicToolThreadItem::completed(ProjectedDynamicToolCompletion {
+                id: "call-5".to_string(),
+                tool: "deploy".to_string(),
+                status: "completed".to_string(),
+                arguments: json!({ "env": "staging" }),
+                content_items: json!([{ "type": "text", "text": "deployed" }]),
+                success: true,
+                error: Value::Null,
+            })
+            .into_value(),
+            dynamic_tool_completed_item(
+                "call-5",
+                "deploy",
+                "completed",
+                json!({ "env": "staging" }),
+                json!([{ "type": "text", "text": "deployed" }]),
+                true,
+                Value::Null,
+            )
+        );
     }
 
     #[test]
