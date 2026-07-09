@@ -46,6 +46,10 @@ impl TuiConversationSession {
         self.runtime.session()
     }
 
+    pub(crate) fn runtime_session_mut(&mut self) -> &mut orca_runtime::session::InteractiveSession {
+        self.runtime.session_mut()
+    }
+
     pub(crate) fn conversation(&self) -> &orca_core::conversation::Conversation {
         self.runtime.session().conversation()
     }

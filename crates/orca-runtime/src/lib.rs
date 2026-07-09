@@ -12,6 +12,10 @@ mod child_agent_response_folding;
 mod child_agent_tests;
 mod child_agent_types;
 pub mod compaction;
+pub use compaction::{
+    TuiAgentProviderErrorAction, TuiAgentTurnCompactionInput, TuiAgentTurnCompactionOutcome,
+    TuiAgentTurnCompactionState, handle_tui_agent_provider_error, run_tui_agent_turn_compaction,
+};
 pub mod controller;
 pub mod cost;
 pub mod extension;

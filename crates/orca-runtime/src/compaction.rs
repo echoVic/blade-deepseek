@@ -1,12 +1,17 @@
 use std::io;
+use std::path::Path;
 
+use orca_core::config::OutputFormat;
 use orca_core::event_schema::EventFactory;
 use orca_core::event_sink::EventSink;
 use orca_core::hook_types::HookEvent;
+use orca_core::provider_types::{ProviderResponse, ProviderStep};
+use orca_core::subagent_types::SubagentType;
 use orca_provider::{ProviderConfig, context};
 
 use crate::hooks::{HookContext, HookRunner, conversation_with_hook_context};
 use crate::lifecycle::RuntimeTurnContext;
+use crate::session::InteractiveSession;
 use crate::thread_store::SessionWriter;
 use orca_core::conversation::Conversation;
 
@@ -93,6 +98,44 @@ impl RuntimeCompactionRetryState {
     pub(crate) fn reset(&mut self) {
         self.prompt_too_long_retried = false;
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TuiAgentTurnCompactionState {
+    retry: RuntimeCompactionRetryState,
+}
+
+impl TuiAgentTurnCompactionState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+pub struct TuiAgentTurnCompactionInput<'a, W: io::Write> {
+    pub provider: orca_core::config::ProviderKind,
+    pub context_config: &'a context::ContextConfig,
+    pub provider_config: &'a ProviderConfig,
+    pub cwd: &'a Path,
+    pub prompt: &'a str,
+    pub subagent_depth: u32,
+    pub subagent_type: &'a SubagentType,
+    pub emit_deltas: bool,
+    pub events: &'a mut EventFactory,
+    pub writer: &'a mut W,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TuiAgentTurnCompactionOutcome {
+    pub used_tokens: usize,
+    pub limit_tokens: usize,
+    pub compacted: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TuiAgentProviderErrorAction {
+    NoError,
+    RetryAfterCompaction,
+    SurfaceError(String),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -214,6 +257,88 @@ impl<'a> RuntimeCompactionPolicy<'a> {
             }
         } else {
             RuntimeCompactionRetryDecision::SurfaceError
+        }
+    }
+}
+
+pub fn run_tui_agent_turn_compaction<W: io::Write>(
+    session: &mut InteractiveSession,
+    input: TuiAgentTurnCompactionInput<'_, W>,
+) -> io::Result<TuiAgentTurnCompactionOutcome> {
+    let runtime_parts = session.runtime_parts();
+    let mut sink = EventSink::new(input.writer, OutputFormat::Jsonl);
+    let turn_context = RuntimeTurnContext::new(
+        input.cwd,
+        input.prompt,
+        input.subagent_depth,
+        input.emit_deltas,
+        input.subagent_type,
+    );
+    let mut compaction = RuntimeCompactionStep::new(
+        input.provider,
+        input.context_config,
+        input.provider_config,
+        turn_context,
+        runtime_parts.hooks,
+        input.events,
+        &mut sink,
+        runtime_parts.writer,
+    );
+    let compacted = compaction.compact_if_needed(runtime_parts.conversation)?;
+    let pressure = context::context_pressure(
+        runtime_parts.conversation,
+        input.context_config,
+        input.provider_config,
+    );
+    Ok(TuiAgentTurnCompactionOutcome {
+        used_tokens: pressure.wire_tokens,
+        limit_tokens: pressure.soft_limit,
+        compacted,
+    })
+}
+
+pub fn handle_tui_agent_provider_error<W: io::Write>(
+    session: &mut InteractiveSession,
+    state: &mut TuiAgentTurnCompactionState,
+    response: &ProviderResponse,
+    input: TuiAgentTurnCompactionInput<'_, W>,
+) -> io::Result<TuiAgentProviderErrorAction> {
+    let Some(error) = response.steps.iter().find_map(|step| match step {
+        ProviderStep::Error(message) => Some(message.clone()),
+        _ => None,
+    }) else {
+        state.retry.reset();
+        return Ok(TuiAgentProviderErrorAction::NoError);
+    };
+
+    match RuntimeCompactionPolicy::decide_for_provider_error(&error, &state.retry) {
+        RuntimeCompactionRetryDecision::CompactAndRetry { trigger, .. } => {
+            let runtime_parts = session.runtime_parts();
+            let mut sink = EventSink::new(input.writer, OutputFormat::Jsonl);
+            let turn_context = RuntimeTurnContext::new(
+                input.cwd,
+                input.prompt,
+                input.subagent_depth,
+                input.emit_deltas,
+                input.subagent_type,
+            );
+            let mut compaction = RuntimeCompactionStep::new(
+                input.provider,
+                input.context_config,
+                input.provider_config,
+                turn_context,
+                runtime_parts.hooks,
+                input.events,
+                &mut sink,
+                runtime_parts.writer,
+            );
+            compaction.compact_after_provider_error_retry(runtime_parts.conversation, trigger)?;
+            state.retry.record_prompt_too_long_retry();
+            Ok(TuiAgentProviderErrorAction::RetryAfterCompaction)
+        }
+        RuntimeCompactionRetryDecision::SurfaceError => {
+            state.retry.reset();
+            Ok(TuiAgentProviderErrorAction::SurfaceError(error))
         }
     }
 }

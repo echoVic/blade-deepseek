@@ -140,6 +140,29 @@ mod tests {
     }
 
     #[test]
+    fn tui_main_agent_compaction_is_runtime_owned() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let runner = std::fs::read_to_string(format!("{manifest_dir}/src/agent_runner.rs"))
+            .expect("TUI agent runner module should exist");
+
+        for marker in [
+            "context_pressure(",
+            "compact_with_summary(",
+            "is_prompt_too_long_error(",
+            "reactive_compacted",
+        ] {
+            assert!(
+                !runner.contains(marker),
+                "TUI main agent loop should delegate compaction policy/retry state to runtime, found marker: {marker}"
+            );
+        }
+        assert!(
+            runner.contains("orca_runtime::run_tui_agent_turn_compaction"),
+            "TUI main agent loop should enter runtime for compaction-aware turns"
+        );
+    }
+
+    #[test]
     fn tui_bash_permission_escalations_use_runtime_permission_policy() {
         let manifest_dir = env!("CARGO_MANIFEST_DIR");
         let agent_tool_execution =

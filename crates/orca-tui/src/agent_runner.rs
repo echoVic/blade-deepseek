@@ -915,7 +915,7 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
     }
 
     let mut turn: u32 = 0;
-    let mut reactive_compacted = false;
+    let mut tui_compaction = orca_runtime::TuiAgentTurnCompactionState::new();
     let mut runtime_events = EventFactory::new(
         session
             .session_id()
@@ -960,24 +960,49 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
             return TuiAgentTurnResult::new("budget_exhausted");
         }
 
-        let pressure = orca_provider::context::context_pressure(
-            session.conversation(),
-            &ctx_config,
-            &provider_config,
-        );
-        if pressure.should_soft_compact || pressure.should_hard_compact {
-            let _ = event_tx.send(TuiEvent::CompactionStarted);
-            session.compact(config, &cwd);
-        }
-        let pressure = orca_provider::context::context_pressure(
-            session.conversation(),
-            &ctx_config,
-            &provider_config,
-        );
+        let mut runtime_event_writer = TuiRuntimeEventWriter::new(event_tx.clone());
+        let context_usage = match orca_runtime::run_tui_agent_turn_compaction(
+            session.runtime_session_mut(),
+            orca_runtime::TuiAgentTurnCompactionInput {
+                provider: config.provider,
+                context_config: &ctx_config,
+                provider_config: &provider_config,
+                cwd: &cwd,
+                prompt,
+                subagent_depth: 0,
+                subagent_type: &SubagentType::General,
+                emit_deltas: true,
+                events: &mut runtime_events,
+                writer: &mut runtime_event_writer,
+            },
+        ) {
+            Ok(context_usage) => context_usage,
+            Err(error) => {
+                send_error_for_tui(
+                    event_tx,
+                    &mut runtime_events,
+                    &format!("context compaction failed: {error}"),
+                );
+                send_session_completed_for_tui(
+                    event_tx,
+                    &mut runtime_events,
+                    orca_core::event_schema::RunStatus::Failed,
+                );
+                finish_main_session_task_for_tui(
+                    session,
+                    event_tx,
+                    &mut runtime_events,
+                    &main_session_task_id,
+                    "failed",
+                );
+                session.complete("failed");
+                return TuiAgentTurnResult::new("failed");
+            }
+        };
 
         let _ = event_tx.send(TuiEvent::ContextUpdated {
-            used_tokens: pressure.wire_tokens,
-            limit_tokens: pressure.soft_limit,
+            used_tokens: context_usage.used_tokens,
+            limit_tokens: context_usage.limit_tokens,
         });
 
         let (turn, task) = session.next_turn_lifecycle();
@@ -1210,55 +1235,65 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
             return TuiAgentTurnResult::new("interrupted");
         }
 
-        if let Some(error) = response.steps.iter().find_map(|step| match step {
-            ProviderStep::Error(message) => Some(message.clone()),
-            _ => None,
-        }) {
-            if orca_provider::context::is_prompt_too_long_error(&error) && !reactive_compacted {
-                let before_messages = session.conversation().messages.len();
-                let compaction = orca_provider::context::compact_with_summary(
-                    config.provider,
-                    session.conversation(),
-                    &ctx_config,
-                    &provider_config,
+        let mut runtime_event_writer = TuiRuntimeEventWriter::new(event_tx.clone());
+        match orca_runtime::handle_tui_agent_provider_error(
+            session.runtime_session_mut(),
+            &mut tui_compaction,
+            &response,
+            orca_runtime::TuiAgentTurnCompactionInput {
+                provider: config.provider,
+                context_config: &ctx_config,
+                provider_config: &provider_config,
+                cwd: &cwd,
+                prompt,
+                subagent_depth: 0,
+                subagent_type: &SubagentType::General,
+                emit_deltas: true,
+                events: &mut runtime_events,
+                writer: &mut runtime_event_writer,
+            },
+        ) {
+            Ok(orca_runtime::TuiAgentProviderErrorAction::NoError) => {}
+            Ok(orca_runtime::TuiAgentProviderErrorAction::RetryAfterCompaction) => continue,
+            Ok(orca_runtime::TuiAgentProviderErrorAction::SurfaceError(error)) => {
+                send_error_for_tui(event_tx, &mut runtime_events, &error);
+                send_session_completed_for_tui(
+                    event_tx,
+                    &mut runtime_events,
+                    orca_core::event_schema::RunStatus::Failed,
                 );
-                *session.conversation_mut() = compaction.conversation;
-                let after_messages = session.conversation().messages.len();
-                let summary_state = session.conversation().summary.clone();
-                if let Some(writer) = session.writer_mut() {
-                    let _ = writer.append_compaction(before_messages, after_messages);
-                    if let orca_provider::context::CompactionKind::RemoteSummary(summary) =
-                        compaction.kind
-                    {
-                        let _ = writer.append_summary_state(
-                            before_messages,
-                            after_messages,
-                            summary,
-                            &summary_state,
-                        );
-                    }
-                }
-                reactive_compacted = true;
-                continue;
+                finish_main_session_task_for_tui(
+                    session,
+                    event_tx,
+                    &mut runtime_events,
+                    &main_session_task_id,
+                    "failed",
+                );
+                session.complete("failed");
+                return TuiAgentTurnResult::new("failed");
             }
-            send_error_for_tui(event_tx, &mut runtime_events, &error);
-            send_session_completed_for_tui(
-                event_tx,
-                &mut runtime_events,
-                orca_core::event_schema::RunStatus::Failed,
-            );
-            finish_main_session_task_for_tui(
-                session,
-                event_tx,
-                &mut runtime_events,
-                &main_session_task_id,
-                "failed",
-            );
-            session.complete("failed");
-            return TuiAgentTurnResult::new("failed");
+            Err(error) => {
+                send_error_for_tui(
+                    event_tx,
+                    &mut runtime_events,
+                    &format!("context compaction failed: {error}"),
+                );
+                send_session_completed_for_tui(
+                    event_tx,
+                    &mut runtime_events,
+                    orca_core::event_schema::RunStatus::Failed,
+                );
+                finish_main_session_task_for_tui(
+                    session,
+                    event_tx,
+                    &mut runtime_events,
+                    &main_session_task_id,
+                    "failed",
+                );
+                session.complete("failed");
+                return TuiAgentTurnResult::new("failed");
+            }
         }
-
-        reactive_compacted = false;
 
         if response.tool_calls.is_empty() {
             if !emitted_message_delta

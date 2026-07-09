@@ -4,14 +4,21 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-07-10
-Current baseline: current main after v0.2.8 moves command/exec sandbox-policy
-mapping, active permission-profile inheritance, filesystem root/glob
-materialization, network domain policy, and Unix socket allowlist resolution
-behind a focused `server/command_exec_sandbox` boundary. TUI bash and server
-`command/exec` still share the same sandbox behavior and JSON wire shapes, but
-future permission, network, filesystem, and task-control work can test that
-boundary without threading more policy logic through the large server loop.
-Earlier v0.2.7 moves the reusable user, persisted, assistant-message,
+Current baseline: current main after v0.2.9 makes TUI main-agent automatic
+compaction and prompt-too-long retry recovery runtime-owned. The TUI main loop
+now asks `orca-runtime` to run pre-turn compaction and classify provider
+context-length errors, while runtime `context.compacted` events still project
+into the existing TUI compacted-context notice and context meter. This keeps the
+most visible long-session recovery path aligned with server and child-agent
+compaction policy instead of leaving retry state in the renderer loop. Earlier
+v0.2.8 moves command/exec sandbox-policy mapping, active permission-profile
+inheritance, filesystem root/glob materialization, network domain policy, and
+Unix socket allowlist resolution behind a focused `server/command_exec_sandbox`
+boundary. TUI bash and server `command/exec` still share the same sandbox
+behavior and JSON wire shapes, but future permission, network, filesystem, and
+task-control work can test that boundary without threading more policy logic
+through the large server loop. Earlier v0.2.7 moves the reusable user,
+persisted, assistant-message,
 proposed-plan, and reasoning thread-item projection types into `orca-core`.
 Runtime projection still emits the same server/TUI JSON, but live TUI streams,
 active steer user messages, and resumed history/read/list views now pass

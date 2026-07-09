@@ -76,6 +76,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.9":
+        "TUI automatic compaction and prompt-too-long retry recovery now run through the runtime compaction boundary. The visible context meter, compacted-context notice, and failed compaction errors keep the same TUI shape, but the main TUI loop no longer owns context-pressure decisions or retry state, reducing drift from server and child-agent compaction paths.",
       "v0.2.8":
         "Command/exec sandbox and permission-profile resolution now lives behind a focused server module instead of the generic server loop. TUI bash and server command/exec still share the same sandbox behavior and JSON wire shapes, while the permission-profile boundary is easier to test before future network, filesystem, and task-control changes.",
       "v0.2.7":
@@ -470,6 +472,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.9":
+        "TUI 自动压缩和 prompt-too-long retry recovery 现在都走 runtime compaction boundary。可见的 context meter、compacted-context notice 和压缩失败错误仍保持同样的 TUI 形态，但主 TUI loop 不再自己拥有 context-pressure 决策和 retry state，减少它与 server、child-agent 压缩路径之间的漂移。",
       "v0.2.8":
         "Command/exec sandbox 与 permission-profile resolution 现在归属到 focused server module，不再压在泛化的 server loop 里。TUI bash 和 server command/exec 仍然共享同一套 sandbox 行为与 JSON wire shape，但 permission-profile 边界更容易测试，为后续网络、文件系统和任务控制改动降低回归风险。",
       "v0.2.7":
