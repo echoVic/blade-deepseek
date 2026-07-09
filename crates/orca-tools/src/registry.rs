@@ -219,7 +219,7 @@ impl ToolRegistry {
 /// nullable, additionalProperties is false throughout, and no unsupported
 /// keywords such as oneOf/minLength/minItems are used). Providers opt these
 /// tools into strict function calling on endpoints that support it.
-pub const STRICT_MODE_TOOL_NAMES: &[&str] = &["update_plan"];
+pub const STRICT_MODE_TOOL_NAMES: &[&str] = &["glob", "update_goal", "update_plan"];
 
 pub fn validate_tool_request(registry: &ToolRegistry, request: &ToolRequest) -> Result<(), String> {
     let Some(resolved) = registry.resolve(request.name.as_str()) else {
@@ -479,34 +479,40 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
             "type": "object",
             "properties": {
                 "pattern": {
-                    "type": "string",
+                    "anyOf": [{"type": "string"}, {"type": "null"}],
                     "description": "Glob pattern such as **/*.rs"
                 },
                 "query": {
-                    "type": "string",
+                    "anyOf": [{"type": "string"}, {"type": "null"}],
                     "description": "Fuzzy path query used when mode is fuzzy, such as rcm for runtime/config/mod.rs"
                 },
                 "mode": {
-                    "type": "string",
-                    "enum": ["glob", "fuzzy"],
+                    "anyOf": [
+                        {"type": "string", "enum": ["glob", "fuzzy"]},
+                        {"type": "null"}
+                    ],
                     "description": "Search mode. Defaults to glob."
                 },
                 "path": {
-                    "type": "string",
+                    "anyOf": [{"type": "string"}, {"type": "null"}],
                     "description": "Directory to search in (default: '.')"
                 },
                 "head_limit": {
-                    "type": "integer",
-                    "minimum": 0,
+                    "anyOf": [
+                        {"type": "integer", "minimum": 0},
+                        {"type": "null"}
+                    ],
                     "description": "Maximum number of paths to return. Defaults to 500. Use 0 for unlimited."
                 },
                 "offset": {
-                    "type": "integer",
-                    "minimum": 0,
+                    "anyOf": [
+                        {"type": "integer", "minimum": 0},
+                        {"type": "null"}
+                    ],
                     "description": "Zero-based result offset for pagination."
                 }
             },
-            "oneOf": [
+            "anyOf": [
                 {
                     "required": ["pattern"],
                     "properties": {
@@ -1182,7 +1188,7 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
                         "description": "Terminal model-controlled goal status"
                     },
                     "reason": {
-                        "type": "string",
+                        "anyOf": [{"type": "string"}, {"type": "null"}],
                         "description": "Optional short reason for the status update"
                     }
                 },
@@ -1894,15 +1900,15 @@ mod tests {
     }
 
     #[test]
-    fn registry_rejects_arguments_that_match_no_one_of_branch() {
+    fn registry_rejects_glob_arguments_that_match_no_any_of_branch() {
         let registry = default_tool_registry();
         let result =
             validate_tool_request(registry, &request(ToolName::Glob, r#"{"mode":"fuzzy"}"#));
 
         assert!(
             result
-                .expect_err("oneOf should reject missing query")
-                .contains("expected exactly one oneOf schema to match"),
+                .expect_err("anyOf should reject missing query")
+                .contains("expected at least one anyOf schema to match"),
         );
     }
 

@@ -57,6 +57,7 @@ Rules:
 - You can mark multiple items complete in a single `update_plan` call.
 - When changing plans mid-task, provide an `explanation` of the rationale.
 - Do not repeat the plan contents after calling `update_plan` — the harness already displays it.
+- Example tool arguments: `{{"plan":[{{"step":"Inspect code","status":"in_progress"}}]}}`.
 
 **High-quality plan examples:**
 
@@ -126,12 +127,7 @@ fn render_tool_prompt_section() -> String {
         .model_visible_tools()
         .filter(|tool| tool_visible_in_schema_mode(tool.name(), ToolSchemaMode::Base))
     {
-        output.push_str(&format!(
-            "\n### {}\n{}\nParameters: `{}`.\n",
-            tool.name(),
-            tool.description(),
-            tool.spec().input_schema
-        ));
+        output.push_str(&format!("\n### {}\n{}\n", tool.name(), tool.description(),));
     }
     output
 }
@@ -147,6 +143,16 @@ mod tests {
         assert!(prompt.contains("### glob"));
         assert!(!prompt.contains("### list_files"));
         assert!(prompt.contains("prefer `read_file`, `glob`, and `grep`"));
+    }
+
+    #[test]
+    fn prompt_does_not_inline_full_tool_json_schemas() {
+        let prompt = build_system_prompt(std::path::Path::new("/repo"));
+
+        assert!(prompt.contains("### update_plan"));
+        assert!(!prompt.contains("Parameters: `"));
+        assert!(!prompt.contains(r#""additionalProperties":false"#));
+        assert!(prompt.contains(r#"{"plan":[{"step":"Inspect code","status":"in_progress"}]}"#));
     }
 
     #[test]

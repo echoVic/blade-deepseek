@@ -15,6 +15,10 @@ use crate::tool_schema::deepseek_tools_schema_with_mcp_and_external;
 
 const DEFAULT_BASE_URL: &str = "https://api.deepseek.com";
 const DEFAULT_MODEL: &str = "deepseek-v4-flash";
+const DEFAULT_CHAT_MAX_TOKENS: u32 = 128_000;
+const DEEPSEEK_MAX_TOOLS: usize = 128;
+const EMPTY_RESPONSE_RETRIES: usize = 1;
+const EMPTY_RESPONSE_ERROR: &str = "response did not contain content or tool calls";
 
 /// DeepSeek strict function calling (Beta) is only served on the /beta endpoint.
 fn is_strict_capable_endpoint(base_url: &str) -> bool {
@@ -59,7 +63,9 @@ fn require_all_properties(schema: &mut Value) {
     let Some(object) = schema.as_object_mut() else {
         return;
     };
-    if let Some(properties) = object.get("properties").and_then(Value::as_object) {
+    let is_typed_object = object.get("type").and_then(Value::as_str) == Some("object");
+    if is_typed_object && let Some(properties) = object.get("properties").and_then(Value::as_object)
+    {
         let names: Vec<Value> = properties.keys().cloned().map(Value::String).collect();
         object.insert("required".to_string(), Value::Array(names));
     }
@@ -95,6 +101,8 @@ struct ChatRequest {
     stream_options: Option<StreamOptions>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<orca_core::config::ReasoningEffort>,
 }
@@ -247,6 +255,7 @@ fn request_chat_streaming(
             &config.external_tools,
         )
     });
+    let tools = cap_tools_for_deepseek(tools);
     let strict_tools = strict_tools_for_endpoint(&tools, base_url);
     let strict_applied = strict_tools.is_some();
 
@@ -258,117 +267,123 @@ fn request_chat_streaming(
             include_usage: true,
         }),
         tools: Some(strict_tools.unwrap_or_else(|| tools.clone())),
+        max_tokens: Some(DEFAULT_CHAT_MAX_TOKENS),
         reasoning_effort: Some(config.reasoning_effort),
     };
 
-    let response = match crate::http_client::execute_streaming_with_retry(|client| {
-        client.post(&url).bearer_auth(api_key).json(&request)
-    }) {
-        Ok(response) => response,
-        // Strict mode is Beta; if the server rejects the strict schema, retry
-        // once with the plain tool list rather than failing the whole turn.
-        Err(error) if strict_applied && is_strict_schema_rejection(&error) => {
-            request.tools = Some(tools);
-            crate::http_client::execute_streaming_with_retry(|client| {
-                client.post(&url).bearer_auth(api_key).json(&request)
-            })?
-        }
-        Err(error) => return Err(error),
-    };
-
-    let mut steps = Vec::new();
-
-    let stream_result = crate::streaming::parse_sse_stream_with_idle_timeout(
-        response,
-        cancel,
-        crate::http_client::streaming_idle_read_timeout(),
-        |delta| {
-            let step = provider_step_from_stream_event(delta);
-            on_step(&step);
-            if stream_step_belongs_in_response_steps(&step) {
-                steps.push(step);
+    for empty_attempt in 0..=EMPTY_RESPONSE_RETRIES {
+        let response = match crate::http_client::execute_streaming_with_retry(|client| {
+            client.post(&url).bearer_auth(api_key).json(&request)
+        }) {
+            Ok(response) => response,
+            // Strict mode is Beta; if the server rejects the strict schema, retry
+            // once with the plain tool list rather than failing the whole turn.
+            Err(error) if strict_applied && is_strict_schema_rejection(&error) => {
+                request.tools = Some(tools.clone());
+                crate::http_client::execute_streaming_with_retry(|client| {
+                    client.post(&url).bearer_auth(api_key).json(&request)
+                })?
             }
-        },
-    )?;
-
-    match stream_result.finish_reason.as_deref() {
-        Some("length") => {
-            return Err(
-                "Response truncated: model hit max_tokens limit (finish_reason=length)".to_string(),
-            );
-        }
-        Some("content_filter") => {
-            return Err("Response blocked by content filter".to_string());
-        }
-        _ => {}
-    }
-
-    let mut raw_calls_for_history = Vec::new();
-    for tc in &stream_result.tool_calls {
-        raw_calls_for_history.push(RawToolCall {
-            id: tc.id.clone(),
-            function_name: tc.function_name.clone(),
-            arguments: tc.arguments.clone(),
-        });
-
-        let tc_response = ApiToolCallResponse {
-            id: tc.id.clone(),
-            function: ApiFunctionResponse {
-                name: tc.function_name.clone(),
-                arguments: tc.arguments.clone(),
-            },
+            Err(error) => return Err(error),
         };
-        match parse_tool_call(&tc_response, &config.external_tools) {
-            Ok(tool_request) => {
-                steps.push(ProviderStep::ToolCall(tool_request));
+
+        let mut steps = Vec::new();
+
+        let stream_result = crate::streaming::parse_sse_stream_with_idle_timeout(
+            response,
+            cancel,
+            crate::http_client::streaming_idle_read_timeout(),
+            |delta| {
+                let step = provider_step_from_stream_event(delta);
+                on_step(&step);
+                if stream_step_belongs_in_response_steps(&step) {
+                    steps.push(step);
+                }
+            },
+        )?;
+
+        match stream_result.finish_reason.as_deref() {
+            Some("length") => {
+                return Err(length_finish_reason_error());
             }
-            Err(error) => {
-                steps.push(ProviderStep::Error(format!(
-                    "failed to parse tool call '{}': {error}",
-                    tc.function_name
-                )));
+            Some("content_filter") => {
+                return Err("Response blocked by content filter".to_string());
+            }
+            _ => {}
+        }
+
+        let mut raw_calls_for_history = Vec::new();
+        for tc in &stream_result.tool_calls {
+            raw_calls_for_history.push(RawToolCall {
+                id: tc.id.clone(),
+                function_name: tc.function_name.clone(),
+                arguments: tc.arguments.clone(),
+            });
+
+            let tc_response = ApiToolCallResponse {
+                id: tc.id.clone(),
+                function: ApiFunctionResponse {
+                    name: tc.function_name.clone(),
+                    arguments: tc.arguments.clone(),
+                },
+            };
+            match parse_tool_call(&tc_response, &config.external_tools) {
+                Ok(tool_request) => {
+                    steps.push(ProviderStep::ToolCall(tool_request));
+                }
+                Err(error) => {
+                    steps.push(ProviderStep::Error(format!(
+                        "failed to parse tool call '{}': {error}",
+                        tc.function_name
+                    )));
+                }
             }
         }
-    }
 
-    let assistant_reasoning = if stream_result.reasoning.is_empty() {
-        if !raw_calls_for_history.is_empty() {
-            Some("(reasoning omitted)".to_string())
+        let assistant_reasoning = if stream_result.reasoning.is_empty() {
+            if !raw_calls_for_history.is_empty() {
+                Some("(reasoning omitted)".to_string())
+            } else {
+                None
+            }
         } else {
+            if !raw_calls_for_history.is_empty() {
+                let tool_call_ids: Vec<String> = raw_calls_for_history
+                    .iter()
+                    .map(|tc| tc.id.clone())
+                    .collect();
+                steps.push(ProviderStep::ReplayState(ProviderReplayState {
+                    provider: "deepseek",
+                    reasoning_content: stream_result.reasoning.clone(),
+                    tool_call_ids,
+                }));
+            }
+            Some(stream_result.reasoning)
+        };
+
+        let assistant_content = if stream_result.content.is_empty() {
             None
-        }
-    } else {
-        if !raw_calls_for_history.is_empty() {
-            let tool_call_ids: Vec<String> = raw_calls_for_history
-                .iter()
-                .map(|tc| tc.id.clone())
-                .collect();
-            steps.push(ProviderStep::ReplayState(ProviderReplayState {
-                provider: "deepseek",
-                reasoning_content: stream_result.reasoning.clone(),
-                tool_call_ids,
-            }));
-        }
-        Some(stream_result.reasoning)
-    };
+        } else {
+            Some(stream_result.content)
+        };
 
-    let assistant_content = if stream_result.content.is_empty() {
-        None
-    } else {
-        Some(stream_result.content)
-    };
+        if steps.is_empty() {
+            if empty_attempt < EMPTY_RESPONSE_RETRIES {
+                continue;
+            }
+            return Err(EMPTY_RESPONSE_ERROR.to_string());
+        }
 
-    if steps.is_empty() {
-        return Err("response did not contain content or tool calls".to_string());
+        return Ok(ProviderResponse {
+            steps,
+            assistant_content,
+            assistant_reasoning,
+            tool_calls: raw_calls_for_history,
+            usage: stream_result.usage,
+        });
     }
 
-    Ok(ProviderResponse {
-        steps,
-        assistant_content,
-        assistant_reasoning,
-        tool_calls: raw_calls_for_history,
-        usage: stream_result.usage,
-    })
+    Err(EMPTY_RESPONSE_ERROR.to_string())
 }
 
 fn provider_step_from_stream_event(delta: crate::streaming::StreamEvent<'_>) -> ProviderStep {
@@ -402,6 +417,7 @@ fn request_chat(
             &config.external_tools,
         )
     });
+    let tools = cap_tools_for_deepseek(tools);
     let strict_tools = strict_tools_for_endpoint(&tools, base_url);
     let strict_applied = strict_tools.is_some();
 
@@ -411,113 +427,126 @@ fn request_chat(
         stream: false,
         stream_options: None,
         tools: Some(strict_tools.unwrap_or_else(|| tools.clone())),
+        max_tokens: Some(DEFAULT_CHAT_MAX_TOKENS),
         reasoning_effort: Some(config.reasoning_effort),
     };
 
-    let response = match crate::http_client::execute_with_retry(|client| {
-        client.post(&url).bearer_auth(api_key).json(&request)
-    }) {
-        Ok(response) => response,
-        // Strict mode is Beta; if the server rejects the strict schema, retry
-        // once with the plain tool list rather than failing the whole turn.
-        Err(error) if strict_applied && is_strict_schema_rejection(&error) => {
-            request.tools = Some(tools);
-            crate::http_client::execute_with_retry(|client| {
-                client.post(&url).bearer_auth(api_key).json(&request)
-            })?
+    for empty_attempt in 0..=EMPTY_RESPONSE_RETRIES {
+        let response = match crate::http_client::execute_with_retry(|client| {
+            client.post(&url).bearer_auth(api_key).json(&request)
+        }) {
+            Ok(response) => response,
+            // Strict mode is Beta; if the server rejects the strict schema, retry
+            // once with the plain tool list rather than failing the whole turn.
+            Err(error) if strict_applied && is_strict_schema_rejection(&error) => {
+                request.tools = Some(tools.clone());
+                crate::http_client::execute_with_retry(|client| {
+                    client.post(&url).bearer_auth(api_key).json(&request)
+                })?
+            }
+            Err(error) => return Err(error),
+        };
+        let response = response
+            .json::<ChatResponse>()
+            .map_err(|error| format!("invalid response: {error}"))?;
+
+        let usage = response.usage.map(Usage::from);
+        let Some(choice) = response.choices.into_iter().next() else {
+            if empty_attempt < EMPTY_RESPONSE_RETRIES {
+                continue;
+            }
+            return Err("response did not contain choices".to_string());
+        };
+
+        let message = choice.message;
+        let finish_reason = choice.finish_reason.unwrap_or_default();
+
+        let mut steps = Vec::new();
+
+        match finish_reason.as_str() {
+            "length" => {
+                return Err(length_finish_reason_error());
+            }
+            "content_filter" => {
+                return Err("Response blocked by content filter".to_string());
+            }
+            "stop" | "tool_calls" | "" => {}
+            other => {
+                steps.push(ProviderStep::Error(format!(
+                    "Unexpected finish_reason: {other}"
+                )));
+            }
         }
-        Err(error) => return Err(error),
-    };
-    let response = response
-        .json::<ChatResponse>()
-        .map_err(|error| format!("invalid response: {error}"))?;
 
-    let usage = response.usage.map(Usage::from);
-    let choice = response
-        .choices
-        .into_iter()
-        .next()
-        .ok_or_else(|| "response did not contain choices".to_string())?;
-
-    let message = choice.message;
-    let finish_reason = choice.finish_reason.unwrap_or_default();
-
-    let mut steps = Vec::new();
-
-    match finish_reason.as_str() {
-        "length" => {
-            return Err(
-                "Response truncated: model hit max_tokens limit (finish_reason=length)".to_string(),
-            );
-        }
-        "content_filter" => {
-            return Err("Response blocked by content filter".to_string());
-        }
-        "stop" | "tool_calls" | "" => {}
-        other => {
-            steps.push(ProviderStep::Error(format!(
-                "Unexpected finish_reason: {other}"
-            )));
-        }
-    }
-
-    let assistant_reasoning = message.reasoning_content.filter(|text| !text.is_empty());
-    let assistant_content = message.content.filter(|text| !text.is_empty());
-
-    if let Some(ref reasoning) = assistant_reasoning {
-        steps.push(ProviderStep::ReasoningDelta(reasoning.clone()));
-    }
-
-    let raw_tool_calls = message.tool_calls.unwrap_or_default();
-    let mut raw_calls_for_history = Vec::new();
-
-    if !raw_tool_calls.is_empty() {
-        let tool_call_ids: Vec<String> = raw_tool_calls.iter().map(|tc| tc.id.clone()).collect();
+        let assistant_reasoning = message.reasoning_content.filter(|text| !text.is_empty());
+        let assistant_content = message.content.filter(|text| !text.is_empty());
 
         if let Some(ref reasoning) = assistant_reasoning {
-            steps.push(ProviderStep::ReplayState(ProviderReplayState {
-                provider: "deepseek",
-                reasoning_content: reasoning.clone(),
-                tool_call_ids,
-            }));
+            steps.push(ProviderStep::ReasoningDelta(reasoning.clone()));
         }
 
-        for tc in &raw_tool_calls {
-            raw_calls_for_history.push(RawToolCall {
-                id: tc.id.clone(),
-                function_name: tc.function.name.clone(),
-                arguments: tc.function.arguments.clone(),
-            });
+        let raw_tool_calls = message.tool_calls.unwrap_or_default();
+        let mut raw_calls_for_history = Vec::new();
 
-            match parse_tool_call(tc, &config.external_tools) {
-                Ok(tool_request) => {
-                    steps.push(ProviderStep::ToolCall(tool_request));
-                }
-                Err(error) => {
-                    steps.push(ProviderStep::Error(format!(
-                        "failed to parse tool call '{}': {error}",
-                        tc.function.name
-                    )));
+        if !raw_tool_calls.is_empty() {
+            let tool_call_ids: Vec<String> =
+                raw_tool_calls.iter().map(|tc| tc.id.clone()).collect();
+
+            if let Some(ref reasoning) = assistant_reasoning {
+                steps.push(ProviderStep::ReplayState(ProviderReplayState {
+                    provider: "deepseek",
+                    reasoning_content: reasoning.clone(),
+                    tool_call_ids,
+                }));
+            }
+
+            for tc in &raw_tool_calls {
+                raw_calls_for_history.push(RawToolCall {
+                    id: tc.id.clone(),
+                    function_name: tc.function.name.clone(),
+                    arguments: tc.function.arguments.clone(),
+                });
+
+                match parse_tool_call(tc, &config.external_tools) {
+                    Ok(tool_request) => {
+                        steps.push(ProviderStep::ToolCall(tool_request));
+                    }
+                    Err(error) => {
+                        steps.push(ProviderStep::Error(format!(
+                            "failed to parse tool call '{}': {error}",
+                            tc.function.name
+                        )));
+                    }
                 }
             }
         }
+
+        if let Some(ref content) = assistant_content {
+            steps.push(ProviderStep::MessageDelta(content.clone()));
+        }
+
+        if steps.is_empty() {
+            if empty_attempt < EMPTY_RESPONSE_RETRIES {
+                continue;
+            }
+            return Err(EMPTY_RESPONSE_ERROR.to_string());
+        }
+
+        return Ok(ProviderResponse {
+            steps,
+            assistant_content,
+            assistant_reasoning,
+            tool_calls: raw_calls_for_history,
+            usage,
+        });
     }
 
-    if let Some(ref content) = assistant_content {
-        steps.push(ProviderStep::MessageDelta(content.clone()));
-    }
+    Err(EMPTY_RESPONSE_ERROR.to_string())
+}
 
-    if steps.is_empty() {
-        return Err("response did not contain content or tool calls".to_string());
-    }
-
-    Ok(ProviderResponse {
-        steps,
-        assistant_content,
-        assistant_reasoning,
-        tool_calls: raw_calls_for_history,
-        usage,
-    })
+fn length_finish_reason_error() -> String {
+    "Response truncated: model hit max_tokens limit (finish_reason=length); ask the model to continue in smaller chunks"
+        .to_string()
 }
 
 fn parse_tool_call(
@@ -578,7 +607,10 @@ fn parse_tool_call(
         name,
         action,
         target,
-        raw_arguments: Some(normalized_raw_arguments(schema_name, &tc.function.arguments)),
+        raw_arguments: Some(normalized_raw_arguments(
+            schema_name,
+            &tc.function.arguments,
+        )),
     })
 }
 
@@ -592,7 +624,35 @@ fn normalized_raw_arguments(schema_name: &str, raw: &str) -> String {
     {
         return normalized;
     }
+    if schema_name == "update_goal" {
+        return orca_tools::update_goal::normalized_update_raw_arguments(raw);
+    }
     raw.to_string()
+}
+
+fn cap_tools_for_deepseek(mut tools: Vec<Value>) -> Vec<Value> {
+    if tools.len() > DEEPSEEK_MAX_TOOLS {
+        eprintln!(
+            "orca: warning: DeepSeek supports at most {DEEPSEEK_MAX_TOOLS} tools; truncating {} advertised tools",
+            tools.len()
+        );
+        tools.truncate(DEEPSEEK_MAX_TOOLS);
+    }
+    tools
+}
+
+fn replayable_reasoning_content(
+    reasoning_content: &Option<String>,
+    has_tool_calls: bool,
+) -> Option<String> {
+    if !has_tool_calls {
+        return None;
+    }
+    reasoning_content
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty() && *text != "(reasoning omitted)")
+        .map(str::to_string)
 }
 
 pub(crate) fn conversation_to_api_messages(conversation: &Conversation) -> Vec<ApiMessage> {
@@ -628,7 +688,7 @@ pub(crate) fn conversation_to_api_messages(conversation: &Conversation) -> Vec<A
             },
             Message::Assistant {
                 content,
-                reasoning_content: _,
+                reasoning_content,
                 tool_calls,
                 ..
             } => {
@@ -652,7 +712,10 @@ pub(crate) fn conversation_to_api_messages(conversation: &Conversation) -> Vec<A
                 ApiMessage {
                     role: "assistant".to_string(),
                     content: content.clone(),
-                    reasoning_content: None,
+                    reasoning_content: replayable_reasoning_content(
+                        reasoning_content,
+                        !tool_calls.is_empty(),
+                    ),
                     tool_calls: api_tool_calls,
                     tool_call_id: None,
                 }
@@ -717,6 +780,9 @@ mod tests {
     use super::*;
     use orca_core::approval_types::ActionKind;
     use orca_core::tool_types::ToolName;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
 
     fn make_tc(name: &str, arguments: &str) -> ApiToolCallResponse {
         ApiToolCallResponse {
@@ -726,6 +792,59 @@ mod tests {
                 arguments: arguments.to_string(),
             },
         }
+    }
+
+    fn read_http_request_body(stream: &mut std::net::TcpStream) -> String {
+        let mut buffer = Vec::new();
+        loop {
+            let mut chunk = [0_u8; 4096];
+            let read = stream.read(&mut chunk).expect("read request");
+            assert!(read > 0, "client closed before sending full request");
+            buffer.extend_from_slice(&chunk[..read]);
+            let Some(header_end) = buffer.windows(4).position(|window| window == b"\r\n\r\n")
+            else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&buffer[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .expect("content-length header");
+            let body_start = header_end + 4;
+            if buffer.len() >= body_start + content_length {
+                return String::from_utf8(buffer[body_start..body_start + content_length].to_vec())
+                    .expect("request body utf8");
+            }
+        }
+    }
+
+    fn spawn_two_response_server(
+        first: &'static str,
+        second: &'static str,
+    ) -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let base_url = format!("http://{}", listener.local_addr().expect("local addr"));
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&bodies);
+        std::thread::spawn(move || {
+            for response in [first, second] {
+                let (mut stream, _) = listener.accept().expect("accept request");
+                let body = read_http_request_body(&mut stream);
+                captured.lock().expect("lock captured bodies").push(body);
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    response.len(),
+                    response
+                );
+                stream.write_all(reply.as_bytes()).expect("write response");
+            }
+        });
+        (base_url, bodies)
     }
 
     #[test]
@@ -797,6 +916,32 @@ mod tests {
     }
 
     #[test]
+    fn parse_update_goal_normalizes_status_aliases_and_flags() {
+        let completed = make_tc("update_goal", r#"{"status":"completed","reason":"done"}"#);
+        let complete_flag = make_tc("update_goal", r#"{"complete":true,"reason":"done"}"#);
+        let blocked_flag = make_tc("update_goal", r#"{"blocked":true,"reason":"stuck"}"#);
+
+        let completed = parse_tool_call(&completed, &[]).unwrap();
+        let complete_flag = parse_tool_call(&complete_flag, &[]).unwrap();
+        let blocked_flag = parse_tool_call(&blocked_flag, &[]).unwrap();
+
+        assert_eq!(
+            serde_json::from_str::<Value>(completed.raw_arguments.as_deref().unwrap()).unwrap()["status"],
+            "complete"
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(complete_flag.raw_arguments.as_deref().unwrap()).unwrap()
+                ["status"],
+            "complete"
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(blocked_flag.raw_arguments.as_deref().unwrap()).unwrap()
+                ["status"],
+            "blocked"
+        );
+    }
+
+    #[test]
     fn parse_update_plan_leaves_clean_arguments_untouched() {
         let clean = r#"{"explanation":"x","plan":[{"step":"a","status":"pending"}]}"#;
         let tc = make_tc("update_plan", clean);
@@ -827,6 +972,38 @@ mod tests {
         assert_eq!(
             update_plan.pointer("/function/parameters/required"),
             Some(&serde_json::json!(["explanation", "plan"]))
+        );
+
+        let glob = strict
+            .iter()
+            .find(|tool| tool.pointer("/function/name").and_then(Value::as_str) == Some("glob"))
+            .expect("glob present");
+        assert_eq!(glob.pointer("/function/strict"), Some(&Value::Bool(true)));
+        assert!(glob.pointer("/function/parameters/oneOf").is_none());
+        assert!(glob.pointer("/function/parameters/anyOf").is_some());
+
+        let update_goal_schema =
+            crate::tool_schema::deepseek_goal_tools_schema_with_mcp_and_external(None, &[]);
+        let goal_strict =
+            strict_tools_for_endpoint(&update_goal_schema, "https://api.deepseek.com/beta")
+                .expect("goal schema must produce strict tools");
+        let update_goal = goal_strict
+            .iter()
+            .find(|tool| {
+                tool.pointer("/function/name").and_then(Value::as_str) == Some("update_goal")
+            })
+            .expect("update_goal present");
+        assert_eq!(
+            update_goal.pointer("/function/strict"),
+            Some(&Value::Bool(true))
+        );
+        assert_eq!(
+            update_goal.pointer("/function/parameters/required"),
+            Some(&serde_json::json!(["reason", "status"]))
+        );
+        assert_eq!(
+            update_goal.pointer("/function/parameters/properties/reason/anyOf/1/type"),
+            Some(&Value::String("null".to_string()))
         );
 
         let bash = strict
@@ -1060,6 +1237,53 @@ mod tests {
     }
 
     #[test]
+    fn api_replay_preserves_reasoning_content_for_tool_call_turns() {
+        let mut conv = Conversation::new();
+        conv.add_user("first".to_string());
+        conv.add_assistant(
+            None,
+            Some("tool reasoning".to_string()),
+            vec![RawToolCall {
+                id: "tc1".to_string(),
+                function_name: "read_file".to_string(),
+                arguments: r#"{"path":"x"}"#.to_string(),
+            }],
+        );
+        conv.add_tool_result("tc1".to_string(), "file contents".to_string());
+
+        let messages = conversation_to_api_messages(&conv);
+        let assistant = messages
+            .iter()
+            .find(|message| message.role == "assistant")
+            .expect("assistant replay");
+
+        assert_eq!(
+            assistant.reasoning_content.as_deref(),
+            Some("tool reasoning")
+        );
+    }
+
+    #[test]
+    fn api_replay_does_not_send_reasoning_omitted_placeholder() {
+        let mut conv = Conversation::new();
+        conv.add_user("first".to_string());
+        conv.add_assistant(
+            None,
+            Some("(reasoning omitted)".to_string()),
+            vec![RawToolCall {
+                id: "tc1".to_string(),
+                function_name: "read_file".to_string(),
+                arguments: r#"{"path":"x"}"#.to_string(),
+            }],
+        );
+        conv.add_tool_result("tc1".to_string(), "file contents".to_string());
+
+        let messages = conversation_to_api_messages(&conv);
+
+        assert!(messages.iter().all(|m| m.reasoning_content.is_none()));
+    }
+
+    #[test]
     fn volatile_overlay_does_not_mutate_source_messages() {
         let mut conv = Conversation::new();
         conv.add_system("sys".to_string());
@@ -1116,11 +1340,66 @@ mod tests {
             stream: true,
             stream_options: None,
             tools: None,
+            max_tokens: Some(DEFAULT_CHAT_MAX_TOKENS),
             reasoning_effort: Some(orca_core::config::ReasoningEffort::Max),
         };
 
         let json = serde_json::to_value(request).expect("serialize request");
 
         assert_eq!(json["reasoning_effort"], "max");
+        assert_eq!(json["max_tokens"], DEFAULT_CHAT_MAX_TOKENS);
+    }
+
+    #[test]
+    fn request_chat_retries_once_after_empty_response() {
+        let (base_url, bodies) = spawn_two_response_server(
+            r#"{"choices":[]}"#,
+            r#"{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}"#,
+        );
+        let mut conversation = Conversation::new();
+        conversation.add_user("hello".to_string());
+        let config = ProviderConfig {
+            api_key: Some("test-key".to_string()),
+            base_url: Some(base_url),
+            model: Some("deepseek-v4-flash".to_string()),
+            reasoning_effort: orca_core::config::ReasoningEffort::default(),
+            tools_override: Some(Vec::new()),
+            mcp_registry: None,
+            external_tools: Vec::new(),
+        };
+
+        let response = request_chat(&conversation, &config).expect("retry succeeds");
+
+        assert_eq!(response.assistant_content.as_deref(), Some("ok"));
+        let bodies = bodies.lock().expect("lock captured bodies");
+        assert_eq!(bodies.len(), 2);
+        for body in bodies.iter() {
+            let json: Value = serde_json::from_str(body).expect("request json");
+            assert_eq!(json["max_tokens"], DEFAULT_CHAT_MAX_TOKENS);
+        }
+    }
+
+    #[test]
+    fn deepseek_tools_are_capped_at_api_limit() {
+        let tools = (0..(DEEPSEEK_MAX_TOOLS + 5))
+            .map(|index| {
+                serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": format!("tool_{index}"),
+                        "description": "test",
+                        "parameters": {"type": "object", "properties": {}, "additionalProperties": false}
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let capped = cap_tools_for_deepseek(tools);
+
+        assert_eq!(capped.len(), DEEPSEEK_MAX_TOOLS);
+        assert_eq!(
+            capped[DEEPSEEK_MAX_TOOLS - 1]["function"]["name"],
+            "tool_127"
+        );
     }
 }

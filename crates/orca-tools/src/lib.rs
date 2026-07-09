@@ -898,12 +898,13 @@ done
         let glob = reg.resolve("glob").expect("glob tool").tool;
         let schema = &glob.spec().input_schema;
 
-        assert_eq!(schema["properties"]["mode"]["enum"][1], "fuzzy");
-        assert_eq!(schema["properties"]["query"]["type"], "string");
+        assert_eq!(schema["properties"]["mode"]["anyOf"][0]["enum"][1], "fuzzy");
+        assert_eq!(schema["properties"]["query"]["anyOf"][0]["type"], "string");
+        assert_eq!(schema["properties"]["query"]["anyOf"][1]["type"], "null");
         assert!(
-            schema["oneOf"]
+            schema["anyOf"]
                 .as_array()
-                .expect("oneOf")
+                .expect("anyOf")
                 .iter()
                 .any(|entry| entry["required"]
                     .as_array()

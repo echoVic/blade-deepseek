@@ -40,6 +40,8 @@ pub struct UpdateGoalArgs {
     pub reason: Option<String>,
 }
 
+const UPDATE_GOAL_STATUS_FLAG_KEYS: [&str; 3] = ["complete", "completed", "blocked"];
+
 pub fn execute_get(request: &ToolRequest) -> ToolResult {
     match parse_get_args(request).and_then(|()| dispatch(GoalToolOperation::Get)) {
         Ok(Some(goal)) => ToolResult::completed(request, format_goal("Goal active.", &goal), false),
@@ -118,8 +120,10 @@ pub fn parse_update_args(request: &ToolRequest) -> Result<UpdateGoalArgs, String
         .raw_arguments
         .as_deref()
         .ok_or_else(|| "update_goal requires raw JSON arguments".to_string())?;
-    let args: UpdateGoalArgs =
-        serde_json::from_str(raw).map_err(|error| format!("invalid update_goal JSON: {error}"))?;
+    let normalized = normalize_update_raw_arguments(raw);
+    let effective = normalized.as_deref().unwrap_or(raw);
+    let args: UpdateGoalArgs = serde_json::from_str(effective)
+        .map_err(|error| format!("invalid update_goal JSON: {error}"))?;
     if args.objective.is_some() {
         return Err(
             "update_goal cannot change the goal objective; use create_goal for a new goal or /goal edit from the TUI"
@@ -136,6 +140,57 @@ pub fn parse_update_args(request: &ToolRequest) -> Result<UpdateGoalArgs, String
         return Err("update_goal can only set status to complete or blocked".to_string());
     }
     Ok(args)
+}
+
+pub fn normalize_update_raw_arguments(raw: &str) -> Option<String> {
+    let mut value: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let object = value.as_object_mut()?;
+    let mut changed = false;
+
+    if object.get("status").and_then(serde_json::Value::as_str) == Some("completed") {
+        object.insert(
+            "status".to_string(),
+            serde_json::Value::String("complete".to_string()),
+        );
+        changed = true;
+    }
+
+    let has_valid_status = object
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|status| matches!(status, "complete" | "blocked"));
+    if !has_valid_status {
+        let derived = if object.get("complete") == Some(&serde_json::Value::Bool(true))
+            || object.get("completed") == Some(&serde_json::Value::Bool(true))
+        {
+            Some("complete")
+        } else if object.get("blocked") == Some(&serde_json::Value::Bool(true)) {
+            Some("blocked")
+        } else {
+            None
+        };
+        if let Some(status) = derived {
+            object.insert(
+                "status".to_string(),
+                serde_json::Value::String(status.to_string()),
+            );
+            changed = true;
+        }
+    }
+
+    for key in UPDATE_GOAL_STATUS_FLAG_KEYS {
+        if object.remove(key).is_some() {
+            changed = true;
+        }
+    }
+
+    changed
+        .then(|| serde_json::to_string(&value).ok())
+        .flatten()
+}
+
+pub fn normalized_update_raw_arguments(raw: &str) -> String {
+    normalize_update_raw_arguments(raw).unwrap_or_else(|| raw.to_string())
 }
 
 pub fn with_goal_handler<R>(handler: GoalHandler, f: impl FnOnce() -> R) -> R {
@@ -243,6 +298,41 @@ mod tests {
         let args =
             parse_update_args(&request(ToolName::UpdateGoal, r#"{"status":"complete"}"#)).unwrap();
         assert_eq!(args.status, Some(ThreadGoalStatus::Complete));
+    }
+
+    #[test]
+    fn normalizes_completed_status_alias() {
+        let args = parse_update_args(&request(
+            ToolName::UpdateGoal,
+            r#"{"status":"completed","reason":"done"}"#,
+        ))
+        .unwrap();
+
+        assert_eq!(args.status, Some(ThreadGoalStatus::Complete));
+        assert_eq!(args.reason.as_deref(), Some("done"));
+    }
+
+    #[test]
+    fn normalizes_boolean_goal_status_flags() {
+        let complete = parse_update_args(&request(
+            ToolName::UpdateGoal,
+            r#"{"complete":true,"reason":"done"}"#,
+        ))
+        .unwrap();
+        let completed = parse_update_args(&request(
+            ToolName::UpdateGoal,
+            r#"{"completed":true,"reason":"done"}"#,
+        ))
+        .unwrap();
+        let blocked = parse_update_args(&request(
+            ToolName::UpdateGoal,
+            r#"{"blocked":true,"reason":"waiting"}"#,
+        ))
+        .unwrap();
+
+        assert_eq!(complete.status, Some(ThreadGoalStatus::Complete));
+        assert_eq!(completed.status, Some(ThreadGoalStatus::Complete));
+        assert_eq!(blocked.status, Some(ThreadGoalStatus::Blocked));
     }
 
     #[test]

@@ -112,7 +112,10 @@ fn provider_path_check(label: &str, config: &ProviderConfig) -> (bool, String) {
         let raw = request.raw_arguments.clone().unwrap_or_default();
         let registry = orca_tools::registry::default_tool_registry();
         if let Err(error) = orca_tools::registry::validate_tool_request(registry, &request) {
-            return (false, format!("schema validation failed: {error}; raw={raw}"));
+            return (
+                false,
+                format!("schema validation failed: {error}; raw={raw}"),
+            );
         }
         let result = orca_tools::update_plan::execute(&request);
         if result.status != ToolStatus::Completed {
@@ -178,7 +181,9 @@ fn strict_probe(api_key: &str) -> (bool, bool, String) {
             return (
                 true,
                 false,
-                format!("MALFORMED JSON from strict mode (#1069 still live): {error}; raw={arguments}"),
+                format!(
+                    "MALFORMED JSON from strict mode (#1069 still live): {error}; raw={arguments}"
+                ),
             );
         }
     };
@@ -202,9 +207,8 @@ fn strict_probe(api_key: &str) -> (bool, bool, String) {
             })
     });
     let conforms = explanation_present && items_ok;
-    let detail = format!(
-        "explanation_present={explanation_present} items_ok={items_ok} args={arguments}"
-    );
+    let detail =
+        format!("explanation_present={explanation_present} items_ok={items_ok} args={arguments}");
     (true, conforms, detail)
 }
 
