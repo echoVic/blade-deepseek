@@ -4,12 +4,10 @@ use serde_json::{Value, json};
 
 use crate::protocol::{self, ServerEvent};
 use crate::tool_item_projection::{
-    ProjectedTextItem, ProjectedTextItemKind, command_execution_completed_item,
-    command_execution_started_item, dynamic_tool_completed_item, dynamic_tool_started_item,
-    file_change_completed_item, file_change_started_item, mcp_result_from_content,
-    mcp_tool_completed_item, mcp_tool_parts, mcp_tool_started_item, parse_json_or_null,
-    tool_error_object_from_value, tool_status_is_completed, workflow_completed_item,
-    workflow_started_item,
+    ProjectedTextItem, ProjectedTextItemKind, ProjectedToolCallCompletion, ProjectedToolCallItem,
+    file_change_completed_item, file_change_started_item, mcp_result_from_content, mcp_tool_parts,
+    parse_json_or_null, tool_error_object_from_value, tool_status_is_completed,
+    workflow_completed_item, workflow_started_item,
 };
 
 const PROPOSED_PLAN_OPEN: &str = "<proposed_plan>";
@@ -21,7 +19,7 @@ pub(crate) struct RuntimeEventProjector {
     plan: Option<ProjectedTextItem>,
     plan_parser: ProposedPlanStreamParser,
     reasoning: Option<ProjectedTextItem>,
-    tool_items: HashMap<String, ToolCallItem>,
+    tool_items: HashMap<String, ProjectedToolCallItem>,
     file_change_items: HashMap<String, FileChangeItem>,
     workflow_items: HashMap<String, WorkflowItem>,
 }
@@ -199,44 +197,35 @@ impl RuntimeEventProjector {
         let tool_id = payload["id"].as_str().unwrap_or("tool-call").to_string();
         let tool = payload["name"].as_str().unwrap_or_default().to_string();
         if let Some((server, local_tool)) = mcp_tool_parts(&tool) {
-            let item = ToolCallItem {
-                id: tool_id.clone(),
-                tool: tool.clone(),
-                command: None,
-            };
+            let item = ProjectedToolCallItem::mcp_tool(tool_id.clone(), server, local_tool);
+            let started_item = item.started_item(tool_arguments(payload));
             self.tool_items.insert(tool_id.clone(), item);
             events.push(ServerEvent::ItemStarted {
                 thread_id: Value::Null,
                 turn_id: Value::Null,
-                item: mcp_tool_started_item(tool_id, server, local_tool, tool_arguments(payload)),
+                item: started_item,
             });
             return;
         }
         if is_dynamic_tool(&tool) {
-            let item = ToolCallItem {
-                id: tool_id.clone(),
-                tool: tool.clone(),
-                command: None,
-            };
+            let item = ProjectedToolCallItem::dynamic_tool(tool_id.clone(), tool);
+            let started_item = item.started_item(tool_arguments(payload));
             self.tool_items.insert(tool_id.clone(), item);
             events.push(ServerEvent::ItemStarted {
                 thread_id: Value::Null,
                 turn_id: Value::Null,
-                item: dynamic_tool_started_item(tool_id, tool, tool_arguments(payload)),
+                item: started_item,
             });
             return;
         }
         let command = payload["target"].as_str().map(ToString::to_string);
-        let item = ToolCallItem {
-            id: tool_id.clone(),
-            tool: tool.clone(),
-            command: command.clone(),
-        };
+        let item = ProjectedToolCallItem::command_execution(tool_id.clone(), tool, command.clone());
+        let started_item = item.started_item(Value::Null);
         self.tool_items.insert(tool_id.clone(), item);
         events.push(ServerEvent::ItemStarted {
             thread_id: Value::Null,
             turn_id: Value::Null,
-            item: command_execution_started_item(tool_id, tool, command),
+            item: started_item,
         });
     }
 
@@ -247,58 +236,30 @@ impl RuntimeEventProjector {
     ) {
         let payload = &runtime_event["payload"];
         let tool_id = payload["id"].as_str().unwrap_or("tool-call").to_string();
-        let item = self.tool_items.remove(&tool_id).unwrap_or(ToolCallItem {
-            id: tool_id,
-            tool: payload["name"].as_str().unwrap_or_default().to_string(),
-            command: None,
+        let item = self.tool_items.remove(&tool_id).unwrap_or_else(|| {
+            fallback_projected_tool_call_item(
+                tool_id,
+                payload["name"].as_str().unwrap_or_default(),
+                payload["target"].as_str(),
+            )
         });
-        if let Some((server, local_tool)) = mcp_tool_parts(&item.tool) {
-            let status = payload["status"].as_str().unwrap_or_default().to_string();
-            events.push(ServerEvent::ItemCompleted {
-                thread_id: Value::Null,
-                turn_id: Value::Null,
-                item: mcp_tool_completed_item(
-                    item.id,
-                    server,
-                    local_tool,
-                    status,
-                    tool_arguments(payload),
-                    mcp_tool_result(payload),
-                    mcp_tool_error(payload),
-                ),
-            });
-            return;
-        }
-        if is_dynamic_tool(&item.tool) {
-            let status = payload["status"].as_str().unwrap_or_default().to_string();
-            events.push(ServerEvent::ItemCompleted {
-                thread_id: Value::Null,
-                turn_id: Value::Null,
-                item: dynamic_tool_completed_item(
-                    item.id,
-                    item.tool,
-                    status,
-                    tool_arguments(payload),
-                    dynamic_tool_content_items(payload),
-                    payload["status"].as_str() == Some("completed"),
-                    dynamic_tool_error(payload),
-                ),
-            });
-            return;
-        }
         events.push(ServerEvent::ItemCompleted {
             thread_id: Value::Null,
             turn_id: Value::Null,
-            item: command_execution_completed_item(
-                item.id,
-                item.tool,
-                item.command,
-                payload["status"].clone(),
-                payload["output"].clone(),
-                payload["error"].clone(),
-                payload["exit_code"].clone(),
-                payload["truncated"].clone(),
-            ),
+            item: item.completed_item(ProjectedToolCallCompletion {
+                status: payload["status"].as_str().unwrap_or_default().to_string(),
+                command_status: payload["status"].clone(),
+                arguments: tool_arguments(payload),
+                result: mcp_tool_result(payload),
+                command_error: payload["error"].clone(),
+                mcp_error: mcp_tool_error(payload),
+                dynamic_error: dynamic_tool_error(payload),
+                content_items: dynamic_tool_content_items(payload),
+                success: payload["status"].as_str() == Some("completed"),
+                aggregated_output: payload["output"].clone(),
+                exit_code: payload["exit_code"].clone(),
+                truncated: payload["truncated"].clone(),
+            }),
         });
     }
 
@@ -459,13 +420,6 @@ enum ProposedPlanSegment {
 }
 
 #[derive(Clone, Debug)]
-struct ToolCallItem {
-    id: String,
-    tool: String,
-    command: Option<String>,
-}
-
-#[derive(Clone, Debug)]
 struct FileChangeItem {
     id: String,
     path: Option<String>,
@@ -612,6 +566,20 @@ fn file_change_diff() -> Value {
 
 fn is_dynamic_tool(tool: &str) -> bool {
     !is_builtin_tool(tool) && mcp_tool_parts(tool).is_none()
+}
+
+fn fallback_projected_tool_call_item(
+    id: String,
+    tool: &str,
+    target: Option<&str>,
+) -> ProjectedToolCallItem {
+    if let Some((server, local_tool)) = mcp_tool_parts(tool) {
+        return ProjectedToolCallItem::mcp_tool(id, server, local_tool);
+    }
+    if is_dynamic_tool(tool) {
+        return ProjectedToolCallItem::dynamic_tool(id, tool.to_string());
+    }
+    ProjectedToolCallItem::command_execution(id, tool.to_string(), target.map(ToString::to_string))
 }
 
 fn is_builtin_tool(tool: &str) -> bool {

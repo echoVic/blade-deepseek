@@ -149,6 +149,120 @@ impl From<ProjectedWorkflowThreadItem> for ProjectedThreadItem {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ProjectedToolCallCompletion {
+    pub(crate) status: String,
+    pub(crate) command_status: Value,
+    pub(crate) arguments: Value,
+    pub(crate) result: Value,
+    pub(crate) command_error: Value,
+    pub(crate) mcp_error: Value,
+    pub(crate) dynamic_error: Value,
+    pub(crate) content_items: Value,
+    pub(crate) success: bool,
+    pub(crate) aggregated_output: Value,
+    pub(crate) exit_code: Value,
+    pub(crate) truncated: Value,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum ProjectedToolCallItem {
+    CommandExecution {
+        id: String,
+        tool: String,
+        command: Option<String>,
+    },
+    McpTool {
+        id: String,
+        server: String,
+        tool: String,
+    },
+    DynamicTool {
+        id: String,
+        tool: String,
+    },
+}
+
+impl ProjectedToolCallItem {
+    pub(crate) fn command_execution(
+        id: impl Into<String>,
+        tool: impl Into<String>,
+        command: Option<impl Into<String>>,
+    ) -> Self {
+        Self::CommandExecution {
+            id: id.into(),
+            tool: tool.into(),
+            command: command.map(Into::into),
+        }
+    }
+
+    pub(crate) fn mcp_tool(
+        id: impl Into<String>,
+        server: impl Into<String>,
+        tool: impl Into<String>,
+    ) -> Self {
+        Self::McpTool {
+            id: id.into(),
+            server: server.into(),
+            tool: tool.into(),
+        }
+    }
+
+    pub(crate) fn dynamic_tool(id: impl Into<String>, tool: impl Into<String>) -> Self {
+        Self::DynamicTool {
+            id: id.into(),
+            tool: tool.into(),
+        }
+    }
+
+    pub(crate) fn started_item(&self, arguments: Value) -> Value {
+        match self {
+            Self::CommandExecution { id, tool, command } => {
+                command_execution_started_item(id.clone(), tool.clone(), command.clone())
+            }
+            Self::McpTool { id, server, tool } => {
+                mcp_tool_started_item(id.clone(), server.clone(), tool.clone(), arguments)
+            }
+            Self::DynamicTool { id, tool } => {
+                dynamic_tool_started_item(id.clone(), tool.clone(), arguments)
+            }
+        }
+    }
+
+    pub(crate) fn completed_item(self, completion: ProjectedToolCallCompletion) -> Value {
+        match self {
+            Self::CommandExecution { id, tool, command } => command_execution_completed_item(
+                id,
+                tool,
+                command,
+                completion.command_status,
+                completion.aggregated_output,
+                completion.command_error,
+                completion.exit_code,
+                completion.truncated,
+            ),
+            Self::McpTool { id, server, tool } => mcp_tool_completed_item(
+                id,
+                server,
+                tool,
+                completion.status,
+                completion.arguments,
+                completion.result,
+                completion.mcp_error,
+            ),
+            Self::DynamicTool { id, tool } => dynamic_tool_completed_item(
+                id,
+                tool,
+                completion.status,
+                completion.arguments,
+                completion.content_items,
+                completion.success,
+                completion.dynamic_error,
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ProjectedMcpToolCompletion {
     id: String,
     server: String,
@@ -1519,6 +1633,104 @@ mod tests {
                 "workflow-task-5",
                 "audit",
                 json!({ "kind": "workflow", "status": "running" }),
+            )
+        );
+    }
+
+    #[test]
+    fn projected_tool_call_item_serializes_current_lifecycle_shapes() {
+        let command =
+            ProjectedToolCallItem::command_execution("tool-1", "bash", Some("cargo test"));
+        assert_eq!(
+            command.started_item(Value::Null),
+            command_execution_started_item("tool-1", "bash", Some("cargo test"))
+        );
+        assert_eq!(
+            command.completed_item(ProjectedToolCallCompletion {
+                status: "completed".to_string(),
+                command_status: Value::from("completed"),
+                arguments: Value::Null,
+                result: Value::Null,
+                command_error: Value::Null,
+                mcp_error: Value::Null,
+                dynamic_error: Value::Null,
+                content_items: Value::Null,
+                success: true,
+                aggregated_output: Value::from("ok"),
+                exit_code: Value::from(0),
+                truncated: Value::from(false),
+            }),
+            command_execution_completed_item(
+                "tool-1",
+                "bash",
+                Some("cargo test"),
+                Value::from("completed"),
+                Value::from("ok"),
+                Value::Null,
+                Value::from(0),
+                Value::from(false),
+            )
+        );
+
+        let mcp = ProjectedToolCallItem::mcp_tool("call-1", "server", "search");
+        assert_eq!(
+            mcp.started_item(json!({ "q": "orca" })),
+            mcp_tool_started_item("call-1", "server", "search", json!({ "q": "orca" }))
+        );
+        assert_eq!(
+            mcp.completed_item(ProjectedToolCallCompletion {
+                status: "failed".to_string(),
+                command_status: Value::from("failed"),
+                arguments: json!({ "q": "orca" }),
+                result: Value::Null,
+                command_error: Value::Null,
+                mcp_error: json!({ "message": "nope" }),
+                dynamic_error: Value::Null,
+                content_items: Value::Null,
+                success: false,
+                aggregated_output: Value::Null,
+                exit_code: Value::Null,
+                truncated: Value::Null,
+            }),
+            mcp_tool_completed_item(
+                "call-1",
+                "server",
+                "search",
+                "failed",
+                json!({ "q": "orca" }),
+                Value::Null,
+                json!({ "message": "nope" }),
+            )
+        );
+
+        let dynamic = ProjectedToolCallItem::dynamic_tool("call-2", "deploy");
+        assert_eq!(
+            dynamic.started_item(json!({ "env": "prod" })),
+            dynamic_tool_started_item("call-2", "deploy", json!({ "env": "prod" }))
+        );
+        assert_eq!(
+            dynamic.completed_item(ProjectedToolCallCompletion {
+                status: "completed".to_string(),
+                command_status: Value::from("completed"),
+                arguments: json!({ "env": "prod" }),
+                result: Value::Null,
+                command_error: Value::Null,
+                mcp_error: Value::Null,
+                dynamic_error: Value::Null,
+                content_items: json!([{ "type": "text", "text": "done" }]),
+                success: true,
+                aggregated_output: Value::Null,
+                exit_code: Value::Null,
+                truncated: Value::Null,
+            }),
+            dynamic_tool_completed_item(
+                "call-2",
+                "deploy",
+                "completed",
+                json!({ "env": "prod" }),
+                json!([{ "type": "text", "text": "done" }]),
+                true,
+                Value::Null,
             )
         );
     }
