@@ -272,7 +272,11 @@ fn server_mode_streams_file_change_item_lifecycle_for_edit() {
     let workspace = tempdir().expect("workspace");
     let home = workspace.path().join("home");
     std::fs::create_dir_all(&home).expect("create home");
-    std::fs::write(home.join("config.toml"), "mode = \"full-auto\"\n").expect("write config");
+    std::fs::write(
+        home.join("config.toml"),
+        "mode = \"suggest\"\n[[permissions.rules]]\ntool = \"bash\"\npattern = \"**\"\ndecision = \"allow\"\n[[permissions.rules]]\ntool = \"edit\"\npattern = \"**\"\ndecision = \"allow\"\n",
+    )
+    .expect("write config");
     let file_path = workspace.path().join("note.txt");
     std::fs::write(&file_path, "hello orca\n").expect("write fixture");
     let mut child = orca_command()
@@ -969,7 +973,11 @@ fn server_mode_interrupt_cancels_active_bash_tool_wait() {
     let workspace = tempdir().expect("workspace");
     let home = workspace.path().join("home");
     std::fs::create_dir_all(&home).expect("create home");
-    std::fs::write(home.join("config.toml"), "mode = \"full-auto\"\n").expect("write config");
+    std::fs::write(
+        home.join("config.toml"),
+        "mode = \"suggest\"\n[[permissions.rules]]\ntool = \"bash\"\npattern = \"**\"\ndecision = \"allow\"\n",
+    )
+    .expect("write config");
     let mut child = orca_command()
         .args([
             "--mode",
@@ -2093,7 +2101,11 @@ fn server_mode_command_exec_uses_session_network_domain_grants() {
     let home_path = home.path();
     let workspace = home_path.join("workspace");
     std::fs::create_dir_all(&workspace).expect("workspace");
-    std::fs::write(home_path.join("config.toml"), "mode = \"full-auto\"\n").expect("write config");
+    std::fs::write(
+        home_path.join("config.toml"),
+        "mode = \"full-auto\"\n\n[permission_profiles.net]\nextends = \":workspace\"\n\n[permission_profiles.net.network]\nenabled = true\n\n[permission_profiles.net.network.domains]\n\"seed.orca.invalid\" = \"allow\"\n",
+    )
+    .expect("write config");
 
     let mut child = orca_command()
         .args([
@@ -2131,18 +2143,25 @@ fn server_mode_command_exec_uses_session_network_domain_grants() {
         let stdin = child.stdin.as_mut().expect("server stdin");
         writeln!(
             stdin,
-            r#"{{"id":"turn","method":"turn/start","params":{{"threadId":"{}","input":[{{"type":"text","text":"request_network_permissions_then_done api.example.com"}}]}}}}"#,
+            r#"{{"id":"cmd-request","method":"command/exec","params":{{"threadId":"{}","permissionProfile":"net","command":["sh","-lc","curl --noproxy '' -sS -D - -o /dev/null http://api.example.com/ || true"],"timeoutMs":5000}}}}"#,
             thread_id,
         )
-        .expect("write turn/start");
-        stdin.flush().expect("flush turn/start");
+        .expect("write command/exec permission request");
+        stdin
+            .flush()
+            .expect("flush command/exec permission request");
     }
 
-    let permission_request = read_until_event(&mut stdout, "turn", "permission_request");
+    let permission_request = read_until_event(
+        &mut stdout,
+        "permission-command-cmd-request",
+        "permission_request",
+    );
     let request_id = permission_request["requestId"]
         .as_str()
         .expect("permission request id")
         .to_string();
+    assert_eq!(permission_request["threadId"], thread_id);
     assert_eq!(
         permission_request["permissions"]["network"]["domains"]["api.example.com"],
         "allow"
@@ -2159,7 +2178,6 @@ fn server_mode_command_exec_uses_session_network_domain_grants() {
         stdin.flush().expect("flush permission/respond");
     }
     read_until_event(&mut stdout, "permission-response", "permission_resolved");
-    read_until_event(&mut stdout, "turn", "turn_completed");
 
     {
         let stdin = child.stdin.as_mut().expect("server stdin");
@@ -2231,7 +2249,7 @@ fn server_mode_session_network_deny_overrides_permission_profile_allow() {
     std::fs::create_dir_all(&workspace).expect("workspace");
     std::fs::write(
         home_path.join("config.toml"),
-        "mode = \"full-auto\"\n\n[permission_profiles.net]\nextends = \":workspace\"\n\n[permission_profiles.net.network]\nenabled = true\n\n[permission_profiles.net.network.domains]\n\"blocked.orca.invalid\" = \"allow\"\n",
+        "mode = \"full-auto\"\n\n[permission_profiles.requester]\nextends = \":workspace\"\n\n[permission_profiles.requester.network]\nenabled = true\n\n[permission_profiles.requester.network.domains]\n\"seed.orca.invalid\" = \"allow\"\n\n[permission_profiles.net]\nextends = \":workspace\"\n\n[permission_profiles.net.network]\nenabled = true\n\n[permission_profiles.net.network.domains]\n\"blocked.orca.invalid\" = \"allow\"\n",
     )
     .expect("write config");
 
@@ -2271,17 +2289,28 @@ fn server_mode_session_network_deny_overrides_permission_profile_allow() {
         let stdin = child.stdin.as_mut().expect("server stdin");
         writeln!(
             stdin,
-            r#"{{"id":"turn","method":"turn/start","params":{{"threadId":"{}","input":[{{"type":"text","text":"request_network_permissions_then_done blocked.orca.invalid"}}]}}}}"#,
+            r#"{{"id":"cmd-request","method":"command/exec","params":{{"threadId":"{}","permissionProfile":"requester","command":["sh","-lc","curl --noproxy '' -sS -D - -o /dev/null http://blocked.orca.invalid/ || true"],"timeoutMs":5000}}}}"#,
             thread_id,
         )
-        .expect("write turn/start");
-        stdin.flush().expect("flush turn/start");
+        .expect("write command/exec permission request");
+        stdin
+            .flush()
+            .expect("flush command/exec permission request");
     }
-    let permission_request = read_until_event(&mut stdout, "turn", "permission_request");
+    let permission_request = read_until_event(
+        &mut stdout,
+        "permission-command-cmd-request",
+        "permission_request",
+    );
     let request_id = permission_request["requestId"]
         .as_str()
         .expect("permission request id")
         .to_string();
+    assert_eq!(permission_request["threadId"], thread_id);
+    assert_eq!(
+        permission_request["permissions"]["network"]["domains"]["blocked.orca.invalid"],
+        "allow"
+    );
 
     {
         let stdin = child.stdin.as_mut().expect("server stdin");
@@ -2294,7 +2323,6 @@ fn server_mode_session_network_deny_overrides_permission_profile_allow() {
         stdin.flush().expect("flush permission/respond");
     }
     read_until_event(&mut stdout, "permission-response", "permission_resolved");
-    read_until_event(&mut stdout, "turn", "turn_completed");
 
     {
         let stdin = child.stdin.as_mut().expect("server stdin");
@@ -6703,7 +6731,11 @@ fn server_mode_request_permissions_waits_for_permission_response() {
     let extra = workspace.path().join("extra");
     std::fs::create_dir_all(&home).expect("create home");
     std::fs::create_dir_all(&extra).expect("create extra");
-    std::fs::write(home.join("config.toml"), "mode = \"full-auto\"\n").expect("write config");
+    std::fs::write(
+        home.join("config.toml"),
+        "mode = \"suggest\"\n[[permissions.rules]]\ntool = \"bash\"\npattern = \"**\"\ndecision = \"allow\"\n",
+    )
+    .expect("write config");
     let output_file = extra.join("granted.txt");
 
     let mut child = orca_command()
@@ -6793,7 +6825,11 @@ fn server_mode_request_permissions_propagates_strict_auto_review() {
     let extra = workspace.path().join("extra");
     std::fs::create_dir_all(&home).expect("create home");
     std::fs::create_dir_all(&extra).expect("create extra");
-    std::fs::write(home.join("config.toml"), "mode = \"full-auto\"\n").expect("write config");
+    std::fs::write(
+        home.join("config.toml"),
+        "mode = \"suggest\"\n[[permissions.rules]]\ntool = \"bash\"\npattern = \"**\"\ndecision = \"allow\"\n",
+    )
+    .expect("write config");
     let output_file = extra.join("granted.txt");
 
     let mut child = orca_command()
@@ -6891,7 +6927,11 @@ fn server_mode_request_permissions_strict_auto_review_prompts_subsequent_command
     let extra = workspace.path().join("extra");
     std::fs::create_dir_all(&home).expect("create home");
     std::fs::create_dir_all(&extra).expect("create extra");
-    std::fs::write(home.join("config.toml"), "mode = \"full-auto\"\n").expect("write config");
+    std::fs::write(
+        home.join("config.toml"),
+        "mode = \"suggest\"\n[[permissions.rules]]\ntool = \"bash\"\npattern = \"**\"\ndecision = \"allow\"\n",
+    )
+    .expect("write config");
     let output_file = extra.join("blocked.txt");
 
     let mut child = orca_command()
@@ -7125,7 +7165,11 @@ fn server_mode_request_permissions_session_scope_persists_directory_grant() {
     let extra = workspace.path().join("extra");
     std::fs::create_dir_all(&home).expect("create home");
     std::fs::create_dir_all(&extra).expect("create extra");
-    std::fs::write(home.join("config.toml"), "mode = \"full-auto\"\n").expect("write config");
+    std::fs::write(
+        home.join("config.toml"),
+        "mode = \"suggest\"\n[[permissions.rules]]\ntool = \"bash\"\npattern = \"**\"\ndecision = \"allow\"\n",
+    )
+    .expect("write config");
     let first_output = extra.join("first.txt");
     let second_output = extra.join("second.txt");
 
@@ -7195,16 +7239,17 @@ fn server_mode_request_permissions_session_scope_persists_directory_grant() {
 
     {
         let stdin = child.stdin.as_mut().expect("server stdin");
+        let command = format!("printf ok > {}", second_output.display());
         writeln!(
             stdin,
-            r#"{{"id":"turn-2","method":"turn/start","params":{{"threadId":"{}","input":[{{"type":"text","text":"force_bash printf ok > {}"}}]}}}}"#,
+            r#"{{"id":"cmd-2","method":"command/exec","params":{{"threadId":"{}","command":["sh","-lc",{}]}}}}"#,
             thread_id,
-            second_output.display(),
+            serde_json::to_string(&command).expect("json command"),
         )
-        .expect("write second turn");
-        stdin.flush().expect("flush second turn");
+        .expect("write second command/exec");
+        stdin.flush().expect("flush second command/exec");
     }
-    let _second_completed = read_until_event(&mut stdout, "turn-2", "turn_completed");
+    let _second_completed = read_until_event(&mut stdout, "cmd-2", "command_exec_completed");
 
     {
         let stdin = child.stdin.as_mut().expect("server stdin");
@@ -7243,7 +7288,11 @@ fn server_mode_request_permissions_session_scope_accepts_file_system_entries() {
     let extra = workspace.path().join("extra");
     std::fs::create_dir_all(&home).expect("create home");
     std::fs::create_dir_all(&extra).expect("create extra");
-    std::fs::write(home.join("config.toml"), "mode = \"full-auto\"\n").expect("write config");
+    std::fs::write(
+        home.join("config.toml"),
+        "mode = \"suggest\"\n[[permissions.rules]]\ntool = \"bash\"\npattern = \"**\"\ndecision = \"allow\"\n",
+    )
+    .expect("write config");
     let first_output = extra.join("first.txt");
     let second_output = extra.join("second.txt");
 
@@ -7316,16 +7365,17 @@ fn server_mode_request_permissions_session_scope_accepts_file_system_entries() {
 
     {
         let stdin = child.stdin.as_mut().expect("server stdin");
+        let command = format!("printf ok > {}", second_output.display());
         writeln!(
             stdin,
-            r#"{{"id":"turn-2","method":"turn/start","params":{{"threadId":"{}","input":[{{"type":"text","text":"force_bash printf ok > {}"}}]}}}}"#,
+            r#"{{"id":"cmd-2","method":"command/exec","params":{{"threadId":"{}","command":["sh","-lc",{}]}}}}"#,
             thread_id,
-            second_output.display(),
+            serde_json::to_string(&command).expect("json command"),
         )
-        .expect("write second turn");
-        stdin.flush().expect("flush second turn");
+        .expect("write second command/exec");
+        stdin.flush().expect("flush second command/exec");
     }
-    let _second_completed = read_until_event(&mut stdout, "turn-2", "turn_completed");
+    let _second_completed = read_until_event(&mut stdout, "cmd-2", "command_exec_completed");
 
     {
         let stdin = child.stdin.as_mut().expect("server stdin");
@@ -7358,7 +7408,11 @@ fn server_mode_request_permissions_session_scope_accepts_workspace_roots_entries
     let docs = workspace.path().join("docs");
     std::fs::create_dir_all(&home).expect("create home");
     std::fs::create_dir_all(&docs).expect("create docs");
-    std::fs::write(home.join("config.toml"), "mode = \"full-auto\"\n").expect("write config");
+    std::fs::write(
+        home.join("config.toml"),
+        "mode = \"suggest\"\n[[permissions.rules]]\ntool = \"bash\"\npattern = \"**\"\ndecision = \"allow\"\n",
+    )
+    .expect("write config");
     let first_output = docs.join("first.txt");
     let second_output = docs.join("second.txt");
 
@@ -7430,16 +7484,17 @@ fn server_mode_request_permissions_session_scope_accepts_workspace_roots_entries
 
     {
         let stdin = child.stdin.as_mut().expect("server stdin");
+        let command = format!("printf ok > {}", second_output.display());
         writeln!(
             stdin,
-            r#"{{"id":"turn-2","method":"turn/start","params":{{"threadId":"{}","input":[{{"type":"text","text":"force_bash printf ok > {}"}}]}}}}"#,
+            r#"{{"id":"cmd-2","method":"command/exec","params":{{"threadId":"{}","command":["sh","-lc",{}]}}}}"#,
             thread_id,
-            second_output.display(),
+            serde_json::to_string(&command).expect("json command"),
         )
-        .expect("write second turn");
-        stdin.flush().expect("flush second turn");
+        .expect("write second command/exec");
+        stdin.flush().expect("flush second command/exec");
     }
-    let _second_completed = read_until_event(&mut stdout, "turn-2", "turn_completed");
+    let _second_completed = read_until_event(&mut stdout, "cmd-2", "command_exec_completed");
 
     {
         let stdin = child.stdin.as_mut().expect("server stdin");
@@ -7475,7 +7530,11 @@ fn server_mode_turn_start_rebinds_runtime_workspace_roots_for_permission_grants(
     std::fs::create_dir_all(&home).expect("create home");
     std::fs::create_dir_all(old_root.join("docs")).expect("create old docs");
     std::fs::create_dir_all(&docs).expect("create docs");
-    std::fs::write(home.join("config.toml"), "mode = \"full-auto\"\n").expect("write config");
+    std::fs::write(
+        home.join("config.toml"),
+        "mode = \"suggest\"\n[[permissions.rules]]\ntool = \"bash\"\npattern = \"**\"\ndecision = \"allow\"\n",
+    )
+    .expect("write config");
     let first_output = docs.join("first.txt");
     let second_output = docs.join("second.txt");
 
@@ -7548,16 +7607,17 @@ fn server_mode_turn_start_rebinds_runtime_workspace_roots_for_permission_grants(
 
     {
         let stdin = child.stdin.as_mut().expect("server stdin");
+        let command = format!("printf ok > {}", second_output.display());
         writeln!(
             stdin,
-            r#"{{"id":"turn-2","method":"turn/start","params":{{"threadId":"{}","input":[{{"type":"text","text":"force_bash printf ok > {}"}}]}}}}"#,
+            r#"{{"id":"cmd-2","method":"command/exec","params":{{"threadId":"{}","command":["sh","-lc",{}]}}}}"#,
             thread_id,
-            second_output.display(),
+            serde_json::to_string(&command).expect("json command"),
         )
-        .expect("write second turn");
-        stdin.flush().expect("flush second turn");
+        .expect("write second command/exec");
+        stdin.flush().expect("flush second command/exec");
     }
-    let _second_completed = read_until_event(&mut stdout, "turn-2", "turn_completed");
+    let _second_completed = read_until_event(&mut stdout, "cmd-2", "command_exec_completed");
 
     {
         let stdin = child.stdin.as_mut().expect("server stdin");

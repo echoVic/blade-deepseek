@@ -467,6 +467,10 @@ impl ToolExecutionActor {
             emit_deltas,
         } = context;
 
+        if tool_request.name == tool_types::ToolName::RequestPermissions {
+            return Ok(None);
+        }
+
         if let Some(approval) = approval_request_for_invocation(invocation)
             && agent_common::requires_approval(approval.action)
         {

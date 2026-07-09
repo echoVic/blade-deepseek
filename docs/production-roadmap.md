@@ -9,7 +9,11 @@ with a TUI-visible permission approval improvement: runtime pending interaction
 records now preserve the permission request kind for network blocks,
 filesystem write grants, and unsandboxed shell retries, and the TUI approval
 modal uses that kind to show a risk-specific title instead of a generic
-approval title. Earlier v0.1.191 and the follow-on TUI bridge slice own
+approval title. The same v0.2.0 line also fixes the `request_permissions`
+runtime path so the tool bypasses the normal tool approval gate and reaches the
+runtime permission handler, letting TUI/server users approve session-scoped
+directory and network grants through the intended pending-permission flow.
+Earlier v0.1.191 and the follow-on TUI bridge slice own
 approved background provider-response continuation execution in `orca-runtime`:
 the runtime consumes the pending provider response from `TaskRegistry` and
 derives the single preapproved tool-call id before the TUI resumes a

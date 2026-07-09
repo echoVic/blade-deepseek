@@ -77,7 +77,7 @@ const copy = {
     },
     summaries: {
       "v0.2.0":
-        "Permission approval dialogs now name the requested risk directly. Network blocks, filesystem write grants, and unsandboxed shell retries keep their runtime permission kind through pending interactions, so the TUI modal can show Network Permission Required, Filesystem Permission Required, or Unsandboxed Shell Required instead of a generic approval title.",
+        "Permission approval dialogs now name the requested risk directly. Network blocks, filesystem write grants, and unsandboxed shell retries keep their runtime permission kind through pending interactions, so the TUI modal can show Network Permission Required, Filesystem Permission Required, or Unsandboxed Shell Required instead of a generic approval title. request_permissions also reaches the runtime permission handler instead of being intercepted as an ordinary tool approval, making TUI and server permission grants more reliable.",
       "v0.1.191":
         "RuntimeProviderResponseStep now consumes RuntimeProviderResponseInput directly instead of flattening the response handoff. Child-agent executors travel through RuntimeProviderResponseExecutors, so provider final-message and tool-turn dispatch keep one named response boundary while behavior stays unchanged.",
       "v0.1.190":
