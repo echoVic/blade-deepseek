@@ -99,6 +99,7 @@ pub(crate) fn dynamic_tool_completed_item(
 #[serde(untagged)]
 pub(crate) enum ProjectedThreadItem {
     UserMessage(ProjectedUserMessageThreadItem),
+    PersistedMessage(ProjectedPersistedMessageThreadItem),
     Text(ProjectedTextThreadItem),
     CommandExecution(ProjectedCommandExecutionThreadItem),
     McpTool(ProjectedMcpToolThreadItem),
@@ -116,6 +117,12 @@ impl ProjectedThreadItem {
 impl From<ProjectedUserMessageThreadItem> for ProjectedThreadItem {
     fn from(item: ProjectedUserMessageThreadItem) -> Self {
         Self::UserMessage(item)
+    }
+}
+
+impl From<ProjectedPersistedMessageThreadItem> for ProjectedThreadItem {
+    fn from(item: ProjectedPersistedMessageThreadItem) -> Self {
+        Self::PersistedMessage(item)
     }
 }
 
@@ -166,6 +173,74 @@ impl ProjectedUserMessageThreadItem {
     pub(crate) fn new(content: impl Into<String>) -> Self {
         Self::Started {
             role: "user",
+            content: content.into(),
+        }
+    }
+}
+
+pub(crate) fn persisted_message_thread_item(item: ProjectedPersistedMessageThreadItem) -> Value {
+    ProjectedThreadItem::from(item).into_value()
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(untagged)]
+pub(crate) enum ProjectedPersistedMessageThreadItem {
+    System {
+        role: &'static str,
+        content: String,
+    },
+    User {
+        role: &'static str,
+        content: String,
+    },
+    Assistant {
+        role: &'static str,
+        content: Option<String>,
+        #[serde(rename = "reasoningContent")]
+        reasoning_content: Option<String>,
+        #[serde(rename = "toolCalls")]
+        tool_calls: Vec<Value>,
+    },
+    Tool {
+        role: &'static str,
+        #[serde(rename = "toolCallId")]
+        tool_call_id: String,
+        content: String,
+    },
+}
+
+impl ProjectedPersistedMessageThreadItem {
+    pub(crate) fn system(content: impl Into<String>) -> Self {
+        Self::System {
+            role: "system",
+            content: content.into(),
+        }
+    }
+
+    pub(crate) fn user(content: impl Into<String>) -> Self {
+        Self::User {
+            role: "user",
+            content: content.into(),
+        }
+    }
+
+    pub(crate) fn assistant(
+        content: Option<String>,
+        reasoning_content: Option<String>,
+        tool_calls: Vec<Value>,
+    ) -> Self {
+        Self::Assistant {
+            role: "assistant",
+            content,
+            reasoning_content,
+            tool_calls,
+        }
+    }
+
+    pub(crate) fn tool(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self::Tool {
+            role: "tool",
+            tool_call_id: tool_call_id.into(),
             content: content.into(),
         }
     }
@@ -1291,6 +1366,55 @@ mod tests {
         assert!(item["contentItems"].is_null());
         assert!(item["success"].is_null());
         assert!(item["error"].is_null());
+    }
+
+    #[test]
+    fn persisted_message_thread_item_projects_existing_thread_store_shape() {
+        let system = persisted_message_thread_item(ProjectedPersistedMessageThreadItem::system(
+            "system context",
+        ));
+        let user =
+            persisted_message_thread_item(ProjectedPersistedMessageThreadItem::user("hello"));
+        let assistant =
+            persisted_message_thread_item(ProjectedPersistedMessageThreadItem::assistant(
+                Some("answer".to_string()),
+                Some("reasoning".to_string()),
+                vec![json!({
+                    "id": "call-1",
+                    "function_name": "bash",
+                    "arguments": "{\"command\":\"cargo test\"}"
+                })],
+            ));
+        let tool = persisted_message_thread_item(ProjectedPersistedMessageThreadItem::tool(
+            "call-1", "ok",
+        ));
+
+        assert_eq!(
+            system,
+            json!({
+                "role": "system",
+                "content": "system context",
+            })
+        );
+        assert_eq!(
+            user,
+            json!({
+                "role": "user",
+                "content": "hello",
+            })
+        );
+        assert_eq!(assistant["role"], "assistant");
+        assert_eq!(assistant["content"], "answer");
+        assert_eq!(assistant["reasoningContent"], "reasoning");
+        assert_eq!(assistant["toolCalls"][0]["id"], "call-1");
+        assert_eq!(
+            tool,
+            json!({
+                "role": "tool",
+                "toolCallId": "call-1",
+                "content": "ok",
+            })
+        );
     }
 
     #[test]

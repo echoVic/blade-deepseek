@@ -34,10 +34,14 @@ server/TUI payload. Workflow lifecycle aggregation now also lives behind
 emits the unchanged workflow card payload. Server active-steer user-message
 item payloads now also use the shared `ProjectedThreadItem` path instead of
 processor-local JSON, keeping TUI-visible steer cards aligned with the same
-typed projection boundary. A server can now ask for URL/form input during an
-MCP tool call, the TUI projects that request as a visible waiting-input prompt
-keyed by the runtime interaction id, and Orca writes the accept/decline
-response back before continuing the original tool call. Earlier v0.2.2 hardened
+typed projection boundary. Persisted thread-store system, user, assistant, and
+tool message projections now also enter that shared typed projection path
+before serializing the unchanged history/read/list JSON, reducing drift between
+live TUI transcript cards and resumed thread views. A server can now ask for
+URL/form input during an MCP tool call, the TUI projects that request as a
+visible waiting-input prompt keyed by the runtime interaction id, and Orca
+writes the accept/decline response back before continuing the original tool
+call. Earlier v0.2.2 hardened
 DeepSeek tool-call compatibility:
 `update_goal` and `update_plan` normalize the status aliases and boolean status
 flags DeepSeek emits before validation, the `glob`/`update_goal` JSON Schemas

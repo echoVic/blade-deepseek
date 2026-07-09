@@ -4715,6 +4715,7 @@ mod tests {
             "persisted_command_execution_completed_item",
             "persisted_file_change_started_item",
             "persisted_file_change_completed_item",
+            "persisted_message_thread_item",
             "complete_projected_tool_item",
             "tool_error_object_from_value",
             "tool_status_is_completed",
@@ -4744,6 +4745,18 @@ mod tests {
             assert!(
                 !thread_projection_source.contains(completed_constructor),
                 "thread_store/projection.rs must complete projected tool items through the shared projection helper, not call {completed_constructor} directly"
+            );
+        }
+
+        for persisted_message_constructor in [
+            "ProjectedPersistedMessageThreadItem::system",
+            "ProjectedPersistedMessageThreadItem::user",
+            "ProjectedPersistedMessageThreadItem::assistant",
+            "ProjectedPersistedMessageThreadItem::tool",
+        ] {
+            assert!(
+                thread_projection_source.contains(persisted_message_constructor),
+                "thread_store/projection.rs must construct persisted message items through {persisted_message_constructor}"
             );
         }
     }

@@ -3,9 +3,10 @@ use orca_core::tool_types::ToolStatus;
 use serde_json::{Value, json};
 
 use crate::tool_item_projection::{
-    complete_projected_tool_item, dynamic_tool_started_item, mcp_tool_parts, mcp_tool_started_item,
-    parse_json_or_null, persisted_command_execution_started_item,
-    persisted_file_change_started_item,
+    ProjectedPersistedMessageThreadItem, complete_projected_tool_item, dynamic_tool_started_item,
+    mcp_tool_parts, mcp_tool_started_item, parse_json_or_null,
+    persisted_command_execution_started_item, persisted_file_change_started_item,
+    persisted_message_thread_item,
 };
 
 use super::types::{
@@ -15,68 +16,67 @@ use super::types::{
 
 pub(crate) fn message_to_thread_json(message: &Message) -> Value {
     match message {
-        Message::System { content, .. } => json!({
-            "role": "system",
-            "content": content,
-        }),
-        Message::User { content, .. } => json!({
-            "role": "user",
-            "content": content,
-        }),
+        Message::System { content, .. } => {
+            persisted_message_thread_item(ProjectedPersistedMessageThreadItem::system(content))
+        }
+        Message::User { content, .. } => {
+            persisted_message_thread_item(ProjectedPersistedMessageThreadItem::user(content))
+        }
         Message::Assistant {
             content,
             reasoning_content,
             tool_calls,
             ..
-        } => json!({
-            "role": "assistant",
-            "content": content,
-            "reasoningContent": reasoning_content,
-            "toolCalls": tool_calls,
-        }),
+        } => persisted_message_thread_item(ProjectedPersistedMessageThreadItem::assistant(
+            content.clone(),
+            reasoning_content.clone(),
+            tool_calls_to_values(tool_calls),
+        )),
         Message::Tool {
             tool_call_id,
             content,
             ..
-        } => json!({
-            "role": "tool",
-            "toolCallId": tool_call_id,
-            "content": content,
-        }),
+        } => persisted_message_thread_item(ProjectedPersistedMessageThreadItem::tool(
+            tool_call_id,
+            content,
+        )),
     }
 }
 
 pub(crate) fn stored_message_to_thread_json(message: &StoredMessage) -> Value {
     match message {
-        StoredMessage::System { content, .. } => json!({
-            "role": "system",
-            "content": content,
-        }),
-        StoredMessage::User { content, .. } => json!({
-            "role": "user",
-            "content": content,
-        }),
+        StoredMessage::System { content, .. } => {
+            persisted_message_thread_item(ProjectedPersistedMessageThreadItem::system(content))
+        }
+        StoredMessage::User { content, .. } => {
+            persisted_message_thread_item(ProjectedPersistedMessageThreadItem::user(content))
+        }
         StoredMessage::Assistant {
             content,
             reasoning_content,
             tool_calls,
             ..
-        } => json!({
-            "role": "assistant",
-            "content": content,
-            "reasoningContent": reasoning_content,
-            "toolCalls": tool_calls,
-        }),
+        } => persisted_message_thread_item(ProjectedPersistedMessageThreadItem::assistant(
+            content.clone(),
+            reasoning_content.clone(),
+            tool_calls_to_values(tool_calls),
+        )),
         StoredMessage::Tool {
             tool_call_id,
             content,
             ..
-        } => json!({
-            "role": "tool",
-            "toolCallId": tool_call_id,
-            "content": content,
-        }),
+        } => persisted_message_thread_item(ProjectedPersistedMessageThreadItem::tool(
+            tool_call_id,
+            content,
+        )),
     }
+}
+
+fn tool_calls_to_values(tool_calls: &[RawToolCall]) -> Vec<Value> {
+    tool_calls
+        .iter()
+        .map(|tool_call| serde_json::to_value(tool_call).expect("raw tool call serializes"))
+        .collect()
 }
 
 pub(crate) fn messages_to_thread_turns(
