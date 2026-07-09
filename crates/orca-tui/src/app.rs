@@ -3432,7 +3432,11 @@ fn agent_loop_thread(
                 }
             }
             Ok(UserAction::Cancel) | Err(_) => break,
-            Ok(UserAction::Approve { .. } | UserAction::RespondToUserInput { .. }) => {}
+            Ok(
+                UserAction::Approve { .. }
+                | UserAction::RespondToUserInput { .. }
+                | UserAction::RespondToMcpElicitation { .. },
+            ) => {}
         }
     }
 }

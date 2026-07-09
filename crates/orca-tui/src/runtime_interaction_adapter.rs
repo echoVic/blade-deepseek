@@ -13,7 +13,7 @@ use orca_runtime::lifecycle::{
 };
 use orca_runtime::protocol::{PermissionGrantScope, PermissionResponseDecision};
 use orca_runtime::runtime_pending_interaction::{
-    RuntimePendingInteractionRecord, RuntimePendingInteractionStore,
+    RuntimeMcpElicitationRequest, RuntimePendingInteractionRecord, RuntimePendingInteractionStore,
 };
 use orca_runtime::tool_invocation::{ToolInvocation, approval_request_for_invocation};
 
@@ -389,6 +389,66 @@ impl RuntimeUserInputHandler for TuiUserInputHandler<'_> {
     }
 }
 
+pub(crate) struct TuiMcpElicitationHandler<'a> {
+    event_tx: &'a Sender<TuiEvent>,
+    action_rx: &'a Receiver<UserAction>,
+    pending_actions: &'a RefCell<VecDeque<UserAction>>,
+    pending_interactions: Option<RuntimePendingInteractionStore>,
+}
+
+impl<'a> TuiMcpElicitationHandler<'a> {
+    pub(crate) fn new(
+        event_tx: &'a Sender<TuiEvent>,
+        action_rx: &'a Receiver<UserAction>,
+        pending_actions: &'a RefCell<VecDeque<UserAction>>,
+    ) -> Self {
+        Self {
+            event_tx,
+            action_rx,
+            pending_actions,
+            pending_interactions: None,
+        }
+    }
+
+    pub(crate) fn with_pending_interactions(
+        mut self,
+        store: RuntimePendingInteractionStore,
+    ) -> Self {
+        self.pending_interactions = Some(store);
+        self
+    }
+
+    pub(crate) fn request_mcp_elicitation(
+        &self,
+        request: &RuntimeMcpElicitationRequest,
+    ) -> io::Result<Option<String>> {
+        let pending = RuntimePendingInteractionRecord::from_mcp_elicitation(request);
+        insert_pending_interaction(self.pending_interactions.as_ref(), pending.clone())?;
+        let _ = self
+            .event_tx
+            .send(mcp_elicitation_event_from_pending_interaction(&pending));
+
+        let response = loop {
+            match self.action_rx.recv() {
+                Ok(UserAction::RespondToMcpElicitation {
+                    id,
+                    accepted,
+                    content_json,
+                }) if id == request.id => {
+                    break Ok(accepted.then_some(content_json.unwrap_or_else(|| "{}".to_string())));
+                }
+                Ok(action @ UserAction::RespondToMcpElicitation { .. }) => {
+                    self.pending_actions.borrow_mut().push_back(action)
+                }
+                Ok(UserAction::Interrupt) | Ok(UserAction::Cancel) | Err(_) => break Ok(None),
+                Ok(action) => self.pending_actions.borrow_mut().push_back(action),
+            }
+        };
+        remove_pending_interaction(self.pending_interactions.as_ref(), &request.id);
+        response
+    }
+}
+
 fn insert_pending_interaction(
     store: Option<&RuntimePendingInteractionStore>,
     record: RuntimePendingInteractionRecord,
@@ -438,6 +498,23 @@ fn user_input_event_from_pending_interaction(record: &RuntimePendingInteractionR
     }
 }
 
+fn mcp_elicitation_event_from_pending_interaction(
+    record: &RuntimePendingInteractionRecord,
+) -> TuiEvent {
+    let elicitation = record
+        .mcp_elicitation
+        .as_ref()
+        .expect("mcp elicitation pending record has details");
+    TuiEvent::McpElicitationRequested {
+        id: record.id.clone(),
+        server_name: elicitation.server_name.clone(),
+        mode: elicitation.mode.clone(),
+        message: record.question.clone().unwrap_or_default(),
+        url: elicitation.url.clone(),
+        requested_schema_json: elicitation.requested_schema_json.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
@@ -446,7 +523,8 @@ mod tests {
 
     use orca_runtime::lifecycle::RuntimeToolActorContext;
     use orca_runtime::runtime_pending_interaction::{
-        RuntimePendingInteractionKind, RuntimePendingInteractionStore,
+        RuntimeMcpElicitationMode, RuntimeMcpElicitationRequest, RuntimePendingInteractionKind,
+        RuntimePendingInteractionRecord, RuntimePendingInteractionStore,
     };
 
     use super::*;
@@ -899,6 +977,136 @@ mod tests {
             result.error.as_deref(),
             Some("user input request cancelled")
         );
+    }
+
+    #[test]
+    fn tui_mcp_elicitation_handler_tracks_runtime_pending_interaction_until_resolved() {
+        let (event_tx, event_rx) = mpsc::channel();
+        let (action_tx, action_rx) = mpsc::channel();
+        let store = RuntimePendingInteractionStore::default();
+        let request = RuntimeMcpElicitationRequest::new(
+            "github",
+            "42",
+            RuntimeMcpElicitationMode::Url,
+            "Authorize GitHub",
+            Some("https://github.com/login/device".to_string()),
+            None,
+        );
+        let request_id = request.id.clone();
+        let worker_store = store.clone();
+
+        let handle = std::thread::spawn(move || {
+            let pending_actions = RefCell::new(VecDeque::new());
+            let handler = TuiMcpElicitationHandler::new(&event_tx, &action_rx, &pending_actions)
+                .with_pending_interactions(worker_store);
+            handler
+                .request_mcp_elicitation(&request)
+                .expect("mcp elicitation response")
+        });
+
+        let prompt = event_rx.recv().expect("mcp elicitation prompt");
+        assert!(matches!(
+            prompt,
+            TuiEvent::McpElicitationRequested {
+                id,
+                server_name,
+                mode,
+                message,
+                url,
+                ..
+            } if id == request_id
+                && server_name == "github"
+                && mode == RuntimeMcpElicitationMode::Url
+                && message == "Authorize GitHub"
+                && url.as_deref() == Some("https://github.com/login/device")
+        ));
+        assert_eq!(
+            store.get(&request_id).map(|record| record.kind),
+            Some(RuntimePendingInteractionKind::McpElicitation)
+        );
+
+        action_tx
+            .send(UserAction::RespondToMcpElicitation {
+                id: request_id.clone(),
+                accepted: true,
+                content_json: Some(r#"{"code":"1234"}"#.to_string()),
+            })
+            .expect("send mcp elicitation response");
+        let response = handle.join().expect("mcp elicitation thread");
+
+        assert_eq!(response.as_deref(), Some(r#"{"code":"1234"}"#));
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn tui_mcp_elicitation_handler_resolves_only_matching_runtime_interaction_id() {
+        let (event_tx, _event_rx) = mpsc::channel();
+        let (action_tx, action_rx) = mpsc::channel();
+        action_tx
+            .send(UserAction::RespondToMcpElicitation {
+                id: "mcp_elicitation:github:wrong".to_string(),
+                accepted: true,
+                content_json: Some(r#"{"wrong":true}"#.to_string()),
+            })
+            .expect("send unrelated response");
+        action_tx
+            .send(UserAction::RespondToMcpElicitation {
+                id: "mcp_elicitation:github:42".to_string(),
+                accepted: true,
+                content_json: Some(r#"{"ok":true}"#.to_string()),
+            })
+            .expect("send matching response");
+        let pending_actions = RefCell::new(VecDeque::new());
+        let handler = TuiMcpElicitationHandler::new(&event_tx, &action_rx, &pending_actions);
+        let request = RuntimeMcpElicitationRequest::new(
+            "github",
+            "42",
+            RuntimeMcpElicitationMode::Form,
+            "Fill required fields",
+            None,
+            Some(r#"{"type":"object"}"#.to_string()),
+        );
+
+        let response = handler
+            .request_mcp_elicitation(&request)
+            .expect("mcp elicitation response");
+
+        assert_eq!(response.as_deref(), Some(r#"{"ok":true}"#));
+        assert!(matches!(
+            pending_actions.borrow_mut().pop_front(),
+            Some(UserAction::RespondToMcpElicitation { id, content_json, .. })
+                if id == "mcp_elicitation:github:wrong"
+                    && content_json.as_deref() == Some(r#"{"wrong":true}"#)
+        ));
+    }
+
+    #[test]
+    fn tui_mcp_elicitation_handler_rejects_duplicate_pending_interaction_id_before_waiting() {
+        let (event_tx, event_rx) = mpsc::channel();
+        let (action_tx, action_rx) = mpsc::channel();
+        action_tx.send(UserAction::Cancel).expect("send cancel");
+        let store = RuntimePendingInteractionStore::default();
+        let request = RuntimeMcpElicitationRequest::new(
+            "github",
+            "42",
+            RuntimeMcpElicitationMode::Url,
+            "Authorize GitHub",
+            Some("https://github.com/login/device".to_string()),
+            None,
+        );
+        let first = RuntimePendingInteractionRecord::from_mcp_elicitation(&request);
+        store.insert(first.clone()).expect("seed pending");
+        let pending_actions = RefCell::new(VecDeque::new());
+        let handler = TuiMcpElicitationHandler::new(&event_tx, &action_rx, &pending_actions)
+            .with_pending_interactions(store.clone());
+
+        let error = handler
+            .request_mcp_elicitation(&request)
+            .expect_err("duplicate pending id should fail before waiting");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(store.get(&request.id), Some(first));
+        assert!(event_rx.try_recv().is_err());
     }
 
     #[test]

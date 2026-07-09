@@ -10,6 +10,7 @@ use orca_core::goal_types::ThreadGoal;
 use orca_core::plan_types::PlanItem;
 use orca_core::task_types::BackgroundTaskSummary;
 use orca_runtime::history::SessionSummary;
+use orca_runtime::runtime_pending_interaction::RuntimeMcpElicitationMode;
 use orca_runtime::runtime_permission::RuntimePermissionRequestKind;
 
 const SUBAGENT_ACTIVITY_TAIL_LIMIT: usize = 6;
@@ -172,6 +173,14 @@ pub enum TuiEvent {
         question: String,
         choices: Vec<String>,
     },
+    McpElicitationRequested {
+        id: String,
+        server_name: String,
+        mode: RuntimeMcpElicitationMode,
+        message: String,
+        url: Option<String>,
+        requested_schema_json: Option<String>,
+    },
     Notice(String),
     Error(String),
     UsageUpdated(UsageTotals),
@@ -199,7 +208,10 @@ pub enum TuiEvent {
 pub enum UserAction {
     Submit(String),
     SubmitWorkflowNotification(PendingWorkflowNotification),
-    RunWorkflow { name: String, args: Option<String> },
+    RunWorkflow {
+        name: String,
+        args: Option<String>,
+    },
     SetModel(String),
     Remember(String),
     Compact,
@@ -209,11 +221,29 @@ pub enum UserAction {
     GoalClear,
     GoalPause,
     GoalResume,
-    Approve { id: String, approved: bool },
-    ResolveBackgroundApproval { id: String, approved: bool },
-    StopTask { task_id: String },
-    ForegroundTask { task_id: String },
-    RespondToUserInput { id: String, answer: String },
+    Approve {
+        id: String,
+        approved: bool,
+    },
+    ResolveBackgroundApproval {
+        id: String,
+        approved: bool,
+    },
+    StopTask {
+        task_id: String,
+    },
+    ForegroundTask {
+        task_id: String,
+    },
+    RespondToUserInput {
+        id: String,
+        answer: String,
+    },
+    RespondToMcpElicitation {
+        id: String,
+        accepted: bool,
+        content_json: Option<String>,
+    },
     Backtrack,
     BackgroundCurrentTurn,
     Interrupt,
@@ -1207,6 +1237,33 @@ impl AppState {
                 }
                 self.messages.push(ChatMessage::System(message));
             }
+            TuiEvent::McpElicitationRequested {
+                id,
+                server_name,
+                mode,
+                message,
+                url,
+                requested_schema_json,
+            } => {
+                self.set_status(AppStatus::WaitingUserInput);
+                self.pending_user_input_id = Some(id);
+                let mut lines = vec![format!("MCP {server_name} requests input: {message}")];
+                match mode {
+                    RuntimeMcpElicitationMode::Form => {
+                        lines.push("Mode: form".to_string());
+                        if let Some(schema) = requested_schema_json {
+                            lines.push(format!("Schema: {schema}"));
+                        }
+                    }
+                    RuntimeMcpElicitationMode::Url => {
+                        lines.push("Mode: url".to_string());
+                        if let Some(url) = url {
+                            lines.push(format!("URL: {url}"));
+                        }
+                    }
+                }
+                self.messages.push(ChatMessage::System(lines.join("\n")));
+            }
             TuiEvent::Error(msg) => {
                 self.clear_receiving_tool_progress();
                 self.messages.push(ChatMessage::Error(msg));
@@ -1894,6 +1951,32 @@ mod tests {
 
         assert_eq!(state.status, AppStatus::WaitingUserInput);
         assert_eq!(state.pending_user_input_id.as_deref(), Some("ask-1"));
+    }
+
+    #[test]
+    fn mcp_elicitation_requested_event_tracks_pending_runtime_interaction_id() {
+        let mut state = state();
+        state.update(TuiEvent::McpElicitationRequested {
+            id: "mcp_elicitation:github:42".to_string(),
+            server_name: "github".to_string(),
+            mode: RuntimeMcpElicitationMode::Url,
+            message: "Authorize GitHub".to_string(),
+            url: Some("https://github.com/login/device".to_string()),
+            requested_schema_json: None,
+        });
+
+        assert_eq!(state.status, AppStatus::WaitingUserInput);
+        assert_eq!(
+            state.pending_user_input_id.as_deref(),
+            Some("mcp_elicitation:github:42")
+        );
+        assert!(matches!(
+            state.messages.last(),
+            Some(ChatMessage::System(message))
+                if message.contains("MCP github requests input: Authorize GitHub")
+                    && message.contains("Mode: url")
+                    && message.contains("URL: https://github.com/login/device")
+        ));
     }
 
     #[test]

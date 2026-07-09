@@ -336,9 +336,12 @@ The deeper July 9 reference pass changes the next refactor order:
    now seeded: `RuntimePendingInteractionRecord` has an `McpElicitation` kind,
    carries server/request/mode/url/schema details, and builds stable
    server-scoped ids so duplicate MCP waits are rejected before a TUI or server
-   surface can create an unrouteable second prompt. Next connect real MCP
-   elicitation requests to that runtime record and project them through the TUI
-   interaction adapter.
+   surface can create an unrouteable second prompt. The TUI interaction adapter
+   can now project MCP elicitation records into a visible waiting-input state,
+   preserve URL/form metadata, resolve only the matching runtime id, and clean
+   up the pending record on answer or cancel. Next connect real MCP transport
+   elicitation requests to that runtime/TUI path, then mirror the same id
+   discipline through server-mode responses.
 5. **P2: Make skills/plugins a manifest-backed capability source only after
    policy and protocol owners are stable.** Codex's skills, connectors, and
    plugin managers are valuable, but adopting them before compaction, exec
