@@ -42,6 +42,7 @@ pub(crate) mod runtime_special;
 pub mod runtime_state;
 mod runtime_steer;
 mod runtime_tool_actor;
+pub(crate) mod runtime_tool_scheduler;
 mod runtime_turn_iteration;
 mod runtime_turn_kernel;
 mod runtime_turn_loop;
@@ -818,10 +819,15 @@ mod tests {
     fn sampling_request_state_owns_tool_dispatch_cursor() {
         let step_context_source = include_str!("step_context.rs");
         let tool_turn_source = include_str!("tool_turn.rs");
+        let scheduler_source = include_str!("runtime_tool_scheduler.rs");
         let tool_turn_runtime_source = tool_turn_source
             .split("mod tests")
             .next()
             .expect("tool turn runtime source");
+        let scheduler_runtime_source = scheduler_source
+            .split("mod tests")
+            .next()
+            .expect("tool scheduler runtime source");
 
         for marker in [
             "tool_cursor_index: usize",
@@ -839,11 +845,15 @@ mod tests {
         }
         assert!(
             tool_turn_runtime_source.contains(".current_tool_request(tool_requests)"),
-            "tool_turn must read the current tool request through sampling state"
+            "tool_turn must read the current tool request through sampling state for policy rejection"
         );
         assert!(
-            tool_turn_runtime_source.contains(".tool_dispatch_window(tool_requests"),
-            "tool_turn must read dispatch windows through sampling state"
+            scheduler_runtime_source.contains(".current_tool_request(tool_requests)"),
+            "runtime_tool_scheduler must read the current tool request through sampling state"
+        );
+        assert!(
+            scheduler_runtime_source.contains(".tool_dispatch_window(tool_requests"),
+            "runtime_tool_scheduler must read dispatch windows through sampling state"
         );
         assert!(
             tool_turn_runtime_source.contains(".advance_tool_cursor_to_window_end("),
@@ -863,10 +873,15 @@ mod tests {
     fn sampling_request_state_owns_tool_dispatch_windows() {
         let step_context_source = include_str!("step_context.rs");
         let tool_turn_source = include_str!("tool_turn.rs");
+        let scheduler_source = include_str!("runtime_tool_scheduler.rs");
         let tool_turn_runtime_source = tool_turn_source
             .split("mod tests")
             .next()
             .expect("tool turn runtime source");
+        let scheduler_runtime_source = scheduler_source
+            .split("mod tests")
+            .next()
+            .expect("tool scheduler runtime source");
 
         for marker in [
             "struct RuntimeToolDispatchWindow<'a>",
@@ -884,8 +899,8 @@ mod tests {
             );
         }
         assert!(
-            tool_turn_runtime_source.contains(".tool_dispatch_window(tool_requests"),
-            "tool_turn must request batch windows through sampling state"
+            scheduler_runtime_source.contains(".tool_dispatch_window(tool_requests"),
+            "runtime_tool_scheduler must request batch windows through sampling state"
         );
         assert!(
             tool_turn_runtime_source.contains(".advance_tool_cursor_to_window_end("),
@@ -1436,6 +1451,55 @@ mod tests {
                 "tool_turn must not own readonly detail {marker}"
             );
         }
+    }
+
+    #[test]
+    fn tool_dispatch_selection_is_owned_by_runtime_tool_scheduler() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let lib_source =
+            std::fs::read_to_string(manifest_dir.join("src/lib.rs")).expect("lib source");
+        let tool_turn_source = std::fs::read_to_string(manifest_dir.join("src/tool_turn.rs"))
+            .expect("tool turn source");
+        let scheduler_source =
+            std::fs::read_to_string(manifest_dir.join("src/runtime_tool_scheduler.rs"))
+                .expect("runtime tool scheduler source");
+
+        assert!(
+            lib_source.contains("pub(crate) mod runtime_tool_scheduler;"),
+            "runtime crate must declare a focused runtime tool scheduler module"
+        );
+        for marker in [
+            "pub(crate) enum RuntimeToolDispatch",
+            "pub(crate) struct RuntimeToolDispatchScheduler",
+            "pub(crate) fn next_dispatch",
+            "should_run_subagent_batch(",
+            "collect_subagent_batch(",
+            "should_run_readonly_batch(",
+            "collect_readonly_batch(",
+            "RuntimeToolDispatch::Normal",
+            "RuntimeToolDispatch::ReadonlyBatch",
+            "RuntimeToolDispatch::SubagentBatch",
+        ] {
+            assert!(
+                scheduler_source.contains(marker),
+                "runtime_tool_scheduler must own tool dispatch selection detail {marker}"
+            );
+        }
+        for marker in [
+            "should_run_subagent_batch(",
+            "collect_subagent_batch(",
+            "should_run_readonly_batch(",
+            "collect_readonly_batch(",
+        ] {
+            assert!(
+                !tool_turn_source.contains(marker),
+                "tool_turn must delegate tool dispatch selection detail {marker}"
+            );
+        }
+        assert!(
+            tool_turn_source.contains("RuntimeToolDispatchScheduler::new("),
+            "tool_turn must ask the scheduler for the next dispatch"
+        );
     }
 
     #[test]

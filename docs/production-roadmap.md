@@ -5,11 +5,15 @@
 
 Last updated: 2026-07-09
 Current baseline: current main after v0.2.3 routes stdio MCP
-`elicitation/create` requests through the TUI pending-interaction path. A server
-can now ask for URL/form input during an MCP tool call, the TUI projects that
-request as a visible waiting-input prompt keyed by the runtime interaction id,
-and Orca writes the accept/decline response back before continuing the original
-tool call. Earlier v0.2.2 hardened DeepSeek tool-call compatibility:
+`elicitation/create` requests through the TUI pending-interaction path. The next
+post-v0.2.3 refactor priority is the Codex/package-3-inspired runtime tool
+scheduler: `tool_turn` keeps execution and result recording, while
+`runtime_tool_scheduler` owns the normal, readonly batch, and sync-subagent batch
+selection rules so mixed tool batches stop at non-concurrent boundaries. A
+server can now ask for URL/form input during an MCP tool call, the TUI projects
+that request as a visible waiting-input prompt keyed by the runtime interaction
+id, and Orca writes the accept/decline response back before continuing the
+original tool call. Earlier v0.2.2 hardened DeepSeek tool-call compatibility:
 `update_goal` and `update_plan` normalize the status aliases and boolean status
 flags DeepSeek emits before validation, the `glob`/`update_goal` JSON Schemas
 gain nullable/`anyOf` support, tool validation errors now list the allowed and

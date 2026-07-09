@@ -21,17 +21,16 @@ use crate::memory::MemoryBlock;
 use crate::runtime_readonly_tool_turn::record_readonly_batch_results;
 use crate::runtime_readonly_tool_turn::{
     RuntimeReadonlyToolTurnContext, RuntimeReadonlyToolTurnIo, RuntimeReadonlyToolTurnRequest,
-    RuntimeReadonlyToolTurnServices, collect_readonly_batch, run_readonly_tool_turn,
-    should_run_readonly_batch,
+    RuntimeReadonlyToolTurnServices, run_readonly_tool_turn,
 };
+use crate::runtime_tool_scheduler::{RuntimeToolDispatch, RuntimeToolDispatchScheduler};
 use crate::step_context::{
     RuntimeSamplingRequestState, RuntimeStepContext, RuntimeToolResultRecordOutcome,
 };
 use crate::subagent_execution::{
     RuntimeSubagentBatchToolTurnContext, RuntimeSubagentBatchToolTurnIo,
     RuntimeSubagentBatchToolTurnRequest, RuntimeSubagentBatchToolTurnRuntime,
-    RuntimeSubagentBatchToolTurnServices, collect_subagent_batch, run_subagent_batch_tool_turn,
-    should_run_subagent_batch,
+    RuntimeSubagentBatchToolTurnServices, run_subagent_batch_tool_turn,
 };
 use crate::tasks::TaskRegistry;
 use crate::thread_store::SessionWriter;
@@ -202,11 +201,13 @@ pub(crate) fn run_tool_turns<W: io::Write>(
             });
         }
 
-        if should_run_subagent_batch(config, tool_request, subagent_depth) {
-            let dispatch_window =
-                sampling_state.tool_dispatch_window(tool_requests, |tool_requests, start_index| {
-                    collect_subagent_batch(config, tool_requests, start_index)
-                });
+        let Some(dispatch) = RuntimeToolDispatchScheduler::new(config, subagent_depth)
+            .next_dispatch(sampling_state, tool_requests)
+        else {
+            break;
+        };
+
+        if let RuntimeToolDispatch::SubagentBatch(dispatch_window) = dispatch {
             match run_subagent_batch_tool_turn(RuntimeSubagentBatchToolTurnContext {
                 request: RuntimeSubagentBatchToolTurnRequest {
                     config,
@@ -243,15 +244,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
             continue;
         }
 
-        if should_run_readonly_batch(config.tools.max_read_parallel, tool_request) {
-            let dispatch_window =
-                sampling_state.tool_dispatch_window(tool_requests, |tool_requests, start_index| {
-                    collect_readonly_batch(
-                        config.tools.max_read_parallel,
-                        tool_requests,
-                        start_index,
-                    )
-                });
+        if let RuntimeToolDispatch::ReadonlyBatch(dispatch_window) = dispatch {
             match run_readonly_tool_turn(RuntimeReadonlyToolTurnContext {
                 request: RuntimeReadonlyToolTurnRequest {
                     cwd,
@@ -278,6 +271,10 @@ pub(crate) fn run_tool_turns<W: io::Write>(
             sampling_state.advance_tool_cursor_to_window_end(&dispatch_window);
             continue;
         }
+
+        let RuntimeToolDispatch::Normal(tool_request) = dispatch else {
+            unreachable!("batch dispatches are handled before normal tool dispatch");
+        };
 
         match run_normal_tool_turn(RuntimeNormalToolTurnContext {
             sampling_state,
