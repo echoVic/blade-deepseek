@@ -76,6 +76,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.6":
+        "TUI proposed plans now render as their own scrollback message instead of leaking <proposed_plan> tags into assistant text. The server and TUI share one UTF-8-safe parser, so split tags and Chinese streaming text keep the same tested behavior across local TUI and server projection.",
       "v0.2.5":
         "Server command/exec network-policy denials now use the same runtime permission evaluation boundary as TUI bash. Requestable blocked hosts still open the existing permission-request and retry flow, while configured denylist hosts now surface a clear policy-denial error instead of falling through as an unpromptable missing request.",
       "v0.2.4":
@@ -464,6 +466,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.6":
+        "TUI proposed plan 现在会作为独立的 scrollback 消息显示，不再把 <proposed_plan> 标签泄漏进普通 assistant 文本。Server 和 TUI 共用同一个 UTF-8 safe parser，所以拆分标签和中文流式文本在本地 TUI 与 server projection 中保持同一套经过测试的行为。",
       "v0.2.5":
         "Server command/exec 的网络策略拒绝现在和 TUI bash 使用同一个 runtime permission evaluation 边界。可申请的 blocked host 仍然走原来的 permission request 与 retry 流程；配置为 denylist 的 host 会显示清晰的 policy-denial error，不再作为不可提示的缺失请求悄悄落下。",
       "v0.2.4":
