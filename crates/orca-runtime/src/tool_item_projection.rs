@@ -1,3 +1,4 @@
+use serde::Serialize;
 use serde_json::{Value, json};
 
 pub(crate) fn mcp_tool_parts(tool: &str) -> Option<(String, String)> {
@@ -107,28 +108,58 @@ pub(crate) fn dynamic_tool_completed_item(
 }
 
 pub(crate) fn agent_message_item(id: impl Into<String>, text: impl Into<String>) -> Value {
-    json!({
-        "id": id.into(),
-        "type": "agent_message",
-        "text": text.into(),
-    })
+    ProjectedTextThreadItem::agent_message(id, text).into_value()
 }
 
 pub(crate) fn plan_item(id: impl Into<String>, text: impl Into<String>) -> Value {
-    json!({
-        "id": id.into(),
-        "type": "plan",
-        "text": text.into(),
-    })
+    ProjectedTextThreadItem::plan(id, text).into_value()
 }
 
 pub(crate) fn reasoning_item(id: impl Into<String>, summary: impl Into<String>) -> Value {
-    json!({
-        "id": id.into(),
-        "type": "reasoning",
-        "summary": summary.into(),
-        "content": "",
-    })
+    ProjectedTextThreadItem::reasoning(id, summary).into_value()
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "type")]
+pub(crate) enum ProjectedTextThreadItem {
+    #[serde(rename = "agent_message")]
+    AgentMessage { id: String, text: String },
+    #[serde(rename = "plan")]
+    Plan { id: String, text: String },
+    #[serde(rename = "reasoning")]
+    Reasoning {
+        id: String,
+        summary: String,
+        content: String,
+    },
+}
+
+impl ProjectedTextThreadItem {
+    pub(crate) fn agent_message(id: impl Into<String>, text: impl Into<String>) -> Self {
+        Self::AgentMessage {
+            id: id.into(),
+            text: text.into(),
+        }
+    }
+
+    pub(crate) fn plan(id: impl Into<String>, text: impl Into<String>) -> Self {
+        Self::Plan {
+            id: id.into(),
+            text: text.into(),
+        }
+    }
+
+    pub(crate) fn reasoning(id: impl Into<String>, summary: impl Into<String>) -> Self {
+        Self::Reasoning {
+            id: id.into(),
+            summary: summary.into(),
+            content: String::new(),
+        }
+    }
+
+    pub(crate) fn into_value(self) -> Value {
+        serde_json::to_value(self).expect("projected text thread item serializes")
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -923,6 +954,22 @@ mod tests {
         assert_eq!(completed["type"], "reasoning");
         assert_eq!(completed["summary"], "thinking");
         assert_eq!(completed["content"], "");
+    }
+
+    #[test]
+    fn projected_text_thread_item_serializes_current_wire_shapes() {
+        assert_eq!(
+            ProjectedTextThreadItem::agent_message("item-agent-message-1", "hello").into_value(),
+            agent_message_item("item-agent-message-1", "hello")
+        );
+        assert_eq!(
+            ProjectedTextThreadItem::plan("item-plan-1", "1. inspect").into_value(),
+            plan_item("item-plan-1", "1. inspect")
+        );
+        assert_eq!(
+            ProjectedTextThreadItem::reasoning("item-reasoning-1", "thinking").into_value(),
+            reasoning_item("item-reasoning-1", "thinking")
+        );
     }
 
     #[test]

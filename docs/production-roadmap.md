@@ -12,7 +12,11 @@ sync-subagent batch selection rules so mixed tool batches stop at
 non-concurrent boundaries, and the text item projection slice moves
 agent-message, plan, and reasoning item lifecycle state into
 `tool_item_projection` so TUI/server streams share one tested start/delta/finish
-shape for the most visible transcript items. A server can now ask for URL/form
+shape for the most visible transcript items. The follow-on typed text item slice
+keeps those same wire shapes but constructs agent-message, plan, and reasoning
+items through a focused typed projection enum first, giving the later
+Codex-style `ThreadItem` protocol migration a narrow tested entry point. A
+server can now ask for URL/form
 input during an MCP tool call, the TUI projects that request as a visible
 waiting-input prompt keyed by the runtime interaction id, and Orca writes the
 accept/decline response back before continuing the original tool call. Earlier
