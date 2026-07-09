@@ -4,7 +4,16 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-07-09
-Current baseline: current main after v0.2.1 continues the Codex/package 3
+Current baseline: current main after v0.2.2 hardens DeepSeek tool-call
+compatibility: `update_goal` and `update_plan` normalize the status aliases and
+boolean status flags DeepSeek emits before validation, the `glob`/`update_goal`
+JSON Schemas gain nullable/`anyOf` support, tool validation errors now list the
+allowed and required properties, and the system prompt stops inlining full tool
+schemas in favor of concise usage examples. The same line adds reasoning-content
+replay, a tool-count upper bound, and an empty-response retry for DeepSeek turns,
+a stale-plan freshness reminder, and a changelog-page SEO check that validates
+the React source instead of rendered HTML.
+Earlier v0.2.1 continued the Codex/package 3
 processor pass: `permission/respond` and `user_input/respond` now resolve their
 pending request ids inside focused server processors instead of the generic
 `server.rs` module. This keeps server-mode interactive responses aligned with

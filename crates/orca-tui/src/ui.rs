@@ -1434,7 +1434,10 @@ fn render_plan_panel(frame: &mut Frame, area: Rect, state: &AppState, theme: &Th
     };
 
     let (title, border_color) = if state.plan_update_failed {
-        (" Task Plan (last update failed — may be stale) ", theme.warning)
+        (
+            " Task Plan (last update failed — may be stale) ",
+            theme.warning,
+        )
     } else {
         (" Task Plan ", theme.border)
     };

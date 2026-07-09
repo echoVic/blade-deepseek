@@ -112,9 +112,10 @@ impl VolatileContext {
 
     fn plan_reminder_due(&self) -> bool {
         self.plan_age_turns >= PLAN_REMINDER_AFTER_TURNS
-            && self.plan.as_deref().is_some_and(|plan| {
-                plan.contains("[in_progress]") || plan.contains("[pending]")
-            })
+            && self
+                .plan
+                .as_deref()
+                .is_some_and(|plan| plan.contains("[in_progress]") || plan.contains("[pending]"))
     }
 
     pub fn render(&self) -> String {

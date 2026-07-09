@@ -76,6 +76,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.2":
+        "DeepSeek tool-call compatibility gets hardened. update_goal and update_plan normalize the status aliases and boolean status flags DeepSeek emits before validation, the glob and update_goal JSON Schemas support nullable/anyOf parameters, and tool validation errors now list the allowed and required properties. The system prompt stops inlining full tool schemas in favor of concise examples, and the line adds reasoning-content replay, a tool-count cap, and empty-response retry for DeepSeek turns.",
       "v0.2.1":
         "Server interactive responses now stay with their focused processors. permission/respond resolves pending permission grants inside the permission processor, user_input/respond resolves runtime user-input waiters inside the user-input processor, and ownership tests guard that the generic server module does not reclaim those response paths.",
       "v0.2.0":
@@ -456,6 +458,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.2":
+        "DeepSeek 工具调用兼容性得到加固。update_goal 与 update_plan 会在校验前把 DeepSeek 生成的 status 别名和布尔状态标志归一化，glob 与 update_goal 的 JSON Schema 支持 nullable/anyOf 参数，工具校验错误也会列出允许和必填的属性。System prompt 不再内联完整工具 Schema，改为展示简洁示例，同时该版本为 DeepSeek turn 新增了 reasoning-content 重放、工具数量上限与空响应重试。",
       "v0.2.1":
         "Server 交互响应现在归属到各自的 focused processor。permission/respond 会在 permission processor 里解析 pending permission grant，user_input/respond 会在 user-input processor 里解析 runtime user-input waiter，并且 ownership tests 会防止这些响应路径重新退回泛化的 server 模块。",
       "v0.2.0":
