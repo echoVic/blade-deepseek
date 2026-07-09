@@ -293,9 +293,10 @@ The deeper July 9 reference pass changes the next refactor order:
    silently granting permissions when no handler exists. The command-origin
    metadata slice is now started as well: runtime permission construction can
    return a structured decision carrying origin plus request kind, and
-   command/exec preserves that metadata when adapting retry prompts. Next mirror
-   Codex more directly by using the same decision shape for bash and future
-   exec-policy rule evaluation instead of returning only prompt text.
+   both bash and command/exec preserve that metadata when adapting retry
+   prompts. Next mirror Codex more directly by using the same decision shape
+   for future exec-policy rule evaluation instead of returning only prompt
+   text.
 4. **P2: Turn MCP elicitation and dynamic waits into pending interactions.**
    Package 3's MCP elicitation queue is the useful reference here: request id,
    server name, mode, abort signal, completion notification, and hook-driven

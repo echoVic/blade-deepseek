@@ -11,7 +11,10 @@ use crate::extension::RuntimeExtensionStores;
 use crate::lifecycle::{RuntimePermissionRequestHandler, TurnPermissionOverlay};
 use crate::network_proxy::{RuntimeNetworkBlockReport, RuntimeNetworkPolicy, RuntimeNetworkProxy};
 use crate::protocol::PermissionResponseDecision;
-use crate::runtime_permission::{RuntimePermissionOrigin, RuntimePermissionPolicy};
+use crate::runtime_permission::{
+    RuntimePermissionDecision, RuntimePermissionOrigin, RuntimePermissionPolicy,
+    RuntimePermissionRequest, RuntimePermissionRequestKind,
+};
 use crate::runtime_state::RuntimeTurnReducer;
 use crate::sandbox_denial::{
     SandboxDenialDiagnostic, diagnose_sandbox_denial,
@@ -109,13 +112,11 @@ pub(crate) fn execute_bash_with_shell_session(
         network_block,
     } = result;
     if let Some(block) = network_block
-        && let Some(permission_request) = RuntimePermissionPolicy::network_block_request(
-            &request.id,
-            RuntimePermissionOrigin::Bash,
-            &block,
-        )
+        && let Some(permission_prompt) =
+            RuntimeBashPermissionPolicy::network_block_prompt(&request.id, &block)
         && let Some(permission_handler) = permission_handler
     {
+        let (_origin, _kind, permission_request) = permission_prompt.into_request_parts();
         let reducer = RuntimeTurnReducer::from_extension_stores(extension_stores);
         let response = match reducer.request_permission(
             permission_overlay,
@@ -151,12 +152,11 @@ pub(crate) fn execute_bash_with_shell_session(
             cwd,
             &diagnostic,
             &sandbox.denied_writable_roots,
-        ) && let Some(permission_request) = RuntimePermissionPolicy::filesystem_write_request(
-            &request.id,
-            RuntimePermissionOrigin::Bash,
-            &diagnostic,
-        ) && let Some(permission_handler) = permission_handler
+        ) && let Some(permission_prompt) =
+            RuntimeBashPermissionPolicy::filesystem_write_prompt(&request.id, &diagnostic)
+            && let Some(permission_handler) = permission_handler
         {
+            let (_origin, _kind, permission_request) = permission_prompt.into_request_parts();
             let reducer = RuntimeTurnReducer::from_extension_stores(extension_stores);
             let response = match reducer.request_permission(
                 permission_overlay,
@@ -195,12 +195,11 @@ pub(crate) fn execute_bash_with_shell_session(
             .with_sandbox_diagnostic(cwd)
             .into_tool_result(request, output_truncation, cancel, task_registry);
         }
-        if let Some(permission_request) = RuntimePermissionPolicy::unsandboxed_shell_request(
-            &request.id,
-            RuntimePermissionOrigin::Bash,
-            &diagnostic,
-        ) && let Some(permission_handler) = permission_handler
+        if let Some(permission_prompt) =
+            RuntimeBashPermissionPolicy::unsandboxed_shell_prompt(&request.id, &diagnostic)
+            && let Some(permission_handler) = permission_handler
         {
+            let (_origin, _kind, permission_request) = permission_prompt.into_request_parts();
             let reducer = RuntimeTurnReducer::from_extension_stores(extension_stores);
             let response = match reducer.request_permission(
                 permission_overlay,
@@ -279,6 +278,74 @@ struct RuntimeBashOnceContext<'a> {
     shell_timeout_secs: u64,
     task_registry: &'a TaskRegistry,
     cancel: Option<&'a CancelToken>,
+}
+
+struct RuntimeBashPermissionPrompt {
+    origin: RuntimePermissionOrigin,
+    kind: RuntimePermissionRequestKind,
+    request: RuntimePermissionRequest,
+}
+
+impl From<RuntimePermissionDecision> for RuntimeBashPermissionPrompt {
+    fn from(decision: RuntimePermissionDecision) -> Self {
+        Self {
+            origin: decision.origin,
+            kind: decision.kind,
+            request: decision.request,
+        }
+    }
+}
+
+impl RuntimeBashPermissionPrompt {
+    fn into_request_parts(
+        self,
+    ) -> (
+        RuntimePermissionOrigin,
+        RuntimePermissionRequestKind,
+        RuntimePermissionRequest,
+    ) {
+        (self.origin, self.kind, self.request)
+    }
+}
+
+struct RuntimeBashPermissionPolicy;
+
+impl RuntimeBashPermissionPolicy {
+    fn network_block_prompt(
+        request_id: &str,
+        block: &RuntimeNetworkBlockReport,
+    ) -> Option<RuntimeBashPermissionPrompt> {
+        RuntimePermissionPolicy::network_block_decision(
+            request_id,
+            RuntimePermissionOrigin::Bash,
+            block,
+        )
+        .map(RuntimeBashPermissionPrompt::from)
+    }
+
+    fn filesystem_write_prompt(
+        request_id: &str,
+        diagnostic: &SandboxDenialDiagnostic,
+    ) -> Option<RuntimeBashPermissionPrompt> {
+        RuntimePermissionPolicy::filesystem_write_decision(
+            request_id,
+            RuntimePermissionOrigin::Bash,
+            diagnostic,
+        )
+        .map(RuntimeBashPermissionPrompt::from)
+    }
+
+    fn unsandboxed_shell_prompt(
+        request_id: &str,
+        diagnostic: &SandboxDenialDiagnostic,
+    ) -> Option<RuntimeBashPermissionPrompt> {
+        RuntimePermissionPolicy::unsandboxed_shell_decision(
+            request_id,
+            RuntimePermissionOrigin::Bash,
+            diagnostic,
+        )
+        .map(RuntimeBashPermissionPrompt::from)
+    }
 }
 
 impl BashShellOutput {
@@ -495,5 +562,84 @@ fn execute_bash_once(context: RuntimeBashOnceContext<'_>) -> BashShellOutput {
     BashShellOutput {
         output,
         task_id: Some(handle.task_id),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use crate::network_proxy::RuntimeNetworkBlockReport;
+    use crate::runtime_permission::{RuntimePermissionOrigin, RuntimePermissionRequestKind};
+    use crate::sandbox_denial::SandboxDenialDiagnostic;
+
+    use super::RuntimeBashPermissionPolicy;
+
+    #[test]
+    fn runtime_bash_permission_policy_preserves_network_decision_metadata() {
+        let block = RuntimeNetworkBlockReport {
+            host: "api.orca.invalid".to_string(),
+            error: "blocked-by-allowlist",
+        };
+
+        let prompt =
+            RuntimeBashPermissionPolicy::network_block_prompt("bash-1", &block).expect("prompt");
+
+        assert_eq!(prompt.origin, RuntimePermissionOrigin::Bash);
+        assert_eq!(prompt.kind, RuntimePermissionRequestKind::NetworkBlock);
+        assert_eq!(
+            prompt.request.reason.as_deref(),
+            Some("bash attempted network access to api.orca.invalid (blocked-by-allowlist)")
+        );
+    }
+
+    #[test]
+    fn runtime_bash_permission_policy_preserves_filesystem_decision_metadata() {
+        let diagnostic = SandboxDenialDiagnostic {
+            denied_path: Some(PathBuf::from("/repo/.git/index.lock")),
+            suggested_write_root: Some(PathBuf::from("/repo/.git")),
+            message: "sandbox denied filesystem access".to_string(),
+        };
+
+        let prompt = RuntimeBashPermissionPolicy::filesystem_write_prompt("bash-1", &diagnostic)
+            .expect("prompt");
+
+        assert_eq!(prompt.origin, RuntimePermissionOrigin::Bash);
+        assert_eq!(prompt.kind, RuntimePermissionRequestKind::FilesystemWrite);
+        assert_eq!(
+            prompt
+                .request
+                .permissions
+                .file_system
+                .as_ref()
+                .and_then(|file_system| file_system.write.as_ref()),
+            Some(&vec![PathBuf::from("/repo/.git")])
+        );
+    }
+
+    #[test]
+    fn runtime_bash_permission_policy_preserves_unsandboxed_decision_metadata() {
+        let diagnostic = SandboxDenialDiagnostic {
+            denied_path: None,
+            suggested_write_root: None,
+            message: "sandbox denied filesystem access".to_string(),
+        };
+
+        let prompt = RuntimeBashPermissionPolicy::unsandboxed_shell_prompt("bash-1", &diagnostic)
+            .expect("prompt");
+
+        assert_eq!(prompt.origin, RuntimePermissionOrigin::Bash);
+        assert_eq!(
+            prompt.kind,
+            RuntimePermissionRequestKind::UnsandboxedShellRetry
+        );
+        assert!(
+            prompt
+                .request
+                .permissions
+                .shell
+                .as_ref()
+                .is_some_and(|shell| shell.unsandboxed)
+        );
     }
 }

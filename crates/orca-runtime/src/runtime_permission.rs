@@ -124,14 +124,6 @@ impl RuntimePermissionPolicy {
         })
     }
 
-    pub(crate) fn network_block_request(
-        request_id: &str,
-        origin: RuntimePermissionOrigin,
-        block: &RuntimeNetworkBlockReport,
-    ) -> Option<RuntimePermissionRequest> {
-        Self::network_block_decision(request_id, origin, block).map(|decision| decision.request)
-    }
-
     pub(crate) fn filesystem_write_decision(
         request_id: &str,
         origin: RuntimePermissionOrigin,
@@ -161,15 +153,6 @@ impl RuntimePermissionPolicy {
         })
     }
 
-    pub(crate) fn filesystem_write_request(
-        request_id: &str,
-        origin: RuntimePermissionOrigin,
-        diagnostic: &SandboxDenialDiagnostic,
-    ) -> Option<RuntimePermissionRequest> {
-        Self::filesystem_write_decision(request_id, origin, diagnostic)
-            .map(|decision| decision.request)
-    }
-
     pub(crate) fn unsandboxed_shell_decision(
         request_id: &str,
         origin: RuntimePermissionOrigin,
@@ -195,15 +178,6 @@ impl RuntimePermissionPolicy {
                 },
             },
         })
-    }
-
-    pub(crate) fn unsandboxed_shell_request(
-        request_id: &str,
-        origin: RuntimePermissionOrigin,
-        diagnostic: &SandboxDenialDiagnostic,
-    ) -> Option<RuntimePermissionRequest> {
-        Self::unsandboxed_shell_decision(request_id, origin, diagnostic)
-            .map(|decision| decision.request)
     }
 
     pub(crate) fn sandbox_denial_decision(
@@ -369,7 +343,7 @@ mod tests {
         };
 
         assert!(
-            RuntimePermissionPolicy::network_block_request(
+            RuntimePermissionPolicy::network_block_decision(
                 "permission-1",
                 RuntimePermissionOrigin::Bash,
                 &block,
@@ -379,37 +353,51 @@ mod tests {
     }
 
     #[test]
-    fn runtime_permission_policy_builds_actor_scoped_network_request() {
+    fn runtime_permission_policy_builds_actor_scoped_network_decision() {
         let block = RuntimeNetworkBlockReport {
             host: "api.orca.invalid".to_string(),
             error: "blocked-by-allowlist",
         };
 
-        let bash_request = RuntimePermissionPolicy::network_block_request(
+        let bash_decision = RuntimePermissionPolicy::network_block_decision(
             "permission-1",
             RuntimePermissionOrigin::Bash,
             &block,
         )
         .expect("bash network request");
-        let command_request = RuntimePermissionPolicy::network_block_request(
+        let command_decision = RuntimePermissionPolicy::network_block_decision(
             "permission-2",
             RuntimePermissionOrigin::CommandExec,
             &block,
         )
         .expect("command/exec network request");
 
+        assert_eq!(bash_decision.origin, RuntimePermissionOrigin::Bash);
         assert_eq!(
-            bash_request.reason.as_deref(),
+            bash_decision.kind,
+            RuntimePermissionRequestKind::NetworkBlock
+        );
+        assert_eq!(
+            bash_decision.request.reason.as_deref(),
             Some("bash attempted network access to api.orca.invalid (blocked-by-allowlist)")
         );
         assert_eq!(
-            command_request.reason.as_deref(),
+            command_decision.origin,
+            RuntimePermissionOrigin::CommandExec
+        );
+        assert_eq!(
+            command_decision.kind,
+            RuntimePermissionRequestKind::NetworkBlock
+        );
+        assert_eq!(
+            command_decision.request.reason.as_deref(),
             Some(
                 "command/exec attempted network access to api.orca.invalid (blocked-by-allowlist)"
             )
         );
         assert_eq!(
-            command_request
+            command_decision
+                .request
                 .permissions
                 .network
                 .as_ref()
