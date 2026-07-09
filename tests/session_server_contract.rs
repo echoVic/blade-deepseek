@@ -2334,16 +2334,12 @@ fn server_mode_session_network_deny_overrides_permission_profile_allow() {
         .expect("write command/exec");
         stdin.flush().expect("flush command/exec");
     }
-    let completed = read_until_event(&mut stdout, "cmd", "command_exec_completed");
+    let error = read_until_event(&mut stdout, "cmd", "error");
     drop(child.stdin.take());
-    assert!(
-        completed["stdout"]
-            .as_str()
-            .expect("stdout")
-            .contains("x-proxy-error: blocked-by-denylist"),
-        "stdout should show session deny overriding profile allow: {completed:?}"
+    assert_eq!(
+        error["message"],
+        "command/exec network access to blocked.orca.invalid was denied by configured network policy"
     );
-    assert_eq!(completed["exitCode"], 0);
 
     let output = child.wait_with_output().expect("wait for server");
     assert_eq!(output.status.code(), Some(0));
@@ -3423,15 +3419,11 @@ fn server_mode_command_exec_configured_permission_profile_enforces_network_domai
         let events = parse_jsonl(&output.stdout);
         assert_eq!(events.len(), 1, "expected one command event: {events:?}");
         assert_eq!(events[0]["id"], "cmd");
-        assert_eq!(events[0]["event"], "command_exec_completed");
-        assert!(
-            events[0]["stdout"]
-                .as_str()
-                .expect("stdout")
-                .contains("x-proxy-error: blocked-by-denylist"),
-            "stdout should include structured proxy block reason: {events:?}"
+        assert_eq!(events[0]["event"], "error");
+        assert_eq!(
+            events[0]["message"],
+            "command/exec network access to blocked.orca.invalid was denied by configured network policy"
         );
-        assert_eq!(events[0]["exitCode"], 0);
     });
 }
 

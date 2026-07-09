@@ -4,13 +4,15 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-07-10
-Current baseline: current main after v0.2.4 makes TUI bash network-deny
-handling use the runtime permission evaluation path, so denylisted network
-blocks produce an explicit policy denial instead of disappearing as a
-non-promptable `Option::None` case. The same runtime policy path still produces
-requestable network grants for allowlist/private-policy blocks, preserving the
-TUI approval prompt flow while making final denials clearer for users and
-future server parity. Earlier v0.2.3 routed stdio MCP `elicitation/create`
+Current baseline: current main after v0.2.5 makes server `command/exec`
+network-deny handling use the same runtime permission evaluation boundary as
+TUI bash. Requestable command/exec network blocks still produce the existing
+permission request and retry flow, while configured denylist blocks now surface
+an explicit policy-denial error instead of falling through as an unpromptable
+missing request. Earlier v0.2.4 made TUI bash network-deny handling use that
+runtime permission evaluation path, so denylisted network blocks produce an
+explicit policy denial instead of disappearing as a non-promptable
+`Option::None` case. Earlier v0.2.3 routed stdio MCP `elicitation/create`
 requests through the TUI pending-interaction path. The
 post-v0.2.3 P0 refactor line now has several narrow slices: the runtime tool
 scheduler makes `runtime_tool_scheduler` own normal, readonly batch, and

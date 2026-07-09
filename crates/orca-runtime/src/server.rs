@@ -143,6 +143,16 @@ fn handle_line<W: Write + Send + 'static>(
             CommandExecDrainOutcome::NetworkPermissionRequired { request, block } => {
                 request_command_exec_network_permission(state, request, block, &mut *writer)?;
             }
+            CommandExecDrainOutcome::NetworkPermissionDenied {
+                command_event_id,
+                reason,
+            } => {
+                protocol::write_server_event(
+                    &mut *writer,
+                    &command_event_id,
+                    ServerEvent::error(reason),
+                )?;
+            }
             CommandExecDrainOutcome::FileSystemPermissionRequired {
                 request,
                 diagnostic,
@@ -848,7 +858,7 @@ fn run_command_exec<W: Write>(
             terminal,
             event_id: id.clone(),
         });
-    if command_permission_request.is_some() && options.permission_profile.is_some() {
+    if options.permission_profile.is_some() {
         let (block_sender, block_receiver) = mpsc::channel();
         retry_block_reporter = Some(block_sender);
         retry_block_receiver = Some(block_receiver);
@@ -968,6 +978,16 @@ fn run_command_exec<W: Write>(
             CommandExecDrainOutcome::NetworkPermissionRequired { request, block } => {
                 return request_command_exec_network_permission(state, request, block, writer);
             }
+            CommandExecDrainOutcome::NetworkPermissionDenied {
+                command_event_id,
+                reason,
+            } => {
+                return protocol::write_server_event(
+                    writer,
+                    &command_event_id,
+                    ServerEvent::error(reason),
+                );
+            }
             CommandExecDrainOutcome::FileSystemPermissionRequired {
                 request,
                 diagnostic,
@@ -994,11 +1014,15 @@ fn run_command_exec<W: Write>(
             );
         }
     };
-    if let (Some(request), Some(blocked_hosts)) =
-        (command_permission_request.clone(), retry_block_receiver)
+    if let Some(blocked_hosts) = retry_block_receiver
         && let Some(block) = CommandExecPermissionPolicy::network_permission_block(blocked_hosts)
     {
-        return request_command_exec_network_permission(state, request, block, writer);
+        if let Some(denial) = CommandExecPermissionPolicy::network_block_denial(&block) {
+            return protocol::write_server_event(writer, &id, ServerEvent::error(denial.reason));
+        }
+        if let Some(request) = command_permission_request.clone() {
+            return request_command_exec_network_permission(state, request, block, writer);
+        }
     }
     if let Some(diagnostic) = diagnose_sandbox_denial(&cwd, &output.stdout, &output.stderr) {
         if CommandExecPermissionPolicy::should_request_filesystem_retry(
@@ -1040,7 +1064,7 @@ fn request_command_exec_network_permission<W: Write>(
     writer: &mut W,
 ) -> io::Result<()> {
     let prompt = CommandExecPermissionPolicy::network_block_prompt(&block)
-        .expect("denylist command/exec network blocks are filtered before prompting");
+        .expect("command/exec network permission prompts require requestable blocks");
     let (_origin, _kind, reason, permissions) = prompt.into_request_parts();
     request_command_exec_permission(state, request, reason, permissions, writer)
 }
@@ -1630,6 +1654,10 @@ fn run_command_exec_read<W: Write>(
         CommandExecDrainOutcome::NetworkPermissionRequired { request, block } => {
             request_command_exec_network_permission(state, request, block, writer)
         }
+        CommandExecDrainOutcome::NetworkPermissionDenied {
+            command_event_id,
+            reason,
+        } => protocol::write_server_event(writer, &command_event_id, ServerEvent::error(reason)),
         CommandExecDrainOutcome::FileSystemPermissionRequired {
             request,
             diagnostic,
@@ -3052,18 +3080,14 @@ enabled = true
             .expect("server run");
 
         let events = parse_jsonl(&output.bytes());
-        let completed = events
+        let error = events
             .iter()
-            .find(|event| event["event"] == "command_exec_completed")
-            .expect("command completed");
-        assert!(
-            completed["stdout"]
-                .as_str()
-                .expect("stdout")
-                .contains("x-proxy-error: blocked-by-denylist"),
-            "stdout should include structured proxy block reason: {completed:?}"
+            .find(|event| event["event"] == "error")
+            .expect("policy denial error");
+        assert_eq!(
+            error["message"],
+            "command/exec network access to blocked.orca.invalid was denied by configured network policy"
         );
-        assert_eq!(completed["exitCode"], 0);
     }
 
     #[test]
@@ -3833,7 +3857,7 @@ enabled = true
     }
 
     #[test]
-    fn command_exec_permission_profile_denylist_block_does_not_request_network_permission() {
+    fn command_exec_permission_profile_denylist_block_reports_policy_denial() {
         with_orca_home(|home| {
             let mut config = test_run_config();
             let file_config: orca_core::config::file::FileConfig = toml::from_str(
@@ -3882,16 +3906,13 @@ enabled = true
                     .all(|event| event["event"] != "permission_request"),
                 "denylist should not be escalated into a permission request: {events:?}"
             );
-            let completed = events
+            let error = events
                 .iter()
-                .find(|event| event["event"] == "command_exec_completed")
-                .expect("command completed");
-            assert!(
-                completed["stdout"]
-                    .as_str()
-                    .expect("stdout")
-                    .contains("x-proxy-error: blocked-by-denylist"),
-                "denylist block should remain a final proxy diagnostic: {completed:?}"
+                .find(|event| event["event"] == "error")
+                .expect("policy denial error");
+            assert_eq!(
+                error["message"],
+                "command/exec network access to blocked.orca.invalid was denied by configured network policy"
             );
         });
     }
@@ -6268,6 +6289,18 @@ enabled = true
                     let mut output = writer.lock().expect("writer");
                     request_command_exec_network_permission(state, request, block, &mut *output)
                         .expect("request network permission");
+                }
+                CommandExecDrainOutcome::NetworkPermissionDenied {
+                    command_event_id,
+                    reason,
+                } => {
+                    let mut output = writer.lock().expect("writer");
+                    protocol::write_server_event(
+                        &mut *output,
+                        &command_event_id,
+                        ServerEvent::error(reason),
+                    )
+                    .expect("write network denial");
                 }
                 CommandExecDrainOutcome::FileSystemPermissionRequired {
                     request,

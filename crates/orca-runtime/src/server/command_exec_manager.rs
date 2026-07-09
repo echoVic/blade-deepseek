@@ -14,8 +14,8 @@ use super::{cap_text, capped_delta, capped_utf8_len};
 use crate::network_proxy::{RuntimeNetworkBlockReport, RuntimeNetworkProxy};
 use crate::protocol::{self, ServerEvent};
 use crate::runtime_permission::{
-    RuntimePermissionDecision, RuntimePermissionOrigin, RuntimePermissionPolicy,
-    RuntimePermissionRequestKind,
+    RuntimePermissionDecision, RuntimePermissionEvaluation, RuntimePermissionOrigin,
+    RuntimePermissionPolicy, RuntimePermissionRequestKind,
 };
 use crate::sandbox_denial::{SandboxDenialDiagnostic, diagnose_sandbox_denial};
 use crate::shell_session::RuntimeShellSessionManager;
@@ -60,6 +60,10 @@ pub(super) enum CommandExecDrainOutcome {
         request: PendingCommandExecPermissionRequest,
         block: RuntimeNetworkBlockReport,
     },
+    NetworkPermissionDenied {
+        command_event_id: Value,
+        reason: String,
+    },
     FileSystemPermissionRequired {
         request: PendingCommandExecPermissionRequest,
         diagnostic: SandboxDenialDiagnostic,
@@ -71,6 +75,10 @@ pub(super) struct CommandExecPermissionPrompt {
     pub(super) kind: RuntimePermissionRequestKind,
     pub(super) reason: String,
     pub(super) permissions: protocol::RequestPermissionProfile,
+}
+
+pub(super) struct CommandExecPermissionDenial {
+    pub(super) reason: String,
 }
 
 impl From<RuntimePermissionDecision> for CommandExecPermissionPrompt {
@@ -103,9 +111,7 @@ impl CommandExecPermissionPolicy {
     pub(super) fn network_permission_block(
         blocked_hosts: mpsc::Receiver<RuntimeNetworkBlockReport>,
     ) -> Option<RuntimeNetworkBlockReport> {
-        blocked_hosts
-            .try_iter()
-            .find(|block| Self::network_block_prompt(block).is_some())
+        blocked_hosts.try_iter().next()
     }
 
     pub(super) fn network_block_prompt(
@@ -117,6 +123,21 @@ impl CommandExecPermissionPolicy {
             block,
         )
         .map(CommandExecPermissionPrompt::from)
+    }
+
+    pub(super) fn network_block_denial(
+        block: &RuntimeNetworkBlockReport,
+    ) -> Option<CommandExecPermissionDenial> {
+        match RuntimePermissionPolicy::network_block_evaluation(
+            "command-exec",
+            RuntimePermissionOrigin::CommandExec,
+            block,
+        ) {
+            RuntimePermissionEvaluation::Request(_) => None,
+            RuntimePermissionEvaluation::Deny { reason, .. } => {
+                Some(CommandExecPermissionDenial { reason })
+            }
+        }
     }
 
     pub(super) fn sandbox_denial_prompt(
@@ -489,13 +510,20 @@ impl CommandExecManager {
                         .network_permission_blocks
                         .and_then(CommandExecPermissionPolicy::network_permission_block)
                     {
-                        let request = process.permission_request.expect(
-                            "command/exec process with network block reporter has retry request",
-                        );
-                        return Ok(CommandExecDrainOutcome::NetworkPermissionRequired {
-                            request,
-                            block,
-                        });
+                        if let Some(denial) =
+                            CommandExecPermissionPolicy::network_block_denial(&block)
+                        {
+                            return Ok(CommandExecDrainOutcome::NetworkPermissionDenied {
+                                command_event_id: process.command_event_id,
+                                reason: denial.reason,
+                            });
+                        }
+                        if let Some(request) = process.permission_request {
+                            return Ok(CommandExecDrainOutcome::NetworkPermissionRequired {
+                                request,
+                                block,
+                            });
+                        }
                     }
                     if let Some(diagnostic) =
                         diagnose_sandbox_denial(&process.cwd, &output.stdout, &output.stderr)
@@ -633,6 +661,7 @@ impl CommandExecManager {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use std::sync::mpsc;
 
     use super::CommandExecPermissionPolicy;
     use crate::network_proxy::RuntimeNetworkBlockReport;
@@ -715,6 +744,41 @@ mod tests {
         };
 
         assert!(CommandExecPermissionPolicy::network_block_prompt(&block).is_none());
+    }
+
+    #[test]
+    fn command_exec_permission_policy_explains_network_denylist_blocks() {
+        let block = RuntimeNetworkBlockReport {
+            host: "blocked.orca.invalid".to_string(),
+            error: "blocked-by-denylist",
+        };
+
+        let denial =
+            CommandExecPermissionPolicy::network_block_denial(&block).expect("policy denial");
+
+        assert_eq!(
+            denial.reason,
+            "command/exec network access to blocked.orca.invalid was denied by configured network policy"
+        );
+    }
+
+    #[test]
+    fn command_exec_permission_policy_keeps_denylist_blocks_for_final_denial() {
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(RuntimeNetworkBlockReport {
+                host: "blocked.orca.invalid".to_string(),
+                error: "blocked-by-denylist",
+            })
+            .expect("send block");
+        drop(sender);
+
+        let block = CommandExecPermissionPolicy::network_permission_block(receiver)
+            .expect("network block should reach command/exec policy");
+
+        assert_eq!(block.host, "blocked.orca.invalid");
+        assert!(CommandExecPermissionPolicy::network_block_prompt(&block).is_none());
+        assert!(CommandExecPermissionPolicy::network_block_denial(&block).is_some());
     }
 
     #[test]

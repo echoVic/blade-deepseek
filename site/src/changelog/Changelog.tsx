@@ -76,6 +76,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.5":
+        "Server command/exec network-policy denials now use the same runtime permission evaluation boundary as TUI bash. Requestable blocked hosts still open the existing permission-request and retry flow, while configured denylist hosts now surface a clear policy-denial error instead of falling through as an unpromptable missing request.",
       "v0.2.4":
         "TUI bash network-policy denials are now explicit. Runtime permission policy returns a structured Request or Deny evaluation for network blocks, so requestable hosts still open the normal approval flow while configured denylist blocks end as a clear denied tool result instead of being represented as a missing prompt.",
       "v0.2.3":
@@ -462,6 +464,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.5":
+        "Server command/exec 的网络策略拒绝现在和 TUI bash 使用同一个 runtime permission evaluation 边界。可申请的 blocked host 仍然走原来的 permission request 与 retry 流程；配置为 denylist 的 host 会显示清晰的 policy-denial error，不再作为不可提示的缺失请求悄悄落下。",
       "v0.2.4":
         "TUI bash 的网络策略拒绝现在会明确显示。Runtime permission policy 会为 network block 返回结构化的 Request 或 Deny evaluation：可申请的 host 仍然走原来的审批流程，而配置为 denylist 的 host 会变成清晰的 denied tool result，不再只是一个缺失的 prompt。",
       "v0.2.3":
