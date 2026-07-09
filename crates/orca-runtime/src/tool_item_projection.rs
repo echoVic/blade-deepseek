@@ -234,6 +234,74 @@ impl ProjectedDynamicToolThreadItem {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ProjectedFileChangeCompletion {
+    id: String,
+    path: Option<String>,
+    kind: String,
+    status: Value,
+    diff: Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub(crate) struct ProjectedFileChange {
+    path: Option<String>,
+    kind: String,
+    diff: Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(tag = "type")]
+pub(crate) enum ProjectedFileChangeThreadItem {
+    #[serde(rename = "fileChange")]
+    Started {
+        id: String,
+        status: Value,
+        changes: Vec<ProjectedFileChange>,
+    },
+    #[serde(rename = "fileChange")]
+    Completed {
+        id: String,
+        status: Value,
+        changes: Vec<ProjectedFileChange>,
+    },
+}
+
+impl ProjectedFileChangeThreadItem {
+    pub(crate) fn started(
+        id: impl Into<String>,
+        path: Option<impl Into<String>>,
+        kind: impl Into<String>,
+        diff: Value,
+    ) -> Self {
+        Self::Started {
+            id: id.into(),
+            status: Value::from("inProgress"),
+            changes: vec![ProjectedFileChange {
+                path: path.map(Into::into),
+                kind: kind.into(),
+                diff,
+            }],
+        }
+    }
+
+    pub(crate) fn completed(completion: ProjectedFileChangeCompletion) -> Self {
+        Self::Completed {
+            id: completion.id,
+            status: completion.status,
+            changes: vec![ProjectedFileChange {
+                path: completion.path,
+                kind: completion.kind,
+                diff: completion.diff,
+            }],
+        }
+    }
+
+    pub(crate) fn into_value(self) -> Value {
+        serde_json::to_value(self).expect("projected file change thread item serializes")
+    }
+}
+
 pub(crate) fn agent_message_item(id: impl Into<String>, text: impl Into<String>) -> Value {
     ProjectedTextThreadItem::agent_message(id, text).into_value()
 }
@@ -492,7 +560,7 @@ pub(crate) fn file_change_started_item(
     kind: impl Into<String>,
     diff: Value,
 ) -> Value {
-    file_change_item(id, "inProgress", path, kind, diff)
+    ProjectedFileChangeThreadItem::started(id, path, kind, diff).into_value()
 }
 
 pub(crate) fn file_change_completed_item(
@@ -502,7 +570,14 @@ pub(crate) fn file_change_completed_item(
     status: Value,
     diff: Value,
 ) -> Value {
-    file_change_item(id, status, path, kind, diff)
+    ProjectedFileChangeThreadItem::completed(ProjectedFileChangeCompletion {
+        id: id.into(),
+        path: path.map(Into::into),
+        kind: kind.into(),
+        status,
+        diff,
+    })
+    .into_value()
 }
 
 pub(crate) fn persisted_file_change_started_item(
@@ -540,25 +615,6 @@ pub(crate) fn complete_projected_tool_item(item: &mut Value, result: &Value) {
         mcp_result_from_content(content),
         Value::Null,
     );
-}
-
-fn file_change_item(
-    id: impl Into<String>,
-    status: impl Into<Value>,
-    path: Option<impl Into<String>>,
-    kind: impl Into<String>,
-    diff: Value,
-) -> Value {
-    json!({
-        "id": id.into(),
-        "type": "fileChange",
-        "status": status.into(),
-        "changes": [{
-            "path": path.map(Into::into),
-            "kind": kind.into(),
-            "diff": diff,
-        }],
-    })
 }
 
 fn file_change_kind(tool: &str) -> Option<&'static str> {
@@ -1051,6 +1107,42 @@ mod tests {
         assert_eq!(item["changes"][0]["diff"], "diff");
         assert!(item.get("tool").is_none());
         assert!(item.get("output").is_none());
+    }
+
+    #[test]
+    fn projected_file_change_thread_item_serializes_current_wire_shapes() {
+        assert_eq!(
+            ProjectedFileChangeThreadItem::started(
+                "call-7:file-change",
+                Some("src/main.rs"),
+                "edit",
+                Value::from(""),
+            )
+            .into_value(),
+            file_change_started_item(
+                "call-7:file-change",
+                Some("src/main.rs"),
+                "edit",
+                Value::from(""),
+            )
+        );
+        assert_eq!(
+            ProjectedFileChangeThreadItem::completed(ProjectedFileChangeCompletion {
+                id: "call-8:file-change".to_string(),
+                path: None,
+                kind: "write".to_string(),
+                status: Value::from("failed"),
+                diff: Value::from("diff"),
+            })
+            .into_value(),
+            file_change_completed_item(
+                "call-8:file-change",
+                None::<String>,
+                "write",
+                Value::from("failed"),
+                Value::from("diff"),
+            )
+        );
     }
 
     #[test]

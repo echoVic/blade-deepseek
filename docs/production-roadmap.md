@@ -16,11 +16,11 @@ shape for the most visible transcript items. The follow-on typed text item slice
 keeps those same wire shapes but constructs agent-message, plan, and reasoning
 items through a focused typed projection enum first, giving the later
 Codex-style `ThreadItem` protocol migration a narrow tested entry point. The
-same typed-protocol path now covers command execution plus MCP and dynamic
-tool-call transcript items too, so TUI command and external-tool cards keep
-their existing wire shapes while moving toward typed construction before shell
-streaming, tool-error diagnostics, and task-control behavior evolve further. A
-server can now ask for URL/form
+same typed-protocol path now covers command execution plus MCP, dynamic
+tool-call, and file-change transcript items too, so TUI command, external-tool,
+and edit/file-change cards keep their existing wire shapes while moving toward
+typed construction before shell streaming, tool-error diagnostics, and
+task-control behavior evolve further. A server can now ask for URL/form
 input during an MCP tool call, the TUI projects that request as a visible
 waiting-input prompt keyed by the runtime interaction id, and Orca writes the
 accept/decline response back before continuing the original tool call. Earlier
