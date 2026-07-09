@@ -196,6 +196,10 @@ pub enum TuiEvent {
     Compacted {
         before_messages: usize,
         after_messages: usize,
+        reason: String,
+        strategy: String,
+        collapsed_messages: usize,
+        status_text: String,
     },
     GoalUpdated(ThreadGoal),
     GoalCleared,
@@ -1304,10 +1308,20 @@ impl AppState {
             TuiEvent::Compacted {
                 before_messages,
                 after_messages,
+                reason,
+                strategy,
+                collapsed_messages,
+                status_text,
             } => {
-                self.messages.push(ChatMessage::System(format!(
-                    "Compacted conversation context: {before_messages} -> {after_messages} messages."
-                )));
+                self.messages
+                    .push(ChatMessage::System(format_compaction_notice(
+                        &reason,
+                        &strategy,
+                        before_messages,
+                        after_messages,
+                        collapsed_messages,
+                        &status_text,
+                    )));
                 self.set_status(AppStatus::Idle);
             }
             TuiEvent::GoalUpdated(goal) => {
@@ -1715,6 +1729,44 @@ fn format_argument_bytes(bytes: usize) -> String {
 
 fn is_panel_owned_tool_progress_name(name: &str) -> bool {
     matches!(name, "subagent" | "update_plan")
+}
+
+fn format_compaction_notice(
+    reason: &str,
+    strategy: &str,
+    before_messages: usize,
+    after_messages: usize,
+    collapsed_messages: usize,
+    status_text: &str,
+) -> String {
+    let label = compaction_notice_label(reason, status_text);
+    let detail = if collapsed_messages > 0 && !strategy.trim().is_empty() {
+        format!(" (collapsed {collapsed_messages}, {strategy})")
+    } else if collapsed_messages > 0 {
+        format!(" (collapsed {collapsed_messages})")
+    } else if !strategy.trim().is_empty() {
+        format!(" ({strategy})")
+    } else {
+        String::new()
+    };
+    format!(
+        "Compacted conversation context {label}: {before_messages} -> {after_messages} messages{detail}."
+    )
+}
+
+fn compaction_notice_label(reason: &str, status_text: &str) -> String {
+    let status = status_text.trim();
+    if let Some(rest) = status.strip_prefix("compacted context ") {
+        return rest.to_string();
+    }
+    match reason {
+        "prompt_too_long_recovery" => "after prompt-too-long".to_string(),
+        "exceeded_context_limit" => "at token limit".to_string(),
+        "approaching_context_limit" => "near token limit".to_string(),
+        "manual" => "manually".to_string(),
+        value if !value.trim().is_empty() => value.replace('_', " "),
+        _ => "completed".to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -3427,6 +3479,28 @@ mod tests {
 
         state.update(TuiEvent::GoalUpdated(goal));
         assert_eq!(state.status, AppStatus::Running);
+    }
+
+    #[test]
+    fn compacted_event_explains_runtime_recovery_reason() {
+        let mut state = state();
+        state.status = AppStatus::Compacting;
+
+        state.update(TuiEvent::Compacted {
+            before_messages: 12,
+            after_messages: 5,
+            reason: "prompt_too_long_recovery".to_string(),
+            strategy: "remote_summary".to_string(),
+            collapsed_messages: 7,
+            status_text: "compacted context after prompt-too-long".to_string(),
+        });
+
+        assert!(matches!(
+            state.messages.last(),
+            Some(ChatMessage::System(message))
+                if message == "Compacted conversation context after prompt-too-long: 12 -> 5 messages (collapsed 7, remote_summary)."
+        ));
+        assert_eq!(state.status, AppStatus::Idle);
     }
 
     #[test]

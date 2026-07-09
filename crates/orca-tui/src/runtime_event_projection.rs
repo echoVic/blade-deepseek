@@ -20,6 +20,27 @@ pub(crate) fn tui_event_from_runtime_event(event: &EventEnvelope) -> Option<TuiE
         EventType::ContextCompacted => Some(TuiEvent::Compacted {
             before_messages: event.payload["before_messages"].as_u64()? as usize,
             after_messages: event.payload["after_messages"].as_u64()? as usize,
+            reason: event.payload["reason"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            strategy: event
+                .payload
+                .get("strategy")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            collapsed_messages: event
+                .payload
+                .get("collapsed_messages")
+                .and_then(|value| value.as_u64())
+                .unwrap_or_default() as usize,
+            status_text: event
+                .payload
+                .get("status_text")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_string(),
         }),
         EventType::ModelRouted => Some(TuiEvent::Notice(format!(
             "Model routed to {} ({})",
@@ -449,9 +470,17 @@ mod tests {
             TuiEvent::Compacted {
                 before_messages,
                 after_messages,
+                reason,
+                strategy,
+                collapsed_messages,
+                status_text,
             } => {
                 assert_eq!(before_messages, 12);
                 assert_eq!(after_messages, 5);
+                assert_eq!(reason, "prompt_too_long_recovery");
+                assert_eq!(strategy, "remote_summary");
+                assert_eq!(collapsed_messages, 7);
+                assert_eq!(status_text, "compacted context after prompt-too-long");
             }
             other => panic!("expected compacted event, got {other:?}"),
         }

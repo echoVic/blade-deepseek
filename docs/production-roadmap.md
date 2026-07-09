@@ -4,14 +4,20 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-07-10
-Current baseline: current main after v0.2.9 makes TUI main-agent automatic
-compaction and prompt-too-long retry recovery runtime-owned. The TUI main loop
-now asks `orca-runtime` to run pre-turn compaction and classify provider
-context-length errors, while runtime `context.compacted` events still project
-into the existing TUI compacted-context notice and context meter. This keeps the
-most visible long-session recovery path aligned with server and child-agent
-compaction policy instead of leaving retry state in the renderer loop. Earlier
-v0.2.8 moves command/exec sandbox-policy mapping, active permission-profile
+Current baseline: current main after v0.2.10 makes TUI compacted-context
+notices explain the runtime compaction reason and strategy. Runtime
+`context.compacted` events now project their reason, strategy,
+collapsed-message count, and status text into the TUI so long DeepSeek sessions
+can distinguish near-limit compaction, hard-limit compaction, and
+prompt-too-long recovery instead of showing only a generic before/after message
+total. Earlier v0.2.9 makes TUI main-agent automatic compaction and
+prompt-too-long retry recovery runtime-owned. The TUI main loop now asks
+`orca-runtime` to run pre-turn compaction and classify provider context-length
+errors, while runtime `context.compacted` events still project into the TUI
+compacted-context notice and context meter. This keeps the most visible
+long-session recovery path aligned with server and child-agent compaction policy
+instead of leaving retry state in the renderer loop. Earlier v0.2.8 moves
+command/exec sandbox-policy mapping, active permission-profile
 inheritance, filesystem root/glob materialization, network domain policy, and
 Unix socket allowlist resolution behind a focused `server/command_exec_sandbox`
 boundary. TUI bash and server `command/exec` still share the same sandbox

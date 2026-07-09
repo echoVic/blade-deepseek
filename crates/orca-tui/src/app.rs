@@ -3190,6 +3190,10 @@ fn agent_loop_thread(
                     let _ = event_tx.send(TuiEvent::Compacted {
                         before_messages,
                         after_messages,
+                        reason: "manual".to_string(),
+                        strategy: "manual".to_string(),
+                        collapsed_messages: before_messages.saturating_sub(after_messages),
+                        status_text: "compacted context manually".to_string(),
                     });
                 } else {
                     let _ = event_tx.send(TuiEvent::Error("nothing to compact".to_string()));

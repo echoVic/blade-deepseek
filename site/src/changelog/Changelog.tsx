@@ -76,6 +76,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.10":
+        "TUI compacted-context notices now keep the runtime compaction reason and strategy. Long DeepSeek sessions can show when Orca compacted near the token limit, at the hard limit, or after prompt-too-long recovery, including the collapsed message count, instead of only showing a generic before/after message total.",
       "v0.2.9":
         "TUI automatic compaction and prompt-too-long retry recovery now run through the runtime compaction boundary. The visible context meter, compacted-context notice, and failed compaction errors keep the same TUI shape, but the main TUI loop no longer owns context-pressure decisions or retry state, reducing drift from server and child-agent compaction paths.",
       "v0.2.8":
@@ -472,6 +474,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.10":
+        "TUI 的 compacted-context notice 现在会保留 runtime compaction reason 与 strategy。长 DeepSeek 会话里，用户能看到 Orca 是接近 token limit、到达 hard limit，还是为了 prompt-too-long recovery 而压缩，并显示被折叠的消息数量，不再只有泛化的前后消息总数。",
       "v0.2.9":
         "TUI 自动压缩和 prompt-too-long retry recovery 现在都走 runtime compaction boundary。可见的 context meter、compacted-context notice 和压缩失败错误仍保持同样的 TUI 形态，但主 TUI loop 不再自己拥有 context-pressure 决策和 retry state，减少它与 server、child-agent 压缩路径之间的漂移。",
       "v0.2.8":
