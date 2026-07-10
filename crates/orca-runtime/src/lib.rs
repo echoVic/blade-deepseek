@@ -64,6 +64,7 @@ mod step_context;
 pub mod subagent;
 pub mod subagent_async_worker;
 pub mod subagent_execution;
+pub mod task_output;
 pub mod tasks;
 pub mod thread;
 pub mod thread_store;

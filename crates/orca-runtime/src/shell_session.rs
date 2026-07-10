@@ -3,13 +3,14 @@ use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ExitStatus, Stdio};
-use std::sync::{Arc, Mutex};
+use std::str;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use orca_core::task_types::TaskStatus;
 use uuid::Uuid;
 
+use crate::task_output::{TaskOutputRead, TaskOutputStore};
 use crate::tasks::TaskRegistry;
 
 #[cfg(unix)]
@@ -171,6 +172,7 @@ pub struct ShellSessionSnapshot {
 
 pub struct RuntimeShellSessionManager {
     tasks: TaskRegistry,
+    output_store: TaskOutputStore,
     sessions: HashMap<String, ShellSession>,
 }
 
@@ -181,8 +183,7 @@ struct ShellSession {
     description: String,
     child: Child,
     stdin: ShellInput,
-    stdout: SharedOutput,
-    stderr: SharedOutput,
+    output_store: TaskOutputStore,
     stdout_handle: Option<thread::JoinHandle<()>>,
     stderr_handle: Option<thread::JoinHandle<()>>,
     requested_terminal: ShellTerminalMode,
@@ -194,14 +195,17 @@ enum ShellInput {
     Pty(File),
 }
 
-type SharedOutput = Arc<Mutex<Vec<u8>>>;
-
 impl RuntimeShellSessionManager {
     pub fn new(tasks: TaskRegistry) -> Self {
         Self {
             tasks,
+            output_store: TaskOutputStore::new(),
             sessions: HashMap::new(),
         }
+    }
+
+    pub fn output_store(&self) -> TaskOutputStore {
+        self.output_store.clone()
     }
 
     pub fn spawn(&mut self, command: ShellSessionCommand) -> io::Result<ShellSessionHandle> {
@@ -275,12 +279,22 @@ impl RuntimeShellSessionManager {
         tasks
             .mark_worker_spawned(&task.id, child.id())
             .map_err(io::Error::other)?;
-        let stdout = Arc::new(Mutex::new(Vec::new()));
-        let stderr = Arc::new(Mutex::new(Vec::new()));
         let (stdin, stdout_reader, stderr_reader) = stdio.finish(&mut child)?;
-        let stdout_handle = Some(spawn_output_reader(stdout_reader, Arc::clone(&stdout)));
-        let stderr_handle =
-            stderr_reader.map(|reader| spawn_output_reader(reader, Arc::clone(&stderr)));
+        let output_store = self.output_store.clone();
+        let stdout_handle = Some(spawn_output_reader(
+            stdout_reader,
+            output_store.clone(),
+            task.id.clone(),
+            ShellOutputStream::Stdout,
+        ));
+        let stderr_handle = stderr_reader.map(|reader| {
+            spawn_output_reader(
+                reader,
+                output_store.clone(),
+                task.id.clone(),
+                ShellOutputStream::Stderr,
+            )
+        });
         let id = format!("shell-{}", Uuid::new_v4());
         self.sessions.insert(
             id.clone(),
@@ -291,8 +305,7 @@ impl RuntimeShellSessionManager {
                 description,
                 stdin,
                 child,
-                stdout,
-                stderr,
+                output_store,
                 stdout_handle,
                 stderr_handle,
                 requested_terminal,
@@ -400,10 +413,7 @@ impl RuntimeShellSessionManager {
                 Self::record_terminal_output(&tasks, &output)?;
                 return Ok(output);
             }
-            if output_len(&session.stdout) > 0
-                || output_len(&session.stderr) > 0
-                || Instant::now() >= deadline
-            {
+            if session.output_size() > 0 || Instant::now() >= deadline {
                 return Ok(session.output(id, TaskStatus::Running, None));
             }
             thread::sleep(Duration::from_millis(10));
@@ -523,16 +533,31 @@ impl ShellSession {
     }
 
     fn output(&self, id: &str, status: TaskStatus, exit_code: Option<i32>) -> ShellSessionOutput {
+        let output = self
+            .output_store
+            .read_delta(&self.task_id, 0, usize::MAX)
+            .unwrap_or_else(|_| TaskOutputRead {
+                stdout: String::new(),
+                stderr: String::new(),
+                next_offset: 0,
+                bytes_read: 0,
+                bytes_total: self.output_size(),
+                omitted_prefix_bytes: 0,
+            });
         ShellSessionOutput {
             id: id.to_string(),
             task_id: self.task_id.clone(),
-            stdout: output_string(&self.stdout),
-            stderr: output_string(&self.stderr),
+            stdout: output.stdout,
+            stderr: output.stderr,
             exit_code,
             status,
             requested_terminal: self.requested_terminal,
             effective_terminal: self.effective_terminal,
         }
+    }
+
+    fn output_size(&self) -> usize {
+        self.output_store.size(&self.task_id)
     }
 }
 
@@ -780,23 +805,32 @@ impl ShellSessionOutput {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ShellOutputStream {
+    Stdout,
+    Stderr,
+}
+
 fn spawn_output_reader<R: Read + Send + 'static>(
     mut reader: R,
-    output: SharedOutput,
+    output_store: TaskOutputStore,
+    task_id: String,
+    stream: ShellOutputStream,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut buffer = [0_u8; 8192];
+        let mut pending = Vec::new();
         loop {
             match reader.read(&mut buffer) {
                 Ok(0) => break,
                 Ok(n) => {
-                    if let Ok(mut output) = output.lock() {
-                        output.extend_from_slice(&buffer[..n]);
-                    }
+                    pending.extend_from_slice(&buffer[..n]);
+                    drain_valid_utf8_output(&output_store, &task_id, stream, &mut pending);
                 }
                 Err(_) => break,
             }
         }
+        flush_lossy_output(&output_store, &task_id, stream, &mut pending);
     })
 }
 
@@ -808,7 +842,7 @@ fn wait_for_output_or_exit(
         .checked_add(timeout)
         .unwrap_or_else(Instant::now);
     loop {
-        if output_len(&session.stdout) > 0 || output_len(&session.stderr) > 0 {
+        if session.output_size() > 0 {
             return Ok(None);
         }
         if let Some(status) = session.child.try_wait()? {
@@ -821,15 +855,58 @@ fn wait_for_output_or_exit(
     }
 }
 
-fn output_len(output: &SharedOutput) -> usize {
-    output.lock().map(|output| output.len()).unwrap_or_default()
+fn drain_valid_utf8_output(
+    output_store: &TaskOutputStore,
+    task_id: &str,
+    stream: ShellOutputStream,
+    pending: &mut Vec<u8>,
+) {
+    loop {
+        match str::from_utf8(pending) {
+            Ok(text) => {
+                append_shell_output(output_store, task_id, stream, text);
+                pending.clear();
+                return;
+            }
+            Err(error) if error.valid_up_to() > 0 => {
+                let valid = error.valid_up_to();
+                let text = str::from_utf8(&pending[..valid]).unwrap_or_default();
+                append_shell_output(output_store, task_id, stream, text);
+                pending.drain(..valid);
+            }
+            Err(error) if error.error_len().is_some() => {
+                append_shell_output(output_store, task_id, stream, "\u{FFFD}");
+                pending.drain(..error.error_len().unwrap_or(1));
+            }
+            Err(_) => return,
+        }
+    }
 }
 
-fn output_string(output: &SharedOutput) -> String {
-    output
-        .lock()
-        .map(|output| String::from_utf8_lossy(&output).into_owned())
-        .unwrap_or_default()
+fn flush_lossy_output(
+    output_store: &TaskOutputStore,
+    task_id: &str,
+    stream: ShellOutputStream,
+    pending: &mut Vec<u8>,
+) {
+    if pending.is_empty() {
+        return;
+    }
+    let text = String::from_utf8_lossy(pending).into_owned();
+    append_shell_output(output_store, task_id, stream, &text);
+    pending.clear();
+}
+
+fn append_shell_output(
+    output_store: &TaskOutputStore,
+    task_id: &str,
+    stream: ShellOutputStream,
+    text: &str,
+) {
+    let _ = match stream {
+        ShellOutputStream::Stdout => output_store.append_stdout(task_id, text),
+        ShellOutputStream::Stderr => output_store.append_stderr(task_id, text),
+    };
 }
 
 fn process_exit_code(status: ExitStatus) -> Option<i32> {
