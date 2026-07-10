@@ -4,13 +4,22 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-07-10
-Current baseline: current main after v0.2.13 routes runtime task output through
-a bounded, UTF-8-safe task-output store. Long-running TUI bash and server
-`command/exec` sessions no longer retain unbounded per-process stdout/stderr
-buffers, streaming command/exec deltas survive retained-output rebasing without
-resetting cumulative output caps, and completed, stopped, or permission-denied
-processes evict retained output when the runtime observes the terminal path.
-Earlier v0.2.12 overhauls TUI scroll performance so long sessions stay
+Current baseline: current main after v0.2.14 gives server-mode clients MCP
+elicitation parity with the TUI path. Stdio MCP `elicitation/create` requests
+now emit `mcp_elicitation_request`, clients respond with
+`mcp_elicitation/respond` by stable runtime `requestId`, and the original MCP
+tool call continues after Orca writes accept/decline back to the MCP server.
+The same baseline also keeps server `command/exec` ownership intact when
+clients inspect shells: `shell/list` no longer reaps or lists command/exec-owned
+backing shell sessions, so `command_exec_completed` remains on the command/exec
+task-control path.
+Earlier v0.2.13 routes runtime task output through a bounded, UTF-8-safe
+task-output store. Long-running TUI bash and server `command/exec` sessions no
+longer retain unbounded per-process stdout/stderr buffers, streaming
+command/exec deltas survive retained-output rebasing without resetting
+cumulative output caps, and completed, stopped, or permission-denied processes
+evict retained output when the runtime observes the terminal path. Earlier
+v0.2.12 overhauls TUI scroll performance so long sessions stay
 responsive. A new frame scheduler coalesces wheel events and caps per-batch
 event processing, message rendering flows through a message-version-based cache
 instead of redrawing the full transcript every frame, and a virtual viewport
@@ -437,9 +446,12 @@ The deeper July 9 reference pass changes the next refactor order:
    up the pending record on answer or cancel. The stdio MCP transport and TUI
    tool path now route real `elicitation/create` requests through that handler,
    write accept/decline responses back to the server, and continue the original
-   tool call once the user answers. Next mirror the same id discipline through
-   server-mode responses and decide whether SSE needs an equivalent streaming
-   request channel before exposing it as parity.
+   tool call once the user answers. Server-mode now mirrors the same id
+   discipline through `mcp_elicitation_request`, `mcp_elicitation/respond`, and
+   `mcp_elicitation_resolved`, so remote and bridge clients can drive the same
+   waiting interaction without a TUI-local queue. Next decide whether SSE needs
+   an equivalent streaming request channel before exposing full transport
+   parity.
 5. **P2: Make skills/plugins a manifest-backed capability source only after
    policy and protocol owners are stable.** Codex's skills, connectors, and
    plugin managers are valuable, but adopting them before compaction, exec

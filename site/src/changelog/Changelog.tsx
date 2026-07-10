@@ -76,6 +76,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.14":
+        "Server-mode MCP elicitation now matches the TUI interaction path. When an stdio MCP tool sends elicitation/create during a turn, Orca emits a turn-scoped mcp_elicitation_request event, accepts mcp_elicitation/respond by requestId, writes accept/decline back to the MCP server, and then continues the original tool call. turn/interrupt now cancels unanswered MCP elicitation prompts, MCP transport cancellation returns promptly across stdio and SSE paths, and server shell/list stops reaping command/exec-owned backing shells.",
       "v0.2.13":
         "Runtime task output now flows through a bounded, UTF-8-safe task-output store. Long-running TUI bash and command/exec sessions avoid unbounded stdout/stderr retention, command/exec streaming keeps cumulative output caps correct after retained-output rebases, and terminal command paths evict retained output after completion, stop, or permission denial.",
       "v0.2.12":
@@ -480,6 +482,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.14":
+        "Server-mode MCP elicitation 现在与 TUI 路径保持一致。stdio MCP tool 在 turn 中发送 elicitation/create 时，Orca 会发出稳定的 mcp_elicitation_request 事件，按 requestId 接收 mcp_elicitation/respond，把 accept/decline 写回 MCP server，然后继续原来的 tool call。Server shell/list 也不再回收 command/exec 拥有的 backing shell，command_exec_completed 会继续由 command/exec 控制路径发出。",
       "v0.2.13":
         "Runtime 任务输出现在通过有上限、UTF-8 safe 的 task-output store 保留。长时间运行的 TUI bash 和 command/exec 会话不再无限持有 stdout/stderr；retained output 被裁剪后，command/exec 流式输出仍会继续遵守累计输出上限；完成、停止或权限拒绝的终端命令路径会清理已保留输出。",
       "v0.2.12":
