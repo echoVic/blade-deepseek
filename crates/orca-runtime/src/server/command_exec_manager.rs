@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -205,6 +205,13 @@ impl CommandExecManager {
 
     pub(super) fn remove(&mut self, process_id: &str) -> Option<CommandExecProcess> {
         self.processes.remove(process_id)
+    }
+
+    pub(super) fn active_shell_ids(&self) -> HashSet<String> {
+        self.processes
+            .values()
+            .filter_map(|process| process.shell_id.clone())
+            .collect()
     }
 
     pub(super) fn tighten_output_cap(&mut self, process_id: &str, output_bytes_cap: usize) {

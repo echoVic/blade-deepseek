@@ -4,7 +4,7 @@ use orca_core::cancel::CancelToken;
 use orca_core::config::RunConfig;
 use orca_core::external_config::ExternalToolConfig;
 use orca_core::tool_types::{ToolName, ToolOutputTruncation, ToolRequest, ToolResult};
-use orca_mcp::McpRegistry;
+use orca_mcp::{McpElicitationHandler, McpRegistry};
 
 use crate::extension::RuntimeExtensionStores;
 use crate::lifecycle::{RuntimePermissionRequestHandler, TurnPermissionOverlay};
@@ -23,6 +23,7 @@ pub(crate) struct RuntimeNormalToolExecutionContext<'a> {
     pub(crate) task_registry: Option<&'a TaskRegistry>,
     pub(crate) cancel: Option<&'a CancelToken>,
     pub(crate) permission_handler: Option<&'a dyn RuntimePermissionRequestHandler>,
+    pub(crate) mcp_elicitation_handler: Option<&'a dyn McpElicitationHandler>,
     pub(crate) permission_overlay: Option<&'a mut TurnPermissionOverlay>,
     pub(crate) extension_stores: Option<RuntimeExtensionStores<'a>>,
 }
@@ -39,6 +40,7 @@ pub(crate) struct RuntimeNormalToolInvocation<'a> {
     pub(crate) task_registry: Option<&'a TaskRegistry>,
     pub(crate) cancel: Option<&'a CancelToken>,
     pub(crate) permission_handler: Option<&'a dyn RuntimePermissionRequestHandler>,
+    pub(crate) mcp_elicitation_handler: Option<&'a dyn McpElicitationHandler>,
     pub(crate) extension_stores: Option<RuntimeExtensionStores<'a>>,
 }
 
@@ -67,6 +69,7 @@ impl<'a> RuntimeNormalToolInvocation<'a> {
             task_registry: self.task_registry,
             cancel: self.cancel,
             permission_handler: self.permission_handler,
+            mcp_elicitation_handler: self.mcp_elicitation_handler,
             permission_overlay,
             extension_stores: self.extension_stores,
         }
@@ -82,6 +85,7 @@ pub(crate) struct RuntimeNormalToolFallbackContext<'a> {
     pub(crate) output_truncation: ToolOutputTruncation,
     pub(crate) shell_timeout_secs: u64,
     pub(crate) cancel: Option<&'a CancelToken>,
+    pub(crate) mcp_elicitation_handler: Option<&'a dyn McpElicitationHandler>,
 }
 
 impl RuntimeNormalToolFallbackContext<'_> {
@@ -98,7 +102,7 @@ struct DefaultRuntimeNormalToolFallbackExecutor;
 
 impl RuntimeNormalToolFallbackExecutor for DefaultRuntimeNormalToolFallbackExecutor {
     fn execute(&self, context: RuntimeNormalToolFallbackContext<'_>) -> ToolResult {
-        orca_tools::execute_with_mcp_external_roots_policy_or_cancel(
+        orca_tools::execute_with_mcp_external_roots_policy_or_cancel_and_elicitation(
             context.request,
             context.cwd,
             context.additional_roots,
@@ -106,6 +110,7 @@ impl RuntimeNormalToolFallbackExecutor for DefaultRuntimeNormalToolFallbackExecu
             context.external_tools,
             context.output_truncation,
             context.shell_timeout_secs,
+            context.mcp_elicitation_handler,
             || context.is_cancelled(),
         )
     }
@@ -156,6 +161,7 @@ impl<'a> RuntimeNormalToolExecutor<'a> {
             task_registry,
             cancel,
             permission_handler,
+            mcp_elicitation_handler,
             permission_overlay,
             extension_stores,
         } = context;
@@ -189,6 +195,7 @@ impl<'a> RuntimeNormalToolExecutor<'a> {
             output_truncation,
             shell_timeout_secs,
             cancel,
+            mcp_elicitation_handler,
         })
     }
 }
@@ -263,6 +270,7 @@ mod tests {
             task_registry: None,
             cancel: Some(&cancel),
             permission_handler: None,
+            mcp_elicitation_handler: None,
             permission_overlay: None,
             extension_stores: None,
         });

@@ -102,6 +102,7 @@ impl RuntimeTurnIterationStep {
                     input.workflow.workflow_ipc,
                     input.deps.turn_interactions.permission_handler(),
                     input.deps.turn_interactions.user_input_handler(),
+                    input.deps.turn_interactions.mcp_elicitation_handler(),
                 ),
                 cost_tracker: input.loop_state.cost_tracker,
                 max_budget_usd: input.provider_context.max_budget_usd,

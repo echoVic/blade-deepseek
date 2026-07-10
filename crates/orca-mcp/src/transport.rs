@@ -60,6 +60,18 @@ pub trait McpTransport: Send + Sync {
     ) -> Result<Value, String> {
         self.call_tool(name, arguments)
     }
+    fn call_tool_with_elicitation_handler_or_cancel(
+        &self,
+        name: &str,
+        arguments: Value,
+        handler: Option<&dyn McpElicitationHandler>,
+        should_cancel: &dyn Fn() -> bool,
+    ) -> Result<Value, String> {
+        if should_cancel() {
+            return Err("MCP tool call cancelled".to_string());
+        }
+        self.call_tool_with_elicitation_handler(name, arguments, handler)
+    }
     fn list_resources(&self) -> Result<Value, String>;
     fn list_resource_templates(&self) -> Result<Value, String>;
     fn read_resource(&self, uri: &str) -> Result<Value, String>;
@@ -163,13 +175,14 @@ impl McpTransport for StdioTransport {
             }),
             self.startup_timeout,
             None,
+            None,
         )?;
         self.notify("notifications/initialized", json!({}))?;
         Ok(result)
     }
 
     fn list_tools(&self) -> Result<Value, String> {
-        self.request_with_timeout("tools/list", json!({}), self.startup_timeout, None)
+        self.request_with_timeout("tools/list", json!({}), self.startup_timeout, None, None)
     }
 
     fn call_tool(&self, name: &str, arguments: Value) -> Result<Value, String> {
@@ -190,11 +203,37 @@ impl McpTransport for StdioTransport {
             }),
             self.tool_timeout,
             handler,
+            None,
+        )
+    }
+
+    fn call_tool_with_elicitation_handler_or_cancel(
+        &self,
+        name: &str,
+        arguments: Value,
+        handler: Option<&dyn McpElicitationHandler>,
+        should_cancel: &dyn Fn() -> bool,
+    ) -> Result<Value, String> {
+        self.request_with_timeout(
+            "tools/call",
+            json!({
+                "name": name,
+                "arguments": arguments
+            }),
+            self.tool_timeout,
+            handler,
+            Some(should_cancel),
         )
     }
 
     fn list_resources(&self) -> Result<Value, String> {
-        self.request_with_timeout("resources/list", json!({}), self.startup_timeout, None)
+        self.request_with_timeout(
+            "resources/list",
+            json!({}),
+            self.startup_timeout,
+            None,
+            None,
+        )
     }
 
     fn list_resource_templates(&self) -> Result<Value, String> {
@@ -202,6 +241,7 @@ impl McpTransport for StdioTransport {
             "resources/templates/list",
             json!({}),
             self.startup_timeout,
+            None,
             None,
         )
     }
@@ -214,6 +254,7 @@ impl McpTransport for StdioTransport {
             }),
             self.tool_timeout,
             None,
+            None,
         )
     }
 }
@@ -225,6 +266,7 @@ impl StdioTransport {
         params: Value,
         timeout: Duration,
         elicitation_handler: Option<&dyn McpElicitationHandler>,
+        should_cancel: Option<&dyn Fn() -> bool>,
     ) -> Result<Value, String> {
         let mut state = self
             .state
@@ -244,6 +286,10 @@ impl StdioTransport {
         let deadline = std::time::Instant::now() + timeout;
         let mut iterations = 0u32;
         loop {
+            if should_cancel.is_some_and(|should_cancel| should_cancel()) {
+                let _ = state._child.kill();
+                return Err("MCP tool call cancelled".to_string());
+            }
             if iterations >= 1000 {
                 return Err(format!(
                     "MCP request '{method}' exceeded max notification count"
@@ -256,13 +302,18 @@ impl StdioTransport {
                     format_duration(timeout)
                 ));
             }
-            iterations += 1;
-
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            let response = match state.responses.recv_timeout(remaining) {
+            let wait = match should_cancel {
+                Some(_) => remaining.min(Duration::from_millis(25)),
+                None => remaining,
+            };
+            let response = match state.responses.recv_timeout(wait) {
                 Ok(Ok(response)) => response,
                 Ok(Err(error)) => return Err(error),
                 Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if should_cancel.is_some() {
+                        continue;
+                    }
                     let _ = state._child.kill();
                     return Err(format!(
                         "MCP request '{method}' timed out after {}",
@@ -273,6 +324,7 @@ impl StdioTransport {
                     return Err("MCP stdio reader stopped before returning".to_string());
                 }
             };
+            iterations += 1;
             if is_elicitation_create_request(&response) {
                 handle_elicitation_create_request(
                     &self.server_name,
@@ -487,6 +539,24 @@ impl McpTransport for SseTransport {
         )
     }
 
+    fn call_tool_with_elicitation_handler_or_cancel(
+        &self,
+        name: &str,
+        arguments: Value,
+        _handler: Option<&dyn McpElicitationHandler>,
+        should_cancel: &dyn Fn() -> bool,
+    ) -> Result<Value, String> {
+        self.request_with_timeout_or_cancel(
+            "tools/call",
+            json!({
+                "name": name,
+                "arguments": arguments
+            }),
+            self.tool_timeout,
+            should_cancel,
+        )
+    }
+
     fn list_resources(&self) -> Result<Value, String> {
         self.request_with_timeout("resources/list", json!({}), self.startup_timeout)
     }
@@ -525,57 +595,113 @@ impl SseTransport {
         params: Value,
         timeout: Duration,
     ) -> Result<Value, String> {
-        let id = {
-            let mut next_id = self
-                .next_id
-                .lock()
-                .map_err(|_| "MCP SSE id lock poisoned".to_string())?;
-            let id = *next_id;
-            *next_id += 1;
-            id
-        };
-
-        let mut builder = self.client.post(&self.endpoint);
-        for (key, value) in &self.headers {
-            builder = builder.header(key, value);
-        }
-        let response = builder
-            .timeout(timeout)
-            .json(&json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "method": method,
-                "params": params
-            }))
-            .send()
-            .map_err(|error| {
-                if error.is_timeout() {
-                    format!(
-                        "MCP SSE request '{method}' timed out after {}",
-                        format_duration(timeout)
-                    )
-                } else {
-                    format!("MCP SSE request '{method}' failed: {error}")
-                }
-            })?;
-
-        let status = response.status();
-        if !status.is_success() {
-            return Err(format!("MCP SSE request '{method}' failed with {status}"));
-        }
-        let text = response
-            .text()
-            .map_err(|error| format!("failed to read MCP SSE response: {error}"))?;
-        let response = parse_sse_or_json_response(&text)
-            .map_err(|error| format!("invalid MCP SSE response for '{method}': {error}"))?;
-        if let Some(error) = response.get("error") {
-            return Err(format!("MCP SSE request '{method}' failed: {error}"));
-        }
-        response
-            .get("result")
-            .cloned()
-            .ok_or_else(|| format!("MCP SSE request '{method}' missing result"))
+        let id = self.next_request_id()?;
+        request_sse_with_client(
+            self.client.clone(),
+            self.endpoint.clone(),
+            self.headers.clone(),
+            id,
+            method.to_string(),
+            params,
+            timeout,
+        )
     }
+
+    fn request_with_timeout_or_cancel(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+        should_cancel: &dyn Fn() -> bool,
+    ) -> Result<Value, String> {
+        if should_cancel() {
+            return Err("MCP tool call cancelled".to_string());
+        }
+        let id = self.next_request_id()?;
+        let client = self.client.clone();
+        let endpoint = self.endpoint.clone();
+        let headers = self.headers.clone();
+        let method = method.to_string();
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result =
+                request_sse_with_client(client, endpoint, headers, id, method, params, timeout);
+            let _ = sender.send(result);
+        });
+        loop {
+            if should_cancel() {
+                return Err("MCP tool call cancelled".to_string());
+            }
+            match receiver.recv_timeout(Duration::from_millis(25)) {
+                Ok(result) => return result,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err("MCP SSE worker stopped before returning".to_string());
+                }
+            }
+        }
+    }
+
+    fn next_request_id(&self) -> Result<u64, String> {
+        let mut next_id = self
+            .next_id
+            .lock()
+            .map_err(|_| "MCP SSE id lock poisoned".to_string())?;
+        let id = *next_id;
+        *next_id += 1;
+        Ok(id)
+    }
+}
+
+fn request_sse_with_client(
+    client: reqwest::blocking::Client,
+    endpoint: String,
+    headers: HashMap<String, String>,
+    id: u64,
+    method: String,
+    params: Value,
+    timeout: Duration,
+) -> Result<Value, String> {
+    let mut builder = client.post(&endpoint);
+    for (key, value) in &headers {
+        builder = builder.header(key, value);
+    }
+    let response = builder
+        .timeout(timeout)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params
+        }))
+        .send()
+        .map_err(|error| {
+            if error.is_timeout() {
+                format!(
+                    "MCP SSE request '{method}' timed out after {}",
+                    format_duration(timeout)
+                )
+            } else {
+                format!("MCP SSE request '{method}' failed: {error}")
+            }
+        })?;
+
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("MCP SSE request '{method}' failed with {status}"));
+    }
+    let text = response
+        .text()
+        .map_err(|error| format!("failed to read MCP SSE response: {error}"))?;
+    let response = parse_sse_or_json_response(&text)
+        .map_err(|error| format!("invalid MCP SSE response for '{method}': {error}"))?;
+    if let Some(error) = response.get("error") {
+        return Err(format!("MCP SSE request '{method}' failed: {error}"));
+    }
+    response
+        .get("result")
+        .cloned()
+        .ok_or_else(|| format!("MCP SSE request '{method}' missing result"))
 }
 
 fn parse_sse_or_json_response(text: &str) -> Result<Value, String> {
@@ -819,6 +945,46 @@ done
             result
                 .unwrap_err()
                 .contains("MCP SSE request 'tools/call' timed out after 100ms")
+        );
+    }
+
+    #[test]
+    fn sse_handler_cancel_returns_promptly() {
+        let server = SlowSseServer::start();
+        let transport = connect(&McpServerConfig {
+            name: "slow_sse".to_string(),
+            transport: McpTransportKind::Sse,
+            command: None,
+            args: Vec::new(),
+            url: Some(server.url()),
+            env: Default::default(),
+            headers: Default::default(),
+            disabled: false,
+            startup_timeout_ms: Some(5000),
+            tool_timeout_ms: Some(5000),
+        })
+        .expect("connect SSE MCP");
+        transport.initialize().expect("initialize SSE MCP");
+        transport.list_tools().expect("list SSE tools");
+        let handler = RecordingElicitationHandler::new(McpElicitationResponse::decline());
+
+        let started = Instant::now();
+        let result = transport.call_tool_with_elicitation_handler_or_cancel(
+            "wait",
+            Value::Object(Default::default()),
+            Some(&handler),
+            &|| started.elapsed() >= Duration::from_millis(100),
+        );
+
+        assert!(
+            started.elapsed() < Duration::from_millis(750),
+            "tool call took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(result.unwrap_err(), "MCP tool call cancelled");
+        assert!(
+            handler.requests.lock().unwrap().is_empty(),
+            "SSE transport does not support elicitation/create routing"
         );
     }
 

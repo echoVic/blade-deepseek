@@ -6,7 +6,7 @@ use orca_core::config::RunConfig;
 use orca_core::event_schema::EventFactory;
 use orca_core::event_sink::EventSink;
 use orca_core::tool_types;
-use orca_mcp::McpRegistry;
+use orca_mcp::{McpElicitationHandler, McpRegistry};
 
 use crate::agent_child::ChildAgentExecutor;
 use crate::cost::CostTracker;
@@ -49,6 +49,7 @@ pub(crate) struct RuntimeToolInvocationContext<'a, W: io::Write> {
     pub(crate) permission_overlay: &'a mut TurnPermissionOverlay,
     pub(crate) permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
     pub(crate) user_input_handler: Option<&'a dyn RuntimeUserInputHandler>,
+    pub(crate) mcp_elicitation_handler: Option<&'a (dyn McpElicitationHandler + Send + Sync)>,
     pub(crate) extension_stores: Option<RuntimeExtensionStores<'a>>,
     pub(crate) child_executor: ChildAgentExecutor<W>,
     pub(crate) workflow_child_executor: ChildAgentExecutor<SharedEventBuffer>,
@@ -87,6 +88,7 @@ impl<'a> RuntimeToolRouter<'a> {
             permission_overlay,
             permission_handler,
             user_input_handler,
+            mcp_elicitation_handler,
             extension_stores,
             child_executor,
             workflow_child_executor,
@@ -213,6 +215,8 @@ impl<'a> RuntimeToolRouter<'a> {
                         cancel: Some(cancel),
                         permission_handler: permission_handler
                             .map(|handler| handler as &dyn RuntimePermissionRequestHandler),
+                        mcp_elicitation_handler: mcp_elicitation_handler
+                            .map(|handler| handler as &dyn McpElicitationHandler),
                         extension_stores,
                     }))
             }

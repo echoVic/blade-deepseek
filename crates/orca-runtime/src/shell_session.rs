@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
@@ -377,11 +377,26 @@ impl RuntimeShellSessionManager {
     }
 
     pub fn reap_completed(&mut self) -> io::Result<Vec<ShellSessionOutput>> {
+        self.reap_completed_where(|_| true)
+    }
+
+    pub fn reap_completed_except(
+        &mut self,
+        protected_ids: &HashSet<String>,
+    ) -> io::Result<Vec<ShellSessionOutput>> {
+        self.reap_completed_where(|id| !protected_ids.contains(id))
+    }
+
+    fn reap_completed_where(
+        &mut self,
+        should_reap: impl Fn(&str) -> bool,
+    ) -> io::Result<Vec<ShellSessionOutput>> {
         let ids = self
             .sessions
             .iter_mut()
             .filter_map(|(id, session)| match session.child.try_wait() {
-                Ok(Some(status)) => Some(Ok((id.clone(), status))),
+                Ok(Some(status)) if should_reap(id) => Some(Ok((id.clone(), status))),
+                Ok(Some(_)) => None,
                 Ok(None) => None,
                 Err(error) => Some(Err(error)),
             })

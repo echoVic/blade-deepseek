@@ -111,6 +111,11 @@ pub enum ClientOp {
         request_id: String,
         answer: Option<String>,
     },
+    McpElicitationRespond {
+        request_id: String,
+        accepted: bool,
+        content_json: Option<Value>,
+    },
     ShellStart {
         thread_id: Option<String>,
         command: String,
@@ -264,6 +269,10 @@ pub(super) struct WireParams {
     pub(super) input: Option<WireInputParam>,
     #[serde(default)]
     pub(super) answer: Option<String>,
+    #[serde(default)]
+    pub(super) accepted: bool,
+    #[serde(rename = "contentJson", default)]
+    pub(super) content_json: Option<Value>,
     #[serde(rename = "timeoutMs", default)]
     pub(super) timeout_ms: Option<i64>,
     #[serde(rename = "streamStdin", default)]
@@ -652,6 +661,26 @@ impl Submission {
                     op: ClientOp::UserInputRespond {
                         request_id,
                         answer: params.and_then(|params| params.answer.clone()),
+                    },
+                })
+            }
+            (_, Some("mcp_elicitation/respond")) => {
+                let params = wire.params.as_ref();
+                let Some(request_id) = params
+                    .and_then(|params| params.request_id.clone())
+                    .filter(|request_id| !request_id.is_empty())
+                else {
+                    return Err(DecodeError {
+                        id: wire.id,
+                        message: "mcp_elicitation/respond params.requestId is required".to_string(),
+                    });
+                };
+                Ok(Self {
+                    id: wire.id,
+                    op: ClientOp::McpElicitationRespond {
+                        request_id,
+                        accepted: params.map(|params| params.accepted).unwrap_or(false),
+                        content_json: params.and_then(|params| params.content_json.clone()),
                     },
                 })
             }
@@ -1799,6 +1828,38 @@ mod tests {
                 request_id: "input-turn-1-ask".to_string(),
                 answer: Some("ship it".to_string()),
             }
+        );
+    }
+
+    #[test]
+    fn submission_decodes_mcp_elicitation_response_wire_shape() {
+        let submission = Submission::decode(
+            r#"{"id":"mcp-response","method":"mcp_elicitation/respond","params":{"requestId":"mcp_elicitation:github:device-flow","accepted":true,"contentJson":{"code":"ABCD-1234"}}}"#,
+        )
+        .expect("mcp_elicitation/respond submission");
+
+        assert_eq!(submission.id, Value::from("mcp-response"));
+        assert_eq!(
+            submission.op,
+            ClientOp::McpElicitationRespond {
+                request_id: "mcp_elicitation:github:device-flow".to_string(),
+                accepted: true,
+                content_json: Some(json!({"code": "ABCD-1234"})),
+            }
+        );
+    }
+
+    #[test]
+    fn submission_rejects_mcp_elicitation_response_without_request_id() {
+        let error = Submission::decode(
+            r#"{"id":"mcp-response","method":"mcp_elicitation/respond","params":{"accepted":false}}"#,
+        )
+        .expect_err("mcp_elicitation/respond must include requestId");
+
+        assert_eq!(error.id, Value::from("mcp-response"));
+        assert_eq!(
+            error.message,
+            "mcp_elicitation/respond params.requestId is required"
         );
     }
 

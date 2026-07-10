@@ -1808,7 +1808,16 @@ impl Tool for McpProxyTool {
         };
 
         let call_result = if let Some(handler) = ctx.mcp_elicitation_handler {
-            registry.call_tool_with_elicitation_handler(&tool_ref, arguments, Some(handler))
+            if ctx.should_cancel.is_some() {
+                registry.call_tool_with_elicitation_handler_or_cancel(
+                    &tool_ref,
+                    arguments,
+                    Some(handler),
+                    &|| ctx.is_cancelled(),
+                )
+            } else {
+                registry.call_tool_with_elicitation_handler(&tool_ref, arguments, Some(handler))
+            }
         } else if ctx.should_cancel.is_some() {
             registry.call_tool_or_cancel(&tool_ref, arguments, &|| ctx.is_cancelled())
         } else {

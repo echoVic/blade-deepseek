@@ -8,6 +8,7 @@ use std::time::Duration;
 mod active_turn_manager;
 mod command_exec_manager;
 mod command_exec_sandbox;
+mod mcp_elicitation_manager;
 mod permission_manager;
 mod router;
 mod shell_manager;
@@ -38,6 +39,7 @@ use command_exec_manager::{
 };
 pub use command_exec_sandbox::{CommandExecSandbox, bash_sandbox_for_cwd};
 use command_exec_sandbox::{command_exec_sandbox_mode, materialize_workspace_roots_paths};
+use mcp_elicitation_manager::{PendingMcpElicitationManager, ServerMcpElicitationRequestHandler};
 use orca_core::config::{HistoryMode, OutputFormat, RunConfig};
 use permission_manager::{
     PendingCommandExecPermissionRequest, PendingPermissionManager, PendingPermissionRequest,
@@ -89,6 +91,7 @@ struct ServerState {
     active_turns: ActiveTurnManager,
     pending_permissions: PendingPermissionManager,
     pending_user_inputs: PendingUserInputManager,
+    pending_mcp_elicitations: PendingMcpElicitationManager,
 }
 
 impl ServerState {
@@ -537,16 +540,21 @@ fn run_shell_resize<W: Write>(
 }
 
 fn run_shell_list<W: Write>(state: &mut ServerState, id: Value, writer: &mut W) -> io::Result<()> {
+    let command_exec_shell_ids = state.command_exec.active_shell_ids();
     for output in state.shells.reap_requested_stops()? {
         write_shell_completed(writer, &id, output)?;
     }
-    for output in state.shells.reap_completed()? {
+    for output in state
+        .shells
+        .reap_completed_except(&command_exec_shell_ids)?
+    {
         write_shell_completed(writer, &id, output)?;
     }
     let shells = state
         .shells
         .list()
         .into_iter()
+        .filter(|snapshot| !command_exec_shell_ids.contains(&snapshot.id))
         .map(shell_snapshot_to_json)
         .collect::<Vec<_>>();
     protocol::write_server_event(
@@ -1838,6 +1846,14 @@ fn run_thread_submit_async<W: Write + Send + 'static>(
         thread_id.clone(),
         active_turn_id.clone(),
     ));
+    let mcp_elicitation_handler = Arc::new(ServerMcpElicitationRequestHandler::new(
+        Arc::clone(&writer),
+        state.pending_mcp_elicitations.clone(),
+        id.clone(),
+        thread_id.clone(),
+        active_turn_id.clone(),
+        cancel.clone(),
+    ));
     let handle = thread::spawn(move || {
         let mut writer = SharedServerRequestWriter::new(id.clone(), Arc::clone(&writer_for_thread));
         let status = thread_state.run_turn_with_permissions_cancel_and_permission_handler(
@@ -1849,6 +1865,7 @@ fn run_thread_submit_async<W: Write + Send + 'static>(
             steer_handle,
             permission_handler,
             user_input_handler,
+            mcp_elicitation_handler,
         );
         let _ = writer.flush_remaining();
         if let Err(error) = status {
@@ -2067,6 +2084,7 @@ mod tests {
         HistoryMode, OutputFormat, ProviderKind, RunConfig, ThemeName, ToolConfig, WorkflowConfig,
     };
     use orca_core::conversation::Message;
+    use orca_core::mcp_types::McpServerConfig;
     use orca_core::model::ModelSelection;
     use orca_core::subagent_config::SubagentConfig;
     use std::io::Cursor;
@@ -2346,6 +2364,89 @@ mod tests {
                 .shell_id
                 .as_deref(),
             Some("shell-3")
+        );
+    }
+
+    #[test]
+    fn shell_list_does_not_reap_command_exec_owned_shells() {
+        let cwd = tempdir().expect("tempdir");
+        let mut state = ServerState::default();
+        let handle = state
+            .shells
+            .spawn(
+                cwd.path(),
+                ShellSessionCommand {
+                    command: "printf command-owned".to_string(),
+                    cwd: cwd.path().to_path_buf(),
+                    additional_readable_directories: Vec::new(),
+                    additional_working_directories: Vec::new(),
+                    denied_working_directories: Vec::new(),
+                    allowed_unix_socket_roots: Vec::new(),
+                    env: std::collections::BTreeMap::new(),
+                    description: "command exec owned shell".to_string(),
+                    terminal: crate::shell_session::ShellTerminalMode::pipe(),
+                    sandbox: ShellSandboxMode::DangerFullAccess,
+                },
+                None,
+            )
+            .expect("spawn command exec shell");
+        state
+            .command_exec
+            .insert(
+                "proc-shell-list".to_string(),
+                CommandExecProcess {
+                    shell_id: Some(handle.id),
+                    command_event_id: Value::from("cmd-shell-list"),
+                    command: vec!["sh".to_string(), "-lc".to_string()],
+                    cwd: cwd.path().to_path_buf(),
+                    denied_writable_roots: Vec::new(),
+                    stream_output: false,
+                    output_bytes_cap: None,
+                    output_offset: 0,
+                    stdout_len: 0,
+                    stderr_len: 0,
+                    stdout_cap_reached: false,
+                    stderr_cap_reached: false,
+                    network_permission_blocks: None,
+                    permission_request: None,
+                    _network_proxy: None,
+                },
+            )
+            .expect("insert command exec process");
+        std::thread::sleep(Duration::from_millis(100));
+
+        let mut output = Vec::new();
+        run_shell_list(&mut state, Value::from("shell-list"), &mut output).expect("shell/list");
+        drain_command_exec_processes_with_timeout(
+            &mut state,
+            &mut output,
+            Duration::from_millis(50),
+        )
+        .expect("drain command exec");
+        let events = parse_jsonl(&output);
+
+        assert!(
+            events
+                .iter()
+                .all(|event| event["event"] != "shell_completed"),
+            "shell/list should not complete command/exec-owned shells: {events:?}"
+        );
+        let listed = events
+            .iter()
+            .find(|event| event["event"] == "shell_listed")
+            .expect("shell/list response");
+        assert_eq!(
+            listed["shells"].as_array().expect("shell list").len(),
+            0,
+            "shell/list should hide command/exec-owned shells: {events:?}"
+        );
+        assert!(
+            events.iter().any(|event| {
+                event["event"] == "command_exec_completed"
+                    && event["processId"] == "proc-shell-list"
+                    && event["stdout"] == "command-owned"
+            }),
+            "command/exec owner should still emit completion after shell/list: {events:?}"
         );
     }
 
@@ -5641,6 +5742,32 @@ enabled = true
     }
 
     #[test]
+    fn mcp_elicitation_response_with_unknown_request_id_reports_error() {
+        let server_config = ServerConfig {
+            run_config: test_run_config(),
+        };
+        let mut state = ServerState::default();
+        let mut output = Vec::new();
+
+        handle_line_for_test(
+            &server_config,
+            &mut state,
+            r#"{"id":"mcp-response","method":"mcp_elicitation/respond","params":{"requestId":"mcp_elicitation:github:missing","accepted":false}}"#,
+            &mut output,
+        )
+        .expect("mcp elicitation response");
+
+        let events = parse_jsonl(&output);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["id"], "mcp-response");
+        assert_eq!(events[0]["event"], "error");
+        assert_eq!(
+            events[0]["message"],
+            "unknown MCP elicitation request: mcp_elicitation:github:missing"
+        );
+    }
+
+    #[test]
     fn turn_user_input_request_waits_for_protocol_response() {
         with_orca_home(|home| {
             let mut config = test_run_config();
@@ -5716,6 +5843,169 @@ enabled = true
         });
     }
 
+    #[test]
+    fn turn_mcp_elicitation_request_waits_for_protocol_response() {
+        with_orca_home(|home| {
+            let script = home.join("eliciting-mcp-server.js");
+            std::fs::write(
+                &script,
+                r#"
+const readline = require("node:readline");
+const rl = readline.createInterface({ input: process.stdin });
+let pendingToolCallId = null;
+
+function send(message) {
+  process.stdout.write(JSON.stringify(message) + "\n");
+}
+
+rl.on("line", (line) => {
+  const message = JSON.parse(line);
+  if (message.method === "initialize") {
+    send({ jsonrpc: "2.0", id: message.id, result: { capabilities: {} } });
+    return;
+  }
+  if (message.method === "notifications/initialized") {
+    return;
+  }
+  if (message.method === "tools/list") {
+    send({
+      jsonrpc: "2.0",
+      id: message.id,
+      result: {
+        tools: [
+          {
+            name: "wait",
+            description: "Waits for an elicitation response",
+            inputSchema: { type: "object", properties: {}, required: [] }
+          }
+        ]
+      }
+    });
+    return;
+  }
+  if (message.method === "tools/call") {
+    pendingToolCallId = message.id;
+    send({
+      jsonrpc: "2.0",
+      id: "device-flow",
+      method: "elicitation/create",
+      params: {
+        message: "Authorize slow wait",
+        url: "https://example.test/device",
+        requestedSchema: {
+          type: "object",
+          properties: { code: { type: "string" } },
+          required: ["code"]
+        }
+      }
+    });
+    return;
+  }
+  if (message.id === "device-flow" && pendingToolCallId !== null) {
+    const action = message.result?.action || "missing";
+    const code = message.result?.content?.code || "";
+    send({
+      jsonrpc: "2.0",
+      id: pendingToolCallId,
+      result: {
+        content: [{ type: "text", text: `elicitation ${action} ${code}` }],
+        isError: false
+      }
+    });
+    pendingToolCallId = null;
+  }
+});
+"#,
+            )
+            .expect("write fake MCP server");
+
+            let mut config = test_run_config();
+            config.cwd = Some(home.to_path_buf());
+            config.mcp_servers = vec![McpServerConfig {
+                name: "slow".to_string(),
+                command: Some("node".to_string()),
+                args: vec![script.display().to_string()],
+                startup_timeout_ms: Some(2_000),
+                tool_timeout_ms: Some(5_000),
+                ..Default::default()
+            }];
+            let server_config = ServerConfig { run_config: config };
+            let mut state = ServerState::default();
+            let writer = Arc::new(Mutex::new(Vec::new()));
+
+            handle_line(
+                &server_config,
+                &mut state,
+                r#"{"id":"thread","method":"thread/start","params":{}}"#,
+                Arc::clone(&writer),
+            )
+            .expect("thread start");
+            let thread_id = parse_jsonl(&writer.lock().expect("writer").clone())
+                .into_iter()
+                .find(|event| event["event"] == "thread_started")
+                .and_then(|event| event["threadId"].as_str().map(ToString::to_string))
+                .expect("thread id");
+
+            handle_line(
+                &server_config,
+                &mut state,
+                &format!(
+                    r#"{{"id":"turn","method":"turn/start","params":{{"threadId":"{thread_id}","input":[{{"type":"text","text":"mcp__slow__wait"}}]}}}}"#
+                ),
+                Arc::clone(&writer),
+            )
+            .expect("turn start");
+
+            let request = wait_for_event(&writer, Duration::from_secs(2), |event| {
+                event["event"] == "mcp_elicitation_request"
+            })
+            .expect("MCP elicitation request");
+            let request_id = request["requestId"]
+                .as_str()
+                .expect("request id")
+                .to_string();
+            assert_eq!(request["threadId"], thread_id);
+            assert_eq!(request["turnId"], "turn-1");
+            assert_eq!(request["serverName"], "slow");
+            assert_eq!(request["mode"], "url");
+            assert_eq!(request["message"], "Authorize slow wait");
+            assert_eq!(request["url"], "https://example.test/device");
+
+            handle_line(
+                &server_config,
+                &mut state,
+                &format!(
+                    r#"{{"id":"mcp-response","method":"mcp_elicitation/respond","params":{{"requestId":"{request_id}","accepted":true,"contentJson":{{"code":"ABCD-1234"}}}}}}"#
+                ),
+                Arc::clone(&writer),
+            )
+            .expect("MCP elicitation response");
+            state.join_active_turns();
+
+            let events = parse_jsonl(&writer.lock().expect("writer").clone());
+            let resolved = events
+                .iter()
+                .find(|event| event["event"] == "mcp_elicitation_resolved")
+                .expect("MCP elicitation resolved");
+            assert_eq!(resolved["id"], "mcp-response");
+            assert_eq!(resolved["requestId"], request_id);
+            assert_eq!(resolved["accepted"], true);
+            assert!(
+                events
+                    .iter()
+                    .any(|event| event["event"] == "turn_completed"),
+                "turn should complete after MCP elicitation response: {events:?}"
+            );
+            assert!(
+                events.iter().any(|event| event["event"] == "tool_completed"
+                    && event["output"]
+                        .as_str()
+                        .is_some_and(|output| output.contains("elicitation accept ABCD-1234"))),
+                "tool output should include the accepted elicitation content: {events:?}"
+            );
+        });
+    }
+
     fn test_run_config() -> RunConfig {
         RunConfig {
             app_version: "0.0.0-test".to_string(),
@@ -5768,7 +6058,7 @@ enabled = true
             .checked_add(timeout)
             .unwrap_or_else(std::time::Instant::now);
         loop {
-            let events = parse_jsonl(&writer.lock().expect("writer").clone());
+            let events = parse_complete_jsonl(&writer.lock().expect("writer").clone());
             if events
                 .iter()
                 .any(|event| event["event"] == "permission_request")
@@ -5817,7 +6107,7 @@ enabled = true
                 }
                 CommandExecDrainOutcome::Drained => {}
             }
-            let events = parse_jsonl(&writer.lock().expect("writer").clone());
+            let events = parse_complete_jsonl(&writer.lock().expect("writer").clone());
             if events
                 .iter()
                 .any(|event| event["event"] == "permission_request")
@@ -5840,7 +6130,7 @@ enabled = true
             .checked_add(timeout)
             .unwrap_or_else(std::time::Instant::now);
         loop {
-            let events = parse_jsonl(&writer.lock().expect("writer").clone());
+            let events = parse_complete_jsonl(&writer.lock().expect("writer").clone());
             if let Some(event) = events.into_iter().find(|event| predicate(event)) {
                 return Some(event);
             }
@@ -5869,7 +6159,7 @@ enabled = true
                 Arc::clone(writer),
             )
             .expect("thread list");
-            let events = parse_jsonl(&writer.lock().expect("writer").clone());
+            let events = parse_complete_jsonl(&writer.lock().expect("writer").clone());
             if events.iter().any(&mut predicate) {
                 return events;
             }

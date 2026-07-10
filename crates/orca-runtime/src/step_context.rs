@@ -8,7 +8,7 @@ use orca_core::config::RunConfig;
 use orca_core::conversation::Conversation;
 use orca_core::event_schema::RunStatus;
 use orca_core::tool_types::{ToolName, ToolRequest, ToolResult};
-use orca_mcp::McpRegistry;
+use orca_mcp::{McpElicitationHandler, McpRegistry};
 
 use crate::extension::RuntimeExtensionContext;
 use crate::hooks::HookRunner;
@@ -35,6 +35,7 @@ pub(crate) struct RuntimeStepCapabilitySnapshot<'a> {
     pub(crate) workflow_ipc: Option<&'a WorkflowIpcContext>,
     pub(crate) permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
     pub(crate) user_input_handler: Option<&'a dyn RuntimeUserInputHandler>,
+    pub(crate) mcp_elicitation_handler: Option<&'a (dyn McpElicitationHandler + Send + Sync)>,
 }
 
 #[derive(Clone)]
@@ -189,6 +190,7 @@ impl<'a> RuntimeStepSnapshot<'a> {
         workflow_ipc: Option<&'a WorkflowIpcContext>,
         permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
         user_input_handler: Option<&'a dyn RuntimeUserInputHandler>,
+        mcp_elicitation_handler: Option<&'a (dyn McpElicitationHandler + Send + Sync)>,
     ) -> Self {
         static GENERAL_SUBAGENT_TYPE: orca_core::subagent_types::SubagentType =
             orca_core::subagent_types::SubagentType::General;
@@ -207,6 +209,7 @@ impl<'a> RuntimeStepSnapshot<'a> {
                 workflow_ipc,
                 permission_handler,
                 user_input_handler,
+                mcp_elicitation_handler,
             ),
         )
     }
@@ -244,6 +247,7 @@ impl<'a> RuntimeStepCapabilitySnapshot<'a> {
         workflow_ipc: Option<&'a WorkflowIpcContext>,
         permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
         user_input_handler: Option<&'a dyn RuntimeUserInputHandler>,
+        mcp_elicitation_handler: Option<&'a (dyn McpElicitationHandler + Send + Sync)>,
     ) -> Self {
         Self {
             instructions,
@@ -255,6 +259,7 @@ impl<'a> RuntimeStepCapabilitySnapshot<'a> {
             workflow_ipc,
             permission_handler,
             user_input_handler,
+            mcp_elicitation_handler,
         }
     }
 }
@@ -278,6 +283,7 @@ impl<'a> RuntimeStepContext<'a> {
         workflow_ipc: Option<&'a WorkflowIpcContext>,
         permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
         user_input_handler: Option<&'a dyn RuntimeUserInputHandler>,
+        mcp_elicitation_handler: Option<&'a (dyn McpElicitationHandler + Send + Sync)>,
     ) -> Self {
         Self {
             snapshot: RuntimeStepSnapshot::new(
@@ -296,6 +302,7 @@ impl<'a> RuntimeStepContext<'a> {
                 workflow_ipc,
                 permission_handler,
                 user_input_handler,
+                mcp_elicitation_handler,
             ),
             extensions: None,
         }

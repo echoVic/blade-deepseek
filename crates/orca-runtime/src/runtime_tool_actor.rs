@@ -203,6 +203,7 @@ impl RuntimeToolActorContext {
             task_registry,
             cancel,
             permission_handler,
+            mcp_elicitation_handler: None,
             extension_stores: None,
         })
     }

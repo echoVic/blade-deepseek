@@ -16,7 +16,7 @@ use orca_core::{
     config::{ProviderKind, RunConfig},
     conversation::Conversation,
 };
-use orca_mcp::McpRegistry;
+use orca_mcp::{McpElicitationHandler, McpRegistry};
 use orca_provider::ProviderConfig;
 use serde_json::Value;
 
@@ -173,6 +173,7 @@ pub(crate) struct RuntimeTurnExecution<'a> {
 pub(crate) struct RuntimeTurnInteractionState<'a> {
     permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
     user_input_handler: Option<&'a dyn RuntimeUserInputHandler>,
+    mcp_elicitation_handler: Option<&'a (dyn McpElicitationHandler + Send + Sync)>,
 }
 
 #[derive(Clone)]
@@ -635,6 +636,7 @@ impl<'a> RuntimeTaskActor<'a> {
             task_registry,
             cancel,
             permission_handler,
+            mcp_elicitation_handler: None,
             extension_stores: None,
         })
     }
@@ -876,6 +878,18 @@ impl<'a> AgentLoopContext<'a> {
         self
     }
 
+    pub(crate) fn with_mcp_elicitation_handler(
+        mut self,
+        mcp_elicitation_handler: Option<&'a (dyn McpElicitationHandler + Send + Sync)>,
+    ) -> Self {
+        self.turn_deps = Some(
+            self.turn_deps
+                .expect("agent loop turn deps")
+                .with_mcp_elicitation_handler(mcp_elicitation_handler),
+        );
+        self
+    }
+
     #[cfg(test)]
     pub(crate) fn turn_interactions(&self) -> RuntimeTurnInteractionState<'a> {
         self.turn_deps().turn_interactions()
@@ -1033,6 +1047,16 @@ impl<'a> RuntimeTurnDeps<'a> {
         self
     }
 
+    pub(crate) fn with_mcp_elicitation_handler(
+        mut self,
+        mcp_elicitation_handler: Option<&'a (dyn McpElicitationHandler + Send + Sync)>,
+    ) -> Self {
+        self.turn_interactions = self
+            .turn_interactions
+            .with_mcp_elicitation_handler(mcp_elicitation_handler);
+        self
+    }
+
     #[cfg(test)]
     pub(crate) fn turn_interactions(&self) -> RuntimeTurnInteractionState<'a> {
         self.turn_interactions
@@ -1044,6 +1068,7 @@ impl<'a> RuntimeTurnInteractionState<'a> {
         Self {
             permission_handler: None,
             user_input_handler: None,
+            mcp_elicitation_handler: None,
         }
     }
 
@@ -1071,6 +1096,20 @@ impl<'a> RuntimeTurnInteractionState<'a> {
 
     pub(crate) fn user_input_handler(&self) -> Option<&'a dyn RuntimeUserInputHandler> {
         self.user_input_handler
+    }
+
+    pub(crate) fn with_mcp_elicitation_handler(
+        mut self,
+        mcp_elicitation_handler: Option<&'a (dyn McpElicitationHandler + Send + Sync)>,
+    ) -> Self {
+        self.mcp_elicitation_handler = mcp_elicitation_handler;
+        self
+    }
+
+    pub(crate) fn mcp_elicitation_handler(
+        &self,
+    ) -> Option<&'a (dyn McpElicitationHandler + Send + Sync)> {
+        self.mcp_elicitation_handler
     }
 }
 

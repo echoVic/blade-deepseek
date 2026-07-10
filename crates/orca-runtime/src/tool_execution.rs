@@ -8,7 +8,7 @@ use orca_core::config::RunConfig;
 use orca_core::event_schema::{EventFactory, RunStatus};
 use orca_core::event_sink::EventSink;
 use orca_core::tool_types;
-use orca_mcp::McpRegistry;
+use orca_mcp::{McpElicitationHandler, McpRegistry};
 
 use crate::agent_child::ChildAgentExecutor;
 use crate::agent_common;
@@ -53,6 +53,7 @@ pub(crate) struct ToolExecutionContext<'a> {
     permission_overlay: Option<&'a mut TurnPermissionOverlay>,
     permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
     user_input_handler: Option<&'a dyn RuntimeUserInputHandler>,
+    mcp_elicitation_handler: Option<&'a (dyn McpElicitationHandler + Send + Sync)>,
     extension_registry: Option<&'a ExtensionRegistry>,
     extension_stores: Option<RuntimeExtensionStores<'a>>,
 }
@@ -100,6 +101,7 @@ impl<'a> ToolExecutionContext<'a> {
             permission_overlay: None,
             permission_handler: None,
             user_input_handler: None,
+            mcp_elicitation_handler: None,
             extension_registry: None,
             extension_stores: None,
         }
@@ -140,6 +142,14 @@ impl<'a> ToolExecutionContext<'a> {
         user_input_handler: Option<&'a dyn RuntimeUserInputHandler>,
     ) -> Self {
         self.user_input_handler = user_input_handler;
+        self
+    }
+
+    pub(crate) fn with_mcp_elicitation_handler(
+        mut self,
+        mcp_elicitation_handler: Option<&'a (dyn McpElicitationHandler + Send + Sync)>,
+    ) -> Self {
+        self.mcp_elicitation_handler = mcp_elicitation_handler;
         self
     }
 
@@ -323,6 +333,7 @@ impl ToolExecutionActor {
             permission_overlay,
             permission_handler,
             user_input_handler,
+            mcp_elicitation_handler,
             extension_registry,
             extension_stores,
         } = context;
@@ -411,6 +422,7 @@ impl ToolExecutionActor {
                 permission_overlay,
                 permission_handler,
                 user_input_handler,
+                mcp_elicitation_handler,
                 extension_stores,
                 child_executor,
                 workflow_child_executor,

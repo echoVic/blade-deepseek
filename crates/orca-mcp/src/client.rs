@@ -329,7 +329,7 @@ impl McpRegistry {
         tool_ref: &McpToolRef,
         arguments: Value,
     ) -> Result<McpCallOutput, String> {
-        self.call_tool_inner(tool_ref, arguments, None)
+        self.call_tool_inner(tool_ref, arguments, None, None)
     }
 
     pub fn call_tool_with_elicitation_handler(
@@ -338,7 +338,20 @@ impl McpRegistry {
         arguments: Value,
         handler: Option<&dyn McpElicitationHandler>,
     ) -> Result<McpCallOutput, String> {
-        self.call_tool_inner(tool_ref, arguments, handler)
+        self.call_tool_inner(tool_ref, arguments, handler, None)
+    }
+
+    pub fn call_tool_with_elicitation_handler_or_cancel(
+        &self,
+        tool_ref: &McpToolRef,
+        arguments: Value,
+        handler: Option<&dyn McpElicitationHandler>,
+        should_cancel: &dyn Fn() -> bool,
+    ) -> Result<McpCallOutput, String> {
+        if should_cancel() {
+            return Err("MCP tool call cancelled".to_string());
+        }
+        self.call_tool_inner(tool_ref, arguments, handler, Some(should_cancel))
     }
 
     pub fn call_tool_or_cancel(
@@ -355,7 +368,7 @@ impl McpRegistry {
         let tool_ref = tool_ref.clone();
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(registry.call_tool_inner(&tool_ref, arguments, None));
+            let _ = tx.send(registry.call_tool_inner(&tool_ref, arguments, None, None));
         });
 
         loop {
@@ -610,13 +623,19 @@ impl McpRegistry {
         tool_ref: &McpToolRef,
         arguments: Value,
         elicitation_handler: Option<&dyn McpElicitationHandler>,
+        should_cancel: Option<&dyn Fn() -> bool>,
     ) -> Result<McpCallOutput, String> {
         let client = self
             .inner
             .clients
             .get(&tool_ref.server)
             .ok_or_else(|| format!("MCP server '{}' is not connected", tool_ref.server))?;
-        let result = client.call_tool(&tool_ref.tool, arguments, elicitation_handler)?;
+        let result = client.call_tool(
+            &tool_ref.tool,
+            arguments,
+            elicitation_handler,
+            should_cancel,
+        )?;
         let result: CallToolResult = serde_json::from_value(result)
             .map_err(|error| format!("invalid MCP tool result: {error}"))?;
         let output = result
@@ -845,8 +864,9 @@ impl McpClient {
         name: &str,
         arguments: Value,
         elicitation_handler: Option<&dyn McpElicitationHandler>,
+        should_cancel: Option<&dyn Fn() -> bool>,
     ) -> Result<Value, String> {
-        match self.call_tool_once(name, arguments, elicitation_handler) {
+        match self.call_tool_once(name, arguments, elicitation_handler, should_cancel) {
             Err(error) if should_reconnect_after_mcp_error(&error) => {
                 let _ = self.reconnect();
                 Err(error)
@@ -860,12 +880,23 @@ impl McpClient {
         name: &str,
         arguments: Value,
         elicitation_handler: Option<&dyn McpElicitationHandler>,
+        should_cancel: Option<&dyn Fn() -> bool>,
     ) -> Result<Value, String> {
         let transport = self
             .transport
             .lock()
             .map_err(|_| format!("MCP server '{}' transport lock poisoned", self.server_name))?;
-        transport.call_tool_with_elicitation_handler(name, arguments, elicitation_handler)
+        match should_cancel {
+            Some(should_cancel) => transport.call_tool_with_elicitation_handler_or_cancel(
+                name,
+                arguments,
+                elicitation_handler,
+                should_cancel,
+            ),
+            None => {
+                transport.call_tool_with_elicitation_handler(name, arguments, elicitation_handler)
+            }
+        }
     }
 
     fn list_resources(&self) -> Result<Value, String> {
@@ -907,6 +938,7 @@ impl McpClient {
 
 fn should_reconnect_after_mcp_error(error: &str) -> bool {
     error.contains("timed out")
+        || error.contains("MCP tool call cancelled")
         || error.contains("reader stopped")
         || error.contains("server closed stdout")
         || error.contains("failed to write MCP request")
@@ -1104,6 +1136,11 @@ mod tests {
 
         assert!(started.elapsed() < Duration::from_millis(750));
         assert_eq!(result.unwrap_err(), "MCP tool call cancelled");
+    }
+
+    #[test]
+    fn cancelled_stdio_tool_call_is_reconnectable() {
+        assert!(should_reconnect_after_mcp_error("MCP tool call cancelled"));
     }
 
     #[test]

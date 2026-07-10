@@ -5,7 +5,9 @@ use std::sync::{Arc, Mutex};
 mod processors;
 
 use super::*;
-use processors::{command_exec, permission, shell, submit, thread, turn, user_input};
+use processors::{
+    command_exec, mcp_elicitation, permission, shell, submit, thread, turn, user_input,
+};
 
 pub(super) fn dispatch_submission<W: Write + Send + 'static>(
     config: &ServerConfig,
@@ -75,6 +77,16 @@ pub(super) fn dispatch_submission<W: Write + Send + 'static>(
         );
     }
 
+    if mcp_elicitation::is_mcp_elicitation_operation(&submission.op) {
+        let mut writer = writer.lock().map_err(lock_error)?;
+        return mcp_elicitation::dispatch_mcp_elicitation_operation(
+            state,
+            &submission.op,
+            submission.id.clone(),
+            &mut *writer,
+        );
+    }
+
     if submit::is_submit_operation(&submission.op) {
         return submit::dispatch_submit_operation(
             config,
@@ -86,6 +98,6 @@ pub(super) fn dispatch_submission<W: Write + Send + 'static>(
     }
 
     unreachable!(
-        "thread query, turn control, shell, command exec, permission, user input, and submit operations are delegated before router dispatch"
+        "thread query, turn control, shell, command exec, permission, user input, MCP elicitation, and submit operations are delegated before router dispatch"
     )
 }

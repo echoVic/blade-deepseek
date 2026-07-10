@@ -9,6 +9,7 @@ use orca_core::event_sink::EventSink;
 use orca_core::subagent_types::SubagentType;
 #[cfg(test)]
 use orca_core::tool_types;
+use orca_mcp::McpElicitationHandler;
 #[cfg(test)]
 use orca_mcp::McpRegistry;
 #[cfg(test)]
@@ -100,6 +101,7 @@ pub struct ThreadTurnRequest {
     steer_handle: Option<ThreadSteerHandle>,
     permission_handler: Option<Arc<dyn RuntimePermissionRequestHandler + Send + Sync>>,
     user_input_handler: Option<Arc<dyn RuntimeUserInputHandler>>,
+    mcp_elicitation_handler: Option<Arc<dyn McpElicitationHandler + Send + Sync>>,
     continuation: Option<RuntimeTurnContinuation>,
 }
 
@@ -272,6 +274,7 @@ impl ThreadTurnRequest {
             steer_handle: None,
             permission_handler: None,
             user_input_handler: None,
+            mcp_elicitation_handler: None,
             continuation: None,
         }
     }
@@ -329,6 +332,14 @@ impl ThreadTurnRequest {
         self
     }
 
+    pub fn with_mcp_elicitation_handler(
+        mut self,
+        handler: Arc<dyn McpElicitationHandler + Send + Sync>,
+    ) -> Self {
+        self.mcp_elicitation_handler = Some(handler);
+        self
+    }
+
     pub fn with_continuation(mut self, continuation: RuntimeTurnContinuation) -> Self {
         self.continuation = Some(continuation);
         self
@@ -346,6 +357,10 @@ impl ThreadTurnRequest {
 
     pub fn user_input_handler(&self) -> Option<&dyn RuntimeUserInputHandler> {
         self.user_input_handler.as_deref()
+    }
+
+    pub fn mcp_elicitation_handler(&self) -> Option<&(dyn McpElicitationHandler + Send + Sync)> {
+        self.mcp_elicitation_handler.as_deref()
     }
 
     pub fn continuation(&self) -> Option<&RuntimeTurnContinuation> {
@@ -562,7 +577,8 @@ fn run_thread_turn_inner_with_events<W: io::Write>(
                 .with_execution(&mut background_workflows, None, Some(lifecycle))
                 .with_steer_handle(request.steer_handle())
                 .with_permission_handler(request.permission_handler())
-                .with_user_input_handler(request.user_input_handler()),
+                .with_user_input_handler(request.user_input_handler())
+                .with_mcp_elicitation_handler(request.mcp_elicitation_handler()),
             events,
             &mut sink,
             AgentConversationContext::new()
@@ -619,7 +635,8 @@ fn run_thread_turn_inner_with_events<W: io::Write>(
             .with_execution(&mut execution.background_workflows, None, Some(lifecycle))
             .with_steer_handle(request.steer_handle())
             .with_permission_handler(request.permission_handler())
-            .with_user_input_handler(request.user_input_handler()),
+            .with_user_input_handler(request.user_input_handler())
+            .with_mcp_elicitation_handler(request.mcp_elicitation_handler()),
         &mut execution.events,
         &mut execution.sink,
         AgentConversationContext::new()
@@ -1461,6 +1478,7 @@ mod tests {
                 permission_overlay: &mut permission_overlay,
                 permission_handler: None,
                 user_input_handler: None,
+                mcp_elicitation_handler: None,
                 extension_stores: None,
                 child_executor: execute_child_agent_loop,
                 workflow_child_executor: execute_child_agent_loop,

@@ -1144,6 +1144,113 @@ fn server_mode_interrupt_cancels_active_mcp_tool_wait() {
 
 #[cfg(unix)]
 #[test]
+fn server_mode_interrupt_cancels_pending_mcp_elicitation() {
+    let _guard = ENV_LOCK.lock().expect("env lock");
+    let workspace = tempdir().expect("workspace");
+    let home = workspace.path().join("home");
+    let server = write_eliciting_mcp_server(workspace.path());
+    std::fs::create_dir_all(&home).expect("create home");
+    std::fs::write(
+        home.join("config.toml"),
+        format!(
+            "mode = \"full-auto\"\n\n[[mcp_servers]]\nname = \"slow\"\ntransport = \"stdio\"\ncommand = \"{}\"\nstartup_timeout_ms = 5000\ntool_timeout_ms = 5000\n",
+            server.display()
+        ),
+    )
+    .expect("write config");
+    let mut child = orca_command()
+        .args([
+            "--mode",
+            "server",
+            "--provider",
+            "mock",
+            "--cwd",
+            workspace.path().to_str().unwrap(),
+        ])
+        .env("ORCA_HOME", &home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn orca server");
+
+    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
+    {
+        let stdin = child.stdin.as_mut().expect("server stdin");
+        writeln!(
+            stdin,
+            r#"{{"id":"thread-req","method":"thread/start","params":{{}}}}"#
+        )
+        .expect("write thread/start");
+        stdin.flush().expect("flush thread/start");
+    }
+    let thread_started = read_until_event(&mut stdout, "thread-req", "thread_started");
+    let thread_id = thread_started["threadId"].as_str().expect("thread id");
+
+    {
+        let stdin = child.stdin.as_mut().expect("server stdin");
+        writeln!(
+            stdin,
+            r#"{{"id":"turn-mcp-elicit","method":"turn/start","params":{{"threadId":"{}","input":[{{"type":"text","text":"mock_stream_tool_delay_ms 0 mcp__slow__wait"}}]}}}}"#,
+            thread_id
+        )
+        .expect("write MCP elicitation turn");
+        stdin.flush().expect("flush MCP elicitation turn");
+    }
+    let turn_started = read_until_event(&mut stdout, "turn-mcp-elicit", "turn_started");
+    let turn_id = turn_started["task"]["task_id"]
+        .as_str()
+        .expect("turn task id")
+        .to_string();
+    let request = read_until_event(&mut stdout, "turn-mcp-elicit", "mcp_elicitation_request");
+    assert_eq!(request["turnId"], turn_id);
+    assert!(
+        request["requestId"]
+            .as_str()
+            .is_some_and(|id| id.contains(&turn_id)),
+        "server MCP elicitation request id should be turn-scoped: {request}"
+    );
+
+    {
+        let stdin = child.stdin.as_mut().expect("server stdin");
+        writeln!(
+            stdin,
+            r#"{{"id":"interrupt-mcp-elicit","method":"turn/interrupt","params":{{"turnId":"{}"}}}}"#,
+            turn_id
+        )
+        .expect("write turn/interrupt");
+        stdin.flush().expect("flush turn/interrupt");
+    }
+
+    let interrupt_sent_at = Instant::now();
+    let interrupt =
+        read_until_event_or_matching_error(&mut stdout, "interrupt-mcp-elicit", "turn_controlled");
+    assert_eq!(interrupt["status"], "interrupted");
+    drop(child.stdin.take());
+    let output = wait_for_child_output_with_timeout(child, Duration::from_millis(1200))
+        .expect("server should exit after interrupting pending MCP elicitation");
+    assert!(
+        interrupt_sent_at.elapsed() < Duration::from_millis(1200),
+        "turn completion waited for the MCP elicitation response"
+    );
+    assert!(output.stderr.is_empty());
+    let mut remaining_stdout = String::new();
+    stdout
+        .read_to_string(&mut remaining_stdout)
+        .expect("read remaining stdout");
+    let remaining_events = parse_jsonl(remaining_stdout.as_bytes());
+    let completed = remaining_events
+        .iter()
+        .find(|event| event["id"] == "turn-mcp-elicit" && event["event"] == "turn_completed")
+        .unwrap_or_else(|| {
+            panic!("turn should complete after interrupting pending MCP elicitation: {remaining_events:?}")
+        });
+    assert_eq!(completed["status"], "cancelled");
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[cfg(unix)]
+#[test]
 fn server_mode_mcp_tool_uses_configured_transport_timeout() {
     let _guard = ENV_LOCK.lock().expect("env lock");
     let workspace = tempdir().expect("workspace");
@@ -7955,6 +8062,24 @@ fn read_until_event<R: BufRead>(stdout: &mut R, id: &str, event_name: &str) -> V
     }
 }
 
+fn read_until_event_or_matching_error<R: BufRead>(
+    stdout: &mut R,
+    id: &str,
+    event_name: &str,
+) -> Value {
+    loop {
+        let event = read_json_event_line(stdout, &format!("{id}/{event_name}"));
+        if event["id"] == id && event["event"] == event_name {
+            return event;
+        }
+        assert!(
+            !(event["id"] == id && event["event"] == "error"),
+            "server returned error before {id}/{event_name}: {}",
+            event["message"].as_str().unwrap_or("<missing message>")
+        );
+    }
+}
+
 fn is_thread_query_event(event_name: &str) -> bool {
     matches!(
         event_name,
@@ -8339,6 +8464,41 @@ done
 "#,
     )
     .expect("write MCP fixture");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&server).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&server, permissions).expect("chmod MCP fixture");
+    }
+    server
+}
+
+#[cfg(unix)]
+fn write_eliciting_mcp_server(dir: &std::path::Path) -> std::path::PathBuf {
+    let server = dir.join("eliciting_mcp_server.sh");
+    std::fs::write(
+        &server,
+        r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"elicits","version":"1"}}}\n'
+      ;;
+    *'"method":"notifications/initialized"'*)
+      ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"wait","description":"waits for elicitation","inputSchema":{"type":"object","properties":{},"required":[]}}]}}\n'
+      ;;
+    *'"method":"tools/call"'*)
+      printf '{"jsonrpc":"2.0","id":"prompt-1","method":"elicitation/create","params":{"message":"Authorize wait","url":"https://example.test/device","requestedSchema":{"type":"object","properties":{"code":{"type":"string"}}}}}\n'
+      IFS= read -r response
+      printf '{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"after elicitation"}],"isError":false}}\n'
+      ;;
+  esac
+done
+"#,
+    )
+    .expect("write eliciting MCP fixture");
     {
         use std::os::unix::fs::PermissionsExt;
         let mut permissions = std::fs::metadata(&server).expect("metadata").permissions();

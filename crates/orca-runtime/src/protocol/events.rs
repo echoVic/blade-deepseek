@@ -244,6 +244,27 @@ pub enum ServerEvent {
         request_id: Value,
         answered: Value,
     },
+    McpElicitationRequest {
+        #[serde(rename = "requestId")]
+        request_id: Value,
+        #[serde(rename = "threadId")]
+        thread_id: Value,
+        #[serde(rename = "turnId")]
+        turn_id: Value,
+        #[serde(rename = "serverName")]
+        server_name: Value,
+        mode: Value,
+        message: Value,
+        #[serde(skip_serializing_if = "Value::is_null")]
+        url: Value,
+        #[serde(rename = "requestedSchema", skip_serializing_if = "Value::is_null")]
+        requested_schema: Value,
+    },
+    McpElicitationResolved {
+        #[serde(rename = "requestId")]
+        request_id: Value,
+        accepted: Value,
+    },
     TurnPlanUpdated {
         #[serde(rename = "threadId")]
         thread_id: Value,

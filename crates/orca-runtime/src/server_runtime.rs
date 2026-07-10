@@ -25,6 +25,7 @@ pub use orca_core::config::{
     ActivePermissionProfile, AdditionalWorkingDirectory, PermissionProfileNetworkAccess,
 };
 use orca_core::config::{HistoryMode, OutputFormat, RunConfig};
+use orca_mcp::McpElicitationHandler;
 
 #[derive(Default)]
 pub struct ServerThreadRuntime {
@@ -306,6 +307,7 @@ impl ServerThread {
         steer_handle: ThreadSteerHandle,
         permission_handler: Arc<dyn RuntimePermissionRequestHandler + Send + Sync>,
         user_input_handler: Arc<dyn RuntimeUserInputHandler + Send + Sync>,
+        mcp_elicitation_handler: Arc<dyn McpElicitationHandler + Send + Sync>,
     ) -> io::Result<RunStatus> {
         let mut run_config = thread_run_config(config);
         run_config.prompt = prompt.to_string();
@@ -328,7 +330,8 @@ impl ServerThread {
             .with_wait_for_background_workflows(false)
             .with_steer_handle(steer_handle)
             .with_permission_handler(permission_handler)
-            .with_threaded_user_input_handler(user_input_handler);
+            .with_threaded_user_input_handler(user_input_handler)
+            .with_mcp_elicitation_handler(mcp_elicitation_handler);
         self.thread
             .run_request_with_cancel(&run_config, &request, writer, cancel)
     }

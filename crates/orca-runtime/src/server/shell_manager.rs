@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::io;
 use std::path::Path;
 use std::time::Duration;
@@ -75,10 +76,13 @@ impl ServerShellManager {
             .unwrap_or_default()
     }
 
-    pub(super) fn reap_completed(&mut self) -> io::Result<Vec<ShellSessionOutput>> {
+    pub(super) fn reap_completed_except(
+        &mut self,
+        protected_ids: &HashSet<String>,
+    ) -> io::Result<Vec<ShellSessionOutput>> {
         self.sessions
             .as_mut()
-            .map(RuntimeShellSessionManager::reap_completed)
+            .map(|manager| manager.reap_completed_except(protected_ids))
             .unwrap_or_else(|| Ok(Vec::new()))
     }
 

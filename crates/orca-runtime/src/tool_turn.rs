@@ -8,7 +8,7 @@ use orca_core::conversation::Conversation;
 use orca_core::event_schema::{EventFactory, RunStatus};
 use orca_core::event_sink::EventSink;
 use orca_core::tool_types::ToolRequest;
-use orca_mcp::McpRegistry;
+use orca_mcp::{McpElicitationHandler, McpRegistry};
 
 use crate::agent_child::ChildAgentExecutor;
 use crate::cost::CostTracker;
@@ -121,6 +121,7 @@ pub(crate) struct RuntimeNormalToolTurnRuntime<'a> {
 pub(crate) struct RuntimeNormalToolTurnInteractions<'a> {
     pub(crate) permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
     pub(crate) user_input_handler: Option<&'a dyn RuntimeUserInputHandler>,
+    pub(crate) mcp_elicitation_handler: Option<&'a (dyn McpElicitationHandler + Send + Sync)>,
 }
 
 impl ToolTurnOutcome {
@@ -184,6 +185,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
     let workflow_ipc = capabilities.workflow_ipc;
     let permission_handler = capabilities.permission_handler;
     let user_input_handler = capabilities.user_input_handler;
+    let mcp_elicitation_handler = capabilities.mcp_elicitation_handler;
     while let Some(tool_request) = sampling_state.current_tool_request(tool_requests) {
         if let Some(result) = reject_disallowed_child_tool(
             tool_request,
@@ -308,6 +310,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
             interactions: RuntimeNormalToolTurnInteractions {
                 permission_handler,
                 user_input_handler,
+                mcp_elicitation_handler,
             },
             extensions,
             executors: RuntimeNormalToolTurnExecutors {
@@ -373,6 +376,7 @@ pub(crate) fn run_normal_tool_turn<W: io::Write>(
     let RuntimeNormalToolTurnInteractions {
         permission_handler,
         user_input_handler,
+        mcp_elicitation_handler,
     } = interactions;
     let mut execution_context = ToolExecutionContext::new(cwd, subagent_depth, emit_deltas, policy)
         .with_services(instructions, memory, mcp_registry, hooks)
@@ -385,7 +389,8 @@ pub(crate) fn run_normal_tool_turn<W: io::Write>(
         )
         .with_permission_overlay(sampling_state.permission_overlay_mut())
         .with_permission_handler(permission_handler)
-        .with_user_input_handler(user_input_handler);
+        .with_user_input_handler(user_input_handler)
+        .with_mcp_elicitation_handler(mcp_elicitation_handler);
     if let Some(extensions) = extensions {
         execution_context =
             execution_context.with_extensions(extensions.registry(), extensions.stores());
@@ -756,6 +761,7 @@ mod tests {
             interactions: RuntimeNormalToolTurnInteractions {
                 permission_handler: None,
                 user_input_handler: None,
+                mcp_elicitation_handler: None,
             },
             extensions: None,
             executors: RuntimeNormalToolTurnExecutors {
@@ -875,6 +881,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         let outcome = run_tool_turns(RuntimeToolTurnsContext {
@@ -957,6 +964,7 @@ mod tests {
             &hooks,
             &cancel,
             &task_registry,
+            None,
             None,
             None,
             None,

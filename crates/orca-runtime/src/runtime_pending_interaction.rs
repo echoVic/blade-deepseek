@@ -43,7 +43,29 @@ impl RuntimeMcpElicitationRequest {
         let server_name = server_name.into();
         let request_id = request_id.into();
         Self {
-            id: mcp_elicitation_pending_id(&server_name, &request_id),
+            id: mcp_elicitation_pending_id(None, &server_name, &request_id),
+            server_name,
+            request_id,
+            mode,
+            message: message.into(),
+            url,
+            requested_schema_json,
+        }
+    }
+
+    pub fn new_scoped(
+        scope: impl AsRef<str>,
+        server_name: impl Into<String>,
+        request_id: impl Into<String>,
+        mode: RuntimeMcpElicitationMode,
+        message: impl Into<String>,
+        url: Option<String>,
+        requested_schema_json: Option<String>,
+    ) -> Self {
+        let server_name = server_name.into();
+        let request_id = request_id.into();
+        Self {
+            id: mcp_elicitation_pending_id(Some(scope.as_ref()), &server_name, &request_id),
             server_name,
             request_id,
             mode,
@@ -54,8 +76,11 @@ impl RuntimeMcpElicitationRequest {
     }
 }
 
-fn mcp_elicitation_pending_id(server_name: &str, request_id: &str) -> String {
-    format!("mcp_elicitation:{server_name}:{request_id}")
+fn mcp_elicitation_pending_id(scope: Option<&str>, server_name: &str, request_id: &str) -> String {
+    match scope {
+        Some(scope) => format!("mcp_elicitation:{scope}:{server_name}:{request_id}"),
+        None => format!("mcp_elicitation:{server_name}:{request_id}"),
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -378,6 +403,23 @@ mod tests {
         );
 
         assert_eq!(request.id, "mcp_elicitation:github:42");
+        assert_eq!(request.server_name, "github");
+        assert_eq!(request.request_id, "42");
+    }
+
+    #[test]
+    fn mcp_elicitation_request_can_scope_pending_id_to_active_turn() {
+        let request = RuntimeMcpElicitationRequest::new_scoped(
+            "turn-1",
+            "github",
+            "42",
+            RuntimeMcpElicitationMode::Form,
+            "Authorize GitHub",
+            None,
+            Some(r#"{"type":"object"}"#.to_string()),
+        );
+
+        assert_eq!(request.id, "mcp_elicitation:turn-1:github:42");
         assert_eq!(request.server_name, "github");
         assert_eq!(request.request_id, "42");
     }
