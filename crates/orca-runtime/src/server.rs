@@ -540,6 +540,9 @@ fn run_shell_list<W: Write>(state: &mut ServerState, id: Value, writer: &mut W) 
     for output in state.shells.reap_requested_stops()? {
         write_shell_completed(writer, &id, output)?;
     }
+    for output in state.shells.reap_completed()? {
+        write_shell_completed(writer, &id, output)?;
+    }
     let shells = state
         .shells
         .list()

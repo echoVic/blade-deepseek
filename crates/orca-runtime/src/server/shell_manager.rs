@@ -75,6 +75,13 @@ impl ServerShellManager {
             .unwrap_or_default()
     }
 
+    pub(super) fn reap_completed(&mut self) -> io::Result<Vec<ShellSessionOutput>> {
+        self.sessions
+            .as_mut()
+            .map(RuntimeShellSessionManager::reap_completed)
+            .unwrap_or_else(|| Ok(Vec::new()))
+    }
+
     pub(super) fn reap_requested_stops(&mut self) -> io::Result<Vec<ShellSessionOutput>> {
         self.sessions
             .as_mut()

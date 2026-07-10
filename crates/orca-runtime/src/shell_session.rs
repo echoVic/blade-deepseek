@@ -376,6 +376,23 @@ impl RuntimeShellSessionManager {
             .collect()
     }
 
+    pub fn reap_completed(&mut self) -> io::Result<Vec<ShellSessionOutput>> {
+        let ids = self
+            .sessions
+            .iter_mut()
+            .filter_map(|(id, session)| match session.child.try_wait() {
+                Ok(Some(status)) => Some(Ok((id.clone(), status))),
+                Ok(None) => None,
+                Err(error) => Some(Err(error)),
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        let mut completed = Vec::new();
+        for (id, status) in ids {
+            completed.push(self.finish_terminal_session(&id, status, true)?);
+        }
+        Ok(completed)
+    }
+
     pub fn reap_requested_stops(&mut self) -> io::Result<Vec<ShellSessionOutput>> {
         let ids = self
             .sessions
@@ -419,23 +436,7 @@ impl RuntimeShellSessionManager {
         loop {
             let session = self.session_mut(id)?;
             if let Some(status) = session.child.try_wait()? {
-                let mut session = self.take_session(id)?;
-                session.join_readers();
-                let tasks = session.tasks.clone();
-                let output = session.output(
-                    id,
-                    if status.success() {
-                        TaskStatus::Completed
-                    } else {
-                        TaskStatus::Failed
-                    },
-                    process_exit_code(status),
-                );
-                Self::record_terminal_output(&tasks, &output)?;
-                if remove_completed_output {
-                    self.output_store.remove(&output.task_id);
-                }
-                return Ok(output);
+                return self.finish_terminal_session(id, status, remove_completed_output);
             }
             if session.output_size() > 0 || Instant::now() >= deadline {
                 return Ok(session.output(id, TaskStatus::Running, None));
@@ -532,6 +533,31 @@ impl RuntimeShellSessionManager {
         Ok(output)
     }
 
+    fn finish_terminal_session(
+        &mut self,
+        id: &str,
+        status: ExitStatus,
+        remove_completed_output: bool,
+    ) -> io::Result<ShellSessionOutput> {
+        let mut session = self.take_session(id)?;
+        session.join_readers();
+        let tasks = session.tasks.clone();
+        let output = session.output(
+            id,
+            if status.success() {
+                TaskStatus::Completed
+            } else {
+                TaskStatus::Failed
+            },
+            process_exit_code(status),
+        );
+        Self::record_terminal_output(&tasks, &output)?;
+        if remove_completed_output {
+            self.output_store.remove(&output.task_id);
+        }
+        Ok(output)
+    }
+
     fn record_terminal_output(tasks: &TaskRegistry, output: &ShellSessionOutput) -> io::Result<()> {
         if output.status == TaskStatus::Completed {
             tasks
@@ -584,6 +610,8 @@ impl ShellSession {
                 bytes_read: 0,
                 bytes_total: self.output_size(),
                 omitted_prefix_bytes: 0,
+                stdout_prefix_bytes: 0,
+                stderr_prefix_bytes: 0,
             });
         let (stdout, stderr) = shell_output_text_with_omitted_prefix(
             output.stdout,

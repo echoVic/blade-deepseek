@@ -17,12 +17,16 @@ pub struct TaskOutputRead {
     pub bytes_read: usize,
     pub bytes_total: usize,
     pub omitted_prefix_bytes: usize,
+    pub stdout_prefix_bytes: usize,
+    pub stderr_prefix_bytes: usize,
 }
 
 #[derive(Clone, Debug)]
 struct TaskOutputBuffer {
     chunks: Vec<TaskOutputChunk>,
     bytes_total: usize,
+    trimmed_stdout_bytes: usize,
+    trimmed_stderr_bytes: usize,
 }
 
 #[derive(Debug)]
@@ -140,6 +144,8 @@ impl TaskOutputRead {
             bytes_read: 0,
             bytes_total: offset,
             omitted_prefix_bytes: 0,
+            stdout_prefix_bytes: 0,
+            stderr_prefix_bytes: 0,
         }
     }
 }
@@ -149,6 +155,8 @@ impl Default for TaskOutputBuffer {
         Self {
             chunks: Vec::new(),
             bytes_total: 0,
+            trimmed_stdout_bytes: 0,
+            trimmed_stderr_bytes: 0,
         }
     }
 }
@@ -174,6 +182,7 @@ impl TaskOutputBuffer {
     fn read_range(&self, start: usize, end: usize, omitted_prefix_bytes: usize) -> TaskOutputRead {
         let mut stdout = String::new();
         let mut stderr = String::new();
+        let (stdout_prefix_bytes, stderr_prefix_bytes) = self.stream_prefix_bytes(start);
         let mut next_offset = start;
         for chunk in &self.chunks {
             let chunk_start = chunk.start;
@@ -203,7 +212,30 @@ impl TaskOutputBuffer {
             bytes_read: next_offset.saturating_sub(start),
             bytes_total: self.bytes_total,
             omitted_prefix_bytes,
+            stdout_prefix_bytes,
+            stderr_prefix_bytes,
         }
+    }
+
+    fn stream_prefix_bytes(&self, offset: usize) -> (usize, usize) {
+        let mut stdout = self.trimmed_stdout_bytes;
+        let mut stderr = self.trimmed_stderr_bytes;
+        for chunk in &self.chunks {
+            let chunk_start = chunk.start;
+            let chunk_end = chunk.start + chunk.content.len();
+            if chunk_start >= offset {
+                break;
+            }
+            let prefix_end = offset.min(chunk_end) - chunk_start;
+            match chunk.stream {
+                TaskOutputStream::Stdout => stdout = stdout.saturating_add(prefix_end),
+                TaskOutputStream::Stderr => stderr = stderr.saturating_add(prefix_end),
+            }
+            if chunk_end >= offset {
+                break;
+            }
+        }
+        (stdout, stderr)
     }
 
     fn trim_to_budget(&mut self, max_retained_bytes: usize) {
@@ -211,6 +243,12 @@ impl TaskOutputBuffer {
         while let Some(chunk) = self.chunks.first_mut() {
             let chunk_end = chunk.start + chunk.content.len();
             if chunk_end <= retained_start {
+                record_trimmed_stream_bytes(
+                    &mut self.trimmed_stdout_bytes,
+                    &mut self.trimmed_stderr_bytes,
+                    chunk.content.len(),
+                    chunk.stream,
+                );
                 self.chunks.remove(0);
                 continue;
             }
@@ -220,9 +258,21 @@ impl TaskOutputBuffer {
 
             let local_start = utf8_ceil(&chunk.content, retained_start - chunk.start);
             if local_start >= chunk.content.len() {
+                record_trimmed_stream_bytes(
+                    &mut self.trimmed_stdout_bytes,
+                    &mut self.trimmed_stderr_bytes,
+                    chunk.content.len(),
+                    chunk.stream,
+                );
                 self.chunks.remove(0);
                 continue;
             }
+            record_trimmed_stream_bytes(
+                &mut self.trimmed_stdout_bytes,
+                &mut self.trimmed_stderr_bytes,
+                local_start,
+                chunk.stream,
+            );
             chunk.content = chunk.content[local_start..].to_string();
             chunk.start += local_start;
             break;
@@ -246,6 +296,22 @@ impl TaskOutputBuffer {
             }
         }
         self.bytes_total
+    }
+}
+
+fn record_trimmed_stream_bytes(
+    trimmed_stdout_bytes: &mut usize,
+    trimmed_stderr_bytes: &mut usize,
+    len: usize,
+    stream: TaskOutputStream,
+) {
+    match stream {
+        TaskOutputStream::Stdout => {
+            *trimmed_stdout_bytes = trimmed_stdout_bytes.saturating_add(len);
+        }
+        TaskOutputStream::Stderr => {
+            *trimmed_stderr_bytes = trimmed_stderr_bytes.saturating_add(len);
+        }
     }
 }
 

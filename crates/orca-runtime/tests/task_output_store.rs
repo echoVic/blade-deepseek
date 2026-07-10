@@ -35,6 +35,8 @@ fn task_output_store_reads_delta_and_tail_without_splitting_utf8() {
             bytes_read: 7,
             bytes_total: 18,
             omitted_prefix_bytes: 0,
+            stdout_prefix_bytes: 6,
+            stderr_prefix_bytes: 0,
         }
     );
 
@@ -45,6 +47,8 @@ fn task_output_store_reads_delta_and_tail_without_splitting_utf8() {
     assert_eq!(tail.bytes_read, 5);
     assert_eq!(tail.bytes_total, 18);
     assert_eq!(tail.omitted_prefix_bytes, 13);
+    assert_eq!(tail.stdout_prefix_bytes, 6);
+    assert_eq!(tail.stderr_prefix_bytes, 7);
 }
 
 #[test]
@@ -106,11 +110,15 @@ fn task_output_store_retains_bounded_tail_and_reports_omitted_prefix() {
     assert_eq!(snapshot.bytes_read, 5);
     assert_eq!(snapshot.bytes_total, 18);
     assert_eq!(snapshot.omitted_prefix_bytes, 13);
+    assert_eq!(snapshot.stdout_prefix_bytes, 6);
+    assert_eq!(snapshot.stderr_prefix_bytes, 7);
 
     let tail = store.tail(task_id, 64).expect("read tail");
     assert_eq!(tail.stdout, "last\n");
     assert_eq!(tail.stderr, "");
     assert_eq!(tail.omitted_prefix_bytes, 13);
+    assert_eq!(tail.stdout_prefix_bytes, 6);
+    assert_eq!(tail.stderr_prefix_bytes, 7);
 }
 
 #[test]
@@ -128,6 +136,8 @@ fn task_output_store_trims_to_utf8_boundary_when_cap_splits_multibyte_character(
     assert_eq!(snapshot.next_offset, store.size(task_id));
     assert_eq!(snapshot.bytes_total, 8);
     assert_eq!(snapshot.omitted_prefix_bytes, 4);
+    assert_eq!(snapshot.stdout_prefix_bytes, 4);
+    assert_eq!(snapshot.stderr_prefix_bytes, 0);
 }
 
 #[test]
@@ -246,6 +256,39 @@ fn shell_session_evicts_completed_process_output_when_read_observes_exit() {
         .expect("read completed shell");
 
     assert_eq!(output.stdout, "done");
+    assert_eq!(manager.output_store().size(&handle.task_id), 0);
+}
+
+#[test]
+fn shell_session_reap_completed_removes_process_output_from_task_output_store() {
+    let cwd = tempfile::tempdir().expect("tempdir");
+    let registry = TaskRegistry::new("shell-output-list-reap".to_string());
+    let mut manager = RuntimeShellSessionManager::new(registry);
+
+    let handle = manager
+        .spawn(ShellSessionCommand {
+            command: "printf listed".to_string(),
+            cwd: cwd.path().to_path_buf(),
+            additional_readable_directories: Vec::new(),
+            additional_working_directories: Vec::new(),
+            denied_working_directories: Vec::new(),
+            allowed_unix_socket_roots: Vec::new(),
+            env: BTreeMap::new(),
+            description: "list reaps output".to_string(),
+            terminal: ShellTerminalMode::pipe(),
+            sandbox: ShellSandboxMode::DangerFullAccess,
+        })
+        .expect("spawn shell");
+
+    std::thread::sleep(Duration::from_millis(100));
+    let completed = manager.reap_completed().expect("reap completed shell");
+
+    assert_eq!(completed.len(), 1);
+    assert_eq!(completed[0].id, handle.id);
+    assert!(
+        manager.list().iter().all(|shell| shell.id != handle.id),
+        "completed shell should be removed after explicit reap"
+    );
     assert_eq!(manager.output_store().size(&handle.task_id), 0);
 }
 

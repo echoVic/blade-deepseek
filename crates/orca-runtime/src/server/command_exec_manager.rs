@@ -476,35 +476,52 @@ impl CommandExecManager {
                             bytes_read: 0,
                             bytes_total: process.output_offset,
                             omitted_prefix_bytes: 0,
+                            stdout_prefix_bytes: process.stdout_len,
+                            stderr_prefix_bytes: process.stderr_len,
                         });
-                    let (stdout_delta, stdout_cap_reached) = capped_stream_delta(
+                    let omitted_notice =
+                        stream_omitted_prefix_notice(output_read.omitted_prefix_bytes);
+                    let stdout_omitted_notice = (!output_read.stdout.is_empty())
+                        .then_some(omitted_notice.as_deref())
+                        .flatten();
+                    let stderr_omitted_notice = output_read
+                        .stdout
+                        .is_empty()
+                        .then_some(omitted_notice.as_deref())
+                        .flatten();
+                    let stdout_delta = capped_stream_delta(
                         &output_read.stdout,
-                        process.stdout_len,
+                        stdout_omitted_notice,
+                        output_read.stdout_prefix_bytes,
                         process.output_bytes_cap,
                         process.stdout_cap_reached,
                     );
-                    let (stderr_delta, stderr_cap_reached) = capped_stream_delta(
+                    let stderr_delta = capped_stream_delta(
                         &output_read.stderr,
-                        process.stderr_len,
+                        stderr_omitted_notice,
+                        output_read.stderr_prefix_bytes,
                         process.output_bytes_cap,
                         process.stderr_cap_reached,
                     );
-                    observed_output |= !stdout_delta.is_empty() || !stderr_delta.is_empty();
+                    observed_output |=
+                        !stdout_delta.text.is_empty() || !stderr_delta.text.is_empty();
                     super::write_command_exec_output_deltas(
                         writer,
                         &process_id,
-                        &stdout_delta,
-                        &stderr_delta,
-                        stdout_cap_reached,
-                        stderr_cap_reached,
+                        &stdout_delta.text,
+                        &stderr_delta.text,
+                        stdout_delta.cap_reached,
+                        stderr_delta.cap_reached,
                         output.status != orca_core::task_types::TaskStatus::Running,
                     )?;
                     if let Some(process) = self.get_mut(&process_id) {
                         process.output_offset = output_read.next_offset;
-                        process.stdout_len = process.stdout_len.saturating_add(stdout_delta.len());
-                        process.stderr_len = process.stderr_len.saturating_add(stderr_delta.len());
-                        process.stdout_cap_reached |= stdout_cap_reached;
-                        process.stderr_cap_reached |= stderr_cap_reached;
+                        process.stdout_len =
+                            process.stdout_len.saturating_add(stdout_delta.output_bytes);
+                        process.stderr_len =
+                            process.stderr_len.saturating_add(stderr_delta.output_bytes);
+                        process.stdout_cap_reached |= stdout_delta.cap_reached;
+                        process.stderr_cap_reached |= stderr_delta.cap_reached;
                     }
                 }
                 if output.status != orca_core::task_types::TaskStatus::Running {
@@ -667,21 +684,46 @@ impl CommandExecManager {
     }
 }
 
+struct CappedStreamDelta {
+    text: String,
+    output_bytes: usize,
+    cap_reached: bool,
+}
+
 fn capped_stream_delta(
     delta: &str,
+    notice: Option<&str>,
     sent_len: usize,
     cap: Option<usize>,
     cap_already_reached: bool,
-) -> (String, bool) {
+) -> CappedStreamDelta {
+    let notice = notice.unwrap_or("");
     let Some(cap) = cap else {
-        return (delta.to_string(), false);
+        return CappedStreamDelta {
+            text: format!("{notice}{delta}"),
+            output_bytes: delta.len(),
+            cap_reached: false,
+        };
     };
-    if cap_already_reached || delta.is_empty() {
-        return (String::new(), false);
+    if cap_already_reached {
+        return CappedStreamDelta {
+            text: String::new(),
+            output_bytes: 0,
+            cap_reached: false,
+        };
     }
     let remaining = cap.saturating_sub(sent_len);
     let capped = cap_text(delta, Some(remaining));
-    (capped, delta.len() >= remaining)
+    CappedStreamDelta {
+        text: format!("{notice}{capped}"),
+        output_bytes: capped.len(),
+        cap_reached: delta.len() >= remaining,
+    }
+}
+
+fn stream_omitted_prefix_notice(omitted_prefix_bytes: usize) -> Option<String> {
+    (omitted_prefix_bytes > 0)
+        .then(|| format!("[{omitted_prefix_bytes} bytes of earlier output omitted]\n"))
 }
 
 #[cfg(test)]
@@ -1040,6 +1082,210 @@ mod tests {
     }
 
     #[test]
+    fn streaming_delta_reports_omitted_prefix_after_retained_output_rebase() {
+        let cwd = tempfile::tempdir().expect("tempdir");
+        let task_registry = TaskRegistry::new("command-exec-output-omitted".to_string());
+        let output_store = TaskOutputStore::with_max_retained_bytes(4);
+        let mut shell_sessions =
+            RuntimeShellSessionManager::with_output_store(task_registry, output_store);
+        let handle = shell_sessions
+            .spawn(ShellSessionCommand {
+                command: "printf abcdef; sleep 0.2".to_string(),
+                cwd: cwd.path().to_path_buf(),
+                additional_readable_directories: Vec::new(),
+                additional_working_directories: Vec::new(),
+                denied_working_directories: Vec::new(),
+                allowed_unix_socket_roots: Vec::new(),
+                env: std::collections::BTreeMap::new(),
+                description: "stream omitted prefix".to_string(),
+                terminal: ShellTerminalMode::pipe(),
+                sandbox: ShellSandboxMode::DangerFullAccess,
+            })
+            .expect("spawn shell");
+
+        let mut manager = CommandExecManager::default();
+        manager
+            .insert(
+                "proc-omitted".to_string(),
+                CommandExecProcess {
+                    shell_id: Some(handle.id),
+                    command_event_id: Value::from("cmd-omitted"),
+                    command: vec!["sh".to_string(), "-lc".to_string()],
+                    cwd: cwd.path().to_path_buf(),
+                    denied_writable_roots: Vec::new(),
+                    stream_output: true,
+                    output_bytes_cap: None,
+                    output_offset: 0,
+                    stdout_len: 0,
+                    stderr_len: 0,
+                    stdout_cap_reached: false,
+                    stderr_cap_reached: false,
+                    network_permission_blocks: None,
+                    permission_request: None,
+                    _network_proxy: None,
+                },
+            )
+            .expect("insert command exec process");
+        let mut output = Vec::new();
+
+        manager
+            .drain_until_output_or_timeout(
+                Some(&mut shell_sessions),
+                &mut output,
+                Duration::from_secs(1),
+            )
+            .expect("drain output");
+        let events = parse_test_jsonl(&output);
+        assert!(
+            events.iter().any(|event| {
+                event["event"] == "command_exec_output_delta"
+                    && event["stream"] == "stdout"
+                    && event["delta"] == "[2 bytes of earlier output omitted]\ncdef"
+            }),
+            "streaming delta should report omitted retained prefix: {events:?}"
+        );
+    }
+
+    #[test]
+    fn streaming_delta_reports_omitted_prefix_on_stderr_when_stdout_empty() {
+        let cwd = tempfile::tempdir().expect("tempdir");
+        let task_registry = TaskRegistry::new("command-exec-stderr-omitted".to_string());
+        let output_store = TaskOutputStore::with_max_retained_bytes(4);
+        let mut shell_sessions =
+            RuntimeShellSessionManager::with_output_store(task_registry, output_store);
+        let handle = shell_sessions
+            .spawn(ShellSessionCommand {
+                command: "printf abcdef >&2; sleep 0.2".to_string(),
+                cwd: cwd.path().to_path_buf(),
+                additional_readable_directories: Vec::new(),
+                additional_working_directories: Vec::new(),
+                denied_working_directories: Vec::new(),
+                allowed_unix_socket_roots: Vec::new(),
+                env: std::collections::BTreeMap::new(),
+                description: "stream stderr omitted prefix".to_string(),
+                terminal: ShellTerminalMode::pipe(),
+                sandbox: ShellSandboxMode::DangerFullAccess,
+            })
+            .expect("spawn shell");
+
+        let mut manager = CommandExecManager::default();
+        manager
+            .insert(
+                "proc-stderr-omitted".to_string(),
+                CommandExecProcess {
+                    shell_id: Some(handle.id),
+                    command_event_id: Value::from("cmd-stderr-omitted"),
+                    command: vec!["sh".to_string(), "-lc".to_string()],
+                    cwd: cwd.path().to_path_buf(),
+                    denied_writable_roots: Vec::new(),
+                    stream_output: true,
+                    output_bytes_cap: None,
+                    output_offset: 0,
+                    stdout_len: 0,
+                    stderr_len: 0,
+                    stdout_cap_reached: false,
+                    stderr_cap_reached: false,
+                    network_permission_blocks: None,
+                    permission_request: None,
+                    _network_proxy: None,
+                },
+            )
+            .expect("insert command exec process");
+        let mut output = Vec::new();
+
+        manager
+            .drain_until_output_or_timeout(
+                Some(&mut shell_sessions),
+                &mut output,
+                Duration::from_secs(1),
+            )
+            .expect("drain output");
+        let events = parse_test_jsonl(&output);
+        assert!(
+            events.iter().any(|event| {
+                event["event"] == "command_exec_output_delta"
+                    && event["stream"] == "stderr"
+                    && event["delta"] == "[2 bytes of earlier output omitted]\ncdef"
+            }),
+            "stderr streaming delta should report omitted retained prefix: {events:?}"
+        );
+        assert!(
+            events.iter().all(|event| event["stream"] != "stdout"),
+            "pure stderr omission should not emit a stdout notice: {events:?}"
+        );
+    }
+
+    #[test]
+    fn streaming_delta_counts_omitted_output_toward_stdout_cap() {
+        let cwd = tempfile::tempdir().expect("tempdir");
+        let task_registry = TaskRegistry::new("command-exec-omitted-cap".to_string());
+        let output_store = TaskOutputStore::with_max_retained_bytes(4);
+        let mut shell_sessions =
+            RuntimeShellSessionManager::with_output_store(task_registry, output_store);
+        let handle = shell_sessions
+            .spawn(ShellSessionCommand {
+                command: "printf abcdef; sleep 0.2".to_string(),
+                cwd: cwd.path().to_path_buf(),
+                additional_readable_directories: Vec::new(),
+                additional_working_directories: Vec::new(),
+                denied_working_directories: Vec::new(),
+                allowed_unix_socket_roots: Vec::new(),
+                env: std::collections::BTreeMap::new(),
+                description: "stream omitted output under cap".to_string(),
+                terminal: ShellTerminalMode::pipe(),
+                sandbox: ShellSandboxMode::DangerFullAccess,
+            })
+            .expect("spawn shell");
+
+        let mut manager = CommandExecManager::default();
+        manager
+            .insert(
+                "proc-omitted-cap".to_string(),
+                CommandExecProcess {
+                    shell_id: Some(handle.id),
+                    command_event_id: Value::from("cmd-omitted-cap"),
+                    command: vec!["sh".to_string(), "-lc".to_string()],
+                    cwd: cwd.path().to_path_buf(),
+                    denied_writable_roots: Vec::new(),
+                    stream_output: true,
+                    output_bytes_cap: Some(3),
+                    output_offset: 0,
+                    stdout_len: 0,
+                    stderr_len: 0,
+                    stdout_cap_reached: false,
+                    stderr_cap_reached: false,
+                    network_permission_blocks: None,
+                    permission_request: None,
+                    _network_proxy: None,
+                },
+            )
+            .expect("insert command exec process");
+        let mut output = Vec::new();
+
+        manager
+            .drain_until_output_or_timeout(
+                Some(&mut shell_sessions),
+                &mut output,
+                Duration::from_secs(1),
+            )
+            .expect("drain output");
+        let events = parse_test_jsonl(&output);
+        assert!(
+            events.iter().any(|event| {
+                event["event"] == "command_exec_output_delta"
+                    && event["stream"] == "stdout"
+                    && event["delta"] == "[2 bytes of earlier output omitted]\nc"
+                    && event["capReached"] == true
+            }),
+            "omitted original stdout bytes should count toward stream cap: {events:?}"
+        );
+        assert!(
+            events.iter().all(|event| event["delta"] != "cde"),
+            "streaming cap must not restart from the retained tail: {events:?}"
+        );
+    }
+
+    #[test]
     fn command_exec_denial_drain_evicts_finished_process_output() {
         let cwd = tempfile::tempdir().expect("tempdir");
         let task_registry = TaskRegistry::new("command-exec-denial-evict".to_string());
@@ -1106,6 +1352,77 @@ mod tests {
             super::CommandExecDrainOutcome::NetworkPermissionDenied { .. }
         ));
         assert_eq!(shell_sessions.output_store().size(&handle.task_id), 0);
+    }
+
+    #[test]
+    fn command_exec_completion_survives_shell_snapshot_listing() {
+        let cwd = tempfile::tempdir().expect("tempdir");
+        let task_registry = TaskRegistry::new("command-exec-list-ownership".to_string());
+        let mut shell_sessions = RuntimeShellSessionManager::new(task_registry);
+        let handle = shell_sessions
+            .spawn(ShellSessionCommand {
+                command: "printf listed-complete".to_string(),
+                cwd: cwd.path().to_path_buf(),
+                additional_readable_directories: Vec::new(),
+                additional_working_directories: Vec::new(),
+                denied_working_directories: Vec::new(),
+                allowed_unix_socket_roots: Vec::new(),
+                env: std::collections::BTreeMap::new(),
+                description: "command exec survives shell list".to_string(),
+                terminal: ShellTerminalMode::pipe(),
+                sandbox: ShellSandboxMode::DangerFullAccess,
+            })
+            .expect("spawn shell");
+
+        let mut manager = CommandExecManager::default();
+        manager
+            .insert(
+                "proc-list-owned".to_string(),
+                CommandExecProcess {
+                    shell_id: Some(handle.id.clone()),
+                    command_event_id: Value::from("cmd-list-owned"),
+                    command: vec!["sh".to_string(), "-lc".to_string()],
+                    cwd: cwd.path().to_path_buf(),
+                    denied_writable_roots: Vec::new(),
+                    stream_output: false,
+                    output_bytes_cap: None,
+                    output_offset: 0,
+                    stdout_len: 0,
+                    stderr_len: 0,
+                    stdout_cap_reached: false,
+                    stderr_cap_reached: false,
+                    network_permission_blocks: None,
+                    permission_request: None,
+                    _network_proxy: None,
+                },
+            )
+            .expect("insert command exec process");
+
+        std::thread::sleep(Duration::from_millis(100));
+        let _shell_snapshots = shell_sessions.list();
+
+        let mut output = Vec::new();
+        manager
+            .drain_with_timeout(
+                Some(&mut shell_sessions),
+                &mut output,
+                Duration::from_millis(50),
+            )
+            .expect("drain listed command exec process");
+        let events = parse_test_jsonl(&output);
+
+        assert!(
+            events.iter().any(|event| {
+                event["event"] == "command_exec_completed"
+                    && event["processId"] == "proc-list-owned"
+                    && event["stdout"] == "listed-complete"
+            }),
+            "command/exec completion should survive generic shell listing: {events:?}"
+        );
+        assert!(
+            manager.list().is_empty(),
+            "completed command/exec process should be removed after drain"
+        );
     }
 
     fn parse_test_jsonl(stdout: &[u8]) -> Vec<Value> {
