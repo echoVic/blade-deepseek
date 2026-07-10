@@ -76,6 +76,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.12":
+        "TUI scroll performance gets a full overhaul so long sessions stay responsive. A frame scheduler coalesces wheel events and caps per-batch processing, message rendering flows through a version-based cache instead of redrawing the whole transcript each frame, and a virtual viewport renders only the visible messages. Scroll offsets widen to usize so sessions past 65,535 lines scroll correctly, and the bottom status line drops the scroll: N/total indicator.",
       "v0.2.11":
         "TUI keyboard handling now runs through a context-aware shortcut resolver. Global, composer, running-turn, and approval-dialog keys keep the same behavior, but the resolver, tests, and shortcut help path now share one binding boundary so future keymap and task-control changes are easier to verify.",
       "v0.2.10":
@@ -476,6 +478,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.12":
+        "TUI 滚动性能迎来全面重构，长会话保持流畅。帧调度器会合并滚轮事件并限制每批处理数量，消息渲染改走基于版本的缓存，而不是每帧重绘整个 transcript，虚拟视口只渲染可见区域的消息。滚动偏移改为 usize，超过 65,535 行的会话也能正确滚动，底部状态栏去掉了 scroll: N/total 指示。",
       "v0.2.11":
         "TUI 键盘处理现在走 context-aware shortcut resolver。Global、composer、running-turn 和 approval-dialog 快捷键行为保持不变，但 resolver、测试和快捷键帮助路径共享同一个绑定边界，后续 keymap 与任务控制改动会更容易验证。",
       "v0.2.10":

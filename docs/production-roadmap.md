@@ -4,7 +4,14 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-07-10
-Current baseline: current main after v0.2.11 routes TUI keyboard handling
+Current baseline: current main after v0.2.12 overhauls TUI scroll performance
+so long sessions stay responsive. A new frame scheduler coalesces wheel events
+and caps per-batch event processing, message rendering flows through a
+message-version-based cache instead of redrawing the full transcript every
+frame, and a virtual viewport renders only the visible messages. Scroll metrics
+widen to `usize` so sessions longer than 65,535 lines scroll correctly, and the
+bottom status line drops the `scroll: N/total` indicator. Earlier v0.2.11 routes
+TUI keyboard handling
 through a context-aware shortcut resolver. Global, composer, running-turn, and
 approval-dialog shortcuts keep their existing behavior, but the resolver,
 focused tests, and shortcut help rendering now share one binding boundary so
