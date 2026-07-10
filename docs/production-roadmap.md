@@ -4,13 +4,19 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-07-10
-Current baseline: current main after v0.2.12 overhauls TUI scroll performance
-so long sessions stay responsive. A new frame scheduler coalesces wheel events
-and caps per-batch event processing, message rendering flows through a
-message-version-based cache instead of redrawing the full transcript every
-frame, and a virtual viewport renders only the visible messages. Scroll metrics
-widen to `usize` so sessions longer than 65,535 lines scroll correctly, and the
-bottom status line drops the `scroll: N/total` indicator. Earlier v0.2.11 routes
+Current baseline: current main after v0.2.13 routes runtime task output through
+a bounded, UTF-8-safe task-output store. Long-running TUI bash and server
+`command/exec` sessions no longer retain unbounded per-process stdout/stderr
+buffers, streaming command/exec deltas survive retained-output rebasing without
+resetting cumulative output caps, and completed, stopped, or permission-denied
+processes evict retained output when the runtime observes the terminal path.
+Earlier v0.2.12 overhauls TUI scroll performance so long sessions stay
+responsive. A new frame scheduler coalesces wheel events and caps per-batch
+event processing, message rendering flows through a message-version-based cache
+instead of redrawing the full transcript every frame, and a virtual viewport
+renders only the visible messages. Scroll metrics widen to `usize` so sessions
+longer than 65,535 lines scroll correctly, and the bottom status line drops the
+`scroll: N/total` indicator. Earlier v0.2.11 routes
 TUI keyboard handling
 through a context-aware shortcut resolver. Global, composer, running-turn, and
 approval-dialog shortcuts keep their existing behavior, but the resolver,
@@ -312,7 +318,7 @@ working baseline used to prioritize the next patch releases.
 | File discovery | `glob` is model-facing with normal glob patterns plus `mode: "fuzzy"` path queries; `list_files` remains a compatibility alias | Claude `Glob`, Codex file search | Implemented |
 | Shell execution | `bash` and server shell ops route through a runtime shell-session manager with task ids, stdin, kill, nonblocking incremental reads, optional Unix PTY mode, PTY resize, stdout/stderr collection, macOS Seatbelt path, configurable timeout, and observable requested/effective terminal modes with pipe fallback where PTY is unavailable | Codex `exec_command` sessions, PTY, stdin, timeout | Seeded; richer shell controls still open |
 | Context management | BPE token counting, local compaction, persisted collapse/summary records | Multi-level local/remote compaction | Partial |
-| Tool output control | Fixed byte truncation helper on tool output | Codex truncation policies by bytes/tokens with explicit warnings | Partial |
+| Tool output control | Runtime task output now uses a bounded, UTF-8-safe `TaskOutputStore` for shell and command/exec output, preserves cumulative streaming caps, and evicts terminal process output; ordinary tool-result truncation still uses fixed byte helpers | Codex bounded exec replay plus package 3 disk-backed task output and offset polling | Partial |
 | Model metadata | `ModelSelection` plus DeepSeek defaults | Codex `models-manager` with model capability metadata | Partial |
 | MCP | stdio/SSE config surface, tool routing, and read-only resource list/read/template tools | Codex MCP client/server ecosystem | Partial; resource access seeded |
 | Hooks | Lifecycle hooks with JSON stdout actions; structured outputs that declare `action` now validate supported actions and required string fields | Codex hooks runtime and schema validation | Implemented; schema docs/validation improved |

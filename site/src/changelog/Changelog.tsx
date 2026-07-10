@@ -76,6 +76,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.13":
+        "Runtime task output now flows through a bounded, UTF-8-safe task-output store. Long-running TUI bash and command/exec sessions avoid unbounded stdout/stderr retention, command/exec streaming keeps cumulative output caps correct after retained-output rebases, and terminal command paths evict retained output after completion, stop, or permission denial.",
       "v0.2.12":
         "TUI scroll performance gets a full overhaul so long sessions stay responsive. A frame scheduler coalesces wheel events and caps per-batch processing, message rendering flows through a version-based cache instead of redrawing the whole transcript each frame, and a virtual viewport renders only the visible messages. Scroll offsets widen to usize so sessions past 65,535 lines scroll correctly, and the bottom status line drops the scroll: N/total indicator.",
       "v0.2.11":
@@ -478,6 +480,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.13":
+        "Runtime 任务输出现在通过有上限、UTF-8 safe 的 task-output store 保留。长时间运行的 TUI bash 和 command/exec 会话不再无限持有 stdout/stderr；retained output 被裁剪后，command/exec 流式输出仍会继续遵守累计输出上限；完成、停止或权限拒绝的终端命令路径会清理已保留输出。",
       "v0.2.12":
         "TUI 滚动性能迎来全面重构，长会话保持流畅。帧调度器会合并滚轮事件并限制每批处理数量，消息渲染改走基于版本的缓存，而不是每帧重绘整个 transcript，虚拟视口只渲染可见区域的消息。滚动偏移改为 usize，超过 65,535 行的会话也能正确滚动，底部状态栏去掉了 scroll: N/total 指示。",
       "v0.2.11":
