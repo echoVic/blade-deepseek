@@ -4,7 +4,7 @@ use std::io;
 use std::path::Path;
 
 use orca_core::config::{HistoryMode, RunConfig};
-use orca_core::conversation::{Conversation, RawToolCall};
+use orca_core::conversation::{Conversation, RawToolCall, assistant_message_has_payload};
 use orca_core::cost_types::UsageTotals;
 use orca_core::hook_types::HookEvent;
 use orca_core::subagent_types::SubagentType;
@@ -123,6 +123,12 @@ pub(crate) fn record_assistant_response_for_agent(
     tool_calls: Vec<RawToolCall>,
     emit_deltas: bool,
 ) -> io::Result<()> {
+    if !assistant_message_has_payload(assistant_content.as_deref(), &tool_calls) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "assistant response did not contain content or tool calls",
+        ));
+    }
     conversation.add_assistant(assistant_content, assistant_reasoning, tool_calls);
     if emit_deltas
         && let Some(writer) = history_writer
@@ -738,6 +744,25 @@ mod tests {
             matches!(&conversation.messages[1], orca_core::conversation::Message::User { content, .. }
                 if content == "inspect repo")
         );
+    }
+
+    #[test]
+    fn record_assistant_response_rejects_empty_payload() {
+        let mut conversation = Conversation::new();
+        conversation.add_user("hello".to_string());
+
+        let error = record_assistant_response_for_agent(
+            &mut conversation,
+            None,
+            None,
+            Some("private thinking".to_string()),
+            vec![],
+            false,
+        )
+        .expect_err("reasoning-only assistant must not enter history");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(conversation.messages.len(), 1);
     }
 
     #[test]

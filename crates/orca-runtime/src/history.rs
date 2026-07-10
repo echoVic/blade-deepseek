@@ -754,6 +754,45 @@ mod tests {
     }
 
     #[test]
+    fn resume_drops_reasoning_only_assistant() {
+        let cwd = std::env::current_dir().unwrap();
+        let transcript = SessionTranscript {
+            meta: create_meta(&cwd, "deepseek", None, "reasoning-only turn"),
+            messages: vec![
+                Message::user("first".to_string()),
+                Message::Assistant {
+                    content: None,
+                    reasoning_content: Some("private thinking".to_string()),
+                    tool_calls: vec![],
+                    pinned: false,
+                },
+                Message::user("second".to_string()),
+            ],
+            compactions: Vec::new(),
+            summaries: Vec::new(),
+            usage: None,
+            plan: None,
+            completion_status: None,
+            path: cwd.join("reasoning-only.jsonl"),
+        };
+
+        let conv = resume_conversation(&transcript, "sys".to_string());
+
+        assert!(!conv.messages.iter().any(|message| matches!(
+            message,
+            Message::Assistant {
+                content: None,
+                tool_calls,
+                ..
+            } if tool_calls.is_empty()
+        )));
+        assert!(conv.messages.iter().any(|message| matches!(
+            message,
+            Message::User { content, .. } if content == "second"
+        )));
+    }
+
+    #[test]
     fn load_session_preserves_latest_completion_status() {
         let _guard = lock_test_env();
         let home = tempfile::tempdir().expect("temp home");

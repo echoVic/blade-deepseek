@@ -300,6 +300,10 @@ impl Conversation {
     }
 }
 
+pub fn assistant_message_has_payload(content: Option<&str>, tool_calls: &[RawToolCall]) -> bool {
+    content.is_some_and(|text| !text.trim().is_empty()) || !tool_calls.is_empty()
+}
+
 pub fn normalize_tool_boundaries(messages: &mut Vec<Message>) {
     let mut normalized = Vec::with_capacity(messages.len());
     let mut index = 0usize;
@@ -307,6 +311,13 @@ pub fn normalize_tool_boundaries(messages: &mut Vec<Message>) {
     while index < messages.len() {
         match &messages[index] {
             Message::Tool { .. } => {
+                index += 1;
+            }
+            Message::Assistant {
+                content,
+                tool_calls,
+                ..
+            } if !assistant_message_has_payload(content.as_deref(), tool_calls) => {
                 index += 1;
             }
             Message::Assistant { tool_calls, .. } if !tool_calls.is_empty() => {
@@ -743,6 +754,41 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert!(matches!(&messages[0], Message::User { content, .. } if content == "before"));
         assert!(matches!(&messages[1], Message::User { content, .. } if content == "after"));
+    }
+
+    #[test]
+    fn normalize_tool_boundaries_drops_reasoning_only_assistant() {
+        let mut messages = vec![
+            Message::user("before".to_string()),
+            Message::Assistant {
+                content: None,
+                reasoning_content: Some("private reasoning".to_string()),
+                tool_calls: vec![],
+                pinned: false,
+            },
+            Message::user("after".to_string()),
+        ];
+
+        normalize_tool_boundaries(&mut messages);
+
+        assert_eq!(messages.len(), 2);
+        assert!(matches!(&messages[0], Message::User { content, .. } if content == "before"));
+        assert!(matches!(&messages[1], Message::User { content, .. } if content == "after"));
+    }
+
+    #[test]
+    fn assistant_message_payload_requires_content_or_tool_calls() {
+        assert!(!assistant_message_has_payload(None, &[]));
+        assert!(!assistant_message_has_payload(Some("  \n"), &[]));
+        assert!(assistant_message_has_payload(Some("answer"), &[]));
+        assert!(assistant_message_has_payload(
+            None,
+            &[RawToolCall {
+                id: "call_1".to_string(),
+                function_name: "read_file".to_string(),
+                arguments: "{}".to_string(),
+            }],
+        ));
     }
 
     #[test]

@@ -4,7 +4,8 @@ use serde_json::Value;
 use orca_core::approval_types::ActionKind;
 use orca_core::cancel::CancelToken;
 use orca_core::conversation::{
-    Conversation, Message, RawToolCall, SummaryState, normalize_tool_boundaries,
+    Conversation, Message, RawToolCall, SummaryState, assistant_message_has_payload,
+    normalize_tool_boundaries,
 };
 use orca_core::provider_types::{ProviderReplayState, ProviderResponse, ProviderStep, Usage};
 use orca_core::tool_types::ToolRequest;
@@ -367,7 +368,11 @@ fn request_chat_streaming(
             Some(stream_result.content)
         };
 
-        if steps.is_empty() {
+        if !assistant_message_has_payload(assistant_content.as_deref(), &raw_calls_for_history)
+            && !steps
+                .iter()
+                .any(|step| matches!(step, ProviderStep::Error(_)))
+        {
             if empty_attempt < EMPTY_RESPONSE_RETRIES {
                 continue;
             }
@@ -525,7 +530,11 @@ fn request_chat(
             steps.push(ProviderStep::MessageDelta(content.clone()));
         }
 
-        if steps.is_empty() {
+        if !assistant_message_has_payload(assistant_content.as_deref(), &raw_calls_for_history)
+            && !steps
+                .iter()
+                .any(|step| matches!(step, ProviderStep::Error(_)))
+        {
             if empty_attempt < EMPTY_RESPONSE_RETRIES {
                 continue;
             }
@@ -838,6 +847,29 @@ mod tests {
                 captured.lock().expect("lock captured bodies").push(body);
                 let reply = format!(
                     "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    response.len(),
+                    response
+                );
+                stream.write_all(reply.as_bytes()).expect("write response");
+            }
+        });
+        (base_url, bodies)
+    }
+
+    fn spawn_two_streaming_response_server(
+        response: &'static str,
+    ) -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let base_url = format!("http://{}", listener.local_addr().expect("local addr"));
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&bodies);
+        std::thread::spawn(move || {
+            for _ in 0..=EMPTY_RESPONSE_RETRIES {
+                let (mut stream, _) = listener.accept().expect("accept request");
+                let body = read_http_request_body(&mut stream);
+                captured.lock().expect("lock captured bodies").push(body);
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
                     response.len(),
                     response
                 );
@@ -1237,6 +1269,24 @@ mod tests {
     }
 
     #[test]
+    fn api_messages_drop_reasoning_only_assistant() {
+        let mut conv = Conversation::new();
+        conv.add_user("first".to_string());
+        conv.add_assistant(None, Some("private thinking".to_string()), vec![]);
+        conv.add_user("second".to_string());
+
+        let messages = conversation_to_api_messages(&conv);
+
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.role.as_str())
+                .collect::<Vec<_>>(),
+            vec!["user", "user"]
+        );
+    }
+
+    #[test]
     fn api_replay_preserves_reasoning_content_for_tool_call_turns() {
         let mut conv = Conversation::new();
         conv.add_user("first".to_string());
@@ -1377,6 +1427,54 @@ mod tests {
             let json: Value = serde_json::from_str(body).expect("request json");
             assert_eq!(json["max_tokens"], DEFAULT_CHAT_MAX_TOKENS);
         }
+    }
+
+    #[test]
+    fn non_streaming_reasoning_only_response_is_rejected() {
+        let reasoning_only = r#"{"choices":[{"message":{"content":null,"reasoning_content":"thinking"},"finish_reason":"stop"}]}"#;
+        let (base_url, bodies) = spawn_two_response_server(reasoning_only, reasoning_only);
+        let mut conversation = Conversation::new();
+        conversation.add_user("hello".to_string());
+        let config = ProviderConfig {
+            api_key: Some("test-key".to_string()),
+            base_url: Some(base_url),
+            model: Some("deepseek-v4-flash".to_string()),
+            reasoning_effort: orca_core::config::ReasoningEffort::default(),
+            tools_override: Some(Vec::new()),
+            mcp_registry: None,
+            external_tools: Vec::new(),
+        };
+
+        let error = request_chat(&conversation, &config).expect_err("reasoning-only is invalid");
+
+        assert_eq!(error, EMPTY_RESPONSE_ERROR);
+        assert_eq!(bodies.lock().expect("lock captured bodies").len(), 2);
+    }
+
+    #[test]
+    fn streaming_reasoning_only_response_is_rejected() {
+        let reasoning_only = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking\"},\"finish_reason\":null}]}\n\n\
+                              data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+                              data: [DONE]\n\n";
+        let (base_url, bodies) = spawn_two_streaming_response_server(reasoning_only);
+        let mut conversation = Conversation::new();
+        conversation.add_user("hello".to_string());
+        let config = ProviderConfig {
+            api_key: Some("test-key".to_string()),
+            base_url: Some(base_url),
+            model: Some("deepseek-v4-flash".to_string()),
+            reasoning_effort: orca_core::config::ReasoningEffort::default(),
+            tools_override: Some(Vec::new()),
+            mcp_registry: None,
+            external_tools: Vec::new(),
+        };
+        let cancel = CancelToken::new();
+
+        let error = request_chat_streaming(&conversation, &config, &cancel, &mut |_| {})
+            .expect_err("reasoning-only is invalid");
+
+        assert_eq!(error, EMPTY_RESPONSE_ERROR);
+        assert_eq!(bodies.lock().expect("lock captured bodies").len(), 2);
     }
 
     #[test]
