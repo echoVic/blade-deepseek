@@ -69,7 +69,7 @@ pub(crate) fn handle_setup_key(
                 *textarea = make_textarea(vim_state, theme);
 
                 if let Some(prompt) = initial_prompt {
-                    state.messages.push(ChatMessage::User(prompt.clone()));
+                    state.push_message(ChatMessage::User(prompt.clone()));
                     state.enter_running();
                     let _ = action_tx.send(UserAction::Submit(prompt));
                 }

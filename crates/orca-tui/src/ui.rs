@@ -17,9 +17,8 @@ use orca_runtime::history::SessionSummary;
 
 use crate::shortcuts::{self, ShortcutScope};
 use crate::theme::Theme;
-use crate::types::{
-    AppState, AppStatus, ApprovalOption, ChatMessage, LiveLineCountCache, PanelMode,
-};
+use crate::transcript_view::viewport_paragraph;
+use crate::types::{AppState, AppStatus, ApprovalOption, ChatMessage, PanelMode};
 
 pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, theme: &Theme) {
     if state.status == AppStatus::Setup {
@@ -373,18 +372,6 @@ fn highlight_match(text: &str, needle: &str, base: Style, theme: &Theme) -> Vec<
     spans
 }
 
-/// The lines the transcript pane shows: the welcome banner before the first message,
-/// otherwise `messages[flushed_count..]`. Single source of truth so the height computation
-/// and the renderer never disagree.
-fn live_pane_lines(state: &AppState, theme: &Theme, width: usize) -> Vec<Line<'static>> {
-    if state.messages.is_empty() {
-        build_welcome_lines(state, theme)
-    } else {
-        let live = &state.messages[state.flushed_count.min(state.messages.len())..];
-        build_lines_for_messages(live, theme, width, state.tick, false)
-    }
-}
-
 fn approval_dialog_height(dialog: &crate::types::ApprovalDialog) -> u16 {
     let diff_lines = dialog
         .diff
@@ -413,60 +400,61 @@ pub(crate) fn render_live_messages(
     theme: &Theme,
 ) {
     let width = area.width.max(1) as usize;
-    let lines = live_pane_lines(state, theme, width);
+    let visible_height = area.height as usize;
+    state.reconcile_message_tracking();
 
-    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
-    // Measure with ratatui's own word wrapper (`Paragraph::line_count`) so the scroll
-    // math and the renderer agree on wrapped height by construction. A hand-rolled
-    // estimate kept diverging on mixed-width CJK/ASCII runs (a 2-cell char at a row
-    // with 1 cell left wraps early, "wasting" a cell), undercounting the height and
-    // pinning auto-scroll a few rows above the real tail.
-    let total = measure_live_line_count_cached(state, area.width.max(1), || {
-        paragraph
-            .line_count(area.width.max(1))
-            .min(u16::MAX as usize) as u16
-    });
-    state.total_lines = total;
-    state.visible_height = area.height;
-
-    // When content is taller than the pane, `max_scroll` is the offset that shows the tail.
-    let max_scroll = total.saturating_sub(area.height);
-    let scroll = if state.auto_scroll {
-        max_scroll
-    } else {
-        state.scroll_offset.min(max_scroll)
-    };
-    // Persist the resolved offset so the status hint and the next scroll keystroke compute
-    // against the value actually shown (content may have grown or shrunk this frame).
-    state.scroll_offset = scroll;
-
-    frame.render_widget(paragraph.scroll((scroll, 0)), area);
-}
-
-fn measure_live_line_count_cached(
-    state: &mut AppState,
-    width: u16,
-    measure: impl FnOnce() -> u16,
-) -> u16 {
-    let (live_start, message_count, signature) = state.live_message_signature();
-    if let Some(cache) = state.live_line_count_cache
-        && cache.width == width
-        && cache.live_start == live_start
-        && cache.message_count == message_count
-        && cache.signature == signature
-    {
-        return cache.total;
+    if state.messages.is_empty() {
+        let lines = build_welcome_lines(state, theme);
+        let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+        let total = paragraph.line_count(area.width.max(1));
+        let max_scroll = total.saturating_sub(visible_height);
+        let scroll = if state.auto_scroll {
+            max_scroll
+        } else {
+            state.scroll_offset.min(max_scroll)
+        };
+        state.total_lines = total;
+        state.visible_height = visible_height;
+        state.scroll_offset = scroll;
+        frame.render_widget(
+            paragraph.scroll((scroll.min(u16::MAX as usize) as u16, 0)),
+            area,
+        );
+        return;
     }
 
-    let total = measure();
-    state.live_line_count_cache = Some(LiveLineCountCache {
+    let requested_scroll = if state.auto_scroll {
+        usize::MAX
+    } else {
+        state.scroll_offset
+    };
+    let live_start = state.flushed_count.min(state.messages.len());
+    state.transcript_render_cache.prepare(
+        &state.messages,
+        &state.message_revisions,
         width,
-        live_start,
-        message_count,
-        signature,
-        total,
-    });
-    total
+        theme,
+        state.tick,
+        false,
+        |message, theme, width, tick, force_expand| {
+            build_lines_for_messages(
+                std::slice::from_ref(message),
+                theme,
+                width,
+                tick,
+                force_expand,
+            )
+        },
+    );
+    let viewport =
+        state
+            .transcript_render_cache
+            .viewport(live_start, requested_scroll, visible_height);
+    state.total_lines = viewport.total_height;
+    state.visible_height = visible_height;
+    state.scroll_offset = viewport.scroll_offset;
+
+    frame.render_widget(viewport_paragraph(viewport.lines), area);
 }
 
 fn render_workflows_panel(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) {
@@ -1628,9 +1616,8 @@ fn append_subagent_lines(
 }
 
 fn append_diff_lines(lines: &mut Vec<Line<'static>>, diff: &str, theme: &Theme) {
-    let mut count = 0;
-    for line in diff.lines().take(80) {
-        count += 1;
+    let mut diff_lines = diff.lines();
+    for line in diff_lines.by_ref().take(80) {
         let color = if line.starts_with('+') && !line.starts_with("+++") {
             theme.diff_add
         } else if line.starts_with('-') && !line.starts_with("---") {
@@ -1645,7 +1632,7 @@ fn append_diff_lines(lines: &mut Vec<Line<'static>>, diff: &str, theme: &Theme) 
             Style::default().fg(color),
         )));
     }
-    if diff.lines().count() > count {
+    if diff_lines.next().is_some() {
         lines.push(Line::from(Span::styled(
             "    [... diff truncated ...]",
             Style::default().fg(theme.muted),
@@ -1670,18 +1657,16 @@ fn append_tool_output_lines(
     } else {
         2
     };
-    let output_lines: Vec<&str> = output.lines().collect();
-    let shown = output_lines.len().min(max_lines);
-
-    for line in output_lines.iter().take(shown) {
+    let mut output_lines = output.lines();
+    for line in output_lines.by_ref().take(max_lines) {
         lines.push(Line::from(Span::styled(
             format!("    {line}"),
             Style::default().fg(theme.muted),
         )));
     }
 
-    if output_lines.len() > shown {
-        let hidden = output_lines.len() - shown;
+    let hidden = output_lines.count();
+    if hidden > 0 {
         lines.push(Line::from(Span::styled(
             format!("    [+{hidden} lines]"),
             Style::default().fg(theme.muted),
@@ -1982,23 +1967,12 @@ fn push_hard_wrapped_segment(
 }
 
 fn render_status(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
-    let scroll_hint = if !state.auto_scroll {
-        format!(
-            "scroll: {}/{} | ",
-            state.scroll_offset,
-            state.total_lines.saturating_sub(state.visible_height)
-        )
-    } else {
-        String::new()
-    };
-
     // The live status dot + elapsed time moved to the activity line above the composer
     // (see `render_activity`); this bottom line is now purely persistent metadata.
     let line = Line::from(vec![
-        Span::styled(format!(" {scroll_hint}"), Style::default().fg(theme.muted)),
         Span::styled(
             format!(
-                "model: {} ({})",
+                " model: {} ({})",
                 state.model_name,
                 state.reasoning_effort.as_str()
             ),
@@ -4205,34 +4179,16 @@ mod tests {
     }
 
     #[test]
-    fn live_line_count_cache_reuses_measurement_until_live_content_changes() {
+    fn assistant_delta_advances_only_the_tail_message_revision() {
         let mut state = test_state();
-        state
-            .messages
-            .push(ChatMessage::Assistant("alpha bravo charlie".to_string()));
-        let mut calls = 0;
-
-        let first = measure_live_line_count_cached(&mut state, 12, || {
-            calls += 1;
-            3
-        });
-        let second = measure_live_line_count_cached(&mut state, 12, || {
-            calls += 1;
-            99
-        });
-
-        assert_eq!(first, 3);
-        assert_eq!(second, 3);
-        assert_eq!(calls, 1);
+        state.push_message(ChatMessage::User("prompt".to_string()));
+        state.push_message(ChatMessage::Assistant("alpha bravo charlie".to_string()));
+        let before = state.message_revisions.clone();
 
         state.update(TuiEvent::MessageDelta(" delta".to_string()));
-        let third = measure_live_line_count_cached(&mut state, 12, || {
-            calls += 1;
-            4
-        });
 
-        assert_eq!(third, 4);
-        assert_eq!(calls, 2);
+        assert_eq!(state.message_revisions[0], before[0]);
+        assert_ne!(state.message_revisions[1], before[1]);
     }
 
     #[test]
@@ -4697,7 +4653,7 @@ mod tests {
         // The composer (input) needs its full height; the messages area is everything above
         // the input + status, so visible_height must leave room for them.
         assert!(
-            state.visible_height <= h - 2,
+            state.visible_height <= (h - 2) as usize,
             "messages area ({}) must not consume the input/status rows (term {h})",
             state.visible_height
         );

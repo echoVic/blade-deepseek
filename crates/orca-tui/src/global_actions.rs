@@ -38,9 +38,7 @@ where
                 return Ok(GlobalShortcutFlow::Exit(130));
             }
             state.last_ctrl_c = Some(now);
-            state
-                .messages
-                .push(ChatMessage::System("Press Ctrl+C again to quit.".into()));
+            state.push_message(ChatMessage::System("Press Ctrl+C again to quit.".into()));
             state.scroll_to_bottom();
         }
         GlobalShortcut::ToggleShortcuts => {
@@ -53,13 +51,49 @@ where
             state.scroll_to_top();
         }
         GlobalShortcut::ClearScreen => {
-            state.messages.clear();
-            state.finalized_count = 0;
-            state.flushed_count = 0;
+            state.clear_messages();
             state.scroll_offset = 0;
             state.auto_scroll = true;
             clear_terminal()?;
         }
     }
     Ok(GlobalShortcutFlow::Continue)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::mpsc;
+
+    use orca_core::cancel::CancelToken;
+
+    use super::handle_global_shortcut;
+    use crate::shortcuts::GlobalShortcut;
+    use crate::types::{AppState, ChatMessage};
+
+    #[test]
+    fn clear_screen_atomically_clears_messages_revisions_and_render_cache() {
+        let (action_tx, _action_rx) = mpsc::channel();
+        let mut state = AppState::new(
+            action_tx.clone(),
+            "test".to_string(),
+            "model".to_string(),
+            "/tmp".to_string(),
+        );
+        state.push_message(ChatMessage::Assistant("cached".to_string()));
+        assert_eq!(state.message_revisions.len(), 1);
+        assert_eq!(state.transcript_render_cache.len(), 1);
+
+        handle_global_shortcut(
+            GlobalShortcut::ClearScreen,
+            &mut state,
+            &action_tx,
+            &CancelToken::new(),
+            || Ok(()),
+        )
+        .expect("clear screen");
+
+        assert!(state.messages.is_empty());
+        assert!(state.message_revisions.is_empty());
+        assert_eq!(state.transcript_render_cache.len(), 0);
+    }
 }

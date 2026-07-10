@@ -7,19 +7,16 @@ use std::time::{Duration, Instant};
 
 use crossterm::ExecutableCommand;
 use crossterm::event::{
-    self, EnableBracketedPaste, EnableMouseCapture, Event, KeyCode, KeyboardEnhancementFlags,
+    self, EnableBracketedPaste, EnableMouseCapture, Event, KeyboardEnhancementFlags,
     PushKeyboardEnhancementFlags,
 };
 use crossterm::terminal;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use tui_textarea::TextArea;
 
-use orca_core::approval_types::ApprovalMode;
 use orca_core::cancel::CancelToken;
 use orca_core::config::{HistoryMode, RunConfig};
 use orca_core::conversation::Message;
-use orca_core::model::ModelSelection;
 use orca_runtime::history;
 
 use crate::background_approval::submit_background_approval_response_for_tui;
@@ -27,28 +24,21 @@ use crate::background_tasks::{
     foreground_task_for_tui, notify_recovered_background_approvals_for_tui, stop_task_for_tui,
 };
 use crate::bridge;
-use crate::commands;
-use crate::composer_textarea::{
-    insert_pasted_text, make_setup_textarea, make_textarea, make_textarea_with_text, textarea_text,
+use crate::composer_textarea::{make_setup_textarea, make_textarea};
+use crate::frame_scheduler::{FrameScheduler, IterationEvent, run_event_loop_iteration};
+use crate::input_event_actions::{
+    BatchedInputEvent, coalesce_input_events, handle_mouse_event, handle_paste_event,
+    handle_scroll_lines,
 };
-use crate::input_event_actions::{handle_mouse_event, handle_paste_event};
 use crate::key_event_actions::{KeyEventFlow, handle_key_event_preflight};
 use crate::runtime_event_actions::handle_runtime_event;
 use crate::status_key_actions::{StatusKeyFlow, handle_status_key};
 use crate::submitted_turn::SubmittedTurn;
 use crate::terminal_lifecycle::TerminalCleanup;
 use crate::theme::Theme;
-use crate::types::{
-    AppState, AppStatus, ChatMessage, SlashMenu, SlashMenuItem, SubMenu, TuiEvent, UserAction,
-};
+use crate::types::{AppState, AppStatus, ChatMessage, TuiEvent, UserAction};
 use crate::ui;
 use crate::vim::VimState;
-use crate::workflow_notifications::{
-    drain_pending_workflow_notifications, is_workflow_notification_turn_boundary,
-    queue_workflow_terminal_notification, remove_pending_workflow_notification_by_id,
-    submit_pending_workflow_notification,
-};
-use crate::workflow_panel_actions::handle_workflows_panel_key;
 
 pub fn run_tui(config: RunConfig) -> i32 {
     match run_tui_inner(config) {
@@ -61,6 +51,11 @@ pub fn run_tui(config: RunConfig) -> i32 {
 }
 
 fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
+    const FRAME_INTERVAL: Duration = Duration::from_millis(16);
+    const ANIMATION_INTERVAL: Duration = Duration::from_millis(80);
+    const MAX_INPUT_EVENTS_PER_BATCH: usize = 64;
+    const MAX_RUNTIME_EVENTS_PER_BATCH: usize = 256;
+
     terminal::enable_raw_mode()?;
     let mut terminal_cleanup = TerminalCleanup::raw_mode_enabled();
     let mut stdout = io::stdout();
@@ -149,7 +144,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
         }) {
             for message in &transcript.messages {
                 if let Some(chat_message) = chat_message_from_history(message.clone()) {
-                    state.messages.push(chat_message);
+                    state.push_message(chat_message);
                 }
             }
             if let Some((explanation, plan)) = &transcript.plan {
@@ -161,7 +156,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                 } else {
                     "Resumed saved conversation."
                 };
-                state.messages.push(ChatMessage::System(label.to_string()));
+                state.push_message(ChatMessage::System(label.to_string()));
             }
             // The preloaded transcript is entirely past turns; freeze it so the next
             // turn (or an initial prompt) starts a fresh live suffix.
@@ -200,7 +195,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
         make_setup_textarea(&theme)
     } else {
         if let Some(prompt) = initial_prompt.clone() {
-            state.messages.push(ChatMessage::User(prompt.clone()));
+            state.push_message(ChatMessage::User(prompt.clone()));
             state.enter_running();
             let _ = action_tx.send(UserAction::Submit(prompt));
         }
@@ -221,76 +216,105 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
     let exit_code;
 
     terminal.draw(|f| ui::render(f, &mut state, &textarea, &theme))?;
+    let started_at = Instant::now();
+    let mut scheduler = FrameScheduler::new(started_at, FRAME_INTERVAL, ANIMATION_INTERVAL);
+    scheduler.did_draw(started_at);
 
-    loop {
-        state.advance_tick();
+    'main: loop {
+        let now = Instant::now();
+        let animation_active = state.status == AppStatus::Running;
+        if animation_active && scheduler.animation_due(now) {
+            state.advance_tick();
+            scheduler.did_animate(now);
+        }
 
-        if event::poll(Duration::from_millis(50))? {
-            let ev = event::read()?;
-
-            if handle_paste_event(&ev, &mut state, &config, &mut textarea) {
-                continue;
-            }
-
-            if handle_mouse_event(&ev, &mut state, Instant::now()) {
-                continue;
-            }
-
-            if let Event::Key(key) = &ev {
-                match handle_key_event_preflight(
-                    *key,
-                    &mut state,
-                    &mut config,
-                    &shared_config,
-                    &action_tx,
-                    &cancel_token,
-                    || clear_terminal_scrollback(&mut terminal),
-                )? {
-                    KeyEventFlow::Continue => continue,
-                    KeyEventFlow::Exit(code) => {
-                        exit_code = code;
-                        break;
-                    }
-                    KeyEventFlow::Unhandled => {}
-                }
-
-                match handle_status_key(
-                    &ev,
-                    key,
-                    &mut state,
-                    &mut config,
-                    &shared_config,
-                    &action_tx,
-                    &cancel_token,
-                    &preloaded_transcript,
-                    &mut textarea,
-                    &mut vim_state,
-                    &theme,
-                    initial_prompt.clone(),
-                    || clear_terminal_scrollback(&mut terminal),
-                )? {
-                    StatusKeyFlow::Continue => continue,
-                    StatusKeyFlow::Exit(code) => {
-                        exit_code = code;
-                        break;
-                    }
-                }
+        let mut input_events = Vec::new();
+        if event::poll(scheduler.poll_timeout(now, animation_active))? {
+            input_events.push(event::read()?);
+            while input_events.len() < MAX_INPUT_EVENTS_PER_BATCH && event::poll(Duration::ZERO)? {
+                input_events.push(event::read()?);
             }
         }
 
-        while let Ok(tui_event) = event_rx.try_recv() {
-            handle_runtime_event(
-                tui_event,
-                &mut state,
-                &action_tx,
-                &pending_workflow_notifications,
-                &mut textarea,
-                &mut vim_state,
-                &theme,
-            );
-        }
+        let iteration = run_event_loop_iteration(
+            &mut scheduler,
+            coalesce_input_events(input_events, 3),
+            event_rx.try_iter(),
+            MAX_INPUT_EVENTS_PER_BATCH,
+            MAX_RUNTIME_EVENTS_PER_BATCH,
+            Instant::now,
+            |event| -> io::Result<Option<i32>> {
+                match event {
+                    IterationEvent::Input(input_event) => match input_event {
+                        BatchedInputEvent::ScrollLines(lines) => {
+                            handle_scroll_lines(&mut state, lines, Instant::now());
+                        }
+                        BatchedInputEvent::Event(ev) => {
+                            if handle_paste_event(&ev, &mut state, &config, &mut textarea) {
+                                return Ok(None);
+                            }
+                            if handle_mouse_event(&ev, &mut state, Instant::now()) {
+                                return Ok(None);
+                            }
+                            let Event::Key(key) = &ev else {
+                                return Ok(None);
+                            };
+                            match handle_key_event_preflight(
+                                *key,
+                                &mut state,
+                                &mut config,
+                                &shared_config,
+                                &action_tx,
+                                &cancel_token,
+                                || clear_terminal_scrollback(&mut terminal),
+                            )? {
+                                KeyEventFlow::Continue => return Ok(None),
+                                KeyEventFlow::Exit(code) => return Ok(Some(code)),
+                                KeyEventFlow::Unhandled => {}
+                            }
 
-        terminal.draw(|f| ui::render(f, &mut state, &textarea, &theme))?;
+                            if let StatusKeyFlow::Exit(code) = handle_status_key(
+                                &ev,
+                                key,
+                                &mut state,
+                                &mut config,
+                                &shared_config,
+                                &action_tx,
+                                &cancel_token,
+                                &preloaded_transcript,
+                                &mut textarea,
+                                &mut vim_state,
+                                &theme,
+                                initial_prompt.clone(),
+                                || clear_terminal_scrollback(&mut terminal),
+                            )? {
+                                return Ok(Some(code));
+                            }
+                        }
+                    },
+                    IterationEvent::Runtime(tui_event) => {
+                        handle_runtime_event(
+                            tui_event,
+                            &mut state,
+                            &action_tx,
+                            &pending_workflow_notifications,
+                            &mut textarea,
+                            &mut vim_state,
+                            &theme,
+                        );
+                    }
+                }
+                Ok(None)
+            },
+        )?;
+        if let Some(code) = iteration.exit_code {
+            exit_code = code;
+            break 'main;
+        }
+        if let Some(draw_at) = iteration.draw_at {
+            terminal.draw(|f| ui::render(f, &mut state, &textarea, &theme))?;
+            scheduler.did_draw(draw_at);
+        }
     }
 
     // No alternate screen to leave.
@@ -329,9 +353,22 @@ fn clear_terminal_scrollback(terminal: &mut InlineTerminal) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::KeyCode;
+    use orca_core::approval_types::ApprovalMode;
+    use orca_core::model::ModelSelection;
+    use tui_textarea::TextArea;
+
     use crate::approval_actions::resolve_approval_option;
+    use crate::commands;
+    use crate::composer_textarea::{insert_pasted_text, make_textarea_with_text, textarea_text};
     use crate::slash_command_actions::handle_slash_command;
-    use crate::types::ApprovalOption;
+    use crate::types::{ApprovalOption, SlashMenu, SlashMenuItem, SubMenu};
+    use crate::workflow_notifications::drain_pending_workflow_notifications;
+    use crate::workflow_notifications::{
+        is_workflow_notification_turn_boundary, queue_workflow_terminal_notification,
+        remove_pending_workflow_notification_by_id, submit_pending_workflow_notification,
+    };
+    use crate::workflow_panel_actions::handle_workflows_panel_key;
     use orca_core::config::{
         ModelRuntimeConfig, OutputFormat, ProviderKind, ThemeName, ToolConfig, WorkflowConfig,
     };

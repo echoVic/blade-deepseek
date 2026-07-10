@@ -63,22 +63,22 @@ where
         cfg.history_mode = HistoryMode::Resume(session_id.clone());
     }
     if let Ok(transcript) = history::load_session(&session_id) {
-        state.messages.clear();
-        state.flushed_count = 0;
+        let restored_messages = transcript
+            .messages
+            .iter()
+            .cloned()
+            .filter_map(chat_message_from_history)
+            .collect::<Vec<_>>();
+        state.replace_messages(restored_messages);
         state.scroll_offset = 0;
         state.auto_scroll = true;
-        for message in &transcript.messages {
-            if let Some(chat_message) = chat_message_from_history(message.clone()) {
-                state.messages.push(chat_message);
-            }
-        }
         if let Some((explanation, plan)) = &transcript.plan {
             state.current_plan = Some((explanation.clone(), plan.clone()));
         } else {
             state.current_plan = None;
         }
         state.plan_update_failed = false;
-        state.messages.push(ChatMessage::System(
+        state.push_message(ChatMessage::System(
             "Resumed saved conversation.".to_string(),
         ));
         state.finalized_count = state.messages.len();

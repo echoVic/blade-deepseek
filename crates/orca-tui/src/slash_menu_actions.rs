@@ -110,7 +110,7 @@ pub(crate) fn handle_slash_menu_key(
                         }
                         state.model_name = model.clone();
                         state.reasoning_effort = effort;
-                        state.messages.push(ChatMessage::System(format!(
+                        state.push_message(ChatMessage::System(format!(
                             "Model switched to {model} (reasoning effort: {}).",
                             effort.as_str()
                         )));
@@ -124,7 +124,7 @@ pub(crate) fn handle_slash_menu_key(
                         cfg.approval_mode = mode;
                     }
                     state.approval_mode = mode;
-                    state.messages.push(ChatMessage::System(format!(
+                    state.push_message(ChatMessage::System(format!(
                         "Approval mode switched to {chosen}."
                     )));
                 }
@@ -266,14 +266,10 @@ fn select_slash_menu_command(
                     state.status = AppStatus::SessionPicker;
                 }
                 Ok(_) => {
-                    state
-                        .messages
-                        .push(ChatMessage::System("No saved sessions.".to_string()));
+                    state.push_message(ChatMessage::System("No saved sessions.".to_string()));
                 }
                 Err(e) => {
-                    state
-                        .messages
-                        .push(ChatMessage::Error(format!("failed to list history: {e}")));
+                    state.push_message(ChatMessage::Error(format!("failed to list history: {e}")));
                 }
             }
         }

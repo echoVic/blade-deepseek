@@ -1,5 +1,4 @@
 use std::collections::VecDeque;
-use std::hash::{Hash, Hasher};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -13,6 +12,8 @@ use orca_core::task_types::BackgroundTaskSummary;
 use orca_runtime::history::SessionSummary;
 use orca_runtime::runtime_pending_interaction::RuntimeMcpElicitationMode;
 use orca_runtime::runtime_permission::RuntimePermissionRequestKind;
+
+use crate::transcript_view::TranscriptRenderCache;
 
 const SUBAGENT_ACTIVITY_TAIL_LIMIT: usize = 6;
 
@@ -303,15 +304,6 @@ pub enum ChatMessage {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct LiveLineCountCache {
-    pub width: u16,
-    pub live_start: usize,
-    pub message_count: usize,
-    pub signature: u64,
-    pub total: u16,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApprovalOption {
     /// Approve this single call.
     Once,
@@ -468,11 +460,13 @@ pub struct SubMenu {
 }
 
 pub struct AppState {
-    pub messages: Vec<ChatMessage>,
-    /// Watermark splitting `messages` into an immutable prefix `[..finalized_count]`
-    /// (a finished turn's transcript) and a live, mutable suffix `[finalized_count..]`
-    /// (the current turn). Finalized messages are frozen: streaming deltas, tool-status
-    /// flips, and `e`-expand only touch the live suffix.
+    pub(crate) messages: Vec<ChatMessage>,
+    pub(crate) message_revisions: Vec<u64>,
+    next_message_revision: u64,
+    pub(crate) transcript_render_cache: TranscriptRenderCache,
+    /// Watermark splitting finished turns from the current turn. Streaming appends target
+    /// the live suffix, but historical tool/subagent expansion can still mutate an older
+    /// message and must advance that message's render revision.
     pub finalized_count: usize,
     /// How many messages are omitted from the live transcript renderer. This is zero in the
     /// current fullscreen TUI, but remains part of the state model for older inline-viewport
@@ -480,11 +474,10 @@ pub struct AppState {
     pub flushed_count: usize,
     pub status: AppStatus,
     pub running_started_at: Option<Instant>,
-    pub scroll_offset: u16,
+    pub scroll_offset: usize,
     pub auto_scroll: bool,
-    pub total_lines: u16,
-    pub visible_height: u16,
-    pub(crate) live_line_count_cache: Option<LiveLineCountCache>,
+    pub total_lines: usize,
+    pub visible_height: usize,
     pub app_version: String,
     pub model_name: String,
     pub reasoning_effort: orca_core::config::ReasoningEffort,
@@ -526,6 +519,34 @@ pub struct AppState {
     pub tick: u64,
 }
 
+pub trait ScrollAmount {
+    fn as_usize(self) -> usize;
+}
+
+impl ScrollAmount for usize {
+    fn as_usize(self) -> usize {
+        self
+    }
+}
+
+impl ScrollAmount for u16 {
+    fn as_usize(self) -> usize {
+        self as usize
+    }
+}
+
+impl ScrollAmount for u32 {
+    fn as_usize(self) -> usize {
+        self as usize
+    }
+}
+
+impl ScrollAmount for i32 {
+    fn as_usize(self) -> usize {
+        self.max(0) as usize
+    }
+}
+
 impl AppState {
     pub fn new(
         event_tx: mpsc::Sender<UserAction>,
@@ -535,6 +556,9 @@ impl AppState {
     ) -> Self {
         Self {
             messages: Vec::new(),
+            message_revisions: Vec::new(),
+            next_message_revision: 1,
+            transcript_render_cache: TranscriptRenderCache::default(),
             finalized_count: 0,
             flushed_count: 0,
             status: AppStatus::Idle,
@@ -543,7 +567,6 @@ impl AppState {
             auto_scroll: true,
             total_lines: 0,
             visible_height: 0,
-            live_line_count_cache: None,
             app_version,
             model_name,
             reasoning_effort: orca_core::config::ReasoningEffort::default(),
@@ -581,6 +604,125 @@ impl AppState {
         }
     }
 
+    fn allocate_message_revision(&mut self) -> u64 {
+        let revision = self.next_message_revision;
+        self.next_message_revision = self.next_message_revision.wrapping_add(1).max(1);
+        revision
+    }
+
+    pub(crate) fn reconcile_message_tracking(&mut self) {
+        if self.message_revisions.len() > self.messages.len() {
+            self.message_revisions.truncate(self.messages.len());
+            self.transcript_render_cache.truncate(self.messages.len());
+        }
+        while self.message_revisions.len() < self.messages.len() {
+            let revision = self.allocate_message_revision();
+            self.message_revisions.push(revision);
+        }
+        self.transcript_render_cache
+            .reconcile_len(self.messages.len());
+    }
+
+    fn reset_message_tracking(&mut self) {
+        self.message_revisions.clear();
+        self.transcript_render_cache.clear();
+        while self.message_revisions.len() < self.messages.len() {
+            let revision = self.allocate_message_revision();
+            self.message_revisions.push(revision);
+        }
+        self.transcript_render_cache
+            .reconcile_len(self.messages.len());
+    }
+
+    pub(crate) fn push_message(&mut self, message: ChatMessage) {
+        self.reconcile_message_tracking();
+        let revision = self.allocate_message_revision();
+        self.messages.push(message);
+        self.message_revisions.push(revision);
+        self.transcript_render_cache
+            .reconcile_len(self.messages.len());
+    }
+
+    pub(crate) fn replace_messages(&mut self, messages: impl IntoIterator<Item = ChatMessage>) {
+        self.messages = messages.into_iter().collect();
+        self.reset_message_tracking();
+        self.finalized_count = 0;
+        self.flushed_count = 0;
+    }
+
+    pub(crate) fn clear_messages(&mut self) {
+        self.messages.clear();
+        self.message_revisions.clear();
+        self.transcript_render_cache.clear();
+        self.finalized_count = 0;
+        self.flushed_count = 0;
+    }
+
+    pub(crate) fn truncate_messages(&mut self, len: usize) {
+        self.reconcile_message_tracking();
+        self.messages.truncate(len);
+        self.message_revisions.truncate(len);
+        self.transcript_render_cache.truncate(len);
+        self.finalized_count = self.finalized_count.min(len);
+        self.flushed_count = self.flushed_count.min(len);
+    }
+
+    pub(crate) fn replace_message(&mut self, index: usize, message: ChatMessage) -> bool {
+        self.reconcile_message_tracking();
+        if index >= self.messages.len() {
+            return false;
+        }
+        self.messages[index] = message;
+        self.touch_message(index);
+        true
+    }
+
+    pub(crate) fn mutate_message<R>(
+        &mut self,
+        index: usize,
+        mutate: impl FnOnce(&mut ChatMessage) -> R,
+    ) -> Option<R> {
+        self.reconcile_message_tracking();
+        let result = mutate(self.messages.get_mut(index)?);
+        self.touch_message(index);
+        Some(result)
+    }
+
+    pub(crate) fn touch_message(&mut self, index: usize) -> bool {
+        self.reconcile_message_tracking();
+        if index >= self.message_revisions.len() {
+            return false;
+        }
+        let revision = self.allocate_message_revision();
+        self.message_revisions[index] = revision;
+        self.transcript_render_cache.invalidate(index);
+        true
+    }
+
+    pub(crate) fn retain_messages(&mut self, mut keep: impl FnMut(&ChatMessage) -> bool) {
+        self.reconcile_message_tracking();
+        let messages = std::mem::take(&mut self.messages);
+        let revisions = std::mem::take(&mut self.message_revisions);
+        let finalized_count = self.finalized_count.min(messages.len());
+        let flushed_count = self.flushed_count.min(messages.len());
+        let mut retained_finalized = 0;
+        let mut retained_flushed = 0;
+        let mut retained_mask = Vec::with_capacity(messages.len());
+        for (index, (message, revision)) in messages.into_iter().zip(revisions).enumerate() {
+            let retain = keep(&message);
+            retained_mask.push(retain);
+            if retain {
+                retained_finalized += usize::from(index < finalized_count);
+                retained_flushed += usize::from(index < flushed_count);
+                self.messages.push(message);
+                self.message_revisions.push(revision);
+            }
+        }
+        self.transcript_render_cache.retain(&retained_mask);
+        self.finalized_count = retained_finalized;
+        self.flushed_count = retained_flushed;
+    }
+
     pub fn enter_running(&mut self) {
         if self.running_started_at.is_none() {
             self.running_started_at = Some(Instant::now());
@@ -602,12 +744,8 @@ impl AppState {
         }
     }
 
-    pub fn scroll_up(&mut self, lines: u16) {
-        // With everything already on screen there is nothing to scroll: a wheel tick
-        // here (trackpad inertia, an accidental touch) must not silently unpin
-        // auto-follow — the view wouldn't move, so the user gets no feedback that
-        // follow was disarmed, and the transcript then stops tracking new content
-        // the moment it grows past one screen.
+    pub fn scroll_up(&mut self, lines: impl ScrollAmount) {
+        let lines = lines.as_usize();
         // With everything already on screen there is nothing to scroll: a wheel tick
         // here (trackpad inertia, an accidental touch) must not silently unpin
         // auto-follow — the view wouldn't move, so the user gets no feedback that
@@ -620,9 +758,10 @@ impl AppState {
         self.auto_scroll = false;
     }
 
-    pub fn scroll_down(&mut self, lines: u16) {
+    pub fn scroll_down(&mut self, lines: impl ScrollAmount) {
+        let lines = lines.as_usize();
         let max_scroll = self.total_lines.saturating_sub(self.visible_height);
-        self.scroll_offset = (self.scroll_offset + lines).min(max_scroll);
+        self.scroll_offset = self.scroll_offset.saturating_add(lines).min(max_scroll);
         if self.scroll_offset >= max_scroll {
             self.auto_scroll = true;
         }
@@ -733,16 +872,21 @@ impl AppState {
         // has been committed to the terminal's immutable scrollback (in fully-expanded
         // form), so `e` can only toggle a live tool/subagent message.
         let live_start = self.flushed_count.min(self.messages.len());
-        for message in self.messages[live_start..].iter_mut().rev() {
-            match message {
-                ChatMessage::ToolCall { expanded, .. } | ChatMessage::Subagent { expanded, .. } => {
-                    *expanded = !*expanded;
-                    return true;
-                }
-                _ => {}
+        let Some(index) = self.messages[live_start..].iter().rposition(|message| {
+            matches!(
+                message,
+                ChatMessage::ToolCall { .. } | ChatMessage::Subagent { .. }
+            )
+        }) else {
+            return false;
+        };
+        self.mutate_message(live_start + index, |message| match message {
+            ChatMessage::ToolCall { expanded, .. } | ChatMessage::Subagent { expanded, .. } => {
+                *expanded = !*expanded;
             }
-        }
-        false
+            _ => unreachable!(),
+        });
+        true
     }
 
     pub fn record_prompt(&mut self, prompt: String) {
@@ -895,10 +1039,16 @@ impl AppState {
                 if self.suppress_background_main_session_output {
                     return;
                 }
-                if let Some(ChatMessage::Reasoning(existing)) = self.messages.last_mut() {
-                    existing.push_str(&text);
+                let last = self.messages.len().saturating_sub(1);
+                if matches!(self.messages.last(), Some(ChatMessage::Reasoning(_))) {
+                    self.mutate_message(last, |message| {
+                        let ChatMessage::Reasoning(existing) = message else {
+                            unreachable!();
+                        };
+                        existing.push_str(&text);
+                    });
                 } else {
-                    self.messages.push(ChatMessage::Reasoning(text));
+                    self.push_message(ChatMessage::Reasoning(text));
                 }
             }
             TuiEvent::MessageDelta(text) => {
@@ -914,20 +1064,26 @@ impl AppState {
                 if name == "subagent" || name == "update_plan" {
                     return;
                 }
-                if let Some(ChatMessage::ToolCall {
-                    name: existing_name,
-                    target: existing_target,
-                    status,
-                    ..
-                }) = self.messages.iter_mut().rev().find(|message| {
+                if let Some(index) = self.messages.iter().rposition(|message| {
                     matches!(message, ChatMessage::ToolCall { id: existing_id, status, .. } if existing_id == &id && status == "receiving")
                 }) {
-                    *existing_name = name;
-                    *existing_target = target;
-                    *status = "running".to_string();
+                    self.mutate_message(index, |message| {
+                        let ChatMessage::ToolCall {
+                            name: existing_name,
+                            target: existing_target,
+                            status,
+                            ..
+                        } = message
+                        else {
+                            unreachable!();
+                        };
+                        *existing_name = name;
+                        *existing_target = target;
+                        *status = "running".to_string();
+                    });
                     return;
                 }
-                self.messages.push(ChatMessage::ToolCall {
+                self.push_message(ChatMessage::ToolCall {
                     id,
                     name,
                     target,
@@ -956,21 +1112,27 @@ impl AppState {
                     "receiving arguments... {}",
                     format_argument_bytes(arguments_bytes)
                 ));
-                if let Some(ChatMessage::ToolCall {
-                    name: existing_name,
-                    status,
-                    output,
-                    ..
-                }) = self.messages.iter_mut().rev().find(|message| {
+                if let Some(index) = self.messages.iter().rposition(|message| {
                     matches!(message, ChatMessage::ToolCall { id: existing_id, status, .. } if existing_id == &id && status == "receiving")
                 }) {
-                    if let Some(name) = name {
-                        *existing_name = name;
-                    }
-                    *status = "receiving".to_string();
-                    *output = progress_output;
+                    self.mutate_message(index, |message| {
+                        let ChatMessage::ToolCall {
+                            name: existing_name,
+                            status,
+                            output,
+                            ..
+                        } = message
+                        else {
+                            unreachable!();
+                        };
+                        if let Some(name) = name {
+                            *existing_name = name;
+                        }
+                        *status = "receiving".to_string();
+                        *output = progress_output;
+                    });
                 } else {
-                    self.messages.push(ChatMessage::ToolCall {
+                    self.push_message(ChatMessage::ToolCall {
                         id,
                         name: name.unwrap_or_else(|| "tool".to_string()),
                         target: None,
@@ -986,12 +1148,15 @@ impl AppState {
                 if self.suppress_background_main_session_output {
                     return;
                 }
-                if let Some(ChatMessage::ToolCall { output, .. }) =
-                    self.messages.iter_mut().rev().find(|message| {
-                        matches!(message, ChatMessage::ToolCall { id: existing_id, .. } if existing_id == &id)
-                    })
-                {
-                    output.get_or_insert_with(String::new).push_str(&chunk);
+                if let Some(index) = self.messages.iter().rposition(|message| {
+                    matches!(message, ChatMessage::ToolCall { id: existing_id, .. } if existing_id == &id)
+                }) {
+                    self.mutate_message(index, |message| {
+                        let ChatMessage::ToolCall { output, .. } = message else {
+                            unreachable!();
+                        };
+                        output.get_or_insert_with(String::new).push_str(&chunk);
+                    });
                 }
             }
             TuiEvent::ToolCompleted {
@@ -1017,36 +1182,42 @@ impl AppState {
                 if name == "subagent" {
                     return;
                 }
-                let updated = if let Some(ChatMessage::ToolCall {
-                    id: existing_id,
-                    name: existing_name,
-                    status: s,
-                    output: o,
-                    diff: d,
-                    kind: k,
-                    ..
-                }) = self.messages.iter_mut().rev().find(|message| {
+                let updated = if let Some(index) = self.messages.iter().rposition(|message| {
                     matches!(message, ChatMessage::ToolCall { id: existing_id, .. } if existing_id == &id)
                 })
                 {
-                    *existing_id = id.clone();
-                    *existing_name = name.clone();
-                    *s = status.clone();
-                    if o.is_none() || output.is_empty() {
-                        *o = if output.is_empty() {
-                            None
-                        } else {
-                            Some(output.clone())
+                    self.mutate_message(index, |message| {
+                        let ChatMessage::ToolCall {
+                            id: existing_id,
+                            name: existing_name,
+                            status: existing_status,
+                            output: existing_output,
+                            diff: existing_diff,
+                            kind: existing_kind,
+                            ..
+                        } = message
+                        else {
+                            unreachable!();
                         };
-                    }
-                    *d = diff.clone();
-                    *k = kind.clone();
+                        *existing_id = id.clone();
+                        *existing_name = name.clone();
+                        *existing_status = status.clone();
+                        if existing_output.is_none() || output.is_empty() {
+                            *existing_output = if output.is_empty() {
+                                None
+                            } else {
+                                Some(output.clone())
+                            };
+                        }
+                        *existing_diff = diff.clone();
+                        *existing_kind = kind.clone();
+                    });
                     true
                 } else {
                     false
                 };
                 if !updated {
-                    self.messages.push(ChatMessage::ToolCall {
+                    self.push_message(ChatMessage::ToolCall {
                         id,
                         name,
                         target: None,
@@ -1080,7 +1251,7 @@ impl AppState {
                 if self.suppress_background_main_session_output {
                     return;
                 }
-                self.messages.push(ChatMessage::Subagent {
+                self.push_message(ChatMessage::Subagent {
                     id,
                     description,
                     status: "running".to_string(),
@@ -1103,27 +1274,27 @@ impl AppState {
                 if self.suppress_background_main_session_output {
                     return;
                 }
-                let updated = self.messages.iter_mut().rev().find_map(|msg| {
-                    if let ChatMessage::Subagent {
-                        id: existing_id,
-                        status: existing_status,
-                        output: existing_output,
-                        error: existing_error,
-                        ..
-                    } = msg
-                    {
-                        if existing_id == &id {
-                            *existing_status = status.clone();
-                            *existing_output = output.clone();
-                            *existing_error = error.clone();
-                            return Some(());
-                        }
-                    }
-                    None
+                let updated = self.messages.iter().rposition(|message| {
+                    matches!(message, ChatMessage::Subagent { id: existing_id, .. } if existing_id == &id)
                 });
 
-                if updated.is_none() {
-                    self.messages.push(ChatMessage::Subagent {
+                if let Some(index) = updated {
+                    self.mutate_message(index, |message| {
+                        let ChatMessage::Subagent {
+                            status: existing_status,
+                            output: existing_output,
+                            error: existing_error,
+                            ..
+                        } = message
+                        else {
+                            unreachable!();
+                        };
+                        *existing_status = status;
+                        *existing_output = output;
+                        *existing_error = error;
+                    });
+                } else {
+                    self.push_message(ChatMessage::Subagent {
                         id,
                         description,
                         status,
@@ -1146,23 +1317,29 @@ impl AppState {
                 if self.suppress_background_main_session_output {
                     return;
                 }
-                if let Some(ChatMessage::Subagent {
-                    activity: existing_activity,
-                    activity_tail,
-                    turn: existing_turn,
-                    usage: existing_usage,
-                    ..
-                }) = self.messages.iter_mut().rev().find(|message| {
+                if let Some(index) = self.messages.iter().rposition(|message| {
                     matches!(message, ChatMessage::Subagent { id: existing_id, .. } if existing_id == &id)
                 }) {
-                    push_subagent_activity_tail(activity_tail, &activity);
-                    *existing_activity = Some(activity);
-                    if turn.is_some() {
-                        *existing_turn = turn;
-                    }
-                    if usage.is_some() {
-                        *existing_usage = usage;
-                    }
+                    self.mutate_message(index, |message| {
+                        let ChatMessage::Subagent {
+                            activity: existing_activity,
+                            activity_tail,
+                            turn: existing_turn,
+                            usage: existing_usage,
+                            ..
+                        } = message
+                        else {
+                            unreachable!();
+                        };
+                        push_subagent_activity_tail(activity_tail, &activity);
+                        *existing_activity = Some(activity);
+                        if turn.is_some() {
+                            *existing_turn = turn;
+                        }
+                        if usage.is_some() {
+                            *existing_usage = usage;
+                        }
+                    });
                 }
             }
             TuiEvent::WorkflowTasksUpdated { tasks } => self.apply_workflow_tasks_update(tasks),
@@ -1184,8 +1361,7 @@ impl AppState {
                 if self
                     .push_pending_workflow_notification(PendingWorkflowNotification { id, prompt })
                 {
-                    self.messages
-                        .push(ChatMessage::System(format!("Workflow {status}. {summary}")));
+                    self.push_message(ChatMessage::System(format!("Workflow {status}. {summary}")));
                 }
             }
             TuiEvent::ApprovalNeeded {
@@ -1239,7 +1415,7 @@ impl AppState {
                     message.push_str("\nChoices: ");
                     message.push_str(&choices.join(", "));
                 }
-                self.messages.push(ChatMessage::System(message));
+                self.push_message(ChatMessage::System(message));
             }
             TuiEvent::McpElicitationRequested {
                 id,
@@ -1266,14 +1442,14 @@ impl AppState {
                         }
                     }
                 }
-                self.messages.push(ChatMessage::System(lines.join("\n")));
+                self.push_message(ChatMessage::System(lines.join("\n")));
             }
             TuiEvent::Error(msg) => {
                 self.clear_receiving_tool_progress();
-                self.messages.push(ChatMessage::Error(msg));
+                self.push_message(ChatMessage::Error(msg));
             }
             TuiEvent::Notice(msg) => {
-                self.messages.push(ChatMessage::System(msg));
+                self.push_message(ChatMessage::System(msg));
             }
             TuiEvent::UsageUpdated(usage) => {
                 self.usage = usage;
@@ -1296,7 +1472,7 @@ impl AppState {
                 self.promote_trailing_reasoning();
                 self.archive_current_plan();
                 if was_backgrounded {
-                    self.messages.push(ChatMessage::System(format!(
+                    self.push_message(ChatMessage::System(format!(
                         "Background session completed: {status}"
                     )));
                 }
@@ -1313,15 +1489,14 @@ impl AppState {
                 collapsed_messages,
                 status_text,
             } => {
-                self.messages
-                    .push(ChatMessage::System(format_compaction_notice(
-                        &reason,
-                        &strategy,
-                        before_messages,
-                        after_messages,
-                        collapsed_messages,
-                        &status_text,
-                    )));
+                self.push_message(ChatMessage::System(format_compaction_notice(
+                    &reason,
+                    &strategy,
+                    before_messages,
+                    after_messages,
+                    collapsed_messages,
+                    &status_text,
+                )));
                 self.set_status(AppStatus::Idle);
             }
             TuiEvent::GoalUpdated(goal) => {
@@ -1330,16 +1505,14 @@ impl AppState {
                 let should_keep_running =
                     self.status == AppStatus::Running && goal.status.should_continue();
                 self.current_goal = Some(goal);
-                self.messages
-                    .push(ChatMessage::System(format!("Goal {label}. {summary}")));
+                self.push_message(ChatMessage::System(format!("Goal {label}. {summary}")));
                 if !should_keep_running {
                     self.set_status(AppStatus::Idle);
                 }
             }
             TuiEvent::GoalCleared => {
                 self.current_goal = None;
-                self.messages
-                    .push(ChatMessage::System("Goal cleared.".to_string()));
+                self.push_message(ChatMessage::System("Goal cleared.".to_string()));
                 self.set_status(AppStatus::Idle);
             }
             TuiEvent::GoalStatus(goal) => {
@@ -1351,12 +1524,10 @@ impl AppState {
                             self.status == AppStatus::Running && goal.status.should_continue();
                         let label = orca_core::goal_types::goal_status_label(goal.status);
                         let summary = orca_core::goal_types::goal_usage_summary(&goal);
-                        self.messages
-                            .push(ChatMessage::System(format!("Goal {label}. {summary}")));
+                        self.push_message(ChatMessage::System(format!("Goal {label}. {summary}")));
                     }
                     None => self
-                        .messages
-                        .push(ChatMessage::System("No goal is currently set.".to_string())),
+                        .push_message(ChatMessage::System("No goal is currently set.".to_string())),
                 }
                 if !should_keep_running {
                     self.set_status(AppStatus::Idle);
@@ -1364,7 +1535,7 @@ impl AppState {
             }
             TuiEvent::Backtracked { prompt } => {
                 self.remove_after_last_user();
-                self.messages.push(ChatMessage::System(format!(
+                self.push_message(ChatMessage::System(format!(
                     "Backtracked to previous prompt: {}",
                     prompt.trim()
                 )));
@@ -1374,10 +1545,10 @@ impl AppState {
     }
 
     fn promote_trailing_reasoning(&mut self) {
-        if let Some(ChatMessage::Reasoning(text)) = self.messages.last() {
+        let index = self.messages.len().saturating_sub(1);
+        if let Some(ChatMessage::Reasoning(text)) = self.messages.get(index) {
             let text = text.clone();
-            self.messages.pop();
-            self.messages.push(ChatMessage::Assistant(text));
+            self.replace_message(index, ChatMessage::Assistant(text));
         }
     }
 
@@ -1404,10 +1575,16 @@ impl AppState {
         if text.is_empty() {
             return;
         }
-        if let Some(ChatMessage::Assistant(existing)) = self.messages.last_mut() {
-            existing.push_str(&text);
+        let last = self.messages.len().saturating_sub(1);
+        if matches!(self.messages.last(), Some(ChatMessage::Assistant(_))) {
+            self.mutate_message(last, |message| {
+                let ChatMessage::Assistant(existing) = message else {
+                    unreachable!();
+                };
+                existing.push_str(&text);
+            });
         } else {
-            self.messages.push(ChatMessage::Assistant(text));
+            self.push_message(ChatMessage::Assistant(text));
         }
     }
 
@@ -1415,10 +1592,16 @@ impl AppState {
         if text.is_empty() {
             return;
         }
-        if let Some(ChatMessage::ProposedPlan(existing)) = self.messages.last_mut() {
-            existing.push_str(&text);
+        let last = self.messages.len().saturating_sub(1);
+        if matches!(self.messages.last(), Some(ChatMessage::ProposedPlan(_))) {
+            self.mutate_message(last, |message| {
+                let ChatMessage::ProposedPlan(existing) = message else {
+                    unreachable!();
+                };
+                existing.push_str(&text);
+            });
         } else {
-            self.messages.push(ChatMessage::ProposedPlan(text));
+            self.push_message(ChatMessage::ProposedPlan(text));
         }
     }
 
@@ -1429,8 +1612,7 @@ impl AppState {
         if let Some((explanation, plan)) = self.current_plan.take()
             && !plan.is_empty()
         {
-            self.messages
-                .push(ChatMessage::PlanUpdate { explanation, plan });
+            self.push_message(ChatMessage::PlanUpdate { explanation, plan });
         }
     }
 
@@ -1442,22 +1624,22 @@ impl AppState {
     }
 
     fn clear_receiving_tool_progress(&mut self) {
+        let original_finalized_count = self.finalized_count;
+        let has_receiving_progress = self.messages[original_finalized_count.min(self.messages.len())..]
+            .iter()
+            .any(|message| {
+                matches!(message, ChatMessage::ToolCall { status, .. } if status == "receiving")
+            });
+        if !has_receiving_progress {
+            return;
+        }
         let mut index = 0;
-        let mut removed_before_flushed = 0;
-        self.messages.retain(|message| {
-            let remove = index >= self.finalized_count
+        self.retain_messages(|message| {
+            let remove = index >= original_finalized_count
                 && matches!(message, ChatMessage::ToolCall { status, .. } if status == "receiving");
-            if remove && index < self.flushed_count {
-                removed_before_flushed += 1;
-            }
             index += 1;
             !remove
         });
-        self.finalized_count = self.finalized_count.min(self.messages.len());
-        self.flushed_count = self
-            .flushed_count
-            .saturating_sub(removed_before_flushed)
-            .min(self.messages.len());
     }
 
     fn apply_workflow_tasks_update(&mut self, tasks: Vec<BackgroundTaskSummary>) {
@@ -1570,88 +1752,13 @@ impl AppState {
         end
     }
 
-    pub(crate) fn live_message_signature(&self) -> (usize, usize, u64) {
-        let live_start = self.flushed_count.min(self.messages.len());
-        let live = &self.messages[live_start..];
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        for message in live {
-            message.hash_for_layout(&mut hasher);
-        }
-        (live_start, live.len(), hasher.finish())
-    }
-
     pub fn remove_after_last_user(&mut self) {
         if let Some(index) = self
             .messages
             .iter()
             .rposition(|message| matches!(message, ChatMessage::User(_)))
         {
-            self.messages.truncate(index);
-            self.finalized_count = self.finalized_count.min(self.messages.len());
-            self.flushed_count = self.flushed_count.min(self.messages.len());
-        }
-    }
-}
-
-impl ChatMessage {
-    fn hash_for_layout<H: Hasher>(&self, state: &mut H) {
-        std::mem::discriminant(self).hash(state);
-        match self {
-            ChatMessage::User(text)
-            | ChatMessage::Reasoning(text)
-            | ChatMessage::Assistant(text)
-            | ChatMessage::ProposedPlan(text)
-            | ChatMessage::Error(text)
-            | ChatMessage::System(text) => text.hash(state),
-            ChatMessage::ToolCall {
-                id,
-                name,
-                target,
-                status,
-                output,
-                diff,
-                kind,
-                expanded,
-            } => {
-                id.hash(state);
-                name.hash(state);
-                target.hash(state);
-                status.hash(state);
-                output.hash(state);
-                diff.hash(state);
-                kind.hash(state);
-                expanded.hash(state);
-            }
-            ChatMessage::PlanUpdate { explanation, plan } => {
-                explanation.hash(state);
-                for item in plan {
-                    item.step.hash(state);
-                    std::mem::discriminant(&item.status).hash(state);
-                }
-            }
-            ChatMessage::Subagent {
-                id,
-                description,
-                status,
-                output,
-                error,
-                activity,
-                activity_tail,
-                turn,
-                usage,
-                expanded,
-            } => {
-                id.hash(state);
-                description.hash(state);
-                status.hash(state);
-                output.hash(state);
-                error.hash(state);
-                activity.hash(state);
-                activity_tail.hash(state);
-                turn.hash(state);
-                usage.map(|usage| usage.total_tokens()).hash(state);
-                expanded.hash(state);
-            }
+            self.truncate_messages(index);
         }
     }
 }
@@ -1895,6 +2002,50 @@ mod tests {
         state.session_query_pop();
         assert_eq!(state.session_picker_query, "aut");
         assert_eq!(state.filtered_session_indices(), vec![0, 1]);
+    }
+
+    #[test]
+    fn replacing_messages_resets_tracking_after_same_length_replacement() {
+        let mut state = state();
+        state.push_message(ChatMessage::Assistant("old session".to_string()));
+        let old_revision = state.message_revisions[0];
+
+        state.replace_messages([ChatMessage::Assistant("new session".to_string())]);
+
+        assert_ne!(state.message_revisions[0], old_revision);
+        assert_eq!(state.transcript_render_cache.len(), state.messages.len());
+    }
+
+    #[test]
+    fn retaining_messages_rebases_watermarks_and_cache_entries() {
+        let mut state = state();
+        state.push_message(ChatMessage::User("keep before".to_string()));
+        state.push_message(ChatMessage::System("remove before".to_string()));
+        state.push_message(ChatMessage::Assistant("keep after".to_string()));
+        state.finalized_count = 3;
+        state.flushed_count = 2;
+        let theme = crate::theme::Theme::named(orca_core::config::ThemeName::Dark);
+        state.transcript_render_cache.prepare(
+            &state.messages,
+            &state.message_revisions,
+            40,
+            &theme,
+            0,
+            false,
+            |message, _, _, _, _| vec![ratatui::text::Line::from(format!("{message:?}"))],
+        );
+        assert_eq!(state.transcript_render_cache.populated_len(), 3);
+
+        state.retain_messages(
+            |message| !matches!(message, ChatMessage::System(text) if text == "remove before"),
+        );
+
+        assert_eq!(state.messages.len(), 2);
+        assert_eq!(state.message_revisions.len(), 2);
+        assert_eq!(state.finalized_count, 2);
+        assert_eq!(state.flushed_count, 1);
+        assert_eq!(state.transcript_render_cache.len(), 2);
+        assert_eq!(state.transcript_render_cache.populated_len(), 2);
     }
 
     #[test]
@@ -2414,6 +2565,32 @@ mod tests {
     }
 
     #[test]
+    fn session_completion_without_receiving_tools_preserves_populated_render_cache() {
+        let mut state = state();
+        state.push_message(ChatMessage::Assistant("stable markdown".to_string()));
+        let theme = crate::theme::Theme::named(orca_core::config::ThemeName::Dark);
+        state.transcript_render_cache.prepare(
+            &state.messages,
+            &state.message_revisions,
+            40,
+            &theme,
+            0,
+            false,
+            |message, _, _, _, _| match message {
+                ChatMessage::Assistant(text) => vec![ratatui::text::Line::from(text.clone())],
+                _ => unreachable!(),
+            },
+        );
+        assert_eq!(state.transcript_render_cache.populated_len(), 1);
+
+        state.update(TuiEvent::SessionCompleted {
+            status: "success".to_string(),
+        });
+
+        assert_eq!(state.transcript_render_cache.populated_len(), 1);
+    }
+
+    #[test]
     fn expand_toggle_only_affects_live_tools_not_flushed_ones() {
         let mut state = state();
 
@@ -2644,6 +2821,34 @@ mod tests {
             "wheel-up on an overflowing transcript should still let the user break away"
         );
         assert_eq!(state.scroll_offset, 73);
+    }
+
+    #[test]
+    fn scroll_navigation_preserves_offsets_above_u16_max() {
+        let mut state = state();
+        state.total_lines = 100_000;
+        state.visible_height = 20;
+        state.scroll_offset = 70_000;
+        state.auto_scroll = false;
+
+        state.scroll_down(5_000usize);
+        assert_eq!(state.scroll_offset, 75_000);
+        state.scroll_up(10_000usize);
+        assert_eq!(state.scroll_offset, 65_000);
+    }
+
+    #[test]
+    fn scroll_down_saturates_when_total_height_reaches_usize_max() {
+        let mut state = state();
+        state.total_lines = usize::MAX;
+        state.visible_height = 0;
+        state.scroll_offset = usize::MAX - 1;
+        state.auto_scroll = false;
+
+        state.scroll_down(10usize);
+
+        assert_eq!(state.scroll_offset, usize::MAX);
+        assert!(state.auto_scroll);
     }
 
     #[test]

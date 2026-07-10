@@ -44,7 +44,7 @@ pub(crate) fn handle_idle_submit(
         }
     } else {
         state.record_prompt(text.clone());
-        state.messages.push(ChatMessage::User(text.clone()));
+        state.push_message(ChatMessage::User(text.clone()));
         state.enter_running();
         state.scroll_to_bottom();
         let _ = action_tx.send(UserAction::Submit(text));

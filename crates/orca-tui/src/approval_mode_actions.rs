@@ -15,7 +15,7 @@ pub(crate) fn cycle_approval_mode(
         cfg.approval_mode = next;
     }
     state.approval_mode = next;
-    state.messages.push(ChatMessage::System(format!(
+    state.push_message(ChatMessage::System(format!(
         "Approval mode switched to {}.",
         next.as_str()
     )));

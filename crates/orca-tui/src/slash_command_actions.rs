@@ -34,22 +34,20 @@ pub(crate) fn handle_slash_command(
                     cfg.model = ModelSelection::from_unchecked(Some(model.clone()));
                 }
                 state.model_name = model.clone();
-                state
-                    .messages
-                    .push(ChatMessage::System(format!("Model switched to {model}.")));
+                state.push_message(ChatMessage::System(format!("Model switched to {model}.")));
                 let _ = action_tx.send(UserAction::SetModel(model));
             }
-            Err(error) => state.messages.push(ChatMessage::Error(error)),
+            Err(error) => state.push_message(ChatMessage::Error(error)),
         },
         SlashCommand::Model(None) => {
-            state.messages.push(ChatMessage::System(format!(
+            state.push_message(ChatMessage::System(format!(
                 "Current model: {} (reasoning effort: {}). Use the /model menu to change both.",
                 state.model_name,
                 state.reasoning_effort.as_str()
             )));
         }
         SlashCommand::Cost => {
-            state.messages.push(ChatMessage::System(format!(
+            state.push_message(ChatMessage::System(format!(
                 "Session usage: {} input, {} output, {} cache tokens, estimated ${:.6}.",
                 state.usage.input_tokens,
                 state.usage.output_tokens,
@@ -58,11 +56,9 @@ pub(crate) fn handle_slash_command(
             )));
         }
         SlashCommand::ConfigShow => {
-            state
-                .messages
-                .push(ChatMessage::System(orca_core::config::format_config_show(
-                    config,
-                )));
+            state.push_message(ChatMessage::System(orca_core::config::format_config_show(
+                config,
+            )));
         }
         SlashCommand::Mode(Some(mode)) => match parse_approval_mode(&mode) {
             Some(approval_mode) => {
@@ -71,16 +67,16 @@ pub(crate) fn handle_slash_command(
                     cfg.approval_mode = approval_mode;
                 }
                 state.approval_mode = approval_mode;
-                state.messages.push(ChatMessage::System(format!(
+                state.push_message(ChatMessage::System(format!(
                     "Approval mode switched to {mode}."
                 )));
             }
-            None => state.messages.push(ChatMessage::Error(
+            None => state.push_message(ChatMessage::Error(
                 "unsupported mode. Use suggest, auto-edit, full-auto, or plan.".to_string(),
             )),
         },
         SlashCommand::Mode(None) => {
-            state.messages.push(ChatMessage::System(format!(
+            state.push_message(ChatMessage::System(format!(
                 "Current mode: {}",
                 config.approval_mode.as_str()
             )));
@@ -92,9 +88,7 @@ pub(crate) fn handle_slash_command(
                     cfg.approval_mode = ApprovalMode::Suggest;
                 }
                 state.approval_mode = ApprovalMode::Suggest;
-                state
-                    .messages
-                    .push(ChatMessage::System("Plan mode disabled.".to_string()));
+                state.push_message(ChatMessage::System("Plan mode disabled.".to_string()));
             }
             None => {
                 config.approval_mode = ApprovalMode::Plan;
@@ -102,11 +96,9 @@ pub(crate) fn handle_slash_command(
                     cfg.approval_mode = ApprovalMode::Plan;
                 }
                 state.approval_mode = ApprovalMode::Plan;
-                state
-                    .messages
-                    .push(ChatMessage::System("Plan mode enabled.".to_string()));
+                state.push_message(ChatMessage::System("Plan mode enabled.".to_string()));
             }
-            Some(_) => state.messages.push(ChatMessage::Error(
+            Some(_) => state.push_message(ChatMessage::Error(
                 "unsupported plan command. Use /plan or /plan off.".to_string(),
             )),
         },
@@ -148,13 +140,13 @@ pub(crate) fn handle_slash_command(
                 orca_runtime::memory::remember_user(&note)
             };
             match &result {
-                Ok(path) => state.messages.push(ChatMessage::System(format!(
+                Ok(path) => state.push_message(ChatMessage::System(format!(
                     "Remembered in {}.",
                     path.display()
                 ))),
-                Err(error) => state
-                    .messages
-                    .push(ChatMessage::Error(format!("failed to remember: {error}"))),
+                Err(error) => {
+                    state.push_message(ChatMessage::Error(format!("failed to remember: {error}")))
+                }
             }
             if result.is_ok() {
                 let _ = action_tx.send(UserAction::Remember(remembered_note));
@@ -165,9 +157,9 @@ pub(crate) fn handle_slash_command(
             let _ = action_tx.send(UserAction::Compact);
         }
         SlashCommand::History => match history::list_sessions(10) {
-            Ok(sessions) if sessions.is_empty() => state
-                .messages
-                .push(ChatMessage::System("No saved sessions.".to_string())),
+            Ok(sessions) if sessions.is_empty() => {
+                state.push_message(ChatMessage::System("No saved sessions.".to_string()))
+            }
             Ok(sessions) => {
                 let summary = sessions
                     .into_iter()
@@ -181,11 +173,9 @@ pub(crate) fn handle_slash_command(
                     })
                     .collect::<Vec<_>>()
                     .join("\n");
-                state
-                    .messages
-                    .push(ChatMessage::System(format!("Recent sessions:\n{summary}")));
+                state.push_message(ChatMessage::System(format!("Recent sessions:\n{summary}")));
             }
-            Err(error) => state.messages.push(ChatMessage::Error(format!(
+            Err(error) => state.push_message(ChatMessage::Error(format!(
                 "failed to list history: {error}"
             ))),
         },

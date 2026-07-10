@@ -13,6 +13,7 @@ pub mod commands;
 mod composer_input_actions;
 mod composer_textarea;
 pub mod diff;
+mod frame_scheduler;
 mod global_actions;
 mod idle_key_actions;
 mod idle_navigation_actions;
@@ -33,6 +34,7 @@ mod status_key_actions;
 mod submitted_turn;
 mod terminal_lifecycle;
 pub mod theme;
+mod transcript_view;
 pub mod types;
 pub mod ui;
 pub mod vim;
@@ -966,8 +968,12 @@ mod tests {
             "app should use status_key_actions instead of routing approval dialog keys inline"
         );
         assert!(
-            !app.contains("state.status == AppStatus::Running"),
+            !app.contains("resolve_shortcut(ShortcutContext::Running"),
             "app should use status_key_actions instead of routing running keys inline"
+        );
+        assert!(
+            app.contains("handle_status_key("),
+            "app should delegate status-specific key routing"
         );
         assert!(
             !app.contains("matches!(state.status, AppStatus::Idle | AppStatus::WaitingUserInput)"),
@@ -1136,6 +1142,29 @@ mod tests {
             !app.contains("MouseEventKind::ScrollUp"),
             "app should use input_event_actions instead of matching mouse scroll inline"
         );
+    }
+
+    #[test]
+    fn production_tui_loop_uses_the_tested_iteration_coordinator() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let app = std::fs::read_to_string(format!("{manifest_dir}/src/app.rs"))
+            .expect("app source should be readable");
+
+        for marker in [
+            "FrameScheduler::new",
+            "coalesce_input_events",
+            "MAX_INPUT_EVENTS_PER_BATCH",
+            "MAX_RUNTIME_EVENTS_PER_BATCH",
+            "run_event_loop_iteration",
+            "IterationEvent::Input",
+            "IterationEvent::Runtime",
+            "iteration.draw_at",
+        ] {
+            assert!(
+                app.contains(marker),
+                "the production event loop must use {marker}"
+            );
+        }
     }
 
     #[test]
