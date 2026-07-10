@@ -197,9 +197,13 @@ enum ShellInput {
 
 impl RuntimeShellSessionManager {
     pub fn new(tasks: TaskRegistry) -> Self {
+        Self::with_output_store(tasks, TaskOutputStore::new())
+    }
+
+    pub fn with_output_store(tasks: TaskRegistry, output_store: TaskOutputStore) -> Self {
         Self {
             tasks,
-            output_store: TaskOutputStore::new(),
+            output_store,
             sessions: HashMap::new(),
         }
     }
@@ -392,6 +396,23 @@ impl RuntimeShellSessionManager {
     }
 
     pub fn read(&mut self, id: &str, timeout: Duration) -> io::Result<ShellSessionOutput> {
+        self.read_inner(id, timeout, true)
+    }
+
+    pub(crate) fn read_preserving_output(
+        &mut self,
+        id: &str,
+        timeout: Duration,
+    ) -> io::Result<ShellSessionOutput> {
+        self.read_inner(id, timeout, false)
+    }
+
+    fn read_inner(
+        &mut self,
+        id: &str,
+        timeout: Duration,
+        remove_completed_output: bool,
+    ) -> io::Result<ShellSessionOutput> {
         let deadline = Instant::now()
             .checked_add(timeout)
             .unwrap_or_else(Instant::now);
@@ -411,6 +432,9 @@ impl RuntimeShellSessionManager {
                     process_exit_code(status),
                 );
                 Self::record_terminal_output(&tasks, &output)?;
+                if remove_completed_output {
+                    self.output_store.remove(&output.task_id);
+                }
                 return Ok(output);
             }
             if session.output_size() > 0 || Instant::now() >= deadline {
@@ -418,6 +442,20 @@ impl RuntimeShellSessionManager {
             }
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    pub(crate) fn read_output_delta(
+        &self,
+        task_id: &str,
+        from_offset: usize,
+        max_bytes: usize,
+    ) -> io::Result<TaskOutputRead> {
+        self.output_store
+            .read_delta(task_id, from_offset, max_bytes)
+    }
+
+    pub(crate) fn remove_output(&self, task_id: &str) -> bool {
+        self.output_store.remove(task_id)
     }
 
     pub fn wait(&mut self, id: &str, timeout: Duration) -> io::Result<ShellSessionOutput> {
@@ -461,6 +499,7 @@ impl RuntimeShellSessionManager {
             process_exit_code(status),
         );
         Self::record_terminal_output(&tasks, &output)?;
+        self.output_store.remove(&output.task_id);
         Ok(output)
     }
 
@@ -479,6 +518,7 @@ impl RuntimeShellSessionManager {
                 process_exit_code(status),
             );
             Self::record_terminal_output(&tasks, &output)?;
+            self.output_store.remove(&output.task_id);
             return Ok(output);
         }
         orca_tools::process::kill_child_tree(&mut session.child);
@@ -488,6 +528,7 @@ impl RuntimeShellSessionManager {
         tasks
             .stop(&output.task_id, output.stdout.clone())
             .map_err(io::Error::other)?;
+        self.output_store.remove(&output.task_id);
         Ok(output)
     }
 
@@ -544,11 +585,16 @@ impl ShellSession {
                 bytes_total: self.output_size(),
                 omitted_prefix_bytes: 0,
             });
+        let (stdout, stderr) = shell_output_text_with_omitted_prefix(
+            output.stdout,
+            output.stderr,
+            output.omitted_prefix_bytes,
+        );
         ShellSessionOutput {
             id: id.to_string(),
             task_id: self.task_id.clone(),
-            stdout: output.stdout,
-            stderr: output.stderr,
+            stdout,
+            stderr,
             exit_code,
             status,
             requested_terminal: self.requested_terminal,
@@ -907,6 +953,23 @@ fn append_shell_output(
         ShellOutputStream::Stdout => output_store.append_stdout(task_id, text),
         ShellOutputStream::Stderr => output_store.append_stderr(task_id, text),
     };
+}
+
+fn shell_output_text_with_omitted_prefix(
+    mut stdout: String,
+    mut stderr: String,
+    omitted_prefix_bytes: usize,
+) -> (String, String) {
+    if omitted_prefix_bytes == 0 {
+        return (stdout, stderr);
+    }
+    let notice = format!("[{omitted_prefix_bytes} bytes of earlier output omitted]\n");
+    if stdout.is_empty() {
+        stderr = format!("{notice}{stderr}");
+    } else {
+        stdout = format!("{notice}{stdout}");
+    }
+    (stdout, stderr)
 }
 
 fn process_exit_code(status: ExitStatus) -> Option<i32> {

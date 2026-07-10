@@ -10,7 +10,7 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use serde_json::Value;
 
 use super::PendingCommandExecPermissionRequest;
-use super::{cap_text, capped_delta, capped_utf8_len};
+use super::cap_text;
 use crate::network_proxy::{RuntimeNetworkBlockReport, RuntimeNetworkProxy};
 use crate::protocol::{self, ServerEvent};
 use crate::runtime_permission::{
@@ -28,6 +28,7 @@ pub(super) struct CommandExecProcess {
     pub(super) denied_writable_roots: Vec<PathBuf>,
     pub(super) stream_output: bool,
     pub(super) output_bytes_cap: Option<usize>,
+    pub(super) output_offset: usize,
     pub(super) stdout_len: usize,
     pub(super) stderr_len: usize,
     pub(super) stdout_cap_reached: bool,
@@ -457,28 +458,37 @@ impl CommandExecManager {
                 else {
                     continue;
                 };
-                let output = match manager.read(&shell_id, Duration::from_millis(1)) {
-                    Ok(output) => output,
-                    Err(_) => continue,
-                };
+                let output =
+                    match manager.read_preserving_output(&shell_id, Duration::from_millis(1)) {
+                        Ok(output) => output,
+                        Err(_) => continue,
+                    };
                 let Some(process) = self.get(&process_id) else {
                     continue;
                 };
                 if process.stream_output {
-                    let stdout_observed_len = output.stdout.len();
-                    let stderr_observed_len = output.stderr.len();
-                    let stdout_delta =
-                        capped_delta(&output.stdout, process.stdout_len, process.output_bytes_cap);
-                    let stderr_delta =
-                        capped_delta(&output.stderr, process.stderr_len, process.output_bytes_cap);
-                    let stdout_cap_reached = process
-                        .output_bytes_cap
-                        .is_some_and(|cap| output.stdout.len() >= cap)
-                        && !process.stdout_cap_reached;
-                    let stderr_cap_reached = process
-                        .output_bytes_cap
-                        .is_some_and(|cap| output.stderr.len() >= cap)
-                        && !process.stderr_cap_reached;
+                    let output_read = manager
+                        .read_output_delta(&output.task_id, process.output_offset, usize::MAX)
+                        .unwrap_or_else(|_| crate::task_output::TaskOutputRead {
+                            stdout: String::new(),
+                            stderr: String::new(),
+                            next_offset: process.output_offset,
+                            bytes_read: 0,
+                            bytes_total: process.output_offset,
+                            omitted_prefix_bytes: 0,
+                        });
+                    let (stdout_delta, stdout_cap_reached) = capped_stream_delta(
+                        &output_read.stdout,
+                        process.stdout_len,
+                        process.output_bytes_cap,
+                        process.stdout_cap_reached,
+                    );
+                    let (stderr_delta, stderr_cap_reached) = capped_stream_delta(
+                        &output_read.stderr,
+                        process.stderr_len,
+                        process.output_bytes_cap,
+                        process.stderr_cap_reached,
+                    );
                     observed_output |= !stdout_delta.is_empty() || !stderr_delta.is_empty();
                     super::write_command_exec_output_deltas(
                         writer,
@@ -490,14 +500,9 @@ impl CommandExecManager {
                         output.status != orca_core::task_types::TaskStatus::Running,
                     )?;
                     if let Some(process) = self.get_mut(&process_id) {
-                        process.stdout_len = match process.output_bytes_cap {
-                            Some(cap) => capped_utf8_len(&output.stdout, cap),
-                            None => stdout_observed_len,
-                        };
-                        process.stderr_len = match process.output_bytes_cap {
-                            Some(cap) => capped_utf8_len(&output.stderr, cap),
-                            None => stderr_observed_len,
-                        };
+                        process.output_offset = output_read.next_offset;
+                        process.stdout_len = process.stdout_len.saturating_add(stdout_delta.len());
+                        process.stderr_len = process.stderr_len.saturating_add(stderr_delta.len());
                         process.stdout_cap_reached |= stdout_cap_reached;
                         process.stderr_cap_reached |= stderr_cap_reached;
                     }
@@ -513,12 +518,14 @@ impl CommandExecManager {
                         if let Some(denial) =
                             CommandExecPermissionPolicy::network_block_denial(&block)
                         {
+                            manager.remove_output(&output.task_id);
                             return Ok(CommandExecDrainOutcome::NetworkPermissionDenied {
                                 command_event_id: process.command_event_id,
                                 reason: denial.reason,
                             });
                         }
                         if let Some(request) = process.permission_request {
+                            manager.remove_output(&output.task_id);
                             return Ok(CommandExecDrainOutcome::NetworkPermissionRequired {
                                 request,
                                 block,
@@ -534,6 +541,7 @@ impl CommandExecManager {
                             &process.denied_writable_roots,
                         ) && let Some(request) = process.permission_request
                         {
+                            manager.remove_output(&output.task_id);
                             return Ok(CommandExecDrainOutcome::FileSystemPermissionRequired {
                                 request,
                                 diagnostic,
@@ -558,6 +566,7 @@ impl CommandExecManager {
                             },
                         },
                     )?;
+                    manager.remove_output(&output.task_id);
                 }
             }
             if std::time::Instant::now() >= deadline
@@ -658,15 +667,39 @@ impl CommandExecManager {
     }
 }
 
+fn capped_stream_delta(
+    delta: &str,
+    sent_len: usize,
+    cap: Option<usize>,
+    cap_already_reached: bool,
+) -> (String, bool) {
+    let Some(cap) = cap else {
+        return (delta.to_string(), false);
+    };
+    if cap_already_reached || delta.is_empty() {
+        return (String::new(), false);
+    }
+    let remaining = cap.saturating_sub(sent_len);
+    let capped = cap_text(delta, Some(remaining));
+    (capped, delta.len() >= remaining)
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
     use std::sync::mpsc;
+    use std::time::Duration;
 
-    use super::CommandExecPermissionPolicy;
+    use super::{CommandExecManager, CommandExecPermissionPolicy, CommandExecProcess};
     use crate::network_proxy::RuntimeNetworkBlockReport;
     use crate::runtime_permission::{RuntimePermissionOrigin, RuntimePermissionRequestKind};
     use crate::sandbox_denial::SandboxDenialDiagnostic;
+    use crate::shell_session::{
+        RuntimeShellSessionManager, ShellSandboxMode, ShellSessionCommand, ShellTerminalMode,
+    };
+    use crate::task_output::TaskOutputStore;
+    use crate::tasks::TaskRegistry;
+    use serde_json::Value;
 
     #[test]
     fn command_exec_permission_policy_requests_pathless_sandbox_retry() {
@@ -834,5 +867,251 @@ mod tests {
                 .expect("shell permissions")
                 .unsandboxed
         );
+    }
+
+    #[test]
+    fn streaming_delta_survives_retained_output_rebase() {
+        let cwd = tempfile::tempdir().expect("tempdir");
+        let task_registry = TaskRegistry::new("command-exec-output-rebase".to_string());
+        let output_store = TaskOutputStore::with_max_retained_bytes(5);
+        let mut shell_sessions =
+            RuntimeShellSessionManager::with_output_store(task_registry, output_store);
+        let handle = shell_sessions
+            .spawn(ShellSessionCommand {
+                command: "printf first; sleep 0.2; printf later; sleep 0.2".to_string(),
+                cwd: cwd.path().to_path_buf(),
+                additional_readable_directories: Vec::new(),
+                additional_working_directories: Vec::new(),
+                denied_working_directories: Vec::new(),
+                allowed_unix_socket_roots: Vec::new(),
+                env: std::collections::BTreeMap::new(),
+                description: "stream output across retained tail rebase".to_string(),
+                terminal: ShellTerminalMode::pipe(),
+                sandbox: ShellSandboxMode::DangerFullAccess,
+            })
+            .expect("spawn shell");
+
+        let mut manager = CommandExecManager::default();
+        manager
+            .insert(
+                "proc-rebase".to_string(),
+                CommandExecProcess {
+                    shell_id: Some(handle.id),
+                    command_event_id: Value::from("cmd-rebase"),
+                    command: vec!["sh".to_string(), "-lc".to_string()],
+                    cwd: cwd.path().to_path_buf(),
+                    denied_writable_roots: Vec::new(),
+                    stream_output: true,
+                    output_bytes_cap: None,
+                    output_offset: 0,
+                    stdout_len: 0,
+                    stderr_len: 0,
+                    stdout_cap_reached: false,
+                    stderr_cap_reached: false,
+                    network_permission_blocks: None,
+                    permission_request: None,
+                    _network_proxy: None,
+                },
+            )
+            .expect("insert command exec process");
+        let mut output = Vec::new();
+
+        manager
+            .drain_until_output_or_timeout(
+                Some(&mut shell_sessions),
+                &mut output,
+                Duration::from_secs(1),
+            )
+            .expect("drain first output");
+        let first_events = parse_test_jsonl(&output);
+        assert!(
+            first_events.iter().any(|event| {
+                event["event"] == "command_exec_output_delta"
+                    && event["stream"] == "stdout"
+                    && event["delta"] == "first"
+            }),
+            "first delta should be emitted: {first_events:?}"
+        );
+
+        output.clear();
+        manager
+            .drain_until_output_or_timeout(
+                Some(&mut shell_sessions),
+                &mut output,
+                Duration::from_secs(1),
+            )
+            .expect("drain second output");
+        let second_events = parse_test_jsonl(&output);
+        assert!(
+            second_events.iter().any(|event| {
+                event["event"] == "command_exec_output_delta"
+                    && event["stream"] == "stdout"
+                    && event["delta"] == "later"
+            }),
+            "later delta should not be lost after retained output rebases: {second_events:?}"
+        );
+    }
+
+    #[test]
+    fn streaming_delta_respects_total_stdout_cap_across_reads() {
+        let cwd = tempfile::tempdir().expect("tempdir");
+        let task_registry = TaskRegistry::new("command-exec-output-cap".to_string());
+        let mut shell_sessions = RuntimeShellSessionManager::new(task_registry);
+        let handle = shell_sessions
+            .spawn(ShellSessionCommand {
+                command: "printf ab; sleep 0.2; printf cd; sleep 0.2".to_string(),
+                cwd: cwd.path().to_path_buf(),
+                additional_readable_directories: Vec::new(),
+                additional_working_directories: Vec::new(),
+                denied_working_directories: Vec::new(),
+                allowed_unix_socket_roots: Vec::new(),
+                env: std::collections::BTreeMap::new(),
+                description: "stream output under cap".to_string(),
+                terminal: ShellTerminalMode::pipe(),
+                sandbox: ShellSandboxMode::DangerFullAccess,
+            })
+            .expect("spawn shell");
+
+        let mut manager = CommandExecManager::default();
+        manager
+            .insert(
+                "proc-cap".to_string(),
+                CommandExecProcess {
+                    shell_id: Some(handle.id),
+                    command_event_id: Value::from("cmd-cap"),
+                    command: vec!["sh".to_string(), "-lc".to_string()],
+                    cwd: cwd.path().to_path_buf(),
+                    denied_writable_roots: Vec::new(),
+                    stream_output: true,
+                    output_bytes_cap: Some(3),
+                    output_offset: 0,
+                    stdout_len: 0,
+                    stderr_len: 0,
+                    stdout_cap_reached: false,
+                    stderr_cap_reached: false,
+                    network_permission_blocks: None,
+                    permission_request: None,
+                    _network_proxy: None,
+                },
+            )
+            .expect("insert command exec process");
+        let mut output = Vec::new();
+
+        manager
+            .drain_until_output_or_timeout(
+                Some(&mut shell_sessions),
+                &mut output,
+                Duration::from_secs(1),
+            )
+            .expect("drain first output");
+        let first_events = parse_test_jsonl(&output);
+        assert!(
+            first_events.iter().any(|event| {
+                event["event"] == "command_exec_output_delta"
+                    && event["stream"] == "stdout"
+                    && event["delta"] == "ab"
+                    && event["capReached"] == false
+            }),
+            "first delta should be under cap: {first_events:?}"
+        );
+
+        output.clear();
+        manager
+            .drain_until_output_or_timeout(
+                Some(&mut shell_sessions),
+                &mut output,
+                Duration::from_secs(1),
+            )
+            .expect("drain second output");
+        let second_events = parse_test_jsonl(&output);
+        assert!(
+            second_events.iter().any(|event| {
+                event["event"] == "command_exec_output_delta"
+                    && event["stream"] == "stdout"
+                    && event["delta"] == "c"
+                    && event["capReached"] == true
+            }),
+            "second delta should stop at the total stdout cap: {second_events:?}"
+        );
+        assert!(
+            second_events.iter().all(|event| event["delta"] != "cd"),
+            "second delta must not treat the cap as per-read: {second_events:?}"
+        );
+    }
+
+    #[test]
+    fn command_exec_denial_drain_evicts_finished_process_output() {
+        let cwd = tempfile::tempdir().expect("tempdir");
+        let task_registry = TaskRegistry::new("command-exec-denial-evict".to_string());
+        let mut shell_sessions = RuntimeShellSessionManager::new(task_registry);
+        let handle = shell_sessions
+            .spawn(ShellSessionCommand {
+                command: "printf denied".to_string(),
+                cwd: cwd.path().to_path_buf(),
+                additional_readable_directories: Vec::new(),
+                additional_working_directories: Vec::new(),
+                denied_working_directories: Vec::new(),
+                allowed_unix_socket_roots: Vec::new(),
+                env: std::collections::BTreeMap::new(),
+                description: "deny after output".to_string(),
+                terminal: ShellTerminalMode::pipe(),
+                sandbox: ShellSandboxMode::DangerFullAccess,
+            })
+            .expect("spawn shell");
+
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(RuntimeNetworkBlockReport {
+                host: "blocked.orca.invalid".to_string(),
+                error: "blocked-by-denylist",
+            })
+            .expect("send network block");
+        drop(sender);
+
+        let mut manager = CommandExecManager::default();
+        manager
+            .insert(
+                "proc-denied".to_string(),
+                CommandExecProcess {
+                    shell_id: Some(handle.id.clone()),
+                    command_event_id: Value::from("cmd-denied"),
+                    command: vec!["sh".to_string(), "-lc".to_string()],
+                    cwd: cwd.path().to_path_buf(),
+                    denied_writable_roots: Vec::new(),
+                    stream_output: false,
+                    output_bytes_cap: None,
+                    output_offset: 0,
+                    stdout_len: 0,
+                    stderr_len: 0,
+                    stdout_cap_reached: false,
+                    stderr_cap_reached: false,
+                    network_permission_blocks: Some(receiver),
+                    permission_request: None,
+                    _network_proxy: None,
+                },
+            )
+            .expect("insert command exec process");
+        let mut output = Vec::new();
+
+        let outcome = manager
+            .drain_with_timeout(
+                Some(&mut shell_sessions),
+                &mut output,
+                Duration::from_secs(1),
+            )
+            .expect("drain denied process");
+
+        assert!(matches!(
+            outcome,
+            super::CommandExecDrainOutcome::NetworkPermissionDenied { .. }
+        ));
+        assert_eq!(shell_sessions.output_store().size(&handle.task_id), 0);
+    }
+
+    fn parse_test_jsonl(stdout: &[u8]) -> Vec<Value> {
+        String::from_utf8_lossy(stdout)
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("valid jsonl line"))
+            .collect()
     }
 }

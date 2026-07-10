@@ -2,9 +2,11 @@ use std::collections::HashMap;
 use std::io;
 use std::sync::{Arc, Mutex};
 
-#[derive(Clone, Debug, Default)]
+pub const DEFAULT_TASK_OUTPUT_RETAINED_BYTES: usize = 8 * 1024 * 1024;
+
+#[derive(Clone, Debug)]
 pub struct TaskOutputStore {
-    inner: Arc<Mutex<HashMap<String, TaskOutputBuffer>>>,
+    inner: Arc<Mutex<TaskOutputStoreInner>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -21,6 +23,12 @@ pub struct TaskOutputRead {
 struct TaskOutputBuffer {
     chunks: Vec<TaskOutputChunk>,
     bytes_total: usize,
+}
+
+#[derive(Debug)]
+struct TaskOutputStoreInner {
+    max_retained_bytes: usize,
+    buffers: HashMap<String, TaskOutputBuffer>,
 }
 
 #[derive(Clone, Debug)]
@@ -41,6 +49,15 @@ impl TaskOutputStore {
         Self::default()
     }
 
+    pub fn with_max_retained_bytes(max_retained_bytes: usize) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(TaskOutputStoreInner {
+                max_retained_bytes,
+                buffers: HashMap::new(),
+            })),
+        }
+    }
+
     pub fn append_stdout(&self, task_id: &str, content: &str) -> io::Result<()> {
         self.append(task_id, TaskOutputStream::Stdout, content)
     }
@@ -53,9 +70,19 @@ impl TaskOutputStore {
         self.inner
             .lock()
             .expect("task output store poisoned")
+            .buffers
             .get(task_id)
             .map(|buffer| buffer.bytes_total)
             .unwrap_or(0)
+    }
+
+    pub fn remove(&self, task_id: &str) -> bool {
+        self.inner
+            .lock()
+            .expect("task output store poisoned")
+            .buffers
+            .remove(task_id)
+            .is_some()
     }
 
     pub fn read_delta(
@@ -65,21 +92,22 @@ impl TaskOutputStore {
         max_bytes: usize,
     ) -> io::Result<TaskOutputRead> {
         let inner = self.inner.lock().expect("task output store poisoned");
-        let Some(buffer) = inner.get(task_id) else {
+        let Some(buffer) = inner.buffers.get(task_id) else {
             return Ok(TaskOutputRead::empty(from_offset));
         };
-        let end = from_offset
-            .saturating_add(max_bytes)
-            .min(buffer.bytes_total);
-        Ok(buffer.read_range(from_offset, end, 0))
+        let retained_start = buffer.retained_start();
+        let start = from_offset.max(retained_start);
+        let end = start.saturating_add(max_bytes).min(buffer.bytes_total);
+        Ok(buffer.read_range(start, end, start.saturating_sub(from_offset)))
     }
 
     pub fn tail(&self, task_id: &str, max_bytes: usize) -> io::Result<TaskOutputRead> {
         let inner = self.inner.lock().expect("task output store poisoned");
-        let Some(buffer) = inner.get(task_id) else {
+        let Some(buffer) = inner.buffers.get(task_id) else {
             return Ok(TaskOutputRead::empty(0));
         };
         let raw_start = buffer.bytes_total.saturating_sub(max_bytes);
+        let raw_start = raw_start.max(buffer.retained_start());
         let start = buffer.next_readable_offset(raw_start);
         Ok(buffer.read_range(start, buffer.bytes_total, start))
     }
@@ -89,9 +117,17 @@ impl TaskOutputStore {
             return Ok(());
         }
         let mut inner = self.inner.lock().expect("task output store poisoned");
-        let buffer = inner.entry(task_id.to_string()).or_default();
+        let max_retained_bytes = inner.max_retained_bytes;
+        let buffer = inner.buffers.entry(task_id.to_string()).or_default();
         buffer.append(stream, content);
+        buffer.trim_to_budget(max_retained_bytes);
         Ok(())
+    }
+}
+
+impl Default for TaskOutputStore {
+    fn default() -> Self {
+        Self::with_max_retained_bytes(DEFAULT_TASK_OUTPUT_RETAINED_BYTES)
     }
 }
 
@@ -128,6 +164,13 @@ impl TaskOutputBuffer {
         });
     }
 
+    fn retained_start(&self) -> usize {
+        self.chunks
+            .first()
+            .map(|chunk| chunk.start)
+            .unwrap_or(self.bytes_total)
+    }
+
     fn read_range(&self, start: usize, end: usize, omitted_prefix_bytes: usize) -> TaskOutputRead {
         let mut stdout = String::new();
         let mut stderr = String::new();
@@ -160,6 +203,29 @@ impl TaskOutputBuffer {
             bytes_read: next_offset.saturating_sub(start),
             bytes_total: self.bytes_total,
             omitted_prefix_bytes,
+        }
+    }
+
+    fn trim_to_budget(&mut self, max_retained_bytes: usize) {
+        let retained_start = self.bytes_total.saturating_sub(max_retained_bytes);
+        while let Some(chunk) = self.chunks.first_mut() {
+            let chunk_end = chunk.start + chunk.content.len();
+            if chunk_end <= retained_start {
+                self.chunks.remove(0);
+                continue;
+            }
+            if retained_start <= chunk.start {
+                break;
+            }
+
+            let local_start = utf8_ceil(&chunk.content, retained_start - chunk.start);
+            if local_start >= chunk.content.len() {
+                self.chunks.remove(0);
+                continue;
+            }
+            chunk.content = chunk.content[local_start..].to_string();
+            chunk.start += local_start;
+            break;
         }
     }
 

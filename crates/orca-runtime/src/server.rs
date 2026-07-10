@@ -824,6 +824,7 @@ fn run_command_exec<W: Write>(
                 output_bytes_cap: options
                     .output_bytes_cap
                     .and_then(|cap| usize::try_from(cap).ok()),
+                output_offset: 0,
                 stdout_len: 0,
                 stderr_len: 0,
                 stdout_cap_reached: false,
@@ -1217,16 +1218,6 @@ fn cap_text(text: &str, cap: Option<usize>) -> String {
     };
     let visible_len = capped_utf8_len(text, cap);
     text[..visible_len].to_string()
-}
-
-fn capped_delta(text: &str, sent_len: usize, cap: Option<usize>) -> String {
-    let visible_len = cap
-        .map(|cap| capped_utf8_len(text, cap))
-        .unwrap_or_else(|| text.len());
-    let sent_len = sent_len.min(visible_len);
-    text.get(sent_len..visible_len)
-        .unwrap_or_default()
-        .to_string()
 }
 
 fn capped_utf8_len(text: &str, cap: usize) -> usize {
@@ -4133,6 +4124,7 @@ enabled = true
             denied_writable_roots: Vec::new(),
             stream_output: false,
             output_bytes_cap: None,
+            output_offset: 0,
             stdout_len: 0,
             stderr_len: 0,
             stdout_cap_reached: false,
