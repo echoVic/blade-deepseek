@@ -1809,6 +1809,73 @@ mod tests {
     }
 
     #[test]
+    fn tui_resume_drops_reasoning_only_assistant_turn() {
+        let mut config = config();
+        config.history_mode = HistoryMode::Resume("latest".to_string());
+        let temp = tempfile::tempdir().expect("temp history dir");
+        let cwd = temp.path().to_path_buf();
+        config.cwd = Some(cwd.clone());
+        let transcript_path = cwd.join("reasoning-only-tui.jsonl");
+        std::fs::write(&transcript_path, "").expect("seed resumable history file");
+        let transcript = orca_runtime::history::SessionTranscript {
+            meta: orca_runtime::history::create_meta(
+                &cwd,
+                "deepseek",
+                None,
+                "resume reasoning-only history",
+            ),
+            messages: vec![
+                orca_core::conversation::Message::user("first".to_string()),
+                orca_core::conversation::Message::Assistant {
+                    content: None,
+                    reasoning_content: Some("synthetic private reasoning".to_string()),
+                    tool_calls: vec![],
+                    pinned: false,
+                },
+                orca_core::conversation::Message::user("second".to_string()),
+            ],
+            compactions: Vec::new(),
+            summaries: Vec::new(),
+            usage: None,
+            plan: None,
+            completion_status: None,
+            path: transcript_path,
+        };
+
+        let session = TuiConversationSession::new_with_preloaded(
+            &config,
+            "resume reasoning-only history",
+            Some(transcript),
+        )
+        .expect("TUI session resumes malformed legacy history");
+
+        assert!(
+            !session
+                .conversation()
+                .messages
+                .iter()
+                .any(|message| matches!(
+                    message,
+                    orca_core::conversation::Message::Assistant {
+                        content: None,
+                        tool_calls,
+                        ..
+                    } if tool_calls.is_empty()
+                ))
+        );
+        assert!(
+            session
+                .conversation()
+                .messages
+                .iter()
+                .any(|message| matches!(
+                    message,
+                    orca_core::conversation::Message::User { content, .. } if content == "second"
+                ))
+        );
+    }
+
+    #[test]
     fn tui_displays_final_assistant_content_without_stream_delta() {
         let config = config();
         let (event_tx, event_rx) = mpsc::channel();
