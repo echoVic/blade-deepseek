@@ -1,6 +1,8 @@
+use std::ffi::OsStr;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
-use std::path::Path;
+use std::ops::{Deref, DerefMut};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
@@ -8,19 +10,104 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use orca_runtime::history::SessionStore;
 use serde_json::Value;
-use tempfile::tempdir;
+use tempfile::{TempDir, tempdir};
 
 static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-fn orca_command() -> Command {
+struct OrcaCommand {
+    command: Command,
+    home: Option<TempDir>,
+}
+
+impl OrcaCommand {
+    fn args<I, S>(&mut self, args: I) -> &mut Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        self.command.args(args);
+        self
+    }
+
+    fn env<K, V>(&mut self, key: K, value: V) -> &mut Self
+    where
+        K: AsRef<OsStr>,
+        V: AsRef<OsStr>,
+    {
+        if key.as_ref() == OsStr::new("ORCA_HOME") {
+            self.home.take();
+        }
+        self.command.env(key, value);
+        self
+    }
+
+    fn stdin<T: Into<Stdio>>(&mut self, cfg: T) -> &mut Self {
+        self.command.stdin(cfg);
+        self
+    }
+
+    fn stdout<T: Into<Stdio>>(&mut self, cfg: T) -> &mut Self {
+        self.command.stdout(cfg);
+        self
+    }
+
+    fn stderr<T: Into<Stdio>>(&mut self, cfg: T) -> &mut Self {
+        self.command.stderr(cfg);
+        self
+    }
+
+    fn spawn(&mut self) -> std::io::Result<OrcaChild> {
+        let child = self.command.spawn()?;
+        Ok(OrcaChild {
+            child: Some(child),
+            _home: self.home.take(),
+        })
+    }
+
+    fn get_envs(&self) -> std::process::CommandEnvs<'_> {
+        self.command.get_envs()
+    }
+}
+
+struct OrcaChild {
+    child: Option<Child>,
+    _home: Option<TempDir>,
+}
+
+impl OrcaChild {
+    fn wait_with_output(mut self) -> std::io::Result<Output> {
+        self.child
+            .take()
+            .expect("orca child must be available")
+            .wait_with_output()
+    }
+}
+
+impl Deref for OrcaChild {
+    type Target = Child;
+
+    fn deref(&self) -> &Self::Target {
+        self.child.as_ref().expect("orca child must be available")
+    }
+}
+
+impl DerefMut for OrcaChild {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.child.as_mut().expect("orca child must be available")
+    }
+}
+
+fn orca_command() -> OrcaCommand {
     let mut command = Command::new(env!("CARGO_BIN_EXE_orca"));
     let home = tempfile::Builder::new()
         .prefix("orca-server-contract-")
         .tempdir()
-        .expect("create isolated ORCA_HOME")
-        .keep();
-    command.env("ORCA_HOME", home);
-    command
+        .expect("create isolated ORCA_HOME");
+    command.env("ORCA_HOME", home.path());
+    OrcaCommand {
+        command,
+        home: Some(home),
+    }
 }
 
 #[test]
@@ -28,11 +115,15 @@ fn server_test_commands_isolate_orca_home() {
     let command = orca_command();
     let orca_home = command
         .get_envs()
-        .find_map(|(key, value)| (key == "ORCA_HOME").then_some(value).flatten());
+        .find_map(|(key, value)| (key == "ORCA_HOME").then_some(value).flatten())
+        .map(PathBuf::from)
+        .expect("isolated ORCA_HOME");
 
+    assert!(orca_home.exists(), "isolated ORCA_HOME must exist");
+    drop(command);
     assert!(
-        orca_home.is_some(),
-        "server tests must not use the real ~/.orca"
+        !orca_home.exists(),
+        "isolated ORCA_HOME must be removed when its command guard is dropped"
     );
 }
 
@@ -8125,7 +8216,7 @@ fn sandbox_seatbelt_available() -> bool {
 }
 
 fn wait_for_child_output_with_timeout(
-    mut child: Child,
+    mut child: OrcaChild,
     timeout: Duration,
 ) -> Result<Output, String> {
     let deadline = Instant::now()
