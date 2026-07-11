@@ -164,6 +164,34 @@ impl GoalStore {
             .cloned())
     }
 
+    pub fn resume_into(
+        &mut self,
+        source_session_id: &str,
+        resumed_session_id: &str,
+    ) -> io::Result<Option<ThreadGoal>> {
+        let mut db = self.load()?;
+        let Some(source) = db.goals.get(source_session_id).cloned() else {
+            return Ok(None);
+        };
+        let now = now_timestamp();
+        let mut resumed = source;
+        resumed.session_id = resumed_session_id.to_string();
+        resumed.status = ThreadGoalStatus::Active;
+        resumed.updated_at = now;
+
+        if source_session_id != resumed_session_id
+            && let Some(source) = db.goals.get_mut(source_session_id)
+        {
+            source.status = ThreadGoalStatus::Paused;
+            source.updated_at = now;
+        }
+
+        db.goals
+            .insert(resumed_session_id.to_string(), resumed.clone());
+        self.save(&db)?;
+        Ok(Some(resumed))
+    }
+
     pub fn replace(
         &mut self,
         session_id: &str,
@@ -382,6 +410,128 @@ mod tests {
 
         assert_eq!(latest.session_id, "active-2");
         assert_eq!(latest.objective, "new");
+    }
+
+    #[test]
+    fn resume_into_same_session_preserves_goal_usage_and_identity() {
+        let dir = tempdir().unwrap();
+        let mut store = GoalStore::with_path(dir.path().join("goals_1.json"));
+        let created = store
+            .replace(
+                "session-1",
+                "finish the release",
+                ThreadGoalStatus::Paused,
+                Some(50_000),
+            )
+            .unwrap();
+        let accounted = store
+            .account_usage("session-1", 12_345, 780)
+            .unwrap()
+            .expect("goal exists");
+
+        let resumed = store
+            .resume_into("session-1", "session-1")
+            .unwrap()
+            .expect("goal resumes");
+
+        assert_eq!(resumed.session_id, "session-1");
+        assert_eq!(resumed.objective, "finish the release");
+        assert_eq!(resumed.status, ThreadGoalStatus::Active);
+        assert_eq!(resumed.token_budget, Some(50_000));
+        assert_eq!(resumed.tokens_used, 12_345);
+        assert_eq!(resumed.time_used_seconds, 780);
+        assert_eq!(resumed.created_at, created.created_at);
+        assert!(resumed.updated_at >= accounted.updated_at);
+    }
+
+    #[test]
+    fn resume_into_different_session_migrates_goal_and_pauses_source() {
+        let dir = tempdir().unwrap();
+        let mut store = GoalStore::with_path(dir.path().join("goals_1.json"));
+        let created = store
+            .replace(
+                "old-session",
+                "migrate the full goal",
+                ThreadGoalStatus::Active,
+                Some(99_000),
+            )
+            .unwrap();
+        let accounted = store
+            .account_usage("old-session", 45_678, 321)
+            .unwrap()
+            .expect("goal exists");
+
+        let resumed = store
+            .resume_into("old-session", "new-session")
+            .unwrap()
+            .expect("goal resumes");
+
+        assert_eq!(resumed.session_id, "new-session");
+        assert_eq!(resumed.objective, "migrate the full goal");
+        assert_eq!(resumed.status, ThreadGoalStatus::Active);
+        assert_eq!(resumed.token_budget, Some(99_000));
+        assert_eq!(resumed.tokens_used, 45_678);
+        assert_eq!(resumed.time_used_seconds, 321);
+        assert_eq!(resumed.created_at, created.created_at);
+        assert!(resumed.updated_at >= accounted.updated_at);
+
+        let source = store
+            .get("old-session")
+            .unwrap()
+            .expect("source goal remains");
+        assert_eq!(source.session_id, "old-session");
+        assert_eq!(source.objective, resumed.objective);
+        assert_eq!(source.status, ThreadGoalStatus::Paused);
+        assert_eq!(source.token_budget, resumed.token_budget);
+        assert_eq!(source.tokens_used, resumed.tokens_used);
+        assert_eq!(source.time_used_seconds, resumed.time_used_seconds);
+        assert_eq!(source.created_at, resumed.created_at);
+        assert_eq!(source.updated_at, resumed.updated_at);
+    }
+
+    #[test]
+    fn resume_into_missing_source_creates_no_target() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("goals_1.json");
+        let mut store = GoalStore::with_path(path.clone());
+
+        let resumed = store.resume_into("missing", "new-session").unwrap();
+
+        assert!(resumed.is_none());
+        assert!(store.get("new-session").unwrap().is_none());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn replace_still_resets_usage_after_prior_accounting() {
+        let dir = tempdir().unwrap();
+        let mut store = GoalStore::with_path(dir.path().join("goals_1.json"));
+        store
+            .replace(
+                "session-1",
+                "old objective",
+                ThreadGoalStatus::Active,
+                Some(50_000),
+            )
+            .unwrap();
+        store
+            .account_usage("session-1", 12_345, 780)
+            .unwrap()
+            .expect("goal exists");
+
+        let replaced = store
+            .replace(
+                "session-1",
+                "new objective",
+                ThreadGoalStatus::Active,
+                Some(60_000),
+            )
+            .unwrap();
+
+        assert_eq!(replaced.objective, "new objective");
+        assert_eq!(replaced.token_budget, Some(60_000));
+        assert_eq!(replaced.tokens_used, 0);
+        assert_eq!(replaced.time_used_seconds, 0);
     }
 
     #[test]
