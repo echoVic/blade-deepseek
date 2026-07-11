@@ -77,7 +77,7 @@ const copy = {
     },
     summaries: {
       "v0.2.16":
-        "TUI context compaction now has a visible, interruptible lifecycle. Automatic soft-limit, hard-limit, and prompt-too-long recovery show Compacting context before hooks or remote summary work; manual /compact uses the same state. Ctrl+C, Esc, and Ctrl+G cancel hooks and the streaming DeepSeek summary, while completion appears only after persistence and post-compact hooks finish. Older compacted events remain compatible.",
+        "TUI context compaction now has a visible, interruptible lifecycle. Automatic soft-limit, hard-limit, and prompt-too-long recovery show Compacting context before hooks or remote summary work; manual /compact uses the same state. Ctrl+C, Esc, and Ctrl+G cancel hooks and the streaming DeepSeek summary, while completion appears only after persistence and post-compact hooks finish. DeepSeek header waits, retry delays, error-body reads, and SSE reads now race cancellation through a joined provider worker, including between events from one SSE frame. Malformed or prematurely ended streams fail explicitly and retry only before visible output; malformed JSON for a known tool is preserved, validated before approval, hooks, task creation, or execution, and returned as a corrective tool failure. Older compacted events remain compatible.",
       "v0.2.15":
         "TUI resume now drops legacy reasoning-only assistant turns before replaying history to DeepSeek. New provider responses that contain reasoning but no visible content or tool calls are retried instead of being persisted, while valid reasoning attached to tool calls remains intact. The release gate now exercises this malformed-history recovery against the real DeepSeek API.",
       "v0.2.14":
@@ -487,7 +487,7 @@ const copy = {
     },
     summaries: {
       "v0.2.16":
-        "TUI 上下文压缩现在有可见、可中断的完整生命周期。自动 soft-limit、hard-limit、prompt-too-long recovery 与手动 /compact 都会在阻塞工作前显示 Compacting context；Ctrl+C、Esc、Ctrl+G 可取消 hook 与 DeepSeek 流式摘要。只有持久化和 post-compact hook 完成后才会回到 idle，旧版 compacted 事件仍兼容。",
+        "TUI 上下文压缩现在有可见、可中断的完整生命周期。自动 soft-limit、hard-limit、prompt-too-long recovery 与手动 /compact 都会在阻塞工作前显示 Compacting context；Ctrl+C、Esc、Ctrl+G 可取消 hook 与 DeepSeek 流式摘要。等待响应头、重试等待、错误响应体和 SSE 响应体读取都会与取消竞争，兼容同步 facade 会在返回前 join provider worker，同一 SSE frame 内的后续事件也会立即停止交付。畸形或提前结束的 SSE 会显式失败，只有尚未产生可见输出时才重试；已知工具的非法 JSON 参数会保留，并在审批、hook、任务创建或执行前完成 schema 校验，作为可纠正的 tool failure 返回。只有持久化和 post-compact hook 完成后才会回到 idle，旧版 compacted 事件仍兼容。",
       "v0.2.15":
         "TUI 恢复会话时会先移除旧历史中只有 reasoning、没有可见正文或工具调用的 assistant turn，再把历史重放给 DeepSeek。新的同类无效响应会触发重试而不会写入历史；与有效工具调用关联的 reasoning 仍会完整保留。发布门禁也新增了真实 DeepSeek API 的畸形历史恢复验证。",
       "v0.2.14":

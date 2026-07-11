@@ -10,9 +10,18 @@ prompt-too-long recovery emit typed `context.compaction.started` before budget
 hooks, compaction hooks, or remote summary work can block. Manual `/compact`
 also enters the existing `Compacting context...` state before its synchronous
 summary call. Ctrl+C, Esc, and Ctrl+G remain live in that state and now cancel
-hooks plus the streaming DeepSeek summary request. Successful completion is
-projected only after summary persistence and the post-compact hook finish, while
-retaining the detailed reason, strategy, and collapsed-message notice.
+hooks plus the underlying streaming DeepSeek HTTP operation. Waiting for
+response headers, retry waits, error bodies, and SSE reads now race
+cancellation through async reqwest with operation-scoped Hickory-DNS clients.
+The temporary synchronous provider facade uses one joined worker and an
+acknowledged zero-capacity step handoff, so callback cancellation cannot leave
+prefetched or same-frame deltas, or detached transport work, behind. Malformed
+or prematurely ended SSE streams fail explicitly and retry only before any
+visible step; a known tool with malformed JSON arguments is preserved as a
+tool request, then validated before approval, hooks, task creation, or
+execution so Orca can return a corrective tool failure. Successful compaction
+is projected only after summary persistence and the post-compact hook finish,
+while retaining the detailed reason, strategy, and collapsed-message notice.
 Earlier v0.2.15 makes DeepSeek history replay
 reject incomplete assistant turns. TUI resume removes legacy assistant turns
 that contain reasoning but no visible content or tool calls before the next
@@ -376,6 +385,28 @@ its task panel, bridge activity summaries, permission update destinations, and
 MCP elicitation queue are good interaction references, but its broad
 `ToolUseContext` and app-state-coupled orchestration should not be copied into
 Orca.
+
+The July 11 ownership and recovery pass supersedes the older priority labels
+below. The full evidence and dependency graph are recorded in
+[`docs/reports/2026-07-11-codex-package3-runtime-refactor.md`](reports/2026-07-11-codex-package3-runtime-refactor.md).
+The immediate sequence is:
+
+1. close every tool invocation with exactly one terminal result, including
+   cancelled and crash-indeterminate turns;
+2. replace resettable shared cancellation with one-shot operation scopes and
+   typed terminal outcomes plus stable operation identities;
+3. introduce a runtime host, thread actors, and one canonical turn executor;
+4. run the async provider directly from that host, then delete the temporary
+   synchronous provider worker;
+5. migrate server, headless, and TUI surfaces onto runtime command/event
+   handles before declaring the executor canonical;
+6. add a semantic execution journal with stable item ids and one thread event
+   sequencer, then add the interaction broker, tool runtime, and fenced task
+   supervisor before attempting true workflow/subagent/goal resume.
+
+The detailed inventory that follows remains useful implementation history, but
+new releases should be ranked against this ownership sequence rather than by
+how many additional call-surface bundles they extract.
 
 The deeper July 9 reference pass changes the next refactor order:
 
@@ -1417,7 +1448,26 @@ instruction and capability system.
 
 ---
 
-## Priority Matrix
+## July 11 Priority Matrix
+
+| Priority | Item | Why Now | Risk |
+|----------|------|---------|------|
+| P0.1 | Tool invocation closure | Prevents interrupted history from deleting completed context or repeating mutating side effects | Medium/High |
+| P0.2 | One-shot operation cancellation and typed terminal outcome | Removes reset races and gives replacement, cancellation, failure, and abort distinct semantics | Medium |
+| P0.3 | Runtime Operation Host and canonical turn executor | Gives one owner to async tasks, child scopes, joins, cleanup, events, and interactive session state across TUI/server/headless | High |
+| P0.4 | Async provider through runtime | Removes the temporary per-call provider runtime and TUI double-worker path | Medium/High |
+| P0.5 | Surface convergence | Moves server/headless first and TUI second onto the same runtime handles, then removes the TUI provider/tool kernel and direct execution dependencies | High |
+| P1.1 | Semantic execution journal, one sequencer, and stable item ids | Makes canonical items, durable history, task state, goal state, and replay derive from one ordered source without synchronously journaling every token delta | High |
+| P1.2 | Async ToolCallRuntime | Gives each invocation concurrency, approval, output, cancellation, cleanup, and exactly one truthful terminal outcome, including `indeterminate` after a crash | High |
+| P1.3 | Durable interaction broker | Lets approval, user input, and MCP elicitation survive process loss as idempotent continuations | High |
+| P1.4 | Unified task supervisor, cancellation tree, lease, and fencing | Makes stop, pause, shutdown, reattach, stale-owner takeover, and stale-commit rejection verifiable | High |
+| P2.1 | Checkpointable workflow and subagent resume | Resumes the same run from a safe cursor instead of replaying only completed cache entries | High |
+| P2.2 | Runtime goal orchestrator | Moves goal cursor, attempts, usage, lease, and continuation policy out of the TUI | High |
+| P2.3 | App-server dependency inversion | Lets processors depend on operation/thread handles and stores instead of full mutable server state | Medium |
+| P2.4 | Context and cache identity | Adds deterministic compatibility repair ids, immutable cache-critical prefixes, isolated fork state, and explicit checkpoints | Medium/High |
+| P3 | Crate cleanup, plugins, remote compaction, worktree automation, richer PTY, multi-format reading | Remove source-text architecture tests and compatibility shims only after compiler-enforced ownership; build product breadth on stable contracts | Medium/High |
+
+## Historical Priority Matrix
 
 | Priority | Item | Why Now | Risk |
 |----------|------|---------|------|
