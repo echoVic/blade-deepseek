@@ -14,8 +14,26 @@ static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn orca_command() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_orca"));
-    command.env_remove("ORCA_HOME");
+    let home = tempfile::Builder::new()
+        .prefix("orca-server-contract-")
+        .tempdir()
+        .expect("create isolated ORCA_HOME")
+        .keep();
+    command.env("ORCA_HOME", home);
     command
+}
+
+#[test]
+fn server_test_commands_isolate_orca_home() {
+    let command = orca_command();
+    let orca_home = command
+        .get_envs()
+        .find_map(|(key, value)| (key == "ORCA_HOME").then_some(value).flatten());
+
+    assert!(
+        orca_home.is_some(),
+        "server tests must not use the real ~/.orca"
+    );
 }
 
 #[test]
