@@ -91,6 +91,18 @@ Automatic continuation stops when:
 - the continuation cap is reached
 - cost or token budget checks stop the session
 
+An unknown or malformed provider function name is recoverable inside the same
+agent turn rather than being treated as a failed turn. Orca preserves the
+provider call id, original name, and raw arguments without inventing a new tool
+identity: configured external names remain `External` with their declared
+action, unresolved `mcp__*` names remain `Mcp`, and other generic unknown names
+become `External`.
+Every unresolved request receives provisional `Read`, fails registry validation
+as a matching tool result, and is sent back to DeepSeek for correction. Orca
+never infers or executes `bash` from a command-shaped function name. Genuine
+transport, provider, and quota failures still fail the turn and pause automatic
+Goal continuation.
+
 Before each active turn, Orca injects a single pinned goal context block. The block is replaced between turns, so long-running goals do not accumulate duplicate instructions.
 
 ## Implementation Notes

@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Ship `v0.2.17` so a DeepSeek call such as `function.name = "wc -l"` becomes a recorded, non-executable tool failure that the model can correct instead of a terminal provider error that pauses Goal mode.
+**Goal:** Ship `v0.2.18` so a DeepSeek call such as `function.name = "wc -l"` becomes a recorded, non-executable tool failure that the model can correct instead of a terminal provider error that pauses Goal mode.
 
-**Architecture:** Preserve every provider tool call as a `ToolRequest`. Registered names retain their existing identity and action; unresolved names become `ToolName::External` with `ActionKind::Read`, the original name as display target, and untouched arguments. Existing registry validation rejects unresolved calls before approval, hooks, task creation, or execution, and the normal tool loop records the failure and asks the model for the next turn.
+**Architecture:** Preserve every provider tool call as a `ToolRequest`. Registered names retain their existing identity and action; configured external names remain `ToolName::External` with their declared action. Unresolved `mcp__*` names remain `ToolName::Mcp`, while other generic unresolved names become `ToolName::External`; every unresolved request uses `ActionKind::Read`, the original name as display target, and untouched arguments. Existing registry validation rejects unresolved calls before approval, hooks, task creation, or execution, and the normal tool loop records the failure and asks the model for the next turn.
 
 **Tech Stack:** Rust 2024, Cargo tests, DeepSeek streaming fixtures, Orca mock provider, ratatui TUI loop, TypeScript/Vite site, Node.js release scripts, GitHub Actions, npm.
 
@@ -15,13 +15,31 @@
 - `crates/orca-provider/src/deepseek_http.rs`: preserve unknown streaming and non-streaming provider calls as non-executable tool requests.
 - `crates/orca-provider/src/lib.rs`: add a deterministic unknown-call-then-correct mock flow.
 - `crates/orca-tui/src/agent_runner.rs`: prove the actual TUI agent loop records the failure and completes the corrective turn.
+- `Cargo.toml`: bump the workspace package to `0.2.18`.
+- `Cargo.lock`: bump only the `blade-deepseek` package entry to `0.2.18`.
+- `npm/orca/package.json`: bump the npm wrapper to `0.2.18`.
+- `README.md`: update the pinned installer example to `0.2.18`.
+- `site/index.html`: update structured-data `softwareVersion` to `0.2.18`.
+- `site/src/shared.ts`: make `v0.2.18` the latest release while retaining the
+  historical `v0.2.17` entry immediately below it.
 - `docs/goal-mode.md`: document which failures pause Goal continuation and which malformed tool calls are recoverable.
-- `docs/production-roadmap.md`: record the `v0.2.17` provider/runtime baseline.
-- `docs/releases/v0.2.17.md`: add incident behavior, safety boundary, and focused verification.
-- `site/src/changelog/Changelog.tsx`: update English and Chinese `v0.2.17` summaries.
+- `docs/production-roadmap.md`: record the `v0.2.18` provider/runtime baseline
+  and retain `v0.2.17` as earlier history.
+- `docs/releases/v0.2.18.md`: add incident behavior, safety boundary, focused
+  verification, the full release gate, and upgrade commands.
+- `site/src/changelog/Changelog.tsx`: add English and Chinese `v0.2.18`
+  summaries without changing the `v0.2.17` summaries.
+- `docs/superpowers/specs/2026-07-12-deepseek-unknown-tool-recovery-design.md`:
+  correct stale release instructions and acceptance criteria.
+- `docs/superpowers/plans/2026-07-12-deepseek-unknown-tool-recovery.md`: keep
+  release commands aligned with the audited public version state.
 
-The base branch already contains the complete cumulative Goal timer feature and
-all `0.2.17` version metadata. This slice must not create a second version bump.
+The design originally assumed this work would join the `v0.2.17` candidate, but
+by execution time `v0.2.17` was already public on GitHub and npm and is
+immutable. This slice must bump every owned latest-release surface to `0.2.18`
+while preserving all historical `v0.2.17` entries. Dependency versions that
+happen to equal `0.2.17`, including `tinyglobby` in `site/package-lock.json`,
+must not change.
 
 ### Task 1: Preserve Unknown DeepSeek Tool Calls
 
@@ -112,8 +130,16 @@ setup must be:
 ```rust
 let reg = registry::tool_registry_with_mcp_and_external(None, external_tools);
 let resolved = reg.resolve(schema_name);
-let name = registry::tool_name_from_schema_name(schema_name)
-    .expect("provider tool names always map to ToolName");
+let name = if external_tools.iter().any(|tool| tool.name == schema_name) {
+    ToolName::External(schema_name.to_string())
+} else if schema_name.starts_with("mcp__") {
+    ToolName::Mcp(schema_name.to_string())
+} else if resolved.is_some() {
+    registry::tool_name_from_schema_name(schema_name)
+        .expect("registered provider tool names always map to ToolName")
+} else {
+    ToolName::External(schema_name.to_string())
+};
 let action = resolved
     .as_ref()
     .map(|resolved| resolved.spec.capabilities.action_kind())
@@ -310,62 +336,112 @@ git add crates/orca-provider/src/lib.rs crates/orca-tui/src/agent_runner.rs
 git commit -m "test(tui): cover unknown tool correction"
 ```
 
-### Task 3: Update Goal And Release Documentation
+### Task 3: Prepare v0.2.18 Metadata And Documentation
 
 **Files:**
+- Modify: `Cargo.toml`
+- Modify: `Cargo.lock`
+- Modify: `npm/orca/package.json`
+- Modify: `README.md`
+- Modify: `site/index.html`
+- Modify: `site/src/shared.ts`
 - Modify: `docs/goal-mode.md`
 - Modify: `docs/production-roadmap.md`
-- Modify: `docs/releases/v0.2.17.md`
+- Create: `docs/releases/v0.2.18.md`
 - Modify: `site/src/changelog/Changelog.tsx`
+- Modify: `docs/superpowers/specs/2026-07-12-deepseek-unknown-tool-recovery-design.md`
+- Modify: `docs/superpowers/plans/2026-07-12-deepseek-unknown-tool-recovery.md`
 
-- [ ] **Step 1: Document the recovery boundary**
+- [ ] **Step 1: Bump every owned latest-release surface**
+
+Set the root Cargo package, npm wrapper, README installer pin, structured-data
+version, and site latest-release metadata to `0.2.18`. In `Cargo.lock`, change
+only the `blade-deepseek` package entry; leave dependencies whose versions are
+`0.2.17` unchanged. Prepend `v0.2.18` dated `2026-07-12` in
+`site/src/shared.ts`, keeping `v0.2.17` immediately below it. Do not edit
+`site/package-lock.json` or the already-current sitemap date.
+
+- [ ] **Step 2: Document the recovery boundary**
 
 In `docs/goal-mode.md`, retain the rule that actual failed turns stop automatic
 continuation, then add that malformed/unknown provider tool names are recorded
-as failed tool results and may be corrected within the same turn. State that
-Orca never converts an unknown name into shell execution.
+as failed tool results and may be corrected within the same agent turn. State
+that Orca never converts an unknown name into shell execution, while genuine
+transport, provider, and quota failures still fail the turn and pause Goal
+continuation.
 
-- [ ] **Step 2: Extend the current roadmap baseline**
+- [ ] **Step 3: Establish the v0.2.18 roadmap baseline**
 
-Add to the `v0.2.17` baseline that unknown DeepSeek function names retain call
-identity and raw arguments, fail registry validation before any side effect,
-and return to the model for correction instead of becoming provider errors.
+Lead the roadmap with `v0.2.18`: unknown DeepSeek function names retain their
+provider call id, name, and raw arguments. Configured external names remain
+`External` with their declared action, unresolved `mcp__*` names remain `Mcp`,
+and other generic unresolved names become `External`; every unresolved request
+receives provisional `Read`, fails registry validation before approval, hooks,
+task creation, or execution, records a matching failed tool result, and returns
+to the model for correction. Transition the previous cumulative Goal timing
+baseline to `Earlier v0.2.17` without rewriting the older history.
 
-- [ ] **Step 3: Extend the release note and site summaries**
+- [ ] **Step 4: Add the release note and site summaries**
 
-Add these release-note bullets:
+Create `docs/releases/v0.2.18.md` covering:
 
-- recoverable unknown tool calls;
+- the `function.name = "wc -l"` incident and terminal-provider-error root cause;
+- recoverable streaming and non-streaming unknown tool calls;
 - no command-shaped-name-to-bash coercion;
-- matching call/result history and Goal continuation;
-- incident-specific `wc -l` regression coverage.
+- matching call/result history and the successful TUI corrective turn;
+- compatibility, focused tests, the full release gate, the `0.2.18`
+  post-publish verifier, and upgrade commands.
 
-Update both English and Chinese `v0.2.17` site summaries with the same user
-outcome. Do not change `releaseVersion` or package versions.
+Add concise English and Chinese `v0.2.18` site summaries with the user outcome
+and safety boundary. Preserve both `v0.2.17` summaries exactly.
 
-- [ ] **Step 4: Verify documentation and site**
+- [ ] **Step 5: Correct stale design and implementation release instructions**
+
+Record that `v0.2.17` was already public when implementation began. Update only
+the release-related design references and this plan's release goal, file map,
+Task 3, Task 4, and commands to `v0.2.18`; leave Tasks 1 and 2 behavior intact.
+
+- [ ] **Step 6: Verify exact release surfaces, metadata, and site**
 
 ```bash
+rg -n 'version = "0\.2\.18"' Cargo.toml Cargo.lock
+rg -n '"version": "0\.2\.18"' npm/orca/package.json
+rg -n 'ORCA_VERSION=0\.2\.18' README.md
+rg -n 'softwareVersion": "0\.2\.18"' site/index.html
+rg -n 'releaseVersion = "v0\.2\.18"|version: "v0\.2\.18"' site/src/shared.ts
+rg -n '"v0\.2\.18"' site/src/changelog/Changelog.tsx
+rg -n 'v0\.2\.18|0\.2\.18' docs/releases/v0.2.18.md docs/production-roadmap.md
 git diff --check
+cargo metadata --no-deps --format-version 1
 npm --prefix site run build
 npm --prefix site run check:seo
+node scripts/release/test-stage-npm.mjs
+node scripts/release/test-verify-published.mjs
+git diff -- site/package-lock.json
 ```
 
-Expected: all exit 0.
+Expected: all commands exit 0; Cargo metadata reports the root package at
+`0.2.18`; `site/package-lock.json` has no diff; historical `v0.2.17` release
+entries remain; and only the `blade-deepseek` Cargo.lock entry changes from
+`0.2.17` to `0.2.18`.
 
-- [ ] **Step 5: Commit documentation**
+- [ ] **Step 7: Commit release preparation**
 
 ```bash
-git add docs/goal-mode.md docs/production-roadmap.md docs/releases/v0.2.17.md site/src/changelog/Changelog.tsx
-git commit -m "docs(release): document unknown tool recovery"
+git add Cargo.toml Cargo.lock npm/orca/package.json README.md site/index.html \
+  site/src/shared.ts docs/goal-mode.md docs/production-roadmap.md \
+  docs/releases/v0.2.18.md site/src/changelog/Changelog.tsx \
+  docs/superpowers/specs/2026-07-12-deepseek-unknown-tool-recovery-design.md \
+  docs/superpowers/plans/2026-07-12-deepseek-unknown-tool-recovery.md
+git commit -m "docs(release): prepare v0.2.18"
 ```
 
-### Task 4: Verify, Review, Integrate, And Publish v0.2.17
+### Task 4: Verify, Review, Integrate, And Publish v0.2.18
 
 **Files:**
 - Verify all files changed since `origin/main`
 - Merge branch: `fix/deepseek-unknown-tool-recovery`
-- Publish tag: `v0.2.17`
+- Publish tag: `v0.2.18`
 
 - [ ] **Step 1: Run the complete local release gate**
 
@@ -434,8 +510,8 @@ and the working tree is clean. Do not modify or delete the other worktrees.
 
 ```bash
 git push origin main
-git tag -a v0.2.17 -m "Orca v0.2.17"
-git push origin v0.2.17
+git tag -a v0.2.18 -m "Orca v0.2.18"
+git push origin v0.2.18
 ```
 
 Expected: both pushes succeed without force.
@@ -445,7 +521,7 @@ Expected: both pushes succeed without force.
 ```bash
 RUN_ID=$(gh run list --repo echoVic/blade-deepseek --workflow Release --limit 20 \
   --json databaseId,headBranch,event \
-  --jq '.[] | select(.headBranch == "v0.2.17" and .event == "push") | .databaseId' \
+  --jq '.[] | select(.headBranch == "v0.2.18" and .event == "push") | .databaseId' \
   | head -n 1)
 gh run watch "$RUN_ID" --repo echoVic/blade-deepseek --exit-status
 ```
@@ -457,12 +533,12 @@ Expected: `test`, `version`, four native builds, `release`, `npm`, and
 
 ```bash
 node scripts/release/verify-published.mjs \
-  --version 0.2.17 \
+  --version 0.2.18 \
   --repo echoVic/blade-deepseek \
   --package @blade-ai/orca \
   --bin orca
-gh release view v0.2.17 --repo echoVic/blade-deepseek --json url,assets
-npm view @blade-ai/orca@0.2.17 version dist-tags --json
+gh release view v0.2.18 --repo echoVic/blade-deepseek --json url,assets
+npm view @blade-ai/orca@0.2.18 version dist-tags --json
 ```
 
 Expected: GitHub Release, npm wrapper/platform packages, and `npm exec` smoke

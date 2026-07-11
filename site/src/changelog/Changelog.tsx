@@ -76,6 +76,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.18":
+        "Unknown or malformed DeepSeek function names now become recorded, failed tool results that the model can correct inside the same agent turn instead of terminal provider errors that pause Goal mode. Orca preserves the original call id, name, and raw arguments across streaming and non-streaming responses, but never infers or executes bash from command-shaped names; registry validation rejects them before approval, hooks, task creation, or execution.",
       "v0.2.17":
         "Active Goal activity time now stays cumulative across automatic continuations by combining persisted completed-turn time with the current turn delta. /goal resume preserves the objective, budget, token usage, elapsed time, and creation timestamp; same- and cross-session restoration use one atomic migration with an occupied-target guard and unchanged state on failure. Restored history projects the preserved Goal before TurnStarted so the first running frame includes the persisted base.",
       "v0.2.16":
@@ -488,6 +490,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.18":
+        "DeepSeek 生成未知或畸形 function name 时，Orca 现在会把它记录为可失败的 tool result，并在同一个 agent turn 内返回给模型纠正，不再直接触发 provider terminal error 并暂停 Goal。流式与非流式响应都会保留原始 call id、名称和 raw arguments，但绝不会从命令形名称推断或执行 bash；registry validation 会在审批、hook、任务创建和执行前拒绝该调用。",
       "v0.2.17":
         "活动 Goal 的计时现在会跨自动续轮累计：已持久化的完整 turn 用时与当前 turn 增量合并显示。/goal resume 会保留目标、预算、token 用量、累计时间和创建时间；同 session 与跨 session 恢复使用一次原子迁移，目标 session 已占用时拒绝覆盖，失败时保持原状态。恢复历史后会在 TurnStarted 前投影 Goal，因此第一帧 running 状态就包含已持久化的时间基数。",
       "v0.2.16":

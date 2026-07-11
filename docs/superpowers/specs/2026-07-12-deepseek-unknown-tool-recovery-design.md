@@ -36,7 +36,9 @@ The corresponding task record contained only `error: "failed"`.
 ## User Outcome
 
 - A single hallucinated or malformed tool name no longer pauses an active Goal.
-- The TUI shows a failed tool call with the original name and call id.
+- The TUI shows the failed tool call's original name and error.
+- The call id is preserved internally and in history to pair the assistant call
+  with its tool result.
 - The failed result is recorded in conversation history and sent back to
   DeepSeek, which can correct the call on the next turn.
 - Genuine provider, transport, quota, and context errors keep their existing
@@ -49,8 +51,9 @@ Provider parsing may classify a call, but it must not invent executable intent.
 
 1. A name resolved by the configured built-in, MCP, or external-tool registry
    keeps its current canonical tool identity and action.
-2. An unresolved name becomes `ToolName::External(original_name)` with the raw
-   arguments and original call id preserved.
+2. An unresolved `mcp__*` name remains `ToolName::Mcp(original_name)`; every
+   other generic unresolved name becomes `ToolName::External(original_name)`.
+   Both keep the raw arguments and original call id.
 3. The unresolved request receives no shell, write, network, or agent
    capability. Its provisional action remains `Read` only so it can enter the
    validation path.
@@ -71,8 +74,9 @@ same boundary. `parse_tool_call` will return a `ToolRequest` for every provider
 tool call:
 
 - registered names use the resolved action and existing target extraction;
-- unresolved names use `ToolName::External`, `ActionKind::Read`, the original
-  name as the display target, and the untouched argument string.
+- unresolved `mcp__*` names use `ToolName::Mcp`; other generic unresolved names
+  use `ToolName::External`. Both use `ActionKind::Read`, the original name as
+  the display target, and the untouched argument string.
 
 Streaming and non-streaming response folding will append
 `ProviderStep::ToolCall` instead of `ProviderStep::Error` for unresolved names.
@@ -152,13 +156,14 @@ cause and is not a finished release candidate.
 
 ## Documentation And Release
 
-The change ships in the existing `v0.2.17` candidate together with cumulative
-Goal timing. Update:
+By execution time, `v0.2.17` and its cumulative Goal timing changes were already
+public on GitHub and npm. The unknown-tool recovery therefore ships as the new
+`v0.2.18` release. Update:
 
 - `docs/goal-mode.md`
 - `docs/production-roadmap.md`
-- `docs/releases/v0.2.17.md`
-- English and Chinese `v0.2.17` site summaries
+- `docs/releases/v0.2.18.md`
+- English and Chinese `v0.2.18` site summaries
 
 The release workflow remains tag-driven and must publish the GitHub Release,
 four native archives, npm wrapper/platform packages, and npm tarball assets.
@@ -176,4 +181,4 @@ four native archives, npm wrapper/platform packages, and npm tarball assets.
 7. Focused provider/TUI regression tests pass.
 8. Formatting, clippy, full workspace tests, site checks, release-script tests,
    npm staging, and the real DeepSeek release smoke pass.
-9. `v0.2.17` is public on GitHub and npm, and `npm exec` reports `orca 0.2.17`.
+9. `v0.2.18` is public on GitHub and npm, and `npm exec` reports `orca 0.2.18`.

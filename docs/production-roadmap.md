@@ -4,8 +4,19 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-07-12
-Current baseline: current main after v0.2.17 keeps the active Goal activity
-timer cumulative across automatic continuations by rendering persisted
+Current baseline: v0.2.18 preserves unknown DeepSeek function calls instead of
+turning them into terminal provider errors. Each call keeps its provider id,
+function name, and raw arguments. Configured external names remain
+`ToolName::External` with their declared action, unresolved `mcp__*` names
+remain `ToolName::Mcp`, and other generic unresolved names become
+`ToolName::External`. Every unresolved request receives provisional
+`ActionKind::Read` and fails registry validation before approval, hooks, task
+creation, or execution. Orca records the matching failed tool result and
+returns it to DeepSeek for correction inside the same agent turn;
+command-shaped names are never inferred or executed as `bash`. Streaming and
+non-streaming responses use the same preservation boundary. Earlier v0.2.17
+keeps the active Goal activity timer
+cumulative across automatic continuations by rendering persisted
 completed-turn time plus the current-turn delta. Between-turn, paused,
 terminal-status, and offline time remains excluded. `/goal resume` preserves
 the objective, token budget, token usage, elapsed time, and original creation
