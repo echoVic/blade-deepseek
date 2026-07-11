@@ -22,6 +22,16 @@ pub(crate) enum RuntimeCompactionTrigger {
     PromptTooLong,
 }
 
+impl RuntimeCompactionTrigger {
+    pub(crate) fn reason(self) -> RuntimeCompactionReason {
+        match self {
+            Self::SoftLimit => RuntimeCompactionReason::ApproachingContextLimit,
+            Self::HardLimit => RuntimeCompactionReason::ExceededContextLimit,
+            Self::PromptTooLong => RuntimeCompactionReason::PromptTooLongRecovery,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RuntimeCompactionStrategy {
     LocalTruncation,
@@ -173,13 +183,7 @@ impl RuntimeCompactionOutcome {
     }
 
     pub(crate) fn reason(&self) -> RuntimeCompactionReason {
-        match self.trigger() {
-            RuntimeCompactionTrigger::SoftLimit => RuntimeCompactionReason::ApproachingContextLimit,
-            RuntimeCompactionTrigger::HardLimit => RuntimeCompactionReason::ExceededContextLimit,
-            RuntimeCompactionTrigger::PromptTooLong => {
-                RuntimeCompactionReason::PromptTooLongRecovery
-            }
-        }
+        self.trigger().reason()
     }
 
     pub(crate) fn details(&self) -> RuntimeCompactionDetails {
@@ -420,6 +424,7 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
         let Some(trigger) = policy.decide(conversation) else {
             return Ok(false);
         };
+        self.emit_compaction_started(trigger, conversation.messages.len())?;
         self.compact_with_budget_hooks(conversation, trigger)?;
         Ok(true)
     }
@@ -429,7 +434,23 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
         conversation: &mut Conversation,
         trigger: RuntimeCompactionTrigger,
     ) -> io::Result<()> {
+        self.emit_compaction_started(trigger, conversation.messages.len())?;
         self.compact_and_persist(conversation, trigger)?;
+        Ok(())
+    }
+
+    fn emit_compaction_started(
+        &mut self,
+        trigger: RuntimeCompactionTrigger,
+        before_messages: usize,
+    ) -> io::Result<()> {
+        if self.turn_context.emit_deltas {
+            self.sink.emit(
+                &self
+                    .events
+                    .context_compaction_started(trigger.reason().as_str(), before_messages),
+            )?;
+        }
         Ok(())
     }
 
@@ -700,7 +721,7 @@ mod tests {
     }
 
     #[test]
-    fn compaction_step_emits_context_compacted_event() {
+    fn compaction_step_emits_started_before_compacted_event() {
         let context_config = context::ContextConfig {
             max_tokens: 100,
             compaction_threshold: 1.0,
@@ -756,12 +777,18 @@ mod tests {
 
         drop(sink);
         let output = String::from_utf8(output).expect("jsonl is utf8");
-        let compacted = output
+        let emitted = output
             .lines()
-            .find(|line| line.contains("\"type\":\"context.compacted\""))
-            .expect("context compacted event emitted");
-        let event: serde_json::Value =
-            serde_json::from_str(compacted).expect("event should be json");
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(line).expect("event should be json")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(emitted.len(), 2);
+        assert_eq!(emitted[0]["type"], "context.compaction.started");
+        assert_eq!(emitted[1]["type"], "context.compacted");
+        assert_eq!(emitted[0]["payload"]["reason"], "prompt_too_long_recovery");
+        assert_eq!(emitted[0]["payload"]["before_messages"], before_messages);
+        let event = &emitted[1];
 
         assert_eq!(event["payload"]["before_messages"], before_messages);
         assert_eq!(

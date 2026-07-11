@@ -3709,6 +3709,24 @@ mod tests {
     }
 
     #[test]
+    fn compaction_lifecycle_sets_compacting_until_completion() {
+        let mut state = state();
+
+        state.update(TuiEvent::CompactionStarted);
+        assert_eq!(state.status, AppStatus::Compacting);
+
+        state.update(TuiEvent::Compacted {
+            before_messages: 12,
+            after_messages: 5,
+            reason: "manual".to_string(),
+            strategy: "manual".to_string(),
+            collapsed_messages: 7,
+            status_text: "compacted context manually".to_string(),
+        });
+        assert_eq!(state.status, AppStatus::Idle);
+    }
+
+    #[test]
     fn running_timer_starts_and_stops_with_running_status() {
         let mut state = state();
         assert!(state.running_started_at.is_none());

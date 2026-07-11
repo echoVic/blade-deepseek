@@ -350,6 +350,22 @@ fn clear_terminal_scrollback(terminal: &mut InlineTerminal) -> io::Result<()> {
     Ok(())
 }
 
+fn run_manual_compaction_with_events(
+    event_tx: &mpsc::Sender<TuiEvent>,
+    compact: impl FnOnce() -> (usize, usize),
+) {
+    let _ = event_tx.send(TuiEvent::CompactionStarted);
+    let (before_messages, after_messages) = compact();
+    let _ = event_tx.send(TuiEvent::Compacted {
+        before_messages,
+        after_messages,
+        reason: "manual".to_string(),
+        strategy: "manual".to_string(),
+        collapsed_messages: before_messages.saturating_sub(after_messages),
+        status_text: "compacted context manually".to_string(),
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -423,6 +439,28 @@ mod tests {
             ),
             rx,
         )
+    }
+
+    #[test]
+    fn manual_compaction_emits_started_before_running_summary_work() {
+        let (event_tx, event_rx) = mpsc::channel();
+
+        run_manual_compaction_with_events(&event_tx, || {
+            assert!(matches!(
+                event_rx.try_recv(),
+                Ok(TuiEvent::CompactionStarted)
+            ));
+            (12, 5)
+        });
+
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(TuiEvent::Compacted {
+                before_messages: 12,
+                after_messages: 5,
+                ..
+            })
+        ));
     }
 
     fn matching_task_update(
@@ -3223,15 +3261,7 @@ fn agent_loop_thread(
                         .cwd
                         .clone()
                         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-                    let (before_messages, after_messages) = session.compact(&cfg, &cwd);
-                    let _ = event_tx.send(TuiEvent::Compacted {
-                        before_messages,
-                        after_messages,
-                        reason: "manual".to_string(),
-                        strategy: "manual".to_string(),
-                        collapsed_messages: before_messages.saturating_sub(after_messages),
-                        status_text: "compacted context manually".to_string(),
-                    });
+                    run_manual_compaction_with_events(&event_tx, || session.compact(&cfg, &cwd));
                 } else {
                     let _ = event_tx.send(TuiEvent::Error("nothing to compact".to_string()));
                 }

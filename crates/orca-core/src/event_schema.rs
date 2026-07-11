@@ -39,6 +39,8 @@ pub enum EventType {
     ProviderReplayUpdated,
     #[serde(rename = "usage.updated")]
     UsageUpdated,
+    #[serde(rename = "context.compaction.started")]
+    ContextCompactionStarted,
     #[serde(rename = "context.compacted")]
     ContextCompacted,
     #[serde(rename = "model.routed")]
@@ -110,6 +112,22 @@ pub enum RunStatus {
     ApprovalRequired,
     VerificationFailed,
     BudgetExhausted,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ContextCompactionStartedPayload {
+    pub reason: String,
+    pub before_messages: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ContextCompactedPayload {
+    pub reason: String,
+    pub strategy: String,
+    pub before_messages: usize,
+    pub after_messages: usize,
+    pub collapsed_messages: usize,
+    pub status_text: String,
 }
 
 impl RunStatus {
@@ -218,6 +236,20 @@ impl EventFactory {
         )
     }
 
+    pub fn context_compaction_started(
+        &mut self,
+        reason: &str,
+        before_messages: usize,
+    ) -> EventEnvelope {
+        self.make_serialized(
+            EventType::ContextCompactionStarted,
+            ContextCompactionStartedPayload {
+                reason: reason.to_string(),
+                before_messages,
+            },
+        )
+    }
+
     pub fn context_compacted(
         &mut self,
         reason: &str,
@@ -227,16 +259,16 @@ impl EventFactory {
         collapsed_messages: usize,
         status_text: &str,
     ) -> EventEnvelope {
-        self.make(
+        self.make_serialized(
             EventType::ContextCompacted,
-            json!({
-                "reason": reason,
-                "strategy": strategy,
-                "before_messages": before_messages,
-                "after_messages": after_messages,
-                "collapsed_messages": collapsed_messages,
-                "status_text": status_text
-            }),
+            ContextCompactedPayload {
+                reason: reason.to_string(),
+                strategy: strategy.to_string(),
+                before_messages,
+                after_messages,
+                collapsed_messages,
+                status_text: status_text.to_string(),
+            },
         )
     }
 
@@ -689,6 +721,13 @@ impl EventFactory {
         self.seq += 1;
         envelope
     }
+
+    fn make_serialized(&mut self, event_type: EventType, payload: impl Serialize) -> EventEnvelope {
+        self.make(
+            event_type,
+            serde_json::to_value(payload).expect("runtime event payload serializes"),
+        )
+    }
 }
 
 fn timestamp_ms() -> u128 {
@@ -987,6 +1026,17 @@ mod tests {
             event.payload["status_text"],
             "compacted context after prompt-too-long"
         );
+    }
+
+    #[test]
+    fn context_compaction_started_payload_includes_trigger_and_message_count() {
+        let mut f = EventFactory::new("run-1".to_string());
+
+        let event = f.context_compaction_started("prompt_too_long_recovery", 12);
+
+        assert_eq!(event.event_type, EventType::ContextCompactionStarted);
+        assert_eq!(event.payload["reason"], "prompt_too_long_recovery");
+        assert_eq!(event.payload["before_messages"], 12);
     }
 
     #[test]

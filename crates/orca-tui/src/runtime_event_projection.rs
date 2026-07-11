@@ -1,5 +1,7 @@
 use orca_core::cost_types::UsageTotals;
-use orca_core::event_schema::{EventEnvelope, EventType};
+use orca_core::event_schema::{
+    ContextCompactedPayload, ContextCompactionStartedPayload, EventEnvelope, EventType,
+};
 
 use crate::types::TuiEvent;
 
@@ -17,31 +19,23 @@ pub(crate) fn tui_event_from_runtime_event(event: &EventEnvelope) -> Option<TuiE
             cache_tokens: event.payload["cache_tokens"].as_u64().unwrap_or_default(),
             estimated_cost_usd: event.payload["estimated_cost_usd"].as_f64()?,
         })),
-        EventType::ContextCompacted => Some(TuiEvent::Compacted {
-            before_messages: event.payload["before_messages"].as_u64()? as usize,
-            after_messages: event.payload["after_messages"].as_u64()? as usize,
-            reason: event.payload["reason"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string(),
-            strategy: event
-                .payload
-                .get("strategy")
-                .and_then(|value| value.as_str())
-                .unwrap_or_default()
-                .to_string(),
-            collapsed_messages: event
-                .payload
-                .get("collapsed_messages")
-                .and_then(|value| value.as_u64())
-                .unwrap_or_default() as usize,
-            status_text: event
-                .payload
-                .get("status_text")
-                .and_then(|value| value.as_str())
-                .unwrap_or_default()
-                .to_string(),
-        }),
+        EventType::ContextCompactionStarted => {
+            let _: ContextCompactionStartedPayload =
+                serde_json::from_value(event.payload.clone()).ok()?;
+            Some(TuiEvent::CompactionStarted)
+        }
+        EventType::ContextCompacted => {
+            let payload: ContextCompactedPayload =
+                serde_json::from_value(event.payload.clone()).ok()?;
+            Some(TuiEvent::Compacted {
+                before_messages: payload.before_messages,
+                after_messages: payload.after_messages,
+                reason: payload.reason,
+                strategy: payload.strategy,
+                collapsed_messages: payload.collapsed_messages,
+                status_text: payload.status_text,
+            })
+        }
         EventType::ModelRouted => Some(TuiEvent::Notice(format!(
             "Model routed to {} ({})",
             event.payload["actual_model"].as_str()?,
@@ -484,6 +478,18 @@ mod tests {
             }
             other => panic!("expected compacted event, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn runtime_context_compaction_started_event_maps_to_tui_compacting_status() {
+        let mut events = EventFactory::new("tui-runtime-adapter".to_string());
+
+        let started = tui_event_from_runtime_event(
+            &events.context_compaction_started("approaching_context_limit", 12),
+        )
+        .expect("compaction started event");
+
+        assert!(matches!(started, TuiEvent::CompactionStarted));
     }
 
     #[test]
