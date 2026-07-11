@@ -421,6 +421,45 @@ fn mock_call(conversation: &Conversation) -> ProviderResponse {
         }
     }
 
+    if prompt.trim() == "unknown_tool_then_fix" {
+        let saw_unknown_tool_error = conversation.messages.iter().any(|message| match message {
+            Message::Tool { content, .. } => content.contains("unknown tool: wc -l"),
+            _ => false,
+        });
+        if saw_unknown_tool_error {
+            let message = "Mock completed after correcting unknown tool call.".to_string();
+            return ProviderResponse {
+                steps: vec![ProviderStep::MessageDelta(message.clone())],
+                assistant_content: Some(message),
+                assistant_reasoning: None,
+                tool_calls: Vec::new(),
+                usage: None,
+            };
+        }
+
+        if !has_tool_results {
+            let tool_request = ToolRequest {
+                id: "mock-unknown-tool-1".to_string(),
+                name: ToolName::External("wc -l".to_string()),
+                action: ActionKind::Read,
+                target: Some("wc -l".to_string()),
+                raw_arguments: Some("{}".to_string()),
+            };
+            let raw_call = RawToolCall {
+                id: tool_request.id.clone(),
+                function_name: tool_request.name.as_str().to_string(),
+                arguments: tool_request.raw_arguments.clone().unwrap_or_default(),
+            };
+            return ProviderResponse {
+                steps: vec![ProviderStep::ToolCall(tool_request)],
+                assistant_content: None,
+                assistant_reasoning: None,
+                tool_calls: vec![raw_call],
+                usage: None,
+            };
+        }
+    }
+
     if (prompt.trim().starts_with("workflow_read_messages ")
         || prompt.trim().starts_with("workflow_list_tasks "))
         && has_tool_results

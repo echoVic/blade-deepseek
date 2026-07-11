@@ -3260,6 +3260,55 @@ mod tests {
     }
 
     #[test]
+    fn tui_main_agent_recovers_from_unknown_tool_call() {
+        let config = full_auto_config();
+        let (event_tx, _event_rx) = mpsc::channel();
+        let (_action_tx, action_rx) = mpsc::channel();
+        let cancel = CancelToken::new();
+        let mut session = TuiConversationSession::new_with_preloaded(&config, "unknown tool", None)
+            .expect("session");
+
+        let status = run_agent_for_tui(
+            &config,
+            &mut session,
+            "unknown_tool_then_fix",
+            &event_tx,
+            &action_rx,
+            &cancel,
+            false,
+        );
+
+        assert_eq!(status, "success");
+        let unknown_tool_result_index = session
+            .conversation()
+            .messages
+            .iter()
+            .position(|message| {
+                matches!(
+                    message,
+                    orca_core::conversation::Message::Tool { content, .. }
+                        if content.contains("unknown tool: wc -l")
+                )
+            })
+            .expect("conversation should record the unknown tool validation failure");
+        let corrected_assistant_index = session
+            .conversation()
+            .messages
+            .iter()
+            .position(|message| {
+                matches!(
+                    message,
+                    orca_core::conversation::Message::Assistant {
+                        content: Some(content),
+                        ..
+                    } if content.contains("Mock completed after correcting unknown tool call")
+                )
+            })
+            .expect("conversation should record the corrected assistant response");
+        assert!(corrected_assistant_index > unknown_tool_result_index);
+    }
+
+    #[test]
     fn tui_subagent_batch_records_child_failure_without_stopping_batch() {
         let config = full_auto_config();
         let (event_tx, _event_rx) = mpsc::channel();
