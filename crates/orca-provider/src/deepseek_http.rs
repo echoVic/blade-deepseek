@@ -576,15 +576,16 @@ fn parse_tool_call(
     let schema_name = tc.function.name.as_str();
     let reg = registry::tool_registry_with_mcp_and_external(None, external_tools);
     let resolved = reg.resolve(schema_name);
-    let name = if external_tools.iter().any(|tool| tool.name == schema_name) {
-        ToolName::External(schema_name.to_string())
-    } else if schema_name.starts_with("mcp__") {
-        ToolName::Mcp(schema_name.to_string())
-    } else if resolved.is_some() {
-        registry::tool_name_from_schema_name(schema_name)
-            .expect("registered provider tool names always map to ToolName")
-    } else {
-        ToolName::External(schema_name.to_string())
+    let name = match resolved.as_ref() {
+        // Resolution is the source of truth for collisions. External winners
+        // keep their registered identity, while built-ins use requested_name
+        // so aliases such as list_files retain their dedicated ToolName.
+        Some(resolved) if matches!(resolved.spec.name, ToolName::External(_)) => {
+            resolved.spec.name.clone()
+        }
+        Some(resolved) => resolved.requested_name.clone(),
+        None if schema_name.starts_with("mcp__") => ToolName::Mcp(schema_name.to_string()),
+        None => ToolName::External(schema_name.to_string()),
     };
     let action = resolved
         .as_ref()
@@ -958,6 +959,24 @@ mod tests {
     }
 
     #[test]
+    fn parse_external_list_files_collision_preserves_builtin_alias_precedence() {
+        let external = orca_core::external_config::ExternalToolConfig {
+            name: "list_files".to_string(),
+            description: "Shadow the built-in glob alias".to_string(),
+            action_kind: ActionKind::Shell,
+            command: "echo shadowed".to_string(),
+            schema: serde_json::json!({}),
+        };
+        let tc = make_tc("list_files", r#"{}"#);
+        let request = parse_tool_call(&tc, &[external]);
+
+        assert_eq!(request.name, ToolName::ListFiles);
+        assert_eq!(request.action, ActionKind::Read);
+        assert_eq!(request.target.as_deref(), Some("."));
+        assert_eq!(request.raw_arguments.as_deref(), Some(r#"{}"#));
+    }
+
+    #[test]
     fn parse_update_plan_normalizes_boolean_status_flags() {
         // Both malformed shapes DeepSeek emits in the wild: flags without status
         // and flags redundant with status. Normalized output must pass the same
@@ -1144,6 +1163,29 @@ mod tests {
         assert_eq!(req.name, ToolName::Bash);
         assert_eq!(req.action, ActionKind::Shell);
         assert_eq!(req.target.as_deref(), Some("cargo test"));
+    }
+
+    #[test]
+    fn parse_external_bash_collision_preserves_builtin_registry_precedence() {
+        let external = orca_core::external_config::ExternalToolConfig {
+            name: "bash".to_string(),
+            description: "Shadow the built-in shell tool".to_string(),
+            action_kind: ActionKind::Network,
+            command: "echo shadowed".to_string(),
+            schema: serde_json::json!({}),
+        };
+        let raw_arguments = r#"{"command":"cargo test -p orca-provider"}"#;
+        let tc = make_tc("bash", raw_arguments);
+        let request = parse_tool_call(&tc, &[external]);
+
+        assert_eq!(request.id, "call_123");
+        assert_eq!(request.name, ToolName::Bash);
+        assert_eq!(request.action, ActionKind::Shell);
+        assert_eq!(
+            request.target.as_deref(),
+            Some("cargo test -p orca-provider")
+        );
+        assert_eq!(request.raw_arguments.as_deref(), Some(raw_arguments));
     }
 
     #[test]
