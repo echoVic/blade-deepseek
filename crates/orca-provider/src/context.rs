@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
+use orca_core::cancel::CancelToken;
 use orca_core::config::{ModelRuntimeConfig, ProviderKind};
 use orca_core::conversation::{Conversation, Message, SummaryState, normalize_tool_boundaries};
 use orca_core::provider_types::ProviderStep;
@@ -325,6 +326,38 @@ pub fn compact_with_summary(
     context_config: &ContextConfig,
     provider_config: &ProviderConfig,
 ) -> CompactionResult {
+    compact_with_summary_inner(
+        provider_kind,
+        conversation,
+        context_config,
+        provider_config,
+        None,
+    )
+}
+
+pub fn compact_with_summary_cancellable(
+    provider_kind: ProviderKind,
+    conversation: &Conversation,
+    context_config: &ContextConfig,
+    provider_config: &ProviderConfig,
+    cancel: &CancelToken,
+) -> CompactionResult {
+    compact_with_summary_inner(
+        provider_kind,
+        conversation,
+        context_config,
+        provider_config,
+        Some(cancel),
+    )
+}
+
+fn compact_with_summary_inner(
+    provider_kind: ProviderKind,
+    conversation: &Conversation,
+    context_config: &ContextConfig,
+    provider_config: &ProviderConfig,
+    cancel: Option<&CancelToken>,
+) -> CompactionResult {
     let micro_compacted = micro_compact_stale_tool_outputs(conversation);
     // Wire-equivalent gate: cheap micro compaction only counts as "enough"
     // when the prompt the provider will actually receive (messages +
@@ -343,6 +376,7 @@ pub fn compact_with_summary(
         &micro_compacted,
         context_config,
         provider_config,
+        cancel,
     ) {
         Some((conversation, summary)) => CompactionResult {
             conversation,
@@ -370,6 +404,7 @@ fn summarize_collapsed_messages(
     conversation: &Conversation,
     context_config: &ContextConfig,
     provider_config: &ProviderConfig,
+    cancel: Option<&CancelToken>,
 ) -> Option<(Conversation, String)> {
     let (system_msg, pinned, collapsed, kept) =
         partition_for_compaction(conversation, context_config, &DefaultTokenCounter)?;
@@ -403,6 +438,7 @@ fn summarize_collapsed_messages(
             SUMMARY_PURPOSE_DELTA,
             None,
             &rendered,
+            cancel,
         )?
     };
 
@@ -423,7 +459,7 @@ fn summarize_collapsed_messages(
         let needs_rebuild = summary.deltas.len() > MAX_SUMMARY_DELTAS
             || summary_total_delta_tokens(&summary) > BASELINE_REBUILD_TOKEN_THRESHOLD;
         if needs_rebuild {
-            let merged = rebuild_baseline(provider_kind, provider_config, &summary);
+            let merged = rebuild_baseline(provider_kind, provider_config, &summary, cancel);
             summary.baseline = Some(merged);
             summary.deltas.clear();
         }
@@ -458,6 +494,7 @@ fn rebuild_baseline(
     provider_kind: ProviderKind,
     provider_config: &ProviderConfig,
     summary: &SummaryState,
+    cancel: Option<&CancelToken>,
 ) -> String {
     let mut combined = String::new();
     if let Some(baseline) = &summary.baseline {
@@ -474,6 +511,7 @@ fn rebuild_baseline(
         SUMMARY_PURPOSE_REBUILD,
         None,
         &rendered,
+        cancel,
     )
     .unwrap_or(combined)
 }
@@ -545,7 +583,11 @@ fn request_summary(
     purpose: &str,
     previous_summary: Option<&str>,
     rendered: &RenderedSummaryDelta,
+    cancel: Option<&CancelToken>,
 ) -> Option<String> {
+    if cancel.is_some_and(CancelToken::is_cancelled) {
+        return None;
+    }
     let collapsed_text = rendered.text.as_str();
     let cache_scope = summary_cache_scope(provider_kind, provider_config);
     let cache_key =
@@ -578,7 +620,20 @@ fn request_summary(
     summary_conversation.add_system(SUMMARY_SYSTEM_PROMPT.to_string());
     summary_conversation.add_user(user_prompt);
 
-    let response = crate::call(provider_kind, &summary_conversation, &summary_config);
+    let response = if let Some(cancel) = cancel {
+        crate::call_streaming(
+            provider_kind,
+            &summary_conversation,
+            &summary_config,
+            cancel,
+            &mut |_| {},
+        )
+    } else {
+        crate::call(provider_kind, &summary_conversation, &summary_config)
+    };
+    if cancel.is_some_and(CancelToken::is_cancelled) {
+        return None;
+    }
     if let Some(usage) = response.usage {
         emit_summary_usage_telemetry(purpose, usage);
     }
@@ -1254,7 +1309,13 @@ fn micro_compact_tool_output(content: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use orca_core::cancel::CancelToken;
     use orca_core::conversation::RawToolCall;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
 
     struct FixedCounter;
 
@@ -1758,6 +1819,83 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_compaction_skips_remote_summary_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind summary endpoint");
+        listener
+            .set_nonblocking(true)
+            .expect("set nonblocking listener");
+        let address = listener.local_addr().expect("summary endpoint address");
+        let requests = Arc::new(AtomicUsize::new(0));
+        let server_requests = Arc::clone(&requests);
+        let server = std::thread::spawn(move || {
+            let started = Instant::now();
+            while started.elapsed() < Duration::from_secs(2) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        server_requests.fetch_add(1, Ordering::SeqCst);
+                        let mut request = [0u8; 16 * 1024];
+                        let _ = stream.read(&mut request);
+                        let body = r#"{"choices":[{"message":{"content":"summary","reasoning_content":null,"tool_calls":null},"finish_reason":"stop"}],"usage":null}"#;
+                        write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        )
+                        .expect("write summary response");
+                        return;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("accept summary request: {error}"),
+                }
+            }
+        });
+        let mut conversation = Conversation::new();
+        conversation.add_system("system".to_string());
+        for index in 0..6 {
+            conversation.add_user(format!("old {index} {}", "x ".repeat(1_200)));
+            conversation.add_assistant(
+                Some(format!("older answer {index} {}", "y ".repeat(1_200))),
+                None,
+                vec![],
+            );
+        }
+        conversation.add_user("newest request".to_string());
+        let config = ContextConfig {
+            max_tokens: 500,
+            compaction_threshold: 1.0,
+            reserved_for_response: 0,
+            auto_compact_token_limit: None,
+            soft_compact_token_limit: None,
+        };
+        let provider_config = ProviderConfig {
+            api_key: Some("test-key".to_string()),
+            base_url: Some(format!("http://{address}")),
+            model: None,
+            reasoning_effort: orca_core::config::ReasoningEffort::Max,
+            tools_override: Some(Vec::new()),
+            mcp_registry: None,
+            external_tools: Vec::new(),
+        };
+        let cancel = CancelToken::new();
+        cancel.cancel();
+
+        let result = compact_with_summary_cancellable(
+            ProviderKind::DeepSeek,
+            &conversation,
+            &config,
+            &provider_config,
+            &cancel,
+        );
+        server.join().expect("summary server");
+
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+        assert!(matches!(result.kind, CompactionKind::LocalTruncation));
+    }
+
+    #[test]
     fn compact_with_existing_summary_falls_back_to_local_when_large_delta_summary_fails() {
         let mut conv = Conversation::new();
         conv.add_system("system".to_string());
@@ -1926,6 +2064,7 @@ mod tests {
             &conv,
             &config,
             &provider_config,
+            None,
         )
         .expect("small collapsed deltas must be kept instead of falling back to local truncation");
 

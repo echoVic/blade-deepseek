@@ -93,7 +93,7 @@ where
         return Ok(StatusKeyFlow::Continue);
     }
 
-    if state.status == AppStatus::Running
+    if matches!(state.status, AppStatus::Running | AppStatus::Compacting)
         && let Some(ShortcutAction::Running(shortcut)) =
             resolve_shortcut(ShortcutContext::Running, *key)
     {
@@ -101,4 +101,93 @@ where
     }
 
     Ok(StatusKeyFlow::Continue)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyModifiers};
+    use orca_core::approval_types::ApprovalMode;
+    use orca_core::config::{
+        HistoryMode, ModelRuntimeConfig, OutputFormat, ProviderKind, ThemeName, ToolConfig,
+        WorkflowConfig,
+    };
+    use orca_core::model::ModelSelection;
+
+    fn config() -> RunConfig {
+        RunConfig {
+            app_version: "test".to_string(),
+            prompt: String::new(),
+            cwd: None,
+            output_format: OutputFormat::Text,
+            approval_mode: ApprovalMode::Suggest,
+            provider: ProviderKind::Mock,
+            verifier: None,
+            model: ModelSelection::from_unchecked(Some("auto".to_string())),
+            model_runtime: ModelRuntimeConfig::default(),
+            reasoning_effort: orca_core::config::ReasoningEffort::Max,
+            api_key: None,
+            base_url: None,
+            mcp_servers: Vec::new(),
+            hooks: Vec::new(),
+            external_tools: Vec::new(),
+            history_mode: HistoryMode::Disabled,
+            show_session_picker: false,
+            active_permission_profile: None,
+            permission_profiles: Default::default(),
+            runtime_workspace_roots: None,
+            permission_rules: Default::default(),
+            additional_working_directories: Vec::new(),
+            max_budget_usd: None,
+            subagents: Default::default(),
+            tools: ToolConfig::default(),
+            workflows: WorkflowConfig::default(),
+            theme: ThemeName::Dark,
+            vim_mode: false,
+            update_check: false,
+            desktop_notifications: false,
+            auto_memory: false,
+        }
+    }
+
+    #[test]
+    fn compacting_status_keeps_running_interrupt_shortcut() {
+        let (action_tx, action_rx) = mpsc::channel();
+        let mut state = AppState::new(
+            action_tx.clone(),
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        state.set_status(AppStatus::Compacting);
+        let mut config = config();
+        let shared_config = Arc::new(Mutex::new(config.clone()));
+        let cancel = CancelToken::new();
+        let preloaded = Arc::new(Mutex::new(None));
+        let mut textarea = TextArea::default();
+        let mut vim_state = VimState::new(false);
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let key = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        let event = Event::Key(key);
+
+        handle_status_key(
+            &event,
+            &key,
+            &mut state,
+            &mut config,
+            &shared_config,
+            &action_tx,
+            &cancel,
+            &preloaded,
+            &mut textarea,
+            &mut vim_state,
+            &theme,
+            None,
+            || Ok(()),
+        )
+        .expect("handle compacting shortcut");
+
+        assert!(cancel.is_cancelled());
+        assert!(matches!(action_rx.try_recv(), Ok(UserAction::Interrupt)));
+    }
 }

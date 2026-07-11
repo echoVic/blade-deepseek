@@ -1,6 +1,7 @@
 use std::io;
 use std::path::Path;
 
+use orca_core::cancel::CancelToken;
 use orca_core::config::OutputFormat;
 use orca_core::event_schema::EventFactory;
 use orca_core::event_sink::EventSink;
@@ -130,6 +131,7 @@ pub struct TuiAgentTurnCompactionInput<'a, W: io::Write> {
     pub subagent_depth: u32,
     pub subagent_type: &'a SubagentType,
     pub emit_deltas: bool,
+    pub cancel: &'a CancelToken,
     pub events: &'a mut EventFactory,
     pub writer: &'a mut W,
 }
@@ -287,7 +289,8 @@ pub fn run_tui_agent_turn_compaction<W: io::Write>(
         input.events,
         &mut sink,
         runtime_parts.writer,
-    );
+    )
+    .with_cancel(input.cancel);
     let compacted = compaction.compact_if_needed(runtime_parts.conversation)?;
     let pressure = context::context_pressure(
         runtime_parts.conversation,
@@ -335,7 +338,8 @@ pub fn handle_tui_agent_provider_error<W: io::Write>(
                 input.events,
                 &mut sink,
                 runtime_parts.writer,
-            );
+            )
+            .with_cancel(input.cancel);
             compaction.compact_after_provider_error_retry(runtime_parts.conversation, trigger)?;
             state.retry.record_prompt_too_long_retry();
             Ok(TuiAgentProviderErrorAction::RetryAfterCompaction)
@@ -391,6 +395,7 @@ pub(crate) struct RuntimeCompactionStep<'a, W: io::Write> {
     events: &'a mut EventFactory,
     sink: &'a mut EventSink<W>,
     history_writer: Option<&'a mut SessionWriter>,
+    cancel: Option<&'a CancelToken>,
 }
 
 impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
@@ -413,7 +418,13 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
             events,
             sink,
             history_writer,
+            cancel: None,
         }
+    }
+
+    pub(crate) fn with_cancel(mut self, cancel: &'a CancelToken) -> Self {
+        self.cancel = Some(cancel);
+        self
     }
 
     pub(crate) fn compact_if_needed(
@@ -435,7 +446,8 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
         trigger: RuntimeCompactionTrigger,
     ) -> io::Result<()> {
         self.emit_compaction_started(trigger, conversation.messages.len())?;
-        self.compact_and_persist(conversation, trigger)?;
+        let outcome = self.compact_and_persist(conversation, trigger)?;
+        self.emit_compaction_completed(&outcome)?;
         Ok(())
     }
 
@@ -467,18 +479,23 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
         trigger: RuntimeCompactionTrigger,
     ) -> io::Result<()> {
         let before_messages = conversation.messages.len();
-        match self.hooks.run(
-            HookEvent::OnBudgetWarning,
-            HookContext {
-                cwd: &self.turn_context.cwd.display().to_string(),
-                session_status: None,
-                tool_request: None,
-                tool_result: None,
-                before_messages: Some(before_messages),
-                after_messages: None,
-                usage: None,
-            },
-        ) {
+        let budget_hook_context = HookContext {
+            cwd: &self.turn_context.cwd.display().to_string(),
+            session_status: None,
+            tool_request: None,
+            tool_result: None,
+            before_messages: Some(before_messages),
+            after_messages: None,
+            usage: None,
+        };
+        let budget_hook = if let Some(cancel) = self.cancel {
+            self.hooks
+                .run_with_cancel(HookEvent::OnBudgetWarning, budget_hook_context, cancel)
+        } else {
+            self.hooks
+                .run(HookEvent::OnBudgetWarning, budget_hook_context)
+        };
+        match budget_hook {
             Ok(outcome) if !outcome.injected_context.is_empty() => {
                 *conversation = conversation_with_hook_context(conversation, &outcome);
             }
@@ -496,15 +513,16 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
             self.run_compaction_hook(HookEvent::PreCompact, before_messages, None)?;
         }
 
-        let after_messages = self.compact_and_persist(conversation, trigger)?;
+        let outcome = self.compact_and_persist(conversation, trigger)?;
 
         if self.turn_context.emit_deltas {
             self.run_compaction_hook(
                 HookEvent::PostCompact,
                 before_messages,
-                Some(after_messages),
+                Some(outcome.after_messages()),
             )?;
         }
+        self.emit_compaction_completed(&outcome)?;
 
         Ok(())
     }
@@ -513,29 +531,29 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
         &mut self,
         conversation: &mut Conversation,
         trigger: RuntimeCompactionTrigger,
-    ) -> io::Result<usize> {
+    ) -> io::Result<RuntimeCompactionOutcome> {
         let before_messages = conversation.messages.len();
         let task = RuntimeCompactionTask::start(trigger, before_messages);
-        let compaction = context::compact_with_summary(
-            self.provider,
-            conversation,
-            self.context_config,
-            self.provider_config,
-        );
+        let compaction = if let Some(cancel) = self.cancel {
+            context::compact_with_summary_cancellable(
+                self.provider,
+                conversation,
+                self.context_config,
+                self.provider_config,
+                cancel,
+            )
+        } else {
+            context::compact_with_summary(
+                self.provider,
+                conversation,
+                self.context_config,
+                self.provider_config,
+            )
+        };
         *conversation = compaction.conversation;
         let after_messages = conversation.messages.len();
         let outcome = task.finish(after_messages, &compaction.kind);
         let details = outcome.details();
-        if self.turn_context.emit_deltas {
-            self.sink.emit(&self.events.context_compacted(
-                details.reason.as_str(),
-                details.strategy.as_str(),
-                details.before_messages,
-                details.after_messages,
-                details.collapsed_messages,
-                details.status_text,
-            ))?;
-        }
         if outcome.should_persist_summary_state(self.turn_context.emit_deltas)
             && let Some(writer) = self.history_writer.as_deref_mut()
         {
@@ -551,7 +569,22 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
                 )?;
             }
         }
-        Ok(after_messages)
+        Ok(outcome)
+    }
+
+    fn emit_compaction_completed(&mut self, outcome: &RuntimeCompactionOutcome) -> io::Result<()> {
+        if self.turn_context.emit_deltas {
+            let details = outcome.details();
+            self.sink.emit(&self.events.context_compacted(
+                details.reason.as_str(),
+                details.strategy.as_str(),
+                details.before_messages,
+                details.after_messages,
+                details.collapsed_messages,
+                details.status_text,
+            ))?;
+        }
+        Ok(())
     }
 
     fn run_compaction_hook(
@@ -560,18 +593,21 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
         before_messages: usize,
         after_messages: Option<usize>,
     ) -> io::Result<()> {
-        if let Err(error) = self.hooks.run(
-            event,
-            HookContext {
-                cwd: &self.turn_context.cwd.display().to_string(),
-                session_status: None,
-                tool_request: None,
-                tool_result: None,
-                before_messages: Some(before_messages),
-                after_messages,
-                usage: None,
-            },
-        ) {
+        let context = HookContext {
+            cwd: &self.turn_context.cwd.display().to_string(),
+            session_status: None,
+            tool_request: None,
+            tool_result: None,
+            before_messages: Some(before_messages),
+            after_messages,
+            usage: None,
+        };
+        let result = if let Some(cancel) = self.cancel {
+            self.hooks.run_with_cancel(event, context, cancel)
+        } else {
+            self.hooks.run(event, context)
+        };
+        if let Err(error) = result {
             self.sink.emit(
                 &self
                     .events
@@ -585,6 +621,33 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use orca_core::hook_types::HookConfig;
+    use std::fs;
+
+    struct CompactionLifecycleAuditWriter {
+        output: Vec<u8>,
+        history_path: std::path::PathBuf,
+        completed_marker: std::path::PathBuf,
+        completed_before_persistence: bool,
+    }
+
+    impl io::Write for CompactionLifecycleAuditWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.output.extend_from_slice(bytes);
+            if !self.completed_marker.exists()
+                && String::from_utf8_lossy(&self.output).contains("\"type\":\"context.compacted\"")
+            {
+                let history = fs::read_to_string(&self.history_path)?;
+                self.completed_before_persistence = !history.contains("\"context.collapsed\"");
+                fs::write(&self.completed_marker, "completed")?;
+            }
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn compaction_policy_maps_pressure_to_trigger() {
@@ -775,7 +838,6 @@ mod tests {
         )
         .expect("compaction should emit event");
 
-        drop(sink);
         let output = String::from_utf8(output).expect("jsonl is utf8");
         let emitted = output
             .lines()
@@ -797,5 +859,84 @@ mod tests {
         );
         assert_eq!(event["payload"]["reason"], "prompt_too_long_recovery");
         assert_eq!(event["payload"]["strategy"], "remote_summary");
+    }
+
+    #[test]
+    fn automatic_compaction_completes_after_persistence_and_post_hook() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let history_path = temp.path().join("session.jsonl");
+        fs::write(&history_path, "").expect("seed history file");
+        let completed_marker = temp.path().join("completed.marker");
+        let hook_command = format!("test ! -e '{}'", completed_marker.display());
+        let hooks = HookRunner::new(vec![HookConfig {
+            event: HookEvent::PostCompact,
+            command: hook_command,
+            tool: None,
+        }]);
+        let context_config = context::ContextConfig {
+            max_tokens: 100,
+            compaction_threshold: 1.0,
+            reserved_for_response: 0,
+            auto_compact_token_limit: Some(100),
+            soft_compact_token_limit: Some(40),
+        };
+        let provider_config = ProviderConfig {
+            api_key: None,
+            base_url: None,
+            model: None,
+            reasoning_effort: orca_core::config::ReasoningEffort::Max,
+            tools_override: Some(Vec::new()),
+            mcp_registry: None,
+            external_tools: Vec::new(),
+        };
+        let mut conversation = Conversation::new();
+        conversation.add_system("system".to_string());
+        for index in 0..20 {
+            conversation.add_user(format!("user message {index}: {}", "context ".repeat(8)));
+            conversation.add_assistant(
+                Some(format!(
+                    "assistant message {index}: {}",
+                    "details ".repeat(8)
+                )),
+                None,
+                vec![],
+            );
+        }
+        let mut writer = CompactionLifecycleAuditWriter {
+            output: Vec::new(),
+            history_path: history_path.clone(),
+            completed_marker,
+            completed_before_persistence: false,
+        };
+        let mut sink = EventSink::new(&mut writer, orca_core::config::OutputFormat::Jsonl);
+        let mut events = EventFactory::new("automatic-compaction-order".to_string());
+        let mut history_writer =
+            SessionWriter::append_to_existing(history_path).expect("history writer");
+        let subagent_type = orca_core::subagent_types::SubagentType::General;
+
+        RuntimeCompactionStep::new(
+            orca_core::config::ProviderKind::Mock,
+            &context_config,
+            &provider_config,
+            RuntimeTurnContext::new(std::path::Path::new("."), "", 0, true, &subagent_type),
+            &hooks,
+            &mut events,
+            &mut sink,
+            Some(&mut history_writer),
+        )
+        .compact_if_needed(&mut conversation)
+        .expect("automatic compaction");
+
+        assert!(!writer.completed_before_persistence);
+        let output = String::from_utf8(writer.output).expect("jsonl is utf8");
+        let event_types = output
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("event json"))
+            .map(|event| event["type"].as_str().unwrap_or_default().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            event_types,
+            vec!["context.compaction.started", "context.compacted"]
+        );
     }
 }

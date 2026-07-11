@@ -527,9 +527,14 @@ impl InteractiveSession {
         self.conversation.replace_skill_context(content);
     }
 
-    pub fn compact(&mut self, config: &RunConfig, cwd: &Path) -> (usize, usize) {
+    pub fn compact(
+        &mut self,
+        config: &RunConfig,
+        cwd: &Path,
+        cancel: &orca_core::cancel::CancelToken,
+    ) -> (usize, usize) {
         let before_messages = self.conversation.messages.len();
-        if let Ok(outcome) = self.hooks.run(
+        if let Ok(outcome) = self.hooks.run_with_cancel(
             HookEvent::OnBudgetWarning,
             HookContext {
                 cwd: &cwd.display().to_string(),
@@ -540,11 +545,12 @@ impl InteractiveSession {
                 after_messages: None,
                 usage: None,
             },
+            cancel,
         ) && !outcome.injected_context.is_empty()
         {
             self.conversation = conversation_with_hook_context(&self.conversation, &outcome);
         }
-        let _ = self.hooks.run(
+        let _ = self.hooks.run_with_cancel(
             HookEvent::PreCompact,
             HookContext {
                 cwd: &cwd.display().to_string(),
@@ -555,6 +561,7 @@ impl InteractiveSession {
                 after_messages: None,
                 usage: None,
             },
+            cancel,
         );
         let provider_config = ProviderConfig {
             api_key: config.api_key.clone(),
@@ -565,7 +572,7 @@ impl InteractiveSession {
             mcp_registry: None,
             external_tools: Vec::new(),
         };
-        let compaction = orca_provider::context::compact_with_summary(
+        let compaction = orca_provider::context::compact_with_summary_cancellable(
             config.provider,
             &self.conversation,
             &orca_provider::context::ContextConfig::for_model_with_runtime(
@@ -573,6 +580,7 @@ impl InteractiveSession {
                 &config.model_runtime,
             ),
             &provider_config,
+            cancel,
         );
         self.conversation = compaction.conversation;
         let after_messages = self.conversation.messages.len();
@@ -588,7 +596,7 @@ impl InteractiveSession {
                 );
             }
         }
-        let _ = self.hooks.run(
+        let _ = self.hooks.run_with_cancel(
             HookEvent::PostCompact,
             HookContext {
                 cwd: &cwd.display().to_string(),
@@ -599,6 +607,7 @@ impl InteractiveSession {
                 after_messages: Some(after_messages),
                 usage: None,
             },
+            cancel,
         );
         (before_messages, after_messages)
     }

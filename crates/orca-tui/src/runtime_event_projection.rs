@@ -481,6 +481,32 @@ mod tests {
     }
 
     #[test]
+    fn legacy_context_compacted_event_keeps_tui_projection_compatible() {
+        let event = EventEnvelope {
+            version: orca_core::event_schema::EVENT_SCHEMA_VERSION,
+            run_id: "legacy-compaction".to_string(),
+            seq: 1,
+            timestamp_ms: 1,
+            event_type: EventType::ContextCompacted,
+            payload: serde_json::json!({
+                "before_messages": 12,
+                "after_messages": 5
+            }),
+        };
+
+        let compacted = tui_event_from_runtime_event(&event).expect("legacy compaction event");
+
+        assert!(matches!(
+            compacted,
+            TuiEvent::Compacted {
+                before_messages: 12,
+                after_messages: 5,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn runtime_context_compaction_started_event_maps_to_tui_compacting_status() {
         let mut events = EventFactory::new("tui-runtime-adapter".to_string());
 

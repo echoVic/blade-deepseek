@@ -3261,7 +3261,9 @@ fn agent_loop_thread(
                         .cwd
                         .clone()
                         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-                    run_manual_compaction_with_events(&event_tx, || session.compact(&cfg, &cwd));
+                    run_manual_compaction_with_events(&event_tx, || {
+                        session.compact(&cfg, &cwd, &cancel)
+                    });
                 } else {
                     let _ = event_tx.send(TuiEvent::Error("nothing to compact".to_string()));
                 }

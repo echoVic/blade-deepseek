@@ -122,11 +122,15 @@ pub struct ContextCompactionStartedPayload {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ContextCompactedPayload {
+    #[serde(default)]
     pub reason: String,
+    #[serde(default)]
     pub strategy: String,
     pub before_messages: usize,
     pub after_messages: usize,
+    #[serde(default)]
     pub collapsed_messages: usize,
+    #[serde(default)]
     pub status_text: String,
 }
 

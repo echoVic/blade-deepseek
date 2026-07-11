@@ -24,7 +24,7 @@ where
 {
     match shortcut {
         GlobalShortcut::Cancel => {
-            if state.status == AppStatus::Running {
+            if matches!(state.status, AppStatus::Running | AppStatus::Compacting) {
                 cancel_token.cancel();
                 let _ = action_tx.send(UserAction::Interrupt);
                 return Ok(GlobalShortcutFlow::Continue);
@@ -68,7 +68,32 @@ mod tests {
 
     use super::handle_global_shortcut;
     use crate::shortcuts::GlobalShortcut;
-    use crate::types::{AppState, ChatMessage};
+    use crate::types::{AppState, AppStatus, ChatMessage, UserAction};
+
+    #[test]
+    fn cancel_interrupts_while_context_is_compacting() {
+        let (action_tx, action_rx) = mpsc::channel();
+        let mut state = AppState::new(
+            action_tx.clone(),
+            "test".to_string(),
+            "model".to_string(),
+            "/tmp".to_string(),
+        );
+        state.set_status(AppStatus::Compacting);
+        let cancel = CancelToken::new();
+
+        handle_global_shortcut(
+            GlobalShortcut::Cancel,
+            &mut state,
+            &action_tx,
+            &cancel,
+            || Ok(()),
+        )
+        .expect("cancel compaction");
+
+        assert!(cancel.is_cancelled());
+        assert!(matches!(action_rx.try_recv(), Ok(UserAction::Interrupt)));
+    }
 
     #[test]
     fn clear_screen_atomically_clears_messages_revisions_and_render_cache() {

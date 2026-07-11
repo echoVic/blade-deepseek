@@ -161,8 +161,13 @@ impl TuiConversationSession {
         self.runtime.session_mut().replace_skill_context(content);
     }
 
-    pub fn compact(&mut self, config: &RunConfig, cwd: &Path) -> (usize, usize) {
-        self.runtime.session_mut().compact(config, cwd)
+    pub fn compact(
+        &mut self,
+        config: &RunConfig,
+        cwd: &Path,
+        cancel: &orca_core::cancel::CancelToken,
+    ) -> (usize, usize) {
+        self.runtime.session_mut().compact(config, cwd, cancel)
     }
 
     pub(crate) fn next_turn_lifecycle(&mut self) -> (u32, Option<TuiTaskLifecycle>) {
