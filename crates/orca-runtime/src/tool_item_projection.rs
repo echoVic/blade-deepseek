@@ -986,6 +986,7 @@ fn rebuild_completed_projected_tool_item(
             error,
         );
         copy_truncated_metadata(item, result);
+        copy_terminal_metadata(item, result);
         return;
     }
 
@@ -1008,6 +1009,7 @@ fn rebuild_completed_projected_tool_item(
             error,
         );
         copy_truncated_metadata(item, result);
+        copy_terminal_metadata(item, result);
         return;
     }
 
@@ -1028,11 +1030,16 @@ fn rebuild_completed_projected_tool_item(
             },
             truncated_metadata(result),
         );
+        copy_terminal_metadata(item, result);
         return;
     }
 
     if item["type"] == "fileChange" {
         *item = persisted_file_change_completed_item(item, Value::from(status.to_string()));
+        if matches!(status, "cancelled" | "indeterminate") {
+            item["error"] = error;
+        }
+        copy_terminal_metadata(item, result);
         return;
     }
 
@@ -1045,6 +1052,7 @@ fn rebuild_completed_projected_tool_item(
         Value::Null
     };
     item["error"] = error;
+    copy_terminal_metadata(item, result);
 }
 
 fn truncated_metadata(result: &Value) -> Value {
@@ -1061,12 +1069,22 @@ fn copy_truncated_metadata(item: &mut Value, result: &Value) {
     }
 }
 
+fn copy_terminal_metadata(item: &mut Value, result: &Value) {
+    for field in ["kind", "terminalSource", "invocationStarted"] {
+        if let Some(value) = result.get(field) {
+            item[field] = value.clone();
+        }
+    }
+}
+
 fn tool_failure_from_result(result: &Value) -> Option<(&'static str, Value)> {
     let status = match result["status"].as_str()? {
         "completed" => return None,
         "failed" => "failed",
         "denied" => "denied",
         "not_implemented" => "not_implemented",
+        "cancelled" => "cancelled",
+        "indeterminate" => "indeterminate",
         _ => "failed",
     };
     let message = result["error"]

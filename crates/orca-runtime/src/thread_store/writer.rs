@@ -39,13 +39,36 @@ pub(crate) fn read_records(path: &Path) -> io::Result<Vec<SessionRecord>> {
         if line.trim().is_empty() {
             continue;
         }
-        match serde_json::from_str(line) {
+        match serde_json::from_str::<SessionRecord>(line) {
             Ok(record) => records.push(record),
+            Err(error) if line_has_invalid_tool_terminal(line) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "invalid session record at {} line {}: {error}",
+                        path.display(),
+                        i + 1
+                    ),
+                ));
+            }
             Err(_) if i == lines.len() - 1 => break,
             Err(_) => continue,
         }
     }
     Ok(records)
+}
+
+fn line_has_invalid_tool_terminal(line: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+        return false;
+    };
+    if value["type"].as_str() != Some("conversation.message")
+        || value["message"]["role"].as_str() != Some("tool")
+    {
+        return false;
+    }
+    super::types::validate_stored_tool_terminal_fields(&value["message"])
+        .is_some_and(|result| result.is_err())
 }
 
 pub(crate) fn rewrite_records(path: &Path, records: &[SessionRecord]) -> io::Result<()> {
@@ -283,9 +306,17 @@ fn add_usage_totals(totals: &mut UsageTotals, usage: UsageTotals) {
 
 fn redact_stored_message(message: &mut StoredMessage) {
     match message {
-        StoredMessage::System { content, .. }
-        | StoredMessage::User { content, .. }
-        | StoredMessage::Tool { content, .. } => redact_string_in_place(content),
+        StoredMessage::System { content, .. } | StoredMessage::User { content, .. } => {
+            redact_string_in_place(content)
+        }
+        StoredMessage::Tool {
+            content, terminal, ..
+        } => {
+            redact_string_in_place(content);
+            if let Some(error) = terminal.error_mut() {
+                redact_string_in_place(error);
+            }
+        }
         StoredMessage::Assistant {
             content,
             reasoning_content,
@@ -602,10 +633,9 @@ impl SessionWriter {
                 message: StoredMessage::Tool {
                     tool_call_id: result.id.clone(),
                     content,
-                    status: Some(result.status),
-                    error: result.error.clone(),
-                    exit_code: result.exit_code,
-                    truncated: result.truncated,
+                    terminal: super::types::StoredToolTerminal::from_terminal(Some(
+                        result.terminal(),
+                    )),
                     pinned,
                 },
             },
@@ -868,5 +898,98 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn read_records_rejects_conflicting_tool_terminal_record() {
+        let path = tempfile::NamedTempFile::new().expect("temp transcript");
+        let valid = serde_json::to_string(&SessionRecord::Message {
+            message: StoredMessage::User {
+                content: "valid".to_string(),
+                pinned: false,
+            },
+        })
+        .expect("serialize valid record");
+        fs::write(
+            path.path(),
+            format!(
+                "{valid}\n{{\"type\":\"conversation.message\",\"message\":{{\"role\":\"tool\",\"tool_call_id\":\"call-1\",\"content\":\"cancelled\",\"status\":\"cancelled\",\"kind\":\"runtime_error\"}}}}\n{valid}\n"
+            ),
+        )
+        .expect("write transcript");
+
+        let error = read_records(path.path()).expect_err("terminal conflict must fail closed");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("line 2"));
+    }
+
+    #[test]
+    fn read_records_ignores_only_truncated_final_record() {
+        let path = tempfile::NamedTempFile::new().expect("temp transcript");
+        let valid = serde_json::to_string(&SessionRecord::Message {
+            message: StoredMessage::User {
+                content: "valid".to_string(),
+                pinned: false,
+            },
+        })
+        .expect("serialize valid record");
+        fs::write(
+            path.path(),
+            format!("{valid}\n{{\"type\":\"conversation.message\",\"message\":{{\"role\":\"tool\""),
+        )
+        .expect("write transcript");
+
+        let records = read_records(path.path()).expect("truncated final record is recoverable");
+        assert_eq!(records.len(), 1);
+    }
+
+    #[test]
+    fn read_records_preserves_legacy_skip_for_unrelated_invalid_record() {
+        let path = tempfile::NamedTempFile::new().expect("temp transcript");
+        fs::write(
+            path.path(),
+            "{\"type\":\"conversation.message\",\"message\":{\"role\":\"tool\"\n",
+        )
+        .expect("write transcript");
+
+        let records = read_records(path.path()).expect("legacy malformed tail is skipped");
+        assert!(records.is_empty());
+    }
+
+    #[test]
+    fn read_records_skips_terminal_shaped_record_with_unrelated_error() {
+        let path = tempfile::NamedTempFile::new().expect("temp transcript");
+        fs::write(
+            path.path(),
+            concat!(
+                "{\"type\":\"conversation.message\",\"message\":{\"role\":\"tool\",\"content\":\"missing id\",\"status\":\"cancelled\",\"kind\":\"cancelled\"}}\n",
+                "{\"type\":\"conversation.message\",\"message\":{\"role\":\"user\",\"content\":\"valid\"}}\n",
+            ),
+        )
+        .expect("write transcript");
+
+        let records = read_records(path.path()).expect("unrelated old bad record is skipped");
+        assert_eq!(records.len(), 1);
+    }
+
+    #[test]
+    fn read_records_rejects_invalid_terminal_metadata_beyond_status_kind_conflicts() {
+        for invalid_fields in [
+            "\"kind\":\"cancelled\"",
+            "\"status\":\"cancelled\",\"kind\":\"cancelled\",\"terminal_source\":\"future\"",
+            "\"status\":\"cancelled\",\"kind\":\"cancelled\",\"invocation_started\":42",
+        ] {
+            let path = tempfile::NamedTempFile::new().expect("temp transcript");
+            fs::write(
+                path.path(),
+                format!(
+                    "{{\"type\":\"conversation.message\",\"message\":{{\"role\":\"tool\",\"tool_call_id\":\"call-1\",\"content\":\"cancelled\",{invalid_fields}}}}}\n"
+                ),
+            )
+            .expect("write transcript");
+
+            let error = read_records(path.path()).expect_err("terminal metadata must fail closed");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        }
     }
 }

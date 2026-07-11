@@ -1,5 +1,6 @@
 use orca_core::conversation::{Message, RawToolCall};
-use orca_core::tool_types::ToolStatus;
+use orca_core::thread_item_projection::ProjectedToolTerminalMetadata;
+use orca_core::tool_types::ToolTerminal;
 use serde_json::{Value, json};
 
 use crate::tool_item_projection::{
@@ -257,8 +258,13 @@ fn message_to_thread_items_for_projection(message: &Message) -> Vec<Value> {
         Message::Tool {
             tool_call_id,
             content,
+            terminal,
             ..
-        } => vec![tool_result_to_thread_item(tool_call_id, content)],
+        } => vec![tool_result_to_thread_item(
+            tool_call_id,
+            content,
+            terminal.as_ref(),
+        )],
         _ => vec![message_to_thread_json(message)],
     }
 }
@@ -281,18 +287,12 @@ fn stored_message_to_thread_items_for_projection(message: &StoredMessage) -> Vec
         StoredMessage::Tool {
             tool_call_id,
             content,
-            status,
-            error,
-            exit_code,
-            truncated,
+            terminal,
             ..
-        } => vec![tool_result_to_thread_item_with_metadata(
+        } => vec![tool_result_to_thread_item(
             tool_call_id,
             content,
-            *status,
-            error.as_deref(),
-            *exit_code,
-            *truncated,
+            terminal.terminal_ref(),
         )],
         _ => vec![stored_message_to_thread_json(message)],
     }
@@ -354,34 +354,33 @@ fn command_execution_thread_item(tool_call: &RawToolCall) -> Value {
     )
 }
 
-fn tool_result_to_thread_item(tool_call_id: &str, content: &str) -> Value {
-    json!({
+fn tool_result_to_thread_item(
+    tool_call_id: &str,
+    content: &str,
+    terminal: Option<&ToolTerminal>,
+) -> Value {
+    let mut item = json!({
         "type": "tool_result",
         "toolCallId": tool_call_id,
         "content": content,
-    })
-}
-
-fn tool_result_to_thread_item_with_metadata(
-    tool_call_id: &str,
-    content: &str,
-    status: Option<ToolStatus>,
-    error: Option<&str>,
-    exit_code: Option<i32>,
-    truncated: bool,
-) -> Value {
-    let mut item = tool_result_to_thread_item(tool_call_id, content);
-    if let Some(status) = status {
-        item["status"] = Value::from(status.as_str());
-    }
-    if let Some(error) = error {
-        item["error"] = Value::from(error.to_string());
-    }
-    if let Some(exit_code) = exit_code {
-        item["exitCode"] = Value::from(exit_code);
-    }
-    if truncated {
-        item["truncated"] = Value::from(true);
+    });
+    if let Some(terminal) = terminal {
+        item["status"] = Value::from(terminal.status.as_str());
+        if let Some(error) = &terminal.error {
+            item["error"] = Value::from(error.clone());
+        }
+        if let Some(exit_code) = terminal.exit_code {
+            item["exitCode"] = Value::from(exit_code);
+        }
+        if terminal.truncated {
+            item["truncated"] = Value::from(true);
+        }
+        if let Value::Object(metadata) = ProjectedToolTerminalMetadata::from(terminal).into_value()
+        {
+            item.as_object_mut()
+                .expect("tool result projection is an object")
+                .extend(metadata);
+        }
     }
     item
 }

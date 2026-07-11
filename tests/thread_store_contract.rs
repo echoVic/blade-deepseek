@@ -1,8 +1,11 @@
 use orca_core::approval_rules::{PermissionRule, PermissionRules};
 use orca_core::approval_types::{ActionKind, ApprovalMode, Decision};
 use orca_core::config::ActivePermissionProfile;
-use orca_core::conversation::{Message, RawToolCall};
-use orca_core::tool_types::{ToolName, ToolRequest, ToolResult};
+use orca_core::conversation::{MISSING_TOOL_TERMINAL_ERROR, Message, RawToolCall};
+use orca_core::tool_types::{
+    ToolInvocationStarted, ToolName, ToolRequest, ToolResult, ToolResultKind, ToolStatus,
+    ToolTerminalSource,
+};
 use orca_runtime::history::{
     SessionStore, SortDirection, ThreadListFilters, ThreadMetadataPatch, ThreadRelationFilter,
     ThreadSortKey, ThreadStore, TurnItemsView,
@@ -1029,6 +1032,142 @@ fn session_store_preserves_failed_command_projection_without_aggregated_output()
         assert!(tool_item.item["aggregatedOutput"].is_null());
         assert_eq!(tool_item.item["error"]["message"], "command failed");
         assert_eq!(tool_item.item["error"]["exitCode"], 42);
+    });
+}
+
+#[test]
+fn session_store_round_trips_tool_terminal_metadata() {
+    with_orca_home(|home| {
+        let store = SessionStore::new();
+        let mut thread = store
+            .create_live_thread(home, "mock", None, "terminal metadata round trip")
+            .expect("create live thread");
+        let thread_id = thread.thread_id().to_string();
+
+        let cancelled_request = ToolRequest {
+            id: "cancelled-call".to_string(),
+            name: ToolName::Bash,
+            action: ActionKind::Shell,
+            target: Some("sleep 10".to_string()),
+            raw_arguments: Some(r#"{"command":"sleep 10"}"#.to_string()),
+        };
+        let indeterminate_request = ToolRequest {
+            id: "indeterminate-call".to_string(),
+            name: ToolName::External("deploy".to_string()),
+            action: ActionKind::Write,
+            target: Some("production".to_string()),
+            raw_arguments: Some(r#"{"env":"production"}"#.to_string()),
+        };
+        let cancelled = ToolResult::cancelled(&cancelled_request, "turn interrupted", Some(130));
+        let indeterminate =
+            ToolResult::indeterminate(&indeterminate_request, MISSING_TOOL_TERMINAL_ERROR)
+                .with_terminal_source(ToolTerminalSource::CompatibilityRepair);
+
+        thread
+            .append_items(&[
+                Message::user("run tools".to_string()),
+                Message::Assistant {
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: vec![
+                        RawToolCall {
+                            id: cancelled_request.id.clone(),
+                            function_name: "bash".to_string(),
+                            arguments: cancelled_request.raw_arguments.clone().unwrap(),
+                        },
+                        RawToolCall {
+                            id: indeterminate_request.id.clone(),
+                            function_name: "deploy".to_string(),
+                            arguments: indeterminate_request.raw_arguments.clone().unwrap(),
+                        },
+                    ],
+                    pinned: false,
+                },
+            ])
+            .expect("append tool calls");
+        thread
+            .writer_mut()
+            .append_tool_result_message(&cancelled, String::new(), false)
+            .expect("append cancelled terminal");
+        thread
+            .writer_mut()
+            .append_tool_result_message(
+                &indeterminate,
+                format!("ERROR: {MISSING_TOOL_TERMINAL_ERROR}"),
+                false,
+            )
+            .expect("append indeterminate terminal");
+
+        let transcript = store.load_session(&thread_id).expect("reload transcript");
+        let raw = std::fs::read_to_string(&transcript.path).expect("read raw transcript");
+        let records = raw
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|record| record["type"] == "conversation.message")
+            .filter(|record| record["message"]["role"] == "tool")
+            .collect::<Vec<_>>();
+        let cancelled_record = records
+            .iter()
+            .find(|record| record["message"]["tool_call_id"] == "cancelled-call")
+            .expect("cancelled JSONL record");
+        assert_eq!(cancelled_record["message"]["status"], "cancelled");
+        assert_eq!(cancelled_record["message"]["kind"], "cancelled");
+        assert_eq!(cancelled_record["message"]["invocation_started"], "yes");
+        assert!(cancelled_record["message"].get("terminal_source").is_none());
+        let indeterminate_record = records
+            .iter()
+            .find(|record| record["message"]["tool_call_id"] == "indeterminate-call")
+            .expect("indeterminate JSONL record");
+        assert_eq!(indeterminate_record["message"]["status"], "indeterminate");
+        assert_eq!(indeterminate_record["message"]["kind"], "indeterminate");
+        assert_eq!(
+            indeterminate_record["message"]["terminal_source"],
+            "compatibility_repair"
+        );
+        assert!(
+            indeterminate_record["message"]
+                .get("invocation_started")
+                .is_none()
+        );
+        let terminals = transcript
+            .messages
+            .iter()
+            .filter_map(|message| match message {
+                Message::Tool {
+                    tool_call_id,
+                    terminal: Some(terminal),
+                    ..
+                } => Some((tool_call_id.as_str(), terminal)),
+                _ => None,
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+
+        let cancelled_terminal = terminals["cancelled-call"];
+        assert_eq!(cancelled_terminal.status, ToolStatus::Cancelled);
+        assert_eq!(cancelled_terminal.kind, ToolResultKind::Cancelled);
+        assert_eq!(cancelled_terminal.source, ToolTerminalSource::Observed);
+        assert_eq!(cancelled_terminal.started, ToolInvocationStarted::Yes);
+        assert_eq!(
+            cancelled_terminal.error.as_deref(),
+            Some("turn interrupted")
+        );
+        assert_eq!(cancelled_terminal.exit_code, Some(130));
+
+        let indeterminate_terminal = terminals["indeterminate-call"];
+        assert_eq!(indeterminate_terminal.status, ToolStatus::Indeterminate);
+        assert_eq!(indeterminate_terminal.kind, ToolResultKind::Indeterminate);
+        assert_eq!(
+            indeterminate_terminal.source,
+            ToolTerminalSource::CompatibilityRepair
+        );
+        assert_eq!(
+            indeterminate_terminal.started,
+            ToolInvocationStarted::Unknown
+        );
+        assert_eq!(
+            indeterminate_terminal.error.as_deref(),
+            Some(MISSING_TOOL_TERMINAL_ERROR)
+        );
     });
 }
 

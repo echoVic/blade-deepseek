@@ -621,6 +621,33 @@ pub struct ToolTerminal {
 }
 
 impl ToolTerminal {
+    pub fn try_from_parts(
+        status: ToolStatus,
+        error: Option<String>,
+        exit_code: Option<i32>,
+        truncated: bool,
+        kind: Option<ToolResultKind>,
+        source: ToolTerminalSource,
+        started: ToolInvocationStarted,
+    ) -> Result<Self, String> {
+        let kind = kind.unwrap_or_else(|| default_kind_for_status(status));
+        if !terminal_status_matches_kind(status, kind) {
+            return Err(format!(
+                "tool terminal status '{}' conflicts with result kind '{kind:?}'",
+                status.as_str()
+            ));
+        }
+        Ok(Self {
+            status,
+            error,
+            exit_code,
+            truncated,
+            kind,
+            source,
+            started,
+        })
+    }
+
     fn new(
         status: ToolStatus,
         error: Option<String>,
@@ -630,16 +657,16 @@ impl ToolTerminal {
         source: ToolTerminalSource,
         started: ToolInvocationStarted,
     ) -> Self {
-        debug_assert!(terminal_status_matches_kind(status, kind));
-        Self {
+        Self::try_from_parts(
             status,
             error,
             exit_code,
             truncated,
-            kind,
+            Some(kind),
             source,
             started,
-        }
+        )
+        .expect("tool terminal constructors use matching status and result kind")
     }
 }
 
@@ -663,24 +690,16 @@ impl<'de> Deserialize<'de> for ToolTerminal {
         D: Deserializer<'de>,
     {
         let wire = ToolTerminalWire::deserialize(deserializer)?;
-        let kind = wire
-            .kind
-            .unwrap_or_else(|| default_kind_for_status(wire.status));
-        if !terminal_status_matches_kind(wire.status, kind) {
-            return Err(serde::de::Error::custom(format!(
-                "tool terminal status '{}' conflicts with result kind '{kind:?}'",
-                wire.status.as_str()
-            )));
-        }
-        Ok(Self::new(
+        Self::try_from_parts(
             wire.status,
             wire.error,
             wire.exit_code,
             wire.truncated,
-            kind,
+            wire.kind,
             wire.source,
             wire.started,
-        ))
+        )
+        .map_err(serde::de::Error::custom)
     }
 }
 

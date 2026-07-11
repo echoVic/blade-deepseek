@@ -11,8 +11,10 @@ use orca_core::config::{
 use orca_core::conversation::{Message, RawToolCall};
 use orca_core::cost_types::UsageTotals;
 use orca_core::plan_types::PlanItem;
-use orca_core::tool_types::ToolStatus;
-use serde::{Deserialize, Serialize};
+use orca_core::tool_types::{
+    ToolInvocationStarted, ToolResultKind, ToolStatus, ToolTerminal, ToolTerminalSource,
+};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
 use super::LiveThread;
@@ -118,7 +120,7 @@ pub(crate) enum SessionRecord {
     },
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "snake_case", tag = "role")]
 pub(crate) enum StoredMessage {
     System {
@@ -141,17 +143,211 @@ pub(crate) enum StoredMessage {
     Tool {
         tool_call_id: String,
         content: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        status: Option<ToolStatus>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        error: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        exit_code: Option<i32>,
-        #[serde(default, skip_serializing_if = "is_false")]
-        truncated: bool,
+        #[serde(flatten)]
+        terminal: StoredToolTerminal,
         #[serde(default)]
         pinned: bool,
     },
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct StoredToolTerminal {
+    terminal: Option<ToolTerminal>,
+}
+
+impl StoredToolTerminal {
+    pub(crate) fn from_terminal(terminal: Option<&ToolTerminal>) -> Self {
+        Self {
+            terminal: terminal.cloned(),
+        }
+    }
+
+    pub(crate) fn terminal(&self) -> Option<ToolTerminal> {
+        self.terminal.clone()
+    }
+
+    pub(crate) fn terminal_ref(&self) -> Option<&ToolTerminal> {
+        self.terminal.as_ref()
+    }
+
+    pub(crate) fn error_mut(&mut self) -> Option<&mut String> {
+        self.terminal.as_mut()?.error.as_mut()
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct StoredToolTerminalWire {
+    #[serde(default)]
+    status: Option<ToolStatus>,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    exit_code: Option<i32>,
+    #[serde(default)]
+    truncated: bool,
+    #[serde(default)]
+    kind: Option<ToolResultKind>,
+    #[serde(default)]
+    terminal_source: Option<ToolTerminalSource>,
+    #[serde(default)]
+    invocation_started: Option<ToolInvocationStarted>,
+}
+
+impl StoredToolTerminalWire {
+    fn into_terminal(self) -> Result<Option<ToolTerminal>, String> {
+        if let Some(status) = self.status {
+            return ToolTerminal::try_from_parts(
+                status,
+                self.error,
+                self.exit_code,
+                self.truncated,
+                self.kind,
+                self.terminal_source.unwrap_or_default(),
+                self.invocation_started.unwrap_or_default(),
+            )
+            .map(Some);
+        }
+        if self.kind.is_some()
+            || self.terminal_source.is_some()
+            || self.invocation_started.is_some()
+        {
+            return Err(
+                "stored tool terminal kind/source/start metadata requires status".to_string(),
+            );
+        }
+        if self.error.is_none() && self.exit_code.is_none() && !self.truncated {
+            return Ok(None);
+        }
+        ToolTerminal::try_from_parts(
+            ToolStatus::Indeterminate,
+            self.error,
+            self.exit_code,
+            self.truncated,
+            Some(ToolResultKind::Indeterminate),
+            ToolTerminalSource::CompatibilityRepair,
+            ToolInvocationStarted::Unknown,
+        )
+        .map(Some)
+    }
+}
+
+pub(crate) fn validate_stored_tool_terminal_fields(message: &Value) -> Option<Result<(), String>> {
+    let fields = [
+        "status",
+        "error",
+        "exit_code",
+        "truncated",
+        "kind",
+        "terminal_source",
+        "invocation_started",
+    ];
+    let object = message.as_object()?;
+    if !fields.iter().any(|field| object.contains_key(*field)) {
+        return None;
+    }
+    Some(
+        serde_json::from_value::<StoredToolTerminalWire>(message.clone())
+            .map_err(|error| error.to_string())
+            .and_then(|wire| wire.into_terminal().map(|_| ())),
+    )
+}
+
+impl Serialize for StoredToolTerminal {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+
+        let mut map = serializer.serialize_map(None)?;
+        if let Some(terminal) = &self.terminal {
+            map.serialize_entry("status", &terminal.status)?;
+            if let Some(error) = &terminal.error {
+                map.serialize_entry("error", error)?;
+            }
+            if let Some(exit_code) = terminal.exit_code {
+                map.serialize_entry("exit_code", &exit_code)?;
+            }
+            if terminal.truncated {
+                map.serialize_entry("truncated", &true)?;
+            }
+            map.serialize_entry("kind", &terminal.kind)?;
+            if terminal.source != ToolTerminalSource::Observed {
+                map.serialize_entry("terminal_source", &terminal.source)?;
+            }
+            if terminal.started != ToolInvocationStarted::Unknown {
+                map.serialize_entry("invocation_started", &terminal.started)?;
+            }
+        }
+        map.end()
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case", tag = "role")]
+enum StoredMessageWire {
+    System {
+        content: String,
+        #[serde(default)]
+        pinned: bool,
+    },
+    User {
+        content: String,
+        #[serde(default)]
+        pinned: bool,
+    },
+    Assistant {
+        content: Option<String>,
+        reasoning_content: Option<String>,
+        tool_calls: Vec<RawToolCall>,
+        #[serde(default)]
+        pinned: bool,
+    },
+    Tool {
+        tool_call_id: String,
+        content: String,
+        #[serde(flatten)]
+        terminal: StoredToolTerminalWire,
+        #[serde(default)]
+        pinned: bool,
+    },
+}
+
+impl<'de> Deserialize<'de> for StoredMessage {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        match StoredMessageWire::deserialize(deserializer)? {
+            StoredMessageWire::System { content, pinned } => Ok(Self::System { content, pinned }),
+            StoredMessageWire::User { content, pinned } => Ok(Self::User { content, pinned }),
+            StoredMessageWire::Assistant {
+                content,
+                reasoning_content,
+                tool_calls,
+                pinned,
+            } => Ok(Self::Assistant {
+                content,
+                reasoning_content,
+                tool_calls,
+                pinned,
+            }),
+            StoredMessageWire::Tool {
+                tool_call_id,
+                content,
+                terminal,
+                pinned,
+            } => {
+                let terminal = terminal.into_terminal().map_err(serde::de::Error::custom)?;
+                Ok(Self::Tool {
+                    tool_call_id,
+                    content,
+                    terminal: StoredToolTerminal { terminal },
+                    pinned,
+                })
+            }
+        }
+    }
 }
 
 impl From<&Message> for StoredMessage {
@@ -179,15 +375,12 @@ impl From<&Message> for StoredMessage {
             Message::Tool {
                 tool_call_id,
                 content,
+                terminal,
                 pinned,
-                ..
             } => Self::Tool {
                 tool_call_id: tool_call_id.clone(),
                 content: content.clone(),
-                status: None,
-                error: None,
-                exit_code: None,
-                truncated: false,
+                terminal: StoredToolTerminal::from_terminal(terminal.as_ref()),
                 pinned: *pinned,
             },
         }
@@ -213,23 +406,16 @@ impl From<StoredMessage> for Message {
             StoredMessage::Tool {
                 tool_call_id,
                 content,
-                status: _,
-                error: _,
-                exit_code: _,
-                truncated: _,
+                terminal,
                 pinned,
             } => Self::Tool {
                 tool_call_id,
                 content,
-                terminal: None,
+                terminal: terminal.terminal(),
                 pinned,
             },
         }
     }
-}
-
-fn is_false(value: &bool) -> bool {
-    !*value
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]

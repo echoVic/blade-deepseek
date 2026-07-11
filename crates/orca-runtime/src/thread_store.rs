@@ -41,7 +41,9 @@ pub(crate) fn resume_conversation(
 mod tests {
     use super::*;
     use crate::history;
-    use orca_core::conversation::Message;
+    use orca_core::approval_types::ActionKind;
+    use orca_core::conversation::{MISSING_TOOL_TERMINAL_ERROR, Message, RawToolCall};
+    use orca_core::tool_types::{ToolName, ToolRequest, ToolResult, ToolTerminalSource};
 
     #[test]
     fn jsonl_thread_store_is_the_named_storage_backend() {
@@ -140,5 +142,161 @@ mod tests {
         ];
 
         assert_eq!(next_turn_id_for_messages("thread-a", &messages), "turn-2");
+    }
+
+    #[test]
+    fn tool_terminal_metadata_projects_live_and_stored_items_identically() {
+        let request = ToolRequest {
+            id: "indeterminate-call".to_string(),
+            name: ToolName::External("deploy".to_string()),
+            action: ActionKind::Write,
+            target: Some("production".to_string()),
+            raw_arguments: Some(r#"{"env":"production"}"#.to_string()),
+        };
+        let result = ToolResult::indeterminate(&request, MISSING_TOOL_TERMINAL_ERROR)
+            .with_terminal_source(ToolTerminalSource::CompatibilityRepair);
+        let messages = vec![
+            Message::user("deploy production".to_string()),
+            Message::Assistant {
+                content: None,
+                reasoning_content: None,
+                tool_calls: vec![RawToolCall {
+                    id: request.id.clone(),
+                    function_name: "deploy".to_string(),
+                    arguments: request.raw_arguments.clone().unwrap(),
+                }],
+                pinned: false,
+            },
+            Message::Tool {
+                tool_call_id: request.id.clone(),
+                content: format!("ERROR: {MISSING_TOOL_TERMINAL_ERROR}"),
+                terminal: Some(result.terminal().clone()),
+                pinned: false,
+            },
+        ];
+        let stored_messages = messages
+            .iter()
+            .map(types::StoredMessage::from)
+            .collect::<Vec<_>>();
+
+        let live_items = messages_to_thread_items("thread-a", &messages, None, usize::MAX);
+        let stored_items = projection::stored_messages_to_thread_items(
+            "thread-a",
+            &stored_messages,
+            None,
+            usize::MAX,
+        );
+
+        assert_eq!(live_items, stored_items);
+        let item = &stored_items
+            .iter()
+            .find(|item| item.item["id"] == request.id)
+            .expect("projected tool item")
+            .item;
+        assert_eq!(item["status"], "indeterminate");
+        assert_eq!(item["terminalSource"], "compatibility_repair");
+        assert!(item.get("invocationStarted").is_none());
+        assert_eq!(item["kind"], "indeterminate");
+        assert_eq!(item["error"]["message"], MISSING_TOOL_TERMINAL_ERROR);
+    }
+
+    #[test]
+    fn tool_terminal_metadata_survives_every_persisted_tool_item_shape() {
+        for (tool_name, arguments, expected_type) in [
+            (
+                "bash",
+                serde_json::json!({ "command": "deploy" }),
+                "commandExecution",
+            ),
+            (
+                "mcp__ops__deploy",
+                serde_json::json!({ "env": "production" }),
+                "mcpToolCall",
+            ),
+            (
+                "deploy",
+                serde_json::json!({ "env": "production" }),
+                "dynamicToolCall",
+            ),
+            (
+                "write_file",
+                serde_json::json!({ "path": "release.txt", "content": "ready" }),
+                "fileChange",
+            ),
+        ] {
+            let request = ToolRequest {
+                id: format!("{tool_name}-call"),
+                name: ToolName::External(tool_name.to_string()),
+                action: ActionKind::Write,
+                target: None,
+                raw_arguments: Some(arguments.to_string()),
+            };
+            let result = ToolResult::indeterminate(&request, MISSING_TOOL_TERMINAL_ERROR)
+                .with_terminal_source(ToolTerminalSource::CompatibilityRepair);
+            let messages = vec![
+                Message::user("run tool".to_string()),
+                Message::Assistant {
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: vec![RawToolCall {
+                        id: request.id.clone(),
+                        function_name: tool_name.to_string(),
+                        arguments: arguments.to_string(),
+                    }],
+                    pinned: false,
+                },
+                Message::Tool {
+                    tool_call_id: request.id.clone(),
+                    content: format!("ERROR: {MISSING_TOOL_TERMINAL_ERROR}"),
+                    terminal: Some(result.terminal().clone()),
+                    pinned: false,
+                },
+            ];
+            let stored_messages = messages
+                .iter()
+                .map(types::StoredMessage::from)
+                .collect::<Vec<_>>();
+            let live_items = messages_to_thread_items("thread-a", &messages, None, usize::MAX);
+            let stored_items = projection::stored_messages_to_thread_items(
+                "thread-a",
+                &stored_messages,
+                None,
+                usize::MAX,
+            );
+            assert_eq!(live_items, stored_items, "tool {tool_name}");
+
+            let item = stored_items
+                .into_iter()
+                .find(|item| {
+                    item.item["id"] == request.id
+                        || item.item["id"] == format!("{}:file-change", request.id)
+                })
+                .expect("projected tool item")
+                .item;
+            assert_eq!(item["type"], expected_type, "tool {tool_name}");
+            assert_eq!(item["status"], "indeterminate", "tool {tool_name}");
+            assert_eq!(
+                item["terminalSource"], "compatibility_repair",
+                "tool {tool_name}"
+            );
+            assert_eq!(item["kind"], "indeterminate", "tool {tool_name}");
+            assert_eq!(
+                item["error"]["message"], MISSING_TOOL_TERMINAL_ERROR,
+                "tool {tool_name}"
+            );
+        }
+    }
+
+    #[test]
+    fn stored_tool_terminal_rejects_conflicting_status_and_kind() {
+        let conflicting = serde_json::json!({
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "content": "cancelled",
+            "status": "cancelled",
+            "kind": "runtime_error"
+        });
+
+        assert!(serde_json::from_value::<types::StoredMessage>(conflicting).is_err());
     }
 }

@@ -1,6 +1,36 @@
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::tool_types::{ToolInvocationStarted, ToolResultKind, ToolTerminal, ToolTerminalSource};
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ProjectedToolTerminalMetadata {
+    #[serde(rename = "kind")]
+    pub result_kind: ToolResultKind,
+    #[serde(rename = "terminalSource", skip_serializing_if = "Option::is_none")]
+    pub terminal_source: Option<ToolTerminalSource>,
+    #[serde(rename = "invocationStarted", skip_serializing_if = "Option::is_none")]
+    pub invocation_started: Option<ToolInvocationStarted>,
+}
+
+impl From<&ToolTerminal> for ProjectedToolTerminalMetadata {
+    fn from(terminal: &ToolTerminal) -> Self {
+        Self {
+            result_kind: terminal.kind,
+            terminal_source: (terminal.source != ToolTerminalSource::Observed)
+                .then_some(terminal.source),
+            invocation_started: (terminal.started != ToolInvocationStarted::Unknown)
+                .then_some(terminal.started),
+        }
+    }
+}
+
+impl ProjectedToolTerminalMetadata {
+    pub fn into_value(self) -> Value {
+        serde_json::to_value(self).expect("projected tool terminal metadata serializes")
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(tag = "type")]
 pub enum ProjectedUserMessageThreadItem {

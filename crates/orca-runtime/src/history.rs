@@ -299,9 +299,12 @@ fn title_from_prompt(prompt: &str) -> String {
 mod tests {
     use super::*;
     use crate::thread_store::ORCA_HOME_ENV;
+    use orca_core::approval_types::ActionKind;
     use orca_core::conversation::RawToolCall;
     use orca_core::plan_types::{PlanItem, PlanStatus};
-    use orca_core::tool_types::{ToolStatus, ToolTerminalSource};
+    use orca_core::tool_types::{
+        ToolName, ToolRequest, ToolResult, ToolStatus, ToolTerminalSource,
+    };
 
     #[test]
     fn title_from_prompt_normalizes_whitespace_and_truncates() {
@@ -427,10 +430,22 @@ mod tests {
                 }],
                 pinned: false,
             })?;
+            let tool_request = ToolRequest {
+                id: "call_1".to_string(),
+                name: ToolName::Bash,
+                action: ActionKind::Shell,
+                target: None,
+                raw_arguments: None,
+            };
+            let tool_result = ToolResult::failed(
+                &tool_request,
+                format!("tool failed with token {tool_secret}"),
+                Some(1),
+            );
             writer.append_message(&Message::Tool {
                 tool_call_id: "call_1".to_string(),
                 content: format!("TOKEN={tool_secret}"),
-                terminal: None,
+                terminal: Some(tool_result.terminal().clone()),
                 pinned: false,
             })?;
             writer.append_summary(3, 2, format!("summary kept {json_secret}"))?;
@@ -715,50 +730,177 @@ mod tests {
 
     #[test]
     fn resume_repairs_incomplete_assistant_tool_call_turns() {
-        let cwd = std::env::current_dir().unwrap();
-        let transcript = SessionTranscript {
-            meta: create_meta(&cwd, "mock", None, "bad tool boundary"),
-            messages: vec![
-                Message::user("start".to_string()),
-                Message::Assistant {
-                    content: None,
-                    reasoning_content: None,
-                    tool_calls: vec![RawToolCall {
-                        id: "call_1".to_string(),
-                        function_name: "read_file".to_string(),
-                        arguments: "{\"path\":\"README.md\"}".to_string(),
-                    }],
-                    pinned: false,
-                },
-                Message::user("continue after failed turn".to_string()),
-            ],
-            compactions: Vec::new(),
-            summaries: Vec::new(),
-            usage: None,
-            plan: None,
-            completion_status: None,
-            completion_error: None,
-            path: cwd.join("bad-tool-boundary.jsonl"),
-        };
+        let _guard = lock_test_env();
+        let home = tempfile::tempdir().expect("temp home");
+        let previous = std::env::var_os(ORCA_HOME_ENV);
+        unsafe {
+            std::env::set_var(ORCA_HOME_ENV, home.path());
+        }
 
-        let conv = resume_conversation(&transcript, "sys".to_string());
+        let result = (|| {
+            let cwd = std::env::current_dir()?;
+            let meta = create_meta(&cwd, "mock", None, "bad tool boundary");
+            let session_id = meta.session_id.clone();
+            let mut writer = SessionWriter::start_from_meta(meta)?;
+            writer.append_message(&Message::user("start".to_string()))?;
+            writer.append_message(&Message::Assistant {
+                content: None,
+                reasoning_content: None,
+                tool_calls: vec![RawToolCall {
+                    id: "call_1".to_string(),
+                    function_name: "read_file".to_string(),
+                    arguments: "{\"path\":\"README.md\"}".to_string(),
+                }],
+                pinned: false,
+            })?;
+            writer.append_message(&Message::user("continue after failed turn".to_string()))?;
 
-        assert_eq!(conv.messages.len(), 5);
-        assert!(matches!(
-            &conv.messages[2],
-            Message::Assistant { tool_calls, .. } if tool_calls.len() == 1
-        ));
-        assert!(matches!(
-            &conv.messages[3],
-            Message::Tool { tool_call_id, terminal: Some(terminal), .. }
-                if tool_call_id == "call_1"
-                    && terminal.status == ToolStatus::Indeterminate
-                    && terminal.source == ToolTerminalSource::CompatibilityRepair
-        ));
-        assert!(matches!(
-            &conv.messages[4],
-            Message::User { content, .. } if content == "continue after failed turn"
-        ));
+            let transcript = load_session(&session_id)?;
+            let path = transcript.path.clone();
+            let original = fs::read(&path)?;
+            let conv = resume_conversation(&transcript, "sys".to_string());
+
+            assert_eq!(conv.messages.len(), 5);
+            assert!(matches!(
+                &conv.messages[2],
+                Message::Assistant { tool_calls, .. } if tool_calls.len() == 1
+            ));
+            assert!(matches!(
+                &conv.messages[3],
+                Message::Tool { tool_call_id, terminal: Some(terminal), .. }
+                    if tool_call_id == "call_1"
+                        && terminal.status == ToolStatus::Indeterminate
+                        && terminal.source == ToolTerminalSource::CompatibilityRepair
+            ));
+            assert!(matches!(
+                &conv.messages[4],
+                Message::User { content, .. } if content == "continue after failed turn"
+            ));
+            assert_eq!(
+                fs::read(&path)?,
+                original,
+                "resume repair must not rewrite the source JSONL"
+            );
+            Ok::<(), io::Error>(())
+        })();
+
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var(ORCA_HOME_ENV, previous);
+            } else {
+                std::env::remove_var(ORCA_HOME_ENV);
+            }
+        }
+        result.expect("resume repaired real JSONL without rewriting it");
+    }
+
+    #[test]
+    fn legacy_tool_result_metadata_without_new_terminal_fields_remains_readable() {
+        let _guard = lock_test_env();
+        let home = tempfile::tempdir().expect("temp home");
+        let previous = std::env::var_os(ORCA_HOME_ENV);
+        unsafe {
+            std::env::set_var(ORCA_HOME_ENV, home.path());
+        }
+
+        let result = (|| {
+            let cwd = std::env::current_dir()?;
+            let meta = create_meta(&cwd, "mock", None, "legacy tool metadata");
+            let session_id = meta.session_id.clone();
+            let path = session_path(&meta.session_id, meta.created_at)?;
+            let writer = SessionWriter::start_from_meta(meta)?;
+            drop(writer);
+            let legacy = serde_json::json!({
+                "type": "conversation.message",
+                "message": {
+                    "role": "tool",
+                    "tool_call_id": "legacy-call",
+                    "content": "ERROR: boom",
+                    "status": "failed",
+                    "error": "boom",
+                    "exit_code": 42,
+                    "truncated": true
+                }
+            });
+            use std::io::Write as _;
+            let mut file = fs::OpenOptions::new().append(true).open(&path)?;
+            writeln!(file, "{legacy}")?;
+
+            let transcript = load_session(&session_id)?;
+            assert!(matches!(
+                transcript.messages.last(),
+                Some(Message::Tool { terminal: Some(terminal), .. })
+                    if terminal.status == ToolStatus::Failed
+                        && terminal.error.as_deref() == Some("boom")
+                        && terminal.exit_code == Some(42)
+                        && terminal.truncated
+                        && terminal.source == ToolTerminalSource::Observed
+            ));
+            Ok::<(), io::Error>(())
+        })();
+
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var(ORCA_HOME_ENV, previous);
+            } else {
+                std::env::remove_var(ORCA_HOME_ENV);
+            }
+        }
+        result.expect("legacy tool terminal metadata remained readable");
+    }
+
+    #[test]
+    fn legacy_tool_result_metadata_without_status_becomes_indeterminate_repair() {
+        let _guard = lock_test_env();
+        let home = tempfile::tempdir().expect("temp home");
+        let previous = std::env::var_os(ORCA_HOME_ENV);
+        unsafe {
+            std::env::set_var(ORCA_HOME_ENV, home.path());
+        }
+
+        let result = (|| {
+            let cwd = std::env::current_dir()?;
+            let meta = create_meta(&cwd, "mock", None, "legacy partial tool metadata");
+            let session_id = meta.session_id.clone();
+            let path = session_path(&meta.session_id, meta.created_at)?;
+            let writer = SessionWriter::start_from_meta(meta)?;
+            drop(writer);
+            let legacy = serde_json::json!({
+                "type": "conversation.message",
+                "message": {
+                    "role": "tool",
+                    "tool_call_id": "legacy-call",
+                    "content": "legacy output",
+                    "error": "legacy diagnostic",
+                    "exit_code": 42,
+                    "truncated": true
+                }
+            });
+            use std::io::Write as _;
+            let mut file = fs::OpenOptions::new().append(true).open(&path)?;
+            writeln!(file, "{legacy}")?;
+
+            let transcript = load_session(&session_id)?;
+            assert!(matches!(
+                transcript.messages.last(),
+                Some(Message::Tool { terminal: Some(terminal), .. })
+                    if terminal.status == ToolStatus::Indeterminate
+                        && terminal.error.as_deref() == Some("legacy diagnostic")
+                        && terminal.exit_code == Some(42)
+                        && terminal.truncated
+                        && terminal.source == ToolTerminalSource::CompatibilityRepair
+            ));
+            Ok::<(), io::Error>(())
+        })();
+
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var(ORCA_HOME_ENV, previous);
+            } else {
+                std::env::remove_var(ORCA_HOME_ENV);
+            }
+        }
+        result.expect("legacy status-less tool diagnostics were repaired conservatively");
     }
 
     #[test]
