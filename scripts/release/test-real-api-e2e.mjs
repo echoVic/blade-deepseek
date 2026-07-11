@@ -52,8 +52,13 @@ if (process.env.ORCA_FAKE_BAD_CLI === "1" && args[0] === "exec") {
 }
 
 if (args[0] === "exec") {
-  process.stdout.write('{"type":"assistant.message.delta","payload":{"text":"ORCA_"}}\\n');
-  process.stdout.write('{"type":"assistant.message.delta","payload":{"text":"REAL_E2E_OK"}}\\n');
+  const text = args.join(" ").includes("ORCA_HISTORY_REPLAY_OK")
+    ? "ORCA_HISTORY_REPLAY_OK"
+    : "ORCA_REAL_E2E_OK";
+  process.stdout.write(JSON.stringify({
+    type: "assistant.message.delta",
+    payload: { text },
+  }) + "\\n");
   process.stdout.write('{"type":"session.completed","payload":{"status":"success"}}\\n');
   process.exit(0);
 }
@@ -384,6 +389,7 @@ if (args[0] === "--mode" && args[1] === "server") {
     "Build verified",
     "Provider summary real API e2e verified",
     "CLI real API e2e verified: ORCA_REAL_E2E_OK",
+    "History replay real API e2e verified: ORCA_HISTORY_REPLAY_OK",
     "Server real API e2e verified: ORCA_SERVER_REAL_OK",
     "Server thread real API e2e verified: ORCA_SERVER_THREAD_MEMORY_OK_",
     "Server thread/read e2e verified",
@@ -410,6 +416,7 @@ if (args[0] === "--mode" && args[1] === "server") {
     "cargo build --bin orca",
     "cargo run -p orca-provider --example summary_render_realapi",
     "orca exec --output-format jsonl --no-history --mode suggest --max-budget 0.01 Reply with exactly: ORCA_REAL_E2E_OK",
+    "orca exec --output-format jsonl --mode suggest --max-budget 0.01 --resume latest Reply with exactly: ORCA_HISTORY_REPLAY_OK",
     "orca --mode server",
     "server-stdin {\"id\":101,\"op\":\"submit\",\"prompt\":\"Reply with exactly: ORCA_SERVER_REAL_OK\"}",
     "server-stdin {\"id\":\"server-thread\",\"method\":\"thread/start\",\"params\":{}}",

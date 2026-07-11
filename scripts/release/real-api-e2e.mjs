@@ -1,11 +1,21 @@
 #!/usr/bin/env node
 
 import { execFileSync, spawn } from "node:child_process";
+import {
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import os from "node:os";
 import readline from "node:readline";
 import path from "node:path";
 
 const repoRoot = path.resolve(import.meta.dirname, "..", "..");
 const cliSentinel = "ORCA_REAL_E2E_OK";
+const historyReplaySentinel = "ORCA_HISTORY_REPLAY_OK";
 const serverSentinel = "ORCA_SERVER_REAL_OK";
 const serverThreadSentinel = `ORCA_SERVER_THREAD_MEMORY_OK_${Date.now()}_${process.pid}`;
 const serverThreadReadySentinel = "READY";
@@ -161,6 +171,102 @@ function runCli(args) {
   }
   assertStatus(events, "type", "session.completed", ["payload", "status"], "CLI real API e2e");
   console.log(`CLI real API e2e verified: ${cliSentinel}`);
+}
+
+function runHistoryReplay(args) {
+  if (args.skipCli) {
+    console.log("History replay real API e2e skipped");
+    return;
+  }
+
+  const home = mkdtempSync(path.join(os.tmpdir(), "orca-history-replay-e2e-"));
+  const sourceHome = process.env.ORCA_HOME ?? path.join(os.homedir(), ".orca");
+  const sourceAuthPath = path.join(sourceHome, "auth.json");
+  if (existsSync(sourceAuthPath)) {
+    copyFileSync(sourceAuthPath, path.join(home, "auth.json"));
+  }
+  const sessionDir = path.join(home, "sessions", "2026", "07", "11");
+  const sessionPath = path.join(
+    sessionDir,
+    "session-2026-07-11T00-00-00-history-replay-e2e.jsonl",
+  );
+  mkdirSync(sessionDir, { recursive: true });
+  const records = [
+    {
+      type: "session.meta",
+      schema_version: 1,
+      session_id: "history-replay-e2e",
+      cwd: repoRoot,
+      provider: "deepseek",
+      model: "deepseek-v4-flash",
+      title: "History replay validity e2e",
+      created_at: "2026-07-11T00:00:00Z",
+    },
+    {
+      type: "conversation.message",
+      message: {
+        role: "user",
+        content: "Legacy valid user context.",
+        pinned: false,
+      },
+    },
+    {
+      type: "conversation.message",
+      message: {
+        role: "assistant",
+        content: null,
+        reasoning_content: "synthetic incomplete reasoning",
+        tool_calls: [],
+        pinned: false,
+      },
+    },
+  ];
+  writeFileSync(
+    sessionPath,
+    `${records.map((record) => JSON.stringify(record)).join("\n")}\n`,
+  );
+
+  try {
+    const output = run(
+      args.orcaBin,
+      [
+        "exec",
+        "--output-format",
+        "jsonl",
+        "--mode",
+        "suggest",
+        "--max-budget",
+        args.maxBudget,
+        "--resume",
+        "latest",
+        `Reply with exactly: ${historyReplaySentinel}`,
+      ],
+      {
+        env: { ...process.env, ORCA_HOME: home },
+        timeoutMs: args.timeoutMs,
+      },
+    );
+    const events = parseJsonLines(output, "history replay CLI");
+    const text = events
+      .filter((event) => event.type === "assistant.message.delta")
+      .map((event) => event.payload?.text ?? "")
+      .join("");
+    if (!text.includes(historyReplaySentinel)) {
+      throw new Error(
+        `History replay real API e2e missing sentinel ${historyReplaySentinel}:\n${output}`,
+      );
+    }
+    assertStatus(
+      events,
+      "type",
+      "session.completed",
+      ["payload", "status"],
+      "History replay real API e2e",
+    );
+    console.log(`History replay real API e2e verified: ${historyReplaySentinel}`);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
 }
 
 function runServerSubmit(args) {
@@ -964,6 +1070,7 @@ async function main() {
   runBuild(args);
   runProviderSummary(args);
   runCli(args);
+  runHistoryReplay(args);
   await runServer(args);
 }
 
