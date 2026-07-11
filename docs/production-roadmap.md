@@ -4,7 +4,16 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-07-11
-Current baseline: current main after v0.2.15 makes DeepSeek history replay
+Current baseline: current main after v0.2.16 makes context compaction visible
+through its full TUI lifecycle. Automatic soft-limit, hard-limit, and
+prompt-too-long recovery emit typed `context.compaction.started` before budget
+hooks, compaction hooks, or remote summary work can block. Manual `/compact`
+also enters the existing `Compacting context...` state before its synchronous
+summary call. Ctrl+C, Esc, and Ctrl+G remain live in that state and now cancel
+hooks plus the streaming DeepSeek summary request. Successful completion is
+projected only after summary persistence and the post-compact hook finish, while
+retaining the detailed reason, strategy, and collapsed-message notice.
+Earlier v0.2.15 makes DeepSeek history replay
 reject incomplete assistant turns. TUI resume removes legacy assistant turns
 that contain reasoning but no visible content or tool calls before the next
 provider request, and new reasoning-only responses are retried instead of
@@ -396,8 +405,14 @@ The deeper July 9 reference pass changes the next refactor order:
    errors. The event/TUI projection slice is also seeded: successful runtime
    compactions emit `context.compacted` from `RuntimeCompactionOutcome` details,
    and the TUI runtime event adapter maps that event into the existing compacted
-   context notice/status path. Next enrich this with finer pre/post status
-   lifecycle if real TUI usage shows users need more than the compacted summary.
+   context notice/status path. The pre-status slice is now complete as well:
+   automatic compaction emits typed `context.compaction.started` before hooks
+   or summary work, and manual `/compact` enters the same TUI compacting state
+   before its synchronous call. Completion now follows persistence and
+   post-compact hooks, and TUI interrupt controls cancel the streaming DeepSeek
+   summary path instead of becoming inert while `Compacting` is visible. Keep
+   later lifecycle additions driven by real user-visible waits rather than
+   adding speculative phases.
 3. **P1: Move exec/permission evaluation toward a dedicated policy manager.**
    Codex keeps mutable exec policy in an `ExecPolicyManager` with parsed rules,
    command-origin lowering, prompt rejection reasons, and serialized updates.
