@@ -445,6 +445,12 @@ pub enum ReplaySemantics {
     IndeterminateAfterStart,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ToolControlSemantics {
+    pub interrupt: InterruptSemantics,
+    pub replay: ReplaySemantics,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolResultKind {
@@ -497,6 +503,8 @@ pub struct ToolSpec {
     pub capabilities: CapabilitySet,
     pub exposure: ToolExposure,
     pub result_semantics: ResultSemantics,
+    pub interrupt_semantics: InterruptSemantics,
+    pub replay_semantics: ReplaySemantics,
     pub renderer: RendererHint,
     pub concurrent_safe: bool,
 }

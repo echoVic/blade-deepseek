@@ -343,7 +343,9 @@ mod tests {
     use super::*;
     use orca_core::approval_types::ActionKind;
     use orca_core::mcp_types::{McpServerConfig, McpTransportKind};
-    use orca_core::tool_types::{ToolStatus, truncate_output};
+    use orca_core::tool_types::{
+        InterruptSemantics, ReplaySemantics, ToolControlSemantics, ToolStatus, truncate_output,
+    };
     use std::collections::HashMap;
     use std::fs;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -407,6 +409,53 @@ mod tests {
         assert_eq!(
             reg.get("subagent").unwrap().action_kind(),
             ActionKind::Agent
+        );
+    }
+
+    #[test]
+    fn registry_control_semantics_resolves_registered_identity_and_aliases() {
+        let default_registry = registry::default_tool_registry();
+        assert_eq!(
+            default_registry.control_semantics(&ToolName::Bash),
+            Some(ToolControlSemantics {
+                interrupt: InterruptSemantics::CooperativeCancel,
+                replay: ReplaySemantics::IndeterminateAfterStart,
+            })
+        );
+        assert_eq!(
+            default_registry.control_semantics(&ToolName::plain("list_files")),
+            Some(ToolControlSemantics {
+                interrupt: InterruptSemantics::WaitForTerminal,
+                replay: ReplaySemantics::SafeToRetry,
+            })
+        );
+        assert_eq!(
+            default_registry.control_semantics(&ToolName::plain("not_registered")),
+            None
+        );
+
+        let external_tools = vec![ExternalToolConfig {
+            name: "inspect_remote".to_string(),
+            description: "external read-like tool".to_string(),
+            action_kind: ActionKind::Read,
+            command: "printf inspected".to_string(),
+            schema: serde_json::json!({}),
+        }];
+        let registry = registry::tool_registry_with_mcp_and_external(None, &external_tools);
+        assert_eq!(
+            registry.control_semantics(&ToolName::plain("inspect_remote")),
+            Some(ToolControlSemantics {
+                interrupt: InterruptSemantics::CooperativeCancel,
+                replay: ReplaySemantics::IndeterminateAfterStart,
+            })
+        );
+        assert_eq!(
+            registry.control_semantics(&ToolName::ReadFile),
+            Some(ToolControlSemantics {
+                interrupt: InterruptSemantics::WaitForTerminal,
+                replay: ReplaySemantics::SafeToRetry,
+            }),
+            "dynamic tools cannot shadow a builtin policy"
         );
     }
 

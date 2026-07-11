@@ -9,8 +9,9 @@ use orca_core::approval_types::ActionKind;
 use orca_core::external_config::ExternalToolConfig;
 use orca_core::mcp_types::McpTool;
 use orca_core::tool_types::{
-    CapabilitySet, MAX_TOOL_OUTPUT_BYTES, RendererHint, ResultSemantics, ToolCapability,
-    ToolExposure, ToolName, ToolOutputTruncation, ToolRequest, ToolResult, ToolSpec,
+    CapabilitySet, InterruptSemantics, MAX_TOOL_OUTPUT_BYTES, RendererHint, ReplaySemantics,
+    ResultSemantics, ToolCapability, ToolControlSemantics, ToolExposure, ToolName,
+    ToolOutputTruncation, ToolRequest, ToolResult, ToolSpec,
 };
 use orca_mcp::{McpElicitationHandler, McpRegistry};
 
@@ -193,6 +194,14 @@ impl ToolRegistry {
             tool,
             spec: tool.spec(),
             requested_name: ToolName::from_str(name)?,
+        })
+    }
+
+    pub fn control_semantics(&self, name: &ToolName) -> Option<ToolControlSemantics> {
+        let resolved = self.resolve(name.as_str())?;
+        Some(ToolControlSemantics {
+            interrupt: resolved.spec.interrupt_semantics,
+            replay: resolved.spec.replay_semantics,
         })
     }
 
@@ -448,7 +457,7 @@ pub fn tool_registry_with_mcp_and_external(
 
 fn register_builtin_tools(registry: &mut ToolRegistry) {
     registry.register(BuiltinTool::new(
-        builtin_spec(
+        safe_local_read_builtin_spec(
             "read_file",
             "Read the contents of a file at the given path relative to workspace root.",
             json!({
@@ -479,7 +488,7 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
         ),
         BuiltinExecutor::ReadFile,
     ));
-    let mut glob = builtin_spec(
+    let mut glob = safe_local_read_builtin_spec(
         "glob",
         "Find files and directories by glob pattern or fuzzy path query. Use this for project file discovery.",
         json!({
@@ -543,7 +552,7 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
     glob.aliases.push(ToolName::plain("list_files"));
     registry.register(BuiltinTool::new(glob, BuiltinExecutor::Glob));
     registry.register(BuiltinTool::new(
-        builtin_spec(
+        safe_local_read_builtin_spec(
             "grep",
             "Search for a regex pattern in files using ripgrep. Returns matching lines with line numbers.",
             json!({
@@ -579,7 +588,7 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
         BuiltinExecutor::Grep,
     ));
     registry.register(BuiltinTool::new(
-        builtin_spec(
+        cooperative_builtin_spec(
             "bash",
             "Execute a shell command via sh -c. Use for running tests, builds, git operations, etc.",
             json!({
@@ -600,7 +609,7 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
         BuiltinExecutor::Bash,
     ));
     registry.register(BuiltinTool::new(
-        builtin_spec(
+        conservative_builtin_spec(
             "edit",
             "Edit a file by replacing exact text. The old_text must match exactly one location in the file.",
             json!({
@@ -629,7 +638,7 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
         BuiltinExecutor::Edit,
     ));
     registry.register(BuiltinTool::new(
-        builtin_spec(
+        conservative_builtin_spec(
             "write_file",
             "Create or overwrite a file with the given content. Use for creating new files or completely replacing file contents.",
             json!({
@@ -654,7 +663,7 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
         BuiltinExecutor::WriteFile,
     ));
     registry.register(BuiltinTool::new(
-        builtin_spec(
+        safe_local_read_builtin_spec(
             "git_status",
             "Show the git working tree status in short format.",
             json!({
@@ -670,7 +679,7 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
         BuiltinExecutor::GitStatus,
     ));
     registry.register(BuiltinTool::new(
-        builtin_spec(
+        conservative_builtin_spec(
             "web_search",
             "Search the web for current information using Brave Search. Returns top results with title, summary, and URL.",
             json!({
@@ -699,7 +708,7 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
         BuiltinExecutor::WebSearch,
     ));
     registry.register(BuiltinTool::new(
-        builtin_spec(
+        conservative_builtin_spec(
             "subagent",
             "Launch a synchronous child agent for a complex, multi-step subtask. The child runs independently and returns a concise result summary.",
             json!({
@@ -748,7 +757,7 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
         BuiltinExecutor::Subagent,
     ));
     registry.register(BuiltinTool::new(
-        builtin_spec(
+        safe_local_read_builtin_spec(
             "subagent_status",
             "Query the status and result of an async subagent by agent_id, including durable headless worker results from prior processes.",
             json!({
@@ -761,7 +770,7 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
                 },
                 "required": ["agent_id"]
             }),
-            CapabilitySet::new(vec![]),
+            CapabilitySet::new(vec![ToolCapability::TaskRead]),
             ToolExposure::Direct,
             RendererHint::Agent,
             true,
@@ -769,7 +778,7 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
         BuiltinExecutor::SubagentStatus,
     ));
     registry.register(BuiltinTool::new(
-        builtin_spec(
+        safe_local_read_builtin_spec(
             "task_list",
             "List background tasks in the current session, including shell, workflow, and subagent work.",
             json!({
@@ -786,7 +795,7 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
         BuiltinExecutor::TaskList,
     ));
     registry.register(BuiltinTool::new(
-        builtin_spec(
+        conservative_builtin_spec(
             "task_stop",
             "Request that a running background task stop. Prefer task_id; shell_id is accepted as a deprecated compatibility alias.",
             json!({
@@ -812,7 +821,7 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
         BuiltinExecutor::TaskStop,
     ));
     registry.register(BuiltinTool::new(
-        builtin_spec(
+        conservative_builtin_spec(
             "WorkflowDraft",
             "Create a previewable dynamic workflow draft from a JavaScript workflow script without launching it. Use this before Workflow when the user should review phases and raw script first.",
             json!({
@@ -833,7 +842,7 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
         BuiltinExecutor::WorkflowDraft,
     ));
     registry.register(BuiltinTool::new(
-        builtin_spec(
+        conservative_builtin_spec(
             "WorkflowDraftAction",
             "Apply a preview decision to a workflow draft. Use run to launch an approved draft, edit to replace the draft script and re-render metadata, save to persist it as a reusable workflow command, or cancel to discard it.",
             json!({
@@ -876,7 +885,7 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
         BuiltinExecutor::WorkflowDraftAction,
     ));
     registry.register(BuiltinTool::new(
-        builtin_spec(
+        conservative_builtin_spec(
             "Workflow",
             "Launch a dynamic workflow: a JavaScript script that orchestrates many subagents in the background. The tool returns task metadata immediately; the final report is delivered later as a task notification.",
             json!({
@@ -925,7 +934,7 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
         BuiltinExecutor::Workflow,
     ));
     registry.register(BuiltinTool::new(
-        builtin_spec(
+        conservative_builtin_spec(
             "workflow_send_message",
             "Send a message to the current workflow run mailbox so later workflow child agents can read it.",
             json!({
@@ -953,7 +962,7 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
         BuiltinExecutor::WorkflowSendMessage,
     ));
     registry.register(BuiltinTool::new(
-        builtin_spec(
+        safe_local_read_builtin_spec(
             "workflow_read_messages",
             "Read messages from a channel in the current workflow run mailbox.",
             json!({
@@ -974,7 +983,7 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
         BuiltinExecutor::WorkflowReadMessages,
     ));
     registry.register(BuiltinTool::new(
-        builtin_spec(
+        conservative_builtin_spec(
             "workflow_clear_messages",
             "Clear messages from a channel in the current workflow run mailbox.",
             json!({
@@ -995,7 +1004,7 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
         BuiltinExecutor::WorkflowClearMessages,
     ));
     registry.register(BuiltinTool::new(
-        builtin_spec(
+        conservative_builtin_spec(
             "workflow_create_task_list",
             "Create or replace a task list in the current workflow run so workflow child agents can claim shared work.",
             json!({
@@ -1021,7 +1030,7 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
         BuiltinExecutor::WorkflowCreateTaskList,
     ));
     registry.register(BuiltinTool::new(
-        builtin_spec(
+        conservative_builtin_spec(
             "workflow_claim_task",
             "Claim the next pending task from a task list in the current workflow run.",
             json!({
@@ -1046,7 +1055,7 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
         BuiltinExecutor::WorkflowClaimTask,
     ));
     registry.register(BuiltinTool::new(
-        builtin_spec(
+        conservative_builtin_spec(
             "workflow_complete_task",
             "Mark a claimed workflow task as completed with a JSON-serializable result.",
             json!({
@@ -1078,7 +1087,7 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
         BuiltinExecutor::WorkflowCompleteTask,
     ));
     registry.register(BuiltinTool::new(
-        builtin_spec(
+        safe_local_read_builtin_spec(
             "workflow_list_tasks",
             "List tasks in a task list from the current workflow run.",
             json!({
@@ -1099,7 +1108,7 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
         BuiltinExecutor::WorkflowListTasks,
     ));
     registry.register(BuiltinTool::new(
-        builtin_spec(
+        conservative_builtin_spec(
             "update_plan",
             "Update the current task plan. Use for complex multi-step tasks or when the user asks for a todo/task list. At most one step may be in_progress. Maximum 50 items, each step max 200 chars.",
             json!({
@@ -1141,7 +1150,7 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
         BuiltinExecutor::UpdatePlan,
     ));
     registry.register(BuiltinTool::new(
-        builtin_spec(
+        safe_local_read_builtin_spec(
             "get_goal",
             "Read the active persistent goal for the current goal-mode session, including objective, status, usage, and budget.",
             json!({
@@ -1157,7 +1166,7 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
         BuiltinExecutor::GetGoal,
     ));
     registry.register(BuiltinTool::new(
-        builtin_spec(
+        conservative_builtin_spec(
             "create_goal",
             "Create a new active persistent goal for the current goal-mode session. This cannot replace an unfinished goal; complete or block the existing goal first.",
             json!({
@@ -1183,7 +1192,7 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
         BuiltinExecutor::CreateGoal,
     ));
     registry.register(BuiltinTool::new(
-        builtin_spec(
+        conservative_builtin_spec(
             "update_goal",
             "Update the active persistent goal status from goal mode. The model may only set status to complete when the goal is fully achieved or blocked after the strict blocked audit is satisfied; pause, resume, clear, budget, and objective edits are controlled by the user or system.",
             json!({
@@ -1210,7 +1219,7 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
         BuiltinExecutor::UpdateGoal,
     ));
     registry.register(BuiltinTool::new(
-        builtin_spec(
+        safe_local_read_builtin_spec(
             "list_skills",
             "List available user and project skills. Use before read_skill when the user asks for a skill or reusable procedure.",
             json!({
@@ -1227,7 +1236,7 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
         BuiltinExecutor::ListSkills,
     ));
     registry.register(BuiltinTool::new(
-        builtin_spec(
+        safe_local_read_builtin_spec(
             "read_skill",
             "Read a skill's Markdown instructions by id after list_skills shows it is available.",
             json!({
@@ -1249,7 +1258,7 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
         BuiltinExecutor::ReadSkill,
     ));
     registry.register(BuiltinTool::new(
-        builtin_spec(
+        conservative_builtin_spec(
             "list_mcp_resources",
             "List resources exposed by connected MCP servers. Prefer this before read_mcp_resource when the user asks for MCP-provided context.",
             json!({
@@ -1271,7 +1280,7 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
         BuiltinExecutor::ListMcpResources,
     ));
     registry.register(BuiltinTool::new(
-        builtin_spec(
+        conservative_builtin_spec(
             "list_mcp_resource_templates",
             "List URI templates exposed by connected MCP servers for parameterized resources.",
             json!({
@@ -1293,7 +1302,7 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
         BuiltinExecutor::ListMcpResourceTemplates,
     ));
     registry.register(BuiltinTool::new(
-        builtin_spec(
+        conservative_builtin_spec(
             "read_mcp_resource",
             "Read a specific MCP resource by server name and resource URI.",
             json!({
@@ -1319,7 +1328,7 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
         BuiltinExecutor::ReadMcpResource,
     ));
     registry.register(BuiltinTool::new(
-        builtin_spec(
+        conservative_builtin_spec(
             "request_permissions",
             "Request additional permissions for the current turn. Compatible with Codex permission profiles; granted fileSystem.write roots are temporary and do not persist to thread metadata.",
             json!({
@@ -1393,7 +1402,7 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
         BuiltinExecutor::RequestPermissions,
     ));
     registry.register(BuiltinTool::new(
-        builtin_spec(
+        conservative_builtin_spec(
             "request_user_input",
             "Ask the user a structured clarification question. Use only when progress requires user input; headless runs return a deterministic failure instead of blocking.",
             json!({
@@ -1423,6 +1432,84 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
     ));
 }
 
+const SAFE_LOCAL_READ: ToolControlSemantics = ToolControlSemantics {
+    interrupt: InterruptSemantics::WaitForTerminal,
+    replay: ReplaySemantics::SafeToRetry,
+};
+
+const CONSERVATIVE_WAIT: ToolControlSemantics = ToolControlSemantics {
+    interrupt: InterruptSemantics::WaitForTerminal,
+    replay: ReplaySemantics::IndeterminateAfterStart,
+};
+
+const COOPERATIVE_INDETERMINATE: ToolControlSemantics = ToolControlSemantics {
+    interrupt: InterruptSemantics::CooperativeCancel,
+    replay: ReplaySemantics::IndeterminateAfterStart,
+};
+
+fn safe_local_read_builtin_spec(
+    name: &str,
+    description: &str,
+    input_schema: Value,
+    capabilities: CapabilitySet,
+    exposure: ToolExposure,
+    renderer: RendererHint,
+    concurrent_safe: bool,
+) -> ToolSpec {
+    builtin_spec(
+        name,
+        description,
+        input_schema,
+        capabilities,
+        exposure,
+        renderer,
+        concurrent_safe,
+        SAFE_LOCAL_READ,
+    )
+}
+
+fn conservative_builtin_spec(
+    name: &str,
+    description: &str,
+    input_schema: Value,
+    capabilities: CapabilitySet,
+    exposure: ToolExposure,
+    renderer: RendererHint,
+    concurrent_safe: bool,
+) -> ToolSpec {
+    builtin_spec(
+        name,
+        description,
+        input_schema,
+        capabilities,
+        exposure,
+        renderer,
+        concurrent_safe,
+        CONSERVATIVE_WAIT,
+    )
+}
+
+fn cooperative_builtin_spec(
+    name: &str,
+    description: &str,
+    input_schema: Value,
+    capabilities: CapabilitySet,
+    exposure: ToolExposure,
+    renderer: RendererHint,
+    concurrent_safe: bool,
+) -> ToolSpec {
+    builtin_spec(
+        name,
+        description,
+        input_schema,
+        capabilities,
+        exposure,
+        renderer,
+        concurrent_safe,
+        COOPERATIVE_INDETERMINATE,
+    )
+}
+
 fn builtin_spec(
     name: &str,
     description: &str,
@@ -1431,6 +1518,7 @@ fn builtin_spec(
     exposure: ToolExposure,
     renderer: RendererHint,
     concurrent_safe: bool,
+    control: ToolControlSemantics,
 ) -> ToolSpec {
     ToolSpec {
         name: ToolName::plain(name),
@@ -1441,6 +1529,8 @@ fn builtin_spec(
         capabilities,
         exposure,
         result_semantics: ResultSemantics::Standard,
+        interrupt_semantics: control.interrupt,
+        replay_semantics: control.replay,
         renderer,
         concurrent_safe,
     }
@@ -1767,6 +1857,8 @@ impl McpProxyTool {
             capabilities: CapabilitySet::filesystem_write(),
             exposure: ToolExposure::Direct,
             result_semantics: ResultSemantics::Standard,
+            interrupt_semantics: InterruptSemantics::CooperativeCancel,
+            replay_semantics: ReplaySemantics::IndeterminateAfterStart,
             renderer: RendererHint::Write,
             concurrent_safe: false,
         };
@@ -1852,6 +1944,8 @@ impl ExternalTool {
             capabilities: capability_set_for_action_kind(tool.action_kind),
             exposure: ToolExposure::Direct,
             result_semantics: ResultSemantics::Standard,
+            interrupt_semantics: InterruptSemantics::CooperativeCancel,
+            replay_semantics: ReplaySemantics::IndeterminateAfterStart,
             renderer: renderer_for_action_kind(tool.action_kind),
             concurrent_safe: matches!(tool.action_kind, ActionKind::Read),
         };
@@ -1887,6 +1981,128 @@ pub fn tool_name_from_schema_name(name: &str) -> Option<ToolName> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn registry_control_semantics_are_conservative_by_resolved_identity() {
+        let registry = default_tool_registry();
+
+        let bash = registry.resolve("bash").expect("bash tool");
+        assert_eq!(
+            bash.spec.interrupt_semantics,
+            InterruptSemantics::CooperativeCancel
+        );
+        assert_eq!(
+            bash.spec.replay_semantics,
+            ReplaySemantics::IndeterminateAfterStart
+        );
+
+        for name in [
+            "read_file",
+            "list_files",
+            "glob",
+            "grep",
+            "git_status",
+            "subagent_status",
+            "task_list",
+            "workflow_read_messages",
+            "workflow_list_tasks",
+            "get_goal",
+            "list_skills",
+            "read_skill",
+        ] {
+            let resolved = registry.resolve(name).expect("local read tool");
+            assert_eq!(
+                resolved.spec.interrupt_semantics,
+                InterruptSemantics::WaitForTerminal,
+                "{name} interrupt policy"
+            );
+            assert_eq!(
+                resolved.spec.replay_semantics,
+                ReplaySemantics::SafeToRetry,
+                "{name} replay policy"
+            );
+        }
+
+        for name in [
+            "write_file",
+            "web_search",
+            "subagent",
+            "request_permissions",
+            "request_user_input",
+            "list_mcp_resources",
+            "read_mcp_resource",
+        ] {
+            let resolved = registry.resolve(name).expect("conservative tool");
+            assert_eq!(
+                resolved.spec.replay_semantics,
+                ReplaySemantics::IndeterminateAfterStart,
+                "{name} replay policy"
+            );
+        }
+
+        let external = ExternalTool::new(ExternalToolConfig {
+            name: "inspect_remote".to_string(),
+            description: "external read-like tool".to_string(),
+            action_kind: ActionKind::Read,
+            command: "printf inspected".to_string(),
+            schema: json!({}),
+        });
+        assert_eq!(
+            external.spec.interrupt_semantics,
+            InterruptSemantics::CooperativeCancel
+        );
+        assert_eq!(
+            external.spec.replay_semantics,
+            ReplaySemantics::IndeterminateAfterStart
+        );
+
+        let mcp = McpProxyTool::new(McpTool {
+            server: "docs".to_string(),
+            name: "search".to_string(),
+            schema_name: "mcp__docs__search".to_string(),
+            description: Some("search docs".to_string()),
+            input_schema: json!({"type": "object", "properties": {}}),
+        });
+        assert_eq!(
+            mcp.spec.interrupt_semantics,
+            InterruptSemantics::CooperativeCancel
+        );
+        assert_eq!(
+            mcp.spec.replay_semantics,
+            ReplaySemantics::IndeterminateAfterStart
+        );
+
+        assert!(registry.iter().all(|tool| {
+            tool.spec().interrupt_semantics != InterruptSemantics::DetachAndObserve
+        }));
+        assert!(registry.iter().all(|tool| {
+            tool.spec().replay_semantics != ReplaySemantics::SafeToRetry
+                || tool.spec().capabilities.is_read_only()
+        }));
+
+        let mut safe_to_retry = registry
+            .iter()
+            .filter(|tool| tool.spec().replay_semantics == ReplaySemantics::SafeToRetry)
+            .map(|tool| tool.name())
+            .collect::<Vec<_>>();
+        safe_to_retry.sort_unstable();
+        assert_eq!(
+            safe_to_retry,
+            [
+                "get_goal",
+                "git_status",
+                "glob",
+                "grep",
+                "list_skills",
+                "read_file",
+                "read_skill",
+                "subagent_status",
+                "task_list",
+                "workflow_list_tasks",
+                "workflow_read_messages",
+            ]
+        );
+    }
 
     fn request(name: ToolName, raw_arguments: &str) -> ToolRequest {
         ToolRequest {
