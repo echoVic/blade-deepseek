@@ -173,6 +173,12 @@ impl GoalStore {
         let Some(source) = db.goals.get(source_session_id).cloned() else {
             return Ok(None);
         };
+        if source_session_id != resumed_session_id && db.goals.contains_key(resumed_session_id) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("goal already exists for resume target session '{resumed_session_id}'"),
+            ));
+        }
         let now = now_timestamp();
         let mut resumed = source;
         resumed.session_id = resumed_session_id.to_string();
@@ -428,6 +434,13 @@ mod tests {
             .account_usage("session-1", 12_345, 780)
             .unwrap()
             .expect("goal exists");
+        let old_updated_at = created.created_at.saturating_sub(60);
+        let mut db = store.load().unwrap();
+        db.goals
+            .get_mut("session-1")
+            .expect("goal exists")
+            .updated_at = old_updated_at;
+        store.save(&db).unwrap();
 
         let resumed = store
             .resume_into("session-1", "session-1")
@@ -441,7 +454,8 @@ mod tests {
         assert_eq!(resumed.tokens_used, 12_345);
         assert_eq!(resumed.time_used_seconds, 780);
         assert_eq!(resumed.created_at, created.created_at);
-        assert!(resumed.updated_at >= accounted.updated_at);
+        assert_eq!(resumed.created_at, accounted.created_at);
+        assert!(resumed.updated_at > old_updated_at);
     }
 
     #[test]
@@ -460,6 +474,13 @@ mod tests {
             .account_usage("old-session", 45_678, 321)
             .unwrap()
             .expect("goal exists");
+        let old_updated_at = created.created_at.saturating_sub(60);
+        let mut db = store.load().unwrap();
+        db.goals
+            .get_mut("old-session")
+            .expect("goal exists")
+            .updated_at = old_updated_at;
+        store.save(&db).unwrap();
 
         let resumed = store
             .resume_into("old-session", "new-session")
@@ -473,7 +494,8 @@ mod tests {
         assert_eq!(resumed.tokens_used, 45_678);
         assert_eq!(resumed.time_used_seconds, 321);
         assert_eq!(resumed.created_at, created.created_at);
-        assert!(resumed.updated_at >= accounted.updated_at);
+        assert_eq!(resumed.created_at, accounted.created_at);
+        assert!(resumed.updated_at > old_updated_at);
 
         let source = store
             .get("old-session")
@@ -500,6 +522,63 @@ mod tests {
         assert!(resumed.is_none());
         assert!(store.get("new-session").unwrap().is_none());
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn resume_into_rejects_occupied_target_without_mutating_either_goal() {
+        let dir = tempdir().unwrap();
+        let mut store = GoalStore::with_path(dir.path().join("goals_1.json"));
+        store
+            .replace(
+                "source-session",
+                "preserve the source",
+                ThreadGoalStatus::Active,
+                Some(100_000),
+            )
+            .unwrap();
+        store
+            .account_usage("source-session", 12_345, 456)
+            .unwrap()
+            .expect("source goal exists");
+        store
+            .replace(
+                "target-session",
+                "preserve the target",
+                ThreadGoalStatus::Paused,
+                Some(200_000),
+            )
+            .unwrap();
+        store
+            .account_usage("target-session", 67_890, 987)
+            .unwrap()
+            .expect("target goal exists");
+        let source_before = store
+            .get("source-session")
+            .unwrap()
+            .expect("source goal exists");
+        let target_before = store
+            .get("target-session")
+            .unwrap()
+            .expect("target goal exists");
+
+        let result = store.resume_into("source-session", "target-session");
+        let source_after = store
+            .get("source-session")
+            .unwrap()
+            .expect("source goal remains");
+        let target_after = store
+            .get("target-session")
+            .unwrap()
+            .expect("target goal remains");
+
+        assert!(
+            result.is_err(),
+            "occupied target was overwritten: source before={source_before:?}, source after={source_after:?}, target before={target_before:?}, target after={target_after:?}"
+        );
+        let error = result.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(source_after, source_before);
+        assert_eq!(target_after, target_before);
     }
 
     #[test]
