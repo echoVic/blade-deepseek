@@ -12,6 +12,7 @@ use chrono::Utc;
 use orca_core::goal_types::{
     GoalUpdate, ThreadGoal, ThreadGoalStatus, validate_thread_goal_objective,
 };
+use orca_core::tool_types::ToolInvocationStarted;
 use serde::{Deserialize, Serialize};
 
 const ORCA_HOME_ENV: &str = "ORCA_HOME";
@@ -83,7 +84,10 @@ fn goal_tool_attempt_counts(outcome: ToolCallOutcome) -> bool {
         outcome,
         ToolCallOutcome::Completed
             | ToolCallOutcome::Failed {
-                handler_executed: true
+                started: ToolInvocationStarted::Yes | ToolInvocationStarted::Unknown
+            }
+            | ToolCallOutcome::Indeterminate {
+                started: ToolInvocationStarted::Yes | ToolInvocationStarted::Unknown
             }
     )
 }
@@ -724,6 +728,55 @@ mod tests {
         assert_eq!(progress.completed_tool_attempts(), 1);
         assert_eq!(progress.last_turn_id().as_deref(), Some("turn-1"));
         assert_eq!(progress.last_call_id().as_deref(), Some("call-1"));
+    }
+
+    #[test]
+    fn goal_extension_counts_possible_started_work_but_not_cancelled_or_unstarted_work() {
+        let thread_store = ExtensionData::new("session-1");
+        let turn_store = ExtensionData::new("turn-1");
+
+        record_goal_tool_finish(
+            &thread_store,
+            &turn_store,
+            "bash",
+            "cancelled-call",
+            ToolCallOutcome::Cancelled {
+                started: ToolInvocationStarted::Yes,
+            },
+        );
+        record_goal_tool_finish(
+            &thread_store,
+            &turn_store,
+            "bash",
+            "unknown-call",
+            ToolCallOutcome::Indeterminate {
+                started: ToolInvocationStarted::Yes,
+            },
+        );
+        record_goal_tool_finish(
+            &thread_store,
+            &turn_store,
+            "bash",
+            "unknown-call",
+            ToolCallOutcome::Indeterminate {
+                started: ToolInvocationStarted::Unknown,
+            },
+        );
+        record_goal_tool_finish(
+            &thread_store,
+            &turn_store,
+            "bash",
+            "unstarted-call",
+            ToolCallOutcome::Failed {
+                started: ToolInvocationStarted::No,
+            },
+        );
+
+        let progress = thread_store
+            .get::<GoalToolProgressState>()
+            .expect("goal progress state");
+        assert_eq!(progress.completed_tool_attempts(), 2);
+        assert_eq!(progress.last_call_id().as_deref(), Some("unknown-call"));
     }
 
     #[test]

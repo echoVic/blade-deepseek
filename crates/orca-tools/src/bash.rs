@@ -119,7 +119,7 @@ pub fn execute_with_policy_roots_or_cancel(
                 .saturating_add(output.stderr_omitted_bytes),
         );
         let mut result = ToolResult::failed(request, message, output.status.code());
-        result.truncated = ingress_truncated || truncated;
+        result.set_truncated(ingress_truncated || truncated);
         return result;
     }
     let timed_out = output.timed_out;
@@ -171,7 +171,7 @@ pub fn execute_with_policy_roots_or_cancel(
             output.status.code()
         },
     );
-    result.truncated = ingress_truncated || truncated;
+    result.set_truncated(ingress_truncated || truncated);
     result
 }
 
@@ -415,7 +415,7 @@ pub fn execute_streaming_command_or_cancel(
             stdout_omitted_bytes.saturating_add(stderr_omitted_bytes),
         );
         let mut result = ToolResult::failed(request, message, status.code());
-        result.truncated = ingress_truncated || truncated;
+        result.set_truncated(ingress_truncated || truncated);
         result
     }
 }

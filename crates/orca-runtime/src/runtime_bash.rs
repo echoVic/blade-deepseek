@@ -408,7 +408,7 @@ impl BashShellOutput {
             let (message, truncated) =
                 orca_core::tool_types::truncate_output_with_policy(message, output_truncation);
             let mut result = ToolResult::failed(request, message, output.exit_code);
-            result.truncated = truncated;
+            result.set_truncated(truncated);
             return result;
         }
         if output.status == TaskStatus::Completed {
@@ -427,7 +427,7 @@ impl BashShellOutput {
         let (message, truncated) =
             orca_core::tool_types::truncate_output_with_policy(message, output_truncation);
         let mut result = ToolResult::failed(request, message, output.exit_code);
-        result.truncated = truncated;
+        result.set_truncated(truncated);
         result
     }
 }

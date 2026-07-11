@@ -64,6 +64,17 @@ pub struct RuntimeTaskActor<'a> {
     turns_started: u32,
 }
 
+pub(crate) fn run_status_from_tool_status(status: ToolStatus) -> RunStatus {
+    match status {
+        ToolStatus::Completed => RunStatus::Success,
+        ToolStatus::Denied => RunStatus::ApprovalRequired,
+        ToolStatus::Cancelled => RunStatus::Cancelled,
+        ToolStatus::Failed | ToolStatus::NotImplemented | ToolStatus::Indeterminate => {
+            RunStatus::Failed
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct AgentLoopResult {
     pub(crate) status: RunStatus,
@@ -437,11 +448,7 @@ impl<'a> RuntimeTaskActor<'a> {
         request: &ToolRequest,
         result: &ToolResult,
     ) -> EventEnvelope {
-        let status = match result.status {
-            ToolStatus::Completed => RuntimeTaskStatus::Succeeded,
-            ToolStatus::Failed | ToolStatus::NotImplemented => RuntimeTaskStatus::Failed,
-            ToolStatus::Denied => RuntimeTaskStatus::ApprovalRequired,
-        };
+        let status = RuntimeTaskStatus::from_run_status(run_status_from_tool_status(result.status));
         let event = events.tool_call_completed(result);
         attach_shell_task_to_tool_event(event, request, status)
     }
@@ -478,7 +485,7 @@ impl<'a> RuntimeTaskActor<'a> {
         };
         result.map_err(|error| {
             if cancel.is_some_and(CancelToken::is_cancelled) {
-                ToolResult::failed(request, "tool cancelled", None)
+                ToolResult::cancelled_before_start(request, "the pre-tool hook was cancelled")
             } else {
                 ToolResult::failed(
                     request,
@@ -1422,6 +1429,30 @@ mod tests {
         assert_eq!(terminal.status, RunStatus::Cancelled);
         assert_eq!(terminal.final_message, None);
         assert_eq!(terminal.error, None);
+    }
+
+    #[test]
+    fn tool_terminal_events_preserve_cancelled_and_unknown_task_statuses() {
+        let request = ToolRequest {
+            id: "call-1".to_string(),
+            name: orca_core::tool_types::ToolName::Bash,
+            action: orca_core::approval_types::ActionKind::Shell,
+            target: Some("sleep 30".to_string()),
+            raw_arguments: None,
+        };
+        let mut events = EventFactory::new("tool-terminal-status".to_string());
+
+        let cancelled = ToolResult::cancelled(&request, "turn interrupted", Some(130));
+        let cancelled_event =
+            RuntimeTaskActor::tool_call_completed_event_for(&mut events, &request, &cancelled);
+        assert_eq!(cancelled_event.payload["status"], "cancelled");
+        assert_eq!(cancelled_event.payload["task"]["status"], "cancelled");
+
+        let indeterminate = ToolResult::indeterminate(&request, "missing terminal result");
+        let indeterminate_event =
+            RuntimeTaskActor::tool_call_completed_event_for(&mut events, &request, &indeterminate);
+        assert_eq!(indeterminate_event.payload["status"], "indeterminate");
+        assert_eq!(indeterminate_event.payload["task"]["status"], "failed");
     }
 
     #[test]

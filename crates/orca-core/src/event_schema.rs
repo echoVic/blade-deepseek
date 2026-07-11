@@ -9,7 +9,7 @@ use crate::model::ModelRouteDecision;
 use crate::plan_types::UpdatePlanArgs;
 use crate::provider_types::{ProviderReplayState, ToolCallProgress};
 use crate::task_types::BackgroundTaskSummary;
-use crate::tool_types::{ToolRequest, ToolResult};
+use crate::tool_types::{ToolRequest, ToolResult, ToolTerminalSource};
 use crate::verification::VerificationResult;
 
 pub const EVENT_SCHEMA_VERSION: &str = "1";
@@ -337,19 +337,20 @@ impl EventFactory {
     }
 
     pub fn tool_call_completed(&mut self, result: &ToolResult) -> EventEnvelope {
-        self.make(
-            EventType::ToolCallCompleted,
-            json!({
-                "id": result.id,
-                "name": result.name,
-                "status": result.status,
-                "output": result.output,
-                "error": result.error,
-                "exit_code": result.exit_code,
-                "truncated": result.truncated,
-                "kind": result.kind
-            }),
-        )
+        let mut payload = json!({
+            "id": result.id,
+            "name": result.name,
+            "status": result.status,
+            "output": result.output,
+            "error": result.error,
+            "exit_code": result.exit_code,
+            "truncated": result.truncated,
+            "kind": result.kind
+        });
+        if result.terminal().source != ToolTerminalSource::Observed {
+            payload["terminal_source"] = json!(result.terminal().source);
+        }
+        self.make(EventType::ToolCallCompleted, payload)
     }
 
     pub fn plan_updated(&mut self, update: &UpdatePlanArgs) -> EventEnvelope {
@@ -745,6 +746,7 @@ fn timestamp_ms() -> u128 {
 mod tests {
     use super::*;
     use crate::task_types::{BackgroundTaskSummary, TaskStatus, TaskType, WorkflowTaskProgress};
+    use crate::tool_types::{ToolName, ToolRequest};
 
     #[test]
     fn factory_increments_seq() {
@@ -784,6 +786,62 @@ mod tests {
         assert_eq!(RunStatus::ApprovalRequired.exit_code(), 3);
         assert_eq!(RunStatus::BudgetExhausted.exit_code(), 4);
         assert_eq!(RunStatus::Cancelled.exit_code(), 130);
+    }
+
+    #[test]
+    fn tool_terminal_event_serializes_cancelled_status_and_kind() {
+        let request = ToolRequest {
+            id: "call-1".to_string(),
+            name: ToolName::Bash,
+            action: crate::approval_types::ActionKind::Shell,
+            target: Some("sleep 30".to_string()),
+            raw_arguments: None,
+        };
+        let cancelled = ToolResult::cancelled(&request, "turn interrupted", Some(130));
+        let mut events = EventFactory::new("run-1".to_string());
+
+        let value = serde_json::to_value(events.tool_call_completed(&cancelled)).unwrap();
+
+        assert_eq!(value["payload"]["status"], "cancelled");
+        assert_eq!(value["payload"]["kind"], "cancelled");
+        assert!(value["payload"].get("terminal_source").is_none());
+        assert_eq!(value["payload"]["error"], "turn interrupted");
+        assert_eq!(value["payload"]["exit_code"], 130);
+
+        let repaired = ToolResult::indeterminate(&request, "missing terminal result")
+            .with_terminal_source(ToolTerminalSource::CompatibilityRepair);
+        let value = serde_json::to_value(events.tool_call_completed(&repaired)).unwrap();
+        assert_eq!(value["payload"]["status"], "indeterminate");
+        assert_eq!(value["payload"]["terminal_source"], "compatibility_repair");
+    }
+
+    #[test]
+    fn observed_tool_terminal_keeps_legacy_event_payload_shape() {
+        let request = ToolRequest {
+            id: "call-1".to_string(),
+            name: ToolName::ReadFile,
+            action: crate::approval_types::ActionKind::Read,
+            target: Some("README.md".to_string()),
+            raw_arguments: None,
+        };
+        let completed = ToolResult::completed(&request, "hello".to_string(), false);
+        let mut events = EventFactory::new("run-1".to_string());
+
+        let event = events.tool_call_completed(&completed);
+
+        assert_eq!(
+            event.payload,
+            json!({
+                "id": "call-1",
+                "name": "read_file",
+                "status": "completed",
+                "output": "hello",
+                "error": null,
+                "exit_code": 0,
+                "truncated": false,
+                "kind": "success"
+            })
+        );
     }
 
     #[test]

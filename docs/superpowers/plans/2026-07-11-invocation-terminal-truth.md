@@ -62,6 +62,21 @@ This plan implements P0.1 from `docs/reports/2026-07-11-codex-package3-runtime-r
 **Files:**
 - Modify: `crates/orca-core/src/tool_types.rs`
 - Modify: `crates/orca-core/src/event_schema.rs`
+- Modify: `crates/orca-runtime/src/child_agent_loop_runner.rs`
+- Modify: `crates/orca-runtime/src/child_agent_response_folding.rs`
+- Modify: `crates/orca-runtime/src/child_agent_tests.rs`
+- Modify: `crates/orca-runtime/src/extension.rs`
+- Modify: `crates/orca-runtime/src/goals.rs`
+- Modify: `crates/orca-runtime/src/lifecycle.rs`
+- Modify: `crates/orca-runtime/src/runtime_bash.rs`
+- Modify: `crates/orca-runtime/src/runtime_lifecycle.rs`
+- Modify: `crates/orca-runtime/src/tool_execution.rs`
+- Modify: `crates/orca-tools/src/bash.rs`
+- Modify: `crates/orca-tools/src/edit.rs`
+- Modify: `crates/orca-tools/src/update_goal.rs`
+- Modify: `crates/orca-tools/src/write_file.rs`
+- Modify: `crates/orca-tui/src/agent_runner.rs`
+- Modify: `crates/orca-tui/src/agent_tool_execution.rs`
 
 - [ ] **Step 1: Write failing terminal-constructor and serialization tests**
 
@@ -123,10 +138,11 @@ pub struct ToolTerminal {
     pub truncated: bool,
     pub kind: ToolResultKind,
     pub source: ToolTerminalSource,
+    pub started: ToolInvocationStarted,
 }
 ```
 
-Add `Cancelled` and `Indeterminate` to both `ToolStatus` and `ToolResultKind`; add `ToolResult::cancelled`, `ToolResult::cancelled_before_start`, and `ToolResult::indeterminate`. Extend `ToolSpec` with required `interrupt_semantics` and `replay_semantics` fields. Keep serialized names snake_case and preserve all old names.
+Add `Cancelled` and `Indeterminate` to both `ToolStatus` and `ToolResultKind`; add `ToolResult::cancelled`, `ToolResult::cancelled_before_start`, and `ToolResult::indeterminate`. Store one canonical terminal object inside `ToolResult`, flatten it only for the legacy wire shape, reject contradictory status/kind pairs, and preserve whether execution started as `Yes`, `No`, or `Unknown`. Serialize non-unknown start state as optional `invocation_started`; old records default to `Unknown`. Add exhaustive status projections so `Cancelled` maps to cancelled runtime/task outcomes and `Indeterminate` maps to failed runtime/task state plus an explicit indeterminate extension outcome. Keep serialized names snake_case and preserve all old names. Treat an omitted event/storage `terminal_source` as `observed`; only compatibility repair must serialize it explicitly. Do not extend `ToolSpec` in this task because doing so without updating every registry initializer would leave this commit unbuildable.
 
 - [ ] **Step 4: Run core tests and verify GREEN**
 
@@ -142,13 +158,14 @@ Expected: all selected tests pass.
 - [ ] **Step 5: Commit the canonical types**
 
 ```bash
-git add crates/orca-core/src/tool_types.rs crates/orca-core/src/event_schema.rs
+git add crates/orca-core/src/tool_types.rs crates/orca-core/src/event_schema.rs crates/orca-runtime/src/child_agent_loop_runner.rs crates/orca-runtime/src/child_agent_response_folding.rs crates/orca-runtime/src/child_agent_tests.rs crates/orca-runtime/src/extension.rs crates/orca-runtime/src/goals.rs crates/orca-runtime/src/lifecycle.rs crates/orca-runtime/src/runtime_bash.rs crates/orca-runtime/src/runtime_lifecycle.rs crates/orca-runtime/src/tool_execution.rs crates/orca-tools/src/bash.rs crates/orca-tools/src/edit.rs crates/orca-tools/src/update_goal.rs crates/orca-tools/src/write_file.rs crates/orca-tui/src/agent_runner.rs crates/orca-tui/src/agent_tool_execution.rs
 git commit -m "feat(core): model truthful tool terminals"
 ```
 
 ### Task 2: Registry-Owned Interrupt And Replay Policy
 
 **Files:**
+- Modify: `crates/orca-core/src/tool_types.rs`
 - Modify: `crates/orca-tools/src/registry.rs`
 - Modify: `crates/orca-tools/src/lib.rs`
 
@@ -180,7 +197,7 @@ Expected: compile or assertion failure because registry specs do not populate co
 
 - [ ] **Step 3: Populate conservative policy**
 
-Set built-in defaults to `WaitForTerminal`; set replay to `SafeToRetry` only for capability sets that are read-only. Explicitly set bash to `CooperativeCancel`. Set external process and MCP proxy tools to `CooperativeCancel + IndeterminateAfterStart`. Expose a registry lookup helper used by runtime/TUI instead of matching names.
+Extend `ToolSpec` with required `interrupt_semantics` and `replay_semantics` fields and update every initializer in the same commit. Set built-in defaults to `WaitForTerminal`; set replay to `SafeToRetry` only for capability sets that are read-only. Explicitly set bash to `CooperativeCancel`. Set external process and MCP proxy tools to `CooperativeCancel + IndeterminateAfterStart`. Expose a registry lookup helper used by runtime/TUI instead of matching names.
 
 - [ ] **Step 4: Run registry tests and verify GREEN**
 
@@ -196,7 +213,7 @@ Expected: all selected tests pass and no registered tool enables detach.
 - [ ] **Step 5: Commit registry policy**
 
 ```bash
-git add crates/orca-tools/src/registry.rs crates/orca-tools/src/lib.rs
+git add crates/orca-core/src/tool_types.rs crates/orca-tools/src/registry.rs crates/orca-tools/src/lib.rs
 git commit -m "feat(tools): declare interrupt and replay policy"
 ```
 
@@ -297,7 +314,7 @@ Expected: failure because `StoredMessage -> Message` discards status metadata an
 
 - [ ] **Step 3: Round-trip one canonical metadata object**
 
-Keep the existing optional `status`, `error`, `exit_code`, and `truncated` fields in the JSONL shape, then add optional `kind` and `terminal_source` fields. Convert those flat stored fields to and from one `ToolTerminal` in the canonical `Message::Tool` model. Old records must still deserialize with `kind/source == None`; new records preserve the full terminal. Make live and stored projection call the same terminal-completion helper.
+Keep the existing optional `status`, `error`, `exit_code`, and `truncated` fields in the JSONL shape, then add optional `kind`, `terminal_source`, and `invocation_started` fields. Convert those flat stored fields to and from one `ToolTerminal` in the canonical `Message::Tool` model. Old records must still deserialize with `kind/source/started == None`; new records preserve the full terminal. Make live and stored projection call the same terminal-completion helper.
 
 - [ ] **Step 4: Run storage and history tests and verify GREEN**
 

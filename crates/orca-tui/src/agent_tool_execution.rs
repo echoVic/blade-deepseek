@@ -1142,12 +1142,7 @@ fn with_sandbox_diagnostic(
     mut result: tool_types::ToolResult,
     message: &str,
 ) -> tool_types::ToolResult {
-    match result.error.as_mut() {
-        Some(error) if !error.trim_end().is_empty() => {
-            error.push_str(&format!("\n\nSandbox diagnostic: {message}"));
-        }
-        _ => result.error = Some(message.to_string()),
-    }
+    result.append_error(&format!("\n\nSandbox diagnostic: {message}"));
     result
 }
 
@@ -1459,7 +1454,7 @@ mod tests {
             !marker.exists(),
             "denied escalation must not re-run the command"
         );
-        let error = result.error.unwrap_or_default();
+        let error = result.error.as_deref().unwrap_or_default();
         assert!(error.contains("Operation not permitted"), "{error}");
         assert!(error.contains("Sandbox diagnostic"), "{error}");
         assert!(error.contains("not granted"), "{error}");

@@ -226,7 +226,7 @@ impl RuntimeTaskLifecycle {
 }
 
 impl RuntimeTaskStatus {
-    fn from_run_status(status: RunStatus) -> Self {
+    pub(crate) fn from_run_status(status: RunStatus) -> Self {
         match status {
             RunStatus::Success => Self::Succeeded,
             RunStatus::Failed | RunStatus::VerificationFailed => Self::Failed,

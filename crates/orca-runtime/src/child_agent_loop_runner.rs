@@ -5,7 +5,7 @@ use orca_core::cancel::CancelToken;
 use orca_core::config::RunConfig;
 use orca_core::event_schema::RunStatus;
 use orca_core::provider_types::{ProviderResponse, ProviderStep};
-use orca_core::tool_types::{ToolRequest, ToolStatus};
+use orca_core::tool_types::ToolRequest;
 
 use crate::child_agent_entrypoints::run_child_agent_with_executor;
 use crate::child_agent_loop_setup::{
@@ -27,6 +27,7 @@ use crate::child_agent_types::{
 use crate::cost::CostTracker;
 use crate::hooks::HookRunner;
 use crate::instructions::ProjectInstructions;
+use crate::lifecycle::run_status_from_tool_status;
 use crate::memory::MemoryBlock;
 
 pub struct ChildAgentLoopContext<'a> {
@@ -337,11 +338,22 @@ pub(crate) fn child_agent_budget_exhausted_result(
     })
 }
 
-fn run_status_from_tool_status(status: ToolStatus) -> RunStatus {
-    match status {
-        ToolStatus::Completed => RunStatus::Success,
-        ToolStatus::Denied => RunStatus::ApprovalRequired,
-        ToolStatus::Failed | ToolStatus::NotImplemented => RunStatus::Failed,
+#[cfg(test)]
+mod tests {
+    use crate::lifecycle::run_status_from_tool_status;
+    use orca_core::event_schema::RunStatus;
+    use orca_core::tool_types::ToolStatus;
+
+    #[test]
+    fn child_agent_tool_terminal_status_preserves_cancelled_and_unknown_outcomes() {
+        assert_eq!(
+            run_status_from_tool_status(ToolStatus::Cancelled),
+            RunStatus::Cancelled
+        );
+        assert_eq!(
+            run_status_from_tool_status(ToolStatus::Indeterminate),
+            RunStatus::Failed
+        );
     }
 }
 

@@ -2,6 +2,8 @@ use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 
+use orca_core::tool_types::ToolInvocationStarted;
+
 type ErasedData = Arc<dyn Any + Send + Sync>;
 
 #[derive(Debug)]
@@ -108,8 +110,10 @@ pub struct ToolStartInput<'a> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ToolCallOutcome {
     Completed,
-    Failed { handler_executed: bool },
+    Failed { started: ToolInvocationStarted },
     Blocked,
+    Cancelled { started: ToolInvocationStarted },
+    Indeterminate { started: ToolInvocationStarted },
     Aborted,
 }
 

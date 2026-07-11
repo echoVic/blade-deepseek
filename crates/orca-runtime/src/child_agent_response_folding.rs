@@ -8,6 +8,7 @@ use crate::agent_common;
 use crate::child_agent_loop_setup::ChildAgentLoopSetup;
 use crate::child_agent_types::ChildAgentResult;
 use crate::cost::CostTracker;
+use crate::lifecycle::run_status_from_tool_status;
 
 pub enum ChildAgentProviderResponseFold {
     Complete(ChildAgentResult),
@@ -92,9 +93,9 @@ pub fn fold_child_agent_tool_result(
 
     if should_stop {
         return ChildAgentToolResultFold::Stop(ChildAgentResult {
-            status: RunStatus::Failed,
+            status: run_status_from_tool_status(result.status),
             final_message: None,
-            error: result.error,
+            error: result.error.clone(),
         });
     }
 

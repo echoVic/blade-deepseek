@@ -368,7 +368,13 @@ mod tests {
     #[test]
     fn execute_fails_without_goal_context() {
         let result = execute_update(&request(ToolName::UpdateGoal, r#"{"status":"blocked"}"#));
-        assert!(result.error.unwrap().contains("goal mode is active"));
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("goal mode is active")
+        );
     }
 
     #[test]
@@ -399,7 +405,7 @@ mod tests {
         });
 
         assert_eq!(result.status, ToolStatus::Failed);
-        assert!(result.error.unwrap().contains("unfinished goal"));
+        assert!(result.error.as_deref().unwrap().contains("unfinished goal"));
     }
 
     #[test]

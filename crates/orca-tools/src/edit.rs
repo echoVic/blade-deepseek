@@ -201,7 +201,7 @@ mod tests {
         let result = execute(&req, &dir);
 
         assert_eq!(result.status, ToolStatus::Failed);
-        assert!(result.error.unwrap().contains("not found"));
+        assert!(result.error.as_deref().unwrap().contains("not found"));
         assert_eq!(fs::read_to_string(&file).unwrap(), "hello world\n");
     }
 
@@ -216,7 +216,7 @@ mod tests {
         let result = execute(&req, &dir);
 
         assert_eq!(result.status, ToolStatus::Failed);
-        assert!(result.error.unwrap().contains("multiple"));
+        assert!(result.error.as_deref().unwrap().contains("multiple"));
         assert_eq!(fs::read_to_string(&file).unwrap(), "aaa\naaa\n");
     }
 
@@ -231,7 +231,7 @@ mod tests {
         let result = execute(&req, &dir);
 
         assert_eq!(result.status, ToolStatus::Failed);
-        assert!(result.error.unwrap().contains("empty"));
+        assert!(result.error.as_deref().unwrap().contains("empty"));
     }
 
     #[test]
@@ -243,7 +243,7 @@ mod tests {
         let result = execute(&req, &dir);
 
         assert_eq!(result.status, ToolStatus::Failed);
-        assert!(result.error.unwrap().contains("failed to read"));
+        assert!(result.error.as_deref().unwrap().contains("failed to read"));
     }
 
     #[test]
@@ -254,7 +254,13 @@ mod tests {
         let result = execute(&req, &dir);
 
         assert_eq!(result.status, ToolStatus::Failed);
-        assert!(result.error.unwrap().contains("invalid edit arguments"));
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("invalid edit arguments")
+        );
     }
 
     #[test]

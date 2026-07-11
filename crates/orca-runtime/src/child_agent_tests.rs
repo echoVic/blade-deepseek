@@ -1114,6 +1114,47 @@ fn fold_child_agent_tool_result_turns_stop_into_failed_child_result() {
 }
 
 #[test]
+fn fold_child_agent_tool_result_preserves_cancelled_child_result() {
+    let request = ChildAgentRequest::new(
+        "inspect repo".to_string(),
+        SubagentType::General,
+        None,
+        2,
+        false,
+    );
+    let instructions = ProjectInstructions::default();
+    let memory = MemoryBlock::default();
+    let runtime_config = config(None);
+    let mut setup = prepare_child_agent_loop(
+        &runtime_config,
+        &request,
+        std::env::temp_dir().as_path(),
+        &instructions,
+        &memory,
+    );
+    let tool_request = ToolRequest {
+        id: "tool-1".to_string(),
+        name: ToolName::Bash,
+        action: ActionKind::Shell,
+        target: Some("sleep 30".to_string()),
+        raw_arguments: None,
+    };
+    let result = ToolResult::cancelled(&tool_request, "turn interrupted", Some(130));
+    let mut tracker = CostTracker::new(None);
+
+    let fold =
+        fold_child_agent_tool_result(&mut setup, &tool_request, true, result, None, &mut tracker);
+
+    match fold {
+        ChildAgentToolResultFold::Stop(result) => {
+            assert_eq!(result.status, RunStatus::Cancelled);
+            assert_eq!(result.error.as_deref(), Some("turn interrupted"));
+        }
+        ChildAgentToolResultFold::Continue => panic!("should_stop should stop child execution"),
+    }
+}
+
+#[test]
 fn run_child_agent_applies_subagent_model_override() {
     let request = ChildAgentRequest {
         prompt: "inspect repo".to_string(),

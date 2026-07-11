@@ -1,5 +1,6 @@
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
+use std::ops::Deref;
 use std::sync::Arc;
 
 use crate::approval_types::ActionKind;
@@ -430,6 +431,22 @@ pub enum ResultSemantics {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
+pub enum InterruptSemantics {
+    CooperativeCancel,
+    WaitForTerminal,
+    DetachAndObserve,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplaySemantics {
+    SafeToRetry,
+    IdempotentWithKey,
+    IndeterminateAfterStart,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ToolResultKind {
     Success,
     Empty,
@@ -438,6 +455,8 @@ pub enum ToolResultKind {
     PermissionDenied,
     InvalidInput,
     RuntimeError,
+    Cancelled,
+    Indeterminate,
 }
 
 impl ToolResultKind {
@@ -456,6 +475,8 @@ impl ToolResultKind {
             }
             Self::PermissionDenied => ToolStatus::Denied,
             Self::InvalidInput | Self::RuntimeError => ToolStatus::Failed,
+            Self::Cancelled => ToolStatus::Cancelled,
+            Self::Indeterminate => ToolStatus::Indeterminate,
         }
     }
 }
@@ -497,6 +518,8 @@ pub enum ToolStatus {
     Failed,
     Denied,
     NotImplemented,
+    Cancelled,
+    Indeterminate,
 }
 
 impl ToolStatus {
@@ -506,6 +529,8 @@ impl ToolStatus {
             Self::Failed => "failed",
             Self::Denied => "denied",
             Self::NotImplemented => "not_implemented",
+            Self::Cancelled => "cancelled",
+            Self::Indeterminate => "indeterminate",
         }
     }
 }
@@ -522,12 +547,49 @@ pub enum FileChangePreview {
     },
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ToolResult {
-    pub id: String,
-    pub name: ToolName,
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolTerminalSource {
+    Observed,
+    CompatibilityRepair,
+}
+
+impl ToolTerminalSource {
+    fn is_observed(&self) -> bool {
+        *self == Self::Observed
+    }
+}
+
+impl Default for ToolTerminalSource {
+    fn default() -> Self {
+        Self::Observed
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolInvocationStarted {
+    Yes,
+    No,
+    Unknown,
+}
+
+impl ToolInvocationStarted {
+    fn is_unknown(&self) -> bool {
+        *self == Self::Unknown
+    }
+}
+
+impl Default for ToolInvocationStarted {
+    fn default() -> Self {
+        Self::Unknown
+    }
+}
+
+#[non_exhaustive]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ToolTerminal {
     pub status: ToolStatus,
-    pub output: Option<String>,
     pub error: Option<String>,
     pub exit_code: Option<i32>,
     pub truncated: bool,
@@ -536,21 +598,151 @@ pub struct ToolResult {
         skip_serializing_if = "ToolResultKind::is_success"
     )]
     pub kind: ToolResultKind,
+    #[serde(
+        default,
+        rename = "terminal_source",
+        skip_serializing_if = "ToolTerminalSource::is_observed"
+    )]
+    pub source: ToolTerminalSource,
+    #[serde(
+        default,
+        rename = "invocation_started",
+        skip_serializing_if = "ToolInvocationStarted::is_unknown"
+    )]
+    pub started: ToolInvocationStarted,
+}
+
+impl ToolTerminal {
+    fn new(
+        status: ToolStatus,
+        error: Option<String>,
+        exit_code: Option<i32>,
+        truncated: bool,
+        kind: ToolResultKind,
+        source: ToolTerminalSource,
+        started: ToolInvocationStarted,
+    ) -> Self {
+        debug_assert!(terminal_status_matches_kind(status, kind));
+        Self {
+            status,
+            error,
+            exit_code,
+            truncated,
+            kind,
+            source,
+            started,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct ToolTerminalWire {
+    status: ToolStatus,
+    error: Option<String>,
+    exit_code: Option<i32>,
+    truncated: bool,
+    #[serde(default)]
+    kind: Option<ToolResultKind>,
+    #[serde(default, rename = "terminal_source")]
+    source: ToolTerminalSource,
+    #[serde(default, rename = "invocation_started")]
+    started: ToolInvocationStarted,
+}
+
+impl<'de> Deserialize<'de> for ToolTerminal {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = ToolTerminalWire::deserialize(deserializer)?;
+        let kind = wire
+            .kind
+            .unwrap_or_else(|| default_kind_for_status(wire.status));
+        if !terminal_status_matches_kind(wire.status, kind) {
+            return Err(serde::de::Error::custom(format!(
+                "tool terminal status '{}' conflicts with result kind '{kind:?}'",
+                wire.status.as_str()
+            )));
+        }
+        Ok(Self::new(
+            wire.status,
+            wire.error,
+            wire.exit_code,
+            wire.truncated,
+            kind,
+            wire.source,
+            wire.started,
+        ))
+    }
+}
+
+fn default_kind_for_status(status: ToolStatus) -> ToolResultKind {
+    match status {
+        ToolStatus::Completed => ToolResultKind::Success,
+        ToolStatus::Failed | ToolStatus::NotImplemented => ToolResultKind::RuntimeError,
+        ToolStatus::Denied => ToolResultKind::PermissionDenied,
+        ToolStatus::Cancelled => ToolResultKind::Cancelled,
+        ToolStatus::Indeterminate => ToolResultKind::Indeterminate,
+    }
+}
+
+fn terminal_status_matches_kind(status: ToolStatus, kind: ToolResultKind) -> bool {
+    status == kind.status()
+        || matches!(
+            (status, kind),
+            (ToolStatus::NotImplemented, ToolResultKind::RuntimeError)
+        )
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ToolResult {
+    pub id: String,
+    pub name: ToolName,
+    pub output: Option<String>,
+    #[serde(flatten)]
+    terminal: ToolTerminal,
     #[serde(skip)]
     pub file_change_preview: Option<Arc<FileChangePreview>>,
 }
 
+impl Deref for ToolResult {
+    type Target = ToolTerminal;
+
+    fn deref(&self) -> &Self::Target {
+        &self.terminal
+    }
+}
+
 impl ToolResult {
+    pub fn terminal(&self) -> &ToolTerminal {
+        &self.terminal
+    }
+
+    pub fn append_error(&mut self, suffix: &str) {
+        match self.terminal.error.as_mut() {
+            Some(error) if !error.trim_end().is_empty() => error.push_str(suffix),
+            _ => self.terminal.error = Some(suffix.trim_start().to_string()),
+        }
+    }
+
+    pub fn set_truncated(&mut self, truncated: bool) {
+        self.terminal.truncated = truncated;
+    }
+
     pub fn completed(request: &ToolRequest, output: String, truncated: bool) -> Self {
         Self {
             id: request.id.clone(),
             name: request.name.clone(),
-            status: ToolStatus::Completed,
             output: Some(output),
-            error: None,
-            exit_code: Some(0),
-            truncated,
-            kind: ToolResultKind::Success,
+            terminal: ToolTerminal::new(
+                ToolStatus::Completed,
+                None,
+                Some(0),
+                truncated,
+                ToolResultKind::Success,
+                ToolTerminalSource::Observed,
+                ToolInvocationStarted::Yes,
+            ),
             file_change_preview: None,
         }
     }
@@ -561,15 +753,29 @@ impl ToolResult {
         truncated: bool,
         kind: ToolResultKind,
     ) -> Self {
+        assert!(
+            matches!(
+                kind,
+                ToolResultKind::Success
+                    | ToolResultKind::Empty
+                    | ToolResultKind::NoMatches
+                    | ToolResultKind::Truncated
+            ),
+            "completed_kind requires a completed result kind"
+        );
         Self {
             id: request.id.clone(),
             name: request.name.clone(),
-            status: kind.status(),
             output: Some(output),
-            error: None,
-            exit_code: Some(0),
-            truncated,
-            kind,
+            terminal: ToolTerminal::new(
+                kind.status(),
+                None,
+                Some(0),
+                truncated,
+                kind,
+                ToolTerminalSource::Observed,
+                ToolInvocationStarted::Yes,
+            ),
             file_change_preview: None,
         }
     }
@@ -578,12 +784,16 @@ impl ToolResult {
         Self {
             id: request.id.clone(),
             name: request.name.clone(),
-            status: ToolStatus::Failed,
             output: None,
-            error: Some(error.into()),
-            exit_code,
-            truncated: false,
-            kind: ToolResultKind::RuntimeError,
+            terminal: ToolTerminal::new(
+                ToolStatus::Failed,
+                Some(error.into()),
+                exit_code,
+                false,
+                ToolResultKind::RuntimeError,
+                ToolTerminalSource::Observed,
+                ToolInvocationStarted::Unknown,
+            ),
             file_change_preview: None,
         }
     }
@@ -592,12 +802,16 @@ impl ToolResult {
         Self {
             id: request.id.clone(),
             name: request.name.clone(),
-            status: ToolStatus::Failed,
             output: None,
-            error: Some(error.into()),
-            exit_code: None,
-            truncated: false,
-            kind: ToolResultKind::InvalidInput,
+            terminal: ToolTerminal::new(
+                ToolStatus::Failed,
+                Some(error.into()),
+                None,
+                false,
+                ToolResultKind::InvalidInput,
+                ToolTerminalSource::Observed,
+                ToolInvocationStarted::No,
+            ),
             file_change_preview: None,
         }
     }
@@ -606,18 +820,88 @@ impl ToolResult {
         Self {
             id: request.id.clone(),
             name: request.name.clone(),
-            status: ToolStatus::Denied,
             output: None,
-            error: Some(reason.into()),
-            exit_code: None,
-            truncated: false,
-            kind: ToolResultKind::PermissionDenied,
+            terminal: ToolTerminal::new(
+                ToolStatus::Denied,
+                Some(reason.into()),
+                None,
+                false,
+                ToolResultKind::PermissionDenied,
+                ToolTerminalSource::Observed,
+                ToolInvocationStarted::No,
+            ),
+            file_change_preview: None,
+        }
+    }
+
+    pub fn cancelled(
+        request: &ToolRequest,
+        reason: impl Into<String>,
+        exit_code: Option<i32>,
+    ) -> Self {
+        Self::cancelled_with_started(request, reason, exit_code, ToolInvocationStarted::Yes)
+    }
+
+    fn cancelled_with_started(
+        request: &ToolRequest,
+        reason: impl Into<String>,
+        exit_code: Option<i32>,
+        started: ToolInvocationStarted,
+    ) -> Self {
+        Self {
+            id: request.id.clone(),
+            name: request.name.clone(),
+            output: None,
+            terminal: ToolTerminal::new(
+                ToolStatus::Cancelled,
+                Some(reason.into()),
+                exit_code,
+                false,
+                ToolResultKind::Cancelled,
+                ToolTerminalSource::Observed,
+                started,
+            ),
+            file_change_preview: None,
+        }
+    }
+
+    pub fn cancelled_before_start(request: &ToolRequest, reason: impl AsRef<str>) -> Self {
+        Self::cancelled_with_started(
+            request,
+            format!(
+                "Tool invocation was not started because {}",
+                reason.as_ref()
+            ),
+            None,
+            ToolInvocationStarted::No,
+        )
+    }
+
+    pub fn indeterminate(request: &ToolRequest, reason: impl Into<String>) -> Self {
+        Self {
+            id: request.id.clone(),
+            name: request.name.clone(),
+            output: None,
+            terminal: ToolTerminal::new(
+                ToolStatus::Indeterminate,
+                Some(reason.into()),
+                None,
+                false,
+                ToolResultKind::Indeterminate,
+                ToolTerminalSource::Observed,
+                ToolInvocationStarted::Unknown,
+            ),
             file_change_preview: None,
         }
     }
 
     pub fn with_file_change_preview(mut self, preview: FileChangePreview) -> Self {
         self.file_change_preview = Some(Arc::new(preview));
+        self
+    }
+
+    pub fn with_terminal_source(mut self, source: ToolTerminalSource) -> Self {
+        self.terminal.source = source;
         self
     }
 }
@@ -832,6 +1116,144 @@ mod tests {
         assert_eq!(ToolResultKind::Truncated.status(), ToolStatus::Completed);
         assert_eq!(ToolResultKind::InvalidInput.status(), ToolStatus::Failed);
         assert_eq!(ToolResultKind::RuntimeError.status(), ToolStatus::Failed);
+    }
+
+    #[test]
+    fn tool_terminal_constructors_distinguish_cancelled_and_indeterminate() {
+        let request = ToolRequest {
+            id: "call-1".to_string(),
+            name: ToolName::Bash,
+            action: ActionKind::Shell,
+            target: Some("sleep 30".to_string()),
+            raw_arguments: Some(r#"{"command":"sleep 30"}"#.to_string()),
+        };
+
+        let cancelled = ToolResult::cancelled(&request, "turn interrupted", Some(130));
+        assert_eq!(cancelled.status, ToolStatus::Cancelled);
+        assert_eq!(cancelled.kind, ToolResultKind::Cancelled);
+        assert_eq!(cancelled.error.as_deref(), Some("turn interrupted"));
+        assert_eq!(cancelled.exit_code, Some(130));
+
+        let not_started = ToolResult::cancelled_before_start(&request, "turn interrupted");
+        assert_eq!(not_started.status, ToolStatus::Cancelled);
+        assert_eq!(not_started.kind, ToolResultKind::Cancelled);
+        assert_eq!(not_started.exit_code, None);
+        assert_eq!(not_started.terminal().started, ToolInvocationStarted::No);
+        assert!(
+            not_started
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("not started"))
+        );
+
+        let indeterminate = ToolResult::indeterminate(&request, "missing terminal result");
+        assert_eq!(indeterminate.status, ToolStatus::Indeterminate);
+        assert_eq!(indeterminate.kind, ToolResultKind::Indeterminate);
+        assert_eq!(
+            indeterminate.error.as_deref(),
+            Some("missing terminal result")
+        );
+        assert_eq!(ToolStatus::Cancelled.as_str(), "cancelled");
+        assert_eq!(ToolStatus::Indeterminate.as_str(), "indeterminate");
+    }
+
+    #[test]
+    fn tool_terminal_metadata_serializes_with_stable_snake_case_names() {
+        let terminal = ToolTerminal {
+            status: ToolStatus::Indeterminate,
+            error: Some("missing terminal result".to_string()),
+            exit_code: None,
+            truncated: false,
+            kind: ToolResultKind::Indeterminate,
+            source: ToolTerminalSource::CompatibilityRepair,
+            started: ToolInvocationStarted::Unknown,
+        };
+
+        let value = serde_json::to_value(terminal).unwrap();
+        assert_eq!(value["status"], "indeterminate");
+        assert_eq!(value["kind"], "indeterminate");
+        assert_eq!(value["terminal_source"], "compatibility_repair");
+        assert!(value.get("started").is_none());
+        assert_eq!(
+            serde_json::to_value(InterruptSemantics::CooperativeCancel).unwrap(),
+            "cooperative_cancel"
+        );
+        assert_eq!(
+            serde_json::to_value(ReplaySemantics::IndeterminateAfterStart).unwrap(),
+            "indeterminate_after_start"
+        );
+
+        let request = ToolRequest {
+            id: "call-1".to_string(),
+            name: ToolName::Bash,
+            action: ActionKind::Shell,
+            target: None,
+            raw_arguments: None,
+        };
+        let result = ToolResult::cancelled(&request, "turn interrupted", Some(130));
+        assert_eq!(
+            result.terminal().clone(),
+            ToolTerminal {
+                status: ToolStatus::Cancelled,
+                error: Some("turn interrupted".to_string()),
+                exit_code: Some(130),
+                truncated: false,
+                kind: ToolResultKind::Cancelled,
+                source: ToolTerminalSource::Observed,
+                started: ToolInvocationStarted::Yes,
+            }
+        );
+
+        let legacy = serde_json::json!({
+            "id": "call-legacy",
+            "name": "bash",
+            "status": "failed",
+            "output": null,
+            "error": "boom",
+            "exit_code": 1,
+            "truncated": false,
+            "kind": "runtime_error"
+        });
+        let decoded: ToolResult = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(decoded.terminal().source, ToolTerminalSource::Observed);
+        assert_eq!(decoded.terminal().started, ToolInvocationStarted::Unknown);
+        assert_eq!(serde_json::to_value(decoded).unwrap(), legacy);
+
+        let before_start = ToolResult::cancelled_before_start(&request, "turn interrupted");
+        let value = serde_json::to_value(&before_start).unwrap();
+        assert_eq!(value["invocation_started"], "no");
+        let decoded: ToolResult = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded.terminal().started, ToolInvocationStarted::No);
+
+        let contradictory = serde_json::json!({
+            "id": "call-invalid",
+            "name": "bash",
+            "status": "cancelled",
+            "output": null,
+            "error": "cancelled",
+            "exit_code": null,
+            "truncated": false,
+            "kind": "runtime_error"
+        });
+        assert!(serde_json::from_value::<ToolResult>(contradictory).is_err());
+    }
+
+    #[test]
+    #[should_panic(expected = "completed_kind requires a completed result kind")]
+    fn completed_kind_rejects_non_completion_kinds() {
+        let request = ToolRequest {
+            id: "call-1".to_string(),
+            name: ToolName::ReadFile,
+            action: ActionKind::Read,
+            target: None,
+            raw_arguments: None,
+        };
+        let _ = ToolResult::completed_kind(
+            &request,
+            "not actually complete".to_string(),
+            false,
+            ToolResultKind::Cancelled,
+        );
     }
 
     #[test]

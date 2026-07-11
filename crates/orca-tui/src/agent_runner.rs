@@ -2467,17 +2467,14 @@ mod tests {
         let config = config();
         let session = TuiConversationSession::new_with_preloaded(&config, "goal progress", None)
             .expect("session");
-        let result = tool_types::ToolResult {
+        let request = tool_types::ToolRequest {
             id: "call-1".to_string(),
             name: tool_types::ToolName::plain("bash"),
-            status: tool_types::ToolStatus::Completed,
-            output: Some("ok".to_string()),
-            error: None,
-            exit_code: Some(0),
-            truncated: false,
-            kind: tool_types::ToolResultKind::Success,
-            file_change_preview: None,
+            action: orca_core::approval_types::ActionKind::Shell,
+            target: None,
+            raw_arguments: None,
         };
+        let result = tool_types::ToolResult::completed(&request, "ok".to_string(), false);
 
         record_tui_goal_tool_finish(&session, "turn-1", &result);
 

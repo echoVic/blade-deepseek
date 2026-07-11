@@ -144,7 +144,13 @@ mod tests {
         let req = make_request("../escape.txt", "bad");
         let result = execute(&req, dir.path());
         assert_eq!(result.status, ToolStatus::Failed);
-        assert!(result.error.unwrap().contains("escapes workspace"));
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("escapes workspace")
+        );
     }
 
     #[test]

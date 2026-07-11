@@ -21,7 +21,7 @@ use crate::instructions::ProjectInstructions;
 use crate::lifecycle::{
     RuntimeApprovalDecision, RuntimeConfigApprovalHandler, RuntimePermissionRequestHandler,
     RuntimeTaskActor, RuntimeToolActorContext, RuntimeToolApprovalPolicy, RuntimeUserInputHandler,
-    TurnPermissionOverlay,
+    TurnPermissionOverlay, run_status_from_tool_status,
 };
 use crate::memory::MemoryBlock;
 use crate::tasks::TaskRegistry;
@@ -556,7 +556,8 @@ impl ToolExecutionActor {
                     if emit_deltas {
                         emit_tool_call_completed(events, sink, tool_request, &result)?;
                     }
-                    return Ok(Err((RunStatus::Failed, result)));
+                    let status = run_status_from_tool_status(result.status);
+                    return Ok(Err((status, result)));
                 }
             };
         match apply_pre_tool_outcome(invocation, &pre_tool_outcome, mcp_registry, config) {
@@ -582,10 +583,6 @@ impl ToolExecutionActor {
         emit_deltas: bool,
         cancel: Option<&CancelToken>,
     ) -> io::Result<(RunStatus, tool_types::ToolResult)> {
-        let is_failure = matches!(
-            result.status,
-            tool_types::ToolStatus::Failed | tool_types::ToolStatus::Denied
-        );
         if emit_deltas {
             emit_tool_call_completed(events, sink, execution_request, result)?;
             if execution_request.name == tool_types::ToolName::UpdatePlan
@@ -605,11 +602,7 @@ impl ToolExecutionActor {
             }
         }
 
-        let status = if is_failure {
-            RunStatus::Failed
-        } else {
-            RunStatus::Success
-        };
+        let status = run_status_from_tool_status(result.status);
 
         Ok((status, result.clone()))
     }
@@ -619,12 +612,18 @@ fn tool_call_outcome_for_result(result: &tool_types::ToolResult) -> ToolCallOutc
     match result.status {
         tool_types::ToolStatus::Completed => ToolCallOutcome::Completed,
         tool_types::ToolStatus::Failed => ToolCallOutcome::Failed {
-            handler_executed: true,
+            started: result.terminal().started,
         },
         tool_types::ToolStatus::NotImplemented => ToolCallOutcome::Failed {
-            handler_executed: false,
+            started: tool_types::ToolInvocationStarted::No,
         },
         tool_types::ToolStatus::Denied => ToolCallOutcome::Blocked,
+        tool_types::ToolStatus::Cancelled => ToolCallOutcome::Cancelled {
+            started: result.terminal().started,
+        },
+        tool_types::ToolStatus::Indeterminate => ToolCallOutcome::Indeterminate {
+            started: result.terminal().started,
+        },
     }
 }
 
@@ -662,14 +661,15 @@ mod tests {
     };
     use orca_core::event_schema::{EventFactory, RunStatus};
     use orca_core::event_sink::EventSink;
+    use orca_core::hook_types::{HookConfig, HookEvent};
     use orca_core::model::ModelSelection;
     use orca_core::subagent_config::SubagentConfig;
-    use orca_core::tool_types::{ToolName, ToolRequest, ToolStatus};
+    use orca_core::tool_types::{ToolName, ToolRequest, ToolResult, ToolStatus};
     use orca_mcp::McpRegistry;
 
     use super::{
         ToolApprovalGateContext, ToolExecutionActor, ToolExecutionContext,
-        policy_for_tool_execution,
+        policy_for_tool_execution, tool_call_outcome_for_result,
     };
     use crate::agent_child::{ChildAgentRequest, ChildAgentResult, ChildAgentRuntime};
     use crate::cost::CostTracker;
@@ -749,6 +749,119 @@ mod tests {
 
         assert_eq!(resolution.decision, ApprovalDecision::Deny);
         assert!(resolution.reason.contains("permission deny rule"));
+    }
+
+    #[test]
+    fn tool_terminal_status_maps_to_runtime_and_extension_lifecycle() {
+        let request = ToolRequest {
+            id: "call-1".to_string(),
+            name: ToolName::Bash,
+            action: ActionKind::Shell,
+            target: Some("sleep 30".to_string()),
+            raw_arguments: None,
+        };
+        let hooks = HookRunner::default();
+        let mut actor = ToolExecutionActor::new("tool-terminal-status", 1);
+        let mut events = EventFactory::new("tool-terminal-status".to_string());
+        let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+
+        let cancelled = ToolResult::cancelled(&request, "turn interrupted", Some(130));
+        let (status, _) = actor
+            .finish_tool_result(
+                &mut events,
+                &mut sink,
+                &request,
+                &cancelled,
+                &hooks,
+                ".",
+                false,
+                None,
+            )
+            .unwrap();
+        assert_eq!(status, RunStatus::Cancelled);
+        assert_eq!(
+            tool_call_outcome_for_result(&cancelled),
+            crate::extension::ToolCallOutcome::Cancelled {
+                started: orca_core::tool_types::ToolInvocationStarted::Yes
+            }
+        );
+
+        let indeterminate = ToolResult::indeterminate(&request, "missing terminal result");
+        let (status, _) = actor
+            .finish_tool_result(
+                &mut events,
+                &mut sink,
+                &request,
+                &indeterminate,
+                &hooks,
+                ".",
+                false,
+                None,
+            )
+            .unwrap();
+        assert_eq!(status, RunStatus::Failed);
+        assert_eq!(
+            tool_call_outcome_for_result(&indeterminate),
+            crate::extension::ToolCallOutcome::Indeterminate {
+                started: orca_core::tool_types::ToolInvocationStarted::Unknown
+            }
+        );
+    }
+
+    #[test]
+    fn cancelled_pre_tool_hook_returns_cancelled_before_start_result() {
+        let config = config_with_permission_rules(PermissionRules::default());
+        let request = ToolRequest {
+            id: "call-1".to_string(),
+            name: ToolName::Bash,
+            action: ActionKind::Shell,
+            target: Some("echo should-not-run".to_string()),
+            raw_arguments: Some(r#"{"command":"echo should-not-run"}"#.to_string()),
+        };
+        let hooks = HookRunner::new(vec![HookConfig {
+            event: HookEvent::PreToolUse,
+            command: "sleep 5".to_string(),
+            tool: Some("bash".to_string()),
+        }]);
+        let mcp_registry = McpRegistry::default();
+        let invocation =
+            crate::tool_invocation::prepare_tool_invocation(&request, 0, &mcp_registry, &config);
+        let cancel = orca_core::cancel::CancelToken::new();
+        cancel.cancel();
+        let mut actor = ToolExecutionActor::new("cancelled-pre-tool-hook", 1);
+        let mut events = EventFactory::new("cancelled-pre-tool-hook".to_string());
+        let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+
+        let result = actor
+            .apply_pre_tool_hook(
+                &config,
+                &mut events,
+                &mut sink,
+                &request,
+                invocation,
+                &hooks,
+                ".",
+                &mcp_registry,
+                false,
+                Some(&cancel),
+            )
+            .unwrap();
+
+        let Err((status, result)) = result else {
+            panic!("cancelled pre-tool hook must stop before tool execution");
+        };
+        assert_eq!(status, RunStatus::Cancelled);
+        assert_eq!(result.status, ToolStatus::Cancelled);
+        assert_eq!(
+            result.terminal().started,
+            orca_core::tool_types::ToolInvocationStarted::No
+        );
+        assert_eq!(
+            tool_call_outcome_for_result(&result),
+            crate::extension::ToolCallOutcome::Cancelled {
+                started: orca_core::tool_types::ToolInvocationStarted::No
+            }
+        );
     }
 
     #[test]

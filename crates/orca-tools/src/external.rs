@@ -231,7 +231,7 @@ pub fn execute_external_tool_with_policy_or_cancel(
             output.status.code()
         },
     );
-    result.truncated = ingress_truncated;
+    result.set_truncated(ingress_truncated);
     result
 }
 
