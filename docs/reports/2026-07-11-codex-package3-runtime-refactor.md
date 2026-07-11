@@ -16,15 +16,23 @@ sequencer, terminal outcome, and cleanup.
 
 The recommended order is:
 
-1. close every tool invocation with exactly one truthful terminal result;
-2. replace resettable cancellation with one-shot operation scopes and stable
-   operation identities;
-3. introduce a runtime host, thread actors, and one canonical turn executor;
-4. call the async provider directly and migrate server, headless, and TUI
+1. close every tool invocation with exactly one truthful terminal result and
+   explicit interrupt/retry semantics;
+2. replace resettable cancellation with one-shot operation scopes, stable
+   operation identities, and separate current-work versus whole-agent stop;
+3. introduce a runtime host and thread actors as the control plane, initially
+   delegating to the existing executor;
+4. move accepted input, same-turn steer, next-turn input, and background
+   notifications behind the actor's generation-fenced input state machine;
+5. move one canonical turn executor under actor-owned operation tasks;
+6. call the async provider directly and migrate server, headless, and TUI
    surfaces onto runtime handles;
-5. add a semantic execution journal with replay projectors;
-6. make interactions and task control durable, then add leases and fencing;
-7. move workflow, subagent, and goal recovery onto that control plane.
+7. add a semantic execution journal with stable IDs and transactional context
+   checkpoints;
+8. make interactions and task control durable, then add leases and fencing;
+9. add a bounded capability catalog for deferred tool discovery;
+10. move workflow, subagent, goal, and scheduled-loop recovery onto that control
+   plane.
 
 This is not a recommendation for a big-bang rewrite. Each row below is a
 shippable compatibility slice, but all new work should move toward the same
@@ -55,8 +63,8 @@ semantics.
 Replacing runtime, storage, protocol, and TUI orchestration in one branch would
 temporarily remove duplicate paths, but it would combine transport, replay,
 interaction, workflow, and UI regressions into one unreviewable change. The
-current working diff already demonstrates why independent release slices are
-valuable: transport cancellation and tool-argument validity can be verified
+`v0.2.16` release already demonstrates why independent release slices are
+valuable: transport cancellation and tool-argument validity were verified
 without simultaneously changing journal compatibility.
 
 ## Reference Baselines
@@ -65,8 +73,8 @@ without simultaneously changing journal compatibility.
 - Package 3: a source-map-restored snapshot of
   `@anthropic-ai/claude-code@2.1.88`, not a Git repository or release
   dependency.
-- Orca: `main@b126657eb`, with the uncommitted v0.2.16 async DeepSeek transport
-  compatibility slice under final verification.
+- Orca: tagged and pushed `v0.2.16` at `main@4e6502704`, including the async
+  DeepSeek transport compatibility slice and pre-side-effect tool validation.
 
 ## Deeper Codex Findings
 
@@ -158,6 +166,35 @@ elicitations are still in-memory one-shot senders in `TurnState`. They are good
 same-process interaction references, but not a durable continuation design.
 Orca should not mistake their presence for crash recovery.
 
+### Input delivery is a state machine, not a string side channel
+
+Codex separates turn-local steered input from session-scoped inter-agent mail.
+It also records whether late mailbox input may still join the current turn or
+must wait for the next one. A steer is accepted only for the expected active
+regular turn; review and compaction tasks reject it. After visible terminal
+output, late child mail is fenced into the next turn unless explicit same-turn
+work reopens delivery.
+
+Relevant reference points:
+
+- turn input and mailbox queues:
+  `codex-rs/core/src/session/input_queue.rs:12`,
+  `codex-rs/core/src/session/input_queue.rs:34`;
+- current-turn versus next-turn delivery:
+  `codex-rs/core/src/state/turn.rs:35`,
+  `codex-rs/core/src/session/input_queue.rs:126`;
+- expected-turn validation and steerability:
+  `codex-rs/core/src/session/mod.rs:3857`;
+- sampling-boundary drain rules:
+  `codex-rs/core/src/session/turn.rs:218`.
+
+Orca already exposes `turn/steer`, but `ThreadSteerHandle` is only a
+process-local `Vec<String>` and the server validates a turn ID rather than an
+operation generation. Workflow notifications and TUI queued input are separate
+queues. The actor migration should preserve these capabilities while replacing
+the separate queues with typed admitted input records: `AcceptedTurnInput`,
+`SameTurnSteer`, `NextTurnInput`, and `BackgroundNotification`.
+
 ## Deeper Package 3 Findings
 
 ### One conversation engine, but not a one-shot turn owner
@@ -243,6 +280,103 @@ The reusable principle is a durable control record plus a fenced worker lease.
 Orca should not copy PID files as its authority. PID and process start time are
 diagnostics; a lease epoch or fencing token must decide who may commit.
 
+### Foregrounding, interrupting work, and terminating an agent are different
+
+Package 3 distinguishes the controller that stops a teammate's current turn
+from the controller that terminates the whole teammate. Foreground/background
+navigation changes presentation ownership without changing execution
+ownership. This is more precise than one shared cancellation flag.
+
+Relevant reference points:
+
+- whole-agent and current-work controllers:
+  `src/tasks/InProcessTeammateTask/types.ts:36`;
+- current-work-only interruption from task navigation:
+  `src/hooks/useBackgroundTaskNavigation.ts:157`;
+- foreground/background view handoff:
+  `src/hooks/useSessionBackgrounding.ts:42`,
+  `src/hooks/useSessionBackgrounding.ts:76`.
+
+Orca should model `DetachSubscriber`, `InterruptOperation`, `StopAgent`, and
+`ShutdownThread` as different commands. Parent cancellation may cascade to
+children, but moving a task to the background must never replace or reset its
+operation token.
+
+### Tool definitions carry control semantics, not only schemas
+
+Package 3 lets tools declare whether an interrupt may cancel them or must wait
+for completion. Its streaming executor closes every queued or executing tool
+with a synthetic result when interruption is allowed. Orca already has the
+better foundation for this in `ToolSpec`: capabilities, exposure,
+`concurrent_safe`, and result semantics. It should extend that registry rather
+than add more name-based checks.
+
+Add two explicit dimensions:
+
+- `InterruptSemantics`: `CooperativeCancel`, `WaitForTerminal`, or
+  `DetachAndObserve`;
+- `ReplaySemantics`: `SafeToRetry`, `IdempotentWithKey`, or
+  `IndeterminateAfterStart`.
+
+These values drive cancellation, recovery, and UI text. They do not claim that
+a process can roll back an external side effect.
+
+`DetachAndObserve` is a target ownership policy, not permission to fire and
+forget work during P0. It becomes executable only when `RuntimeHost` can
+atomically adopt the invocation ID, join handle, cleanup obligation, and
+terminal commit. Until that handoff exists, the runtime must use
+`WaitForTerminal` or fail closed.
+
+### The command queue is an admission mechanism
+
+Package 3 uses one queue with `now`, `next`, and `later` priorities and a query
+generation guard so a stale `finally` block cannot release a reservation owned
+by a newer query. The useful part is not its React store. It is the invariant
+that dequeue, reservation, execution generation, and release agree on one
+owner.
+
+Relevant reference points:
+
+- unified queue subscription and priorities:
+  `src/hooks/useQueueProcessor.ts:17`;
+- generation fencing: `src/utils/QueryGuard.ts:29`;
+- accepted input persisted before provider work: `src/QueryEngine.ts:436`.
+
+In Orca, the thread actor should append an `InputAdmitted` semantic record before
+acknowledging a state-changing submission. P0.4 seeds this narrow record in the
+same append-only stream that P1.1 later expands into the full execution journal;
+it must not create a throwaway queue file or wait for the full journal redesign.
+A stale generation may finish cleanup, but it may not drain input, publish a
+terminal record, or clear the new operation.
+
+This durability rule applies to resumable threads. An explicitly ephemeral
+thread may acknowledge only process-local admission, must advertise that it is
+not recoverable, and must not persist prompt text behind
+`HistoryMode::Disabled`.
+
+### Deferred tools are now a correctness concern
+
+Orca counts tool schemas in its wire-equivalent context budget and already has
+`ToolExposure::Deferred`, but every registered tool is currently direct. The
+DeepSeek adapter truncates advertised tools to the first 128. Once MCP and
+external tools cross that boundary, a configured tool can become model-invisible
+based only on registry order.
+
+Package 3 and Codex both provide references for deferred capability discovery.
+Orca should implement a provider-neutral local catalog rather than copy
+Anthropic's `tool_reference` wire type:
+
+1. keep a small, stable base schema containing `tool_search`;
+2. search bounded name/description/capability metadata locally;
+3. persist discovered tool identities in the operation context;
+4. advertise the selected schemas on the next sampling request in deterministic
+   order;
+5. fail explicitly when a required capability cannot fit, instead of silently
+   truncating it.
+
+This belongs after stable operation and tool identities, but before a plugin
+marketplace or large remote-tool ecosystem.
+
 ## Current Orca Gaps
 
 | Gap | Current evidence | Consequence |
@@ -250,9 +384,11 @@ diagnostics; a lease epoch or fencing token must decide who may commit.
 | Two main execution kernels | TUI owns provider/tool/compaction loops in `crates/orca-tui/src/agent_runner.rs:838`; runtime defines `ThreadTurnExecutor` in `crates/orca-runtime/src/controller.rs:75` and enters it at `:481` | Cancellation, replay, and tool fixes do not automatically cover every surface |
 | Lifecycle records do not own execution | `RuntimeTaskLifecycle` is descriptive in `runtime_lifecycle.rs:12`; `RuntimeThread::run_request` is synchronous in `thread.rs:104` | There is no shared handle that guarantees cancel, join, cleanup, and one terminal outcome |
 | Resettable shared cancellation | `CancelToken::reset` is in `orca-core/src/cancel.rs:20`; TUI and server reuse it, including `server/processors/turn.rs:86` | A stale operation can be re-enabled and `turn/resume` has ambiguous semantics |
+| Input admission is split by surface | runtime steer is a `Vec<String>` in `lifecycle.rs:97`; server owns active-turn controls; TUI owns workflow notification queues | Accepted input, same-turn steer, next-turn input, and late child output have no single ordering or generation owner |
 | Nested surface-specific workers | Server moves a whole thread into `std::thread::spawn` at `server.rs:1787`; TUI starts an agent thread and another provider thread; the provider facade creates a Tokio runtime per call | Shutdown, replacement, resource reclamation, and backpressure have different contracts |
 | Incomplete tool turns are discarded | `normalize_tool_boundaries` keeps a tool-bearing assistant only when every result is present in `orca-core/src/conversation.rs:307` | Resume can lose completed context or repeat a mutating side effect |
 | Tool terminal taxonomy is too weak | `ToolStatus` has completed/failed/denied/not-implemented only in `orca-core/src/tool_types.rs:494` | Cancellation and crash-unknown outcomes are collapsed into misleading success/failure text |
+| Tool control metadata is incomplete | `ToolSpec` has capability, exposure, result semantics, and concurrency safety in `orca-core/src/tool_types.rs:468`, but no interrupt or replay policy | The runtime cannot decide whether to cancel, wait, detach, or mark an interrupted mutating tool indeterminate |
 | Event ordering is local, not canonical | `EventFactory` owns a local `seq` at `event_schema.rs:161`; TUI creates a second factory for the same run at `agent_runner.rs:1064` | Duplicate sequence numbers and cross-child ordering make replay ambiguous |
 | Durable history is message-shaped | `SessionRecord` stores messages, completion, compaction, usage, and plan only in `thread_store/types.rs:81` | Turn, operation, interaction, invocation, and control transitions cannot be reconstructed |
 | IDs are derived from current position | turn and item IDs are rebuilt as `turn-N` and `item-N` in `thread_store/projection.rs:408` | Compaction, repair, or filtering can change public identity across reads |
@@ -262,6 +398,8 @@ diagnostics; a lease epoch or fencing token must decide who may commit.
 | Dependency direction does not enforce the boundary | `orca-tui` directly depends on provider, tools, MCP, approval, and runtime crates | The TUI can continue growing a second runtime even if helper functions move |
 | Architecture tests overfit source text | `orca-runtime/src/lib.rs` is over 6,000 lines and contains many `include_str!().contains(...)` assertions | Tests prove spelling and file placement more often than ownership, cancellation, or replay behavior |
 | Goal execution remains a TUI loop | goal state is persisted in `goals.rs`, but automatic continuation is `app.rs:2847` | Headless/server recovery and cost control do not share an orchestrator |
+| Deferred tool support is scaffold-only | `ToolExposure::Deferred` exists, all registry entries are direct, and `deepseek_http.rs:668` truncates after 128 tools | Large MCP/external-tool sets silently lose capabilities and destabilize the prompt prefix |
+| Compaction commit is not atomic | `session.rs:585` replaces live conversation before best-effort count and summary records are appended separately | A crash or write failure can leave live state, replayed state, and summary state disagreeing |
 
 The v0.2.16 provider facade is intentionally temporary. It now owns async HTTP
 request/body cancellation and joins its worker, but runtime still calls the
@@ -287,12 +425,20 @@ bounded command channel serializes:
 - `InterruptOperation`;
 - `SteerOperation`;
 - `ResolveInteraction`;
+- `AdmitNextTurnInput`;
+- `AdmitBackgroundNotification`;
 - `ReadSnapshot`;
 - `ShutdownThread`.
 
 The actor may run child work concurrently, but every authoritative state
 transition returns through the actor, which checks the operation generation and
 assigns the next thread sequence number.
+
+The input side has explicit delivery phases. Inputs admitted for an active
+operation carry `expected_operation_id`; inputs intended for a later turn are
+durable thread mail. A visible terminal answer closes same-turn mailbox
+delivery. Late child output remains queued unless an explicit steer reopens the
+current operation before its terminal commit.
 
 ### Operation task
 
@@ -307,6 +453,11 @@ Each turn, compaction, workflow, subagent, or long-running tool gets a fresh
 - typed terminal outcome;
 - cleanup hook and deadline;
 - operation-local interaction registry.
+
+Operation scope and agent lifetime are separate. A background subagent has an
+agent lifetime scope and creates a fresh child operation for each turn. Stopping
+current work cancels only that child operation; stopping the agent cancels the
+lifetime scope and all descendants. Detaching a UI subscriber cancels neither.
 
 `turn/resume` must never reset a cancelled token. Compatibility RPCs may keep
 their current wire shape, but resuming an interrupted turn creates a new
@@ -338,6 +489,28 @@ Not every token delta needs a synchronous durable write.
 The actor sequences both planes. Authoritative events are appended before they
 are projected. A live delta can appear before durability, but recovery never
 depends on reconstructing partial text from those deltas.
+
+### Transactional context checkpoints
+
+Compaction builds a candidate projection without mutating the authoritative
+conversation. The actor then appends one checkpoint record containing the
+compaction ID, source sequence, retained item IDs, summary state, and context
+window metadata. Only after append acceptance does it swap the live projection
+and publish `context.compacted`.
+
+This fixes a current Orca weakness: conversation replacement happens before
+best-effort compaction and summary records, and those records are correlated by
+message counts. Counts are not stable identities. Legacy count-based records
+remain readable, while all new checkpoints use item IDs.
+
+### Capability catalog
+
+`ToolSpec` remains the canonical registry record. The runtime derives a bounded
+base catalog from direct tools and searchable metadata from deferred tools.
+Discovery changes the operation's capability snapshot, not the global registry,
+so a child or retry cannot silently change an already running request's tool
+surface. Catalog revisions and selected tool IDs become part of step context and
+trace metadata.
 
 ### Storage and projections
 
@@ -395,51 +568,70 @@ Architecture work is complete only when tests can prove these properties:
 5. every tool invocation has exactly one terminal result;
 6. a crash-recovered running mutating tool is `indeterminate`, not falsely
    reported as cancelled or safe to retry;
-7. no event is authoritative before its semantic record is append-accepted;
-8. thread journal sequence is contiguous and assigned by one owner;
-9. interaction resolution is idempotent by interaction ID;
-10. a stale lease holder cannot commit after takeover;
-11. replaying the same journal produces byte-equivalent canonical projections;
-12. TUI, server, and headless commands execute through the same turn kernel.
+7. a stale operation cannot drain or clear input admitted for a newer
+   generation;
+8. same-turn steer, next-turn input, and late child mail have explicit delivery
+   phases;
+9. no event is authoritative before its semantic record is append-accepted;
+10. thread journal sequence is contiguous and assigned by one owner;
+11. interaction resolution is idempotent by interaction ID;
+12. a stale lease holder cannot commit after takeover;
+13. compaction changes the live projection only after its checkpoint is
+    append-accepted;
+14. a capability snapshot never exceeds provider limits through silent
+    truncation;
+15. replaying the same journal produces byte-equivalent canonical projections;
+16. TUI, server, and headless commands execute through the same turn kernel.
 
 ## Ranked Refactor Plan
 
+Completed baseline: `v0.2.16` is no longer active architecture work. Keep its
+joined synchronous provider facade frozen as a compatibility boundary and
+delete it when the final synchronous production caller moves to the async
+provider API.
+
 | Priority | Slice | Main outcome | Risk | Prerequisites |
 |----------|-------|--------------|------|---------------|
-| P0.0 | Finish v0.2.16 as a compatibility release | Ship and freeze the cancellable transport facade before structural work | Mixing transport and runtime regressions | Current final verification |
-| P0.1 | Tool invocation closure | Add cancelled and indeterminate terminal kinds; preserve a call plus one terminal result; deterministically repair legacy incomplete history | Transcript compatibility and accidental replay of mutating tools | None |
-| P0.2 | Stable operation identity, one-shot `OperationScope`, typed terminal outcome | New scope per operation; parent/child cancellation; no `reset`; explicit completed/cancelled/failed/forced-abort outcomes | Turn resume semantics change | P0.1 for truthful cancellation history |
-| P0.3 | `RuntimeHost`, `ThreadActor`, and canonical `ThreadTurnExecutor` | One owner for session state, task handle, done signal, cleanup, sequencing, and interactions | Borrowed sync contexts must become owned values or actor messages | P0.2 |
-| P0.4 | Async provider through runtime | Runtime awaits `call_streaming_async`; remove per-call provider runtime/thread from production paths | Event sink backpressure and `Send` boundaries | P0.3 |
-| P0.5 | Surface convergence | Server and headless use runtime handles first; TUI follows; delete TUI provider loop and direct execution dependencies | Broad behavior parity across surfaces | P0.3-P0.4 |
-| P1.1 | Semantic execution journal and stable public IDs | Append replayable operation/item/invocation facts; one sequencer; projections no longer derive IDs from indexes | Migration, write amplification, and corruption policy | Stable P0 identities and one kernel |
-| P1.2 | Async `ToolCallRuntime` | Per-invocation task owner, concurrency permit, approval state, output stream, cancellation, cleanup, and terminal CAS | Shell/MCP teardown and blocking tool adapters | P0.1, P0.3, P1.1 |
+| P0.1 | Invocation truth and tool control metadata | Add cancelled/indeterminate terminals plus interrupt and replay semantics; preserve every call with exactly one result; repair legacy history deterministically | Transcript compatibility and accidental retry of mutating tools | None |
+| P0.2 | Stable operation identity and stop hierarchy | One-shot `OperationScope`; separate detach, interrupt current operation, stop agent, and shutdown thread; no token reset | `turn/resume` semantics and background-task control change | P0.1 for truthful cancellation history |
+| P0.3 | `RuntimeHost` and `ThreadActor` control plane | One bounded command owner for active operation, generation, input, terminal completion, and sequencing; initially delegate execution to the legacy `ThreadTurnExecutor` | Borrowed session state must move behind owned commands without changing behavior | P0.2 |
+| P0.4 | Generation-fenced input admission | Through the actor, seed `InputAdmitted` records for resumable threads before provider work; distinguish same-turn steer, next-turn input, and background notification; stale generations cannot drain or clear newer input | Ordering changes at answer and child-mail boundaries; ephemeral threads remain explicitly non-resumable | P0.3 |
+| P0.5 | Canonical actor-owned `ThreadTurnExecutor` | Move turn, compaction, interactions, and child-operation ownership under one operation task while retaining current surface contracts | Large parity surface and cleanup ordering | P0.3-P0.4 |
+| P0.6 | Async provider through runtime | Runtime awaits `call_streaming_async`; remove per-call provider runtime/thread from production paths | Event sink backpressure and `Send` boundaries | P0.5 |
+| P0.7 | Surface convergence | Migrate server, then headless, then TUI to runtime handles; delete the TUI provider/tool loop and direct execution dependencies | Broad behavior parity across surfaces | P0.5-P0.6 |
+| P1.1 | Semantic execution journal, stable IDs, transactional compaction | Append replayable operation/item/invocation facts; one sequencer; install context checkpoints before projection swaps | Migration, write amplification, and corruption policy | Stable P0 identities and one kernel |
+| P1.2 | Async `ToolCallRuntime` | Per-invocation task owner, concurrency permit, approval state, output stream, cancellation, cleanup, and terminal CAS | Shell/MCP teardown and blocking tool adapters | P0.1, P0.5, P1.1 |
 | P1.3 | Durable interaction broker | Permission, tool approval, user input, and MCP elicitation become persisted idempotent request/response records | Expiry, duplicate, and ownership policy | P1.1-P1.2 |
-| P1.4 | Unified supervisor, leases, and fencing | Merge active turns, task workers, subagents, workflows, shell, and background work under cancellation trees and owner epochs | Incorrect takeover or stale commit | P0.3, P1.1 |
-| P2.1 | Checkpointable workflow/subagent resume | Resume the same run from a safe cursor with idempotency keys instead of replaying only cached completions | External side effects may be indeterminate | P1.1-P1.4 |
-| P2.2 | Runtime goal orchestrator | Move goal cursor, attempt, usage, tool attempts, lease, and continuation policy out of TUI | Runaway retries and cost policy | P0.5, P1.1, P1.4 |
-| P2.3 | App-server dependency inversion | Processors depend on runtime handles, stores, and outgoing interfaces instead of full mutable `ServerState` | Request ordering and response timing | P0.5, P1.1 |
-| P2.4 | Context/cache identity | Stable synthetic IDs, immutable cache-critical prefixes, isolated fork state, and explicit context checkpoints | Cache invalidation during migration | P1.1 and canonical items |
-| P3 | Crate cleanup and product expansion | Remove source shims/source-text tests; consider CLI/store crate splits; then add plugins, remote control, richer PTY, and scheduled loops | Feature-specific | P0-P2 |
+| P1.4 | Context identity and deferred capability catalog | Stable cache-critical prefix, operation-scoped tool snapshot, local `tool_search`, deterministic selection, and explicit provider-cap errors | Loaded-tool changes can invalidate cache or strand old history | P1.1 and canonical tool IDs |
+| P1.5 | Unified supervisor, leases, and fencing | Merge active turns, task workers, subagents, workflows, shell, and background work under cancellation trees and owner epochs | Incorrect takeover or stale commit | P0.5, P1.1 |
+| P2.1 | Checkpointable workflow/subagent resume | Resume the same run from a safe cursor with idempotency keys instead of replaying only cached completions | External side effects may be indeterminate | P1.1-P1.5 |
+| P2.2 | Runtime goal and schedule orchestrator | Move goal cursor, attempt, usage, tool attempts, lease, continuation, cadence, overlap, missed-run, expiry, and budget policy out of TUI | Runaway retries, duplicate fires, and cost policy | P0.7, P1.1, P1.5 |
+| P2.3 | App-server dependency inversion | Processors depend on runtime handles, stores, and outgoing interfaces instead of full mutable `ServerState` | Request ordering and response timing | P0.7, P1.1 |
+| P2.4 | Workspace mutation checkpoints | Optionally snapshot files touched by first-party edit/write tools and expose explicit rewind; never claim rollback of shell, MCP, network, or external effects | Disk usage and false safety if scope is unclear | Stable invocation IDs and P1.2 |
+| P3 | Crate cleanup and product expansion | Remove source shims/source-text tests; consider CLI/store crate splits; then add plugins, remote control, LSP, and richer PTY support | Feature-specific | P0-P2 |
 
 ## Recommended Release Slices
 
 Preserve the repository's patch-release cadence:
 
-1. `v0.2.17`: tool terminal taxonomy, interrupted/indeterminate closure, and
-   deterministic legacy repair.
+1. `v0.2.17`: tool terminal taxonomy, interrupt/replay metadata,
+   interrupted/indeterminate closure, and deterministic legacy repair.
 2. `v0.2.18`: one-shot operation scopes, typed operation terminal outcomes,
-   and replacement for token-reset `turn/resume`.
-3. `v0.2.19`: seed `RuntimeHost` and `ThreadActor`; move the canonical runtime
-   turn and compaction under the owned operation task.
-4. `v0.2.20`: call the async provider directly; migrate server/headless and
+   stop hierarchy, and replacement for token-reset `turn/resume`.
+3. `v0.2.19`: seed `RuntimeHost`, `ThreadActor`, and the narrow
+   `InputAdmitted` semantic record, then route generation-fenced current/next-turn
+   input through that owner while execution still delegates to the existing
+   turn executor.
+4. `v0.2.20`: move the canonical runtime turn and compaction under the owned
+   operation task.
+5. `v0.2.21`: call the async provider directly; migrate server and headless, and
    remove their compatibility provider workers.
-5. `v0.2.21`: migrate TUI to command/event handles; delete its provider/tool
+6. `v0.2.22`: migrate TUI to command/event handles; delete its provider/tool
    loop and direct provider dependency.
-6. `v0.2.22`: introduce semantic journal v2, stable item IDs, and replay
-   equivalence tests while dual-reading existing session JSONL.
-7. `v0.2.23+`: durable interactions, `ToolCallRuntime`, supervisor leases, then
-   workflow/subagent/goal recovery.
+7. `v0.2.23`: introduce semantic journal v2, stable item IDs, transactional
+   context checkpoints, and replay equivalence while dual-reading legacy JSONL.
+8. `v0.2.24+`: durable interactions, `ToolCallRuntime`, capability catalog,
+   supervisor leases, then workflow/subagent/goal recovery.
 
 Do not assign dates to later releases until the preceding ownership invariant
 is proven. Version numbers are dependency markers, not permission to merge an
@@ -485,13 +677,19 @@ Every slice needs behavioral tests, not only source-placement assertions:
 
 - cancellation before request, during retry wait, during body streaming,
   during approval, during tool execution, and during cleanup;
+- current-operation interrupt versus whole-agent stop versus subscriber detach;
 - callback/event-consumer panic or disconnect;
 - replacement while an old worker is finishing;
+- stale steer, stale cleanup, late child mail, and next-turn input ordering;
 - exactly one operation terminal and exactly one invocation terminal;
 - process-kill fault injection after `tool.running` but before terminal commit;
+- compaction failure before checkpoint append and after checkpoint append but
+  before live projection swap;
 - replay equivalence between live projection and cold reconstruction;
 - final partial record recovery and middle-record corruption rejection;
 - duplicate interaction response and stale lease-holder commit rejection;
+- deferred-tool selection stability, provider tool-cap overflow, and replay
+  after a discovered tool disappears;
 - server, headless, and TUI contract tests against the same mock turn script;
 - compile-time dependency checks proving the TUI cannot call provider or tool
   execution directly.
@@ -506,6 +704,9 @@ next to the behavior they protect.
 - Codex's process-local interaction waiters as a durability design.
 - Package 3's reusable conversation-level `AbortController`.
 - Package 3's broad callback-heavy `ToolUseContext`.
+- Package 3's React command queue as the runtime source of truth.
+- Anthropic-specific `tool_reference` blocks; DeepSeek needs a local catalog
+  and deterministic next-request schema selection.
 - React/Ink waiters, Zod object layout, PID files, or package-specific JSONL.
 - Per-token synchronous fsync.
 - A generic event-sourcing framework before Orca's own semantic records are
@@ -523,10 +724,9 @@ recovery work.
 | P3.1 | Plugin and capability manifests | Codex app-server plugin/marketplace processors; Package 3 `PluginInstallationManager` | Extend the existing skill system with signed/validated manifests and capability declarations only after runtime/tool interfaces stabilize |
 | P3.2 | Remote control and reattachment | Codex app-server; Package 3 `RemoteSessionManager`, permission bridge, and WebSocket transport | Put a network transport in front of the same runtime handles and durable interactions; never create a remote-only execution kernel |
 | P3.3 | LSP diagnostics service | Package 3 `LSPDiagnosticRegistry` and `LSPServerManager` | Add a project-scoped diagnostic actor whose snapshots are bounded context artifacts and whose processes live under the supervisor |
-| P3.4 | Scheduled loops and unattended runs | Package 3 cron scheduler, durable lock, and bundled loop skill | Model schedules as durable intent plus fenced operation creation, with budget and missed-run policy; no in-process timer as the source of truth |
-| P3.5 | Memory consolidation | Codex memory pipeline; Package 3 SessionMemory and auto-consolidation services | Derive candidate memories from completed semantic journal ranges, then require explicit bounded storage and provenance |
-| P3.6 | Structured output contracts | Package 3 QueryEngine structured-output enforcement; Codex typed protocol items | Validate terminal agent output against a schema at the runtime boundary, with repair attempts represented as child operations |
-| P3.7 | Richer shell and worktree isolation | Codex unified exec, sandbox, and agent worktree controls | Move PTY/process ownership and worktree leases under the supervisor before adding more terminal fidelity or automatic worktree workflows |
+| P3.4 | Memory consolidation | Codex memory pipeline; Package 3 SessionMemory and auto-consolidation services | Derive candidate memories from completed semantic journal ranges, then require explicit bounded storage and provenance |
+| P3.5 | Structured output contracts | Package 3 QueryEngine structured-output enforcement; Codex typed protocol items | Validate terminal agent output against a schema at the runtime boundary, with repair attempts represented as child operations |
+| P3.6 | Richer shell and worktree isolation | Codex unified exec, sandbox, and agent worktree controls | Move PTY/process ownership and worktree leases under the supervisor before adding more terminal fidelity or automatic worktree workflows |
 
 Prompt suggestions, voice, decorative task-panel parity, plugin marketplace UX,
 and additional media readers are lower priority. They increase surface area but
@@ -538,6 +738,11 @@ do not improve correctness, recovery, or execution ownership.
 - Do not add SQLite merely to call task snapshots durable.
 - Do not expose workflow checkpoint resume until mutating-tool indeterminacy and
   idempotency policy are defined.
+- Do not call file snapshots transactional rollback; they cover only known
+  first-party file mutations, never arbitrary shell or external effects.
+- Do not enable deferred tools by assigning `ToolExposure::Deferred` alone;
+  discovery, stable IDs, history compatibility, and provider-cap failures must
+  land together.
 - Do not expand the synchronous provider facade after v0.2.16.
 - Do not merge goal, workflow, operation, and task status enums; their control
   semantics are different.
