@@ -25,7 +25,9 @@ use orca_runtime::runtime_permission::{
     RuntimePermissionEvaluation, RuntimePermissionOrigin, RuntimePermissionPolicy,
 };
 use orca_runtime::tasks::TaskRegistry;
-use orca_runtime::tool_invocation::prepare_tool_invocation;
+use orca_runtime::tool_invocation::{
+    apply_pre_tool_outcome, prepare_tool_invocation, validate_tool_invocation,
+};
 
 use crate::agent_runner::{
     DEFAULT_MAX_TURNS, send_runtime_event_as_tui, send_task_status_updated_for_tui,
@@ -43,6 +45,7 @@ use crate::runtime_interaction_adapter::{
 use crate::types::{TuiEvent, UserAction};
 
 pub(crate) fn execute_readonly_batch_for_tui(
+    config: &RunConfig,
     cwd: &Path,
     tool_requests: &[tool_types::ToolRequest],
     event_tx: &Sender<TuiEvent>,
@@ -50,12 +53,21 @@ pub(crate) fn execute_readonly_batch_for_tui(
     hooks: &HookRunner,
     output_truncation: tool_types::ToolOutputTruncation,
 ) -> Vec<tool_types::ToolResult> {
-    let mut hook_failed: Vec<Option<tool_types::ToolResult>> = vec![None; tool_requests.len()];
+    let mut early_results: Vec<Option<tool_types::ToolResult>> = vec![None; tool_requests.len()];
     let mut runnable = Vec::new();
     let mut events = EventFactory::new("tui-readonly-batch".to_string());
+    let mut schema_invalid = vec![false; tool_requests.len()];
 
     for (idx, tool_request) in tool_requests.iter().enumerate() {
         send_tool_requested_for_tui(event_tx, &mut events, tool_request);
+        let invocation = prepare_tool_invocation(tool_request, 0, mcp_registry, config);
+        if tool_request.raw_arguments.is_some()
+            && let Err(error) = validate_tool_invocation(&invocation, mcp_registry, config)
+        {
+            early_results[idx] = Some(error.into_result());
+            schema_invalid[idx] = true;
+            continue;
+        }
         match hooks.run(
             HookEvent::PreToolUse,
             HookContext {
@@ -69,10 +81,22 @@ pub(crate) fn execute_readonly_batch_for_tui(
             },
         ) {
             Ok(outcome) => {
-                runnable.push((idx, tool_request_with_hook_outcome(tool_request, &outcome)));
+                let effective_request = if tool_request.raw_arguments.is_some() {
+                    match apply_pre_tool_outcome(invocation, &outcome, mcp_registry, config) {
+                        Ok(invocation) => invocation.effective,
+                        Err(error) => {
+                            early_results[idx] = Some(error.into_result());
+                            schema_invalid[idx] = true;
+                            continue;
+                        }
+                    }
+                } else {
+                    tool_request_with_hook_outcome(tool_request, &outcome)
+                };
+                runnable.push((idx, effective_request));
             }
             Err(error) => {
-                hook_failed[idx] = Some(tool_types::ToolResult::failed(
+                early_results[idx] = Some(tool_types::ToolResult::failed(
                     tool_request,
                     format!("pre_tool_use hook blocked tool: {error}"),
                     None,
@@ -81,22 +105,38 @@ pub(crate) fn execute_readonly_batch_for_tui(
         }
     }
 
-    let mut results = orca_tools::run_readonly_batch_parallel_with_policy(
-        tool_requests,
-        runnable,
+    let runnable_requests = runnable
+        .iter()
+        .map(|(_, request)| request.clone())
+        .collect::<Vec<_>>();
+    let dense_runnable = runnable_requests.iter().cloned().enumerate().collect();
+    let runnable_results = orca_tools::run_readonly_batch_parallel_with_policy(
+        &runnable_requests,
+        dense_runnable,
         cwd,
         mcp_registry,
         output_truncation,
     );
 
-    for (idx, failed) in hook_failed.into_iter().enumerate() {
-        if let Some(result) = failed {
-            results[idx] = result;
-        }
+    let mut results = early_results;
+    for ((original_idx, _), result) in runnable.into_iter().zip(runnable_results) {
+        results[original_idx] = Some(result);
+    }
+    let results = results
+        .into_iter()
+        .map(|result| result.expect("each read-only batch item has a result"))
+        .collect::<Vec<_>>();
+
+    for result in &results {
+        send_tool_completed_for_tui(event_tx, &mut events, result, None);
     }
 
-    for (tool_request, result) in tool_requests.iter().zip(results.iter()) {
-        send_tool_completed_for_tui(event_tx, &mut events, result, None);
+    for ((tool_request, result), schema_invalid) in
+        tool_requests.iter().zip(results.iter()).zip(schema_invalid)
+    {
+        if schema_invalid {
+            continue;
+        }
         if let Err(error) = hooks.run(
             HookEvent::PostToolUse,
             HookContext {
@@ -199,6 +239,14 @@ fn execute_tool_for_tui_inner(
             .map(str::to_string)
             .unwrap_or_else(|| "tui-tool-session".to_string()),
     );
+    if tool_request.raw_arguments.is_some()
+        && let Err(error) = validate_tool_invocation(&invocation, mcp_registry, config)
+    {
+        send_tool_requested_for_tui(event_tx, &mut events, tool_request);
+        let result = error.into_result();
+        send_tool_completed_for_tui(event_tx, &mut events, &result, None);
+        return (false, result, None);
+    }
     let mut runtime_context =
         RuntimeToolActorContext::new(events.run_id().to_string(), DEFAULT_MAX_TURNS);
     // request_permissions is itself an approval prompt (the permission
@@ -263,8 +311,18 @@ fn execute_tool_for_tui_inner(
                 return (true, result, None);
             }
         };
-        let effective_tool_request =
-            tool_request_with_hook_outcome(tool_request, &pre_tool_outcome);
+        let effective_tool_request = if tool_request.raw_arguments.is_some() {
+            match apply_pre_tool_outcome(invocation, &pre_tool_outcome, mcp_registry, config) {
+                Ok(invocation) => invocation.effective,
+                Err(error) => {
+                    let result = error.into_result();
+                    send_tool_completed_for_tui(event_tx, &mut events, &result, None);
+                    return (false, result, None);
+                }
+            }
+        } else {
+            tool_request_with_hook_outcome(tool_request, &pre_tool_outcome)
+        };
         let execution_request = &effective_tool_request;
         let before = diff::capture_before(execution_request, cwd);
         // Match the runtime path (tool_router.rs): configured extra working
@@ -1412,6 +1470,99 @@ mod tests {
             "approved write root must persist for the rest of the turn: {:?}",
             overlay.additional_working_directories()
         );
+    }
+
+    #[test]
+    fn execute_tool_for_tui_rejects_malformed_subagent_before_task_creation() {
+        let workspace = TempDir::new().unwrap();
+        let (event_tx, _event_rx) = mpsc::channel();
+        let (_action_tx, action_rx) = mpsc::channel();
+        let pending_actions = RefCell::new(VecDeque::new());
+        let config = config(ApprovalMode::FullAuto);
+        let policy = ApprovalPolicy::new(ApprovalMode::FullAuto);
+        let registry = TaskRegistry::new("session-malformed-single-subagent".to_string());
+        let request = tool_types::ToolRequest {
+            id: "subagent-malformed-single".to_string(),
+            name: ToolName::Subagent,
+            action: ActionKind::Agent,
+            target: None,
+            raw_arguments: Some("{\"description\":\"broken".to_string()),
+        };
+        let mut overlay = TurnPermissionOverlay::default();
+
+        let (should_stop, result, child_cost) = execute_tool_for_tui(
+            &config,
+            workspace.path(),
+            &request,
+            &event_tx,
+            &action_rx,
+            &pending_actions,
+            None,
+            0,
+            None,
+            None,
+            &policy,
+            &ProjectInstructions::default(),
+            &MemoryBlock::default(),
+            &McpRegistry::default(),
+            &HookRunner::default(),
+            Some(&registry),
+            &mut overlay,
+            &CancelToken::new(),
+        );
+
+        assert!(!should_stop);
+        assert_eq!(result.status, ToolStatus::Failed);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("arguments are not valid JSON")
+        );
+        assert!(child_cost.is_none());
+        assert!(registry.list().is_empty());
+    }
+
+    #[test]
+    fn execute_readonly_batch_rejects_malformed_arguments_before_hooks() {
+        let workspace = TempDir::new().unwrap();
+        let marker = workspace.path().join("hook-ran");
+        let hooks = HookRunner::new(vec![orca_core::hook_types::HookConfig {
+            event: HookEvent::PreToolUse,
+            command: format!("printf ran > {}", marker.display()),
+            tool: Some("read_file".to_string()),
+        }]);
+        let config = config(ApprovalMode::FullAuto);
+        let (event_tx, _event_rx) = mpsc::channel();
+        let request = tool_types::ToolRequest {
+            id: "read-malformed".to_string(),
+            name: ToolName::ReadFile,
+            action: ActionKind::Read,
+            target: None,
+            raw_arguments: Some("{\"path\":\"broken".to_string()),
+        };
+
+        let results = execute_readonly_batch_for_tui(
+            &config,
+            workspace.path(),
+            &[request],
+            &event_tx,
+            &McpRegistry::default(),
+            &hooks,
+            config.tools.output_truncation,
+        );
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].status, ToolStatus::Failed);
+        assert!(
+            results[0]
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("arguments are not valid JSON")
+        );
+        assert!(!marker.exists(), "schema-invalid tools must not run hooks");
     }
 
     #[test]

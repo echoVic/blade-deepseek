@@ -352,8 +352,10 @@ fn clear_terminal_scrollback(terminal: &mut InlineTerminal) -> io::Result<()> {
 
 fn run_manual_compaction_with_events(
     event_tx: &mpsc::Sender<TuiEvent>,
+    cancel: &CancelToken,
     compact: impl FnOnce() -> (usize, usize),
 ) {
+    cancel.reset();
     let _ = event_tx.send(TuiEvent::CompactionStarted);
     let (before_messages, after_messages) = compact();
     let _ = event_tx.send(TuiEvent::Compacted {
@@ -444,8 +446,9 @@ mod tests {
     #[test]
     fn manual_compaction_emits_started_before_running_summary_work() {
         let (event_tx, event_rx) = mpsc::channel();
+        let cancel = CancelToken::new();
 
-        run_manual_compaction_with_events(&event_tx, || {
+        run_manual_compaction_with_events(&event_tx, &cancel, || {
             assert!(matches!(
                 event_rx.try_recv(),
                 Ok(TuiEvent::CompactionStarted)
@@ -461,6 +464,21 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn manual_compaction_starts_with_a_fresh_cancel_state() {
+        let (event_tx, _event_rx) = mpsc::channel();
+        let cancel = CancelToken::new();
+        cancel.cancel();
+
+        run_manual_compaction_with_events(&event_tx, &cancel, || {
+            assert!(
+                !cancel.is_cancelled(),
+                "a prior turn interrupt must not cancel the next manual compaction"
+            );
+            (8, 3)
+        });
     }
 
     fn matching_task_update(
@@ -3261,7 +3279,7 @@ fn agent_loop_thread(
                         .cwd
                         .clone()
                         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-                    run_manual_compaction_with_events(&event_tx, || {
+                    run_manual_compaction_with_events(&event_tx, &cancel, || {
                         session.compact(&cfg, &cwd, &cancel)
                     });
                 } else {

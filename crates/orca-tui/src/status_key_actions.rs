@@ -14,7 +14,7 @@ use crate::idle_key_actions::handle_idle_key;
 use crate::running_actions::handle_running_shortcut;
 use crate::session_picker_actions::handle_session_picker_key;
 use crate::setup_actions::{SetupFlow, handle_setup_key};
-use crate::shortcuts::{ShortcutAction, ShortcutContext, resolve_shortcut};
+use crate::shortcuts::{RunningShortcut, ShortcutAction, ShortcutContext, resolve_shortcut};
 use crate::theme::Theme;
 use crate::types::{AppState, AppStatus, UserAction};
 use crate::vim::VimState;
@@ -93,14 +93,35 @@ where
         return Ok(StatusKeyFlow::Continue);
     }
 
-    if matches!(state.status, AppStatus::Running | AppStatus::Compacting)
+    if state.status == AppStatus::Running
         && let Some(ShortcutAction::Running(shortcut)) =
             resolve_shortcut(ShortcutContext::Running, *key)
     {
         handle_running_shortcut(shortcut, state, action_tx, cancel_token);
     }
 
+    if state.status == AppStatus::Compacting
+        && let Some(ShortcutAction::Running(shortcut)) =
+            resolve_shortcut(ShortcutContext::Running, *key)
+        && compacting_shortcut_allowed(shortcut)
+    {
+        handle_running_shortcut(shortcut, state, action_tx, cancel_token);
+    }
+
     Ok(StatusKeyFlow::Continue)
+}
+
+fn compacting_shortcut_allowed(shortcut: RunningShortcut) -> bool {
+    match shortcut {
+        RunningShortcut::Interrupt
+        | RunningShortcut::ScrollUp
+        | RunningShortcut::ScrollDown
+        | RunningShortcut::PageUp
+        | RunningShortcut::PageDown
+        | RunningShortcut::HalfPageUp
+        | RunningShortcut::HalfPageDown => true,
+        RunningShortcut::BackgroundCurrentTurn => false,
+    }
 }
 
 #[cfg(test)]
@@ -189,5 +210,47 @@ mod tests {
 
         assert!(cancel.is_cancelled());
         assert!(matches!(action_rx.try_recv(), Ok(UserAction::Interrupt)));
+    }
+
+    #[test]
+    fn compacting_status_rejects_background_current_turn_shortcut() {
+        let (action_tx, action_rx) = mpsc::channel();
+        let mut state = AppState::new(
+            action_tx.clone(),
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        state.set_status(AppStatus::Compacting);
+        let mut config = config();
+        let shared_config = Arc::new(Mutex::new(config.clone()));
+        let cancel = CancelToken::new();
+        let preloaded = Arc::new(Mutex::new(None));
+        let mut textarea = TextArea::default();
+        let mut vim_state = VimState::new(false);
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let key = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL);
+        let event = Event::Key(key);
+
+        handle_status_key(
+            &event,
+            &key,
+            &mut state,
+            &mut config,
+            &shared_config,
+            &action_tx,
+            &cancel,
+            &preloaded,
+            &mut textarea,
+            &mut vim_state,
+            &theme,
+            None,
+            || Ok(()),
+        )
+        .expect("handle compacting shortcut");
+
+        assert_eq!(state.status, AppStatus::Compacting);
+        assert!(action_rx.try_recv().is_err());
+        assert!(!cancel.is_cancelled());
     }
 }

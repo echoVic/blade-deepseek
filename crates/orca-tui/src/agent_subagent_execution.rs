@@ -20,10 +20,12 @@ use orca_runtime::memory::MemoryBlock;
 use orca_runtime::runtime_pending_interaction::RuntimePendingInteractionStore;
 use orca_runtime::subagent::{self, SubagentMode};
 use orca_runtime::tasks::TaskRegistry;
+use orca_runtime::tool_invocation::{prepare_tool_invocation, validate_tool_invocation};
 
 use crate::agent_runner::{
     send_subagent_completed_for_tui, send_subagent_started_for_tui,
-    send_task_status_updated_for_tui, task_summary_for_tui,
+    send_task_status_updated_for_tui, send_tool_completed_for_tui, send_tool_requested_for_tui,
+    task_summary_for_tui,
 };
 use crate::agent_tool_execution::execute_tool_for_tui;
 use crate::types::{TuiEvent, UserAction};
@@ -75,6 +77,7 @@ pub(crate) fn execute_subagent_batch_for_tui(
     subagent_depth: u32,
     instructions: &ProjectInstructions,
     memory: &MemoryBlock,
+    mcp_registry: &orca_mcp::McpRegistry,
     hooks: &HookRunner,
     task_registry: Option<&TaskRegistry>,
 ) -> Vec<(bool, tool_types::ToolResult, CostTracker)> {
@@ -84,6 +87,17 @@ pub(crate) fn execute_subagent_batch_for_tui(
     let mut events = EventFactory::new("tui-subagent-batch".to_string());
 
     for (idx, tool_request) in tool_requests.iter().enumerate() {
+        let invocation =
+            prepare_tool_invocation(tool_request, subagent_depth, mcp_registry, config);
+        if tool_request.raw_arguments.is_some()
+            && let Err(error) = validate_tool_invocation(&invocation, mcp_registry, config)
+        {
+            send_tool_requested_for_tui(event_tx, &mut events, tool_request);
+            let result = error.into_result();
+            send_tool_completed_for_tui(event_tx, &mut events, &result, None);
+            results[idx] = Some((false, result, CostTracker::new(None)));
+            continue;
+        }
         let request = subagent::create_subagent_request(tool_request);
         let description = request.description.clone();
         let subagent_type = request.subagent_type;

@@ -1391,6 +1391,7 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
                     0,
                     session.instructions(),
                     session.memory(),
+                    session.mcp_registry(),
                     session.hooks(),
                     Some(session.task_registry()),
                 );
@@ -1445,6 +1446,7 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
                     index,
                 );
                 let results = execute_readonly_batch_for_tui(
+                    config,
                     &cwd,
                     &tool_requests[index..batch_end],
                     event_tx,
@@ -3299,6 +3301,7 @@ mod tests {
             0,
             &instructions,
             &memory,
+            &McpRegistry::default(),
             &hooks,
             None,
         );
@@ -3308,6 +3311,57 @@ mod tests {
         assert_eq!(results[0].1.status, tool_types::ToolStatus::Failed);
         assert!(!results[1].0);
         assert_eq!(results[1].1.status, tool_types::ToolStatus::Completed);
+    }
+
+    #[test]
+    fn tui_subagent_batch_rejects_malformed_arguments_before_starting_child() {
+        let config = full_auto_config();
+        let (event_tx, event_rx) = mpsc::channel();
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let hooks = HookRunner::default();
+        let registry = TaskRegistry::new("session-malformed-subagent".to_string());
+        let request = tool_types::ToolRequest {
+            id: "subagent-malformed".to_string(),
+            name: tool_types::ToolName::Subagent,
+            action: orca_core::approval_types::ActionKind::Agent,
+            target: None,
+            raw_arguments: Some("{\"description\":\"broken".to_string()),
+        };
+
+        let results = execute_subagent_batch_for_tui(
+            &config,
+            config.cwd.as_deref().unwrap_or_else(|| Path::new(".")),
+            &[request],
+            &event_tx,
+            0,
+            &instructions,
+            &memory,
+            &McpRegistry::default(),
+            &hooks,
+            Some(&registry),
+        );
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].1.status, tool_types::ToolStatus::Failed);
+        assert!(
+            results[0]
+                .1
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("arguments are not valid JSON")
+        );
+        assert!(
+            registry.list().is_empty(),
+            "schema-invalid subagent arguments must not create a child task"
+        );
+        assert!(
+            event_rx
+                .try_iter()
+                .all(|event| !matches!(event, TuiEvent::SubagentProgress { .. })),
+            "schema-invalid subagent arguments must not run a child agent"
+        );
     }
 
     #[test]
@@ -3339,6 +3393,7 @@ mod tests {
             0,
             &instructions,
             &memory,
+            &McpRegistry::default(),
             &hooks,
             None,
         );
@@ -3387,6 +3442,7 @@ mod tests {
             0,
             &instructions,
             &memory,
+            &McpRegistry::default(),
             &hooks,
             Some(&registry),
         );
