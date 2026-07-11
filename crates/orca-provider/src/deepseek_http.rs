@@ -8,7 +8,7 @@ use orca_core::conversation::{
     normalize_tool_boundaries,
 };
 use orca_core::provider_types::{ProviderReplayState, ProviderResponse, ProviderStep, Usage};
-use orca_core::tool_types::ToolRequest;
+use orca_core::tool_types::{ToolName, ToolRequest};
 use orca_tools::registry;
 
 use crate::ProviderConfig;
@@ -354,17 +354,10 @@ async fn request_chat_streaming(
                     arguments: tc.arguments.clone(),
                 },
             };
-            match parse_tool_call(&tc_response, &config.external_tools) {
-                Ok(tool_request) => {
-                    steps.push(ProviderStep::ToolCall(tool_request));
-                }
-                Err(error) => {
-                    steps.push(ProviderStep::Error(format!(
-                        "failed to parse tool call '{}': {error}",
-                        tc.function_name
-                    )));
-                }
-            }
+            steps.push(ProviderStep::ToolCall(parse_tool_call(
+                &tc_response,
+                &config.external_tools,
+            )));
         }
 
         let assistant_reasoning = if stream_result.reasoning.is_empty() {
@@ -537,17 +530,10 @@ fn request_chat(
                     arguments: tc.function.arguments.clone(),
                 });
 
-                match parse_tool_call(tc, &config.external_tools) {
-                    Ok(tool_request) => {
-                        steps.push(ProviderStep::ToolCall(tool_request));
-                    }
-                    Err(error) => {
-                        steps.push(ProviderStep::Error(format!(
-                            "failed to parse tool call '{}': {error}",
-                            tc.function.name
-                        )));
-                    }
-                }
+                steps.push(ProviderStep::ToolCall(parse_tool_call(
+                    tc,
+                    &config.external_tools,
+                )));
             }
         }
 
@@ -586,40 +572,35 @@ fn length_finish_reason_error() -> String {
 fn parse_tool_call(
     tc: &ApiToolCallResponse,
     external_tools: &[orca_core::external_config::ExternalToolConfig],
-) -> Result<ToolRequest, String> {
+) -> ToolRequest {
     let schema_name = tc.function.name.as_str();
-    // ToolName::from_str has a catch-all that wraps unknown names as External(...),
-    // so we must gate on the registry to reject truly unknown tools.
     let reg = registry::tool_registry_with_mcp_and_external(None, external_tools);
     let resolved = reg.resolve(schema_name);
-    let is_known_tool = resolved.is_some()
-        || schema_name.starts_with("mcp__")
-        || external_tools.iter().any(|tool| tool.name == schema_name);
-    if !is_known_tool {
-        return Err(format!("unknown tool: {schema_name}"));
-    }
-    let name = registry::tool_name_from_schema_name(schema_name)
-        .expect("known tool must parse to ToolName");
-    let action = reg
-        .resolve(schema_name)
+    let name = if external_tools.iter().any(|tool| tool.name == schema_name) {
+        ToolName::External(schema_name.to_string())
+    } else if schema_name.starts_with("mcp__") {
+        ToolName::Mcp(schema_name.to_string())
+    } else if resolved.is_some() {
+        registry::tool_name_from_schema_name(schema_name)
+            .expect("registered provider tool names always map to ToolName")
+    } else {
+        ToolName::External(schema_name.to_string())
+    };
+    let action = resolved
+        .as_ref()
         .map(|resolved| resolved.spec.capabilities.action_kind())
         .unwrap_or(ActionKind::Read);
     let target = serde_json::from_str::<Value>(&tc.function.arguments)
         .ok()
         .and_then(|args| match schema_name {
             "read_file" => args["path"].as_str().map(String::from),
-            "list_files" => args["path"]
-                .as_str()
-                .map(String::from)
-                .or(Some(".".to_string())),
-            "glob" => args["path"]
+            "list_files" | "glob" => args["path"]
                 .as_str()
                 .map(String::from)
                 .or(Some(".".to_string())),
             "grep" => args["pattern"].as_str().map(String::from),
             "bash" => args["command"].as_str().map(String::from),
-            "edit" => args["path"].as_str().map(String::from),
-            "write_file" => args["path"].as_str().map(String::from),
+            "edit" | "write_file" => args["path"].as_str().map(String::from),
             "git_status" => Some(".".to_string()),
             "subagent" => args["description"]
                 .as_str()
@@ -635,9 +616,10 @@ fn parse_tool_call(
                 Some(other.to_string())
             }
             _ => None,
-        });
+        })
+        .or_else(|| resolved.is_none().then(|| schema_name.to_string()));
 
-    Ok(ToolRequest {
+    ToolRequest {
         id: tc.id.clone(),
         name,
         action,
@@ -646,7 +628,7 @@ fn parse_tool_call(
             schema_name,
             &tc.function.arguments,
         )),
-    })
+    }
 }
 
 /// Rewrites known-recoverable argument shapes before schema validation sees them.
@@ -951,7 +933,7 @@ mod tests {
     #[test]
     fn parse_read_file() {
         let tc = make_tc("read_file", r#"{"path":"src/main.rs"}"#);
-        let req = parse_tool_call(&tc, &[]).unwrap();
+        let req = parse_tool_call(&tc, &[]);
         assert_eq!(req.name, ToolName::ReadFile);
         assert_eq!(req.action, ActionKind::Read);
         assert_eq!(req.target.as_deref(), Some("src/main.rs"));
@@ -961,7 +943,7 @@ mod tests {
     #[test]
     fn parse_list_files_with_path() {
         let tc = make_tc("list_files", r#"{"path":"src/provider"}"#);
-        let req = parse_tool_call(&tc, &[]).unwrap();
+        let req = parse_tool_call(&tc, &[]);
         assert_eq!(req.name, ToolName::ListFiles);
         assert_eq!(req.action, ActionKind::Read);
         assert_eq!(req.target.as_deref(), Some("src/provider"));
@@ -970,7 +952,7 @@ mod tests {
     #[test]
     fn parse_list_files_without_path_defaults_to_dot() {
         let tc = make_tc("list_files", r#"{}"#);
-        let req = parse_tool_call(&tc, &[]).unwrap();
+        let req = parse_tool_call(&tc, &[]);
         assert_eq!(req.name, ToolName::ListFiles);
         assert_eq!(req.target.as_deref(), Some("."));
     }
@@ -984,7 +966,7 @@ mod tests {
             "update_plan",
             r#"{"plan":[{"completed":true,"step":"a"},{"in_progress":true,"status":"in_progress","step":"b"}]}"#,
         );
-        let req = parse_tool_call(&tc, &[]).unwrap();
+        let req = parse_tool_call(&tc, &[]);
 
         let raw = req.raw_arguments.as_deref().unwrap();
         let value: Value = serde_json::from_str(raw).unwrap();
@@ -1003,9 +985,9 @@ mod tests {
         let complete_flag = make_tc("update_goal", r#"{"complete":true,"reason":"done"}"#);
         let blocked_flag = make_tc("update_goal", r#"{"blocked":true,"reason":"stuck"}"#);
 
-        let completed = parse_tool_call(&completed, &[]).unwrap();
-        let complete_flag = parse_tool_call(&complete_flag, &[]).unwrap();
-        let blocked_flag = parse_tool_call(&blocked_flag, &[]).unwrap();
+        let completed = parse_tool_call(&completed, &[]);
+        let complete_flag = parse_tool_call(&complete_flag, &[]);
+        let blocked_flag = parse_tool_call(&blocked_flag, &[]);
 
         assert_eq!(
             serde_json::from_str::<Value>(completed.raw_arguments.as_deref().unwrap()).unwrap()["status"],
@@ -1027,7 +1009,7 @@ mod tests {
     fn parse_update_plan_leaves_clean_arguments_untouched() {
         let clean = r#"{"explanation":"x","plan":[{"step":"a","status":"pending"}]}"#;
         let tc = make_tc("update_plan", clean);
-        let req = parse_tool_call(&tc, &[]).unwrap();
+        let req = parse_tool_call(&tc, &[]);
         assert_eq!(req.raw_arguments.as_deref(), Some(clean));
     }
 
@@ -1126,7 +1108,7 @@ mod tests {
     #[test]
     fn parse_glob_with_pattern_and_path() {
         let tc = make_tc("glob", r#"{"pattern":"**/*.rs","path":"src"}"#);
-        let req = parse_tool_call(&tc, &[]).unwrap();
+        let req = parse_tool_call(&tc, &[]);
         assert_eq!(req.name, ToolName::Glob);
         assert_eq!(req.action, ActionKind::Read);
         assert_eq!(req.target.as_deref(), Some("src"));
@@ -1139,7 +1121,7 @@ mod tests {
     #[test]
     fn parse_glob_with_pattern_only_defaults_path_to_dot() {
         let tc = make_tc("glob", r#"{"pattern":"*.rs"}"#);
-        let req = parse_tool_call(&tc, &[]).unwrap();
+        let req = parse_tool_call(&tc, &[]);
         assert_eq!(req.name, ToolName::Glob);
         assert_eq!(req.action, ActionKind::Read);
         assert_eq!(req.target.as_deref(), Some("."));
@@ -1149,7 +1131,7 @@ mod tests {
     #[test]
     fn parse_grep() {
         let tc = make_tc("grep", r#"{"pattern":"fn main","path":"src"}"#);
-        let req = parse_tool_call(&tc, &[]).unwrap();
+        let req = parse_tool_call(&tc, &[]);
         assert_eq!(req.name, ToolName::Grep);
         assert_eq!(req.action, ActionKind::Read);
         assert_eq!(req.target.as_deref(), Some("fn main"));
@@ -1158,7 +1140,7 @@ mod tests {
     #[test]
     fn parse_bash() {
         let tc = make_tc("bash", r#"{"command":"cargo test"}"#);
-        let req = parse_tool_call(&tc, &[]).unwrap();
+        let req = parse_tool_call(&tc, &[]);
         assert_eq!(req.name, ToolName::Bash);
         assert_eq!(req.action, ActionKind::Shell);
         assert_eq!(req.target.as_deref(), Some("cargo test"));
@@ -1167,7 +1149,7 @@ mod tests {
     #[test]
     fn parse_edit() {
         let tc = make_tc("edit", r#"{"path":"foo.rs","old_text":"a","new_text":"b"}"#);
-        let req = parse_tool_call(&tc, &[]).unwrap();
+        let req = parse_tool_call(&tc, &[]);
         assert_eq!(req.name, ToolName::Edit);
         assert_eq!(req.action, ActionKind::Write);
         assert_eq!(req.target.as_deref(), Some("foo.rs"));
@@ -1177,7 +1159,7 @@ mod tests {
     #[test]
     fn parse_git_status() {
         let tc = make_tc("git_status", r#"{}"#);
-        let req = parse_tool_call(&tc, &[]).unwrap();
+        let req = parse_tool_call(&tc, &[]);
         assert_eq!(req.name, ToolName::GitStatus);
         assert_eq!(req.action, ActionKind::Read);
         assert_eq!(req.target.as_deref(), Some("."));
@@ -1189,7 +1171,7 @@ mod tests {
             "subagent",
             r#"{"description":"inspect repo","prompt":"inspect the repo and report"}"#,
         );
-        let req = parse_tool_call(&tc, &[]).unwrap();
+        let req = parse_tool_call(&tc, &[]);
         assert_eq!(req.name, ToolName::Subagent);
         assert_eq!(req.action, ActionKind::Agent);
         assert_eq!(req.target.as_deref(), Some("inspect repo"));
@@ -1199,7 +1181,7 @@ mod tests {
     #[test]
     fn parse_mcp_tool() {
         let tc = make_tc("mcp__demo__search", r#"{"query":"orca"}"#);
-        let req = parse_tool_call(&tc, &[]).unwrap();
+        let req = parse_tool_call(&tc, &[]);
         assert_eq!(req.name, ToolName::Mcp("mcp__demo__search".to_string()));
         assert_eq!(req.action, ActionKind::Read);
         assert_eq!(req.target.as_deref(), Some("mcp__demo__search"));
@@ -1212,7 +1194,7 @@ mod tests {
             "web_search",
             r#"{"query":"deepseek latest","count":3,"fresh_days":30}"#,
         );
-        let req = parse_tool_call(&tc, &[]).unwrap();
+        let req = parse_tool_call(&tc, &[]);
         assert_eq!(req.name, ToolName::WebSearch);
         assert_eq!(req.action, ActionKind::Network);
         assert_eq!(req.target.as_deref(), Some("deepseek latest"));
@@ -1225,7 +1207,7 @@ mod tests {
             "update_plan",
             r#"{"plan":[{"step":"Inspect references","status":"completed"},{"step":"Patch Orca","status":"in_progress"}]}"#,
         );
-        let req = parse_tool_call(&tc, &[]).unwrap();
+        let req = parse_tool_call(&tc, &[]);
         assert_eq!(req.name, ToolName::UpdatePlan);
         assert_eq!(req.action, ActionKind::Read);
         assert_eq!(req.target.as_deref(), Some("2 items"));
@@ -1233,16 +1215,50 @@ mod tests {
     }
 
     #[test]
-    fn parse_unknown_tool_returns_error() {
-        let tc = make_tc("unknown_tool", r#"{}"#);
-        let err = parse_tool_call(&tc, &[]).unwrap_err();
-        assert!(err.contains("unknown tool"));
+    fn parse_unknown_tool_preserves_call_for_model_correction() {
+        let tc = make_tc("wc -l", r#"{}"#);
+        let request = parse_tool_call(&tc, &[]);
+
+        assert_eq!(request.name, ToolName::External("wc -l".to_string()));
+        assert_ne!(request.name, ToolName::Bash);
+        assert_eq!(request.action, ActionKind::Read);
+        assert_eq!(request.target.as_deref(), Some("wc -l"));
+        assert_eq!(request.raw_arguments.as_deref(), Some(r#"{}"#));
+    }
+
+    #[test]
+    fn parse_unresolved_namespaced_tool_stays_external() {
+        let tc = make_tc("wc__lines", r#"{}"#);
+        let request = parse_tool_call(&tc, &[]);
+
+        assert_eq!(request.name, ToolName::External("wc__lines".to_string()));
+        assert_eq!(request.action, ActionKind::Read);
+        assert_eq!(request.target.as_deref(), Some("wc__lines"));
+        assert_eq!(request.raw_arguments.as_deref(), Some(r#"{}"#));
+    }
+
+    #[test]
+    fn parse_configured_namespaced_external_tool_stays_external() {
+        let external = orca_core::external_config::ExternalToolConfig {
+            name: "acme__deploy".to_string(),
+            description: "Deploy through Acme".to_string(),
+            action_kind: ActionKind::Shell,
+            command: "acme deploy".to_string(),
+            schema: serde_json::json!({}),
+        };
+        let tc = make_tc("acme__deploy", r#"{}"#);
+        let request = parse_tool_call(&tc, &[external]);
+
+        assert_eq!(request.name, ToolName::External("acme__deploy".to_string()));
+        assert_eq!(request.action, ActionKind::Shell);
+        assert_eq!(request.target.as_deref(), Some("acme__deploy"));
+        assert_eq!(request.raw_arguments.as_deref(), Some(r#"{}"#));
     }
 
     #[test]
     fn parse_invalid_json_preserves_known_tool_call() {
         let tc = make_tc("write_file", r#"{"path":"note.txt","content":"partial"#);
-        let request = parse_tool_call(&tc, &[]).expect("known tool should reach validation");
+        let request = parse_tool_call(&tc, &[]);
 
         assert_eq!(request.name, ToolName::WriteFile);
         assert!(request.target.is_none());
@@ -1504,6 +1520,47 @@ mod tests {
         assert_eq!(bodies.lock().expect("lock captured bodies").len(), 2);
     }
 
+    #[test]
+    fn non_streaming_unknown_tool_is_returned_for_model_correction() {
+        let unknown = r#"{"choices":[{"message":{"content":null,"tool_calls":[{"id":"call_wc","function":{"name":"wc -l","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#;
+        let (base_url, bodies) = spawn_two_response_server(unknown, unknown);
+        let mut conversation = Conversation::new();
+        conversation.add_user("count lines".to_string());
+        let config = ProviderConfig {
+            api_key: Some("test-key".to_string()),
+            base_url: Some(base_url),
+            model: Some("deepseek-v4-pro".to_string()),
+            reasoning_effort: orca_core::config::ReasoningEffort::default(),
+            tools_override: None,
+            mcp_registry: None,
+            external_tools: Vec::new(),
+        };
+
+        let response = request_chat(&conversation, &config)
+            .expect("unknown tool should remain a corrective tool turn");
+
+        assert_eq!(bodies.lock().expect("lock captured bodies").len(), 1);
+        assert!(
+            response
+                .steps
+                .iter()
+                .all(|step| !matches!(step, ProviderStep::Error(_)))
+        );
+        assert!(matches!(
+            response.steps.as_slice(),
+            [ProviderStep::ToolCall(request)]
+                if request.id == "call_wc"
+                    && request.name == ToolName::External("wc -l".to_string())
+                    && request.name != ToolName::Bash
+                    && request.action == ActionKind::Read
+                    && request.target.as_deref() == Some("wc -l")
+                    && request.raw_arguments.as_deref() == Some("{}")
+        ));
+        assert_eq!(response.tool_calls[0].id, "call_wc");
+        assert_eq!(response.tool_calls[0].function_name, "wc -l");
+        assert_eq!(response.tool_calls[0].arguments, "{}");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn streaming_reasoning_only_response_is_rejected() {
         let reasoning_only = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking\"},\"finish_reason\":null}]}\n\n\
@@ -1563,6 +1620,47 @@ mod tests {
                     && request.raw_arguments.as_deref()
                         == Some("{\"path\":\"src/main.rs\",\"content\":\"partial")
         ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn streaming_unknown_tool_is_returned_for_model_correction() {
+        let unknown = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_wc\",\"function\":{\"name\":\"wc -l\",\"arguments\":\"{}\"}}]},\"finish_reason\":null}]}\n\n\
+                       data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n\
+                       data: [DONE]\n\n";
+        let (base_url, bodies) = spawn_streaming_response_sequence_server(vec![unknown]);
+        let mut conversation = Conversation::new();
+        conversation.add_user("count lines".to_string());
+        let config = ProviderConfig {
+            api_key: Some("test-key".to_string()),
+            base_url: Some(base_url),
+            model: Some("deepseek-v4-pro".to_string()),
+            reasoning_effort: orca_core::config::ReasoningEffort::default(),
+            tools_override: None,
+            mcp_registry: None,
+            external_tools: Vec::new(),
+        };
+        let cancel = CancelToken::new();
+
+        let response = request_chat_streaming(&conversation, &config, &cancel, &mut |_| {})
+            .await
+            .expect("unknown tool should remain a corrective tool turn");
+
+        assert_eq!(bodies.lock().expect("lock captured bodies").len(), 1);
+        assert!(
+            response
+                .steps
+                .iter()
+                .all(|step| !matches!(step, ProviderStep::Error(_)))
+        );
+        assert!(matches!(
+            response.steps.as_slice(),
+            [ProviderStep::ToolCall(request)]
+                if request.id == "call_wc"
+                    && request.name == ToolName::External("wc -l".to_string())
+                    && request.target.as_deref() == Some("wc -l")
+        ));
+        assert_eq!(response.tool_calls[0].function_name, "wc -l");
+        assert_eq!(response.tool_calls[0].arguments, "{}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
