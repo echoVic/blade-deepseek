@@ -1166,14 +1166,20 @@ mod tests {
             writer.complete("approval_required").unwrap();
             let old_session_id = history::load_session("latest").unwrap().meta.session_id;
 
-            orca_runtime::goals::GoalStore::load_default()
+            let mut goal_store = orca_runtime::goals::GoalStore::load_default();
+            goal_store
                 .replace(
                     &old_session_id,
                     "resume me",
                     orca_core::goal_types::ThreadGoalStatus::Active,
-                    None,
+                    Some(80_000),
                 )
                 .unwrap();
+            let original = goal_store
+                .account_usage(&old_session_id, 23_456, 13 * 60)
+                .unwrap()
+                .unwrap();
+            assert_eq!(original.token_budget, Some(80_000));
 
             let config = Arc::new(Mutex::new(test_config(HistoryMode::Record)));
             let preloaded = Arc::new(Mutex::new(None));
@@ -1210,15 +1216,25 @@ mod tests {
                     // Resume continues the same thread: the goal must stay on
                     // the original session id; only fork mints a new one.
                     assert_eq!(goal.session_id, old_session_id);
+                    assert_eq!(goal.token_budget, Some(80_000));
+                    assert_eq!(goal.tokens_used, 23_456);
+                    assert_eq!(goal.time_used_seconds, 13 * 60);
+                    assert_eq!(goal.created_at, original.created_at);
                     goal.session_id
                 }
                 other => panic!("expected resumed goal update, got {other:?}"),
             };
             let store = orca_runtime::goals::GoalStore::load_default();
+            let persisted = store.get(&resumed_session_id).unwrap().unwrap();
             assert_eq!(
-                store.get(&resumed_session_id).unwrap().unwrap().status,
+                persisted.status,
                 orca_core::goal_types::ThreadGoalStatus::Active
             );
+            assert_eq!(persisted.token_budget, Some(80_000));
+            assert_eq!(persisted.objective, original.objective);
+            assert_eq!(persisted.created_at, original.created_at);
+            assert!(persisted.tokens_used >= original.tokens_used);
+            assert!(persisted.time_used_seconds >= original.time_used_seconds);
         });
     }
 
@@ -3053,26 +3069,17 @@ fn resume_latest_active_goal_for_tui(
         return;
     };
 
-    if new_session_id != goal.session_id {
-        let _ = store.update(
-            &goal.session_id,
-            orca_core::goal_types::GoalUpdate {
-                objective: None,
-                status: Some(orca_core::goal_types::ThreadGoalStatus::Paused),
-                token_budget: None,
-            },
-        );
-    }
-    let active_goal = match store.replace(
-        &new_session_id,
-        &goal.objective,
-        orca_core::goal_types::ThreadGoalStatus::Active,
-        goal.token_budget,
-    ) {
-        Ok(goal) => goal,
+    let active_goal = match store.resume_into(&goal.session_id, &new_session_id) {
+        Ok(Some(goal)) => goal,
+        Ok(None) => {
+            let _ = event_tx.send(TuiEvent::Error(
+                "goal disappeared while restoring its session".to_string(),
+            ));
+            return;
+        }
         Err(error) => {
             let _ = event_tx.send(TuiEvent::Error(format!(
-                "failed to resume goal in new session: {error}"
+                "failed to resume goal in restored session: {error}"
             )));
             return;
         }
