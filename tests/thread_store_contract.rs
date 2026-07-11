@@ -615,6 +615,7 @@ fn session_store_projects_mcp_tool_calls_as_thread_items() {
                 Message::Tool {
                     tool_call_id: "mcp-call-1".to_string(),
                     content: r#"{"content":[{"type":"text","text":"found"}],"structuredContent":{"count":1},"_meta":{"source":"test"}}"#.to_string(),
+                    terminal: None,
                     pinned: false,
                 },
             ])
@@ -670,6 +671,7 @@ fn session_store_preserves_failed_mcp_tool_metadata_in_thread_items() {
                     content:
                         r#"{"status":"failed","error":"MCP request timed out","exit_code":124}"#
                             .to_string(),
+                    terminal: None,
                     pinned: false,
                 },
             ])
@@ -719,6 +721,7 @@ fn session_store_projects_error_prefixed_mcp_tool_content_as_failed_item() {
                 Message::Tool {
                     tool_call_id: "mcp-call-error".to_string(),
                     content: "ERROR: MCP request 'tools/call' timed out after 100ms".to_string(),
+                    terminal: None,
                     pinned: false,
                 },
             ])
@@ -770,6 +773,7 @@ fn session_store_projects_external_tool_calls_as_dynamic_thread_items() {
                 Message::Tool {
                     tool_call_id: "external-call-1".to_string(),
                     content: "deployed staging".to_string(),
+                    terminal: None,
                     pinned: false,
                 },
             ])
@@ -827,6 +831,7 @@ fn session_store_preserves_failed_external_tool_metadata_in_dynamic_thread_items
                     tool_call_id: "external-call-1".to_string(),
                     content: r#"{"status":"failed","error":"deploy failed","exit_code":42}"#
                         .to_string(),
+                    terminal: None,
                     pinned: false,
                 },
             ])
@@ -1185,6 +1190,7 @@ fn session_store_projects_builtin_read_tool_as_dynamic_thread_item() {
                 Message::Tool {
                     tool_call_id: "read-call-1".to_string(),
                     content: "readme contents".to_string(),
+                    terminal: None,
                     pinned: false,
                 },
             ])

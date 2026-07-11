@@ -358,7 +358,8 @@ fn compact_with_summary_inner(
     provider_config: &ProviderConfig,
     cancel: Option<&CancelToken>,
 ) -> CompactionResult {
-    let micro_compacted = micro_compact_stale_tool_outputs(conversation);
+    let normalized = normalized_for_compaction(conversation);
+    let micro_compacted = micro_compact_stale_tool_outputs(&normalized);
     // Wire-equivalent gate: cheap micro compaction only counts as "enough"
     // when the prompt the provider will actually receive (messages +
     // injected summary + volatile overlay + tool schema JSON) is back under
@@ -372,7 +373,7 @@ fn compact_with_summary_inner(
     }
     match summarize_collapsed_messages(
         provider_kind,
-        conversation,
+        &normalized,
         &micro_compacted,
         context_config,
         provider_config,
@@ -737,6 +738,7 @@ pub fn render_summary_delta(collapsed: &[Message]) -> RenderedSummaryDelta {
             Message::Tool {
                 tool_call_id,
                 content,
+                terminal,
                 pinned,
             } => {
                 let (rendered, compacted) = render_tool_output(content);
@@ -746,6 +748,7 @@ pub fn render_summary_delta(collapsed: &[Message]) -> RenderedSummaryDelta {
                 Message::Tool {
                     tool_call_id: tool_call_id.clone(),
                     content: rendered,
+                    terminal: terminal.clone(),
                     pinned: *pinned,
                 }
             }
@@ -1077,9 +1080,10 @@ pub fn compact_with_counter(
     config: &ContextConfig,
     counter: &impl TokenCounter,
 ) -> Conversation {
-    let micro_compacted = micro_compact_stale_tool_outputs(conversation);
+    let normalized = normalized_for_compaction(conversation);
+    let micro_compacted = micro_compact_stale_tool_outputs(&normalized);
     if conversation_tokens_with_counter(&micro_compacted, counter) <= config.effective_limit() {
-        return normalize_compacted_conversation(micro_compacted);
+        return micro_compacted;
     }
 
     let messages = &micro_compacted.messages;
@@ -1165,22 +1169,10 @@ pub fn compact_with_counter(
     result
 }
 
-fn normalize_compacted_conversation(mut conversation: Conversation) -> Conversation {
-    if conversation.messages.len() <= 1 {
-        return conversation;
-    }
-    let volatile = conversation.volatile.clone();
-    let rolling_summary = conversation.rolling_summary.clone();
-    let summary = conversation.summary.clone();
-    let system = conversation.messages.remove(0);
-    normalize_tool_boundaries(&mut conversation.messages);
-    let mut result = Conversation::new();
-    result.messages.push(system);
-    result.messages.extend(conversation.messages);
-    result.volatile = volatile;
-    result.rolling_summary = rolling_summary;
-    result.summary = summary;
-    result
+fn normalized_for_compaction(conversation: &Conversation) -> Conversation {
+    let mut normalized = conversation.clone();
+    normalize_tool_boundaries(&mut normalized.messages);
+    normalized
 }
 
 fn keep_latest_droppable_if_empty(kept: &mut Vec<Message>, droppable: &[&Message]) {
@@ -1210,20 +1202,24 @@ fn micro_compact_stale_tool_outputs(conversation: &Conversation) -> Conversation
             Message::Tool {
                 tool_call_id,
                 content,
+                terminal,
                 pinned,
             } if count_compacted_tool_indexes.contains(&index) => Message::Tool {
                 tool_call_id: tool_call_id.clone(),
                 content: cleared_tool_result_output(tool_call_id, content),
+                terminal: terminal.clone(),
                 pinned: false,
             },
             Message::Tool {
                 tool_call_id,
                 content,
+                terminal,
                 pinned,
             } if index < last_user_index && !*pinned && content.len() > STALE_TOOL_OUTPUT_BYTES => {
                 Message::Tool {
                     tool_call_id: tool_call_id.clone(),
                     content: micro_compact_tool_output(content),
+                    terminal: terminal.clone(),
                     pinned: false,
                 }
             }
@@ -1669,6 +1665,44 @@ mod tests {
     }
 
     #[test]
+    fn micro_compaction_preserves_tool_terminal_metadata() {
+        use orca_core::approval_types::ActionKind;
+        use orca_core::tool_types::{ToolName, ToolRequest, ToolResult, ToolTerminalSource};
+
+        let request = ToolRequest {
+            id: "tc1".to_string(),
+            name: ToolName::ReadFile,
+            action: ActionKind::Read,
+            target: None,
+            raw_arguments: Some(r#"{"path":"large.log"}"#.to_string()),
+        };
+        let result = ToolResult::indeterminate(&request, "missing terminal")
+            .with_terminal_source(ToolTerminalSource::CompatibilityRepair);
+        let mut conv = Conversation::new();
+        conv.add_user("inspect".to_string());
+        conv.add_assistant(
+            None,
+            None,
+            vec![RawToolCall {
+                id: request.id.clone(),
+                function_name: request.name.as_str().to_string(),
+                arguments: request.raw_arguments.clone().unwrap_or_default(),
+            }],
+        );
+        conv.add_tool_result_with_terminal(&result, "x".repeat(STALE_TOOL_OUTPUT_BYTES + 1));
+        conv.add_user("continue".to_string());
+
+        let compacted = micro_compact_stale_tool_outputs(&conv);
+
+        assert!(matches!(
+            &compacted.messages[2],
+            Message::Tool { terminal: Some(terminal), content, .. }
+                if terminal == result.terminal()
+                    && content.contains("[tool output micro-compact]")
+        ));
+    }
+
+    #[test]
     fn effective_limit_does_not_underflow_when_reserved_exceeds_threshold() {
         let config = ContextConfig {
             max_tokens: 100,
@@ -1746,9 +1780,9 @@ mod tests {
     }
 
     #[test]
-    fn compact_trims_trailing_assistant_with_pending_tool_calls() {
+    fn compact_repairs_pending_tool_calls_within_budget() {
         let config = ContextConfig {
-            max_tokens: 50,
+            max_tokens: 22,
             compaction_threshold: 1.0,
             reserved_for_response: 0,
             auto_compact_token_limit: None,
@@ -1770,12 +1804,31 @@ mod tests {
 
         let compacted = compact_with_counter(&conv, &config, &FixedCounter);
 
-        // Last message should NOT be an Assistant with pending tool_calls
-        if let Some(Message::Assistant { tool_calls, .. }) = compacted.messages.last() {
-            assert!(
-                tool_calls.is_empty(),
-                "trailing Assistant with pending tool_calls should be trimmed"
-            );
+        assert!(
+            conversation_tokens_with_counter(&compacted, &FixedCounter) <= config.effective_limit(),
+            "repair terminal must participate in compaction budgeting: {:#?}",
+            compacted.messages
+        );
+        for (index, message) in compacted.messages.iter().enumerate() {
+            match message {
+                Message::Assistant { tool_calls, .. } if !tool_calls.is_empty() => assert!(
+                    matches!(
+                        compacted.messages.get(index + 1),
+                        Some(Message::Tool { tool_call_id, terminal: Some(_), .. })
+                            if tool_call_id == &tool_calls[0].id
+                    ),
+                    "compaction must retain or collapse the repaired invocation atomically"
+                ),
+                Message::Tool { .. } => assert!(
+                    index > 0
+                        && matches!(
+                            &compacted.messages[index - 1],
+                            Message::Assistant { tool_calls, .. } if !tool_calls.is_empty()
+                        ),
+                    "compaction must not leave an orphan tool result"
+                ),
+                _ => {}
+            }
         }
     }
 
@@ -2556,6 +2609,7 @@ mod tests {
         let messages = vec![Message::Tool {
             tool_call_id: "call_1".to_string(),
             content: big_output,
+            terminal: None,
             pinned: false,
         }];
 
@@ -2581,6 +2635,7 @@ mod tests {
         let messages = vec![Message::Tool {
             tool_call_id: "call_1".to_string(),
             content: big_output,
+            terminal: None,
             pinned: false,
         }];
 
@@ -2638,6 +2693,7 @@ mod tests {
         let messages = vec![Message::Tool {
             tool_call_id: "call_1".to_string(),
             content: small.clone(),
+            terminal: None,
             pinned: false,
         }];
 
@@ -2656,6 +2712,7 @@ mod tests {
         let messages = vec![Message::Tool {
             tool_call_id: "call_1".to_string(),
             content: already.clone(),
+            terminal: None,
             pinned: false,
         }];
 
@@ -2757,6 +2814,7 @@ mod tests {
         let messages = vec![Message::Tool {
             tool_call_id: "call_1".to_string(),
             content: big_output,
+            terminal: None,
             pinned: false,
         }];
 
@@ -2776,11 +2834,13 @@ mod tests {
             Message::Tool {
                 tool_call_id: "call_1".to_string(),
                 content: big_output,
+                terminal: None,
                 pinned: false,
             },
             Message::Tool {
                 tool_call_id: "call_2".to_string(),
                 content: "tiny".to_string(),
+                terminal: None,
                 pinned: false,
             },
         ];

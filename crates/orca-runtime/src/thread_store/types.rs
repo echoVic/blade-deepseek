@@ -180,6 +180,7 @@ impl From<&Message> for StoredMessage {
                 tool_call_id,
                 content,
                 pinned,
+                ..
             } => Self::Tool {
                 tool_call_id: tool_call_id.clone(),
                 content: content.clone(),
@@ -220,6 +221,7 @@ impl From<StoredMessage> for Message {
             } => Self::Tool {
                 tool_call_id,
                 content,
+                terminal: None,
                 pinned,
             },
         }

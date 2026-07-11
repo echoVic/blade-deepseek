@@ -82,6 +82,10 @@ pub fn fold_child_agent_tool_result(
     child_cost: Option<CostTracker>,
     child_cost_tracker: &mut CostTracker,
 ) -> ChildAgentToolResultFold {
+    debug_assert_eq!(
+        tool_request.id, result.id,
+        "child tool result must match the requested invocation"
+    );
     if let Some(cost) = child_cost {
         child_cost_tracker.merge(&cost);
     }
@@ -89,7 +93,7 @@ pub fn fold_child_agent_tool_result(
     let result_content = agent_common::format_tool_result_for_model(&result);
     setup
         .conversation
-        .add_tool_result(tool_request.id.clone(), result_content);
+        .add_tool_result_with_terminal(&result, result_content);
 
     if should_stop {
         return ChildAgentToolResultFold::Stop(ChildAgentResult {

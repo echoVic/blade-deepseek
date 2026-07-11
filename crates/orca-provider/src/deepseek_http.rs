@@ -1601,37 +1601,64 @@ mod tests {
     }
 
     #[test]
-    fn api_messages_drop_incomplete_tool_call_boundaries_without_mutating_source() {
+    fn api_messages_repair_incomplete_tool_call_boundaries_without_mutating_source() {
         let mut conv = Conversation::new();
         conv.add_system("sys".to_string());
         conv.add_user("start".to_string());
         conv.add_assistant(
             None,
             None,
-            vec![RawToolCall {
-                id: "tc1".to_string(),
-                function_name: "read_file".to_string(),
-                arguments: r#"{"path":"x"}"#.to_string(),
-            }],
+            vec![
+                RawToolCall {
+                    id: "tc1".to_string(),
+                    function_name: "read_file".to_string(),
+                    arguments: r#"{"path":"x"}"#.to_string(),
+                },
+                RawToolCall {
+                    id: "tc2".to_string(),
+                    function_name: "grep".to_string(),
+                    arguments: r#"{"pattern":"needle"}"#.to_string(),
+                },
+            ],
         );
+        conv.add_tool_result("orphan".to_string(), "discard orphan".to_string());
+        conv.add_tool_result("tc2".to_string(), "existing second".to_string());
+        conv.add_tool_result("tc2".to_string(), "discard duplicate".to_string());
         conv.add_user("resume after failed turn".to_string());
 
         let messages = conversation_to_api_messages(&conv);
+        let first_payload = serde_json::to_vec(&messages).expect("serialize first payload");
+        let second_payload = serde_json::to_vec(&conversation_to_api_messages(&conv))
+            .expect("serialize second payload");
 
-        assert!(
-            messages.iter().all(|message| message.tool_calls.is_none()),
-            "provider request must not include assistant tool calls without matching tool results"
+        assert_eq!(
+            first_payload, second_payload,
+            "repair must be deterministic"
         );
         assert_eq!(
             messages
                 .iter()
                 .map(|message| message.role.as_str())
                 .collect::<Vec<_>>(),
-            vec!["system", "user", "user"]
+            vec!["system", "user", "assistant", "tool", "tool", "user"]
         );
+        assert_eq!(messages[2].tool_calls.as_ref().map(Vec::len), Some(2));
+        assert_eq!(messages[3].tool_call_id.as_deref(), Some("tc1"));
+        assert!(
+            messages[3]
+                .content
+                .as_deref()
+                .is_some_and(|content| content.contains("indeterminate"))
+        );
+        assert_eq!(messages[4].tool_call_id.as_deref(), Some("tc2"));
+        assert_eq!(messages[4].content.as_deref(), Some("existing second"));
+        assert!(messages.iter().all(|message| {
+            message.content.as_deref() != Some("discard orphan")
+                && message.content.as_deref() != Some("discard duplicate")
+        }));
         assert!(matches!(
             &conv.messages[2],
-            Message::Assistant { tool_calls, .. } if tool_calls.len() == 1
+            Message::Assistant { tool_calls, .. } if tool_calls.len() == 2
         ));
     }
 

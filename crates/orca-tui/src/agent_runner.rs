@@ -1723,7 +1723,7 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
                     let result_content = agent_common::format_tool_result_for_model(&result);
                     session
                         .conversation_mut()
-                        .add_tool_result(result.id.clone(), result_content);
+                        .add_tool_result_with_terminal(&result, result_content);
                     if let Some(message) = session.conversation().messages.last().cloned() {
                         session.append_message(&message);
                     }
@@ -1781,7 +1781,7 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
                     let result_content = agent_common::format_tool_result_for_model(&result);
                     session
                         .conversation_mut()
-                        .add_tool_result(result.id.clone(), result_content);
+                        .add_tool_result_with_terminal(&result, result_content);
                     if let Some(message) = session.conversation().messages.last().cloned() {
                         session.append_message(&message);
                     }
@@ -1871,7 +1871,7 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
             let result_content = agent_common::format_tool_result_for_model(&result);
             session
                 .conversation_mut()
-                .add_tool_result(tool_request.id.clone(), result_content);
+                .add_tool_result_with_terminal(&result, result_content);
             if let Some(message) = session.conversation().messages.last().cloned() {
                 session.append_message(&message);
             }

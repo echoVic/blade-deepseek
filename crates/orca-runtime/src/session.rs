@@ -109,7 +109,7 @@ pub(crate) fn record_tool_result_for_agent(
     emit_deltas: bool,
 ) -> io::Result<String> {
     let result_content = agent_common::format_tool_result_for_model(result);
-    conversation.add_tool_result(result.id.clone(), result_content.clone());
+    conversation.add_tool_result_with_terminal(result, result_content.clone());
     if emit_deltas && let Some(writer) = history_writer {
         writer.append_tool_result_message(result, result_content.clone(), false)?;
     }

@@ -301,6 +301,7 @@ mod tests {
     use crate::thread_store::ORCA_HOME_ENV;
     use orca_core::conversation::RawToolCall;
     use orca_core::plan_types::{PlanItem, PlanStatus};
+    use orca_core::tool_types::{ToolStatus, ToolTerminalSource};
 
     #[test]
     fn title_from_prompt_normalizes_whitespace_and_truncates() {
@@ -429,6 +430,7 @@ mod tests {
             writer.append_message(&Message::Tool {
                 tool_call_id: "call_1".to_string(),
                 content: format!("TOKEN={tool_secret}"),
+                terminal: None,
                 pinned: false,
             })?;
             writer.append_summary(3, 2, format!("summary kept {json_secret}"))?;
@@ -712,7 +714,7 @@ mod tests {
     }
 
     #[test]
-    fn resume_drops_incomplete_assistant_tool_call_turns() {
+    fn resume_repairs_incomplete_assistant_tool_call_turns() {
         let cwd = std::env::current_dir().unwrap();
         let transcript = SessionTranscript {
             meta: create_meta(&cwd, "mock", None, "bad tool boundary"),
@@ -741,17 +743,22 @@ mod tests {
 
         let conv = resume_conversation(&transcript, "sys".to_string());
 
-        assert!(
-            !conv.messages.iter().any(|message| matches!(
-                message,
-                Message::Assistant { tool_calls, .. } if !tool_calls.is_empty()
-            )),
-            "resumed conversation must not contain assistant tool calls without tool results"
-        );
-        assert!(conv.messages.iter().any(|message| matches!(
-            message,
+        assert_eq!(conv.messages.len(), 5);
+        assert!(matches!(
+            &conv.messages[2],
+            Message::Assistant { tool_calls, .. } if tool_calls.len() == 1
+        ));
+        assert!(matches!(
+            &conv.messages[3],
+            Message::Tool { tool_call_id, terminal: Some(terminal), .. }
+                if tool_call_id == "call_1"
+                    && terminal.status == ToolStatus::Indeterminate
+                    && terminal.source == ToolTerminalSource::CompatibilityRepair
+        ));
+        assert!(matches!(
+            &conv.messages[4],
             Message::User { content, .. } if content == "continue after failed turn"
-        )));
+        ));
     }
 
     #[test]

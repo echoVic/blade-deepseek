@@ -1,5 +1,10 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+
+use crate::approval_types::ActionKind;
+use crate::tool_types::{ToolName, ToolRequest, ToolResult, ToolTerminal, ToolTerminalSource};
+
+pub const MISSING_TOOL_TERMINAL_ERROR: &str = "Tool invocation outcome is indeterminate because its terminal result was missing from recovered history. Inspect external state before retrying.";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RawToolCall {
@@ -27,6 +32,7 @@ pub enum Message {
     Tool {
         tool_call_id: String,
         content: String,
+        terminal: Option<ToolTerminal>,
         pinned: bool,
     },
 }
@@ -275,6 +281,16 @@ impl Conversation {
         self.messages.push(Message::Tool {
             tool_call_id,
             content,
+            terminal: None,
+            pinned: false,
+        });
+    }
+
+    pub fn add_tool_result_with_terminal(&mut self, result: &ToolResult, content: String) {
+        self.messages.push(Message::Tool {
+            tool_call_id: result.id.clone(),
+            content,
+            terminal: Some(result.terminal().clone()),
             pinned: false,
         });
     }
@@ -320,34 +336,49 @@ pub fn normalize_tool_boundaries(messages: &mut Vec<Message>) {
             } if !assistant_message_has_payload(content.as_deref(), tool_calls) => {
                 index += 1;
             }
-            Message::Assistant { tool_calls, .. } if !tool_calls.is_empty() => {
-                let expected = tool_calls
+            Message::Assistant {
+                content,
+                reasoning_content,
+                tool_calls,
+                pinned,
+            } if !tool_calls.is_empty() => {
+                let mut seen_call_ids = HashSet::new();
+                let unique_tool_calls = tool_calls
+                    .iter()
+                    .filter(|tool_call| seen_call_ids.insert(tool_call.id.as_str()))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let expected = unique_tool_calls
                     .iter()
                     .map(|tool_call| tool_call.id.as_str())
                     .collect::<HashSet<_>>();
-                let mut seen = HashSet::new();
-                let mut collected_tools = Vec::new();
+                let mut collected_tools = HashMap::new();
                 let mut next = index + 1;
 
                 while next < messages.len() {
                     let Message::Tool { tool_call_id, .. } = &messages[next] else {
                         break;
                     };
-                    if !expected.contains(tool_call_id.as_str()) {
-                        break;
-                    }
-                    if seen.insert(tool_call_id.as_str()) {
-                        collected_tools.push(messages[next].clone());
+                    if expected.contains(tool_call_id.as_str()) {
+                        collected_tools
+                            .entry(tool_call_id.clone())
+                            .or_insert_with(|| messages[next].clone());
                     }
                     next += 1;
-                    if seen.len() == expected.len() {
-                        break;
-                    }
                 }
 
-                if seen.len() == expected.len() {
-                    normalized.push(messages[index].clone());
-                    normalized.extend(collected_tools);
+                normalized.push(Message::Assistant {
+                    content: content.clone(),
+                    reasoning_content: reasoning_content.clone(),
+                    tool_calls: unique_tool_calls.clone(),
+                    pinned: *pinned,
+                });
+                for tool_call in &unique_tool_calls {
+                    normalized.push(
+                        collected_tools
+                            .remove(&tool_call.id)
+                            .unwrap_or_else(|| repaired_missing_tool_result(tool_call)),
+                    );
                 }
                 index = next.max(index + 1);
             }
@@ -359,6 +390,25 @@ pub fn normalize_tool_boundaries(messages: &mut Vec<Message>) {
     }
 
     *messages = normalized;
+}
+
+fn repaired_missing_tool_result(tool_call: &RawToolCall) -> Message {
+    let request = ToolRequest {
+        id: tool_call.id.clone(),
+        name: ToolName::from_str(&tool_call.function_name)
+            .unwrap_or_else(|| ToolName::plain(&tool_call.function_name)),
+        action: ActionKind::Read,
+        target: None,
+        raw_arguments: Some(tool_call.arguments.clone()),
+    };
+    let result = ToolResult::indeterminate(&request, MISSING_TOOL_TERMINAL_ERROR)
+        .with_terminal_source(ToolTerminalSource::CompatibilityRepair);
+    Message::Tool {
+        tool_call_id: tool_call.id.clone(),
+        content: format!("ERROR: {MISSING_TOOL_TERMINAL_ERROR}"),
+        terminal: Some(result.terminal().clone()),
+        pinned: false,
+    }
 }
 
 #[cfg(test)]
@@ -478,6 +528,28 @@ mod tests {
     }
 
     #[test]
+    fn add_tool_result_with_terminal_preserves_canonical_terminal() {
+        let request = ToolRequest {
+            id: "call_1".to_string(),
+            name: ToolName::ReadFile,
+            action: ActionKind::Read,
+            target: None,
+            raw_arguments: Some("{}".to_string()),
+        };
+        let result = ToolResult::indeterminate(&request, "terminal missing")
+            .with_terminal_source(ToolTerminalSource::CompatibilityRepair);
+        let mut conv = Conversation::new();
+
+        conv.add_tool_result_with_terminal(&result, "ERROR: terminal missing".to_string());
+
+        assert!(matches!(
+            &conv.messages[0],
+            Message::Tool { terminal: Some(terminal), .. }
+                if terminal == result.terminal()
+        ));
+    }
+
+    #[test]
     fn last_user_message_returns_most_recent() {
         let mut conv = Conversation::new();
         conv.add_user("first".to_string());
@@ -584,8 +656,9 @@ mod tests {
                 Message::Tool {
                     tool_call_id,
                     content,
+                    terminal,
                     pinned,
-                } => format!("tool|{pinned}|{tool_call_id}|{content}"),
+                } => format!("tool|{pinned}|{tool_call_id}|{content}|{terminal:?}"),
             })
             .collect()
     }
@@ -733,7 +806,7 @@ mod tests {
     }
 
     #[test]
-    fn normalize_tool_boundaries_drops_incomplete_assistant_tool_call() {
+    fn normalize_tool_boundaries_repairs_missing_results() {
         let mut messages = vec![
             Message::user("before".to_string()),
             Message::Assistant {
@@ -751,9 +824,22 @@ mod tests {
 
         normalize_tool_boundaries(&mut messages);
 
-        assert_eq!(messages.len(), 2);
+        assert_eq!(messages.len(), 4);
         assert!(matches!(&messages[0], Message::User { content, .. } if content == "before"));
-        assert!(matches!(&messages[1], Message::User { content, .. } if content == "after"));
+        assert!(
+            matches!(&messages[1], Message::Assistant { tool_calls, .. } if tool_calls.len() == 1)
+        );
+        assert!(matches!(
+            &messages[2],
+            Message::Tool {
+                tool_call_id,
+                terminal: Some(terminal),
+                ..
+            } if tool_call_id == "call_1"
+                && terminal.status == crate::tool_types::ToolStatus::Indeterminate
+                && terminal.source == crate::tool_types::ToolTerminalSource::CompatibilityRepair
+        ));
+        assert!(matches!(&messages[3], Message::User { content, .. } if content == "after"));
     }
 
     #[test]
@@ -807,6 +893,7 @@ mod tests {
             Message::Tool {
                 tool_call_id: "call_1".to_string(),
                 content: "ok".to_string(),
+                terminal: None,
                 pinned: false,
             },
         ];
@@ -821,5 +908,108 @@ mod tests {
         assert!(
             matches!(&messages[1], Message::Tool { tool_call_id, .. } if tool_call_id == "call_1")
         );
+    }
+
+    #[test]
+    fn normalize_tool_boundaries_orders_results_and_discards_duplicate_orphans() {
+        let mut messages = vec![
+            Message::Assistant {
+                content: None,
+                reasoning_content: None,
+                tool_calls: vec![
+                    RawToolCall {
+                        id: "call_1".to_string(),
+                        function_name: "read_file".to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                    RawToolCall {
+                        id: "call_2".to_string(),
+                        function_name: "grep".to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                ],
+                pinned: false,
+            },
+            Message::Tool {
+                tool_call_id: "orphan".to_string(),
+                content: "discard me".to_string(),
+                terminal: None,
+                pinned: false,
+            },
+            Message::Tool {
+                tool_call_id: "call_2".to_string(),
+                content: "existing second".to_string(),
+                terminal: None,
+                pinned: false,
+            },
+            Message::Tool {
+                tool_call_id: "call_2".to_string(),
+                content: "duplicate second".to_string(),
+                terminal: None,
+                pinned: false,
+            },
+            Message::user("after".to_string()),
+        ];
+
+        normalize_tool_boundaries(&mut messages);
+
+        assert_eq!(messages.len(), 4);
+        assert!(
+            matches!(&messages[1], Message::Tool { tool_call_id, terminal: Some(_), .. } if tool_call_id == "call_1")
+        );
+        assert!(
+            matches!(&messages[2], Message::Tool { tool_call_id, content, terminal: None, .. }
+            if tool_call_id == "call_2" && content == "existing second")
+        );
+        assert!(matches!(&messages[3], Message::User { content, .. } if content == "after"));
+
+        let once = format!("{messages:?}");
+        normalize_tool_boundaries(&mut messages);
+        assert_eq!(format!("{messages:?}"), once);
+    }
+
+    #[test]
+    fn normalize_tool_boundaries_keeps_first_duplicate_assistant_call_id() {
+        let mut messages = vec![
+            Message::Assistant {
+                content: None,
+                reasoning_content: None,
+                tool_calls: vec![
+                    RawToolCall {
+                        id: "call_1".to_string(),
+                        function_name: "read_file".to_string(),
+                        arguments: r#"{"path":"first"}"#.to_string(),
+                    },
+                    RawToolCall {
+                        id: "call_1".to_string(),
+                        function_name: "write_file".to_string(),
+                        arguments: r#"{"path":"second"}"#.to_string(),
+                    },
+                ],
+                pinned: false,
+            },
+            Message::Tool {
+                tool_call_id: "call_1".to_string(),
+                content: "first result".to_string(),
+                terminal: None,
+                pinned: false,
+            },
+        ];
+
+        normalize_tool_boundaries(&mut messages);
+
+        assert_eq!(messages.len(), 2);
+        assert!(matches!(
+            &messages[0],
+            Message::Assistant { tool_calls, .. }
+                if tool_calls.len() == 1
+                    && tool_calls[0].function_name == "read_file"
+                    && tool_calls[0].arguments == r#"{"path":"first"}"#
+        ));
+        assert!(matches!(
+            &messages[1],
+            Message::Tool { tool_call_id, content, .. }
+                if tool_call_id == "call_1" && content == "first result"
+        ));
     }
 }
