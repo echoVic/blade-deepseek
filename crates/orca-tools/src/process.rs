@@ -27,6 +27,14 @@ pub struct CommandOutput {
     pub stderr_omitted_bytes: usize,
     pub status: ExitStatus,
     pub timed_out: bool,
+    pub termination: CommandTermination,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CommandTermination {
+    Exited,
+    TimedOut,
+    Cancelled,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -167,7 +175,7 @@ pub fn wait_for_child_output_with_timeout_or_cancel_and_limit(
     reader_stop.store(true, Ordering::Release);
     let stdout = join_reader(stdout_handle, "stdout");
     let stderr = join_reader(stderr_handle, "stderr");
-    let (status, timed_out) = status?;
+    let (status, termination) = status?;
     let stdout = stdout?;
     let stderr = stderr?;
 
@@ -179,7 +187,8 @@ pub fn wait_for_child_output_with_timeout_or_cancel_and_limit(
         stdout_omitted_bytes: stdout.omitted_bytes,
         stderr_omitted_bytes: stderr.omitted_bytes,
         status,
-        timed_out,
+        timed_out: termination == CommandTermination::TimedOut,
+        termination,
     })
 }
 
@@ -260,7 +269,7 @@ where
         .join()
         .map_err(|_| io::Error::other("stdout line reader thread panicked"));
     let stderr = join_reader(stderr_handle, "stderr");
-    let (status, timed_out) = status?;
+    let (status, termination) = status?;
     let stdout = stdout??;
     let stderr = stderr?;
 
@@ -273,7 +282,7 @@ where
         stderr_observed_bytes: stderr.observed_bytes,
         stderr_omitted_bytes: stderr.omitted_bytes,
         status,
-        timed_out,
+        timed_out: termination == CommandTermination::TimedOut,
     })
 }
 
@@ -284,7 +293,7 @@ fn wait_for_child_and_readers(
     should_cancel: impl Fn() -> bool,
     readers_finished: impl Fn() -> bool,
     reader_stop: &AtomicBool,
-) -> io::Result<(ExitStatus, bool)> {
+) -> io::Result<(ExitStatus, CommandTermination)> {
     let deadline = Instant::now()
         .checked_add(timeout)
         .unwrap_or_else(Instant::now);
@@ -312,23 +321,33 @@ fn wait_for_child_and_readers(
         if let Some(exit_status) = status
             && readers_finished()
         {
-            return Ok((exit_status, false));
+            return Ok((exit_status, CommandTermination::Exited));
         }
         if should_cancel() {
+            let termination = if status.is_none() {
+                CommandTermination::Cancelled
+            } else {
+                CommandTermination::Exited
+            };
             if status.is_none() {
                 kill_child_tree(child);
                 status = Some(child.wait()?);
             }
             reader_stop.store(true, Ordering::Release);
-            return Ok((status.expect("cancelled child status"), false));
+            return Ok((status.expect("cancelled child status"), termination));
         }
         if Instant::now() >= deadline {
+            let termination = if status.is_none() {
+                CommandTermination::TimedOut
+            } else {
+                CommandTermination::Exited
+            };
             if status.is_none() {
                 kill_child_tree(child);
                 status = Some(child.wait()?);
             }
             reader_stop.store(true, Ordering::Release);
-            return Ok((status.expect("timed out child status"), true));
+            return Ok((status.expect("timed out child status"), termination));
         }
         thread::sleep(Duration::from_millis(50));
     }
@@ -765,5 +784,48 @@ fn kill_process_group(pid: u32) {
     thread::sleep(Duration::from_millis(50));
     unsafe {
         let _ = kill(pgid, SIGKILL);
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn completed_process_wins_cancellation_observed_during_callback() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let release = temp.path().join("release");
+        let completed = temp.path().join("completed");
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(format!(
+            "while [ ! -e {release:?} ]; do sleep 0.01; done; printf completed; : > {completed:?}"
+        ));
+        prepare_non_interactive_command(&mut command);
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let child = command.spawn().expect("spawn child");
+        let cancellation_observed = AtomicBool::new(false);
+
+        let output =
+            wait_for_child_output_with_timeout_or_cancel(child, Duration::from_secs(5), || {
+                if !cancellation_observed.swap(true, Ordering::SeqCst) {
+                    std::fs::write(&release, []).expect("release child");
+                    let deadline = Instant::now() + Duration::from_secs(2);
+                    while !completed.exists() && Instant::now() < deadline {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    assert!(completed.exists(), "child did not complete during callback");
+                    thread::sleep(Duration::from_millis(50));
+                }
+                true
+            })
+            .expect("wait for child");
+
+        assert!(cancellation_observed.load(Ordering::SeqCst));
+        assert!(output.status.success());
+        assert_eq!(output.termination, CommandTermination::Exited);
+        assert_eq!(output.stdout, b"completed");
     }
 }

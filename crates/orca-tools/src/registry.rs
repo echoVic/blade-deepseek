@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
@@ -13,7 +14,7 @@ use orca_core::tool_types::{
     ResultSemantics, ToolCapability, ToolControlSemantics, ToolExposure, ToolName,
     ToolOutputTruncation, ToolRequest, ToolResult, ToolSpec,
 };
-use orca_mcp::{McpElicitationHandler, McpRegistry};
+use orca_mcp::{McpElicitationHandler, McpRegistry, client::McpCallOutput};
 
 use crate::{
     bash, edit, external, git, glob, grep, list_files, read_file, skills, update_goal, update_plan,
@@ -1903,28 +1904,47 @@ impl Tool for McpProxyTool {
             }
         };
 
+        let cancellation_observed = Cell::new(false);
+        let should_cancel = || {
+            let cancelled = ctx.is_cancelled();
+            cancellation_observed.set(cancellation_observed.get() || cancelled);
+            cancelled
+        };
         let call_result = if let Some(handler) = ctx.mcp_elicitation_handler {
             if ctx.should_cancel.is_some() {
                 registry.call_tool_with_elicitation_handler_or_cancel(
                     &tool_ref,
                     arguments,
                     Some(handler),
-                    &|| ctx.is_cancelled(),
+                    &should_cancel,
                 )
             } else {
                 registry.call_tool_with_elicitation_handler(&tool_ref, arguments, Some(handler))
             }
         } else if ctx.should_cancel.is_some() {
-            registry.call_tool_or_cancel(&tool_ref, arguments, &|| ctx.is_cancelled())
+            registry.call_tool_or_cancel(&tool_ref, arguments, &should_cancel)
         } else {
             registry.call_tool(&tool_ref, arguments)
         };
 
-        match call_result {
-            Ok(result) if result.is_error => ToolResult::failed(request, result.output, None),
-            Ok(result) => ToolResult::completed(request, result.output, false),
-            Err(error) => ToolResult::failed(request, error, None),
+        mcp_call_result_to_tool_result(request, call_result, cancellation_observed.get())
+    }
+}
+
+const MCP_TOOL_CALL_CANCELLED: &str = "MCP tool call cancelled";
+
+fn mcp_call_result_to_tool_result(
+    request: &ToolRequest,
+    call_result: Result<McpCallOutput, String>,
+    cancellation_observed: bool,
+) -> ToolResult {
+    match call_result {
+        Ok(result) if result.is_error => ToolResult::failed(request, result.output, None),
+        Ok(result) => ToolResult::completed(request, result.output, false),
+        Err(error) if cancellation_observed && error == MCP_TOOL_CALL_CANCELLED => {
+            ToolResult::cancelled(request, error, None)
         }
+        Err(error) => ToolResult::failed(request, error, None),
     }
 }
 
@@ -1981,6 +2001,42 @@ pub fn tool_name_from_schema_name(name: &str) -> Option<ToolName> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mcp_cancellation_mapping_requires_exact_error_and_observation() {
+        let request = request(ToolName::Mcp("mcp__docs__search".to_string()), "{}");
+
+        let cancelled = mcp_call_result_to_tool_result(
+            &request,
+            Err(MCP_TOOL_CALL_CANCELLED.to_string()),
+            true,
+        );
+        assert_eq!(
+            cancelled.status,
+            orca_core::tool_types::ToolStatus::Cancelled
+        );
+        assert_eq!(
+            cancelled.kind,
+            orca_core::tool_types::ToolResultKind::Cancelled
+        );
+
+        for (error, cancellation_observed) in [
+            (MCP_TOOL_CALL_CANCELLED, false),
+            ("remote error: MCP tool call cancelled", true),
+            ("MCP tool call cancelled after response", true),
+        ] {
+            let result = mcp_call_result_to_tool_result(
+                &request,
+                Err(error.to_string()),
+                cancellation_observed,
+            );
+            assert_eq!(
+                result.status,
+                orca_core::tool_types::ToolStatus::Failed,
+                "error={error:?}, cancellation_observed={cancellation_observed}"
+            );
+        }
+    }
 
     #[test]
     fn registry_control_semantics_are_conservative_by_resolved_identity() {

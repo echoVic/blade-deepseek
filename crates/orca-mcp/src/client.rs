@@ -1,16 +1,14 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::mpsc;
-use std::time::Duration;
 
 use serde_json::Value;
 
 use crate::transport::{self, McpElicitationHandler, McpTransport};
 use orca_core::mcp_types::{
     CallToolResult, McpContent, McpResource, McpResourceTemplate, McpServerConfig, McpTool,
-    McpToolRef, ReadResourceResult, ResourceTemplatesListResult, ResourcesListResult,
-    ToolsListResult,
+    McpToolRef, McpTransportKind, ReadResourceResult, ResourceTemplatesListResult,
+    ResourcesListResult, ToolsListResult,
 };
 
 #[derive(Clone, Default)]
@@ -363,26 +361,7 @@ impl McpRegistry {
         if should_cancel() {
             return Err("MCP tool call cancelled".to_string());
         }
-
-        let registry = self.clone();
-        let tool_ref = tool_ref.clone();
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = tx.send(registry.call_tool_inner(&tool_ref, arguments, None, None));
-        });
-
-        loop {
-            if should_cancel() {
-                return Err("MCP tool call cancelled".to_string());
-            }
-            match rx.recv_timeout(Duration::from_millis(25)) {
-                Ok(result) => return result,
-                Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    return Err("MCP tool call worker stopped before returning".to_string());
-                }
-            }
-        }
+        self.call_tool_inner(tool_ref, arguments, None, Some(should_cancel))
     }
 
     #[cfg(any(test, feature = "test-utils"))]
@@ -867,8 +846,11 @@ impl McpClient {
         should_cancel: Option<&dyn Fn() -> bool>,
     ) -> Result<Value, String> {
         match self.call_tool_once(name, arguments, elicitation_handler, should_cancel) {
-            Err(error) if should_reconnect_after_mcp_error(&error) => {
-                let _ = self.reconnect();
+            Err(error) if should_reconnect_after_mcp_error(&self.config.transport, &error) => {
+                let startup_timeout_cap_ms = (self.config.transport == McpTransportKind::Stdio
+                    && error == MCP_TOOL_CALL_CANCELLED)
+                    .then_some(CANCELLED_STDIO_RECONNECT_TIMEOUT_MS);
+                let _ = self.reconnect(startup_timeout_cap_ms);
                 Err(error)
             }
             result => result,
@@ -923,8 +905,13 @@ impl McpClient {
         transport.read_resource(uri)
     }
 
-    fn reconnect(&self) -> Result<(), String> {
-        let transport = transport::connect(&self.config)?;
+    fn reconnect(&self, startup_timeout_cap_ms: Option<u64>) -> Result<(), String> {
+        let mut config = self.config.clone();
+        if let Some(cap_ms) = startup_timeout_cap_ms {
+            config.startup_timeout_ms =
+                Some(config.startup_timeout_ms.unwrap_or(cap_ms).min(cap_ms));
+        }
+        let transport = transport::connect(&config)?;
         transport.initialize()?;
         let _ = transport.list_tools()?;
         let mut current = self
@@ -936,9 +923,12 @@ impl McpClient {
     }
 }
 
-fn should_reconnect_after_mcp_error(error: &str) -> bool {
+const MCP_TOOL_CALL_CANCELLED: &str = "MCP tool call cancelled";
+const CANCELLED_STDIO_RECONNECT_TIMEOUT_MS: u64 = 500;
+
+fn should_reconnect_after_mcp_error(transport: &McpTransportKind, error: &str) -> bool {
     error.contains("timed out")
-        || error.contains("MCP tool call cancelled")
+        || (transport == &McpTransportKind::Stdio && error.contains("MCP tool call cancelled"))
         || error.contains("reader stopped")
         || error.contains("server closed stdout")
         || error.contains("failed to write MCP request")
@@ -1054,10 +1044,13 @@ mod tests {
     }
 
     #[test]
-    fn call_tool_or_cancel_returns_promptly_when_cancelled() {
-        struct BlockingTransport;
+    fn call_tool_or_cancel_waits_for_transport_cleanup() {
+        struct CleanupAwareTransport {
+            active: Arc<AtomicBool>,
+            release: Arc<AtomicBool>,
+        }
 
-        impl McpTransport for BlockingTransport {
+        impl McpTransport for CleanupAwareTransport {
             fn initialize(&self) -> Result<Value, String> {
                 Ok(serde_json::json!({"capabilities": {"resources": {}}}))
             }
@@ -1067,11 +1060,30 @@ mod tests {
             }
 
             fn call_tool(&self, _name: &str, _arguments: Value) -> Result<Value, String> {
-                std::thread::sleep(Duration::from_secs(5));
+                self.active.store(true, Ordering::SeqCst);
+                while !self.release.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                self.active.store(false, Ordering::SeqCst);
                 Ok(serde_json::json!({
                     "content": [{"type": "text", "text": "too late"}],
                     "isError": false
                 }))
+            }
+
+            fn call_tool_with_elicitation_handler_or_cancel(
+                &self,
+                _name: &str,
+                _arguments: Value,
+                _handler: Option<&dyn McpElicitationHandler>,
+                should_cancel: &dyn Fn() -> bool,
+            ) -> Result<Value, String> {
+                self.active.store(true, Ordering::SeqCst);
+                while !should_cancel() {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                self.active.store(false, Ordering::SeqCst);
+                Err("MCP tool call cancelled".to_string())
             }
 
             fn list_resources(&self) -> Result<Value, String> {
@@ -1094,6 +1106,8 @@ mod tests {
             description: None,
             input_schema: serde_json::json!({"type": "object"}),
         };
+        let active = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
         let registry = McpRegistry {
             inner: Arc::new(McpRegistryInner {
                 clients: HashMap::from([(
@@ -1105,7 +1119,10 @@ mod tests {
                         },
                         server_name: "slow".to_string(),
                         capabilities: McpServerCapabilities::resource_capable_for_test(),
-                        transport: Mutex::new(Box::new(BlockingTransport)),
+                        transport: Mutex::new(Box::new(CleanupAwareTransport {
+                            active: Arc::clone(&active),
+                            release: Arc::clone(&release),
+                        })),
                     }),
                 )]),
                 tools: vec![tool.clone()],
@@ -1123,24 +1140,232 @@ mod tests {
         let tool_ref = registry
             .resolve_tool("mcp__slow__wait")
             .expect("tool ref for slow MCP tool");
-        let cancelled = AtomicBool::new(false);
         let started = Instant::now();
 
         let result =
             registry.call_tool_or_cancel(&tool_ref, Value::Object(Default::default()), &|| {
-                if started.elapsed() >= Duration::from_millis(100) {
-                    cancelled.store(true, Ordering::SeqCst);
-                }
-                cancelled.load(Ordering::SeqCst)
+                active.load(Ordering::SeqCst) && started.elapsed() >= Duration::from_millis(50)
             });
+
+        let worker_active_at_return = active.load(Ordering::SeqCst);
+        release.store(true, Ordering::SeqCst);
+        let cleanup_deadline = Instant::now() + Duration::from_secs(1);
+        while active.load(Ordering::SeqCst) && Instant::now() < cleanup_deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
 
         assert!(started.elapsed() < Duration::from_millis(750));
         assert_eq!(result.unwrap_err(), "MCP tool call cancelled");
+        assert!(
+            !worker_active_at_return,
+            "call_tool_or_cancel returned before its transport worker finished"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancelled_stdio_tool_call_reconnects_before_returning() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let server = temp_dir.path().join("reconnecting_mcp_server.sh");
+        let generation_file = temp_dir.path().join("generation");
+        let pid_prefix = temp_dir.path().join("pid");
+        let started_file = temp_dir.path().join("started");
+        std::fs::write(
+            &server,
+            r#"#!/bin/sh
+generation=0
+if [ -f "$GENERATION_FILE" ]; then
+  IFS= read -r generation < "$GENERATION_FILE"
+fi
+generation=$((generation + 1))
+printf '%s' "$generation" > "$GENERATION_FILE"
+printf '%s' "$$" > "$PID_PREFIX.$generation"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"reconnect","version":"1"}}}\n'
+      ;;
+    *'"method":"notifications/initialized"'*)
+      ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"wait","description":"waits","inputSchema":{"type":"object","properties":{},"required":[]}}]}}\n'
+      ;;
+    *'"method":"tools/call"'*)
+      printf started > "$STARTED_FILE"
+      if [ "$generation" -eq 1 ]; then
+        IFS= read -r ignored
+      else
+        printf '{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"generation 2"}],"isError":false}}\n'
+      fi
+      ;;
+  esac
+done
+"#,
+        )
+        .expect("write MCP fixture");
+        let mut config = stdio_fixture_config("reconnect", &server);
+        config.env = HashMap::from([
+            (
+                "GENERATION_FILE".to_string(),
+                generation_file.to_string_lossy().into_owned(),
+            ),
+            (
+                "PID_PREFIX".to_string(),
+                pid_prefix.to_string_lossy().into_owned(),
+            ),
+            (
+                "STARTED_FILE".to_string(),
+                started_file.to_string_lossy().into_owned(),
+            ),
+        ]);
+        config.tool_timeout_ms = Some(500);
+        let registry = initialize_registry(&[config]);
+        assert!(registry.errors().is_empty(), "{:?}", registry.errors());
+        let tool_ref = registry
+            .resolve_tool("mcp__reconnect__wait")
+            .expect("reconnect tool ref");
+
+        let result =
+            registry.call_tool_or_cancel(&tool_ref, Value::Object(Default::default()), &|| {
+                started_file.exists()
+            });
+
+        let generation_at_return =
+            std::fs::read_to_string(&generation_file).expect("generation at cancellation return");
+        let first_pid =
+            std::fs::read_to_string(pid_prefix.with_extension("1")).expect("first server pid");
+        let first_pid_alive_at_return = process_is_alive(first_pid.trim());
+
+        let cleanup_deadline = Instant::now() + Duration::from_secs(2);
+        while (std::fs::read_to_string(&generation_file).ok().as_deref() != Some("2")
+            || process_is_alive(first_pid.trim()))
+            && Instant::now() < cleanup_deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let second = registry
+            .call_tool(&tool_ref, Value::Object(Default::default()))
+            .expect("tool call after reconnect");
+
+        assert_eq!(result.unwrap_err(), "MCP tool call cancelled");
+        assert_eq!(
+            generation_at_return, "2",
+            "reconnect must finish before return"
+        );
+        assert!(
+            !first_pid_alive_at_return,
+            "cancelled stdio server must be reaped before return"
+        );
+        assert_eq!(second.output, "generation 2");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancelled_stdio_tool_call_bounds_failed_reconnect_handshake() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let server = temp_dir.path().join("stalled_reconnect_mcp_server.sh");
+        let generation_file = temp_dir.path().join("generation");
+        let pid_prefix = temp_dir.path().join("pid");
+        let started_file = temp_dir.path().join("started");
+        std::fs::write(
+            &server,
+            r#"#!/bin/sh
+generation=0
+if [ -f "$GENERATION_FILE" ]; then
+  IFS= read -r generation < "$GENERATION_FILE"
+fi
+generation=$((generation + 1))
+printf '%s' "$generation" > "$GENERATION_FILE"
+printf '%s' "$$" > "$PID_PREFIX.$generation"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      if [ "$generation" -eq 1 ]; then
+        printf '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"reconnect","version":"1"}}}\n'
+      else
+        sleep 10
+      fi
+      ;;
+    *'"method":"notifications/initialized"'*)
+      ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"wait","description":"waits","inputSchema":{"type":"object","properties":{},"required":[]}}]}}\n'
+      ;;
+    *'"method":"tools/call"'*)
+      printf started > "$STARTED_FILE"
+      IFS= read -r ignored
+      ;;
+  esac
+done
+"#,
+        )
+        .expect("write MCP fixture");
+        let mut config = stdio_fixture_config("stalled_reconnect", &server);
+        config.env = HashMap::from([
+            (
+                "GENERATION_FILE".to_string(),
+                generation_file.to_string_lossy().into_owned(),
+            ),
+            (
+                "PID_PREFIX".to_string(),
+                pid_prefix.to_string_lossy().into_owned(),
+            ),
+            (
+                "STARTED_FILE".to_string(),
+                started_file.to_string_lossy().into_owned(),
+            ),
+        ]);
+        config.startup_timeout_ms = Some(3_000);
+        let registry = initialize_registry(&[config]);
+        assert!(registry.errors().is_empty(), "{:?}", registry.errors());
+        let tool_ref = registry
+            .resolve_tool("mcp__stalled_reconnect__wait")
+            .expect("stalled reconnect tool ref");
+        let started = Instant::now();
+
+        let result =
+            registry.call_tool_or_cancel(&tool_ref, Value::Object(Default::default()), &|| {
+                started_file.exists()
+            });
+
+        let elapsed = started.elapsed();
+        let generation_at_return =
+            std::fs::read_to_string(&generation_file).expect("generation at cancellation return");
+        let second_pid =
+            std::fs::read_to_string(pid_prefix.with_extension("2")).expect("second server pid");
+
+        assert_eq!(result.unwrap_err(), "MCP tool call cancelled");
+        assert_eq!(generation_at_return, "2", "reconnect must be attempted");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "failed reconnect delayed cancellation for {elapsed:?}"
+        );
+        assert!(
+            !process_is_alive(second_pid.trim()),
+            "failed reconnect server must be reaped before return"
+        );
+    }
+
+    #[cfg(unix)]
+    fn process_is_alive(pid: &str) -> bool {
+        std::process::Command::new("/bin/kill")
+            .args(["-0", pid])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
     }
 
     #[test]
-    fn cancelled_stdio_tool_call_is_reconnectable() {
-        assert!(should_reconnect_after_mcp_error("MCP tool call cancelled"));
+    fn cancellation_reconnect_policy_is_transport_aware() {
+        assert!(should_reconnect_after_mcp_error(
+            &McpTransportKind::Stdio,
+            "MCP tool call cancelled"
+        ));
+        assert!(!should_reconnect_after_mcp_error(
+            &McpTransportKind::Sse,
+            "MCP tool call cancelled"
+        ));
     }
 
     #[test]

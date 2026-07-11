@@ -34,7 +34,7 @@ pub(crate) fn execute_user_input_tool(
     };
     Ok(match handler.request_user_input(&input)? {
         Some(answer) => ToolResult::completed(request, answer, false),
-        None => ToolResult::failed(request, "user input request cancelled", None),
+        None => ToolResult::cancelled(request, "user input request cancelled", None),
     })
 }
 

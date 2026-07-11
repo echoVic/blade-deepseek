@@ -2,7 +2,8 @@ use std::time::Duration;
 
 use orca_core::task_types::{TaskStatus, TaskType};
 use orca_runtime::shell_session::{
-    RuntimeShellSessionManager, ShellSandboxMode, ShellSessionCommand, ShellTerminalMode,
+    RuntimeShellSessionManager, ShellSandboxMode, ShellSessionCommand, ShellSessionTermination,
+    ShellTerminalMode,
 };
 use orca_runtime::tasks::TaskRegistry;
 
@@ -123,6 +124,61 @@ fn shell_session_kill_stops_running_task_and_collects_partial_output() {
     let task = tasks.get(&handle.task_id).expect("shell task");
     assert_eq!(task.status, TaskStatus::Stopped);
     assert_eq!(task.result.as_deref(), Some(output.stdout.as_str()));
+}
+
+#[test]
+fn shell_session_kill_preserves_already_exited_terminal_with_buffered_output() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let tasks = TaskRegistry::new("session-shell".to_string());
+    let mut sessions = RuntimeShellSessionManager::new(tasks.clone());
+    let handle = sessions
+        .spawn(ShellSessionCommand {
+            command: "printf completed".to_string(),
+            cwd: temp.path().to_path_buf(),
+            additional_readable_directories: Vec::new(),
+            additional_working_directories: Vec::new(),
+            denied_working_directories: Vec::new(),
+            allowed_unix_socket_roots: Vec::new(),
+            env: Default::default(),
+            description: "already completed shell".to_string(),
+            terminal: ShellTerminalMode::pipe(),
+            sandbox: ShellSandboxMode::default(),
+        })
+        .expect("spawn shell session");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while sessions.output_store().size(&handle.task_id) == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "output was not buffered"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    loop {
+        let status = sessions
+            .list()
+            .into_iter()
+            .find(|snapshot| snapshot.id == handle.id)
+            .expect("shell snapshot")
+            .status;
+        if status != TaskStatus::Running {
+            assert_eq!(status, TaskStatus::Completed);
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "shell did not exit");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    let output = sessions.kill(&handle.id).expect("collect exited shell");
+
+    assert_eq!(output.termination, ShellSessionTermination::Exited);
+    assert_eq!(output.status, TaskStatus::Completed);
+    assert_eq!(output.exit_code, Some(0));
+    assert_eq!(output.stdout, "completed");
+    assert_eq!(
+        tasks.get(&handle.task_id).expect("shell task").status,
+        TaskStatus::Completed
+    );
 }
 
 #[test]

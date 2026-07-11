@@ -101,16 +101,8 @@ pub fn execute_with_policy_roots_or_cancel(
     let ingress_truncated = output.output_was_omitted();
     let stdout = output.stdout_text().trim_end().to_string();
     let stderr = output.stderr_text().trim_end().to_string();
-    if should_cancel() {
-        let message = if stderr.is_empty() && stdout.is_empty() {
-            "shell command cancelled".to_string()
-        } else if stderr.is_empty() {
-            format!("shell command cancelled: {stdout}")
-        } else if stdout.is_empty() {
-            format!("shell command cancelled: {stderr}")
-        } else {
-            format!("shell command cancelled: {stdout}\n{stderr}")
-        };
+    if output.termination == process::CommandTermination::Cancelled {
+        let message = cancelled_message(&stdout, &stderr);
         let (message, truncated) = truncate_output_with_policy(message, output_truncation);
         let message = process::preserve_ingress_omission_notice(
             message,
@@ -118,7 +110,7 @@ pub fn execute_with_policy_roots_or_cancel(
                 .stdout_omitted_bytes
                 .saturating_add(output.stderr_omitted_bytes),
         );
-        let mut result = ToolResult::failed(request, message, output.status.code());
+        let mut result = ToolResult::cancelled(request, message, output.status.code());
         result.set_truncated(ingress_truncated || truncated);
         return result;
     }
@@ -325,24 +317,47 @@ pub fn execute_streaming_command_or_cancel(
         .unwrap_or_else(Instant::now);
     let mut timed_out = false;
     let mut cancelled = false;
+    let mut output_open = true;
     let status = loop {
-        match rx.recv_timeout(Duration::from_millis(50)) {
-            Ok(StreamEvent::Stdout(chunk)) => {
-                emit_live_preview(&chunk, &mut preview_remaining, on_output);
-                stdout.append(&chunk);
+        if output_open {
+            match rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(StreamEvent::Stdout(chunk)) => {
+                    emit_live_preview(&chunk, &mut preview_remaining, on_output);
+                    stdout.append(&chunk);
+                }
+                Ok(StreamEvent::Stderr(chunk)) => {
+                    emit_live_preview(&chunk, &mut preview_remaining, on_output);
+                    stderr.append(&chunk);
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => output_open = false,
             }
-            Ok(StreamEvent::Stderr(chunk)) => {
-                emit_live_preview(&chunk, &mut preview_remaining, on_output);
-                stderr.append(&chunk);
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                break child
-                    .wait()
-                    .map_err(|error| format!("failed to wait for shell command: {error}"));
+        } else {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) => {}
+            Err(error) => {
+                return ToolResult::failed(
+                    request,
+                    format!("failed to wait for shell command: {error}"),
+                    None,
+                );
             }
         }
         if should_cancel() {
+            match child.try_wait() {
+                Ok(Some(status)) => break Ok(status),
+                Ok(None) => {}
+                Err(error) => {
+                    return ToolResult::failed(
+                        request,
+                        format!("failed to wait for shell command: {error}"),
+                        None,
+                    );
+                }
+            }
             cancelled = true;
             process::kill_child_tree(&mut child);
             break child
@@ -350,6 +365,17 @@ pub fn execute_streaming_command_or_cancel(
                 .map_err(|error| format!("failed to wait for shell command: {error}"));
         }
         if Instant::now() >= deadline {
+            match child.try_wait() {
+                Ok(Some(status)) => break Ok(status),
+                Ok(None) => {}
+                Err(error) => {
+                    return ToolResult::failed(
+                        request,
+                        format!("failed to wait for shell command: {error}"),
+                        None,
+                    );
+                }
+            }
             timed_out = true;
             process::kill_child_tree(&mut child);
             break child
@@ -414,7 +440,11 @@ pub fn execute_streaming_command_or_cancel(
             message,
             stdout_omitted_bytes.saturating_add(stderr_omitted_bytes),
         );
-        let mut result = ToolResult::failed(request, message, status.code());
+        let mut result = if cancelled {
+            ToolResult::cancelled(request, message, status.code())
+        } else {
+            ToolResult::failed(request, message, status.code())
+        };
         result.set_truncated(ingress_truncated || truncated);
         result
     }
@@ -762,7 +792,11 @@ mod tests {
             start.elapsed() < Duration::from_secs(2),
             "cancelled command should not wait for the shell timeout"
         );
-        assert_eq!(result.status, ToolStatus::Failed);
+        assert_eq!(result.status, ToolStatus::Cancelled);
+        assert_eq!(
+            result.kind,
+            orca_core::tool_types::ToolResultKind::Cancelled
+        );
         assert!(
             result
                 .error
@@ -771,6 +805,33 @@ mod tests {
                 .contains("shell command cancelled"),
             "unexpected error: {:?}",
             result.error
+        );
+    }
+
+    #[test]
+    fn bash_wait_preserves_one_shot_cancel_observation() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let request = bash_request("printf before; sleep 5; printf after");
+        let calls = std::cell::Cell::new(0usize);
+
+        let result = execute_with_policy_or_cancel(
+            &request,
+            dir.path(),
+            ToolOutputTruncation::bytes(1024),
+            Duration::from_secs(30),
+            || {
+                let call = calls.get();
+                calls.set(call + 1);
+                call == 2
+            },
+        );
+
+        assert_eq!(result.status, ToolStatus::Cancelled);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("before"))
         );
     }
 
@@ -806,7 +867,11 @@ mod tests {
             start.elapsed() < Duration::from_secs(2),
             "cancelled streaming command should not wait for the shell timeout"
         );
-        assert_eq!(result.status, ToolStatus::Failed);
+        assert_eq!(result.status, ToolStatus::Cancelled);
+        assert_eq!(
+            result.kind,
+            orca_core::tool_types::ToolResultKind::Cancelled
+        );
         assert!(
             result
                 .error
@@ -820,6 +885,69 @@ mod tests {
             chunks.join("").contains("before"),
             "partial output should still stream before cancellation"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn streaming_completed_process_wins_cancellation_observed_during_callback() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let release = dir.path().join("release");
+        let completed = dir.path().join("completed");
+        let request = bash_request(&format!(
+            "while [ ! -e {release:?} ]; do sleep 0.01; done; printf 'completed\\n'; : > {completed:?}"
+        ));
+        let cancellation_observed = AtomicBool::new(false);
+        let mut chunks = Vec::new();
+
+        let result = execute_streaming_with_policy_or_cancel(
+            &request,
+            dir.path(),
+            ToolOutputTruncation::bytes(1024),
+            Duration::from_secs(5),
+            &mut |chunk| chunks.push(chunk.to_string()),
+            || {
+                if !cancellation_observed.swap(true, Ordering::SeqCst) {
+                    std::fs::write(&release, []).expect("release child");
+                    let deadline = Instant::now() + Duration::from_secs(2);
+                    while !completed.exists() && Instant::now() < deadline {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    assert!(completed.exists(), "child did not complete during callback");
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                true
+            },
+        );
+
+        assert!(cancellation_observed.load(Ordering::SeqCst));
+        assert_eq!(result.status, ToolStatus::Completed);
+        assert_eq!(result.output.as_deref(), Some("completed"));
+        assert!(chunks.join("").contains("completed"));
+    }
+
+    #[test]
+    fn streaming_bash_keeps_polling_cancel_after_output_closes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let request = bash_request("exec >/dev/null 2>/dev/null; sleep 5");
+        let started = Instant::now();
+        let mut output = String::new();
+
+        let result = execute_streaming_with_policy_roots_or_cancel(
+            &request,
+            dir.path(),
+            &[],
+            ToolOutputTruncation::bytes(1024),
+            Duration::from_secs(30),
+            &mut |chunk| output.push_str(chunk),
+            || started.elapsed() >= Duration::from_millis(100),
+        );
+
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "cancelled command with closed output should not block in wait"
+        );
+        assert_eq!(result.status, ToolStatus::Cancelled);
+        assert!(output.is_empty());
     }
 
     #[test]
@@ -848,7 +976,7 @@ mod tests {
             "noisy streaming cancel deadlocked reader shutdown: {:?}",
             start.elapsed()
         );
-        assert_eq!(result.status, ToolStatus::Failed);
+        assert_eq!(result.status, ToolStatus::Cancelled);
         assert!(
             result
                 .error

@@ -951,7 +951,7 @@ fn tool_actor_context_routes_request_user_input_through_handler() {
 }
 
 #[test]
-fn tool_actor_context_cancelled_user_input_returns_failed_result() {
+fn tool_actor_context_cancelled_user_input_returns_cancelled_result() {
     struct CancelHandler;
 
     impl RuntimeUserInputHandler for CancelHandler {
@@ -977,7 +977,11 @@ fn tool_actor_context_cancelled_user_input_returns_failed_result() {
         .execute_user_input_tool(&request, &CancelHandler)
         .expect("user input result");
 
-    assert_eq!(result.status, orca_core::tool_types::ToolStatus::Failed);
+    assert_eq!(result.status, orca_core::tool_types::ToolStatus::Cancelled);
+    assert_eq!(
+        result.kind,
+        orca_core::tool_types::ToolResultKind::Cancelled
+    );
     assert_eq!(
         result.error.as_deref(),
         Some("user input request cancelled")
@@ -1780,7 +1784,11 @@ fn tool_actor_context_cancels_shell_session_tool_wait() {
         start.elapsed() < std::time::Duration::from_secs(2),
         "cancelled shell-session tool should not wait for the shell timeout"
     );
-    assert_eq!(result.status, orca_core::tool_types::ToolStatus::Failed);
+    assert_eq!(result.status, orca_core::tool_types::ToolStatus::Cancelled);
+    assert_eq!(
+        result.kind,
+        orca_core::tool_types::ToolResultKind::Cancelled
+    );
     assert!(
         result
             .error
@@ -1796,6 +1804,52 @@ fn tool_actor_context_cancels_shell_session_tool_wait() {
             .iter()
             .any(|task| task.task_type == TaskType::Shell && task.status == TaskStatus::Stopped),
         "cancelled shell execution should stop its shell task record"
+    );
+}
+
+#[test]
+fn tool_actor_context_preserves_shell_session_timeout_as_failure() {
+    let mut context = RuntimeToolActorContext::new("run-tools", 2);
+    let task_registry = orca_runtime::tasks::TaskRegistry::new("run-tools".to_string());
+    let request = ToolRequest {
+        id: "tool-timeout".to_string(),
+        name: ToolName::Bash,
+        action: ActionKind::Shell,
+        target: Some("printf before; sleep 5; printf after".to_string()),
+        raw_arguments: Some(
+            serde_json::json!({ "command": "printf before; sleep 5; printf after" }).to_string(),
+        ),
+    };
+    let start = std::time::Instant::now();
+
+    let result = context.execute_normal_tool_with_cancel(
+        &request,
+        std::env::current_dir().expect("cwd").as_path(),
+        &McpRegistry::default(),
+        &[],
+        ToolConfig::default().output_truncation,
+        1,
+        Some(&task_registry),
+        None,
+    );
+
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(3),
+        "timed out shell-session tool should stop near its timeout"
+    );
+    assert_eq!(result.status, orca_core::tool_types::ToolStatus::Failed);
+    assert_eq!(
+        result.kind,
+        orca_core::tool_types::ToolResultKind::RuntimeError
+    );
+    assert!(
+        result
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("shell command timed out after 1s"),
+        "unexpected error: {:?}",
+        result.error
     );
 }
 
@@ -1862,7 +1916,11 @@ fn tool_actor_context_task_stop_cancels_running_shell_task_wait() {
         stop_started.elapsed() < std::time::Duration::from_secs(2),
         "task_stop should cancel the running shell wait promptly"
     );
-    assert_eq!(result.status, orca_core::tool_types::ToolStatus::Failed);
+    assert_eq!(result.status, orca_core::tool_types::ToolStatus::Cancelled);
+    assert_eq!(
+        result.kind,
+        orca_core::tool_types::ToolResultKind::Cancelled
+    );
     assert!(
         task_registry
             .list()

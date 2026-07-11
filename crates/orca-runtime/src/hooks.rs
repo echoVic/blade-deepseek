@@ -147,7 +147,7 @@ impl HookRunner {
                 &should_cancel,
             )
             .map_err(|error| format!("hook '{}' failed: {error}", hook.command))?;
-            if should_cancel() {
+            if output.termination == orca_tools::process::CommandTermination::Cancelled {
                 return Err(format!("hook '{}' cancelled", hook.command));
             }
 

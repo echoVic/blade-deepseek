@@ -56,7 +56,13 @@ impl RuntimeApprovalHandler for TuiApprovalHandler<'_> {
                 Ok(action @ UserAction::Approve { .. }) => {
                     self.pending_actions.borrow_mut().push_back(action)
                 }
-                Ok(UserAction::Interrupt) | Ok(UserAction::Cancel) | Err(_) => break false,
+                Ok(UserAction::Interrupt) | Ok(UserAction::Cancel) => break false,
+                Err(error) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        format!("TUI action channel closed while waiting for approval: {error}"),
+                    ));
+                }
                 Ok(action) => self.pending_actions.borrow_mut().push_back(action),
             }
         };
@@ -256,15 +262,24 @@ impl RuntimePermissionRequestHandler for TuiPermissionRequestHandler<'_> {
             .send(approval_event_from_pending_interaction(&pending));
         let allowed = loop {
             match self.action_rx.recv() {
-                Ok(UserAction::Approve { id, approved }) if id == request.id => break approved,
+                Ok(UserAction::Approve { id, approved }) if id == request.id => {
+                    break Ok(approved);
+                }
                 Ok(action @ UserAction::Approve { .. }) => {
                     self.pending_actions.borrow_mut().push_back(action)
                 }
-                Ok(UserAction::Interrupt) | Ok(UserAction::Cancel) | Err(_) => break false,
+                Ok(UserAction::Interrupt) | Ok(UserAction::Cancel) => break Ok(false),
+                Err(error) => {
+                    break Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        format!("TUI action channel closed while waiting for permission: {error}"),
+                    ));
+                }
                 Ok(action) => self.pending_actions.borrow_mut().push_back(action),
             }
         };
         remove_pending_interaction(self.pending_interactions.as_ref(), &request.id);
+        let allowed = allowed?;
         Ok(RuntimePermissionResponse {
             decision: if allowed {
                 PermissionResponseDecision::Allow
@@ -383,7 +398,13 @@ impl RuntimeUserInputHandler for TuiUserInputHandler<'_> {
                 Ok(action @ UserAction::RespondToUserInput { .. }) => {
                     self.pending_actions.borrow_mut().push_back(action)
                 }
-                Ok(UserAction::Interrupt) | Ok(UserAction::Cancel) | Err(_) => break Ok(None),
+                Ok(UserAction::Interrupt) | Ok(UserAction::Cancel) => break Ok(None),
+                Err(error) => {
+                    break Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        format!("TUI action channel closed while waiting for user input: {error}"),
+                    ));
+                }
                 Ok(action) => self.pending_actions.borrow_mut().push_back(action),
             }
         };
@@ -443,7 +464,15 @@ impl<'a> TuiMcpElicitationHandler<'a> {
                 Ok(action @ UserAction::RespondToMcpElicitation { .. }) => {
                     self.pending_actions.borrow_mut().push_back(action)
                 }
-                Ok(UserAction::Interrupt) | Ok(UserAction::Cancel) | Err(_) => break Ok(None),
+                Ok(UserAction::Interrupt) | Ok(UserAction::Cancel) => break Ok(None),
+                Err(error) => {
+                    break Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        format!(
+                            "TUI action channel closed while waiting for MCP elicitation: {error}"
+                        ),
+                    ));
+                }
                 Ok(action) => self.pending_actions.borrow_mut().push_back(action),
             }
         };
@@ -991,7 +1020,7 @@ mod tests {
     }
 
     #[test]
-    fn tui_user_input_handler_maps_cancel_to_runtime_failure() {
+    fn tui_user_input_handler_maps_cancel_to_cancelled_terminal() {
         let (event_tx, _event_rx) = mpsc::channel();
         let (action_tx, action_rx) = mpsc::channel();
         action_tx.send(UserAction::Cancel).expect("send cancel");
@@ -1010,11 +1039,37 @@ mod tests {
             .execute_user_input_tool(&request, &handler)
             .expect("user input result");
 
-        assert_eq!(result.status, tool_types::ToolStatus::Failed);
+        assert_eq!(result.status, tool_types::ToolStatus::Cancelled);
         assert_eq!(
             result.error.as_deref(),
             Some("user input request cancelled")
         );
+    }
+
+    #[test]
+    fn tui_user_input_handler_reports_closed_action_channel() {
+        let (event_tx, _event_rx) = mpsc::channel();
+        let (action_tx, action_rx) = mpsc::channel();
+        drop(action_tx);
+        let store = RuntimePendingInteractionStore::default();
+        let pending_actions = RefCell::new(VecDeque::new());
+        let handler = TuiUserInputHandler::new(&event_tx, &action_rx, &pending_actions)
+            .with_pending_interactions(store.clone());
+        let mut context = RuntimeToolActorContext::new("tui-user-input", 2);
+        let request = tool_types::ToolRequest {
+            id: "ask".to_string(),
+            name: tool_types::ToolName::RequestUserInput,
+            action: orca_core::approval_types::ActionKind::Read,
+            target: None,
+            raw_arguments: Some(serde_json::json!({ "question": "Continue?" }).to_string()),
+        };
+
+        let error = context
+            .execute_user_input_tool(&request, &handler)
+            .expect_err("closed action channel must not be reported as user cancellation");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+        assert!(store.is_empty());
     }
 
     #[test]
@@ -1145,6 +1200,32 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
         assert_eq!(store.get(&request.id), Some(first));
         assert!(event_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn tui_mcp_elicitation_handler_reports_closed_action_channel() {
+        let (event_tx, _event_rx) = mpsc::channel();
+        let (action_tx, action_rx) = mpsc::channel();
+        drop(action_tx);
+        let store = RuntimePendingInteractionStore::default();
+        let pending_actions = RefCell::new(VecDeque::new());
+        let handler = TuiMcpElicitationHandler::new(&event_tx, &action_rx, &pending_actions)
+            .with_pending_interactions(store.clone());
+        let request = RuntimeMcpElicitationRequest::new(
+            "github",
+            "42",
+            RuntimeMcpElicitationMode::Form,
+            "Fill required fields",
+            None,
+            Some(r#"{"type":"object"}"#.to_string()),
+        );
+
+        let error = handler
+            .request_mcp_elicitation(&request)
+            .expect_err("closed action channel must not be reported as user cancellation");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+        assert!(store.is_empty());
     }
 
     #[test]

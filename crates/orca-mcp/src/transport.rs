@@ -105,6 +105,7 @@ struct StdioState {
     child: StdioChild,
     stdin: ChildStdin,
     responses: Option<mpsc::Receiver<Result<Value, String>>>,
+    reader_worker: Option<std::thread::JoinHandle<()>>,
     next_id: u64,
 }
 
@@ -112,11 +113,20 @@ impl StdioState {
     fn terminate(&mut self) {
         self.responses.take();
         self.child.terminate();
+        if let Some(worker) = self.reader_worker.take() {
+            let _ = worker.join();
+        }
     }
 
     fn terminal_error<T>(&mut self, error: String) -> Result<T, String> {
         self.terminate();
         Err(error)
+    }
+}
+
+impl Drop for StdioState {
+    fn drop(&mut self) {
+        self.terminate();
     }
 }
 
@@ -182,7 +192,7 @@ impl StdioTransport {
             .take()
             .ok_or_else(|| format!("failed to open stdout for MCP server '{}'", config.name))?;
         let (response_tx, responses) = mpsc::sync_channel(STDIO_RESPONSE_QUEUE_CAPACITY);
-        std::thread::spawn(move || {
+        let reader_worker = std::thread::spawn(move || {
             let mut stdout = BufReader::new(stdout);
             loop {
                 match read_json_line(&mut stdout) {
@@ -205,6 +215,7 @@ impl StdioTransport {
                 child,
                 stdin,
                 responses: Some(responses),
+                reader_worker: Some(reader_worker),
                 next_id: 1,
             }),
             startup_timeout: timeout_from_ms(config.startup_timeout_ms),
@@ -340,8 +351,26 @@ impl StdioTransport {
         let deadline = std::time::Instant::now() + timeout;
         let mut iterations = 0u32;
         loop {
-            if should_cancel.is_some_and(|should_cancel| should_cancel()) {
-                return state.terminal_error("MCP tool call cancelled".to_string());
+            let mut response = match state.responses.as_ref() {
+                Some(responses) => match try_recv_stdio_response(responses) {
+                    Ok(response) => response,
+                    Err(error) => return state.terminal_error(error),
+                },
+                None => return state.terminal_error("MCP stdio reader is unavailable".to_string()),
+            };
+            if response.is_none() && should_cancel.is_some_and(|should_cancel| should_cancel()) {
+                response = match state.responses.as_ref() {
+                    Some(responses) => match try_recv_stdio_response(responses) {
+                        Ok(response) => response,
+                        Err(error) => return state.terminal_error(error),
+                    },
+                    None => {
+                        return state.terminal_error("MCP stdio reader is unavailable".to_string());
+                    }
+                };
+                if response.is_none() {
+                    return state.terminal_error("MCP tool call cancelled".to_string());
+                }
             }
             if iterations >= 1000 {
                 return state.terminal_error(format!(
@@ -359,28 +388,33 @@ impl StdioTransport {
                 Some(_) => remaining.min(Duration::from_millis(25)),
                 None => remaining,
             };
-            let received = match state.responses.as_ref() {
-                Some(responses) => responses.recv_timeout(wait),
-                None => {
-                    return state.terminal_error("MCP stdio reader is unavailable".to_string());
-                }
-            };
-            let response = match received {
-                Ok(Ok(response)) => response,
-                Ok(Err(error)) => return state.terminal_error(error),
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    if should_cancel.is_some() {
-                        continue;
+            let response = match response {
+                Some(response) => response,
+                None => match state
+                    .responses
+                    .as_ref()
+                    .map(|responses| responses.recv_timeout(wait))
+                {
+                    None => {
+                        return state.terminal_error("MCP stdio reader is unavailable".to_string());
                     }
-                    return state.terminal_error(format!(
-                        "MCP request '{method}' timed out after {}",
-                        format_duration(timeout)
-                    ));
-                }
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    return state
-                        .terminal_error("MCP stdio reader stopped before returning".to_string());
-                }
+                    Some(Ok(Ok(response))) => response,
+                    Some(Ok(Err(error))) => return state.terminal_error(error),
+                    Some(Err(mpsc::RecvTimeoutError::Timeout)) => {
+                        if should_cancel.is_some() {
+                            continue;
+                        }
+                        return state.terminal_error(format!(
+                            "MCP request '{method}' timed out after {}",
+                            format_duration(timeout)
+                        ));
+                    }
+                    Some(Err(mpsc::RecvTimeoutError::Disconnected)) => {
+                        return state.terminal_error(
+                            "MCP stdio reader stopped before returning".to_string(),
+                        );
+                    }
+                },
             };
             iterations += 1;
             if is_elicitation_create_request(&response) {
@@ -426,24 +460,16 @@ impl StdioTransport {
     }
 }
 
-fn kill_child_tree(child: &mut Child) {
-    #[cfg(unix)]
-    {
-        kill_process_group(child.id());
-    }
-    let _ = child.kill();
-}
-
-#[cfg(unix)]
-fn kill_process_group(pid: u32) {
-    unsafe extern "C" {
-        fn kill(pid: i32, sig: i32) -> i32;
-    }
-
-    const SIGKILL: i32 = 9;
-    let pgid = -(pid as i32);
-    unsafe {
-        let _ = kill(pgid, SIGKILL);
+fn try_recv_stdio_response(
+    responses: &mpsc::Receiver<Result<Value, String>>,
+) -> Result<Option<Value>, String> {
+    match responses.try_recv() {
+        Ok(Ok(response)) => Ok(Some(response)),
+        Ok(Err(error)) => Err(error),
+        Err(mpsc::TryRecvError::Empty) => Ok(None),
+        Err(mpsc::TryRecvError::Disconnected) => {
+            Err("MCP stdio reader stopped before returning".to_string())
+        }
     }
 }
 
@@ -591,6 +617,27 @@ fn read_json_line<R: BufRead>(stdout: &mut R) -> Result<Value, String> {
         .map_err(|error| format!("invalid MCP response JSON: {error}"))
 }
 
+fn kill_child_tree(child: &mut Child) {
+    #[cfg(unix)]
+    kill_process_group(child.id());
+    let _ = child.kill();
+}
+
+#[cfg(unix)]
+fn kill_process_group(pid: u32) {
+    unsafe extern "C" {
+        fn kill(pid: i32, signal: i32) -> i32;
+    }
+
+    const SIGKILL: i32 = 9;
+    let Ok(pid) = i32::try_from(pid) else {
+        return;
+    };
+    unsafe {
+        let _ = kill(-pid, SIGKILL);
+    }
+}
+
 struct SseTransport {
     endpoint: String,
     headers: HashMap<String, String>,
@@ -606,12 +653,11 @@ impl SseTransport {
             .url
             .clone()
             .ok_or_else(|| format!("MCP SSE server '{}' is missing url", config.name))?;
-        let client = reqwest::blocking::Client::new();
         Ok(Self {
             endpoint,
             headers: config.headers.clone(),
             next_id: Mutex::new(1),
-            client,
+            client: reqwest::blocking::Client::new(),
             startup_timeout: timeout_from_ms(config.startup_timeout_ms),
             tool_timeout: timeout_from_ms(config.tool_timeout_ms),
         })
@@ -766,13 +812,30 @@ impl SseTransport {
             let _ = sender.send(result);
         });
         loop {
+            match receiver.try_recv() {
+                Ok(result) => {
+                    worker
+                        .join()
+                        .map_err(|_| "MCP SSE worker panicked before returning".to_string())?;
+                    return result;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    worker
+                        .join()
+                        .map_err(|_| "MCP SSE worker panicked before returning".to_string())?;
+                    return Err("MCP SSE worker stopped before returning".to_string());
+                }
+            }
             if should_cancel() {
                 cancel.store(true, Ordering::Release);
-                let _ = receiver.recv();
+                let result = receiver
+                    .recv()
+                    .map_err(|_| "MCP SSE worker stopped during cancellation".to_string())?;
                 worker
                     .join()
                     .map_err(|_| "MCP SSE worker panicked during cancellation".to_string())?;
-                return Err("MCP tool call cancelled".to_string());
+                return result;
             }
             match receiver.recv_timeout(Duration::from_millis(25)) {
                 Ok(result) => {
@@ -960,6 +1023,31 @@ fn read_bounded_sse_response(response: reqwest::blocking::Response) -> Result<St
         .map_err(|error| format!("MCP SSE response was not valid UTF-8: {error}"))
 }
 
+#[cfg(test)]
+fn run_sse_operation<T>(
+    operation: impl std::future::Future<Output = Result<T, String>>,
+) -> Result<T, String> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| format!("failed to create MCP SSE runtime: {error}"))?
+        .block_on(operation)
+}
+
+#[cfg(test)]
+async fn select_sse_result_or_cancel<T>(
+    result: impl std::future::Future<Output = Result<T, String>>,
+    cancel: impl std::future::Future<Output = ()>,
+) -> Result<T, String> {
+    tokio::pin!(result);
+    tokio::pin!(cancel);
+    tokio::select! {
+        biased;
+        result = &mut result => result,
+        _ = &mut cancel => Err("MCP tool call cancelled".to_string()),
+    }
+}
+
 fn parse_sse_or_json_response(text: &str) -> Result<Value, String> {
     if let Ok(value) = serde_json::from_str::<Value>(text.trim()) {
         return Ok(value);
@@ -995,6 +1083,7 @@ mod tests {
     use std::fs;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex as StdMutex};
     use std::time::{Duration, Instant};
 
@@ -1507,6 +1596,139 @@ done
 
     #[cfg(unix)]
     #[test]
+    fn cancelled_stdio_tool_call_reaps_server_before_returning() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let server = temp_dir.path().join("cancelled_mcp_server.sh");
+        let pid_file = temp_dir.path().join("server.pid");
+        fs::write(
+            &server,
+            r#"#!/bin/sh
+printf '%s' "$$" > "$PID_FILE"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"cancelled","version":"1"}}}\n'
+      ;;
+    *'"method":"notifications/initialized"'*)
+      ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"wait","description":"waits","inputSchema":{"type":"object","properties":{},"required":[]}}]}}\n'
+      ;;
+    *'"method":"tools/call"'*)
+      IFS= read -r ignored
+      ;;
+  esac
+done
+"#,
+        )
+        .expect("write MCP fixture");
+        let transport = StdioTransport::start(&McpServerConfig {
+            name: "cancelled".to_string(),
+            transport: McpTransportKind::Stdio,
+            command: Some("/bin/sh".to_string()),
+            args: vec![server.to_string_lossy().into_owned()],
+            url: None,
+            env: HashMap::from([(
+                "PID_FILE".to_string(),
+                pid_file.to_string_lossy().into_owned(),
+            )]),
+            headers: Default::default(),
+            disabled: false,
+            startup_timeout_ms: Some(STDIO_TEST_STARTUP_TIMEOUT_MS),
+            tool_timeout_ms: Some(1000),
+        })
+        .expect("connect stdio MCP");
+        transport.initialize().expect("initialize MCP");
+        transport.list_tools().expect("list tools");
+        let started = Instant::now();
+
+        let result = transport.call_tool_with_elicitation_handler_or_cancel(
+            "wait",
+            Value::Object(Default::default()),
+            None,
+            &|| started.elapsed() >= Duration::from_millis(50),
+        );
+
+        let pid = fs::read_to_string(&pid_file).expect("server pid");
+        std::thread::sleep(Duration::from_millis(25));
+        let server_alive_at_return = process_is_alive(pid.trim());
+        drop(transport);
+
+        assert_eq!(result.unwrap_err(), "MCP tool call cancelled");
+        assert!(
+            !server_alive_at_return,
+            "stdio cancellation returned before the server was waited and reaped"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdio_completed_result_wins_racing_cancellation() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let server = temp_dir.path().join("completed_mcp_server.sh");
+        let completed_file = temp_dir.path().join("completed");
+        fs::write(
+            &server,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"completed","version":"1"}}}\n'
+      ;;
+    *'"method":"notifications/initialized"'*)
+      ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"finish","description":"finishes","inputSchema":{"type":"object","properties":{},"required":[]}}]}}\n'
+      ;;
+    *'"method":"tools/call"'*)
+      printf '{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"completed"}],"isError":false}}\n'
+      printf completed > "$COMPLETED_FILE"
+      ;;
+  esac
+done
+"#,
+        )
+        .expect("write MCP fixture");
+        let transport = StdioTransport::start(&McpServerConfig {
+            name: "completed".to_string(),
+            transport: McpTransportKind::Stdio,
+            command: Some("/bin/sh".to_string()),
+            args: vec![server.to_string_lossy().into_owned()],
+            url: None,
+            env: HashMap::from([(
+                "COMPLETED_FILE".to_string(),
+                completed_file.to_string_lossy().into_owned(),
+            )]),
+            headers: Default::default(),
+            disabled: false,
+            startup_timeout_ms: Some(STDIO_TEST_STARTUP_TIMEOUT_MS),
+            tool_timeout_ms: Some(1000),
+        })
+        .expect("connect stdio MCP");
+        transport.initialize().expect("initialize MCP");
+        transport.list_tools().expect("list tools");
+
+        let result = transport.call_tool_with_elicitation_handler_or_cancel(
+            "finish",
+            Value::Object(Default::default()),
+            None,
+            &|| {
+                let deadline = Instant::now() + Duration::from_secs(1);
+                while !completed_file.exists() && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                completed_file.exists()
+            },
+        );
+
+        assert_eq!(
+            result.expect("completed response must win racing cancellation")["content"][0]["text"],
+            "completed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn stdio_tool_call_routes_elicitation_request_before_final_response() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let server = temp_dir.path().join("elicitation_mcp_server.sh");
@@ -1646,10 +1868,22 @@ done
     }
 
     #[test]
-    fn sse_handler_cancel_returns_promptly() {
-        let server = SlowSseServer::start();
+    fn sse_completed_result_wins_racing_cancellation() {
+        let expected = json!({"content": [{"type": "text", "text": "completed"}]});
+
+        let result = run_sse_operation(select_sse_result_or_cancel(
+            std::future::ready(Ok::<Value, String>(expected.clone())),
+            std::future::ready(()),
+        ));
+
+        assert_eq!(result, Ok(expected));
+    }
+
+    #[test]
+    fn sse_cancel_drops_stalled_request_before_returning() {
+        let server = CancellableSseServer::start();
         let transport = connect(&McpServerConfig {
-            name: "slow_sse".to_string(),
+            name: "cancellable_sse".to_string(),
             transport: McpTransportKind::Sse,
             command: None,
             args: Vec::new(),
@@ -1663,26 +1897,98 @@ done
         .expect("connect SSE MCP");
         transport.initialize().expect("initialize SSE MCP");
         transport.list_tools().expect("list SSE tools");
-        let handler = RecordingElicitationHandler::new(McpElicitationResponse::decline());
-
         let started = Instant::now();
         let result = transport.call_tool_with_elicitation_handler_or_cancel(
             "wait",
             Value::Object(Default::default()),
-            Some(&handler),
-            &|| started.elapsed() >= Duration::from_millis(100),
+            None,
+            &|| started.elapsed() >= Duration::from_millis(50),
         );
+        let cancellation_elapsed = started.elapsed();
+        // The fixture accepts serially, so this cannot complete until the stalled socket closes.
+        let second = transport
+            .call_tool("wait", Value::Object(Default::default()))
+            .expect("SSE transport remains usable after cancellation cleanup");
+        let reuse_elapsed = started.elapsed();
 
         assert!(
-            started.elapsed() < Duration::from_millis(750),
+            cancellation_elapsed < Duration::from_millis(750),
             "tool call took {:?}",
-            started.elapsed()
+            cancellation_elapsed
         );
         assert_eq!(result.unwrap_err(), "MCP tool call cancelled");
         assert!(
-            handler.requests.lock().unwrap().is_empty(),
-            "SSE transport does not support elicitation/create routing"
+            reuse_elapsed < Duration::from_millis(750),
+            "SSE transport was not reusable promptly after cancellation: {reuse_elapsed:?}"
         );
+        assert!(
+            server.first_tool_call_finished(),
+            "cancelled SSE request connection remained active"
+        );
+        assert_eq!(second["content"][0]["text"], "reconnected");
+    }
+
+    struct CancellableSseServer {
+        addr: std::net::SocketAddr,
+        first_finished: Arc<AtomicBool>,
+    }
+
+    impl CancellableSseServer {
+        fn start() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind cancellable SSE fixture");
+            let addr = listener.local_addr().expect("cancellable SSE fixture addr");
+            let first_finished = Arc::new(AtomicBool::new(false));
+            let finished_for_server = Arc::clone(&first_finished);
+            std::thread::spawn(move || {
+                let tool_calls = AtomicUsize::new(0);
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else {
+                        break;
+                    };
+                    let request = read_http_request(&mut stream);
+                    if request.contains(r#""method":"tools/call""#) {
+                        let call = tool_calls.fetch_add(1, Ordering::SeqCst);
+                        if call == 0 {
+                            stream
+                                .set_read_timeout(None)
+                                .expect("clear stalled request read timeout");
+                            let mut probe = [0u8; 1];
+                            while stream.read(&mut probe).is_ok_and(|read| read != 0) {}
+                            finished_for_server.store(true, Ordering::SeqCst);
+                        } else {
+                            write_json_response(
+                                &mut stream,
+                                r#"{"jsonrpc":"2.0","id":4,"result":{"content":[{"type":"text","text":"reconnected"}],"isError":false}}"#,
+                            );
+                        }
+                    } else if request.contains(r#""method":"tools/list""#) {
+                        write_json_response(
+                            &mut stream,
+                            r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"wait","description":"waits","inputSchema":{"type":"object","properties":{},"required":[]}}]}}"#,
+                        );
+                    } else if request.contains(r#""method":"initialize""#) {
+                        write_json_response(
+                            &mut stream,
+                            r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"cancellable_sse","version":"1"}}}"#,
+                        );
+                    } else {
+                        write_json_response(&mut stream, r#"{"jsonrpc":"2.0","result":{}}"#);
+                    }
+                }
+            });
+            Self {
+                addr,
+                first_finished,
+            }
+        }
+
+        fn url(&self) -> String {
+            format!("http://{}", self.addr)
+        }
+
+        fn first_tool_call_finished(&self) -> bool {
+            self.first_finished.load(Ordering::SeqCst)
+        }
     }
 
     #[test]
@@ -1937,5 +2243,15 @@ done
             .write_all(response.as_bytes())
             .expect("write response");
         let _ = stream.write_all(body);
+    }
+
+    #[cfg(unix)]
+    fn process_is_alive(pid: &str) -> bool {
+        Command::new("/bin/kill")
+            .args(["-0", pid])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
     }
 }

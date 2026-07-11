@@ -610,7 +610,11 @@ done
             "cancelled MCP call took {:?}",
             started.elapsed()
         );
-        assert_eq!(result.status, ToolStatus::Failed);
+        assert_eq!(result.status, ToolStatus::Cancelled);
+        assert_eq!(
+            result.kind,
+            orca_core::tool_types::ToolResultKind::Cancelled
+        );
         assert_eq!(result.error.as_deref(), Some("MCP tool call cancelled"));
     }
 

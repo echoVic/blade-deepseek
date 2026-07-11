@@ -170,21 +170,29 @@ pub fn execute_external_tool_with_policy_or_cancel(
     let ingress_truncated = output.output_was_omitted();
     let stdout = output.stdout_text();
     let stderr = output.stderr_text().trim().to_string();
-    if should_cancel() {
-        let detail = if stderr.is_empty() {
-            stdout.trim().to_string()
-        } else {
-            stderr
+    if output.termination == process::CommandTermination::Cancelled {
+        let stdout = stdout.trim();
+        let detail = match (stdout.is_empty(), stderr.is_empty()) {
+            (true, true) => String::new(),
+            (false, true) => stdout.to_string(),
+            (true, false) => stderr,
+            (false, false) => format!("{stdout}\n{stderr}"),
         };
-        return ToolResult::failed(
-            request,
-            if detail.is_empty() {
-                format!("external tool '{}' cancelled", config.name)
-            } else {
-                format!("external tool '{}' cancelled: {detail}", config.name)
-            },
-            output.status.code(),
+        let message = if detail.is_empty() {
+            format!("external tool '{}' cancelled", config.name)
+        } else {
+            format!("external tool '{}' cancelled: {detail}", config.name)
+        };
+        let (message, truncated) = truncate_output_with_policy(message, output_truncation);
+        let message = process::preserve_ingress_omission_notice(
+            message,
+            output
+                .stdout_omitted_bytes
+                .saturating_add(output.stderr_omitted_bytes),
         );
+        let mut result = ToolResult::cancelled(request, message, output.status.code());
+        result.set_truncated(ingress_truncated || truncated);
+        return result;
     }
     if output.status.success() && !output.timed_out {
         let (result_output, truncated) = truncate_output_with_policy(stdout, output_truncation);
@@ -193,45 +201,47 @@ pub fn execute_external_tool_with_policy_or_cancel(
         return ToolResult::completed(request, result_output, ingress_truncated || truncated);
     }
 
-    let detail = if stderr.is_empty() {
-        stdout.trim().to_string()
-    } else {
-        stderr
+    let stdout = stdout.trim();
+    let detail = match (stdout.is_empty(), stderr.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => stdout.to_string(),
+        (true, false) => stderr,
+        (false, false) => format!("{stdout}\n{stderr}"),
     };
-    let mut result = ToolResult::failed(
-        request,
-        if output.timed_out {
-            if detail.is_empty() {
-                format!(
-                    "external tool '{}' timed out after {}s",
-                    config.name,
-                    shell_timeout.as_secs()
-                )
-            } else {
-                format!(
-                    "external tool '{}' timed out after {}s: {detail}",
-                    config.name,
-                    shell_timeout.as_secs()
-                )
-            }
-        } else if detail.is_empty() {
+    let message = if output.timed_out {
+        if detail.is_empty() {
             format!(
-                "external tool '{}' exited with {}",
-                config.name, output.status
+                "external tool '{}' timed out after {}s",
+                config.name,
+                shell_timeout.as_secs()
             )
         } else {
             format!(
-                "external tool '{}' exited with {}: {detail}",
-                config.name, output.status
+                "external tool '{}' timed out after {}s: {detail}",
+                config.name,
+                shell_timeout.as_secs()
             )
-        },
-        if output.timed_out {
-            None
-        } else {
-            output.status.code()
-        },
+        }
+    } else if detail.is_empty() {
+        format!(
+            "external tool '{}' exited with {}",
+            config.name, output.status
+        )
+    } else {
+        format!(
+            "external tool '{}' exited with {}: {detail}",
+            config.name, output.status
+        )
+    };
+    let (message, truncated) = truncate_output_with_policy(message, output_truncation);
+    let message = process::preserve_ingress_omission_notice(
+        message,
+        output
+            .stdout_omitted_bytes
+            .saturating_add(output.stderr_omitted_bytes),
     );
-    result.set_truncated(ingress_truncated);
+    let mut result = ToolResult::failed(request, message, output.status.code());
+    result.set_truncated(ingress_truncated || truncated);
     result
 }
 
@@ -255,7 +265,8 @@ mod tests {
             name: "slow_tool".to_string(),
             description: "slow tool".to_string(),
             action_kind: ActionKind::Shell,
-            command: "printf before; sleep 5; printf after".to_string(),
+            command: "printf stdout-before; printf stderr-before >&2; sleep 5; printf after"
+                .to_string(),
             schema: serde_json::json!({}),
         };
         let request = ToolRequest {
@@ -279,6 +290,9 @@ mod tests {
             start.elapsed() < Duration::from_secs(2),
             "external tool should not wait for descendant processes"
         );
+        let error = result.error.as_deref().unwrap_or_default();
+        assert!(error.contains("stdout-before"), "missing stdout: {error}");
+        assert!(error.contains("stderr-before"), "missing stderr: {error}");
         assert_eq!(result.status, ToolStatus::Failed);
         let error = result.error.as_deref().unwrap_or_default();
         assert!(
@@ -289,6 +303,90 @@ mod tests {
         assert!(
             !error.contains("beforeafter"),
             "timeout should kill descendants before the trailing command runs: {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_tool_timeout_preserves_observed_exit_code() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = ExternalToolConfig {
+            name: "slow_tool".to_string(),
+            description: "slow tool".to_string(),
+            action_kind: ActionKind::Shell,
+            command: "trap 'exit 42' TERM; printf before; while :; do sleep 1; done".to_string(),
+            schema: serde_json::json!({}),
+        };
+        let request = ToolRequest {
+            id: "external-timeout-exit".to_string(),
+            name: ToolName::External("slow_tool".to_string()),
+            action: ActionKind::Shell,
+            target: None,
+            raw_arguments: Some("{}".to_string()),
+        };
+
+        let result = execute_external_tool_with_policy(
+            &config,
+            &request,
+            dir.path(),
+            ToolOutputTruncation::bytes(1024),
+            Duration::from_millis(200),
+        );
+
+        assert_eq!(result.status, ToolStatus::Failed);
+        assert_eq!(result.exit_code, Some(42));
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("before"))
+        );
+    }
+
+    #[test]
+    fn external_tool_failure_combines_and_truncates_diagnostics() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let stdout = format!("stdout-head:{}", "o".repeat(160));
+        let stderr = format!("{}:stderr-tail", "e".repeat(160));
+        let config = ExternalToolConfig {
+            name: "failing_tool".to_string(),
+            description: "failing tool".to_string(),
+            action_kind: ActionKind::Shell,
+            command: format!("printf {stdout:?}; printf {stderr:?} >&2; exit 7"),
+            schema: serde_json::json!({}),
+        };
+        let request = ToolRequest {
+            id: "external-failure".to_string(),
+            name: ToolName::External("failing_tool".to_string()),
+            action: ActionKind::Shell,
+            target: None,
+            raw_arguments: Some("{}".to_string()),
+        };
+
+        let result = execute_external_tool_with_policy(
+            &config,
+            &request,
+            dir.path(),
+            ToolOutputTruncation::bytes(180),
+            Duration::from_secs(5),
+        );
+
+        let error = result.error.as_deref().unwrap_or_default();
+        assert_eq!(result.status, ToolStatus::Failed);
+        assert_eq!(result.exit_code, Some(7));
+        assert!(result.truncated);
+        assert!(
+            error.len() <= 180,
+            "untruncated error length: {}",
+            error.len()
+        );
+        assert!(
+            error.contains("stdout-head"),
+            "missing stdout head: {error}"
+        );
+        assert!(
+            error.contains("stderr-tail"),
+            "missing stderr tail: {error}"
         );
     }
 
@@ -324,7 +422,11 @@ mod tests {
             start.elapsed() < Duration::from_secs(2),
             "cancelled external tool should not wait for the shell timeout"
         );
-        assert_eq!(result.status, ToolStatus::Failed);
+        assert_eq!(result.status, ToolStatus::Cancelled);
+        assert_eq!(
+            result.kind,
+            orca_core::tool_types::ToolResultKind::Cancelled
+        );
         assert!(
             result
                 .error

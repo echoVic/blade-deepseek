@@ -159,8 +159,17 @@ pub struct ShellSessionOutput {
     pub stderr: String,
     pub exit_code: Option<i32>,
     pub status: TaskStatus,
+    pub termination: ShellSessionTermination,
     pub requested_terminal: ShellTerminalMode,
     pub effective_terminal: ShellTerminalMode,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ShellSessionTermination {
+    Running,
+    Exited,
+    Cancelled,
+    TimedOut,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -474,7 +483,12 @@ impl RuntimeShellSessionManager {
                 return self.finish_terminal_session(id, status, remove_completed_output);
             }
             if session.output_size() > 0 || Instant::now() >= deadline {
-                return Ok(session.output(id, TaskStatus::Running, None));
+                return Ok(session.output(
+                    id,
+                    TaskStatus::Running,
+                    None,
+                    ShellSessionTermination::Running,
+                ));
             }
             thread::sleep(Duration::from_millis(10));
         }
@@ -516,7 +530,7 @@ impl RuntimeShellSessionManager {
                 return self.kill(id);
             }
             if Instant::now() >= deadline {
-                return self.kill(id);
+                return self.terminate(id, ShellSessionTermination::TimedOut);
             }
             thread::sleep(Duration::from_millis(25));
         }
@@ -533,6 +547,7 @@ impl RuntimeShellSessionManager {
                 TaskStatus::Failed
             },
             process_exit_code(status),
+            ShellSessionTermination::Exited,
         );
         Self::record_terminal_output(&tasks, &output)?;
         self.output_store.remove(&output.task_id);
@@ -540,9 +555,21 @@ impl RuntimeShellSessionManager {
     }
 
     pub fn kill(&mut self, id: &str) -> io::Result<ShellSessionOutput> {
+        self.terminate(id, ShellSessionTermination::Cancelled)
+    }
+
+    fn terminate(
+        &mut self,
+        id: &str,
+        termination: ShellSessionTermination,
+    ) -> io::Result<ShellSessionOutput> {
+        debug_assert!(matches!(
+            termination,
+            ShellSessionTermination::Cancelled | ShellSessionTermination::TimedOut
+        ));
         let mut session = self.take_session(id)?;
         let tasks = session.tasks.clone();
-        if let Some(status) = wait_for_output_or_exit(&mut session, Duration::from_millis(150))? {
+        if let Some(status) = wait_for_process_exit(&mut session, Duration::from_millis(150))? {
             session.join_readers();
             let output = session.output(
                 id,
@@ -552,6 +579,7 @@ impl RuntimeShellSessionManager {
                     TaskStatus::Failed
                 },
                 process_exit_code(status),
+                ShellSessionTermination::Exited,
             );
             Self::record_terminal_output(&tasks, &output)?;
             self.output_store.remove(&output.task_id);
@@ -560,7 +588,12 @@ impl RuntimeShellSessionManager {
         orca_tools::process::kill_child_tree(&mut session.child);
         let status = session.child.wait()?;
         session.join_readers();
-        let output = session.output(id, TaskStatus::Stopped, process_exit_code(status));
+        let output = session.output(
+            id,
+            TaskStatus::Stopped,
+            process_exit_code(status),
+            termination,
+        );
         tasks
             .stop(&output.task_id, output.stdout.clone())
             .map_err(io::Error::other)?;
@@ -571,34 +604,8 @@ impl RuntimeShellSessionManager {
     pub fn terminate_all(&mut self) {
         let ids = self.sessions.keys().cloned().collect::<Vec<_>>();
         for id in ids {
-            let _ = self.terminate(&id);
+            let _ = self.terminate(&id, ShellSessionTermination::Cancelled);
         }
-    }
-
-    fn terminate(&mut self, id: &str) -> io::Result<ShellSessionOutput> {
-        let mut session = self.take_session(id)?;
-        let tasks = session.tasks.clone();
-        session.stdin.close();
-        let natural_status = session.child.try_wait()?;
-        orca_tools::process::kill_child_tree(&mut session.child);
-        let waited_status = session.child.wait()?;
-        let status = natural_status.unwrap_or(waited_status);
-        let task_status = match natural_status {
-            Some(_) if status.success() => TaskStatus::Completed,
-            Some(_) => TaskStatus::Failed,
-            None => TaskStatus::Stopped,
-        };
-        session.join_readers();
-        let output = session.output(id, task_status, process_exit_code(status));
-        if natural_status.is_some() {
-            Self::record_terminal_output(&tasks, &output)?;
-        } else {
-            tasks
-                .stop(&output.task_id, output.stdout.clone())
-                .map_err(io::Error::other)?;
-        }
-        self.output_store.remove(&output.task_id);
-        Ok(output)
     }
 
     fn finish_terminal_session(
@@ -618,6 +625,7 @@ impl RuntimeShellSessionManager {
                 TaskStatus::Failed
             },
             process_exit_code(status),
+            ShellSessionTermination::Exited,
         );
         Self::record_terminal_output(&tasks, &output)?;
         if remove_completed_output {
@@ -676,7 +684,13 @@ impl ShellSession {
         }
     }
 
-    fn output(&self, id: &str, status: TaskStatus, exit_code: Option<i32>) -> ShellSessionOutput {
+    fn output(
+        &self,
+        id: &str,
+        status: TaskStatus,
+        exit_code: Option<i32>,
+        termination: ShellSessionTermination,
+    ) -> ShellSessionOutput {
         let output = self
             .output_store
             .read_delta(&self.task_id, 0, usize::MAX)
@@ -702,6 +716,7 @@ impl ShellSession {
             stderr,
             exit_code,
             status,
+            termination,
             requested_terminal: self.requested_terminal,
             effective_terminal: self.effective_terminal,
         }
@@ -1062,7 +1077,7 @@ fn set_nonblocking(reader: &impl AsRawFd) -> io::Result<()> {
     Ok(())
 }
 
-fn wait_for_output_or_exit(
+fn wait_for_process_exit(
     session: &mut ShellSession,
     timeout: Duration,
 ) -> io::Result<Option<std::process::ExitStatus>> {
@@ -1070,9 +1085,6 @@ fn wait_for_output_or_exit(
         .checked_add(timeout)
         .unwrap_or_else(Instant::now);
     loop {
-        if session.output_size() > 0 {
-            return Ok(None);
-        }
         if let Some(status) = session.child.try_wait()? {
             return Ok(Some(status));
         }

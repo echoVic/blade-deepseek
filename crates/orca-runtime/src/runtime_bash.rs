@@ -21,7 +21,8 @@ use crate::sandbox_denial::{
     should_request_filesystem_permission_with_denied_roots,
 };
 use crate::shell_session::{
-    RuntimeShellSessionManager, ShellSandboxMode, ShellSessionCommand, ShellTerminalMode,
+    RuntimeShellSessionManager, ShellSandboxMode, ShellSessionCommand, ShellSessionTermination,
+    ShellTerminalMode,
 };
 use crate::tasks::TaskRegistry;
 
@@ -77,7 +78,7 @@ pub(crate) fn execute_bash_with_shell_session(
             task_registry,
             cancel,
         })
-        .into_tool_result(request, output_truncation, cancel, task_registry);
+        .into_tool_result(request, output_truncation, shell_timeout_secs);
     };
     let mut sandbox = match bash_sandbox_from_active_permission_profile(config, cwd) {
         Ok(sandbox) => sandbox,
@@ -145,7 +146,7 @@ pub(crate) fn execute_bash_with_shell_session(
             cancel,
         })
         .output
-        .into_tool_result(request, output_truncation, cancel, task_registry);
+        .into_tool_result(request, output_truncation, shell_timeout_secs);
     }
     if let Some(diagnostic) = output.sandbox_denial_diagnostic(cwd) {
         if should_request_filesystem_permission_with_denied_roots(
@@ -193,7 +194,7 @@ pub(crate) fn execute_bash_with_shell_session(
             })
             .output
             .with_sandbox_diagnostic(cwd)
-            .into_tool_result(request, output_truncation, cancel, task_registry);
+            .into_tool_result(request, output_truncation, shell_timeout_secs);
         }
         if let Some(permission_prompt) =
             RuntimeBashPermissionPolicy::unsandboxed_shell_prompt(&request.id, &diagnostic)
@@ -227,16 +228,15 @@ pub(crate) fn execute_bash_with_shell_session(
                 cancel,
             })
             .with_sandbox_diagnostic(cwd)
-            .into_tool_result(request, output_truncation, cancel, task_registry);
+            .into_tool_result(request, output_truncation, shell_timeout_secs);
         }
         return output.with_diagnostic(diagnostic).into_tool_result(
             request,
             output_truncation,
-            cancel,
-            task_registry,
+            shell_timeout_secs,
         );
     }
-    output.into_tool_result(request, output_truncation, cancel, task_registry)
+    output.into_tool_result(request, output_truncation, shell_timeout_secs)
 }
 
 fn bash_sandbox_from_active_permission_profile(
@@ -253,7 +253,6 @@ struct BashExecutionResult {
 
 struct BashShellOutput {
     output: Result<crate::shell_session::ShellSessionOutput, String>,
-    task_id: Option<String>,
 }
 
 struct RuntimeBashSandboxContext<'a> {
@@ -381,8 +380,7 @@ impl BashShellOutput {
         self,
         request: &ToolRequest,
         output_truncation: ToolOutputTruncation,
-        cancel: Option<&CancelToken>,
-        task_registry: &TaskRegistry,
+        shell_timeout_secs: u64,
     ) -> ToolResult {
         let output = match self.output {
             Ok(output) => output,
@@ -390,12 +388,7 @@ impl BashShellOutput {
         };
         let stdout = output.stdout.trim_end().to_string();
         let stderr = output.stderr.trim_end().to_string();
-        if cancel.is_some_and(CancelToken::is_cancelled)
-            || self
-                .task_id
-                .as_deref()
-                .is_some_and(|task_id| task_registry.is_cancelled(task_id))
-        {
+        if output.termination == ShellSessionTermination::Cancelled {
             let message = if stderr.is_empty() && stdout.is_empty() {
                 "shell command cancelled".to_string()
             } else if stderr.is_empty() {
@@ -404,6 +397,23 @@ impl BashShellOutput {
                 format!("shell command cancelled: {stderr}")
             } else {
                 format!("shell command cancelled: {stdout}\n{stderr}")
+            };
+            let (message, truncated) =
+                orca_core::tool_types::truncate_output_with_policy(message, output_truncation);
+            let mut result = ToolResult::cancelled(request, message, output.exit_code);
+            result.set_truncated(truncated);
+            return result;
+        }
+        if output.termination == ShellSessionTermination::TimedOut {
+            let timeout_secs = shell_timeout_secs.max(1);
+            let message = if stderr.is_empty() && stdout.is_empty() {
+                format!("shell command timed out after {timeout_secs}s")
+            } else if stderr.is_empty() {
+                format!("shell command timed out after {timeout_secs}s: {stdout}")
+            } else if stdout.is_empty() {
+                format!("shell command timed out after {timeout_secs}s: {stderr}")
+            } else {
+                format!("shell command timed out after {timeout_secs}s: {stdout}\n{stderr}")
             };
             let (message, truncated) =
                 orca_core::tool_types::truncate_output_with_policy(message, output_truncation);
@@ -481,7 +491,6 @@ fn execute_bash_with_sandbox(context: RuntimeBashSandboxContext<'_>) -> BashExec
                 return BashExecutionResult {
                     output: BashShellOutput {
                         output: Err(format!("failed to start network proxy: {error}")),
-                        task_id: None,
                     },
                     network_block: None,
                 };
@@ -543,7 +552,6 @@ fn execute_bash_once(context: RuntimeBashOnceContext<'_>) -> BashShellOutput {
         Err(error) => {
             return BashShellOutput {
                 output: Err(format!("failed to run shell command: {error}")),
-                task_id: None,
             };
         }
     };
@@ -559,10 +567,7 @@ fn execute_bash_once(context: RuntimeBashOnceContext<'_>) -> BashShellOutput {
         Ok(output) => Ok(output),
         Err(error) => Err(format!("failed to wait for shell command: {error}")),
     };
-    BashShellOutput {
-        output,
-        task_id: Some(handle.task_id),
-    }
+    BashShellOutput { output }
 }
 
 #[cfg(test)]
