@@ -2007,10 +2007,18 @@ fn activity_line(state: &AppState, theme: &Theme) -> Option<(String, ratatui::st
     match &state.status {
         AppStatus::Idle | AppStatus::Setup | AppStatus::SessionPicker => None,
         AppStatus::Running => {
-            let elapsed = state
+            let live_elapsed = state
                 .running_started_at
-                .map(|started| format_elapsed_compact(started.elapsed().as_secs()))
-                .unwrap_or_else(|| "0s".to_string());
+                .map(|started| started.elapsed().as_secs())
+                .unwrap_or_default();
+            let persisted_goal_elapsed = state
+                .current_goal
+                .as_ref()
+                .filter(|goal| goal.status.should_continue())
+                .map(|goal| goal.time_used_seconds.max(0) as u64)
+                .unwrap_or_default();
+            let elapsed =
+                format_elapsed_compact(persisted_goal_elapsed.saturating_add(live_elapsed));
             Some((format!("● running {elapsed}"), theme.warning))
         }
         AppStatus::Compacting => Some(("● Compacting context...".to_string(), theme.warning)),
@@ -2914,6 +2922,7 @@ mod tests {
     use crate::types::TuiEvent;
     use chrono::Utc;
     use orca_core::config::AdditionalWorkingDirectory;
+    use orca_core::goal_types::{ThreadGoal, ThreadGoalStatus};
     use orca_runtime::history::SessionSummary;
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
@@ -2951,6 +2960,19 @@ mod tests {
             "deepseek".to_string(),
             "/tmp".to_string(),
         )
+    }
+
+    fn goal_with_elapsed(status: ThreadGoalStatus, time_used_seconds: i64) -> ThreadGoal {
+        ThreadGoal {
+            session_id: "goal-session".to_string(),
+            objective: "finish the migration".to_string(),
+            status,
+            token_budget: None,
+            tokens_used: 42,
+            time_used_seconds,
+            created_at: 1,
+            updated_at: 2,
+        }
     }
 
     fn session_summary(id: &str, title: &str) -> SessionSummary {
@@ -3316,6 +3338,77 @@ mod tests {
         let (text, color) = activity_line(&state, &theme).expect("running shows an activity line");
         assert_eq!(text, "● running 1m 05s");
         assert_eq!(color, theme.warning);
+    }
+
+    #[test]
+    fn active_goal_activity_line_adds_persisted_and_live_elapsed_time() {
+        let mut state = test_state();
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        state.status = AppStatus::Running;
+        state.current_goal = Some(goal_with_elapsed(ThreadGoalStatus::Active, 13 * 60));
+        state.running_started_at = Some(Instant::now() - Duration::from_secs(10));
+
+        let (text, color) = activity_line(&state, &theme).expect("running shows an activity line");
+
+        assert_eq!(text, "● running 13m 10s");
+        assert_eq!(color, theme.warning);
+    }
+
+    #[test]
+    fn active_goal_activity_line_never_decreases_across_continuations() {
+        let mut state = test_state();
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        state.status = AppStatus::Running;
+        state.current_goal = Some(goal_with_elapsed(ThreadGoalStatus::Active, 13 * 60));
+        state.running_started_at = Some(Instant::now() - Duration::from_secs(10));
+        let first = activity_line(&state, &theme).unwrap().0;
+
+        state.update(TuiEvent::SessionCompleted {
+            status: "success".to_string(),
+        });
+        state.update(TuiEvent::GoalStatus(Some(goal_with_elapsed(
+            ThreadGoalStatus::Active,
+            13 * 60 + 20,
+        ))));
+        state.update(TuiEvent::TurnStarted {
+            turn: 2,
+            task: None,
+        });
+        state.running_started_at = Some(Instant::now() - Duration::from_secs(5));
+        let second = activity_line(&state, &theme).unwrap().0;
+
+        assert_eq!(first, "● running 13m 10s");
+        assert_eq!(second, "● running 13m 25s");
+    }
+
+    #[test]
+    fn inactive_goal_does_not_change_the_current_turn_timer() {
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        for status in [
+            ThreadGoalStatus::Paused,
+            ThreadGoalStatus::Blocked,
+            ThreadGoalStatus::UsageLimited,
+            ThreadGoalStatus::BudgetLimited,
+            ThreadGoalStatus::Complete,
+        ] {
+            let mut state = test_state();
+            state.status = AppStatus::Running;
+            state.current_goal = Some(goal_with_elapsed(status, 13 * 60));
+            state.running_started_at = Some(Instant::now() - Duration::from_secs(10));
+
+            assert_eq!(activity_line(&state, &theme).unwrap().0, "● running 10s");
+        }
+    }
+
+    #[test]
+    fn active_goal_activity_line_clamps_negative_persisted_time() {
+        let mut state = test_state();
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        state.status = AppStatus::Running;
+        state.current_goal = Some(goal_with_elapsed(ThreadGoalStatus::Active, -20));
+        state.running_started_at = Some(Instant::now() - Duration::from_secs(10));
+
+        assert_eq!(activity_line(&state, &theme).unwrap().0, "● running 10s");
     }
 
     #[test]
