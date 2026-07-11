@@ -7,6 +7,10 @@ pub mod summary_cache;
 pub mod system_prompt;
 pub mod tool_schema;
 
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
+
 use orca_core::approval_types::ActionKind;
 use orca_core::cancel::CancelToken;
 use orca_core::config::{ProviderKind, ReasoningEffort};
@@ -89,6 +93,79 @@ pub fn call_streaming(
     cancel: &CancelToken,
     on_step: &mut dyn FnMut(&ProviderStep),
 ) -> ProviderResponse {
+    let conversation = conversation.clone();
+    let config = config.clone();
+    let worker_cancel = cancel.clone();
+    let guard_cancel = cancel.clone();
+    let (step_tx, step_rx) = mpsc::sync_channel(0);
+    let worker = match thread::Builder::new()
+        .name("orca-provider-stream".to_string())
+        .spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    let response = provider_worker_error(format!(
+                        "failed to start async provider runtime: {error}"
+                    ));
+                    send_response_steps(&step_tx, &worker_cancel, &response);
+                    return response;
+                }
+            };
+            let step_cancel = worker_cancel.clone();
+            runtime.block_on(call_streaming_async(
+                kind,
+                &conversation,
+                &config,
+                &worker_cancel,
+                move |step| {
+                    let _ = send_worker_step(&step_tx, &step_cancel, step);
+                },
+            ))
+        }) {
+        Ok(worker) => worker,
+        Err(error) => {
+            let response =
+                provider_worker_error(format!("failed to start provider worker: {error}"));
+            send_response_steps_to_callback(&response, on_step);
+            return response;
+        }
+    };
+    let worker = JoinedProviderWorker::new(worker, guard_cancel);
+
+    let callback_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        while let Ok(delivery) = step_rx.recv() {
+            on_step(&delivery.step);
+            let _ = delivery.acknowledged.send(());
+        }
+    }));
+    if let Err(payload) = callback_result {
+        drop(step_rx);
+        worker.cancel();
+        let _ = worker.join();
+        std::panic::resume_unwind(payload);
+    }
+    drop(step_rx);
+
+    match worker.join() {
+        Ok(response) => response,
+        Err(_) => {
+            let response = provider_worker_error("provider worker panicked".to_string());
+            send_response_steps_to_callback(&response, on_step);
+            response
+        }
+    }
+}
+
+pub async fn call_streaming_async(
+    kind: ProviderKind,
+    conversation: &Conversation,
+    config: &ProviderConfig,
+    cancel: &CancelToken,
+    mut on_step: impl FnMut(&ProviderStep) + Send,
+) -> ProviderResponse {
     match kind {
         ProviderKind::Mock => {
             if conversation
@@ -106,8 +183,7 @@ pub fn call_streaming(
                 let started =
                     ProviderStep::MessageDelta("Mock slow tool stream started.".to_string());
                 on_step(&started);
-                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
-                if cancel.is_cancelled() {
+                if !sleep_with_cancel(Duration::from_millis(delay_ms), cancel).await {
                     return ProviderResponse {
                         steps: vec![started],
                         assistant_content: Some("Mock slow tool stream started.".to_string()),
@@ -134,8 +210,7 @@ pub fn call_streaming(
             if let Some(delay_ms) = mock_stream_delay_ms(conversation) {
                 let started = ProviderStep::MessageDelta("Mock slow stream started.".to_string());
                 on_step(&started);
-                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
-                if cancel.is_cancelled() {
+                if !sleep_with_cancel(Duration::from_millis(delay_ms), cancel).await {
                     return ProviderResponse {
                         steps: vec![started],
                         assistant_content: Some("Mock slow stream started.".to_string()),
@@ -171,7 +246,110 @@ pub fn call_streaming(
             response
         }
         ProviderKind::DeepSeek => {
-            deepseek_http::call_streaming(conversation, config, cancel, on_step)
+            deepseek_http::call_streaming_async(conversation, config, cancel, on_step).await
+        }
+    }
+}
+
+async fn sleep_with_cancel(delay: Duration, cancel: &CancelToken) -> bool {
+    tokio::select! {
+        biased;
+        _ = http_client::wait_for_cancel(cancel) => false,
+        _ = tokio::time::sleep(delay) => true,
+    }
+}
+
+fn provider_worker_error(message: String) -> ProviderResponse {
+    ProviderResponse {
+        steps: vec![ProviderStep::Error(format!(
+            "provider worker error: {message}"
+        ))],
+        assistant_content: None,
+        assistant_reasoning: None,
+        tool_calls: Vec::new(),
+        usage: None,
+    }
+}
+
+struct ProviderWorkerStep {
+    step: ProviderStep,
+    acknowledged: mpsc::SyncSender<()>,
+}
+
+fn send_worker_step(
+    sender: &mpsc::SyncSender<ProviderWorkerStep>,
+    cancel: &CancelToken,
+    step: &ProviderStep,
+) -> bool {
+    if cancel.is_cancelled() {
+        return false;
+    }
+    let (acknowledged, acknowledgement) = mpsc::sync_channel(0);
+    if sender
+        .send(ProviderWorkerStep {
+            step: step.clone(),
+            acknowledged,
+        })
+        .is_err()
+    {
+        cancel.cancel();
+        return false;
+    }
+    if acknowledgement.recv().is_err() {
+        cancel.cancel();
+        return false;
+    }
+    !cancel.is_cancelled()
+}
+
+fn send_response_steps(
+    sender: &mpsc::SyncSender<ProviderWorkerStep>,
+    cancel: &CancelToken,
+    response: &ProviderResponse,
+) {
+    for step in &response.steps {
+        if !send_worker_step(sender, cancel, step) {
+            break;
+        }
+    }
+}
+
+fn send_response_steps_to_callback(
+    response: &ProviderResponse,
+    on_step: &mut dyn FnMut(&ProviderStep),
+) {
+    for step in &response.steps {
+        on_step(step);
+    }
+}
+
+struct JoinedProviderWorker {
+    handle: Option<thread::JoinHandle<ProviderResponse>>,
+    cancel: CancelToken,
+}
+
+impl JoinedProviderWorker {
+    fn new(handle: thread::JoinHandle<ProviderResponse>, cancel: CancelToken) -> Self {
+        Self {
+            handle: Some(handle),
+            cancel,
+        }
+    }
+
+    fn join(mut self) -> thread::Result<ProviderResponse> {
+        self.handle.take().expect("provider worker handle").join()
+    }
+
+    fn cancel(&self) {
+        self.cancel.cancel();
+    }
+}
+
+impl Drop for JoinedProviderWorker {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            self.cancel.cancel();
+            let _ = handle.join();
         }
     }
 }
@@ -1405,6 +1583,107 @@ mod tests {
         assert_eq!(
             response.assistant_content.as_deref(),
             Some("Mock slow stream started.Mock slow stream completed.")
+        );
+    }
+
+    #[test]
+    fn synchronous_streaming_facade_invokes_callbacks_on_the_calling_thread() {
+        let mut conversation = Conversation::new();
+        conversation.add_user("mock_stream_delay_ms 1".to_string());
+        let config = ProviderConfig {
+            api_key: None,
+            base_url: None,
+            model: None,
+            reasoning_effort: ReasoningEffort::Max,
+            tools_override: None,
+            mcp_registry: None,
+            external_tools: Vec::new(),
+        };
+        let cancel = CancelToken::new();
+        let caller = std::thread::current().id();
+        let mut callback_threads = Vec::new();
+
+        let response = call_streaming(
+            ProviderKind::Mock,
+            &conversation,
+            &config,
+            &cancel,
+            &mut |_| callback_threads.push(std::thread::current().id()),
+        );
+
+        assert!(!callback_threads.is_empty());
+        assert!(callback_threads.iter().all(|thread| *thread == caller));
+        assert!(response.assistant_content.is_some());
+    }
+
+    #[test]
+    fn synchronous_streaming_facade_callback_panic_cancels_and_joins_worker() {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut conversation = Conversation::new();
+            conversation.add_user("inspect the repository".to_string());
+            let config = ProviderConfig {
+                api_key: None,
+                base_url: None,
+                model: None,
+                reasoning_effort: ReasoningEffort::Max,
+                tools_override: None,
+                mcp_registry: None,
+                external_tools: Vec::new(),
+            };
+            let cancel = CancelToken::new();
+
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                call_streaming(
+                    ProviderKind::DeepSeekFixture,
+                    &conversation,
+                    &config,
+                    &cancel,
+                    &mut |_| panic!("callback panic"),
+                )
+            }));
+            let _ = done_tx.send(result.is_err());
+        });
+
+        assert_eq!(
+            done_rx.recv_timeout(Duration::from_millis(500)),
+            Ok(true),
+            "callback panic must close the step receiver and join the provider worker"
+        );
+    }
+
+    #[test]
+    fn synchronous_streaming_facade_joins_after_mock_cancellation() {
+        let mut conversation = Conversation::new();
+        conversation.add_user("mock_stream_delay_ms 1000".to_string());
+        let config = ProviderConfig {
+            api_key: None,
+            base_url: None,
+            model: None,
+            reasoning_effort: ReasoningEffort::Max,
+            tools_override: None,
+            mcp_registry: None,
+            external_tools: Vec::new(),
+        };
+        let cancel = CancelToken::new();
+        let cancel_from_callback = cancel.clone();
+        let started = std::time::Instant::now();
+
+        let response = call_streaming(
+            ProviderKind::Mock,
+            &conversation,
+            &config,
+            &cancel,
+            &mut |_| cancel_from_callback.cancel(),
+        );
+
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "cancelled mock stream must not wait for the full delay"
+        );
+        assert_eq!(
+            response.assistant_content.as_deref(),
+            Some("Mock slow stream started.")
         );
     }
 

@@ -19,6 +19,7 @@ const DEFAULT_MODEL: &str = "deepseek-v4-flash";
 const DEFAULT_CHAT_MAX_TOKENS: u32 = 128_000;
 const DEEPSEEK_MAX_TOOLS: usize = 128;
 const EMPTY_RESPONSE_RETRIES: usize = 1;
+const STREAM_INTEGRITY_RETRIES: usize = 1;
 const EMPTY_RESPONSE_ERROR: &str = "response did not contain content or tool calls";
 
 /// DeepSeek strict function calling (Beta) is only served on the /beta endpoint.
@@ -214,13 +215,13 @@ pub fn call(conversation: &Conversation, config: &ProviderConfig) -> ProviderRes
     }
 }
 
-pub fn call_streaming(
+pub async fn call_streaming_async(
     conversation: &Conversation,
     config: &ProviderConfig,
     cancel: &CancelToken,
-    on_step: &mut dyn FnMut(&ProviderStep),
+    mut on_step: impl FnMut(&ProviderStep),
 ) -> ProviderResponse {
-    match request_chat_streaming(conversation, config, cancel, on_step) {
+    match request_chat_streaming(conversation, config, cancel, &mut on_step).await {
         Ok(response) => response,
         Err(error) => {
             let step = ProviderStep::Error(format!("DeepSeek provider error: {error}"));
@@ -236,11 +237,11 @@ pub fn call_streaming(
     }
 }
 
-fn request_chat_streaming(
+async fn request_chat_streaming(
     conversation: &Conversation,
     config: &ProviderConfig,
     cancel: &CancelToken,
-    on_step: &mut dyn FnMut(&ProviderStep),
+    on_step: &mut impl FnMut(&ProviderStep),
 ) -> Result<ProviderResponse, String> {
     let api_key = config.api_key.as_deref().ok_or_else(|| {
         "DEEPSEEK_API_KEY is required (set via env var or ~/.orca/auth.json)".to_string()
@@ -248,6 +249,7 @@ fn request_chat_streaming(
     let base_url = config.base_url.as_deref().unwrap_or(DEFAULT_BASE_URL);
     let model = config.model.as_deref().unwrap_or(DEFAULT_MODEL);
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+    let streaming_client = crate::http_client::streaming_client()?;
 
     let messages = conversation_to_api_messages(conversation);
     let tools = config.tools_override.clone().unwrap_or_else(|| {
@@ -272,36 +274,60 @@ fn request_chat_streaming(
         reasoning_effort: Some(config.reasoning_effort),
     };
 
-    for empty_attempt in 0..=EMPTY_RESPONSE_RETRIES {
-        let response = match crate::http_client::execute_streaming_with_retry(|client| {
-            client.post(&url).bearer_auth(api_key).json(&request)
-        }) {
+    let mut empty_response_retries = 0;
+    let mut stream_integrity_retries = 0;
+    loop {
+        let response = match crate::http_client::execute_streaming_with_retry(
+            &streaming_client,
+            |client| client.post(&url).bearer_auth(api_key).json(&request),
+            cancel,
+        )
+        .await
+        {
             Ok(response) => response,
             // Strict mode is Beta; if the server rejects the strict schema, retry
             // once with the plain tool list rather than failing the whole turn.
             Err(error) if strict_applied && is_strict_schema_rejection(&error) => {
                 request.tools = Some(tools.clone());
-                crate::http_client::execute_streaming_with_retry(|client| {
-                    client.post(&url).bearer_auth(api_key).json(&request)
-                })?
+                crate::http_client::execute_streaming_with_retry(
+                    &streaming_client,
+                    |client| client.post(&url).bearer_auth(api_key).json(&request),
+                    cancel,
+                )
+                .await?
             }
             Err(error) => return Err(error),
         };
 
         let mut steps = Vec::new();
+        let mut emitted_step = false;
 
-        let stream_result = crate::streaming::parse_sse_stream_with_idle_timeout(
+        let stream_result = match crate::streaming::parse_sse_response(
             response,
             cancel,
             crate::http_client::streaming_idle_read_timeout(),
             |delta| {
                 let step = provider_step_from_stream_event(delta);
+                emitted_step = true;
                 on_step(&step);
                 if stream_step_belongs_in_response_steps(&step) {
                     steps.push(step);
                 }
             },
-        )?;
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(error)
+                if !emitted_step
+                    && stream_integrity_retries < STREAM_INTEGRITY_RETRIES
+                    && crate::streaming::is_stream_integrity_error(&error) =>
+            {
+                stream_integrity_retries += 1;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
 
         match stream_result.finish_reason.as_deref() {
             Some("length") => {
@@ -373,7 +399,8 @@ fn request_chat_streaming(
                 .iter()
                 .any(|step| matches!(step, ProviderStep::Error(_)))
         {
-            if empty_attempt < EMPTY_RESPONSE_RETRIES {
+            if empty_response_retries < EMPTY_RESPONSE_RETRIES {
+                empty_response_retries += 1;
                 continue;
             }
             return Err(EMPTY_RESPONSE_ERROR.to_string());
@@ -387,8 +414,6 @@ fn request_chat_streaming(
             usage: stream_result.usage,
         });
     }
-
-    Err(EMPTY_RESPONSE_ERROR.to_string())
 }
 
 fn provider_step_from_stream_event(delta: crate::streaming::StreamEvent<'_>) -> ProviderStep {
@@ -562,9 +587,6 @@ fn parse_tool_call(
     tc: &ApiToolCallResponse,
     external_tools: &[orca_core::external_config::ExternalToolConfig],
 ) -> Result<ToolRequest, String> {
-    let args: Value = serde_json::from_str(&tc.function.arguments)
-        .map_err(|e| format!("invalid arguments JSON: {e}"))?;
-
     let schema_name = tc.function.name.as_str();
     // ToolName::from_str has a catch-all that wraps unknown names as External(...),
     // so we must gate on the registry to reject truly unknown tools.
@@ -582,34 +604,38 @@ fn parse_tool_call(
         .resolve(schema_name)
         .map(|resolved| resolved.spec.capabilities.action_kind())
         .unwrap_or(ActionKind::Read);
-    let target = match schema_name {
-        "read_file" => args["path"].as_str().map(String::from),
-        "list_files" => args["path"]
-            .as_str()
-            .map(String::from)
-            .or(Some(".".to_string())),
-        "glob" => args["path"]
-            .as_str()
-            .map(String::from)
-            .or(Some(".".to_string())),
-        "grep" => args["pattern"].as_str().map(String::from),
-        "bash" => args["command"].as_str().map(String::from),
-        "edit" => args["path"].as_str().map(String::from),
-        "write_file" => args["path"].as_str().map(String::from),
-        "git_status" => Some(".".to_string()),
-        "subagent" => args["description"]
-            .as_str()
-            .map(String::from)
-            .or_else(|| args["prompt"].as_str().map(String::from)),
-        "web_search" => args["query"].as_str().map(String::from),
-        "update_plan" => {
-            let count = args["plan"].as_array().map(|plan| plan.len()).unwrap_or(0);
-            Some(format!("{count} items"))
-        }
-        other if other.starts_with("mcp__") => Some(other.to_string()),
-        other if external_tools.iter().any(|tool| tool.name == other) => Some(other.to_string()),
-        _ => None,
-    };
+    let target = serde_json::from_str::<Value>(&tc.function.arguments)
+        .ok()
+        .and_then(|args| match schema_name {
+            "read_file" => args["path"].as_str().map(String::from),
+            "list_files" => args["path"]
+                .as_str()
+                .map(String::from)
+                .or(Some(".".to_string())),
+            "glob" => args["path"]
+                .as_str()
+                .map(String::from)
+                .or(Some(".".to_string())),
+            "grep" => args["pattern"].as_str().map(String::from),
+            "bash" => args["command"].as_str().map(String::from),
+            "edit" => args["path"].as_str().map(String::from),
+            "write_file" => args["path"].as_str().map(String::from),
+            "git_status" => Some(".".to_string()),
+            "subagent" => args["description"]
+                .as_str()
+                .map(String::from)
+                .or_else(|| args["prompt"].as_str().map(String::from)),
+            "web_search" => args["query"].as_str().map(String::from),
+            "update_plan" => {
+                let count = args["plan"].as_array().map(|plan| plan.len()).unwrap_or(0);
+                Some(format!("{count} items"))
+            }
+            other if other.starts_with("mcp__") => Some(other.to_string()),
+            other if external_tools.iter().any(|tool| tool.name == other) => {
+                Some(other.to_string())
+            }
+            _ => None,
+        });
 
     Ok(ToolRequest {
         id: tc.id.clone(),
@@ -791,7 +817,8 @@ mod tests {
     use orca_core::tool_types::ToolName;
     use std::io::{Read, Write};
     use std::net::TcpListener;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, mpsc};
+    use std::time::{Duration, Instant};
 
     fn make_tc(name: &str, arguments: &str) -> ApiToolCallResponse {
         ApiToolCallResponse {
@@ -865,6 +892,29 @@ mod tests {
         let captured = Arc::clone(&bodies);
         std::thread::spawn(move || {
             for _ in 0..=EMPTY_RESPONSE_RETRIES {
+                let (mut stream, _) = listener.accept().expect("accept request");
+                let body = read_http_request_body(&mut stream);
+                captured.lock().expect("lock captured bodies").push(body);
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    response.len(),
+                    response
+                );
+                stream.write_all(reply.as_bytes()).expect("write response");
+            }
+        });
+        (base_url, bodies)
+    }
+
+    fn spawn_streaming_response_sequence_server(
+        responses: Vec<&'static str>,
+    ) -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let base_url = format!("http://{}", listener.local_addr().expect("local addr"));
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&bodies);
+        std::thread::spawn(move || {
+            for response in responses {
                 let (mut stream, _) = listener.accept().expect("accept request");
                 let body = read_http_request_body(&mut stream);
                 captured.lock().expect("lock captured bodies").push(body);
@@ -1190,10 +1240,13 @@ mod tests {
     }
 
     #[test]
-    fn parse_invalid_json_returns_error() {
-        let tc = make_tc("read_file", "not json");
-        let err = parse_tool_call(&tc, &[]).unwrap_err();
-        assert!(err.contains("invalid arguments JSON"));
+    fn parse_invalid_json_preserves_known_tool_call() {
+        let tc = make_tc("write_file", r#"{"path":"note.txt","content":"partial"#);
+        let request = parse_tool_call(&tc, &[]).expect("known tool should reach validation");
+
+        assert_eq!(request.name, ToolName::WriteFile);
+        assert!(request.target.is_none());
+        assert_eq!(request.raw_arguments, Some(tc.function.arguments));
     }
 
     #[test]
@@ -1451,8 +1504,8 @@ mod tests {
         assert_eq!(bodies.lock().expect("lock captured bodies").len(), 2);
     }
 
-    #[test]
-    fn streaming_reasoning_only_response_is_rejected() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn streaming_reasoning_only_response_is_rejected() {
         let reasoning_only = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking\"},\"finish_reason\":null}]}\n\n\
                               data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
                               data: [DONE]\n\n";
@@ -1471,10 +1524,376 @@ mod tests {
         let cancel = CancelToken::new();
 
         let error = request_chat_streaming(&conversation, &config, &cancel, &mut |_| {})
+            .await
             .expect_err("reasoning-only is invalid");
 
         assert_eq!(error, EMPTY_RESPONSE_ERROR);
         assert_eq!(bodies.lock().expect("lock captured bodies").len(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn streaming_invalid_tool_arguments_are_returned_for_tool_failure() {
+        let incomplete = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_incomplete\",\"function\":{\"name\":\"write_file\",\"arguments\":\"{\\\"path\\\":\\\"src/main.rs\\\",\\\"content\\\":\\\"partial\"}}]},\"finish_reason\":null}]}\n\n\
+                          data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n\
+                          data: [DONE]\n\n";
+        let (base_url, bodies) = spawn_streaming_response_sequence_server(vec![incomplete]);
+        let mut conversation = Conversation::new();
+        conversation.add_user("write the file".to_string());
+        let config = ProviderConfig {
+            api_key: Some("test-key".to_string()),
+            base_url: Some(base_url),
+            model: Some("deepseek-v4-pro".to_string()),
+            reasoning_effort: orca_core::config::ReasoningEffort::default(),
+            tools_override: None,
+            mcp_registry: None,
+            external_tools: Vec::new(),
+        };
+        let cancel = CancelToken::new();
+
+        let response = request_chat_streaming(&conversation, &config, &cancel, &mut |_| {})
+            .await
+            .expect("invalid tool arguments should remain a tool call");
+
+        assert_eq!(bodies.lock().expect("lock captured bodies").len(), 1);
+        assert!(matches!(
+            response.steps.as_slice(),
+            [ProviderStep::ToolCall(request)]
+                if request.id == "call_incomplete"
+                    && request.target.is_none()
+                    && request.raw_arguments.as_deref()
+                        == Some("{\"path\":\"src/main.rs\",\"content\":\"partial")
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn streaming_premature_eof_without_visible_delta_retries_once() {
+        let premature = "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":0,\"total_tokens\":1}}\n\n";
+        let complete = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_complete\",\"function\":{\"name\":\"write_file\",\"arguments\":\"{\\\"path\\\":\\\"src/main.rs\\\",\\\"content\\\":\\\"done\\\"}\"}}]},\"finish_reason\":null}]}\n\n\
+                        data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n\
+                        data: [DONE]\n\n";
+        let (base_url, bodies) =
+            spawn_streaming_response_sequence_server(vec![premature, complete]);
+        let mut conversation = Conversation::new();
+        conversation.add_user("write the file".to_string());
+        let config = ProviderConfig {
+            api_key: Some("test-key".to_string()),
+            base_url: Some(base_url),
+            model: Some("deepseek-v4-pro".to_string()),
+            reasoning_effort: orca_core::config::ReasoningEffort::default(),
+            tools_override: None,
+            mcp_registry: None,
+            external_tools: Vec::new(),
+        };
+        let cancel = CancelToken::new();
+
+        let response = request_chat_streaming(&conversation, &config, &cancel, &mut |_| {})
+            .await
+            .expect("premature stream should retry once");
+
+        assert_eq!(bodies.lock().expect("lock captured bodies").len(), 2);
+        assert!(matches!(
+            response.steps.as_slice(),
+            [ProviderStep::ToolCall(request)]
+                if request.id == "call_complete" && request.target.as_deref() == Some("src/main.rs")
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn streaming_integrity_error_after_visible_delta_does_not_retry() {
+        let premature = "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n";
+        let replacement = "data: {\"choices\":[{\"delta\":{\"content\":\"replacement\"},\"finish_reason\":\"stop\"}]}\n\n\
+                           data: [DONE]\n\n";
+        let (base_url, bodies) =
+            spawn_streaming_response_sequence_server(vec![premature, replacement]);
+        let mut conversation = Conversation::new();
+        conversation.add_user("hello".to_string());
+        let config = ProviderConfig {
+            api_key: Some("test-key".to_string()),
+            base_url: Some(base_url),
+            model: Some("deepseek-v4-flash".to_string()),
+            reasoning_effort: orca_core::config::ReasoningEffort::default(),
+            tools_override: Some(Vec::new()),
+            mcp_registry: None,
+            external_tools: Vec::new(),
+        };
+        let cancel = CancelToken::new();
+        let mut deltas = Vec::new();
+
+        let error = request_chat_streaming(&conversation, &config, &cancel, &mut |step| {
+            if let ProviderStep::MessageDelta(text) = step {
+                deltas.push(text.clone());
+            }
+        })
+        .await
+        .expect_err("a visible partial response must not be replayed transparently");
+
+        assert_eq!(error, "stream ended before terminal marker");
+        assert_eq!(bodies.lock().expect("lock captured bodies").len(), 1);
+        assert_eq!(deltas, vec!["partial"]);
+    }
+
+    #[test]
+    fn synchronous_facade_cancellation_does_not_deliver_prefetched_deltas() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind facade stream server");
+        let base_url = format!("http://{}", listener.local_addr().expect("local addr"));
+        let (closed_tx, closed_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept facade stream request");
+            let _ = read_http_request_body(&mut stream);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n\
+                      data: {\"choices\":[{\"delta\":{\"content\":\"first\"},\"finish_reason\":null}]}\n\n\
+                      data: {\"choices\":[{\"delta\":{\"content\":\"second\"},\"finish_reason\":null}]}\n\n",
+                )
+                .expect("write facade stream response");
+            stream.flush().expect("flush facade stream response");
+            stream
+                .set_read_timeout(Some(Duration::from_millis(400)))
+                .expect("set facade peer close timeout");
+            let mut byte = [0_u8; 1];
+            let closed = match stream.read(&mut byte) {
+                Ok(0) => true,
+                Ok(_) => false,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionAborted
+                            | std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::BrokenPipe
+                    ) =>
+                {
+                    true
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    false
+                }
+                Err(error) => panic!("read facade client close: {error}"),
+            };
+            closed_tx.send(closed).expect("report facade close");
+        });
+        let mut conversation = Conversation::new();
+        conversation.add_user("hello".to_string());
+        let config = ProviderConfig {
+            api_key: Some("test-key".to_string()),
+            base_url: Some(base_url),
+            model: Some("deepseek-v4-flash".to_string()),
+            reasoning_effort: orca_core::config::ReasoningEffort::default(),
+            tools_override: Some(Vec::new()),
+            mcp_registry: None,
+            external_tools: Vec::new(),
+        };
+        let cancel = CancelToken::new();
+        let cancel_from_callback = cancel.clone();
+        let mut deltas = Vec::new();
+        let started = Instant::now();
+
+        let _response = crate::call_streaming(
+            orca_core::config::ProviderKind::DeepSeek,
+            &conversation,
+            &config,
+            &cancel,
+            &mut |step| {
+                if let ProviderStep::MessageDelta(text) = step {
+                    deltas.push(text.clone());
+                    if deltas.len() == 1 {
+                        std::thread::sleep(Duration::from_millis(50));
+                        cancel_from_callback.cancel();
+                    }
+                }
+            },
+        );
+        let elapsed = started.elapsed();
+        let connection_closed = closed_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("wait for facade peer close result");
+
+        server.join().expect("facade stream server");
+        assert_eq!(deltas, vec!["first"]);
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "cancelled facade returned after {elapsed:?}"
+        );
+        assert!(connection_closed, "facade cancellation must close the peer");
+    }
+
+    #[test]
+    fn synchronous_facade_cancellation_stops_remaining_same_frame_callbacks() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind facade stream server");
+        let base_url = format!("http://{}", listener.local_addr().expect("local addr"));
+        let (closed_tx, closed_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept facade stream request");
+            let _ = read_http_request_body(&mut stream);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n\
+                      data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"first\",\"content\":\"second\"},\"finish_reason\":null}]}\n\n",
+                )
+                .expect("write facade stream response");
+            stream.flush().expect("flush facade stream response");
+            stream
+                .set_read_timeout(Some(Duration::from_millis(400)))
+                .expect("set facade peer close timeout");
+            let mut byte = [0_u8; 1];
+            let closed = match stream.read(&mut byte) {
+                Ok(0) => true,
+                Ok(_) => false,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionAborted
+                            | std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::BrokenPipe
+                    ) =>
+                {
+                    true
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    false
+                }
+                Err(error) => panic!("read facade client close: {error}"),
+            };
+            closed_tx.send(closed).expect("report facade close");
+        });
+        let mut conversation = Conversation::new();
+        conversation.add_user("hello".to_string());
+        let config = ProviderConfig {
+            api_key: Some("test-key".to_string()),
+            base_url: Some(base_url),
+            model: Some("deepseek-v4-flash".to_string()),
+            reasoning_effort: orca_core::config::ReasoningEffort::default(),
+            tools_override: Some(Vec::new()),
+            mcp_registry: None,
+            external_tools: Vec::new(),
+        };
+        let cancel = CancelToken::new();
+        let cancel_from_callback = cancel.clone();
+        let mut deltas = Vec::new();
+        let started = Instant::now();
+
+        let _response = crate::call_streaming(
+            orca_core::config::ProviderKind::DeepSeek,
+            &conversation,
+            &config,
+            &cancel,
+            &mut |step| {
+                let text = match step {
+                    ProviderStep::ReasoningDelta(text) | ProviderStep::MessageDelta(text) => text,
+                    _ => return,
+                };
+                deltas.push(text.clone());
+                if deltas.len() == 1 {
+                    cancel_from_callback.cancel();
+                }
+            },
+        );
+        let elapsed = started.elapsed();
+        let connection_closed = closed_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("wait for facade peer close result");
+
+        server.join().expect("facade stream server");
+        assert_eq!(deltas, vec!["first"]);
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "cancelled facade returned after {elapsed:?}"
+        );
+        assert!(connection_closed, "facade cancellation must close the peer");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_streaming_body_closes_in_flight_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind stalled stream server");
+        let base_url = format!("http://{}", listener.local_addr().expect("local addr"));
+        let (headers_tx, headers_rx) = mpsc::channel();
+        let (closed_tx, closed_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept stalled stream request");
+            let _ = read_http_request_body(&mut stream);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n",
+                )
+                .expect("write stream headers");
+            stream.flush().expect("flush stream headers");
+            headers_tx.send(()).expect("announce stream headers");
+            stream
+                .set_read_timeout(Some(Duration::from_millis(400)))
+                .expect("set peer close timeout");
+            let mut byte = [0_u8; 1];
+            let closed = match stream.read(&mut byte) {
+                Ok(0) => true,
+                Ok(_) => false,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionAborted
+                            | std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::BrokenPipe
+                    ) =>
+                {
+                    true
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    false
+                }
+                Err(error) => panic!("read stalled stream close: {error}"),
+            };
+            closed_tx.send(closed).expect("report stream close");
+        });
+        let mut conversation = Conversation::new();
+        conversation.add_user("hello".to_string());
+        let config = ProviderConfig {
+            api_key: Some("test-key".to_string()),
+            base_url: Some(base_url),
+            model: Some("deepseek-v4-flash".to_string()),
+            reasoning_effort: orca_core::config::ReasoningEffort::default(),
+            tools_override: Some(Vec::new()),
+            mcp_registry: None,
+            external_tools: Vec::new(),
+        };
+        let cancel = CancelToken::new();
+        let cancel_after_headers = cancel.clone();
+        let canceller = std::thread::spawn(move || {
+            headers_rx.recv().expect("wait for stream headers");
+            std::thread::sleep(Duration::from_millis(100));
+            cancel_after_headers.cancel();
+        });
+
+        let started = Instant::now();
+        let result = request_chat_streaming(&conversation, &config, &cancel, &mut |_| {}).await;
+        let elapsed = started.elapsed();
+        let connection_closed = closed_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("wait for stalled stream close result");
+
+        canceller.join().expect("stalled stream canceller");
+        server.join().expect("stalled stream server");
+        assert_eq!(result.unwrap_err(), "cancelled");
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "cancelled stream returned after {elapsed:?}"
+        );
+        assert!(
+            connection_closed,
+            "cancelled stream left the response body owned by a detached reader"
+        );
     }
 
     #[test]

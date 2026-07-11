@@ -1313,8 +1313,8 @@ mod tests {
     use orca_core::conversation::RawToolCall;
     use std::io::{Read, Write};
     use std::net::TcpListener;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, mpsc};
     use std::time::{Duration, Instant};
 
     struct FixedCounter;
@@ -1892,6 +1892,107 @@ mod tests {
         server.join().expect("summary server");
 
         assert_eq!(requests.load(Ordering::SeqCst), 0);
+        assert!(matches!(result.kind, CompactionKind::LocalTruncation));
+    }
+
+    #[test]
+    fn in_flight_summary_request_stops_waiting_for_headers_when_cancelled() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind summary endpoint");
+        let address = listener.local_addr().expect("summary endpoint address");
+        let (accepted_tx, accepted_rx) = mpsc::channel();
+        let (closed_tx, closed_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept summary request");
+            let mut request = [0u8; 16 * 1024];
+            let _ = stream.read(&mut request);
+            accepted_tx.send(()).expect("announce accepted request");
+            stream
+                .set_read_timeout(Some(Duration::from_millis(400)))
+                .expect("set summary peer close timeout");
+            let mut byte = [0_u8; 1];
+            let closed = match stream.read(&mut byte) {
+                Ok(0) => true,
+                Ok(_) => false,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionAborted
+                            | std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::BrokenPipe
+                    ) =>
+                {
+                    true
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    false
+                }
+                Err(error) => panic!("read summary client close: {error}"),
+            };
+            closed_tx.send(closed).expect("report summary close");
+        });
+
+        let mut conversation = Conversation::new();
+        conversation.add_system("system".to_string());
+        for index in 0..6 {
+            conversation.add_user(format!("old {index} {}", "x ".repeat(1_200)));
+            conversation.add_assistant(
+                Some(format!("older answer {index} {}", "y ".repeat(1_200))),
+                None,
+                vec![],
+            );
+        }
+        conversation.add_user("newest request".to_string());
+        let config = ContextConfig {
+            max_tokens: 500,
+            compaction_threshold: 1.0,
+            reserved_for_response: 0,
+            auto_compact_token_limit: None,
+            soft_compact_token_limit: None,
+        };
+        let provider_config = ProviderConfig {
+            api_key: Some("test-key".to_string()),
+            base_url: Some(format!("http://{address}")),
+            model: None,
+            reasoning_effort: orca_core::config::ReasoningEffort::Max,
+            tools_override: Some(Vec::new()),
+            mcp_registry: None,
+            external_tools: Vec::new(),
+        };
+        let cancel = CancelToken::new();
+        let cancel_after_accept = cancel.clone();
+        let canceller = std::thread::spawn(move || {
+            accepted_rx.recv().expect("wait for accepted request");
+            cancel_after_accept.cancel();
+        });
+
+        let started = Instant::now();
+        let result = compact_with_summary_cancellable(
+            ProviderKind::DeepSeek,
+            &conversation,
+            &config,
+            &provider_config,
+            &cancel,
+        );
+        let elapsed = started.elapsed();
+        let connection_closed = closed_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("wait for summary peer close result");
+
+        canceller.join().expect("summary canceller");
+        server.join().expect("summary server");
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "cancelled summary request waited {elapsed:?} for response headers"
+        );
+        assert!(
+            connection_closed,
+            "cancelled summary request left the TCP connection owned by its provider worker"
+        );
         assert!(matches!(result.kind, CompactionKind::LocalTruncation));
     }
 

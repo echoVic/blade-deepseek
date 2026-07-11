@@ -1,7 +1,5 @@
-use std::io::{self, BufRead, BufReader, Read};
-use std::sync::mpsc;
-use std::thread;
-use std::time::{Duration, Instant};
+use std::io::{BufRead, BufReader, Read};
+use std::time::Duration;
 
 use serde::Deserialize;
 
@@ -9,7 +7,9 @@ use orca_core::cancel::CancelToken;
 use orca_core::provider_types::{ToolCallProgress, Usage};
 
 const TOOL_CALL_PROGRESS_ARGUMENT_BYTES_STEP: usize = 8 * 1024;
-const IDLE_READ_CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const INVALID_SSE_DATA_JSON_PREFIX: &str = "invalid SSE data JSON";
+const INVALID_SSE_UTF8_PREFIX: &str = "invalid UTF-8 in SSE data";
+const PREMATURE_STREAM_EOF_ERROR: &str = "stream ended before terminal marker";
 
 #[derive(Debug, Deserialize)]
 pub struct StreamChunk {
@@ -104,31 +104,13 @@ pub enum StreamEvent<'a> {
     ToolCallProgress(ToolCallProgress),
 }
 
-pub fn parse_sse_stream_with_idle_timeout<R: Read + Send + 'static>(
-    reader: R,
-    cancel: &CancelToken,
-    idle_timeout: Duration,
-    on_delta: impl FnMut(StreamEvent),
-) -> Result<StreamResult, String> {
-    parse_sse_stream(
-        IdleReadTimeoutReader::new(reader, idle_timeout, cancel.clone()),
-        cancel,
-        on_delta,
-    )
-}
-
 pub fn parse_sse_stream<R: Read>(
     reader: R,
     cancel: &CancelToken,
     mut on_delta: impl FnMut(StreamEvent),
 ) -> Result<StreamResult, String> {
     let buf_reader = BufReader::new(reader);
-    let mut finish_reason: Option<String> = None;
-    let mut reasoning_buf = String::new();
-    let mut content_buf = String::new();
-    let mut tool_calls: Vec<ToolCallAccumulator> = Vec::new();
-    let mut tool_call_progress = ToolCallProgressTracker::default();
-    let mut usage = None;
+    let mut accumulator = StreamAccumulator::default();
 
     for line in buf_reader.lines() {
         if cancel.is_cancelled() {
@@ -141,32 +123,142 @@ pub fn parse_sse_stream<R: Read>(
                 format!("stream read error: {e}")
             }
         })?;
-        let line = line.trim_end();
+        if accumulator.push_line(&line, cancel, &mut on_delta)? {
+            break;
+        }
+    }
 
+    if cancel.is_cancelled() {
+        return Err("cancelled".to_string());
+    }
+    accumulator.finish()
+}
+
+pub(crate) async fn parse_sse_response(
+    mut response: reqwest::Response,
+    cancel: &CancelToken,
+    idle_timeout: Duration,
+    mut on_delta: impl FnMut(StreamEvent),
+) -> Result<StreamResult, String> {
+    let mut accumulator = StreamAccumulator::default();
+    let mut buffer = Vec::new();
+
+    loop {
+        let next = tokio::select! {
+            biased;
+            _ = crate::http_client::wait_for_cancel(cancel) => {
+                return Err("cancelled".to_string());
+            }
+            result = tokio::time::timeout(idle_timeout, response.chunk()) => result,
+        };
+
+        let chunk = match next {
+            Ok(Ok(Some(chunk))) => chunk,
+            Ok(Ok(None)) => {
+                if !buffer.is_empty() {
+                    buffer.push(b'\n');
+                    let _ = process_complete_lines(
+                        &mut buffer,
+                        cancel,
+                        &mut accumulator,
+                        &mut on_delta,
+                    )?;
+                }
+                return accumulator.finish();
+            }
+            Ok(Err(error)) => {
+                if cancel.is_cancelled() {
+                    return Err("cancelled".to_string());
+                }
+                return Err(format!("stream read error: {error}"));
+            }
+            Err(_) => {
+                return Err(format!(
+                    "stream read error: idle read timed out after {idle_timeout:?}"
+                ));
+            }
+        };
+
+        buffer.extend_from_slice(&chunk);
+        if process_complete_lines(&mut buffer, cancel, &mut accumulator, &mut on_delta)? {
+            return accumulator.finish();
+        }
+    }
+}
+
+fn process_complete_lines(
+    buffer: &mut Vec<u8>,
+    cancel: &CancelToken,
+    accumulator: &mut StreamAccumulator,
+    on_delta: &mut impl FnMut(StreamEvent),
+) -> Result<bool, String> {
+    let mut consumed = 0;
+    let mut done = false;
+    while let Some(relative_newline) = buffer[consumed..].iter().position(|byte| *byte == b'\n') {
+        if cancel.is_cancelled() {
+            return Err("cancelled".to_string());
+        }
+        let newline = consumed + relative_newline;
+        let mut line = &buffer[consumed..newline];
+        if line.ends_with(b"\r") {
+            line = &line[..line.len() - 1];
+        }
+        let line = std::str::from_utf8(line)
+            .map_err(|error| format!("{INVALID_SSE_UTF8_PREFIX}: {error}"))?;
+        if accumulator.push_line(line, cancel, on_delta)? {
+            done = true;
+            consumed = newline + 1;
+            break;
+        }
+        consumed = newline + 1;
+    }
+    if consumed > 0 {
+        buffer.drain(..consumed);
+    }
+    Ok(done)
+}
+
+#[derive(Default)]
+struct StreamAccumulator {
+    saw_done: bool,
+    finish_reason: Option<String>,
+    reasoning: String,
+    content: String,
+    tool_calls: Vec<ToolCallAccumulator>,
+    tool_call_progress: ToolCallProgressTracker,
+    usage: Option<Usage>,
+}
+
+impl StreamAccumulator {
+    fn push_line(
+        &mut self,
+        line: &str,
+        cancel: &CancelToken,
+        on_delta: &mut impl FnMut(StreamEvent),
+    ) -> Result<bool, String> {
+        let line = line.trim_end();
         if line.is_empty() || line.starts_with(':') {
-            continue;
+            return Ok(false);
         }
 
         let Some(data) = line.strip_prefix("data: ") else {
-            continue;
+            return Ok(false);
         };
-
         if data == "[DONE]" {
-            break;
+            self.saw_done = true;
+            return Ok(true);
         }
 
-        let chunk: StreamChunk = match serde_json::from_str(data) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
+        let chunk: StreamChunk = serde_json::from_str(data)
+            .map_err(|error| format!("{INVALID_SSE_DATA_JSON_PREFIX}: {error}"))?;
 
         if let Some(chunk_usage) = chunk.usage {
-            usage = Some(chunk_usage.into());
+            self.usage = Some(chunk_usage.into());
         }
 
         for choice in &chunk.choices {
             if let Some(ref reason) = choice.finish_reason {
-                finish_reason = Some(reason.clone());
+                self.finish_reason = Some(reason.clone());
             }
 
             let delta = &choice.delta;
@@ -174,37 +266,60 @@ pub fn parse_sse_stream<R: Read>(
             if let Some(text) = delta.reasoning()
                 && !text.is_empty()
             {
-                reasoning_buf.push_str(text);
+                self.reasoning.push_str(text);
+                if cancel.is_cancelled() {
+                    return Err("cancelled".to_string());
+                }
                 on_delta(StreamEvent::Reasoning(text));
             }
 
             if let Some(ref text) = delta.content
                 && !text.is_empty()
             {
-                content_buf.push_str(text);
+                if cancel.is_cancelled() {
+                    return Err("cancelled".to_string());
+                }
+                self.content.push_str(text);
                 on_delta(StreamEvent::Content(text));
             }
 
             if let Some(ref tcs) = delta.tool_calls {
                 for tc_delta in tcs {
-                    accumulate_tool_call(&mut tool_calls, tc_delta);
-                    if let Some(progress) =
-                        tool_call_progress.progress_for_delta(&tool_calls, tc_delta.index)
+                    accumulate_tool_call(&mut self.tool_calls, tc_delta);
+                    if let Some(progress) = self
+                        .tool_call_progress
+                        .progress_for_delta(&self.tool_calls, tc_delta.index)
                     {
+                        if cancel.is_cancelled() {
+                            return Err("cancelled".to_string());
+                        }
                         on_delta(StreamEvent::ToolCallProgress(progress));
                     }
                 }
             }
         }
+
+        Ok(false)
     }
 
-    Ok(StreamResult {
-        finish_reason,
-        reasoning: reasoning_buf,
-        content: content_buf,
-        tool_calls,
-        usage,
-    })
+    fn finish(self) -> Result<StreamResult, String> {
+        if !self.saw_done && self.finish_reason.is_none() {
+            return Err(PREMATURE_STREAM_EOF_ERROR.to_string());
+        }
+        Ok(StreamResult {
+            finish_reason: self.finish_reason,
+            reasoning: self.reasoning,
+            content: self.content,
+            tool_calls: self.tool_calls,
+            usage: self.usage,
+        })
+    }
+}
+
+pub(crate) fn is_stream_integrity_error(error: &str) -> bool {
+    error == PREMATURE_STREAM_EOF_ERROR
+        || error.starts_with(INVALID_SSE_DATA_JSON_PREFIX)
+        || error.starts_with(INVALID_SSE_UTF8_PREFIX)
 }
 
 fn accumulate_tool_call(buf: &mut Vec<ToolCallAccumulator>, delta: &StreamToolCallDelta) {
@@ -225,87 +340,6 @@ fn accumulate_tool_call(buf: &mut Vec<ToolCallAccumulator>, delta: &StreamToolCa
         }
         if let Some(ref args) = func.arguments {
             buf[idx].arguments.push_str(args);
-        }
-    }
-}
-
-struct IdleReadTimeoutReader {
-    request_tx: mpsc::Sender<usize>,
-    response_rx: mpsc::Receiver<io::Result<Vec<u8>>>,
-    idle_timeout: Duration,
-    cancel: CancelToken,
-}
-
-impl IdleReadTimeoutReader {
-    fn new<R: Read + Send + 'static>(
-        mut reader: R,
-        idle_timeout: Duration,
-        cancel: CancelToken,
-    ) -> Self {
-        let (request_tx, request_rx) = mpsc::channel::<usize>();
-        let (response_tx, response_rx) = mpsc::channel::<io::Result<Vec<u8>>>();
-
-        // The helper thread can outlive this wrapper if the underlying blocking
-        // read never returns after a stall. That is the deliberate tradeoff that
-        // lets the main streaming path enforce an idle timeout and observe cancel.
-        thread::spawn(move || {
-            while let Ok(len) = request_rx.recv() {
-                let mut buf = vec![0; len];
-                let result = reader.read(&mut buf).map(|read| {
-                    buf.truncate(read);
-                    buf
-                });
-                if response_tx.send(result).is_err() {
-                    break;
-                }
-            }
-        });
-
-        Self {
-            request_tx,
-            response_rx,
-            idle_timeout,
-            cancel,
-        }
-    }
-}
-
-impl Read for IdleReadTimeoutReader {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if buf.is_empty() {
-            return Ok(0);
-        }
-        self.request_tx
-            .send(buf.len())
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stream reader stopped"))?;
-        let started = Instant::now();
-        loop {
-            if self.cancel.is_cancelled() {
-                return Err(io::Error::other("cancelled"));
-            }
-            let elapsed = started.elapsed();
-            if elapsed >= self.idle_timeout {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    format!("idle read timed out after {:?}", self.idle_timeout),
-                ));
-            }
-            let wait = (self.idle_timeout - elapsed).min(IDLE_READ_CANCEL_POLL_INTERVAL);
-            match self.response_rx.recv_timeout(wait) {
-                Ok(Ok(bytes)) => {
-                    let len = bytes.len();
-                    buf[..len].copy_from_slice(&bytes);
-                    return Ok(len);
-                }
-                Ok(Err(err)) => return Err(err),
-                Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "stream reader stopped",
-                    ));
-                }
-            }
         }
     }
 }
@@ -360,18 +394,8 @@ fn tool_call_progress(current: &ToolCallAccumulator, arguments_bytes: usize) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::mpsc;
-
-    struct BlockingReader {
-        unblock_rx: mpsc::Receiver<()>,
-    }
-
-    impl Read for BlockingReader {
-        fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
-            let _ = self.unblock_rx.recv();
-            Ok(0)
-        }
-    }
+    use std::io::Write;
+    use std::net::TcpListener;
 
     #[test]
     fn parse_simple_content_stream() {
@@ -436,6 +460,38 @@ mod tests {
     }
 
     #[test]
+    fn parse_tool_calls_stream_rejects_malformed_data_frame() {
+        let sse_data = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"write_file\",\"arguments\":\"{\\\"path\\\":\\\"src/main.rs\\\",\\\"content\\\":\\\"partial\"}}]},\"finish_reason\":null}]}\n\n\
+                        data: {\"choices\":[{\"delta\":{\"tool_calls\":[\n\n\
+                        data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n\
+                        data: [DONE]\n\n";
+
+        let cancel = CancelToken::new();
+        let error = parse_sse_stream(sse_data.as_bytes(), &cancel, |_| {})
+            .expect_err("malformed SSE data must not be discarded");
+
+        assert!(error.contains("invalid SSE data JSON"), "{error}");
+    }
+
+    #[test]
+    fn parse_tool_calls_stream_rejects_premature_eof() {
+        let sse_data = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"write_file\",\"arguments\":\"{\\\"path\\\":\\\"src/main.rs\\\",\\\"content\\\":\\\"partial\"}}]},\"finish_reason\":null}]}\n\n";
+
+        let cancel = CancelToken::new();
+        let error = parse_sse_stream(sse_data.as_bytes(), &cancel, |_| {})
+            .expect_err("EOF without a finish reason or [DONE] must fail");
+
+        assert_eq!(error, "stream ended before terminal marker");
+    }
+
+    #[test]
+    fn invalid_utf8_stream_error_is_retryable_before_visible_output() {
+        assert!(is_stream_integrity_error(
+            "invalid UTF-8 in SSE data: invalid utf-8 sequence"
+        ));
+    }
+
+    #[test]
     fn parse_tool_calls_stream_emits_argument_progress() {
         let large_chunk = "a".repeat(8 * 1024);
         let sse_data = format!(
@@ -496,52 +552,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_stream_with_idle_timeout_fails_when_read_stalls() {
-        let (unblock_tx, unblock_rx) = mpsc::channel();
-        let cancel = CancelToken::new();
-
-        let result = parse_sse_stream_with_idle_timeout(
-            BlockingReader { unblock_rx },
-            &cancel,
-            Duration::from_millis(10),
-            |_| {},
-        );
-
-        drop(unblock_tx);
-        assert!(
-            result
-                .unwrap_err()
-                .contains("stream read error: idle read timed out after 10ms")
-        );
-    }
-
-    #[test]
-    fn parse_stream_with_idle_timeout_observes_cancel_while_read_stalls() {
-        let (_unblock_tx, unblock_rx) = mpsc::channel();
-        let cancel = CancelToken::new();
-        let parse_cancel = cancel.clone();
-        let (result_tx, result_rx) = mpsc::channel();
-
-        thread::spawn(move || {
-            let result = parse_sse_stream_with_idle_timeout(
-                BlockingReader { unblock_rx },
-                &parse_cancel,
-                Duration::from_secs(5),
-                |_| {},
-            );
-            let _ = result_tx.send(result.map(|_| ()));
-        });
-
-        thread::sleep(Duration::from_millis(20));
-        cancel.cancel();
-
-        let result = result_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("cancel should interrupt a stalled read promptly");
-        assert_eq!(result.unwrap_err(), "cancelled");
-    }
-
-    #[test]
     fn cancel_interrupts_stream() {
         let sse_data = "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}\n\n\
                         data: {\"choices\":[{\"delta\":{\"content\":\" world\"},\"finish_reason\":null}]}\n\n\
@@ -566,5 +576,73 @@ mod tests {
         assert_eq!(usage.input_tokens, 120);
         assert_eq!(usage.output_tokens, 30);
         assert_eq!(usage.cache_tokens, 10);
+    }
+
+    #[test]
+    fn incremental_line_buffer_reassembles_utf8_sse_across_chunks() {
+        let stream = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"你好\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let split = stream.find('你').expect("multibyte content") + 1;
+        let cancel = CancelToken::new();
+        let mut buffer = stream.as_bytes()[..split].to_vec();
+        let mut accumulator = StreamAccumulator::default();
+        let mut content = Vec::new();
+
+        assert!(
+            !process_complete_lines(&mut buffer, &cancel, &mut accumulator, &mut |event| {
+                if let StreamEvent::Content(text) = event {
+                    content.push(text.to_string());
+                }
+            },)
+            .expect("partial chunk")
+        );
+        buffer.extend_from_slice(&stream.as_bytes()[split..]);
+        assert!(
+            process_complete_lines(&mut buffer, &cancel, &mut accumulator, &mut |event| {
+                if let StreamEvent::Content(text) = event {
+                    content.push(text.to_string());
+                }
+            },)
+            .expect("complete chunks")
+        );
+
+        let result = accumulator.finish().expect("complete stream");
+        assert_eq!(result.content, "你好");
+        assert_eq!(result.finish_reason.as_deref(), Some("stop"));
+        assert_eq!(content, vec!["你好"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn async_response_parser_times_out_a_stalled_body_read() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind stalled SSE endpoint");
+        let address = listener.local_addr().expect("stalled SSE address");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept stalled SSE request");
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request).expect("read stalled SSE request");
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n",
+                )
+                .expect("write stalled SSE headers");
+            stream.flush().expect("flush stalled SSE headers");
+            std::thread::sleep(Duration::from_millis(100));
+        });
+        let response = reqwest::Client::new()
+            .get(format!("http://{address}/stream"))
+            .send()
+            .await
+            .expect("open stalled SSE response");
+        let cancel = CancelToken::new();
+
+        let error = parse_sse_response(response, &cancel, Duration::from_millis(20), |_| {})
+            .await
+            .expect_err("stalled body must time out");
+
+        server.join().expect("stalled SSE server");
+        assert_eq!(error, "stream read error: idle read timed out after 20ms");
     }
 }
