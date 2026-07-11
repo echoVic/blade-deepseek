@@ -76,6 +76,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.15":
+        "TUI resume now drops legacy reasoning-only assistant turns before replaying history to DeepSeek. New provider responses that contain reasoning but no visible content or tool calls are retried instead of being persisted, while valid reasoning attached to tool calls remains intact. The release gate now exercises this malformed-history recovery against the real DeepSeek API.",
       "v0.2.14":
         "Server-mode MCP elicitation now matches the TUI interaction path. When an stdio MCP tool sends elicitation/create during a turn, Orca emits a turn-scoped mcp_elicitation_request event, accepts mcp_elicitation/respond by requestId, writes accept/decline back to the MCP server, and then continues the original tool call. turn/interrupt now cancels unanswered MCP elicitation prompts, MCP transport cancellation returns promptly across stdio and SSE paths, and server shell/list stops reaping command/exec-owned backing shells.",
       "v0.2.13":
@@ -482,6 +484,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.15":
+        "TUI 恢复会话时会先移除旧历史中只有 reasoning、没有可见正文或工具调用的 assistant turn，再把历史重放给 DeepSeek。新的同类无效响应会触发重试而不会写入历史；与有效工具调用关联的 reasoning 仍会完整保留。发布门禁也新增了真实 DeepSeek API 的畸形历史恢复验证。",
       "v0.2.14":
         "Server-mode MCP elicitation 现在与 TUI 路径保持一致。stdio MCP tool 在 turn 中发送 elicitation/create 时，Orca 会发出稳定的 mcp_elicitation_request 事件，按 requestId 接收 mcp_elicitation/respond，把 accept/decline 写回 MCP server，然后继续原来的 tool call。Server shell/list 也不再回收 command/exec 拥有的 backing shell，command_exec_completed 会继续由 command/exec 控制路径发出。",
       "v0.2.13":

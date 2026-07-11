@@ -3,8 +3,15 @@
 > Goal: evolve Orca into a production-grade DeepSeek-native agent runtime.
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
-Last updated: 2026-07-10
-Current baseline: current main after v0.2.14 gives server-mode clients MCP
+Last updated: 2026-07-11
+Current baseline: current main after v0.2.15 makes DeepSeek history replay
+reject incomplete assistant turns. TUI resume removes legacy assistant turns
+that contain reasoning but no visible content or tool calls before the next
+provider request, and new reasoning-only responses are retried instead of
+being persisted. Valid reasoning attached to tool calls remains available for
+DeepSeek replay. The real API release gate now seeds malformed history and
+verifies that the resumed turn completes successfully.
+Earlier v0.2.14 gives server-mode clients MCP
 elicitation parity with the TUI path. Stdio MCP `elicitation/create` requests
 now emit `mcp_elicitation_request`, clients respond with
 `mcp_elicitation/respond` by stable runtime `requestId`, and the original MCP
@@ -337,7 +344,7 @@ working baseline used to prioritize the next patch releases.
 | Workflows | JavaScript workflow DSL, generated drafts, edit/save/run controls, reusable workflow commands, task state, notifications, runtime status events, evidence-bound reports, and worktree-isolated/recoverable agent runs | Codex/Claude workflow orchestration concepts | Implemented |
 | Runtime lifecycle | Headless, server-mode, and TUI agent runs now seed an agent task lifecycle through a runtime turn runner; `RuntimeThread` groups runtime-owned interactive session state with lifecycle state, and server-mode `ServerThread`, the headless controller, and the TUI conversation-session wrapper now keep long-lived agent state behind `RuntimeThread` instead of directly assembling session/lifecycle/executor pieces; workflow runs, sync/async subagent boundaries, workflow child agents, and shell tool calls also carry task metadata; tool approval/hooks/normal fallback now share a runtime tool actor context, while workflow, subagent, task, permission, workflow IPC, and normal-tool dispatch route through `RuntimeToolRouter`; server stdio decoding now delegates operation dispatch through a focused router boundary, with synchronous thread query/metadata, turn-control, shell session, command/exec compatibility, permission response, user-input response, and submit-family dispatch moved into focused processor modules; command/exec active process state and pending server user-input state now live in focused server manager modules; runtime-special tool classification and small executors now live in `runtime_special.rs`; approved background provider-response continuations now convert into typed `RuntimeTurnContinuation` values, and the runtime consumes the single preapproved tool-call id exactly once through the turn permission overlay | Codex `Session -> Task -> Turn`, app-server request processors; package 3 pending permission maps | Seeded; deeper TUI loop delegation still open |
 | TUI | Markdown-ish rendering, themes, Vim mode, diff preview, slash commands, workflow panel, elapsed timers, and clearer approval dialogs | Codex/Claude richer terminal UX | Partial |
-| History | JSONL transcripts, resume/fork/search/archive/compress with a dedicated `SessionStore` boundary | Codex thread store with queryable metadata | Partial |
+| History | JSONL transcripts, resume/fork/search/archive/compress with a dedicated `SessionStore` boundary; resume normalization drops legacy reasoning-only assistant turns before provider replay | Codex thread store with queryable metadata | Partial |
 | Release | GitHub release + npm alias distribution scripts, retrying post-publish GitHub/npm/npm-exec verification, and a reusable real API e2e release gate | Codex npm/native release model | Implemented |
 | Skills | Markdown skill discovery, `list_skills`/`read_skill`, and explicit `$skill` prompt injection | Codex skills and plugin-provided skill bundles | Partial |
 
