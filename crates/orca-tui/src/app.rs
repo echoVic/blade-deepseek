@@ -1239,6 +1239,145 @@ mod tests {
     }
 
     #[test]
+    fn goal_resume_store_failure_preserves_shared_loop_state() {
+        with_orca_home(|home| {
+            let mut writer =
+                history::SessionWriter::start(home, "mock", Some("auto".to_string()), "goal")
+                    .unwrap();
+            writer
+                .append_message(&orca_core::conversation::Message::user(
+                    "previous goal work".to_string(),
+                ))
+                .unwrap();
+            writer.complete("approval_required").unwrap();
+            let old_session_id = history::load_session("latest").unwrap().meta.session_id;
+
+            orca_runtime::goals::GoalStore::load_default()
+                .replace(
+                    &old_session_id,
+                    "resume atomically",
+                    orca_core::goal_types::ThreadGoalStatus::Active,
+                    None,
+                )
+                .unwrap();
+            std::fs::create_dir(home.join("goals_1.json.tmp")).unwrap();
+
+            let config = Arc::new(Mutex::new(test_config(HistoryMode::Record)));
+            let preloaded = Arc::new(Mutex::new(Some(transcript("untouched-preloaded"))));
+            let (event_tx, event_rx) = mpsc::channel();
+            let (_action_tx, action_rx) = mpsc::channel();
+            let cancel = CancelToken::new();
+            let pending_actions = RefCell::new(VecDeque::new());
+            let pending_workflow_notifications = test_pending_workflow_notifications();
+            let mut session = None;
+
+            resume_latest_active_goal_for_tui(
+                &mut session,
+                &config,
+                &preloaded,
+                &event_tx,
+                &action_rx,
+                &pending_actions,
+                &cancel,
+                &pending_workflow_notifications,
+            );
+            let event = event_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+            match event {
+                TuiEvent::Error(message) => assert!(
+                    message.starts_with("failed to resume goal in restored session:"),
+                    "unexpected error: {message}"
+                ),
+                other => panic!("expected restored-session error, got {other:?}"),
+            }
+            assert!(session.is_none());
+            assert!(matches!(
+                &config.lock().unwrap().history_mode,
+                HistoryMode::Record
+            ));
+            assert_eq!(
+                preloaded
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|transcript| transcript.meta.session_id.as_str()),
+                Some("untouched-preloaded")
+            );
+        });
+    }
+
+    #[test]
+    fn preloaded_goal_resume_projects_elapsed_before_first_turn_started() {
+        with_orca_home(|home| {
+            let session_id = "resume-goal-timer-session";
+            let mut goal_store = orca_runtime::goals::GoalStore::load_default();
+            goal_store
+                .replace(
+                    session_id,
+                    "resume with elapsed time",
+                    orca_core::goal_types::ThreadGoalStatus::Active,
+                    None,
+                )
+                .unwrap();
+            let persisted = goal_store
+                .account_usage(session_id, 23_456, 13 * 60)
+                .unwrap()
+                .unwrap();
+            assert_eq!(persisted.time_used_seconds, 13 * 60);
+
+            let config = Arc::new(Mutex::new(test_config(HistoryMode::Resume(
+                session_id.to_string(),
+            ))));
+            let mut restored = transcript(session_id);
+            restored.path = home.join("resume-goal-timer.jsonl");
+            std::fs::write(&restored.path, "").unwrap();
+            let preloaded = Arc::new(Mutex::new(Some(restored)));
+            let (event_tx, event_rx) = mpsc::channel();
+            let (action_tx, action_rx) = mpsc::channel();
+            let cancel = CancelToken::new();
+
+            let handle = std::thread::spawn({
+                let config = Arc::clone(&config);
+                let preloaded = Arc::clone(&preloaded);
+                let cancel = cancel.clone();
+                move || {
+                    agent_loop_thread(
+                        config,
+                        preloaded,
+                        event_tx,
+                        action_rx,
+                        cancel,
+                        test_pending_workflow_notifications(),
+                    )
+                }
+            });
+
+            action_tx
+                .send(UserAction::Submit("mock_stream_delay_ms 250".to_string()))
+                .unwrap();
+            let mut projected_goal = None;
+            loop {
+                match event_rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+                    TuiEvent::GoalStatus(Some(goal)) if goal.session_id == session_id => {
+                        projected_goal = Some(goal);
+                    }
+                    TuiEvent::TurnStarted { .. } => break,
+                    TuiEvent::Error(message) => panic!("unexpected resume error: {message}"),
+                    _ => {}
+                }
+            }
+
+            cancel.cancel();
+            action_tx.send(UserAction::Cancel).unwrap();
+            handle.join().unwrap();
+
+            let projected_goal = projected_goal
+                .expect("active GoalStatus with elapsed time must precede TurnStarted");
+            assert_eq!(projected_goal.time_used_seconds, 13 * 60);
+        });
+    }
+
+    #[test]
     fn preloaded_resume_goal_pause_updates_persisted_goal_before_live_session_exists() {
         with_orca_home(|_| {
             let session_id = "resume-goal-session";
@@ -2895,6 +3034,7 @@ fn run_goal_turns_for_tui(
             session.replace_goal_context(
                 orca_runtime::agent_common::format_goal_mode_instructions(&goal),
             );
+            let _ = event_tx.send(TuiEvent::GoalStatus(Some(goal)));
         }
         let before_usage = session.usage_totals();
         let started_at = std::time::Instant::now();
@@ -3042,10 +3182,6 @@ fn resume_latest_active_goal_for_tui(
 
     let mut cfg = config.lock().unwrap().clone();
     cfg.history_mode = HistoryMode::Resume(goal.session_id.clone());
-    if let Ok(mut shared) = config.lock() {
-        shared.history_mode = cfg.history_mode.clone();
-    }
-    *preloaded.lock().unwrap() = None;
 
     let resumed = match bridge::TuiConversationSession::new_with_preloaded(
         &cfg,
@@ -3085,6 +3221,10 @@ fn resume_latest_active_goal_for_tui(
         }
     };
 
+    if let Ok(mut shared) = config.lock() {
+        shared.history_mode = cfg.history_mode.clone();
+    }
+    *preloaded.lock().unwrap() = None;
     *session = Some(resumed);
     if let Some(session) = session.as_ref() {
         notify_recovered_background_approvals_for_tui(session.task_registry(), event_tx);
