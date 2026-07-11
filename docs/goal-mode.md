@@ -24,6 +24,35 @@ Goals are stored by session id in:
 
 Persistent goals require recorded history so there is a stable session id. TUI sessions started with history disabled cannot use `/goal`.
 
+## Timing and Resume
+
+The activity timer is cumulative while a goal is active:
+
+```text
+displayed time = persisted completed-turn time + current-turn elapsed time
+```
+
+Orca persists the current turn's elapsed time when that turn returns. Approval
+and user-input waits inside the turn are therefore included. Time between
+automatic continuations, time spent paused or in a terminal goal status, and
+time while Orca is closed are excluded. A process crash can lose the unfinished
+current-turn delta because that delta has not yet been added to the persisted
+goal record.
+
+`/goal resume` reactivates the existing record without resetting its objective,
+token budget, tokens used, elapsed time, or `created_at`. Same-session resume
+updates that record in place. If history restoration produces a different
+session id, Orca writes the full record to the restored session and pauses the
+source record in the same atomic store replacement.
+
+Cross-session resume refuses to overwrite a goal that already exists for the
+target session. Missing-source, collision, and persistence errors leave the
+existing goal records unchanged; the TUI also keeps its prior session,
+preloaded-history, and history-mode state until the goal-store update succeeds.
+After restored history is loaded, Orca projects the preserved goal state before
+the first `TurnStarted` event so the cumulative timer has its persisted base
+from the first rendered frame.
+
 ## Statuses
 
 | Status | Meaning |

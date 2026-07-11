@@ -33,7 +33,7 @@ Set `INSTALL_DIR` to choose a destination and `ORCA_VERSION` to pin a version:
 
 ```bash
 curl -fsSL https://orcaagent.dev/install.sh | \
-  INSTALL_DIR=/usr/local/bin ORCA_VERSION=0.2.16 sh
+  INSTALL_DIR=/usr/local/bin ORCA_VERSION=0.2.17 sh
 ```
 
 ### GitHub Releases
@@ -221,6 +221,8 @@ TUI sessions support persistent goals with `/goal`. A goal is stored by session 
 ```
 
 While a goal is active, Orca automatically starts another turn after a successful turn and injects goal-mode instructions as pinned context. The loop stops when the goal is paused, cleared, blocked, completed, budget-limited, interrupted, or reaches the continuation cap. Goal turns expose `get_goal`, `create_goal`, and `update_goal`; the model can only use `update_goal` to mark the active goal `complete` or `blocked`, while `/goal` commands own pause, resume, edit, and clear.
+
+The running timer for an active Goal is cumulative: Orca displays persisted time from completed Goal turns plus the elapsed time of the current turn. Time between turns, while the Goal is paused, or while Orca is closed is excluded. `/goal resume` preserves the elapsed time, tokens used, token budget, objective, and original creation timestamp instead of starting the Goal's accounting over.
 
 Persistent goals require recorded history. If history is disabled with `--no-history`, `/goal` reports an error instead of creating ephemeral goal state.
 

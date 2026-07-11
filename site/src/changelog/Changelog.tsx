@@ -76,6 +76,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.17":
+        "Active Goal activity time now stays cumulative across automatic continuations by combining persisted completed-turn time with the current turn delta. /goal resume preserves the objective, budget, token usage, elapsed time, and creation timestamp; same- and cross-session restoration use one atomic migration with an occupied-target guard and unchanged state on failure. Restored history projects the preserved Goal before TurnStarted so the first running frame includes the persisted base.",
       "v0.2.16":
         "TUI context compaction now has a visible, interruptible lifecycle. Automatic soft-limit, hard-limit, and prompt-too-long recovery show Compacting context before hooks or remote summary work; manual /compact uses the same state. Ctrl+C, Esc, and Ctrl+G cancel hooks and the streaming DeepSeek summary, while completion appears only after persistence and post-compact hooks finish. DeepSeek header waits, retry delays, error-body reads, and SSE reads now race cancellation through a joined provider worker, including between events from one SSE frame. Malformed or prematurely ended streams fail explicitly and retry only before visible output; malformed JSON for a known tool is preserved, validated before approval, hooks, task creation, or execution, and returned as a corrective tool failure. Older compacted events remain compatible.",
       "v0.2.15":
@@ -486,6 +488,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.17":
+        "活动 Goal 的计时现在会跨自动续轮累计：已持久化的完整 turn 用时与当前 turn 增量合并显示。/goal resume 会保留目标、预算、token 用量、累计时间和创建时间；同 session 与跨 session 恢复使用一次原子迁移，目标 session 已占用时拒绝覆盖，失败时保持原状态。恢复历史后会在 TurnStarted 前投影 Goal，因此第一帧 running 状态就包含已持久化的时间基数。",
       "v0.2.16":
         "TUI 上下文压缩现在有可见、可中断的完整生命周期。自动 soft-limit、hard-limit、prompt-too-long recovery 与手动 /compact 都会在阻塞工作前显示 Compacting context；Ctrl+C、Esc、Ctrl+G 可取消 hook 与 DeepSeek 流式摘要。等待响应头、重试等待、错误响应体和 SSE 响应体读取都会与取消竞争，兼容同步 facade 会在返回前 join provider worker，同一 SSE frame 内的后续事件也会立即停止交付。畸形或提前结束的 SSE 会显式失败，只有尚未产生可见输出时才重试；已知工具的非法 JSON 参数会保留，并在审批、hook、任务创建或执行前完成 schema 校验，作为可纠正的 tool failure 返回。只有持久化和 post-compact hook 完成后才会回到 idle，旧版 compacted 事件仍兼容。",
       "v0.2.15":

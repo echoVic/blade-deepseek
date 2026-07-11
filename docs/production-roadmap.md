@@ -3,9 +3,21 @@
 > Goal: evolve Orca into a production-grade DeepSeek-native agent runtime.
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
-Last updated: 2026-07-11
-Current baseline: current main after v0.2.16 makes context compaction visible
-through its full TUI lifecycle. Automatic soft-limit, hard-limit, and
+Last updated: 2026-07-12
+Current baseline: current main after v0.2.17 keeps the active Goal activity
+timer cumulative across automatic continuations by rendering persisted
+completed-turn time plus the current-turn delta. Between-turn, paused,
+terminal-status, and offline time remains excluded. `/goal resume` preserves
+the objective, token budget, token usage, elapsed time, and original creation
+timestamp instead of replacing the Goal record. Same-session reactivation and
+cross-session migration use one persisted store replacement; cross-session
+migration pauses the source, refuses to overwrite an occupied target, and
+leaves both persisted and live TUI state unchanged on failure. Restored history
+projects the preserved Goal state before `TurnStarted`, so the first running
+frame includes its elapsed-time base. This remains a TUI-owned continuation
+path; the runtime Goal orchestrator, durable cursor, lease, and fencing work are
+still open. Earlier v0.2.16 makes context compaction visible through its full
+TUI lifecycle. Automatic soft-limit, hard-limit, and
 prompt-too-long recovery emit typed `context.compaction.started` before budget
 hooks, compaction hooks, or remote summary work can block. Manual `/compact`
 also enters the existing `Compacting context...` state before its synchronous
@@ -358,10 +370,10 @@ working baseline used to prioritize the next patch releases.
 | Hooks | Lifecycle hooks with JSON stdout actions; structured outputs that declare `action` now validate supported actions and required string fields | Codex hooks runtime and schema validation | Implemented; schema docs/validation improved |
 | Project instructions | User/project/rules files with includes | `AGENTS.md` style layered instructions | Implemented |
 | Memory | Manual `/remember` plus optional project extraction | Codex memories extension | Partial |
-| Persistent goals | `/goal` with persisted state plus goal-scoped `get_goal`, `create_goal`, and narrow `update_goal` | Codex goal extension | Implemented |
+| Persistent goals | `/goal` with persisted state, cumulative active-Goal timing, metadata-preserving atomic resume, plus goal-scoped `get_goal`, `create_goal`, and narrow `update_goal` | Codex goal extension | Implemented; runtime orchestration still open |
 | Workflows | JavaScript workflow DSL, generated drafts, edit/save/run controls, reusable workflow commands, task state, notifications, runtime status events, evidence-bound reports, and worktree-isolated/recoverable agent runs | Codex/Claude workflow orchestration concepts | Implemented |
 | Runtime lifecycle | Headless, server-mode, and TUI agent runs now seed an agent task lifecycle through a runtime turn runner; `RuntimeThread` groups runtime-owned interactive session state with lifecycle state, and server-mode `ServerThread`, the headless controller, and the TUI conversation-session wrapper now keep long-lived agent state behind `RuntimeThread` instead of directly assembling session/lifecycle/executor pieces; workflow runs, sync/async subagent boundaries, workflow child agents, and shell tool calls also carry task metadata; tool approval/hooks/normal fallback now share a runtime tool actor context, while workflow, subagent, task, permission, workflow IPC, and normal-tool dispatch route through `RuntimeToolRouter`; server stdio decoding now delegates operation dispatch through a focused router boundary, with synchronous thread query/metadata, turn-control, shell session, command/exec compatibility, permission response, user-input response, and submit-family dispatch moved into focused processor modules; command/exec active process state and pending server user-input state now live in focused server manager modules; runtime-special tool classification and small executors now live in `runtime_special.rs`; approved background provider-response continuations now convert into typed `RuntimeTurnContinuation` values, and the runtime consumes the single preapproved tool-call id exactly once through the turn permission overlay | Codex `Session -> Task -> Turn`, app-server request processors; package 3 pending permission maps | Seeded; deeper TUI loop delegation still open |
-| TUI | Markdown-ish rendering, themes, Vim mode, diff preview, slash commands, workflow panel, elapsed timers, and clearer approval dialogs | Codex/Claude richer terminal UX | Partial |
+| TUI | Markdown-ish rendering, themes, Vim mode, diff preview, slash commands, workflow panel, per-turn timers plus cumulative active-Goal timing, and clearer approval dialogs | Codex/Claude richer terminal UX | Partial |
 | History | JSONL transcripts, resume/fork/search/archive/compress with a dedicated `SessionStore` boundary; resume normalization drops legacy reasoning-only assistant turns before provider replay | Codex thread store with queryable metadata | Partial |
 | Release | GitHub release + npm alias distribution scripts, retrying post-publish GitHub/npm/npm-exec verification, and a reusable real API e2e release gate | Codex npm/native release model | Implemented |
 | Skills | Markdown skill discovery, `list_skills`/`read_skill`, and explicit `$skill` prompt injection | Codex skills and plugin-provided skill bundles | Partial |
@@ -1448,7 +1460,7 @@ instruction and capability system.
 
 ---
 
-## July 11 Priority Matrix
+## July 12 Priority Matrix
 
 | Priority | Item | Why Now | Risk |
 |----------|------|---------|------|
