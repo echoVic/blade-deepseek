@@ -8,6 +8,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+#[cfg(unix)]
+use std::process::Command;
+
 use orca_core::cancel::CancelToken;
 use orca_core::conversation::RawToolCall;
 use orca_core::cost_types::UsageTotals;
@@ -100,6 +103,24 @@ pub struct TaskControl {
     pub cancel: CancelToken,
     pub pause: Arc<AtomicBool>,
     worker: Arc<Mutex<Option<Child>>>,
+}
+
+enum TaskStopTarget {
+    InProcess,
+    Owned {
+        worker: Arc<Mutex<Option<Child>>>,
+        child: Child,
+    },
+    Recovered {
+        pid: u32,
+        agent_id: String,
+    },
+}
+
+enum RecoveredWorkerState {
+    Missing,
+    Matches,
+    Replaced,
 }
 
 #[derive(Clone, Debug)]
@@ -1068,68 +1089,89 @@ impl TaskRegistry {
     }
 
     pub fn request_stop(&self, id: &str) -> Result<(), String> {
-        let mut owned_worker = None;
-        self.with_tasks(|tasks| {
-            let worker = {
+        let target = self
+            .with_tasks(|tasks| {
                 let record = tasks
-                    .get_mut(id)
+                    .get(id)
                     .ok_or_else(|| format!("task '{id}' not found"))?;
                 if is_terminal(record.status) {
                     return Err(task_state_error("request_stop", record.status));
                 }
-
-                let worker = if record.task_type == TaskType::Subagent
-                    && record.worker_pid.is_some()
-                {
-                    Some(Arc::clone(&record.control.worker))
-                } else {
-                    None
+                let Some(pid) = (record.task_type == TaskType::Subagent)
+                    .then_some(record.worker_pid)
+                    .flatten()
+                else {
+                    return Ok(TaskStopTarget::InProcess);
                 };
-                if let Some(worker) = &worker {
-                    let mut slot = worker
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    let Some(child) = slot.take() else {
-                        return Err(format!(
-                            "task '{id}' worker ownership is unavailable; refusing to signal a persisted PID"
-                        ));
-                    };
-                    owned_worker = Some((Arc::clone(worker), child));
+                let worker = Arc::clone(&record.control.worker);
+                let agent_id = record.id.clone();
+                let mut slot = worker
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some(child) = slot.take() {
+                    drop(slot);
+                    return Ok(TaskStopTarget::Owned { worker, child });
                 }
-
-                record.status = TaskStatus::Stopping;
-                if record.started_at_ms.is_none() {
-                    record.started_at_ms = Some(now_ms());
+                drop(slot);
+                if pid == 0 {
+                    return Err(format!("task '{id}' worker has not finished starting"));
                 }
-                record.control.cancel.cancel();
-                worker
-            };
+                Ok(TaskStopTarget::Recovered { pid, agent_id })
+            })
+            .map_err(|_| "task registry lock poisoned".to_string())??;
 
-            if let Err(error) = self.persist_current_session(tasks) {
-                if let (Some(worker), Some((_, child))) = (&worker, owned_worker.take()) {
+        if let TaskStopTarget::Recovered { pid, agent_id } = &target {
+            match verify_recovered_worker(*pid, agent_id)? {
+                RecoveredWorkerState::Missing | RecoveredWorkerState::Replaced => {
+                    self.mark_stop_requested(id)?;
+                    return self.stop(id, "Task stopped; worker already exited".to_string());
+                }
+                RecoveredWorkerState::Matches => {}
+            }
+        }
+
+        if let Err(error) = self.mark_stop_requested(id) {
+            if let TaskStopTarget::Owned { worker, child } = target {
+                let mut slot = worker
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                *slot = Some(child);
+            }
+            return Err(error);
+        }
+
+        match target {
+            TaskStopTarget::InProcess => Ok(()),
+            TaskStopTarget::Owned { worker, mut child } => {
+                terminate_worker(&mut child);
+                if let Err(error) = child.wait() {
                     let mut slot = worker
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
                     *slot = Some(child);
+                    return Err(format!("failed to reap async subagent worker: {error}"));
                 }
-                return Err(error);
+                self.stop(id, "Task stopped".to_string())
             }
+            TaskStopTarget::Recovered { pid, agent_id } => {
+                terminate_recovered_worker(pid, &agent_id)?;
+                self.stop(id, "Task stopped".to_string())
+            }
+        }
+    }
+
+    fn mark_stop_requested(&self, id: &str) -> Result<(), String> {
+        self.update_task(id, |record| {
+            if is_terminal(record.status) {
+                return Err(task_state_error("request_stop", record.status));
+            }
+            record.status = TaskStatus::Stopping;
+            if record.started_at_ms.is_none() {
+                record.started_at_ms = Some(now_ms());
+            }
+            record.control.cancel.cancel();
             Ok(())
         })
-        .map_err(|_| "task registry lock poisoned".to_string())??;
-
-        let Some((worker, mut child)) = owned_worker else {
-            return Ok(());
-        };
-        terminate_worker(&mut child);
-        if let Err(error) = child.wait() {
-            let mut slot = worker
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            *slot = Some(child);
-            return Err(format!("failed to reap async subagent worker: {error}"));
-        }
-        self.stop(id, "Task stopped".to_string())
     }
 
     pub fn request_pause(&self, id: &str) -> Result<(), String> {
@@ -1547,6 +1589,139 @@ fn spawn_worker_reaper(worker: Arc<Mutex<Option<Child>>>) {
 
 fn terminate_worker(child: &mut Child) {
     orca_tools::process::kill_child_tree(child);
+}
+
+const SUBAGENT_WORKER_PROCESS_PREFIX: &str = "orca-subagent-worker-";
+
+pub(crate) fn subagent_worker_process_name(agent_id: &str) -> String {
+    format!("{SUBAGENT_WORKER_PROCESS_PREFIX}{agent_id}")
+}
+
+#[cfg(unix)]
+fn verify_recovered_worker(pid: u32, agent_id: &str) -> Result<RecoveredWorkerState, String> {
+    unsafe extern "C" {
+        fn getpgid(pid: i32) -> i32;
+    }
+
+    let pid = i32::try_from(pid).map_err(|_| "worker PID exceeds Unix pid_t".to_string())?;
+    let pgid = unsafe { getpgid(pid) };
+    if pgid < 0 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(3) {
+            return Ok(RecoveredWorkerState::Missing);
+        }
+        return Err(format!("failed to inspect async subagent worker: {error}"));
+    }
+    if pgid != pid {
+        return Ok(RecoveredWorkerState::Replaced);
+    }
+
+    let ps = [Path::new("/bin/ps"), Path::new("/usr/bin/ps")]
+        .into_iter()
+        .find(|candidate| candidate.is_file())
+        .ok_or_else(|| "cannot verify async subagent worker without ps".to_string())?;
+    let pid_text = pid.to_string();
+    let output = Command::new(ps)
+        .args(["-ww", "-p", pid_text.as_str(), "-o", "command="])
+        .output()
+        .map_err(|error| format!("failed to inspect async subagent worker: {error}"))?;
+    if !output.status.success() {
+        let pgid = unsafe { getpgid(pid) };
+        if pgid < 0 && io::Error::last_os_error().raw_os_error() == Some(3) {
+            return Ok(RecoveredWorkerState::Missing);
+        }
+        return Err("failed to inspect async subagent worker command".to_string());
+    }
+    if !subagent_worker_command_matches(&String::from_utf8_lossy(&output.stdout), agent_id) {
+        return Ok(RecoveredWorkerState::Replaced);
+    }
+    Ok(RecoveredWorkerState::Matches)
+}
+
+fn subagent_worker_command_matches(command_line: &str, agent_id: &str) -> bool {
+    let arguments = command_line.split_whitespace().collect::<Vec<_>>();
+    let expected = subagent_worker_process_name(agent_id);
+    if arguments.first().copied() == Some(expected.as_str()) {
+        return true;
+    }
+    arguments.get(1).copied() == Some("subagent-worker")
+        && arguments
+            .windows(2)
+            .any(|pair| pair[0] == "--agent-id" && pair[1] == agent_id)
+}
+
+#[cfg(not(unix))]
+fn verify_recovered_worker(_pid: u32, _agent_id: &str) -> Result<RecoveredWorkerState, String> {
+    Err("cannot safely verify a recovered async subagent worker on this platform".to_string())
+}
+
+#[cfg(unix)]
+fn terminate_recovered_worker(pid: u32, agent_id: &str) -> Result<(), String> {
+    unsafe extern "C" {
+        fn kill(pid: i32, signal: i32) -> i32;
+    }
+
+    if !matches!(
+        verify_recovered_worker(pid, agent_id)?,
+        RecoveredWorkerState::Matches
+    ) {
+        return Ok(());
+    }
+    let pid = i32::try_from(pid).map_err(|_| "worker PID exceeds Unix pid_t".to_string())?;
+    let process_group = -pid;
+    if unsafe { kill(process_group, 15) } < 0 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(3) {
+            return Ok(());
+        }
+        return Err(format!(
+            "failed to signal async subagent worker process group with SIGTERM: {error}"
+        ));
+    }
+    thread::sleep(Duration::from_millis(50));
+    if !process_group_has_live_members(pid)? {
+        return Ok(());
+    }
+    if unsafe { kill(process_group, 9) } < 0 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(3) || !process_group_has_live_members(pid)? {
+            return Ok(());
+        }
+        return Err(format!(
+            "failed to signal async subagent worker process group with SIGKILL: {error}"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn process_group_has_live_members(pgid: i32) -> Result<bool, String> {
+    let ps = [Path::new("/bin/ps"), Path::new("/usr/bin/ps")]
+        .into_iter()
+        .find(|candidate| candidate.is_file())
+        .ok_or_else(|| {
+            "cannot inspect async subagent worker process group without ps".to_string()
+        })?;
+    let output = Command::new(ps)
+        .args(["-ax", "-o", "pgid=", "-o", "stat="])
+        .output()
+        .map_err(|error| format!("failed to inspect async subagent worker group: {error}"))?;
+    if !output.status.success() {
+        return Err("failed to inspect async subagent worker process group".to_string());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).lines().any(|line| {
+        let mut fields = line.split_whitespace();
+        fields
+            .next()
+            .and_then(|value| value.parse::<i32>().ok())
+            .is_some_and(|candidate| candidate == pgid)
+            && fields.next().is_some_and(|state| !state.starts_with('Z'))
+    }))
+}
+
+#[cfg(not(unix))]
+fn terminate_recovered_worker(_pid: u32, _agent_id: &str) -> Result<(), String> {
+    Err("cannot safely stop a recovered async subagent worker on this platform".to_string())
 }
 
 fn new_task_id() -> String {
@@ -2488,31 +2663,124 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn request_stop_refuses_unowned_persisted_worker_pid() {
+    fn request_stop_does_not_signal_reused_worker_pid() {
+        use std::os::unix::process::CommandExt;
+
         let registry = TaskRegistry::new("session-1".to_string());
         let task = registry.create_subagent("inspect auth".to_string(), None);
-        let mut unrelated = std::process::Command::new("sh")
+        let mut command = std::process::Command::new("sh");
+        command
             .arg("-c")
             .arg("sleep 30")
-            .spawn()
-            .expect("spawn unrelated process");
+            .arg0("unrelated-process")
+            .process_group(0);
+        let mut unrelated = command.spawn().expect("spawn unrelated process");
         registry
             .mark_worker_spawned(&task.id, unrelated.id())
             .unwrap();
         registry.mark_running(&task.id).unwrap();
 
-        let error = registry.request_stop(&task.id).unwrap_err();
+        registry.request_stop(&task.id).unwrap();
 
-        assert!(error.contains("refusing to signal a persisted PID"));
         assert!(
             unrelated.try_wait().unwrap().is_none(),
-            "unowned PID must not be signalled"
+            "reused PID with a different identity must not be signalled"
         );
         let record = registry.get(&task.id).unwrap();
-        assert_eq!(record.status, TaskStatus::Running);
-        assert!(!record.control.cancel.is_cancelled());
-        let _ = unrelated.kill();
+        assert_eq!(record.status, TaskStatus::Stopped);
+        assert_eq!(
+            record.result.as_deref(),
+            Some("Task stopped; worker already exited")
+        );
+        orca_tools::process::kill_child_tree(&mut unrelated);
         let _ = unrelated.wait();
+    }
+
+    #[test]
+    fn recovered_worker_identity_accepts_current_and_legacy_launch_shapes() {
+        let agent_id = "task-1234";
+
+        assert!(subagent_worker_command_matches(
+            "orca-subagent-worker-task-1234 subagent-worker --agent-id task-1234",
+            agent_id
+        ));
+        assert!(subagent_worker_command_matches(
+            "/opt/orca/bin/orca subagent-worker --cwd /tmp --agent-id task-1234 --subagent-depth 1",
+            agent_id
+        ));
+        assert!(!subagent_worker_command_matches(
+            "/opt/orca/bin/orca subagent-worker --agent-id task-reused",
+            agent_id
+        ));
+        assert!(!subagent_worker_command_matches(
+            "/bin/sh -c 'echo --agent-id task-1234'",
+            agent_id
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn request_stop_terminates_verified_recovered_worker_group() {
+        use std::os::unix::process::CommandExt;
+        use std::process::Stdio;
+        use std::time::Instant;
+
+        let temp = tempfile::tempdir().unwrap();
+        let signal_file = temp.path().join("signals");
+        let ready_file = temp.path().join("ready");
+        let root = temp.path().join("tasks");
+        let registry = TaskRegistry::new_persistent("session-1".to_string(), root.clone()).unwrap();
+        let task = registry.create_subagent("long-running recovered work".to_string(), None);
+        let mut command = std::process::Command::new("sh");
+        command
+            .env("ORCA_TEST_SIGNAL_FILE", &signal_file)
+            .env("ORCA_TEST_READY_FILE", &ready_file)
+            .arg("-c")
+            .arg(
+                r#"
+trap 'printf "worker\n" >> "$ORCA_TEST_SIGNAL_FILE"; exit 0' TERM
+sh -c 'trap '\''printf "descendant\n" >> "$ORCA_TEST_SIGNAL_FILE"; exit 0'\'' TERM; while :; do sleep 1; done' &
+printf 'ready\n' > "$ORCA_TEST_READY_FILE"
+wait
+"#,
+            )
+            .arg0(subagent_worker_process_name(&task.id))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0);
+        let mut child = command.spawn().expect("spawn recovered worker fixture");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !ready_file.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            ready_file.exists(),
+            "recovered worker fixture did not start"
+        );
+
+        registry.mark_worker_spawned(&task.id, child.id()).unwrap();
+        registry.mark_running(&task.id).unwrap();
+        let recovered = TaskRegistry::new_persistent("session-2".to_string(), root).unwrap();
+        let loaded = recovered.get(&task.id).expect("recovered worker task");
+        assert_eq!(loaded.worker_pid, Some(child.id()));
+
+        let stop_result = recovered.request_stop(&task.id);
+        if stop_result.is_err() {
+            orca_tools::process::kill_child_tree(&mut child);
+        }
+        let _ = child.wait();
+        stop_result.unwrap();
+
+        let stopped = recovered.get(&task.id).unwrap();
+        assert_eq!(stopped.status, TaskStatus::Stopped);
+        assert_eq!(stopped.worker_pid, None);
+        let signals = fs::read_to_string(&signal_file).unwrap_or_default();
+        assert!(signals.contains("worker"), "recovered worker missed TERM");
+        assert!(
+            signals.contains("descendant"),
+            "recovered worker descendant missed process-group TERM"
+        );
     }
 
     #[cfg(unix)]

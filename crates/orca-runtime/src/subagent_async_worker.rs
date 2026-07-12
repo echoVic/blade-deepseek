@@ -2,6 +2,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as ProcessCommand, Stdio};
 
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+
 use orca_core::cancel::CancelToken;
 use orca_core::config::RunConfig;
 use orca_core::cost_types::UsageTotals;
@@ -21,6 +24,8 @@ use crate::subagent::{self, SubagentIsolation};
 use crate::subagent_execution::{append_worktree_outcome, validate_subagent_output_schema};
 use crate::tasks::TaskRegistry;
 use crate::worktree::WorktreeGuard;
+
+const ASYNC_SUBAGENT_WORKER_API_KEY_ENV: &str = "ORCA_SUBAGENT_WORKER_API_KEY";
 
 #[derive(Clone, Debug)]
 pub struct AsyncSubagentWorktree {
@@ -65,6 +70,10 @@ struct AsyncSubagentWorkerSpawnContext<'a> {
 }
 
 pub fn run_async_subagent_worker(input: AsyncSubagentWorkerInput) -> i32 {
+    let mut input = input;
+    if let Some(api_key) = take_async_subagent_worker_api_key() {
+        input.config.api_key = Some(api_key);
+    }
     run_async_subagent_worker_with_executor(AsyncSubagentWorkerContext {
         input,
         child_executor: execute_child_agent_loop,
@@ -296,9 +305,7 @@ fn spawn_async_subagent_worker(
     if let Some(model) = config.model.as_history_value() {
         command.arg("--model").arg(model);
     }
-    if let Some(api_key) = config.api_key.as_deref() {
-        command.arg("--api-key").arg(api_key);
-    }
+    configure_async_subagent_worker_api_key(&mut command, config.api_key.as_deref());
     if let Some(base_url) = config.base_url.as_deref() {
         command.arg("--base-url").arg(base_url);
     }
@@ -309,12 +316,31 @@ fn spawn_async_subagent_worker(
             .arg("--worktree-path")
             .arg(&worktree.path);
     }
-    prepare_async_subagent_worker_command(&mut command);
+    prepare_async_subagent_worker_command(&mut command, agent_id);
     command.spawn().map_err(|error| error.to_string())
 }
 
-fn prepare_async_subagent_worker_command(command: &mut ProcessCommand) {
+fn prepare_async_subagent_worker_command(command: &mut ProcessCommand, agent_id: &str) {
     orca_tools::process::prepare_non_interactive_command(command);
+    #[cfg(unix)]
+    command.arg0(crate::tasks::subagent_worker_process_name(agent_id));
+}
+
+fn configure_async_subagent_worker_api_key(command: &mut ProcessCommand, api_key: Option<&str>) {
+    command.env_remove(ASYNC_SUBAGENT_WORKER_API_KEY_ENV);
+    if let Some(api_key) = api_key {
+        command.env(ASYNC_SUBAGENT_WORKER_API_KEY_ENV, api_key);
+    }
+}
+
+fn take_async_subagent_worker_api_key() -> Option<String> {
+    let api_key = std::env::var(ASYNC_SUBAGENT_WORKER_API_KEY_ENV).ok();
+    // The worker reads this before starting provider/tool threads. Removing it prevents
+    // subsequently launched tools from inheriting the provider credential.
+    unsafe {
+        std::env::remove_var(ASYNC_SUBAGENT_WORKER_API_KEY_ENV);
+    }
+    api_key
 }
 
 pub(crate) fn usage_totals_if_non_empty(usage: UsageTotals) -> Option<UsageTotals> {
@@ -339,24 +365,94 @@ pub(crate) fn async_subagent_result_payload(
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    static API_KEY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
-    fn async_subagent_worker_command_owns_its_process_group() {
+    fn async_subagent_worker_takes_api_key_from_environment() {
+        let _guard = API_KEY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = std::env::var_os(ASYNC_SUBAGENT_WORKER_API_KEY_ENV);
+        unsafe {
+            std::env::set_var(ASYNC_SUBAGENT_WORKER_API_KEY_ENV, "worker-secret");
+        }
+
+        let api_key = take_async_subagent_worker_api_key();
+
+        assert_eq!(api_key.as_deref(), Some("worker-secret"));
+        assert!(std::env::var_os(ASYNC_SUBAGENT_WORKER_API_KEY_ENV).is_none());
+        if let Some(previous) = previous {
+            unsafe {
+                std::env::set_var(ASYNC_SUBAGENT_WORKER_API_KEY_ENV, previous);
+            }
+        }
+    }
+
+    #[test]
+    fn async_subagent_worker_command_hides_key_and_owns_process_group() {
         unsafe extern "C" {
             fn getpgid(pid: i32) -> i32;
         }
 
+        let temp = tempfile::tempdir().unwrap();
+        let key_file = temp.path().join("worker-key");
+        let sentinel = "orca-secret-sentinel-not-for-argv";
+        let agent_id = "task-test-worker";
+        assert!(
+            !include_str!("subagent_async_worker.rs").contains(".arg(\"--api-key\")"),
+            "production async worker launch must not rebuild the leaked API key argument"
+        );
         let mut command = ProcessCommand::new("sh");
-        command.arg("-c").arg("sleep 30");
-        prepare_async_subagent_worker_command(&mut command);
+        command
+            .env("ORCA_TEST_KEY_FILE", &key_file)
+            .arg("-c")
+            .arg(format!(
+                "printf '%s' \"${ASYNC_SUBAGENT_WORKER_API_KEY_ENV}\" > \"$ORCA_TEST_KEY_FILE\"; sleep 30"
+            ));
+        configure_async_subagent_worker_api_key(&mut command, Some(sentinel));
+        prepare_async_subagent_worker_command(&mut command, agent_id);
         let mut child = command.spawn().expect("spawn worker process-group fixture");
         let pid = child.id() as i32;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !key_file.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            key_file.exists(),
+            "worker did not receive API key environment"
+        );
 
         let pgid = unsafe { getpgid(pid) };
+        let pid_text = pid.to_string();
+        let command_line = ProcessCommand::new("/bin/ps")
+            .args(["-ww", "-p", pid_text.as_str(), "-o", "command="])
+            .output()
+            .expect("inspect worker command line");
 
         assert_eq!(
             pgid, pid,
             "async worker must lead an isolated process group"
+        );
+        let command_line = String::from_utf8_lossy(&command_line.stdout);
+        assert!(
+            command_line.starts_with(&crate::tasks::subagent_worker_process_name(agent_id)),
+            "async worker must expose its persisted identity in argv0"
+        );
+        assert!(
+            !command_line.contains(sentinel),
+            "provider API key must not appear in worker argv"
+        );
+        assert!(
+            !command_line.contains("--api-key"),
+            "internal worker must not receive an API key argument"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&key_file).unwrap(),
+            sentinel,
+            "worker must receive the provider API key through its environment"
         );
         orca_tools::process::kill_child_tree(&mut child);
         let _ = child.wait();
