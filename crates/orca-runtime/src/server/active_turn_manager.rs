@@ -100,7 +100,7 @@ impl ActiveTurnManager {
         }
     }
 
-    pub(super) fn join_all_bounded(
+    pub(super) fn wait_all_bounded(
         &mut self,
         threads: &mut ServerThreadRuntime,
         timeout: Duration,
@@ -115,14 +115,13 @@ impl ActiveTurnManager {
                 return true;
             }
             if Instant::now() >= deadline {
-                self.handoff_remaining_to_reaper();
                 return false;
             }
             thread::sleep(POLL);
         }
     }
 
-    fn handoff_remaining_to_reaper(&mut self) {
+    pub(super) fn handoff_remaining_to_reaper(&mut self) {
         let running = std::mem::take(&mut self.running);
         let mut controls = std::mem::take(&mut self.controls);
         drop(thread::spawn(move || {

@@ -98,19 +98,25 @@ struct ServerState {
 
 impl ServerState {
     fn shutdown(&mut self) {
-        const ACTIVE_TURN_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+        const GRACEFUL_TURN_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+        const CANCELLED_TURN_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(500);
         self.command_exec.terminate_all(self.shells.sessions_mut());
-        self.active_turns.cancel_all();
         let _ = self.pending_permissions.close();
         let _ = self.pending_user_inputs.close();
         self.shells.terminate_all();
+        if self
+            .active_turns
+            .wait_all_bounded(&mut self.threads, GRACEFUL_TURN_SHUTDOWN_TIMEOUT)
+        {
+            return;
+        }
+        self.active_turns.cancel_all();
         if !self
             .active_turns
-            .join_all_bounded(&mut self.threads, ACTIVE_TURN_SHUTDOWN_TIMEOUT)
+            .wait_all_bounded(&mut self.threads, CANCELLED_TURN_SHUTDOWN_TIMEOUT)
         {
-            eprintln!(
-                "orca: server shutdown timed out waiting for active turns; cleanup continues in the background"
-            );
+            self.active_turns.handoff_remaining_to_reaper();
+            eprintln!("orca: server shutdown cleanup continues in the background");
         }
     }
 }
