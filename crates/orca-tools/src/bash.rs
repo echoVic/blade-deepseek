@@ -354,9 +354,7 @@ pub fn execute_streaming_command_or_cancel(
         }
     };
 
-    let stdout_reader = join_stream_reader(stdout_handle, "stdout");
-    let stderr_reader = join_stream_reader(stderr_handle, "stderr");
-    while let Ok(event) = rx.try_recv() {
+    while let Ok(event) = rx.recv() {
         match event {
             StreamEvent::Stdout(chunk) => {
                 emit_live_preview(&chunk, &mut preview_remaining, on_output);
@@ -368,6 +366,8 @@ pub fn execute_streaming_command_or_cancel(
             }
         }
     }
+    let stdout_reader = join_stream_reader(stdout_handle, "stdout");
+    let stderr_reader = join_stream_reader(stderr_handle, "stderr");
 
     if let Err(error) = stdout_reader.and(stderr_reader) {
         return ToolResult::failed(request, error, status.code());
@@ -638,6 +638,43 @@ mod tests {
     }
 
     #[test]
+    fn noisy_streaming_timeout_does_not_deadlock_reader_shutdown() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let request = bash_request("while :; do printf 1234567890; done");
+        let start = Instant::now();
+        let mut delayed_callback = false;
+
+        let result = execute_streaming_with_policy(
+            &request,
+            dir.path(),
+            ToolOutputTruncation::bytes(1024),
+            Duration::from_millis(100),
+            &mut |_| {
+                if !delayed_callback {
+                    delayed_callback = true;
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+            },
+        );
+
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "noisy streaming timeout deadlocked reader shutdown: {:?}",
+            start.elapsed()
+        );
+        assert_eq!(result.status, ToolStatus::Failed);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("shell command timed out after 0s"),
+            "unexpected error: {:?}",
+            result.error
+        );
+    }
+
+    #[test]
     fn bash_wait_observes_cancel_callback() {
         let dir = tempfile::TempDir::new().unwrap();
         let request = bash_request("printf before; sleep 5; printf after");
@@ -712,6 +749,44 @@ mod tests {
         assert!(
             chunks.join("").contains("before"),
             "partial output should still stream before cancellation"
+        );
+    }
+
+    #[test]
+    fn noisy_streaming_cancel_does_not_deadlock_reader_shutdown() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let request = bash_request("while :; do printf 1234567890; done");
+        let start = Instant::now();
+        let mut delayed_callback = false;
+
+        let result = execute_streaming_with_policy_or_cancel(
+            &request,
+            dir.path(),
+            ToolOutputTruncation::bytes(1024),
+            Duration::from_secs(30),
+            &mut |_| {
+                if !delayed_callback {
+                    delayed_callback = true;
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+            },
+            || start.elapsed() >= Duration::from_millis(100),
+        );
+
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "noisy streaming cancel deadlocked reader shutdown: {:?}",
+            start.elapsed()
+        );
+        assert_eq!(result.status, ToolStatus::Failed);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("shell command cancelled"),
+            "unexpected error: {:?}",
+            result.error
         );
     }
 
