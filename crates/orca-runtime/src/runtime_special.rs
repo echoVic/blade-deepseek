@@ -368,15 +368,20 @@ impl RuntimeToolActorContext {
                 None,
             );
         }
-        if record.status == TaskStatus::ApprovalRequired {
+        let stopped_immediately = if record.status == TaskStatus::ApprovalRequired {
             if let Err(error) = task_registry.stop(task_id, "Task stopped".to_string()) {
                 return ToolResult::failed(request, error, None);
             }
+            true
         } else if let Err(error) = task_registry.request_stop(task_id) {
             return ToolResult::failed(request, error, None);
-        }
+        } else {
+            task_registry
+                .get(task_id)
+                .is_some_and(|record| record.status == TaskStatus::Stopped)
+        };
         let output = json!({
-            "message": if record.status == TaskStatus::ApprovalRequired {
+            "message": if stopped_immediately {
                 "Task stopped"
             } else {
                 "Task stop requested"
@@ -564,6 +569,17 @@ mod tests {
     use orca_core::task_types::PendingToolCallSummary;
     use orca_core::tool_types::{ToolRequest, ToolStatus};
 
+    #[cfg(unix)]
+    use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::process::CommandExt;
+    #[cfg(unix)]
+    use std::process::{Command, Stdio};
+    #[cfg(unix)]
+    use std::thread;
+    #[cfg(unix)]
+    use std::time::{Duration, Instant};
+
     #[test]
     fn task_summary_json_marks_backgrounded_main_sessions() {
         let task = BackgroundTaskSummary {
@@ -641,10 +657,104 @@ mod tests {
         let result = context.execute_task_stop_tool(&request, &registry);
 
         assert_eq!(result.status, ToolStatus::Completed, "{:?}", result.error);
+        let output: Value = serde_json::from_str(result.output.as_deref().unwrap()).unwrap();
+        assert_eq!(output["message"], "Task stopped");
         let stopped = registry.get(&task.id).unwrap();
         assert_eq!(stopped.status, TaskStatus::Stopped);
         assert_eq!(stopped.result.as_deref(), Some("Task stopped"));
         assert_eq!(stopped.error, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn task_stop_terminates_owned_async_subagent_process_group() {
+        let temp = tempfile::tempdir().unwrap();
+        let signal_file = temp.path().join("signals");
+        let ready_file = temp.path().join("ready");
+        let mut command = Command::new("sh");
+        command
+            .env("ORCA_TEST_SIGNAL_FILE", &signal_file)
+            .env("ORCA_TEST_READY_FILE", &ready_file)
+            .arg("-c")
+            .arg(
+                r#"
+trap 'printf "worker\n" >> "$ORCA_TEST_SIGNAL_FILE"; exit 0' TERM
+sh -c 'trap '\''printf "descendant\n" >> "$ORCA_TEST_SIGNAL_FILE"; exit 0'\'' TERM; while :; do sleep 1; done' &
+printf 'ready\n' > "$ORCA_TEST_READY_FILE"
+wait
+"#,
+            )
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0);
+        let child = command.spawn().expect("spawn async subagent fixture");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !ready_file.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(ready_file.exists(), "async subagent fixture did not start");
+
+        let registry = TaskRegistry::new("session-1".to_string());
+        let task = registry.create_subagent("long-running async work".to_string(), None);
+        registry
+            .adopt_subagent_worker(&task.id, child)
+            .expect("adopt async subagent worker");
+        registry.mark_running(&task.id).unwrap();
+        let request = ToolRequest {
+            id: "call-stop-async".to_string(),
+            name: ToolName::TaskStop,
+            action: ActionKind::Write,
+            target: None,
+            raw_arguments: Some(format!(r#"{{"task_id":"{}"}}"#, task.id)),
+        };
+        let mut context = RuntimeToolActorContext::new("test-run", 8);
+
+        let result = context.execute_task_stop_tool(&request, &registry);
+
+        assert_eq!(result.status, ToolStatus::Completed, "{:?}", result.error);
+        let output: Value = serde_json::from_str(result.output.as_deref().unwrap()).unwrap();
+        assert_eq!(output["message"], "Task stopped");
+        let stopped = registry.get(&task.id).unwrap();
+        assert_eq!(stopped.status, TaskStatus::Stopped);
+        assert_eq!(stopped.result.as_deref(), Some("Task stopped"));
+        assert_eq!(stopped.worker_pid, None);
+        assert!(stopped.control.cancel.is_cancelled());
+        let signals = fs::read_to_string(&signal_file).unwrap_or_default();
+        assert!(signals.contains("worker"), "worker did not receive TERM");
+        assert!(
+            signals.contains("descendant"),
+            "worker descendant did not receive process-group TERM"
+        );
+    }
+
+    #[test]
+    fn task_stop_preserves_in_process_cancellation_semantics() {
+        let registry = TaskRegistry::new("session-1".to_string());
+        let task = registry.create_workflow(
+            "workflow-run-1".to_string(),
+            "audit".to_string(),
+            "Audit code".to_string(),
+            1,
+        );
+        registry.mark_running(&task.id).unwrap();
+        let request = ToolRequest {
+            id: "call-stop-workflow".to_string(),
+            name: ToolName::TaskStop,
+            action: ActionKind::Write,
+            target: None,
+            raw_arguments: Some(format!(r#"{{"task_id":"{}"}}"#, task.id)),
+        };
+        let mut context = RuntimeToolActorContext::new("test-run", 8);
+
+        let result = context.execute_task_stop_tool(&request, &registry);
+
+        assert_eq!(result.status, ToolStatus::Completed, "{:?}", result.error);
+        let output: Value = serde_json::from_str(result.output.as_deref().unwrap()).unwrap();
+        assert_eq!(output["message"], "Task stop requested");
+        let stopping = registry.get(&task.id).unwrap();
+        assert_eq!(stopping.status, TaskStatus::Stopping);
+        assert!(stopping.control.cancel.is_cancelled());
     }
 
     #[test]

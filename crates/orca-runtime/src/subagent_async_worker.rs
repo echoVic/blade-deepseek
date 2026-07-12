@@ -1,6 +1,6 @@
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Command as ProcessCommand, Stdio};
+use std::process::{Child, Command as ProcessCommand, Stdio};
 
 use orca_core::cancel::CancelToken;
 use orca_core::config::RunConfig;
@@ -229,8 +229,14 @@ pub(crate) fn launch_async_subagent(
         child_depth: subagent_depth + 1,
         worktree: worktree.as_ref(),
     }) {
-        Ok(pid) => {
-            let _ = task_registry.mark_worker_spawned(&agent_id, pid);
+        Ok(child) => {
+            if let Err(error) = task_registry.adopt_subagent_worker(&agent_id, child) {
+                let worktree = worktree_guard.and_then(|guard| guard.finish().ok());
+                let mut error = format!("failed to own async subagent worker: {error}");
+                append_worktree_outcome(&mut error, worktree.as_ref());
+                let _ = task_registry.fail(&agent_id, error.clone());
+                return tool_types::ToolResult::failed(tool_request, error, None);
+            }
             std::mem::forget(worktree_guard);
         }
         Err(error) => {
@@ -253,7 +259,7 @@ pub(crate) fn launch_async_subagent(
 
 fn spawn_async_subagent_worker(
     context: AsyncSubagentWorkerSpawnContext<'_>,
-) -> Result<u32, String> {
+) -> Result<Child, String> {
     let AsyncSubagentWorkerSpawnContext {
         config,
         cwd,
@@ -303,10 +309,12 @@ fn spawn_async_subagent_worker(
             .arg("--worktree-path")
             .arg(&worktree.path);
     }
-    command
-        .spawn()
-        .map(|child| child.id())
-        .map_err(|error| error.to_string())
+    prepare_async_subagent_worker_command(&mut command);
+    command.spawn().map_err(|error| error.to_string())
+}
+
+fn prepare_async_subagent_worker_command(command: &mut ProcessCommand) {
+    orca_tools::process::prepare_non_interactive_command(command);
 }
 
 pub(crate) fn usage_totals_if_non_empty(usage: UsageTotals) -> Option<UsageTotals> {
@@ -326,4 +334,31 @@ pub(crate) fn async_subagent_result_payload(
         "task": task,
     })
     .to_string()
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn async_subagent_worker_command_owns_its_process_group() {
+        unsafe extern "C" {
+            fn getpgid(pid: i32) -> i32;
+        }
+
+        let mut command = ProcessCommand::new("sh");
+        command.arg("-c").arg("sleep 30");
+        prepare_async_subagent_worker_command(&mut command);
+        let mut child = command.spawn().expect("spawn worker process-group fixture");
+        let pid = child.id() as i32;
+
+        let pgid = unsafe { getpgid(pid) };
+
+        assert_eq!(
+            pgid, pid,
+            "async worker must lead an isolated process group"
+        );
+        orca_tools::process::kill_child_tree(&mut child);
+        let _ = child.wait();
+    }
 }

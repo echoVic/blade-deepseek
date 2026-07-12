@@ -2,9 +2,11 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::process::Child;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use orca_core::cancel::CancelToken;
 use orca_core::conversation::RawToolCall;
@@ -97,6 +99,7 @@ pub struct TaskRecord {
 pub struct TaskControl {
     pub cancel: CancelToken,
     pub pause: Arc<AtomicBool>,
+    worker: Arc<Mutex<Option<Child>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -226,6 +229,7 @@ impl TaskRegistry {
         let control = TaskControl {
             cancel: CancelToken::new(),
             pause: Arc::new(AtomicBool::new(false)),
+            worker: Arc::new(Mutex::new(None)),
         };
         let record = TaskRecord {
             id: id.clone(),
@@ -278,6 +282,7 @@ impl TaskRegistry {
         let control = TaskControl {
             cancel: CancelToken::new(),
             pause: Arc::new(AtomicBool::new(false)),
+            worker: Arc::new(Mutex::new(None)),
         };
         let record = TaskRecord {
             id: id.clone(),
@@ -330,6 +335,7 @@ impl TaskRegistry {
         let control = TaskControl {
             cancel: CancelToken::new(),
             pause: Arc::new(AtomicBool::new(false)),
+            worker: Arc::new(Mutex::new(None)),
         };
         let record = TaskRecord {
             id: id.clone(),
@@ -382,6 +388,7 @@ impl TaskRegistry {
         let control = TaskControl {
             cancel: CancelToken::new(),
             pause: Arc::new(AtomicBool::new(false)),
+            worker: Arc::new(Mutex::new(None)),
         };
         let record = TaskRecord {
             id: id.clone(),
@@ -702,6 +709,56 @@ impl TaskRegistry {
         })
     }
 
+    pub(crate) fn adopt_subagent_worker(&self, id: &str, child: Child) -> Result<(), String> {
+        let pid = child.id();
+        let mut child = Some(child);
+        let worker = self
+            .with_tasks(|tasks| {
+                let worker = {
+                    let record = tasks
+                        .get(id)
+                        .ok_or_else(|| format!("task '{id}' not found"))?;
+                    if record.task_type != TaskType::Subagent {
+                        return Err(format!("task '{id}' is not a subagent"));
+                    }
+                    if is_terminal(record.status) {
+                        return Err(task_state_error("adopt_subagent_worker", record.status));
+                    }
+                    Arc::clone(&record.control.worker)
+                };
+                let mut slot = worker
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if slot.is_some() {
+                    return Err(format!("task '{id}' already owns a worker process"));
+                }
+                let previous_pid = tasks.get(id).and_then(|record| record.worker_pid);
+                tasks.get_mut(id).expect("validated task record").worker_pid = Some(pid);
+                if let Err(error) = self.persist_current_session(tasks) {
+                    tasks.get_mut(id).expect("validated task record").worker_pid = previous_pid;
+                    return Err(error);
+                }
+                *slot = child.take();
+                drop(slot);
+                Ok(worker)
+            })
+            .map_err(|_| "task registry lock poisoned".to_string())?;
+
+        match worker {
+            Ok(worker) => {
+                spawn_worker_reaper(worker);
+                Ok(())
+            }
+            Err(error) => {
+                if let Some(mut child) = child {
+                    terminate_worker(&mut child);
+                    let _ = child.wait();
+                }
+                Err(error)
+            }
+        }
+    }
+
     pub fn complete(&self, id: &str, result: String) -> Result<(), String> {
         self.complete_with_usage(id, result, None)
     }
@@ -1011,18 +1068,68 @@ impl TaskRegistry {
     }
 
     pub fn request_stop(&self, id: &str) -> Result<(), String> {
-        self.update_task(id, |record| {
-            if is_terminal(record.status) {
-                return Err(task_state_error("request_stop", record.status));
-            }
+        let mut owned_worker = None;
+        self.with_tasks(|tasks| {
+            let worker = {
+                let record = tasks
+                    .get_mut(id)
+                    .ok_or_else(|| format!("task '{id}' not found"))?;
+                if is_terminal(record.status) {
+                    return Err(task_state_error("request_stop", record.status));
+                }
 
-            record.status = TaskStatus::Stopping;
-            if record.started_at_ms.is_none() {
-                record.started_at_ms = Some(now_ms());
+                let worker = if record.task_type == TaskType::Subagent
+                    && record.worker_pid.is_some()
+                {
+                    Some(Arc::clone(&record.control.worker))
+                } else {
+                    None
+                };
+                if let Some(worker) = &worker {
+                    let mut slot = worker
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let Some(child) = slot.take() else {
+                        return Err(format!(
+                            "task '{id}' worker ownership is unavailable; refusing to signal a persisted PID"
+                        ));
+                    };
+                    owned_worker = Some((Arc::clone(worker), child));
+                }
+
+                record.status = TaskStatus::Stopping;
+                if record.started_at_ms.is_none() {
+                    record.started_at_ms = Some(now_ms());
+                }
+                record.control.cancel.cancel();
+                worker
+            };
+
+            if let Err(error) = self.persist_current_session(tasks) {
+                if let (Some(worker), Some((_, child))) = (&worker, owned_worker.take()) {
+                    let mut slot = worker
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    *slot = Some(child);
+                }
+                return Err(error);
             }
-            record.control.cancel.cancel();
             Ok(())
         })
+        .map_err(|_| "task registry lock poisoned".to_string())??;
+
+        let Some((worker, mut child)) = owned_worker else {
+            return Ok(());
+        };
+        terminate_worker(&mut child);
+        if let Err(error) = child.wait() {
+            let mut slot = worker
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *slot = Some(child);
+            return Err(format!("failed to reap async subagent worker: {error}"));
+        }
+        self.stop(id, "Task stopped".to_string())
     }
 
     pub fn request_pause(&self, id: &str) -> Result<(), String> {
@@ -1402,7 +1509,44 @@ fn new_task_control() -> TaskControl {
     TaskControl {
         cancel: CancelToken::new(),
         pause: Arc::new(AtomicBool::new(false)),
+        worker: Arc::new(Mutex::new(None)),
     }
+}
+
+fn spawn_worker_reaper(worker: Arc<Mutex<Option<Child>>>) {
+    thread::spawn(move || {
+        loop {
+            let finished = {
+                let mut slot = worker
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let Some(child) = slot.as_mut() else {
+                    return;
+                };
+                match child.try_wait() {
+                    Ok(Some(_)) => true,
+                    Ok(None) => false,
+                    Err(_) => {
+                        terminate_worker(child);
+                        let _ = child.wait();
+                        true
+                    }
+                }
+            };
+            if finished {
+                let mut slot = worker
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                slot.take();
+                return;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    });
+}
+
+fn terminate_worker(child: &mut Child) {
+    orca_tools::process::kill_child_tree(child);
 }
 
 fn new_task_id() -> String {
@@ -2340,6 +2484,65 @@ mod tests {
         let record = registry.get(&task.id).unwrap();
         assert_eq!(record.status, TaskStatus::Stopping);
         assert!(record.control.cancel.is_cancelled());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn request_stop_refuses_unowned_persisted_worker_pid() {
+        let registry = TaskRegistry::new("session-1".to_string());
+        let task = registry.create_subagent("inspect auth".to_string(), None);
+        let mut unrelated = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("sleep 30")
+            .spawn()
+            .expect("spawn unrelated process");
+        registry
+            .mark_worker_spawned(&task.id, unrelated.id())
+            .unwrap();
+        registry.mark_running(&task.id).unwrap();
+
+        let error = registry.request_stop(&task.id).unwrap_err();
+
+        assert!(error.contains("refusing to signal a persisted PID"));
+        assert!(
+            unrelated.try_wait().unwrap().is_none(),
+            "unowned PID must not be signalled"
+        );
+        let record = registry.get(&task.id).unwrap();
+        assert_eq!(record.status, TaskStatus::Running);
+        assert!(!record.control.cancel.is_cancelled());
+        let _ = unrelated.kill();
+        let _ = unrelated.wait();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn adopted_worker_is_reaped_after_natural_exit() {
+        let registry = TaskRegistry::new("session-1".to_string());
+        let task = registry.create_subagent("quick async work".to_string(), None);
+        let child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("exit 0")
+            .spawn()
+            .expect("spawn quick worker");
+        registry.adopt_subagent_worker(&task.id, child).unwrap();
+        let worker = Arc::clone(&registry.get(&task.id).unwrap().control.worker);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let is_reaped = worker
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_none();
+            if is_reaped {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker Child was not reaped after exit"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]
