@@ -1964,6 +1964,7 @@ mod tests {
             "struct ActiveTurnControl",
             "struct ActiveTurnHandle",
             "struct ActiveTurnManager",
+            "struct ActiveTurnReaper",
         ] {
             assert!(
                 !server_source.contains(type_name),
@@ -1977,6 +1978,15 @@ mod tests {
         assert!(
             manager_source.contains("fn merge_completed_turn_metadata"),
             "server/active_turn_manager.rs must own completed-turn metadata merge"
+        );
+        assert!(
+            server_source.contains("let reaper = state.shutdown();")
+                && server_source.contains("reaper.join();"),
+            "server exit must retain and join handed-off turn cleanup before process::exit"
+        );
+        assert!(
+            !manager_source.contains("drop(thread::spawn("),
+            "active turn cleanup must not discard its reaper join handle"
         );
     }
 

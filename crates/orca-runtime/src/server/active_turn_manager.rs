@@ -44,6 +44,32 @@ impl ActiveTurnHandle {
     }
 }
 
+#[must_use = "active turn cleanup must be joined before server exit"]
+pub(super) struct ActiveTurnReaper {
+    running: Vec<ActiveTurnHandle>,
+    controls: HashMap<String, ActiveTurnControl>,
+}
+
+impl ActiveTurnReaper {
+    pub(super) fn join(mut self) {
+        self.join_all();
+    }
+
+    fn join_all(&mut self) {
+        for active in self.running.drain(..) {
+            if let Ok((turn_id, _thread_id, _thread)) = active.handle.join() {
+                self.controls.remove(&turn_id);
+            }
+        }
+    }
+}
+
+impl Drop for ActiveTurnReaper {
+    fn drop(&mut self) {
+        self.join_all();
+    }
+}
+
 #[derive(Default)]
 pub(super) struct ActiveTurnManager {
     controls: HashMap<String, ActiveTurnControl>,
@@ -121,16 +147,15 @@ impl ActiveTurnManager {
         }
     }
 
-    pub(super) fn handoff_remaining_to_reaper(&mut self) {
+    pub(super) fn handoff_remaining_to_reaper(&mut self) -> Option<ActiveTurnReaper> {
         let running = std::mem::take(&mut self.running);
-        let mut controls = std::mem::take(&mut self.controls);
-        drop(thread::spawn(move || {
-            for active in running {
-                if let Ok((turn_id, _thread_id, _thread)) = active.handle.join() {
-                    controls.remove(&turn_id);
-                }
-            }
-        }));
+        if running.is_empty() {
+            return None;
+        }
+        Some(ActiveTurnReaper {
+            running,
+            controls: std::mem::take(&mut self.controls),
+        })
     }
 
     pub(super) fn reclaim_finished(&mut self, threads: &mut ServerThreadRuntime) {
@@ -193,4 +218,37 @@ fn merge_completed_turn_metadata(
         }
     }
     thread
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    #[test]
+    fn handed_off_turn_reaper_remains_joinable_until_cleanup_finishes() {
+        let (release_tx, release_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let handle = thread::spawn(move || -> (String, String, ServerThread) {
+            release_rx.recv().expect("release turn");
+            finished_tx.send(()).expect("report completion");
+            panic!("test turn exits without a ServerThread");
+        });
+        let mut manager = ActiveTurnManager::default();
+        manager.push_running(ActiveTurnHandle::new(handle));
+        let reaper = manager
+            .handoff_remaining_to_reaper()
+            .expect("active turn reaper");
+
+        assert!(finished_rx.try_recv().is_err());
+        release_tx.send(()).expect("release turn");
+        reaper.join();
+        assert_eq!(finished_rx.try_recv(), Ok(()));
+    }
+
+    #[test]
+    fn empty_turn_manager_does_not_spawn_a_reaper() {
+        let mut manager = ActiveTurnManager::default();
+        assert!(manager.handoff_remaining_to_reaper().is_none());
+    }
 }

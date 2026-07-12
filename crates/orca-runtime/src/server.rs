@@ -32,7 +32,9 @@ use crate::thread_store::{
     SessionStore, SortDirection, StoredThreadSummary, ThreadListFilters, ThreadMetadataPatch,
     ThreadSortKey, ThreadStore, TurnItemsView,
 };
-use active_turn_manager::{ActiveTurnControl, ActiveTurnHandle, ActiveTurnManager};
+use active_turn_manager::{
+    ActiveTurnControl, ActiveTurnHandle, ActiveTurnManager, ActiveTurnReaper,
+};
 use command_exec_manager::{
     CommandExecDrainOutcome, CommandExecManager, CommandExecPermissionPolicy, CommandExecProcess,
     CommandExecProcessSnapshot,
@@ -81,7 +83,10 @@ fn run_with_io<R: BufRead, W: Write + Send + 'static>(
         }
         Ok(())
     })();
-    state.shutdown();
+    let reaper = state.shutdown();
+    if let Some(reaper) = reaper {
+        reaper.join();
+    }
     result
 }
 
@@ -97,7 +102,7 @@ struct ServerState {
 }
 
 impl ServerState {
-    fn shutdown(&mut self) {
+    fn shutdown(&mut self) -> Option<ActiveTurnReaper> {
         const GRACEFUL_TURN_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
         const CANCELLED_TURN_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(500);
         self.command_exec.terminate_all(self.shells.sessions_mut());
@@ -108,16 +113,16 @@ impl ServerState {
             .active_turns
             .wait_all_bounded(&mut self.threads, GRACEFUL_TURN_SHUTDOWN_TIMEOUT)
         {
-            return;
+            return None;
         }
         self.active_turns.cancel_all();
         if !self
             .active_turns
             .wait_all_bounded(&mut self.threads, CANCELLED_TURN_SHUTDOWN_TIMEOUT)
         {
-            self.active_turns.handoff_remaining_to_reaper();
-            eprintln!("orca: server shutdown cleanup continues in the background");
+            return self.active_turns.handoff_remaining_to_reaper();
         }
+        None
     }
 }
 
@@ -2132,6 +2137,39 @@ mod tests {
         }
     }
 
+    struct DelayedTerminalWriter {
+        output: SharedVecWriter,
+        delay_started: Arc<std::sync::atomic::AtomicBool>,
+        delay_finished: Arc<std::sync::atomic::AtomicBool>,
+        delay: Duration,
+    }
+
+    impl Write for DelayedTerminalWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            use std::sync::atomic::Ordering;
+
+            let written = self.output.write(buf)?;
+            if self
+                .output
+                .bytes()
+                .windows(b"turn_completed".len())
+                .any(|window| window == b"turn_completed")
+                && self
+                    .delay_started
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            {
+                thread::sleep(self.delay);
+                self.delay_finished.store(true, Ordering::Release);
+            }
+            Ok(written)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
     struct ErrorAfterPendingUserInputReader {
         phase: u8,
         output: SharedVecWriter,
@@ -2212,6 +2250,41 @@ mod tests {
             Arc::strong_count(&output.0),
             1,
             "server input failure must release the active turn writer"
+        );
+    }
+
+    #[test]
+    fn run_with_io_waits_for_handed_off_turn_reaper() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let temp = tempdir().expect("tempdir");
+        let mut config = test_run_config();
+        config.cwd = Some(temp.path().to_path_buf());
+        let output = SharedVecWriter::default();
+        let delay_started = Arc::new(AtomicBool::new(false));
+        let delay_finished = Arc::new(AtomicBool::new(false));
+        let reader = ErrorAfterPendingUserInputReader {
+            phase: 0,
+            output: output.clone(),
+        };
+        let writer = DelayedTerminalWriter {
+            output,
+            delay_started: Arc::clone(&delay_started),
+            delay_finished: Arc::clone(&delay_finished),
+            delay: Duration::from_secs(2),
+        };
+
+        let error = run_with_io(ServerConfig { run_config: config }, reader, writer)
+            .expect_err("reader failure should be returned");
+
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
+        assert!(
+            delay_started.load(Ordering::Acquire),
+            "test must hold the active turn past both bounded shutdown phases"
+        );
+        assert!(
+            delay_finished.load(Ordering::Acquire),
+            "run_with_io must join transferred reaper ownership before returning"
         );
     }
 
