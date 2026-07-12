@@ -38,6 +38,8 @@ use crate::runtime::controller;
 use crate::runtime::history;
 use crate::tui::app;
 
+const MAX_WORKER_API_KEY_BYTES: u64 = 64 * 1024;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum TuiUpdatePreflight {
     Continue,
@@ -390,6 +392,10 @@ struct WorkflowWorkerArgs {
     #[arg(long)]
     api_key: Option<String>,
 
+    /// Read the API key once from stdin (internal worker handoff).
+    #[arg(long, hide = true)]
+    api_key_stdin: bool,
+
     /// API base URL (overrides config file and ORCA_BASE_URL env).
     #[arg(long)]
     base_url: Option<String>,
@@ -424,6 +430,10 @@ struct SubagentWorkerArgs {
     /// API key to use (overrides config file and ORCA_API_KEY env).
     #[arg(long)]
     api_key: Option<String>,
+
+    /// Read the API key once from stdin (internal worker handoff).
+    #[arg(long, hide = true)]
+    api_key_stdin: bool,
 
     /// API base URL (overrides config file and ORCA_BASE_URL env).
     #[arg(long)]
@@ -501,6 +511,7 @@ struct WorkflowCliLaunchRecord {
     cwd: String,
     provider: ProviderKind,
     model: Option<String>,
+    #[serde(default, skip_serializing)]
     api_key: Option<String>,
     base_url: Option<String>,
     input: WorkflowInput,
@@ -994,11 +1005,18 @@ fn run_subagent_worker(args: SubagentWorkerArgs) -> i32 {
             return 1;
         }
     };
+    let api_key = match resolve_worker_api_key(args.api_key, args.api_key_stdin) {
+        Ok(api_key) => api_key,
+        Err(error) => {
+            eprintln!("orca: {error}");
+            return 1;
+        }
+    };
     let config = match build_worker_run_config(
         &args.cwd,
         args.provider,
         args.model.clone(),
-        args.api_key.clone(),
+        api_key,
         args.base_url.clone(),
     ) {
         Ok(config) => config,
@@ -1385,6 +1403,21 @@ fn workflow_restart_command(run_id: &str, restart_phase: Option<String>) -> i32 
                 }
             };
             let launch_cwd = PathBuf::from(&record.cwd);
+            let legacy_api_key = record.api_key.clone();
+            if legacy_api_key.is_some() {
+                let sanitized = WorkflowCliLaunchRecord {
+                    cwd: record.cwd.clone(),
+                    provider: record.provider,
+                    model: record.model.clone(),
+                    api_key: None,
+                    base_url: record.base_url.clone(),
+                    input: record.input.clone(),
+                };
+                if let Err(error) = write_workflow_cli_launch_record(&run.run_dir, &sanitized) {
+                    eprintln!("orca: failed to sanitize workflow launch record: {error}");
+                    return 1;
+                }
+            }
             let mut input = record.input;
             input.resume_from_run_id = Some(run.state.run_id.clone());
             input.restart_phase = restart_phase;
@@ -1393,7 +1426,7 @@ fn workflow_restart_command(run_id: &str, restart_phase: Option<String>) -> i32 
                 run.session_id,
                 record.provider,
                 record.model,
-                record.api_key,
+                legacy_api_key,
                 record.base_url,
                 &input,
             )
@@ -1410,6 +1443,13 @@ fn workflow_restart_command(run_id: &str, restart_phase: Option<String>) -> i32 
 }
 
 fn run_workflow_worker(args: WorkflowWorkerArgs) -> i32 {
+    let worker_api_key = match resolve_worker_api_key(args.api_key, args.api_key_stdin) {
+        Ok(api_key) => api_key,
+        Err(error) => {
+            eprintln!("orca: {error}");
+            return 1;
+        }
+    };
     let input: WorkflowInput = match serde_json::from_str(&args.input_json) {
         Ok(input) => input,
         Err(error) => {
@@ -1421,7 +1461,7 @@ fn run_workflow_worker(args: WorkflowWorkerArgs) -> i32 {
         &args.cwd,
         args.provider,
         args.model.clone(),
-        args.api_key.clone(),
+        worker_api_key,
         args.base_url.clone(),
     ) {
         Ok(config) => config,
@@ -1449,7 +1489,7 @@ fn run_workflow_worker(args: WorkflowWorkerArgs) -> i32 {
             cwd: args.cwd.display().to_string(),
             provider: args.provider,
             model: args.model,
-            api_key: args.api_key,
+            api_key: None,
             base_url: args.base_url,
             input,
         },
@@ -1615,9 +1655,14 @@ fn spawn_workflow_worker(
     };
 
     let mut command = ProcessCommand::new(current_exe);
+    let has_api_key = api_key.is_some();
     command
         .current_dir(cwd)
-        .stdin(Stdio::null())
+        .stdin(if has_api_key {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .arg("workflow")
@@ -1629,12 +1674,14 @@ fn spawn_workflow_worker(
         .arg("--session-id")
         .arg(&session_id)
         .arg("--input-json")
-        .arg(input_json);
+        .arg(input_json)
+        .env_remove("ORCA_API_KEY")
+        .env_remove("DEEPSEEK_API_KEY");
     if let Some(model) = model {
         command.arg("--model").arg(model);
     }
-    if let Some(api_key) = api_key {
-        command.arg("--api-key").arg(api_key);
+    if has_api_key {
+        command.arg("--api-key-stdin");
     }
     if let Some(base_url) = base_url {
         command.arg("--base-url").arg(base_url);
@@ -1647,6 +1694,10 @@ fn spawn_workflow_worker(
             return 1;
         }
     };
+    if let Err(error) = handoff_workflow_worker_api_key(&mut child, api_key.as_deref()) {
+        eprintln!("orca: {error}");
+        return 1;
+    }
 
     let stdout = match child.stdout.take() {
         Some(stdout) => stdout,
@@ -1673,6 +1724,58 @@ fn spawn_workflow_worker(
             1
         }
     }
+}
+
+fn handoff_workflow_worker_api_key(
+    child: &mut std::process::Child,
+    api_key: Option<&str>,
+) -> Result<(), String> {
+    let Some(api_key) = api_key else {
+        return Ok(());
+    };
+    let result = child
+        .stdin
+        .take()
+        .ok_or_else(|| "workflow worker did not expose credential stdin".to_string())
+        .and_then(|mut stdin| {
+            stdin
+                .write_all(api_key.as_bytes())
+                .map_err(|error| format!("failed to hand off workflow credential: {error}"))
+        });
+    if result.is_err() {
+        orca_tools::process::kill_child_tree(child);
+        let _ = child.wait();
+    }
+    result
+}
+
+fn resolve_worker_api_key(
+    api_key_arg: Option<String>,
+    api_key_stdin: bool,
+) -> Result<Option<String>, String> {
+    resolve_worker_api_key_from_reader(api_key_arg, api_key_stdin, std::io::stdin())
+}
+
+fn resolve_worker_api_key_from_reader(
+    api_key_arg: Option<String>,
+    api_key_stdin: bool,
+    reader: impl Read,
+) -> Result<Option<String>, String> {
+    if !api_key_stdin {
+        return Ok(api_key_arg);
+    }
+    if api_key_arg.is_some() {
+        return Err("--api-key and --api-key-stdin cannot be used together".to_string());
+    }
+    let mut api_key = String::new();
+    reader
+        .take(MAX_WORKER_API_KEY_BYTES + 1)
+        .read_to_string(&mut api_key)
+        .map_err(|error| format!("failed to read worker credential from stdin: {error}"))?;
+    if api_key.len() as u64 > MAX_WORKER_API_KEY_BYTES {
+        return Err("worker credential from stdin exceeds 64 KiB".to_string());
+    }
+    Ok(Some(api_key))
 }
 
 fn workflow_input_for_launch(
@@ -2346,6 +2449,110 @@ mod tests {
                 .args
                 .iter()
                 .any(|arg| arg.contains("| ORCA_NON_INTERACTIVE"))
+        );
+    }
+
+    #[test]
+    fn workflow_launch_record_never_serializes_api_key() {
+        let temp = tempfile::tempdir().unwrap();
+        let record = WorkflowCliLaunchRecord {
+            cwd: "/tmp/workspace".to_string(),
+            provider: ProviderKind::DeepSeek,
+            model: Some("deepseek-chat".to_string()),
+            api_key: Some("orca-secret-sentinel-launch-record".to_string()),
+            base_url: None,
+            input: workflow_input_for_launch(Path::new("/tmp/workspace"), "workflow", None, None),
+        };
+
+        let json = serde_json::to_string(&record).unwrap();
+        write_workflow_cli_launch_record(temp.path(), &record).unwrap();
+        let persisted = fs::read_to_string(workflow_cli_launch_record_path(temp.path())).unwrap();
+
+        assert!(!json.contains("orca-secret-sentinel-launch-record"));
+        assert!(!json.contains("apiKey"));
+        assert!(!persisted.contains("orca-secret-sentinel-launch-record"));
+        assert!(!persisted.contains("apiKey"));
+        assert!(
+            read_workflow_cli_launch_record(temp.path())
+                .unwrap()
+                .api_key
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn legacy_workflow_launch_record_api_key_can_be_read_for_sanitization() {
+        let record: WorkflowCliLaunchRecord = serde_json::from_value(serde_json::json!({
+            "cwd": "/tmp/workspace",
+            "provider": "deep-seek",
+            "model": null,
+            "apiKey": "legacy-secret",
+            "baseUrl": null,
+            "input": {
+                "name": "workflow"
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(record.api_key.as_deref(), Some("legacy-secret"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn workflow_worker_receives_key_without_exposing_it_in_argv() {
+        let sentinel = "orca-secret-sentinel-workflow-argv";
+        let temp = tempfile::tempdir().unwrap();
+        let key_file = temp.path().join("key");
+        let mut command = ProcessCommand::new("sh");
+        command
+            .env("ORCA_TEST_KEY_FILE", &key_file)
+            .stdin(Stdio::piped())
+            .arg("-c")
+            .arg("cat > \"$ORCA_TEST_KEY_FILE\"; sleep 30");
+        let mut child = command.spawn().unwrap();
+        handoff_workflow_worker_api_key(&mut child, Some(sentinel)).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !key_file.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(key_file.exists(), "workflow worker fixture did not start");
+
+        let pid = child.id().to_string();
+        let output = ProcessCommand::new("/bin/ps")
+            .args(["-ww", "-p", pid.as_str(), "-o", "command="])
+            .output()
+            .unwrap();
+        let command_line = String::from_utf8_lossy(&output.stdout);
+
+        assert!(!command_line.contains(sentinel));
+        assert!(!command_line.contains("--api-key"));
+        assert_eq!(fs::read_to_string(&key_file).unwrap(), sentinel);
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn worker_key_arg_remains_compatible_without_stdin_handoff() {
+        assert_eq!(
+            resolve_worker_api_key_from_reader(Some("legacy-key".to_string()), false, io::empty())
+                .unwrap(),
+            Some("legacy-key".to_string())
+        );
+        assert!(
+            resolve_worker_api_key_from_reader(Some("key".to_string()), true, io::empty()).is_err()
+        );
+    }
+
+    #[test]
+    fn worker_key_stdin_handoff_is_bounded() {
+        assert_eq!(
+            resolve_worker_api_key_from_reader(None, true, io::Cursor::new(b"private-key"))
+                .unwrap(),
+            Some("private-key".to_string())
+        );
+        let oversized = vec![b'x'; MAX_WORKER_API_KEY_BYTES as usize + 1];
+        assert!(
+            resolve_worker_api_key_from_reader(None, true, io::Cursor::new(oversized)).is_err()
         );
     }
 }

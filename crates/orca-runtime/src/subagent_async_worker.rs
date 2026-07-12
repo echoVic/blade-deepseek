@@ -1,4 +1,4 @@
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as ProcessCommand, Stdio};
 
@@ -24,8 +24,6 @@ use crate::subagent::{self, SubagentIsolation};
 use crate::subagent_execution::{append_worktree_outcome, validate_subagent_output_schema};
 use crate::tasks::TaskRegistry;
 use crate::worktree::WorktreeGuard;
-
-const ASYNC_SUBAGENT_WORKER_API_KEY_ENV: &str = "ORCA_SUBAGENT_WORKER_API_KEY";
 
 #[derive(Clone, Debug)]
 pub struct AsyncSubagentWorktree {
@@ -70,10 +68,6 @@ struct AsyncSubagentWorkerSpawnContext<'a> {
 }
 
 pub fn run_async_subagent_worker(input: AsyncSubagentWorkerInput) -> i32 {
-    let mut input = input;
-    if let Some(api_key) = take_async_subagent_worker_api_key() {
-        input.config.api_key = Some(api_key);
-    }
     run_async_subagent_worker_with_executor(AsyncSubagentWorkerContext {
         input,
         child_executor: execute_child_agent_loop,
@@ -282,9 +276,15 @@ fn spawn_async_subagent_worker(
     let current_exe = std::env::current_exe().map_err(|error| error.to_string())?;
     let request_json = serde_json::to_string(request).map_err(|error| error.to_string())?;
     let mut command = ProcessCommand::new(current_exe);
+    prepare_async_subagent_worker_command(&mut command, agent_id);
+    let api_key = config.api_key.as_deref();
     command
         .current_dir(cwd)
-        .stdin(Stdio::null())
+        .stdin(if api_key.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .arg("subagent-worker")
@@ -301,11 +301,15 @@ fn spawn_async_subagent_worker(
         .arg("--subagent-depth")
         .arg(child_depth.to_string())
         .arg("--request-json")
-        .arg(request_json);
+        .arg(request_json)
+        .env_remove("ORCA_API_KEY")
+        .env_remove("DEEPSEEK_API_KEY");
     if let Some(model) = config.model.as_history_value() {
         command.arg("--model").arg(model);
     }
-    configure_async_subagent_worker_api_key(&mut command, config.api_key.as_deref());
+    if api_key.is_some() {
+        command.arg("--api-key-stdin");
+    }
     if let Some(base_url) = config.base_url.as_deref() {
         command.arg("--base-url").arg(base_url);
     }
@@ -316,8 +320,9 @@ fn spawn_async_subagent_worker(
             .arg("--worktree-path")
             .arg(&worktree.path);
     }
-    prepare_async_subagent_worker_command(&mut command, agent_id);
-    command.spawn().map_err(|error| error.to_string())
+    let mut child = command.spawn().map_err(|error| error.to_string())?;
+    handoff_async_subagent_worker_api_key(&mut child, api_key)?;
+    Ok(child)
 }
 
 fn prepare_async_subagent_worker_command(command: &mut ProcessCommand, agent_id: &str) {
@@ -326,21 +331,27 @@ fn prepare_async_subagent_worker_command(command: &mut ProcessCommand, agent_id:
     command.arg0(crate::tasks::subagent_worker_process_name(agent_id));
 }
 
-fn configure_async_subagent_worker_api_key(command: &mut ProcessCommand, api_key: Option<&str>) {
-    command.env_remove(ASYNC_SUBAGENT_WORKER_API_KEY_ENV);
-    if let Some(api_key) = api_key {
-        command.env(ASYNC_SUBAGENT_WORKER_API_KEY_ENV, api_key);
+fn handoff_async_subagent_worker_api_key(
+    child: &mut Child,
+    api_key: Option<&str>,
+) -> Result<(), String> {
+    let Some(api_key) = api_key else {
+        return Ok(());
+    };
+    let result = child
+        .stdin
+        .take()
+        .ok_or_else(|| "async subagent worker did not expose credential stdin".to_string())
+        .and_then(|mut stdin| {
+            stdin
+                .write_all(api_key.as_bytes())
+                .map_err(|error| format!("failed to hand off async subagent credential: {error}"))
+        });
+    if result.is_err() {
+        orca_tools::process::kill_child_tree(child);
+        let _ = child.wait();
     }
-}
-
-fn take_async_subagent_worker_api_key() -> Option<String> {
-    let api_key = std::env::var(ASYNC_SUBAGENT_WORKER_API_KEY_ENV).ok();
-    // The worker reads this before starting provider/tool threads. Removing it prevents
-    // subsequently launched tools from inheriting the provider credential.
-    unsafe {
-        std::env::remove_var(ASYNC_SUBAGENT_WORKER_API_KEY_ENV);
-    }
-    api_key
+    result
 }
 
 pub(crate) fn usage_totals_if_non_empty(usage: UsageTotals) -> Option<UsageTotals> {
@@ -368,29 +379,6 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    static API_KEY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    #[test]
-    fn async_subagent_worker_takes_api_key_from_environment() {
-        let _guard = API_KEY_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let previous = std::env::var_os(ASYNC_SUBAGENT_WORKER_API_KEY_ENV);
-        unsafe {
-            std::env::set_var(ASYNC_SUBAGENT_WORKER_API_KEY_ENV, "worker-secret");
-        }
-
-        let api_key = take_async_subagent_worker_api_key();
-
-        assert_eq!(api_key.as_deref(), Some("worker-secret"));
-        assert!(std::env::var_os(ASYNC_SUBAGENT_WORKER_API_KEY_ENV).is_none());
-        if let Some(previous) = previous {
-            unsafe {
-                std::env::set_var(ASYNC_SUBAGENT_WORKER_API_KEY_ENV, previous);
-            }
-        }
-    }
-
     #[test]
     fn async_subagent_worker_command_hides_key_and_owns_process_group() {
         unsafe extern "C" {
@@ -406,15 +394,15 @@ mod tests {
             "production async worker launch must not rebuild the leaked API key argument"
         );
         let mut command = ProcessCommand::new("sh");
+        prepare_async_subagent_worker_command(&mut command, agent_id);
         command
             .env("ORCA_TEST_KEY_FILE", &key_file)
+            .stdin(Stdio::piped())
             .arg("-c")
-            .arg(format!(
-                "printf '%s' \"${ASYNC_SUBAGENT_WORKER_API_KEY_ENV}\" > \"$ORCA_TEST_KEY_FILE\"; sleep 30"
-            ));
-        configure_async_subagent_worker_api_key(&mut command, Some(sentinel));
-        prepare_async_subagent_worker_command(&mut command, agent_id);
+            .arg("cat > \"$ORCA_TEST_KEY_FILE\"; sleep 30");
         let mut child = command.spawn().expect("spawn worker process-group fixture");
+        handoff_async_subagent_worker_api_key(&mut child, Some(sentinel))
+            .expect("hand off worker credential");
         let pid = child.id() as i32;
         let deadline = Instant::now() + Duration::from_secs(2);
         while !key_file.exists() && Instant::now() < deadline {
@@ -452,7 +440,7 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&key_file).unwrap(),
             sentinel,
-            "worker must receive the provider API key through its environment"
+            "worker must receive the provider API key through its private stdin"
         );
         orca_tools::process::kill_child_tree(&mut child);
         let _ = child.wait();
