@@ -239,6 +239,7 @@ fn workspace_write_profile(context: WorkspaceWriteProfileContext<'_>) -> String 
 (allow process*)
 (allow sysctl-read)
 (allow signal (target self))
+(allow signal (target children))
 (allow file-read*)
 (allow file-read* file-write* (literal "/dev/null"))
 (allow file-write* (subpath "{cwd_escaped}"))
@@ -294,6 +295,7 @@ fn read_only_profile(context: ReadOnlyProfileContext<'_>) -> String {
 (allow process*)
 (allow sysctl-read)
 (allow signal (target self))
+(allow signal (target children))
 {global_read_rule}
 (allow file-read* file-write* (literal "/dev/null"))
 {additional_read_rules}
@@ -405,6 +407,93 @@ mod tests {
         assert!(content.contains("(version 1)"));
         assert!(content.contains(&workspace.path().display().to_string()));
         assert!(content.contains(r#"(allow file-read* file-write* (literal "/dev/null"))"#));
+    }
+
+    #[test]
+    fn sandbox_profiles_allow_signalling_child_processes() {
+        let workspace = TempDir::new().unwrap();
+        let workspace_profile = workspace_write_profile(WorkspaceWriteProfileContext {
+            cwd: workspace.path(),
+            readable_roots: &[],
+            additional_roots: &[],
+            denied_roots: &[],
+            network_access: false,
+            exclude_tmpdir_env_var: false,
+            exclude_slash_tmp: false,
+            allowed_unix_socket_roots: &[],
+        });
+        let read_only_profile = read_only_profile(ReadOnlyProfileContext {
+            readable_roots: &[],
+            additional_roots: &[],
+            denied_roots: &[],
+            network_access: false,
+            allow_global_read: true,
+            allowed_unix_socket_roots: &[],
+        });
+
+        for profile in [workspace_profile, read_only_profile] {
+            assert!(
+                profile.contains("(allow signal (target children))"),
+                "sandboxed process managers must be able to terminate their own workers: {profile}"
+            );
+            assert!(
+                !profile.lines().any(|line| line.trim() == "(allow signal)")
+                    && !profile.contains("(target others)")
+                    && !profile.contains("(target same-sandbox)"),
+                "child cleanup must not grant authority to signal unrelated processes: {profile}"
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_write_sandbox_can_terminate_a_child_process() {
+        if !available() {
+            return;
+        }
+
+        let workspace = TempDir::new().unwrap();
+        let output = bash_command(
+            "sleep 0.2 & child=$!; kill -TERM \"$child\"; rc=$?; wait \"$child\" || true; exit \"$rc\"",
+            workspace.path(),
+        )
+        .output()
+        .unwrap();
+
+        assert!(
+            output.status.success(),
+            "sandboxed test runners must be able to clean up child workers\nstatus: {:?}\nstderr: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn read_only_sandbox_can_terminate_a_child_process() {
+        if !available() {
+            return;
+        }
+
+        let workspace = TempDir::new().unwrap();
+        let command = "sleep 0.2 & child=$!; kill -TERM \"$child\"; rc=$?; wait \"$child\" || true; exit \"$rc\"";
+        let output = read_only_bash_command(ReadOnlySandboxCommandContext {
+            command,
+            cwd: workspace.path(),
+            readable_roots: &[],
+            additional_roots: &[],
+            denied_roots: &[],
+            network_access: false,
+            allow_global_read: true,
+            allowed_unix_socket_roots: &[],
+        })
+        .output()
+        .unwrap();
+
+        assert!(
+            output.status.success(),
+            "read-only sandboxed test runners must be able to clean up child workers\nstatus: {:?}\nstderr: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]

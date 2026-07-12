@@ -105,6 +105,19 @@ Goal continuation.
 
 Before each active turn, Orca injects a single pinned goal context block. The block is replaced between turns, so long-running goals do not accumulate duplicate instructions.
 
+## Shell Worker Cleanup On macOS
+
+Goal turns use the same shell sandbox as ordinary Orca turns. The macOS
+workspace-write and read-only Seatbelt profiles let a sandboxed process signal
+itself and its own child processes. This is required by process managers such
+as Vitest, Tinypool, and other test runners when they stop worker pools after a
+test failure or shutdown.
+
+The permission remains lineage-scoped: sandboxed commands cannot signal
+unrelated processes or other processes that merely share the sandbox. Orca
+also starts non-interactive shell commands in their own process group so
+timeouts and explicit cancellation can clean up the command tree.
+
 ## Implementation Notes
 
 - Shared types live in `crates/orca-core/src/goal_types.rs`.
