@@ -15,7 +15,7 @@ jobs:
       PACKAGE_VERSION: "0.1.1"
       TEST_TAG: "ci-token-check"
     steps:
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 20
           registry-url: https://registry.npmjs.org
