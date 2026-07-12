@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::Mutex;
 use std::sync::mpsc;
@@ -14,6 +14,7 @@ use orca_core::mcp_types::{McpServerConfig, McpTransportKind};
 
 const STDIO_RESPONSE_QUEUE_CAPACITY: usize = 8;
 const MAX_STDIO_RESPONSE_LINE_BYTES: usize = 1024 * 1024;
+const MAX_SSE_RESPONSE_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum McpElicitationMode {
@@ -628,7 +629,7 @@ impl McpTransport for SseTransport {
             }),
             self.startup_timeout,
         )?;
-        self.notify("notifications/initialized", json!({}))?;
+        self.notify("notifications/initialized", json!({}), self.startup_timeout)?;
         Ok(result)
     }
 
@@ -685,15 +686,25 @@ impl McpTransport for SseTransport {
 }
 
 impl SseTransport {
-    fn notify(&self, method: &str, params: Value) -> Result<(), String> {
+    fn notify(&self, method: &str, params: Value, timeout: Duration) -> Result<(), String> {
         let mut builder = self.client.post(&self.endpoint);
         for (key, value) in &self.headers {
             builder = builder.header(key, value);
         }
         builder
+            .timeout(timeout)
             .json(&json!({ "jsonrpc": "2.0", "method": method, "params": params }))
             .send()
-            .map_err(|e| format!("MCP SSE notify '{method}' failed: {e}"))?;
+            .map_err(|error| {
+                if error.is_timeout() {
+                    format!(
+                        "MCP SSE notify '{method}' timed out after {}",
+                        format_duration(timeout)
+                    )
+                } else {
+                    format!("MCP SSE notify '{method}' failed: {error}")
+                }
+            })?;
         Ok(())
     }
 
@@ -798,9 +809,7 @@ fn request_sse_with_client(
     if !status.is_success() {
         return Err(format!("MCP SSE request '{method}' failed with {status}"));
     }
-    let text = response
-        .text()
-        .map_err(|error| format!("failed to read MCP SSE response: {error}"))?;
+    let text = read_bounded_sse_response(response)?;
     let response = parse_sse_or_json_response(&text)
         .map_err(|error| format!("invalid MCP SSE response for '{method}': {error}"))?;
     if let Some(error) = response.get("error") {
@@ -810,6 +819,22 @@ fn request_sse_with_client(
         .get("result")
         .cloned()
         .ok_or_else(|| format!("MCP SSE request '{method}' missing result"))
+}
+
+fn read_bounded_sse_response(response: reqwest::blocking::Response) -> Result<String, String> {
+    let read_limit = MAX_SSE_RESPONSE_BYTES.saturating_add(1) as u64;
+    let mut bytes = Vec::with_capacity(MAX_SSE_RESPONSE_BYTES.min(8 * 1024));
+    response
+        .take(read_limit)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("failed to read MCP SSE response: {error}"))?;
+    if bytes.len() > MAX_SSE_RESPONSE_BYTES {
+        return Err(format!(
+            "MCP SSE response exceeded maximum body size of {MAX_SSE_RESPONSE_BYTES} bytes"
+        ));
+    }
+    String::from_utf8(bytes)
+        .map_err(|error| format!("MCP SSE response was not valid UTF-8: {error}"))
 }
 
 fn parse_sse_or_json_response(text: &str) -> Result<Value, String> {
@@ -1537,12 +1562,74 @@ done
         );
     }
 
+    #[test]
+    fn sse_response_body_is_bounded() {
+        let server = OneShotSseServer::start(|stream| {
+            let _ = read_http_request(stream);
+            let body = vec![b'x'; MAX_SSE_RESPONSE_BYTES + 1];
+            write_bytes_response(stream, &body);
+        });
+
+        let error = request_sse_with_client(
+            reqwest::blocking::Client::new(),
+            server.url(),
+            HashMap::new(),
+            1,
+            "tools/list".to_string(),
+            json!({}),
+            Duration::from_secs(2),
+        )
+        .expect_err("oversized SSE response must be rejected");
+
+        assert!(
+            error.contains("exceeded maximum body size"),
+            "unexpected oversized response error: {error}"
+        );
+    }
+
+    #[test]
+    fn sse_initialized_notification_uses_startup_timeout() {
+        let server = SlowSseServer::start_with_stalling_notification();
+        let transport = connect(&McpServerConfig {
+            name: "slow_notify_sse".to_string(),
+            transport: McpTransportKind::Sse,
+            command: None,
+            args: Vec::new(),
+            url: Some(server.url()),
+            env: Default::default(),
+            headers: Default::default(),
+            disabled: false,
+            startup_timeout_ms: Some(100),
+            tool_timeout_ms: Some(100),
+        })
+        .expect("connect SSE MCP");
+
+        let started = Instant::now();
+        let error = transport
+            .initialize()
+            .expect_err("stalled initialized notification must time out");
+
+        assert!(started.elapsed() < Duration::from_millis(750));
+        assert!(
+            error.contains("notify 'notifications/initialized' timed out after 100ms"),
+            "unexpected notification timeout: {error}"
+        );
+    }
+
     struct SlowSseServer {
         addr: std::net::SocketAddr,
     }
 
     impl SlowSseServer {
         fn start() -> Self {
+            Self::start_with_behavior(false)
+        }
+
+        fn start_with_stalling_notification() -> Self {
+            Self::start_with_behavior(true)
+        }
+
+        fn start_with_behavior(stall_notification: bool) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").expect("bind SSE fixture");
             let addr = listener.local_addr().expect("SSE fixture addr");
             let listener = Arc::new(listener);
@@ -1550,7 +1637,9 @@ done
             std::thread::spawn(move || {
                 for stream in acceptor.incoming() {
                     match stream {
-                        Ok(mut stream) => handle_sse_fixture_request(&mut stream),
+                        Ok(mut stream) => {
+                            handle_sse_fixture_request(&mut stream, stall_notification)
+                        }
                         Err(_) => break,
                     }
                 }
@@ -1563,8 +1652,33 @@ done
         }
     }
 
-    fn handle_sse_fixture_request(stream: &mut TcpStream) {
+    struct OneShotSseServer {
+        addr: std::net::SocketAddr,
+    }
+
+    impl OneShotSseServer {
+        fn start(handler: impl FnOnce(&mut TcpStream) + Send + 'static) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind SSE fixture");
+            let addr = listener.local_addr().expect("SSE fixture addr");
+            std::thread::spawn(move || {
+                if let Ok(mut stream) = listener.accept().map(|(stream, _)| stream) {
+                    handler(&mut stream);
+                }
+            });
+            Self { addr }
+        }
+
+        fn url(&self) -> String {
+            format!("http://{}", self.addr)
+        }
+    }
+
+    fn handle_sse_fixture_request(stream: &mut TcpStream, stall_notification: bool) {
         let request = read_http_request(stream);
+        if stall_notification && request.contains(r#""method":"notifications/initialized""#) {
+            std::thread::sleep(Duration::from_secs(5));
+            return;
+        }
         if request.contains(r#""method":"tools/call""#) {
             std::thread::sleep(Duration::from_secs(5));
             write_json_response(
@@ -1622,13 +1736,17 @@ done
     }
 
     fn write_json_response(stream: &mut TcpStream, body: &str) {
+        write_bytes_response(stream, body.as_bytes());
+    }
+
+    fn write_bytes_response(stream: &mut TcpStream, body: &[u8]) {
         let response = format!(
-            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-            body.len(),
-            body
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            body.len()
         );
         stream
             .write_all(response.as_bytes())
             .expect("write response");
+        let _ = stream.write_all(body);
     }
 }

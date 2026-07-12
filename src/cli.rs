@@ -1052,16 +1052,19 @@ fn run_workflow_command(args: WorkflowRunArgs) -> i32 {
         .cwd
         .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-    if let Err(error) = build_workflow_run_config(
+    let run_config = match build_workflow_run_config(
         &cwd,
         args.provider,
         args.model.clone(),
         args.api_key.clone(),
         args.base_url.clone(),
     ) {
-        eprintln!("orca: {error}");
-        return 1;
-    }
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("orca: {error}");
+            return 1;
+        }
+    };
     let workflow_args = match parse_optional_json_arg(args.args.as_deref()) {
         Ok(value) => value,
         Err(error) => {
@@ -1095,7 +1098,7 @@ fn run_workflow_command(args: WorkflowRunArgs) -> i32 {
         session_id,
         args.provider,
         args.model,
-        args.api_key,
+        run_config.api_key,
         args.base_url,
         &input,
     )
@@ -2865,6 +2868,25 @@ mod tests {
         assert_eq!(fs::read_to_string(&key_file).unwrap(), sentinel);
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    #[test]
+    fn workflow_launch_hands_off_the_resolved_api_key() {
+        let source = include_str!("cli.rs");
+        let launch = source
+            .split("fn run_workflow_command")
+            .nth(1)
+            .and_then(|source| source.split("fn workflow_list_command").next())
+            .expect("workflow launch source");
+
+        assert!(
+            launch.contains("run_config.api_key"),
+            "workflow launch must hand the resolved env/config/CLI key to the worker"
+        );
+        assert!(
+            !launch.contains("args.api_key,\n        args.base_url"),
+            "workflow launch must not discard env/config keys by forwarding only the CLI argument"
+        );
     }
 
     #[test]
