@@ -30,8 +30,10 @@ terminal events fail immediately.
 - [x] Run formatting and focused harness/server contracts.
 - [x] Review event ordering, reader failure, and descendant cleanup edge cases.
 - [x] Commit as one reviewable lifecycle/validation slice.
-- [ ] Rebase latest `main` and rerun affected tests.
-- [ ] Run the workspace gate and verify no test-owned process remains.
+- [x] Rebase the slice from the v0.2.19 base onto current `main` at v0.2.20 and
+  rerun affected tests.
+- [x] Rerun the workspace gate after rebase and verify no test-owned process
+  remains.
 
 ## Verification
 
@@ -50,6 +52,39 @@ CARGO_TARGET_DIR=/private/tmp/blade-deepseek-server-contract-harness-target \
 cargo fmt --all -- --check
 git diff --check
 ```
+
+Pre-rebase verification observed on 2026-07-12 from
+`/private/tmp/blade-deepseek-v020-bounded-server-harness`:
+
+- harness lifecycle tests: 21 passed;
+- previously hanging network-policy contract: passed in under one second;
+- complete `session_server_contract`: 122 passed in 36.01 seconds;
+- `cargo test --workspace --all-targets --locked --offline --
+  --test-threads=1`: passed;
+- `cargo clippy --workspace --all-targets --locked --offline`: exit 0 with
+  existing warnings;
+- `cargo fmt --all -- --check` and `git diff --check`: passed;
+- post-gate process inspection found no Cargo, contract-test, or test-owned Orca
+  process associated with this worktree.
+
+The workspace gate initially exposed a location-dependent macOS Seatbelt test
+fixture: a worktree below `/private/tmp` inherited the profile's intentional
+`/tmp` write allowance, so a nominal outside-workspace path was not denied.
+Commit `947e3df6b` moves deny-sensitive fixtures outside the temporary allow
+roots and keeps explicit `/tmp` allowance tests unchanged.
+
+Post-rebase verification against `main@c6ec1ad16`:
+
+- harness lifecycle tests: 21 passed;
+- previously hanging network-policy contract: passed in 0.74 seconds;
+- complete `session_server_contract`: 122 passed in 36.50 seconds;
+- `cargo test --workspace --all-targets --locked --offline --
+  --test-threads=1`: passed, including the v0.2.20 TUI tests;
+- `cargo clippy --workspace --all-targets --locked --offline`: exit 0 with
+  existing warnings;
+- `cargo fmt --all -- --check` and `git diff --check`: passed;
+- remote `main` still resolved to `c6ec1ad16`, and post-gate process inspection
+  found no test-owned process associated with this worktree.
 
 Before integration, run the repository's required workspace, site, release
 script, and real DeepSeek gates from a main-rebased branch.
