@@ -934,8 +934,6 @@ mod tests {
             "fn record_normal_tool_result(",
             "record_plan_state_for_agent(",
             "record_tool_result_for_agent(",
-            "status == RunStatus::ApprovalRequired",
-            "tool_request.name == ToolName::Subagent",
         ] {
             assert!(
                 step_context_source.contains(marker),

@@ -98,6 +98,7 @@ impl RuntimeSamplingRequestState {
         tool_requests.get(self.tool_cursor_index)
     }
 
+    #[cfg(test)]
     pub(crate) fn tool_cursor_position(&self) -> usize {
         self.tool_cursor_index
     }

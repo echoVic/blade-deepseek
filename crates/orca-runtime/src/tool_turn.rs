@@ -448,21 +448,19 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                     )?;
                     return Err(error);
                 }
-                let end_index = sampling_state
-                    .tool_cursor_position()
-                    .saturating_add(1)
-                    .min(tool_requests.len());
-                record_indeterminate_tool_requests_until(
-                    sampling_state,
-                    tool_requests,
-                    end_index,
-                    conversation,
-                    history_writer.as_deref_mut(),
-                    emit_deltas,
-                    &format!(
+                let result = ToolResult::indeterminate(
+                    tool_request,
+                    format!(
                         "Tool invocation outcome is indeterminate after runtime I/O error: {error}. Inspect external state before retrying."
                     ),
+                );
+                record_tool_result_for_agent(
+                    conversation,
+                    history_writer.as_deref_mut(),
+                    &result,
+                    emit_deltas,
                 )?;
+                sampling_state.advance_tool_cursor_one(tool_requests.len());
                 close_unstarted_tool_requests(
                     sampling_state,
                     tool_requests,
@@ -555,31 +553,6 @@ fn conversation_has_tool_result(conversation: &Conversation, tool_call_id: &str)
             } if recorded_id == tool_call_id
         )
     })
-}
-
-fn record_indeterminate_tool_requests_until(
-    sampling_state: &mut RuntimeSamplingRequestState,
-    tool_requests: &[ToolRequest],
-    end_index: usize,
-    conversation: &mut Conversation,
-    mut history_writer: Option<&mut SessionWriter>,
-    emit_deltas: bool,
-    reason: &str,
-) -> io::Result<()> {
-    while sampling_state.tool_cursor_position() < end_index {
-        let Some(tool_request) = sampling_state.current_tool_request(tool_requests) else {
-            break;
-        };
-        let result = ToolResult::indeterminate(tool_request, reason);
-        record_tool_result_for_agent(
-            conversation,
-            history_writer.as_deref_mut(),
-            &result,
-            emit_deltas,
-        )?;
-        sampling_state.advance_tool_cursor_one(tool_requests.len());
-    }
-    Ok(())
 }
 
 fn emit_tool_terminal_events<W: io::Write>(
