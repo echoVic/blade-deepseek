@@ -34,6 +34,11 @@ use orca_runtime::tasks::TaskRegistry;
 use serde_json::Value;
 use tempfile::tempdir;
 
+#[path = "support/sandbox_test_parent.rs"]
+mod sandbox_test_support;
+
+use sandbox_test_support::sandbox_test_parent;
+
 #[test]
 fn agent_loop_module_does_not_depend_on_controller() {
     let agent_loop = std::fs::read_to_string("crates/orca-runtime/src/agent_loop.rs")
@@ -1352,8 +1357,7 @@ fn tool_actor_context_allows_bash_writes_to_additional_working_directories() {
         return;
     }
 
-    let parent =
-        tempfile::tempdir_in(std::env::current_dir().expect("cwd")).expect("sandbox parent");
+    let parent = sandbox_test_parent("runtime-additional-roots-");
     let workspace = parent.path().join("workspace");
     let extra = parent.path().join("extra");
     let outside = parent.path().join("outside");
@@ -1425,8 +1429,7 @@ fn tool_actor_context_retries_bash_after_filesystem_permission_grant() {
         }
     }
 
-    let parent =
-        tempfile::tempdir_in(std::env::current_dir().expect("cwd")).expect("sandbox parent");
+    let parent = sandbox_test_parent("runtime-permission-grant-");
     let workspace = parent.path().join("workspace");
     let outside = parent.path().join("outside");
     std::fs::create_dir(&workspace).expect("workspace dir");
@@ -1573,8 +1576,7 @@ fn tool_actor_context_retries_pathless_sandbox_denial_unsandboxed_after_permissi
         }
     }
 
-    let parent =
-        tempfile::tempdir_in(std::env::current_dir().expect("cwd")).expect("sandbox parent");
+    let parent = sandbox_test_parent("runtime-unsandboxed-grant-");
     let workspace = parent.path().join("workspace");
     let outside = parent.path().join("outside");
     std::fs::create_dir(&workspace).expect("workspace dir");

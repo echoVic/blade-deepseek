@@ -602,7 +602,7 @@ mod tests {
             return;
         }
 
-        let parent = tempfile::TempDir::new_in(std::env::current_dir().unwrap()).unwrap();
+        let parent = crate::sandbox::sandbox_test_parent("bash-additional-roots-");
         let workspace = parent.path().join("workspace");
         let extra = parent.path().join("extra");
         let outside = parent.path().join("outside");

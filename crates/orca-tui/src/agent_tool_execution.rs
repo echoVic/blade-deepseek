@@ -1206,6 +1206,42 @@ mod tests {
 
     use super::*;
 
+    fn sandbox_test_parent(prefix: &str) -> TempDir {
+        #[cfg(target_os = "macos")]
+        {
+            let home = PathBuf::from(
+                std::env::var_os("HOME").expect("HOME is required for macOS Seatbelt tests"),
+            )
+            .canonicalize()
+            .expect("canonical macOS HOME");
+            for root in [
+                Some(PathBuf::from("/tmp")),
+                std::env::var_os("TMPDIR").map(PathBuf::from),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                let root = root.canonicalize().unwrap_or(root);
+                assert!(
+                    !home.starts_with(&root),
+                    "macOS Seatbelt fixtures require HOME outside temporary allow root {}",
+                    root.display()
+                );
+            }
+            tempfile::Builder::new()
+                .prefix(prefix)
+                .tempdir_in(home)
+                .expect("sandbox parent outside temporary allow roots")
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            tempfile::Builder::new()
+                .prefix(prefix)
+                .tempdir()
+                .expect("sandbox parent")
+        }
+    }
+
     fn config(approval_mode: ApprovalMode) -> RunConfig {
         RunConfig {
             app_version: "0.0.0-test".to_string(),
@@ -1572,7 +1608,7 @@ mod tests {
         }
 
         let harness = EscalationHarness::new();
-        let outside = TempDir::new_in(std::env::current_dir().unwrap()).unwrap();
+        let outside = sandbox_test_parent("tui-escalation-outside-");
         let marker = outside.path().join("credential-helper-output");
         let request = bash_request(&format!(
             "touch {} 2>/dev/null || {{ printf %s\\\\n \"fatal: could not read Username for 'https://github.com': Operation not permitted\" >&2; exit 128; }}",

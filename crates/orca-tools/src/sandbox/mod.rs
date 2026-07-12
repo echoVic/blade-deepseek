@@ -86,6 +86,43 @@ pub fn seatbelt_available() -> bool {
     platform::seatbelt_available()
 }
 
+#[cfg(test)]
+pub(crate) fn sandbox_test_parent(prefix: &str) -> tempfile::TempDir {
+    #[cfg(target_os = "macos")]
+    {
+        let home = PathBuf::from(
+            std::env::var_os("HOME").expect("HOME is required for macOS Seatbelt tests"),
+        )
+        .canonicalize()
+        .expect("canonical macOS HOME");
+        for root in [
+            Some(PathBuf::from("/tmp")),
+            std::env::var_os("TMPDIR").map(PathBuf::from),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let root = root.canonicalize().unwrap_or(root);
+            assert!(
+                !home.starts_with(&root),
+                "macOS Seatbelt fixtures require HOME outside temporary allow root {}",
+                root.display()
+            );
+        }
+        tempfile::Builder::new()
+            .prefix(prefix)
+            .tempdir_in(home)
+            .expect("sandbox parent outside temporary allow roots")
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        tempfile::Builder::new()
+            .prefix(prefix)
+            .tempdir()
+            .expect("sandbox parent")
+    }
+}
+
 #[cfg(target_os = "macos")]
 mod platform {
     use super::*;
@@ -119,7 +156,6 @@ mod platform {
     mod tests {
         use super::*;
         use std::process::Output;
-        use tempfile::TempDir;
 
         #[test]
         fn sandbox_blocks_writes_outside_workspace() {
@@ -127,7 +163,7 @@ mod platform {
                 return;
             }
 
-            let parent = TempDir::new_in(std::env::current_dir().unwrap()).unwrap();
+            let parent = crate::sandbox::sandbox_test_parent("sandbox-module-deny-");
             let workspace_path = parent.path().join("workspace");
             std::fs::create_dir(&workspace_path).unwrap();
             let outside = parent.path().join("blocked.txt");

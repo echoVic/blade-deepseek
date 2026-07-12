@@ -2088,7 +2088,7 @@ mod tests {
     use orca_core::model::ModelSelection;
     use orca_core::subagent_config::SubagentConfig;
     use std::io::Cursor;
-    use tempfile::tempdir;
+    use tempfile::{TempDir, tempdir};
 
     #[derive(Clone, Default)]
     struct SharedVecWriter(Arc<Mutex<Vec<u8>>>);
@@ -2969,8 +2969,7 @@ enabled = true
         }
 
         with_orca_home(|_| {
-            let parent = tempfile::tempdir_in(std::env::current_dir().expect("cwd"))
-                .expect("sandbox parent");
+            let parent = sandbox_test_parent("server-unsandboxed-");
             let workspace = parent.path().join("workspace-unsandboxed");
             let outside = parent.path().join("outside-unsandboxed");
             std::fs::create_dir_all(&workspace).expect("workspace dir");
@@ -3073,8 +3072,7 @@ enabled = true
         }
 
         with_orca_home(|_| {
-            let parent = tempfile::tempdir_in(std::env::current_dir().expect("cwd"))
-                .expect("sandbox parent");
+            let parent = sandbox_test_parent("server-unsandboxed-stream-");
             let workspace = parent.path().join("workspace-unsandboxed-stream");
             let outside = parent.path().join("outside-unsandboxed-stream");
             std::fs::create_dir_all(&workspace).expect("workspace dir");
@@ -6213,5 +6211,41 @@ rl.on("line", (line) => {
             }
         }
         result
+    }
+
+    fn sandbox_test_parent(prefix: &str) -> TempDir {
+        #[cfg(target_os = "macos")]
+        {
+            let home = PathBuf::from(
+                std::env::var_os("HOME").expect("HOME is required for macOS Seatbelt tests"),
+            )
+            .canonicalize()
+            .expect("canonical macOS HOME");
+            for root in [
+                Some(PathBuf::from("/tmp")),
+                std::env::var_os("TMPDIR").map(PathBuf::from),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                let root = root.canonicalize().unwrap_or(root);
+                assert!(
+                    !home.starts_with(&root),
+                    "macOS Seatbelt fixtures require HOME outside temporary allow root {}",
+                    root.display()
+                );
+            }
+            tempfile::Builder::new()
+                .prefix(prefix)
+                .tempdir_in(home)
+                .expect("sandbox parent outside temporary allow roots")
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            tempfile::Builder::new()
+                .prefix(prefix)
+                .tempdir()
+                .expect("sandbox parent")
+        }
     }
 }

@@ -11,9 +11,12 @@ use orca_runtime::history::SessionStore;
 use serde_json::Value;
 use tempfile::{TempDir, tempdir};
 
+#[path = "support/sandbox_test_parent.rs"]
+mod sandbox_test_support;
 #[path = "support/server_test_client.rs"]
 mod server_test_client;
 
+use sandbox_test_support::sandbox_test_parent;
 use server_test_client::ServerTestClient;
 
 static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -2165,11 +2168,12 @@ fn server_mode_command_exec_uses_thread_additional_working_directories() {
         return;
     }
 
-    let home = tempdir().expect("orca home");
-    let home_path = home.path();
+    let parent = sandbox_test_parent("orca-command-additional-roots-");
+    let home_path = parent.path().join("home");
     {
-        let workspace = home_path.join("workspace");
-        let extra = home_path.join("extra");
+        let workspace = parent.path().join("workspace");
+        let extra = parent.path().join("extra");
+        std::fs::create_dir_all(&home_path).expect("orca home");
         std::fs::create_dir_all(&workspace).expect("workspace");
         std::fs::create_dir_all(&extra).expect("extra");
         let output_file = extra.join("allowed.txt");
@@ -2184,7 +2188,7 @@ fn server_mode_command_exec_uses_thread_additional_working_directories() {
                 "--cwd",
                 workspace.to_str().unwrap(),
             ])
-            .env("ORCA_HOME", home_path)
+            .env("ORCA_HOME", &home_path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -6722,9 +6726,11 @@ fn server_mode_permission_updates_remove_directories_by_destination() {
 
 #[test]
 fn server_mode_request_permissions_waits_for_permission_response() {
-    let workspace = tempdir().expect("workspace");
-    let home = workspace.path().join("home");
-    let extra = workspace.path().join("extra");
+    let parent = sandbox_test_parent("orca-request-permissions-turn-");
+    let workspace = parent.path().join("workspace");
+    let home = parent.path().join("home");
+    let extra = parent.path().join("extra");
+    std::fs::create_dir_all(&workspace).expect("create workspace");
     std::fs::create_dir_all(&home).expect("create home");
     std::fs::create_dir_all(&extra).expect("create extra");
     std::fs::write(
@@ -6741,7 +6747,7 @@ fn server_mode_request_permissions_waits_for_permission_response() {
             "--provider",
             "mock",
             "--cwd",
-            workspace.path().to_str().unwrap(),
+            workspace.to_str().unwrap(),
         ])
         .env("ORCA_HOME", &home)
         .stdin(Stdio::piped())
@@ -7148,9 +7154,11 @@ fn server_mode_lists_and_searches_threads() {
 
 #[test]
 fn server_mode_request_permissions_session_scope_persists_directory_grant() {
-    let workspace = tempdir().expect("workspace");
-    let home = workspace.path().join("home");
-    let extra = workspace.path().join("extra");
+    let parent = sandbox_test_parent("orca-request-permissions-session-");
+    let workspace = parent.path().join("workspace");
+    let home = parent.path().join("home");
+    let extra = parent.path().join("extra");
+    std::fs::create_dir_all(&workspace).expect("create workspace");
     std::fs::create_dir_all(&home).expect("create home");
     std::fs::create_dir_all(&extra).expect("create extra");
     std::fs::write(
@@ -7168,7 +7176,7 @@ fn server_mode_request_permissions_session_scope_persists_directory_grant() {
             "--provider",
             "mock",
             "--cwd",
-            workspace.path().to_str().unwrap(),
+            workspace.to_str().unwrap(),
         ])
         .env("ORCA_HOME", &home)
         .stdin(Stdio::piped())
@@ -7269,9 +7277,11 @@ fn server_mode_request_permissions_session_scope_persists_directory_grant() {
 
 #[test]
 fn server_mode_request_permissions_session_scope_accepts_file_system_entries() {
-    let workspace = tempdir().expect("workspace");
-    let home = workspace.path().join("home");
-    let extra = workspace.path().join("extra");
+    let parent = sandbox_test_parent("orca-request-permissions-entries-");
+    let workspace = parent.path().join("workspace");
+    let home = parent.path().join("home");
+    let extra = parent.path().join("extra");
+    std::fs::create_dir_all(&workspace).expect("create workspace");
     std::fs::create_dir_all(&home).expect("create home");
     std::fs::create_dir_all(&extra).expect("create extra");
     std::fs::write(
@@ -7289,7 +7299,7 @@ fn server_mode_request_permissions_session_scope_accepts_file_system_entries() {
             "--provider",
             "mock",
             "--cwd",
-            workspace.path().to_str().unwrap(),
+            workspace.to_str().unwrap(),
         ])
         .env("ORCA_HOME", &home)
         .stdin(Stdio::piped())
@@ -7933,16 +7943,6 @@ fn sandbox_seatbelt_available() -> bool {
         .output()
         .map(|output| output.status.success())
         .unwrap_or(false)
-}
-
-fn sandbox_test_parent(prefix: &str) -> TempDir {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .expect("HOME is required for macOS Seatbelt contract tests");
-    tempfile::Builder::new()
-        .prefix(prefix)
-        .tempdir_in(home)
-        .expect("sandbox parent outside temporary allow roots")
 }
 
 fn wait_for_child_output_with_timeout(

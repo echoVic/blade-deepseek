@@ -6,6 +6,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
+#[path = "support/sandbox_test_parent.rs"]
+mod sandbox_test_support;
+
+use sandbox_test_support::sandbox_test_parent;
+
 static TOOL_CLI_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 #[test]
@@ -394,8 +399,7 @@ fn full_auto_bash_cannot_write_outside_workspace() {
         return;
     }
 
-    let parent =
-        tempfile::tempdir_in(std::env::current_dir().expect("cwd")).expect("sandbox parent");
+    let parent = sandbox_test_parent("tool-full-auto-deny-");
     let temp_dir = parent.path().join("workspace");
     std::fs::create_dir(&temp_dir).expect("workspace dir");
     let outside = parent.path().join(format!(
@@ -438,8 +442,11 @@ fn request_permissions_grants_bash_write_root_for_current_turn() {
         return;
     }
 
-    let workspace = make_temp_workspace("request-permissions-workspace");
-    let extra = make_temp_workspace("request-permissions-extra");
+    let parent = sandbox_test_parent("tool-request-permissions-");
+    let workspace = parent.path().join("workspace");
+    let extra = parent.path().join("extra");
+    fs::create_dir(&workspace).expect("workspace dir");
+    fs::create_dir(&extra).expect("extra dir");
     let output_file = extra.join("generated.txt");
     let prompt = format!(
         "request_permissions_then_bash {} :: printf granted > {}",

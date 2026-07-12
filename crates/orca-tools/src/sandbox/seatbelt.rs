@@ -802,7 +802,7 @@ mod tests {
             return;
         }
 
-        let parent = TempDir::new_in(std::env::current_dir().unwrap()).unwrap();
+        let parent = crate::sandbox::sandbox_test_parent("seatbelt-outside-deny-");
         let workspace_path = parent.path().join("workspace");
         let readable_path = parent.path().join("readable");
         std::fs::create_dir(&workspace_path).unwrap();
@@ -962,7 +962,7 @@ mod tests {
             return;
         }
 
-        let parent = TempDir::new_in(std::env::current_dir().unwrap()).unwrap();
+        let parent = crate::sandbox::sandbox_test_parent("seatbelt-outside-deny-");
         let workspace_path = parent.path().join("workspace");
         std::fs::create_dir(&workspace_path).unwrap();
         let outside = parent.path().join("blocked.txt");
@@ -984,7 +984,7 @@ mod tests {
             return;
         }
 
-        let parent = TempDir::new_in(std::env::current_dir().unwrap()).unwrap();
+        let parent = crate::sandbox::sandbox_test_parent("seatbelt-additional-roots-");
         let workspace_path = parent.path().join("workspace");
         let extra = parent.path().join("extra");
         let outside = parent.path().join("outside");
