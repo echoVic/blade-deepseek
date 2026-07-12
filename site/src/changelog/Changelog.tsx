@@ -76,6 +76,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.19":
+        "macOS Seatbelt now lets sandboxed test runners signal only their own child workers, so Vitest, Tinypool, Jest, and similar pools can clean up after failures and shutdown. The incident behind this fix left 10 Node workers using 40.51 GiB while Orca native used about 30.2 MiB and its npm wrapper about 11.8 MiB; it was not an Orca transcript-heap leak. Workspace-write and read-only profiles keep unrelated processes outside the signal boundary.",
       "v0.2.18":
         "Unknown or malformed DeepSeek function names now become recorded, failed tool results that the model can correct inside the same agent turn instead of terminal provider errors that pause Goal mode. Orca preserves the original call id, name, and raw arguments across streaming and non-streaming responses, but never infers or executes bash from command-shaped names; registry validation rejects them before approval, hooks, task creation, or execution.",
       "v0.2.17":
@@ -490,6 +492,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.19":
+        "macOS Seatbelt 现在允许沙箱内的测试运行器只向自己的子 worker 发信号，因此 Vitest、Tinypool、Jest 等 worker pool 能在失败或退出时正常清理。触发本次修复的事故中，10 个遗留 Node worker 合计占用 40.51 GiB，而 Orca native 约 30.2 MiB、npm wrapper 约 11.8 MiB；这不是 Orca transcript heap 泄漏。workspace-write 与 read-only profile 仍无权影响无关进程。",
       "v0.2.18":
         "DeepSeek 生成未知或畸形 function name 时，Orca 现在会把它记录为可失败的 tool result，并在同一个 agent turn 内返回给模型纠正，不再直接触发 provider terminal error 并暂停 Goal。流式与非流式响应都会保留原始 call id、名称和 raw arguments，但绝不会从命令形名称推断或执行 bash；registry validation 会在审批、hook、任务创建和执行前拒绝该调用。",
       "v0.2.17":

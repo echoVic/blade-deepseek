@@ -4,8 +4,14 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-07-12
-Current baseline: v0.2.18 preserves unknown DeepSeek function calls instead of
-turning them into terminal provider errors. Each call keeps its provider id,
+Current baseline: v0.2.19 lets process managers inside the macOS workspace-write
+and read-only Seatbelt profiles signal their own child workers. This restores
+Vitest, Tinypool, Jest, and similar worker-pool cleanup after failures and
+shutdown without granting authority over unrelated or same-sandbox processes.
+The regression suite exercises real child termination in both profiles and
+keeps the broader signal targets denied. Earlier v0.2.18 preserves unknown
+DeepSeek function calls instead of turning them into terminal provider errors.
+Each call keeps its provider id,
 function name, and raw arguments. Configured external names remain
 `ToolName::External` with their declared action, unresolved `mcp__*` names
 remain `ToolName::Mcp`, and other generic unresolved names become
