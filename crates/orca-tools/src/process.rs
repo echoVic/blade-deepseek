@@ -121,8 +121,11 @@ pub fn wait_for_child_output_with_timeout_or_cancel_and_limit(
                 Ok(None) => {}
             }
         }
-        if status.is_some() && stdout_handle.is_finished() && stderr_handle.is_finished() {
-            break Ok(status.expect("completed child status"));
+        if let Some(exit_status) = status
+            && stdout_handle.is_finished()
+            && stderr_handle.is_finished()
+        {
+            break Ok(exit_status);
         }
         if should_cancel() {
             kill_process_group_by_pid(child_pid);

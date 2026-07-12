@@ -131,8 +131,11 @@ fn wait_for_child_output_with_timeout(
                 }
             }
         }
-        if status.is_some() && stdout_handle.is_finished() && stderr_handle.is_finished() {
-            break Ok(status.expect("completed verifier status"));
+        if let Some(exit_status) = status
+            && stdout_handle.is_finished()
+            && stderr_handle.is_finished()
+        {
+            break Ok(exit_status);
         }
         if std::time::Instant::now() >= deadline {
             timed_out = true;
