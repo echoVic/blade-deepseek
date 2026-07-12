@@ -4,7 +4,11 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-07-12
-Current baseline: v0.2.19 lets process managers inside the macOS workspace-write
+Current baseline: v0.2.20 makes the TUI resilient to long interactive content:
+large pastes remain compact before and after submission, Goal and plan surfaces
+truncate by display width, approval decisions stay visible, candidate menus
+follow selection, tool headers preserve status, and the footer degrades by
+information priority with permission-mode semantic colors. Earlier v0.2.19 lets process managers inside the macOS workspace-write
 and read-only Seatbelt profiles signal their own child workers. This restores
 Vitest, Tinypool, Jest, and similar worker-pool cleanup after failures and
 shutdown without granting authority over unrelated or same-sandbox processes.

@@ -5,7 +5,7 @@ use tui_textarea::TextArea;
 
 use orca_core::config::RunConfig;
 
-use crate::composer_textarea::{make_textarea, textarea_text};
+use crate::composer_textarea::{expand_pending_pastes, make_textarea, textarea_text};
 use crate::slash_command_actions::{SlashOutcome, handle_slash_command};
 use crate::theme::Theme;
 use crate::types::{AppState, AppStatus, ChatMessage, UserAction};
@@ -22,7 +22,10 @@ pub(crate) fn handle_idle_submit(
     action_tx: &mpsc::Sender<UserAction>,
 ) -> bool {
     state.slash_menu = None;
-    let text = textarea_text(textarea).trim().to_string();
+    let visible_text = textarea_text(textarea);
+    let text = expand_pending_pastes(&visible_text, &state.pending_pastes)
+        .trim()
+        .to_string();
     if text.is_empty() {
         return false;
     }
@@ -30,6 +33,7 @@ pub(crate) fn handle_idle_submit(
     if let Some(outcome) = handle_slash_command(&text, config, shared_config, state, action_tx) {
         match outcome {
             SlashOutcome::Continue => {
+                state.pending_pastes.clear();
                 reset_composer_after_submit(textarea, vim_state, theme);
                 return true;
             }
@@ -44,11 +48,12 @@ pub(crate) fn handle_idle_submit(
         }
     } else {
         state.record_prompt(text.clone());
-        state.push_message(ChatMessage::User(text.clone()));
+        state.push_message(ChatMessage::User(visible_text.trim().to_string()));
         state.enter_running();
         state.scroll_to_bottom();
         let _ = action_tx.send(UserAction::Submit(text));
     }
+    state.pending_pastes.clear();
     reset_composer_after_submit(textarea, vim_state, theme);
     true
 }

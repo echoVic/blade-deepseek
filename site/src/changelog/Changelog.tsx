@@ -76,6 +76,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.20":
+        "The TUI now keeps long sessions compact across the full interaction loop. Large pastes stay collapsed in the composer and transcript while the complete prompt reaches the model; Goal objectives and notices, task-plan steps, and tool targets use display-width-aware ellipses; long approval content cannot push decisions away; slash and file menus follow the selected row; and the responsive footer preserves permission mode and context before optional metadata. Permission modes now use blue, violet, red, and teal semantic accents.",
       "v0.2.19":
         "macOS Seatbelt now lets sandboxed test runners signal only their own child workers, so Vitest, Tinypool, Jest, and similar pools can clean up after failures and shutdown. The incident behind this fix left 10 Node workers using 40.51 GiB while Orca native used about 30.2 MiB and its npm wrapper about 11.8 MiB; it was not an Orca transcript-heap leak. Workspace-write and read-only profiles keep unrelated processes outside the signal boundary.",
       "v0.2.18":
@@ -492,6 +494,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.20":
+        "TUI 现在会在完整交互链路中控制长内容占用。大段粘贴在输入框和 transcript 中保持折叠，但提交给模型的正文不变；Goal 目标与状态、Task Plan 步骤和工具 target 会按终端显示宽度省略；长审批内容不会再把决策选项挤出；Slash 与文件菜单会跟随当前选择滚动；响应式底栏优先保留权限模式和 context。权限模式分别使用蓝、紫、红、青绿语义色。",
       "v0.2.19":
         "macOS Seatbelt 现在允许沙箱内的测试运行器只向自己的子 worker 发信号，因此 Vitest、Tinypool、Jest 等 worker pool 能在失败或退出时正常清理。触发本次修复的事故中，10 个遗留 Node worker 合计占用 40.51 GiB，而 Orca native 约 30.2 MiB、npm wrapper 约 11.8 MiB；这不是 Orca transcript heap 泄漏。workspace-write 与 read-only profile 仍无权影响无关进程。",
       "v0.2.18":

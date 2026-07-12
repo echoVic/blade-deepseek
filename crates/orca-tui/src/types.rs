@@ -13,9 +13,38 @@ use orca_runtime::history::SessionSummary;
 use orca_runtime::runtime_pending_interaction::RuntimeMcpElicitationMode;
 use orca_runtime::runtime_permission::RuntimePermissionRequestKind;
 
+use crate::display_text::truncate_to_display_width;
 use crate::transcript_view::TranscriptRenderCache;
 
 const SUBAGENT_ACTIVITY_TAIL_LIMIT: usize = 6;
+const GOAL_NOTICE_OBJECTIVE_WIDTH: usize = 80;
+
+fn format_goal_notice(goal: &orca_core::goal_types::ThreadGoal) -> String {
+    use orca_core::goal_types::{
+        format_goal_elapsed_seconds, format_tokens_compact, goal_status_label,
+    };
+
+    let objective = goal
+        .objective
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut parts = vec![
+        format!("Goal {}", goal_status_label(goal.status)),
+        truncate_to_display_width(&objective, GOAL_NOTICE_OBJECTIVE_WIDTH),
+    ];
+    if goal.time_used_seconds > 0 {
+        parts.push(format_goal_elapsed_seconds(goal.time_used_seconds));
+    }
+    if let Some(token_budget) = goal.token_budget {
+        parts.push(format!(
+            "{}/{} tok",
+            format_tokens_compact(goal.tokens_used),
+            format_tokens_compact(token_budget)
+        ));
+    }
+    parts.join(" · ")
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TuiTaskLifecycle {
@@ -493,6 +522,7 @@ pub struct AppState {
     pub setup_step: u8,
     pub show_shortcuts: bool,
     pub input_history: Vec<String>,
+    pub(crate) pending_pastes: Vec<(String, String)>,
     pub history_cursor: Option<usize>,
     pub draft_before_history: Option<String>,
     pub last_ctrl_c: Option<Instant>,
@@ -579,6 +609,7 @@ impl AppState {
             setup_step: 0,
             show_shortcuts: false,
             input_history: Vec::new(),
+            pending_pastes: Vec::new(),
             history_cursor: None,
             draft_before_history: None,
             last_ctrl_c: None,
@@ -608,6 +639,22 @@ impl AppState {
         let revision = self.next_message_revision;
         self.next_message_revision = self.next_message_revision.wrapping_add(1).max(1);
         revision
+    }
+
+    fn push_goal_notice(&mut self, notice: String, suppress_duplicate: bool) {
+        let duplicate = suppress_duplicate
+            && self
+                .messages
+                .iter()
+                .rev()
+                .find_map(|message| match message {
+                    ChatMessage::System(text) if text.starts_with("Goal ") => Some(text),
+                    _ => None,
+                })
+                == Some(&notice);
+        if !duplicate {
+            self.push_message(ChatMessage::System(notice));
+        }
     }
 
     pub(crate) fn reconcile_message_tracking(&mut self) {
@@ -1500,12 +1547,11 @@ impl AppState {
                 self.set_status(AppStatus::Idle);
             }
             TuiEvent::GoalUpdated(goal) => {
-                let summary = orca_core::goal_types::goal_usage_summary(&goal);
-                let label = orca_core::goal_types::goal_status_label(goal.status);
                 let should_keep_running =
                     self.status == AppStatus::Running && goal.status.should_continue();
+                let notice = format_goal_notice(&goal);
                 self.current_goal = Some(goal);
-                self.push_message(ChatMessage::System(format!("Goal {label}. {summary}")));
+                self.push_goal_notice(notice, should_keep_running);
                 if !should_keep_running {
                     self.set_status(AppStatus::Idle);
                 }
@@ -1522,9 +1568,8 @@ impl AppState {
                     Some(goal) => {
                         should_keep_running =
                             self.status == AppStatus::Running && goal.status.should_continue();
-                        let label = orca_core::goal_types::goal_status_label(goal.status);
-                        let summary = orca_core::goal_types::goal_usage_summary(&goal);
-                        self.push_message(ChatMessage::System(format!("Goal {label}. {summary}")));
+                        let notice = format_goal_notice(&goal);
+                        self.push_goal_notice(notice, should_keep_running);
                     }
                     None => self
                         .push_message(ChatMessage::System("No goal is currently set.".to_string())),
@@ -3684,6 +3729,60 @@ mod tests {
 
         state.update(TuiEvent::GoalUpdated(goal));
         assert_eq!(state.status, AppStatus::Running);
+    }
+
+    #[test]
+    fn goal_status_messages_compact_long_objectives() {
+        let mut state = state();
+        let objective = "目标内容很长".repeat(100);
+        let goal = ThreadGoal {
+            session_id: "session-1".to_string(),
+            objective: objective.clone(),
+            status: orca_core::goal_types::ThreadGoalStatus::Active,
+            token_budget: Some(2_000),
+            tokens_used: 1_500,
+            time_used_seconds: 120,
+            created_at: 1,
+            updated_at: 1,
+        };
+
+        state.update(TuiEvent::GoalStatus(Some(goal)));
+
+        let Some(ChatMessage::System(message)) = state.messages.last() else {
+            panic!("goal status should add a system message");
+        };
+        assert!(message.starts_with("Goal active · 目标内容"));
+        assert!(message.contains('…'));
+        assert!(message.ends_with("2m · 1.5K/2K tok"));
+        assert!(!message.contains(&objective));
+    }
+
+    #[test]
+    fn running_goal_does_not_repeat_unchanged_status_notice() {
+        let mut state = state();
+        state.status = AppStatus::Running;
+        let goal = ThreadGoal {
+            session_id: "session-1".to_string(),
+            objective: "keep going".to_string(),
+            status: orca_core::goal_types::ThreadGoalStatus::Active,
+            token_budget: None,
+            tokens_used: 10,
+            time_used_seconds: 120,
+            created_at: 1,
+            updated_at: 1,
+        };
+
+        state.update(TuiEvent::GoalStatus(Some(goal.clone())));
+        state.update(TuiEvent::GoalStatus(Some(goal)));
+
+        assert_eq!(
+            state
+                .messages
+                .iter()
+                .filter(|message| matches!(message, ChatMessage::System(text) if text.starts_with("Goal active")))
+                .count(),
+            1
+        );
     }
 
     #[test]

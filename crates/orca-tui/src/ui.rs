@@ -9,12 +9,14 @@ use std::path::{Path, PathBuf};
 use tui_textarea::TextArea;
 use unicode_width::UnicodeWidthStr;
 
+use orca_core::approval_types::ApprovalMode;
 use orca_core::task_types::{
     BackgroundTaskSummary, TaskStatus, TaskType, WorkflowAgentTaskSummary,
 };
 use orca_core::workflow_types::{WorkflowAgentStatus, WorkflowRunStatus};
 use orca_runtime::history::SessionSummary;
 
+use crate::display_text::{compact_long_text, truncate_to_display_width};
 use crate::shortcuts::{self, ShortcutScope};
 use crate::theme::Theme;
 use crate::transcript_view::viewport_paragraph;
@@ -171,21 +173,12 @@ fn render_goal_banner(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    // Truncate the objective to a single line; real usage stats follow.
-    let objective = goal.objective.replace('\n', " ");
-    let mut spans = vec![
-        Span::styled(
-            objective,
-            Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("  ", Style::default()),
-        Span::styled(
-            format!("● {}", goal_status_label(goal.status)),
-            Style::default().fg(status_color),
-        ),
-    ];
+    let mut metadata_spans = vec![Span::styled(
+        format!("● {}", goal_status_label(goal.status)),
+        Style::default().fg(status_color),
+    )];
     if goal.time_used_seconds > 0 {
-        spans.push(Span::styled(
+        metadata_spans.push(Span::styled(
             format!(
                 "  · {}",
                 format_goal_elapsed_seconds(goal.time_used_seconds)
@@ -194,19 +187,44 @@ fn render_goal_banner(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
         ));
     }
     if goal.tokens_used > 0 {
-        spans.push(Span::styled(
+        metadata_spans.push(Span::styled(
             format!("  · {} tok", format_tokens_compact(goal.tokens_used)),
             Style::default().fg(theme.muted),
         ));
     }
     if goal.status.should_continue() {
-        spans.push(Span::styled(
+        metadata_spans.push(Span::styled(
             "  · auto-continue",
             Style::default().fg(theme.muted),
         ));
     }
 
-    let paragraph = Paragraph::new(Line::from(spans)).wrap(Wrap { trim: false });
+    let metadata_width = metadata_spans
+        .iter()
+        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+        .sum::<usize>();
+    let separator_width = 2usize;
+    let objective_width = (inner.width as usize)
+        .saturating_sub(metadata_width)
+        .saturating_sub(separator_width);
+    let objective = goal
+        .objective
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let objective = truncate_to_display_width(&objective, objective_width);
+    let has_objective = !objective.is_empty();
+
+    let mut spans = vec![Span::styled(
+        objective,
+        Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+    )];
+    if has_objective {
+        spans.push(Span::raw("  "));
+    }
+    spans.append(&mut metadata_spans);
+
+    let paragraph = Paragraph::new(Line::from(spans));
     frame.render_widget(paragraph, inner);
 }
 
@@ -370,24 +388,6 @@ fn highlight_match(text: &str, needle: &str, base: Style, theme: &Theme) -> Vec<
         spans.push(Span::styled(text[end..].to_string(), base));
     }
     spans
-}
-
-fn approval_dialog_height(dialog: &crate::types::ApprovalDialog) -> u16 {
-    let diff_lines = dialog
-        .diff
-        .as_ref()
-        .map(|diff| diff.lines().take(12).count() as u16)
-        .unwrap_or(0);
-    let diff_truncated = dialog
-        .diff
-        .as_ref()
-        .map(|diff| diff.lines().count() > 12)
-        .unwrap_or(false);
-    let diff_h = diff_lines + u16::from(diff_truncated);
-    let diff_spacing = u16::from(dialog.diff.is_some());
-    let option_count = dialog.options.len() as u16;
-    let content_height = 3 + diff_h + diff_spacing + option_count + 2;
-    (content_height + 2).max(8)
 }
 
 /// Render the transcript messages into `area` with no border. While `auto_scroll` is on
@@ -1281,9 +1281,10 @@ fn append_message_lines(
 ) {
     match msg {
         ChatMessage::User(text) => {
+            let text = compact_long_text(text, width.saturating_sub(2).max(1), 3);
             lines.push(Line::from(vec![
                 Span::styled("> ", Style::default().fg(theme.user)),
-                Span::styled(text.clone(), Style::default().fg(theme.user)),
+                Span::styled(text, Style::default().fg(theme.user)),
             ]));
             lines.push(Line::from(""));
         }
@@ -1341,16 +1342,19 @@ fn append_message_lines(
                 "denied" | "failed" => theme.error,
                 _ => theme.muted,
             };
+            let prefix = format!("  {icon} {name}");
+            let status_text = format!(" ({status})");
+            let reserved_width = UnicodeWidthStr::width(prefix.as_str())
+                + UnicodeWidthStr::width(status_text.as_str());
+            let target_width =
+                width.saturating_sub(reserved_width + 2 * usize::from(target.is_some()));
             let target_str = target
                 .as_deref()
-                .map(|t| format!(": {t}"))
+                .map(|target| format!(": {}", truncate_to_display_width(target, target_width)))
                 .unwrap_or_default();
             lines.push(Line::from(vec![
-                Span::styled(
-                    format!("  {icon} {name}{target_str}"),
-                    Style::default().fg(color),
-                ),
-                Span::styled(format!(" ({status})"), Style::default().fg(theme.muted)),
+                Span::styled(format!("{prefix}{target_str}"), Style::default().fg(color)),
+                Span::styled(status_text, Style::default().fg(theme.muted)),
             ]));
             if let Some(out) = output {
                 append_tool_output_lines(lines, out, *expanded, force_expand, theme);
@@ -1360,7 +1364,7 @@ fn append_message_lines(
             }
         }
         ChatMessage::PlanUpdate { explanation, plan } => {
-            append_archived_plan_lines(lines, explanation.as_deref(), plan, theme);
+            append_archived_plan_lines(lines, explanation.as_deref(), plan, width, theme);
         }
         ChatMessage::Subagent {
             description,
@@ -1442,6 +1446,7 @@ fn render_plan_panel(frame: &mut Frame, area: Rect, state: &AppState, theme: &Th
     frame.render_widget(block, area);
 
     let mut lines = Vec::new();
+    let step_width = (inner.width as usize).saturating_sub(3);
     for item in plan {
         let (icon, color) = match item.status {
             PlanStatus::Completed => ("✓", theme.success),
@@ -1450,11 +1455,14 @@ fn render_plan_panel(frame: &mut Frame, area: Rect, state: &AppState, theme: &Th
         };
         lines.push(Line::from(vec![
             Span::styled(format!(" {icon} "), Style::default().fg(color)),
-            Span::styled(item.step.clone(), Style::default().fg(color)),
+            Span::styled(
+                truncate_to_display_width(&item.step.replace('\n', " "), step_width),
+                Style::default().fg(color),
+            ),
         ]));
     }
 
-    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+    let paragraph = Paragraph::new(lines);
     frame.render_widget(paragraph, inner);
 }
 
@@ -1465,6 +1473,7 @@ fn append_archived_plan_lines(
     lines: &mut Vec<Line<'static>>,
     explanation: Option<&str>,
     plan: &[orca_core::plan_types::PlanItem],
+    width: usize,
     theme: &Theme,
 ) {
     use orca_core::plan_types::PlanStatus;
@@ -1503,7 +1512,10 @@ fn append_archived_plan_lines(
         };
         lines.push(Line::from(vec![
             Span::styled(format!("  {icon} "), icon_style),
-            Span::styled(item.step.clone(), text_style),
+            Span::styled(
+                truncate_to_display_width(&item.step.replace('\n', " "), width.saturating_sub(4)),
+                text_style,
+            ),
         ]));
     }
 
@@ -1969,34 +1981,70 @@ fn push_hard_wrapped_segment(
 fn render_status(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     // The live status dot + elapsed time moved to the activity line above the composer
     // (see `render_activity`); this bottom line is now purely persistent metadata.
-    let line = Line::from(vec![
-        Span::styled(
-            format!(
-                " model: {} ({})",
-                state.model_name,
-                state.reasoning_effort.as_str()
-            ),
-            Style::default().fg(theme.muted),
-        ),
-        Span::styled(
-            format!(" | mode: {}", state.approval_mode.as_str()),
-            Style::default().fg(theme.muted),
-        ),
-        Span::styled(
-            format!(
-                " | tokens: {} | cost: ${:.6}",
-                state.usage.total_tokens(),
-                state.usage.estimated_cost_usd
-            ),
-            Style::default().fg(theme.muted),
-        ),
-        context_cell(state, theme),
-        Span::styled(" | shift+drag to copy", Style::default().fg(theme.muted)),
-        Span::styled(" | F1/ctrl+k shortcuts", Style::default().fg(theme.muted)),
-    ]);
+    let line = status_line(state, theme, area.width as usize);
 
     let paragraph = Paragraph::new(line);
     frame.render_widget(paragraph, area);
+}
+
+fn status_line(state: &AppState, theme: &Theme, width: usize) -> Line<'static> {
+    let mode_prefix = " | mode: ";
+    let mode_value = state.approval_mode.as_str();
+    let mode_width = UnicodeWidthStr::width(mode_prefix) + UnicodeWidthStr::width(mode_value);
+    let model = format!(
+        " model: {} ({})",
+        state.model_name,
+        state.reasoning_effort.as_str()
+    );
+    let model = truncate_to_display_width(&model, width.saturating_sub(mode_width));
+    let mut used = UnicodeWidthStr::width(model.as_str()) + mode_width;
+    let mut spans = vec![
+        Span::styled(model, Style::default().fg(theme.muted)),
+        Span::styled(mode_prefix, Style::default().fg(theme.muted)),
+        Span::styled(
+            mode_value,
+            Style::default().fg(approval_mode_color(state.approval_mode, theme)),
+        ),
+    ];
+
+    let mut optional = Vec::new();
+    if state.context_limit_tokens > 0 {
+        optional.push(context_cell(state, theme));
+    }
+    optional.push(Span::styled(
+        format!(" | tokens: {}", state.usage.total_tokens()),
+        Style::default().fg(theme.muted),
+    ));
+    optional.push(Span::styled(
+        format!(" | cost: ${:.6}", state.usage.estimated_cost_usd),
+        Style::default().fg(theme.muted),
+    ));
+    optional.push(Span::styled(
+        " | shift+drag to copy",
+        Style::default().fg(theme.muted),
+    ));
+    optional.push(Span::styled(
+        " | F1/ctrl+k shortcuts",
+        Style::default().fg(theme.muted),
+    ));
+
+    for span in optional {
+        let span_width = UnicodeWidthStr::width(span.content.as_ref());
+        if used + span_width <= width {
+            used += span_width;
+            spans.push(span);
+        }
+    }
+    Line::from(spans)
+}
+
+fn approval_mode_color(mode: ApprovalMode, theme: &Theme) -> Color {
+    match mode {
+        ApprovalMode::Suggest => theme.border,
+        ApprovalMode::AutoEdit => theme.approval,
+        ApprovalMode::FullAuto => theme.error,
+        ApprovalMode::Plan => theme.plan_mode,
+    }
 }
 
 /// The activity indicator shown on its own line directly above the composer. Returns
@@ -2133,7 +2181,13 @@ fn render_slash_menu(frame: &mut Frame, input_area: Rect, state: &AppState, them
             (items, menu.selected, " Commands ")
         };
 
-    let item_count = items.len() as u16;
+    let visible_count = items.len().min(12);
+    let max_start = items.len().saturating_sub(visible_count);
+    let start = selected
+        .saturating_sub(visible_count.saturating_sub(1))
+        .min(max_start);
+    let end = (start + visible_count).min(items.len());
+    let item_count = visible_count as u16;
     let height = (item_count + 2).min(14); // +2 for border
     let width = input_area.width;
     let y = input_area.y.saturating_sub(height);
@@ -2142,9 +2196,10 @@ fn render_slash_menu(frame: &mut Frame, input_area: Rect, state: &AppState, them
     frame.render_widget(Clear, popup_area);
 
     let mut lines: Vec<Line> = Vec::new();
-    for (i, (cmd, desc)) in items.iter().enumerate() {
-        let prefix = if i == selected as usize { "▸ " } else { "  " };
-        let style = if i == selected as usize {
+    for (i, (cmd, desc)) in items[start..end].iter().enumerate() {
+        let item_index = start + i;
+        let prefix = if item_index == selected { "▸ " } else { "  " };
+        let style = if item_index == selected {
             Style::default()
                 .fg(theme.border)
                 .add_modifier(Modifier::BOLD)
@@ -2178,7 +2233,14 @@ fn render_mention_candidates(frame: &mut Frame, input_area: Rect, state: &AppSta
         return;
     }
 
-    let item_count = candidates.len().min(12) as u16;
+    let visible_count = candidates.len().min(12);
+    let max_start = candidates.len().saturating_sub(visible_count);
+    let start = state
+        .mention_selected
+        .saturating_sub(visible_count.saturating_sub(1))
+        .min(max_start);
+    let end = (start + visible_count).min(candidates.len());
+    let item_count = visible_count as u16;
     let height = item_count + 2;
     let width = input_area.width;
     let y = input_area.y.saturating_sub(height);
@@ -2188,8 +2250,9 @@ fn render_mention_candidates(frame: &mut Frame, input_area: Rect, state: &AppSta
 
     let lines: Vec<Line> = candidates
         .iter()
-        .take(12)
         .enumerate()
+        .skip(start)
+        .take(end.saturating_sub(start))
         .map(|(i, c)| {
             let prefix = if i == state.mention_selected {
                 "▸ "
@@ -2224,12 +2287,31 @@ fn render_approval_dialog(frame: &mut Frame, state: &AppState, theme: &Theme) {
 
     let area = frame.area();
     let target_str = dialog.target.as_deref().unwrap_or("(none)");
+    let width = 64u16.min(area.width.saturating_sub(4));
+    let inner_width = width.saturating_sub(2) as usize;
+    let target_str = truncate_to_display_width(target_str, inner_width.saturating_sub(9));
+    let max_height = area.height.saturating_sub(4).max(8);
+    let fixed_content_rows = 3 + dialog.options.len() as u16 + 2 + u16::from(dialog.diff.is_some());
+    let available_diff_rows = max_height
+        .saturating_sub(2)
+        .saturating_sub(fixed_content_rows) as usize;
+    let source_diff_lines = dialog
+        .diff
+        .as_ref()
+        .map(|diff| diff.lines().count())
+        .unwrap_or(0);
+    let desired_diff_lines = source_diff_lines.min(12);
+    let diff_truncated =
+        source_diff_lines > desired_diff_lines || desired_diff_lines > available_diff_rows;
+    let truncation_row = usize::from(diff_truncated && available_diff_rows > 0);
+    let shown_diff_lines =
+        desired_diff_lines.min(available_diff_rows.saturating_sub(truncation_row));
 
     // Build the diff/preview lines (colored) if a preview is present.
     let diff_lines: Vec<Line<'static>> = match &dialog.diff {
         Some(diff) => diff
             .lines()
-            .take(12)
+            .take(shown_diff_lines)
             .map(|line| {
                 let color = if line.starts_with('+') {
                     theme.diff_add
@@ -2241,24 +2323,20 @@ fn render_approval_dialog(frame: &mut Frame, state: &AppState, theme: &Theme) {
                     theme.muted
                 };
                 Line::from(Span::styled(
-                    format!("  {line}"),
+                    truncate_to_display_width(&format!("  {line}"), inner_width),
                     Style::default().fg(color),
                 ))
             })
             .collect(),
         None => Vec::new(),
     };
-    let diff_truncated = dialog
-        .diff
-        .as_ref()
-        .map(|d| d.lines().count() > 12)
-        .unwrap_or(false);
-
-    // Header (3) + diff + options + footer (2); clamp to the screen.
-    let width = 64u16.min(area.width.saturating_sub(4));
-    let height = approval_dialog_height(dialog)
-        .min(area.height.saturating_sub(4))
-        .max(8);
+    // Header, bounded preview, all decisions, and footer; clamp to the screen.
+    let height = (fixed_content_rows
+        + shown_diff_lines as u16
+        + u16::from(diff_truncated && available_diff_rows > 0)
+        + 2)
+    .min(max_height)
+    .max(8);
     let popup_area = centered_rect(area, width, height);
 
     frame.render_widget(Clear, popup_area);
@@ -2275,7 +2353,7 @@ fn render_approval_dialog(frame: &mut Frame, state: &AppState, theme: &Theme) {
         ]),
         Line::from(vec![
             Span::styled("  target ", Style::default().fg(theme.muted)),
-            Span::styled(target_str.to_string(), Style::default().fg(theme.text)),
+            Span::styled(target_str.clone(), Style::default().fg(theme.text)),
         ]),
         Line::from(""),
     ];
@@ -2309,6 +2387,7 @@ fn render_approval_dialog(frame: &mut Frame, state: &AppState, theme: &Theme) {
             ApprovalOption::AlwaysTarget => "always allow this exact call".to_string(),
             _ => option.label().to_string(),
         };
+        let label_text = truncate_to_display_width(&label_text, inner_width.saturating_sub(8));
         content.push(Line::from(vec![
             Span::styled(prefix, Style::default().fg(theme.border)),
             Span::styled(
@@ -2331,9 +2410,7 @@ fn render_approval_dialog(frame: &mut Frame, state: &AppState, theme: &Theme) {
         .title(dialog.title())
         .border_style(Style::default().fg(theme.approval));
 
-    let paragraph = Paragraph::new(content)
-        .block(block)
-        .wrap(Wrap { trim: false });
+    let paragraph = Paragraph::new(content).block(block);
     frame.render_widget(paragraph, popup_area);
 }
 
@@ -2919,10 +2996,11 @@ fn truncate_lines(text: &str, max_lines: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::TuiEvent;
+    use crate::types::{SlashMenu, SlashMenuItem, TuiEvent};
     use chrono::Utc;
     use orca_core::config::AdditionalWorkingDirectory;
     use orca_core::goal_types::{ThreadGoal, ThreadGoalStatus};
+    use orca_core::plan_types::{PlanItem, PlanStatus};
     use orca_runtime::history::SessionSummary;
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
@@ -2973,6 +3051,34 @@ mod tests {
             created_at: 1,
             updated_at: 2,
         }
+    }
+
+    #[test]
+    fn long_goal_objective_keeps_status_visible_on_one_line() {
+        let mut state = test_state();
+        let mut goal = goal_with_elapsed(ThreadGoalStatus::Active, 13 * 60);
+        goal.objective = "将当前项目重构为分层清晰的生产级 Agent SDK monorepo".repeat(8);
+        state.current_goal = Some(goal);
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let width = 80u16;
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 3))
+            .expect("test backend");
+
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_goal_banner(frame, area, &state, &theme);
+            })
+            .expect("draw");
+
+        let buffer = terminal.backend().buffer();
+        let content_row = (0..width)
+            .map(|x| buffer[(x, 1)].symbol())
+            .collect::<String>();
+        assert!(content_row.contains('…'));
+        assert!(content_row.contains("● active"));
+        assert!(content_row.contains("auto-continue"));
+        assert!(!content_row.contains("monorepomonorepo"));
     }
 
     fn session_summary(id: &str, title: &str) -> SessionSummary {
@@ -3128,6 +3234,76 @@ mod tests {
 
         assert!(rendered.contains("Network Permission Required"));
         assert!(!rendered.contains("Approval Required"));
+    }
+
+    #[test]
+    fn approval_dialog_keeps_actions_visible_with_long_content() {
+        let mut state = test_state();
+        state.update(TuiEvent::ApprovalNeeded {
+            id: "approval-long".to_string(),
+            tool: "bash".to_string(),
+            target: Some(format!("echo {}", "very-long-target ".repeat(30))),
+            preview: Some(
+                (0..20)
+                    .map(|index| format!("preview {index}: {}", "x".repeat(120)))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+        });
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(70, 20))
+            .expect("test backend");
+
+        terminal
+            .draw(|frame| render_approval_dialog(frame, &state, &theme))
+            .expect("draw");
+        let rendered = format!("{:?}", terminal.backend().buffer());
+
+        assert!(rendered.contains('…'));
+        assert!(rendered.contains("[1] allow this once"));
+        assert!(rendered.contains("[2] always allow this exact call"));
+        assert!(rendered.contains("[3] always allow \"bash\""));
+        assert!(rendered.contains("[4] deny"));
+        assert!(rendered.contains("preview truncated"));
+        assert!(rendered.contains("↑↓ select · Enter · 1/2/3/4"));
+    }
+
+    #[test]
+    fn long_slash_and_mention_menus_keep_selection_visible() {
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let mut state = test_state();
+        state.slash_menu = Some(SlashMenu {
+            items: (0..20)
+                .map(|index| SlashMenuItem {
+                    command: format!("/command-{index:02}"),
+                    description: format!("command {index}"),
+                })
+                .collect(),
+            selected: 19,
+            sub_menu: None,
+        });
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(70, 20))
+            .expect("test backend");
+        terminal
+            .draw(|frame| {
+                render_slash_menu(frame, Rect::new(0, 18, 70, 1), &state, &theme);
+            })
+            .expect("draw");
+        let rendered = format!("{:?}", terminal.backend().buffer());
+        assert!(rendered.contains("▸ /command-19"));
+        assert!(!rendered.contains("/command-00"));
+
+        state.slash_menu = None;
+        state.mention_candidates = (0..20).map(|index| format!("file-{index:02}.rs")).collect();
+        state.mention_selected = 19;
+        terminal
+            .draw(|frame| {
+                render_mention_candidates(frame, Rect::new(0, 18, 70, 1), &state, &theme);
+            })
+            .expect("draw");
+        let rendered = format!("{:?}", terminal.backend().buffer());
+        assert!(rendered.contains("▸ @file-19.rs"));
+        assert!(!rendered.contains("@file-00.rs"));
     }
 
     #[test]
@@ -3326,6 +3502,138 @@ mod tests {
         danger.context_limit_tokens = 1000;
         danger.context_used_tokens = 900; // 10% remaining
         assert_eq!(context_cell(&danger, &theme).style.fg, Some(theme.error));
+    }
+
+    #[test]
+    fn approval_modes_use_distinct_semantic_colors() {
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+
+        assert_eq!(
+            approval_mode_color(ApprovalMode::Suggest, &theme),
+            theme.border
+        );
+        assert_eq!(
+            approval_mode_color(ApprovalMode::AutoEdit, &theme),
+            theme.approval
+        );
+        assert_eq!(
+            approval_mode_color(ApprovalMode::FullAuto, &theme),
+            theme.error
+        );
+        assert_eq!(
+            approval_mode_color(ApprovalMode::Plan, &theme),
+            theme.plan_mode
+        );
+
+        let colors = [theme.border, theme.approval, theme.error, theme.plan_mode];
+        for (index, color) in colors.iter().enumerate() {
+            assert!(!colors[..index].contains(color));
+        }
+    }
+
+    #[test]
+    fn status_line_renders_each_approval_mode_in_its_semantic_color() {
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        for mode in [
+            ApprovalMode::Suggest,
+            ApprovalMode::AutoEdit,
+            ApprovalMode::FullAuto,
+            ApprovalMode::Plan,
+        ] {
+            let mut state = test_state();
+            state.approval_mode = mode;
+            let width = 180u16;
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 1))
+                .expect("test backend");
+            terminal
+                .draw(|frame| {
+                    let area = frame.area();
+                    render_status(frame, area, &state, &theme);
+                })
+                .expect("draw");
+
+            let buffer = terminal.backend().buffer();
+            let row = (0..width)
+                .map(|x| buffer[(x, 0)].symbol())
+                .collect::<String>();
+            let marker = format!("mode: {}", mode.as_str());
+            let marker_start = row.find(&marker).expect("mode should be visible");
+            let value_x = (marker_start + "mode: ".len()) as u16;
+            assert_eq!(
+                buffer[(value_x, 0)].fg,
+                approval_mode_color(mode, &theme),
+                "wrong status color for {}",
+                mode.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn responsive_status_line_keeps_mode_and_context_before_optional_metadata() {
+        let mut state = test_state();
+        state.context_limit_tokens = 1000;
+        state.context_used_tokens = 250;
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+
+        let narrow = status_line(&state, &theme, 70).to_string();
+        assert!(narrow.contains("mode: suggest"));
+        assert!(narrow.contains("context: 75%"));
+        assert!(!narrow.contains("cost:"));
+        assert!(!narrow.contains("shortcuts"));
+
+        let wide = status_line(&state, &theme, 180).to_string();
+        assert!(wide.contains("tokens:"));
+        assert!(wide.contains("cost:"));
+        assert!(wide.contains("shift+drag"));
+        assert!(wide.contains("shortcuts"));
+    }
+
+    #[test]
+    fn long_plan_steps_and_tool_targets_stay_on_single_rows() {
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let mut state = test_state();
+        state.current_plan = Some((
+            None,
+            vec![
+                PlanItem {
+                    step: "inspect the complete workspace topology and every package boundary"
+                        .repeat(3),
+                    status: PlanStatus::InProgress,
+                },
+                PlanItem {
+                    step: "run verification".to_string(),
+                    status: PlanStatus::Pending,
+                },
+            ],
+        ));
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 4))
+            .expect("test backend");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_plan_panel(frame, area, &state, &theme);
+            })
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        let first_step = (0..40).map(|x| buffer[(x, 1)].symbol()).collect::<String>();
+        let second_step = (0..40).map(|x| buffer[(x, 2)].symbol()).collect::<String>();
+        assert!(first_step.contains('…'));
+        assert!(second_step.contains("run verification"));
+
+        let tool = ChatMessage::ToolCall {
+            id: "tool-long".to_string(),
+            name: "bash".to_string(),
+            target: Some("cargo test --workspace --all-features ".repeat(20)),
+            status: "completed".to_string(),
+            output: None,
+            diff: None,
+            kind: Some("success".to_string()),
+            expanded: false,
+        };
+        let rendered = build_lines_for_messages(&[tool], &theme, 40, 0, false);
+        assert_eq!(rendered[0].width(), 40);
+        assert!(rendered[0].to_string().contains('…'));
+        assert!(rendered[0].to_string().ends_with("(completed)"));
     }
 
     #[test]

@@ -378,7 +378,10 @@ mod tests {
 
     use crate::approval_actions::resolve_approval_option;
     use crate::commands;
-    use crate::composer_textarea::{insert_pasted_text, make_textarea_with_text, textarea_text};
+    use crate::composer_textarea::{
+        insert_composer_paste, insert_pasted_text, make_textarea_with_text, textarea_text,
+    };
+    use crate::idle_submit_actions::handle_idle_submit;
     use crate::slash_command_actions::handle_slash_command;
     use crate::types::{ApprovalOption, SlashMenu, SlashMenuItem, SubMenu};
     use crate::workflow_notifications::drain_pending_workflow_notifications;
@@ -2891,6 +2894,47 @@ mod tests {
         assert!(insert_pasted_text(&mut textarea, "\nnext"));
 
         assert_eq!(textarea_text(&textarea), "prefix\nnext");
+    }
+
+    #[test]
+    fn large_paste_submits_full_content_and_clears_pending_payload() {
+        let (mut state, _rx) = test_state();
+        let mut config = test_config(HistoryMode::Record);
+        let shared_config = Arc::new(Mutex::new(config.clone()));
+        let (action_tx, action_rx) = mpsc::channel();
+        let theme = Theme::named(ThemeName::Dark);
+        let mut vim_state = VimState::new(false);
+        let mut textarea = make_textarea(&vim_state, &theme);
+        let pasted = "long line\n".repeat(120);
+
+        assert!(insert_composer_paste(
+            &mut textarea,
+            &mut state.pending_pastes,
+            &pasted,
+        ));
+        assert!(textarea_text(&textarea).starts_with("[Pasted Content "));
+
+        assert!(handle_idle_submit(
+            &mut textarea,
+            &mut vim_state,
+            &theme,
+            &mut state,
+            &mut config,
+            &shared_config,
+            &action_tx,
+        ));
+
+        assert!(matches!(
+            action_rx.try_recv(),
+            Ok(UserAction::Submit(prompt)) if prompt == pasted.trim()
+        ));
+        assert!(state.pending_pastes.is_empty());
+        assert!(textarea_text(&textarea).is_empty());
+        assert_eq!(state.input_history, vec![pasted.trim().to_string()]);
+        assert!(matches!(
+            state.messages.last(),
+            Some(ChatMessage::User(display)) if display.starts_with("[Pasted Content ")
+        ));
     }
 }
 

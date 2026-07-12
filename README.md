@@ -33,7 +33,7 @@ Set `INSTALL_DIR` to choose a destination and `ORCA_VERSION` to pin a version:
 
 ```bash
 curl -fsSL https://orcaagent.dev/install.sh | \
-  INSTALL_DIR=/usr/local/bin ORCA_VERSION=0.2.19 sh
+  INSTALL_DIR=/usr/local/bin ORCA_VERSION=0.2.20 sh
 ```
 
 ### GitHub Releases
@@ -59,6 +59,23 @@ orca exec --approval-mode full-auto "refactor the auth module"
 orca exec --model deepseek-v4-pro "explain this codebase"
 orca exec --verifier "cargo test" "fix the failing test"
 ```
+
+## Terminal UI
+
+The interactive TUI keeps long-running sessions compact without changing the
+content sent to the model:
+
+- Pastes over 1,000 characters appear as `[Pasted Content N chars]` in the
+  composer and expand only for submission. Long submitted messages remain a
+  bounded transcript preview.
+- Goal objectives, task-plan steps, tool targets, and Goal status notices are
+  shortened by terminal display width with a visible ellipsis.
+- Approval dialogs keep the decision options visible when commands or previews
+  are long, and slash/file candidate menus scroll with the current selection.
+- The status line preserves permission mode and context pressure first on narrow
+  terminals, then adds token, cost, and shortcut metadata as space permits.
+- Permission modes use semantic colors: `suggest` blue, `auto-edit` violet,
+  `full-auto` red, and `plan` teal.
 
 ## Configuration
 

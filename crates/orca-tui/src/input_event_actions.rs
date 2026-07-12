@@ -6,7 +6,7 @@ use tui_textarea::TextArea;
 use orca_core::config::RunConfig;
 
 use crate::composer_input_actions::refresh_input_menus;
-use crate::composer_textarea::insert_pasted_text;
+use crate::composer_textarea::{insert_composer_paste, insert_pasted_text};
 use crate::types::{AppState, AppStatus, PanelMode};
 
 #[derive(Debug, PartialEq)]
@@ -78,7 +78,7 @@ pub(crate) fn handle_paste_event(
             insert_pasted_text(textarea, pasted);
         }
         AppStatus::Idle | AppStatus::WaitingUserInput => {
-            if insert_pasted_text(textarea, pasted) {
+            if insert_composer_paste(textarea, &mut state.pending_pastes, pasted) {
                 state.reset_history_navigation();
                 refresh_input_menus(textarea, state, config);
             }
