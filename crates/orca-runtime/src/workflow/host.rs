@@ -1,14 +1,23 @@
 use std::env;
 use std::fs;
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+use orca_core::retained_output::{RetainedOutput, RetainedOutputSnapshot};
+
+const WORKFLOW_STDERR_RETAINED_BYTES: usize =
+    orca_tools::process::DEFAULT_PROCESS_OUTPUT_RETAINED_BYTES_PER_STREAM;
+const WORKFLOW_STDERR_READ_CHUNK_BYTES: usize = 8 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -54,6 +63,38 @@ pub struct WorkflowHost;
 pub struct WorkflowHostIpcPaths {
     pub mailbox_path: PathBuf,
     pub task_lists_path: PathBuf,
+}
+
+struct WorkflowChild {
+    child: Option<Child>,
+}
+
+impl WorkflowChild {
+    fn new(child: Child) -> Self {
+        Self { child: Some(child) }
+    }
+
+    fn child_mut(&mut self) -> &mut Child {
+        self.child.as_mut().expect("workflow child is available")
+    }
+
+    fn wait(&mut self) -> io::Result<ExitStatus> {
+        let status = self.child_mut().wait();
+        if status.is_ok() {
+            self.child.take();
+        }
+        status
+    }
+}
+
+impl Drop for WorkflowChild {
+    fn drop(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        orca_tools::process::kill_child_tree(&mut child);
+        let _ = child.wait();
+    }
 }
 
 impl WorkflowHost {
@@ -184,21 +225,34 @@ impl WorkflowHost {
                 .arg(&ipc_paths.mailbox_path)
                 .arg(&ipc_paths.task_lists_path);
         }
-        let mut child = command
+        command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
+            .stderr(Stdio::piped());
+        #[cfg(unix)]
+        {
+            command.process_group(0);
+        }
+        let child = command.spawn()?;
+        let mut child = WorkflowChild::new(child);
         let stdin = child
+            .child_mut()
             .stdin
             .take()
             .ok_or_else(|| io::Error::other("failed to capture workflow host stdin"))?;
         let stdin = Arc::new(Mutex::new(stdin));
 
         let stdout = child
+            .child_mut()
             .stdout
             .take()
             .ok_or_else(|| io::Error::other("failed to capture workflow host stdout"))?;
+        let stderr = child
+            .child_mut()
+            .stderr
+            .take()
+            .ok_or_else(|| io::Error::other("failed to capture workflow host stderr"))?;
+        let stderr_reader = spawn_stderr_reader(stderr);
         let reader = BufReader::new(stdout);
 
         let mut events = Vec::new();
@@ -274,26 +328,60 @@ impl WorkflowHost {
             return Err(io::Error::other(error));
         }
 
-        let output = child.wait_with_output()?;
-        if !output.status.success() {
+        let status = child.wait()?;
+        let stderr = join_stderr_reader(stderr_reader)?;
+        if !status.success() {
             if workflow_failed.is_some() {
                 return Ok(events);
             }
 
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let stderr = format_stderr(stderr);
             let message = if stderr.is_empty() {
-                format!("workflow host exited with status {}", output.status)
+                format!("workflow host exited with status {status}")
             } else {
-                format!(
-                    "workflow host exited with status {}: {stderr}",
-                    output.status
-                )
+                format!("workflow host exited with status {status}: {stderr}")
             };
             return Err(io::Error::other(message));
         }
 
         Ok(events)
     }
+}
+
+fn spawn_stderr_reader(
+    mut stderr: impl Read + Send + 'static,
+) -> thread::JoinHandle<io::Result<RetainedOutputSnapshot>> {
+    thread::spawn(move || {
+        let mut output = RetainedOutput::new(WORKFLOW_STDERR_RETAINED_BYTES);
+        let mut buffer = [0_u8; WORKFLOW_STDERR_READ_CHUNK_BYTES];
+        loop {
+            match stderr.read(&mut buffer) {
+                Ok(0) => return Ok(output.into_snapshot()),
+                Ok(read) => output.append(&buffer[..read]),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+        }
+    })
+}
+
+fn join_stderr_reader(
+    reader: thread::JoinHandle<io::Result<RetainedOutputSnapshot>>,
+) -> io::Result<RetainedOutputSnapshot> {
+    reader
+        .join()
+        .map_err(|_| io::Error::other("workflow host stderr reader thread panicked"))?
+}
+
+fn format_stderr(stderr: RetainedOutputSnapshot) -> String {
+    let mut message = String::from_utf8_lossy(&stderr.bytes).trim().to_string();
+    if stderr.omitted_bytes > 0 {
+        message.push_str(&format!(
+            "\n[{} workflow stderr bytes omitted]",
+            stderr.omitted_bytes
+        ));
+    }
+    message
 }
 
 fn write_host_command(writer: &Arc<Mutex<impl Write>>, command: &HostCommand) -> io::Result<()> {
@@ -388,6 +476,36 @@ fn node_from_path_sibling() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    struct TestEnvVar {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    #[cfg(unix)]
+    impl TestEnvVar {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let previous = env::var_os(key);
+            unsafe {
+                env::set_var(key, value);
+            }
+            Self { key, previous }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for TestEnvVar {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(previous) = &self.previous {
+                    env::set_var(self.key, previous);
+                } else {
+                    env::remove_var(self.key);
+                }
+            }
+        }
+    }
 
     #[test]
     fn host_file_paths_are_unique_for_parallel_tests() {
@@ -491,12 +609,115 @@ mod tests {
         }
     }
 
+    #[test]
+    #[cfg(unix)]
+    fn event_callback_error_reaps_workflow_process_group() {
+        let _guard = crate::history::lock_test_env();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let survivor_marker = temp.path().join("workflow-survivor");
+        let node = write_fake_node_script(
+            temp.path(),
+            r#"#!/bin/sh
+(sleep 0.4; : > "$ORCA_WORKFLOW_TEST_MARKER") &
+printf '{"type":"phase_started","name":"scan"}\n'
+wait
+"#,
+        );
+        let _node_path = TestEnvVar::set("ORCA_NODE_PATH", &node);
+        let _marker = TestEnvVar::set("ORCA_WORKFLOW_TEST_MARKER", &survivor_marker);
+
+        let error = WorkflowHost::run_collecting_events_with_agent_and_event_callback(
+            &temp.path().join("unused-workflow.js"),
+            serde_json::json!(null),
+            |_| unreachable!("fixture does not emit agent calls"),
+            |_| Err(io::Error::other("event callback failed")),
+        )
+        .expect_err("event callback should fail");
+
+        assert_eq!(error.to_string(), "event callback failed");
+        thread::sleep(std::time::Duration::from_millis(600));
+        assert!(
+            !survivor_marker.exists(),
+            "workflow descendant continued after callback error"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn workflow_host_drains_stderr_while_reading_events() {
+        let _guard = crate::history::lock_test_env();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let pid_path = temp.path().join("workflow-host.pid");
+        let node = write_fake_node_script(
+            temp.path(),
+            r#"#!/bin/sh
+printf '%s' "$$" > "$ORCA_WORKFLOW_TEST_PID"
+i=0
+while [ "$i" -lt 20000 ]; do
+  printf 'workflow stderr padding 0123456789012345678901234567890123456789\n' >&2
+  i=$((i + 1))
+done
+printf '{"type":"workflow_completed","result":{"ok":true}}\n'
+"#,
+        );
+        let _node_path = TestEnvVar::set("ORCA_NODE_PATH", &node);
+        let _pid_path = TestEnvVar::set("ORCA_WORKFLOW_TEST_PID", &pid_path);
+        let script = temp.path().join("unused-workflow.js");
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let worker = thread::spawn(move || {
+            let result = WorkflowHost::run_collecting_events(&script, serde_json::json!(null));
+            let _ = sender.send(result);
+        });
+
+        let result = receiver.recv_timeout(std::time::Duration::from_secs(2));
+        if result.is_err() {
+            terminate_fixture_process(&pid_path);
+            let _ = receiver.recv_timeout(std::time::Duration::from_secs(2));
+        }
+        worker.join().expect("workflow host worker");
+
+        let events = result
+            .expect("workflow host blocked on its stderr pipe")
+            .expect("workflow host result");
+        assert!(events.iter().any(|event| {
+            matches!(event, HostEvent::WorkflowCompleted { result } if result["ok"] == true)
+        }));
+    }
+
+    #[test]
+    fn workflow_stderr_reader_bounds_retained_output() {
+        let observed_bytes = WORKFLOW_STDERR_RETAINED_BYTES + 4096;
+        let stderr = std::io::Cursor::new(vec![b'x'; observed_bytes]);
+
+        let retained = join_stderr_reader(spawn_stderr_reader(stderr)).expect("read stderr");
+
+        assert_eq!(retained.observed_bytes, observed_bytes);
+        assert_eq!(retained.bytes.len(), WORKFLOW_STDERR_RETAINED_BYTES);
+        assert_eq!(retained.omitted_bytes, 4096);
+        assert!(format_stderr(retained).ends_with("[4096 workflow stderr bytes omitted]"));
+    }
+
+    #[cfg(unix)]
+    fn terminate_fixture_process(pid_path: &Path) {
+        let Ok(pid) = std::fs::read_to_string(pid_path) else {
+            return;
+        };
+        let _ = Command::new("/bin/kill")
+            .args(["-KILL", pid.trim()])
+            .status();
+    }
+
     #[cfg(unix)]
     fn write_fake_node(dir: &Path) -> PathBuf {
+        write_fake_node_script(dir, "#!/bin/sh\nexit 0\n")
+    }
+
+    #[cfg(unix)]
+    fn write_fake_node_script(dir: &Path, script: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
 
         let node = dir.join("node");
-        std::fs::write(&node, "#!/bin/sh\nexit 0\n").expect("write fake node");
+        std::fs::write(&node, script).expect("write fake node");
         let mut permissions = std::fs::metadata(&node)
             .expect("fake node metadata")
             .permissions();

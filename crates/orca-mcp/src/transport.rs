@@ -5,6 +5,9 @@ use std::sync::Mutex;
 use std::sync::mpsc;
 use std::time::Duration;
 
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+
 use serde_json::{Value, json};
 
 use orca_core::mcp_types::{McpServerConfig, McpTransportKind};
@@ -92,16 +95,37 @@ struct StdioTransport {
 }
 
 struct StdioState {
-    _child: Child,
+    child: StdioChild,
     stdin: ChildStdin,
     responses: mpsc::Receiver<Result<Value, String>>,
     next_id: u64,
 }
 
-impl Drop for StdioState {
+struct StdioChild {
+    child: Option<Child>,
+}
+
+impl StdioChild {
+    fn new(child: Child) -> Self {
+        Self { child: Some(child) }
+    }
+
+    fn child_mut(&mut self) -> &mut Child {
+        self.child.as_mut().expect("stdio child is available")
+    }
+
+    fn terminate(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        kill_child_tree(&mut child);
+        let _ = child.wait();
+    }
+}
+
+impl Drop for StdioChild {
     fn drop(&mut self) {
-        let _ = self._child.kill();
-        let _ = self._child.wait();
+        self.terminate();
     }
 }
 
@@ -112,20 +136,29 @@ impl StdioTransport {
             .as_deref()
             .ok_or_else(|| format!("MCP server '{}' is missing command", config.name))?;
 
-        let mut child = Command::new(command)
+        let mut child_command = Command::new(command);
+        child_command
             .args(&config.args)
             .envs(&config.env)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::null());
+        #[cfg(unix)]
+        {
+            child_command.process_group(0);
+        }
+        let child = child_command
             .spawn()
             .map_err(|error| format!("failed to start MCP server '{}': {error}", config.name))?;
+        let mut child = StdioChild::new(child);
 
         let stdin = child
+            .child_mut()
             .stdin
             .take()
             .ok_or_else(|| format!("failed to open stdin for MCP server '{}'", config.name))?;
         let stdout = child
+            .child_mut()
             .stdout
             .take()
             .ok_or_else(|| format!("failed to open stdout for MCP server '{}'", config.name))?;
@@ -150,7 +183,7 @@ impl StdioTransport {
         Ok(Self {
             server_name: config.name.clone(),
             state: Mutex::new(StdioState {
-                _child: child,
+                child,
                 stdin,
                 responses,
                 next_id: 1,
@@ -287,7 +320,7 @@ impl StdioTransport {
         let mut iterations = 0u32;
         loop {
             if should_cancel.is_some_and(|should_cancel| should_cancel()) {
-                let _ = state._child.kill();
+                state.child.terminate();
                 return Err("MCP tool call cancelled".to_string());
             }
             if iterations >= 1000 {
@@ -296,7 +329,7 @@ impl StdioTransport {
                 ));
             }
             if std::time::Instant::now() >= deadline {
-                let _ = state._child.kill();
+                state.child.terminate();
                 return Err(format!(
                     "MCP request '{method}' timed out after {}",
                     format_duration(timeout)
@@ -314,7 +347,7 @@ impl StdioTransport {
                     if should_cancel.is_some() {
                         continue;
                     }
-                    let _ = state._child.kill();
+                    state.child.terminate();
                     return Err(format!(
                         "MCP request '{method}' timed out after {}",
                         format_duration(timeout)
@@ -360,6 +393,27 @@ impl StdioTransport {
                 "params": params
             }),
         )
+    }
+}
+
+fn kill_child_tree(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        kill_process_group(child.id());
+    }
+    let _ = child.kill();
+}
+
+#[cfg(unix)]
+fn kill_process_group(pid: u32) {
+    unsafe extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+
+    const SIGKILL: i32 = 9;
+    let pgid = -(pid as i32);
+    unsafe {
+        let _ = kill(pgid, SIGKILL);
     }
 }
 
@@ -748,7 +802,56 @@ mod tests {
     #[test]
     fn stdio_tool_call_uses_configured_tool_timeout() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
-        let server = temp_dir.path().join("slow_mcp_server.sh");
+        let survivor_marker = temp_dir.path().join("timeout-survivor");
+        let transport = stalling_stdio_transport(&temp_dir, &survivor_marker, 100);
+
+        let started = Instant::now();
+        let result = transport.call_tool("wait", Value::Object(Default::default()));
+
+        assert!(
+            started.elapsed() < Duration::from_millis(750),
+            "tool call took {:?}",
+            started.elapsed()
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .contains("MCP request 'tools/call' timed out after 100ms")
+        );
+        assert_descendant_did_not_survive(&survivor_marker);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdio_tool_call_cancel_reaps_descendant_processes() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let survivor_marker = temp_dir.path().join("cancel-survivor");
+        let transport = stalling_stdio_transport(&temp_dir, &survivor_marker, 5_000);
+
+        let started = Instant::now();
+        let result = transport.call_tool_with_elicitation_handler_or_cancel(
+            "wait",
+            Value::Object(Default::default()),
+            None,
+            &|| started.elapsed() >= Duration::from_millis(100),
+        );
+
+        assert!(
+            started.elapsed() < Duration::from_millis(750),
+            "tool cancellation took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(result.unwrap_err(), "MCP tool call cancelled");
+        assert_descendant_did_not_survive(&survivor_marker);
+    }
+
+    #[cfg(unix)]
+    fn stalling_stdio_transport(
+        temp_dir: &tempfile::TempDir,
+        survivor_marker: &std::path::Path,
+        tool_timeout_ms: u64,
+    ) -> Box<dyn McpTransport> {
+        let server = temp_dir.path().join("stalling_mcp_server.sh");
         fs::write(
             &server,
             r#"#!/bin/sh
@@ -763,8 +866,8 @@ while IFS= read -r line; do
       printf '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"wait","description":"waits","inputSchema":{"type":"object","properties":{},"required":[]}}]}}\n'
       ;;
     *'"method":"tools/call"'*)
-      sleep 5
-      printf '{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"too late"}],"isError":false}}\n'
+      (sleep 0.4; : > "$1") &
+      wait
       ;;
   esac
 done
@@ -781,30 +884,29 @@ done
             name: "slow".to_string(),
             transport: McpTransportKind::Stdio,
             command: Some("/bin/sh".to_string()),
-            args: vec![server.to_string_lossy().into_owned()],
+            args: vec![
+                server.to_string_lossy().into_owned(),
+                survivor_marker.to_string_lossy().into_owned(),
+            ],
             url: None,
             env: Default::default(),
             headers: Default::default(),
             disabled: false,
             startup_timeout_ms: Some(STDIO_TEST_STARTUP_TIMEOUT_MS),
-            tool_timeout_ms: Some(100),
+            tool_timeout_ms: Some(tool_timeout_ms),
         })
         .expect("connect stdio MCP");
         transport.initialize().expect("initialize MCP");
         transport.list_tools().expect("list tools");
+        transport
+    }
 
-        let started = Instant::now();
-        let result = transport.call_tool("wait", Value::Object(Default::default()));
-
+    #[cfg(unix)]
+    fn assert_descendant_did_not_survive(survivor_marker: &std::path::Path) {
+        std::thread::sleep(Duration::from_millis(600));
         assert!(
-            started.elapsed() < Duration::from_millis(750),
-            "tool call took {:?}",
-            started.elapsed()
-        );
-        assert!(
-            result
-                .unwrap_err()
-                .contains("MCP request 'tools/call' timed out after 100ms")
+            !survivor_marker.exists(),
+            "MCP descendant continued running after transport termination"
         );
     }
 
